@@ -9,15 +9,25 @@
 ///    (even when no relay exists), then marks the target as Suspect.
 /// 6. Promotes expired suspects to Dead.
 ///
+/// Every message received while waiting goes through `handle_message`, so a
+/// node answers PINGs and serves relays in the middle of its own probe. A
+/// relay never waits inline: it records the request and forwards the
+/// target's ACK when it arrives.
+///
+/// Each message carries the sender's sequence number under the HMAC, and a
+/// node drops any message whose sequence isn't above the highest it has
+/// seen from that sender, so a replayed datagram can't move a member's
+/// address or roll its directory fields back.
+///
 /// Every `push_pull_interval` (and on the first cycle, so a joining node
 /// syncs straight away) it also exchanges its membership table with one
 /// random live peer: anti-entropy for whatever piggybacking missed.
 ///
 /// The `MustardNode` struct owns the membership table, dissemination
 /// queue, and transport, and drives the protocol as an async task.
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -28,6 +38,7 @@ use tokio::sync::watch;
 
 use crate::meat::NodeId;
 
+use super::MustardError;
 use super::config::GossipConfig;
 use super::directory::NodeDirectory;
 use super::dissemination::DisseminationQueue;
@@ -38,6 +49,58 @@ use super::message::{
 };
 use super::state::NodeState;
 use super::transport::MustardTransport;
+
+/// Most indirect probes a relay serves at once. A PING-REQ beyond this
+/// displaces the oldest, so a flood of requests can't grow memory.
+const MAX_PENDING_RELAYS: usize = 64;
+
+/// Shortest gap between two log lines about failed gossip sends.
+const SEND_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// An indirect probe this node is running for a peer: when `target`
+/// acknowledges our PING before `expires`, we forward the ACK to
+/// `requester`.
+#[derive(Debug, Clone)]
+struct PendingRelay {
+    target: NodeId,
+    requester: NodeId,
+    expires: tokio::time::Instant,
+}
+
+/// Rate-limited reporting of failed gossip sends. A send that fails used
+/// to vanish (`let _ =`), so a node whose datagrams were refused stopped
+/// acknowledging without a trace. Now every failure is counted, and one
+/// line goes to stderr at most every [`SEND_FAILURE_LOG_INTERVAL`].
+#[derive(Debug, Default)]
+struct SendFailureLog {
+    /// Failures since the node started.
+    total: u64,
+    /// Failures since the last line we printed.
+    unreported: u64,
+    last_logged: Option<Instant>,
+}
+
+impl SendFailureLog {
+    /// Count a failure. Returns the line to log, or `None` while the last
+    /// line is too recent.
+    fn record(&mut self, now: Instant, target: SocketAddr, error: &MustardError) -> Option<String> {
+        self.total += 1;
+        self.unreported += 1;
+        if self
+            .last_logged
+            .is_some_and(|last| now.duration_since(last) < SEND_FAILURE_LOG_INTERVAL)
+        {
+            return None;
+        }
+        let line = format!(
+            "mustard: gossip send to {target} failed: {error} ({} failure(s) since the last report)",
+            self.unreported
+        );
+        self.unreported = 0;
+        self.last_logged = Some(now);
+        Some(line)
+    }
+}
 
 /// What a published membership snapshot is compared by.
 type MembershipDigest = (
@@ -106,6 +169,9 @@ pub struct MustardNode<T: MustardTransport> {
     last_published_roster_digest: Vec<MembershipDigest>,
     /// Process-local proof that a peer has acknowledged our gossip.
     rejoin_watch: Option<watch::Sender<bool>>,
+    /// Flips to `true` the first time a peer's membership table arrives in
+    /// a `Sync` exchange: gossip has joined and synced (#694).
+    synced_watch: Option<watch::Sender<bool>>,
     /// Digest of the last-published membership. Used to publish on any content
     /// change (state/incarnation/council/leader), not just a count change.
     last_published_digest: Vec<MembershipDigest>,
@@ -139,6 +205,11 @@ pub struct MustardNode<T: MustardTransport> {
     /// outgoing extension so the leader learns this voter should resign.
     /// `None` until wired — then the bit is always `false`.
     disk_pressured_rx: Option<watch::Receiver<bool>>,
+    /// The kinds of job this node runs (#788), published once its task
+    /// executor exists. Every outgoing extension advertises the latest value,
+    /// and the local directory lists it under this node. `None` until wired.
+    job_capabilities_rx:
+        Option<watch::Receiver<Option<crate::meat::job_capability::JobCapabilities>>>,
     /// This node's recovery fence (#424), whose claimed epoch every outgoing
     /// extension advertises. `None` until wired: then no epoch is claimed.
     recovery_fence_rx: Option<watch::Receiver<crate::council::fence::FenceSnapshot>>,
@@ -164,6 +235,17 @@ pub struct MustardNode<T: MustardTransport> {
     /// Where the next outgoing window of the membership table starts, for
     /// tables larger than one exchange carries (`MAX_SYNC_ENTRIES`).
     sync_cursor: usize,
+    /// The highest message sequence accepted from each sender. A message
+    /// at or below it is a replay or a duplicate and is dropped. Pruned
+    /// when the sender is reaped from membership.
+    sequences: HashMap<NodeId, u64>,
+    /// Indirect probes this node is relaying, waiting for the target's ACK.
+    pending_relays: VecDeque<PendingRelay>,
+    /// Failed sends, reported at a bounded rate.
+    send_failures: SendFailureLog,
+    /// Whether we've already said that our directory extension is too big
+    /// to send, so the line appears once rather than on every datagram.
+    oversize_extension_logged: bool,
 }
 
 impl<T: MustardTransport> MustardNode<T> {
@@ -171,6 +253,13 @@ impl<T: MustardTransport> MustardNode<T> {
     /// Seed entries and piggybacked membership never count as proof.
     pub fn set_rejoin_watch(&mut self, sender: watch::Sender<bool>) {
         self.rejoin_watch = Some(sender);
+    }
+
+    /// Publish `true` once a peer's table first arrives in a push-pull
+    /// exchange. The recovery fence opens its startup probe window then,
+    /// not at process start (#694).
+    pub fn set_synced_watch(&mut self, sender: watch::Sender<bool>) {
+        self.synced_watch = Some(sender);
     }
 
     /// Maximum number of peers to notify during graceful leave.
@@ -195,6 +284,7 @@ impl<T: MustardTransport> MustardNode<T> {
             roster_watch: None,
             last_published_roster_digest: Vec::new(),
             rejoin_watch: None,
+            synced_watch: None,
             last_published_digest: Vec::new(),
             left: false,
             seeds: Vec::new(),
@@ -203,6 +293,7 @@ impl<T: MustardTransport> MustardNode<T> {
             advertised_labels: BTreeMap::new(),
             leader_hint_rx: None,
             disk_pressured_rx: None,
+            job_capabilities_rx: None,
             recovery_fence_rx: None,
             council_roles_rx: None,
             directory: NodeDirectory::default(),
@@ -211,6 +302,10 @@ impl<T: MustardTransport> MustardNode<T> {
             rng: StdRng::from_entropy(),
             next_push_pull: Instant::now(),
             sync_cursor: 0,
+            sequences: HashMap::new(),
+            pending_relays: VecDeque::new(),
+            send_failures: SendFailureLog::default(),
+            oversize_extension_logged: false,
         }
     }
 
@@ -270,6 +365,18 @@ impl<T: MustardTransport> MustardNode<T> {
         self.disk_pressured_rx = Some(rx);
     }
 
+    /// Wire the kinds of job this node runs (#788): the runtime publishes
+    /// them once its task executor exists, and every outgoing extension then
+    /// advertises the latest value, so the leader can refuse a run no live
+    /// node could take at submission.
+    pub fn set_job_capabilities_watch(
+        &mut self,
+        rx: watch::Receiver<Option<crate::meat::job_capability::JobCapabilities>>,
+    ) {
+        self.job_capabilities_rx = Some(rx);
+        self.refresh_own_job_capabilities();
+    }
+
     /// Wire this node's recovery fence (#424): every outgoing extension then
     /// advertises the epoch it claims, so restarted voters can tell whether a
     /// recovery replaced their council before they serve Raft.
@@ -323,10 +430,10 @@ impl<T: MustardTransport> MustardNode<T> {
             ),
             (a, b) => a.or(b),
         };
-        let recovery_epoch = self
+        let recovery_claim = self
             .recovery_fence_rx
             .as_ref()
-            .and_then(|rx| rx.borrow().claimed_epoch());
+            .and_then(|rx| rx.borrow().claim());
         let disk_pressured = self
             .disk_pressured_rx
             .as_ref()
@@ -339,15 +446,112 @@ impl<T: MustardTransport> MustardNode<T> {
             leader,
             labels: super::message::bounded_labels(&self.advertised_labels),
             disk_pressured,
-            recovery_epoch,
+            recovery_epoch: recovery_claim.map(|claim| claim.epoch),
+            recovery_id: recovery_claim.and_then(|claim| claim.id),
+            jobs: self.own_job_capabilities(),
             hmac: [0u8; 32],
         })
     }
 
-    /// Stamp an outgoing message with this node's directory extension.
-    fn stamp(&self, mut message: GossipMessage) -> GossipMessage {
-        message.extension = self.local_extension();
+    /// The kinds of job this node runs, as its runtime last published them.
+    fn own_job_capabilities(&self) -> Option<crate::meat::job_capability::JobCapabilities> {
+        self.job_capabilities_rx
+            .as_ref()
+            .and_then(|rx| *rx.borrow())
+    }
+
+    /// List this node's own job summary in its directory, publishing on a
+    /// change. Its own extension never comes back over the wire, and the
+    /// leader counts itself among the nodes that might run a job (#788).
+    fn refresh_own_job_capabilities(&mut self) {
+        let own = self.own_job_capabilities();
+        let changed = match own {
+            Some(jobs) => self.directory.jobs.insert(self.node_id.clone(), jobs) != Some(jobs),
+            None => self.directory.jobs.remove(&self.node_id).is_some(),
+        };
+        if changed {
+            self.publish_directory();
+        }
+    }
+
+    /// Build an outgoing probe (Ping, PingReq or Ack) from this node:
+    /// stamp our directory extension, then fill whatever room the datagram
+    /// has left with piggybacked updates, so it never exceeds
+    /// [`MAX_DATAGRAM_BYTES`](super::message::MAX_DATAGRAM_BYTES).
+    ///
+    /// `payload` arrives with no updates. When `peer` names a member we
+    /// hold Suspect, Dead or Left, our claim about it goes first: a
+    /// directly contacted peer must learn it even after ordinary piggyback
+    /// retransmissions have run out, so it can refute it.
+    fn probe_message(&mut self, payload: GossipPayload, peer: Option<&NodeId>) -> GossipMessage {
+        let mut message = GossipMessage::new(self.node_id.clone(), self.incarnation, payload);
+        let mut room = match self.local_extension() {
+            Some(extension) => message.attach_extension(extension),
+            None => message.piggyback_room(),
+        };
+        if self.advertised.is_some()
+            && message.extension.is_none()
+            && !self.oversize_extension_logged
+        {
+            self.oversize_extension_logged = true;
+            eprintln!(
+                "mustard: directory extension does not fit a gossip datagram; \
+                 sending membership without it (shorten the node name or labels)"
+            );
+        }
+
+        // Our claim about the peer, if it fits, then whatever else fits.
+        let claim = peer
+            .and_then(|peer| self.membership.get(peer))
+            .filter(|member| member.state != NodeState::Alive)
+            .map(|member| MembershipUpdate {
+                node_id: member.node_id.clone(),
+                address: member.address,
+                state: member.state,
+                incarnation: member.incarnation,
+            })
+            .filter(|claim| claim.encoded_len() <= room);
+        let mut slots = MAX_PIGGYBACK_UPDATES;
+        if let Some(claim) = &claim {
+            room -= claim.encoded_len();
+            slots -= 1;
+        }
+        let mut updates = self.dissemination.select_updates_within(room, slots);
+        if let Some(claim) = claim {
+            updates.retain(|update| update.node_id != claim.node_id);
+            updates.insert(0, claim);
+        }
+        *message.payload.updates_mut() = updates;
         message
+    }
+
+    /// Send one datagram. A failure is counted and logged at a bounded
+    /// rate, never dropped silently: a node whose ACKs can't leave looks
+    /// dead to its peers, and the log is how an operator finds out why.
+    async fn send(&mut self, target: SocketAddr, message: &GossipMessage) {
+        if let Err(error) = self.transport.send(target, message).await
+            && let Some(line) = self.send_failures.record(Instant::now(), target, &error)
+        {
+            eprintln!("{line}");
+        }
+    }
+
+    /// Whether `message` is the newest we've seen from its sender. Records
+    /// its sequence if so. A replayed or duplicated datagram carries a
+    /// sequence at or below the last one we accepted from that sender.
+    fn admit_sequence(&mut self, message: &GossipMessage) -> bool {
+        match self.sequences.get_mut(&message.sender) {
+            Some(last) if message.sequence <= *last => false,
+            Some(last) => {
+                *last = message.sequence;
+                true
+            }
+            None => {
+                self.sequences
+                    .insert(message.sender.clone(), message.sequence);
+                true
+            }
+        }
     }
 
     /// Fold a received extension into the directory and publish on change.
@@ -382,6 +586,11 @@ impl<T: MustardTransport> MustardNode<T> {
         self.seeds = seeds;
     }
 
+    /// Whether this node has any seed to join through.
+    pub fn has_seeds(&self) -> bool {
+        !self.seeds.is_empty()
+    }
+
     /// Probe configured seeds while isolated.
     async fn ping_seeds(&mut self) {
         let addresses = self.seeds.clone();
@@ -391,13 +600,8 @@ impl<T: MustardTransport> MustardNode<T> {
                 .iter()
                 .find(|member| member.address == address)
                 .map(|member| member.node_id.clone());
-            let updates = self.updates_for_peer(peer.as_ref());
-            let ping = GossipMessage::new(
-                self.node_id.clone(),
-                self.incarnation,
-                GossipPayload::Ping { updates },
-            );
-            let _ = self.transport.send(address, &self.stamp(ping)).await;
+            let ping = self.probe_message(GossipPayload::Ping { updates: vec![] }, peer.as_ref());
+            self.send(address, &ping).await;
         }
     }
 
@@ -416,35 +620,8 @@ impl<T: MustardTransport> MustardNode<T> {
         {
             return;
         }
-        let updates = self.updates_for_peer(Some(&node));
-        let ping = GossipMessage::new(
-            self.node_id.clone(),
-            self.incarnation,
-            GossipPayload::Ping { updates },
-        );
-        let _ = self.transport.send(address, &self.stamp(ping)).await;
-    }
-
-    /// A directly contacted peer must learn our current suspicion/death claim
-    /// even if its ordinary piggyback retransmissions have been exhausted.
-    fn updates_for_peer(&mut self, peer: Option<&NodeId>) -> Vec<MembershipUpdate> {
-        let mut updates = self.dissemination.select_updates();
-        if let Some(member) = peer.and_then(|peer| self.membership.get(peer))
-            && member.state != NodeState::Alive
-        {
-            updates.retain(|update| update.node_id != member.node_id);
-            updates.insert(
-                0,
-                MembershipUpdate {
-                    node_id: member.node_id.clone(),
-                    address: member.address,
-                    state: member.state,
-                    incarnation: member.incarnation,
-                },
-            );
-            updates.truncate(super::message::MAX_PIGGYBACK_UPDATES);
-        }
-        updates
+        let ping = self.probe_message(GossipPayload::Ping { updates: vec![] }, Some(&node));
+        self.send(address, &ping).await;
     }
 
     /// Set the membership watch channel for publishing snapshots.
@@ -531,13 +708,8 @@ impl<T: MustardTransport> MustardNode<T> {
             .collect();
 
         for peer_addr in peers {
-            let updates = self.dissemination.select_updates();
-            let ping = GossipMessage::new(
-                self.node_id.clone(),
-                self.incarnation,
-                GossipPayload::Ping { updates },
-            );
-            let _ = self.transport.send(peer_addr, &self.stamp(ping)).await;
+            let ping = self.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+            self.send(peer_addr, &ping).await;
         }
     }
 
@@ -581,6 +753,7 @@ impl<T: MustardTransport> MustardNode<T> {
         if self.node_gate.is_quiesced() {
             return;
         }
+        self.refresh_own_job_capabilities();
         // An explicit departure retires a contact; a failure does not. Inspect
         // Left before reaping, while that distinction still exists.
         self.rejoin_contacts.retain(|(node, _)| {
@@ -593,8 +766,16 @@ impl<T: MustardTransport> MustardNode<T> {
         let reaped = self
             .membership
             .reap_expired_dead(self.config.cleanup_timeout, now);
-        if !reaped.is_empty() && self.directory.prune(&reaped) {
-            self.publish_directory();
+        if !reaped.is_empty() {
+            // Forget a reaped member's sequence, so the same node coming
+            // back (a restart whose clock stepped backwards included) is
+            // heard again rather than dropped as a replay forever.
+            for node in &reaped {
+                self.sequences.remove(node);
+            }
+            if self.directory.prune(&reaped) {
+                self.publish_directory();
+            }
         }
         self.ping_rejoin_contact().await;
 
@@ -612,14 +793,8 @@ impl<T: MustardTransport> MustardNode<T> {
             return;
         };
 
-        // Send PING
-        let updates = self.dissemination.select_updates();
-        let ping = GossipMessage::new(
-            self.node_id.clone(),
-            self.incarnation,
-            GossipPayload::Ping { updates },
-        );
-        let _ = self.transport.send(target_addr, &self.stamp(ping)).await;
+        let ping = self.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+        self.send(target_addr, &ping).await;
 
         // Wait for ACK
         let got_ack = self
@@ -631,21 +806,16 @@ impl<T: MustardTransport> MustardNode<T> {
 
         // No direct ACK — try indirect probes
         let relays = self.pick_relays(&target_id);
-        for relay_addr in &relays {
-            let updates = self.dissemination.select_updates();
-            let ping_req = GossipMessage::new(
-                self.node_id.clone(),
-                self.incarnation,
+        for relay_addr in relays {
+            let ping_req = self.probe_message(
                 GossipPayload::PingReq {
                     target: target_id.clone(),
                     requester: self.node_id.clone(),
-                    updates,
+                    updates: vec![],
                 },
+                None,
             );
-            let _ = self
-                .transport
-                .send(*relay_addr, &self.stamp(ping_req))
-                .await;
+            self.send(relay_addr, &ping_req).await;
         }
 
         // Wait for an indirect ACK, or a late direct one. Wait even with no
@@ -680,54 +850,62 @@ impl<T: MustardTransport> MustardNode<T> {
         }
     }
 
-    /// Handle an incoming gossip message.
-    pub async fn handle_message(&mut self, from: SocketAddr, message: GossipMessage) {
+    /// Handle an incoming gossip message. Returns `false` if it was dropped
+    /// unread: a different protocol generation, or a sequence number at or
+    /// below the last one accepted from its sender (a replay or duplicate).
+    pub async fn handle_message(&mut self, from: SocketAddr, message: GossipMessage) -> bool {
         if message.version != GossipMessage::VERSION
             || message.state_format != crate::compatibility::CURRENT.state
         {
-            return;
+            return false;
+        }
+        // Replay protection comes before anything is applied. The HMAC proves
+        // the sender wrote these bytes once, not that it wrote them just now:
+        // a captured datagram replayed from another socket would otherwise
+        // move the sender's address there, and an old extension would roll
+        // its directory fields (recovery epoch included) back.
+        if message.sender != self.node_id && !self.admit_sequence(&message) {
+            return false;
         }
         let now = Instant::now();
 
         // Fold the directory extension in first — endpoint knowledge and the
         // leader hint are useful even if the membership payload is stale.
-        if let Some(extension) = &message.extension {
+        // Only the sender's own extension counts: it's the one the sequence
+        // number above vouches for.
+        let extension = message
+            .extension
+            .as_ref()
+            .filter(|extension| extension.node_id == message.sender);
+        if let Some(extension) = extension {
             self.ingest_extension(extension);
         }
 
-        // Register the sender at the socket it came from — but NOT for a
-        // relayed ACK, whose socket is the relay's, not the sender's (M13).
-        // Recording the probed node at the relay's address made the next
-        // direct probe hit the relay, whose ACK (sender = relay ≠ probed node)
-        // never matched, falsely evicting a healthy node. The relayed sender is
-        // already the probe target we know; its liveness is applied below.
-        let is_relayed_ack = matches!(&message.payload, GossipPayload::Ack { relayed: true, .. });
-        let is_new = if is_relayed_ack {
-            false
-        } else {
-            if message.sender != self.node_id && from != self.address {
-                self.rejoin_contacts
-                    .retain(|(node, _)| node != &message.sender);
-                self.rejoin_contacts
-                    .push_back((message.sender.clone(), from));
-                if self.rejoin_contacts.len() > Self::MAX_REJOIN_CONTACTS {
-                    self.rejoin_contacts.pop_front();
-                }
+        // Register the sender at the socket it came from. A relayed ACK's
+        // sender is the relay itself, so this records the relay at its own
+        // socket, never the probed node at the relay's (M13).
+        if message.sender != self.node_id && from != self.address {
+            self.rejoin_contacts
+                .retain(|(node, _)| node != &message.sender);
+            self.rejoin_contacts
+                .push_back((message.sender.clone(), from));
+            if self.rejoin_contacts.len() > Self::MAX_REJOIN_CONTACTS {
+                self.rejoin_contacts.pop_front();
             }
-            self.membership.add_node(
-                message.sender.clone(),
-                from,
-                message.incarnation,
-                BTreeMap::new(),
-                now,
-            )
-        };
+        }
+        let is_new = self.membership.add_node(
+            message.sender.clone(),
+            from,
+            message.incarnation,
+            BTreeMap::new(),
+            now,
+        );
 
         // Mirror the freshly-registered sender's advertised labels onto its
         // membership record. `ingest_extension` above ran before `add_node`,
         // so a first-contact sender wouldn't yet have a record to label;
         // do it here now the record exists.
-        if let Some(extension) = &message.extension
+        if let Some(extension) = extension
             && let Some(member) = self.membership.get_mut(&extension.node_id)
             && member.labels != extension.labels
         {
@@ -783,65 +961,35 @@ impl<T: MustardTransport> MustardNode<T> {
             GossipPayload::Ping { .. } => {
                 // A returning peer can refute a retained Dead claim even when
                 // ordinary dissemination has already forgotten that update.
-                let updates = self.updates_for_peer(Some(&message.sender));
-                let ack = GossipMessage::new(
-                    self.node_id.clone(),
-                    self.incarnation,
+                let ack = self.probe_message(
                     GossipPayload::Ack {
-                        updates,
-                        relayed: false,
+                        updates: vec![],
+                        relayed_for: None,
                     },
+                    Some(&message.sender),
                 );
-                let _ = self.transport.send(from, &self.stamp(ack)).await;
+                self.send(from, &ack).await;
             }
             GossipPayload::PingReq {
                 target, requester, ..
             } => {
-                // Probe the target on behalf of the requester.
-                // If the target responds, forward an ACK to the requester
-                // with sender = target's NodeId so the requester's
-                // wait_for_ack recognises it.
-                if let Some(target_member) = self.membership.get(target) {
-                    let target_addr = target_member.address;
-                    let requester = requester.clone();
-                    let target = target.clone();
-                    let updates = self.dissemination.select_updates();
-                    let ping = GossipMessage::new(
-                        self.node_id.clone(),
-                        self.incarnation,
-                        GossipPayload::Ping { updates },
-                    );
-                    let _ = self.transport.send(target_addr, &self.stamp(ping)).await;
-
-                    // Wait for target's ACK (simple inline wait to avoid
-                    // async recursion through handle_message → wait_for_ack)
-                    let got_ack = self
-                        .wait_for_relay_ack(&target, self.config.probe_timeout)
-                        .await;
-
-                    if got_ack {
-                        // Forward ACK to the original requester
-                        if let Some(req_member) = self.membership.get(&requester) {
-                            let req_addr = req_member.address;
-                            let target_inc = self.membership_incarnation_of(&target);
-                            let fwd_updates = self.dissemination.select_updates();
-                            let fwd_ack = GossipMessage::new(
-                                target,
-                                target_inc,
-                                GossipPayload::Ack {
-                                    updates: fwd_updates,
-                                    // Forwarded on the target's behalf: the
-                                    // requester must not learn the target's
-                                    // address from our socket (M13).
-                                    relayed: true,
-                                },
-                            );
-                            let _ = self.transport.send(req_addr, &self.stamp(fwd_ack)).await;
-                        }
-                    }
+                // Probe the target on the requester's behalf. We don't wait
+                // for the answer here: a relay that waited inline stopped
+                // answering everyone else for a whole probe timeout. The
+                // target's ACK arrives through this function like any other
+                // message, and the Ack arm forwards it.
+                if let Some(target_addr) = self.membership.get(target).map(|m| m.address) {
+                    let ping = self.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+                    self.send(target_addr, &ping).await;
+                    self.expect_relay_ack(target.clone(), requester.clone());
                 }
             }
             GossipPayload::Sync { wants_reply, .. } => {
+                if message.sender != self.node_id
+                    && let Some(sender) = &self.synced_watch
+                {
+                    sender.send_if_modified(|synced| !std::mem::replace(synced, true));
+                }
                 // The entries were merged above like any piggybacked update.
                 // Answer a request with our own table; never answer a reply,
                 // or two nodes would bounce their tables back and forth.
@@ -849,22 +997,73 @@ impl<T: MustardTransport> MustardNode<T> {
                     self.send_membership(from, false).await;
                 }
             }
-            GossipPayload::Ack { relayed, .. } => {
-                if !relayed
+            GossipPayload::Ack { relayed_for, .. } => {
+                if relayed_for.is_none()
                     && message.sender != self.node_id
                     && let Some(sender) = &self.rejoin_watch
                 {
                     sender.send_replace(true);
                 }
-                // Mark sender as alive (ACK received)
-                if let Some(member) = self.membership.get_mut(&message.sender) {
+                // Mark the acknowledged node alive: the sender itself, or the
+                // probed node a relay vouches for.
+                let acknowledged = relayed_for.as_ref().unwrap_or(&message.sender);
+                if let Some(member) = self.membership.get_mut(acknowledged) {
                     if member.state == NodeState::Suspect {
                         member.state = NodeState::Alive;
                         member.state_changed = now;
                     }
                     member.last_ack = now;
                 }
+                if relayed_for.is_none() {
+                    self.forward_relay_acks(&message.sender).await;
+                }
             }
+        }
+        true
+    }
+
+    /// Remember that we pinged `target` for `requester`, so its ACK can be
+    /// forwarded when it arrives within one probe timeout.
+    fn expect_relay_ack(&mut self, target: NodeId, requester: NodeId) {
+        let now = tokio::time::Instant::now();
+        self.pending_relays.retain(|relay| relay.expires > now);
+        if self.pending_relays.len() >= MAX_PENDING_RELAYS {
+            self.pending_relays.pop_front();
+        }
+        self.pending_relays.push_back(PendingRelay {
+            target,
+            requester,
+            expires: now + self.config.probe_timeout,
+        });
+    }
+
+    /// `target` just acknowledged us directly: forward an ACK vouching for
+    /// it to everyone whose indirect probe of it we are still running.
+    async fn forward_relay_acks(&mut self, target: &NodeId) {
+        let now = tokio::time::Instant::now();
+        let mut requesters = Vec::new();
+        self.pending_relays.retain(|relay| {
+            if relay.expires <= now {
+                return false;
+            }
+            if relay.target == *target {
+                requesters.push(relay.requester.clone());
+                return false;
+            }
+            true
+        });
+        for requester in requesters {
+            let Some(address) = self.membership.get(&requester).map(|m| m.address) else {
+                continue;
+            };
+            let ack = self.probe_message(
+                GossipPayload::Ack {
+                    updates: vec![],
+                    relayed_for: Some(target.clone()),
+                },
+                Some(&requester),
+            );
+            self.send(address, &ack).await;
         }
     }
 
@@ -892,7 +1091,10 @@ impl<T: MustardTransport> MustardNode<T> {
         // membership table — the one its scheduler and council reads see —
         // still holds it Suspect, Dead or Left.
         self.membership.apply_update(&update, Instant::now());
-        self.dissemination.enqueue(update, self.membership.len());
+        // Ahead of every queued Suspect and Dead: a falsely suspected node
+        // that waits behind a rack failure's backlog flaps.
+        self.dissemination
+            .enqueue_refutation(update, self.membership.len());
     }
 
     /// Start an anti-entropy exchange with one random live peer.
@@ -922,7 +1124,7 @@ impl<T: MustardTransport> MustardNode<T> {
     /// Only the first datagram carries `wants_reply`, so the peer answers once.
     ///
     /// Sync datagrams go out unstamped: the directory extension can take
-    /// ~700 bytes with a full label set, and every probe already carries it,
+    /// ~1,100 bytes with a full label set, and every probe already carries it,
     /// so the whole UDP budget goes to membership entries instead.
     async fn send_membership(&mut self, target: SocketAddr, wants_reply: bool) {
         let window = self.membership_window();
@@ -935,7 +1137,7 @@ impl<T: MustardTransport> MustardNode<T> {
                     wants_reply: wants_reply && index == 0,
                 },
             );
-            let _ = self.transport.send(target, &sync).await;
+            self.send(target, &sync).await;
         }
     }
 
@@ -1048,8 +1250,10 @@ impl<T: MustardTransport> MustardNode<T> {
 
     /// Wait for an ACK from (or about) the target within the timeout.
     ///
-    /// Drains inbound messages while waiting. Non-ACK messages are
-    /// still handled (their piggybacked updates are applied).
+    /// Every message that arrives meanwhile goes through `handle_message`:
+    /// PINGs are answered, relays served and syncs merged while we wait.
+    /// An ACK counts only if `handle_message` accepted it, so a replayed
+    /// old ACK can't stand in for a fresh one.
     async fn wait_for_ack(&mut self, target_id: &NodeId, timeout: std::time::Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
 
@@ -1061,73 +1265,25 @@ impl<T: MustardTransport> MustardNode<T> {
 
             match tokio::time::timeout(remaining, self.transport.recv()).await {
                 Ok(Some((from, message))) => {
-                    let is_ack_from_target = matches!(&message.payload, GossipPayload::Ack { .. })
-                        && message.sender == *target_id;
+                    let acknowledges_target = match &message.payload {
+                        GossipPayload::Ack {
+                            relayed_for: Some(vouched),
+                            ..
+                        } => vouched == target_id,
+                        GossipPayload::Ack {
+                            relayed_for: None, ..
+                        } => message.sender == *target_id,
+                        _ => false,
+                    };
 
-                    self.handle_message(from, message).await;
+                    let accepted = self.handle_message(from, message).await;
 
-                    if is_ack_from_target {
+                    if accepted && acknowledges_target {
                         return true;
                     }
                 }
                 Ok(None) => return false, // Transport shut down
                 Err(_) => return false,   // Timeout
-            }
-        }
-    }
-
-    /// Wait for an ACK from the target during a relay probe.
-    ///
-    /// Unlike `wait_for_ack`, this does not recursively call `handle_message`
-    /// (which would cause async recursion). It only checks for ACKs and
-    /// applies piggybacked updates from them.
-    async fn wait_for_relay_ack(
-        &mut self,
-        target_id: &NodeId,
-        timeout: std::time::Duration,
-    ) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return false;
-            }
-
-            match tokio::time::timeout(remaining, self.transport.recv()).await {
-                Ok(Some((_from, message))) => {
-                    let is_ack_from_target = matches!(&message.payload, GossipPayload::Ack { .. })
-                        && message.sender == *target_id;
-
-                    // Apply piggybacked updates without full handle_message
-                    let now = Instant::now();
-                    if let Some(extension) = &message.extension {
-                        self.ingest_extension(extension);
-                    }
-                    for update in message.payload.updates() {
-                        self.membership.apply_update(update, now);
-                        // Refute a Suspect/Dead/Left claimed about *us* here too
-                        // (M11): this relay-wait applies piggybacked updates but
-                        // used to skip the refutation `handle_message` does, so a
-                        // false Suspect/Dead about this node arriving during a
-                        // relay probe was never refuted and could stick until the
-                        // reap timeout.
-                        let refutable = match update.state {
-                            NodeState::Suspect | NodeState::Dead => true,
-                            NodeState::Left => !self.left,
-                            NodeState::Alive => false,
-                        };
-                        if update.node_id == self.node_id && refutable {
-                            self.refute(update.incarnation);
-                        }
-                    }
-
-                    if is_ack_from_target {
-                        return true;
-                    }
-                }
-                Ok(None) => return false,
-                Err(_) => return false,
             }
         }
     }
@@ -1769,7 +1925,8 @@ mod tests {
     async fn ping_req_relay_forwards_to_target_and_requester() {
         // When C receives a PingReq from A asking to probe B, C should:
         // 1. Send a Ping to B
-        // 2. If B responds with Ack, forward an Ack to A (with sender=B)
+        // 2. When B's Ack arrives, forward an Ack to A that C sends in its
+        //    own name and that vouches for B
         let net = InMemoryNetwork::new();
         let ta = net.register(addr(1)).await;
         let tb = net.register(addr(2)).await;
@@ -1793,25 +1950,30 @@ mod tests {
         );
         ta.send(addr(3), &ping_req).await.unwrap();
 
-        // C handles the PingReq (will send Ping to B, wait for ACK, forward
-        // to A) while B answers on the same task.
-        let (from, msg) = node_c.transport.recv().await.unwrap();
-        tokio::select! {
-            biased;
-            () = answer(&mut node_b) => {}
-            () = node_c.handle_message(from, msg) => {}
-        }
+        // C handles the PingReq (sends Ping to B, then forwards B's ACK to A
+        // when it arrives) while B answers on the same task.
+        let _ = tokio::time::timeout(fast_config().probe_timeout, async {
+            tokio::join!(answer(&mut node_b), answer(&mut node_c));
+        })
+        .await;
 
-        // A should have received a forwarded ACK with sender=B
+        // A should have received C's forwarded ACK vouching for B.
         let mut saw_forwarded_ack = false;
-        while let Some((_from, msg)) = ta.try_recv() {
-            if matches!(&msg.payload, GossipPayload::Ack { .. }) && msg.sender == NodeId::new("b") {
+        while let Some((from, msg)) = ta.try_recv() {
+            if let GossipPayload::Ack {
+                relayed_for: Some(vouched),
+                ..
+            } = &msg.payload
+                && *vouched == NodeId::new("b")
+            {
+                assert_eq!(msg.sender, NodeId::new("c"), "the relay signs for itself");
+                assert_eq!(from, addr(3));
                 saw_forwarded_ack = true;
             }
         }
         assert!(
             saw_forwarded_ack,
-            "A should have received a forwarded ACK with sender=B"
+            "A should have received a forwarded ACK vouching for B"
         );
     }
 
@@ -2249,12 +2411,19 @@ mod tests {
             joiner_transport,
         );
         joiner.add_seed(NodeId::new("seed"), addr(2));
+        let (synced_tx, synced_rx) = watch::channel(false);
+        joiner.set_synced_watch(synced_tx);
 
         let ((), requests) = tokio::join!(
             joiner.run_one_cycle(),
             serve(&mut seed, Duration::from_millis(100))
         );
         assert_eq!(requests, 1, "the first cycle must start a push-pull");
+        // #694: the recovery fence's probe window opens on this signal.
+        assert!(
+            *synced_rx.borrow(),
+            "the join sync did not report gossip as synced"
+        );
         for name in ["seed", "a", "b", "c"] {
             assert_eq!(
                 state_of(&joiner, name).map(|(state, _)| state),
@@ -2326,22 +2495,14 @@ mod tests {
         node1.set_leader_hint_watch(hint_rx);
 
         // n1 pings n2 directly.
-        let ping = node1.stamp(GossipMessage::new(
-            node1.node_id.clone(),
-            node1.incarnation,
-            GossipPayload::Ping { updates: vec![] },
-        ));
+        let ping = node1.probe_message(GossipPayload::Ping { updates: vec![] }, None);
         node1.transport.send(addr(2), &ping).await.unwrap();
         let (from, msg) = node2.transport.try_recv().unwrap();
         node2.handle_message(from, msg).await;
         assert_eq!(node2.directory().leader, Some(hint.clone()));
 
         // n2 (not a leader — no local hint) relays it to n3.
-        let ping = node2.stamp(GossipMessage::new(
-            node2.node_id.clone(),
-            node2.incarnation,
-            GossipPayload::Ping { updates: vec![] },
-        ));
+        let ping = node2.probe_message(GossipPayload::Ping { updates: vec![] }, None);
         node2.transport.send(addr(3), &ping).await.unwrap();
         let (from, msg) = node3.transport.try_recv().unwrap();
         node3.handle_message(from, msg).await;
@@ -2381,6 +2542,8 @@ mod tests {
             labels: BTreeMap::new(),
             disk_pressured: false,
             recovery_epoch: None,
+            recovery_id: None,
+            jobs: None,
             hmac: [0u8; 32],
         };
 
@@ -2438,6 +2601,8 @@ mod tests {
             labels: BTreeMap::new(),
             disk_pressured: false,
             recovery_epoch: None,
+            recovery_id: None,
+            jobs: None,
             hmac: [0u8; 32],
         });
         node.handle_message(addr(2), msg).await;
@@ -2469,6 +2634,81 @@ mod tests {
                 .disk_pressured
                 .contains(&NodeId::new("n2")),
             "n1 must learn n2's advertised disk pressure from gossip"
+        );
+    }
+
+    fn job_summary(mount_isolation: bool) -> crate::meat::job_capability::JobCapabilities {
+        crate::meat::job_capability::JobCapabilities {
+            host: true,
+            host_limits: true,
+            containers: false,
+            singleton_images: false,
+            singleton_image_limits: false,
+            encrypted_env: true,
+            network_policy: false,
+            mount_isolation,
+            binaries: true,
+        }
+    }
+
+    /// #788: n2 advertises the kinds of job it runs; n1 probes it and
+    /// learns them, which is what the leader's admission reads.
+    #[tokio::test(start_paused = true)]
+    async fn advertised_job_capabilities_reach_a_remote_member_via_gossip() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        node2.set_advertised_endpoints(9117, 9445, BTreeMap::new());
+        let (_jobs_tx, jobs_rx) = watch::channel(Some(job_summary(true)));
+        node2.set_job_capabilities_watch(jobs_rx);
+        node1.add_seed(NodeId::new("n2"), addr(2));
+
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
+
+        assert_eq!(
+            node1.directory().jobs.get(&NodeId::new("n2")),
+            Some(&job_summary(true)),
+            "n1 must learn n2's job capabilities from gossip"
+        );
+    }
+
+    /// #788: a node counts itself. The leader is a member too, and its own
+    /// summary never arrives over the wire, so it goes in the local
+    /// directory, and a change to it is published.
+    #[tokio::test]
+    async fn a_node_lists_its_own_job_capabilities_and_republishes_a_change() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let (directory_tx, directory_rx) = watch::channel(NodeDirectory::default());
+        node.set_directory_watch(directory_tx);
+        node.set_advertised_endpoints(9117, 9445, BTreeMap::new());
+        let (jobs_tx, jobs_rx) = watch::channel(None);
+        node.set_job_capabilities_watch(jobs_rx);
+
+        node.run_one_cycle().await;
+        assert!(!directory_rx.borrow().jobs.contains_key(&NodeId::new("n1")));
+
+        jobs_tx.send(Some(job_summary(true))).unwrap();
+        node.run_one_cycle().await;
+        assert_eq!(
+            directory_rx.borrow().jobs.get(&NodeId::new("n1")),
+            Some(&job_summary(true))
+        );
+        let ping = node.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+        assert_eq!(
+            ping.extension.and_then(|extension| extension.jobs),
+            Some(job_summary(true))
+        );
+
+        jobs_tx.send(Some(job_summary(false))).unwrap();
+        node.run_one_cycle().await;
+        assert_eq!(
+            directory_rx.borrow().jobs.get(&NodeId::new("n1")),
+            Some(&job_summary(false))
         );
     }
 
@@ -2815,15 +3055,16 @@ mod tests {
     }
 
     /// M13: a relayed ACK (forwarded by a relay on the target's behalf) must
-    /// not overwrite the target's recorded address with the relay's socket —
-    /// doing so made the next direct probe hit the relay and falsely evict the
-    /// healthy target.
+    /// not record the target at the relay's socket — doing so made the next
+    /// direct probe hit the relay and falsely evict the healthy target. The
+    /// relay now sends the ACK in its own name, vouching for the target, so
+    /// the only address it can teach is its own.
     #[tokio::test]
     async fn relayed_ack_does_not_rewrite_the_targets_address() {
         let net = InMemoryNetwork::new();
         let ta = net.register(addr(1)).await;
         let mut node_a = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
-        // A knows B at its real address (addr 2).
+        // A knows B at its real address (addr 2), and suspects it.
         node_a.membership.add_node(
             NodeId::new("b"),
             addr(2),
@@ -2831,39 +3072,327 @@ mod tests {
             BTreeMap::new(),
             Instant::now(),
         );
+        node_a.membership.suspect(&NodeId::new("b"));
 
         // A relay C (socket addr 3) forwards B's ACK to A.
         let relayed = GossipMessage::new(
-            NodeId::new("b"),
-            2,
+            NodeId::new("c"),
+            1,
             GossipPayload::Ack {
                 updates: vec![],
-                relayed: true,
+                relayed_for: Some(NodeId::new("b")),
             },
         );
-        node_a.handle_message(addr(3), relayed).await;
+        assert!(node_a.handle_message(addr(3), relayed).await);
 
-        // B's address is unchanged — still its own, not the relay's.
+        let b = node_a.membership.get(&NodeId::new("b")).unwrap();
         assert_eq!(
-            node_a.membership.get(&NodeId::new("b")).unwrap().address,
+            b.address,
             addr(2),
             "a relayed ACK must not record the target at the relay's address"
         );
+        assert_eq!(b.state, NodeState::Alive, "the relay's word clears B");
+        assert_eq!(
+            node_a.membership.get(&NodeId::new("c")).unwrap().address,
+            addr(3),
+            "the relay is recorded at its own socket"
+        );
+    }
 
-        // A direct ACK, by contrast, does refresh the address (B legitimately
-        // reachable at the socket it came from).
-        let direct = GossipMessage::new(
-            NodeId::new("b"),
-            2,
-            GossipPayload::Ack {
+    // -- replay protection, relay waits, send failures (#696) -----------------
+
+    fn ping_from(sender: &str) -> GossipMessage {
+        GossipMessage::new(
+            NodeId::new(sender),
+            1,
+            GossipPayload::Ping { updates: vec![] },
+        )
+    }
+
+    #[tokio::test]
+    async fn replayed_ping_from_another_address_does_not_move_the_member() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+
+        let captured = ping_from("peer");
+        assert!(node.handle_message(addr(2), captured.clone()).await);
+
+        // An attacker on the LAN replays the signed datagram from its own IP.
+        assert!(
+            !node.handle_message(addr(66), captured).await,
+            "a replayed datagram must be dropped"
+        );
+        assert_eq!(
+            node.membership.get(&NodeId::new("peer")).unwrap().address,
+            addr(2),
+            "a replay moved the member to the attacker's address"
+        );
+
+        // A genuinely newer message may still move it: nodes do change
+        // address.
+        assert!(node.handle_message(addr(7), ping_from("peer")).await);
+        assert_eq!(
+            node.membership.get(&NodeId::new("peer")).unwrap().address,
+            addr(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_extension_cannot_roll_a_recovery_epoch_back() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let with_epoch = |epoch: u64| {
+            let mut message = ping_from("voter");
+            message.extension = Some(DirectoryExtension {
+                node_id: NodeId::new("voter"),
+                api_address: addr(9117),
+                reporting_address: addr(9445),
+                leader: None,
+                labels: BTreeMap::new(),
+                disk_pressured: false,
+                recovery_epoch: Some(epoch),
+                recovery_id: None,
+                jobs: None,
+                hmac: [0u8; 32],
+            });
+            message
+        };
+        let old = with_epoch(1);
+        let new = with_epoch(2);
+        assert!(node.handle_message(addr(2), new).await);
+
+        node.handle_message(addr(2), old).await;
+        let claim = node.directory().recovery_claims[&NodeId::new("voter")];
+        assert_eq!(
+            claim.map(|claim| claim.epoch),
+            Some(2),
+            "a replayed extension rolled the recovery epoch back"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_extension_about_another_node_is_ignored() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut message = ping_from("peer");
+        message.extension = Some(DirectoryExtension {
+            node_id: NodeId::new("victim"),
+            api_address: addr(9117),
+            reporting_address: addr(9445),
+            leader: None,
+            labels: BTreeMap::new(),
+            disk_pressured: true,
+            recovery_epoch: Some(9),
+            recovery_id: None,
+            jobs: None,
+            hmac: [0u8; 32],
+        });
+        node.handle_message(addr(2), message).await;
+        assert!(
+            !node
+                .directory()
+                .endpoints
+                .contains_key(&NodeId::new("victim"))
+        );
+        assert!(
+            !node
+                .directory()
+                .disk_pressured
+                .contains(&NodeId::new("victim"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ping_during_a_relay_wait_is_acknowledged() {
+        // C relays A's probe of B, but B is silent. While C would have been
+        // waiting for B, D pings C. C must answer D at once: a relay that
+        // ignored everyone else for a probe timeout got itself suspected.
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let _tb = net.register(addr(2)).await;
+        let tc = net.register(addr(3)).await;
+        let td = net.register(addr(4)).await;
+        let mut node_c = MustardNode::new(NodeId::new("c"), addr(3), fast_config(), tc);
+        node_c.add_seed(NodeId::new("a"), addr(1));
+        node_c.add_seed(NodeId::new("b"), addr(2));
+
+        let ping_req = GossipMessage::new(
+            NodeId::new("a"),
+            1,
+            GossipPayload::PingReq {
+                target: NodeId::new("b"),
+                requester: NodeId::new("a"),
                 updates: vec![],
-                relayed: false,
             },
         );
-        node_a.handle_message(addr(2), direct).await;
-        assert_eq!(
-            node_a.membership.get(&NodeId::new("b")).unwrap().address,
-            addr(2),
+        ta.send(addr(3), &ping_req).await.unwrap();
+        td.send(addr(3), &ping_from("d")).await.unwrap();
+
+        let _ = tokio::time::timeout(fast_config().probe_timeout * 3, answer(&mut node_c)).await;
+
+        let mut acked = false;
+        while let Some((_, message)) = td.try_recv() {
+            acked |= matches!(message.payload, GossipPayload::Ack { .. })
+                && message.sender == NodeId::new("c");
+        }
+        assert!(acked, "C left D's ping unanswered while relaying");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relayed_ack_arriving_after_the_probe_timeout_is_not_forwarded() {
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let tc = net.register(addr(3)).await;
+        let mut node_c = MustardNode::new(NodeId::new("c"), addr(3), fast_config(), tc);
+        node_c.add_seed(NodeId::new("a"), addr(1));
+        node_c.add_seed(NodeId::new("b"), addr(2));
+        node_c
+            .handle_message(
+                addr(1),
+                GossipMessage::new(
+                    NodeId::new("a"),
+                    1,
+                    GossipPayload::PingReq {
+                        target: NodeId::new("b"),
+                        requester: NodeId::new("a"),
+                        updates: vec![],
+                    },
+                ),
+            )
+            .await;
+        tokio::time::sleep(fast_config().probe_timeout * 2).await;
+        let late_ack = GossipMessage::new(
+            NodeId::new("b"),
+            1,
+            GossipPayload::Ack {
+                updates: vec![],
+                relayed_for: None,
+            },
         );
+        node_c.handle_message(addr(2), late_ack).await;
+        assert!(
+            ta.try_recv().is_none(),
+            "an expired relay must not vouch for the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_failure_is_logged_not_silent() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+
+        // Nobody is registered at addr(9): the transport refuses the send.
+        let ping = node.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+        node.send(addr(9), &ping).await;
+        node.send(addr(9), &ping).await;
+        assert_eq!(node.send_failures.total, 2, "a failed send went uncounted");
+
+        // The log is rate-limited: one line, then quiet within the interval,
+        // then a line again that reports what it held back.
+        let mut log = SendFailureLog::default();
+        let error = MustardError::SendFailed {
+            reason: "refused".into(),
+        };
+        let start = Instant::now();
+        assert!(log.record(start, addr(9), &error).is_some());
+        assert!(log.record(start, addr(9), &error).is_none());
+        let later = log
+            .record(start + SEND_FAILURE_LOG_INTERVAL, addr(9), &error)
+            .expect("a line after the interval");
+        assert!(later.contains("2 failure(s)"), "{later}");
+    }
+
+    #[tokio::test]
+    async fn probes_from_a_maximally_labelled_node_fit_the_datagram() {
+        // 63-byte names and a full label set: the probe must still fit, with
+        // its piggyback trimmed to the room the extension leaves.
+        let long = |tag: &str| NodeId::new(format!("{}{tag}", "n".repeat(63 - tag.len())));
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(long("self"), addr(1), fast_config(), t1);
+        let labels = (0..16)
+            .map(|i| (format!("{i:0>16}"), "v".repeat(16)))
+            .collect();
+        node.set_advertised_endpoints(9117, 9445, labels);
+        for i in 0..20 {
+            node.dissemination.enqueue(
+                MembershipUpdate {
+                    node_id: long(&i.to_string()),
+                    address: addr(100 + i),
+                    state: NodeState::Suspect,
+                    incarnation: u64::MAX,
+                },
+                20,
+            );
+        }
+        let queued = node.dissemination.len();
+        let ping_req = node.probe_message(
+            GossipPayload::PingReq {
+                target: long("t"),
+                requester: long("self"),
+                updates: vec![],
+            },
+            None,
+        );
+        assert!(ping_req.extension.is_some());
+        assert!(ping_req.encoded_len() <= super::super::message::MAX_DATAGRAM_BYTES);
+        let ping = node.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+        assert!(ping.encoded_len() <= super::super::message::MAX_DATAGRAM_BYTES);
+        assert!(!ping.payload.updates().is_empty());
+        assert!(
+            ping.payload.updates().len() < MAX_PIGGYBACK_UPDATES,
+            "the byte budget, not the count, must have stopped selection"
+        );
+        assert_eq!(node.dissemination.len(), queued, "nothing was dropped");
+    }
+
+    /// #788: the job summary joins a full label set and 63-byte names
+    /// without pushing the extension out of the probe, and the probe still
+    /// carries a membership update.
+    #[tokio::test]
+    async fn probes_from_a_maximally_labelled_node_with_job_capabilities_fit_the_datagram() {
+        let long = |tag: &str| NodeId::new(format!("{}{tag}", "n".repeat(63 - tag.len())));
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(long("self"), addr(1), fast_config(), t1);
+        let labels = (0..16)
+            .map(|i| (format!("{i:0>16}"), "v".repeat(16)))
+            .collect();
+        node.set_advertised_endpoints(9117, 9445, labels);
+        let every = crate::meat::job_capability::JobCapabilities {
+            host: true,
+            host_limits: true,
+            containers: true,
+            singleton_images: true,
+            singleton_image_limits: true,
+            encrypted_env: true,
+            network_policy: true,
+            mount_isolation: true,
+            binaries: true,
+        };
+        let (_jobs_tx, jobs_rx) = watch::channel(Some(every));
+        node.set_job_capabilities_watch(jobs_rx);
+        for i in 0..20 {
+            node.dissemination.enqueue(
+                MembershipUpdate {
+                    node_id: long(&i.to_string()),
+                    address: addr(100 + i),
+                    state: NodeState::Suspect,
+                    incarnation: u64::MAX,
+                },
+                20,
+            );
+        }
+        let ping = node.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+        assert_eq!(
+            ping.extension.as_ref().and_then(|extension| extension.jobs),
+            Some(every)
+        );
+        assert!(ping.encoded_len() <= super::super::message::MAX_DATAGRAM_BYTES);
+        assert!(!ping.payload.updates().is_empty());
     }
 }

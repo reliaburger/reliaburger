@@ -3,7 +3,8 @@
 use oci_distribution::errors::OciDistributionError;
 use oci_distribution::manifest::{
     IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, ImageIndexEntry,
-    OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE, OciImageManifest, OciManifest, Versioned,
+    OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE, OciImageIndex, OciImageManifest, OciManifest,
+    Versioned,
 };
 use oci_distribution::secrets::RegistryAuth;
 use oci_distribution::{Client, Reference};
@@ -23,13 +24,21 @@ pub(crate) struct VerifiedImageManifest {
     pub(crate) manifest_bytes: Vec<u8>,
     pub(crate) digest: String,
     pub(crate) config_bytes: Vec<u8>,
+    /// The index the reference named, when it named one rather than the
+    /// platform manifest itself, verified against the reference's digest.
+    pub(crate) index_bytes: Option<Vec<u8>>,
 }
 
 fn invalid(message: impl Into<String>) -> OciDistributionError {
     OciDistributionError::GenericError(Some(message.into()))
 }
 
-fn verify(bytes: &[u8], expected: &str, size: Option<i64>) -> Result<(), OciDistributionError> {
+/// Check that `bytes` hash to `expected` and, when a descriptor gives one, have its size.
+pub(crate) fn verify(
+    bytes: &[u8],
+    expected: &str,
+    size: Option<i64>,
+) -> Result<(), OciDistributionError> {
     let actual = format!("sha256:{:x}", Sha256::digest(bytes));
     if actual != expected {
         return Err(invalid(format!(
@@ -47,7 +56,8 @@ fn verify(bytes: &[u8], expected: &str, size: Option<i64>) -> Result<(), OciDist
     Ok(())
 }
 
-fn parse_manifest(bytes: &[u8]) -> Result<OciManifest, OciDistributionError> {
+/// Parse a manifest or index of a media type Reliaburger runs.
+pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<OciManifest, OciDistributionError> {
     let versioned: Versioned = serde_json::from_slice(bytes)
         .map_err(|e| OciDistributionError::VersionedParsingError(e.to_string()))?;
     if versioned.schema_version != 2 {
@@ -100,32 +110,22 @@ pub(crate) async fn pull_verified_manifest_for_architecture(
     if let Some(expected) = reference.digest() {
         verify(&manifest_bytes, expected, None)?;
     }
+    let mut index_bytes = None;
     let manifest = match parse_manifest(&manifest_bytes)? {
         OciManifest::Image(manifest) => manifest,
         OciManifest::ImageIndex(index) => {
-            let descriptor = index
-                .manifests
-                .iter()
-                .find(|entry| {
-                    entry.platform.as_ref().is_some_and(|platform| {
-                        platform.os == "linux" && platform.architecture == architecture
-                    })
-                })
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "upstream index has no manifest for linux/{architecture}"
-                    ))
-                })?;
+            let descriptor = platform_descriptor(&index, architecture)?;
             let digest = descriptor.digest.clone();
             let child_reference = Reference::with_digest(
                 reference.registry().to_owned(),
                 reference.repository().to_owned(),
                 digest,
             );
-            (manifest_bytes, _) = client
+            let (child_bytes, _) = client
                 .pull_manifest_raw(&child_reference, auth, MEDIA_TYPES)
                 .await?;
-            verify(&manifest_bytes, &descriptor.digest, Some(descriptor.size))?;
+            verify(&child_bytes, &descriptor.digest, Some(descriptor.size))?;
+            index_bytes = Some(std::mem::replace(&mut manifest_bytes, child_bytes));
             match parse_manifest(&manifest_bytes)? {
                 OciManifest::Image(manifest) => manifest,
                 OciManifest::ImageIndex(_) => {
@@ -136,7 +136,42 @@ pub(crate) async fn pull_verified_manifest_for_architecture(
             }
         }
     };
-    verified_image(client, reference, manifest_bytes, manifest).await
+    let mut verified = verified_image(client, reference, manifest_bytes, manifest).await?;
+    verified.index_bytes = index_bytes;
+    Ok(verified)
+}
+
+/// The index entry for `linux/{architecture}`, where `architecture` is
+/// already an OCI name (see [`linux_architecture`]).
+pub(crate) fn platform_descriptor<'a>(
+    index: &'a OciImageIndex,
+    architecture: &str,
+) -> Result<&'a ImageIndexEntry, OciDistributionError> {
+    index
+        .manifests
+        .iter()
+        .find(|entry| {
+            entry.platform.as_ref().is_some_and(|platform| {
+                platform.os == "linux" && platform.architecture == architecture
+            })
+        })
+        .ok_or_else(|| {
+            invalid(format!(
+                "upstream index has no manifest for linux/{architecture}"
+            ))
+        })
+}
+
+/// Refuse negative layer sizes and totals that overflow cache accounting.
+pub(crate) fn check_layer_sizes(manifest: &OciImageManifest) -> Result<(), OciDistributionError> {
+    manifest.layers.iter().try_fold(0_u64, |total, layer| {
+        let size = u64::try_from(layer.size)
+            .map_err(|_| invalid(format!("negative upstream layer size for {}", layer.digest)))?;
+        total
+            .checked_add(size)
+            .ok_or_else(|| invalid("upstream layer sizes overflow cache accounting"))
+    })?;
+    Ok(())
 }
 
 /// Check an image manifest's layer sizes, then fetch and verify its config.
@@ -149,13 +184,7 @@ async fn verified_image(
 ) -> Result<VerifiedImageManifest, OciDistributionError> {
     // Cache accounting sums layer lengths as u64. Validate before any cast,
     // allocation or publication, even when the raw manifest digest is valid.
-    manifest.layers.iter().try_fold(0_u64, |total, layer| {
-        let size = u64::try_from(layer.size)
-            .map_err(|_| invalid(format!("negative upstream layer size for {}", layer.digest)))?;
-        total
-            .checked_add(size)
-            .ok_or_else(|| invalid("upstream layer sizes overflow cache accounting"))
-    })?;
+    check_layer_sizes(&manifest)?;
     let mut config_bytes = Vec::new();
     client
         .pull_blob(reference, &manifest.config, &mut config_bytes)
@@ -172,6 +201,7 @@ async fn verified_image(
         manifest,
         manifest_bytes,
         config_bytes,
+        index_bytes: None,
     })
 }
 

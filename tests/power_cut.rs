@@ -26,7 +26,8 @@ use std::time::Duration;
 use rand::Rng;
 use reliaburger::bun::disk_pressure::check_and_relieve;
 use reliaburger::council::backup::{
-    BackupConfig, BackupStore, decode_backup, encode_backup, seal_snapshot, unseal_snapshot,
+    BackupConfig, BackupKey, BackupStore, decode_backup, encode_backup, seal_snapshot,
+    unseal_snapshot,
 };
 use reliaburger::ketchup::export::{CHECKPOINT_FILENAME, ExportCheckpoint, export_logs};
 use reliaburger::ketchup::log_store::LogStore;
@@ -885,7 +886,7 @@ const BACKUP_TEST: &str = "actual_power_cut_preserves_acknowledged_council_backu
 const BACKUP_KEY: [u8; 32] = [7; 32];
 /// Small, so pruning deletes an older backup on almost every tick.
 const BACKUP_RETAIN: usize = 3;
-/// Backup keys are millisecond timestamps; a fixed base keeps them unique.
+/// A fixed base for the backups' wall-clock field.
 const BACKUP_EPOCH_MS: u64 = 1_790_000_000_000;
 
 fn backup_directory(root: &Path) -> PathBuf {
@@ -896,8 +897,16 @@ fn backup_url(root: &Path) -> String {
     format!("file://{}", backup_directory(root).display())
 }
 
-fn backup_time(sequence: u64) -> std::time::SystemTime {
-    std::time::UNIX_EPOCH + Duration::from_millis(BACKUP_EPOCH_MS + sequence)
+/// Backup `sequence` sits at log index `sequence`, so key order is
+/// sequence order.
+fn backup_key(sequence: u64) -> BackupKey {
+    BackupKey {
+        recovery_epoch: 0,
+        term: 1,
+        index: sequence,
+        millis: BACKUP_EPOCH_MS + sequence,
+        recovery_id: None,
+    }
 }
 
 fn backup_payload(sequence: u64) -> Vec<u8> {
@@ -919,7 +928,7 @@ async fn run_backup_worker(root: &Path) {
         .unwrap();
         let bytes = encode_backup(&sealed).unwrap();
         ledger.record(&format!("begin {sequence}"));
-        store.put(&sealed, backup_time(sequence)).await.unwrap();
+        store.put(&backup_key(sequence), &sealed).await.unwrap();
         ledger.record(&format!("put {sequence} {}", sha256(&bytes)));
         store.prune(BACKUP_RETAIN).await.unwrap();
         ledger.record(&format!("prune {sequence}"));
@@ -957,14 +966,11 @@ fn stored_backups(root: &Path) -> (BTreeMap<u64, Vec<u8>>, usize) {
     for entry in std::fs::read_dir(backup_directory(root)).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(millis) = name
-            .strip_prefix("council-")
-            .and_then(|rest| rest.strip_suffix(".backup"))
-        else {
+        let Some(key) = BackupKey::parse(&name) else {
             staged += 1;
             continue;
         };
-        let sequence = millis.parse::<u64>().unwrap() - BACKUP_EPOCH_MS;
+        let sequence = key.index;
         backups.insert(sequence, std::fs::read(entry.path()).unwrap());
     }
     (backups, staged)
@@ -1045,7 +1051,7 @@ async fn verify_backups(root: &Path) {
         &BackupConfig::default(),
     )
     .unwrap();
-    store.put(&sealed, backup_time(fresh)).await.unwrap();
+    store.put(&backup_key(fresh), &sealed).await.unwrap();
     store.prune(BACKUP_RETAIN).await.unwrap();
     let latest = store.latest().await.unwrap().unwrap();
     assert_eq!(

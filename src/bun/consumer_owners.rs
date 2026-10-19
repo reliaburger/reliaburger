@@ -199,9 +199,9 @@ impl ConsumerOwnership {
                     return Err(io::Error::other("duplicate consumer ingress assignment"));
                 }
             }
-            crate::wrapper::routing::RoutingTable::new()
-                .rebuild(&effective, &ingress)
-                .map_err(io::Error::other)?;
+            // An invalid route's config is not checked here: installing the
+            // view skips that one route, and refusing the record would hold
+            // back discovery for every other app (#700).
             let remote = ServiceMap::new().with_cluster_catalog_excluding_node(
                 &publication.catalog,
                 Some(&self.identity.node_id.0),

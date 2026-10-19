@@ -291,12 +291,12 @@ impl TestContext {
     /// namespace.
     ///
     /// The workload is the `testapp` server embedded in `bun` itself, launched
-    /// as a process workload — every node already has `bun` at
-    /// [`BUN_BINARY_PATH`], so no container image is needed. Cases built on
-    /// this must therefore require
-    /// [`Capability::ProcessRuntime`](crate::bun::capabilities::Capability::ProcessRuntime);
-    /// on a runc/apple cluster the spec would be handed to the container
-    /// runtime and fail.
+    /// as an `exec` app — every node already has `bun` at [`BUN_BINARY_PATH`],
+    /// so no container image is needed. Cases built on this must therefore
+    /// require
+    /// [`Capability::ProcessRuntime`](crate::bun::capabilities::Capability::ProcessRuntime),
+    /// and the node's `[process_workloads] allowed_binaries` must name
+    /// [`BUN_BINARY_PATH`].
     ///
     /// `mode` is a `testapp` mode string (`"healthy"`, `"unhealthy-after"`,
     /// `"hang"`, `"exit-after"`, `"slow"`, `"alloc"`). The port is derived
@@ -320,7 +320,6 @@ impl TestContext {
     ) -> String {
         let port = testapp_port(app);
         let mut argv: Vec<String> = vec![
-            BUN_BINARY_PATH.to_string(),
             "testapp".to_string(),
             "--mode".to_string(),
             mode.to_string(),
@@ -335,7 +334,7 @@ impl TestContext {
             .join(", ");
         format!(
             "[app.{app}]\n\
-             image = \"proc-grill:image-ignored\"\n\
+             exec = \"{BUN_BINARY_PATH}\"\n\
              command = [{command}]\n\
              port = {port}\n\
              replicas = {replicas}\n\
@@ -344,7 +343,7 @@ impl TestContext {
              [app.{app}.health]\n\
              path = \"/\"\n\
              interval = 1\n\
-             timeout = 2\n\
+             timeout = 1\n\
              threshold_unhealthy = 3\n\
              threshold_healthy = 1\n",
             ns = self.namespace,
@@ -352,20 +351,23 @@ impl TestContext {
     }
 
     /// TOML for a run-to-completion job in this test's namespace, running
-    /// `command` as a process workload (no image). Needs the `process`
-    /// runtime, same as [`Self::testapp_spec`].
+    /// `command` as a host process: its first element is the binary, the
+    /// rest its arguments. Jobs take the common job lifecycle, whose task
+    /// runners start host commands on any node but need runc for images.
     ///
     /// `JobSpec` has no `retries` field, so retry-count is not something a case
-    /// can configure — the agent's default backoff applies.
+    /// can configure; the run's default attempts apply.
     pub fn process_job_spec(&self, job: &str, command: &[&str]) -> String {
-        let argv = command
+        let (binary, arguments) = command.split_first().unwrap_or((&"/bin/true", &[]));
+        let argv = arguments
             .iter()
             .map(|arg| format!("\"{arg}\""))
             .collect::<Vec<_>>()
             .join(", ");
         format!(
             "[job.{job}]\n\
-             image = \"proc-grill:image-ignored\"\n\
+             runtime = \"process\"\n\
+             exec = \"{binary}\"\n\
              command = [{argv}]\n\
              namespace = \"{ns}\"\n",
             ns = self.namespace,
@@ -494,13 +496,19 @@ impl TestContext {
                 .status()
                 .await
                 .map_err(|error| format!("could not inspect cleanup on node {node}: {error}"))?;
-            all.extend(
-                statuses
-                    .into_iter()
-                    .filter(|instance| instance.namespace == self.namespace),
-            );
+            all.extend(statuses.into_iter().filter(|instance| {
+                instance.namespace == self.namespace && !Self::is_finished_run(instance)
+            }));
         }
         Ok(all)
+    }
+
+    /// A job run that has finished is retained history, not a live
+    /// workload: the cluster keeps its record for `relish batch` until
+    /// pruning, after its lease's cleanup has stopped it.
+    fn is_finished_run(instance: &InstanceStatus) -> bool {
+        instance.id.starts_with("run-")
+            && matches!(instance.state.as_str(), "stopped" | "failed" | "cancelled")
     }
 
     /// Wait until `app` has at least `replicas` running instances *anywhere in
@@ -544,6 +552,52 @@ impl TestContext {
             let waiting = format!(
                 "waiting for {app} to reach {what} cluster-wide; \
                  last saw {} instance(s): {seen:?}; last query error: {last_error:?}",
+                last.len()
+            );
+            if self.deadline.remaining().is_zero() {
+                return Err(format!("timed out after {:?} {waiting}", self.timeout));
+            }
+            self.wait_note.record(waiting).await;
+            tokio::time::sleep(Duration::from_millis(500).min(self.deadline.remaining())).await;
+        }
+    }
+
+    /// Poll the cluster's job runs (`/v1/jobs?cluster=true`) until
+    /// `predicate` holds for `job`'s rows in this test's namespace.
+    ///
+    /// Jobs run through the common job lifecycle, so their runs are cluster
+    /// records the leader keeps, not instances in any one node's status.
+    pub async fn wait_for_job_runs<F>(
+        &self,
+        job: &str,
+        what: &str,
+        predicate: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(&[crate::bun::agent::JobStatus]) -> bool,
+    {
+        let mut last: Vec<crate::bun::agent::JobStatus> = Vec::new();
+        loop {
+            let last_error = match self.client.jobs().await {
+                Ok(view) => {
+                    last = view
+                        .jobs
+                        .into_iter()
+                        .map(|tagged| tagged.row)
+                        .filter(|row| row.name == job && row.namespace == self.namespace)
+                        .collect();
+                    if predicate(&last) {
+                        self.wait_note.clear().await;
+                        return Ok(());
+                    }
+                    None
+                }
+                Err(error) => Some(error.to_string()),
+            };
+            let seen: Vec<&str> = last.iter().map(|row| row.state.as_str()).collect();
+            let waiting = format!(
+                "waiting for job {job} to reach {what}; last saw {} row(s): {seen:?}; \
+                 last query error: {last_error:?}",
                 last.len()
             );
             if self.deadline.remaining().is_zero() {
@@ -912,6 +966,24 @@ fn testapp_port(app: &str) -> u16 {
     40_000 + (hash % 20_000) as u16
 }
 
+/// A context that talks to no cluster, for unit tests of spec generators.
+#[cfg(test)]
+impl TestContext {
+    pub(crate) fn offline(namespace: &str) -> Self {
+        TestContext {
+            client: BunClient::new_with_token("http://127.0.0.1:9117", None),
+            namespace: namespace.to_string(),
+            lease_id: None,
+            chaos_guard: crate::testkit::chaos::ChaosGuard::default(),
+            capabilities: ClusterCapabilities::default(),
+            timeout: Duration::from_millis(200),
+            deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
+            peer_route: PeerRoute::Direct,
+            wait_note: Default::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,17 +1002,7 @@ mod tests {
     }
 
     fn context(namespace: &str) -> TestContext {
-        TestContext {
-            client: BunClient::new_with_token("http://127.0.0.1:9117", None),
-            namespace: namespace.to_string(),
-            lease_id: None,
-            chaos_guard: crate::testkit::chaos::ChaosGuard::default(),
-            capabilities: ClusterCapabilities::default(),
-            timeout: Duration::from_millis(200),
-            deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
-            peer_route: PeerRoute::Direct,
-            wait_note: Default::default(),
-        }
+        TestContext::offline(namespace)
     }
 
     #[tokio::test]
@@ -1374,12 +1436,14 @@ mod tests {
         let app = config.app.get("web").expect("app named web");
         assert_eq!(app.namespace.as_deref(), Some("rbtest-abc-00"));
         assert_eq!(app.replicas, crate::config::types::Replicas::Fixed(1));
-        // The workload is launched from the node's installed bun, as a process.
+        // The workload is launched from the node's installed bun, as a host
+        // `exec` app: the process runtime runs no images (#914).
         assert_eq!(
-            app.command.first().map(String::as_str),
-            Some(BUN_BINARY_PATH)
+            app.exec.as_deref(),
+            Some(std::path::Path::new(BUN_BINARY_PATH))
         );
-        assert_eq!(app.command.get(1).map(String::as_str), Some("testapp"));
+        assert!(app.image.is_none());
+        assert_eq!(app.command.first().map(String::as_str), Some("testapp"));
         assert!(
             app.command.iter().any(|arg| arg == "healthy"),
             "mode should appear in argv: {:?}",
@@ -1557,6 +1621,29 @@ mod tests {
         assert!(!headers.contains("private-api-token"));
         server.await.unwrap();
         forwarding.await.unwrap();
+    }
+
+    /// The API refuses a spec `validate_intrinsic` refuses, so a generated
+    /// spec has to pass it too: a health timeout longer than its interval
+    /// failed every `relish test` case built on `testapp_spec` at apply
+    /// (#1068).
+    #[test]
+    fn every_generated_spec_passes_the_validation_the_api_applies() {
+        let ctx = context("rbtest-abc-00");
+        let specs = [
+            ctx.testapp_spec("web", "healthy", 1),
+            ctx.testapp_spec_args("slow", "slow", 1, &["--delay", "500"]),
+            ctx.process_job_spec("once", &["/bin/sh", "-c", "exit 0"]),
+            ctx.process_job_spec("empty", &[]),
+            ctx.container_idle_spec("box"),
+            ctx.container_http_spec("web", 2),
+        ];
+        for spec in specs {
+            let config = Config::parse(&spec).unwrap();
+            if let Err(error) = config.validate_intrinsic() {
+                panic!("the API would refuse this generated spec: {error}\n{spec}");
+            }
+        }
     }
 
     #[test]

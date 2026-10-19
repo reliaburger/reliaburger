@@ -7,5 +7,6 @@
 # Deploy with:  cargo run --bin relish -- apply examples/phase-1/proc-job-failure.toml
 
 [job.broken]
-image = "proc-grill:image-ignored"
-command = ["false"]
+runtime = "process"
+exec = "/bin/false"
+# Authorise this binary in process_workloads.allowed_binaries on Bun.

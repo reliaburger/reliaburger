@@ -106,8 +106,78 @@ fn resolve_location(base: &str, location: &str) -> Result<String, String> {
     Ok(resolved.into())
 }
 
+/// How long a registry write keeps asking again after a 503, and how long it
+/// waits between attempts.
+///
+/// Pickle answers a write with 503 when it can't confirm the write with the
+/// council leader right now: no leader is known, or the leader couldn't
+/// confirm its own leadership in time. Nothing was accepted, so the write can
+/// simply be made again. The case deadline still bounds the whole wait.
+#[derive(Debug, Clone, Copy)]
+struct RegistryRetry {
+    window: std::time::Duration,
+    pause: std::time::Duration,
+}
+
+impl RegistryRetry {
+    /// Long enough to ride out a leader change or a leader briefly missing its
+    /// heartbeat round, the same window lease creation uses.
+    const DEFAULT: RegistryRetry = RegistryRetry {
+        window: std::time::Duration::from_secs(30),
+        pause: std::time::Duration::from_millis(500),
+    };
+}
+
+/// Why one registry write attempt failed.
+#[derive(Debug)]
+enum WriteFailure {
+    /// The registry answered 503: it can't confirm writes right now.
+    Unavailable(String),
+    /// Anything else, which asking again won't change.
+    Refused(String),
+}
+
+impl WriteFailure {
+    /// Classify a non-success `status`, described by `message`.
+    fn status(status: reqwest::StatusCode, message: String) -> Self {
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            WriteFailure::Unavailable(message)
+        } else {
+            WriteFailure::Refused(message)
+        }
+    }
+}
+
+impl From<String> for WriteFailure {
+    fn from(message: String) -> Self {
+        WriteFailure::Refused(message)
+    }
+}
+
+/// Run one registry write, making it again from the start after a 503 until
+/// `retry.window` has passed. Any other failure ends it at once.
+async fn retry_unavailable<F, Fut>(retry: RegistryRetry, mut write: F) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), WriteFailure>>,
+{
+    let give_up = std::time::Instant::now() + retry.window;
+    loop {
+        match write().await {
+            Ok(()) => return Ok(()),
+            Err(WriteFailure::Unavailable(_)) if std::time::Instant::now() < give_up => {
+                tokio::time::sleep(retry.pause).await;
+            }
+            Err(WriteFailure::Unavailable(message) | WriteFailure::Refused(message)) => {
+                return Err(message);
+            }
+        }
+    }
+}
+
 /// Push one blob through the `/v2` monolithic-upload dance: POST to start,
-/// PATCH the bytes, PUT with the digest to finish.
+/// PATCH the bytes, PUT with the digest to finish. A 503 at any step starts
+/// the dance again; the registry's reaper retires the abandoned session.
 async fn push_blob(
     http: &reqwest::Client,
     base: &str,
@@ -115,7 +185,22 @@ async fn push_blob(
     data: &[u8],
     digest: &str,
     lease_id: Option<&str>,
+    retry: RegistryRetry,
 ) -> Result<(), String> {
+    retry_unavailable(retry, || {
+        push_blob_once(http, base, repo, data, digest, lease_id)
+    })
+    .await
+}
+
+async fn push_blob_once(
+    http: &reqwest::Client,
+    base: &str,
+    repo: &str,
+    data: &[u8],
+    digest: &str,
+    lease_id: Option<&str>,
+) -> Result<(), WriteFailure> {
     let start = with_lease(
         http.post(format!("{base}/v2/{repo}/blobs/uploads/")),
         lease_id,
@@ -124,7 +209,10 @@ async fn push_blob(
     .await
     .map_err(|e| format!("blob upload POST failed: {e}"))?;
     if !start.status().is_success() {
-        return Err(format!("blob upload POST returned {}", start.status()));
+        return Err(WriteFailure::status(
+            start.status(),
+            format!("blob upload POST returned {}", start.status()),
+        ));
     }
     let location = start
         .headers()
@@ -139,7 +227,10 @@ async fn push_blob(
         .await
         .map_err(|e| format!("blob PATCH failed: {e}"))?;
     if !patched.status().is_success() {
-        return Err(format!("blob PATCH returned {}", patched.status()));
+        return Err(WriteFailure::status(
+            patched.status(),
+            format!("blob PATCH returned {}", patched.status()),
+        ));
     }
     let location = patched
         .headers()
@@ -158,7 +249,10 @@ async fn push_blob(
     .await
     .map_err(|e| format!("blob PUT failed: {e}"))?;
     if !finish.status().is_success() {
-        return Err(format!("blob PUT returned {}", finish.status()));
+        return Err(WriteFailure::status(
+            finish.status(),
+            format!("blob PUT returned {}", finish.status()),
+        ));
     }
     Ok(())
 }
@@ -172,7 +266,7 @@ pub async fn push_image(
     tag: &str,
     image: &SyntheticImage,
 ) -> Result<(), String> {
-    push_image_owned(http, base, repo, tag, image, None).await
+    push_image_retrying(http, base, repo, tag, image, None, RegistryRetry::DEFAULT).await
 }
 
 /// Push a fixture under its server-issued repository lease on every write.
@@ -184,16 +278,26 @@ pub async fn push_leased_image(
     image: &SyntheticImage,
     lease_id: &str,
 ) -> Result<(), String> {
-    push_image_owned(http, base, repo, tag, image, Some(lease_id)).await
+    push_image_retrying(
+        http,
+        base,
+        repo,
+        tag,
+        image,
+        Some(lease_id),
+        RegistryRetry::DEFAULT,
+    )
+    .await
 }
 
-async fn push_image_owned(
+async fn push_image_retrying(
     http: &reqwest::Client,
     base: &str,
     repo: &str,
     tag: &str,
     image: &SyntheticImage,
     lease_id: Option<&str>,
+    retry: RegistryRetry,
 ) -> Result<(), String> {
     push_blob(
         http,
@@ -202,6 +306,7 @@ async fn push_image_owned(
         &image.config,
         &image.config_digest,
         lease_id,
+        retry,
     )
     .await?;
     push_blob(
@@ -211,9 +316,10 @@ async fn push_image_owned(
         &image.layer,
         &image.layer_digest,
         lease_id,
+        retry,
     )
     .await?;
-    push_manifest(http, base, repo, tag, &image.manifest, lease_id).await
+    push_manifest(http, base, repo, tag, &image.manifest, lease_id, retry).await
 }
 
 fn with_lease(request: reqwest::RequestBuilder, lease_id: Option<&str>) -> reqwest::RequestBuilder {
@@ -223,6 +329,7 @@ fn with_lease(request: reqwest::RequestBuilder, lease_id: Option<&str>) -> reqwe
     }
 }
 
+/// Publish a manifest under `tag`, making the same PUT again after a 503.
 async fn push_manifest(
     http: &reqwest::Client,
     base: &str,
@@ -230,7 +337,22 @@ async fn push_manifest(
     tag: &str,
     manifest: &[u8],
     lease_id: Option<&str>,
+    retry: RegistryRetry,
 ) -> Result<(), String> {
+    retry_unavailable(retry, || {
+        push_manifest_once(http, base, repo, tag, manifest, lease_id)
+    })
+    .await
+}
+
+async fn push_manifest_once(
+    http: &reqwest::Client,
+    base: &str,
+    repo: &str,
+    tag: &str,
+    manifest: &[u8],
+    lease_id: Option<&str>,
+) -> Result<(), WriteFailure> {
     let response = with_lease(
         http.put(format!("{base}/v2/{repo}/manifests/{tag}")),
         lease_id,
@@ -241,9 +363,12 @@ async fn push_manifest(
     .await
     .map_err(|error| format!("manifest PUT failed: {error}"))?;
     if response.status() != reqwest::StatusCode::CREATED {
-        return Err(format!(
-            "manifest PUT did not confirm publication: {}",
-            response.status()
+        return Err(WriteFailure::status(
+            response.status(),
+            format!(
+                "manifest PUT did not confirm publication: {}",
+                response.status()
+            ),
         ));
     }
     Ok(())
@@ -289,6 +414,7 @@ pub async fn stage_upstream_image(
         &manifest.config_bytes,
         manifest.config.digest.as_str(),
         Some(lease_id),
+        RegistryRetry::DEFAULT,
     )
     .await?;
     for layer in &manifest.layers {
@@ -304,6 +430,7 @@ pub async fn stage_upstream_image(
             &bytes,
             layer.digest.as_str(),
             Some(lease_id),
+            RegistryRetry::DEFAULT,
         )
         .await?;
     }
@@ -314,6 +441,7 @@ pub async fn stage_upstream_image(
         "runnable",
         &manifest.manifest_bytes,
         Some(lease_id),
+        RegistryRetry::DEFAULT,
     )
     .await?;
     Ok(manifest.digest.as_str().to_owned())
@@ -518,6 +646,145 @@ mod tests {
             "upload Location forwarded the registry bearer to another origin"
         );
         assert!(result.unwrap_err().contains("origin"));
+    }
+
+    /// A fake registry that refuses its first `refusals` upload starts and
+    /// manifest writes with `status`, then accepts, counting each request.
+    async fn refusing_registry(
+        refusals: usize,
+        status: axum::http::StatusCode,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{
+            Router,
+            http::{StatusCode, header::LOCATION},
+            response::IntoResponse,
+            routing::{patch, post, put},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let starts = std::sync::Arc::new(AtomicUsize::new(0));
+        let manifests = std::sync::Arc::new(AtomicUsize::new(0));
+        let (start_count, manifest_count) = (starts.clone(), manifests.clone());
+        let router = Router::new()
+            .route(
+                "/v2/test/blobs/uploads/",
+                post(move || {
+                    let seen = start_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if seen < refusals {
+                            return status.into_response();
+                        }
+                        (
+                            StatusCode::ACCEPTED,
+                            [(LOCATION, "/v2/test/blobs/uploads/session")],
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/v2/test/blobs/uploads/session",
+                patch(|| async { StatusCode::ACCEPTED }).put(|| async { StatusCode::CREATED }),
+            )
+            .route(
+                "/v2/test/manifests/v1",
+                put(move || {
+                    let seen = manifest_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if seen < refusals {
+                            status
+                        } else {
+                            StatusCode::CREATED
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (base, starts, manifests, task)
+    }
+
+    const QUICK_RETRY: RegistryRetry = RegistryRetry {
+        window: std::time::Duration::from_secs(5),
+        pause: std::time::Duration::from_millis(10),
+    };
+
+    #[tokio::test]
+    async fn a_registry_write_refused_as_unavailable_is_pushed_again() {
+        // The 0.2.0 soak's pulse failed on one 503 from a blob upload start
+        // while the council leader briefly couldn't confirm its leadership.
+        let (base, starts, manifests, task) =
+            refusing_registry(2, axum::http::StatusCode::SERVICE_UNAVAILABLE).await;
+        let result = push_image_retrying(
+            &reqwest::Client::new(),
+            &base,
+            "test",
+            "v1",
+            &build_synthetic_image("unavailable"),
+            None,
+            QUICK_RETRY,
+        )
+        .await;
+        task.abort();
+        assert_eq!(result, Ok(()));
+        // Two refused starts, then one for each blob.
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(manifests.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn other_registry_refusals_fail_the_push_at_once() {
+        for status in [
+            axum::http::StatusCode::FORBIDDEN,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+        ] {
+            let (base, starts, _, task) = refusing_registry(1, status).await;
+            let error = push_image_retrying(
+                &reqwest::Client::new(),
+                &base,
+                "test",
+                "v1",
+                &build_synthetic_image("refused"),
+                None,
+                QUICK_RETRY,
+            )
+            .await
+            .unwrap_err();
+            task.abort();
+            assert!(error.contains(status.as_str()), "{status}: {error}");
+            assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_stays_unavailable_fails_after_the_retry_window() {
+        let (base, starts, _, task) =
+            refusing_registry(usize::MAX, axum::http::StatusCode::SERVICE_UNAVAILABLE).await;
+        let started = std::time::Instant::now();
+        let error = push_image_retrying(
+            &reqwest::Client::new(),
+            &base,
+            "test",
+            "v1",
+            &build_synthetic_image("lasting"),
+            None,
+            RegistryRetry {
+                window: std::time::Duration::from_millis(300),
+                pause: std::time::Duration::from_millis(20),
+            },
+        )
+        .await
+        .unwrap_err();
+        task.abort();
+        assert!(error.contains("503"), "{error}");
+        assert!(starts.load(std::sync::atomic::Ordering::SeqCst) > 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

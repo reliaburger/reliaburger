@@ -256,7 +256,6 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
         namespace: "default".into(),
         app_name: "owned-runc".into(),
         replica_index: 0,
-        is_job: false,
         image: "/empty-fixture".into(),
         runtime: RuntimeKind::Runc,
         pid,
@@ -316,7 +315,6 @@ async fn a_stale_adoption_record_retires_its_generation_and_others_still_adopt()
             namespace: "default".into(),
             app_name: "owned-runc".into(),
             replica_index: 0,
-            is_job: false,
             image: "/empty-fixture".into(),
             runtime: RuntimeKind::Runc,
             pid,
@@ -360,9 +358,12 @@ fn quote(path: &Path) -> String {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup() {
+    if let Some(root) = std::env::var_os("RELIABURGER_CANCELLED_PREPARATION_FIXTURE") {
+        cancelled_preparation(Path::new(&root)).await;
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
-    let id = instance(root.path());
     let bin = root.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let real_ip = std::process::Command::new("sh")
@@ -381,28 +382,43 @@ async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup(
     );
     std::fs::write(bin.join("ip"), script).unwrap();
     std::fs::set_permissions(bin.join("ip"), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let wrapper = root.path().join("owner-wrapper");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nPATH={}:\"$PATH\"; export PATH\nexec {} \"$@\"\n",
-            quote(&bin),
-            quote(Path::new(env!("CARGO_BIN_EXE_bun")))
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let runtime = RuncGrill::new(
-        root.path().join("bundles"),
-        ImageStore::new(root.path().join("images")),
-        false,
-        root.path().join("state"),
-        wrapper,
-    )
-    .unwrap();
+    // Runtime commands use the environment recorded by the caller. Install
+    // the fake ip in that caller's PATH, without changing this test process's
+    // environment or relying on an owner's wrapper to overwrite it later.
+    let caller = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("RELIABURGER_CANCELLED_PREPARATION_FIXTURE", root.path())
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(45), caller)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fixture failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn cancelled_preparation(root: &Path) {
+    let id = instance(root);
+    let ready = root.join("prepare-ready");
+    let release = root.join("release-preparation");
+    let runtime = runtime(root);
     let creator = runtime.clone();
     let preparation_id = id.clone();
-    let specification = spec(root.path(), "exit 0");
+    let specification = spec(root, "exit 0");
     let caller = tokio::spawn(async move { creator.create(&preparation_id, &specification).await });
     wait_file(&ready).await;
     caller.abort();
@@ -421,14 +437,11 @@ async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup(
     })
     .await
     .unwrap();
-    assert_absent(root.path(), &id);
+    assert_absent(root, &id);
     // Positive retirement permits a new generation using the same name.
-    runtime
-        .create(&id, &spec(root.path(), "exit 7"))
-        .await
-        .unwrap();
+    runtime.create(&id, &spec(root, "exit 7")).await.unwrap();
     runtime.kill(&id).await.unwrap();
-    assert_absent(root.path(), &id);
+    assert_absent(root, &id);
 }
 
 #[tokio::test]
@@ -559,16 +572,8 @@ async fn generated_cgroup_path_matches_the_actual_container_before_its_first_ins
         root.path(),
         "/bin/busybox cat /proc/self/cgroup > /work/cgroup; exec /bin/busybox sleep 60",
     );
-    specification.linux.cgroups_path = reliaburger::grill::oci::generate_init_oci_spec(
-        &specification.process.args,
-        "default",
-        "cgroup-check",
-        None,
-        &host_path,
-        None,
-    )
-    .linux
-    .cgroups_path;
+    specification.linux.cgroups_path =
+        Some(reliaburger::grill::oci::hierarchy_cgroup_path(&host_path));
     runtime.create(&id, &specification).await.unwrap();
     install_fixture(root.path(), &id);
     // Model Bun's pre-start policy: the cgroup must be the same kernel object
@@ -658,32 +663,18 @@ async fn retiring_a_rollout_predecessor_preserves_its_live_successor() {
     let mut specification = spec(root.path(), "exec /bin/busybox sleep 60");
     let first_path =
         reliaburger::grill::cgroup::instance_cgroup_path("default", &app_name, &first_id).unwrap();
-    specification.linux.cgroups_path = reliaburger::grill::oci::generate_init_oci_spec(
-        &specification.process.args,
-        "default",
-        &app_name,
-        None,
+    specification.linux.cgroups_path = Some(reliaburger::grill::oci::hierarchy_cgroup_path(
         first_path.to_str().unwrap(),
-        None,
-    )
-    .linux
-    .cgroups_path;
+    ));
     runtime.create(&first_id, &specification).await.unwrap();
     install_fixture(root.path(), &first_id);
     runtime.start(&first_id).await.unwrap();
     let successor_path =
         reliaburger::grill::cgroup::instance_cgroup_path("default", &app_name, &successor_id)
             .unwrap();
-    specification.linux.cgroups_path = reliaburger::grill::oci::generate_init_oci_spec(
-        &specification.process.args,
-        "default",
-        &app_name,
-        None,
+    specification.linux.cgroups_path = Some(reliaburger::grill::oci::hierarchy_cgroup_path(
         successor_path.to_str().unwrap(),
-        None,
-    )
-    .linux
-    .cgroups_path;
+    ));
     runtime.create(&successor_id, &specification).await.unwrap();
     install_fixture(root.path(), &successor_id);
     let started = runtime.start(&successor_id).await;
@@ -839,7 +830,6 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
         namespace: "default".into(),
         app_name: "owned-runc".into(),
         replica_index: 0,
-        is_job: false,
         image: "/empty-fixture".into(),
         runtime: RuntimeKind::Runc,
         pid,
@@ -1214,7 +1204,6 @@ async fn owned_runc_unit_stop_fixture() {
         namespace: "default".into(),
         app_name: "owned-runc".into(),
         replica_index: 0,
-        is_job: false,
         image: "/empty-fixture".into(),
         runtime: RuntimeKind::Runc,
         pid,
@@ -1244,6 +1233,9 @@ async fn owned_runc_unit_stop_fixture() {
 #[path = "support/task_harness.rs"]
 mod capacity_task_harness;
 
+#[path = "support/fixture_dir.rs"]
+mod fixture_dir;
+
 mod capacity_contract {
 
     use std::collections::BTreeMap;
@@ -1270,11 +1262,40 @@ mod capacity_contract {
     use super::capacity_task_harness::TestTasks;
     const TEST_SERVICE_TOKEN: &str = "rbrg_test_service_token";
 
+    /// One node's agent and API over the actual runc runtime.
+    ///
+    /// The harness owns the agent's volumes directory for its whole life.
+    /// A rootful agent mounts a workload identity tmpfs beneath it, and a
+    /// `TempDir` dropped over a mount fails to remove it without a word, so
+    /// [`Drop`] stops the agent first, then unmounts and removes the
+    /// directory with `clear_fixture_dir` (#852).
     struct Harness {
         client: BunClient,
-        _tasks: TestTasks,
+        /// `Some` until `Drop` stops the tasks.
+        tasks: Option<TestTasks>,
         _capacity_publisher:
             tokio::sync::watch::Sender<reliaburger::reporting::aggregator::AggregatedState>,
+        volumes: PathBuf,
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            // Nothing may mount beneath the volumes while they're cleared.
+            drop(self.tasks.take());
+            if let Err(error) = super::fixture_dir::clear_fixture_dir(&self.volumes) {
+                let message = format!(
+                    "capacity harness cleanup: cannot remove {}: {error}",
+                    self.volumes.display()
+                );
+                // A second panic while unwinding aborts the binary and hides
+                // the first failure.
+                if std::thread::panicking() {
+                    eprintln!("{message}");
+                } else {
+                    panic!("{message}");
+                }
+            }
+        }
     }
 
     impl Harness {
@@ -1290,8 +1311,8 @@ mod capacity_contract {
             agent.set_node_capacity(8000, 16384);
             agent.set_records_dir(records);
             agent.adopt_recorded_instances().await.unwrap();
-            let volumes = tempfile::tempdir().unwrap();
-            agent.set_volumes_dir(volumes.path().to_path_buf());
+            let volumes = tempfile::tempdir().unwrap().keep();
+            agent.set_volumes_dir(volumes.clone());
             let deploy_history = agent.deploy_history_handle();
             let status_reader = agent.status_reader();
             let job_data = tempfile::tempdir().unwrap();
@@ -1317,7 +1338,6 @@ mod capacity_contract {
             let agent_task = tokio::spawn(async move {
                 agent.run().await;
                 drop(agent);
-                drop(volumes);
                 drop(job_data);
             });
 
@@ -1337,6 +1357,7 @@ mod capacity_contract {
                         timestamp: std::time::SystemTime::UNIX_EPOCH,
                         running_apps: Vec::new(),
                         cached_specs: Vec::new(),
+                        rollouts: Vec::new(),
                         resource_usage: reliaburger::reporting::types::ResourceUsage {
                             cpu_total_millicores: 8000,
                             memory_total_mb: 16384,
@@ -1344,6 +1365,8 @@ mod capacity_contract {
                         },
                         event_log: Vec::new(),
                         has_buildah: false,
+                        job_reservations: Default::default(),
+                        capacity_refusals: Vec::new(),
                     },
                 )]
                 .into_iter()
@@ -1368,6 +1391,7 @@ mod capacity_contract {
                     node_id: reliaburger::meat::NodeId::new("node-1"),
                     address: "127.0.0.1:9001".parse().unwrap(),
                     api_advertised: true,
+                    jobs: None,
                 }]))),
                 None,
                 None,
@@ -1413,8 +1437,9 @@ mod capacity_contract {
             );
             Self {
                 client,
-                _tasks: tasks,
+                tasks: Some(tasks),
                 _capacity_publisher: capacity_tx,
+                volumes,
             }
         }
     }
@@ -1740,10 +1765,6 @@ mod capacity_contract {
                 .unwrap()
                 .replay_unknown
         );
-        assert!(
-            desired.prerequisite_claims.is_empty(),
-            "ordinary work must not use the old dispatcher"
-        );
 
         let probe = |name: &str, cpu: &str, memory: &str| {
             Config::parse(&format!(
@@ -1761,7 +1782,7 @@ mod capacity_contract {
             fresh_capacity(&harness, council.current_term());
             let response = harness
                 .client
-                .submit_batch(&probe(name, cpu, memory))
+                .submit_batch(&probe(name, cpu, memory), None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1808,7 +1829,7 @@ mod capacity_contract {
             Duration::from_secs(20),
             harness
                 .client
-                .submit_batch(&probe("full-after-terminal", "8", "16Gi")),
+                .submit_batch(&probe("full-after-terminal", "8", "16Gi"), None),
         )
         .await
         .expect("released capacity admission did not settle")
@@ -1832,5 +1853,79 @@ mod capacity_contract {
         drop(release);
         drop(harness);
         cleanup.finish().await;
+    }
+
+    /// Start a capacity harness on a runtime with no images, for tests of
+    /// the harness itself.
+    async fn bare_harness(root: &Path) -> (Harness, CouncilCleanup) {
+        let runtime = RuncGrill::new(
+            root.join("bundles"),
+            ImageStore::new(root.join("images")),
+            false,
+            root.join("state"),
+            env!("CARGO_BIN_EXE_bun").into(),
+        )
+        .unwrap();
+        let council = single_node_leader().await;
+        let cleanup = CouncilCleanup(council.clone());
+        let harness = Harness::start(council, runtime, root.join("records")).await;
+        (harness, cleanup)
+    }
+
+    /// Mount workload identity tmpfs beneath `volumes` the way the agent
+    /// does for a rootful workload, one nested inside the other.
+    fn mount_identity(volumes: &Path) {
+        let outer = reliaburger::sesame::identity::instance_identity_dir(volumes, "a");
+        for dir in [&outer, &outer.join("nested")] {
+            reliaburger::sesame::identity::prepare_identity_dir(dir).unwrap();
+        }
+        assert_eq!(mounts_under(volumes).len(), 2, "identity tmpfs not mounted");
+    }
+
+    /// The mount points `/proc/self/mountinfo` lists at or beneath `root`.
+    fn mounts_under(root: &Path) -> Vec<PathBuf> {
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        super::fixture_dir::mounts_beneath(&mountinfo, root)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires root, runc, overlayfs, cgroup v2, ip and nft; run with scripts/release/qualify-oci-interruptions.sh"]
+    async fn runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes() {
+        assert!(nix::unistd::geteuid().is_root());
+        let root = tempfile::tempdir().unwrap();
+        let (harness, _council) = bare_harness(root.path()).await;
+        let volumes = harness.volumes.clone();
+        mount_identity(&volumes);
+        drop(harness);
+        assert_eq!(mounts_under(&volumes), Vec::<PathBuf>::new());
+        assert!(
+            !volumes.exists(),
+            "{} survived the harness",
+            volumes.display()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires root, runc, overlayfs, cgroup v2, ip and nft; run with scripts/release/qualify-oci-interruptions.sh"]
+    async fn runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds() {
+        assert!(nix::unistd::geteuid().is_root());
+        let root = tempfile::tempdir().unwrap();
+        let (volumes_tx, volumes_rx) = tokio::sync::oneshot::channel();
+        let root_path = root.path().to_path_buf();
+        let failed = tokio::spawn(async move {
+            let (harness, _council) = bare_harness(&root_path).await;
+            mount_identity(&harness.volumes);
+            volumes_tx.send(harness.volumes.clone()).unwrap();
+            panic!("a failed assertion with identity tmpfs still mounted");
+        })
+        .await;
+        assert!(failed.unwrap_err().is_panic());
+        let volumes = volumes_rx.await.unwrap();
+        assert_eq!(mounts_under(&volumes), Vec::<PathBuf>::new());
+        assert!(
+            !volumes.exists(),
+            "{} survived the harness",
+            volumes.display()
+        );
     }
 }

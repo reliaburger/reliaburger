@@ -34,19 +34,23 @@ def shared_rule(source):
 def caller_rule(source, kind):
     if kind == 'apply':
         start = source.index('    for (app_name, namespace, host_execution) in targets {')
-        end = source.index('    let identities:', start)
+        end = source.index('    // Every job, leased or not, takes the common job lifecycle', start)
         expected = '''crate::sesame::auth::authorize_workload(
             auth.as_deref(), app_name, namespace, host_execution, &permissions,
         )'''
         before = source[source.index('    let targets ='):start]
-        if before.count('spec.script.is_some() || spec.exec.is_some()') != 2:
+        # Apps delegate to AppSpec::needs_host_access (host commands plus
+        # host-path sources, #676); jobs name their host command fields.
+        if before.count('spec.needs_host_access()') != 1:
+            return False
+        if before.count('spec.script.is_some() || spec.exec.is_some()') != 1:
             return False
     else:
         start = source.index('    let permissions = super::api::permission_map(&state).await;')
         end = source.index('    // Preserve the caller on the second hop', start)
         expected = '''crate::sesame::auth::authorize_workload(
             auth.as_deref(), &job.name, job.namespace(),
-            job.spec.exec.is_some() || job.spec.script.is_some(), &permissions,
+            job.spec.is_host(), &permissions,
         )'''
     body = compact(source[start:end])
     if kind == 'apply':
@@ -62,6 +66,23 @@ class WorkloadAuthorizationPolicy(unittest.TestCase):
     def test_apply_delegates_each_resolved_target_without_local_policy_duplicate(self):
         source = (ROOT / 'src/bun/api/apply.rs').read_text()
         self.assertTrue(caller_rule(source, 'apply'))
+
+    def test_job_host_test_never_narrows_below_the_host_command_fields(self):
+        source = (ROOT / 'src/config/job.rs').read_text()
+        start = source.index('    pub fn is_host(&self) -> bool {')
+        body = compact(source[start:source.index('\n    }', start)])
+        self.assertIn(compact('self.exec.is_some() || self.script.is_some()'), body)
+
+    def test_app_host_test_covers_host_commands_and_host_path_sources(self):
+        source = (ROOT / 'src/config/app.rs').read_text()
+        start = source.index('    pub fn needs_host_access(&self) -> bool {')
+        body = compact(source[start:source.index('\n    }', start)])
+        self.assertIn(compact('self.exec.is_some() || self.script.is_some()'), body)
+        self.assertIn(compact('self.host_path_sources().next().is_some()'), body)
+        start = source.index('    pub fn host_path_sources(&self)')
+        body = compact(source[start:source.index('\n    }', start)])
+        self.assertIn(compact('volume.source.as_deref()'), body)
+        self.assertIn(compact('file.source.as_deref()'), body)
 
     def test_batch_delegates_each_resolved_target_before_forwarding(self):
         source = (ROOT / 'src/bun/batch.rs').read_text()
@@ -89,7 +110,7 @@ class WorkloadAuthorizationPolicy(unittest.TestCase):
             self.assertFalse(caller_rule(source.replace(anchor, anchor + 'if false {').replace(
                 'return response;', 'return response; }'), kind))
         batch = (ROOT / 'src/bun/batch.rs').read_text()
-        self.assertFalse(caller_rule(batch.replace('job.spec.exec.is_some() || job.spec.script.is_some()', 'false'), 'batch'))
+        self.assertFalse(caller_rule(batch.replace('job.spec.is_host()', 'false'), 'batch'))
 
 
 if __name__ == '__main__':

@@ -165,30 +165,47 @@ impl GuestImageMetadata {
     }
 }
 
+/// The Lima release the quickstart installs privately and drives.
+///
+/// 2.2.1 carries the guest-agent socket fix for CVE-2026-53657 (2.1.3) and
+/// the fix for the guest-agent socket leaked per forwarded connection
+/// (lima-vm/lima#5210, fixed in 2.2.0).
+pub const LIMA_VERSION: &str = "2.2.1";
+
+/// Where the managed `limactl` lives under the Reliaburger root directory.
+pub fn managed_limactl(root: &Path) -> PathBuf {
+    root.join("tools")
+        .join(format!("lima-{LIMA_VERSION}"))
+        .join("bin/limactl")
+}
+
 /// Select a checksummed Lima distribution for the host platform.
+///
+/// The checksums are the release's own `SHA256SUMS`
+/// (<https://github.com/lima-vm/lima/releases/tag/v2.2.1>).
 pub fn lima_archive(os: &str, arch: &str) -> Result<(String, &'static str)> {
     let (platform, checksum) = match (os, arch) {
         ("macos", "aarch64") => (
             "Darwin-arm64",
-            "1da852bce2f98b8310fb53e5047e08ff798880ddf9ae4b3161d4de4e73777b34",
+            "9e9eacce88f37e185c346bad73aa6136f738d8cdf8c3bb23cd42b071824bc66e",
         ),
         ("macos", "x86_64") => (
             "Darwin-x86_64",
-            "529d6dad275bded4bd1fb17c6df4d22f11917712aab1693f5bc43286b5e78824",
+            "6b776e4bc41f358e6ee01fefcc78e2eb26f11635a0fcff632234af77a566c6c4",
         ),
         ("linux", "aarch64") => (
             "Linux-aarch64",
-            "8b806c81f38ad7ea8104f196b414e243726cad1dfa6aa52843608d55df8c5290",
+            "fbcf4d127936666aa2cf6013b663c250431f2a59394757b404070f8d6a160e10",
         ),
         ("linux", "x86_64") => (
             "Linux-x86_64",
-            "9e52c605790649aceac1f894eb2bb7cdb45897257faafb54ff30ce6a576bebfa",
+            "b391ac7fcac2b2a5a1628107756463188ded4d18d3104a40a66a8bb6fec01bcb",
         ),
         _ => bail!("managed clusters require macOS or Linux on arm64 or x86_64"),
     };
     Ok((
         format!(
-            "https://github.com/lima-vm/lima/releases/download/v2.1.0/lima-2.1.0-{platform}.tar.gz"
+            "https://github.com/lima-vm/lima/releases/download/v{LIMA_VERSION}/lima-{LIMA_VERSION}-{platform}.tar.gz"
         ),
         checksum,
     ))
@@ -199,10 +216,10 @@ pub async fn tooling(root: &Path, downloader: &Downloader, step: &Step) -> Resul
     let (url, checksum) = lima_archive(std::env::consts::OS, std::env::consts::ARCH)?;
     let tools = root.join("tools");
     tokio::fs::create_dir_all(&tools).await?;
-    let installed = tools.join("lima-2.1.0");
-    let executable = installed.join("bin/limactl");
+    let executable = managed_limactl(root);
+    let installed = tools.join(format!("lima-{LIMA_VERSION}"));
     if !executable.exists() {
-        let archive = tools.join("lima-2.1.0.tar.gz");
+        let archive = tools.join(format!("lima-{LIMA_VERSION}.tar.gz"));
         downloader
             .fetch(&url, checksum, &archive, 256 * 1024 * 1024, Some(step))
             .await?;
@@ -230,7 +247,7 @@ pub async fn tooling(root: &Path, downloader: &Downloader, step: &Step) -> Resul
     }
     let lima = Lima::new(executable, Duration::from_secs(240)).with_home(root.join("lima"));
     let version = lima.command(&["--version"]).await?;
-    if !version.split_whitespace().any(|word| word == "2.1.0") {
+    if !version.split_whitespace().any(|word| word == LIMA_VERSION) {
         bail!("managed Lima installation has an unexpected version");
     }
     Ok(lima)
@@ -445,10 +462,69 @@ mod tests {
         for os in ["macos", "linux"] {
             for arch in ["aarch64", "x86_64"] {
                 let (url, checksum) = lima_archive(os, arch).unwrap();
-                assert!(url.contains("/v2.1.0/"));
+                assert!(url.contains(&format!("/v{LIMA_VERSION}/lima-{LIMA_VERSION}-")));
                 assert_eq!(checksum.len(), 64);
             }
         }
         assert!(lima_archive("windows", "x86_64").is_err());
+    }
+
+    /// Lima 2.2.1 is the first pin with both the guest-agent socket fix
+    /// (CVE-2026-53657, 2.1.3) and the forwarder leak fix (lima-vm/lima#5216,
+    /// 2.2.0). The checksums are the release's own `SHA256SUMS`.
+    #[test]
+    fn tooling_pins_lima_2_2_1_with_its_published_checksums() {
+        assert_eq!(LIMA_VERSION, "2.2.1");
+        let base = "https://github.com/lima-vm/lima/releases/download/v2.2.1";
+        for (os, arch, platform, expected) in [
+            (
+                "macos",
+                "aarch64",
+                "Darwin-arm64",
+                "9e9eacce88f37e185c346bad73aa6136f738d8cdf8c3bb23cd42b071824bc66e",
+            ),
+            (
+                "macos",
+                "x86_64",
+                "Darwin-x86_64",
+                "6b776e4bc41f358e6ee01fefcc78e2eb26f11635a0fcff632234af77a566c6c4",
+            ),
+            (
+                "linux",
+                "aarch64",
+                "Linux-aarch64",
+                "fbcf4d127936666aa2cf6013b663c250431f2a59394757b404070f8d6a160e10",
+            ),
+            (
+                "linux",
+                "x86_64",
+                "Linux-x86_64",
+                "b391ac7fcac2b2a5a1628107756463188ded4d18d3104a40a66a8bb6fec01bcb",
+            ),
+        ] {
+            let (url, checksum) = lima_archive(os, arch).unwrap();
+            assert_eq!(url, format!("{base}/lima-2.2.1-{platform}.tar.gz"));
+            assert_eq!(checksum, expected, "{platform}");
+        }
+    }
+
+    #[test]
+    fn managed_limactl_lives_in_a_directory_named_for_the_pinned_version() {
+        let root = Path::new("/home/user/.reliaburger");
+        assert_eq!(
+            managed_limactl(root),
+            root.join(format!("tools/lima-{LIMA_VERSION}/bin/limactl"))
+        );
+    }
+
+    /// The soak harness drives the quickstart's own Lima, so it must look for
+    /// it where the pinned version installs it.
+    #[test]
+    fn soak_harness_drives_the_pinned_lima() {
+        let harness = include_str!("../../../scripts/release/qualify-sustained.sh");
+        assert!(
+            harness.contains(&format!("$home/tools/lima-{LIMA_VERSION}/bin/limactl")),
+            "qualify-sustained.sh must use lima-{LIMA_VERSION}"
+        );
     }
 }

@@ -119,8 +119,7 @@ impl Ledger {
                 file.sync_all()?;
             }
         }
-        let index =
-            super::task_result_index::TaskResultIndex::open(&path.with_extension("index.redb"))?;
+        let index = super::task_result_index::TaskResultIndex::open(&path.with_extension("index"))?;
         index.rebuild(path)?;
         Ok(Self {
             index,
@@ -174,15 +173,30 @@ impl Ledger {
     }
 }
 
-pub(crate) fn encode(record: &TaskRecord, out: &mut Vec<u8>) {
-    let outcome: u8 = match record.outcome {
+/// The byte an outcome is stored as. Never zero, so an all-zero result
+/// slot can mean "no outcome".
+pub(crate) fn outcome_byte(outcome: TaskFinal) -> u8 {
+    match outcome {
         TaskFinal::Succeeded => 1,
         TaskFinal::Failed => 2,
         TaskFinal::NotRun => 3,
-    };
+    }
+}
+
+/// The outcome stored as `byte`, if it is one.
+pub(crate) fn outcome_from_byte(byte: u8) -> Option<TaskFinal> {
+    match byte {
+        1 => Some(TaskFinal::Succeeded),
+        2 => Some(TaskFinal::Failed),
+        3 => Some(TaskFinal::NotRun),
+        _ => None,
+    }
+}
+
+pub(crate) fn encode(record: &TaskRecord, out: &mut Vec<u8>) {
     out.extend_from_slice(&record.index.to_le_bytes());
     out.push(record.attempts);
-    out.push(outcome);
+    out.push(outcome_byte(record.outcome));
     out.extend_from_slice(&record.exit_code.unwrap_or(NO_EXIT_CODE).to_le_bytes());
     out.extend_from_slice(&record.run_ms.to_le_bytes());
     out.extend_from_slice(&record.grant_attempt.to_le_bytes());
@@ -191,17 +205,10 @@ pub(crate) fn encode(record: &TaskRecord, out: &mut Vec<u8>) {
 pub(crate) fn decode(bytes: &[u8; RECORD_BYTES], offset: u64) -> Result<TaskRecord, LedgerError> {
     let u32_at =
         |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
-    let outcome = match bytes[5] {
-        1 => TaskFinal::Succeeded,
-        2 => TaskFinal::Failed,
-        3 => TaskFinal::NotRun,
-        other => {
-            return Err(LedgerError::BadRecord {
-                offset,
-                outcome: other,
-            });
-        }
-    };
+    let outcome = outcome_from_byte(bytes[5]).ok_or(LedgerError::BadRecord {
+        offset,
+        outcome: bytes[5],
+    })?;
     let exit_code = u32_at(6) as i32;
     Ok(TaskRecord {
         grant_attempt: u64::from_le_bytes(bytes[14..22].try_into().expect("record width")),
@@ -211,6 +218,8 @@ pub(crate) fn decode(bytes: &[u8; RECORD_BYTES], offset: u64) -> Result<TaskReco
         exit_code: (exit_code != NO_EXIT_CODE).then_some(exit_code),
         run_ms: u32_at(10),
         output: None,
+        // The ledger keeps attempt counts only; see `TaskRecord::retry_causes`.
+        retry_causes: Default::default(),
     })
 }
 
@@ -461,6 +470,7 @@ mod tests {
             },
             run_ms: index.wrapping_mul(3),
             output: None,
+            retry_causes: Default::default(),
         }
     }
 
@@ -686,20 +696,66 @@ mod tests {
             ledger.append(&shifted);
             ledger.flush().unwrap();
         }
-        let bytes = std::fs::metadata(path_in(&dir)).unwrap().len();
-        assert!(bytes <= 24 * 1024 * 1024, "{bytes} ledger bytes");
-        let indexed = std::fs::metadata(path_in(&dir).with_extension("index.redb"))
-            .unwrap()
-            .len();
-        eprintln!("million task outcomes: ledger={bytes} bytes, index={indexed} bytes");
+        let tasks = 245 * 4096u64;
+        // The format, to the byte: a header per block plus 22-byte records,
+        // and one 24-byte index slot per task. Logical lengths don't depend
+        // on the filesystem, so these are exact on every run.
+        let length = |path: &Path| std::fs::metadata(path).unwrap().len();
+        assert_eq!(
+            length(&path_in(&dir)),
+            (MAGIC.len() + 245 * BLOCK_HEADER_BYTES) as u64 + tasks * RECORD_BYTES as u64
+        );
+        assert_eq!(
+            length(&path_in(&dir).with_extension("index")),
+            tasks * super::super::task_result_index::SLOT_BYTES as u64
+        );
+        // Allocated bytes: what the disk actually pays. The filesystem, not
+        // the format, decides these. APFS keeps up to about 1 MiB allocated
+        // past the end of a file grown by fsynced appends, a different amount
+        // each run (#717), so only the whole budget, which leaves room for
+        // that, bounds them. Production-sized blocks keep the measurement
+        // honest: written as one block, the same records allocate no slack.
+        let allocated = |path: &Path| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).unwrap().blocks() * 512
+        };
+        let bytes = allocated(&path_in(&dir));
+        let indexed = allocated(&path_in(&dir).with_extension("index"));
+        eprintln!(
+            "{tasks} task outcomes: ledger {bytes} bytes ({:.1}/task), index {indexed} bytes ({:.1}/task)",
+            bytes as f64 / tasks as f64,
+            indexed as f64 / tasks as f64,
+        );
+        let bound = super::super::task_array_node::ACTIVE_STORAGE_BYTES_PER_TASK;
         assert!(
-            bytes + indexed <= 128 * 1024 * 1024,
-            "{} total bytes",
+            bytes + indexed <= tasks * bound,
+            "{} bytes is over {bound} per task while the run is active",
             bytes + indexed
         );
         let replayed = replay(&path_in(&dir)).unwrap();
         assert_eq!(replayed.records.len(), 245 * 4096);
         assert_eq!(replayed.finished.range_count(), 1);
+
+        // The run finishes: its results move to the compact file and the
+        // ledger and live index go. That is all a finished run keeps.
+        use super::super::task_result_index::{self, FINAL_SLOT_BYTES, RESULTS_FILE};
+        let results = dir.path().join(RESULTS_FILE);
+        task_result_index::compact(&path_in(&dir), &results)
+            .unwrap()
+            .unwrap();
+        assert!(!path_in(&dir).exists());
+        assert!(!path_in(&dir).with_extension("index").exists());
+        assert_eq!(length(&results), tasks * FINAL_SLOT_BYTES as u64);
+        let kept = allocated(&results);
+        eprintln!(
+            "{tasks} finished tasks: results {kept} bytes ({:.1}/task)",
+            kept as f64 / tasks as f64,
+        );
+        let bound = super::super::task_array_node::STORAGE_BYTES_PER_TASK;
+        assert!(
+            kept <= tasks * bound,
+            "{kept} bytes is over {bound} per finished task"
+        );
     }
 
     #[test]

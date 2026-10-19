@@ -93,8 +93,11 @@ fn check_quorum_risk(request: &FaultRequest, context: &SafetyContext) -> Option<
 
 /// Check whether the fault would kill all replicas of the target service.
 ///
-/// At least one replica must survive. This rail applies to Kill, Pause,
-/// and resource faults that could make instances unavailable.
+/// At least one replica must survive. This rail applies to Kill and Pause,
+/// the faults that take a replica out of service. A resource or network
+/// fault slows a replica down but leaves it serving, so the rail lets it
+/// through; the already-faulted count it compares against is the target's
+/// active pauses in the same namespace.
 fn check_replica_minimum(
     request: &FaultRequest,
     context: &SafetyContext,

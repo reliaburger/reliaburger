@@ -6,6 +6,10 @@
 //!
 //! Modules are added incrementally as each roadmap phase is implemented.
 
+#[cfg(all(test, unix))]
+#[path = "../tests/support/first_launch.rs"]
+pub(crate) mod first_launch;
+
 pub mod appliance;
 pub mod brioche;
 pub mod bun;

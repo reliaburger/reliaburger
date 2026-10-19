@@ -7,12 +7,15 @@ use super::trace::{MAX_CONCURRENT_TRACES, trace_dns_command, trace_dns_step, tra
 use super::*;
 use crate::grill::mock::MockGrill;
 
+#[cfg(target_os = "linux")]
+mod cgroup_faults;
 mod fault_coverage;
 mod loop_harness;
 mod loop_rule;
 mod namespace_secrets;
 mod published_status;
 mod restart_ownership;
+mod runtime_metadata;
 mod upgrade_answer;
 
 #[test]
@@ -611,6 +614,265 @@ async fn reporting_binds_a_retired_launch_whose_environment_values_were_scrubbed
         .handle_snapshot_request(CollectSnapshotRequest { response: tx })
         .await;
     assert!(rx.await.unwrap().instances[0].execution.is_none());
+}
+
+/// Job leases and app replicas share one budget. When jobs hold it, a
+/// fresh deploy fails for capacity, and the state report says so (and how
+/// much the jobs hold) so the leader can place the replica elsewhere.
+#[tokio::test]
+async fn capacity_refusal_and_job_reservations_reach_the_state_snapshot() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    // Requests come with limits, which only a container runtime enforces.
+    grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    let budget = agent.execution_budget();
+    budget.set_capacity(crate::meat::Resources::new(1000, 1 << 30, 0));
+    let held = crate::meat::Resources::new(1000, 1 << 29, 0);
+    let attempt = budget
+        .acquire(held, &CancellationToken::new())
+        .await
+        .unwrap();
+    let config =
+        Config::parse("[app.web]\nimage = 'web:v1'\ncpu = '500m'\nmemory = '64Mi'\n").unwrap();
+
+    let events = drain_deploy(&mut agent, config.clone()).await;
+    assert!(
+        matches!(events.last(), Some(ApplyEvent::Error { .. })),
+        "{events:?}"
+    );
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    let snapshot = rx.await.unwrap();
+    assert_eq!(
+        snapshot.job_reservations,
+        crate::reporting::types::JobReservations {
+            cpu_millicores: 1000,
+            memory_bytes: 1 << 29,
+        }
+    );
+    assert_eq!(
+        snapshot.capacity_refusals,
+        vec![crate::reporting::types::CapacityRefusal {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            ordinals: vec![0],
+        }]
+    );
+
+    drop(attempt);
+    expect_complete(&drain_deploy(&mut agent, config).await);
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    let snapshot = rx.await.unwrap();
+    assert!(snapshot.capacity_refusals.is_empty());
+    assert_eq!(snapshot.job_reservations, Default::default());
+}
+
+/// The apps the agent's next state report says it refused for capacity,
+/// with the replica ordinals it couldn't start.
+async fn reported_refusals(agent: &mut TestAgent) -> Vec<(String, String, Vec<u32>)> {
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    rx.await
+        .unwrap()
+        .capacity_refusals
+        .into_iter()
+        .map(|refusal| (refusal.app_name, refusal.namespace, refusal.ordinals))
+        .collect()
+}
+
+/// An agent whose 1000m budget runs one 500m replica of `web`, with a job
+/// lease holding the other 500m. Returns the lease, which frees the room.
+async fn agent_with_web_beside_a_job_lease() -> (
+    TestAgent,
+    MockGrill,
+    crate::bun::execution_budget::ResourceLease,
+) {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    // Requests come with limits, which only a container runtime enforces.
+    grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    let budget = agent.execution_budget();
+    budget.set_capacity(crate::meat::Resources::new(1000, 1 << 30, 0));
+    expect_complete(&drain_deploy(&mut agent, budgeted_web("web:v1", 1)).await);
+    let job = budget
+        .acquire(
+            crate::meat::Resources::new(500, 1 << 29, 0),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    (agent, grill, job)
+}
+
+/// An agent whose 1000m budget a job lease holds whole, so a fresh deploy
+/// of `web` is refused. Returns the lease.
+async fn agent_with_a_full_budget() -> (
+    TestAgent,
+    MockGrill,
+    crate::bun::execution_budget::ResourceLease,
+) {
+    let (agent, _, _, grill) = test_agent_with_grill();
+    grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    let budget = agent.execution_budget();
+    budget.set_capacity(crate::meat::Resources::new(1000, 1 << 30, 0));
+    let job = budget
+        .acquire(
+            crate::meat::Resources::new(1000, 1 << 29, 0),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    (agent, grill, job)
+}
+
+fn budgeted_web(image: &str, replicas: u32) -> Config {
+    Config::parse(&format!(
+        "[app.web]\nimage = '{image}'\nreplicas = {replicas}\ncpu = '500m'\nmemory = '64Mi'\n"
+    ))
+    .unwrap()
+}
+
+/// `web`'s refusal, naming the replica ordinals it couldn't start.
+fn web_refused(ordinals: &[u32]) -> Vec<(String, String, Vec<u32>)> {
+    vec![("web".to_string(), "default".to_string(), ordinals.to_vec())]
+}
+
+/// #967: a replica added beside running ones leases from the same budget as
+/// a fresh deploy. When job leases fill it, the leader must hear about the
+/// refusal, or it keeps the replica on a node that can never start it. The
+/// refusal names only the replica the scale-up tried to add (#971).
+#[tokio::test]
+async fn capacity_refusal_while_adding_replicas_reaches_the_state_snapshot() {
+    let (mut agent, _grill, job) = agent_with_web_beside_a_job_lease().await;
+
+    let events = drain_deploy(&mut agent, budgeted_web("web:v1", 2)).await;
+    assert!(
+        events.iter().any(|event| matches!(event,
+            ApplyEvent::Progress { message } if message.contains("beside the running ones"))),
+        "the scale-up must take the add-replicas path: {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(ApplyEvent::Error { message }) if message.contains("capacity")),
+        "{events:?}"
+    );
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[1]));
+    drop(job);
+}
+
+/// #971: the refused scale-up started nothing, so its retry adds the same
+/// replica in place again. It used to find its own spec already stored and
+/// roll the app instead, which needs room for both new replicas beside the
+/// old one: more than the scale-up ever asked for.
+#[tokio::test]
+async fn a_refused_scale_up_retries_in_place_with_the_room_it_needed() {
+    let (mut agent, _grill, job) = agent_with_web_beside_a_job_lease().await;
+    let before = live_web_ids(&agent);
+    drain_deploy(&mut agent, budgeted_web("web:v1", 2)).await;
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[1]));
+
+    // Room for the one added replica, and no more.
+    drop(job);
+    let events = drain_deploy(&mut agent, budgeted_web("web:v1", 2)).await;
+
+    expect_complete(&events);
+    assert!(
+        events.iter().any(|event| matches!(event,
+            ApplyEvent::Progress { message } if message.contains("beside the running ones"))),
+        "the retry must add in place, not roll: {events:?}"
+    );
+    let after = live_web_ids(&agent);
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert!(
+        after.contains(&before[0]),
+        "the serving replica was replaced"
+    );
+    assert!(reported_refusals(&mut agent).await.is_empty());
+}
+
+/// #971: once the leader moves the replica this node refused, the node's
+/// share is what it already runs. That deploy changes nothing, so it must
+/// not roll the healthy replica, and the refusal it answered goes away.
+#[tokio::test]
+async fn the_share_left_after_a_refused_replica_moves_is_not_rolled() {
+    let (mut agent, _grill, _job) = agent_with_web_beside_a_job_lease().await;
+    let before = live_web_ids(&agent);
+    drain_deploy(&mut agent, budgeted_web("web:v1", 2)).await;
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[1]));
+
+    let events = drain_deploy(&mut agent, budgeted_web("web:v1", 1)).await;
+
+    expect_complete(&events);
+    assert_eq!(
+        live_web_ids(&agent),
+        before,
+        "the serving replica was replaced"
+    );
+    assert!(reported_refusals(&mut agent).await.is_empty());
+}
+
+/// #967: a rolling replacement reserves its new instance from the budget
+/// before the old one leaves, so job leases can refuse it too.
+#[tokio::test]
+async fn capacity_refusal_while_reserving_a_rolling_replacement_reaches_the_state_snapshot() {
+    let (mut agent, _grill, job) = agent_with_web_beside_a_job_lease().await;
+
+    let events = drain_deploy(&mut agent, budgeted_web("web:v2", 1)).await;
+    assert!(
+        events.iter().any(|event| matches!(event,
+            ApplyEvent::Error { message } if message.contains("capacity"))),
+        "{events:?}"
+    );
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[0]));
+
+    drop(job);
+    expect_complete(&drain_deploy(&mut agent, budgeted_web("web:v2", 1)).await);
+    assert!(reported_refusals(&mut agent).await.is_empty());
+}
+
+/// #967: the node's deploy retries back off to five minutes. A refusal that
+/// lapsed after a minute was missing from most reports in between, and a
+/// leader pass in that gap kept the replica where it couldn't start.
+#[tokio::test]
+async fn capacity_refusal_stays_reported_while_the_deploy_backs_off() {
+    let (mut agent, _grill, _job) = agent_with_a_full_budget().await;
+    drain_deploy(&mut agent, budgeted_web("web:v1", 1)).await;
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[0]));
+
+    tokio::time::pause();
+    tokio::time::advance(
+        crate::cluster::deploy_backoff::MAX_DEPLOY_BACKOFF + std::time::Duration::from_secs(60),
+    )
+    .await;
+    tokio::time::resume();
+
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[0]));
+}
+
+/// #967: once the leader moves the app off this node, the node retires it,
+/// and the refusal goes with it. It was about a placement that no longer
+/// exists, and would otherwise move the app off this node again later.
+#[tokio::test]
+async fn retiring_a_refused_app_withdraws_its_capacity_refusal() {
+    let (mut agent, _grill, _job) = agent_with_a_full_budget().await;
+    drain_deploy(&mut agent, budgeted_web("web:v1", 1)).await;
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[0]));
+
+    let (response, _answer) = oneshot::channel();
+    agent
+        .request_app_stop(
+            "web".into(),
+            "default".into(),
+            StopPurpose::Retire,
+            response,
+        )
+        .await;
+
+    assert!(reported_refusals(&mut agent).await.is_empty());
 }
 
 #[tokio::test]
@@ -2400,18 +2662,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// those ops inline until the deploy's events channel closes. Keeps the
     /// direct-`deploy` unit tests working without standing up a full loop.
     async fn deploy(&mut self, config: Config, events: &mpsc::Sender<ApplyEvent>) {
-        self.deploy_with_rerun(config, events, false).await;
-    }
-
-    async fn deploy_with_rerun(
-        &mut self,
-        config: Config,
-        events: &mpsc::Sender<ApplyEvent>,
-        rerun_unknown_jobs: bool,
-    ) {
         let worker = DeployWorker {
-            prepared_batch_jobs: None,
-            rerun_unknown_jobs,
             grill: self.supervisor.grill().clone(),
             ops: DeployOps {
                 tx: self.deploy_ops_tx.clone(),
@@ -2475,7 +2726,7 @@ async fn lease_storage_waits_for_confirmed_runtime_retirement() {
     store.create(lease).await.unwrap();
     grill.set_ignore_stop(true);
     grill.set_ignore_kill(true);
-    let refused = cleanup_local_lease(&store, &tx, "cleanup", Some("owner")).await;
+    let refused = cleanup_local_lease(&store, &tx, None, "cleanup", Some("owner")).await;
     assert!(refused.is_err());
     assert!(store.get("cleanup").await.is_some());
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "live");
@@ -2487,7 +2738,7 @@ async fn lease_storage_waits_for_confirmed_runtime_retirement() {
     );
     grill.set_ignore_stop(false);
     grill.set_ignore_kill(false);
-    cleanup_local_lease(&store, &tx, "cleanup", Some("owner"))
+    cleanup_local_lease(&store, &tx, None, "cleanup", Some("owner"))
         .await
         .unwrap();
     assert!(!marker.exists());
@@ -2597,7 +2848,7 @@ async fn lease_retirement_removes_only_owned_test_volumes_after_stop_preserves_t
         app_id: crate::meat::AppId::new("web", "rbtest-cleanup"),
     });
     store.create(lease).await.unwrap();
-    let cleanup = cleanup_local_lease(&store, &tx, "cleanup", Some("owner")).await;
+    let cleanup = cleanup_local_lease(&store, &tx, None, "cleanup", Some("owner")).await;
     shutdown.cancel();
     task.await.unwrap();
     cleanup.unwrap();
@@ -2637,7 +2888,7 @@ async fn lease_cleanup_retires_owned_instances_without_erasing_another_namespace
         app_id: crate::meat::AppId::new("web", "rbtest-cleanup"),
     });
     store.create(lease).await.unwrap();
-    cleanup_local_lease(&store, &tx, "cleanup", Some("owner"))
+    cleanup_local_lease(&store, &tx, None, "cleanup", Some("owner"))
         .await
         .unwrap();
     let (response, result) = oneshot::channel();
@@ -2653,339 +2904,6 @@ async fn lease_cleanup_retires_owned_instances_without_erasing_another_namespace
     );
     assert_eq!(instances[0].namespace, "rbtest-keep");
     assert_eq!(instances[0].state, "running");
-}
-
-#[tokio::test]
-async fn cron_registration_and_stop_survive_agent_replacement() {
-    let directory = tempfile::tempdir().unwrap();
-    let records = directory.path().join("instances");
-    let (mut agent, tx, _shutdown) = test_agent();
-    agent.set_records_dir(records.clone());
-    agent.set_volumes_dir(directory.path().join("volumes"));
-    let task = tokio::spawn(async move { agent.run().await });
-    for namespace in ["red", "blue"] {
-        let config = Config::parse(&format!(
-            "[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\nnamespace = '{namespace}'\n"
-        ))
-        .unwrap();
-        expect_complete(&send_deploy(&tx, config).await);
-    }
-    let (response, stopped) = oneshot::channel();
-    tx.send(AgentCommand::Stop {
-        app_name: "backup".into(),
-        namespace: "red".into(),
-        response,
-    })
-    .await
-    .unwrap();
-    stopped.await.unwrap().unwrap();
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-
-    let (mut replacement, tx, shutdown) = test_agent();
-    replacement.set_records_dir(records);
-    replacement.set_volumes_dir(directory.path().join("volumes"));
-    replacement.adopt_recorded_instances().await.unwrap();
-    let task = tokio::spawn(async move { replacement.run().await });
-    let conflicting =
-        Config::parse("[app.backup]\nimage = 'test:v1'\nnamespace = 'blue'\n").unwrap();
-    let events = send_deploy(&tx, conflicting).await;
-    assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("registered cron job"))));
-    for (namespace, exists) in [("red", false), ("blue", true)] {
-        let (response, stopped) = oneshot::channel();
-        tx.send(AgentCommand::Stop {
-            app_name: "backup".into(),
-            namespace: namespace.into(),
-            response,
-        })
-        .await
-        .unwrap();
-        let result = stopped.await.unwrap();
-        assert_eq!(result.is_ok(), exists, "{namespace}: {result:?}");
-    }
-    shutdown.cancel();
-    task.await.unwrap();
-}
-
-#[tokio::test]
-async fn cron_claim_is_durable_before_launch_and_is_not_repeated_after_crash() {
-    let seconds = time::OffsetDateTime::now_utc().second();
-    if seconds >= 50 {
-        tokio::time::sleep(std::time::Duration::from_secs(u64::from(61 - seconds))).await;
-    }
-    let directory = tempfile::tempdir().unwrap();
-    let records = directory.path().join("instances");
-    let (mut agent, tx, _shutdown, grill) = test_agent_with_grill();
-    agent.set_records_dir(records.clone());
-    agent.set_volumes_dir(directory.path().join("volumes"));
-    grill.block_creates();
-    let task = tokio::spawn(async move { agent.run().await });
-    let config = Config::parse("[job.once]\nimage = 'test:v1'\nschedule = '* * * * *'\n").unwrap();
-    expect_complete(&send_deploy(&tx, config).await);
-    tokio::time::timeout(std::time::Duration::from_secs(3), grill.wait_for_creates(1))
-        .await
-        .unwrap();
-    let checkpoint: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(records.join("scheduled-jobs.checkpoint")).unwrap())
-            .unwrap();
-    let claimed = checkpoint["jobs"][0]["last_fired_minute"].as_i64().unwrap();
-    assert_eq!(
-        claimed,
-        time::OffsetDateTime::now_utc()
-            .unix_timestamp()
-            .div_euclid(60)
-    );
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-    grill.release_creates(1);
-
-    let (mut replacement, _tx, shutdown, runtime) = test_agent_with_grill();
-    replacement.set_records_dir(records);
-    replacement.set_volumes_dir(directory.path().join("volumes"));
-    replacement.adopt_recorded_instances().await.unwrap();
-    let task = tokio::spawn(async move { replacement.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
-    shutdown.cancel();
-    task.await.unwrap();
-    assert_eq!(
-        claimed,
-        time::OffsetDateTime::now_utc()
-            .unix_timestamp()
-            .div_euclid(60),
-        "fixture crossed the minute boundary"
-    );
-    assert!(
-        !runtime
-            .calls()
-            .iter()
-            .any(|(operation, _)| operation == "create"),
-        "recovery repeated a claimed firing"
-    );
-}
-
-#[tokio::test]
-async fn failed_cron_stop_retains_checkpoint_and_fences_later_changes() {
-    let directory = tempfile::tempdir().unwrap();
-    let records = directory.path().join("instances");
-    let (mut agent, tx, shutdown) = test_agent();
-    agent.set_records_dir(records.clone());
-    agent.set_volumes_dir(directory.path().join("volumes"));
-    let task = tokio::spawn(async move { agent.run().await });
-    let config =
-        Config::parse("[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\n").unwrap();
-    expect_complete(&send_deploy(&tx, config.clone()).await);
-    let saved = directory.path().join("saved");
-    std::fs::rename(&records, &saved).unwrap();
-    std::fs::write(&records, "blocked").unwrap();
-    let (response, stopped) = oneshot::channel();
-    tx.send(AgentCommand::Stop {
-        app_name: "backup".into(),
-        namespace: "default".into(),
-        response,
-    })
-    .await
-    .unwrap();
-    assert!(stopped.await.unwrap().is_err());
-    std::fs::remove_file(&records).unwrap();
-    std::fs::rename(&saved, &records).unwrap();
-    let events = send_deploy(&tx, config).await;
-    assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("previous write is uncertain"))));
-    shutdown.cancel();
-    task.await.unwrap();
-    let (mut replacement, _tx, _shutdown) = test_agent();
-    replacement.set_records_dir(records);
-    replacement.set_volumes_dir(directory.path().join("volumes"));
-    replacement.adopt_recorded_instances().await.unwrap();
-    assert!(
-        replacement
-            .scheduled_jobs
-            .contains_key(&("backup".into(), "default".into()))
-    );
-}
-
-#[tokio::test]
-async fn cron_checkpoint_corruption_refuses_startup() {
-    let job = serde_json::json!({"name":"backup", "namespace":"default", "spec":{"image":"test:v1", "schedule":"* * * * *"}, "last_fired_minute":null});
-    let mut wrong_namespace = job.clone();
-    wrong_namespace["namespace"] = "other".into();
-    let mut invalid_schedule = job.clone();
-    invalid_schedule["spec"]["schedule"] = "bad".into();
-    let mut invalid_stamp = job.clone();
-    invalid_stamp["last_fired_minute"] = (-1).into();
-    for contents in [
-        "{broken".to_string(),
-        serde_json::json!({"schema":999,"jobs":[]}).to_string(),
-        serde_json::json!({"schema":1,"jobs":[job.clone(),job]}).to_string(),
-        serde_json::json!({"schema":1,"jobs":[wrong_namespace]}).to_string(),
-        serde_json::json!({"schema":1,"jobs":[invalid_schedule]}).to_string(),
-        serde_json::json!({"schema":1,"jobs":[invalid_stamp]}).to_string(),
-    ] {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("scheduled-jobs.checkpoint");
-        std::fs::write(&path, &contents).unwrap();
-        let (mut agent, _tx, _shutdown) = test_agent();
-        agent.set_records_dir(directory.path().to_path_buf());
-        agent.set_volumes_dir(directory.path().join("volumes"));
-        assert!(
-            agent.adopt_recorded_instances().await.is_err(),
-            "invalid checkpoint was accepted: {contents}"
-        );
-        assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
-    }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn cron_checkpoint_refuses_symlinks_and_nonregular_files() {
-    let directory = tempfile::tempdir().unwrap();
-    let checkpoint = directory.path().join("scheduled-jobs.checkpoint");
-    let source = directory.path().join("source");
-    std::fs::write(&source, r#"{"schema":1,"jobs":[]}"#).unwrap();
-    for kind in 0..3 {
-        match kind {
-            0 => std::os::unix::fs::symlink(&source, &checkpoint).unwrap(),
-            1 => nix::unistd::mkfifo(&checkpoint, nix::sys::stat::Mode::S_IRUSR).unwrap(),
-            _ => std::fs::create_dir(&checkpoint).unwrap(),
-        }
-        let (mut agent, _tx, _shutdown) = test_agent();
-        agent.set_records_dir(directory.path().to_path_buf());
-        agent.set_volumes_dir(directory.path().join("volumes"));
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                agent.adopt_recorded_instances()
-            )
-            .await
-            .unwrap()
-            .is_err()
-        );
-        if kind == 2 {
-            std::fs::remove_dir(&checkpoint).unwrap();
-        } else {
-            std::fs::remove_file(&checkpoint).unwrap();
-        }
-    }
-}
-
-#[tokio::test]
-async fn cron_registration_refuses_when_ownership_cannot_be_persisted() {
-    let directory = tempfile::tempdir().unwrap();
-    let records = directory.path().join("instances");
-    std::fs::write(&records, "not a directory").unwrap();
-    let (mut agent, tx, shutdown) = test_agent();
-    agent.set_records_dir(records);
-    agent.set_volumes_dir(directory.path().join("volumes"));
-    let task = tokio::spawn(async move { agent.run().await });
-    let config =
-        Config::parse("[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\n").unwrap();
-    let events = send_deploy(&tx, config).await;
-    let (response, stopped) = oneshot::channel();
-    tx.send(AgentCommand::Stop {
-        app_name: "backup".into(),
-        namespace: "default".into(),
-        response,
-    })
-    .await
-    .unwrap();
-    assert!(
-        matches!(stopped.await.unwrap(), Err(BunError::ScheduleState(_))),
-        "an uncertain new registration must retain ownership"
-    );
-    shutdown.cancel();
-    task.await.unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, ApplyEvent::Error { .. })),
-        "schedule was acknowledged without durable ownership: {events:?}"
-    );
-}
-
-#[tokio::test]
-async fn reapplying_a_job_without_schedule_retires_only_its_previous_cron() {
-    let (mut agent, tx, shutdown) = test_agent();
-    let task = tokio::spawn(async move {
-        agent.run().await;
-        agent
-    });
-    for namespace in ["red", "blue"] {
-        let config = Config::parse(&format!(
-            "[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\nnamespace = '{namespace}'\n"
-        ))
-        .unwrap();
-        expect_complete(&send_deploy(&tx, config).await);
-    }
-    let config = Config::parse("[job.backup]\nimage = 'test:v2'\nnamespace = 'red'\n").unwrap();
-    expect_complete(&send_deploy(&tx, config).await);
-    shutdown.cancel();
-    let agent = task.await.unwrap();
-    assert!(
-        !agent
-            .scheduled_jobs
-            .contains_key(&("backup".into(), "red".into())),
-        "removing schedule from the applied job must retire its old cron"
-    );
-    assert!(
-        agent
-            .scheduled_jobs
-            .contains_key(&("backup".into(), "blue".into()))
-    );
-}
-
-#[tokio::test]
-async fn stopping_a_scheduled_job_before_its_first_run_retires_only_its_namespace() {
-    let (tx, rx) = mpsc::channel(32);
-    let shutdown = CancellationToken::new();
-    let mut agent = BunAgent::new(
-        crate::grill::mock::MockGrill::new(),
-        PortAllocator::new(30000, 31000),
-        rx,
-        shutdown.clone(),
-    );
-    let task = tokio::spawn(async move {
-        agent.run().await;
-        agent
-    });
-    for namespace in ["red", "blue"] {
-        // February 30 never matches, so this tests the pre-first-run path
-        // without depending on which minute CI happens to execute it.
-        let config = Config::parse(&format!(
-                "[job.backup]\nimage = \"busybox:latest\"\ncommand = [\"true\"]\nschedule = \"0 0 30 2 *\"\nnamespace = \"{namespace}\"\n"
-            )).unwrap();
-        let events = send_deploy(&tx, config).await;
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ApplyEvent::Complete { .. })),
-            "{events:?}"
-        );
-    }
-    let (response, result) = oneshot::channel();
-    tx.send(AgentCommand::Stop {
-        app_name: "backup".into(),
-        namespace: "red".into(),
-        response,
-    })
-    .await
-    .unwrap();
-    let stopped = result.await.unwrap();
-    shutdown.cancel();
-    let agent = task.await.unwrap();
-    assert!(
-        stopped.is_ok(),
-        "stopping a registered schedule failed: {stopped:?}"
-    );
-    assert!(
-        !agent
-            .scheduled_jobs
-            .contains_key(&("backup".into(), "red".into()))
-    );
-    assert!(
-        agent
-            .scheduled_jobs
-            .contains_key(&("backup".into(), "blue".into()))
-    );
-    assert!(agent.supervisor.list_instances().is_empty());
 }
 
 /// A standalone `relish stop` keeps the stopped replicas owned but
@@ -3284,6 +3202,10 @@ async fn deploy_leaves_hostpath_volumes_alone() {
     let source_dir = tempfile::tempdir().unwrap();
     let (mut agent, tx, shutdown) = test_agent();
     agent.set_volumes_dir(volumes_dir.path().to_path_buf());
+    agent.set_host_path_policy(crate::bun::host_paths::HostPathPolicy::new(
+        vec![source_dir.path().to_path_buf()],
+        vec![volumes_dir.path().to_path_buf()],
+    ));
     let handle = tokio::spawn(async move {
         agent.run().await;
     });
@@ -3309,6 +3231,118 @@ async fn deploy_leaves_hostpath_volumes_alone() {
 
     shutdown.cancel();
     let _ = handle.await;
+}
+
+/// #797: the OCI spec a fresh instance is created from mounts the path the
+/// host-path policy approved, with the symlink in the written source
+/// already resolved, so runc mounts exactly what the node checked.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fresh_instance_mounts_the_resolved_host_path_not_the_symlink() {
+    let (mut agent, _tx, _shutdown) = test_agent();
+    let import = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(import.path().join("releases/v2")).unwrap();
+    std::os::unix::fs::symlink(
+        import.path().join("releases/v2"),
+        import.path().join("current"),
+    )
+    .unwrap();
+    agent.set_host_path_policy(crate::bun::host_paths::HostPathPolicy::new(
+        vec![import.path().to_path_buf()],
+        Vec::new(),
+    ));
+    let config = Config::parse(&format!(
+        "[app.web]\nimage = 'web:v1'\n[[app.web.volumes]]\npath = '/data'\nsource = '{}'\n",
+        import.path().join("current").display()
+    ))
+    .unwrap();
+    let spec = config.app["web"].clone();
+    let ids = agent
+        .supervisor
+        .deploy_app("web", "default", &spec, Instant::now())
+        .await
+        .unwrap();
+    let prepared = loop {
+        match agent
+            .prepare_fresh_instance(&ids[0], "web", "default", &spec)
+            .await
+        {
+            Err(BunError::StillRunning { .. }) => {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            outcome => break outcome.unwrap(),
+        }
+    };
+    let data = prepared
+        .oci_spec
+        .mounts
+        .iter()
+        .find(|mount| mount.destination == std::path::Path::new("/data"))
+        .unwrap();
+    assert_eq!(
+        data.source.as_deref(),
+        Some(
+            std::fs::canonicalize(import.path().join("releases/v2"))
+                .unwrap()
+                .as_path()
+        )
+    );
+}
+
+/// #797: a redeploy that replaces running replicas checks host paths too.
+/// Adding an unlisted `source` to an app that already runs is refused, and
+/// no replacement is created with it.
+#[tokio::test]
+async fn a_rolling_redeploy_refuses_a_host_path_the_node_does_not_allow() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let unlisted = tempfile::tempdir().unwrap();
+    let first = Config::parse("[app.web]\nimage = 'web:v1'\n").unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(256);
+    agent.deploy(first, &ev_tx).await;
+    drop(ev_tx);
+    let mut events = Vec::new();
+    while let Some(event) = ev_rx.recv().await {
+        events.push(event);
+    }
+    expect_complete(&events);
+
+    let creates_before = grill
+        .calls()
+        .iter()
+        .filter(|(call, _)| call == "create")
+        .count();
+    let second = Config::parse(&format!(
+        "[app.web]\nimage = 'web:v2'\n[[app.web.volumes]]\npath = '/steal'\nsource = '{}'\n",
+        unlisted.path().display()
+    ))
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(256);
+    agent.deploy(second, &ev_tx).await;
+    drop(ev_tx);
+    let mut events = Vec::new();
+    while let Some(event) = ev_rx.recv().await {
+        events.push(event);
+    }
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ApplyEvent::Error { message } if message.contains("allowed_host_paths")
+        )),
+        "{events:?}"
+    );
+    let creates_after = grill
+        .calls()
+        .iter()
+        .filter(|(call, _)| call == "create")
+        .count();
+    assert_eq!(creates_before, creates_after, "{:?}", grill.calls());
+    assert!(agent.supervisor.list_instances().iter().all(|instance| {
+        instance.oci_spec.as_ref().is_none_or(|oci| {
+            oci.mounts
+                .iter()
+                .all(|mount| mount.source.as_deref() != Some(unlisted.path()))
+        })
+    }));
 }
 
 /// Phase 12 E2: restoring a snapshot under a running app is
@@ -3538,12 +3572,12 @@ async fn a_restore_is_refused_while_an_instance_awaits_its_restart() {
                 ..Default::default()
             },
             health_config: None,
-            is_job: false,
             retry_pending: true,
             image: "myapp:v1".into(),
             oci_spec: None,
             identity: None,
             identity_mount: None,
+            launch_failure: None,
         },
     );
     agent
@@ -3698,7 +3732,7 @@ async fn enforce_image_signature_fails_closed_without_council() {
     let spec: AppSpec = toml::from_str(r#"image = "myapp:v1""#).unwrap();
     // No cluster/council → the gate can't obtain verification material, so
     // it must refuse rather than skip (IMG2 fail-closed).
-    let result = agent.enforce_image_signature(&spec).await;
+    let result = agent.enforce_image_signature(spec.image.as_deref()).await;
     assert!(result.is_err(), "expected refusal, got {result:?}");
     assert!(
         result.unwrap_err().contains("requires a signature"),
@@ -3713,7 +3747,12 @@ async fn enforce_image_signature_allows_a_process_workload_without_council() {
     // A process workload has no image — nothing to verify, so it passes
     // even with require_signatures on and no council.
     let spec: AppSpec = toml::from_str(r#"command = ["echo", "hi"]"#).unwrap();
-    assert!(agent.enforce_image_signature(&spec).await.is_ok());
+    assert!(
+        agent
+            .enforce_image_signature(spec.image.as_deref())
+            .await
+            .is_ok()
+    );
 }
 
 // --- relish sign, end to end (operator key → attach → deploy gate) ---
@@ -3863,13 +3902,19 @@ async fn relish_signed_image_is_admitted_only_under_a_policy_trusting_its_key() 
     });
 
     // Signed with the trusted key: admitted, pinned to the signed digest.
-    let pinned = agent.enforce_image_signature(&app("myapp:v1")).await;
+    let pinned = agent
+        .enforce_image_signature(app("myapp:v1").image.as_deref())
+        .await;
     assert_eq!(pinned, Ok(Some(format!("myapp@sha256:{signed}"))));
     // Never signed: refused.
-    let unsigned = agent.enforce_image_signature(&app("unsigned:v1")).await;
+    let unsigned = agent
+        .enforce_image_signature(app("unsigned:v1").image.as_deref())
+        .await;
     assert!(unsigned.is_err(), "unsigned image admitted: {unsigned:?}");
     // Signed, but by a key the policy doesn't list: refused.
-    let untrusted = agent.enforce_image_signature(&app("stranger:v1")).await;
+    let untrusted = agent
+        .enforce_image_signature(app("stranger:v1").image.as_deref())
+        .await;
     assert!(
         untrusted
             .as_ref()
@@ -3902,7 +3947,9 @@ async fn moving_a_tag_after_signing_leaves_the_new_digest_unsigned() {
     // Someone re-pushes v1 with different bytes: the signature covered
     // the old digest, not the tag, so the new content is refused.
     push_manifest(&council, "myapp", "v1", &"4".repeat(64)).await;
-    let result = agent.enforce_image_signature(&app("myapp:v1")).await;
+    let result = agent
+        .enforce_image_signature(app("myapp:v1").image.as_deref())
+        .await;
     assert!(result.is_err(), "re-tagged content admitted: {result:?}");
 }
 
@@ -3957,7 +4004,7 @@ async fn pulling_agent(
 async fn a_deploy_refuses_an_upstream_image_the_rules_do_not_allow() {
     let (_council, agent) = pulling_agent(9310, official_images_only()).await;
     let refused = agent
-        .enforce_image_signature(&app("ghcr.io/evil/miner:1"))
+        .enforce_image_signature(app("ghcr.io/evil/miner:1").image.as_deref())
         .await;
     assert!(
         refused
@@ -3967,7 +4014,7 @@ async fn a_deploy_refuses_an_upstream_image_the_rules_do_not_allow() {
     );
     let digest = format!("sha256:{}", "a".repeat(64));
     let allowed = agent
-        .enforce_image_signature(&app(&format!("nginx:1.27@{digest}")))
+        .enforce_image_signature(app(&format!("nginx:1.27@{digest}")).image.as_deref())
         .await;
     assert_eq!(allowed, Ok(None));
 }
@@ -3978,20 +4025,20 @@ async fn a_deploy_leaves_pickle_images_to_require_signatures() {
     let (council, agent) = pulling_agent(9311, official_images_only()).await;
     push_manifest(&council, "team/web", "v1", &"5".repeat(64)).await;
     let result = agent
-        .enforce_image_signature(&app("localhost:5050/team/web:v1"))
+        .enforce_image_signature(app("localhost:5050/team/web:v1").image.as_deref())
         .await;
     assert_eq!(result, Ok(None));
 }
 
-/// Under ProcessGrill an image is a placeholder nobody pulls, so there's
-/// nothing for the upstream rules to judge (decision 5).
+/// A process runtime never pulls an image: it refuses image apps (#914). So
+/// there's nothing for the upstream rules to judge (decision 5).
 #[tokio::test]
 async fn upstream_rules_do_not_judge_images_a_process_runtime_never_pulls() {
     let council = catalogue_council(9312).await;
     let mut agent = agent_with_council(council);
     agent.set_trust_policy(official_images_only());
     let result = agent
-        .enforce_image_signature(&app("proc-grill:image-ignored"))
+        .enforce_image_signature(app("registry.example.com/web:1").image.as_deref())
         .await;
     assert_eq!(result, Ok(None));
 }
@@ -4141,6 +4188,168 @@ async fn deploy_command_creates_instances() {
 
     shutdown.cancel();
     agent_handle.await.unwrap();
+}
+
+/// #881: a binary the node can't run fails the deploy at once with the
+/// reason, and the instance is `failed` with that reason in its status,
+/// instead of sitting in `starting` while something retries.
+#[tokio::test]
+async fn a_refused_launch_fails_the_deploy_and_the_instance_with_its_reason() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    grill.set_refused_launch(Some(crate::grill::LaunchProblem::BinaryNotFound(
+        "/opt/ghost/server".into(),
+    )));
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let events = send_deploy(&tx, basic_config()).await;
+    let Some(ApplyEvent::Error { message }) = events.last() else {
+        panic!("the deploy must fail: {events:?}");
+    };
+    assert!(
+        message.contains("binary not found: /opt/ghost/server"),
+        "{message}"
+    );
+
+    let (response, result) = oneshot::channel();
+    tx.send(AgentCommand::Status { response }).await.unwrap();
+    let instances = result.await.unwrap();
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+    let web = instances
+        .iter()
+        .find(|instance| instance.app_name == "web")
+        .expect("the failed instance stays listed");
+    assert_eq!(web.state, "failed");
+    assert_eq!(
+        web.reason.as_deref(),
+        Some("binary not found: /opt/ghost/server")
+    );
+    assert!(
+        !grill.calls().iter().any(|(call, _)| call == "start"),
+        "a refused launch must never be started: {:?}",
+        grill.calls()
+    );
+}
+
+/// #905: a binary deleted between the pre-launch check and the owner gate's
+/// `exec` fails the deploy and the instance with the gate's reason, as one
+/// missing at `create` does, instead of leaving the instance in `starting`.
+#[tokio::test]
+async fn a_launch_refused_at_exec_fails_the_deploy_and_the_instance_with_its_reason() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    grill.set_refused_start(Some(crate::grill::LaunchProblem::BinaryNotFound(
+        "/opt/ghost/server".into(),
+    )));
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let events = send_deploy(&tx, basic_config()).await;
+    let Some(ApplyEvent::Error { message }) = events.last() else {
+        panic!("the deploy must fail: {events:?}");
+    };
+    assert!(
+        message.contains("binary not found: /opt/ghost/server"),
+        "{message}"
+    );
+
+    let (response, result) = oneshot::channel();
+    tx.send(AgentCommand::Status { response }).await.unwrap();
+    let instances = result.await.unwrap();
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+    let web = instances
+        .iter()
+        .find(|instance| instance.app_name == "web")
+        .expect("the failed instance stays listed");
+    assert_eq!(web.state, "failed");
+    assert_eq!(
+        web.reason.as_deref(),
+        Some("binary not found: /opt/ghost/server")
+    );
+}
+
+/// What an instance looks like after restart ticks the runtime refused.
+struct RefusedRestart {
+    id: InstanceId,
+    state: ContainerState,
+    launch_failure: Option<String>,
+    retry_pending: bool,
+    restart_count: u32,
+}
+
+/// The instance after restart ticks that the runtime refused (#905).
+async fn restart_refused_by(
+    refuse: impl FnOnce(&MockGrill, crate::grill::LaunchProblem),
+) -> (RefusedRestart, MockGrill) {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+    // The binary vanishes while the app runs, then the app exits.
+    refuse(
+        &grill,
+        crate::grill::LaunchProblem::BinaryNotFound("/opt/ghost/server".into()),
+    );
+    grill.set_state(&id, ContainerState::Stopped);
+    agent.check_apps().await;
+    agent.drive_pending_restarts_to_completion().await;
+    // Later ticks must not spend the restart budget on it.
+    agent.check_apps().await;
+    agent.drive_pending_restarts_to_completion().await;
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    let refused = RefusedRestart {
+        id: id.clone(),
+        state: instance.state,
+        launch_failure: instance.launch_failure.clone(),
+        retry_pending: instance.retry_pending,
+        restart_count: instance.restart_count,
+    };
+    (refused, grill)
+}
+
+/// #905: a restart the runtime refuses at `create` because the binary has
+/// gone is terminal, with the reason, as a fresh deploy's is. It doesn't
+/// spend the restart budget and end `Failed` without saying why.
+#[tokio::test]
+async fn a_restart_after_the_binary_vanished_fails_at_once_with_binary_not_found() {
+    let (instance, grill) =
+        restart_refused_by(|grill, problem| grill.set_refused_launch(Some(problem))).await;
+    assert_eq!(instance.state, ContainerState::Failed);
+    assert_eq!(
+        instance.launch_failure.as_deref(),
+        Some("binary not found: /opt/ghost/server")
+    );
+    assert!(!instance.retry_pending, "a refused launch is not retried");
+    assert_eq!(
+        instance.restart_count, 1,
+        "one attempt, not the whole budget"
+    );
+    let creates = grill
+        .calls()
+        .iter()
+        .filter(|(call, id)| call == "create" && id == &instance.id)
+        .count();
+    assert_eq!(creates, 2, "the deploy's create and one restart's");
+}
+
+/// #905: a restart whose `exec` the owner gate reports failed is terminal
+/// with the reason too.
+#[tokio::test]
+async fn a_restart_refused_at_exec_fails_at_once_with_binary_not_found() {
+    let (instance, _grill) =
+        restart_refused_by(|grill, problem| grill.set_refused_start(Some(problem))).await;
+    assert_eq!(instance.state, ContainerState::Failed);
+    assert_eq!(
+        instance.launch_failure.as_deref(),
+        Some("binary not found: /opt/ghost/server")
+    );
+    assert!(!instance.retry_pending, "a refused launch is not retried");
+    assert_eq!(
+        instance.restart_count, 1,
+        "one attempt, not the whole budget"
+    );
 }
 
 /// DEP4/codex-M3: a deploy that blocks on a slow image pull must not
@@ -4802,30 +5011,6 @@ async fn cancellation_interrupts_health_wait_and_holds_ownership_through_rollbac
 }
 
 #[tokio::test]
-async fn app_deploy_does_not_roll_over_an_existing_job() {
-    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
-    let task = tokio::spawn(async move { agent.run().await });
-    let job = Config::parse("[job.web]\nimage = 'job:v1'\n").unwrap();
-    expect_complete(&send_deploy(&tx, job).await);
-    let events = send_deploy(&tx, basic_config()).await;
-    let calls_before_shutdown = grill.calls();
-    shutdown.cancel();
-    task.await.unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, ApplyEvent::Error { .. })),
-        "an app rollout accepted a live job as its previous generation"
-    );
-    assert!(
-        !calls_before_shutdown
-            .iter()
-            .any(|(call, _)| call == "stop" || call == "kill"),
-        "the conflicting deploy changed the existing job"
-    );
-}
-
-#[tokio::test]
 async fn failed_deploy_keeps_target_ownership_until_rollback_finishes() {
     for strategy in ["rolling", "blue-green"] {
         let port = spawn_health_responder(500).await;
@@ -5100,6 +5285,24 @@ fn probe_host_prefers_container_ip() {
     );
 }
 
+/// Let `agent` run host workloads: `script` apps through `/bin/sh`, and
+/// `exec` apps for each of `binaries`, unisolated. The process runtime runs
+/// nothing else (#914), so every real-process test here needs it.
+fn allow_host_workloads<G: Grill + Clone + 'static>(
+    agent: &mut BunAgent<G>,
+    binaries: &[&std::path::Path],
+) {
+    let mut allowed_binaries = vec![std::path::PathBuf::from("/bin/sh")];
+    allowed_binaries.extend(binaries.iter().map(|binary| binary.to_path_buf()));
+    agent
+        .supervisor
+        .set_process_config(crate::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries,
+            mount_isolation: false,
+            ..Default::default()
+        });
+}
+
 #[tokio::test]
 async fn container_logs_forwarded_to_log_sink() {
     // Use a real ProcessGrill so follow_logs actually streams output.
@@ -5108,15 +5311,13 @@ async fn container_logs_forwarded_to_log_sink() {
     let grill = crate::grill::process::ProcessGrill::new();
     let port_allocator = PortAllocator::new(30000, 31000);
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+    allow_host_workloads(&mut agent, &[]);
 
     let (log_tx, mut log_rx) = mpsc::channel(64);
     agent.set_log_sink(log_tx, Default::default());
     let handle = tokio::spawn(async move { agent.run().await });
 
-    let config = Config::parse(
-        "[app.printer]\nimage = \"proc-grill:ignored\"\ncommand = [\"echo\", \"hello-logs\"]\n",
-    )
-    .unwrap();
+    let config = Config::parse("[app.printer]\nscript = \"echo hello-logs\"\n").unwrap();
     let _ = send_deploy(&tx, config).await;
 
     // The per-instance forwarder should stream the echoed line into the sink.
@@ -5138,13 +5339,12 @@ async fn crashed_app_without_health_check_is_restarted() {
     let grill = crate::grill::process::ProcessGrill::new();
     let port_allocator = PortAllocator::new(30000, 31000);
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+    allow_host_workloads(&mut agent, &[]);
     let handle = tokio::spawn(async move { agent.run().await });
 
     // An app with no health check whose process exits immediately. Nothing
     // probes it, so only crash detection can notice and restart it.
-    let config =
-        Config::parse("[app.crasher]\nimage = \"proc-grill:ignored\"\ncommand = [\"true\"]\n")
-            .unwrap();
+    let config = Config::parse("[app.crasher]\nscript = \"true\"\n").unwrap();
     let _ = send_deploy(&tx, config).await;
 
     let crasher = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -5188,9 +5388,10 @@ async fn redeploy_registers_backends_health_and_port() {
     let volumes = tempfile::tempdir().unwrap();
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
     agent.set_volumes_dir(volumes.path().to_path_buf());
+    allow_host_workloads(&mut agent, &[]);
 
     let config = Config::parse(&format!(
-            "[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\nport = {port}\n\n[app.web.health]\npath = \"/healthz\"\n\n[app.web.deploy]\nhealth_timeout = \"5s\"\n",
+            "[app.web]\nscript = \"exec sleep 60\"\nport = {port}\n\n[app.web.health]\npath = \"/healthz\"\n\n[app.web.deploy]\nhealth_timeout = \"5s\"\n",
         ))
         .unwrap();
     let (ev_tx, mut ev_rx) = mpsc::channel(256);
@@ -5398,38 +5599,6 @@ async fn restart_start_failure_recovers_after_cleanup_and_backoff() {
 }
 
 #[tokio::test]
-async fn restart_start_failures_exhaust_job_budget() {
-    let (mut agent, _, _, grill) = test_agent_with_grill();
-    let directory = tempfile::tempdir().unwrap();
-    agent.set_records_dir(directory.path().to_path_buf());
-    grill.set_pid(std::process::id());
-    expect_complete(
-        &drain_deploy(
-            &mut agent,
-            Config::parse("[job.retry]\nimage = 'test:v1'\n").unwrap(),
-        )
-        .await,
-    );
-    let id = InstanceId("default__retry-0".into());
-    grill.set_state(&id, ContainerState::Stopped);
-    grill.set_exit_code(&id, Some(1));
-    agent.check_jobs().await;
-    grill.set_fail_start(true);
-    for _ in 0..4 {
-        agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
-            Some(Instant::now() - std::time::Duration::from_secs(600));
-        agent.drive_pending_restarts_to_completion().await;
-    }
-    let instance = agent.supervisor.get_instance(&id).unwrap();
-    assert_eq!(instance.state, ContainerState::Failed);
-    assert_eq!(instance.restart_count, 3);
-    assert_eq!(
-        grill.calls().iter().filter(|(op, _)| op == "start").count(),
-        4
-    );
-}
-
-#[tokio::test]
 async fn explicit_stop_cancels_failed_restart_recovery() {
     let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
     grill.set_fail_start(true);
@@ -5457,16 +5626,17 @@ async fn explicit_stop_cancels_pending_restart_before_creation() {
     assert_eq!(grill.calls().len(), calls);
 }
 
+/// A real process crashing during backoff stays eligible for a later tick.
+/// Once its executable is gone, the restart fails at once with the reason
+/// instead of retrying until the binary returns (#905). Transient restart
+/// failures still retry: see `failed_restart_recovers`.
 #[tokio::test]
-async fn real_process_restart_recovers_when_executable_returns() {
+async fn real_process_restart_stays_eligible_and_fails_at_once_without_its_executable() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let program = directory.path().join("worker");
-    let install = || {
-        std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    };
-    install();
+    std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (_tx, rx) = mpsc::channel(32);
     let grill = crate::grill::process::ProcessGrill::new();
     let mut agent = BunAgent::new(
@@ -5476,8 +5646,9 @@ async fn real_process_restart_recovers_when_executable_returns() {
         CancellationToken::new(),
     );
     agent.set_volumes_dir(directory.path().join("volumes"));
+    allow_host_workloads(&mut agent, &[&program]);
     let config = Config::parse(&format!(
-        "[app.retry]\nimage = 'proc-grill:ignored'\ncommand = [{:?}]\n",
+        "[app.retry]\nexec = {:?}\n",
         program.to_str().unwrap()
     ))
     .unwrap();
@@ -5485,24 +5656,10 @@ async fn real_process_restart_recovers_when_executable_returns() {
     agent.deploy(config, &events).await;
     let id = agent.supervisor.list_instances()[0].id.clone();
     grill.kill(&id).await.unwrap();
-    std::fs::remove_file(&program).unwrap();
     agent.check_apps().await;
     agent.drive_pending_restarts_to_completion().await;
-    assert_eq!(
-        agent.supervisor.get_instance(&id).unwrap().state,
-        ContainerState::Stopping
-    );
-    agent.drive_pending_restarts_to_completion().await;
-    assert_eq!(
-        agent.supervisor.get_instance(&id).unwrap().state,
-        ContainerState::Stopped
-    );
-    install();
-    agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
-        Some(Instant::now() - std::time::Duration::from_secs(600));
-    agent.drive_pending_restarts_to_completion().await;
     assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
-    assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 2);
+    assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 1);
     // A second crash during backoff must stay eligible for a later tick.
     grill.kill(&id).await.unwrap();
     agent.check_apps().await;
@@ -5514,7 +5671,22 @@ async fn real_process_restart_recovers_when_executable_returns() {
         Some(Instant::now() - std::time::Duration::from_secs(600));
     agent.drive_pending_restarts_to_completion().await;
     assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
-    assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 3);
+    assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 2);
+
+    // Now the executable goes, and the process with it.
+    std::fs::remove_file(&program).unwrap();
+    grill.kill(&id).await.unwrap();
+    agent.check_apps().await;
+    agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+        Some(Instant::now() - std::time::Duration::from_secs(600));
+    agent.drive_pending_restarts_to_completion().await;
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Failed);
+    assert_eq!(
+        instance.launch_failure,
+        Some(format!("binary not found: {}", program.display()))
+    );
+    assert_eq!(instance.restart_count, 3);
     agent.stop_app("retry", "default").await.unwrap();
 }
 
@@ -5527,10 +5699,9 @@ async fn redeployed_instance_restarts_after_a_crash() {
     let volumes = tempfile::tempdir().unwrap();
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
     agent.set_volumes_dir(volumes.path().to_path_buf());
+    allow_host_workloads(&mut agent, &[]);
 
-    let config =
-        Config::parse("[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\n")
-            .unwrap();
+    let config = Config::parse("[app.web]\nscript = \"exec sleep 60\"\n").unwrap();
     let (ev_tx, mut ev_rx) = mpsc::channel(256);
 
     // Fresh deploy, then redeploy (existing instances → rolling path).
@@ -5683,14 +5854,6 @@ async fn cluster_consumer_advances_identical_generations_and_does_not_consume_re
         .unwrap()
         .backends[0]
         .host_port = 30002;
-    let mut invalid = ingress.clone();
-    invalid[0].config.rate_limit_rps = Some(0);
-    assert!(
-        agent
-            .publish_cluster_catalogue(6, changed.clone(), invalid)
-            .await
-            .is_err()
-    );
     agent
         .publish_cluster_catalogue(5, changed.clone(), ingress.clone())
         .await
@@ -5711,6 +5874,90 @@ async fn cluster_consumer_advances_identical_generations_and_does_not_consume_re
         .publish_cluster_catalogue(5, changed, ingress)
         .await
         .unwrap();
+}
+
+/// `base` plus a second remote service: `remote` keeps its valid ingress
+/// route and `broken` gets one naming a TLS mode no node supports.
+fn with_one_bad_route(
+    base: &crate::onion::catalog::EndpointCatalog,
+) -> (
+    crate::onion::catalog::EndpointCatalog,
+    Vec<crate::cluster::orchestrate::IngressAssignment>,
+) {
+    let (_, mut ingress) = cluster_publication_fixture();
+    let remote = base.services["default__remote"].clone();
+    let catalog = base
+        .reconcile([
+            (
+                crate::onion::service_id::ServiceId::new("default", "remote"),
+                remote.port,
+                remote.backends,
+            ),
+            (
+                crate::onion::service_id::ServiceId::new("default", "broken"),
+                9090,
+                vec![crate::onion::catalog::CatalogBackend {
+                    execution: None,
+                    node_id: "other-node".into(),
+                    node_ip: "192.168.1.3".parse().unwrap(),
+                    host_port: 30010,
+                    healthy: true,
+                }],
+            ),
+        ])
+        .unwrap();
+    ingress.push(crate::cluster::orchestrate::IngressAssignment {
+        namespace: "default".into(),
+        name: "broken".into(),
+        config: toml::from_str("host = \"broken.local\"\ntls = \"acme\"").unwrap(),
+    });
+    (catalog, ingress)
+}
+
+/// Assert that both services resolve, `remote.local` routes, and the bad
+/// route was skipped rather than installed.
+async fn assert_only_the_bad_route_is_skipped(agent: &BunAgent<MockGrill>) {
+    let view = agent.service_map_tx.borrow().clone();
+    for name in ["remote", "broken"] {
+        assert!(
+            view.resolve(&crate::onion::service_id::ServiceId::new("default", name))
+                .is_some(),
+            "{name} must still resolve"
+        );
+    }
+    let table = agent.routing_table.read().await;
+    assert!(table.lookup("remote.local", "/").is_some());
+    assert!(table.lookup("broken.local", "/").is_none());
+}
+
+/// #700: one app's invalid ingress route made every node refuse every new
+/// catalogue, freezing discovery and ingress for the whole cluster. The bad
+/// route is skipped and logged; everything else publishes.
+#[tokio::test]
+async fn one_invalid_cluster_route_does_not_block_the_catalogue() {
+    let (mut agent, _, _) = test_agent();
+    let (catalog, ingress) = with_one_bad_route(&cluster_publication_fixture().0);
+    agent
+        .publish_cluster_catalogue(1, catalog.clone(), ingress)
+        .await
+        .unwrap();
+    assert_eq!(agent.cluster_catalog, catalog);
+    assert_eq!(agent.cluster_catalog_generation, Some(1));
+    assert_only_the_bad_route_is_skipped(&agent).await;
+}
+
+/// #700, the discovery-owning consumer path: the same bad route must not
+/// refuse the publication either.
+#[tokio::test]
+async fn one_invalid_consumer_route_does_not_block_the_view() {
+    let (mut agent, _root, base) = clustered_allocation_fixture().await;
+    let (committed, ingress) = with_one_bad_route(&base);
+    agent
+        .synchronise_consumer(2, committed, ingress, vec![])
+        .await
+        .unwrap();
+    assert_eq!(agent.cluster_catalog_generation, Some(2));
+    assert_only_the_bad_route_is_skipped(&agent).await;
 }
 
 #[tokio::test]
@@ -5777,21 +6024,21 @@ async fn cluster_publication_refusal_preserves_the_confirmed_catalogue_dns_and_i
         .unwrap()
         .backends[0]
         .host_port = 30002;
-    let mut invalid = ingress.clone();
-    invalid[0].config.rate_limit_rps = Some(0);
+    // A rewritten generation 1 conflicts with the confirmed one. (An invalid
+    // route no longer refuses a generation; it's skipped, #700.)
     let (response, reply) = oneshot::channel();
     agent
         .handle_command(AgentCommand::SyncClusterCatalog {
-            generation: 2,
+            generation: 1,
             response,
             catalog: Box::new(changed.clone()),
-            ingress: invalid,
+            ingress: ingress.clone(),
         })
         .await;
     assert!(reply.await.unwrap().is_err());
     assert_eq!(
         agent.cluster_catalog, original,
-        "a refused route changed the installed catalogue"
+        "a refused publication changed the installed catalogue"
     );
     assert_eq!(
         agent
@@ -6100,14 +6347,12 @@ async fn follow_logs_does_not_block_the_event_loop() {
     let grill = crate::grill::process::ProcessGrill::new();
     let port_allocator = PortAllocator::new(30000, 31000);
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+    allow_host_workloads(&mut agent, &[]);
     let handle = tokio::spawn(async move { agent.run().await });
 
     // A long-running process whose follow would block the loop for 60s if
     // handled inline.
-    let config = Config::parse(
-        "[app.sleeper]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\n",
-    )
-    .unwrap();
+    let config = Config::parse("[app.sleeper]\nscript = \"exec sleep 60\"\n").unwrap();
     let _ = send_deploy(&tx, config).await;
 
     // Start following logs; never drain them.
@@ -6152,7 +6397,7 @@ const STUBBORN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 fn stubborn_app(name: &str, dir: &std::path::Path) -> String {
     let trapped = dir.join(format!("{name}.trapped"));
     format!(
-        "[app.{name}]\nimage = \"proc-grill:ignored\"\ncommand = [\"sh\", \"-c\", \"trap '' TERM; touch '{}'; sleep 60\"]\n",
+        "[app.{name}]\nscript = \"trap '' TERM; touch '{}'; sleep 60\"\n",
         trapped.display()
     )
 }
@@ -6191,6 +6436,7 @@ fn stubborn_agent() -> (
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
     let volumes = tempfile::tempdir().unwrap();
     agent.set_volumes_dir(volumes.path().to_path_buf());
+    allow_host_workloads(&mut agent, &[]);
     agent.set_stop_grace(STUBBORN_GRACE);
     agent.set_shutdown_grace(std::time::Duration::from_millis(200));
     let handle = tokio::spawn(async move { agent.run().await });
@@ -6296,7 +6542,16 @@ async fn retirement_releases_ownership_only_after_the_process_exits() {
         .expect("retirement never finished")
         .unwrap()
         .unwrap();
-    assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+    // The runtime then forgets the instance (#738), which it does only
+    // for one it has seen stop.
+    let state = grill.state(&id).await;
+    assert!(
+        matches!(
+            state,
+            Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. })
+        ),
+        "{state:?}"
+    );
     let (status, _) = timed_status(&tx).await;
     assert!(status.is_empty(), "retirement must release ownership");
 
@@ -7107,31 +7362,6 @@ async fn rolling_redeploy_halts_without_reverting_when_auto_rollback_is_false() 
     agent_handle.await.unwrap();
 }
 
-fn job_config() -> Config {
-    let toml_str = r#"
-            [job.migrate]
-            image = "myapp:v1"
-            command = ["echo", "done"]
-        "#;
-    Config::parse(toml_str).unwrap()
-}
-
-fn run_before_config() -> Config {
-    Config::parse(
-        r#"
-            [app.web]
-            image = "myapp:v1"
-            port = 8080
-
-            [job.migrate]
-            image = "myapp:v1"
-            command = ["echo", "migrating"]
-            run_before = ["app.web"]
-        "#,
-    )
-    .unwrap()
-}
-
 async fn drain_deploy(agent: &mut BunAgent<MockGrill>, config: Config) -> Vec<ApplyEvent> {
     let (ev_tx, mut ev_rx) = mpsc::channel(256);
     agent.deploy(config, &ev_tx).await;
@@ -7141,91 +7371,6 @@ async fn drain_deploy(agent: &mut BunAgent<MockGrill>, config: Config) -> Vec<Ap
         events.push(e);
     }
     events
-}
-
-#[tokio::test]
-async fn run_before_runs_the_job_to_completion_before_the_app() {
-    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
-
-    // The prerequisite job exits cleanly, so the gate lets the app through.
-    let job_id = InstanceId("default__migrate-0".to_string());
-    grill.set_state(&job_id, ContainerState::Stopped);
-    grill.set_exit_code(&job_id, Some(0));
-
-    let events = drain_deploy(&mut agent, run_before_config()).await;
-    expect_complete(&events);
-
-    let calls = grill.calls();
-    let migrate_at = calls
-        .iter()
-        .position(|(op, id)| op == "create" && id.0.contains("migrate"))
-        .expect("prerequisite job was never created");
-    let web_at = calls
-        .iter()
-        .position(|(op, id)| op == "create" && id.0.contains("web"))
-        .expect("app was never created");
-    assert!(
-        migrate_at < web_at,
-        "the run_before job must be created before the app: {calls:?}"
-    );
-
-    let migrate_creates = calls
-        .iter()
-        .filter(|(op, id)| op == "create" && id.0.contains("migrate"))
-        .count();
-    assert_eq!(
-        migrate_creates, 1,
-        "the run_before job must not also run in the regular jobs loop: {calls:?}"
-    );
-}
-
-#[tokio::test]
-async fn run_before_failure_aborts_the_deploy() {
-    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
-
-    // The prerequisite job exits non-zero, so the whole deploy is aborted.
-    let job_id = InstanceId("default__migrate-0".to_string());
-    grill.set_state(&job_id, ContainerState::Stopped);
-    grill.set_exit_code(&job_id, Some(1));
-
-    let events = drain_deploy(&mut agent, run_before_config()).await;
-    match events.last().expect("no events received") {
-        ApplyEvent::Error { message } => assert!(
-            message.contains("migrate"),
-            "expected a prerequisite failure, got: {message}"
-        ),
-        other => panic!("expected an Error event, got {other:?}"),
-    }
-
-    let calls = grill.calls();
-    assert!(
-        !calls
-            .iter()
-            .any(|(op, id)| op == "create" && id.0.contains("web")),
-        "the app must not deploy once a prerequisite fails: {calls:?}"
-    );
-}
-
-#[tokio::test]
-async fn scheduled_job_is_not_run_at_deploy_time() {
-    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
-    let config = Config::parse(
-        r#"
-            [job.nightly]
-            image = "myapp:v1"
-            command = ["echo", "hi"]
-            schedule = "0 3 * * *"
-        "#,
-    )
-    .unwrap();
-
-    let events = drain_deploy(&mut agent, config).await;
-    let (created, _) = expect_complete(&events);
-    assert_eq!(created, 0, "a scheduled job must not run at deploy time");
-    assert!(
-        !grill.calls().iter().any(|(op, _)| op == "create"),
-        "no container should be created for a scheduled job at deploy time"
-    );
 }
 
 #[tokio::test]
@@ -7376,7 +7521,7 @@ async fn rollout_retirement_fences_the_crash_restart_driver() {
         grill.block_kills();
         let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = {replicas}\n[app.web.deploy]\nstrategy = '{strategy}'\ndrain_timeout = '0s'\n")).unwrap();
         let (events, mut stream) = mpsc::channel(64);
-        agent.begin_deploy(config, events, true, false).await;
+        agent.begin_deploy(config, events).await;
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 tokio::select! {
@@ -7880,6 +8025,208 @@ async fn rolling_redeploy_rolls_back_when_the_probe_fails() {
     agent_handle.await.unwrap();
 }
 
+/// Run `first`, then `second` with the given replacements failing their
+/// health wait, on a running agent. Returns the agent once it has shut
+/// down, every event of the second deploy, and its deploy history.
+async fn deploy_over_failing_replacements(
+    first: &str,
+    second: &str,
+    failing: &[InstanceId],
+) -> (
+    TestAgent,
+    Vec<ApplyEvent>,
+    Vec<crate::meat::deploy_types::DeployHistoryEntry>,
+) {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    let history = agent.deploy_history_handle();
+    let task = tokio::spawn(async move {
+        agent.run().await;
+        agent
+    });
+    expect_complete(&send_deploy(&tx, Config::parse(first).unwrap()).await);
+    for id in failing {
+        grill.set_state(id, ContainerState::Failed);
+    }
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        send_deploy(&tx, Config::parse(second).unwrap()),
+    )
+    .await
+    .expect("the aborted rollout must finish");
+    let history = history.read().await.clone();
+    shutdown.cancel();
+    (task.await.unwrap(), events, history)
+}
+
+/// The live instances of `web`, sorted, with the image each runs.
+fn web_instances(agent: &BunAgent<MockGrill>) -> Vec<(String, String)> {
+    let mut instances: Vec<(String, String)> = agent
+        .supervisor
+        .list_instances()
+        .iter()
+        .filter(|instance| instance.app_name == "web")
+        .filter(|instance| {
+            !matches!(
+                instance.state,
+                ContainerState::Stopped | ContainerState::Failed
+            )
+        })
+        .map(|instance| (instance.id.0.clone(), instance.image.clone()))
+        .collect();
+    instances.sort();
+    instances
+}
+
+/// #692 scenario A: three replicas on one node, defaults. The first
+/// replacement goes healthy and an old instance retires for it, then the
+/// second replacement fails. Auto-rollback used to kill the healthy
+/// replacement and never restart the retired old instance, leaving two of
+/// three. It must end with three replicas, all on the old spec.
+#[tokio::test]
+async fn auto_rollback_after_a_retirement_restores_old_capacity() {
+    let canary = |generation, ordinal| {
+        crate::grill::InstanceIdentity::canary("default", "web", generation, ordinal).instance_id()
+    };
+    let (agent, events, history) = deploy_over_failing_replacements(
+        "[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 3\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\n",
+        "[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 3\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\nhealth_timeout = '1s'\n",
+        &[canary(1, 1)],
+    )
+    .await;
+
+    let message = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ApplyEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the failed rollout must report an error");
+    assert!(message.contains("rolled back"), "{message}");
+    let instances = web_instances(&agent);
+    assert_eq!(
+        instances.len(),
+        3,
+        "the abort must end with the capacity it started from: {instances:?}"
+    );
+    assert!(
+        instances.iter().all(|(_, image)| image == "web:v1"),
+        "every replica must run the old spec again: {instances:?}"
+    );
+    assert!(
+        instances.iter().all(|(id, _)| !id.contains("-g1-")),
+        "no replacement of the failed spec may survive a rollback: {instances:?}"
+    );
+    assert_eq!(
+        instances
+            .iter()
+            .filter(|(id, _)| id.contains("-g2-"))
+            .count(),
+        1,
+        "the retired old instance comes back as one old-spec replacement: {instances:?}"
+    );
+    assert_eq!(
+        history.last().map(|entry| entry.result),
+        Some(crate::meat::deploy_types::DeployResult::RolledBack)
+    );
+    assert_eq!(
+        agent
+            .deployed_specs
+            .get(&("web".to_string(), "default".to_string()))
+            .and_then(|spec| spec.image.clone())
+            .as_deref(),
+        Some("web:v1"),
+        "a rolled-back app's deployed spec is the old one again"
+    );
+}
+
+/// #692 scenario B: a managed volume forces stop-first, so the only old
+/// instance retires before its replacement starts. When the replacement
+/// fails, the old spec must run again rather than leave nothing.
+#[tokio::test]
+async fn auto_rollback_of_a_stop_first_volume_app_restarts_the_old_instance() {
+    let (agent, events, history) = deploy_over_failing_replacements(
+        "[app.web]\nimage = 'web:v1'\n[[app.web.volumes]]\npath = '/data'\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\n",
+        "[app.web]\nimage = 'web:v2'\n[[app.web.volumes]]\npath = '/data'\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\nhealth_timeout = '1s'\n",
+        &[crate::grill::InstanceIdentity::canary("default", "web", 1, 0).instance_id()],
+    )
+    .await;
+
+    assert!(
+        matches!(events.last(), Some(ApplyEvent::Error { .. })),
+        "{events:?}"
+    );
+    let instances = web_instances(&agent);
+    assert_eq!(
+        instances,
+        vec![(
+            crate::grill::InstanceIdentity::canary("default", "web", 2, 0)
+                .instance_id()
+                .0,
+            "web:v1".to_string()
+        )],
+        "the volume app must run its old spec again, not nothing"
+    );
+    assert_eq!(
+        history.last().map(|entry| entry.result),
+        Some(crate::meat::deploy_types::DeployResult::RolledBack)
+    );
+}
+
+/// When the old spec can't come back either, the abort keeps the healthy
+/// replacement serving and says so, rather than killing it.
+#[tokio::test]
+async fn abort_keeps_healthy_new_instances_when_old_capacity_cannot_return() {
+    let canary = |generation, ordinal| {
+        crate::grill::InstanceIdentity::canary("default", "web", generation, ordinal).instance_id()
+    };
+    let (agent, events, history) = deploy_over_failing_replacements(
+        "[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 3\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\nhealth_timeout = '1s'\n",
+        "[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 3\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\nhealth_timeout = '1s'\n",
+        &[canary(1, 1), canary(2, 0), canary(2, 1), canary(2, 2)],
+    )
+    .await;
+
+    let message = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ApplyEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the failed rollout must report an error");
+    assert!(message.contains("halted"), "{message}");
+    let instances = web_instances(&agent);
+    assert_eq!(
+        instances.len(),
+        3,
+        "healthy new + remaining old must survive the abort: {instances:?}"
+    );
+    assert!(
+        instances.contains(&(canary(1, 0).0, "web:v2".to_string())),
+        "the healthy replacement must keep serving: {instances:?}"
+    );
+    assert_eq!(
+        instances
+            .iter()
+            .filter(|(_, image)| image == "web:v1")
+            .count(),
+        2,
+        "{instances:?}"
+    );
+    assert_eq!(
+        history.last().map(|entry| entry.result),
+        Some(crate::meat::deploy_types::DeployResult::Halted)
+    );
+}
+
 /// The gate must not break healthy deploys: with the responder answering
 /// 200, the rolling redeploy completes through the real probe path and
 /// the replacement takes over.
@@ -7959,67 +8306,6 @@ async fn blue_green_rolls_back_when_green_fails_its_probe() {
     agent_handle.await.unwrap();
 }
 
-fn mixed_config() -> Config {
-    let toml_str = r#"
-            [app.web]
-            image = "myapp:v1"
-            port = 8080
-
-            [job.migrate]
-            image = "myapp:v1"
-            command = ["echo", "done"]
-        "#;
-    Config::parse(toml_str).unwrap()
-}
-
-#[tokio::test]
-async fn uncertain_job_checkpoint_does_not_block_unrelated_app_retirement() {
-    let records = tempfile::tempdir().unwrap();
-    let (mut agent, _, _, grill) = test_agent_with_grill();
-    agent.set_records_dir(records.path().to_path_buf());
-    grill.set_pid(std::process::id());
-    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
-    std::fs::create_dir(records.path().join(super::super::jobs::CHECKPOINT_FILE)).unwrap();
-    let events = drain_deploy(
-        &mut agent,
-        Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
-    )
-    .await;
-    assert!(matches!(events.last(), Some(ApplyEvent::Error { .. })));
-    agent.retire_workload("web", "default").await.unwrap();
-    assert!(
-        agent
-            .supervisor
-            .get_instance(&InstanceId("default__web-0".into()))
-            .is_none()
-    );
-    assert!(agent.job_store_uncertain);
-    assert_eq!(agent.get_job_status()[0].state, "unknown");
-}
-
-#[tokio::test]
-async fn job_launch_refuses_uncertain_checkpoint_without_runtime_mutation() {
-    let records = tempfile::tempdir().unwrap();
-    std::fs::create_dir(records.path().join(super::super::jobs::CHECKPOINT_FILE)).unwrap();
-    let (mut agent, _, _, grill) = test_agent_with_grill();
-    agent.set_records_dir(records.path().to_path_buf());
-    let config = Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap();
-    let events = drain_deploy(&mut agent, config.clone()).await;
-    assert!(matches!(events.last(), Some(ApplyEvent::Error { .. })));
-    assert!(
-        !grill
-            .calls()
-            .iter()
-            .any(|(op, _)| op == "create" || op == "start")
-    );
-    std::fs::remove_dir(records.path().join(super::super::jobs::CHECKPOINT_FILE)).unwrap();
-    let events = drain_deploy(&mut agent, config).await;
-    assert!(
-        matches!(events.last(), Some(ApplyEvent::Error { message }) if message.contains("uncertain"))
-    );
-    assert!(!grill.calls().iter().any(|(op, _)| op == "start"));
-}
-
 #[tokio::test]
 async fn application_deploy_refuses_failed_adoption_record_write() {
     let records = tempfile::tempdir().unwrap();
@@ -8059,136 +8345,6 @@ async fn application_deploy_refuses_missing_runtime_identity_for_adoption() {
     );
 }
 
-#[tokio::test]
-async fn job_checkpoint_failure_after_create_refuses_execution() {
-    let records = tempfile::tempdir().unwrap();
-    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
-    agent.set_records_dir(records.path().to_path_buf());
-    grill.block_creates();
-    let task = tokio::spawn(async move { agent.run().await });
-    let (events, mut results) = mpsc::channel(32);
-    tx.send(AgentCommand::Deploy {
-        config: Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
-        events,
-    })
-    .await
-    .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), grill.wait_for_creates(1))
-        .await
-        .unwrap();
-    let checkpoint = records.path().join(super::super::jobs::CHECKPOINT_FILE);
-    std::fs::remove_file(&checkpoint).unwrap();
-    std::fs::create_dir(&checkpoint).unwrap();
-    grill.release_creates(1);
-    let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let event = results.recv().await.unwrap();
-            if matches!(
-                event,
-                ApplyEvent::Complete { .. } | ApplyEvent::Error { .. }
-            ) {
-                break event;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    shutdown.cancel();
-    task.await.unwrap();
-    assert!(matches!(event, ApplyEvent::Error { .. }), "{event:?}");
-    assert!(!grill.calls().iter().any(|(op, _)| op == "start"));
-}
-
-#[tokio::test]
-async fn job_attempt_precedes_create_and_missing_record_stays_unknown() {
-    let records = tempfile::tempdir().unwrap();
-    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
-    agent.set_records_dir(records.path().to_path_buf());
-    grill.block_creates();
-    let task = tokio::spawn(async move { agent.run().await });
-    let (events, mut results) = mpsc::channel(32);
-    tx.send(AgentCommand::Deploy {
-        config: Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
-        events,
-    })
-    .await
-    .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), grill.wait_for_creates(1))
-        .await
-        .unwrap();
-    let checkpoint = super::super::jobs::load(records.path()).unwrap();
-    assert_eq!(
-        checkpoint["default__work-0"].phase,
-        super::super::jobs::JobPhase::Preparing
-    );
-    assert!(
-        crate::grill::records::load_records(records.path())
-            .unwrap()
-            .is_empty()
-    );
-    // A separate directory captures exactly this physical crash window.
-    let crashed = tempfile::tempdir().unwrap();
-    super::super::jobs::persist(crashed.path(), checkpoint).unwrap();
-    for _ in 0..2 {
-        let (mut replacement, _, _, runtime) = test_agent_with_grill();
-        replacement.set_records_dir(crashed.path().to_path_buf());
-        replacement.adopt_recorded_instances().await.unwrap();
-        assert_eq!(replacement.get_job_status()[0].state, "unknown");
-        replacement.drive_pending_restarts_to_completion().await;
-        assert!(runtime.calls().is_empty());
-    }
-    grill.release_creates(1);
-    while let Some(event) = results.recv().await {
-        if matches!(
-            event,
-            ApplyEvent::Complete { .. } | ApplyEvent::Error { .. }
-        ) {
-            break;
-        }
-    }
-    shutdown.cancel();
-    task.await.unwrap();
-}
-
-#[tokio::test]
-async fn short_job_exit_without_an_adoption_record_keeps_absence_evidence() {
-    for code in [Some(0), Some(1), None] {
-        let records = tempfile::tempdir().unwrap();
-        let (mut agent, _, _, grill) = test_agent_with_grill();
-        agent.set_records_dir(records.path().to_path_buf());
-        expect_complete(
-            &drain_deploy(
-                &mut agent,
-                Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
-            )
-            .await,
-        );
-        assert!(
-            crate::grill::records::load_records(records.path())
-                .unwrap()
-                .is_empty()
-        );
-        let id = InstanceId("default__work-0".into());
-        grill.set_state(&id, ContainerState::Stopped);
-        grill.set_exit_code(&id, code);
-        agent.check_jobs().await;
-        assert!(super::super::jobs::load(records.path()).unwrap()[&id.0].runtime_absent);
-        let (mut replacement, _, _, runtime) = test_agent_with_grill();
-        replacement.set_records_dir(records.path().to_path_buf());
-        replacement.adopt_recorded_instances().await.unwrap();
-        runtime.set_fail_state(true);
-        replacement
-            .retire_workload("work", "default")
-            .await
-            .unwrap();
-        assert!(
-            runtime.calls().is_empty(),
-            "positive absence must not require an unadoptable runtime handle"
-        );
-        assert!(super::super::jobs::load(records.path()).unwrap().is_empty());
-    }
-}
-
 /// Z6.7: runc holds an instance's lifecycle lock for its whole create,
 /// image pull included, so asking it for a creating instance's PID held
 /// the agent loop for the length of the pull. Status timed out, reports
@@ -8212,289 +8368,6 @@ async fn status_does_not_ask_the_runtime_about_an_instance_being_created() {
     };
     assert_eq!(pid_of("default__web-0"), Some(Some(4242)));
     assert_eq!(pid_of("default__web-1"), Some(None));
-}
-
-#[tokio::test]
-async fn job_observed_exit_and_stop_survive_replacement() {
-    for code in [0, 1] {
-        let records = tempfile::tempdir().unwrap();
-        let (mut agent, _, _, grill) = test_agent_with_grill();
-        agent.set_records_dir(records.path().to_path_buf());
-        grill.set_pid(std::process::id());
-        expect_complete(
-            &drain_deploy(
-                &mut agent,
-                Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
-            )
-            .await,
-        );
-        let id = InstanceId("default__work-0".into());
-        grill.set_state(&id, ContainerState::Stopped);
-        grill.set_exit_code(&id, Some(code));
-        agent.check_jobs().await;
-        let (mut replacement, _, _, runtime) = test_agent_with_grill();
-        replacement.set_records_dir(records.path().to_path_buf());
-        replacement.adopt_recorded_instances().await.unwrap();
-        assert_eq!(replacement.get_status().await[0].exit_code, Some(code));
-        assert_eq!(
-            replacement
-                .supervisor
-                .get_instance(&id)
-                .unwrap()
-                .retry_pending,
-            code != 0
-        );
-        replacement.stop_app("work", "default").await.unwrap();
-        let (mut stopped, _, _, _) = test_agent_with_grill();
-        stopped.set_records_dir(records.path().to_path_buf());
-        stopped.adopt_recorded_instances().await.unwrap();
-        assert!(!stopped.supervisor.get_instance(&id).unwrap().retry_pending);
-        assert_eq!(stopped.get_job_status()[0].state, "stopped");
-        assert!(!runtime.calls().iter().any(|(op, _)| op == "start"));
-    }
-}
-
-#[tokio::test]
-async fn job_explicit_rerun_retires_old_owner_and_claims_a_new_generation() {
-    let records = tempfile::tempdir().unwrap();
-    let (mut agent, _, _, grill) = test_agent_with_grill();
-    agent.set_records_dir(records.path().to_path_buf());
-    grill.set_pid(std::process::id());
-    let config = Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap();
-    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
-    let id = InstanceId("default__work-0".into());
-    grill.set_state(&id, ContainerState::Stopped);
-    grill.set_exit_code(&id, None);
-    agent.check_jobs().await;
-    let (mut replacement, _, _, runtime) = test_agent_with_grill();
-    replacement.set_records_dir(records.path().to_path_buf());
-    replacement.adopt_recorded_instances().await.unwrap();
-    let (events, mut results) = mpsc::channel(32);
-    replacement.deploy_with_rerun(config, &events, true).await;
-    drop(events);
-    let mut all = Vec::new();
-    while let Some(event) = results.recv().await {
-        all.push(event);
-    }
-    expect_complete(&all);
-    let job = &super::super::jobs::load(records.path()).unwrap()[&id.0];
-    assert_eq!(job.generation, 2);
-    assert_eq!(job.restart_count, 0);
-    assert_eq!(job.phase, super::super::jobs::JobPhase::Launching);
-    assert_eq!(
-        runtime
-            .calls()
-            .iter()
-            .filter(|(op, _)| op == "start")
-            .count(),
-        1
-    );
-    replacement
-        .retire_workload("work", "default")
-        .await
-        .unwrap();
-    assert!(super::super::jobs::load(records.path()).unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn job_adoption_persists_absence_before_retiring_runtime_evidence() {
-    let records = tempfile::tempdir().unwrap();
-    let volumes = tempfile::tempdir().unwrap();
-    let (mut agent, _, _, grill) = test_agent_with_grill();
-    agent.set_records_dir(records.path().to_path_buf());
-    grill.set_pid(std::process::id());
-    expect_complete(&drain_deploy(&mut agent, job_config()).await);
-    let id = "default__migrate-0";
-    let identity = crate::sesame::identity::instance_identity_dir(volumes.path(), id);
-    std::fs::create_dir_all(identity.parent().unwrap()).unwrap();
-    std::fs::write(&identity, b"blocked retirement").unwrap();
-    let (mut replacement, _, _, _) = test_agent_with_grill();
-    replacement.set_records_dir(records.path().to_path_buf());
-    replacement.set_volumes_dir(volumes.path().to_path_buf());
-    assert!(replacement.adopt_recorded_instances().await.is_err());
-    let checkpoint = super::super::jobs::load(records.path()).unwrap();
-    assert!(checkpoint[id].runtime_absent);
-    assert_eq!(checkpoint[id].phase, super::super::jobs::JobPhase::Unknown);
-    assert!(crate::grill::records::record_path(records.path(), id).exists());
-    std::fs::remove_file(identity).unwrap();
-    replacement.adopt_recorded_instances().await.unwrap();
-    assert_eq!(replacement.get_job_status()[0].state, "unknown");
-}
-
-#[tokio::test]
-async fn job_checkpoint_rejects_corruption_before_adopting_any_runtime() {
-    for contents in ["{", "{\"schema\":99,\"jobs\":[]}"] {
-        let records = tempfile::tempdir().unwrap();
-        std::fs::write(
-            records.path().join(super::super::jobs::CHECKPOINT_FILE),
-            contents,
-        )
-        .unwrap();
-        let (mut agent, _, _, grill) = test_agent_with_grill();
-        agent.set_records_dir(records.path().to_path_buf());
-        assert!(agent.adopt_recorded_instances().await.is_err());
-        assert!(grill.calls().is_empty());
-    }
-}
-
-#[tokio::test]
-async fn job_checkpoint_rejects_unsafe_and_ambiguous_files() {
-    for fault in ["duplicate", "budget", "symlink", "oversized"] {
-        let records = tempfile::tempdir().unwrap();
-        let (mut agent, _, _, grill) = test_agent_with_grill();
-        agent.set_records_dir(records.path().to_path_buf());
-        grill.set_pid(std::process::id());
-        expect_complete(&drain_deploy(&mut agent, job_config()).await);
-        let path = records.path().join(super::super::jobs::CHECKPOINT_FILE);
-        let original = std::fs::read(&path).unwrap();
-        match fault {
-            "duplicate" | "budget" => {
-                let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
-                if fault == "duplicate" {
-                    let duplicate = value["jobs"][0].clone();
-                    value["jobs"].as_array_mut().unwrap().push(duplicate);
-                } else {
-                    value["jobs"][0]["restart_count"] = serde_json::json!(4);
-                }
-                std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-            }
-            "symlink" => {
-                let target = records.path().join("foreign.checkpoint");
-                std::fs::rename(&path, &target).unwrap();
-                std::os::unix::fs::symlink(target, &path).unwrap();
-            }
-            "oversized" => std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .set_len(17 * 1024 * 1024)
-                .unwrap(),
-            _ => unreachable!(),
-        }
-        let (mut replacement, _, _, runtime) = test_agent_with_grill();
-        replacement.set_records_dir(records.path().to_path_buf());
-        assert!(
-            replacement.adopt_recorded_instances().await.is_err(),
-            "{fault}"
-        );
-        assert!(runtime.calls().is_empty(), "{fault}");
-        assert_eq!(
-            crate::grill::records::load_records(records.path())
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-}
-
-#[tokio::test]
-async fn job_retry_budget_survives_adoption() {
-    let records = tempfile::tempdir().unwrap();
-    let (mut agent, _, _, grill) = test_agent_with_grill();
-    agent.set_records_dir(records.path().to_path_buf());
-    grill.set_pid(std::process::id());
-    let config = Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap();
-    expect_complete(&drain_deploy(&mut agent, config).await);
-    let id = InstanceId("default__work-0".into());
-    // Exercise the real retry driver so durable state must precede launch.
-    agent.supervisor.get_instance_mut(&id).unwrap().state = ContainerState::Pending;
-    agent
-        .supervisor
-        .get_instance_mut(&id)
-        .unwrap()
-        .restart_count = 3;
-    agent.drive_pending_restarts_to_completion().await;
-    assert_eq!(
-        agent.supervisor.get_instance(&id).unwrap().state,
-        ContainerState::Running
-    );
-    let (mut replacement, _, _, runtime) = test_agent_with_grill();
-    replacement.set_records_dir(records.path().to_path_buf());
-    runtime.set_adopt_result(&id, true);
-    replacement.adopt_recorded_instances().await.unwrap();
-    let restored = replacement.supervisor.get_instance(&id).unwrap();
-    assert_eq!(restored.restart_count, 3);
-    assert_eq!(restored.restart_policy.max_restarts, Some(3));
-    runtime.set_state(&id, ContainerState::Stopped);
-    runtime.set_exit_code(&id, Some(1));
-    replacement.check_jobs().await;
-    replacement.drive_pending_restarts_to_completion().await;
-    assert!(!runtime.calls().iter().any(|(op, _)| op == "start"));
-}
-
-#[tokio::test]
-async fn job_unknown_exit_requires_explicit_rerun() {
-    let records = tempfile::tempdir().unwrap();
-    let (mut agent, _, _, grill) = test_agent_with_grill();
-    agent.set_records_dir(records.path().to_path_buf());
-    grill.set_pid(std::process::id());
-    expect_complete(
-        &drain_deploy(
-            &mut agent,
-            Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
-        )
-        .await,
-    );
-    let id = InstanceId("default__work-0".into());
-    grill.set_state(&id, ContainerState::Stopped);
-    grill.set_exit_code(&id, None);
-    agent.check_jobs().await;
-    assert_eq!(agent.get_job_status()[0].state, "unknown");
-    assert!(!agent.supervisor.get_instance(&id).unwrap().retry_pending);
-    let (mut replacement, _, _, _) = test_agent_with_grill();
-    replacement.set_records_dir(records.path().to_path_buf());
-    replacement.adopt_recorded_instances().await.unwrap();
-    assert_eq!(replacement.get_job_status()[0].state, "unknown");
-    let events = drain_deploy(
-        &mut replacement,
-        Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
-    )
-    .await;
-    assert!(
-        matches!(events.last(), Some(ApplyEvent::Error { message }) if message.contains("rerun"))
-    );
-}
-
-#[tokio::test]
-async fn deploy_job_creates_instance() {
-    let (mut agent, tx, shutdown) = test_agent();
-
-    let agent_handle = tokio::spawn(async move {
-        agent.run().await;
-    });
-
-    let events = send_deploy(&tx, job_config()).await;
-    let (created, instances) = expect_complete(&events);
-    assert_eq!(created, 1);
-    assert_eq!(instances, &["default__migrate-0"]);
-
-    shutdown.cancel();
-    agent_handle.await.unwrap();
-}
-
-#[tokio::test]
-async fn deploy_job_starts_in_running() {
-    let (mut agent, tx, shutdown) = test_agent();
-
-    let agent_handle = tokio::spawn(async move {
-        agent.run().await;
-    });
-
-    let events = send_deploy(&tx, job_config()).await;
-    expect_complete(&events);
-
-    let (resp_tx, resp_rx) = oneshot::channel();
-    tx.send(AgentCommand::Status { response: resp_tx })
-        .await
-        .unwrap();
-
-    let statuses = resp_rx.await.unwrap();
-    assert_eq!(statuses.len(), 1);
-    assert_eq!(statuses[0].app_name, "migrate");
-    assert_eq!(statuses[0].state, "running");
-
-    shutdown.cancel();
-    agent_handle.await.unwrap();
 }
 
 #[tokio::test]
@@ -8574,30 +8447,6 @@ async fn workload_labels_are_refused_before_runtime_mutation() {
                 .any(|(operation, _)| operation == "create")
         );
     }
-}
-
-#[tokio::test]
-async fn deploy_mixed_apps_and_jobs() {
-    let (mut agent, tx, shutdown) = test_agent();
-
-    let agent_handle = tokio::spawn(async move {
-        agent.run().await;
-    });
-
-    let events = send_deploy(&tx, mixed_config()).await;
-    let (created, _instances) = expect_complete(&events);
-    assert_eq!(created, 2);
-
-    let (resp_tx, resp_rx) = oneshot::channel();
-    tx.send(AgentCommand::Status { response: resp_tx })
-        .await
-        .unwrap();
-
-    let statuses = resp_rx.await.unwrap();
-    assert_eq!(statuses.len(), 2);
-
-    shutdown.cancel();
-    agent_handle.await.unwrap();
 }
 
 fn config_with_init_container() -> Config {
@@ -8848,6 +8697,169 @@ async fn failing_init_container_reports_the_runtimes_stderr() {
     );
 }
 
+/// #701: an init container runs its own image, with the app's env and the
+/// app's volume and config-file mounts. It used to run in the app's image
+/// with no env and only the standard mounts, so a migration couldn't see
+/// `DATABASE_URL` and a config generator couldn't write a volume.
+#[tokio::test]
+async fn init_container_runs_its_own_image_with_the_app_env_and_mounts() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let volumes = tempfile::tempdir().unwrap();
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    let own = InstanceId("default__web-0__init-0".to_string());
+    let inherited = InstanceId("default__web-0__init-1".to_string());
+    for init in [&own, &inherited] {
+        grill.set_state(init, ContainerState::Stopped);
+        grill.set_exit_code(init, Some(0));
+    }
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let config = Config::parse(
+        r#"
+            [app.web]
+            image = "myapp:v1"
+            env = { DATABASE_URL = "postgres://db/app" }
+
+            [[app.web.volumes]]
+            path = "/data"
+
+            [[app.web.config_file]]
+            path = "/etc/web/app.conf"
+            content = "key = value"
+
+            [[app.web.init]]
+            image = "migrate:v2"
+            command = ["migrate"]
+
+            [[app.web.init]]
+            command = ["echo", "inherits the app image"]
+        "#,
+    )
+    .unwrap();
+    let events = send_deploy(&tx, config).await;
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+    expect_complete(&events);
+
+    let own = grill
+        .created_spec(&own)
+        .expect("the first init was created");
+    assert_eq!(own.root.path, "migrate:v2");
+    assert_eq!(own.process.args, vec!["migrate".to_string()]);
+    assert!(
+        own.process
+            .env
+            .contains(&"DATABASE_URL=postgres://db/app".to_string()),
+        "{:?}",
+        own.process.env
+    );
+    for destination in ["/data", "/etc/web/app.conf"] {
+        assert!(
+            own.mounts
+                .iter()
+                .any(|m| m.destination == std::path::Path::new(destination)),
+            "init is missing {destination}: {:?}",
+            own.mounts
+        );
+    }
+    let inherited = grill
+        .created_spec(&inherited)
+        .expect("the second init was created");
+    assert_eq!(inherited.root.path, "myapp:v1");
+}
+
+/// #701: each instance reads its own copy of an inline config file, and the
+/// copy goes when the instance does.
+#[tokio::test]
+async fn stop_removes_each_instances_inline_config_files() {
+    let (mut agent, tx, shutdown) = test_agent();
+    let volumes = tempfile::tempdir().unwrap();
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let config = Config::parse(
+        r#"
+            [app.web]
+            image = "myapp:v1"
+            replicas = 2
+
+            [[app.web.config_file]]
+            path = "/etc/web/app.conf"
+            content = "key = value"
+        "#,
+    )
+    .unwrap();
+    expect_complete(&send_deploy(&tx, config).await);
+    for instance in ["default__web-0", "default__web-1"] {
+        let dir = crate::grill::oci::inline_config_dir(volumes.path(), "default", "web", instance);
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1, "{instance} has its own copy");
+    }
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(AgentCommand::Stop {
+        app_name: "web".to_string(),
+        namespace: "default".to_string(),
+        response: resp_tx,
+    })
+    .await
+    .unwrap();
+    resp_rx.await.unwrap().unwrap();
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+
+    for instance in ["default__web-0", "default__web-1"] {
+        let dir = crate::grill::oci::inline_config_dir(volumes.path(), "default", "web", instance);
+        assert!(!dir.exists(), "{} survived the stop", dir.display());
+    }
+}
+
+/// #701: `health.port` defaults the probe's port, not the app's `port`.
+/// The rollout gate used to skip the probe when the app had no `port`, so
+/// a failing replacement was announced healthy.
+#[tokio::test]
+async fn rollout_gate_probes_health_port_without_app_port() {
+    let port = spawn_health_responder(500).await;
+    let (mut agent, tx, shutdown, _grill) = test_agent_with_grill();
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let v1 = Config::parse("[app.web]\nimage = \"myapp:v1\"\n").unwrap();
+    expect_complete(&send_deploy(&tx, v1).await);
+    let v2 = Config::parse(&format!(
+        r#"
+            [app.web]
+            image = "myapp:v2"
+
+            [app.web.health]
+            path = "/healthz"
+            port = {port}
+
+            [app.web.deploy]
+            strategy = "rolling"
+            health_timeout = "1s"
+        "#
+    ))
+    .unwrap();
+    let events = send_deploy(&tx, v2).await;
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+
+    let error = events
+        .iter()
+        .find_map(|e| match e {
+            ApplyEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the gate must probe health.port and refuse the failing replacement");
+    assert!(error.contains("failed its health check"), "{error}");
+}
+
 #[test]
 fn tail_lines_empty_string() {
     assert_eq!(super::tail_lines("", 5), "");
@@ -8971,7 +8983,11 @@ fn council_metrics(
 }
 
 fn fence(state: crate::council::fence::FenceState) -> Option<crate::council::fence::FenceSnapshot> {
-    Some(crate::council::fence::FenceSnapshot { epoch: 0, state })
+    Some(crate::council::fence::FenceSnapshot {
+        epoch: 0,
+        recovery_id: None,
+        state,
+    })
 }
 
 #[test]
@@ -9001,6 +9017,14 @@ fn council_role_puts_the_fence_before_what_raft_says() {
     let stale_leader = council_metrics(1, &[1, 2, 3], &[], ServerState::Leader);
     assert_eq!(
         council_role(&stale_leader, fence(FenceState::Fenced { newer_epoch: 1 })),
+        CouncilRole::Fenced
+    );
+    // #694: a split fences the leader of either half just the same.
+    let split = FenceState::Split {
+        other_id: crate::council::types::RecoveryId(7),
+    };
+    assert_eq!(
+        council_role(&stale_leader, fence(split)),
         CouncilRole::Fenced
     );
     assert_eq!(
@@ -9056,7 +9080,6 @@ fn adoption_record(
         namespace: "default".to_string(),
         app_name: app.to_string(),
         replica_index: 0,
-        is_job: false,
         image: "myapp:v1".to_string(),
         runtime: crate::grill::records::RuntimeKind::Process,
         pid: 4242,
@@ -9067,6 +9090,9 @@ fn adoption_record(
         host_port: Some(30123),
         app_spec: Some(app_spec),
         oci_spec: crate::grill::oci::OciSpec {
+            reusable_executor: false,
+            host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: "/tmp/test".to_string(),
@@ -9079,6 +9105,7 @@ fn adoption_record(
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: vec![],
@@ -9505,6 +9532,126 @@ async fn started_rootless_instance_persists_network_recreation_state() {
     assert_eq!(persisted[0].schema, crate::grill::records::RECORD_SCHEMA);
     assert_eq!(persisted[0].boot_id, crate::grill::records::current_boot());
     assert_eq!(persisted[0].rootless_network, Some(rootless_network));
+}
+
+/// An adoption record whose workload has a cgroup and resource limits, as
+/// a runc instance's has.
+pub(super) fn limited_adoption_record(
+    instance: &str,
+    app: &str,
+) -> crate::grill::records::InstanceRecord {
+    let mut record = adoption_record(instance, app, false);
+    record.oci_spec.linux.cgroups_path = Some(format!("/reliaburger/default/{app}/0"));
+    record.oci_spec.linux.resources = Some(crate::grill::oci::OciResources {
+        cpu: Some(crate::grill::oci::OciCpuResources {
+            quota: 50_000,
+            period: 100_000,
+        }),
+        memory: Some(crate::grill::oci::OciMemoryResources {
+            limit: 128 * 1024 * 1024,
+        }),
+        unified: std::collections::BTreeMap::from([(
+            "memory.high".to_string(),
+            "33554432".to_string(),
+        )]),
+    });
+    record
+}
+
+/// Whether `ps` reports `pid` as stopped (state `T`).
+pub(super) fn process_is_stopped(pid: u32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .trim_start()
+        .starts_with('T')
+}
+
+/// Wait up to five seconds for `pid` to be stopped, or running.
+pub(super) async fn wait_for_stopped(pid: u32, stopped: bool) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while process_is_stopped(pid) != stopped {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pid {pid} never became stopped={stopped}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Bun keeps a CPU fault's saved `cpu.max` only in memory. A Bun that was
+/// killed mid-fault left the cap behind, and the next one adopted the
+/// instance without lifting it (#699): the recorded specification says
+/// what the limits should be, so adoption writes them back.
+#[tokio::test]
+async fn adopting_an_instance_restores_its_recorded_cpu_max() {
+    let records = tempfile::tempdir().unwrap();
+    let mount = tempfile::tempdir().unwrap();
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_records_dir(records.path().to_path_buf());
+    agent.set_cgroup_mount(mount.path().to_path_buf());
+    let record = limited_adoption_record("default__web-0", "web");
+    let cgroup = mount.path().join("reliaburger/default/web/0");
+    std::fs::create_dir_all(&cgroup).unwrap();
+    // What a 99% CPU fault, a memory fault and a disk-I/O fault left.
+    std::fs::write(cgroup.join("cpu.max"), "1000 100000").unwrap();
+    std::fs::write(cgroup.join("memory.high"), "1024").unwrap();
+    std::fs::write(
+        cgroup.join("io.max"),
+        "8:0 rbps=1048576 wbps=1048576 riops=max wiops=max\n",
+    )
+    .unwrap();
+    crate::grill::records::write_record(records.path(), &record).unwrap();
+    grill.set_adopt_result(&InstanceId(record.instance_id.clone()), true);
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    let read = |name: &str| std::fs::read_to_string(cgroup.join(name)).unwrap();
+    assert_eq!(read("cpu.max"), "50000 100000");
+    assert_eq!(read("memory.high"), "33554432");
+    assert_eq!(read("io.max"), "8:0 rbps=max wbps=max riops=max wiops=max");
+}
+
+/// A pause fault's frozen pids lived only in the old Bun's registry, so an
+/// instance paused when Bun died stayed frozen for good (#699).
+#[tokio::test]
+async fn adopting_an_instance_sends_sigcont_to_its_pids() {
+    let records = tempfile::tempdir().unwrap();
+    let mount = tempfile::tempdir().unwrap();
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_records_dir(records.path().to_path_buf());
+    agent.set_cgroup_mount(mount.path().to_path_buf());
+    let mut main = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let mut worker = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    for child in [&main, &worker] {
+        crate::smoker::process::pause_process(child.id() as i32).unwrap();
+        wait_for_stopped(child.id(), true).await;
+    }
+    // The runtime names the main process; the cgroup lists the rest.
+    grill.set_pid(main.id());
+    let record = limited_adoption_record("default__web-0", "web");
+    let cgroup = mount.path().join("reliaburger/default/web/0");
+    std::fs::create_dir_all(&cgroup).unwrap();
+    std::fs::write(cgroup.join("cgroup.procs"), format!("{}\n", worker.id())).unwrap();
+    crate::grill::records::write_record(records.path(), &record).unwrap();
+    grill.set_adopt_result(&InstanceId(record.instance_id.clone()), true);
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    wait_for_stopped(main.id(), false).await;
+    wait_for_stopped(worker.id(), false).await;
+    for child in [&mut main, &mut worker] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 }
 
 #[tokio::test]
@@ -10478,6 +10625,10 @@ async fn blue_green_volume_app_redeploys_stop_first() {
 async fn host_path_volume_app_keeps_surge_first_rollout() {
     let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
     let shared = tempfile::tempdir().unwrap();
+    agent.set_host_path_policy(crate::bun::host_paths::HostPathPolicy::new(
+        vec![shared.path().to_path_buf()],
+        Vec::new(),
+    ));
 
     let config = Config::parse(&format!(
             "[app.web]\nimage = \"web:v1\"\n\n[[app.web.volumes]]\npath = \"/srv\"\nsource = \"{}\"\n\n[app.web.deploy]\ndrain_timeout = \"0s\"\n",
@@ -10894,6 +11045,56 @@ async fn node_fault_expiry_restores_the_transport_gate() {
     agent.expire_faults().await;
     assert!(agent.fault_registry.is_empty());
     assert!(!gate.is_quiesced());
+}
+
+#[tokio::test]
+async fn expired_fault_records_fault_expired() {
+    let (mut agent, _gate, _) = test_cluster_fault_agent().await;
+    let dir = tempfile::tempdir().unwrap();
+    let log = crate::bun::audit::AuditLog::open(
+        dir.path().join("audit"),
+        crate::bun::audit::AuditLimits::from_total(1 << 20),
+    )
+    .unwrap();
+    let mut store = crate::bun::events::EventStore::new();
+    store.set_audit_log(log.clone());
+    let events = Arc::new(tokio::sync::RwLock::new(store));
+    agent.set_event_store(Arc::clone(&events));
+    let rule = register_fault(
+        &mut agent,
+        crate::smoker::types::FaultType::NodeKill {
+            kill_containers: false,
+        },
+        std::time::Duration::from_millis(1),
+    );
+    agent.apply_fault(&rule).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    agent.expire_faults().await;
+
+    let ring = events.read().await.recent(10, None, None);
+    let expired = ring
+        .iter()
+        .find(|event| event.action.as_deref() == Some("fault.expired"))
+        .expect("expiry is in the event ring");
+    assert_eq!(expired.principal.as_deref(), Some("system"));
+    assert_eq!(expired.details.get("fault_id"), Some(&rule.id.to_string()));
+    // The agent loop doesn't wait for the disk, so the durable copy lands
+    // shortly after.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let filter = crate::bun::audit::AuditFilter {
+            action: Some("fault.expired".to_string()),
+            ..crate::bun::audit::AuditFilter::default()
+        };
+        if log.query(filter).await.unwrap().len() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fault.expired never reached the audit log"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -12437,9 +12638,7 @@ async fn clustered_startup_retains_orphan_ports_until_api_driven_cleanup_can_fin
             .is_some()
     );
     let (events, mut received) = mpsc::channel(8);
-    agent
-        .begin_deploy(basic_config(), events, true, false)
-        .await;
+    agent.begin_deploy(basic_config(), events).await;
     assert!(matches!(
         received.recv().await,
         Some(ApplyEvent::Error { .. })
@@ -12598,7 +12797,6 @@ fn provision_op(instance: &str) -> (DeployOp, oneshot::Receiver<()>) {
         app_name: "web".into(),
         namespace: "default".into(),
         instance_id: InstanceId(instance.into()),
-        is_job: false,
         reply,
     };
     (op, answered)
@@ -12799,6 +12997,7 @@ fn runtime_unknown_is_serialised_only_when_set() {
         pid: Some(7),
         runtime_unknown: false,
         status_age_ms: None,
+        reason: None,
     };
     let plain = serde_json::to_value(&status).unwrap();
     assert!(plain.get("runtime_unknown").is_none(), "{plain}");
@@ -12924,466 +13123,4 @@ async fn adopted_placement_query_is_answered_on_the_command_channel() {
     );
     shutdown.cancel();
     task.await.unwrap();
-}
-
-async fn recovered_owned_exit_preserves_retirement_provenance(
-    runtime: crate::grill::records::RuntimeKind,
-) {
-    use crate::bun::jobs::{BatchExecutionOwnership, JobInventory, JobPhase, RecordedJob};
-    let records = tempfile::tempdir().unwrap();
-    let volumes = tempfile::tempdir().unwrap();
-    let (mut agent, _, _, grill) = test_agent_with_grill();
-    grill.set_runtime_kind(runtime);
-    let id = InstanceId("default__batch-retained-object-0".into());
-    let name = "batch-retained-object";
-    let spec = Config::parse(&format!("[job.{name}]\nimage='myapp:v1'\n"))
-        .unwrap()
-        .job
-        .remove(name)
-        .unwrap();
-    let job = RecordedJob {
-        name: name.into(),
-        namespace: "default".into(),
-        batch_execution: Some(BatchExecutionOwnership {
-            batch_id: 42,
-            logical_name: "migration".into(),
-            spec_digest: crate::meat::batch_execution::spec_digest("default", "migration", &spec)
-                .unwrap(),
-            observed_exit_code: Some(0),
-            observed_restart_count: Some(0),
-        }),
-        spec,
-        runtime,
-        generation: 1,
-        restart_count: 0,
-        phase: JobPhase::Exited { code: 0 },
-        runtime_absent: false,
-    };
-    crate::bun::jobs::persist_inventory(
-        records.path(),
-        JobInventory {
-            jobs: BTreeMap::from([(id.0.clone(), job)]),
-            retired: BTreeMap::new(),
-        },
-    )
-    .unwrap();
-    let mut record = adoption_record(&id.0, name, false);
-    record.is_job = true;
-    record.app_spec = None;
-    record.runtime = runtime;
-    record.runc_container_id =
-        (runtime == crate::grill::records::RuntimeKind::Runc).then(|| id.0.clone());
-    crate::grill::records::write_record(records.path(), &record).unwrap();
-    grill.set_state(&id, ContainerState::Stopped);
-    grill.set_adopt_result(&id, false);
-    agent.set_records_dir(records.path().to_path_buf());
-    agent.set_volumes_dir(volumes.path().to_path_buf());
-    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
-    assert_eq!(agent.recorded_jobs[&id.0].batch_terminal_exit(), Some(0));
-    // A confirmed process stop must retain the same object-absence distinction.
-    agent
-        .finish_app_stop(
-            name,
-            "default",
-            app_stop::AppStop {
-                instances: vec![id.clone()],
-                owns_job: true,
-                taken_restarts: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
-    let compact = agent.release_retired_workload(name, "default").await;
-    if runtime == crate::grill::records::RuntimeKind::Process {
-        compact.unwrap();
-        assert_eq!(
-            agent.retired_batch_executions[&id.0].terminal_exit(),
-            Some(0)
-        );
-    } else {
-        assert!(
-            compact.is_err(),
-            "a retained stopped OCI object was compacted as absent"
-        );
-        assert!(
-            !agent.recorded_jobs[&id.0].runtime_absent,
-            "process exit became object-absence provenance"
-        );
-        assert!(agent.retired_batch_executions.is_empty());
-    }
-}
-
-#[tokio::test]
-async fn recovered_owned_process_exit_allows_positive_compact_retirement() {
-    recovered_owned_exit_preserves_retirement_provenance(
-        crate::grill::records::RuntimeKind::Process,
-    )
-    .await;
-}
-#[tokio::test]
-async fn recovered_owned_apple_exit_keeps_retained_object_fenced() {
-    recovered_owned_exit_preserves_retirement_provenance(crate::grill::records::RuntimeKind::Apple)
-        .await;
-}
-#[tokio::test]
-async fn recovered_owned_runc_exit_keeps_retained_object_fenced() {
-    recovered_owned_exit_preserves_retirement_provenance(crate::grill::records::RuntimeKind::Runc)
-        .await;
-}
-
-#[tokio::test]
-async fn admitting_a_batch_execution_encodes_the_job_inventory_once() {
-    // Each encoding validates and serialises the whole inventory, so with a
-    // nearly full checkpoint every extra pass cost seconds in a debug build
-    // and pushed publication past its bound (#592).
-    let records = tempfile::tempdir().unwrap();
-    let (mut agent, _, _, _) = test_agent_with_grill();
-    agent.set_records_dir(records.path().to_path_buf());
-    let name = "batch-encoded-once";
-    let config = Config::parse(&format!(
-        "[job.{name}]\nimage='myapp:v1'\ncommand=['true']\n"
-    ))
-    .unwrap();
-    let labels = BTreeMap::from([(
-        name.to_string(),
-        crate::bun::batch::BatchExecutionLabel {
-            name: "migration".into(),
-            namespace: "default".into(),
-        },
-    )]);
-    let (events, _received) = mpsc::channel(64);
-    let before = agent.loop_stalls.reached(LoopStall::JobInventoryEncode);
-    agent
-        .begin_owned_batch(7, config, labels, events)
-        .await
-        .unwrap();
-    assert_eq!(
-        agent.loop_stalls.reached(LoopStall::JobInventoryEncode) - before,
-        1,
-        "admission encoded the job inventory more than once"
-    );
-    assert!(
-        crate::bun::jobs::load(records.path())
-            .unwrap()
-            .contains_key("default__batch-encoded-once-0"),
-        "the admitted execution was not published"
-    );
-}
-
-#[tokio::test]
-async fn prerequisite_failure_is_durably_settled_before_the_gate_reports_failure() {
-    let records = tempfile::tempdir().unwrap();
-    let (mut agent, _, _, grill) = test_agent_with_grill();
-    agent.set_records_dir(records.path().to_path_buf());
-    let id = InstanceId("default__migrate-0".into());
-    grill.set_state(&id, ContainerState::Stopped);
-    grill.set_exit_code(&id, Some(1));
-    let events = drain_deploy(&mut agent, run_before_config()).await;
-    assert!(matches!(events.last(), Some(ApplyEvent::Error { .. })));
-    assert_eq!(
-        agent.recorded_jobs[&id.0].phase,
-        crate::bun::jobs::JobPhase::Exited { code: 1 }
-    );
-    assert!(!agent.supervisor.get_instance(&id).unwrap().retry_pending);
-}
-
-#[tokio::test]
-async fn prerequisite_failed_attempt_cannot_claim_an_automatic_retry() {
-    let (mut agent, _, _, grill) = test_agent_with_grill();
-    let id = InstanceId("default__migrate-0".into());
-    grill.set_state(&id, ContainerState::Stopped);
-    grill.set_exit_code(&id, Some(1));
-    let _ = drain_deploy(&mut agent, run_before_config()).await;
-    agent.observe_job_exit(&id, Some(1)).await;
-    agent
-        .supervisor
-        .get_instance_mut(&id)
-        .unwrap()
-        .restart_count = 1;
-    assert!(
-        agent.claim_job_retry(&id).await.is_err(),
-        "a failed prerequisite must not restart outside its apply gate"
-    );
-}
-
-#[tokio::test]
-async fn prerequisite_trust_preflight_refuses_before_any_migration_launch() {
-    let (mut agent, _, _, grill) = test_agent_with_grill();
-    agent.trust_policy.require_signatures = true;
-    let id = InstanceId("default__migrate-0".into());
-    grill.set_state(&id, ContainerState::Stopped);
-    grill.set_exit_code(&id, Some(0));
-    let events = drain_deploy(&mut agent, run_before_config()).await;
-    assert!(matches!(events.last(), Some(ApplyEvent::Error { .. })));
-    assert!(
-        !grill
-            .calls()
-            .iter()
-            .any(|(operation, _)| operation == "create" || operation == "start"),
-        "unverified apply launched its migration: {:?}",
-        grill.calls()
-    );
-}
-
-#[tokio::test]
-async fn ordinary_cluster_job_receipt_requires_current_positive_terminal_evidence() {
-    use super::cluster_jobs::ClusterJobSettlement;
-    let (mut agent, _, _, grill) = test_agent_with_grill();
-    let config = job_config();
-    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
-    let receipt = agent.capture_cluster_jobs(&config).unwrap();
-    assert_eq!(
-        agent.cluster_jobs_settlement(&receipt),
-        ClusterJobSettlement::Pending,
-        "startup Complete cannot release a still-running ordinary job reservation"
-    );
-    let id = InstanceId("default__migrate-0".into());
-    grill.set_state(&id, ContainerState::Stopped);
-    grill.set_exit_code(&id, Some(0));
-    agent.observe_job_exit(&id, Some(0)).await;
-    assert_eq!(
-        agent.cluster_jobs_settlement(&receipt),
-        ClusterJobSettlement::Terminal
-    );
-}
-
-#[tokio::test]
-async fn ordinary_cluster_job_receipt_cannot_reuse_a_previous_generation_or_uncertain_publication()
-{
-    use super::cluster_jobs::ClusterJobSettlement;
-    let (mut agent, _, _, _) = test_agent_with_grill();
-    let config = job_config();
-    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
-    let receipt = agent.capture_cluster_jobs(&config).unwrap();
-    agent
-        .recorded_jobs
-        .get_mut("default__migrate-0")
-        .unwrap()
-        .generation += 1;
-    assert!(
-        matches!(
-            agent.cluster_jobs_settlement(&receipt),
-            ClusterJobSettlement::Unknown(_)
-        ),
-        "a replacement generation cannot settle its predecessor's reservation"
-    );
-    agent
-        .recorded_jobs
-        .get_mut("default__migrate-0")
-        .unwrap()
-        .generation -= 1;
-    agent.job_store_uncertain = true;
-    assert!(matches!(
-        agent.cluster_jobs_settlement(&receipt),
-        ClusterJobSettlement::Unknown(_)
-    ));
-}
-
-#[tokio::test]
-async fn ordinary_cluster_job_receipt_retains_retrying_failure_and_unconfirmed_stop() {
-    use super::cluster_jobs::ClusterJobSettlement;
-    let (mut agent, _, _, _) = test_agent_with_grill();
-    let config = job_config();
-    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
-    let receipt = agent.capture_cluster_jobs(&config).unwrap();
-    let record = agent.recorded_jobs.get_mut("default__migrate-0").unwrap();
-    record.phase = crate::bun::jobs::JobPhase::Exited { code: 1 };
-    record.restart_count = 1;
-    assert_eq!(
-        agent.cluster_jobs_settlement(&receipt),
-        ClusterJobSettlement::Pending
-    );
-    let record = agent.recorded_jobs.get_mut("default__migrate-0").unwrap();
-    record.phase = crate::bun::jobs::JobPhase::Stopped;
-    record.runtime_absent = false;
-    assert!(matches!(
-        agent.cluster_jobs_settlement(&receipt),
-        ClusterJobSettlement::Unknown(_)
-    ));
-    agent
-        .recorded_jobs
-        .get_mut("default__migrate-0")
-        .unwrap()
-        .runtime_absent = true;
-    assert_eq!(
-        agent.cluster_jobs_settlement(&receipt),
-        ClusterJobSettlement::Terminal
-    );
-}
-
-#[tokio::test]
-async fn cluster_cron_registration_ack_is_not_a_terminal_execution_receipt() {
-    use super::cluster_jobs::ClusterJobSettlement;
-    let (mut agent, _, _, _) = test_agent_with_grill();
-    let config = Config::parse("[job.tick]\nimage='test:v1'\nschedule='* * * * *'\n").unwrap();
-    agent.register_scheduled_jobs(&config).await.unwrap();
-    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
-    assert!(
-        agent
-            .scheduled_jobs
-            .contains_key(&("tick".into(), "default".into()))
-    );
-    assert!(agent.recorded_jobs.is_empty());
-    let receipt = agent.capture_cluster_jobs(&config);
-    assert!(
-        match &receipt {
-            Err(_) => true,
-            Ok(receipt) => agent.cluster_jobs_settlement(receipt) != ClusterJobSettlement::Terminal,
-        },
-        "registration ACK cannot retire recurring ownership as an exited execution"
-    );
-}
-
-#[tokio::test]
-async fn a_completed_ordinary_job_does_not_make_its_registered_cron_peer_terminal() {
-    use super::cluster_jobs::ClusterJobSettlement;
-    let (mut agent, _, _, grill) = test_agent_with_grill();
-    let mut config = job_config();
-    let schedule = Config::parse("[job.tick]\nimage='test:v1'\nschedule='* * * * *'\n").unwrap();
-    config.job.extend(schedule.job);
-    agent.register_scheduled_jobs(&config).await.unwrap();
-    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
-    let receipt = agent.capture_cluster_jobs(&config);
-    let id = InstanceId("default__migrate-0".into());
-    grill.set_state(&id, ContainerState::Stopped);
-    grill.set_exit_code(&id, Some(0));
-    agent.observe_job_exit(&id, Some(0)).await;
-    assert!(
-        match &receipt {
-            Err(_) => true,
-            Ok(receipt) => agent.cluster_jobs_settlement(receipt) != ClusterJobSettlement::Terminal,
-        },
-        "ordinary exit must not silently erase registered scheduled ownership"
-    );
-}
-
-#[tokio::test]
-async fn scheduled_receipt_does_not_prove_retirement_when_schedule_publication_is_uncertain() {
-    use super::cluster_jobs::ClusterJobSettlement;
-    let (mut agent, _, _, _) = test_agent_with_grill();
-    let config = Config::parse("[job.tick]\nimage='test:v1'\nschedule='* * * * *'\n").unwrap();
-    agent.register_scheduled_jobs(&config).await.unwrap();
-    expect_complete(&drain_deploy(&mut agent, config.clone()).await);
-    let receipt = super::cluster_jobs::ClusterJobReceipt {
-        executions: BTreeMap::new(),
-    };
-    agent.scheduled_jobs_store_uncertain = true;
-    assert!(matches!(
-        agent.cluster_jobs_settlement(&receipt),
-        ClusterJobSettlement::Unknown(_)
-    ));
-}
-
-#[tokio::test]
-async fn prerequisite_cannot_launch_under_a_still_registered_cron_identity() {
-    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
-    let cron = Config::parse("[job.migrate]\nimage='test:v1'\nschedule='0 0 30 2 *'\n").unwrap();
-    agent.register_scheduled_jobs(&cron).await.unwrap();
-    let running = tokio::spawn(async move {
-        agent.run().await;
-        agent
-    });
-    let (response, answer) = oneshot::channel();
-    tx.send(AgentCommand::PreparePrerequisites {
-        config: run_before_config(),
-        response,
-    })
-    .await
-    .unwrap();
-    let prepared = tokio::time::timeout(std::time::Duration::from_secs(5), answer)
-        .await
-        .expect("actual prerequisite preparation did not settle")
-        .unwrap();
-    if let Ok((_, operation)) = &prepared {
-        operation
-            .finish(
-                crate::bun::deploy_operations::DeployOperationOutcome::Failed,
-                "test-owned unlaunched preparation completed",
-            )
-            .await;
-    }
-    shutdown.cancel();
-    let agent = running.await.unwrap();
-    assert!(
-        prepared.is_err(),
-        "a migration was prepared under a registered recurring identity"
-    );
-    assert!(
-        !grill
-            .calls()
-            .iter()
-            .any(|(op, _)| op == "create" || op == "start")
-    );
-    assert!(
-        agent
-            .scheduled_jobs
-            .contains_key(&("migrate".into(), "default".into()))
-    );
-}
-
-async fn assert_preparation_refuses_predictable_job_policy(config: Config, process: bool) {
-    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
-    if process {
-        grill.set_runtime_kind(crate::grill::records::RuntimeKind::Process);
-    }
-    let running = tokio::spawn(async move {
-        agent.run().await;
-        agent
-    });
-    let (response, answer) = oneshot::channel();
-    tx.send(AgentCommand::PreparePrerequisites { config, response })
-        .await
-        .unwrap();
-    let prepared = tokio::time::timeout(std::time::Duration::from_secs(5), answer)
-        .await
-        .expect("job policy preparation did not settle")
-        .unwrap();
-    if let Ok((_, operation)) = &prepared {
-        operation
-            .finish(
-                crate::bun::deploy_operations::DeployOperationOutcome::Failed,
-                "test-owned unlaunched preparation completed",
-            )
-            .await;
-    }
-    shutdown.cancel();
-    let agent = running.await.unwrap();
-    assert!(
-        prepared.is_err(),
-        "predictable job policy refusal admitted a prepared cluster operation"
-    );
-    assert!(
-        agent.recorded_jobs.is_empty(),
-        "preparation persisted execution intent"
-    );
-    assert!(
-        !grill
-            .calls()
-            .iter()
-            .any(|(op, _)| op == "create" || op == "start")
-    );
-}
-
-#[tokio::test]
-async fn prerequisite_preparation_refuses_denied_host_job_before_claiming_migration() {
-    let mut config = run_before_config();
-    let mut denied = Config::parse("[job.denied]\nexec='/bin/sh'\n").unwrap();
-    config.job.append(&mut denied.job);
-    assert_preparation_refuses_predictable_job_policy(config, false).await;
-}
-
-#[tokio::test]
-async fn prerequisite_preparation_refuses_unenforceable_ordinary_tail_limits() {
-    let mut config = run_before_config();
-    let mut denied = Config::parse("[job.denied]\nimage='test:v1'\ncpu='100m'\n").unwrap();
-    config.job.append(&mut denied.job);
-    assert_preparation_refuses_predictable_job_policy(config, true).await;
-}
-
-#[tokio::test]
-async fn prerequisite_preparation_refuses_unenforceable_migration_limits() {
-    let mut config = run_before_config();
-    let limited = Config::parse("[job.migrate]\nimage='myapp:v1'\ncommand=['echo', 'migrating']\nrun_before=['app.web']\ncpu='100m'\n").unwrap();
-    config.job = limited.job;
-    assert_preparation_refuses_predictable_job_policy(config, true).await;
 }

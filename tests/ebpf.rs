@@ -33,56 +33,98 @@ fn ebpf_tests_enabled() -> bool {
 }
 
 /// Load and attach the Onion programs, refusing to run without the eBPF gate.
+///
+/// This loads the object embedded in the library under test, as production
+/// does. Searching the target directory instead could find another
+/// worktree's object when several share one `CARGO_TARGET_DIR` (#878).
 fn load_ebpf() -> OnionEbpf {
     assert!(
         ebpf_tests_enabled(),
         "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
     );
-    OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).expect("failed to load eBPF program")
+    OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).expect("failed to load eBPF program")
 }
 
-/// Find the directory containing compiled .bpf.o files.
+/// Bind a TCP listener on `ip` whose port is not `avoid`.
 ///
-/// build.rs puts them in OUT_DIR, which is under the target directory.
-/// We search for them relative to the current cargo target dir.
-fn find_bpf_obj_dir() -> PathBuf {
-    // The OUT_DIR from build.rs is something like:
-    // target/debug/build/reliaburger-HASH/out/
-    // We search for onion_connect.bpf.o under the target dir.
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("target"));
-
-    // Walk the build directory to find the .bpf.o file
-    for entry in walkdir(&target_dir) {
-        if entry.ends_with("onion_connect.bpf.o") {
-            return entry.parent().unwrap().to_path_buf();
-        }
+/// Port 0 lets the kernel choose, and it chooses per address: a listener on
+/// 127.0.0.6 (or `[::1]`) can be handed the very port another listener holds
+/// on 127.0.0.5 (or 127.0.0.1), roughly once in every 14,000 binds. A policy
+/// test whose "unlisted" destination differs only by port must rule that out,
+/// or the allowed port's rule lets the connection through (#913).
+fn listener_avoiding_port(ip: std::net::IpAddr, avoid: u16) -> (std::net::TcpListener, u16) {
+    let bind = || {
+        let listener = std::net::TcpListener::bind(SocketAddr::new(ip, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    };
+    let first = bind();
+    if first.1 != avoid {
+        return first;
     }
-
-    panic!(
-        "onion_connect.bpf.o not found under {}. Did you build with --features ebpf?",
-        target_dir.display()
-    );
-}
-
-/// Recursively walk a directory and return all file paths.
-fn walkdir(dir: &std::path::Path) -> Vec<PathBuf> {
-    let mut results = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                results.extend(walkdir(&path));
-            } else {
-                results.push(path);
-            }
-        }
-    }
-    results
+    // `first` still holds `avoid` on this address, so the kernel can't hand
+    // it out again.
+    bind()
 }
 
 const CGROUP_PATH: &str = "/sys/fs/cgroup";
+
+/// The object this build's `build.rs` wrote, read from this build's own
+/// `OUT_DIR`. Cargo gives the library and its integration tests the same
+/// build-script output directory, so no other tree's object can answer.
+const THIS_BUILDS_OBJECT: &str = concat!(env!("OUT_DIR"), "/onion_connect.bpf.o");
+
+/// Map names this tree's `ebpf/onion_connect.bpf.c` declares, read from
+/// `} name SEC(".maps");` lines.
+fn maps_declared_by_this_trees_source() -> Vec<String> {
+    let source_path = concat!(env!("CARGO_MANIFEST_DIR"), "/ebpf/onion_connect.bpf.c");
+    let source = std::fs::read_to_string(source_path).unwrap();
+    source
+        .lines()
+        .filter_map(|line| line.trim().strip_suffix("SEC(\".maps\");"))
+        .filter_map(|line| line.trim().strip_prefix('}'))
+        .map(|name| name.trim().to_string())
+        .collect()
+}
+
+/// Does the ELF object name this symbol? Symbol names sit NUL-terminated
+/// in the object's string tables.
+fn object_names_symbol(object: &[u8], name: &str) -> bool {
+    let needle = format!("\0{name}\0");
+    object
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// Tier 0: Which object the tests load (no kernel needed)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tests_load_the_object_this_build_compiled() {
+    let loaded = OnionEbpf::embedded_object();
+    let compiled = std::fs::read(THIS_BUILDS_OBJECT).unwrap();
+    assert!(
+        loaded == compiled.as_slice(),
+        "the object the tests load differs from {THIS_BUILDS_OBJECT}"
+    );
+
+    let declared = maps_declared_by_this_trees_source();
+    assert!(
+        declared.len() >= reliaburger::onion::ebpf::loader::REQUIRED_MAPS.len(),
+        "found only {declared:?} in ebpf/onion_connect.bpf.c"
+    );
+    for name in declared
+        .iter()
+        .map(String::as_str)
+        .chain(reliaburger::onion::ebpf::loader::REQUIRED_PROGRAMS)
+    {
+        assert!(
+            object_names_symbol(loaded, name),
+            "the loaded object has no {name}, so it was not built from this tree"
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tier 0: what the compiler produced
@@ -146,6 +188,18 @@ async fn ebpf_load_and_attach() {
     assert!(ebpf.sendmsg4_attached());
     assert!(ebpf.sendmsg6_attached());
     ebpf.detach().unwrap();
+
+    // The `[ebpf] program_dir` override loads from a directory. Give it a
+    // private copy of this build's object, never a search of the target tree.
+    let program_dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        THIS_BUILDS_OBJECT,
+        program_dir.path().join("onion_connect.bpf.o"),
+    )
+    .unwrap();
+    let mut overridden = OnionEbpf::load(program_dir.path(), CGROUP_PATH.as_ref()).unwrap();
+    assert!(overridden.is_attached());
+    overridden.detach().unwrap();
 }
 
 #[tokio::test]
@@ -541,8 +595,7 @@ async fn agent_deploy_populates_backend_map() {
     let config = Config::parse(&format!(
         r#"
         [app.{name}]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         port = 8080
     "#
     ))
@@ -626,8 +679,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
     let config = Config::parse(&format!(
         r#"
         [app.{name}]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         port = {service_port}
     "#
     ))
@@ -950,9 +1002,10 @@ async fn partition_answers_only_once_every_source_instance_is_covered() {
 // ---------------------------------------------------------------------------
 
 /// With egress enforcement on for a cgroup, a listed destination is
-/// reachable and every other destination is denied (EPERM). We enforce
-/// on the *test's own* cgroup — the process doing the connects — so the
-/// eBPF `bpf_get_current_cgroup_id()` matches what we program.
+/// reachable and every other destination is denied (EPERM). We enforce on a
+/// fresh cgroup that only this test's probes join, as the product does per
+/// workload. The runner's cgroup holds every other test process, so
+/// enforcing there would deny their connects too (#919).
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn egress_denied_by_default_allowed_when_listed() {
@@ -963,13 +1016,13 @@ async fn egress_denied_by_default_allowed_when_listed() {
     // Two real listeners: one we'll allow, one we won't.
     let allowed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let allowed_port = allowed.local_addr().unwrap().port();
-    let denied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let denied_port = denied.local_addr().unwrap().port();
+    let unlisted = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let denied_port = unlisted.local_addr().unwrap().port();
 
-    let cgroup_id =
-        egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
+    let probe = ProbeCgroup::new("egress-default-deny");
+    let cgroup_id = probe.id;
 
-    // Allow only 127.0.0.1:allowed_port for our cgroup, then enforce.
+    // Allow only 127.0.0.1:allowed_port for the probe's cgroup, then enforce.
     let key = EgressKey {
         src_cgroup_id: cgroup_id,
         dst_ip: u32::from(Ipv4Addr::LOCALHOST).to_be(),
@@ -985,11 +1038,12 @@ async fn egress_denied_by_default_allowed_when_listed() {
     )
     .expect("write egress entry");
     egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable egress enforcement");
+    assert_runner_cgroup_unrestricted(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), denied_port));
 
     // The allowed destination connects.
-    let ok = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv4Addr::LOCALHOST.into(), allowed_port),
-        Duration::from_secs(2),
+    let ok = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), allowed_port),
     );
     assert!(
         ok.is_ok(),
@@ -997,15 +1051,12 @@ async fn egress_denied_by_default_allowed_when_listed() {
     );
 
     // The unlisted destination is denied with EPERM (BPF returns 0).
-    let blocked = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv4Addr::LOCALHOST.into(), denied_port),
-        Duration::from_secs(2),
+    let blocked = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), denied_port),
     );
     assert!(
-        matches!(
-            blocked.as_ref().map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        denied(&blocked),
         "unlisted egress destination should be denied with EPERM, got {blocked:?}"
     );
 
@@ -1029,24 +1080,24 @@ async fn egress_denied_by_default_allowed_when_listed() {
         },
     )
     .unwrap();
-    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    assert_eq!(
-        sender
-            .send_to(&[1], (Ipv4Addr::LOCALHOST, udp_allowed_port))
-            .unwrap(),
-        1
+    let udp_ok = probe.attempt(
+        Transport::Udp,
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), udp_allowed_port),
     );
-    let udp_blocked = sender.send_to(&[1], (Ipv4Addr::LOCALHOST, udp_denied_port));
     assert!(
-        matches!(
-            udp_blocked.as_ref().map_err(|error| error.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        udp_ok.is_ok(),
+        "listed UDP destination should send: {udp_ok:?}"
+    );
+    let udp_blocked = probe.attempt(
+        Transport::Udp,
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), udp_denied_port),
+    );
+    assert!(
+        denied(&udp_blocked),
         "unlisted UDP destination should be denied with EPERM, got {udp_blocked:?}"
     );
 
-    // Lift enforcement so the harness's own connections are unaffected.
-    egress::clear_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("clear enforcement");
+    egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
     ebpf.detach().unwrap();
 }
 
@@ -1169,11 +1220,12 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
         .update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
         .expect("write backend entry");
 
-    // Put the test process's cgroup in a *different* namespace than the
-    // destination service. Any id that differs from the service's forces the
-    // hook's cross-namespace branch.
-    let src_cgroup = reliaburger::sesame::egress::cgroup_id_of_pid(std::process::id())
-        .expect("failed to resolve own cgroup id");
+    // Put a probe cgroup in a *different* namespace than the destination
+    // service. Any id that differs from the service's forces the hook's
+    // cross-namespace branch. The probe, not the test process, is bound, so
+    // concurrent tests sharing the runner's cgroup are untouched.
+    let probe = ProbeCgroup::new("isolation-default");
+    let src_cgroup = probe.id;
     let src_ns = entry.namespace_id.wrapping_add(1);
     firewall::write_cgroup_namespace_entry(&mut ebpf.bpf, src_cgroup, src_ns)
         .expect("write cgroup-namespace entry");
@@ -1181,12 +1233,9 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
     let vip_dst = SocketAddr::new(entry.vip.0.into(), entry.port);
 
     // Cross-namespace, no allow entry → denied with EPERM.
-    let blocked = TcpStream::connect_timeout(&vip_dst, Duration::from_secs(2));
+    let blocked = probe.connect(vip_dst);
     assert!(
-        matches!(
-            blocked.as_ref().map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        denied(&blocked),
         "cross-namespace connect should be denied with EPERM, got {blocked:?}"
     );
 
@@ -1199,15 +1248,14 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
     }]) {
         firewall::write_firewall_entry(&mut ebpf.bpf, key, value).expect("write firewall entry");
     }
-    let allowed = TcpStream::connect_timeout(&vip_dst, Duration::from_secs(2));
+    let allowed = probe.connect(vip_dst);
     assert!(
         allowed.is_ok(),
         "allowed cross-namespace connect should reach the backend: {allowed:?}"
     );
 
-    // Forget the namespace mapping so the harness's own connections aren't
-    // caught by a lingering isolation identity on a reused cgroup.
-    firewall::delete_cgroup_namespace_entry(&mut ebpf.bpf, src_cgroup).ok();
+    // Forget the probe's identity so a reused cgroup id inherits nothing.
+    firewall::delete_cgroup_firewall_state(&mut ebpf.bpf, src_cgroup).ok();
     ebpf.detach().unwrap();
 }
 
@@ -1215,7 +1263,7 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn namespace_grant_cannot_authorise_a_same_named_destination() {
-    use reliaburger::sesame::{egress, firewall};
+    use reliaburger::sesame::firewall;
     use std::collections::HashMap;
     assert!(ebpf_tests_enabled());
     let mut ebpf = OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).unwrap();
@@ -1247,7 +1295,8 @@ async fn namespace_grant_cannot_authorise_a_same_named_destination() {
             .update_backends_bpf(&mut ebpf, entry.vip, entry.port, entry)
             .unwrap();
     }
-    let cgroup = egress::cgroup_id_of_pid(std::process::id()).unwrap();
+    let probe = ProbeCgroup::new("grant-identity");
+    let cgroup = probe.id;
     firewall::write_cgroup_namespace_entry(
         &mut ebpf.bpf,
         cgroup,
@@ -1271,14 +1320,8 @@ async fn namespace_grant_cannot_authorise_a_same_named_destination() {
     let private = services
         .resolve(&ServiceId::new("private", "database"))
         .unwrap();
-    let allowed = TcpStream::connect_timeout(
-        &SocketAddr::new(permitted.vip.0.into(), port),
-        Duration::from_secs(2),
-    );
-    let denied = TcpStream::connect_timeout(
-        &SocketAddr::new(private.vip.0.into(), port),
-        Duration::from_secs(2),
-    );
+    let allowed = probe.connect(SocketAddr::new(permitted.vip.0.into(), port));
+    let refused = probe.connect(SocketAddr::new(private.vip.0.into(), port));
     firewall::delete_cgroup_firewall_state(&mut ebpf.bpf, cgroup).unwrap();
     ebpf.detach().unwrap();
     assert!(
@@ -1286,9 +1329,821 @@ async fn namespace_grant_cannot_authorise_a_same_named_destination() {
         "explicitly allowed destination failed: {allowed:?}"
     );
     assert!(
-        matches!(denied, Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied),
-        "grant to permitted/database also authorised private/database"
+        denied(&refused),
+        "grant to permitted/database also authorised private/database: {refused:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2d: Isolation on real addresses (#677)
+// ---------------------------------------------------------------------------
+
+/// Bind a TCP listener on a loopback address of its own, so the test's
+/// `destination_map` entries can't touch any other test's traffic.
+fn private_listener(last_octet: u8) -> (std::net::TcpListener, SocketAddr) {
+    let listener = std::net::TcpListener::bind(SocketAddr::new(
+        Ipv4Addr::new(127, 0, 0, last_octet).into(),
+        0,
+    ))
+    .unwrap();
+    let address = listener.local_addr().unwrap();
+    (listener, address)
+}
+
+/// A cgroup of the test's own that its probes connect from. Concurrent tests
+/// share the runner's cgroup, so binding that one to a namespace would hold
+/// their traffic to it too.
+struct ProbeCgroup {
+    path: PathBuf,
+    id: u64,
+}
+
+impl ProbeCgroup {
+    fn new(label: &str) -> Self {
+        let path = PathBuf::from(format!(
+            "/sys/fs/cgroup/rb-ebpf-probe-{label}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let id = reliaburger::sesame::egress::cgroup_id_of_path(&path).unwrap();
+        Self { path, id }
+    }
+
+    /// Probe from an existing cgroup, such as a delegated task's.
+    fn at(path: PathBuf) -> Self {
+        let id = reliaburger::sesame::egress::cgroup_id_of_path(&path).unwrap();
+        Self { path, id }
+    }
+
+    /// Open `kind` (`tcp` or `udp`) to `address` from a fresh process in
+    /// this cgroup. `Err` carries what the shell said when it was refused.
+    fn open(&self, kind: &str, address: SocketAddr) -> Result<(), String> {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "echo $$ > {}/cgroup.procs && exec bash -c 'exec 3<>/dev/{kind}/{}/{}'",
+                self.path.display(),
+                address.ip(),
+                address.port()
+            ))
+            .output()
+            .unwrap();
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+        }
+    }
+
+    fn connect(&self, address: SocketAddr) -> Result<(), String> {
+        self.open("tcp", address)
+    }
+
+    /// Send over `transport` to `address` from a child of this test binary
+    /// that joins this cgroup before it opens a socket, as a workload sits in
+    /// a cgroup of its own. `Err` carries the error kind and message.
+    fn attempt(&self, transport: Transport, address: SocketAddr) -> Result<(), String> {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "egress_probe_process_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(EGRESS_PROBE_CGROUP, &self.path)
+            .env(EGRESS_PROBE_TRANSPORT, transport.as_str())
+            .env(EGRESS_PROBE_ADDRESS, address.to_string())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let Some(verdict) = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(EGRESS_PROBE_VERDICT))
+        else {
+            panic!("the egress probe reported no verdict: {output:?}");
+        };
+        match verdict {
+            "ok" => Ok(()),
+            refusal => Err(refusal.to_string()),
+        }
+    }
+}
+
+/// What an egress probe sends: a TCP connect, or an unconnected UDP datagram,
+/// which the `sendmsg` hooks police rather than the `connect` ones.
+#[derive(Debug, Clone, Copy)]
+enum Transport {
+    Tcp,
+    Udp,
+}
+
+impl Transport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Transport::Tcp => "tcp",
+            Transport::Udp => "udp",
+        }
+    }
+}
+
+const EGRESS_PROBE_CGROUP: &str = "RELIABURGER_EGRESS_PROBE_CGROUP";
+const EGRESS_PROBE_TRANSPORT: &str = "RELIABURGER_EGRESS_PROBE_TRANSPORT";
+const EGRESS_PROBE_ADDRESS: &str = "RELIABURGER_EGRESS_PROBE_ADDRESS";
+const EGRESS_PROBE_VERDICT: &str = "egress-probe-verdict: ";
+
+/// The child [`ProbeCgroup::attempt`] starts. It moves itself into the
+/// probe's cgroup, sends once and prints what the kernel said.
+#[test]
+#[ignore = "subprocess fixture for egress probes from a cgroup of their own"]
+fn egress_probe_process_fixture() {
+    let Some(cgroup) = std::env::var_os(EGRESS_PROBE_CGROUP) else {
+        return;
+    };
+    std::fs::write(
+        PathBuf::from(cgroup).join("cgroup.procs"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    let address: SocketAddr = std::env::var(EGRESS_PROBE_ADDRESS)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let result = match std::env::var(EGRESS_PROBE_TRANSPORT).unwrap().as_str() {
+        "tcp" => TcpStream::connect_timeout(&address, Duration::from_secs(2)).map(drop),
+        "udp" => {
+            let local = if address.is_ipv4() {
+                "127.0.0.1:0"
+            } else {
+                "[::1]:0"
+            };
+            std::net::UdpSocket::bind(local)
+                .and_then(|socket| socket.send_to(&[1], address))
+                .map(drop)
+        }
+        other => panic!("unknown egress probe transport {other:?}"),
+    };
+    let verdict = match result {
+        Ok(()) => "ok".to_string(),
+        Err(error) => format!("{:?}: {error}", error.kind()),
+    };
+    // A leading newline keeps the verdict off libtest's `test ... ` line.
+    println!("\n{EGRESS_PROBE_VERDICT}{verdict}");
+}
+
+impl Drop for ProbeCgroup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+/// Connect to `address` from the runner's cgroup, where this process and every
+/// other test process started. An egress test's deny policy must never reach
+/// it, or a test that happens to overlap one fails with a spurious EPERM
+/// (#919).
+fn assert_runner_cgroup_unrestricted(address: SocketAddr) {
+    let result = TcpStream::connect_timeout(&address, Duration::from_secs(2));
+    assert!(
+        result.is_ok(),
+        "a process in the runner's cgroup was held to this test's egress policy: {result:?}"
+    );
+}
+
+/// A probe the connect hooks refused: `EPERM`, not a missing listener.
+fn denied(result: &Result<(), String>) -> bool {
+    result
+        .as_ref()
+        .is_err_and(|error| error.contains("not permitted"))
+}
+
+/// Put `probe` in `namespace` and write `entries` the way the agent's
+/// reconcile does. Returns the written keys.
+fn isolate_probe(
+    ebpf: &mut OnionEbpf,
+    probe: &ProbeCgroup,
+    namespace: &str,
+    entries: &std::collections::BTreeMap<
+        reliaburger::onion::types::DestinationKey,
+        reliaburger::onion::types::DestinationValue,
+    >,
+) -> std::collections::HashSet<reliaburger::onion::types::DestinationKey> {
+    use reliaburger::sesame::firewall;
+    firewall::write_cgroup_namespace_entry(
+        &mut ebpf.bpf,
+        probe.id,
+        reliaburger::onion::vip::name_to_id(namespace),
+    )
+    .unwrap();
+    let mut keys = std::collections::HashSet::new();
+    firewall::reconcile_destination_map(&mut ebpf.bpf, entries, &mut keys).unwrap();
+    keys
+}
+
+/// Undo [`isolate_probe`], so a reused cgroup id inherits nothing.
+fn release_probe(
+    ebpf: &mut OnionEbpf,
+    probe: &ProbeCgroup,
+    mut keys: std::collections::HashSet<reliaburger::onion::types::DestinationKey>,
+) {
+    use reliaburger::sesame::firewall;
+    firewall::reconcile_destination_map(&mut ebpf.bpf, &Default::default(), &mut keys).unwrap();
+    firewall::delete_cgroup_firewall_state(&mut ebpf.bpf, probe.id).unwrap();
+}
+
+/// D3-B: a backend's real container address and port belongs to its
+/// namespace exactly as its VIP does. Before #677, dialling the address
+/// `relish resolve` prints walked straight past the namespace check; so did
+/// any other port of a container address.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn cross_namespace_connect_to_container_ip_is_denied() {
+    use reliaburger::sesame::firewall::{LocalWorkload, destination_entries, workload_app_id};
+    let mut ebpf = load_ebpf();
+    let probe = ProbeCgroup::new("container-ip");
+    let (_backend, backend) = private_listener(71);
+    let (_other_port, other_port) = private_listener(71);
+    let SocketAddr::V4(backend_v4) = backend else {
+        unreachable!()
+    };
+    let mut services = ServiceMap::new();
+    let id = ServiceId::new("backend-ns", "db");
+    services.register(&id, backend.port(), None).unwrap();
+    services
+        .add_backend(
+            &id,
+            BackendInstance {
+                instance_id: "backend-ns__db-0".into(),
+                node_ip: *backend_v4.ip(),
+                host_port: backend.port(),
+                healthy: true,
+                local: true,
+            },
+        )
+        .unwrap();
+    let entry = services.resolve(&id).unwrap().clone();
+    let entries = destination_entries(
+        std::slice::from_ref(&entry),
+        &Default::default(),
+        &[LocalWorkload {
+            address: *backend_v4.ip(),
+            namespace: "backend-ns".into(),
+            name: "db".into(),
+            app_id: entry.app_id,
+        }],
+    );
+
+    let keys = isolate_probe(&mut ebpf, &probe, "frontend-ns", &entries);
+    let to_backend = probe.connect(backend);
+    let to_other_port = probe.connect(other_port);
+    // The same namespace reaches both.
+    reliaburger::sesame::firewall::write_cgroup_namespace_entry(
+        &mut ebpf.bpf,
+        probe.id,
+        reliaburger::onion::vip::name_to_id("backend-ns"),
+    )
+    .unwrap();
+    let same_namespace = probe.connect(backend);
+    release_probe(&mut ebpf, &probe, keys);
+    ebpf.detach().unwrap();
+
+    assert!(denied(&to_backend), "real backend address: {to_backend:?}");
+    assert!(
+        denied(&to_other_port),
+        "another port of the container address: {to_other_port:?}"
+    );
+    assert!(same_namespace.is_ok(), "same namespace: {same_namespace:?}");
+    assert_ne!(workload_app_id("backend-ns", "db"), entry.app_id);
+}
+
+/// D3-B: a published host port on any node is the DNAT target another
+/// node's workload dials, so the cluster catalogue's node address and host
+/// port belong to the service's namespace too. One kernel can't host two
+/// Buns, so this test is the cross-node case: the catalogue names a remote
+/// node at a loopback address of its own.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn cross_namespace_connect_to_node_host_port_is_denied() {
+    use reliaburger::onion::catalog::{CatalogBackend, CatalogService, EndpointCatalog};
+    let mut ebpf = load_ebpf();
+    let probe = ProbeCgroup::new("host-port");
+    let (_published, published) = private_listener(72);
+    let SocketAddr::V4(published_v4) = published else {
+        unreachable!()
+    };
+    let mut catalog = EndpointCatalog::new();
+    catalog.services.insert(
+        ServiceId::new("payments", "ledger").qualified(),
+        CatalogService {
+            vip: VirtualIP::from_service_id(&ServiceId::new("payments", "ledger")),
+            port: 8080,
+            backends: vec![CatalogBackend {
+                execution: None,
+                node_id: "node-b".into(),
+                node_ip: *published_v4.ip(),
+                host_port: published.port(),
+                healthy: true,
+            }],
+        },
+    );
+    let entries = reliaburger::sesame::firewall::destination_entries(&[], &catalog, &[]);
+
+    let keys = isolate_probe(&mut ebpf, &probe, "tenant-b", &entries);
+    let cross = probe.connect(published);
+    reliaburger::sesame::firewall::write_cgroup_namespace_entry(
+        &mut ebpf.bpf,
+        probe.id,
+        reliaburger::onion::vip::name_to_id("payments"),
+    )
+    .unwrap();
+    let same = probe.connect(published);
+    release_probe(&mut ebpf, &probe, keys);
+    ebpf.detach().unwrap();
+
+    assert!(
+        denied(&cross),
+        "published host port across namespaces: {cross:?}"
+    );
+    assert!(same.is_ok(), "published host port in-namespace: {same:?}");
+}
+
+/// D4: `allow_from` opens a cross-namespace path, and the grant for a
+/// service covers its real address as well as its VIP.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn allow_from_opens_the_real_address_path_too() {
+    use reliaburger::sesame::firewall;
+    use std::collections::HashMap;
+    let mut ebpf = load_ebpf();
+    let probe = ProbeCgroup::new("allow-from");
+    let (_granted, granted) = private_listener(73);
+    let (_private, private) = private_listener(74);
+    let mut services = ServiceMap::new();
+    for (namespace, address, allow) in [
+        ("permitted", granted, vec!["frontend/client".to_string()]),
+        ("private", private, Vec::new()),
+    ] {
+        let SocketAddr::V4(v4) = address else {
+            unreachable!()
+        };
+        let id = ServiceId::new(namespace, "database");
+        services.register(&id, address.port(), Some(allow)).unwrap();
+        services
+            .add_backend(
+                &id,
+                BackendInstance {
+                    instance_id: format!("{namespace}__database-0"),
+                    node_ip: *v4.ip(),
+                    host_port: address.port(),
+                    healthy: true,
+                    local: true,
+                },
+            )
+            .unwrap();
+        let entry = services.resolve(&id).unwrap();
+        BpfServiceMap::new()
+            .update_backends_bpf(&mut ebpf, entry.vip, entry.port, entry)
+            .unwrap();
+    }
+    let entries: Vec<_> = services.resolve_all().into_iter().cloned().collect();
+    let destinations = firewall::destination_entries(&entries, &Default::default(), &[]);
+    let keys = isolate_probe(&mut ebpf, &probe, "frontend", &destinations);
+    let sources = HashMap::from([(("frontend".into(), "client".into()), vec![probe.id])]);
+    for (key, value) in
+        firewall::rules_to_bpf_entries(&firewall::resolve_firewall_rules(&entries, &sources))
+    {
+        firewall::write_firewall_entry(&mut ebpf.bpf, key, value).unwrap();
+    }
+    let permitted = services
+        .resolve(&ServiceId::new("permitted", "database"))
+        .unwrap()
+        .clone();
+    let real = probe.connect(granted);
+    let vip = probe.connect(SocketAddr::new(permitted.vip.0.into(), permitted.port));
+    let refused = probe.connect(private);
+    release_probe(&mut ebpf, &probe, keys);
+    for entry in &entries {
+        BpfServiceMap::new()
+            .remove_backends_bpf(&mut ebpf, entry.vip, entry.port)
+            .unwrap();
+    }
+    ebpf.detach().unwrap();
+
+    assert!(real.is_ok(), "granted real address: {real:?}");
+    assert!(vip.is_ok(), "granted VIP: {vip:?}");
+    assert!(denied(&refused), "ungranted real address: {refused:?}");
+}
+
+/// An `exec`/`script` workload starts inside its own workload cgroup, which
+/// the agent binds to the workload's namespace before start, so a host
+/// command is held to namespace isolation like a container.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn exec_workload_is_held_to_its_namespace() {
+    use reliaburger::bun::agent::AgentCommand;
+    use reliaburger::config::Config;
+    use reliaburger::grill::port::PortAllocator;
+    use reliaburger::grill::process::ProcessGrill;
+    use reliaburger::onion::types::{DestinationKey, DestinationValue};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc};
+
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
+    let (_foreign, foreign) = private_listener(75);
+    let (_own, own) = private_listener(76);
+    let SocketAddr::V4(foreign_v4) = foreign else {
+        unreachable!()
+    };
+    let SocketAddr::V4(own_v4) = own else {
+        unreachable!()
+    };
+    let foreign_key = DestinationKey::new(*foreign_v4.ip(), foreign.port());
+    let own_key = DestinationKey::new(*own_v4.ip(), own.port());
+    {
+        let mut e = ebpf.lock().await;
+        for (key, namespace) in [(foreign_key, "vault"), (own_key, "tenant")] {
+            reliaburger::sesame::firewall::write_destination_entry(
+                &mut e.bpf,
+                key,
+                DestinationValue {
+                    app_id: 7,
+                    namespace_id: reliaburger::onion::vip::name_to_id(namespace),
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let results = root.path().join("results");
+    let volumes = TestVolumes::new();
+    let name = root_app_name("hostcmd", volumes.path());
+    let _cgroups = AppCgroups::new("tenant", &name);
+    let grill =
+        ProcessGrill::with_owner(root.path().join("owners"), env!("CARGO_BIN_EXE_bun").into());
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = test_agent(
+        grill,
+        PortAllocator::new(42600, 42700),
+        cmd_rx,
+        shutdown.clone(),
+        volumes.path(),
+    );
+    agent.set_process_config(
+        reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries: vec!["/bin/bash".into()],
+            mount_isolation: false,
+            ..Default::default()
+        },
+    );
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let agent_task = tokio::spawn(async move { agent.run().await });
+    let _tasks = TestTasks::new(shutdown.clone(), vec![agent_task]);
+
+    let probe = |address: SocketAddr, label: &str| {
+        format!(
+            "(exec 3<>/dev/tcp/{}/{}) 2>/dev/null && echo {label}=reached >> {path} || echo {label}=refused >> {path}",
+            address.ip(),
+            address.port(),
+            path = results.display()
+        )
+    };
+    // A host app the agent deploys itself (jobs run as task arrays). It
+    // probes, then idles until the test stops it.
+    let script = format!(
+        "{}; {}; exec sleep 300",
+        probe(foreign, "foreign"),
+        probe(own, "own")
+    );
+    let config = Config::parse(&format!(
+        r#"
+        [app.{name}]
+        namespace = "tenant"
+        exec = "/bin/bash"
+        command = ["-c", {script:?}]
+    "#
+    ))
+    .unwrap();
+    let (events, mut event_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy { config, events })
+        .await
+        .unwrap();
+    while let Some(event) = event_rx.recv().await {
+        assert!(
+            !matches!(event, reliaburger::bun::agent::ApplyEvent::Error { .. }),
+            "host workload deploy failed: {event:?}"
+        );
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let outcome = loop {
+        let text = std::fs::read_to_string(&results).unwrap_or_default();
+        if text.lines().count() >= 2 || tokio::time::Instant::now() > deadline {
+            break text;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    // Stop the app before the agent, so no owned process outlives the test.
+    let (reply, stopped) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(AgentCommand::Stop {
+            app_name: name.clone(),
+            namespace: "tenant".into(),
+            response: reply,
+        })
+        .await
+        .unwrap();
+    stopped.await.unwrap().unwrap();
+    shutdown.cancel();
+    {
+        let mut e = ebpf.lock().await;
+        for key in [foreign_key, own_key] {
+            reliaburger::sesame::firewall::delete_destination_entry(&mut e.bpf, key).unwrap();
+        }
+    }
+    assert!(
+        outcome.contains("foreign=refused"),
+        "a host command reached another namespace: {outcome:?}"
+    );
+    assert!(
+        outcome.contains("own=reached"),
+        "a host command lost its own namespace: {outcome:?}"
+    );
+}
+
+/// Whitepaper §10: an allowlist implicitly permits DNS. Every allowlist the
+/// agent programs carries the node's resolver on port 53, and the kernel
+/// then lets UDP and TCP through to it, and nothing else unlisted.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn egress_allowlist_still_resolves_dns() {
+    use reliaburger::bun::agent::AgentCommand;
+    use reliaburger::config::Config;
+    use reliaburger::grill::mock::MockGrill;
+    use reliaburger::grill::port::PortAllocator;
+    use reliaburger::sesame::egress::{
+        self, exact_v4_key, implicit_destinations, merge_cidr_ports,
+    };
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc};
+
+    let resolver = Ipv4Addr::new(127, 0, 0, 77);
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
+
+    // The agent programs the resolver into an app's allowlist.
+    let grill = MockGrill::new();
+    grill.set_honours_cgroup_path(true);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let volumes = TestVolumes::new();
+    let name = root_app_name("resolving", volumes.path());
+    let _cgroups = AppCgroups::new("default", &name);
+    let mut agent = test_agent(
+        grill,
+        PortAllocator::new(42700, 42800),
+        cmd_rx,
+        shutdown.clone(),
+        volumes.path(),
+    );
+    agent.set_workload_dns(resolver);
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    tokio::spawn(async move { agent.run().await });
+    let config = Config::parse(&format!(
+        r#"
+        [app.{name}]
+        image = "mock:image"
+        command = ["sleep", "600"]
+
+        [app.{name}.egress]
+        allow = ["203.0.113.9:443"]
+    "#
+    ))
+    .unwrap();
+    let (events, mut event_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy { config, events })
+        .await
+        .unwrap();
+    while event_rx.recv().await.is_some() {}
+    let app_cgroup = egress::cgroup_id_of_path(&reliaburger::grill::cgroup::cgroup_path(
+        "default", &name, 0,
+    ))
+    .unwrap();
+    let programmed = {
+        let mut e = ebpf.lock().await;
+        let allowed = egress::egress_allowed(&mut e.bpf, exact_v4_key(app_cgroup, resolver, 53));
+        egress::delete_cgroup_egress_state(&mut e.bpf, app_cgroup).unwrap();
+        allowed
+    };
+    shutdown.cancel();
+    assert!(
+        programmed.unwrap(),
+        "the app's allowlist does not permit its resolver"
+    );
+
+    // And the kernel lets both DNS transports through while it denies the
+    // rest, for a cgroup holding exactly what the agent programs.
+    let _udp_server = std::net::UdpSocket::bind((resolver, 53)).unwrap();
+    let _tcp_server = std::net::TcpListener::bind((resolver, 53)).unwrap();
+    let (_other, other) = private_listener(77);
+    let probe = ProbeCgroup::new("dns");
+    let destinations = implicit_destinations(Some(resolver));
+    {
+        let mut e = ebpf.lock().await;
+        egress::set_egress_enforced(&mut e.bpf, probe.id).unwrap();
+        egress::write_egress_destinations(
+            &mut e.bpf,
+            probe.id,
+            &destinations,
+            &merge_cidr_ports(&destinations).unwrap(),
+        )
+        .unwrap();
+    }
+    let udp = probe.open("udp", SocketAddr::from((resolver, 53)));
+    let tcp = probe.connect(SocketAddr::from((resolver, 53)));
+    let elsewhere = probe.connect(other);
+    egress::delete_cgroup_egress_state(&mut ebpf.lock().await.bpf, probe.id).unwrap();
+    assert!(udp.is_ok(), "DNS over UDP: {udp:?}");
+    assert!(tcp.is_ok(), "DNS over TCP: {tcp:?}");
+    assert!(denied(&elsewhere), "unlisted destination: {elsewhere:?}");
+}
+
+/// D26: a job's allowlist is programmed on its delegated task's lease before
+/// the task starts, and retiring the task lifts it. Every job runs as a task
+/// array, so there is no separate agent job path to check.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn job_egress_allowlist_is_enforced() {
+    use reliaburger::bun::task_namespace::{DelegatedNetwork, TaskNamespacePolicy};
+    use reliaburger::sesame::egress::{self, exact_v4_key};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
+    let allowed = Ipv4Addr::new(203, 0, 113, 9);
+
+    // A delegated task: its lease programs the task cgroup and lifts it.
+    let data = tempfile::tempdir().unwrap();
+    let network = Arc::new(DelegatedNetwork::default());
+    let policy = TaskNamespacePolicy::recover(ebpf.clone(), data.path(), network.clone(), None)
+        .await
+        .unwrap();
+    let task_name = root_app_name("task", data.path());
+    let _task_cgroups = AppCgroups::new("default", &task_name);
+    let task_cgroup = reliaburger::grill::cgroup::cgroup_path("default", &task_name, 0);
+    let mut lease = policy.acquire("default", &task_cgroup).await.unwrap();
+    std::fs::create_dir_all(&task_cgroup).unwrap();
+    lease
+        .enforce_egress(&task_cgroup, &[format!("{allowed}:443")])
+        .await
+        .unwrap();
+    let task_id = egress::cgroup_id_of_path(&task_cgroup).unwrap();
+    let claimed = network.snapshot().await.egress_cgroups.contains(&task_id);
+    let (enforced, listed) = {
+        let mut e = ebpf.lock().await;
+        (
+            egress::egress_enforced(&mut e.bpf, task_id).unwrap(),
+            egress::egress_allowed(&mut e.bpf, exact_v4_key(task_id, allowed, 443)).unwrap(),
+        )
+    };
+    lease.retired().await;
+    let lifted = !egress::egress_enforced(&mut ebpf.lock().await.bpf, task_id).unwrap();
+    let released = !network.snapshot().await.egress_cgroups.contains(&task_id);
+    drop(policy);
+    TaskNamespacePolicy::recover(ebpf.clone(), data.path(), network, None)
+        .await
+        .unwrap();
+    assert!(claimed, "the sweep would scrub an unclaimed task allowlist");
+    assert!(enforced && listed, "the task cgroup was not programmed");
+    assert!(lifted && released, "retirement left the task's allowlist");
+}
+
+/// #737: another namespace's `allow_from` can name a job as its source. A
+/// task's cgroup is bound to its run's identity (namespace plus job) before
+/// the task starts, and the grant names that identity, so it holds before
+/// any task of the job exists. Another job in the same namespace, and an
+/// app cgroup that merely shares the job's namespace, stay refused.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn allow_from_can_name_a_delegated_job_as_its_source() {
+    use reliaburger::bun::task_namespace::{DelegatedNetwork, TaskNamespacePolicy};
+    use reliaburger::sesame::firewall;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
+    let (_listener, vault) = private_listener(77);
+    let SocketAddr::V4(vault_v4) = vault else {
+        unreachable!()
+    };
+    let mut services = ServiceMap::new();
+    let id = ServiceId::new("vault", "secrets");
+    services
+        .register(&id, vault.port(), Some(vec!["default/report".to_string()]))
+        .unwrap();
+    services
+        .add_backend(
+            &id,
+            BackendInstance {
+                instance_id: "vault__secrets-0".into(),
+                node_ip: *vault_v4.ip(),
+                host_port: vault.port(),
+                healthy: true,
+                local: true,
+            },
+        )
+        .unwrap();
+    let entries: Vec<_> = services.resolve_all().into_iter().cloned().collect();
+    let destinations: Vec<_> = entries
+        .iter()
+        .map(firewall::IsolatedDestination::from)
+        .collect();
+    let grants = firewall::rules_to_bpf_entries(&firewall::resolve_job_source_rules(&destinations));
+    let mut destination_keys = std::collections::HashSet::new();
+    {
+        let mut e = ebpf.lock().await;
+        firewall::reconcile_destination_map(
+            &mut e.bpf,
+            &firewall::destination_entries(&entries, &Default::default(), &[]),
+            &mut destination_keys,
+        )
+        .unwrap();
+        for (key, value) in &grants {
+            firewall::write_firewall_entry(&mut e.bpf, *key, *value).unwrap();
+        }
+    }
+
+    // Two delegated tasks in "default": one of the named job, one not.
+    let data = tempfile::tempdir().unwrap();
+    let network = Arc::new(DelegatedNetwork::default());
+    let policy = TaskNamespacePolicy::recover(ebpf.clone(), data.path(), network.clone(), None)
+        .await
+        .unwrap();
+    let task_name = root_app_name("source", data.path());
+    let _task_cgroups = AppCgroups::new("default", &task_name);
+    let mut leases = Vec::new();
+    let mut probes = Vec::new();
+    for (ordinal, job) in [(0, "report"), (1, "render")] {
+        let cgroup = reliaburger::grill::cgroup::cgroup_path("default", &task_name, ordinal);
+        let mut lease = policy.acquire("default", &cgroup).await.unwrap();
+        std::fs::create_dir_all(&cgroup).unwrap();
+        lease.bind_source(&cgroup, job).await.unwrap();
+        leases.push(lease);
+        probes.push(ProbeCgroup::at(cgroup));
+    }
+    let bound = {
+        let mut e = ebpf.lock().await;
+        firewall::read_cgroup_source_entry(&mut e.bpf, probes[0].id).unwrap()
+    };
+    let named = probes[0].connect(vault);
+    let other_job = probes[1].connect(vault);
+
+    // An app cgroup in the same namespace has no run identity to match.
+    let app = ProbeCgroup::new("job-source-app");
+    let app_keys = isolate_probe(
+        &mut *ebpf.lock().await,
+        &app,
+        "default",
+        &Default::default(),
+    );
+    let app_refused = app.connect(vault);
+    release_probe(&mut *ebpf.lock().await, &app, app_keys);
+
+    let mut unbound = Vec::new();
+    for (lease, probe) in leases.into_iter().zip(&probes) {
+        lease.retired().await;
+        let mut e = ebpf.lock().await;
+        unbound.push(firewall::read_cgroup_source_entry(&mut e.bpf, probe.id).unwrap());
+    }
+    {
+        let mut e = ebpf.lock().await;
+        for (key, _) in &grants {
+            firewall::delete_firewall_entry(&mut e.bpf, *key).unwrap();
+        }
+        firewall::reconcile_destination_map(&mut e.bpf, &Default::default(), &mut destination_keys)
+            .unwrap();
+    }
+    drop(probes);
+    drop(policy);
+    TaskNamespacePolicy::recover(ebpf.clone(), data.path(), network, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bound,
+        Some(firewall::job_source_identity("default", "report")),
+        "the task cgroup was not bound to its run's identity"
+    );
+    assert!(named.is_ok(), "the job allow_from names: {named:?}");
+    assert!(
+        denied(&other_job),
+        "another job in its namespace: {other_job:?}"
+    );
+    assert!(
+        denied(&app_refused),
+        "an app in its namespace: {app_refused:?}"
+    );
+    assert_eq!(unbound, vec![None, None], "retirement left a run identity");
 }
 
 // ---------------------------------------------------------------------------
@@ -1312,7 +2167,7 @@ async fn dns_responder_resolves_internal_name() {
     // Use a high port to avoid needing root for port 53
     let config = reliaburger::onion::dns::DnsConfig {
         listen_addr: "127.0.0.1:15353".parse().unwrap(),
-        upstream: "8.8.8.8:53".parse().unwrap(),
+        upstreams: vec!["192.0.2.1:53".parse().unwrap()],
         upstream_timeout: Duration::from_secs(2),
         source_namespaces: tokio::sync::watch::channel(
             reliaburger::onion::dns::DnsSourceNamespaces::from_bindings([(
@@ -1376,7 +2231,7 @@ async fn dns_responder_non_internal_times_out() {
     let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let config = reliaburger::onion::dns::DnsConfig {
         listen_addr: "127.0.0.1:15354".parse().unwrap(),
-        upstream: upstream.local_addr().unwrap(),
+        upstreams: vec![upstream.local_addr().unwrap()],
         upstream_timeout: Duration::from_millis(500),
         source_namespaces: tokio::sync::watch::channel(
             reliaburger::onion::dns::DnsSourceNamespaces::from_bindings([(
@@ -1423,7 +2278,7 @@ async fn dns_responder_non_internal_times_out() {
 
 /// NET7: with egress enforcement on, a listed IPv6 destination connects
 /// and an unlisted one is denied with EPERM — the connect6 hook, driven
-/// against the test's own cgroup.
+/// from a fresh cgroup of the test's own.
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
@@ -1438,11 +2293,11 @@ async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
 
     let allowed = std::net::TcpListener::bind("[::1]:0").unwrap();
     let allowed_port = allowed.local_addr().unwrap().port();
-    let denied = std::net::TcpListener::bind("[::1]:0").unwrap();
-    let denied_port = denied.local_addr().unwrap().port();
+    let unlisted = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let denied_port = unlisted.local_addr().unwrap().port();
 
-    let cgroup_id =
-        egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
+    let probe = ProbeCgroup::new("egress-connect6");
+    let cgroup_id = probe.id;
 
     egress::write_egress6_entry(
         &mut ebpf.bpf,
@@ -1453,14 +2308,15 @@ async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
     )
     .expect("write egress6 entry");
     egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable enforcement");
+    assert_runner_cgroup_unrestricted(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), denied_port));
 
-    let ok = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv6Addr::LOCALHOST.into(), allowed_port),
-        Duration::from_secs(2),
+    let ok = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), allowed_port),
     );
-    let blocked = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv6Addr::LOCALHOST.into(), denied_port),
-        Duration::from_secs(2),
+    let blocked = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), denied_port),
     );
     let udp_allowed = std::net::UdpSocket::bind("[::1]:0").unwrap();
     let udp_allowed_port = udp_allowed.local_addr().unwrap().port();
@@ -1474,33 +2330,29 @@ async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
         },
     )
     .unwrap();
-    let udp_sender = std::net::UdpSocket::bind("[::1]:0").unwrap();
-    let udp_ok = udp_sender.send_to(&[1], (Ipv6Addr::LOCALHOST, udp_allowed_port));
-    let udp_blocked = udp_sender.send_to(&[1], (Ipv6Addr::LOCALHOST, udp_denied_port));
+    let udp_ok = probe.attempt(
+        Transport::Udp,
+        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), udp_allowed_port),
+    );
+    let udp_blocked = probe.attempt(
+        Transport::Udp,
+        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), udp_denied_port),
+    );
 
-    // Lift enforcement before asserting, so a failure never leaves the
-    // harness cgroup restricted.
     egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
     ebpf.detach().unwrap();
 
     assert!(ok.is_ok(), "listed IPv6 destination should connect: {ok:?}");
-    assert_eq!(
-        udp_ok.unwrap(),
-        1,
-        "listed IPv6 UDP destination should send"
+    assert!(
+        udp_ok.is_ok(),
+        "listed IPv6 UDP destination should send: {udp_ok:?}"
     );
     assert!(
-        matches!(
-            blocked.as_ref().map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        denied(&blocked),
         "unlisted IPv6 destination should be denied with EPERM, got {blocked:?}"
     );
     assert!(
-        matches!(
-            udp_blocked.as_ref().map_err(|error| error.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        denied(&udp_blocked),
         "unlisted IPv6 UDP destination should be denied, got {udp_blocked:?}"
     );
 }
@@ -1521,11 +2373,12 @@ async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
     // A v4 listener we allow, and a v6 listener we do not.
     let v4_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let v4_port = v4_listener.local_addr().unwrap().port();
-    let v6_listener = std::net::TcpListener::bind("[::1]:0").unwrap();
-    let v6_port = v6_listener.local_addr().unwrap().port();
+    // The v6 port doubles as the unlisted v4-mapped port below, so it must
+    // not be the allowed v4 port: [::1] and 127.0.0.1 can share one (#913).
+    let (_v6_listener, v6_port) = listener_avoiding_port(Ipv6Addr::LOCALHOST.into(), v4_port);
 
-    let cgroup_id =
-        egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
+    let probe = ProbeCgroup::new("egress-v4-only");
+    let cgroup_id = probe.id;
 
     egress::write_egress_entry(
         &mut ebpf.bpf,
@@ -1536,27 +2389,28 @@ async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
     )
     .expect("write egress entry");
     egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable enforcement");
+    assert_runner_cgroup_unrestricted(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), v6_port));
 
     // Native v4: allowed.
-    let v4_ok = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv4Addr::LOCALHOST.into(), v4_port),
-        Duration::from_secs(2),
+    let v4_ok = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), v4_port),
     );
     // v4-mapped through connect6: same policy, still allowed.
     let mapped = Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001);
-    let mapped_ok = TcpStream::connect_timeout(
-        &SocketAddr::V6(SocketAddrV6::new(mapped, v4_port, 0, 0)),
-        Duration::from_secs(2),
+    let mapped_ok = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::V6(SocketAddrV6::new(mapped, v4_port, 0, 0)),
     );
     // Plain IPv6 to an unlisted destination: the old bypass, now denied.
-    let v6_blocked = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv6Addr::LOCALHOST.into(), v6_port),
-        Duration::from_secs(2),
+    let v6_blocked = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), v6_port),
     );
     // v4-mapped to an unlisted v4 port: denied through connect6 too.
-    let mapped_blocked = TcpStream::connect_timeout(
-        &SocketAddr::V6(SocketAddrV6::new(mapped, v6_port, 0, 0)),
-        Duration::from_secs(2),
+    let mapped_blocked = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::V6(SocketAddrV6::new(mapped, v6_port, 0, 0)),
     );
 
     egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
@@ -1571,17 +2425,11 @@ async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
         "listed v4 destination should connect as v4-mapped IPv6: {mapped_ok:?}"
     );
     assert!(
-        matches!(
-            v6_blocked.as_ref().map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        denied(&v6_blocked),
         "IPv6 must no longer bypass a v4 allowlist, got {v6_blocked:?}"
     );
     assert!(
-        matches!(
-            mapped_blocked.as_ref().map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        denied(&mapped_blocked),
         "unlisted v4-mapped destination should be denied, got {mapped_blocked:?}"
     );
 }
@@ -1598,14 +2446,15 @@ async fn cidr_egress_allowed_via_lpm_trie() {
     let mut ebpf = load_ebpf();
 
     // Two loopback listeners; 127.0.0.0/8 covers both addresses, but only
-    // one port is allowed.
+    // one port is allowed. The kernel picks port 0 per address, so the
+    // second listener must be kept off the allowed port explicitly (#913).
     let allowed = std::net::TcpListener::bind("127.0.0.5:0").unwrap();
     let allowed_port = allowed.local_addr().unwrap().port();
-    let denied = std::net::TcpListener::bind("127.0.0.6:0").unwrap();
-    let denied_port = denied.local_addr().unwrap().port();
+    let (_unlisted, denied_port) =
+        listener_avoiding_port(Ipv4Addr::new(127, 0, 0, 6).into(), allowed_port);
 
-    let cgroup_id =
-        egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
+    let probe = ProbeCgroup::new("egress-cidr");
+    let cgroup_id = probe.id;
 
     let dests = vec![EgressDestination::Cidr {
         network: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)),
@@ -1616,14 +2465,18 @@ async fn cidr_egress_allowed_via_lpm_trie() {
     egress::write_egress_destinations(&mut ebpf.bpf, cgroup_id, &dests, &merged)
         .expect("program CIDR destinations");
     egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable enforcement");
+    assert_runner_cgroup_unrestricted(SocketAddr::new(
+        Ipv4Addr::new(127, 0, 0, 6).into(),
+        denied_port,
+    ));
 
-    let inside_cidr = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv4Addr::new(127, 0, 0, 5).into(), allowed_port),
-        Duration::from_secs(2),
+    let inside_cidr = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv4Addr::new(127, 0, 0, 5).into(), allowed_port),
     );
-    let wrong_port = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv4Addr::new(127, 0, 0, 6).into(), denied_port),
-        Duration::from_secs(2),
+    let wrong_port = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv4Addr::new(127, 0, 0, 6).into(), denied_port),
     );
 
     egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
@@ -1634,11 +2487,9 @@ async fn cidr_egress_allowed_via_lpm_trie() {
         "address inside the allowed CIDR should connect on the listed port: {inside_cidr:?}"
     );
     assert!(
-        matches!(
-            wrong_port.as_ref().map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
-        "same CIDR on an unlisted port should be denied, got {wrong_port:?}"
+        denied(&wrong_port),
+        "same CIDR on an unlisted port {denied_port} (allowed {allowed_port}) should be denied, \
+         got {wrong_port:?}"
     );
 }
 
@@ -2186,6 +3037,16 @@ fn test_agent<G: reliaburger::grill::Grill + Clone + 'static>(
 ) -> reliaburger::bun::agent::BunAgent<G> {
     let mut agent = reliaburger::bun::agent::BunAgent::new(grill, ports, commands, shutdown);
     agent.set_volumes_dir(volumes.to_path_buf());
+    // The process runtime runs host workloads only (#914), so ProcessGrill
+    // fixtures are `script` apps through `/bin/sh`. A test that needs other
+    // binaries replaces this policy.
+    agent.set_process_config(
+        reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries: vec!["/bin/sh".into()],
+            mount_isolation: false,
+            ..Default::default()
+        },
+    );
     agent
 }
 
@@ -2596,6 +3457,58 @@ fn egress_owner_process_fixture() {
     loop {
         std::thread::park();
     }
+}
+
+/// The pinned maps outlive a crashed Bun, and its faults must not: the next
+/// Bun's registry is empty, so a drop or partition entry left in
+/// `fault_connect_map` would keep firing with nothing in `fault list` to
+/// clear it (#699). The egress policy in the same pins stays.
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+fn owned_loader_clears_stale_fault_connect_entries() {
+    use reliaburger::smoker::bpf_maps::{read_connect_fault, write_connect_fault};
+    use reliaburger::smoker::bpf_types::{
+        BpfConnectFaultValue, FAULT_ACTION_PARTITION, partition_fault_key,
+    };
+    assert!(ebpf_tests_enabled());
+    let owned = OwnedPolicyFixture::new();
+    let leaf = reliaburger::sesame::egress::cgroup_id_of_path(&owned.cgroup.join("probe")).unwrap();
+    let key = partition_fault_key(
+        u32::from(Ipv4Addr::new(127, 128, 0, 9)).to_be(),
+        6379u16.to_be(),
+        leaf,
+    );
+    let mut crashed = owned.load().unwrap();
+    write_connect_fault(
+        &mut crashed.bpf,
+        key,
+        BpfConnectFaultValue {
+            action: FAULT_ACTION_PARTITION,
+            probability: 100,
+            _pad: [0; 6],
+            delay_ns: 0,
+            jitter_ns: 0,
+            expires_ns: u64::MAX,
+        },
+    )
+    .unwrap();
+    reliaburger::sesame::egress::set_egress_enforced(&mut crashed.bpf, leaf).unwrap();
+    // Dropping the handle is what a SIGKILL leaves: pins and links stay.
+    drop(crashed);
+
+    let mut recovered = owned.load().unwrap();
+
+    assert!(
+        read_connect_fault(&mut recovered.bpf, &key)
+            .unwrap()
+            .is_none(),
+        "a fault from the previous Bun survived its recovery"
+    );
+    assert!(
+        reliaburger::sesame::egress::egress_enforced(&mut recovered.bpf, leaf).unwrap(),
+        "recovery cleared egress policy along with the faults"
+    );
+    recovered.retire_owned().unwrap();
 }
 
 #[test]
@@ -3620,14 +4533,14 @@ async fn agent_retirement_confirms_backend_absence_before_forgetting_ownership()
     assert!(backend.is_none());
 }
 
-async fn assert_source_policy_precedes_start(job: bool) {
+async fn assert_source_policy_precedes_start() {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{mock::MockGrill, port::PortAllocator};
     use reliaburger::sesame::{egress, firewall};
     use std::sync::Arc;
     use tokio::sync::{Mutex, mpsc, oneshot};
     assert!(ebpf_tests_enabled());
-    let kind = if job { "job" } else { "app" };
+    let kind = "app";
     let root = tempfile::tempdir().unwrap();
     let name = root_app_name(&format!("source-before-{kind}"), root.path());
     let target_name = root_app_name(&format!("source-target-{kind}"), root.path());
@@ -3780,13 +4693,7 @@ async fn assert_source_policy_precedes_start(job: bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn source_policy_precedes_portless_application_start() {
-    assert_source_policy_precedes_start(false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
-async fn source_policy_precedes_job_start() {
-    assert_source_policy_precedes_start(true).await;
+    assert_source_policy_precedes_start().await;
 }
 
 #[tokio::test]
@@ -4727,7 +5634,9 @@ async fn check_backend_retirement(
                             "rollout retired the original destination before confirmed backend withdrawal");
                     } else {
                         anyhow::ensure!(completed, "rollout did not complete");
-                        anyhow::ensure!(runtime.state(&id).await? == reliaburger::grill::ContainerState::Stopped,
+                        // Retired, and possibly forgotten already (#738).
+                        anyhow::ensure!(matches!(runtime.state(&id).await,
+                            Ok(reliaburger::grill::ContainerState::Stopped) | Err(reliaburger::grill::GrillError::NotFound { .. })),
                             "confirmed rollout did not retire the original destination");
                     }
                 } else {
@@ -4828,7 +5737,7 @@ async fn refused_backend_publication_cannot_report_a_completed_deployment() {
     let task = tokio::spawn(async move { agent.run().await });
     let name = root_app_name("publication-refusal", root.path());
     let config = reliaburger::config::Config::parse(&format!(
-        "[app.{name}]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '60']\nport = 8080\n"
+        "[app.{name}]\nscript = 'exec sleep 60'\nport = 8080\n"
     ))
     .unwrap();
     let (events, mut results) = mpsc::channel(64);
@@ -5125,7 +6034,12 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
         }
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if runtime.state(&old).await? == ContainerState::Stopped { return Ok::<(), anyhow::Error>(()); }
+                // Retired, and possibly forgotten already (#738).
+                match runtime.state(&old).await {
+                    Ok(ContainerState::Stopped) | Err(reliaburger::grill::GrillError::NotFound { .. }) => return Ok::<(), anyhow::Error>(()),
+                    Ok(_) => {}
+                    Err(error) => return Err(error.into()),
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await??;
@@ -5254,7 +6168,7 @@ async fn refused_health_publication_prevents_restart_and_preserves_ownership() {
     let id = InstanceId(format!("default__{name}-0"));
     let exercise = tokio::time::timeout(Duration::from_secs(12), async {
         let config = reliaburger::config::Config::parse(&format!(
-            "[app.{name}]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '60']\nport = 8080\n[app.{name}.health]\npath = '/'\nport = {health_port}\ninterval = 1\ntimeout = 1\nthreshold_unhealthy = 1\nthreshold_healthy = 1\n"
+            "[app.{name}]\nscript = 'exec sleep 60'\nport = 8080\n[app.{name}.health]\npath = '/'\nport = {health_port}\ninterval = 1\ntimeout = 1\nthreshold_unhealthy = 1\nthreshold_healthy = 1\n"
         ))?;
         let (events, mut results) = mpsc::channel(64);
         commands.send(AgentCommand::Deploy { config, events }).await?;

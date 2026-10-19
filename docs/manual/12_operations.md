@@ -10,14 +10,25 @@ cluster, and getting the council back when everything else has gone wrong.
 The new binary adopts running workloads without restarting them, and one that
 crash-loops on boot reverts to the previous version by itself.
 
+Until 1.0 it works only between builds of the same format. Every build speaks
+one cluster protocol and one state format (`bun --compatibility` prints them),
+and a node takes only a binary with its own pair. Every release from 0.1.0 to
+0.2.0 changed one or the other, so none of them can roll onto the release
+before it: moving between them means a fresh cluster, as described below.
+`relish upgrade` is for a later build with the same pair, such as a patch release that doesn't
+change a format, or your own rebuild. `relish upgrade check` tells you which
+case you're in.
+
 ```sh
-relish upgrade check                  # is there a newer release?
-relish upgrade plan v0.2.0            # the rolling order and an estimate
-relish upgrade start v0.2.0           # download, verify, roll
+relish upgrade check                  # is there a newer release, and can it roll?
+relish upgrade plan v0.2.1            # the rolling order and an estimate
+relish upgrade start v0.2.1 --external-key keys/release.key
+                                      # download, countersign, verify, roll
+relish upgrade start --binary ./bun-v0.2.1   # a local, countersigned binary
 relish upgrade status
 relish upgrade resume                 # continue a paused upgrade
 relish upgrade abort                  # end a paused upgrade that moved no node
-relish upgrade rollback v0.1.0        # also replaces a paused upgrade
+relish upgrade rollback v0.2.0        # also replaces a paused upgrade
 ```
 
 To see what a node runs, ask it. `bun --version` and `relish --version` print
@@ -44,17 +55,44 @@ It needs three things on every node:
   `relish dev keygen --out keys/` (or
   `openssl genpkey -algorithm ed25519 -outform DER -out operator.key`) and
   countersign each release binary with
-  `relish dev countersign-binary --external-key keys/release.key bun-v0.2.0`.
-  That adds your signature to the release's `bun-v0.2.0.sig` and leaves the
+  `relish dev countersign-binary --external-key keys/release.key bun-v0.2.1`.
+  That adds your signature to the release's `bun-v0.2.1.sig` and leaves the
   release signature as it is; it also prints the `ed25519:…` public key to
   put in node.toml.
 
-`relish upgrade start --binary ./bun-v0.2.0` rolls a local binary instead of
-downloading one, with its signatures in `bun-v0.2.0.sig` beside it (or
+Published release metadata carries only the release's signature, never yours,
+so the version form needs your key or your envelope. With
+`--external-key keys/release.key`, relish countersigns each binary it
+downloads before pushing it. Or countersign the downloaded binary yourself and
+pass the envelope with `--sig bun-v0.2.1.sig`, which works when every node
+runs on the same platform. Without either, `start` stops before it downloads
+anything and says so.
+
+relish downloads the build for the platform each node reports
+(`platform` in `GET /v1/version`, such as `linux-aarch64`), not for the
+machine relish runs on: from a Mac it still fetches the Linux builds the nodes
+need. A cluster that mixes architectures gets one build per platform, each
+node fetches its own, and `start` refuses before recording anything if the
+release has no build for one of them.
+
+`relish upgrade start --binary ./bun-v0.2.1` rolls a local binary instead of
+downloading one, with its signatures in `bun-v0.2.1.sig` beside it (or
 `--sig`). On a single node that's an air-gapped upgrade and needs only the
 release signature. In a cluster the other nodes fetch the binary from the
 registry, which counts as the network, so every node wants both signatures:
-countersign it first.
+countersign it first. One local file is one platform's build, so the cluster
+form refuses `--binary` when the nodes run on more than one platform.
+
+relish asks the node it's connected to whether it belongs to a cluster
+(`GET /v1/upgrade/cluster`). Only the node's own answer that it has no
+council makes `start`, `status` and `rollback` act on that single node. Any
+other failure, such as a timeout or a 5xx, stops the command with that error:
+an upgrade that silently fell back to the connected node alone would skip the
+rolling order, the quorum checks and the run record. On a single node, a
+downloaded binary is staged in a fresh directory only relish's user can open,
+and removed once the node has answered. So bun has to be able to read it: run
+bun as root, or as the same user that runs relish. Otherwise download and
+countersign the binary yourself and use `--binary` from a path bun can read.
 
 relish pushes the binary to the registry of the node it's connected to and
 tells the other nodes to fetch it from that node's cluster address. From a
@@ -94,7 +132,23 @@ format can't join the cluster, so `start` fails with both pairs and nothing is
 recorded:
 
 ```text
-refusing to upgrade to v0.1.6: incompatible binary: found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58. …
+refusing to upgrade to v0.2.0: incompatible binary: found protocol 51, state 68; this cluster (reliaburger v0.1.6 (…)) needs protocol 46, state 63. …
+```
+
+The candidate gets 60 seconds to answer. It normally takes milliseconds, but
+on macOS the first run of a new executable waits while the system assesses
+it: about a second for a release `bun`, and longer while the host is starting
+other new programs. A candidate that doesn't answer in time is refused, and
+the message says how far it got, for example `compatibility query timed out
+after 60s (launched as pid 4242 after 2ms, no output, still running)`.
+
+From 0.2.0 the release metadata names each release's pair (`compatibility` in
+`metadata.json`), so relish can tell sooner. `relish upgrade check` reports a
+release with another pair as needing a fresh cluster instead of offering the
+command, and `relish upgrade start <version>` refuses it before downloading:
+
+```text
+v0.2.1 changes the cluster formats (protocol 51 -> 52, state 68 -> 68), so it needs a fresh cluster, not `relish upgrade start`; see …
 ```
 
 A cluster `rollback` never downloads anything: each node goes back to a binary
@@ -137,9 +191,14 @@ it the same way
 And 0.1.6: protocol 46 and state format 63. A 0.1.5 cluster's leader refuses
 it the same way
 ([upgrading from 0.1.5](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-015)).
-Development builds of 0.3.0, the appliance release, are at protocol 49 and
-state format 66, so a 0.1.6 cluster's leader refuses them too
+And 0.2.0: protocol 51 and state format 68. A 0.1.6 cluster's leader refuses
+it the same way, and moving means recreating the cluster, which loses
+everything the council held
 ([upgrading from 0.1.6](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-016)).
+So no published release has yet rolled in place onto another; the first that
+can will be a release that keeps 0.2.0's pair.
+Development builds of 0.3.0, the appliance release, are at protocol 54 and
+state format 71, so a 0.2.x cluster's leader refuses them too.
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it
@@ -156,7 +215,7 @@ line says what it found and what it needs, so even a truncated journal line
 carries it:
 
 ```text
-incompatible state format: found 58; this binary (reliaburger v0.1.6 (465fdeb)) needs 63. Pre-1.0 builds don't migrate state: …
+incompatible state format: found 63; this binary (reliaburger v0.2.0 (465fdeb)) needs 68. Pre-1.0 builds don't migrate state: …
 ```
 
 A join between mismatched binaries fails the same way, starting
@@ -167,6 +226,43 @@ tells you its pair), or move the data directory aside and recreate the
 cluster. Don't write a new `state-format.json` by hand; the stamp is the only
 thing standing between the new binary and data it can't read. The policy is
 in [docs/releasing.md](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100).
+
+## Sizing a node's disk
+
+A node's disk holds four growing things besides images and volumes: logs,
+metrics, job data and the council log. Logs and metrics are capped by default
+(`[logs] max_storage_mb = 2048`, `[metrics] max_storage_mb = 1024`; see
+[Observability](04_observability.md)), and Bun refuses a cap larger than the
+filesystem. Job data is the outcome ledger, its result index and the kept
+output of failed tasks, under `<data>/task-arrays/`. It stays while the cluster
+lists the run and goes about an hour after the run finishes, whether or not
+anyone submits more work. Each chunk keeps the output of its first 16 failed
+tasks only, so a run that fails everywhere costs a few hundred kilobytes of
+output per thousand tasks, not a file per task.
+
+Plan for job data at the measured bytes per task in
+[Batch jobs](14_batch-jobs.md#execution-and-capacity-limits), multiplied by
+the tasks a node finishes in an hour plus whatever the retained runs hold.
+When job data and the audit log (`audit/`, see
+[Audit log](10_security.md#audit-log)) together pass a quarter of the filesystem, or less than 1 GiB of it is
+free, the node keeps running the chunks it already holds but advertises no free
+slots, so it takes no new grants until retention frees space.
+
+## When a node runs out of memory
+
+A workload over its own `memory.limit` is killed inside its cgroup and
+restarts with backoff. When the whole machine runs out, the kernel's OOM
+killer picks a victim by `oom_score_adj` instead, and losing Bun stops the
+node's discovery updates, health checks and, on an API node, the API. So Bun
+runs at -900 (the `OOMScoreAdjust=-900` in the systemd units we ship and in
+`relish dev`'s launch), and every app, init container, job and task starts at
++500. The kernel takes a workload or a task first, then the machine's own
+daemons, and Bun last.
+
+Check a node with `cat /proc/$(pidof bun)/oom_score_adj`. If you run Bun from
+your own unit, copy `OOMScoreAdjust=-900` from
+[Linux servers](https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md);
+without it Bun runs at 0 and can lose to any daemon that asked for less.
 
 ## GitOps
 
@@ -179,6 +275,35 @@ namespace, and defaults outside it are not inherited. A workload's explicit
 namespace wins. GitOps reconciles deletions too: delete an app from the
 repository and it goes from the cluster.
 
+### What GitOps owns
+
+GitOps owns only what it wrote. The cluster remembers, in Raft, every app,
+namespace and permission a sync created or changed, and a sync removes only
+those. Turn GitOps on in a working cluster, or commit an empty tree, and the
+apps you deployed with `relish apply` stay where they are. A resource that
+already exists and matches the repository is adopted the first time a sync
+sees it: from then on GitOps owns it, and deleting it from the repository
+deletes it from the cluster. A running test's `rbtest-*` namespace, and
+everything in it, never enters a sync at all.
+
+So GitOps and `relish apply` coexist, with a few rules for the resources
+GitOps owns:
+
+- `relish apply` of a GitOps-managed resource goes ahead and warns:
+  `warning: namespace 'production' is managed by GitOps; manual changes are
+  reverted on the next sync`.
+- `relish delete` and `relish rollback` of a GitOps-managed app are refused,
+  because the next sync would undo them. Change the repository instead, or
+  pass `--force` when you really want the cluster to differ for a poll.
+- A forced delete also forgets the ownership. While the repository still
+  declares the app, the next sync recreates it and owns it again.
+
+A change the cluster refuses (an image that can't be bound, an identity a job
+already holds) doesn't hold the others up. The sync applies every change it
+can and records a partial result naming each refused one in the sync status.
+The applied commit doesn't move until everything applies, so the next poll
+retries the rest.
+
 GitOps reconciles apps, namespaces and permissions. Any `[job.*]` declaration,
 including a cron registration or a `run_before = ["app.web"]` migration, refuses
 the whole commit before desired-state writes. The failed sync names the jobs;
@@ -186,6 +311,8 @@ the applied SHA stays at the previous successful commit. Use `relish apply`
 with the migration and dependent app in the same manifest to execute their
 ordering, or `relish batch` for batch work. Lettuce has no durable job identity
 or dispatch path tied to a Git revision yet.
+
+### Configuring it
 
 ```toml
 [gitops]
@@ -197,6 +324,29 @@ require_signed_commits = true
 trusted_signing_keys = ["<GPG or SSH key fingerprint>"]
 webhook_secret = "a-long-random-string"
 ```
+
+The configuration lives in the cluster, in Raft, so every council member syncs
+the same repository and a leader failover carries on where the last leader
+stopped. A node's `[gitops]` section in `node.toml` only seeds it: the first
+leader that finds the cluster without a configuration writes its own. After
+that the cluster's copy wins. A node whose `[gitops]` differs logs the
+difference and `relish wtf` reports it, but the node still syncs the
+cluster's repository. A node with no `[gitops]` at all syncs it too.
+
+Change the cluster's configuration with `relish gitops` (an Admin token,
+and audited):
+
+```sh
+relish gitops status            # repository, last sync, warnings, what GitOps owns
+relish gitops set gitops.toml   # a file with a [gitops] section, or node.toml
+relish gitops disable           # stop syncing; what GitOps wrote stays
+```
+
+The credentials (a `user:token@` in the repository URL, and the webhook
+secret) never reach Raft in clear: the leader seals them with a key derived
+from the cluster master key, the way it seals CA keys. A configuration with a
+credential therefore needs `[security] master_key_path` on the council
+members, and `relish gitops status` never shows one.
 
 The sync always reads every `.toml` file under `path`, subdirectories
 included. Credentials go in the URL; Bun strips them out of the process arguments and
@@ -215,8 +365,23 @@ Every poll reconciles, not just polls that find a new commit: change or delete
 a GitOps-managed app by hand and the next poll puts it back. Autoscaler
 replica overrides and `relish stop` are left alone. A `git` command that runs
 longer than two minutes is killed and the sync retried later, so a stalled
-remote can't wedge GitOps. There's no `relish gitops` command: the web
-dashboard's GitOps page shows the last sync.
+remote can't wedge GitOps. `relish gitops status` and the web dashboard's
+GitOps page show the last sync.
+
+A sync that lost the leadership it started with is abandoned before it
+writes. It read the cluster's state in one Raft term, and the cluster refuses
+its writes in any other, so a leader that lost and regained leadership mid-sync
+can't apply a stale diff. The new leader's sync takes over.
+
+### Plaintext secrets
+
+An `env` value whose key looks secret (it contains `PASSWORD`, `SECRET`,
+`TOKEN` or `CREDENTIAL`, or ends in `_KEY`, in any case) but isn't an
+`ENC[AGE:...]` value gets a warning. It shows in the leader's log, in the
+sync status (`relish gitops status`) and in `relish wtf`. The sync still
+applies it: refusing would break repositories that worked yesterday. Encrypt
+the value with `relish secret encrypt` (see
+[Secrets](10_security.md#secrets)) and commit that instead.
 
 To sync on push rather than on the next poll, point a GitHub, Gitea or GitLab
 webhook at `https://NODE:9117/v1/gitops/webhook` with the same secret. The
@@ -257,7 +422,23 @@ retain = 24                         # default
 ```
 
 The leader writes one every `interval_secs`, encrypted with a key derived from
-the cluster's master key. Volumes aren't in it; snapshot those separately (see
+the cluster's master key. Each object is named after the state inside it: its
+recovery epoch, Raft term and last applied log index, then the leader's clock
+and the recovery id. Restores and retention go by that position, not by the
+time. A former leader whose clock ran fast can't push correct backups out of
+retention or win a restore with stale state, and the clock only breaks ties.
+The leader confirms it's still the leader before each export, so a deposed
+one skips it. Backups written by 0.2.0 or earlier are named by time alone;
+they're left alone and never restored.
+
+For `s3://` and `gs://`, Bun reads the standard variables of each backend:
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+`AWS_REGION` (or `AWS_DEFAULT_REGION`) and `AWS_ENDPOINT` for S3 and
+S3-compatible stores; `GOOGLE_SERVICE_ACCOUNT` (or `SERVICE_ACCOUNT`) and
+`GOOGLE_APPLICATION_CREDENTIALS` for GCS. Set them in Bun's environment, and in
+the shell you run `relish council recover` from. With none set, S3 falls back
+to the instance's metadata credentials. Volume-snapshot upload and log and
+metrics export read the same variables. Volumes aren't in it; snapshot those separately (see
 `images-and-volumes`). Nor is the root CA's private key, which never enters the
 council: back that up yourself with `relish ca backup`, sealed to a passphrase
 or your own age key, and check it with `relish ca verify` (see `security`).
@@ -269,6 +450,24 @@ relish council recover --data-dir /var/lib/reliaburger/data \
   --from s3://backups/prod-council --master-key /etc/reliaburger/master.key
 ```
 
+With `--from`, it restores the newest backup that it can download, unseal
+and parse, and whose state sits where its name says. A backup that fails any
+of those (a torn upload, one sealed under another master key) is skipped with
+a line saying why, and the next older one is tried. Recovery fails only when
+none is usable, listing every backup and its reason. To see what's there, or to
+pick one yourself:
+
+```sh
+relish council backups --from s3://backups/prod-council
+relish council recover --data-dir /var/lib/reliaburger/data \
+  --from s3://backups/prod-council \
+  --backup council-e00000000000000000001-t00000000000000000004-…backup
+```
+
+`council backups` lists newest first, in the order recover tries them, and
+needs no master key. `--backup` restores exactly that object, and fails rather
+than falling back if it's unusable.
+
 Without `--from`, it rebuilds the state from the node's own Raft directory:
 its snapshot, if it has taken one, plus every committed log entry after it.
 That only works on a node that was a voter, and the log is encrypted, so pass
@@ -276,7 +475,9 @@ That only works on a node that was a voter, and the log is encrypted, so pass
 exists). Entries the node hadn't seen committed are left out. It moves the dead
 council's Raft directory aside (to `.raft-recovery-*/previous` in the data
 directory, where you can delete it once the cluster is healthy) and stamps a
-new recovery epoch. It refuses while the node is still running, and the next
+new recovery epoch, with a random recovery id that tells this recovery apart
+from any other. The epoch lands above both the restored state's and any
+epoch the node's own fence record knows of. It refuses while the node is still running, and the next
 start finishes a recovery that crashed part-way. Starting the node brings up a
 one-voter council that grows again as nodes rejoin, even if its config still
 lists `cluster.join` seeds. New members receive the whole restored state.
@@ -288,15 +489,25 @@ catalogue than the backup holds still follow the recovered one, because each
 recovery starts a new range of catalogue generations; a leader of the replaced
 council stays refused.
 
-Before it starts, it asks the local agent whether any voter is still alive
-and refuses if one is; `--force` skips that check. The node is stopped by
-then, though, so in practice nothing answers and the check passes. Make sure
-yourself that the other voters are really gone: recovering a cluster that's
-still alive splits the brain.
+Before it changes anything, it reads the voters of the council the restored
+state came from (the data directory's last membership, or the backup's) and
+asks each one's `/v1/health` whether it still serves a council. It refuses,
+naming the voter, while any of them says yes, or answers in a way it can't
+read. A voter that doesn't answer at all counts as gone. Pass `--api-port` if
+your nodes' API doesn't listen on 9117. When the restored state names no
+voters, it can't check, so it refuses too. Recovering a cluster that's still
+alive splits the brain; `--force` skips the check once you're sure.
 
-You need `--force` when a majority is gone but not every voter, say two of
-three. The survivor can't regrow the council alone (changing membership needs
-a quorum too), so you stop it and recover it as above.
+It also refuses a data directory whose fence record says another recovery
+already replaced it (see below): recovering it would start a rival council
+next to the one that fenced it. Re-enrol that node instead. `--force`
+recovers it anyway, on an epoch above the one that fenced it, which in turn
+fences that newer council when the two meet.
+
+When a majority is gone but not every voter (two of three, say), the survivor
+can't regrow the council alone, because changing membership needs a quorum
+too. Stop it and recover it as above: the dead voters don't answer, so the
+check passes without `--force`.
 
 ### When the old voters come back
 
@@ -305,16 +516,32 @@ directories. Two of three old voters are a majority of it, so on their own
 they would elect a leader and take writes: a second council. The recovery
 epoch stops that, as long as they can reach the recovered side:
 
-- A restarted voter waits a few seconds for gossip to show its peers'
-  epochs before it serves Raft. If any peer holds a newer epoch, it fences
-  itself.
+- A restarted voter doesn't serve Raft until gossip has joined and synced,
+  and then for two anti-entropy intervals (20 seconds), unless every peer its
+  membership names has advertised an epoch sooner. If any peer holds a newer
+  epoch, it fences itself. On a network where gossip converges slowly, raise
+  `[cluster] recovery_probe_window_secs`. The node logs when the window runs
+  out without hearing from every peer. A single-voter council has no peers to
+  wait for and serves as soon as gossip is up.
 - A voter that talks to the recovered council, or to an already fenced
   peer, is refused with the newer epoch and fences itself on the spot.
 - A fenced node serves no Raft, refuses writes, claims no leader, and stays
-  fenced across restarts. It keeps running its workloads as a worker.
+  fenced across restarts. It keeps running its workloads as a worker. If the
+  fence can't be written to disk (a full disk), the node keeps retrying, and
+  `relish council status` and `relish wtf` warn that a restart would forget
+  it.
+- Two councils on the same epoch with different recovery ids came from two
+  separate recoveries, for example two survivors that two operators
+  recovered independently. Each side fences itself as a `split` when it
+  meets the other, because neither can tell which one is real. Pick the side
+  to keep, stop one of its nodes and run `relish council recover --force` on
+  it (its fence record says it's fenced, hence `--force`): it lands on a newer
+  epoch, and the other side's nodes fence themselves against it. Re-enrol
+  those.
 
-`relish council status` shows such a node as `fenced`, `relish status` prints
-a warning line, and `relish wtf` reports it as CRITICAL until you re-enrol it.
+`relish council status` shows such a node as `fenced` (its epoch column reads
+`0 < 1`, or `1 split` for a split), `relish status` prints a warning line, and
+`relish wtf` reports it as CRITICAL until you re-enrol it.
 Stop the node, then:
 
 ```sh
@@ -329,8 +556,8 @@ isn't fenced; `--force` overrides that for an old voter that never heard of the
 recovery.
 
 The fence has one gap. An old voter learns of the new epoch only from a node
-that holds it. **After `council recover --force`, don't start the old voters
-where they can reach each other but not the recovered side.** Wipe them with
+that holds it. **After `council recover`, don't start the old voters where
+they can reach each other but never the recovered side.** Wipe them with
 `relish council re-enrol` first, or keep them stopped until they can see the
 recovered council. If two of them do come back cut off from it, they form a
 council of their own; `relish council status` and `relish wtf` show it as two

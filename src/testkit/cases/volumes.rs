@@ -8,6 +8,7 @@
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
@@ -116,18 +117,21 @@ pub fn cases() -> Vec<TestCase> {
             name: "volume_data_survives_instance_restart",
             group: TestGroup::Volumes,
             requires: &[Capability::ContainerRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(volume_data_survives_instance_restart),
         },
         TestCase {
             name: "volume_is_isolated_per_app",
             group: TestGroup::Volumes,
             requires: &[Capability::ContainerRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(volume_is_isolated_per_app),
         },
         TestCase {
             name: "volume_size_limit_is_enforced",
             group: TestGroup::Volumes,
             requires: &[Capability::ContainerRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(volume_size_limit_is_enforced),
         },
     ]
@@ -146,6 +150,18 @@ mod tests {
     use std::time::Duration;
 
     const NAMESPACE: &str = "rbtest-volumes-01";
+
+    #[test]
+    fn volume_workloads_pass_the_validation_the_api_applies() {
+        let ctx = TestContext::offline(NAMESPACE);
+        for size in [None, Some("4Mi")] {
+            let spec = idle_with_volume(&ctx, "vol-persist", size);
+            let config = crate::config::Config::parse(&spec).unwrap();
+            if let Err(error) = config.validate_intrinsic() {
+                panic!("the API would refuse this volume workload: {error}\n{spec}");
+            }
+        }
+    }
 
     /// A laptop's view of a two-node cluster: node `one` is the entry node
     /// and runs nothing; `two` runs `app` and answers only through `one`'s
@@ -249,6 +265,7 @@ mod tests {
             pid: None,
             runtime_unknown: false,
             status_age_ms: None,
+            reason: None,
         }
     }
 

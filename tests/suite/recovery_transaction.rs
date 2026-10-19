@@ -28,7 +28,7 @@ fn recovery_retains_the_previous_log_even_when_its_stores_are_damaged() {
 
     let mut state = DesiredState::default();
     state.config.insert("restored".into(), "yes".into());
-    recover_data_dir(dir.path(), state).unwrap();
+    recover_data_dir(dir.path(), state, false).unwrap();
 
     let retained = retained_directories(dir.path());
     assert_eq!(retained.len(), 1, "exactly one retained directory");
@@ -47,11 +47,11 @@ fn recovery_retains_the_previous_log_even_when_its_stores_are_damaged() {
 #[test]
 fn recovery_must_not_replace_a_store_held_open_by_a_live_node() {
     let dir = tempfile::tempdir().unwrap();
-    recover_data_dir(dir.path(), DesiredState::default()).unwrap();
+    recover_data_dir(dir.path(), DesiredState::default(), false).unwrap();
     let before = retained_directories(dir.path()).len();
     let path = dir.path().join("raft/snapshot.redb");
     let _live_handle = redb::Database::create(&path).unwrap();
-    let result = recover_data_dir(dir.path(), DesiredState::default());
+    let result = recover_data_dir(dir.path(), DesiredState::default(), false);
     assert!(
         result.is_err(),
         "recovery unlinks the locked inode and replaces live state successfully"

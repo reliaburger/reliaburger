@@ -78,6 +78,13 @@ pub(super) async fn test_lease_create_handler(
             Ok(auth) => auth,
             Err(response) => return response,
         };
+    // A lease provisions cluster resources for tests, so under a
+    // `[permission]` block it needs `admin` across the cluster (D5).
+    if let Err(response) =
+        enforce_cluster_permission(&state, Some(auth), crate::config::PermissionAction::Admin).await
+    {
+        return response;
+    }
     if let Err(response) = test_operation_authorisation(&state, auth) {
         return response;
     }
@@ -94,7 +101,6 @@ pub(super) async fn test_lease_create_handler(
         }
     }
     if let Some(council) = &state.council
-        && request.scope == LeaseScope::Applications
         && !council.is_leader().await
     {
         let created = forward_test_lease_request(
@@ -141,12 +147,15 @@ pub(super) async fn test_lease_create_handler(
         .as_ref()
         .is_some_and(|namespaces| !namespaces.contains(&namespace))
     {
-        return (
-            StatusCode::FORBIDDEN,
+        return crate::sesame::auth::scope_refusal(
             "token scope does not allow the requested test namespace",
-        )
-            .into_response();
+        );
     }
+    crate::bun::audit::annotate(crate::bun::audit::AuditNote {
+        app: None,
+        namespace: Some(namespace.clone()),
+        details: std::collections::BTreeMap::from([("lease_id".to_string(), lease_id.clone())]),
+    });
     let now = crate::testkit::lease::now_unix_millis();
     let lease = match crate::testkit::lease::TestLease::new_scoped(
         lease_id,
@@ -161,9 +170,7 @@ pub(super) async fn test_lease_create_handler(
         Err(error) => return lease_error_response(error),
     };
 
-    if let Some(council) = &state.council
-        && request.scope == LeaseScope::Applications
-    {
+    if let Some(council) = &state.council {
         if let Err(response) = write_lease_request(
             council,
             crate::council::RaftRequest::TestLeaseCreate(lease.clone()),
@@ -239,7 +246,6 @@ pub(super) async fn test_lease_get_handler(
             Err(response) => return response,
         };
     if let Some(council) = &state.council
-        && !is_node_job_lease(&lease_id)
         && !confirmed_lease_leader(council).await
     {
         return forward_test_lease_request::<()>(
@@ -284,6 +290,13 @@ pub(super) async fn test_lease_renew_handler(
             Ok(auth) => auth,
             Err(response) => return response,
         };
+    // A lease provisions cluster resources for tests, so under a
+    // `[permission]` block it needs `admin` across the cluster (D5).
+    if let Err(response) =
+        enforce_cluster_permission(&state, Some(auth), crate::config::PermissionAction::Admin).await
+    {
+        return response;
+    }
     if let Err(response) = test_operation_authorisation(&state, auth) {
         return response;
     }
@@ -292,7 +305,6 @@ pub(super) async fn test_lease_renew_handler(
         Err(response) => return response,
     };
     if let Some(council) = &state.council
-        && !is_node_job_lease(&lease_id)
         && !council.is_leader().await
     {
         return forward_test_lease_request(
@@ -314,9 +326,7 @@ pub(super) async fn test_lease_renew_handler(
         return lease_error_response(error);
     }
 
-    if let Some(council) = &state.council
-        && !is_node_job_lease(&lease_id)
-    {
+    if let Some(council) = &state.council {
         if let Err(response) = write_lease_request(
             council,
             crate::council::RaftRequest::TestLeaseRenew {
@@ -357,8 +367,14 @@ pub(super) async fn test_lease_release_handler(
             Ok(auth) => auth,
             Err(response) => return response,
         };
+    // A lease provisions cluster resources for tests, so under a
+    // `[permission]` block it needs `admin` across the cluster (D5).
+    if let Err(response) =
+        enforce_cluster_permission(&state, Some(auth), crate::config::PermissionAction::Admin).await
+    {
+        return response;
+    }
     if let Some(council) = &state.council
-        && !is_node_job_lease(&lease_id)
         && !council.is_leader().await
     {
         return forward_test_lease_request::<()>(
@@ -390,14 +406,13 @@ pub(super) async fn test_lease_release_handler(
     } else {
         return lease_error_response(crate::testkit::lease::LeaseError::WrongOwner);
     };
-    let result = if let Some(council) = &state.council
-        && !is_node_job_lease(&lease_id)
-    {
+    let result = if let Some(council) = &state.council {
         crate::testkit::lease::cleanup_cluster_lease(council, &lease_id, owner_id).await
     } else {
         crate::testkit::lease::cleanup_local_lease(
             &state.local_test_leases,
             &state.cmd_tx,
+            Some(&state.task_arrays),
             &lease_id,
             owner_id,
         )
@@ -471,18 +486,24 @@ pub(super) async fn forward_test_lease_request<T: Serialize + ?Sized>(
         )
             .into_response();
     }
-    let Some(leader_url) = leader_api_url(state, council).await else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no cluster leader known yet; retry shortly",
-        )
-            .into_response();
+    let leader_url = match leader_api_url(state, council, headers).await {
+        Ok(url) => url,
+        Err(NoLeaderRoute::Unknown) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no cluster leader known yet; retry shortly",
+            )
+                .into_response();
+        }
+        Err(refusal) => return refusal.into_response(),
     };
-    let mut request = state
-        .cluster_http
-        .client()
-        .request(method, format!("{leader_url}{path}"))
-        .header("x-reliaburger-lease-forwarded", "1");
+    let mut request = mark_leader_forwarded(
+        state
+            .cluster_http
+            .client()
+            .request(method, format!("{leader_url}{path}"))
+            .header("x-reliaburger-lease-forwarded", "1"),
+    );
     for name in [
         axum::http::header::AUTHORIZATION,
         axum::http::header::COOKIE,
@@ -556,9 +577,6 @@ pub(super) async fn find_test_lease(
     state: &ApiState,
     lease_id: &str,
 ) -> Option<crate::testkit::lease::TestLease> {
-    if is_node_job_lease(lease_id) {
-        return state.local_test_leases.get(lease_id).await;
-    }
     match &state.council {
         Some(council) => council
             .desired_state()

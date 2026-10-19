@@ -76,7 +76,7 @@ def inventory(row, root):
         require(set(gate['hosts']) <= {'linux', 'darwin'}, 'unsupported host')
         if 'required_in' in gate:
             require(
-                set(strings(gate['required_in'], 'required_in')) <= {'portable', 'full'},
+                set(strings(gate['required_in'], 'required_in')) <= {'light', 'portable', 'train-full', 'full'},
                 'unknown gate-plan mode',
             )
         argv(gate['command'])
@@ -173,6 +173,26 @@ def selected(discovery):
                 found.add(identity)
     require(bool(found), 'empty selected discovery')
     return found
+
+
+def partitioned(discovery):
+    """This shard's tests and every shard's tests, from a partitioned nextest list.
+
+    nextest partitions after every other filter, and lists each test it left
+    to another shard as a mismatch whose reason is `partition`. Those tests
+    and this shard's own are the unpartitioned selection.
+    """
+    found = selected(discovery)
+    everything = set(found)
+    for binary, suite in discovery['rust-suites'].items():
+        if suite['status'] == 'skipped':
+            continue
+        for name, case in suite['testcases'].items():
+            if case['filter-match'] == {'status': 'mismatch', 'reason': 'partition'}:
+                identity = binary, string(name, 'discovery name')
+                require(identity not in everything, 'duplicate discovery identity')
+                everything.add(identity)
+    return found, everything
 
 
 def passed_junit(path):

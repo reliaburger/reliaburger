@@ -659,7 +659,11 @@ pub struct ReplicaEvidence {
 // ---------------------------------------------------------------------------
 
 /// A scripted multi-step chaos scenario, parsed from TOML.
+///
+/// Unknown keys are refused, so a misspelt field fails the whole file
+/// before any step runs instead of being quietly ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScriptedScenario {
     /// Human-readable scenario name.
     pub name: String,
@@ -669,7 +673,11 @@ pub struct ScriptedScenario {
 }
 
 /// One step in a scripted scenario.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The optional scope fields carry what the matching `relish fault` flags
+/// do; a field a fault type can't use is refused when the scenario loads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScenarioStep {
     /// Human-readable description of what this step tests.
     pub description: String,
@@ -677,7 +685,9 @@ pub struct ScenarioStep {
     pub fault: String,
     /// Target service name.
     pub target: String,
-    /// Fault value (e.g. "200ms", "10%", "90%", "nxdomain").
+    /// Fault value (e.g. "200ms", "10%", "90%", "nxdomain"). `kill` and
+    /// `pause` take none.
+    #[serde(default)]
     pub value: String,
     /// Optional jitter (e.g. "50ms").
     pub jitter: Option<String>,
@@ -685,6 +695,16 @@ pub struct ScenarioStep {
     pub duration: Option<String>,
     /// Delay before activating this step, relative to scenario start.
     pub start_after: Option<String>,
+    /// Namespace of the target service (`--namespace`); the server's
+    /// `default` when absent.
+    pub namespace: Option<String>,
+    /// Source app for a `delay` or `partition` (`--from`): only its calls to
+    /// the target are faulted. Without it, every caller is.
+    pub from: Option<String>,
+    /// How many replicas a `kill` takes (`--count`); one when absent.
+    pub count: Option<u32>,
+    /// One instance id to scope the fault to (`--instance`).
+    pub instance: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -700,6 +720,11 @@ pub struct FaultSummary {
     pub fault_type: String,
     /// Target service.
     pub target_service: String,
+    /// Namespace of the target service; `None` for a node fault, which
+    /// targets no workload. Scoped callers see only their own namespaces'
+    /// faults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// Target instance, if scoped.
     pub target_instance: Option<String>,
     /// Target node, for routed node faults.
@@ -724,6 +749,7 @@ impl From<&FaultRule> for FaultSummary {
             id: rule.id.0,
             fault_type: rule.fault_type.to_string(),
             target_service: rule.target_service.clone(),
+            namespace: rule.namespace.clone(),
             target_instance: rule.target_instance.clone(),
             target_node: rule.target_node.clone(),
             remaining_secs: rule.remaining().as_secs(),

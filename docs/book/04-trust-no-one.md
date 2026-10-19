@@ -15,7 +15,7 @@ By the end of this chapter, a fresh Reliaburger cluster will have:
 - **Join tokens** so new nodes prove their right to join
 - **API authentication** with scoped, time-limited tokens
 - **Secret encryption** so `ENC[AGE:...]` values in your config are decrypted only at runtime
-- **Raft log encryption** at rest, so even physical disk access doesn't reveal cluster state
+- **Raft log encryption** at rest, so a stolen disk doesn't reveal the log's entries
 - **eBPF firewall rules** enforcing which apps can talk to which
 
 Zero configuration required. You get all of it by default.
@@ -80,9 +80,65 @@ That normal command now writes `require_mtls = true` into the generated
 start cluster mode without it. You don't generate keys and then quietly run
 plaintext because you missed one Boolean. If you really need plaintext for an
 isolated experiment, you must say `--development-plaintext`; the generated
-file and both commands warn you. `relish dev create` makes the same explicit
-trade for its local Lima network because that provisioner doesn't enrol a
-separate identity in every VM yet. Subtle, it isn't.
+file and both commands warn you. Subtle, it isn't.
+
+The default goes the same way. `SecuritySection` used to derive `Default`,
+which gave `require_mtls` the `bool` default of `false`. So a config that left
+out `[security]` got plaintext without anyone asking for it. Now the struct
+implements `Default` by hand:
+
+```rust
+impl Default for SecuritySection {
+    fn default() -> Self {
+        Self {
+            require_mtls: true,
+            master_key_path: None,
+            // ... every other field at its ordinary default
+        }
+    }
+}
+```
+
+`#[serde(default)]` on the struct means serde fills every missing field from
+this `Default` value, not from each field type's own default. That's the Rust
+detail that matters here. A missing `require_mtls` key now reads as `true`, and
+`bun --cluster` with no identity stops with "run `relish init`". Single-node
+`bun` never reads the field, so it's unaffected. Plaintext is now something you
+write down, `require_mtls = false`, and nothing gives it to you by omission.
+
+`relish dev create` used to be the awkward exception. Its Lima provisioner
+didn't enrol an identity in every VM, so it wrote plaintext configs. It now
+reuses the laptop quickstart's bootstrap code: the CA, master key and an
+administrator token come from the same `security::prepare_in`, the first VM
+gets the first identity, and every other VM enrols with a join token and
+`relish join`, exactly as you would by hand. One less special case, and the dev
+cluster finally has a registry, which needs mTLS.
+
+The first mTLS dev cluster formed a healthy council and then failed every
+linearizable read on the leader. Pulls failed, and `relish wtf` said the leader
+wasn't the leader. The cause was a timing budget. Our Raft transport opens a
+fresh TCP and TLS connection for every RPC, and when openraft checks that it's
+still the leader, it gives each follower's heartbeat just `heartbeat_interval`,
+150 ms, to answer. `relish dev` VMs run debug builds, and Cargo's dev profile
+compiles `ring`, the crypto under rustls, without optimisation. A handshake
+between VMs on Lima's user-mode network, plus unoptimised elliptic-curve maths
+at both ends, blew the budget every time. The fix is two lines in `Cargo.toml`:
+
+```toml
+[profile.dev.package.ring]
+opt-level = 3
+```
+
+A `[profile.<name>.package.<crate>]` table overrides settings for one
+dependency only, so `ring` is optimised while our own code keeps fast debug
+builds. We'd already done the same for the SHA-256 and Argon2 crates. Release
+builds, which `relish setup --quickstart` uses, were never affected. That
+treated the symptom. The cause went later, in
+[#928](https://github.com/reliaburger/reliaburger/issues/928): the Raft
+transport now keeps a small pool of open connections per peer, so a heartbeat
+no longer pays for a handshake at all. Chapter 2's "Keeping Raft connections
+open" explains the pool. We kept the `ring` override, since debug builds still
+handshake whenever a pooled connection is retired.
 
 The generated master key and security-bootstrap JSON both land as `0600`.
 That second file used to land as `0644`, while Bun's loader quite reasonably
@@ -429,6 +485,8 @@ let _ = tokio::time::timeout(RAFT_ACCEPT_DEADLINE, async {
 
 A peer that stalls is dropped when the deadline fires, and the task is freed. `tokio::time::timeout` wraps any future and races it against a timer, returning `Err` if the timer wins — a much better tool than trusting TCP's own timeouts, which are measured in minutes and aren't really yours to set. The outbound side already had a connect timeout; this closes the same gap on the way in.
 
+When the Raft transport later started keeping connections open ([#928](https://github.com/reliaburger/reliaburger/issues/928), Chapter 2's "Keeping Raft connections open"), one deadline per connection no longer fit, because a healthy connection now carries many requests. So the clock split in three. The handshake keeps `RAFT_ACCEPT_DEADLINE`, so does each request, and the wait for the *next* request gets its own idle timeout. A stalled peer still pins a task for a bounded time; the bound is just counted per request now.
+
 ### A number is a promise, not a fact
 
 That fixed the clock. There were two more bounds missing on the same listener, and both come from the same habit: believing what a stranger tells you.
@@ -617,11 +675,15 @@ Tokens have three roles:
 - **Deployer** — deploy and stop apps, view status
 - **ReadOnly** — view status, logs, and service resolution
 
-Tokens are hashed with Argon2id before storage. Argon2id is deliberately slow — it's designed to resist GPU-based brute force attacks. The Rust `argon2` crate handles the hashing:
+Only a hash of each token goes into Raft, never the token itself. Since 0.2.1 that hash is plain SHA-256 of the whole token string, and "Token validation" below explains why it isn't the password hash we started with:
 
 ```rust
-let argon2 = Argon2::default();
-let hash = argon2.hash_password(token.as_bytes(), &salt)?;
+pub(crate) fn hash_secret(plaintext: &str) -> Result<Vec<u8>, TokenError> {
+    if !looks_like_token(plaintext) {
+        return Err(TokenError::WeakSecret);
+    }
+    Ok(digest(plaintext).to_vec())
+}
 ```
 
 The middleware skips authentication for `/v1/health` (so liveness probes still work) and when no user tokens exist yet. That second case is a bootstrap window, not permission to publish an open control plane: Bun only permits it on an IP-literal loopback listener. Wildcard, routable and hostname listeners are refused until the cluster has a real user token.
@@ -707,22 +769,30 @@ Namespaces can have their own `age` keypairs, so team A's secrets can't be decry
 
 ## Raft log encryption at rest
 
-The Raft log contains everything: CA keys, API token hashes, scheduling state, app configs. Even with key wrapping, we want another layer of protection for the log itself.
+The Raft log contains almost everything: wrapped CA keys, API token hashes, scheduling state, app configs. Even with key wrapping, we want another layer of protection for the log itself.
 
-Every Raft entry is encrypted with AES-256-GCM before writing to disk. The encryption key is derived from the node's certificate private key via HKDF:
+Every Raft entry is encrypted with AES-256-GCM before it's written to disk. Each entry's key is derived with HKDF from the cluster master key and a fresh random salt:
 
 ```rust
 const RAFT_LOG_HKDF_INFO: &str = "reliaburger-raft-log-encryption-v1";
 
 pub fn derive_log_encryption_key(
-    node_private_key_der: &[u8],
+    master_key: &[u8],
     salt: &[u8; 32],
 ) -> Result<[u8; 32], RaftEncryptionError> {
-    crypto::hkdf_derive_key(node_private_key_der, salt, RAFT_LOG_HKDF_INFO)
+    Ok(crypto::hkdf_derive_key(
+        master_key,
+        salt,
+        RAFT_LOG_HKDF_INFO,
+    )?)
 }
 ```
 
-Each entry gets a fresh random salt, so identical entries produce different ciphertext. If someone steals the disk, they need the node's private key to decrypt anything.
+The `?` converts a `CryptoError` into a `RaftEncryptionError` on the way out, through the `From` impl that `#[from]` generates. The fresh salt means identical entries produce different ciphertext.
+
+Be clear about what this buys. The master key lives on the node, in `master.key`, because every node needs it to unwrap CA keys and authenticate gossip. So the encryption protects a stolen disk, a copied `log.redb` or a careless backup of the data directory. It doesn't protect against someone with root on a running node: they can read the master key as easily as Bun can. And it only covers log entries. The Raft snapshot, `snapshot.redb`, which holds token hashes, wrapped keys and the whole desired state, is written in plaintext, and so are Raft's vote and log-position records. A cluster started without a master key writes a plaintext log too.
+
+We decided to say exactly that rather than extend the encryption now. The snapshot would need the same key, which sits on the same host, so encrypting it with the master key would add work without changing who can read it. The real fix is a key the host's root account can't simply read, sealed to a TPM or derived from the node's hardware identity, and that's 0.3.0 appliance work ([#402](https://github.com/reliaburger/reliaburger/issues/402)).
 
 ## eBPF firewall wiring
 
@@ -735,9 +805,11 @@ When you deploy an app with `firewall.allow_from`:
 allow_from = ["api", "frontend/web"]
 ```
 
-Bun resolves `"api"` to its cgroup IDs and writes allow rules to the BPF map. The eBPF connect hook checks this map on every `connect()` syscall. If the source cgroup isn't in the map for the destination app, the connection is denied with `EPERM`.
+Bun resolves `"frontend/web"` to that app's cgroup IDs and writes allow rules to the BPF map. The eBPF connect hook consults this map when a caller from one namespace reaches a destination in another. If the source cgroup has no grant for the destination app, the connection is denied with `EPERM`.
 
-The default behaviour (no `allow_from` specified) permits all apps in the same namespace to connect to each other — namespace isolation without any configuration.
+Apps in the same namespace always reach each other, with or without `allow_from`; that's namespace isolation without any configuration. An earlier draft of the whitepaper promised `allow_from` would also narrow callers *inside* a namespace. The code never did, and in the 0.2.0 audit we chose to drop the promise rather than half-build it (decision D4). `allow_from` opens cross-namespace paths, nothing more. Finer control would reuse the real-address map from Chapter 3, so it may come back later.
+
+Two things turned this from "advertised" into "on by default". First, `relish init` now writes `[ebpf]` and `[dns]` enabled when it runs as root on Linux with `runc` installed, and Bun refuses to start a rootful runc node whose eBPF data path fails to load. Before, the generated config had eBPF off, so a cluster built the documented way enforced nothing and said nothing. Second, a node that *can't* enforce isolation (rootless runc, ProcessGrill, macOS) refuses `allow_from` at deploy, the same way it refuses an egress allowlist, and `relish wtf` warns when a cluster with more than one namespace has such a node. A grant that opens a path through a wall that isn't there would be worse than useless: it would tell you the wall exists.
 
 ## The perimeter firewall
 
@@ -830,36 +902,45 @@ Second, `seal_in_place_append_tag` modifies the buffer in place — the plaintex
 
 Third, `LessSafeKey` can't be cloned, serialised, or sent across threads. You create it, use it, and it disappears when the function returns. The type system prevents you from accidentally persisting the encryption key alongside the ciphertext.
 
-### Token validation: cheap checks first
+### Token validation: the wrong hash for the job
 
-The token validation function shows a pattern worth remembering — order your checks from cheapest to most expensive:
+Phase 4 stored tokens the way you'd store passwords: Argon2id with a random salt per token. It felt like the responsible choice. Argon2id is slow and memory-hungry on purpose, so an attacker who steals the hashes can't try billions of guesses a second on a GPU.
+
+Now think about what those guesses are. A password hash protects *short, human-chosen* secrets. `hunter2` and `Summer2026!` are in every cracking dictionary, so making each guess cost 20 ms really does stop an attacker. Our tokens aren't chosen by humans. Each one is `rbrg_` plus 32 bytes from the operating system's random number generator: 256 bits. Even at a trillion guesses a second, you'd expect to need around 10^57 years to find one. Making each guess slower doesn't change "never" into anything. The salt is pointless for the same reason: it defends against precomputed tables of likely passwords, and there are no likely 256-bit secrets.
+
+So the slowness bought nothing, but every request paid for it. Bun checks the bearer on every API call, against every stored token in turn, and nothing cached the answer. With ten tokens in the store one request cost 177 ms of hashing, and each Argon2 verification briefly allocated about 19 MiB. Chapter 10 had to bound that work with a semaphore and push it onto a blocking thread pool. Then in the 0.2.0 soak the API node, answering thousands of job-controller requests an hour, ran out of memory during an upgrade (#892): glibc's allocator keeps part of the freed memory resident, and 19 MiB at a time adds up.
+
+In 0.2.1 we switched to SHA-256 (#912). Validation hashes the bearer once and compares the digest with each stored one:
 
 ```rust
-pub fn validate_token(plaintext: &str, stored: &ApiToken) -> Result<(), TokenError> {
-    // Check expiry first (cheap: compare two timestamps)
-    if let Some(expires_at) = stored.expires_at
-        && SystemTime::now() > expires_at
-    {
-        return Err(TokenError::Expired);
-    }
+pub fn validate_token_at(
+    plaintext: &str,
+    stored: &ApiToken,
+    now: SystemTime,
+) -> Result<MatchedSecret, TokenError> {
+    validate_digest_at(&digest(plaintext), stored, now)
+}
 
-    // Verify Argon2id hash (expensive: deliberately slow)
-    let hash_str = String::from_utf8(stored.token_hash.clone())
-        .map_err(|_| TokenError::ValidationFailed)?;
-    let parsed_hash = PasswordHash::new(&hash_str)
-        .map_err(|_| TokenError::ValidationFailed)?;
-
-    Argon2::default()
-        .verify_password(plaintext.as_bytes(), &parsed_hash)
-        .map_err(|_| TokenError::ValidationFailed)?;
-
-    Ok(())
+fn digests_equal(candidate: &[u8; 32], stored: &[u8]) -> bool {
+    super::ca::constant_time_eq(candidate, stored)
 }
 ```
 
-Expiry is a nanosecond comparison. Argon2id verification is deliberately slow (tens of milliseconds). By checking expiry first, we reject expired tokens instantly without burning CPU on the hash. This matters under load — an attacker spamming expired tokens costs you almost nothing.
+`digest` returns `[u8; 32]`, a fixed-size array whose length is part of its type, so the compiler knows every candidate is exactly 32 bytes. The stored side is a `&[u8]` slice, because it comes out of Raft as a `Vec<u8>`. `constant_time_eq` is the comparison join tokens already used: it XORs every byte pair into one accumulator instead of stopping at the first difference, so the time it takes doesn't reveal how much of the digest a guess got right. Strictly, learning the digest wouldn't help an attacker (SHA-256 can't be run backwards), but the constant-time compare costs nothing, so we keep the defence. The same measurement as before now takes under 7 µs, and a burst of verifications on four threads no longer moves peak memory at all.
 
-The `if let Some(x) && condition` syntax is relatively new in Rust (stabilised in 1.64). It combines pattern matching with a boolean guard in a single `if` clause. Without it, you'd need a nested `if let` inside an `if`, which is both uglier and harder to read.
+The fast hash is safe only while every secret behind it is long and random, so the code says so twice. `hash_secret` refuses anything that isn't `rbrg_` plus 64 hex characters, and the byte count is pinned at compile time:
+
+```rust
+pub const TOKEN_SECRET_BYTES: usize = 32;
+
+const _: () = assert!(TOKEN_SECRET_BYTES >= 32);
+```
+
+`const _: () = ...` declares an unnamed constant, and evaluating a constant happens at compile time, so a failing `assert!` here is a build error, not a runtime panic. Someone who "simplifies" tokens to 8 bytes gets told off by the compiler before a single weak token exists.
+
+The stored format changed, so 0.2.1 starts a fresh cluster and everyone reissues their tokens. Before 1.0 we don't migrate (see `src/compatibility.rs`).
+
+What would we do differently? Ask what kind of secret we're protecting before picking the hash. "Hash passwords with Argon2" is good advice, and these weren't passwords.
 
 ### The CA hierarchy generation
 
@@ -1058,7 +1139,7 @@ The roster maps directly onto the primitives in this chapter:
 - **AES-256-GCM** — encrypt/decrypt round-trips, and the one that matters most: flip a byte of ciphertext and decryption returns an error, never plaintext.
 - **Key wrapping** — wrap an intermediate CA key, unwrap it, get the original back; unwrap with the wrong purpose string and it fails.
 - **`age` secrets** — encrypt/decrypt, plus namespace isolation (team B's key can't read team A's secret).
-- **Argon2id** — hashing and verification, and that the three roles (`Admin`/`Deployer`/`ReadOnly`) gate the right operations.
+- **Token hashing** — the stored hash is the SHA-256 of the full token; a correct, wrong, revoked or wrong-length token does what you'd expect; a secret without 256 random bits is refused at issue time; a property test changes one character of a real token at every position and checks it never validates; and the three roles (`Admin`/`Deployer`/`ReadOnly`) gate the right operations.
 - **Gossip HMAC**, **mTLS config building**, **Raft log entry encryption**, **eBPF firewall rule resolution** — each gets its own test.
 
 A nice property of testing crypto this way: the tamper-detection and namespace-isolation tests are *negative* tests. They assert that the wrong key fails. Those are the tests that actually tell you the security property holds, not just that the happy path works.

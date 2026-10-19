@@ -17,8 +17,6 @@ use super::{BunAgent, BunError, Grill, InstanceId};
 #[derive(Clone)]
 pub(super) struct AppStop {
     pub(super) instances: Vec<InstanceId>,
-    /// Whether any instance is a recorded job whose phase must be committed.
-    pub(super) owns_job: bool,
     /// Restarts this stop took its instances back from. The exit wait lets
     /// their in-flight runtime steps finish before it signals anything.
     pub(super) taken_restarts: Vec<super::restarts::TakenRestart>,
@@ -90,6 +88,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Ok(()) => self.begin_app_stop(app_name, namespace).await,
             Err(error) => Err(error),
         };
+        // The app is leaving this node, so a refusal to admit it here is
+        // stale: it would move the app off this node again if the leader
+        // later places it here (#967). A refused stop (a deploy is still
+        // running) leaves the app, and the record, in place.
+        if matches!(begun, Ok(_) | Err(BunError::AppNotFound { .. })) {
+            self.capacity_refusals.remove(&key);
+        }
         match begun {
             Ok(stop) => {
                 let waiters = vec![StopWaiter { purpose, response }];
@@ -322,15 +327,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         app_name: &str,
         namespace: &str,
     ) -> Result<AppStop, BunError> {
-        // A schedule exists before its first instance. Retire future firings
-        // even when there is no running process (or runtime cleanup fails).
-        let mut next = self.scheduled_jobs.clone();
-        let had_schedule = next
-            .remove(&(app_name.to_string(), namespace.to_string()))
-            .is_some();
-        if had_schedule {
-            self.commit_scheduled_jobs(next).await?;
-        }
         // Get instance IDs for this app
         let instances: Vec<InstanceId> = self
             .supervisor
@@ -340,26 +336,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|i| i.id.clone())
             .collect();
 
-        if instances.is_empty() && !had_schedule {
+        if instances.is_empty() {
             return Err(BunError::AppNotFound {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
             });
-        }
-
-        let owns_job = instances
-            .iter()
-            .any(|id| self.recorded_jobs.contains_key(&id.0));
-        let mut jobs = self.recorded_jobs.clone();
-        for id in &instances {
-            if let Some(job) = jobs.get_mut(&id.0)
-                && job.phase != crate::bun::jobs::JobPhase::Unknown
-            {
-                job.phase = crate::bun::jobs::JobPhase::Stopping;
-            }
-        }
-        if owns_job {
-            self.commit_jobs(jobs).await?;
         }
 
         // Runtime retirement can release a reusable container address. Refuse
@@ -390,7 +371,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         Ok(AppStop {
             instances,
-            owns_job,
             taken_restarts,
         })
     }
@@ -459,17 +439,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         stop: &AppStop,
     ) -> impl std::future::Future<Output = Result<(), BunError>> + Send + 'static {
-        let ids: Vec<InstanceId> = stop
-            .instances
-            .iter()
-            .filter(|id| {
-                !self
-                    .recorded_jobs
-                    .get(&id.0)
-                    .is_some_and(|job| job.runtime_absent)
-            })
-            .cloned()
-            .collect();
+        let ids = stop.instances.clone();
         let grill = self.supervisor.grill().clone();
         let drains = self.drains.clone();
         let grace = self.stop_grace;
@@ -498,11 +468,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         namespace: &str,
         stop: AppStop,
     ) -> Result<(), BunError> {
-        let AppStop {
-            instances,
-            owns_job,
-            ..
-        } = stop;
+        let AppStop { instances, .. } = stop;
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
 
         // Transition Stopping → Stopped now the exit is confirmed.
@@ -517,21 +483,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         instance.state = s;
                     });
             }
-        }
-
-        let mut jobs = self.recorded_jobs.clone();
-        for id in &instances {
-            if let Some(job) = jobs.get_mut(&id.0) {
-                if job.phase != crate::bun::jobs::JobPhase::Unknown {
-                    job.phase = crate::bun::jobs::JobPhase::Stopped;
-                }
-                // Confirmed process exit does not establish OCI object absence.
-                job.runtime_absent = job.batch_execution.is_none()
-                    || job.runtime == crate::grill::records::RuntimeKind::Process;
-            }
-        }
-        if owns_job {
-            self.commit_jobs(jobs).await?;
         }
 
         // A failed artifact cleanup retains the empty service's key for retry.
@@ -634,7 +585,6 @@ mod tests {
             PendingStop {
                 stop: AppStop {
                     instances: Vec::new(),
-                    owns_job: false,
                     taken_restarts: Vec::new(),
                 },
                 task,

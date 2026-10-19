@@ -1,0 +1,258 @@
+{
+  "cpu_request_millicores": 25,
+  "cpu_limit_millicores": 1000,
+  "memory_bytes": 33554432,
+  "window_seconds": 60,
+  "rows": [
+    {
+      "runtime": "shared-runc",
+      "concurrency": 8,
+      "batch_id": 63,
+      "admission_upper_bound": 8,
+      "receipt_chunk_size": 1000,
+      "cold": {
+        "requested_seconds": 60,
+        "unique_accepted_successes": 120000,
+        "terminal_failures": 0,
+        "accepted_retries": 0,
+        "application_failures": 0,
+        "initial_accepted_counts": [
+          0,
+          0,
+          0
+        ],
+        "last_accepted_sample_seconds": 59.958220231113955,
+        "error": null,
+        "service_latency_ms": {
+          "samples": 214,
+          "maximum": 12.66089198179543,
+          "p95": 1.2895509134978056
+        },
+        "successes_per_second": 2000.0,
+        "healthy": true,
+        "maximum_sampled_active_commands": 8,
+        "maximum_sampled_other_in_flight_attempts": 8,
+        "maximum_sampled_held_tasks": 9000
+      },
+      "warm": {
+        "requested_seconds": 60,
+        "unique_accepted_successes": 110000,
+        "terminal_failures": 0,
+        "accepted_retries": 0,
+        "application_failures": 0,
+        "initial_accepted_counts": [
+          120000,
+          0,
+          0
+        ],
+        "last_accepted_sample_seconds": 59.88772863801569,
+        "error": null,
+        "service_latency_ms": {
+          "samples": 211,
+          "maximum": 12.943142093718052,
+          "p95": 1.5278039500117302
+        },
+        "successes_per_second": 1833.3333333333333,
+        "healthy": true,
+        "maximum_sampled_active_commands": 8,
+        "maximum_sampled_other_in_flight_attempts": 8,
+        "maximum_sampled_held_tasks": 8000
+      },
+      "drain_proof": {
+        "batch_id": 63,
+        "done": true,
+        "held": 0,
+        "active_commands": 0
+      }
+    },
+    {
+      "runtime": "shared-runc",
+      "concurrency": 16,
+      "batch_id": 65,
+      "admission_upper_bound": 16,
+      "receipt_chunk_size": 1000,
+      "cold": {
+        "requested_seconds": 60,
+        "unique_accepted_successes": 95000,
+        "terminal_failures": 0,
+        "accepted_retries": 0,
+        "application_failures": 0,
+        "initial_accepted_counts": [
+          0,
+          0,
+          0
+        ],
+        "last_accepted_sample_seconds": 59.80658085993491,
+        "error": null,
+        "service_latency_ms": {
+          "samples": 213,
+          "maximum": 12.289301957935095,
+          "p95": 1.3721350114792585
+        },
+        "successes_per_second": 1583.3333333333333,
+        "healthy": true,
+        "maximum_sampled_active_commands": 4,
+        "maximum_sampled_other_in_flight_attempts": 16,
+        "maximum_sampled_held_tasks": 8000
+      },
+      "warm": {
+        "requested_seconds": 60,
+        "unique_accepted_successes": 117000,
+        "terminal_failures": 0,
+        "accepted_retries": 0,
+        "application_failures": 0,
+        "initial_accepted_counts": [
+          95000,
+          0,
+          0
+        ],
+        "last_accepted_sample_seconds": 59.897052416810766,
+        "error": null,
+        "service_latency_ms": {
+          "samples": 210,
+          "maximum": 16.257913084700704,
+          "p95": 2.1327240392565727
+        },
+        "successes_per_second": 1950.0,
+        "healthy": true,
+        "maximum_sampled_active_commands": 15,
+        "maximum_sampled_other_in_flight_attempts": 16,
+        "maximum_sampled_held_tasks": 8000
+      },
+      "drain_proof": {
+        "batch_id": 65,
+        "done": true,
+        "held": 0,
+        "active_commands": 0
+      }
+    },
+    {
+      "runtime": "shared-runc",
+      "concurrency": 27,
+      "batch_id": 67,
+      "admission_upper_bound": 27,
+      "receipt_chunk_size": 1000,
+      "cold": {
+        "requested_seconds": 60,
+        "unique_accepted_successes": 43000,
+        "terminal_failures": 0,
+        "accepted_retries": 0,
+        "application_failures": 0,
+        "initial_accepted_counts": [
+          0,
+          0,
+          0
+        ],
+        "last_accepted_sample_seconds": 59.8509033289738,
+        "error": null,
+        "service_latency_ms": {
+          "samples": 210,
+          "maximum": 12.771927053108811,
+          "p95": 1.9253890495747328
+        },
+        "successes_per_second": 716.6666666666666,
+        "healthy": true,
+        "maximum_sampled_active_commands": 6,
+        "maximum_sampled_other_in_flight_attempts": 27,
+        "maximum_sampled_held_tasks": 4000
+      },
+      "warm": {
+        "requested_seconds": 60,
+        "unique_accepted_successes": 148000,
+        "terminal_failures": 0,
+        "accepted_retries": 0,
+        "application_failures": 0,
+        "initial_accepted_counts": [
+          43000,
+          0,
+          0
+        ],
+        "last_accepted_sample_seconds": 59.869674121029675,
+        "error": null,
+        "service_latency_ms": {
+          "samples": 213,
+          "maximum": 13.304387917742133,
+          "p95": 2.1789739839732647
+        },
+        "successes_per_second": 2466.6666666666665,
+        "healthy": true,
+        "maximum_sampled_active_commands": 22,
+        "maximum_sampled_other_in_flight_attempts": 17,
+        "maximum_sampled_held_tasks": 8000
+      },
+      "drain_proof": {
+        "batch_id": 67,
+        "done": true,
+        "held": 0,
+        "active_commands": 0
+      }
+    },
+    {
+      "runtime": "shared-runc",
+      "concurrency": 32,
+      "batch_id": 69,
+      "admission_upper_bound": 32,
+      "receipt_chunk_size": 1000,
+      "cold": {
+        "requested_seconds": 60,
+        "unique_accepted_successes": 25000,
+        "terminal_failures": 0,
+        "accepted_retries": 0,
+        "application_failures": 0,
+        "initial_accepted_counts": [
+          0,
+          0,
+          0
+        ],
+        "last_accepted_sample_seconds": 59.71782950498164,
+        "error": null,
+        "service_latency_ms": {
+          "samples": 209,
+          "maximum": 12.880174908787012,
+          "p95": 1.6975118778645992
+        },
+        "successes_per_second": 416.6666666666667,
+        "healthy": true,
+        "maximum_sampled_active_commands": 2,
+        "maximum_sampled_other_in_flight_attempts": 32,
+        "maximum_sampled_held_tasks": 2000
+      },
+      "warm": {
+        "requested_seconds": 60,
+        "unique_accepted_successes": 102000,
+        "terminal_failures": 0,
+        "accepted_retries": 0,
+        "application_failures": 0,
+        "initial_accepted_counts": [
+          26000,
+          0,
+          0
+        ],
+        "last_accepted_sample_seconds": 59.797500130021945,
+        "error": null,
+        "service_latency_ms": {
+          "samples": 215,
+          "maximum": 20.202100975438952,
+          "p95": 1.3742181472480297
+        },
+        "successes_per_second": 1700.0,
+        "healthy": true,
+        "maximum_sampled_active_commands": 0,
+        "maximum_sampled_other_in_flight_attempts": 4,
+        "maximum_sampled_held_tasks": 6000
+      },
+      "drain_proof": {
+        "batch_id": 69,
+        "done": true,
+        "held": 0,
+        "active_commands": 0
+      }
+    }
+  ],
+  "complete": true,
+  "methodology": "Cold executors, warm image. Submit once, observe cold window after submit response, then immediately observe a second warm window with counter subtraction. Cancel/drain only afterwards. One active submission.",
+  "activity_caveat": "Active command snapshots are sampled at node sync and may miss short commands; configured concurrency is a cap, not an observation of continuous occupancy.",
+  "reusable_executor_pool_limit": 32,
+  "job_cpu_budget_millicores": 3000,
+  "binary_sha256": "ca99c4e0a7079d930770417d1a9da396306b3a883ba3f5e58b06f8448bb4d19e"
+}

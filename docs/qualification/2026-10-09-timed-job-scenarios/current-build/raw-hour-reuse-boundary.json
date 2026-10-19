@@ -1,0 +1,9 @@
+{
+  "concurrency": 27,
+  "raw_hour_reused": true,
+  "requested_seconds": 3600,
+  "executable_sha256": "f19470457088612bc3285404783d9f93533d917e869050aca13a4139b937c0a5",
+  "cpu_profile_inputs_have_no_enforcement_or_admission_effect": true,
+  "reason": "Same executable, VM and concurrency; bare mode ignores the comparison-only CPU request fields",
+  "verified_utc": "2026-10-09T17:08:49.834326+00:00"
+}

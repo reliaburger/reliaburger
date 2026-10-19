@@ -21,9 +21,10 @@
 #                           to a copy (OpenSSL 3 needed); each walk upgrades to
 #                           it and rolls back to the version the candidate's
 #                           nodes report; without it the upgrade slots are skipped
-#   --tier T                fast (compressed schedule, 90m: the iteration loop
+#   --tier T                fast (compressed schedule, 60m: the iteration loop
 #                           after each round of fixes) or final (full schedule,
-#                           8h: the acceptance run on the final candidate)
+#                           8h); the release gate's final soak is the job
+#                           final, qualify-jobs-sustained.sh --tier final
 #   --duration D            soak length: 40m, 8h, 2d (default: the tier's, or 24h)
 #   --schedule S            full (hourly cycle) or compressed (10-minute cycle);
 #                           default: the tier's, or full
@@ -39,6 +40,21 @@
 #   --resume                continue the run in --evidence after an interruption;
 #                           the gap is recorded as a pause of the soak clock
 #   --keep                  leave the cluster and the installation afterwards
+#   --job-load L            calibration (the release soak's conservative job
+#                           mix, the default) or target (#668: shared and host
+#                           runs become million-task arrays, and the run fails
+#                           unless jobs average --target-rate)
+#   --target-rate R         accepted successes a second for --job-load target
+#                           (default 1390: the 1,158 of 100 million a day, plus
+#                           20% headroom)
+#   --node-faults           add one node-level fault to every cycle, in
+#                           rotation: inter-node delay, a full disk, slow
+#                           fsync (#686); jobs must overlap each kind
+#   --plan                  print the fault schedule these options give and
+#                           exit, touching nothing
+#
+# scripts/release/qualify-jobs-sustained.sh runs the job qualification tiers
+# (D18-C) through this script.
 set -euo pipefail
 
 usage() { sed -n '3,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
@@ -52,6 +68,10 @@ fi
 
 repository=$(cd "$(dirname "$0")/../.." && pwd)
 checker=$repository/scripts/release/sustained_check.py
+job_controller=$repository/scripts/release/job_soak.py
+job_inventory=$repository/scripts/release/job_soak_inventory.py
+guest_memory=$repository/scripts/release/sustained/guest-memory.sh
+jobs_pid=
 workloads_template=$repository/scripts/release/sustained/soak-workloads.toml
 podinfo=$repository/examples/kubernetes/podinfo.yaml
 base_url=
@@ -65,6 +85,10 @@ record=
 home=
 resume=false
 keep=false
+job_load=
+target_rate=
+node_faults=
+plan=false
 while [ "$#" -gt 0 ]; do
     case $1 in
         --base-url) base_url=${2:-}; shift 2 ;;
@@ -78,6 +102,10 @@ while [ "$#" -gt 0 ]; do
         --home) home=${2:-}; shift 2 ;;
         --resume) resume=true; shift ;;
         --keep) keep=true; shift ;;
+        --job-load) job_load=${2:-}; shift 2 ;;
+        --target-rate) target_rate=${2:-}; shift 2 ;;
+        --node-faults) node_faults=true; shift ;;
+        --plan) plan=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; fail "unknown argument: $1" ;;
     esac
@@ -89,10 +117,22 @@ if [ "$resume" = true ] && [ -f "${evidence:-.}/metadata.json" ]; then
     [ -n "$tier" ] || tier=$(started_with tier)
     [ -n "$schedule" ] || schedule=$(started_with schedule)
     [ -n "$duration_text" ] || { duration_text=$(started_with duration_target); duration_text=${duration_text:+$(( duration_text / 60 ))m}; }
+    # The job load and node faults are part of the campaign's identity.
+    [ -n "$job_load" ] || job_load=$(started_with job_load)
+    [ -n "$target_rate" ] || target_rate=$(started_with target_rate)
+    [ -n "$node_faults" ] || { [ "$(started_with node_faults)" != True ] || node_faults=true; }
 fi
+: "${job_load:=calibration}" "${node_faults:=false}"
+case $job_load in
+    calibration) [ -z "$target_rate" ] || fail '--target-rate needs --job-load target' ;;
+    target) : "${target_rate:=1390}"
+            [[ $target_rate =~ ^[0-9]+$ ]] && [ "$target_rate" -ge 1158 ] \
+                || fail '--target-rate must be a whole number of at least 1158 (100 million accepted jobs a day)' ;;
+    *) fail '--job-load must be calibration or target' ;;
+esac
 # The two tiers (plan D3): fast for the fix-and-rerun loop, final for acceptance.
 case $tier in
-    fast) : "${schedule:=compressed}" "${duration_text:=90m}" ;;
+    fast) : "${schedule:=compressed}" "${duration_text:=60m}" ;;
     final) : "${schedule:=full}" "${duration_text:=8h}" ;;
     ''|custom) tier=custom; : "${schedule:=full}" "${duration_text:=24h}" ;;
     *) fail '--tier must be fast or final' ;;
@@ -104,6 +144,13 @@ case $duration_text in
     *[0-9]d) duration=$(( ${duration_text%d} * 86400 )) ;;
     *) fail '--duration must look like 40m, 24h or 2d' ;;
 esac
+# Every port the harness reaches (API, ingress, registry) goes through Lima's
+# port forwarder. The soak exercises the default gRPC forwarder quickstart
+# users run, so a caller's LIMA_SSH_PORT_FORWARDER (the 0.2.0 workaround for
+# the guest-agent leak fixed by Lima 2.2, #982, #983) must not switch it.
+# limactl reads it when relish starts a VM, so unsetting it here covers the
+# bootstrap and every power-on.
+unset LIMA_SSH_PORT_FORWARDER
 # Schedule parameters: cycle length, power-off hold, TLS rotation period, how
 # often the catalogue pulse, offline export and registry push run, and how many
 # chaos kinds each chaos slot runs. Two a slot lets an 8-hour full run (four
@@ -121,13 +168,16 @@ case $schedule in
     *) fail '--schedule must be full or compressed' ;;
 esac
 slot=$(( cycle / 6 ))
+# The job controller holds a bounded number of runs (#989): refuse a soak
+# whose job load wouldn't fit, now rather than hours in.
+job_runs=$(python3 "$job_controller" budget --duration "$duration") || fail 'the job campaign would outgrow its retained-run limit'
 light_every=30
 heavy_every=300
 leaf_lifetime=3600
 
 if [ "$resume" = true ]; then
     [ -f "${evidence:-.}/metadata.json" ] || fail '--resume needs --evidence with an earlier run'
-else
+elif [ "$plan" = false ]; then
     [ -n "$base_url" ] || [ -n "$home" ] || { usage >&2; fail '--base-url (or --home) is required'; }
 fi
 if [ -n "$base_url" ]; then
@@ -159,7 +209,10 @@ real_home_state() {
 }
 real_before=$(real_home_state)
 
-if [ -z "$evidence" ]; then
+if [ "$plan" = true ]; then
+    # Only a scratch directory for run_cycle's own bookkeeping files.
+    evidence=$(mktemp -d "${TMPDIR:-/tmp}/reliaburger-plan.XXXXXX")
+elif [ -z "$evidence" ]; then
     evidence=$(mktemp -d /var/tmp/reliaburger-v02.XXXXXX)
 elif [ "$resume" = false ]; then
     mkdir -p "$evidence"
@@ -170,7 +223,7 @@ evidence=$(cd "$evidence" && pwd)
 [ ! -e "$record" ] || fail "$record already exists"
 mkdir -p "$evidence/snapshots" "$evidence/failures" "$evidence/tls" "$evidence/config"
 chmod 700 "$evidence"
-say "evidence: $evidence"
+[ "$plan" = true ] || say "evidence: $evidence"
 
 check() { python3 "$checker" "$@"; }
 event() { check event "$evidence" "$@" || true; }
@@ -187,7 +240,11 @@ elif value.startswith("json:"):
     data[key] = json.loads(value[5:])
 else:
     data[key] = value
-json.dump(data, open(path, "w"), indent=1, sort_keys=True)
+import os
+with open(path+".new","w") as file:
+    json.dump(data,file,indent=1,sort_keys=True)
+    file.flush(); os.fsync(file.fileno())
+os.replace(path+".new",path)
 PY
 }
 meta_get() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$evidence/metadata.json" "$1" 2>/dev/null || true; }
@@ -271,7 +328,7 @@ discover() {
     export RELIABURGER_HOME=$home RELIABURGER_NO_MODIFY_PATH=1
     export LIMA_HOME=$home/lima
     relish=$home/bin/relish
-    limactl=$home/tools/lima-2.1.0/bin/limactl
+    limactl=$home/tools/lima-2.2.1/bin/limactl
     if [ ! -x "$relish" ] || [ ! -x "$limactl" ]; then fail "no relish or limactl in $home"; fi
     local state=$home/clusters/laptop/state.json index name ip
     read -r api_port ingress_port registry_port < <(python3 -c '
@@ -335,6 +392,7 @@ api_get() {
 }
 kill_bun() {
     local node=$1
+    job_mark_fault "$node" "${current_slot:-agent-kill}"
     check expect "$evidence" restart "${vm[node]}"
     gsh "$node" 'kill -9 "$(systemctl show -p MainPID --value reliaburger.service)"'
 }
@@ -403,6 +461,15 @@ push_pair() {
             '"'"'/^@@$/ {part = 1; next} {print > (part ? cert : key)}'"'"'
         mv /etc/reliaburger/soak-tls/ingress.key.new /etc/reliaburger/soak-tls/ingress.key
         mv /etc/reliaburger/soak-tls/ingress.crt.new /etc/reliaburger/soak-tls/ingress.crt'
+}
+
+# Push the current pair to a node that may have missed rotations, and tell
+# the checker that's what it must serve. A rotation while every node is down
+# still moves `current` on (#1108).
+push_current_pair() {
+    local node=$1
+    push_pair "$node" "$tls/current/cert.pem" "$tls/current/key.pem" || true
+    check ingress-expect "$evidence" "${vm[node]}" "$(cat "$tls/current/serial")"
 }
 
 served_ingress_serial() {
@@ -514,6 +581,7 @@ configure_nodes() {
     meta deviations+ 'node.toml `[testing] allowed_operations` adds `provision_isolated_workloads` (quickstart allows only inject_workload_faults and alter_node_state), so the catalogue pulse can lease test namespaces'
     meta deviations+ 'node.toml `[logs]`/`[metrics]` export to file:///var/lib/reliaburger/soak-export every 60 s with max_storage_mb = 8, `[storage.snapshots]` every 900 s (compressed: 120 s), retain 4, uploaded to the same directory'
     meta deviations+ 'node.toml `[ingress] tls_cert/tls_key` point at an operator pair from a soak CA, 45-minute leaves rotated by the harness'
+    meta deviations+ 'Bun runs with auto/mixed; host jobs opt in to a single pinned BusyBox copy under /var/lib/reliaburger/soak-jobs, mount_isolation=false. The independent verifier listens on each private VM address, TCP 8189, with a separate run token'
     meta deviations+ 'node.toml `[node.labels] soak-volume` = "writer" on node 2 and "redis" on node 3, to pin the volume apps'
     if [ -n "$operator_public" ]; then
         meta deviations+ "node.toml \`[upgrades] external_signing_key\` = a throwaway operator key the harness made for this run (\`$operator_public\`); the soak build's \`.sig\` gets that key's external signature beside the release one (D2)"
@@ -541,6 +609,8 @@ configure_nodes() {
             'testing.allowed_operations=["inject_workload_faults", "alter_node_state", "provision_isolated_workloads"]'
             'ingress.tls_cert="/etc/reliaburger/soak-tls/ingress.crt"'
             'ingress.tls_key="/etc/reliaburger/soak-tls/ingress.key"'
+            'process_workloads.allowed_binaries=["/var/lib/reliaburger/soak-jobs/busybox"]'
+            process_workloads.mount_isolation=false
         )
         [ -z "$label" ] || settings+=("node.labels.soak-volume=\"$label\"")
         [ "$leaf_supported" != yes ] || settings+=("security.leaf_lifetime_override_secs=$leaf_lifetime")
@@ -548,6 +618,24 @@ configure_nodes() {
         check toml-set "$evidence/config/node-$node.soak.toml" "${settings[@]}"
         push_pair "$node" "$tls/current/cert.pem" "$tls/current/key.pem"
         gsh_in "$node" < <(printf 'set -e\numask 077\nmkdir -p /var/lib/reliaburger/soak-export\ncat > /etc/reliaburger/node.toml.new <<"TOML"\n%s\nTOML\nmv /etc/reliaburger/node.toml.new /etc/reliaburger/node.toml\n' "$(cat "$evidence/config/node-$node.soak.toml")")
+        gsh_in "$node" <<'GUEST'
+set -e
+python3 - <<'PYUNIT'
+from pathlib import Path
+import re
+path=Path('/etc/systemd/system/reliaburger.service')
+text=path.read_text()
+lines=[line for line in text.splitlines() if line.startswith('ExecStart=')]
+if len(lines)!=1: raise SystemExit('soak needs one explicit Bun ExecStart')
+line=lines[0]
+if re.search(r'--runtime(?:=|\s+)(?:auto|mixed)(?=\s|$)',line): pass
+elif re.search(r'--runtime(?:=|\s+)runc(?=\s|$)',line):
+    text=text.replace(line,re.sub(r'(--runtime(?:=|\s+))runc(?=\s|$)',r'\1mixed',line))
+    path.write_text(text)
+else: raise SystemExit('soak cannot safely select mixed runtime in Bun unit')
+PYUNIT
+systemctl daemon-reload
+GUEST
         # SIGKILL, not a graceful restart: systemd restarts bun with the new
         # file. A graceful `systemctl restart` currently wedges a node whose
         # retirement it interrupts (see the plan's product findings).
@@ -616,8 +704,22 @@ wait_cluster() {
 }
 
 generation=0
+# Whether an apply may carry the job fixtures. Not once the campaign drains,
+# nor in the minute before (an apply's schedules commit after its hooks): an
+# apply re-registers each cron schedule the drain disabled and runs every
+# run_before hook and plain job once more, so a deploy-kill after the drain
+# ran job work the campaign never saw (#963). Leaving them out keeps the
+# definitions as the drain left them: apply doesn't remove absent jobs.
+jobs_applied() {
+    [ -f "$evidence/jobs/installed" ] && [ ! -f "$evidence/jobs/stop" ] || return 1
+    local stop_at
+    stop_at=$(meta_get job_stop_at)
+    [ -z "$stop_at" ] || [ $(( $(date +%s) + 60 )) -lt "$stop_at" ]
+}
+
 write_workloads() {
     sed "s/SOAK_GENERATION = \"[0-9]*\"/SOAK_GENERATION = \"$generation\"/" "$workloads_template" > "$evidence/workloads.toml"
+    ! jobs_applied || cat "$repository/scripts/release/sustained/soak-jobs.toml" >> "$evidence/workloads.toml"
 }
 
 apply_workloads() {
@@ -642,6 +744,74 @@ PY
     event --phase configure --target workloads --verdict ok --detail "generation $generation"
 }
 
+# The verifier is independent of Bun and starts before its listener baseline.
+prepare_jobs() {
+    mkdir -p "$evidence/jobs"
+    chmod 700 "$evidence/jobs"
+    [ -f "$evidence/jobs/.token" ] || (umask 077; openssl rand -hex 32 > "$evidence/jobs/.token")
+    python3 - "$evidence/jobs/nodes.json" "${vm[1]}" "${address[1]}" "${vm[2]}" "${address[2]}" "${vm[3]}" "${address[3]}" <<'PYNODES'
+import json,sys
+json.dump([dict(name=n,address=a) for n,a in zip(sys.argv[2::2],sys.argv[3::2])],open(sys.argv[1],'w'))
+PYNODES
+    local node
+    for node in 1 2 3; do
+        with_timeout 30 "$limactl" copy "$job_controller" "$job_inventory" "${vm[node]}:/var/tmp/" > /dev/null
+        gsh_in "$node" "${address[node]}" < <(printf 'set -e
+umask 077
+root=/var/lib/reliaburger/soak-jobs
+mkdir -p "$root"
+chmod 700 "$root"
+install -m 600 /var/tmp/job_soak.py /var/tmp/job_soak_inventory.py "$root/"
+cat > "$root/.token" <<"TOKEN"
+%s
+TOKEN
+' "$(cat "$evidence/jobs/.token")"; cat <<'GUEST'
+# Identity replicas have already pulled the pinned image on all three nodes.
+# Copy that exact image binary; never install an unrelated host BusyBox build.
+python3 - <<'PYBOX'
+from pathlib import Path
+import shutil,hashlib
+root=Path('/var/lib/reliaburger/images/rootfs/public.ecr.aws/docker/library/busybox/sha256%3A9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028')
+files=sorted(root.glob('gen-*/bin/busybox'))
+if not files or len({hashlib.sha256(file.read_bytes()).hexdigest() for file in files})!=1:
+    raise SystemExit('pinned BusyBox rootfs is missing or has inconsistent binary copies')
+shutil.copyfile(files[0],'/var/lib/reliaburger/soak-jobs/busybox')
+Path('/var/lib/reliaburger/soak-jobs/busybox').chmod(0o755)
+PYBOX
+cat > /etc/systemd/system/reliaburger-soak-audit.service <<UNIT
+[Unit]
+Description=Independent release job effect verifier
+After=network-online.target
+[Service]
+ExecStart=/usr/bin/python3 /var/lib/reliaburger/soak-jobs/job_soak.py serve --database /var/lib/reliaburger/soak-jobs/effects.sqlite --token-file /var/lib/reliaburger/soak-jobs/.token --address $1
+Restart=on-failure
+RestartSec=1
+UMask=0077
+MemoryMax=64M
+TasksMax=40
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now reliaburger-soak-audit.service >/dev/null
+/var/lib/reliaburger/soak-jobs/busybox true
+GUEST
+        ) || setup_fail "job verifier or pinned host executable setup failed on ${vm[node]}"
+    done
+    touch "$evidence/jobs/installed"
+}
+
+start_jobs() {
+    local load=(--load "$job_load")
+    [ -z "$target_rate" ] || load+=(--target-rate "$target_rate")
+    python3 "$job_controller" run --evidence "$evidence" --api-port "$api_port" --ca "$ca" --limactl "$limactl" "${load[@]}" > "$evidence/jobs/controller.log" 2>&1 &
+    jobs_pid=$!
+}
+job_mark_fault() {
+    [ -n "${jobs_pid:-}" ] || return 0
+    python3 "$job_controller" mark "$evidence/jobs" "${vm[$1]}" "$2" || event --phase harness-error --target jobs --detail 'could not record active fault overlap'
+}
+
 # --- evidence collection ---------------------------------------------------------
 
 # Everything one guest reports in a single shell: leak inventory, served
@@ -657,19 +827,31 @@ echo "bun_pid $pid"
 if [ "${pid:-0}" -gt 0 ]; then
     echo "bun_fd $(ls /proc/"$pid"/fd | wc -l)"
     echo "bun_rss_kb $(awk '/^VmRSS/ {print $2}' /proc/"$pid"/status)"
+    # utime + stime: fields 14 and 15, counted after comm's closing parenthesis.
+    echo "bun_cpu_ticks $(sed 's/.*) //' /proc/"$pid"/stat | awk '{print $12 + $13}')"
+    echo "clk_tck $(getconf CLK_TCK)"
     # exec keeps the pid, but the kernel hands the new image a fresh
     # auxiliary vector whose addresses ASLR randomises: its checksum tells a
     # self-upgrade's exec apart from the process it replaced.
     echo "bun_image $(cksum < /proc/"$pid"/auxv | cut -d' ' -f1)"
 fi
-runc --root /var/lib/reliaburger/data/instances/runc/state list -q 2>/dev/null | sed 's/^/runc /'
-ls /run/netns 2>/dev/null | sed 's/^/netns /'
-ip -o link show type veth | awk -F': ' '{split($2, name, "@"); print "veth " name[1]}'
-find /sys/fs/cgroup/reliaburger -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sed 's|^/sys/fs/cgroup/reliaburger/|cgroup |'
+if [ -f /var/lib/reliaburger/soak-jobs/job_soak_inventory.py ]; then
+    python3 /var/lib/reliaburger/soak-jobs/job_soak_inventory.py
+else
+    runc --root /var/lib/reliaburger/data/instances/runc/state list -q 2>/dev/null | sed 's/^/runc /'
+    ls /run/netns 2>/dev/null | sed 's/^/netns /'
+    ip -o link show type veth | awk -F': ' '{split($2, name, "@"); print "veth " name[1]}'
+    find /sys/fs/cgroup/reliaburger -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sed 's|^/sys/fs/cgroup/reliaburger/|cgroup |'
+    leases=/var/lib/reliaburger/data/instances/runc/bundles/.network-leases.json
+    [ ! -f "$leases" ] || python3 -c 'import json, sys; [print("lease", key) for key in json.load(open(sys.argv[1])).get("allocations", {})]' "$leases"
+fi
 find /sys/fs/bpf -mindepth 1 2>/dev/null | sed 's|^/sys/fs/bpf/|bpf |'
+# Executor helpers' own CPU, outside the commands they run (M8).
+find /sys/fs/cgroup/reliaburger -mindepth 4 -maxdepth 4 -type d -name helper -path '*/executor-*' 2>/dev/null \
+    | while read -r group; do
+        echo "executor_cpu ${group#/sys/fs/cgroup/reliaburger/} $(awk '/^usage_usec/ {print $2}' "$group/cpu.stat" 2>/dev/null)"
+    done
 ss -ltnH | awk '{print "listen " $4}'
-leases=/var/lib/reliaburger/data/instances/runc/bundles/.network-leases.json
-[ ! -f "$leases" ] || python3 -c 'import json, sys; [print("lease", key) for key in json.load(open(sys.argv[1])).get("allocations", {})]' "$leases"
 for directory in data images logs metrics volumes soak-export; do
     echo "disk $directory $(du -sk /var/lib/reliaburger/$directory 2>/dev/null | cut -f1)"
 done
@@ -710,6 +892,11 @@ done
 GUEST
 }
 
+# Guest memory, the guest agent and kernel OOM reports (#985). Heavy checks
+# read the kernel messages since the last heavy check; failure bundles the
+# last half hour.
+memory_report() { gsh_in "$1" "$2" < "$guest_memory" 2>/dev/null; }
+
 split_report() {
     local directory=$1 name=$2
     awk -v directory="$directory" -v name="$name" '
@@ -719,19 +906,58 @@ split_report() {
 
 snapshot_count=0
 snapshot_dir=
+snapshot_started=
 new_snapshot() {
     snapshot_count=$(( snapshot_count + 1 ))
     snapshot_dir=$evidence/snapshots/$(date -u +%Y%m%dT%H%M%S)-$1-$snapshot_count
+    snapshot_started=$(date +%s)
     mkdir -p "$snapshot_dir"
-    printf '{"ts": %s, "kind": "%s", "slot": "%s"}\n' "$(date +%s)" "$1" "${current_slot:-}" > "$snapshot_dir/meta.json"
+    printf '{"ts": %s, "kind": "%s", "slot": "%s"}\n' "$snapshot_started" "$1" "${current_slot:-}" > "$snapshot_dir/meta.json"
+}
+# The guests are asked after the snapshot starts, so their own timestamps are
+# later than meta.json's ts. Recording when collection ended lets the checker
+# accept exactly the evidence taken in between.
+finish_snapshot() {
+    printf '{"ts": %s, "kind": "%s", "slot": "%s", "collected": %s}\n' \
+        "$snapshot_started" "$1" "${current_slot:-}" "$(date +%s)" > "$snapshot_dir/meta.json"
 }
 
 collect_light() {
     local directory=$1
+    if [ -f "$evidence/jobs/snapshot.json" ]; then
+        cp "$evidence/jobs/snapshot.json" "$directory/jobs.json"
+    fi
     curl -s -o /dev/null -w '%{http_code} %{time_total}\n' --max-time 5 -H 'Host: podinfo.localhost' \
         "http://127.0.0.1:$ingress_port/" > "$directory/http.txt" 2>/dev/null || true
+    probe_forwards "$directory"
     rel logs soak-writer --tail 20 > "$directory/writer-log.txt" 2>&1 || true
     rel logs soak-redis-client --tail 20 > "$directory/redis-log.txt" 2>&1 || true
+}
+
+# Every forwarded port (each node's API, node 1's ingress and registry),
+# asked from the host, and from inside the guest when the host gets no
+# answer. Every check runs it, so it follows each reboot, power-off, upgrade
+# exec and Bun restart. A port the guest serves but the host can't reach is
+# one `host-forward` failure, and the checks through it are excused rather
+# than timing out settle after settle (#987).
+probe_forwards() {
+    local directory=$1 node down_nodes=()
+    for node in 1 2 3; do [ "${down[node]}" = 0 ] || down_nodes+=(--down "$node"); done
+    check forwards "$directory" --limactl "$limactl" --api-port "$api_port" --ingress-port "$ingress_port" \
+        --registry-port "$registry_port" --node "${vm[1]}" --node "${vm[2]}" --node "${vm[3]}" \
+        ${down_nodes[@]+"${down_nodes[@]}"} 2>> "$evidence/harness-errors.log" || true
+}
+
+# Lima truncates a VM's host-agent log (ha.stderr.log, where forwarding
+# errors land) when the VM starts again, so keep a copy before every stop
+# and at the end (#987).
+keep_host_logs() {
+    local reason=$1; shift
+    [ -n "${LIMA_HOME:-}" ] || return 0
+    local node names=()
+    for node in "$@"; do names+=("${vm[node]}"); done
+    check keep-host-logs "$evidence" --lima-home "$LIMA_HOME" --reason "$reason" "${names[@]}" \
+        2>> "$evidence/harness-errors.log" || true
 }
 
 # settle: what recovery needs; heavy: everything.
@@ -751,6 +977,7 @@ collect() {
         if [ "$kind" = heavy ]; then
             api_get "$node" /v1/diagnostics > "$directory/diagnostics-${vm[node]}.json" 2>/dev/null || true
             guest_report | gsh_in "$node" 2>/dev/null | split_report "$directory" "${vm[node]}" || true
+            memory_report "$node" cursor > "$directory/memory-${vm[node]}.txt" || true
             rel_on "$node" exec soak-identity cat /run/reliaburger/identity/cert.pem 2>/dev/null \
                 | openssl x509 -noout -serial -enddate > "$directory/identity-${vm[node]}.txt" 2>/dev/null || true
         else
@@ -797,6 +1024,7 @@ PY
         [ "${down[node]}" = 0 ] || continue
         gsh "$node" 'journalctl -u reliaburger --since "-15min" --no-pager' > "$directory/journal-${vm[node]}.txt" 2>&1 || true
         api_get "$node" /v1/diagnostics > "$directory/diagnostics-${vm[node]}.json" 2>/dev/null || true
+        memory_report "$node" recent > "$directory/memory-${vm[node]}.txt" || true
     done
     rel --output json status > "$directory/status.json" 2>&1 || true
     rel --output json wtf > "$directory/wtf.json" 2>&1 || true
@@ -819,6 +1047,7 @@ observe() {
     new_snapshot "$kind"
     directory=$snapshot_dir
     if [ "$kind" = light ]; then collect_light "$directory"; else collect "$kind" "$directory"; fi
+    finish_snapshot "$kind"
     output=$(check evaluate "$evidence" "$directory") || result=$?
     [ -z "$output" ] || printf '%s\n' "$output" > "$directory/findings.txt"
     if [ "$result" -eq 1 ]; then
@@ -834,7 +1063,7 @@ window_label=
 next_light=0
 next_heavy=$(( $(date +%s) + heavy_every ))
 next_rotation=$(( $(date +%s) + rotation ))
-open_window() { window_label=$1; check window "$evidence" open "$1" --down "${2:-0}"; }
+open_window() { window_label=$1; check window "$evidence" open "$1" --down "${2:-0}" ${3:+--node "$3"}; }
 close_window() { check window "$evidence" "${1:-close}"; window_label=; }
 
 # Wait for two consecutive clean settle checks after a fault.
@@ -916,6 +1145,8 @@ slot_deploy_kill() {
 power_offs=0
 power_off() {
     local node=$1
+    job_mark_fault "$node" "${current_slot:-power-off}"
+    keep_host_logs power-off "$node"
     down[node]=1
     check power-cut "$evidence"
     "$limactl" stop --force "${vm[node]}" > "$evidence/snapshots/power-off-$node-$(date +%s).log" 2>&1 || true
@@ -924,9 +1155,7 @@ power_on() {
     local node=$1 result=0
     "$relish" local start "$node" > "$evidence/snapshots/power-on-$node-$(date +%s).log" 2>&1 || result=$?
     down[node]=0
-    # A node that missed rotations must serve the current pair.
-    push_pair "$node" "$tls/current/cert.pem" "$tls/current/key.pem" || true
-    check ingress-expect "$evidence" "${vm[node]}" "$(cat "$tls/current/serial")"
+    push_current_pair "$node"
     return "$result"
 }
 
@@ -944,9 +1173,55 @@ slot_power_off() {
     settle fault:power-off 480 || true
 }
 
+# Node-level faults for the job qualification (#686, D19-B). They need no
+# per-job targeting: the whole node slows down or runs out of disk while its
+# executors hold work. `delay` adds netem latency on the interface towards a
+# peer; `disk-full` leaves 64 MiB free on Bun's filesystem; `slow-fsync`
+# throttles Bun's own writes (Raft log, ledgers) to 20 IOPS and 1 MiB/s.
+node_fault_index=0
+node_fault_kind() { local kinds=(delay disk-full slow-fsync); echo "${kinds[$1 % 3]}"; }
+# Every three cycles each node gets one kind, and each kind moves on a node, so
+# the hour-long fast tier reaches every node and puts each kind on two of them,
+# and every nine cycles put each kind on every node (the leader among them).
+node_fault_node() { echo $(( ($1 + $1 / 3) % 3 + 1 )); }
+node_fault_script() {
+    case $1:$2 in
+        delay:start) printf '%s\n' 'dev=$(ip -o route get "$PEER" | sed -n "s/.* dev \([^ ]*\).*/\1/p"); [ -n "$dev" ] && tc qdisc replace dev "$dev" root netem delay 200ms 50ms && echo "$dev" > /run/soak-delay-dev' ;;
+        delay:stop) printf '%s\n' 'tc qdisc del dev "$(cat /run/soak-delay-dev)" root && rm -f /run/soak-delay-dev' ;;
+        disk-full:start) printf '%s\n' 'free=$(df --output=avail -B1 /var/lib/reliaburger | tail -n 1); [ "$free" -gt 134217728 ] && fallocate -l $(( free - 67108864 )) /var/lib/reliaburger/soak-disk-fill' ;;
+        disk-full:stop) printf '%s\n' 'rm -f /var/lib/reliaburger/soak-disk-fill' ;;
+        slow-fsync:start) printf '%s\n' 'source=$(findmnt -no SOURCE --target /var/lib/reliaburger); disk=$(lsblk -no PKNAME "$source" | head -n 1); disk=/dev/${disk:-${source#/dev/}}; systemctl set-property --runtime reliaburger.service "IOWriteIOPSMax=$disk 20" "IOWriteBandwidthMax=$disk 1M"' ;;
+        slow-fsync:stop) printf '%s\n' 'systemctl set-property --runtime reliaburger.service IOWriteIOPSMax= IOWriteBandwidthMax=' ;;
+    esac
+}
+slot_node_fault() {
+    local kind node peer hold result=0 log
+    kind=$(node_fault_kind "$node_fault_index")
+    node=$(node_fault_node "$node_fault_index")
+    node_fault_index=$(( node_fault_index + 1 ))
+    [ "${down[node]}" = 0 ] || node=1
+    peer=$(( node % 3 + 1 ))
+    hold=$(random_between "$hold_min" "$hold_max")
+    log=$evidence/snapshots/node-$kind-$node_fault_index.log
+    say "fault: $kind on ${vm[node]} for $hold s"
+    # The checker excuses slow turns only on the node the fault throttles (#972).
+    open_window "node-$kind" 0 "${vm[node]}"
+    avoid=$node
+    job_mark_fault "$node" "${current_slot%%:*}:$kind"
+    gsh "$node" "PEER=${address[peer]}; $(node_fault_script "$kind" start)" > "$log" 2>&1 || result=$?
+    event --phase "fault:node-$kind" --target "${vm[node]}" --exit "$result" --command "$kind" --detail "held $hold s"
+    [ "$result" -eq 0 ] || record_failure "node-$kind" "could not inject $kind on ${vm[node]}; see ${log##*/}"
+    wait_until $(( $(date +%s) + hold ))
+    gsh "$node" "$(node_fault_script "$kind" stop)" >> "$log" 2>&1 \
+        || record_failure "node-$kind" "could not remove $kind from ${vm[node]}; see ${log##*/}"
+    settle "fault:node-$kind" 300 || true
+    avoid=0
+}
+
 # Every chaos kind against the rails: kill and pause meet the replica minimum,
 # so they aim at the three-replica frontend, one replica at a time; delay,
 # drop, partition and dns are network faults, which no replica rail guards;
+# cpu and memory cap each frontend's cgroup until the clear lifts it (#699);
 # the scenario runs its own checks.
 # Print one running instance of APP, or nothing unless at least two run.
 one_of_several() {
@@ -965,7 +1240,7 @@ slot_chaos() {
 }
 
 chaos_one() {
-    local kinds=(kill delay partition scenario pause drop dns) kind instance result=0 output=$evidence/snapshots/chaos-$chaos_index.log
+    local kinds=(kill delay partition scenario pause drop dns cpu memory) kind instance result=0 output=$evidence/snapshots/chaos-$chaos_index.log
     kind=${kinds[chaos_index % ${#kinds[@]}]}
     chaos_index=$(( chaos_index + 1 ))
     say "fault: chaos $kind"
@@ -986,12 +1261,23 @@ chaos_one() {
             fi ;;
         drop) rel fault drop frontend 10% --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         dns) rel fault dns soak-redis nxdomain --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
+        # The frontend declares a 128 MiB limit, which a memory fault needs.
+        cpu) rel fault cpu frontend 80% --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
+        memory) rel fault memory frontend 90% --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         scenario)
             rel_budget=900 rel --output json test --chaos --yes --filter dead_worker_node_has_workloads_rescheduled \
-                --timeout 600s > "$output" 2>&1 || result=$? ;;
+                --timeout 600s > "$output" 2> "$output.err" || result=$? ;;
     esac
     event --phase "fault:chaos-$kind" --exit "$result" --command "$kind" --verdict "$([ "$result" -eq 0 ] && echo ok || echo fail)"
-    [ "$result" -eq 0 ] || record_failure "chaos-$kind" "$(tail -n 3 "$output" | tr '\n' ' ')"
+    if [ "$result" -ne 0 ]; then
+        # A JSON report's last lines are only closing brackets: name the
+        # failing case and its reason instead (#1068).
+        if [ "$kind" = scenario ]; then
+            record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")"
+        else
+            record_failure "chaos-$kind" "$(tail -n 3 "$output" | tr '\n' ' ')"
+        fi
+    fi
     case $kind in kill|scenario) ;; *) wait_until $(( $(date +%s) + 65 )) ;; esac
     rel fault clear > /dev/null 2>&1 || true
     settle "fault:chaos-$kind" 300 || true
@@ -1032,6 +1318,7 @@ offline_export() {
 special_graceful() {
     say 'special: graceful whole-cluster stop and start'
     open_window graceful-stop 3
+    keep_host_logs graceful-stop 1 2 3
     down=(0 1 1 1)
     "$relish" local stop > "$evidence/snapshots/graceful-stop.log" 2>&1 || true
     event --phase special:graceful-stop
@@ -1075,7 +1362,7 @@ special_all_off() {
     down=(0 0 0 0)
     local node
     for node in 1 2 3; do
-        push_pair "$node" "$tls/current/cert.pem" "$tls/current/key.pem" || true
+        push_current_pair "$node"
     done
     [ "$result" -eq 0 ] || record_failure all-off-start "relish local start exited $result"
     settle special:all-off 600 || true
@@ -1137,15 +1424,25 @@ wait_upgrade_idle() {
     done
 }
 
-# The version each node's API reports, one line per node, "?" for a node
-# that doesn't answer.
+# The version each node's API reports, one line per node. A node the host
+# can't reach is asked from inside its guest, so a cut host forward (#987)
+# doesn't fail the walk; one that answers neither way is "?(why)".
 node_versions() {
-    local node
+    local node reply code reason
     for node in 1 2 3; do
-        curl -fsS --max-time 5 --cacert "$ca" --connect-to "${vm[node]}:9117:127.0.0.1:$(( api_port + node - 1 ))" \
-            "https://${vm[node]}:9117/v1/version" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || echo '?'
+        code=0
+        reply=$(curl -fsS --max-time 5 --cacert "$ca" --connect-to "${vm[node]}:9117:127.0.0.1:$(( api_port + node - 1 ))" \
+            "https://${vm[node]}:9117/v1/version" 2>/dev/null) || code=$?
+        if [ "$code" -eq 0 ] && version_of "$reply"; then continue; fi
+        if [ "$code" -eq 0 ]; then reason='bad reply'; else reason=$(check curl-reason "$code"); fi
+        if [ "${down[node]}" = 1 ]; then echo "?(host: $reason; powered off)"; continue; fi
+        code=0
+        reply=$(gsh "$node" 'curl -fsSk --max-time 5 https://127.0.0.1:9117/v1/version' 2>/dev/null) || code=$?
+        if [ "$code" -eq 0 ] && version_of "$reply"; then continue; fi
+        echo "?(host: $reason; guest: $(if [ "$code" -eq 0 ]; then echo 'bad reply'; else check curl-reason "$code"; fi))"
     done
 }
+version_of() { python3 -c 'import json,sys; print(json.loads(sys.argv[1])["version"])' "$1" 2>/dev/null; }
 
 wait_versions() {
     local want=$1 budget=$2 started=$3 label=$4 version versions
@@ -1217,6 +1514,9 @@ run_cycle() {
         current_slot="$index:power-off"; wait_until $(( start + 3 * slot )); run_slot slot_power_off
         current_slot="$index:chaos"; wait_until $(( start + 4 * slot )); run_slot slot_chaos
     fi
+    if [ "$node_faults" = true ]; then
+        current_slot="$index:node-fault"; wait_until $(( start + 5 * slot )); run_slot slot_node_fault
+    fi
     current_slot="$index:settle"; wait_until $(( start + 5 * slot ))
     observe heavy || true
     next_heavy=$(( $(date +%s) + heavy_every ))
@@ -1276,12 +1576,28 @@ teardown_cluster() {
 finish() {
     local result=$?
     trap - EXIT
+    if [ -n "${jobs_pid:-}" ]; then
+        if kill -0 "$jobs_pid" 2>/dev/null; then
+            kill "$jobs_pid" 2>/dev/null || true
+            meta notes+ 'Job controller was still running at teardown; positive drain must be present to pass'
+        else
+            wait "$jobs_pid" || result=1
+        fi
+    fi
     [ -z "${background_pid:-}" ] || kill "$background_pid" 2>/dev/null || true
     [ -f "$evidence/metadata.json" ] || { printf 'sustained: stopped before the soak started\n' >&2; exit "$result"; }
     meta finished_at "json:$(date +%s)"
+    [ -z "${vm[3]:-}" ] || keep_host_logs end 1 2 3
     if [ "$keep" = true ]; then
         teardown="kept: RELIABURGER_HOME=${home:-none}"
     elif ! teardown_cluster; then
+        result=1
+    fi
+    if [ -n "${jobs_pid:-}" ] && kill -0 "$jobs_pid" 2>/dev/null; then
+        # Teardown is already over. Do not add another drain allowance or
+        # leave an orphan controller making requests after the harness exits.
+        kill -KILL "$jobs_pid" 2>/dev/null || true
+        wait "$jobs_pid" 2>/dev/null || true
         result=1
     fi
     meta teardown "$teardown"
@@ -1309,6 +1625,9 @@ start_run() {
     meta evidence "\`$evidence\`"
     meta started_at "json:$(date +%s)"
     meta duration_target "json:$duration"
+    meta job_load "$job_load"
+    [ -z "$target_rate" ] || meta target_rate "$target_rate"
+    meta node_faults "json:$node_faults"
     meta ingress_rotation_secs "json:$rotation"
     [ -z "$base_url" ] || meta base_url "<$base_url>"
     meta candidate_digest "\`${qualified_digest:-not checked}\`"
@@ -1325,6 +1644,35 @@ start_run() {
     fi
 }
 
+if [ "$plan" = true ]; then
+    # The schedule run_cycle follows, with every action replaced by a line.
+    wait_until() { :; }; observe() { :; }; registry() { :; }; event() { :; }; say() { :; }
+    run_slot() {
+        case $1 in
+            special_for_cycle) "$@" ;;
+            slot_bun_kill) printf 'plan: cycle %s %s-kill\n' "$index" "$2" ;;
+            slot_node_fault) printf 'plan: cycle %s node-fault %s node %s\n' "$index" "$(node_fault_kind "$node_fault_index")" \
+                                 "$(node_fault_node "$node_fault_index")"
+                             node_fault_index=$(( node_fault_index + 1 )) ;;
+            *) printf 'plan: cycle %s %s\n' "$index" "$(printf '%s' "${1#slot_}" | tr _ -)" ;;
+        esac
+    }
+    # shellcheck disable=SC2329  # special_for_cycle calls these by name
+    special_graceful() { printf 'plan: cycle %s special graceful-stop\n' "$index"; }
+    # shellcheck disable=SC2329
+    special_quorum_loss() { printf 'plan: cycle %s special quorum-loss\n' "$index"; }
+    # shellcheck disable=SC2329
+    special_all_off() { printf 'plan: cycle %s special all-off\n' "$index"; }
+    printf 'plan: tier %s schedule %s duration %s cycle %s job-load %s target-rate %s node-faults %s\n' \
+        "$tier" "$schedule" "$duration" "$cycle" "$job_load" "${target_rate:-none}" "$node_faults"
+    plan_cycles=$(( (duration + cycle - 1) / cycle ))
+    [ "$plan_cycles" -ge "$min_cycles" ] || plan_cycles=$min_cycles
+    printf 'plan: %s\n' "$job_runs"
+    for (( index = 0; index < plan_cycles; index++ )); do run_cycle "$index" 0; done
+    rm -rf "$evidence"
+    exit 0
+fi
+
 trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
@@ -1333,6 +1681,8 @@ if [ "$resume" = true ]; then
     home=$(meta_get home_path)
     [ "$(meta_get bootstrapped)" != true ] || bootstrapped=true
     discover
+    [ "$(meta_get job_soak)" = True ] || fail '--resume needs a job-enabled campaign; start a fresh qualification for this harness'
+    [ ! -f "$evidence/jobs/stop" ] || fail 'cannot resume a campaign already asked to drain'
     generation=$(meta_get generation); generation=${generation:-0}
     first_cycle=$(meta_get cycles); first_cycle=${first_cycle:-0}
     started_at=$(meta_get started_at)
@@ -1344,6 +1694,7 @@ if [ "$resume" = true ]; then
     # Carry on the chaos rotation and the walk count where the run left off.
     chaos_index=$(python3 -c 'import json,sys; print(sum(1 for e in map(json.loads, open(sys.argv[1])) if e.get("phase", "").startswith("fault:chaos-") and "exit" in e))' "$evidence/events.jsonl")
     upgrade_walks=$(python3 -c 'import json,sys; print(sum(1 for e in map(json.loads, open(sys.argv[1])) if e.get("phase") == "upgrade:upgrade"))' "$evidence/events.jsonl")
+    node_fault_index=$(python3 -c 'import json,sys; print(sum(1 for e in map(json.loads, open(sys.argv[1])) if e.get("phase", "").startswith("fault:node-") and "exit" in e))' "$evidence/events.jsonl")
     ingress_rotations=$(find "$tls" -maxdepth 1 -name 'leaf-*' | wc -l | tr -d ' ')
     say "resuming at cycle $first_cycle after a $gap s gap"
     paused=$(python3 -c 'import json,sys; print(sum(e.get("duration", 0) for e in map(json.loads, open(sys.argv[1])) if e.get("phase") == "pause"))' "$evidence/events.jsonl")
@@ -1378,12 +1729,16 @@ PY
             || setup_fail "no release version to roll back to: the nodes report $(printf '%s' "$versions" | tr '\n' ' ')"
         meta release_version "$release_version"
     fi
+    prepare_jobs
     say 'waiting for the baseline to settle'
     open_window baseline
     settle baseline 600 || setup_fail 'the cluster did not settle for the baseline'
     check baseline "$evidence" "$last_snapshot"
     event --phase baseline --verdict ok --detail "${last_snapshot##*/}"
     registry push --tag baseline > "$evidence/snapshots/registry-push-baseline.json" 2>&1 || true
+    meta job_soak json:true
+    start_jobs
+    apply_workloads
     # A full check of the healthy cluster, before the first fault.
     observe heavy || true
     first_cycle=0
@@ -1392,6 +1747,8 @@ PY
     end=$(( started_at + duration ))
     next_rotation=$(( started_at + rotation ))
 fi
+meta job_stop_at "json:$(( end - 120 ))"
+[ -n "$jobs_pid" ] || start_jobs
 
 next_light=$(date +%s)
 next_heavy=$(( $(date +%s) + heavy_every ))

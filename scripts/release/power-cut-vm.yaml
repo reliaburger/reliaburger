@@ -1,0 +1,63 @@
+# The disposable Lima VM for release gate step 5, "Pull the plug"
+# (docs/releasing.md). qualify-power-cut-reboot.sh renders it: it replaces
+# __WORKTREE__ with the candidate's clean checkout, creates the VM from the
+# result, checks the swap and the read-only mount from inside, and deletes
+# the VM afterwards. Never create the development VM from this file.
+#
+# It follows the development VM's template (Ubuntu 24.04, virtiofs, the same
+# packages) with three differences: less memory plus 6 GiB of swap, so the
+# guest behaves like a small node yet the linker isn't killed; only the
+# candidate's checkout mounted, read-only, so a power cut can't corrupt it
+# and no build can change what's under test; and provisioning that runs once,
+# because Lima runs provision scripts on every boot and every lane boots the
+# VM again after a power cut.
+images:
+- location: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
+  arch: "aarch64"
+- location: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+  arch: "x86_64"
+cpus: 4
+memory: "6GiB"
+disk: "40GiB"
+mountType: "virtiofs"
+mounts:
+- location: "__WORKTREE__"
+  writable: false
+containerd:
+  system: false
+  user: false
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux
+    if [ ! -f /swapfile ]; then
+      fallocate -l 6G /swapfile
+      chmod 600 /swapfile
+      mkswap /swapfile
+      echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+    swapon -a
+    if [ ! -f /var/lib/reliaburger-power-cut-provisioned ]; then
+      apt-get update -qq
+      apt-get install -y -qq runc uidmap slirp4netns curl buildah btrfs-progs build-essential pkg-config libssl-dev clang llvm libbpf-dev linux-headers-$(uname -r)
+      sync
+      touch /var/lib/reliaburger-power-cut-provisioned
+    fi
+- mode: user
+  script: |
+    #!/bin/bash
+    set -eux
+    if [ ! -f "$HOME/.cargo/bin/rustup" ]; then
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    fi
+probes:
+- description: "rustup installed"
+  script: |
+    #!/bin/bash
+    set -eux
+    if ! timeout 600s bash -c "until test -x $HOME/.cargo/bin/cargo; do sleep 5; done"; then
+      echo >&2 "cargo is not installed yet"
+      exit 1
+    fi
+  hint: See "/var/log/cloud-init-output.log" in the guest

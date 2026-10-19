@@ -25,7 +25,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
-use crate::meat::batch_tracker::epoch_now_secs;
+use crate::meat::batch_ids::epoch_now_secs;
 
 use super::api::ApiState;
 
@@ -130,6 +130,11 @@ pub struct BuildRecord {
     pub state: BuildState,
     /// Registration time as seconds since the Unix epoch.
     pub created_at_epoch_secs: u64,
+    /// The destination repository (`<namespace>/<app>`) the build pushes to.
+    /// `GET /v1/build/{id}` holds a scoped caller to it, so a tenant can't
+    /// read another tenant's build.
+    #[serde(default)]
+    pub repository: Option<String>,
 }
 
 /// Why a build state update was rejected.
@@ -323,14 +328,20 @@ async fn forward_track_to_leader(
     council: &crate::council::CouncilNode,
     request: &BuildTrackRequest,
 ) -> Result<Option<u64>, String> {
-    let Some(leader_url) = super::api::leader_api_url(state, council).await else {
-        return Err("no cluster leader known yet".to_string());
-    };
-    let mut proxied = state
-        .cluster_http
-        .client()
-        .post(format!("{leader_url}/v1/build/track"))
-        .json(request);
+    // The runner starts this request itself: nothing forwarded it here.
+    let leader_url = super::api::leader_api_url(state, council, &axum::http::HeaderMap::new())
+        .await
+        .map_err(|refusal| match refusal {
+            super::api::NoLeaderRoute::Unknown => "no cluster leader known yet".to_string(),
+            other => other.to_string(),
+        })?;
+    let mut proxied = super::api::mark_leader_forwarded(
+        state
+            .cluster_http
+            .client()
+            .post(format!("{leader_url}/v1/build/track"))
+            .json(request),
+    );
     if let Some(token) = &state.service_token {
         proxied = proxied.bearer_auth(token);
     }
@@ -450,36 +461,56 @@ async fn sign_on_leader(
     Ok(())
 }
 
-/// POST `request` to the leader's `/v1/build/sign`.
+/// POST `request` to the leader's `/v1/build/sign`. `inbound` is the sign
+/// request this node received, or an empty map when its own runner asks.
+///
+/// A failure carries the status to answer: 503 when there's no leader to
+/// send it to (none known, or only this node, which can't confirm it
+/// leads), 502 when the leader didn't sign.
 async fn forward_sign_to_leader(
     state: &ApiState,
     request: &BuildSignRequest,
-) -> Result<(), String> {
+    inbound: &axum::http::HeaderMap,
+) -> Result<(), (StatusCode, String)> {
     let Some(council) = &state.council else {
-        return Err("no council available for signing".to_string());
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no council available for signing".to_string(),
+        ));
     };
-    let Some(leader_url) = super::api::leader_api_url(state, council).await else {
-        return Err("no cluster leader known yet".to_string());
-    };
-    let mut forwarded = state
-        .cluster_http
-        .client()
-        .post(format!("{leader_url}/v1/build/sign"))
-        .header(FORWARDED_SIGN_HEADER, "1")
-        .json(request);
+    let leader_url = super::api::leader_api_url(state, council, inbound)
+        .await
+        .map_err(|refusal| {
+            let reason = match refusal {
+                super::api::NoLeaderRoute::Unknown => "no cluster leader known yet".to_string(),
+                other => other.to_string(),
+            };
+            (StatusCode::SERVICE_UNAVAILABLE, reason)
+        })?;
+    let mut forwarded = super::api::mark_leader_forwarded(
+        state
+            .cluster_http
+            .client()
+            .post(format!("{leader_url}/v1/build/sign"))
+            .header(FORWARDED_SIGN_HEADER, "1")
+            .json(request),
+    );
     if let Some(token) = &state.service_token {
         forwarded = forwarded.bearer_auth(token);
     }
+    let bad_gateway = |reason: String| (StatusCode::BAD_GATEWAY, reason);
     let response = tokio::time::timeout(std::time::Duration::from_secs(30), forwarded.send())
         .await
-        .map_err(|_| "the leader didn't answer the sign request in 30s".to_string())?
-        .map_err(|e| format!("leader forward failed: {e}"))?;
+        .map_err(|_| bad_gateway("the leader didn't answer the sign request in 30s".to_string()))?
+        .map_err(|e| bad_gateway(format!("leader forward failed: {e}")))?;
     if response.status().is_success() {
         return Ok(());
     }
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
-    Err(format!("the leader refused to sign ({status}): {body}"))
+    Err(bad_gateway(format!(
+        "the leader refused to sign ({status}): {body}"
+    )))
 }
 
 /// Have the manifests a build pushed signed: here when this node leads,
@@ -489,7 +520,12 @@ async fn request_build_signatures(
     request: &BuildSignRequest,
 ) -> Result<(), String> {
     match sign_on_leader(state, request).await {
-        Err(BuildSignError::NotLeader) => forward_sign_to_leader(state, request).await,
+        Err(BuildSignError::NotLeader) => {
+            // The runner asks itself: nothing forwarded this request here.
+            forward_sign_to_leader(state, request, &axum::http::HeaderMap::new())
+                .await
+                .map_err(|(_, reason)| reason)
+        }
         other => other.map_err(|e| e.to_string()),
     }
 }
@@ -510,9 +546,7 @@ pub async fn build_sign_handler(
     }
     let outcome = match sign_on_leader(&state, &request).await {
         Err(BuildSignError::NotLeader) if !headers.contains_key(FORWARDED_SIGN_HEADER) => {
-            forward_sign_to_leader(&state, &request)
-                .await
-                .map_err(|reason| (StatusCode::BAD_GATEWAY, reason))
+            forward_sign_to_leader(&state, &request, &headers).await
         }
         other => other.map_err(|e| (e.status(), e.to_string())),
     };
@@ -1480,6 +1514,37 @@ pub async fn build_submit_handler(
             ) {
                 return (StatusCode::FORBIDDEN, denied.to_string()).into_response();
             }
+            // Under a `[permission]` block, pushing an app's image is a
+            // deploy of that app (D5). A repository that names no namespace
+            // could be anyone's, so only a cluster-wide grant covers it.
+            let permissions = super::api::permission_map(&state).await;
+            let granted = match crate::pickle::registry_auth::repository_namespace(&repository) {
+                Some((namespace, app)) => crate::sesame::auth::authorize_permission(
+                    auth.as_deref(),
+                    crate::config::PermissionAction::Deploy,
+                    app,
+                    namespace,
+                    &permissions,
+                ),
+                None => crate::sesame::auth::authorize_cluster_permission(
+                    auth.as_deref(),
+                    crate::config::PermissionAction::Deploy,
+                    &permissions,
+                ),
+            };
+            if let Err(resp) = granted {
+                return resp;
+            }
+            let mut note = crate::bun::audit::AuditNote::default();
+            note.details
+                .insert("repository".to_string(), repository.to_string());
+            if let Some((namespace, app)) =
+                crate::pickle::registry_auth::repository_namespace(&repository)
+            {
+                note.app = Some(app.to_string());
+                note.namespace = Some(namespace.to_string());
+            }
+            crate::bun::audit::annotate(note);
         }
         Err(e) => {
             return (
@@ -1607,6 +1672,7 @@ pub async fn build_submit_handler(
                 remote_id,
             },
             created_at_epoch_secs: epoch_now_secs(),
+            repository: crate::pickle::build::destination_repository(&request.spec).ok(),
         };
         return match register_build_record(&state, record).await {
             Ok(build_id) => (
@@ -1754,6 +1820,7 @@ async fn accept_build(state: &ApiState, request: BuildSubmitRequest) -> Response
         runner_node: state.node_name.clone(),
         state: BuildState::Running,
         created_at_epoch_secs: epoch_now_secs(),
+        repository: crate::pickle::build::destination_repository(&request.spec).ok(),
     };
     let build_id = match register_build_record(state, record).await {
         Ok(id) => id,
@@ -1782,12 +1849,32 @@ async fn accept_build(state: &ApiState, request: BuildSubmitRequest) -> Response
         .into_response()
 }
 
+/// Hold a scoped caller to the build's destination repository: a token
+/// confined to some apps or namespaces may read only the builds that push
+/// into them. A build whose repository names no namespace belongs to no
+/// tenant, so only an unscoped caller may read it.
+#[allow(clippy::result_large_err)]
+fn authorize_build_read(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    record: &BuildRecord,
+) -> Result<(), Response> {
+    match record
+        .repository
+        .as_deref()
+        .and_then(crate::pickle::registry_auth::repository_namespace)
+    {
+        Some((namespace, app)) => crate::sesame::auth::authorize_scoped(auth, app, namespace),
+        None => crate::sesame::auth::require_unscoped(auth),
+    }
+}
+
 /// `GET /v1/build/{id}`: local state, or a proxy read for delegated
 /// builds. A `Running` record whose runner is this node but has no
 /// live runner task means the node restarted mid-build: the record is
 /// terminated honestly rather than reading `Running` forever (JOB4).
 pub async fn build_status_handler(
     State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     AxumPath(build_id): AxumPath<u64>,
 ) -> Response {
     let Some(record) = lookup_build(&state, build_id).await else {
@@ -1797,6 +1884,9 @@ pub async fn build_status_handler(
         )
             .into_response();
     };
+    if let Err(resp) = authorize_build_read(auth.as_deref(), &record) {
+        return resp;
+    }
 
     match record.state {
         BuildState::Delegated { url, remote_id } => {
@@ -2106,6 +2196,7 @@ mod tests {
             runner_node: Some("n1".to_string()),
             state: BuildState::Running,
             created_at_epoch_secs: 1_000_000,
+            repository: None,
         }
     }
 
@@ -2281,6 +2372,7 @@ mod tests {
                 remote_id: 4,
             },
             created_at_epoch_secs: 1_000_000,
+            repository: None,
         });
         let err = state
             .update(
@@ -2323,9 +2415,12 @@ mod tests {
             timestamp: std::time::SystemTime::UNIX_EPOCH,
             running_apps: vec![],
             cached_specs: vec![],
+            rollouts: Vec::new(),
             resource_usage: ResourceUsage::default(),
             event_log: vec![],
             has_buildah,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         }
     }
 
@@ -2346,11 +2441,13 @@ mod tests {
                 node_id: plain,
                 address: std::net::SocketAddr::from(([10, 0, 0, 1], 9117)),
                 api_advertised: true,
+                jobs: None,
             },
             super::super::api::NodeMembershipInfo {
                 node_id: builder.clone(),
                 address: std::net::SocketAddr::from(([10, 0, 0, 2], 9117)),
                 api_advertised: true,
+                jobs: None,
             },
         ];
 

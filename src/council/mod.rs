@@ -12,12 +12,13 @@
 /// - `InMemoryRaftRouter` — in-memory network for testing
 pub mod apply;
 pub mod backup;
+pub(crate) mod connection_pool;
 pub mod durable_log;
 pub mod fence;
+pub mod handover;
 pub mod log_store;
 pub mod network;
 pub mod node;
-pub mod prerequisites;
 pub mod recovery;
 pub(crate) mod recovery_storage;
 pub mod selection;
@@ -91,6 +92,20 @@ pub enum CouncilError {
          epoch {newer_epoch}; re-enrol it with a fresh data directory"
     )]
     Fenced { epoch: u64, newer_epoch: u64 },
+    /// Two recoveries landed on this node's epoch (#694).
+    #[error(
+        "this node is fenced: another council claims its recovery epoch {epoch} from a different \
+         recovery (a split); recover one side again with `relish council recover` and re-enrol \
+         the other"
+    )]
+    Split { epoch: u64 },
+    /// A voter campaigned to take over leadership, and nobody but the
+    /// previous leader led before the deadline (#755).
+    #[error("leadership did not move off {previous} within {waited:?}")]
+    HandoverTimedOut {
+        previous: String,
+        waited: std::time::Duration,
+    },
 }
 
 #[cfg(test)]

@@ -109,6 +109,28 @@ async fn new_leader_retains_registry_cleanup_until_the_killed_writer_returns() {
     qualify_registry_owner_crash(true).await;
 }
 
+/// GET a registry manifest, retrying its fail-closed 503 for up to 30 s.
+///
+/// A manifest GET reads the council's catalogue, and a registry that can't
+/// confirm that catalogue with the leader answers 503 rather than a stale
+/// view: while the killed writer rejoins, or while a loaded leader misses a
+/// heartbeat round. That 503 is the documented retryable answer, like the
+/// lease leader's; any other status is the registry's answer. Blob GETs read
+/// local content-addressed files and need no retry.
+async fn get_retrying_unconfirmed_catalogue(
+    http: &reqwest::Client,
+    url: &str,
+) -> reqwest::Response {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = http.get(url).send().await.unwrap();
+        if response.status() != 503 || Instant::now() >= deadline {
+            return response;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn qualify_registry_owner_crash(with_followers: bool) {
     use reliaburger::pickle::types::ManifestCatalog;
     use reliaburger::relish::client::BunClient;
@@ -129,6 +151,11 @@ async fn qualify_registry_owner_crash(with_followers: bool) {
     );
     let mut config = cluster_dir.join("reliaburger.toml");
     let mut node = reliaburger::config::NodeConfig::from_file(&config).unwrap();
+    // As root on a runc host, `relish init` enables eBPF and DNS. This
+    // fixture doesn't need them, and a durable eBPF owner it left
+    // behind would stay attached to the host's root cgroup.
+    node.ebpf.enabled = false;
+    node.dns.enabled = false;
     node.network.advertise_address = Some("127.0.0.1".into());
     node.storage.data = root.path().join("data");
     node.storage.images = root.path().join("images");
@@ -398,13 +425,23 @@ async fn qualify_registry_owner_crash(with_followers: bool) {
         catalogue.repository_owners.get(&repository),
         Some(&lease.lease_id)
     );
-    let observed = client
-        .http()
-        .unwrap()
-        .get(format!("{endpoint}/v1/test/leases/{}", lease.lease_id))
-        .send()
-        .await
-        .unwrap();
+    // A lease leader that can't prove it still leads answers 503 "retry
+    // shortly", the documented retryable answer (#1009). Retry that within
+    // a bound; any other status is the answer.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let observed = loop {
+        let response = client
+            .http()
+            .unwrap()
+            .get(format!("{endpoint}/v1/test/leases/{}", lease.lease_id))
+            .send()
+            .await
+            .unwrap();
+        if response.status() != 503 || Instant::now() >= deadline {
+            break response;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
     assert_eq!(observed.status(), 200);
     let observed: reliaburger::testkit::lease::TestLease = observed.json().await.unwrap();
     assert_eq!(observed.repositories[&repository].len(), 1);
@@ -574,25 +611,12 @@ async fn qualify_registry_owner_crash(with_followers: bool) {
         .registry
         .unwrap();
     let http = observer.registry_http_client(&registry).unwrap();
-    assert_eq!(
-        http.get(format!(
-            "{registry}/v2/{repository}/manifests/{}",
-            image.manifest_digest
-        ))
-        .send()
-        .await
-        .unwrap()
-        .status(),
-        404
-    );
-    let ordinary = http
-        .get(format!(
-            "{registry}/v2/ordinary/manifests/{}",
-            image.manifest_digest
-        ))
-        .send()
-        .await
-        .unwrap();
+    let manifest_digest = &image.manifest_digest;
+    let leased_url = format!("{registry}/v2/{repository}/manifests/{manifest_digest}");
+    let leased = get_retrying_unconfirmed_catalogue(&http, &leased_url).await;
+    assert_eq!(leased.status(), 404);
+    let ordinary_url = format!("{registry}/v2/ordinary/manifests/{manifest_digest}");
+    let ordinary = get_retrying_unconfirmed_catalogue(&http, &ordinary_url).await;
     assert_eq!(ordinary.status(), 200);
     assert_eq!(ordinary.bytes().await.unwrap().as_ref(), image.manifest);
     for (digest, expected) in [

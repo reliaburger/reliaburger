@@ -10,6 +10,7 @@ use crate::relish::client::BunClient;
 use crate::smoker::types::{FaultRequest, FaultSummary, FaultType};
 use crate::testkit::TestContext;
 use crate::testkit::context::{PINNED_TEST_WORKLOAD_IMAGE, container_http_script};
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::{CleanupOutcome, TestGroup};
 
@@ -35,7 +36,7 @@ fn container_spec(context: &TestContext, app: &str, replicas: u32, delayed: bool
          [app.{app}.health]\n\
          path = \"/hostname\"\n\
          interval = 1\n\
-         timeout = 2\n\
+         timeout = 1\n\
          threshold_unhealthy = 3\n\
          threshold_healthy = 1\n",
         namespace = context.namespace,
@@ -580,6 +581,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::ContainerRuntime,
                 Capability::NodeKill,
             ],
+            lease: LeaseScope::Applications,
             run: crate::testkit_case!(leader_failure_elects_new_leader_and_cluster_recovers),
         },
         TestCase {
@@ -591,6 +593,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::ContainerRuntime,
                 Capability::NodeKill,
             ],
+            lease: LeaseScope::Applications,
             run: crate::testkit_case!(dead_worker_node_has_workloads_rescheduled),
         },
         TestCase {
@@ -602,6 +605,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::ContainerRuntime,
                 Capability::NodeKill,
             ],
+            lease: LeaseScope::Applications,
             run: crate::testkit_case!(minority_partition_degrades_and_heals),
         },
         TestCase {
@@ -613,6 +617,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::ContainerRuntime,
                 Capability::NodePressure,
             ],
+            lease: LeaseScope::Applications,
             run: crate::testkit_case!(resource_exhaustion_degrades_gracefully),
         },
         TestCase {
@@ -624,6 +629,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::ContainerRuntime,
                 Capability::NodeKill,
             ],
+            lease: LeaseScope::Applications,
             run: crate::testkit_case!(node_death_during_deploy_ends_clean),
         },
     ]
@@ -655,6 +661,7 @@ mod tests {
                 id: 7,
                 fault_type: "node-kill".to_string(),
                 target_service: String::new(),
+                namespace: None,
                 target_instance: None,
                 target_node: request.target_node,
                 remaining_secs: 30,
@@ -792,6 +799,20 @@ mod tests {
             );
         }
         assert_self_served(&context.container_http_spec("web", 1), "web");
+    }
+
+    /// V02 soak: C2 failed at apply in 200 ms because its health timeout was
+    /// longer than its interval, which the API refuses (#1068).
+    #[test]
+    fn chaos_workloads_pass_the_validation_the_api_applies() {
+        let context = offline_context();
+        for delayed in [false, true] {
+            let spec = container_spec(&context, "chaos-c2-reschedule", 3, delayed);
+            let config = Config::parse(&spec).unwrap();
+            if let Err(error) = config.validate_intrinsic() {
+                panic!("the API would refuse this chaos workload: {error}\n{spec}");
+            }
+        }
     }
 
     #[test]

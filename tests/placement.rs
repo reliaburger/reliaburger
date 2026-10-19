@@ -4,6 +4,10 @@
 //! refresher, and placement reconciler — the exact wiring `bun --cluster`
 //! runs. Apply an app on one node; assert replicas spread across the
 //! cluster.
+//!
+//! Each test leases its nodes' ports with `reserve_port_block_lease` and
+//! holds them until it ends, so these tests can run beside each other and
+//! beside the other cluster suites or another worktree's run (#744).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,6 +22,21 @@ use tokio_util::sync::CancellationToken;
 #[path = "support/cluster.rs"]
 mod cluster_support;
 use cluster_support::{MembershipSource, WiredNode, WiredNodeOptions, local, start_wired_node};
+#[path = "support/bun_process.rs"]
+mod bun_process;
+use bun_process::{PortBlockReservation, reserve_port_block_lease};
+
+/// Ports per node: gossip, +1 Raft, +2 reporting, +3 API.
+const PORTS_PER_NODE: u16 = 4;
+
+/// One leased block for a three-node test cluster: node `n` (0, 1 or 2)
+/// starts at `base + 4n`. The test holds it until it ends, so no other
+/// fixture on the host (a test beside it, another suite, another
+/// worktree's run) binds these ports, including a stopped node's ports
+/// while it restarts (#744).
+fn lease_cluster_ports() -> PortBlockReservation {
+    reserve_port_block_lease(3 * PORTS_PER_NODE)
+}
 
 /// How often `wait_until` re-checks its condition in this binary.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -62,13 +81,17 @@ impl NodeFaultAuth {
     }
 }
 
-/// Cut `node` off from `peers` on the gossip and Raft transports.
+/// Cut `node` off from `peers` on the gossip and Raft transports, sending
+/// the request to `node` itself. Retries (bounded) only the leader's exact
+/// "stable current council membership" refusal, in case the self-healing
+/// loop moves membership between the caller's wait and the request.
 async fn partition(
     node: &Node,
     peers: &[String],
 ) -> Result<reliaburger::smoker::types::FaultSummary, reliaburger::relish::RelishError> {
-    node.client
-        .inject_fault(&reliaburger::smoker::types::FaultRequest {
+    inject_node_fault_once_council_settles(
+        node,
+        &reliaburger::smoker::types::FaultRequest {
             fault_type: reliaburger::smoker::types::FaultType::CouncilPartition {
                 peers: peers.to_vec(),
             },
@@ -82,8 +105,9 @@ async fn partition(
             include_leader: true,
             override_safety: false,
             acknowledged: true,
-        })
-        .await
+        },
+    )
+    .await
 }
 
 async fn start_node(
@@ -108,8 +132,7 @@ async fn start_node_with_auth(
         seeds,
         shutdown,
         auth,
-        Default::default(),
-        false,
+        NodeSetup::default(),
     )
     .await
 }
@@ -148,16 +171,39 @@ async fn labelled_node(
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
-    start_node_with(
-        name,
-        gossip_port,
-        seeds,
-        shutdown,
-        None,
+    let setup = NodeSetup {
         labels,
         keep_data_dir,
-    )
-    .await
+        ..NodeSetup::default()
+    };
+    start_node_with(name, gossip_port, seeds, shutdown, None, setup).await
+}
+
+/// What a test node starts with beyond its ports and seeds.
+struct NodeSetup {
+    /// Node labels, for placement constraints.
+    labels: std::collections::BTreeMap<String, String>,
+    /// Come back on an earlier run's data directory.
+    keep_data_dir: bool,
+    /// When a report counts as stale.
+    stale_report_timeout_secs: u64,
+    /// How long the leader holds a stale node's placements; `None` uses
+    /// the node default.
+    stale_node_grace: Option<Duration>,
+    /// Run the process runtime, which runs no containers (#914).
+    process_only: bool,
+}
+
+impl Default for NodeSetup {
+    fn default() -> Self {
+        Self {
+            labels: Default::default(),
+            keep_data_dir: false,
+            stale_report_timeout_secs: 30,
+            stale_node_grace: None,
+            process_only: false,
+        }
+    }
 }
 
 async fn start_node_with(
@@ -166,16 +212,24 @@ async fn start_node_with(
     seeds: Vec<SocketAddr>,
     shutdown: &CancellationToken,
     auth: Option<NodeFaultAuth>,
-    labels: std::collections::BTreeMap<String, String>,
-    keep_data_dir: bool,
+    setup: NodeSetup,
 ) -> Node {
+    let NodeSetup {
+        labels,
+        keep_data_dir,
+        stale_report_timeout_secs,
+        stale_node_grace,
+        process_only,
+    } = setup;
     let wired = start_wired_node(WiredNodeOptions {
         name: name.to_string(),
         gossip_port,
         seeds,
         shutdown: shutdown.clone(),
         data_dir_prefix: "rb-placement",
-        stale_report_timeout_secs: 30,
+        data_root: None,
+        stale_report_timeout_secs,
+        stale_node_grace,
         metrics_rollup: Some(Duration::from_millis(500)),
         // Fast learning period so the test doesn't wait long.
         scheduler: Some(reliaburger::config::node::ReconstructionSection {
@@ -194,6 +248,8 @@ async fn start_node_with(
         labels,
         keep_data_dir,
         task_arrays: None,
+        task_arrays_on_agent_budget: None,
+        process_only,
     })
     .await;
 
@@ -260,9 +316,11 @@ async fn nodes_running_web(nodes: &[&Node]) -> usize {
 async fn apply_on_any_node_places_across_the_cluster() {
     let shutdown = CancellationToken::new();
 
-    let n1 = start_node("p1", 18441, vec![], &shutdown).await;
-    let n2 = start_node("p2", 18445, vec![local(18441)], &shutdown).await;
-    let n3 = start_node("p3", 18449, vec![local(18441)], &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("p1", base, vec![], &shutdown).await;
+    let n2 = start_node("p2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("p3", base + 8, vec![local(base)], &shutdown).await;
     let nodes = [&n1, &n2, &n3];
 
     // Wait for a leader to emerge and reports to arrive (the scheduler
@@ -279,8 +337,7 @@ async fn apply_on_any_node_places_across_the_cluster() {
     let config = reliaburger::config::Config::parse(
         r#"
         [app.web]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 3
     "#,
     )
@@ -380,9 +437,11 @@ async fn live_web_instances(nodes: &[&Node]) -> usize {
 async fn cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app() {
     let shutdown = CancellationToken::new();
 
-    let n1 = start_node("s1", 18461, vec![], &shutdown).await;
-    let n2 = start_node("s2", 18465, vec![local(18461)], &shutdown).await;
-    let n3 = start_node("s3", 18469, vec![local(18461)], &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("s1", base, vec![], &shutdown).await;
+    let n2 = start_node("s2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("s3", base + 8, vec![local(base)], &shutdown).await;
     let nodes = [&n1, &n2, &n3];
 
     let ready = wait_until(Duration::from_secs(30), || {
@@ -395,8 +454,7 @@ async fn cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app() {
     let config = reliaburger::config::Config::parse(
         r#"
         [app.web]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 1
     "#,
     )
@@ -566,6 +624,111 @@ async fn stop_until_gone(node: &Node, nodes: &[&Node], app: &str) {
     panic!("{app} was not torn down after stop");
 }
 
+/// #914: an app that names an image needs a container runtime, and a node
+/// on `--runtime process` refuses one. With one such node and two that run
+/// containers, the image app never lands on the process node. Pinned to the
+/// process node's zone, it's unschedulable, with that reason, instead of
+/// placed where it would be refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn an_image_app_is_never_placed_on_a_process_only_node() {
+    let shutdown = CancellationToken::new();
+
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let process_setup = NodeSetup {
+        labels: [("zone".to_string(), "a".to_string())].into(),
+        process_only: true,
+        ..NodeSetup::default()
+    };
+    let n1 = start_node_with("p1", base, vec![], &shutdown, None, process_setup).await;
+    let n2 = start_labelled_node(
+        "c2",
+        base + 4,
+        vec![local(base)],
+        &shutdown,
+        &[("zone", "b")],
+    )
+    .await;
+    let n3 = start_labelled_node(
+        "c3",
+        base + 8,
+        vec![local(base)],
+        &shutdown,
+        &[("zone", "b")],
+    )
+    .await;
+    let nodes = [&n1, &n2, &n3];
+    let ready = wait_until(Duration::from_secs(30), || {
+        nodes.iter().any(|n| *n.thinks_leader.borrow())
+    })
+    .await;
+    assert!(ready, "no leader elected");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let image = r#"
+        [app.web]
+        image = "app:v1"
+        command = ["sleep", "600"]
+        replicas = 2
+    "#;
+    apply_until_live(&n1, &nodes, image, "web").await;
+    let placed = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let mut live = nodes_with_live(&nodes, "web").await;
+            live.sort();
+            if live.len() == 2 {
+                return live;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("web never ran two replicas");
+    assert_eq!(placed, ["c2", "c3"]);
+    let on_process_node = n1.client.status().await.unwrap();
+    assert!(
+        on_process_node.iter().all(|row| row.app_name != "web"),
+        "the process node was handed an image app: {on_process_node:?}"
+    );
+
+    let pinned = reliaburger::config::Config::parse(
+        r#"
+        [app.pinned]
+        image = "app:v1"
+        command = ["sleep", "600"]
+
+        [app.pinned.placement]
+        required = ["zone=a"]
+    "#,
+    )
+    .unwrap();
+    let app = reliaburger::meat::AppId::new("pinned", "default");
+    let reason = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let _ = tokio::time::timeout(Duration::from_secs(15), n2.client.apply(&pinned)).await;
+            for node in nodes {
+                let Some(council) = node.handle.council.as_ref() else {
+                    continue;
+                };
+                if let Some(short) = council.desired_state().await.unschedulable.get(&app) {
+                    return short.reason;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .expect("the pinned image app was never reported unschedulable");
+    assert_eq!(
+        reason,
+        reliaburger::meat::types::UnplacedReason::NoContainerRuntime
+    );
+    assert!(nodes_with_live(&nodes, "pinned").await.is_empty());
+
+    shutdown.cancel();
+}
+
 /// V02 soak on 9e6a6b6: `relish stop` then `apply` brought a volume app back
 /// on another node, with an empty volume. It must go back to the node that
 /// holds its data, even when the scheduler would now rather go elsewhere.
@@ -574,11 +737,25 @@ async fn stop_until_gone(node: &Node, nodes: &[&Node], app: &str) {
 async fn a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume() {
     let shutdown = CancellationToken::new();
 
-    let n1 = start_labelled_node("v1", 18561, vec![], &shutdown, &[("zone", "a")]).await;
-    let n2 =
-        start_labelled_node("v2", 18565, vec![local(18561)], &shutdown, &[("zone", "b")]).await;
-    let n3 =
-        start_labelled_node("v3", 18569, vec![local(18561)], &shutdown, &[("zone", "b")]).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_labelled_node("v1", base, vec![], &shutdown, &[("zone", "a")]).await;
+    let n2 = start_labelled_node(
+        "v2",
+        base + 4,
+        vec![local(base)],
+        &shutdown,
+        &[("zone", "b")],
+    )
+    .await;
+    let n3 = start_labelled_node(
+        "v3",
+        base + 8,
+        vec![local(base)],
+        &shutdown,
+        &[("zone", "b")],
+    )
+    .await;
     let nodes = [&n1, &n2, &n3];
     let ready = wait_until(Duration::from_secs(30), || {
         nodes.iter().any(|n| *n.thinks_leader.borrow())
@@ -590,7 +767,7 @@ async fn a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume() {
     // Pinned to zone b, db lands on v2, which then holds its volume.
     let pinned = r#"
         [app.db]
-        image = "proc-grill:image-ignored"
+        image = "app:v1"
         command = ["sleep", "600"]
 
         [app.db.placement]
@@ -607,7 +784,7 @@ async fn a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume() {
     stop_until_gone(&n1, &nodes, "db").await;
     let unpinned = r#"
         [app.db]
-        image = "proc-grill:image-ignored"
+        image = "app:v1"
         command = ["sleep", "600"]
 
         [[app.db.volumes]]
@@ -642,7 +819,9 @@ fn volume_root(name: &str, gossip_port: u16, app: &str) -> std::path::PathBuf {
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn restarting_bun_on_a_volume_apps_node_never_moves_the_app() {
     let root = CancellationToken::new();
-    let ports = [("h1", 21141_u16), ("h2", 21145), ("h3", 21149)];
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let ports = [("h1", base), ("h2", base + 4), ("h3", base + 8)];
     let zones = [[("zone", "a")], [("zone", "b")], [("zone", "b")]];
     let tokens: Vec<CancellationToken> = (0..3).map(|_| root.child_token()).collect();
     let mut nodes: Vec<Option<Node>> = Vec::new();
@@ -670,7 +849,7 @@ async fn restarting_bun_on_a_volume_apps_node_never_moves_the_app() {
     // a wrong move would take it.
     let manifest = r#"
         [app.db]
-        image = "proc-grill:image-ignored"
+        image = "app:v1"
         command = ["sleep", "600"]
 
         [app.db.placement]
@@ -872,8 +1051,7 @@ async fn autoscaler_scales_up_on_high_metric() {
     let config = reliaburger::config::Config::parse(
         r#"
         [app.scaler]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 1
 
         [app.scaler.autoscale]
@@ -885,7 +1063,9 @@ async fn autoscaler_scales_up_on_high_metric() {
     "#,
     )
     .unwrap();
-    let [n1, n2, n3] = start_autoscale_cluster(18541, &config, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let [n1, n2, n3] = start_autoscale_cluster(base, &config, &shutdown).await;
     let nodes = [&n1, &n2, &n3];
 
     // The leader's autoscaler reads its own store; feed every node's so it
@@ -950,8 +1130,7 @@ async fn autoscaler_scales_up_from_real_collector_cpu() {
     let config = reliaburger::config::Config::parse(
         r#"
         [app.scaler]
-        image = "proc-grill:image-ignored"
-        command = ["sh", "-c", "while :; do :; done"]
+        script = "while :; do :; done"
         replicas = 1
 
         [app.scaler.autoscale]
@@ -964,7 +1143,9 @@ async fn autoscaler_scales_up_from_real_collector_cpu() {
     "#,
     )
     .unwrap();
-    let [n1, n2, n3] = start_autoscale_cluster(27341, &config, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let [n1, n2, n3] = start_autoscale_cluster(base, &config, &shutdown).await;
     let nodes = [&n1, &n2, &n3];
 
     for node in &nodes {
@@ -1014,16 +1195,18 @@ async fn autoscaler_scales_up_from_real_collector_cpu() {
 async fn fault_injection_rejected_when_quorum_at_risk() {
     let auth = NodeFaultAuth::admin("partition-admin");
     let shutdown = CancellationToken::new();
-    let n1 = start_node_with_auth("r1", 18741, vec![], &shutdown, Some(auth.clone())).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("r1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "r2",
-        18745,
-        vec![local(18741)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
-    let n3 = start_node_with_auth("r3", 18749, vec![local(18741)], &shutdown, Some(auth)).await;
+    let n3 = start_node_with_auth("r3", base + 8, vec![local(base)], &shutdown, Some(auth)).await;
     let nodes = [&n1, &n2, &n3];
 
     // Wait for a 3-member council so `council_size == 3`.
@@ -1032,24 +1215,26 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
     })
     .await;
     assert!(ready, "no leader elected");
-    // Wait for the council to actually grow to 3 voters. The self-healing
-    // reconciler admits members one action per tick with a stability
-    // window, so growth takes several ticks rather than one.
+    // Wait until every node has applied the same uniform three-voter
+    // config. The self-healing reconciler admits members one action per
+    // tick, and each node's quorum rail reads its own Raft metrics: the
+    // first partition goes through a follower, which may not have appended
+    // the promotion yet and would still count two voters (max allowed 0).
     let grown = wait_until(Duration::from_secs(60), || {
-        nodes.iter().any(|n| {
-            n.handle.council.as_ref().is_some_and(|c| {
-                c.metrics()
-                    .borrow()
-                    .membership_config
-                    .membership()
-                    .voter_ids()
-                    .count()
-                    >= 3
-            })
-        })
+        council_membership_settled(&nodes, 3)
     })
     .await;
-    assert!(grown, "council did not grow to 3 voters");
+    assert!(
+        grown,
+        "council never settled on a uniform three-voter membership"
+    );
+    // The rail also subtracts the voters missing from the serving node's
+    // API membership table, so wait until every node's table lists all
+    // three; otherwise a late join reads as one voter already down.
+    assert!(
+        wait_until_api_views_list_all(&nodes, Duration::from_secs(30)).await,
+        "not every node's API membership listed all three members"
+    );
 
     let leader = nodes
         .iter()
@@ -1224,6 +1409,32 @@ async fn inject_node_fault_once_council_settles(
     }
 }
 
+/// Wait until every node's API membership table (what the fault safety
+/// rails read) lists every node in `nodes`.
+async fn wait_until_api_views_list_all(nodes: &[&Node], timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let mut all_listed = true;
+        for observer in nodes {
+            let table = observer.membership_table.read().await;
+            if !nodes
+                .iter()
+                .all(|node| table.iter().any(|member| member.node_id.0 == node.name))
+            {
+                all_listed = false;
+                break;
+            }
+        }
+        if all_listed {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Wait until `observer`'s API membership table (what the fault safety
 /// rails read) no longer lists `target`.
 async fn wait_until_api_view_drops(observer: &Node, target: &str, timeout: Duration) -> bool {
@@ -1268,16 +1479,18 @@ async fn partition_isolates_a_node_for_real() {
 
     let auth = NodeFaultAuth::admin("partition-admin");
     let shutdown = CancellationToken::new();
-    let n1 = start_node_with_auth("q1", 18641, vec![], &shutdown, Some(auth.clone())).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("q1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "q2",
-        18645,
-        vec![local(18641)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
-    let n3 = start_node_with_auth("q3", 18649, vec![local(18641)], &shutdown, Some(auth)).await;
+    let n3 = start_node_with_auth("q3", base + 8, vec![local(base)], &shutdown, Some(auth)).await;
     let nodes = [&n1, &n2, &n3];
 
     // Gossip can converge before Raft has elected a stable three-voter council.
@@ -1363,16 +1576,18 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
 
     let auth = NodeFaultAuth::admin("chaos-admin");
     let shutdown = CancellationToken::new();
-    let n1 = start_node_with_auth("f1", 18941, vec![], &shutdown, Some(auth.clone())).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("f1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "f2",
-        18945,
-        vec![local(18941)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
-    let n3 = start_node_with_auth("f3", 18949, vec![local(18941)], &shutdown, Some(auth)).await;
+    let n3 = start_node_with_auth("f3", base + 8, vec![local(base)], &shutdown, Some(auth)).await;
     let nodes = [&n1, &n2, &n3];
 
     let converged = wait_until(Duration::from_secs(30), || {
@@ -1529,8 +1744,7 @@ async fn start_spread_web_cluster(
         let config = reliaburger::config::Config::parse(
             r#"
             [app.web]
-            image = "proc-grill:image-ignored"
-            command = ["sh", "-c", "while true; do echo tick from $$; sleep 0.3; done"]
+            script = "while true; do echo tick from $$; sleep 0.3; done"
             port = 8080
             replicas = 3
         "#,
@@ -1587,7 +1801,9 @@ async fn web_ordinals(nodes: &[&Node]) -> Vec<(u32, String)> {
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn losing_the_leader_node_places_only_its_replica_on_the_survivors() {
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("nl", 19941, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("nl", base, &shutdown).await;
     let spread = web_ordinals(&nodes.iter().collect::<Vec<_>>()).await;
     let numbers: Vec<u32> = spread.iter().map(|(ordinal, _)| *ordinal).collect();
     assert_eq!(numbers, [0, 1, 2], "replicas share an id: {spread:?}");
@@ -1739,7 +1955,9 @@ async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
     use reliaburger::smoker::types::{FaultRequest, FaultType};
 
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("kw", 20441, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("kw", base, &shutdown).await;
     // The quorum rail admits one affected voter only once three vote, and the
     // leader refuses node faults until that membership has settled.
     let council: Vec<&Node> = nodes.iter().collect();
@@ -1889,7 +2107,9 @@ async fn a_kill_sent_to_one_node_kills_a_replica_on_another() {
     use reliaburger::smoker::types::{FaultRequest, FaultType};
 
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("wk", 19541, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("wk", base, &shutdown).await;
     let [entry, target, bystander] = &nodes;
 
     let (target_pid, _) = web_process(target).await.expect("target runs web");
@@ -1979,7 +2199,9 @@ async fn a_network_fault_sent_to_one_node_is_installed_where_every_caller_runs()
     use reliaburger::smoker::types::{FaultRequest, FaultType};
 
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("nf", 19841, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("nf", base, &shutdown).await;
     let entry = &nodes[0];
 
     let summary = entry
@@ -2069,7 +2291,9 @@ fn followed_nodes(events: &[reliaburger::ketchup::sse::SseEvent]) -> Vec<String>
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn follow_and_top_cover_every_node_and_survive_one_leaving() {
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("lf", 19641, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("lf", base, &shutdown).await;
     let entry = &nodes[0];
     // Lose a follower rather than the leader, so the test watches the
     // follow's reaction rather than an election.
@@ -2188,7 +2412,9 @@ async fn tui_logs_history_and_events_cover_every_node_and_name_a_missing_one() {
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("cv", 20541, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("cv", base, &shutdown).await;
     let entry = &nodes[0];
     let doomed = nodes[1..]
         .iter()
@@ -2306,7 +2532,9 @@ async fn tui_logs_history_and_events_cover_every_node_and_name_a_missing_one() {
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn wtf_and_path_reach_every_node_through_the_entry_node() {
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("wt", 19741, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("wt", base, &shutdown).await;
     // Enter through the middle node, so the path's source (the lowest-named
     // node running `web`) is somewhere else.
     let entry = &nodes[1];
@@ -2374,15 +2602,16 @@ async fn wtf_and_path_reach_every_node_through_the_entry_node() {
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn ingress_reaches_nodes_without_local_replicas() {
     let shutdown = CancellationToken::new();
-    let n1 = start_node("ingress1", 19441, vec![], &shutdown).await;
-    let n2 = start_node("ingress2", 19445, vec![local(19441)], &shutdown).await;
-    let n3 = start_node("ingress3", 19449, vec![local(19441)], &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("ingress1", base, vec![], &shutdown).await;
+    let n2 = start_node("ingress2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("ingress3", base + 8, vec![local(base)], &shutdown).await;
     let nodes = [&n1, &n2, &n3];
     let config = reliaburger::config::Config::parse(
         r#"
         [app.web]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 1
         port = 8080
         [app.web.ingress]
@@ -2534,20 +2763,22 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
     use reliaburger::smoker::types::{FaultRequest, FaultType};
     let auth = NodeFaultAuth::admin("reservation-admin");
     let shutdown = CancellationToken::new();
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
     let n1 =
-        start_node_with_auth("reservation1", 20341, vec![], &shutdown, Some(auth.clone())).await;
+        start_node_with_auth("reservation1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "reservation2",
-        20345,
-        vec![local(20341)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
     let n3 = start_node_with_auth(
         "reservation3",
-        20349,
-        vec![local(20341)],
+        base + 8,
+        vec![local(base)],
         &shutdown,
         Some(auth),
     )
@@ -2724,6 +2955,130 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
     }
 }
 
+/// `GET /v1/audit?cluster=true` asks every node for its own durable log
+/// and merges the answers by time (#685).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "multi-node audit query acceptance; run with make test-cluster"]
+async fn cluster_audit_query_merges_every_node() {
+    let auth = NodeFaultAuth::admin("audit-admin");
+    let shutdown = CancellationToken::new();
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("audit1", base, vec![], &shutdown, Some(auth.clone())).await;
+    let n2 = start_node_with_auth(
+        "audit2",
+        base + 4,
+        vec![local(base)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth(
+        "audit3",
+        base + 8,
+        vec![local(base)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let nodes = [&n1, &n2, &n3];
+    assert!(
+        wait_until(Duration::from_secs(60), || nodes.iter().all(|node| {
+            node.handle.council.as_ref().is_some_and(|council| {
+                let metrics = council.metrics().borrow().clone();
+                metrics.current_leader.is_some()
+                    && metrics.membership_config.membership().voter_ids().count() == 3
+            })
+        }))
+        .await
+    );
+    // One audited action through each node: each records it in its own log
+    // (and the leader again, for the ones forwarded to it).
+    for node in nodes {
+        let manifest = format!("[namespace.from-{}]\nmax_apps = 1\n", node.name);
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/apply", node.client.base_url()))
+            .bearer_auth(&auth.plaintext)
+            .body(manifest)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "{status}: {body}");
+    }
+    let filter = reliaburger::bun::audit::AuditFilter {
+        action: Some("app.applied".to_string()),
+        ..reliaburger::bun::audit::AuditFilter::default()
+    };
+    // Every node answers once gossip has shown the querying node all three.
+    let mut listing = reliaburger::bun::audit::AuditListing::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(answer) = n1.client.audit(&filter, true).await {
+            listing = answer;
+            let recorded_on: std::collections::BTreeSet<_> = listing
+                .records
+                .iter()
+                .filter_map(|record| record.node.clone())
+                .collect();
+            if listing.warnings.is_empty() && recorded_on.len() == 3 {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cluster audit query never merged all three nodes: {listing:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let names: std::collections::BTreeSet<_> = listing
+        .records
+        .iter()
+        .filter_map(|record| record.node.clone())
+        .collect();
+    assert_eq!(
+        names,
+        ["audit1", "audit2", "audit3"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    );
+    // Merged oldest first.
+    assert!(
+        listing
+            .records
+            .windows(2)
+            .all(|pair| pair[0].timestamp <= pair[1].timestamp)
+    );
+    for node in nodes {
+        let namespace = format!("from-{}", node.name);
+        assert!(
+            listing
+                .records
+                .iter()
+                .any(|record| record.node.as_deref() == Some(node.name.as_str())
+                    && record.namespace.as_deref() == Some(namespace.as_str())),
+            "{} did not record its own apply: {listing:?}",
+            node.name
+        );
+    }
+    // Without `cluster`, a node answers from its own log only.
+    let local = n2.client.audit(&filter, false).await.unwrap();
+    assert!(!local.records.is_empty());
+    assert!(
+        local
+            .records
+            .iter()
+            .all(|record| record.node.as_deref() == Some("audit2"))
+    );
+    shutdown.cancel();
+    for node in nodes {
+        node.handle.council.as_ref().unwrap().shutdown().await.ok();
+    }
+}
+
 /// Administrative apply must retain the user's authority at the leader.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "multi-node apply forwarding acceptance; run with make test-cluster"]
@@ -2731,19 +3086,21 @@ async fn follower_apply_preserves_user_authority_for_administrative_manifests() 
     use reliaburger::sesame::types::{ApiRole, TokenScope};
     let auth = NodeFaultAuth::admin("apply-admin");
     let shutdown = CancellationToken::new();
-    let n1 = start_node_with_auth("apply1", 20401, vec![], &shutdown, Some(auth.clone())).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("apply1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "apply2",
-        20405,
-        vec![local(20401)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
     let n3 = start_node_with_auth(
         "apply3",
-        20409,
-        vec![local(20401)],
+        base + 8,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
@@ -2834,16 +3191,18 @@ async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an
     use reliaburger::relish::RelishError;
     let auth = NodeFaultAuth::admin("capacity-admin");
     let shutdown = CancellationToken::new();
-    let n1 = start_node_with_auth("cap1", 26341, vec![], &shutdown, Some(auth.clone())).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("cap1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "cap2",
-        26345,
-        vec![local(26341)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
-    let n3 = start_node_with_auth("cap3", 26349, vec![local(26341)], &shutdown, Some(auth)).await;
+    let n3 = start_node_with_auth("cap3", base + 8, vec![local(base)], &shutdown, Some(auth)).await;
     let nodes = [&n1, &n2, &n3];
     assert!(
         wait_until(Duration::from_secs(40), || nodes.iter().any(|node| {
@@ -2869,7 +3228,7 @@ async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an
         loop {
             let peers = follower.client.nodes().await.unwrap();
             if peers.len() == 3 && peers.iter().all(|peer| peer.api_address.is_some()) {
-                let expected = [("cap1", 26344), ("cap2", 26348), ("cap3", 26352)];
+                let expected = [("cap1", base + 3), ("cap2", base + 7), ("cap3", base + 11)];
                 for (id, port) in expected {
                     let peer = peers.iter().find(|peer| peer.node_id == id).unwrap();
                     assert_eq!(peer.api_address, Some(local(port)));
@@ -2896,7 +3255,7 @@ async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an
         .await
         .unwrap();
     let mut config = reliaburger::config::Config::parse(&format!(
-        "[app.capacity]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"300\"]\ncpu = \"100000m\"\nmemory = \"1Mi\"\nnamespace = \"{}\"\n", lease.namespace
+        "[app.capacity]\nscript = \"exec sleep 300\"\ncpu = \"100000m\"\nmemory = \"1Mi\"\nnamespace = \"{}\"\n", lease.namespace
     )).unwrap();
     let app_id = reliaburger::meat::AppId::new("capacity", &lease.namespace);
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -3001,17 +3360,25 @@ async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an
 async fn leased_storage_cleanup_waits_for_former_placements_and_failed_deletion() {
     let auth = NodeFaultAuth::admin("storage-admin");
     let shutdown = CancellationToken::new();
-    let n1 = start_node_with_auth("storage1", 26841, vec![], &shutdown, Some(auth.clone())).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("storage1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "storage2",
-        26845,
-        vec![local(26841)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
-    let n3 =
-        start_node_with_auth("storage3", 26849, vec![local(26841)], &shutdown, Some(auth)).await;
+    let n3 = start_node_with_auth(
+        "storage3",
+        base + 8,
+        vec![local(base)],
+        &shutdown,
+        Some(auth),
+    )
+    .await;
     let nodes = [&n1, &n2, &n3];
     assert!(
         wait_until(Duration::from_secs(40), || nodes.iter().any(|node| *node
@@ -3040,16 +3407,16 @@ async fn leased_storage_cleanup_waits_for_former_placements_and_failed_deletion(
         .create_test_lease(120, Some("rbtest-storage-contract"))
         .await
         .unwrap();
-    let mut config = reliaburger::config::Config::parse(&format!("[app.web]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '120']\nreplicas = 3\nnamespace = '{}'\n[[app.web.volumes]]\npath = '/data'\n", lease.namespace)).unwrap();
+    let mut config = reliaburger::config::Config::parse(&format!("[app.web]\nimage = 'app:v1'\ncommand = ['sleep', '120']\nreplicas = 3\nnamespace = '{}'\n[[app.web.volumes]]\npath = '/data'\n", lease.namespace)).unwrap();
     leader
         .client
         .apply_with_lease(&config, &lease.lease_id)
         .await
         .unwrap();
     let roots: Vec<_> = [
-        ("storage1", 26841),
-        ("storage2", 26845),
-        ("storage3", 26849),
+        ("storage1", base),
+        ("storage2", base + 4),
+        ("storage3", base + 8),
     ]
     .into_iter()
     .map(|(name, port)| std::env::temp_dir().join(format!("rb-placement-{name}-{port}/volumes")))
@@ -3214,25 +3581,33 @@ async fn desired_web(node: &Node) -> Option<reliaburger::config::app::AppSpec> {
         .cloned()
 }
 
-/// Apply `web` at `tag` with two replicas until the council holds it and two
-/// replicas run.
+/// The `VERSION` a `web` spec rolled out by [`roll_web_out`] carries. A host
+/// app has no image tag to tell its versions apart (#914).
+fn web_version(spec: &reliaburger::config::app::AppSpec) -> Option<&str> {
+    match spec.env.get("VERSION")? {
+        reliaburger::config::types::EnvValue::Plain(version) => Some(version),
+        _ => None,
+    }
+}
+
+/// Apply `web` at version `tag` with two replicas until the council holds it
+/// and two replicas run.
 async fn roll_web_out(nodes: &[&Node], tag: &str) {
     let config = reliaburger::config::Config::parse(&format!(
         r#"
         [app.web]
-        image = "proc-grill:{tag}"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 2
+        [app.web.env]
+        VERSION = "{tag}"
     "#
     ))
     .unwrap();
-    let image = format!("proc-grill:{tag}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let mut last_apply: Option<tokio::time::Instant> = None;
     loop {
         let spec = desired_web(nodes[0]).await;
-        if spec.as_ref().and_then(|s| s.image.as_deref()) == Some(image.as_str())
-            && live_web_instances(nodes).await == 2
+        if spec.as_ref().and_then(web_version) == Some(tag) && live_web_instances(nodes).await == 2
         {
             return;
         }
@@ -3258,9 +3633,11 @@ async fn roll_web_out(nodes: &[&Node], tag: &str) {
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn rolling_back_through_a_node_that_never_ran_the_app_keeps_its_scale() {
     let shutdown = CancellationToken::new();
-    let n1 = start_node("rb1", 18961, vec![], &shutdown).await;
-    let n2 = start_node("rb2", 18965, vec![local(18961)], &shutdown).await;
-    let n3 = start_node("rb3", 18969, vec![local(18961)], &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("rb1", base, vec![], &shutdown).await;
+    let n2 = start_node("rb2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("rb3", base + 8, vec![local(base)], &shutdown).await;
     let nodes = [&n1, &n2, &n3];
     let ready = wait_until(Duration::from_secs(30), || {
         nodes.iter().any(|n| *n.thinks_leader.borrow())
@@ -3311,7 +3688,7 @@ async fn rolling_back_through_a_node_that_never_ran_the_app_keeps_its_scale() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let spec = desired_web(&n1).await.expect("web is still desired");
-        if spec.image.as_deref() == Some("proc-grill:v1") {
+        if web_version(&spec) == Some("v1") {
             assert_eq!(
                 spec.replicas,
                 reliaburger::config::Replicas::Fixed(2),
@@ -3323,6 +3700,551 @@ async fn rolling_back_through_a_node_that_never_ran_the_app_keeps_its_scale() {
             tokio::time::Instant::now() < deadline,
             "the rollback never restored v1: {:?}",
             spec.image
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    shutdown.cancel();
+}
+
+/// The council's rollout record for `web` (#692).
+async fn web_rollouts(node: &Node) -> Option<reliaburger::meat::deploy_types::AppRollouts> {
+    node.handle
+        .council
+        .as_ref()?
+        .desired_state()
+        .await
+        .rollouts
+        .get(&reliaburger::meat::AppId::new("web", "default"))
+        .cloned()
+}
+
+/// Wait until the council records `count` specs of `web` that rolled out on
+/// every node.
+async fn wait_for_released_web(node: &Node, count: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let released = web_rollouts(node)
+            .await
+            .map_or(0, |rollouts| rollouts.released.len());
+        if released >= count {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the council never recorded {count} rolled-out spec(s) of web, only {released}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Apply `toml` through `node` until the council holds its `web` spec.
+async fn apply_web(node: &Node, toml: &str) {
+    let config = reliaburger::config::Config::parse(toml).unwrap();
+    // A host `script` app's version is its script (#914).
+    let web = config.app.get("web").unwrap();
+    let wanted = (web.command.clone(), web.script.clone());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let desired = desired_web(node)
+            .await
+            .map(|spec| (spec.command, spec.script));
+        if desired == Some(wanted.clone()) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the council never took the new web spec"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(15), node.client.apply(&config)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Running `web` instances on each node, and the ids of those that came
+/// from a rollout (`-g{generation}-`).
+async fn web_rollout_view(nodes: &[&Node]) -> (Vec<usize>, Vec<String>) {
+    let mut running = Vec::new();
+    let mut generated = Vec::new();
+    for node in nodes {
+        let statuses = node.client.status().await.unwrap_or_default();
+        running.push(
+            statuses
+                .iter()
+                .filter(|s| s.app_name == "web" && s.state == "running")
+                .count(),
+        );
+        generated.extend(
+            statuses
+                .iter()
+                .filter(|s| s.app_name == "web" && s.id.contains("-g"))
+                .map(|s| format!("{}/{}", node.name, s.id)),
+        );
+    }
+    (running, generated)
+}
+
+/// #692 (D10-C): one replica per node, rolling stop-first. When every node
+/// rolled its share at once, all three replicas were down together for the
+/// length of a replacement. Released one node at a time, two of the three
+/// keep serving throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy() {
+    let shutdown = CancellationToken::new();
+    let cluster_ports = lease_cluster_ports();
+    let cluster = start_spread_web_cluster("rs", cluster_ports.base, &shutdown).await;
+    let nodes: Vec<&Node> = cluster.iter().collect();
+    wait_for_released_web(nodes[0], 1).await;
+
+    // Stop-first on each node, and three seconds of init before the new
+    // replica runs, so a node mid-rollout serves nothing for a while.
+    apply_web(
+        nodes[0],
+        r#"
+        [app.web]
+        script = "while true; do echo tock from $$; sleep 0.3; done"
+        port = 8080
+        replicas = 3
+
+        [[app.web.init]]
+        command = ["sleep", "3"]
+
+        [app.web.deploy]
+        max_surge = 0
+        max_unavailable = 1
+        drain_timeout = "0s"
+    "#,
+    )
+    .await;
+
+    let mut fewest = usize::MAX;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let (running, generated) = web_rollout_view(&nodes).await;
+        fewest = fewest.min(running.iter().sum());
+        let rolled = nodes
+            .iter()
+            .filter(|node| {
+                generated
+                    .iter()
+                    .any(|id| id.starts_with(&format!("{}/", node.name)))
+            })
+            .count();
+        if rolled == 3 && running == [1, 1, 1] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the redeploy never reached every node: running {running:?}, new {generated:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        fewest >= 2,
+        "a node-by-node rollout keeps two of three replicas serving; saw {fewest}"
+    );
+    wait_for_released_web(nodes[0], 2).await;
+    shutdown.cancel();
+}
+
+/// #692 (D11-B): a version that fails its health check on the first node
+/// is marked `RolloutFailed`. No other node ever gets it, nothing retries
+/// it, every replica keeps serving the old version, and a different spec
+/// clears the mark. A scale change counts as different (#929): it starts a
+/// new rollout of the version, which fails and is marked again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying() {
+    let shutdown = CancellationToken::new();
+    let cluster_ports = lease_cluster_ports();
+    let cluster = start_spread_web_cluster("rf", cluster_ports.base, &shutdown).await;
+    let nodes: Vec<&Node> = cluster.iter().collect();
+    wait_for_released_web(nodes[0], 1).await;
+
+    apply_web(
+        nodes[0],
+        r#"
+        [app.web]
+        script = "exec sleep 600"
+        port = 8080
+        replicas = 3
+
+        [app.web.health]
+        path = "/healthz"
+
+        [app.web.deploy]
+        health_timeout = "5s"
+    "#,
+    )
+    .await;
+    let bad = desired_web(nodes[0]).await.unwrap();
+
+    let mut tried: std::collections::BTreeSet<String> = Default::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let failure = loop {
+        let (_, generated) = web_rollout_view(&nodes).await;
+        tried.extend(generated);
+        if let Some(failure) = web_rollouts(nodes[0]).await.and_then(|r| r.failed) {
+            break failure;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the failed rollout was never marked RolloutFailed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        failure.fingerprint,
+        reliaburger::meat::deploy_types::rollout_fingerprint(&bad)
+    );
+
+    // Twenty seconds is four of the reconciler's first retry delays.
+    let window = tokio::time::Instant::now() + Duration::from_secs(20);
+    let before = tried.len();
+    while tokio::time::Instant::now() < window {
+        let (_, generated) = web_rollout_view(&nodes).await;
+        tried.extend(generated);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        tried.len(),
+        before,
+        "a RolloutFailed spec must not be retried: {tried:?}"
+    );
+    let tried_on: std::collections::BTreeSet<&str> = tried
+        .iter()
+        .filter_map(|id| id.split_once('/').map(|(node, _)| node))
+        .collect();
+    assert!(
+        tried_on.len() <= 1,
+        "only the first node may try a spec change before it proves healthy: {tried:?}"
+    );
+    assert_eq!(
+        running_web_instances(&nodes).await,
+        3,
+        "every replica keeps serving the old version"
+    );
+    // Status, wtf and the dashboard read it from here.
+    let desired = nodes[1].client.desired_apps().await.unwrap();
+    let web = desired.iter().find(|app| app.app == "web").unwrap();
+    assert_eq!(web.rollout_failed.as_ref(), Some(&failure));
+
+    // Re-applying the same spec, as a GitOps re-sync would, keeps the mark.
+    let same = reliaburger::config::Config::parse(
+        "[app.web]\nscript = \"exec sleep 600\"\n\
+         port = 8080\nreplicas = 3\n[app.web.health]\npath = \"/healthz\"\n\
+         [app.web.deploy]\nhealth_timeout = \"5s\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        same.app.get("web"),
+        Some(&bad),
+        "the re-apply is the same spec"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(15), nodes[0].client.apply(&same)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        web_rollouts(nodes[0]).await.unwrap().failed.is_some(),
+        "an identical re-apply must not clear RolloutFailed"
+    );
+
+    // #929: a scale change is a different spec. It clears the mark and
+    // starts a new rollout of the version, which fails again and is marked
+    // again, later.
+    // Built from the applied spec, so only `replicas` changes.
+    let mut scaled = reliaburger::config::Config::default();
+    let mut scaled_web = bad.clone();
+    scaled_web.replicas = reliaburger::config::Replicas::Fixed(2);
+    scaled.app.insert("web".into(), scaled_web);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while desired_web(nodes[0]).await.map(|spec| spec.replicas)
+        != Some(reliaburger::config::Replicas::Fixed(2))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the council never took the scaled web spec"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(15), nodes[0].client.apply(&scaled)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let before = tried.len();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let again = loop {
+        let (_, generated) = web_rollout_view(&nodes).await;
+        tried.extend(generated);
+        let failed = web_rollouts(nodes[0]).await.and_then(|r| r.failed);
+        if let Some(again) = failed.filter(|again| again.at_unix_ms > failure.at_unix_ms) {
+            break again;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a scale change never started a new rollout that failed again: {tried:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(again.fingerprint, failure.fingerprint);
+    assert!(
+        tried.len() > before,
+        "the scale change's rollout started a new instance of the version: {tried:?}"
+    );
+
+    // A fixed spec clears it and rolls out everywhere.
+    apply_web(
+        nodes[0],
+        r#"
+        [app.web]
+        script = "while true; do echo fixed from $$; sleep 0.3; done"
+        port = 8080
+        replicas = 3
+    "#,
+    )
+    .await;
+    assert!(
+        web_rollouts(nodes[0]).await.unwrap().failed.is_none(),
+        "a different spec clears RolloutFailed"
+    );
+    wait_for_released_web(nodes[0], 2).await;
+    shutdown.cancel();
+}
+
+/// #692: deploy history lived only in each node's memory, so once every
+/// node had restarted (an upgrade, say) `relish rollback` had nothing to
+/// go back to and answered 404. The council now keeps the specs that
+/// rolled out everywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn rollback_works_after_every_node_restarts() {
+    let root = CancellationToken::new();
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let ports = [("rr1", base), ("rr2", base + 4), ("rr3", base + 8)];
+    let mut tokens: Vec<CancellationToken> = (0..3).map(|_| root.child_token()).collect();
+    let mut nodes: Vec<Option<Node>> = Vec::new();
+    for (index, (name, port)) in ports.iter().enumerate() {
+        let seeds = if index == 0 {
+            vec![]
+        } else {
+            vec![local(ports[0].1)]
+        };
+        nodes.push(Some(
+            labelled_node(name, *port, seeds, &tokens[index], &[], false).await,
+        ));
+    }
+    {
+        let live: Vec<&Node> = nodes.iter().flatten().collect();
+        let ready = wait_until(Duration::from_secs(30), || {
+            live.iter().any(|n| *n.thinks_leader.borrow())
+        })
+        .await;
+        assert!(ready, "no leader elected");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        roll_web_out(&live, "v1").await;
+        wait_for_released_web(live[0], 1).await;
+        roll_web_out(&live, "v2").await;
+        wait_for_released_web(live[0], 2).await;
+    }
+
+    // Restart every node in turn, on its own data directory, the way an
+    // upgrade does. Each one's in-memory deploy history goes with it.
+    for index in 0..ports.len() {
+        let (name, port) = ports[index];
+        let stopped = nodes[index].take().unwrap();
+        tokens[index].cancel();
+        if let Some(council) = &stopped.handle.council {
+            council.shutdown().await.ok();
+        }
+        drop(stopped);
+        let seed = ports[(index + 1) % ports.len()].1;
+        // Like a real restart, the old process is gone (its Raft store
+        // released) before the new one starts.
+        {
+            let observer = nodes[(index + 1) % ports.len()].as_ref().unwrap();
+            let left = wait_until(Duration::from_secs(20), || {
+                peer_state(observer, name) != Some(reliaburger::mustard::state::NodeState::Alive)
+            })
+            .await;
+            assert!(left, "{name} never left gossip");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokens[index] = root.child_token();
+        nodes[index] =
+            Some(labelled_node(name, port, vec![local(seed)], &tokens[index], &[], true).await);
+        let live: Vec<&Node> = nodes.iter().flatten().collect();
+        let settled = wait_until(Duration::from_secs(60), || {
+            live.iter().filter(|n| *n.thinks_leader.borrow()).count() == 1
+        })
+        .await;
+        assert!(settled, "no leader after restarting {name}");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    let live: Vec<&Node> = nodes.iter().flatten().collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            live[0].client.rollback("web", "default"),
+        )
+        .await
+        .expect("rollback did not hang")
+        {
+            Ok(()) => break,
+            Err(reliaburger::relish::RelishError::ApiError { status: 503, .. })
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => panic!("rollback after every node restarted: {error}"),
+        }
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let spec = desired_web(live[0]).await.expect("web is still desired");
+        if web_version(&spec) == Some("v1") {
+            assert_eq!(spec.replicas, reliaburger::config::Replicas::Fixed(2));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the rollback never restored v1: {:?}",
+            spec.image
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    root.cancel();
+    for node in nodes.iter().flatten() {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}
+
+/// The nodes the council places `web` on, as `node` sees desired state.
+async fn web_placements(node: &Node) -> Vec<String> {
+    let Some(council) = &node.handle.council else {
+        return Vec::new();
+    };
+    council
+        .desired_state()
+        .await
+        .scheduling
+        .get(&reliaburger::meat::AppId::new("web", "default"))
+        .map(|placements| placements.iter().map(|p| p.node_id.0.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// #702, D28: a worker's agent stops, so its reports stop, but gossip still
+/// lists it alive. For the stale-node grace its replica stays placed there:
+/// the reporter may only be wedged, with the replica still serving. After
+/// the grace the leader moves it to a survivor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn replicas_move_off_a_node_whose_reports_stopped_after_the_grace() {
+    const STALE_SECS: u64 = 3;
+    const GRACE: Duration = Duration::from_secs(15);
+
+    let shutdown = CancellationToken::new();
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let start = |index: u16| {
+        let shutdown = shutdown.child_token();
+        async move {
+            let seeds = if index == 0 {
+                vec![]
+            } else {
+                vec![local(base)]
+            };
+            let setup = NodeSetup {
+                stale_report_timeout_secs: STALE_SECS,
+                stale_node_grace: Some(GRACE),
+                ..NodeSetup::default()
+            };
+            start_node_with(
+                &format!("sg{}", index + 1),
+                base + index * PORTS_PER_NODE,
+                seeds,
+                &shutdown,
+                None,
+                setup,
+            )
+            .await
+        }
+    };
+    let nodes = [start(0).await, start(1).await, start(2).await];
+    let all: Vec<&Node> = nodes.iter().collect();
+    let elected = wait_until(Duration::from_secs(30), || {
+        all.iter().any(|node| *node.thinks_leader.borrow())
+    })
+    .await;
+    assert!(elected, "no leader elected");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let config = reliaburger::config::Config::parse(
+        r#"
+        [app.web]
+        script = "exec sleep 600"
+        replicas = 3
+    "#,
+    )
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut last_apply: Option<tokio::time::Instant> = None;
+    while nodes_running_web(&all).await < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "web never spread one replica per node"
+        );
+        if last_apply.is_none_or(|at| at.elapsed() >= Duration::from_secs(8)) {
+            let _ =
+                tokio::time::timeout(Duration::from_secs(15), nodes[0].client.apply(&config)).await;
+            last_apply = Some(tokio::time::Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let target = nodes
+        .iter()
+        .find(|node| !*node.thinks_leader.borrow())
+        .expect("a worker exists");
+    let observer = nodes
+        .iter()
+        .find(|node| node.name != target.name)
+        .expect("a survivor exists");
+    assert!(web_placements(observer).await.contains(&target.name));
+
+    // Stop only the agent: gossip and Raft carry on, the reports don't.
+    target._wired.agent_shutdown.cancel();
+    let stopped = tokio::time::Instant::now();
+
+    // Within the grace the replica stays placed on the silent node.
+    let hold_until = stopped + Duration::from_secs(STALE_SECS) + GRACE - Duration::from_secs(3);
+    while tokio::time::Instant::now() < hold_until {
+        let placed = web_placements(observer).await;
+        assert!(
+            placed.contains(&target.name),
+            "{} lost its replica {}s into the grace: {placed:?}",
+            target.name,
+            stopped.elapsed().as_secs()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // After it, the replica moves and three run on the survivors.
+    let survivors: Vec<&Node> = nodes
+        .iter()
+        .filter(|node| node.name != target.name)
+        .collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let placed = web_placements(observer).await;
+        let moved = placed.len() == 3 && !placed.contains(&target.name);
+        if moved && running_web_instances(&survivors).await >= 3 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the replica never left {} after the grace: placed {placed:?}",
+            target.name
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

@@ -2,7 +2,7 @@
 
 **Component:** Pickle (image registry)
 **Whitepaper Section:** 12
-**Status:** Design
+**Status:** Implemented (durability and expiry as of 0.2.1)
 
 ---
 
@@ -48,7 +48,7 @@ on routable reads. Clients reach it in one of two envelopes:
 - **Bearer.** `Authorization: Bearer <token>`. `relish`, the build runner and peer
   replication use it. Accepted over TLS and plaintext.
 - **HTTP Basic.** `Authorization: Basic base64(<anything>:<token>)`, which is what
-  `docker login`/`docker push`, `crane`, `podman`, `skopeo` and `oras` send. The password
+  docker, podman, skopeo, crane and oras send. The password
   is the API token; the username is ignored. Accepted **only on a TLS connection**: the
   TLS listener tags each request, and a Basic header on an untagged (plaintext) request is
   refused with 401 even when the token is good. A Basic credential over TLS is rewritten
@@ -59,7 +59,28 @@ Every 401 from a TLS listener carries `WWW-Authenticate: Basic realm="reliaburge
 is what makes docker offer its stored credential. Plaintext 401s carry no challenge.
 Pickle does not implement the Docker token service (`WWW-Authenticate: Bearer realm=…`):
 every client above speaks Basic, and a token service would add a second credential type
-with nothing to gain over the API token it would be exchanged for.
+with nothing to gain over the API token it would be exchanged for. Every `/v2/` response
+also carries `Docker-Distribution-API-Version: registry/2.0`, as the distribution spec asks.
+A manifest is served with the `Content-Type` its own `mediaType` names (Docker schema 2 or
+OCI, image or index), because docker refuses a pull whose header and body disagree; one
+with no `mediaType` is served as an OCI index if it lists manifests, else an OCI manifest.
+
+**Tested clients.** `make test-standard-clients` (`tests/suite/registry_standard_clients.rs`,
+run by CI's acceptance job) drives docker, podman, skopeo and crane against a TLS listener
+on a non-loopback address, named `pickle-clients.test` by `scripts/standard-clients-host.sh`.
+docker treats `127.0.0.0/8` registries as insecure and would skip the certificate check.
+Each client trusts the cluster root the way users do (`/etc/docker/certs.d`,
+`/etc/containers/certs.d`, skopeo `--cert-dir`, crane `SSL_CERT_FILE`), logs in with a token,
+pushes a two-layer image and pulls every layer back. A request log on the router proves the
+pull fetched the layers. Each client is also refused for a wrong token, another cluster's
+CA, and a scoped token outside its namespace. skopeo's repository-to-repository copy
+exercises the declined cross-repository mount. oras and buildah are not tested. Versions
+are whatever the runner image ships; the gate logs them.
+
+**Write admission.** At most four write requests (`POST`, `PATCH`, `PUT`, `DELETE`) run at
+once. A fifth waits up to 60 seconds for a slot, with its body unread, and only then gets
+429 with `Retry-After: 1`. Refusing at once broke `docker push`: docker 29 with the
+containerd image store uploads every blob of an image in parallel and doesn't retry a 429.
 
 **Token scope.** A token created with `--apps` or `--namespaces` is also held to its
 scope, on every write (blob upload start, chunk and completion, manifest `PUT`, and the
@@ -95,19 +116,20 @@ the repositories the caller may read. Before this, a namespace-scoped Deployer c
 to any repository through `docker push`, and a bare build destination counted as
 `default`.
 
-What works where, in 0.1.0:
+What works where:
 
 | Listener | Bearer clients (`relish build`) | Basic clients (docker, crane) |
 |----------|--------------------------------|-------------------------------|
 | Standalone, loopback, no API token yet | open (bootstrap window) | anonymous push works; Basic refused |
 | Standalone, loopback, tokens exist | token | refused: plaintext |
 | Cluster with node identity (TLS, routable) | token | `docker login` / `crane auth login` with a token |
-| Cluster without node identity (plaintext) | token | refused: plaintext |
+| Cluster without node identity (plaintext) | refused: the registry needs mTLS (§8.5) | refused: plaintext |
 
 Node certificates name the node (its node id), not an IP address or `localhost`, so a
 client that verifies hostnames (docker, crane) must reach the registry by the node's name
 and trust the cluster root CA. On the laptop quickstart that means an `/etc/hosts` entry
-for node 1's name pointing at `127.0.0.1` and the port forward on `15050`. A loopback-only
+for node 1's name and the port forward on `15050`. For docker on Linux that entry must be
+a non-loopback address of the machine, for the insecure-registry reason above. A loopback-only
 TLS listener answers anonymous `GET /v2/` with 200, so docker (which only offers
 credentials after a challenge on that probe) can't push to one; clustered listeners are
 routable, so this only affects hand-built configurations.
@@ -568,13 +590,26 @@ pub enum PickleRaftCommand {
         signature: ImageSignature,
     },
 
-    /// Delete a tag (but not the manifest if other tags reference it).
+    /// Delete a tag. The manifest stays, untagged, until it expires.
     DeleteTag {
         repository: String,
         tag: String,
+        deleted_at_unix_ms: u64, // stamped by the leader
+    },
+
+    /// Remove a manifest untagged for `gc_retain_days` (§5.5). Rechecked at
+    /// apply: still untagged since `untagged_at_unix_ms`, not pinned.
+    ExpireManifest {
+        repository: String,
+        digest: Digest,
+        untagged_at_unix_ms: u64,
     },
 }
 ```
+
+The shipped variants live in `RaftRequest` (`src/council/types.rs`); the
+catalogue they mutate is `ManifestCatalog` (`src/pickle/types.rs`), which
+also carries `untagged_at: BTreeMap<"repository@digest", u64>`.
 
 ### 4.3 On-Disk Layout
 
@@ -646,8 +681,9 @@ Client          Node A (receiver)                         Raft
 
 Later, independently:
 
-Leader heal loop (≈60s)  ──stream missing layers──►  peer nodes
-                         ──update layer-location map──►  Raft
+Leader heal loop (≈60s)  ──POST /v2/<name>/replicas/<digest>──►  target node
+target node              ──GET missing blobs──►  a live holder (never via the leader)
+target node              ──ConfirmImageCopy──►  Raft
 ```
 
 ### 5.2 OCI Pull
@@ -737,7 +773,7 @@ When an image reference includes a registry hostname (e.g., `docker.io/redis:7-a
 
 4. **Tag re-resolution.** For mutable tags (e.g., `redis:7-alpine`), Pickle periodically re-checks the upstream registry for manifest changes (configurable interval, default 1 hour). If the upstream digest has changed, the new manifest and any new layers are pulled and cached. Since F03 U1 this matters less: an apply binds each tag to a digest (`redis:7-alpine@sha256:…`), so pulls ask for the digest and a moved tag changes nothing until the next apply. A fresh fill of a bound reference also records the image under the tag it carries, so an apply while upstream is down can bind the tag from the cache.
 
-5. **Binding at apply.** The node that handles `POST /v1/apply` (the leader, on a cluster), the GitOps runner, and a standalone node's apply resolve each tag through `pickle::binding::ImageBinder`: Pickle's catalogue for a Pickle image, otherwise a manifest `HEAD` upstream (20 s), otherwise the cached tag. With none of those the apply fails rather than store an unbound tag. A reference that already carries a digest is left alone, which is why a rollback restores the digest that ran. Bun attaches a binder only when its runtime pulls images; under ProcessGrill the image is a placeholder and stays as written.
+5. **Binding at apply.** The node that handles `POST /v1/apply` (the leader, on a cluster), the GitOps runner, and a standalone node's apply resolve each tag through `pickle::binding::ImageBinder`: Pickle's catalogue for a Pickle image, otherwise a manifest `HEAD` upstream (20 s), otherwise the cached tag. With none of those the apply fails rather than store an unbound tag. A reference that already carries a digest is left alone, which is why a rollback restores the digest that ran. Bun attaches a binder only when its runtime pulls images. ProcessGrill pulls none: it refuses image apps (#914), so there's nothing to bind.
 
 ```rust
 /// Pull-through cache resolution for an external image reference.
@@ -778,41 +814,42 @@ async fn resolve_external(
 }
 ```
 
-### 5.5 Garbage Collection
+### 5.5 Expiry and Garbage Collection
 
-Pickle runs per-node garbage collection on a configurable schedule. The GC algorithm is designed to be safe against concurrent operations and globally aware via Raft.
+Pickle splits cleanup in two. **Expiry** decides that an *image* is gone and removes its manifest from the Raft catalogue. **Garbage collection** reclaims *blobs* nothing references any more. GC never decides an image is gone; it only follows expiry.
 
-**GC algorithm (per node):**
+**Untagging.** Pushing a tag that already points somewhere moves it, and the manifest it left loses that tag. `DELETE /v2/<name>/manifests/<tag>` (or `relish images delete repo:tag`) removes a tag outright; it needs the same repository write scope as a push. Either way, when a manifest loses its last real tag the catalogue records `untagged_at` for it, keyed `repository@digest`. The time comes from the Raft entry: the new push's `pushed_at` for a tag move, the leader's clock (stamped when the deletion becomes a Raft request) for a deletion. No replica ever reads its own clock while applying. A manifest pushed by digest only (a multi-platform image's platform manifests are) counts as untagged from the moment it arrives. An untagged manifest stays in the catalogue and stays pullable by digest. Deleting by digest answers `405 UNSUPPORTED`.
+
+**Expiry.** On every GC tick the council leader lists manifests untagged for at least `gc_retain_days` and proposes `ExpireManifest { repository, digest, untagged_at_unix_ms }` for each. The state machine rechecks at apply time and refuses (`Refused`) when:
+
+- the manifest is gone, or tagged again;
+- its `untagged_at` differs from the one the leader planned with (it was tagged and untagged again since);
+- an app or job in desired state pins it (`repo:tag@sha256:…`: app and init-container images, job definitions, task-array templates), directly or through a pinned multi-platform index;
+- it's a platform of a multi-platform index still in the catalogue.
+
+An accepted expiry removes the manifest and drops the holder records of every blob no other manifest references. That last step matters: the GC arbiter never approves deleting a blob's last advertised holder, so without it one copy of every expired blob would live forever. A standalone node applies the same rule to its own catalogue, counting the images its instances run as pinned. On a cluster the rollback targets in each app's rollout record (the last ten specs that rolled out everywhere, #692) count as pinned too, so `relish rollback` can always pull them.
+
+**GC (per node, two-phase).**
 
 ```
-[1] Build local inventory: all blobs on this node, with sizes and reference counts.
+[1] Nominate: walk the local blob store. Skip blobs that a manifest protects:
+    tagged, running here (an instance's pinned digest), or untagged for less
+    than gc_retain_days. Skip untracked blobs younger than the orphan grace
+    (an hour: an upload mid-push). Skip blobs this node holds alone.
+    Council members nominate against the Raft catalogue; a worker, whose
+    local view only knows its own pushes, nominates freely.
 
-[2] Build active reference set from Raft state:
-    - All manifests referenced by running or recently-deployed apps.
-    - The last N tags per repository (default N=10 from gc_retain_tags).
+[2] Arbitrate: propose GcReport { node_id, deleted_layers } through Raft.
+    The state machine refuses every digest any catalogued manifest still
+    references, and approves a tracked blob only while another node also
+    holds it, removing this node from its holder set. Untracked blobs are
+    approved as orphans.
 
-[3] For each local blob not in the active reference set:
-    │
-    ├─ Is it within the retention window (gc_retain_days)?
-    │  └─ Yes → skip (within retention).
-    │
-    ├─ Is this node the sole known holder (from Raft peer location map)?
-    │  └─ Yes → skip (sole copy protection).
-    │
-    ├─ Is the blob referenced by any active manifest in Raft?
-    │  └─ Yes → skip (active reference).
-    │
-    └─ Safe to delete:
-       ├─ Delete from local disk.
-       ├─ Propose GcReport to Raft (update peer location map).
-       └─ Log deletion.
+[3] Delete only the approved blobs, re-checking each against the live
+    reference set first (a push may have re-referenced one since).
 ```
 
-**Sole-copy protection:** Before deleting any layer, Bun reads the `PeerLocation` for that digest from the Raft-synchronised state. If `holders.len() <= 1` and this node is in the holder set, the layer isn't deleted regardless of other GC criteria. This prevents the last copy of a layer from being garbage collected.
-
-**Raft location map update:** After a GC run, Bun proposes a `GcReport` to Raft listing all removed layers. The Raft state machine removes this node from the holder sets, ensuring other nodes never attempt to fetch from stale locations.
-
-**Reference counting:** Each blob on disk maintains a local reference count (number of manifests on this node that include the layer). Only blobs with a local reference count of zero are GC candidates. This is a local-only optimisation; the global safety check (Raft active manifests) provides the authoritative protection.
+**Sole-copy protection** lives in the arbiter, serialised through Raft: two nodes racing to delete the last two copies of a blob can't both win.
 
 ### 5.6 Image Signing
 
@@ -1033,8 +1070,8 @@ All Pickle configuration lives in the `[images]` section of `node.toml`:
 
 ```toml
 [images]
-# Maximum disk space for the Pickle blob store on this node.
-# When exceeded, GC runs more aggressively (evicting beyond retain policy).
+# Maximum disk space for the Pickle blob store on this node. Writes that
+# would exceed it are refused with 413 (§7.4); expiry is what frees space.
 max_storage = "50Gi"
 
 # Target number of layer copies across the cluster, INCLUDING the pushing
@@ -1042,10 +1079,13 @@ max_storage = "50Gi"
 # background; push itself does not wait. Default 2 = pusher + one peer.
 redundancy = 2
 
-# Number of days to retain unreferenced images before GC eligibility.
-# Images referenced by running deployments are never collected regardless.
-# Default: 7
+# Days an untagged image is kept, counted from when it lost its last tag.
+# Then it expires (§5.5) and GC reclaims its blobs. Images an app or job
+# pins never expire. Default: 7
 gc_retain_days = 7
+
+# Hours between expiry and GC passes. Default: 1
+gc_interval_hours = 1
 
 # External registries for pull-through caching (see the pull_through flag).
 # Pickle authenticates to these when pulling external images. password_secret
@@ -1083,7 +1123,7 @@ pub struct PickleConfig {
     #[serde(default = "default_redundancy")]
     pub redundancy: u32,
 
-    /// GC: retain unreferenced images for this many days.
+    /// Days an untagged image is kept before it expires.
     #[serde(default = "default_gc_retain_days")]
     pub gc_retain_days: u32,
 
@@ -1110,44 +1150,53 @@ fn default_gc_retain_days() -> u32 { 7 }
 
 ## 7. Failure Modes
 
+Everything here counts **effective holders**: the nodes recorded as holding a blob that are live right now, meaning Alive or Suspect in gossip (plus the node doing the counting). A Suspect node may be back in a moment, so heal doesn't race to replace it. A Dead or Left node's copy can't serve a pull, so it stops counting the moment gossip says so, even though Raft still lists it until it's decommissioned.
+
 ### 7.1 Peers Unreachable at Push Time
 
 **Scenario:** A push arrives at Node A, which stores the layers locally and commits the manifest, but no peers are currently reachable to replicate to.
 
 **Behaviour:** The push still succeeds — replication is not on the push path. Node A stores the blobs, commits the manifest to Raft, and returns `201 Created` with `oci-replication: pending`. The image is immediately schedulable but under-replicated (only Node A holds the layers). If the Raft proposal itself fails or times out on a council member, the response is `503 Service Unavailable`; the client must retry before treating the image as accepted.
 
-**Recovery:** The leader-only heal loop (§3.2, ≈ every 60s) replicates the layers to peers once any are reachable, until `redundancy` is met. Capability and status reporting expose the under-replicated layer count so operators can see that replication is still pending.
+**Recovery:** The leader-only heal loop (≈ every 60 s) adds copies once peers are reachable, until `redundancy` is met. Until then the image lives on one node: losing Node A in that window loses the image (§7.3). Capability and status reporting expose the under-replicated count.
 
 ### 7.2 Under-Replicated Images
 
-**Scenario:** A node holding one of the copies goes down permanently (e.g., hardware failure). The image's replica count drops below the desired redundancy.
+**Scenario:** A node holding one of the copies goes down permanently (e.g., hardware failure). The image's live copy count drops below `redundancy`.
 
-**Behaviour:** The Raft layer-location map updates as holders change. The image is now under-replicated but remains schedulable from surviving holders.
+**Behaviour:** As soon as gossip marks the node Dead, its copies stop counting: heal, the `under_replicated_layers` capability count and P2P source planning all use effective holders. The image stays schedulable from the survivors.
 
-**Recovery:** The leader-only heal loop detects manifests below `redundancy`, pulls any layers the leader lacks, and replicates them onward to peers that lack them (rarest first, capped per tick), restoring the desired redundancy over successive ticks.
+**Recovery:** The leader plans and the targets copy. Each tick (rarest first, capped at 10 manifests) the leader picks targets among live nodes without a full copy, putting itself last so it never ends up relaying and storing every image. It sends each target `POST /v2/<name>/replicas/<digest>` with the live holders as sources. The target pulls every blob it lacks straight from a holder, verifies each digest, and confirms its own copy through Raft (`ConfirmImageCopy`). Only the cluster's service principal may call the route. The leader copies only when it is itself a chosen target. Decommissioning the node (`DecommissionNode`) also removes it from every holder set for good.
 
 ### 7.3 Node Holding Sole Copy Goes Down
 
-**Scenario:** Through an unlikely sequence of failures (or misconfiguration with `redundancy = 0`), a node holding the only copy of an image's layers goes down.
+**Scenario:** The only nodes holding some blob of an image are gone: a node died before heal copied a fresh push, or `redundancy = 1`.
 
-**Behaviour:** The image's `ReplicationState` transitions to `Lost`. Meat can't schedule new instances of the image. Running instances on other nodes (which have the layers cached locally from prior pulls) continue operating.
+**Behaviour:** The image is **Lost**: some blob it references has no effective holder. A multi-platform image is lost when its index or any of its platforms is. The registry capability evidence carries `lost_images` (`repository:tag`, or `repository@digest` when untagged; at most 50 names) and `lost_image_count`. `relish status` prints a line naming them, `relish wtf` raises a CRITICAL `registry-lost-images` finding, and a pull or deploy fails with `image … is lost: no live node holds N of its blobs; re-push it` rather than a generic pull failure. Running instances that already unpacked the image carry on.
 
-**Recovery:** If the node recovers, its layers become available again. If the node is permanently lost, the image must be re-pushed. `relish status` and `relish wtf` prominently warn about lost images. No silent data loss occurs -- the system explicitly reports the situation.
+**Recovery:** If the node comes back, its copies count again and the image isn't lost any more. If it's gone for good, re-push the image. Nothing is lost silently.
 
-### 7.4 GC Race Conditions
+### 7.4 Storage Cap Reached
 
-**Scenario:** Node A decides to GC a layer at the same moment Node B is trying to pull it from Node A.
+**Scenario:** A node's blob store reaches `max_storage`.
 
-**Mitigation:** GC operates in two phases:
+**Behaviour:** Every write that would grow it (push chunks, peer copies, pull-through fills, runtime pulls) is refused before writing, with `413` from the registry. GC doesn't run "more aggressively"; it reclaims only what expiry has released.
 
-1. **Mark phase:** Identify candidates and check Raft state (sole copy, active references). Layers being actively served are excluded via a reader lock on the blob file.
-2. **Sweep phase:** Delete candidates. Each deletion is preceded by a final `holders.len() > 1` check against the latest Raft state. If the holder count has changed (e.g., another node GC'd its copy concurrently), the deletion is aborted.
+**Recovery:** Expiry bounds growth: superseded and deleted tags leave after `gc_retain_days`, and the next GC tick frees their blobs. Lower `gc_retain_days`, delete tags you don't need, or raise `max_storage`.
 
-Additionally, Raft commits for GC reports are serialised: only one `GcReport` is processed at a time. This prevents two nodes from simultaneously deciding they are not the sole copy and both deleting.
+### 7.5 GC Race Conditions
 
-**Scenario:** A new deployment references an image whose layers are being GC'd.
+**Scenario:** Two nodes each hold one of the two copies of an unreferenced blob and both nominate it.
 
-**Mitigation:** GC reads the active reference set from Raft at the start of each sweep. A Raft commit for a new deployment (which adds the manifest to the active reference set) happens-before any GC decision based on a stale active set. The GC sweep rechecks active references before each individual deletion, catching deployments that were committed during the sweep.
+**Mitigation:** The Raft state machine arbitrates `GcReport`s in log order. The first is approved (another holder exists); the second is refused (it would remove the last holder).
+
+**Scenario:** A push re-references a blob between nomination and deletion (a client `HEAD`s the blob, skips the upload, and `PUT`s a manifest that pins it).
+
+**Mitigation:** The arbiter refuses any digest a catalogued manifest references at apply time, and the node re-checks the live reference set immediately before each physical delete. A publication that verified its blobs before a GC generation that removed them is refused as stale (`RegistryPublicationStale`) and must re-verify.
+
+**Scenario:** A deploy pins an untagged image just as the leader plans its expiry.
+
+**Mitigation:** `ExpireManifest` rechecks desired state at apply time, so whichever commits first wins consistently: either the deploy pins an image that still exists, or it is refused because the image already expired.
 
 ---
 
@@ -1192,6 +1241,14 @@ anonymous access for that host. Credentials are:
 ### 8.4 Inter-Node Layer Transfer
 
 All layer transfers between nodes occur over the cluster's mTLS connections (Sesame node certificates). No layer data travels in plaintext. Node identity is verified by the certificate common name, preventing a rogue node from intercepting layer transfers.
+
+### 8.5 Registry Control Traffic Needs mTLS
+
+Every catalogue change and every authoritative read goes through the council leader. A follower or worker sends `POST /v1/registry/propose` (manifest commits, writer claims, copy confirmations, GC reports, retirements, tag deletes) and `POST /v1/registry/query` (GC generation, image list, repository view, lease owner, retirements) to the leader's API. Both endpoints require the internal service token **and** a TLS client certificate. The leader takes the proposing node's identity from that certificate's URI SAN and builds the Raft request for that node, so a node can only report its own copies and its own cleanup. The service token alone can't, because any holder of the token could then claim to be any node (#792).
+
+So a plaintext cluster (`require_mtls = false` with no node identities, as `relish dev` and the upgrade fixture run) has no cluster registry. `RegistryForwarder::requires_mtls` is true when its transport is plaintext, and the forwarder then answers every proposal and query with `PickleError::RegistryNeedsMtls` without sending anything: "the registry needs mTLS … start the cluster with TLS (`relish init`, then `relish join` on each node)". Registry writes answer 503 with that message. The leader's own local proposals (heal, expiry) still commit, because they don't forward, but pushes, builds, catalogue reads and Pickle-resolved pulls all need a query, so they fail. Bun logs the refusal once at start-up. The 1 s lease reaper logs through `RegistryCleanupLog`, which prints a problem once, stays quiet while it repeats, and prints "registry cleanup resumed" when a pass succeeds. The capability evidence carries `needs_mtls`, `relish status` prints `registry: needs mTLS`, and `relish wtf` raises one `registry-needs-mtls` warning listing the nodes.
+
+A standalone node (no `--cluster`) has no forwarder: it commits to its local catalogue and is unaffected.
 
 ---
 
@@ -1430,7 +1487,7 @@ Traditional container registries (Docker Hub, GitHub Container Registry, Amazon 
 
 **Reference:** [OCI Distribution Spec](https://github.com/opencontainers/distribution-spec)
 
-Pickle implements the push and pull subset of the OCI Distribution Specification (blob `HEAD`/`GET`, monolithic and chunked uploads, manifest `HEAD`/`GET`/`PUT`, tag listing). Tools that speak it (docker, crane, buildah, podman, skopeo, oras) work without modification, subject to the authentication rules in §1.2: Basic-auth clients need a TLS listener and an API token. `crane` is exercised end to end by `tests/suite/registry_standard_clients.rs`. Not implemented: manifest and blob `DELETE`, cross-repository mounts (a `mount` request falls back to an ordinary upload, as the spec allows), the referrers API and the catalogue endpoint.
+Pickle implements the push and pull subset of the OCI Distribution Specification (blob `HEAD`/`GET`, monolithic and chunked uploads, manifest `HEAD`/`GET`/`PUT`, tag listing). Tools that speak it (docker, crane, buildah, podman, skopeo, oras) should work without modification, subject to the authentication rules in §1.2: Basic-auth clients need a TLS listener and an API token. docker, podman, skopeo and crane are exercised end to end with CA verification by `tests/suite/registry_standard_clients.rs` (§1.2, "Tested clients"); buildah and oras are not. Tag `DELETE` exists (§5.5). Not implemented: manifest `DELETE` by digest, blob `DELETE`, cross-repository mounts (a `mount` request falls back to an ordinary upload, as the spec allows), the referrers API and the catalogue endpoint.
 
 ---
 

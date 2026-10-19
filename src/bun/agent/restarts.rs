@@ -302,20 +302,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Begin cleaning up the runtime a failed restart attempt left behind.
     pub(super) async fn begin_restart_cleanup(&mut self, id: InstanceId) {
-        if self.runtime_known_absent(&id) {
-            self.restart_after_cleanup(&id).await;
-            return;
-        }
         self.spawn_restart_step(id, RestartStep::Cleanup, None, RestartGate::default());
     }
 
     /// Begin a restart of a Pending instance: kill the predecessor first.
     pub(super) async fn begin_restart_launch(&mut self, id: InstanceId, launch: RestartLaunch) {
-        if self.runtime_known_absent(&id) {
-            self.restart_after_clear(id, launch, RestartGate::default())
-                .await;
-            return;
-        }
         self.spawn_restart_step(id, RestartStep::Clear, Some(launch), RestartGate::default());
     }
 
@@ -372,7 +363,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.restart_after_start(&id, &launch, &evidence).await;
             }
             (RestartStep::Create | RestartStep::Start, StepResult::Failed(error), _) => {
-                self.record_failed_restart(&id, &error.to_string()).await;
+                // A binary that's gone fails every attempt the same way, so
+                // spending the restart budget on it only hides why (#905).
+                match error.launch_problem() {
+                    Some(problem) => {
+                        self.record_launch_failure(&id, problem.to_string()).await;
+                    }
+                    None => self.record_failed_restart(&id, &error.to_string()).await,
+                }
             }
             (RestartStep::Refuse, StepResult::Done, _) => {
                 if let Some(instance) = self.supervisor.get_instance_mut(&id)
@@ -397,13 +395,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Whether the job ledger already proves `id` has no runtime left.
-    fn runtime_known_absent(&self, id: &InstanceId) -> bool {
-        self.recorded_jobs
-            .get(&id.0)
-            .is_some_and(|job| job.runtime_absent)
-    }
-
     /// The loop's step between Cleanup and a new attempt: the failed
     /// attempt's runtime is gone, so the instance may restart again.
     async fn restart_after_cleanup(&mut self, id: &InstanceId) {
@@ -420,8 +411,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.retry_restart(id).await;
     }
 
-    /// The loop's step between Clear and Create: settle the job ledger and
-    /// the predecessor's artifacts, then hand the create to a task.
+    /// The loop's step between Clear and Create: settle the predecessor's
+    /// artifacts, then hand the create to a task.
     async fn restart_after_clear(
         &mut self,
         id: InstanceId,
@@ -434,20 +425,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if instance.state != ContainerState::Pending {
             return;
         }
-        if instance.is_job {
-            if let Err(error) = self.record_job_runtime_absent(&id).await {
-                eprintln!("bun: job retry cannot persist runtime absence for {id}: {error}");
-                return;
-            }
-            if let Err(error) = self.retire_instance_artifacts(&id).await {
-                eprintln!("bun: job retry retains artifacts for {id}: {error}");
-                return;
-            }
-            if let Err(error) = self.claim_job_retry(&id).await {
-                eprintln!("bun: job retry refused for {id}: {error}");
-                return;
-            }
-        } else if let Err(error) = self.retire_restart_artifacts(&id).await {
+        if let Err(error) = self.retire_restart_artifacts(&id).await {
             eprintln!("bun: application restart retains predecessor artifacts for {id}: {error}");
             return;
         }
@@ -462,8 +440,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// The loop's step between Create and Start: program the recreated
-    /// cgroup's network before anything runs in it, then take the durable
-    /// job permit.
+    /// cgroup's network before anything runs in it.
     async fn restart_after_create(
         &mut self,
         id: InstanceId,
@@ -514,7 +491,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 )
                 .await
             }
-            None if self.supervisor.grill().honours_cgroup_path()
+            None if (self.supervisor.grill().honours_cgroup_path()
+                && !restart_spec
+                    .as_ref()
+                    .is_some_and(|s| s.exec.is_some() || s.script.is_some()))
                 || restart_spec
                     .as_ref()
                     .and_then(|spec| spec.egress.as_ref())
@@ -670,7 +650,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .iter()
             .filter(|instance| {
                 instance.retry_pending
-                    && (!instance.is_job || !self.job_store_uncertain)
                     && matches!(
                         instance.state,
                         ContainerState::Stopping | ContainerState::Stopped
@@ -723,10 +702,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .list_instances()
             .iter()
             .filter(|i| {
-                i.state == ContainerState::Pending
-                    && i.restart_count > 0
-                    && (!i.is_job || !self.job_store_uncertain)
-                    && !self.restarting(&i.id)
+                i.state == ContainerState::Pending && i.restart_count > 0 && !self.restarting(&i.id)
             })
             .filter_map(|i| {
                 i.oci_spec.as_ref().map(|spec| {

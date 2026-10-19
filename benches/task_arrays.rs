@@ -4,25 +4,44 @@
 /// predict the headline before any VM exists:
 /// - range-set operations the leader does per chunk;
 /// - the leader's whole control-plane cost for a 1M-task array (no
-///   processes), with 3 and 200 nodes, and the JSON snapshot of it;
+///   processes), with 3 and 200 nodes, and the JSON snapshot of it,
+///   encoded 64 times an iteration;
+/// - one leader tick (plan every array's writes, batch them, apply the
+///   entry) with 64 concurrent arrays on 3 nodes, and with one array of
+///   one-task chunks on 10 nodes, the shape that splits state the most;
 /// - the node pool's overhead per task with a zero-cost fake runner (the
 ///   ceiling a real process can't beat);
 /// - the fork/exec floor of this machine: `/usr/bin/true` through the
-///   real process runner at concurrency 1, 4 and 16.
+///   real process runner at concurrency 1, 4 and 16;
+/// - a worker's disk cost per task: 1M outcomes through the real ledger and
+///   result index, broken down per file, failing above
+///   `ACTIVE_STORAGE_BYTES_PER_TASK` while the run is active, then the
+///   compacted results of the finished run, failing above
+///   `STORAGE_BYTES_PER_TASK`.
 ///
 /// Every benchmark reports tasks (or elements) per second.
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use reliaburger::bun::task_executor::{
-    AttemptOutcome, ChunkWork, FakeRunner, PoolConfig, ProcessRunner, TaskPool, TaskRunner,
+use reliaburger::bun::task_array_leader::{TickInputs, plan_tick, tick_entries};
+use reliaburger::bun::task_array_node::{
+    ACTIVE_STORAGE_BYTES_PER_TASK, ArrayProgress, NodeArrayCounters, NodeSyncResponse,
+    STORAGE_BYTES_PER_TASK,
 };
+use reliaburger::bun::task_executor::{
+    AttemptOutcome, ChunkWork, FakeRunner, PoolConfig, ProcessRunner, TaskFinal, TaskPool,
+    TaskRecord, TaskRunner,
+};
+use reliaburger::bun::task_ledger::Ledger;
+use reliaburger::bun::task_result_index;
 use reliaburger::meat::NodeId;
 use reliaburger::meat::index_set::IndexRangeSet;
 use reliaburger::meat::task_array::{ChunkId, TaskArraySpec};
 use reliaburger::meat::task_array_state::{ChunkResult, NodeSlots, TaskArrayState, plan_grants};
+use reliaburger::meat::task_array_store::{TaskArrayWrite, TaskArrays};
 use tokio_util::sync::CancellationToken;
 
 const MILLION: u32 = 1_000_000;
@@ -88,11 +107,12 @@ fn simulate_leader(nodes: usize) -> TaskArrayState {
                     failed_indices: failed,
                     not_run: 0,
                     retried: 0,
+                    retry_causes: Default::default(),
                 };
                 let _ = state.complete(&holder, &result);
             }
         }
-        for (holder, chunks) in plan_grants(&state, &slots) {
+        for (holder, chunks) in plan_grants(&state, &slots, true) {
             let _ = state.grant(&holder, &chunks);
         }
     }
@@ -110,11 +130,154 @@ fn bench_leader(c: &mut Criterion) {
             |b, &nodes| b.iter(|| simulate_leader(nodes)),
         );
     }
+    // One encode of the finished state takes about 0.1 ms, close enough to
+    // timer and scheduling noise that it was the noisiest benchmark in the
+    // gate (#872). So each iteration encodes it `JSON_ENCODES` times, and the
+    // throughput still reports encodes per second. The name carries the
+    // count: a different workload must not be compared with main's baseline
+    // for the old one.
+    const JSON_ENCODES: usize = 64;
     let finished = simulate_leader(3);
-    group.throughput(Throughput::Elements(1));
-    group.bench_function("json_encode_1m", |b| {
-        b.iter(|| serde_json::to_vec(&finished).map(|bytes| bytes.len()))
+    group.throughput(Throughput::Elements(JSON_ENCODES as u64));
+    group.bench_function("json_encode_1m_x64", |b| {
+        b.iter(|| {
+            (0..JSON_ENCODES)
+                .map(|_| serde_json::to_vec(&finished).map_or(0, |bytes| bytes.len()))
+                .sum::<usize>()
+        })
     });
+    group.finish();
+}
+
+/// `count` registered arrays of `tasks` tasks in `chunk_size`-task chunks.
+fn running_arrays(count: u64, tasks: u32, chunk_size: u32) -> TaskArrays {
+    let mut arrays = TaskArrays::default();
+    for id in 1..=count {
+        let register = TaskArrayWrite::Register {
+            name: format!("bench-{id}"),
+            namespace: format!("team-{}", id % 4),
+            template: Box::new(
+                toml::from_str("runtime = 'process'\nexec = '/usr/bin/true'").unwrap(),
+            ),
+            spec: TaskArraySpec {
+                chunk_size,
+                ..TaskArraySpec::with_count(tasks)
+            },
+            submitted_at_epoch_secs: 1,
+        };
+        arrays.apply(&register, || id).unwrap();
+    }
+    arrays
+}
+
+/// Every node's answer: 16 free slots per array, and every chunk it holds
+/// finished except the lowest, so completions land out of order.
+fn answers(arrays: &TaskArrays, nodes: usize) -> Vec<(NodeId, NodeSyncResponse)> {
+    (0..nodes)
+        .map(|i| {
+            let node = NodeId::new(format!("n{i:02}"));
+            let response = NodeSyncResponse {
+                arrays: arrays
+                    .active()
+                    .map(|(batch_id, record)| ArrayProgress {
+                        batch_id,
+                        slots: 16,
+                        refused: None,
+                        unrunnable: false,
+                        finished: record
+                            .state
+                            .held_by(&node)
+                            .into_iter()
+                            .flat_map(|held| held.iter().skip(1))
+                            .map(|chunk| {
+                                let range = record.state.spec.chunk_range(ChunkId(chunk)).unwrap();
+                                let mut result = ChunkResult {
+                                    duration_counts: [0; 16],
+                                    chunk: ChunkId(chunk),
+                                    attempt: record.state.attempt_of(ChunkId(chunk)),
+                                    succeeded: range.end() - range.start() + 1,
+                                    failed_count: 0,
+                                    failed_indices: IndexRangeSet::new(),
+                                    not_run: 0,
+                                    retried: 0,
+                                    retry_causes: Default::default(),
+                                };
+                                result.duration_counts[0] = u64::from(result.succeeded);
+                                result
+                            })
+                            .collect(),
+                        counters: NodeArrayCounters::default(),
+                    })
+                    .collect(),
+            };
+            (node, response)
+        })
+        .collect()
+}
+
+/// One leader tick against `arrays`: plan, batch, apply. Returns the
+/// number of Raft entries it wrote.
+fn tick(arrays: &mut TaskArrays, answers: &[(NodeId, NodeSyncResponse)]) -> usize {
+    let now = Instant::now();
+    let heard = HashMap::new();
+    let inputs = TickInputs {
+        answers,
+        last_heard: &heard,
+        since: now,
+        now,
+        silence: Duration::from_secs(30),
+        now_epoch_secs: 2,
+        eligible: answers.iter().map(|(node, _)| node.clone()).collect(),
+    };
+    let entries = tick_entries(plan_tick(arrays, None, &inputs));
+    for entry in &entries {
+        let _ = arrays.apply(entry, || 0);
+    }
+    entries.len()
+}
+
+/// Run `ticks` ticks so the arrays are mid-run, with nodes holding work.
+fn warmed(mut arrays: TaskArrays, nodes: usize, ticks: usize) -> TaskArrays {
+    for _ in 0..ticks {
+        let answers = answers(&arrays, nodes);
+        tick(&mut arrays, &answers);
+    }
+    arrays
+}
+
+fn bench_tick(c: &mut Criterion) {
+    let mut group = c.benchmark_group("leader_tick");
+    group.sample_size(20);
+    let shapes = [
+        (
+            "64_arrays_3_nodes",
+            warmed(running_arrays(64, 100_000, 1024), 3, 2),
+            3,
+        ),
+        (
+            "one_task_chunks_10_nodes",
+            warmed(running_arrays(1, 1 << 16, 1), 10, 100),
+            10,
+        ),
+    ];
+    for (name, arrays, nodes) in shapes {
+        let answers = answers(&arrays, nodes);
+        let mut probe = arrays.clone();
+        let entries = tick(&mut probe, &answers);
+        assert_eq!(entries, 1, "{name}: the arrays must still be running");
+        let bytes = serde_json::to_vec(&arrays).map_or(0, |bytes| bytes.len());
+        eprintln!(
+            "leader_tick/{name}: {entries} Raft entry per tick, {bytes} bytes of array state"
+        );
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || arrays.clone(),
+                |mut arrays| tick(&mut arrays, &answers),
+                criterion::BatchSize::LargeInput,
+            )
+        });
+    }
     group.finish();
 }
 
@@ -185,5 +348,89 @@ fn bench_executor(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_index_set, bench_leader, bench_executor);
+/// Write `tasks` outcomes (1% failed) the way a worker does: blocks of 4,096
+/// records, each fsynced to the ledger and then its result index. Returns
+/// the allocated bytes of the ledger and the index.
+fn write_outcomes(directory: &std::path::Path, tasks: u32) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let path = directory.join("ledger");
+    let mut ledger = Ledger::open(&path).unwrap();
+    for start in (0..tasks).step_by(4096) {
+        let records: Vec<TaskRecord> = (start..(start + 4096).min(tasks))
+            .map(|index| TaskRecord {
+                grant_attempt: 1,
+                index,
+                attempts: 1,
+                outcome: if index % 100 == 0 {
+                    TaskFinal::Failed
+                } else {
+                    TaskFinal::Succeeded
+                },
+                exit_code: Some(i32::from(index % 100 == 0)),
+                run_ms: 5,
+                output: None,
+                retry_causes: Default::default(),
+            })
+            .collect();
+        ledger.append(&records);
+        ledger.flush().unwrap();
+    }
+    let allocated = |path: &std::path::Path| std::fs::metadata(path).unwrap().blocks() * 512;
+    (allocated(&path), allocated(&path.with_extension("index")))
+}
+
+fn bench_storage(c: &mut Criterion) {
+    let directory = tempfile::tempdir().unwrap();
+    let (ledger, index) = write_outcomes(directory.path(), MILLION);
+    let per_task = (ledger + index) as f64 / f64::from(MILLION);
+    eprintln!(
+        "storage per 1M tasks while the run is active: ledger {:.1} MiB ({:.1} B/task), result index {:.1} MiB ({:.1} B/task), total {per_task:.1} B/task",
+        ledger as f64 / 1048576.0,
+        ledger as f64 / f64::from(MILLION),
+        index as f64 / 1048576.0,
+        index as f64 / f64::from(MILLION),
+    );
+    assert!(
+        ledger + index <= u64::from(MILLION) * ACTIVE_STORAGE_BYTES_PER_TASK,
+        "{per_task:.1} bytes per task is over the {ACTIVE_STORAGE_BYTES_PER_TASK}-byte bound"
+    );
+    // The run finishes: the node compacts both files into its results.
+    let results = directory.path().join(task_result_index::RESULTS_FILE);
+    task_result_index::compact(&directory.path().join("ledger"), &results)
+        .unwrap()
+        .unwrap();
+    let kept = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&results).unwrap().blocks() * 512
+    };
+    let per_task = kept as f64 / f64::from(MILLION);
+    eprintln!(
+        "storage per 1M tasks once the run finishes: results {:.1} MiB ({per_task:.1} B/task)",
+        kept as f64 / 1048576.0,
+    );
+    assert!(
+        kept <= u64::from(MILLION) * STORAGE_BYTES_PER_TASK,
+        "{per_task:.1} bytes per finished task is over the {STORAGE_BYTES_PER_TASK}-byte bound"
+    );
+
+    let mut group = c.benchmark_group("storage");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(65_536));
+    group.bench_function("ledger_and_index_64k", |b| {
+        b.iter(|| {
+            let directory = tempfile::tempdir().unwrap();
+            write_outcomes(directory.path(), 65_536)
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_index_set,
+    bench_leader,
+    bench_tick,
+    bench_executor,
+    bench_storage
+);
 criterion_main!(benches);

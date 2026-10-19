@@ -6,6 +6,7 @@
 # Deploy: relish apply examples/phase-8/proc-script-job.toml
 
 [job.db-backup]
+runtime = "process"
 script = """
 #!/bin/sh
 set -e

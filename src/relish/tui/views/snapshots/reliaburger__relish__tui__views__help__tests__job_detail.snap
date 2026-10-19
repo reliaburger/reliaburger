@@ -12,7 +12,7 @@ expression: "render_to_string(&app, 120, 40)"
 │state           stopped                                                                                               │
 │restarts        0                                                                                                     │
 │age             60s                                                                                                   │
-│image           proc-grill:image-ignored                                                                              │
+│image           app:v1                                                                                                │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

@@ -2,6 +2,7 @@
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
@@ -229,6 +230,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::MultiNode,
                 Capability::ProcessRuntime,
             ],
+            lease: LeaseScope::Applications,
             run: testkit_case!(schedule_fixed_replicas_across_nodes),
         },
         TestCase {
@@ -239,12 +241,14 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::MultiNode,
                 Capability::ProcessRuntime,
             ],
+            lease: LeaseScope::Applications,
             run: testkit_case!(schedule_respects_required_placement_label),
         },
         TestCase {
             name: "schedule_rejects_app_exceeding_namespace_quota",
             group: TestGroup::Scheduling,
             requires: &[Capability::Cluster, Capability::ProcessRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(schedule_rejects_app_exceeding_namespace_quota),
         },
     ]

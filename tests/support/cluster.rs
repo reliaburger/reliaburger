@@ -9,7 +9,8 @@
 //!   `InMemoryRaftRouter`, three voters and two spares) and the leader waits
 //!   that go with it;
 //! - [`start_wired_node`], the same subsystems `bun --cluster` starts
-//!   (gossip, Raft, reporting, a real `BunAgent` on `ProcessGrill`, the HTTP
+//!   (gossip, Raft, reporting, a real `BunAgent` on `ProcessGrill` posing as
+//!   a container runtime ([`host_containers::HostContainers`]), the HTTP
 //!   API, the leader scheduler and the placement reconciler), on one host
 //!   with per-node port blocks.
 //!
@@ -24,6 +25,7 @@
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,7 +46,6 @@ use reliaburger::council::selection::CouncilSelectionConfig;
 use reliaburger::council::state_machine::CouncilStateMachine;
 use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo};
 use reliaburger::grill::port::PortAllocator;
-use reliaburger::grill::process::ProcessGrill;
 use reliaburger::mayo::rollup_store::RollupStore;
 use reliaburger::meat::NodeId;
 use reliaburger::mustard::directory::NodeDirectory;
@@ -54,6 +55,8 @@ use reliaburger::reporting::aggregator::AggregatedState;
 use reliaburger::sesame::auth::TokenStore;
 use reliaburger::sesame::types::ApiToken;
 
+#[path = "host_containers.rs"]
+pub(crate) mod host_containers;
 #[path = "task_harness.rs"]
 pub(crate) mod task_harness;
 use task_harness::TestTasks;
@@ -230,6 +233,14 @@ pub async fn initial_voter_leader_index(nodes: &[Arc<CouncilNode>]) -> Option<us
 }
 
 // ---------------------------------------------------------------------------
+// Fixture directories
+// ---------------------------------------------------------------------------
+
+#[path = "fixture_dir.rs"]
+pub mod fixture_dir;
+pub use fixture_dir::clear_fixture_dir;
+
+// ---------------------------------------------------------------------------
 // Fully wired node
 // ---------------------------------------------------------------------------
 
@@ -243,6 +254,15 @@ pub enum MembershipSource {
 }
 
 /// How to start one fully wired node.
+/// Builds a node's task-array service on its agent's execution budget, so
+/// task attempts and app replicas share one ledger as they do in Bun.
+pub type TaskArraysOnBudget = Box<
+    dyn FnOnce(
+            Arc<reliaburger::bun::execution_budget::ExecutionBudget>,
+        ) -> Arc<reliaburger::bun::task_array_leader::TaskArrayService>
+        + Send,
+>;
+
 pub struct WiredNodeOptions {
     pub name: String,
     /// First port of the node's block: gossip, +1 Raft, +2 reporting, +3 API.
@@ -251,8 +271,17 @@ pub struct WiredNodeOptions {
     /// Cancelling this token stops the node.
     pub shutdown: CancellationToken,
     /// Prefix of the node's temp data directory, unique per test binary.
+    /// Ignored when `data_root` is set.
     pub data_dir_prefix: &'static str,
+    /// A directory the test owns (a fresh temporary directory per test).
+    /// The node keeps its data in `data_root/name`, so no other test or
+    /// earlier run shares it. `None` uses
+    /// `$TMPDIR/{data_dir_prefix}-{name}-{gossip_port}`.
+    pub data_root: Option<PathBuf>,
     pub stale_report_timeout_secs: u64,
+    /// How long the leader holds a stale-but-alive node's placements.
+    /// `None` uses the node default.
+    pub stale_node_grace: Option<Duration>,
     /// `Some(interval)` gives the node a Mayo store with rollups at that
     /// interval, and runs the autoscaler alongside the scheduler.
     pub metrics_rollup: Option<Duration>,
@@ -276,6 +305,13 @@ pub struct WiredNodeOptions {
     /// Task arrays: the executor and leader timings. `None` gives the API
     /// the default service with no executor.
     pub task_arrays: Option<Arc<reliaburger::bun::task_array_leader::TaskArrayService>>,
+    /// Task arrays built on the agent's own execution budget. Takes
+    /// precedence over `task_arrays`.
+    pub task_arrays_on_agent_budget: Option<TaskArraysOnBudget>,
+    /// Run plain `ProcessGrill`, as a node on `--runtime process` does: it
+    /// refuses image apps and reports no container runtime (#914). `false`
+    /// runs [`host_containers::HostContainers`], which runs them.
+    pub process_only: bool,
 }
 
 /// A running wired node and everything a test observes it through.
@@ -302,6 +338,9 @@ pub struct WiredNode {
     pub reconciler: JoinHandle<()>,
     /// Cancelling this token kills this node.
     pub shutdown: CancellationToken,
+    /// Cancelling this token stops only the node's agent: gossip and Raft
+    /// carry on, but its reports stop, as when a report worker wedges.
+    pub agent_shutdown: CancellationToken,
     pub _runtime: runtime::ClusterRuntime,
     pub _tasks: TestTasks,
 }
@@ -314,7 +353,9 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         seeds,
         shutdown,
         data_dir_prefix,
+        data_root,
         stale_report_timeout_secs,
+        stale_node_grace,
         metrics_rollup,
         scheduler,
         lease_reaper,
@@ -325,14 +366,24 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         labels,
         keep_data_dir,
         task_arrays,
+        task_arrays_on_agent_budget,
+        process_only,
     } = options;
     let raft_port = gossip_port + 1;
     let reporting_port = gossip_port + 2;
     let api_port = gossip_port + 3;
 
-    let data_dir = std::env::temp_dir().join(format!("{data_dir_prefix}-{name}-{gossip_port}"));
-    if !keep_data_dir {
-        let _ = std::fs::remove_dir_all(&data_dir);
+    let data_dir = match &data_root {
+        Some(root) => root.join(&name),
+        None => std::env::temp_dir().join(format!("{data_dir_prefix}-{name}-{gossip_port}")),
+    };
+    if !keep_data_dir && let Err(error) = clear_fixture_dir(&data_dir) {
+        // Starting on whatever is left would hand this node an earlier
+        // run's state, and the test would fail somewhere unrelated (#721).
+        panic!(
+            "cannot clear wired-node data directory {}: {error}",
+            data_dir.display()
+        );
     }
     let reconciler_state_dir = data_dir.clone();
 
@@ -355,6 +406,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
                 report_interval_secs: 1,
                 max_events_per_report: 100,
                 stale_report_timeout_secs,
+                ..Default::default()
             },
             seeds,
             wrapping_ikm: None,
@@ -367,7 +419,9 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             backup: Default::default(),
             labels,
             self_disk_pressured_rx: None,
+            job_capabilities_rx: None,
             readiness: Some(readiness.clone()),
+            recovery_probe_window: None,
         },
         shutdown.clone(),
     )
@@ -385,36 +439,75 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     let rollup_store = Arc::clone(&cluster_runtime.rollup_store);
     let directory_rx = cluster_runtime.directory_rx.clone();
 
-    // Real agent with a ProcessGrill, built with the cluster handle so it
-    // answers reporting snapshots with real capacity. `ClusterHandle` isn't
-    // `Clone` (it owns `snapshot_rx`), so the agent takes it and the node
-    // keeps clones of the watch receivers above.
+    // Real agent with a ProcessGrill that also runs image apps as host
+    // processes, so tests can place volume apps (#914). It's built with the
+    // cluster handle so it answers reporting snapshots with real capacity.
+    // `ClusterHandle` isn't `Clone` (it owns `snapshot_rx`), so the agent
+    // takes it and the node keeps clones of the watch receivers above.
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
+    // The agent stops with the node, or on its own to wedge its reports
+    // while gossip carries on.
+    let agent_shutdown = shutdown.child_token();
     let mut agent = BunAgent::with_cluster(
-        ProcessGrill::new(),
+        if process_only {
+            host_containers::HostContainers::process_only()
+        } else {
+            host_containers::HostContainers::new()
+        },
         PortAllocator::new(gossip_port + 100, gossip_port + 400),
         cmd_rx,
-        shutdown.clone(),
+        agent_shutdown.clone(),
         handle,
         "default".to_string(),
     );
     agent.set_volumes_dir(reconciler_state_dir.join("volumes"));
+    // The process runtime runs only host workloads (#914), so fixture apps
+    // are `script` apps through `/bin/sh` or `exec` apps of these binaries.
+    agent.set_process_config(
+        reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries: [
+                "/bin/sh",
+                "/bin/sleep",
+                "/bin/echo",
+                "/bin/false",
+                "/usr/bin/true",
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+            mount_isolation: false,
+            ..Default::default()
+        },
+    );
     agent.set_node_capacity(8000, 16384);
     agent.set_readiness_tracker(readiness.clone());
     // Several agents share this host; don't spawn nft against the real
     // host firewall (`with_cluster` enables it by default on Linux).
     agent.set_perimeter_enabled(false);
+    let task_arrays = match task_arrays_on_agent_budget {
+        Some(build) => Some(build(agent.execution_budget())),
+        None => task_arrays,
+    };
     // The API answers status from the loop's published snapshot, and reads
     // the agent's event ring and deploy history, as Bun does.
     let status_reader = agent.status_reader();
-    let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));
+    let mut events = reliaburger::bun::events::EventStore::new();
+    // Each node keeps its own durable audit log under its data directory.
+    events.set_audit_log(
+        reliaburger::bun::audit::AuditLog::open(
+            reconciler_state_dir.join(reliaburger::bun::audit::AUDIT_DIRECTORY),
+            reliaburger::bun::audit::AuditLimits::from_total(1 << 20),
+        )
+        .expect("open the node's audit log"),
+    );
+    let event_store = Arc::new(RwLock::new(events));
     agent.set_event_store(Arc::clone(&event_store));
     let deploy_history = agent.deploy_history_handle();
     let agent_task = reliaburger::bun::readiness::spawn_owned(
         "agent",
         true,
         readiness.clone(),
-        shutdown.clone(),
+        agent_shutdown.clone(),
         move |ready| async move { agent.run_with_readiness(ready).await },
     );
     let mut tasks = vec![agent_task];
@@ -454,9 +547,15 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             Arc::clone(&council),
             membership_rx.clone(),
             aggregated_rx.clone(),
-            false,
-            reconstruction,
+            reliaburger::cluster::orchestrate::LeaderSchedulerSettings {
+                dns_required: false,
+                reconstruction,
+                stale_node_grace: stale_node_grace.unwrap_or(Duration::from_secs(
+                    ReportingTreeSection::default().stale_node_grace_secs,
+                )),
+            },
             None,
+            Some(Arc::clone(&event_store)),
             shutdown.clone(),
         )
     });
@@ -522,7 +621,8 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             api_port,
             Some(Arc::clone(&event_store)),
             None,
-            None,
+            // The leader reads rollout progress from these (#692).
+            Some(aggregated_rx.clone()),
             "default".to_string(),
             Some(name.clone()),
             reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
@@ -556,7 +656,8 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             api_port,
             None,
             None,
-            None,
+            // The leader reads rollout progress from these (#692).
+            Some(aggregated_rx.clone()),
             "default".to_string(),
             Some(name.clone()),
             reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
@@ -590,7 +691,8 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             api_port,
             Some(event_store),
             None,
-            None,
+            // The leader reads rollout progress from these (#692).
+            Some(aggregated_rx.clone()),
             "default".to_string(),
             None,
             reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
@@ -657,9 +759,43 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         thinks_leader,
         reconciler,
         shutdown: shutdown.clone(),
+        agent_shutdown,
         _runtime: cluster_runtime,
         _tasks: TestTasks::new(shutdown, tasks),
     }
+}
+
+/// The chunks of task array `batch_id` whose accepted report came from
+/// `owner`, as `node` has applied them. A chunk whose accepted record was
+/// folded past `MAX_ACCEPTED_RANGES` has no owner and isn't listed.
+pub async fn chunks_accepted_from(
+    node: &WiredNode,
+    batch_id: u64,
+    owner: &NodeId,
+) -> std::collections::BTreeSet<u32> {
+    let desired = node.council.desired_state().await;
+    let Some(record) = desired.task_arrays.get(batch_id) else {
+        return std::collections::BTreeSet::new();
+    };
+    (0..record.state.spec.chunk_count())
+        .filter(|chunk| {
+            record
+                .state
+                .accepted_grant(reliaburger::meat::task_array::ChunkId(*chunk))
+                .is_some_and(|grant| grant.owner.as_ref() == Some(owner))
+        })
+        .collect()
+}
+
+/// Whether `node` has applied an entry of its own current term. A new
+/// leader commits a blank entry at election, so once this holds, every
+/// entry an earlier leader wrote while it led has been applied here too;
+/// a later change can only come from this term.
+pub fn applied_own_term(node: &WiredNode) -> bool {
+    let metrics = node.metrics_rx.borrow();
+    metrics
+        .last_applied
+        .is_some_and(|applied| applied.leader_id.get_term() == metrics.current_term)
 }
 
 /// Keep `table` in step with the alive gossip members (API = gossip + 3),
@@ -680,6 +816,7 @@ fn spawn_gossip_membership_table(
                         node_id: m.node_id.clone(),
                         address: SocketAddr::new(m.address.ip(), m.address.port() + 3),
                         api_advertised: true,
+                        jobs: None,
                     },
                     gossip_address: m.address,
                     state: m.state,
@@ -719,6 +856,7 @@ fn spawn_directory_membership_table(
                     node_id: node_id.clone(),
                     address: endpoints.api_address,
                     api_advertised: true,
+                    jobs: None,
                 })
                 .collect();
             *table.write().await = snapshot;

@@ -82,6 +82,10 @@ pub struct MemLogStore {
     /// Test hook: once set, every append fails as a full disk would (#480).
     #[cfg(test)]
     fail_appends: Arc<std::sync::atomic::AtomicBool>,
+    /// Test hook: how long each appended entry takes to write, in
+    /// microseconds, as on a slow disk (#779).
+    #[cfg(test)]
+    entry_write_micros: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MemLogStore {
@@ -95,6 +99,16 @@ impl MemLogStore {
     pub(crate) fn fail_appends(&self) {
         self.fail_appends
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test hook: make every later append take `per_entry` for each entry
+    /// it writes, so catching a follower up takes time in proportion to its
+    /// log gap, as on a slow disk (#779).
+    #[cfg(test)]
+    pub(crate) fn slow_entry_writes(&self, per_entry: std::time::Duration) {
+        let micros = u64::try_from(per_entry.as_micros()).unwrap_or(u64::MAX);
+        self.entry_write_micros
+            .store(micros, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -192,6 +206,18 @@ impl RaftLogStorage<TypeConfig> for MemLogStore {
             return Err(StorageError::from(openraft::StorageIOError::write_logs(
                 &error,
             )));
+        }
+        let entries: Vec<Entry<TypeConfig>> = entries.into_iter().collect();
+        #[cfg(test)]
+        {
+            let micros = self
+                .entry_write_micros
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let count = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+            if micros > 0 {
+                let delay = micros.saturating_mul(count);
+                tokio::time::sleep(std::time::Duration::from_micros(delay)).await;
+            }
         }
         let mut guard = self.inner.lock().await;
         guard.append_entries(entries);

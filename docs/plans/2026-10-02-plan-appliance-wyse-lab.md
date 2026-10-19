@@ -216,7 +216,7 @@ Most of this needs no Wyse:
 6. **S5:** first lab runs on CI lab builds (PR 5); the formal S5 run on the signed channel after 0.3.0 publishes one.
 7. **Trust:** `--trust-lan` for day-to-day lab runs; the formal S5 run compares all ten claim keys on the monitor, as a user would.
 
-**The train:** `release-1-3-0` (gate PR #490). It's renumbered for compatibility each time it takes main: on 7 October 2026, after main's 0.1.5, 0.1.6 and the 0.2.0 jobs work (protocol 48, state 65), to protocol 49 and state 66.
+**The train:** `release-1-3-0` (gate PR #490). It's renumbered for compatibility each time it takes main: on 7 October 2026, after main's 0.1.5, 0.1.6 and the 0.2.0 jobs work (protocol 48, state 65), to protocol 49 and state 66; on 19 October 2026, after main's 0.2.0 and 0.2.1 (52/69), to protocol 54 and state 71, skipping the 0.2.2 train's 53/70.
 
 ## Decisions, 7 October 2026
 

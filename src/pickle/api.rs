@@ -27,6 +27,8 @@ const MAX_REQUEST_BYTES: usize = 512 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 /// Admission bounds open writers and the small buffers retained by each stream.
 const MAX_CONCURRENT_WRITES: usize = 4;
+/// How long a write over that limit waits for a slot before a 429.
+const WRITE_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Shared state for Pickle API handlers.
@@ -176,62 +178,6 @@ impl PickleState {
                 StatusCode::UNAUTHORIZED,
                 "UNAUTHORIZED",
                 "registry read requires authentication on a non-loopback bind".to_string(),
-            )),
-        }
-    }
-
-    /// The current stored size of a repository and of the whole registry,
-    /// from the authoritative catalogue (REG4 quota accounting).
-    async fn stored_sizes(
-        &self,
-        repository: &str,
-    ) -> Result<(u64, u64), super::types::PickleError> {
-        match self
-            .registry_query(super::authority::RegistryQuery::Usage {
-                repository: repository.into(),
-            })
-            .await?
-        {
-            super::authority::RegistryQueryResponse::Usage {
-                repository_bytes,
-                total_bytes,
-            } => Ok((repository_bytes, total_bytes)),
-            _ => Err(super::types::PickleError::ReplicationFailed(
-                "invalid registry usage response".into(),
-            )),
-        }
-    }
-
-    /// Enforce the storage quota for admitting `incoming` bytes into
-    /// `repository` (REG4). `Ok(())` when unlimited or within limits;
-    /// `Err(response)` is 413 for a full quota or 503 for unavailable authority.
-    // `Response` is large but it IS the HTTP reply to send on failure —
-    // boxing it would tax every call site for a value that lives one frame.
-    #[allow(clippy::result_large_err)]
-    async fn enforce_quota(&self, repository: &str, incoming: u64) -> Result<(), Response> {
-        let logical_quota = QuotaConfig {
-            total_bytes: 0,
-            ..self.quota
-        };
-        if logical_quota.is_unlimited() {
-            return Ok(());
-        }
-        let (repo_current, total_current) = self
-            .stored_sizes(repository)
-            .await
-            .map_err(registry_write_error)?;
-        match super::registry_auth::check_quota(
-            &logical_quota,
-            repository,
-            incoming,
-            repo_current,
-            total_current,
-        ) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(oci_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "DENIED",
-                e.to_string(),
             )),
         }
     }
@@ -565,7 +511,8 @@ pub fn router(state: PickleState) -> Router {
                 .head(dispatch_v2)
                 .post(dispatch_v2)
                 .patch(dispatch_v2)
-                .put(dispatch_v2),
+                .put(dispatch_v2)
+                .delete(dispatch_v2),
         )
         .layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
@@ -576,10 +523,17 @@ pub fn router(state: PickleState) -> Router {
                         axum::http::Method::POST
                             | axum::http::Method::PATCH
                             | axum::http::Method::PUT
+                            | axum::http::Method::DELETE
                     ) {
-                        match writers.try_acquire_owned() {
-                            Ok(permit) => Some(permit),
-                            Err(_) => {
+                        // Queue rather than refuse at once: docker and
+                        // containerd push several layers in parallel and
+                        // fail the whole push on a 429. A queued request's
+                        // body stays unread on its socket until admitted.
+                        match tokio::time::timeout(WRITE_ADMISSION_WAIT, writers.acquire_owned())
+                            .await
+                        {
+                            Ok(Ok(permit)) => Some(permit),
+                            Ok(Err(_)) | Err(_) => {
                                 return (
                                     StatusCode::TOO_MANY_REQUESTS,
                                     [("retry-after", "1")],
@@ -596,7 +550,23 @@ pub fn router(state: PickleState) -> Router {
             },
         ))
         .layer(axum::middleware::from_fn(standard_client_credentials))
+        .layer(axum::middleware::from_fn(api_version_header))
         .with_state(state)
+}
+
+/// Mark every answer as coming from a v2 registry, as the distribution spec
+/// asks. docker reads the header on its first `GET /v2/` to decide that this
+/// is a registry it can push to, and remembers it when explaining a failure.
+async fn api_version_header(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        "docker-distribution-api-version",
+        axum::http::HeaderValue::from_static("registry/2.0"),
+    );
+    response
 }
 
 /// The challenge a TLS registry sends with every 401, so `docker login`,
@@ -705,6 +675,9 @@ fn basic_challenge(mut response: Response) -> Response {
 enum V2Route {
     /// Internal storage-node confirmation of a complete existing image.
     Copy { name: String, digest: String },
+    /// Internal leader request: copy an image from live holders, then
+    /// confirm it (#697 heal).
+    Replica { name: String, digest: String },
     /// `/v2/{name}/blobs/{digest}`
     Blob { name: String, digest: String },
     /// `/v2/{name}/blobs/uploads/`
@@ -755,6 +728,12 @@ fn parse_v2_route(rest: &str) -> Option<V2Route> {
             digest: digest.to_string(),
         });
     }
+    if let Some((name, digest)) = rest.rsplit_once("/replicas/") {
+        return Some(V2Route::Replica {
+            name: name.to_string(),
+            digest: digest.to_string(),
+        });
+    }
     if let Some(name) = rest.strip_suffix("/tags/list") {
         return Some(V2Route::Tags {
             name: name.to_string(),
@@ -773,6 +752,7 @@ async fn dispatch_v2(
     headers: HeaderMap,
     Query(init_query): Query<InitiateUploadQuery>,
     Query(complete_query): Query<CompleteUploadQueryOpt>,
+    replica_client: Option<axum::Extension<super::replication::ReplicaClient>>,
     body: axum::body::Body,
 ) -> Response {
     use axum::http::Method;
@@ -798,23 +778,8 @@ async fn dispatch_v2(
 
     match (method, route) {
         (Method::POST, V2Route::Copy { name, digest }) => {
-            let principal = match state
-                .authorise_write(&headers, &name, RepositoryAccess::WriteManifest)
-                .await
-            {
-                Ok(principal) => principal,
-                Err(response) => return response,
-            };
-            let internal = principal.as_ref().is_some_and(|context| {
-                context.principal_id == crate::sesame::auth::SYSTEM_PRINCIPAL
-            });
-            let anonymous_local = principal.is_none()
-                && state.council.is_none()
-                && state.forwarder.is_none()
-                && state.allow_unauthenticated_bootstrap
-                && !super::lease::is_test_repository(&name);
-            if !internal && !anonymous_local {
-                return StatusCode::FORBIDDEN.into_response();
+            if let Err(response) = authorise_internal(&state, &headers, &name).await {
+                return response;
             }
             let digest = match Digest::new(&digest) {
                 Ok(digest) => digest,
@@ -827,6 +792,51 @@ async fn dispatch_v2(
                 Ok(Err(error)) => registry_write_error(error),
                 Err(_) => StatusCode::GATEWAY_TIMEOUT.into_response(),
             }
+        }
+        (Method::POST, V2Route::Replica { name, digest }) => {
+            if let Err(response) = authorise_internal(&state, &headers, &name).await {
+                return response;
+            }
+            let Some(axum::Extension(super::replication::ReplicaClient(client))) = replica_client
+            else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "this node has no peer client to copy images with",
+                )
+                    .into_response();
+            };
+            let digest = match Digest::new(&digest) {
+                Ok(digest) => digest,
+                Err(error) => return registry_write_error(error),
+            };
+            let request: super::replication::ReplicaRequest = match tokio::time::timeout(
+                UPLOAD_TIMEOUT,
+                axum::body::to_bytes(body, MAX_MANIFEST_BYTES),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => match serde_json::from_slice(&bytes) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+                    }
+                },
+                Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+                Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+            };
+            match tokio::time::timeout(
+                super::replication::REPLICA_TIMEOUT,
+                state.copy_image_from(&name, &digest, &request.sources, &client),
+            )
+            .await
+            {
+                Ok(Ok(receipt)) => Json(receipt).into_response(),
+                Ok(Err(error)) => registry_write_error(error),
+                Err(_) => StatusCode::GATEWAY_TIMEOUT.into_response(),
+            }
+        }
+        (Method::DELETE, V2Route::Manifest { name, reference }) => {
+            manifest_delete(&state, &name, &reference, &headers).await
         }
         (Method::HEAD, V2Route::Blob { name, digest }) => blob_head(&state, &name, &digest).await,
         (Method::GET, V2Route::Blob { name, digest }) => blob_get(&state, &name, &digest).await,
@@ -876,11 +886,40 @@ async fn dispatch_v2(
     }
 }
 
+/// Admit only another cluster node (the service principal) to an internal
+/// storage route, or anyone on a standalone loopback registry that has no
+/// authentication at all.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+async fn authorise_internal(
+    state: &PickleState,
+    headers: &HeaderMap,
+    name: &str,
+) -> Result<(), Response> {
+    let principal = state
+        .authorise_write(headers, name, RepositoryAccess::WriteManifest)
+        .await?;
+    let internal = principal
+        .as_ref()
+        .is_some_and(|context| context.principal_id == crate::sesame::auth::SYSTEM_PRINCIPAL);
+    let anonymous_local = principal.is_none()
+        && state.council.is_none()
+        && state.forwarder.is_none()
+        && state.allow_unauthenticated_bootstrap
+        && !super::lease::is_test_repository(name);
+    if internal || anonymous_local {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN.into_response())
+    }
+}
+
 impl V2Route {
     /// The repository the request names.
     fn repository(&self) -> &str {
         match self {
             V2Route::Copy { name, .. }
+            | V2Route::Replica { name, .. }
             | V2Route::Blob { name, .. }
             | V2Route::UploadInitiate { name }
             | V2Route::UploadSession { name, .. }
@@ -975,40 +1014,48 @@ async fn blob_head(state: &PickleState, _name: &str, digest_str: &str) -> Respon
     }
 }
 
+/// How much of a blob a GET reads from disk at a time (#892).
+const BLOB_READ_CHUNK_BYTES: usize = 64 * 1024;
+
 /// `GET /v2/{name}/blobs/{digest}` — download a blob.
+///
+/// The blob streams from its file a piece at a time. Reading it whole first
+/// cost the serving node a copy of the blob per fetch: an upgrade binary is
+/// over 100 MB, and the node it was pushed to served it to itself and to the
+/// leader at once, on top of its own working set, until the kernel killed
+/// it (#892). The file stays readable through its open handle even if
+/// garbage collection unlinks the blob while it streams.
 async fn blob_get(state: &PickleState, _name: &str, digest_str: &str) -> Response {
     let Ok(digest) = Digest::new(digest_str) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-
-    // read_blob is a synchronous `std::fs::read` of the whole blob (up to the
-    // request ceiling). Run it on the blocking pool (M7) so a large GET doesn't
-    // stall an async runtime worker while the file is read.
-    let store = Arc::clone(&state.store);
-    let read_digest = digest.clone();
-    let read = tokio::task::spawn_blocking(move || store.read_blob(&read_digest)).await;
-    match read {
-        Ok(Ok(data)) => {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                "content-length",
-                data.len().to_string().parse().expect("ASCII header value"),
-            );
-            headers.insert(
-                "docker-content-digest",
-                digest.as_str().parse().expect("ASCII header value"),
-            );
-            headers.insert(
-                "content-type",
-                "application/octet-stream"
-                    .parse()
-                    .expect("ASCII header value"),
-            );
-            (StatusCode::OK, headers, data).into_response()
-        }
-        Ok(Err(_)) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+    let Ok(file) = tokio::fs::File::open(state.store.blob_path(&digest)).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let length = match file.metadata().await {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::CONTENT_LENGTH, length.into());
+    headers.insert(
+        "docker-content-digest",
+        digest.as_str().parse().expect("ASCII header value"),
+    );
+    headers.insert(
+        "content-type",
+        "application/octet-stream"
+            .parse()
+            .expect("ASCII header value"),
+    );
+    let pieces = tokio_util::io::ReaderStream::with_capacity(file, BLOB_READ_CHUNK_BYTES);
+    (
+        StatusCode::OK,
+        headers,
+        axum::body::Body::from_stream(pieces),
+    )
+        .into_response()
 }
 
 /// Query params for POST /v2/{name}/blobs/uploads/ (monolithic upload).
@@ -1291,17 +1338,11 @@ async fn blob_upload_complete(
         return response;
     }
 
-    // Enforce the storage quota against the fully-assembled blob before it is
-    // committed (M10). Every upload path only knows its total size here — the on-disk
-    // temp file is authoritative. Over quota: drop the temp and the session so
-    // nothing lands in the blob store.
+    // The physical cap was enforced as the bytes streamed in (the shared
+    // BlobStore budget answers 413); here we only confirm the session's
+    // temp file still exists.
     match state.store.upload_size(upload_id).await {
-        Ok(incoming) => {
-            if let Err(response) = state.enforce_quota(name, incoming).await {
-                discard_upload(state, upload_id).await;
-                return response;
-            }
-        }
+        Ok(_) => {}
         Err(super::types::PickleError::InvalidUploadId(_)) => {
             return StatusCode::BAD_REQUEST.into_response();
         }
@@ -1413,7 +1454,9 @@ fn registry_write_error(error: super::types::PickleError) -> Response {
     let status = match error {
         super::types::PickleError::StorageQuotaExceeded => StatusCode::PAYLOAD_TOO_LARGE,
         super::types::PickleError::LeaseDenied(_) => StatusCode::FORBIDDEN,
-        super::types::PickleError::ReplicationFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
+        super::types::PickleError::ReplicationFailed(_)
+        | super::types::PickleError::RegistryNeedsMtls => StatusCode::SERVICE_UNAVAILABLE,
+        super::types::PickleError::ImageLost { .. } => StatusCode::GONE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     oci_error(status, "DENIED", error.to_string())
@@ -1738,12 +1781,6 @@ async fn manifest_put(
         );
     };
 
-    // Quota: charge the whole image (manifest + config + layers) against
-    // the repository and registry ceilings before committing (REG4).
-    if let Err(response) = state.enforce_quota(name, manifest.total_size).await {
-        return response;
-    }
-
     // Validation passed: store the exact bytes (content addressing must
     // see what the client sent, not a re-serialisation) off the runtime,
     // then commit.
@@ -1834,10 +1871,23 @@ async fn manifest_head(state: &PickleState, name: &str, reference: &str) -> Resp
 }
 
 /// Detect the correct content-type for a manifest blob.
+///
+/// A manifest that names its own `mediaType` is served as that type: docker
+/// refuses a Docker schema 2 manifest labelled as OCI. One that doesn't is
+/// an OCI index if it lists manifests, else an OCI image manifest.
 fn detect_manifest_content_type(data: &[u8]) -> &'static str {
-    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(data)
-        && json.get("manifests").is_some()
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return "application/vnd.oci.image.manifest.v1+json";
+    };
+    let declared = json.get("mediaType").and_then(|value| value.as_str());
+    if let Some(known) = MANIFEST_MEDIA_TYPES
+        .iter()
+        .chain(INDEX_MEDIA_TYPES.iter())
+        .find(|known| Some(**known) == declared)
     {
+        return known;
+    }
+    if json.get("manifests").is_some() {
         return "application/vnd.oci.image.index.v1+json";
     }
     "application/vnd.oci.image.manifest.v1+json"
@@ -1861,6 +1911,173 @@ async fn tags_list(state: &PickleState, name: &str) -> Response {
         "tags": tags,
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Tag deletion and expiry (#697)
+// ---------------------------------------------------------------------------
+
+/// `DELETE /v2/{name}/manifests/{tag}` — remove a tag.
+///
+/// Authorised exactly like a push: the caller needs repository write scope.
+/// The manifest stays in the catalogue, untagged and still pullable by
+/// digest, until expiry removes it `gc_retain_days` later. Deleting by
+/// digest answers `405 UNSUPPORTED`: an image leaves only by losing its tags.
+async fn manifest_delete(
+    state: &PickleState,
+    name: &str,
+    reference: &str,
+    headers: &HeaderMap,
+) -> Response {
+    if let Err(response) = state
+        .authorise_write(headers, name, RepositoryAccess::WriteManifest)
+        .await
+    {
+        return response;
+    }
+    if Digest::new(reference).is_ok() {
+        return oci_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "UNSUPPORTED",
+            "deleting a manifest by digest is not supported: delete its tags and \
+             expiry removes it after gc_retain_days"
+                .to_string(),
+        );
+    }
+    if is_reserved_cache_repo(name) || super::lease::is_test_repository(name) {
+        return oci_error(
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            "cache/ and test-lease repositories are cleaned up by Reliaburger, not by tag deletion"
+                .to_string(),
+        );
+    }
+    let catalog = match state.catalog_snapshot(name).await {
+        Ok(catalog) => catalog,
+        Err(error) => return registry_write_error(error),
+    };
+    if catalog.get_manifest_by_tag(name, reference).is_none() {
+        return oci_error(
+            StatusCode::NOT_FOUND,
+            "MANIFEST_UNKNOWN",
+            format!("{name}:{reference} is not in the registry"),
+        );
+    }
+    let delete = super::types::DeleteTag {
+        repository: name.to_string(),
+        tag: reference.to_string(),
+        deleted_at_unix_ms: crate::testkit::lease::now_unix_millis(),
+    };
+    match state.delete_tag(delete).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => registry_write_error(error),
+    }
+}
+
+impl PickleState {
+    /// Untag `repository:tag` in the authoritative catalogue: through Raft
+    /// in a cluster (the leader stamps the deletion time), locally and
+    /// persisted on a standalone node.
+    pub async fn delete_tag(
+        &self,
+        delete: super::types::DeleteTag,
+    ) -> Result<(), super::types::PickleError> {
+        if let Some(response) = self
+            .propose(super::authority::RegistryMutation::DeleteTag(
+                delete.clone(),
+            ))
+            .await?
+        {
+            super::lease::require_acceptance(response)?;
+        }
+        // Standalone this is the catalogue. In a cluster it keeps this node's
+        // local view honest about a tag it may have pushed itself.
+        let mut catalog = Arc::clone(&self.catalog).write_owned().await;
+        let persist = self.persist_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut next = catalog.clone();
+            if !next.apply_delete_tag(&delete) {
+                return Ok(());
+            }
+            if let Some(path) = persist {
+                next.persist_to(&path)?;
+            }
+            *catalog = next;
+            Ok(())
+        })
+        .await
+        .map_err(|error| super::types::PickleError::CatalogPersist(error.to_string()))?
+    }
+
+    /// Expire every manifest untagged for at least `retain` at `now_unix_ms`
+    /// that nothing in `pinned` (digests apps and jobs pin) protects.
+    ///
+    /// On a cluster's leader each expiry is proposed through Raft, where the
+    /// state machine rechecks it against desired state; a follower or worker
+    /// does nothing, because only the leader plans expiry. A standalone node
+    /// applies the same rule to its own catalogue. Returns what expired.
+    pub async fn expire_untagged_manifests(
+        &self,
+        now_unix_ms: u64,
+        retain: std::time::Duration,
+        pinned: &std::collections::HashSet<String>,
+    ) -> Result<Vec<super::types::ExpireManifest>, super::types::PickleError> {
+        use super::types::PickleError;
+        if let Some(council) = &self.council {
+            if !council.is_leader().await {
+                return Ok(Vec::new());
+            }
+            let desired = council.desired_state().await;
+            let mut pinned = pinned.clone();
+            pinned.extend(desired.pinned_image_digests());
+            let mut expired = Vec::new();
+            for expire in desired
+                .manifest_catalog
+                .expirable_manifests(now_unix_ms, retain, &pinned)
+            {
+                match council
+                    .write(crate::council::RaftRequest::ExpireManifest(expire.clone()))
+                    .await
+                    .map_err(|error| PickleError::ReplicationFailed(error.to_string()))?
+                {
+                    crate::council::CouncilResponse::Refused { reason } => {
+                        eprintln!(
+                            "pickle: expiry of {}@{} refused: {reason}",
+                            expire.repository,
+                            expire.digest.as_str()
+                        );
+                    }
+                    _ => expired.push(expire),
+                }
+            }
+            return Ok(expired);
+        }
+        if self.forwarder.is_some() {
+            return Ok(Vec::new());
+        }
+        let mut catalog = Arc::clone(&self.catalog).write_owned().await;
+        let persist = self.persist_path.clone();
+        let pinned = pinned.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut next = catalog.clone();
+            let mut expired = Vec::new();
+            for expire in next.expirable_manifests(now_unix_ms, retain, &pinned) {
+                if next.apply_expire_manifest(&expire, &pinned).is_ok() {
+                    expired.push(expire);
+                }
+            }
+            if expired.is_empty() {
+                return Ok(expired);
+            }
+            if let Some(path) = persist {
+                next.persist_to(&path)?;
+            }
+            *catalog = next;
+            Ok(expired)
+        })
+        .await
+        .map_err(|error| PickleError::CatalogPersist(error.to_string()))?
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2048,33 +2265,71 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn registry_refuses_excess_writers_without_buffering_their_bodies() {
-        let (state, _dir) = test_state();
-        let app = router(state);
-        let mut writers = Vec::new();
+    /// Fill every write slot with an upload whose body never arrives.
+    fn stalled_writers(
+        app: &Router,
+    ) -> Vec<futures_util::future::BoxFuture<'static, Result<Response, std::convert::Infallible>>>
+    {
         let digest = compute_sha256(b"data");
-        for _ in 0..MAX_CONCURRENT_WRITES {
-            let body = Body::from_stream(futures_util::stream::pending::<
-                Result<axum::body::Bytes, std::io::Error>,
-            >());
-            let request = axum::http::Request::builder()
-                .method("POST")
-                .uri(format!("/v2/web/blobs/uploads/?digest={}", digest.as_str()))
-                .body(body)
-                .unwrap();
-            let mut writer = Box::pin(app.clone().oneshot(request));
-            assert!(futures_util::poll!(writer.as_mut()).is_pending());
-            writers.push(writer);
-        }
-        let request = axum::http::Request::builder()
+        (0..MAX_CONCURRENT_WRITES)
+            .map(|_| {
+                let body = Body::from_stream(futures_util::stream::pending::<
+                    Result<axum::body::Bytes, std::io::Error>,
+                >());
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v2/web/blobs/uploads/?digest={}", digest.as_str()))
+                    .body(body)
+                    .unwrap();
+                let writer: futures_util::future::BoxFuture<'static, _> =
+                    Box::pin(app.clone().oneshot(request));
+                writer
+            })
+            .collect()
+    }
+
+    fn start_upload() -> axum::http::Request<Body> {
+        axum::http::Request::builder()
             .method("POST")
             .uri("/v2/web/blobs/uploads/")
             .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_refuses_excess_writers_without_buffering_their_bodies() {
+        let (state, _dir) = test_state();
+        let app = router(state);
+        let mut writers = stalled_writers(&app);
+        for writer in &mut writers {
+            assert!(futures_util::poll!(writer.as_mut()).is_pending());
+        }
+        // The excess writer waits for a slot, then gives up with 429.
+        let response = app.oneshot(start_upload()).await.unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()["retry-after"], "1");
+        drop(writers);
+    }
+
+    /// docker and containerd push several layers at once and never retry a
+    /// 429, so a writer over the limit queues for a slot instead.
+    #[tokio::test(start_paused = true)]
+    async fn an_excess_writer_waits_for_a_free_slot_instead_of_failing() {
+        let (state, _dir) = test_state();
+        let app = router(state);
+        let mut writers = stalled_writers(&app);
+        for writer in &mut writers {
+            assert!(futures_util::poll!(writer.as_mut()).is_pending());
+        }
+        let mut waiting = Box::pin(app.clone().oneshot(start_upload()));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+
+        // One stalled upload goes away; its slot admits the waiter.
+        drop(writers.pop());
+        let response = waiting.await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         drop(writers);
     }
 
@@ -3318,10 +3573,13 @@ mod tests {
             }),
             ..Default::default()
         });
-        state.forwarder = Some(RegistryForwarder::new(
-            crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
-            rx,
-        ));
+        state.forwarder = Some(
+            RegistryForwarder::new(
+                crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
+                rx,
+            )
+            .against_plaintext_stand_in(),
+        );
         let publisher = state.clone();
         let caller = tokio::spawn(async move {
             if copy {
@@ -3404,7 +3662,8 @@ mod tests {
         let forwarder = RegistryForwarder::new(
             crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
             rx,
-        );
+        )
+        .against_plaintext_stand_in();
         (forwarder, server)
     }
 
@@ -3536,10 +3795,13 @@ mod tests {
             }),
             ..Default::default()
         });
-        state.forwarder = Some(RegistryForwarder::new(
-            crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
-            rx,
-        ));
+        state.forwarder = Some(
+            RegistryForwarder::new(
+                crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
+                rx,
+            )
+            .against_plaintext_stand_in(),
+        );
         let gate = state.catalog.write().await;
         let owner = state.clone();
         let collected = digest.clone();
@@ -3932,37 +4194,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_reads_and_writes_share_the_api_verification_admission() {
+    async fn registry_reads_and_writes_authenticate_bearer_and_basic_credentials() {
         let (state, _dir, deployer, _reader) = standard_client_state().await;
         let app = test_router(state);
         for authorization in [format!("Bearer {deployer}"), basic("ci", &deployer)] {
             for (method, uri) in [("GET", "/v2/"), ("POST", "/v2/team/api/blobs/uploads/")] {
-                let permits = crate::sesame::auth::hold_all_verify_permits().await;
-                let request =
-                    app.clone()
-                        .oneshot(client_request(method, uri, Some(&authorization), true));
-                tokio::pin!(request);
-                assert!(
-                    tokio::time::timeout(std::time::Duration::from_millis(20), &mut request)
-                        .await
-                        .is_err(),
-                    "{method} registry verification bypassed the shared admission"
-                );
-                drop(permits);
-                let response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                let response = app
+                    .clone()
+                    .oneshot(client_request(method, uri, Some(&authorization), true))
                     .await
-                    .expect("registry verification should resume after admission opens")
                     .unwrap();
-                assert!(response.status().is_success());
+                assert!(
+                    response.status().is_success(),
+                    "{method} {uri} with {authorization}: {}",
+                    response.status()
+                );
             }
         }
     }
 
     #[tokio::test]
-    async fn malformed_registry_credentials_do_not_wait_for_verification_admission() {
+    async fn malformed_registry_credentials_are_refused_before_hashing() {
         let (state, _dir, _deployer, _reader) = standard_client_state().await;
         let app = test_router(state);
-        let _permits = crate::sesame::auth::hold_all_verify_permits().await;
         for authorization in ["Bearer invalid".to_string(), basic("ci", "invalid")] {
             for (method, uri) in [("GET", "/v2/"), ("POST", "/v2/team/api/blobs/uploads/")] {
                 let response = tokio::time::timeout(
@@ -4711,6 +4965,48 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// #892: a blob GET read the whole blob into memory before answering, so
+    /// a node serving a 114 MB upgrade binary held it once per fetch. It now
+    /// streams the file, in pieces no larger than the read buffer.
+    #[tokio::test]
+    async fn blob_get_streams_a_large_blob_in_bounded_pieces() {
+        let (state, _dir) = test_state();
+        let data: Vec<u8> = (0..3 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+        let digest = compute_sha256(&data);
+        state.store.write_blob(&data, &digest).unwrap();
+        let app = test_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/v2/myapp/blobs/{}", digest.as_str()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-length"],
+            data.len().to_string().as_str()
+        );
+        let mut frames = response.into_body().into_data_stream();
+        let mut received = Vec::new();
+        let mut largest = 0;
+        while let Some(frame) = frames.next().await {
+            let frame = frame.unwrap();
+            largest = largest.max(frame.len());
+            received.extend_from_slice(&frame);
+        }
+        assert_eq!(received, data);
+        assert!(
+            largest <= BLOB_READ_CHUNK_BYTES,
+            "a {}-byte blob arrived in a {largest}-byte piece",
+            data.len()
+        );
+    }
+
     /// Helper: push a single blob through the upload API.
     async fn push_blob(app: &Router, name: &str, data: &[u8]) -> Digest {
         let digest = compute_sha256(data);
@@ -4763,6 +5059,66 @@ mod tests {
         assert!(resp.headers().contains_key("location"));
 
         digest
+    }
+
+    #[tokio::test]
+    async fn a_docker_schema_2_manifest_is_served_as_its_own_media_type() {
+        // docker 28 pushes Docker schema 2 manifests, and on pull refuses
+        // one whose content type disagrees with its `mediaType` field.
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+        let config = b"docker config";
+        let layer = b"docker layer";
+        let config_digest = push_blob(&app, "myapp", config).await;
+        let layer_digest = push_blob(&app, "myapp", layer).await;
+        let docker_manifest = "application/vnd.docker.distribution.manifest.v2+json";
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": docker_manifest,
+            "config": {
+                "digest": config_digest.as_str(),
+                "size": config.len(),
+                "mediaType": "application/vnd.docker.container.image.v1+json"
+            },
+            "layers": [{
+                "digest": layer_digest.as_str(),
+                "size": layer.len(),
+                "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip"
+            }]
+        });
+        let put = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/v2/myapp/manifests/v1")
+                    .header("content-type", docker_manifest)
+                    .body(Body::from(serde_json::to_vec(&manifest).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        for method in ["GET", "HEAD"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri("/v2/myapp/manifests/v1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method}");
+            assert_eq!(
+                response.headers()["content-type"],
+                docker_manifest,
+                "{method}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5341,25 +5697,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_catalogue_authority_refuses_reads_and_quota_admission() {
+    async fn unavailable_catalogue_authority_refuses_reads() {
         let (mut state, _dir) = test_state();
         let (_tx, rx) =
             tokio::sync::watch::channel(crate::mustard::directory::NodeDirectory::default());
-        state.forwarder = Some(super::super::authority::RegistryForwarder::new(
-            crate::cluster::ClusterHttp::plaintext(),
-            rx,
-        ));
-        state.quota = QuotaConfig {
-            per_repository_bytes: 10,
-            total_bytes: 0,
-        };
-        assert_eq!(
-            state
-                .enforce_quota("ordinary", 1)
-                .await
-                .unwrap_err()
-                .status(),
-            StatusCode::SERVICE_UNAVAILABLE
+        state.forwarder = Some(
+            super::super::authority::RegistryForwarder::new(
+                crate::cluster::ClusterHttp::plaintext(),
+                rx,
+            )
+            .against_plaintext_stand_in(),
         );
         let app = test_router(state.clone());
         for path in ["/v2/ordinary/manifests/latest", "/v2/ordinary/tags/list"] {
@@ -5494,129 +5841,6 @@ mod tests {
                 .unwrap()
                 .count(),
             0
-        );
-    }
-
-    /// REG4: a push that would breach the repository quota is refused with
-    /// 413, and nothing is stored.
-    #[tokio::test]
-    async fn push_over_repository_quota_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(BlobStore::new(dir.path()));
-        let state = PickleState {
-            store: Arc::clone(&store),
-            catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
-            node_raft_id: 7,
-            council: None,
-            forwarder: None,
-            test_leases: Default::default(),
-            repository_writers: Default::default(),
-            persist_path: None,
-            auth: None,
-            require_read_auth: false,
-            allow_unauthenticated_bootstrap: true,
-            quota: QuotaConfig {
-                per_repository_bytes: 4,
-                total_bytes: 0,
-            },
-            sessions: UploadSessions::new(super::super::registry_auth::DEFAULT_UPLOAD_TTL),
-        };
-        let app = test_router(state);
-
-        // A monolithic blob larger than the 4-byte repository quota.
-        let blob = b"way too big for the quota".to_vec();
-        let digest = compute_sha256(&blob);
-        let resp = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri(format!("/v2/web/blobs/uploads/?digest={}", digest.as_str()))
-                    .body(Body::from(blob))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(
-            !store.has_blob(&digest),
-            "over-quota blob must not be stored"
-        );
-    }
-
-    /// REG4/M10: a chunked upload whose assembled size breaches the quota is
-    /// refused at completion, and nothing lands in the blob store. The
-    /// monolithic path checks at initiate; this covers the chunked/bare-PUT
-    /// path that previously skipped quota entirely.
-    #[tokio::test]
-    async fn chunked_upload_over_repository_quota_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(BlobStore::new(dir.path()));
-        let state = PickleState {
-            store: Arc::clone(&store),
-            catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
-            node_raft_id: 7,
-            council: None,
-            forwarder: None,
-            test_leases: Default::default(),
-            repository_writers: Default::default(),
-            persist_path: None,
-            auth: None,
-            require_read_auth: false,
-            allow_unauthenticated_bootstrap: true,
-            quota: QuotaConfig {
-                per_repository_bytes: 4,
-                total_bytes: 0,
-            },
-            sessions: UploadSessions::new(super::super::registry_auth::DEFAULT_UPLOAD_TTL),
-        };
-        let app = test_router(state);
-
-        // Initiate a chunked session (no digest, no body).
-        let resp = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v2/web/blobs/uploads/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
-        let location = resp.headers()["location"].to_str().unwrap().to_string();
-
-        // Push a chunk larger than the 4-byte quota.
-        let blob = b"way too big for the quota".to_vec();
-        let digest = compute_sha256(&blob);
-        let resp = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("PATCH")
-                    .uri(&location)
-                    .body(Body::from(blob.clone()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
-
-        // Completing must be refused with 413 and store nothing.
-        let resp = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("{location}?digest={}", digest.as_str()))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(
-            !store.has_blob(&digest),
-            "over-quota chunked blob must not be committed"
         );
     }
 

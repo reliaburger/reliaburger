@@ -530,7 +530,7 @@ The five tests are the roadmap's five promises, verbatim:
 - **`version_retention_gc_keeps_last_three`** — four consecutive upgrades; asserts exactly v0.3.0–v0.5.0 remain on disk, sidecars gone with their binaries.
 - **`upgrade_rejects_bad_external_signature`** — right key, wrong bytes: `409`, and the node is byte-for-byte untouched.
 
-Two practical notes that will save you an afternoon. First, everything binds ephemeral ports — including the Pickle registry, whose default port turned out to be squatted on macOS dev machines (AirPlay sits on 5000; ask us how we know). Second, the tests are **serialised** with a file-local `tokio::sync::Mutex`: each one runs a full node with real processes, and five at once starve each other into flaky timeouts on a laptop. A `static SERIAL: Mutex<()>` and one `lock().await` per test is the cheapest fix that doesn't add a dependency.
+Two practical notes that will save you an afternoon. First, everything that can binds ephemeral ports — including the Pickle registry, whose default port turned out to be squatted on macOS dev machines (AirPlay sits on 5000; ask us how we know). The API port can't, because the node must come back on the same address after every exec. Our first version picked that port the lazy way: bind `127.0.0.1:0`, note the number, close the socket, hand the number to Bun. That number comes from the kernel's ephemeral range, the same pool every other process's `bind(0)` and outgoing `connect()` draws from. Each exec closes Bun's socket, so for a moment nobody holds the port, and on a busy CI runner another test can take it. The new binary then dies with "Address already in use", and the test only ever sees an upgrade that never settles (#734). The fixtures now lease their fixed ports from a range below the ephemeral one, through `reserve_port_block_lease` in `tests/support/bun_process.rs`, and hold the lease until the test ends. Second, the tests are **serialised** with a file-local `tokio::sync::Mutex`: each one runs a full node with real processes, and five at once starve each other into flaky timeouts on a laptop. A `static SERIAL: Mutex<()>` and one `lock().await` per test is the cheapest fix that doesn't add a dependency.
 
 What we decided not to do: mock the supervisor (its behaviour under exec — *not waking up* — is part of what's under test), and share one harness across tests (isolation is the entire point; 40 seconds per test is the price and it's worth paying).
 
@@ -588,7 +588,7 @@ A refusal is only as good as its first line. The 0.1.0 version said `invalid or 
 So every refusal now leads with the pair, then the remedy, then a link to the policy:
 
 ```text
-incompatible state format: found 58; this binary (reliaburger v0.1.6 (465fdeb)) needs 63. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100
+incompatible state format: found 63; this binary (reliaburger v0.2.0 (465fdeb)) needs 68. Pre-1.0 builds don't migrate state: run the reliaburger release that wrote /var/lib/reliaburger/data/state-format.json, or move the data aside and recreate the cluster. See https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100
 ```
 
 A stamp from another generation used to share a variant with a corrupt one. They're different problems (one has an answer, the other doesn't), so the number now travels in its own variant:
@@ -608,17 +608,43 @@ Two bits of `thiserror` syntax are new here. `{found}` names a field of the vari
 
 `this_binary()` names the release and, when the build knew it, the commit, reusing the same `describe` that `relish version` prints (`v0.1.3 (465fdeb)`). Two dev builds can share a version number and still hold different code, so the commit is what tells a user which one refused.
 
-The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking `/v1/version`. `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 40, state 58; this binary (...) needs protocol 46, state 63`.
+The join refusal gets the same treatment. It used to wrap the mismatch as `cluster member rejected the join: ...`, which blamed a member that never rejected anything: the joiner itself refused the member's formats after asking for them (then on `/v1/version`; see below for why it now asks `/v1/cluster/ca`). `JoinClientError::Incompatible` now carries the `CompatibilityError` through `#[from]`, so `?` converts it and the message starts `cannot join: incompatible cluster formats: found protocol 46, state 63; this binary (...) needs protocol 51, state 68`.
 
 The tests pin the order, not just the content. A helper takes everything before the first `". "` and checks that it holds both numbers and the version, so a future edit can't push the key facts past the point where the journal cuts the line.
 
-A candidate binary gets checked too, before it's staged. Run `bun --compatibility` and it prints the pair as JSON without loading config or starting a runtime. The upgrade manager verifies the release signature first, writes those verified bytes to a private temporary file, runs *that* copy with `--compatibility`, and caps the output at 4 KiB with a ten-second deadline. Why a copy? Checking the download path and executing it later would let the file change in between. `NamedTempFile::into_temp_path` hands us a path that deletes the file when dropped, and closes our writable descriptor first, because Linux refuses to execute a file that's open for writing (`ETXTBSY`, "text file busy"). Even then, the full test suite caught the occasional `ETXTBSY`: another thread forking at the wrong moment briefly inherits the descriptor. That's a [known race in process launching](https://github.com/rust-lang/rust/issues/114554), so the probe retries that one error within the same deadline. Retrying can't turn an incompatible binary into an accepted one.
+A candidate binary gets checked too, before it's staged. Run `bun --compatibility` and it prints the pair as JSON without loading config or starting a runtime. The upgrade manager verifies the release signature first, writes those verified bytes to a private temporary file, runs *that* copy with `--compatibility`, and caps the output at 4 KiB with a sixty-second deadline (it used to be ten; see below). Why a copy? Checking the download path and executing it later would let the file change in between. `NamedTempFile::into_temp_path` hands us a path that deletes the file when dropped, and closes our writable descriptor first, because Linux refuses to execute a file that's open for writing (`ETXTBSY`, "text file busy"). Even then, the full test suite caught the occasional `ETXTBSY`: another thread forking at the wrong moment briefly inherits the descriptor. That's a [known race in process launching](https://github.com/rust-lang/rust/issues/114554), so the probe retries that one error within the same deadline. Retrying can't turn an incompatible binary into an accepted one.
+
+### The deadline was timing macOS, not the candidate
+
+Ten seconds sounds generous for a program that prints twenty bytes. It wasn't always enough. Two tests kept timing out on macOS, in CI and on loaded Macs, and passed every time we ran them alone: `verified_upgrade_probes_survive_concurrent_process_creation` (32 probes at once while four tasks spawn `true` in a loop) and the agent's `an_upgrade_execs_only_after_its_answer_is_delivered`. The agent test's own diagnostics said the candidate script hadn't even run its first line by the time the ten seconds were up.
+
+Nothing failed on the machine we were debugging on, under any load we threw at it. That turned out to be the clue. macOS assesses the first exec of every new executable file before letting it run (`syspolicyd` does it, part of Gatekeeper and XProtect), and it skips that for programs started from a terminal that has the "Developer Tools" permission. A CI runner, a launchd service and a sandboxed agent don't have it. So we wrote a ten-line C launcher that starts a program as its own "responsible process" (`posix_spawn` with `responsibility_spawnattrs_setdisclaim`), which drops the terminal's exemption, and measured:
+
+- `posix_spawn` returns in about 1 ms. The wait comes after, before the child runs any of its own code.
+- A fresh shell script waits about 0.13 s. A fresh copy of a release `bun` (104 MB) waits about 1 s, and a fresh copy of the 800 MB debug test binary about 7.5 s. Run the same file again and it starts in milliseconds.
+- Assessments go one at a time across the whole host. 32 fresh scripts launched together took 12.9 s; four fresh `bun` copies answered after 1.0, 1.9, 2.9 and 4.1 s. A tiny script launched just after a fresh 800 MB binary waited 6.0 s.
+
+The probe always writes a fresh private copy (that's the point of the copy), so every probe pays for one assessment and waits behind every other new executable the host is starting. The 32-probe test built a 32-deep queue all by itself. The agent test queued behind whatever else was going on: freshly built debug binaries launched by the rest of the suite, the upgrade gate's copies of `bun`, another build. Under the disclaimed launcher with eight loops copying and running `bun`, both tests failed 40 runs out of 40, the agent test with exactly the signature from CI.
+
+So we changed three things, none of them a retry:
+
+1. **The bound is now 60 seconds** (`QUERY_DEADLINE` in `src/upgrade/compatibility.rs`). It's still a hang guard: a candidate that answers takes milliseconds, and one that hangs still gets refused. Sixty seconds covers about 55 release-sized assessments queued ahead of ours, or about eight debug-sized ones, where ten covered barely one debug build. The leader's directive request has no client timeout of its own, so nothing else had to move.
+2. **A timeout says how far the candidate got.** The probe now waits for the end of the answer and the exit separately in a `tokio::select!` loop, noting when each happens. Both `read` and `wait` are cancel-safe, so the branch that loses a round drops nothing. The error reads `compatibility query timed out after 60s (launched as pid 4242 after 2ms, no output, still running)`, which tells "never got to run" apart from "ran and said nothing".
+3. **The 32-probe test keeps four probes in flight**, with `buffer_unordered(4)`. They still overlap each other and the fork churn, which is what the Linux `ETXTBSY` race needs, but they no longer measure macOS's queue. A node only ever runs one probe at a time.
+
+One Rust detail bit us on the way. The test first built all 32 fixtures, then moved each into an `async move` block that only used `fixture.manager`. Since the 2021 edition a closure or async block captures just the fields it names, so the fixture's `TempDir` field stayed behind and was dropped the moment the stream's `map` closure returned, deleting the candidate before the probe could read it. A `let fixture = fixture;` inside the block makes it take the whole struct.
+
+Tests and CI got one more change: `make test` now depends on `make warm-executables`, which builds the `[[bin]]` targets and runs each once with `--help` (`scripts/ci/warm_executables.py`, macOS only). nextest already runs every test binary once to list its tests, so after that step no freshly built binary of ours pays its assessment inside a test's deadline.
+
+That step had a hole we only found in 0.2.1. It built the binaries with `cargo build --bins`, which picks features without the dev-dependencies, so nextest's own `cargo test --no-run` rebuilt the library and the binaries with different features, and replaced the very files the step had just warmed. The step now runs `cargo test --no-run` itself, so it warms exactly what the suite launches and nextest has nothing left to build. Chapter 15 has the story and the timings ([#846](https://github.com/reliaburger/reliaburger/issues/846)).
 
 Tests cover mismatched gossip and Raft messages, refused development state, rejected joins, signed-but-incompatible executables and rollback refusal. Test fixtures that model a *compatible* peer take their pair from `compatibility::CURRENT` rather than hard-coding numbers. We learnt that one when a state bump turned ten unrelated tests red at the compatibility check instead of at the behaviour they were meant to test.
 
 That fresh-cluster promise outlived 0.1.0. We sketched a stricter rule for after the release: bump a generation only for a change old nodes can't read, ship a migration with every bump, and let additive JSON fields through without one. Then we asked who it would serve. Before 1.0.0 every release is a development release, and every migration is code we'd have to test and then carry for a cluster you could simply rebuild. So the rule waits for 1.0.0. Until then, any incompatible change bumps its generation, nodes refuse old peers and old state, and you start a fresh cluster.
 
 Two lines of work bumping the same counters is where this gets fiddly. The 0.3.0 appliance work lives on its own merge train, and it added two things to the council's log and state: the OS rollout (`RaftRequest::OsRolloutUpdate` and `OsRolloutClear`, with `DesiredState::os_rollout` and its history) and the cluster-wide council size (`RaftRequest::CouncilSize`, `DesiredState::council_size`). Meanwhile main moved on to 48/65 for 0.2.0's jobs. The two bumps don't add up by themselves: the train said 36/51, main said 48/65, and a merge that kept either number would let a train binary talk to a main binary that can't read its Raft entries. So the merge takes the larger pair and goes one past it, 49/66, and `peers_and_state_from_before_the_appliance_train_are_refused` pins main's 48/65 as a generation the train must refuse.
+
+The next merge, after 0.2.0 and the 0.2.1 cluster-safety train, found a third line in the way. Main was at 52/69, and the 0.2.2 train had already taken 53/70 for its own formats. One past main would have given the appliance train 53/70 as well: two different formats under one pair, which is exactly what the pair exists to prevent. So the train skipped to 54/71, and the test now pins both 52/69 and 53/70 as generations it refuses.
 
 ### Cordoning
 
@@ -654,13 +680,19 @@ One more thing has to be true before a node counts as *done*, and it's easy to m
 
 The leader's check isn't the only one. The upgraded node itself decides whether to commit its new binary or revert, so it needs its own proof. It removes its upgrade marker only after it has survived `boot_grace_secs` *and* its own gossip transport has received a direct acknowledgement from a peer within `gossip_rejoin_secs`. Membership restored from disk or a configured seed list doesn't count. The observation lives in a `watch::Receiver<bool>` that starts at `false` and is never saved, and `tokio::join!` waits on the grace timer and the gossip deadline at the same time, so a long grace period can't stretch the rejoin deadline. If either fails, the node writes `RevertPending` and exits, and the supervisor brings back the old binary, which adopts the same workloads.
 
+When do those two clocks start? At first they started as soon as the new binary had recovered its marker, before its API answered anything. That measured the wrong thing (#771). `/v1/version` reports the hash of the running binary, so a replacement can't say what it runs until that hash is ready. A debug `bun` is 581 MB. On a Mac at a load average of 150, hashing it took up to 7.2 seconds, longer than the whole five-second rejoin window that the isolated-node test uses. The replacement spent its window unable to answer, then reverted before anyone could see it. The deadline wasn't measuring the node's time to rejoin. It was mostly measuring the hash.
+
+So the verification task now starts after the API task, and `upgrade::rejoin::verify_after_answerable` waits for the replacement to become answerable before it starts either clock. Bun passes the hash itself as that future: `running_binary_sha256()` awaits the `OnceCell` that the boot task is filling. The function is generic over any `F: Future`, which lets the unit tests pass `tokio::time::sleep` or `std::future::pending()` in its place and check the timing under paused time. A peer's acknowledgement that arrives during the hash still counts, because the `watch` receiver keeps the latest value. And a hash that never finishes (a hung disk, say) can only delay the clocks by one `gossip_rejoin_secs`, so the node still reaches a verdict instead of leaving its marker in flight forever.
+
+We could instead have made `/v1/version` answer at once and report the digest as pending. That would change what every reader of `binary_sha256` has to handle: the leader's same-version gate, the orchestrator's re-check when a node reaches the target, and `relish`. They'd all need a third state, and a "pending" that slipped through would be read as "unknown bytes", which the gate refuses. Moving when the clock starts changes one task and nothing on the wire. The cost is that a slow hash lengthens a replacement's total verification time, by at most one rejoin period.
+
 ### The leader goes last — in place
 
 The original design called for the leader to *transfer* leadership to an already-upgraded member, then upgrade as a follower. We built that, and it failed the integration test in an instructive way. openraft 0.9 has no `transfer_leader`; the closest primitive is `Raft::trigger().elect()`, "call an election on yourself". So the old leader asked an upgraded member to campaign — and it never won. Raft has an *anti-disruption* rule (leader-stickiness): a follower that's recently heard the leader's heartbeat refuses to vote for a challenger, precisely so a flaky node can't unseat a healthy leader. A live leader replicating happily is unseatable this way by design.
 
 (Amusingly, an earlier version of this test *passed* — because at that point nothing else wrote to Raft, so once the workers and council were done the log went quiet, the heartbeats were the only traffic, and the challenger squeaked through. The moment the cluster grew background writers — a scheduler, an autoscaler — the log stayed busy and the transfer wedged forever. A test that passes for a reason you didn't intend is a landmine.)
 
-The honest fix is to stop fighting Raft: **the leader upgrades in place, last.** It execs itself like any other node. Exec is sub-second; a council of three or more keeps quorum through the bounce (losing one voter of three still leaves two, a majority); and when the node comes back — reclaiming leadership, or yielding to whoever the followers elected in the interim — the current leader's orchestrator does what it always does, polls reality, sees the former leader now healthy on the target version, and marks the run complete. No special path, just the poll-first idempotency from earlier doing its job. `TransferringLeadership` survives as a one-tick pass-through to `UpgradingLeader` (and a place to hang this explanation); `/v1/cluster/elect` survives as a manual admin tool for moving leadership before planned maintenance. The whitepaper's "transfers leadership and upgrades last" became "upgrades last, in place" — same guarantee (the leader is the last thing to move, and quorum never drops), simpler mechanism.
+The honest fix is to stop fighting Raft: **the leader upgrades in place, last.** It execs itself like any other node. Exec is sub-second; a council of three or more keeps quorum through the bounce (losing one voter of three still leaves two, a majority); and when the node comes back — reclaiming leadership, or yielding to whoever the followers elected in the interim — the current leader's orchestrator does what it always does, polls reality, sees the former leader now healthy on the target version, and marks the run complete. No special path, just the poll-first idempotency from earlier doing its job. `TransferringLeadership` survives as a one-tick pass-through to `UpgradingLeader` (and a place to hang this explanation); `/v1/cluster/elect` survives as a manual admin tool for moving leadership before planned maintenance. (It only became reliable in 0.2.1: the old leader now holds its own elections while the new voter campaigns, or it tends to win straight back. Chapter 2 tells that story.) The whitepaper's "transfers leadership and upgrades last" became "upgrades last, in place" — same guarantee (the leader is the last thing to move, and quorum never drops), simpler mechanism.
 
 The lesson is worth more than the feature: when a distributed primitive resists you, check whether you're working *against* a safety property. Leader-stickiness wasn't in our way by accident — it's the same rule that stops a partitioned node from disrupting a healthy cluster. The design that respects it is shorter than the one that fought it.
 
@@ -692,7 +724,7 @@ relish upgrade resume                  # carry on after a pause
 
 `check` fetches the **release metadata** — a static JSON file listing versions and per-platform artefacts (`{os}-{arch}` keys from `std::env::consts`, so the binary knows its own platform). The metadata is served over HTTPS but deliberately *not* signed: it can at worst advertise versions that don't exist, because nothing executes without the per-binary dual signatures from §14.2. Signing the metadata (TUF-style freshness guarantees) is real hardening we consciously deferred; the trust anchor is the binary signature, full stop.
 
-`start` has two personalities. The network flow downloads the artefact, checks its hash against the metadata, and takes the signatures from the metadata entry. The air-gapped flow reads a local file and its `.sig` envelope. Either way relish then asks the connected node a question that shapes everything after: *are you a cluster?* (`GET /v1/upgrade/cluster` answers 503 on a single node.) Single node → build a `LocalFile` directive and POST it straight to §14.6's node-level endpoint. Cluster → push the binary as a content-addressed blob to the leader's Pickle registry (a plain monolithic Distribution-API upload — the same registry that serves container images happily serves *our own* binary, which has a pleasing circularity), then POST the plan to `/v1/upgrade/start` and let the orchestrator walk.
+`start` has two personalities. The network flow downloads the artefact, checks its hash against the metadata, and takes the signatures from the metadata entry. (As first written it also picked the artefact by relish's own platform, took the operator's signature from metadata that never carries one, and read any error as "single node". "The headline command that couldn't", at the end of this chapter, fixes all three.) The air-gapped flow reads a local file and its `.sig` envelope. Either way relish then asks the connected node a question that shapes everything after: *are you a cluster?* (`GET /v1/upgrade/cluster` answers 503 on a single node.) Single node → build a `LocalFile` directive and POST it straight to §14.6's node-level endpoint. Cluster → push the binary as a content-addressed blob to the leader's Pickle registry (a plain monolithic Distribution-API upload — the same registry that serves container images happily serves *our own* binary, which has a pleasing circularity), then POST the plan to `/v1/upgrade/start` and let the orchestrator walk.
 
 Notice what relish deliberately does **not** do: verify the signatures itself. It could — it embeds the same release keys — but the nodes *must* verify regardless (relish is outside their trust boundary), and a relish-side check would give integration tests signed with throwaway keys a false failure. One verification, in the place that matters.
 
@@ -720,7 +752,7 @@ Tests: the render functions and address/role derivation under `cargo test --lib 
 
 One honesty note up front. With four nodes and a council cap of seven, *every* node should become a Raft voter, and since #373 the harness waits until every node has before a test starts. A genuine non-voter worker would need an eight-node harness, which is a lot of laptop for one assertion. So the test labels one voter "worker" in its start request, and the leader's server-side derivation *corrects* that to `Council` (both roles precede the leader, so it's a harmless relabel, not a rejection). The mechanics under test (council members one at a time, each step gated on live quorum, the leader last and in place) are untouched by the label, and the correction is exactly the behaviour a unit test pins directly.
 
-"Should become" is doing some work in that paragraph, because for a long time it didn't. The harness picked every port at random, so each node's Raft port sat a different distance above its gossip port. Bun doesn't gossip Raft addresses: it works out a peer's Raft address from the peer's gossip port plus its *own* offset, which is right on a real fleet where every node uses the same ports. On the harness that sum pointed at the wrong port, the leader never reached a node it tried to add, and the council stayed at the one voter that bootstrapped it. The tests still passed, because a walk over learners and a lone leader looks the same from `/v1/upgrade/cluster`. Nobody noticed until #373 pointed out that one test's comment admitted to "a one-voter council" while the module header promised four voters. Now the harness gives every node the same Raft offset, and its start-up waits until the leader's `/v1/cluster/nodes` marks all four as council members. Only then does a rolling upgrade take real voters down, one at a time, against a real quorum. A real council had one side effect: two refusal tests that started two nodes now met a two-voter council, which the leader refuses to roll at all (see "Two voters, no way through" below), before the refusal they were written to check. They start three nodes now.
+"Should become" is doing some work in that paragraph, because for a long time it didn't. The harness picked every port at random, so each node's Raft port sat a different distance above its gossip port. Bun doesn't gossip Raft addresses: it works out a peer's Raft address from the peer's gossip port plus its *own* offset, which is right on a real fleet where every node uses the same ports. On the harness that sum pointed at the wrong port, the leader never reached a node it tried to add, and the council stayed at the one voter that bootstrapped it. The tests still passed, because a walk over learners and a lone leader looks the same from `/v1/upgrade/cluster`. Nobody noticed until #373 pointed out that one test's comment admitted to "a one-voter council" while the module header promised four voters. Now the harness gives every node the same Raft offset, and its start-up waits until the leader's `/v1/cluster/nodes` marks all four as council members. Only then does a rolling upgrade take real voters down, one at a time, against a real quorum. A real council had one side effect: two refusal tests that started two nodes now met a two-voter council, which the leader refuses to roll at all (see "Two voters, no way through" below), before the refusal they were written to check. They start three nodes now. (Since 0.2.1 every cluster test here starts three: the council holds an odd number of voters, so a fourth node would sit out as a worker, and the harness waits for the full three-voter council instead.)
 
 **`rolling_upgrade_walks_workers_council_then_leader`** is the milestone test. Deploy a workload, push the signed blob to the leader's Pickle, POST the plan, and then just *watch* `/v1/upgrade/cluster` — any node can serve it, it's replicated — recording when each node first reports `Healthy`. The assertions read like the design doc: worker first; old leader last; the cluster still has a leader at the end; all four nodes report v0.2.0; and the app stays *reachable* across the whole roll. Note that last one is an **availability** assertion, not a same-pid one: unlike the single-node case (§14.7), a cluster's scheduler may legitimately reschedule an app while its host node bounces, so pid-identity is the wrong thing to demand here — "still serving, still has a running instance" is the honest cluster guarantee.
 
@@ -827,7 +859,32 @@ The second gap is quieter. The orchestrator marks a node `Healthy` when `/v1/ver
 The fix works at three layers, because each one can be reached without the others:
 
 - **The binary store** refuses to put different bytes under an existing version (`VersionContentConflict`). Identical bytes are accepted and left alone.
-- **Nodes report what they run.** `/v1/version` gains `binary_sha256`. Hashing a whole bun is CPU work, so the manager does it once, on the blocking pool, and caches it in a `tokio::sync::OnceCell`. `OnceCell::get_or_try_init` takes an async closure; the first caller runs it and everyone else awaits the same result. If the closure fails, the cell stays empty and the next caller tries again, which is what you want for an I/O error.
+- **Nodes report what they run.** `/v1/version` gains `binary_sha256`. Hashing a whole bun is CPU work, so the manager does it once, off the async workers, and caches it in a `tokio::sync::OnceCell`. `OnceCell::get_or_try_init` takes an async closure; the first caller runs it and everyone else awaits the same result. If the closure fails, the cell stays empty and the next caller tries again, which is what you want for an I/O error.
+
+  Doing it on the first request turned out to be a mistake. A debug bun is over 500 MB, and on a loaded host the first `/v1/version` took longer than the 10 s a joining `relish` allows for its compatibility check, so `relish join` failed with "failed to reach cluster member" against an API that was up ([#765](https://github.com/reliaburger/reliaburger/issues/765)). Bun now calls `spawn_running_binary_hash` at boot, which `tokio::spawn`s a task that fills the same cell, and the hash reads the file in 1 MiB chunks instead of loading it whole. The `OnceCell` makes the change small: a request that arrives while the boot task is still hashing awaits that attempt instead of starting a second one.
+
+  Hashing at boot had a catch of its own ([#816](https://github.com/reliaburger/reliaburger/issues/816)). The hash first ran under `tokio::task::spawn_blocking`, Tokio's pool for work that would otherwise stall an async worker. When `main` returns, it drops the runtime, and dropping a runtime waits for every blocking-pool task to finish. Async tasks get cancelled at their next `.await`; a thread halfway through a `read` loop has no `.await` to cancel at. So a start-up error raised after the hash began, say the refusal to change durable ownership mode, sat silent until the whole binary was hashed: 2.5 s on an idle VM, about 17 s under load. Bun didn't even print the error until then, because `main` prints it after `block_on` returns and the runtime is gone.
+
+  The fix hands the hash to a plain `std::thread` that nothing joins and sends the digest back on a `tokio::sync::oneshot` channel:
+
+  ```rust
+  let (digest_tx, digest_rx) = tokio::sync::oneshot::channel();
+  std::thread::Builder::new()
+      .name("binary-hash".to_string())
+      .spawn(move || {
+          let _ = digest_tx.send(hash_running_binary(&stored));
+      })
+      .ok()?;
+  digest_rx.await.ok().flatten()
+  ```
+
+  In C you'd call this a detached pthread; in Go it's what every goroutine already is. Rust's `spawn` returns a `JoinHandle`, and dropping that handle detaches the thread rather than killing or joining it. When `main` returns, the process exits and takes the thread with it, which is exactly what you want for a cache nobody will ever read. The `move` closure takes ownership of `stored` and the sender, so the thread holds nothing borrowed from the caller and can outlive it. The `?` after `.ok()` is the escape hatch: if the OS won't give us a thread, there's no digest, the same as an unreadable file, and the next caller tries again.
+
+  The test needed a hash that's slow on demand, not on a slow machine. A FIFO does it. The test puts a named pipe where the stored binary should be, so the hash blocks in `read` until the test closes the write end. One test drops a runtime while the hash is blocked and fails if the drop takes more than 5 s; another starts the real `bun` with a FIFO nobody writes to and a refused data directory, and fails if it hasn't exited within 30 s. Before the fix both hung.
+
+  Hashing at boot moved the work earlier, but it didn't take the join off the hash ([#884](https://github.com/reliaburger/reliaburger/issues/884)). `/v1/version` still awaits the cell, and the boot task is one thread competing for the CPU with everything else. With 48 busy loops and six copies of the first-run test on a 10-core Mac, the hash of a 593 MB debug bun hadn't finished in any failing run, even 10 s after the join asked for it. On the same Mac at a load average near 60 it took 2.2 s. The join reached `/v1/version` a few seconds after boot, waited its 10 s and failed, 28 times in 30. Every other request in those runs, the token mints and the status checks, answered in under half a second.
+
+  The joiner never wanted the digest. It asks the member for its formats so that it refuses a mismatched cluster before the one-time token leaves the machine. The member's `/v1/cluster/ca` already reports those formats, the joiner already fetches it to learn the CA, and its handler reads the CA from the council's state without touching the hash. So `request_join` now asks the pinned member's `/v1/cluster/ca` instead. It still asks over the CA-pinned connection, so a man-in-the-middle can't lie about the formats, and the 10 s deadline is unchanged. `/v1/version` keeps waiting for the digest, for the reasons above: the upgrade gates need the real bytes, not "pending". The test that pins it serves a `/v1/version` that never answers and fails if the join takes more than 5 s.
 - **One pure gate, `upgrade::plan::check_target`,** compares the target with what every node runs. Same version and different (or unknown) bytes: `SameVersionDifferentBinary`, which tells the operator to give the candidate a new version. Same version and identical bytes everywhere: `TargetCheck::AlreadyRunning`, and relish prints "nothing to do" and exits cleanly. The leader runs the gate in `/v1/upgrade/start` after probing every planned node, before anything goes into Raft. Each node runs it again in `prepare`. And the orchestrator re-checks the digest when a node reports the target version, so a node that changed underneath the walk fails the run instead of passing it.
 
 The API handler maps "already running" to a 200 rather than an error, with a match arm that binds and filters at once:
@@ -995,7 +1052,9 @@ We also didn't make the orchestrator wait for its own registry after a restart. 
 
 In `manager::tests`, `flaky_registry` is a tiny TCP server that follows a script (hang up, answer a status, or serve the blob) and counts requests. `prepare_rides_out_a_registry_that_is_briefly_unavailable` gets a hang-up, then a 503, then the blob, and stages it on the third request. A 404 fails after exactly one request and isn't transient. A registry that never comes back is reported transient with nothing staged. So is one that accepts and never answers, or stalls halfway through the body, and `a_hanging_registry_is_a_transient_failure_within_the_ceiling` checks that it gives up within the ceiling instead of hanging. Finally, and bytes that don't verify aren't transient even though they came over the network. An API test checks the 503/409 split end to end.
 
-The cluster suite gets `a_registry_outage_at_directive_time_does_not_pause_the_upgrade`. It puts a TCP proxy in front of the leader's registry that hangs up on everything for the first 25 seconds, longer than a node's own 10 s budget, so the orchestrator has to re-send. It points the upgrade at the proxy and requires the run to reach `Completed` with every node on v0.2.0, and requires that the outage actually turned fetches away. Otherwise the test would prove nothing.
+The cluster suite gets `a_registry_outage_at_directive_time_does_not_pause_the_upgrade`. It puts a TCP proxy in front of the leader's registry that hangs up on everything, points the upgrade at the proxy, and keeps the proxy down until the run's state shows a directive that failed on it. Only then does it reopen the proxy. So the node has used up its own 10 s budget and answered 503, and the orchestrator has to re-send. The test requires the run to reach `Completed` with every node on v0.2.0, and requires that the outage actually turned fetches away. Otherwise the test would prove nothing.
+
+The first version timed the outage instead: 25 seconds from when the proxy started. That flaked twice over (#908). On a loaded host, pushing the binary and starting the run took up to 45 seconds, so the outage was over before the first directive and the test failed with "proved nothing". And with the outage hit, three swaps of 45 to 55 seconds each brought the walk within seconds of the harness's 180 s watch, so CI once timed out with the leader, which goes last, still on v0.1.0. Ending the outage on an event, not a clock, fixes the first. For the second, `watch_upgrade` now fails after 180 s *without progress*: any change to the run's phase, a node's phase or a node's retry count restarts the clock. A walk that stops moving still fails, but a slow one no longer does.
 
 ## Asking the wrong node
 
@@ -1412,11 +1471,11 @@ IncompatibleFormats {
 },
 ```
 
-and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58` (a 0.1.5 cluster offered 0.1.6), followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
+and its message leads with them, like every other compatibility refusal in §14.8: `incompatible binary: found protocol 51, state 68; this cluster (reliaburger v0.1.6 (…)) needs protocol 46, state 63` (a 0.1.6 cluster offered 0.2.0), followed by the remedy and the policy link. Keeping the pairs typed rather than baked into a string lets a test match on `found` and `expected` directly instead of grepping prose.
 
 The check runs last among the start gates, after the cheap probes, because it's the expensive one: a fetch, a hash and a process spawn. It sits under a twenty-second `tokio::time::timeout`, since a follower that forwarded the call gives up after thirty.
 
-Only a definite answer refuses: other formats, a bad signature, a blob the registry doesn't have. Those are 409s and nothing reaches Raft. Our first draft also refused when the registry was unavailable, and the cluster suite caught it straight away: `a_registry_outage_at_directive_time_does_not_pause_the_upgrade` points the nodes at a registry that drops every connection for 25 seconds, and the start itself now waited out the node-side retry budget and timed out. An outage says nothing about the candidate, and "One blip is not a refusal" already taught the nodes to ride one out. So the leader asks once (a small `Fetch::Retrying` / `Fetch::Once` enum threaded through `fetch_binary`, rather than a bare `bool` nobody can read at the call site), logs that it couldn't check, and records the run. The nodes still check every candidate themselves.
+Only a definite answer refuses: other formats, a bad signature, a blob the registry doesn't have. Those are 409s and nothing reaches Raft. Our first draft also refused when the registry was unavailable, and the cluster suite caught it straight away: `a_registry_outage_at_directive_time_does_not_pause_the_upgrade` points the nodes at a registry that drops every connection, and the start itself now waited out the node-side retry budget and timed out. An outage says nothing about the candidate, and "One blip is not a refusal" already taught the nodes to ride one out. So the leader asks once (a small `Fetch::Retrying` / `Fetch::Once` enum threaded through `fetch_binary`, rather than a bare `bool` nobody can read at the call site), logs that it couldn't check, and records the run. The nodes still check every candidate themselves.
 
 ### Asking the nodes what they hold
 
@@ -1556,6 +1615,10 @@ if quorum_ok || !voter_phase {
 
 We didn't let `abort` end a waiting run. A run waiting on quorum may already have moved its workers, and `abort` refuses once a node has moved for a good reason: it would leave the cluster on two versions. Refusing the run up front removes the one case with no exit, without loosening the rule for the cases that have one.
 
+### Two machines, one voter
+
+The table above has a second lesson in it, and 0.2.1 took it (D12, #694). A two-voter council can't survive losing either voter, and it can't upgrade, so why did the reconciler ever build one? It promoted every eligible node up to seven, and nothing kept the count odd. Now the council holds the largest odd number of voters the live nodes allow (chapter 2, "Odd numbers only"), so the pair of thin clients forms a one-voter council: the voter execs in place, the other machine upgrades as a worker, and the refusal never fires. The check stays anyway. A council an older release left at two voters, or one a decommission shrank to two, still has no way through, and the reconciler needs a tick or two to put it back to one. A guard that costs one comparison is cheap insurance for that window.
+
 We didn't upgrade the leader first on a two-voter council either. The leader execs in place in under a second, so in principle the pair would survive it. In practice that's a second upgrade order with its own failure modes, written for a cluster size that can't survive losing a machine anyway. Three is the smallest council that tolerates a failure, so it's the smallest one we roll.
 
 ### Tests
@@ -1563,3 +1626,308 @@ We didn't upgrade the leader first on a two-voter council either. The leader exe
 `plan::tests` pins the arithmetic: `a_two_voter_council_is_refused_before_the_run_is_recorded` checks the variant's fields and that the message asks for three voters, and `one_voter_or_three_and_more_can_roll` walks the sizes that pass, zero included. `bun::api`'s `a_two_voter_council_refuses_to_roll_and_three_voters_can` checks the wiring: it forms an in-memory Raft council of two voters and one of three, and the handlers' check reads each one's configured voters, refusing the pair with a 409 that asks for a third node and letting the trio through.
 
 We first wrote that as a real-binary test in the cluster upgrade suite, and it timed out waiting for the second node to vote. Three minutes in, the council still had one voter. The suite's own forwarding test says why in a comment: its harness keeps a one-voter council, so it can't build a two-voter one at all. We kept the in-memory version rather than teach the harness to grow its council for one assertion.
+
+
+## The headline command that couldn't
+
+`relish upgrade start v0.2.0` is the command the whole chapter builds up to, and the 0.2.0 audit ([#687](https://github.com/reliaburger/reliaburger/issues/687)) found that it had never worked against a published release. Three things were wrong, and each one alone was enough.
+
+The first was the signature. A network upgrade needs two: the release's and the operator's (§14.2). `package.py` writes the release one into `metadata.json` and, quite properly, `null` for the operator's, because only the operator holds that key. The version form copied that `null` straight into the directive, and `--sig` only worked with `--binary`. Every node then refused with `ExternalKeyRequired` or `ExternalSignatureInvalid`. The only working path was to download the binary by hand, countersign it, and roll it with `--binary`.
+
+The second was the platform. relish chose the artefact with `platform_key()`, which is `std::env::consts::OS` and `ARCH` of the machine relish runs on. From a Mac that's `macos-aarch64`, and there is no bun for macOS in the metadata, so the command found nothing. From an x86_64 admin box upgrading arm64 nodes it found something worse: the wrong architecture, which then failed the `--compatibility` probe on every node.
+
+The third was the fallback. relish decides between a cluster and a single node by asking `GET /v1/upgrade/cluster`, and it treated *any* error as "no council here". A timeout or a 502 in a real cluster turned a rolling upgrade into a single-node one, aimed at whichever node relish happened to be connected to. Possibly the leader. No ordering, no quorum check, no run record, and in the network form a directive pointing at a temp file that existed only on the laptop.
+
+### Asking the nodes
+
+The fix for the platform is to ask the right machine. `/v1/version` now carries `platform`, and relish asks every live node through the connected node's relay (the same one `relish wtf` uses), so it works from a laptop that can't reach the guests directly. Then it picks one artefact per platform present:
+
+```rust
+let mut chosen = BTreeMap::new();
+for node in nodes {
+    let (platform, artifact) = release
+        .platforms
+        .get_key_value(&node.platform)
+        .ok_or_else(|| /* names the node and its platform */)?;
+    chosen.insert(platform.as_str(), artifact);
+}
+Ok(chosen.into_iter().collect())
+```
+
+`get_key_value` returns the map's own copy of the key as well as the value, both borrowed from `release`. That matters for the return type, `Vec<(&'a str, &'a PlatformArtifact)>`: the `'a` says both halves live as long as the metadata does, which the node's own `String` wouldn't. A `BTreeMap` rather than a `HashMap` gives a sorted, deterministic order, so the download log and the tests don't depend on hashing.
+
+One artefact per platform means the cluster run has to carry several builds, and each node has to get its own. `ClusterUpgradeState` used to hold one `binary_sha256` and one pair of signatures. It now holds `binaries: Vec<PlatformBinary>`, and every `NodeUpgradeRecord` remembers its node's `platform`, filled in from the probes the leader already makes at start, or from the orchestrator's first poll. The choice itself is strict:
+
+```rust
+match platform {
+    Some(platform) => binaries.iter().find(|binary| binary.platform == platform),
+    None => match binaries {
+        [only] => Some(only),
+        _ => None,
+    },
+}
+```
+
+`[only]` is a *slice pattern*: it matches a slice of exactly one element and binds it. A node whose platform we know gets exactly its own build or nothing; one we haven't heard from yet gets the only build if there is just one. "Nothing" becomes a refused directive that pauses the run with `the upgrade carries no v0.2.0 build for platform linux-aarch64`, which beats handing it an x86_64 binary. The leader checks the same thing before it records the run, so in practice that refusal comes back to relish as a 409.
+
+The orchestrator change ran into the borrow checker in a way worth showing. The walk loops over `state.nodes.iter_mut()` and, inside the loop, needs to build a directive from the rest of `state`. Rust won't let you hold a mutable borrow of one field while also borrowing the whole struct. Cloning `state` every tick would work but copies the node list, which can be thousands long. Instead:
+
+```rust
+let nodes = std::mem::take(&mut state.nodes);
+let binaries = state.clone();
+state.nodes = nodes;
+```
+
+`std::mem::take` moves the vector out and leaves an empty one in its place, so the clone copies everything but the nodes. Then the vector goes back. Three lines, no `unsafe`, and the compiler is satisfied that nobody can see the node list half-moved.
+
+### The operator's signature
+
+The version form now takes `--external-key`: relish downloads each build, checks its hash against the metadata, and countersigns it with the operator's key, using the same `signing::countersign` that `relish dev countersign-binary` uses. Or the operator countersigns beforehand and passes the envelope with `--sig`, as long as every node shares one platform (one envelope signs one binary). If neither is given, and the metadata comes from a public host that has no operator signature, relish stops before downloading anything and says which flag to pass. Better one clear refusal on the laptop than a 409 from every node.
+
+### Only "no council" means single node
+
+The fallback now reads the answer as a type, not a hope:
+
+```rust
+pub fn topology(answer: Result<serde_json::Value, RelishError>) -> Result<Topology, RelishError> {
+    match answer {
+        Ok(state) => Ok(Topology::Cluster(state)),
+        Err(RelishError::ApiError { status: 503, ref body }) if says_no_council(body) => {
+            Ok(Topology::SingleNode)
+        }
+        Err(error) => Err(error),
+    }
+}
+```
+
+The middle arm combines three things. It destructures the error variant and matches the literal `503` in its `status` field at the same time. `ref body` borrows the field instead of moving it out, because the guard (`if says_no_council(body)`) runs before Rust knows the arm is taken, and if the guard fails the last arm still needs the whole `error`. And the guard compares the body's `error` with `crate::upgrade::NO_COUNCIL`, the same constant the bun handlers answer with, so the two sides can't drift apart. `start`, `status` and `rollback` all go through `topology`, and every other failure surfaces as itself.
+
+### Staging that cleans up after itself
+
+On a single node the downloaded binary has to land somewhere the local bun can read. It used to go to `$TMPDIR/reliaburger-upgrade-<sha>` with `std::fs::write`, a predictable name that follows a symlink someone planted there, and it was never removed. Now `StagedBinary` holds a `tempfile::TempDir`, created owner-only with a random name, and writes the file with `create_new`, which refuses anything already at the path. `TempDir` deletes the directory in its `Drop` implementation, so the staged copy disappears as soon as the `StagedBinary` goes out of scope, after the node has answered (it reads the file before it does). That's RAII (resource acquisition is initialisation): the value owns the resource, so the cleanup can't be forgotten on an early `return` or a `?`.
+
+### Same format only, until 1.0
+
+Fixing all of that still leaves an honest problem. Every release from 0.1.0 to 0.2.0 changed the cluster protocol or the state format, and nodes refuse a binary with another pair. So no published release has ever rolled onto another, and none could. The maintainer's decision (D31 in [#674](https://github.com/reliaburger/reliaburger/issues/674)) was to say so plainly: until 1.0, self-upgrade works between builds of the same format, and a format change needs a fresh cluster. Shipping a patch release that keeps its predecessor's pair, and qualifying a real published-to-published walk on it, is a goal rather than a 0.2.0 gate.
+
+Two changes make that rule visible before anyone hits a refusal. `package.py` now publishes each release's `compatibility` pair in `metadata.json`, read from `CURRENT` in `src/compatibility.rs`, and `relish upgrade check` compares it with what the cluster speaks. A 0.1.6 operator asking about 0.2.0 gets `v0.2.0 changes the cluster formats (protocol 46 -> 51, state 63 -> 68), so it needs a fresh cluster`, not a command the cluster will refuse. `start` refuses the same release before it downloads anything. The [release guide](../releasing.md#upgrading-from-016) has the recreate procedure and the list of what doesn't survive it.
+
+The other change is the version number. Builds from main said `0.1.6` while speaking 51/68, so a tip `relish setup --quickstart` downloaded released 0.1.6 nodes that refused it, its refusals named "reliaburger v0.1.6" next to the new pair, and a dev `bun-v0.1.6` collided in the binary store with the real one. Main is now `0.2.0-dev`. `BinaryVersion::is_pre_release` asks semver whether the version has a pre-release part, and quickstart refuses a pre-release without `--development-binaries` or a candidate mirror, because there is nothing correct to download for it.
+
+### Tests
+
+`relish::upgrade::tests` covers each finding. `version_form_carries_the_countersigned_external_signature` checks that both `--external-key` and a countersigned `--sig` produce a signature `verify_binary` accepts with the operator's key, and that neither, an envelope for other bytes, or one never countersigned is refused. `artefact_is_chosen_per_node_platform_not_cli_host` gives an arm64 cluster, a mixed one and a node on a platform the release lacks. `a_cluster_timeout_does_not_fall_back_to_single_node` and `only_no_council_answer_selects_the_single_node_path` pin `topology`. `check_reports_a_format_change_as_needing_a_fresh_cluster` renders `check` for both pairs, and `network_download_is_staged_privately_and_removed` checks the directory's mode and that dropping the value removes it.
+
+On the bun side, `upgrade::orchestrator`'s `each_node_is_directed_to_the_build_for_its_own_platform` and `a_node_whose_platform_has_no_build_fails_instead_of_taking_another` drive the walk with mock nodes on two platforms, and `upgrade::plan`'s `each_node_is_compared_with_the_build_for_its_platform` does the same for the start-time checks. `metadata_json_carries_the_compatibility_pair` in `scripts/release/test_package.py` packages a release and compares the pair with the source. Quickstart's `a_dev_version_without_development_binaries_is_refused` pins the new refusal.
+
+The gated cluster suite gained `version_form_rolls_the_nodes_platform_build_countersigned_by_relish`. It serves release metadata from a local HTTP server, with the real build under the nodes' platform and a decoy under another, and runs `relish upgrade start v0.2.0 --external-key` against four real nodes. A copy of the metadata one protocol generation on is refused with "fresh cluster" before anything is recorded; the real one completes. Every node in that harness runs on the test host's platform, so it can't show a mixed cluster; the unit tests do that.
+
+### What we decided not to do
+
+We didn't make the leader download the release. It would know every node's platform without asking, but it would need outbound internet access that air-gapped clusters don't have, and the operator's key would have to live on the cluster. Keeping download and countersigning on the operator's machine keeps that key off every node.
+
+We didn't let `--binary` cover a mixed cluster. One file is one architecture's build. Taking a `--binary` per platform would be possible, but the version form already does that job with less to get wrong.
+
+And we didn't sign the metadata. It's still a list of things that exist, and the binary signatures are still the trust anchor. The new `compatibility` field can at worst make `check` give wrong advice; the nodes' own `--compatibility` probe is what actually refuses.
+
+
+## A swap that deposed the leader
+
+The cluster suite's `paused_upgrade_can_be_aborted_or_replaced_by_a_rollback` poisons one node's v0.2.0, lets the run pause, aborts it and starts another one that should pause on the same node ([#783](https://github.com/reliaburger/reliaburger/issues/783)). On a second laptop it failed three times in a row. Twice the second run didn't pause first: it upgraded other nodes, then paused on the poisoned one, and the test timed out waiting for every node to be back on v0.1.0.
+
+The test plans each run from the current leader: the leader goes last, and the first other node in its list goes first. That's the node it poisoned. So if leadership moved between the two runs, the poisoned node was no longer first in the walk. Both bad version maps fit exactly that. Why would leadership move, though? Nothing in the test kills the leader.
+
+So we watched it. A task in the test polled every node's `/v1/cluster/council` every 100 ms and printed the leader and term whenever they changed, and the upgrade manager printed a timestamp at each step of `prepare`. Five of six voter swaps took leadership away from a healthy leader, on a Mac where the test still passed:
+
+```text
+fetch-end    776345
+verified     782992    6.6 s of signature checks
+probe-end    787097
+n1: down     787683    n1's API stops answering
+stage-end    796895    9.8 s of staging
+exec         796929
+n0: leader=null term=2   797114
+```
+
+The node being upgraded (n1) did seconds of synchronous work inside an `async fn`. `verify_binary` hashes the whole binary with SHA-256 and checks two Ed25519 signatures over it, and `stage` reads the copy already on disk, hashes both, writes and syncs. On a 590 MB debug build that's the better part of 16 s. A Tokio worker that's busy in plain code can't run anything else, and tasks queued behind it on that worker wait too. The council's Raft core was one of them. It missed the leader's heartbeats, so when staging finished its election timer had long expired, and it called an election at term 2 just before it exec'd. The leader saw the higher term and stepped down. The cluster elected someone again about two seconds later, usually the old leader. Sometimes not.
+
+The rollback path already did this right: `prepare_rollback` reads and verifies the stored binary inside `tokio::task::spawn_blocking`. The upgrade path now does the same. Here's the signature check:
+
+```rust
+let release_keys = self.release_keys.clone();
+let external_key = self.external_key;
+let checked = envelope.clone();
+let (bytes, verified) = tokio::task::spawn_blocking(move || {
+    let verified = signing::verify_binary(
+        &bytes,
+        &checked,
+        &release_keys,
+        external_key.as_ref(),
+        is_network,
+    );
+    (bytes, verified)
+})
+.await
+.map_err(std::io::Error::other)?;
+verified?;
+```
+
+`spawn_blocking` runs the closure on Tokio's separate pool of threads that are allowed to block, so the workers stay free for heartbeats and API calls. The closure must be `'static`: it can outlive the function that started it, so it can't borrow anything from it. The `move` keyword moves the 590 MB `Vec<u8>` into the closure, which costs nothing (a `Vec` is a pointer, a length and a capacity). Then we need the bytes back for the compatibility probe and for staging, so the closure returns them in a tuple next to the result. That's the usual way to lend owned data to another thread in Rust: hand it over and get it back, instead of sharing it behind a lock. `external_key` is an `Option<[u8; 32]>`, which is `Copy`, so assigning it copies it and there's nothing to clone.
+
+The `.await` gives a `Result<(Vec<u8>, Result<(), UpgradeError>), JoinError>`: the outer error means the closure panicked. `std::io::Error::other` turns that into an I/O error, and `UpgradeError`'s `#[from] std::io::Error` lets `?` convert it the rest of the way. The inner result is the verification itself, checked with `verified?` once we have the bytes back.
+
+Staging does the same with the store. `BinaryStore` is a directory path and a file name stem, so cloning it is cheap, and the clone moves into the closure with the bytes and the envelope. The first-upgrade bootstrap that copies the running executable into the store when it isn't there yet went in with it. It used to be a method on the manager, and a closure that called it would have had to borrow `self`, which a `'static` closure can't. Now it's a free function that takes the store and the running version, so the closure can own what it needs.
+
+### Tests
+
+`upgrade::manager`'s `preparing_a_large_binary_leaves_the_runtime_free` runs `prepare` on a single-threaded runtime with a 96 MB candidate (a shell script that answers `--compatibility`, exits, and then carries 96 MB of padding it never reads). Beside it, a ticker task sleeps 5 ms at a time and records the longest gap between wake-ups. With one runtime thread, any work done in place stops the ticker for exactly as long as it takes. Before the change the longest gap was 489 ms of a 1.36 s `prepare`; the test allows 250 ms, a quarter of Raft's shortest election timeout.
+
+The cluster test's assertions stay as they were. (Its harness now strips local symbols as well as debug ones from the candidate it pushes: on the Mac the build had grown to 540 MB with debug symbols gone, past the registry's 512 MiB upload cap, and the suite couldn't start.) Its plan depends on who leads, and that dependence is what caught a bug that would otherwise only have shown up as a leader election per upgraded node in production logs. With the change, the leader-and-term poller showed term 1 and the same leader through all four voter swaps of two runs.
+
+### What we decided not to do
+
+We didn't stop a node from campaigning while it prepares a swap. Switching its elections off (`raft.runtime_config().elect(false)`) would hide this symptom, but the cause was a starved runtime, and a starved runtime also delays the node's API answers and gossip. Moving the blocking work off the workers fixes all three.
+
+We didn't lengthen the election timeout either. One to two seconds is what lets the cluster notice a dead leader quickly, and a node that blocks its own workers for ten seconds would still outlast any sensible value.
+
+### The stalls the first fix left behind
+
+The new test then failed in CI, twice, but only in the coverage run: "prepare held the runtime for 291 ms of its 3.28 s" ([#794](https://github.com/reliaburger/reliaburger/issues/794)). Coverage instrumentation makes everything slower, so it's tempting to call that noise and raise the bound. But the ticker doesn't measure how slow `prepare` is. It measures how long the worker went without running anything else, and the hashing and staging were already elsewhere. So something else was still on the worker.
+
+We reproduced it on a Mac by running the test 200 times under `cargo llvm-cov nextest --stress-count 200` while two loops wrote and synced 512 MB files and four more spun the CPU, with other agents' builds running beside them (load average 55 to 70 on 12 cores). Four runs failed, with stalls of 251 to 416 ms. Recording a timestamp at each step and lining the timestamps up against the ticker's gaps found three culprits, none of them hashing:
+
+- **The marker's syncs.** `UpgradeMarker::store` writes the `Staged` marker, syncs it, renames it and syncs the directory. That's a few hundred bytes, but a sync waits for the disk, and on a disk that has just taken 96 MB of staged binary it waited up to 516 ms.
+- **The probe's delete.** The compatibility probe runs a private copy of the candidate. That copy is a `tempfile::TempPath`, which deletes its file when it's dropped, and it was dropped at the end of `check_binary`, on the worker. Deleting a 96 MB file frees every page of it: up to 230 ms.
+- **The copy of the bytes.** `check_binary` took its own `Vec<u8>`, so `fetch_verified` called `bytes.clone()` on the worker, a 96 MB allocation and copy.
+
+The second one is worth a moment, because it's the Rust one. `Drop` is Rust's destructor: a type can implement it, and the compiler calls it wherever a value goes out of scope, with nothing in the source to mark the spot. That's what makes `TempPath` tidy (you can't forget to delete the file), and it's also why blocking work can hide behind a closing brace. In async code, ask where the drop happens, not just where the work starts.
+
+The fix moves each of the three to the blocking pool. The verification closure now writes the probe's copy too, from the bytes it has just checked, so there's no second copy at all:
+
+```rust
+let (bytes, probe) = tokio::task::spawn_blocking(move || {
+    let probe = signing::verify_binary(
+        &bytes,
+        &checked,
+        &release_keys,
+        external_key.as_ref(),
+        is_network,
+    )
+    .and_then(|()| super::compatibility::write_probe(&bytes, &probe_directory));
+    (bytes, probe)
+})
+.await
+.map_err(std::io::Error::other)?;
+```
+
+`Result::and_then` runs its closure only when the result is `Ok`, so a candidate that fails its signature check is never written anywhere executable. The closure's parameter is `()`, the unit value an `Ok(())` carries, written as a pattern. `write_probe` returns a `Probe`, a newtype around the `TempPath`, and `query_probe` takes it by value, launches it, and hands it to the blocking pool to be deleted:
+
+```rust
+let answer = query(&probe.0).await;
+let _ = tokio::task::spawn_blocking(move || probe.0.close()).await;
+answer
+```
+
+Taking `Probe` by value means the caller can't keep it, so the delete can only happen in one place. `close()` is `TempPath`'s explicit delete. It returns the I/O error that `Drop` would have swallowed, and we ignore it the same way: the answer is what the caller needs, and a stray temporary file doesn't change it. Staging got the marker. The manager builds the `UpgradeMarker` first, moves it into the staging closure, and the closure stores it after the binary and hands it back, as the verification closure hands back the bytes. The rollback path had the same delete and the same syncs on its worker, so it got the same treatment.
+
+How we measured mattered too. The first timestamps went out with `eprintln!`, and on the loaded Mac a line to the log file sometimes took 270 ms by itself, which looked like yet another stall. The fixture's own `upgrade-fixture phase=...` lines do the same under `--no-capture`. Pushing the timestamps onto an in-memory list and printing it once at the end gave clean readings. (CI captures each test's output through a pipe, so it doesn't pay this; the timestamps did.) Two control tests, a ticker beside a bare two-second sleep and a ticker beside a blocking-pool hash of 96 MB, never saw more than 25 ms on the same loaded machine. So the bound wasn't too tight for the machine, and it stayed at 250 ms. After the fix the same 200-run loop, under the same load, passed 200 times out of 200.
+
+### The probe's launch
+
+One more step sat in the same timeline without causing the election: about 4 s between `verified` and `probe-end` ([#793](https://github.com/reliaburger/reliaburger/issues/793)). Most of that is the launch. `tokio::process::Command::spawn` looks async because it lives in `tokio`, but it's a plain function: no `.await`, and it returns only once the kernel has exec'd the new program. On macOS the first exec of a new file waits while the host assesses it, and the probe's private copy is always new. So the worker sat in `spawn` for seconds, exactly as it had sat in the hashing.
+
+The launch now goes to the blocking pool, with the same hand-over-and-hand-back as the bytes:
+
+```rust
+let launched = tokio::task::spawn_blocking(move || {
+    let launched = command.spawn();
+    (command, launched)
+})
+.await
+.map_err(std::io::Error::other)?;
+```
+
+The command comes back because a launch that fails with `ETXTBSY` is retried. Blocking-pool threads carry the runtime's context, so the child is still one the runtime can wait on, and if the upgrade is cancelled mid-launch, the child is dropped when the launch finishes and `kill_on_drop` stops it. We had two other patterns to hand. The managed-status check pays the assessment ahead of time by running the binary once early, but here the probe *is* that first run, so there's nothing earlier to move it to. The boot-time hash runs on a detached `std::thread` so that a start-up error doesn't wait for it, but the probe's answer is the very next thing the upgrade needs, and a plain thread has no runtime to register the child with. `spawn_blocking` is the simplest of the three.
+
+`upgrade::compatibility`'s `a_slow_probe_launch_leaves_the_runtime_free` is the same ticker test, around a launch made slow on purpose. It can't rely on Gatekeeper being slow (CI's Linux has no Gatekeeper at all), and a script that sleeps doesn't help: `spawn` returns as soon as exec succeeds, before the script's first line runs. Instead the test gives the command a `pre_exec` hook, which runs in the forked child just before exec, that sleeps for a second. The parent's `spawn` waits that second on any host. Before the change the ticker saw a 1.0 s gap; now it sees milliseconds. The first draft of the test passed against the old code, though. On a one-thread runtime the ticker doesn't start until the test yields, and the old launch blocked before its first `.await`, so the ticker missed it entirely. A `tokio::task::yield_now().await` before the launch lets it take its first reading.
+
+## A binary too big to hold
+
+The 0.2.0 soak upgraded a three-node cluster of 2 GiB Lima VMs to a 114 MB signed build. Seven seconds after `relish upgrade start`, the kernel killed Bun on node 1: `Out of memory: Killed process 141380 (bun) ... anon-rss:1084604kB` ([#892](https://github.com/reliaburger/reliaburger/issues/892)). The harness had run `relish` on node 1, so the binary went into node 1's registry, and node 1 was the first node the leader told to upgrade. Then it fetched the binary from itself.
+
+Count the copies. The registry's blob `GET` read the whole file into a `Vec<u8>` before it answered. The upgrade manager's `fetch_once` collected the response with `response.bytes()` and turned that into a `Vec` with `to_vec()`, a second copy while the first was still alive. The leader's start-time check had just done the same against node 1's registry, which cost node 1 another read of the blob. So a node that already used 600 MB (more on that in [chapter 3](03-talking-to-each-other.md#the-buffer-every-connection-kept-020-soak-fix)) needed several hundred more for a few seconds, on a machine with 2 GiB and no swap.
+
+We wrote the test before touching the code. `tests/upgrade_memory.rs` is its own test binary with a counting global allocator, like `tests/mayo_memory.rs`: every heap allocation in the process goes through it, so it can say exactly how much heap a call had live at its peak. Each test writes a 64 MiB candidate to disk, signs it, drops the bytes, and only then starts counting. Before the fix:
+
+| Path | Peak heap above the start |
+|------|---------------------------|
+| `prepare` from a registry | 193 MB |
+| the leader's `check_candidate` | 193 MB |
+| `prepare` from a local file | 67 MB |
+| `prepare_rollback` | 67 MB |
+
+Three times the binary for a registry fetch, once for everything else. After the fix the four peaks are 388 KB, 518 KB, 3 KB and 3 KB, and the tests allow 4 MiB whatever the binary's size.
+
+### The candidate lives on disk
+
+The fix is a new type, `upgrade::candidate::Candidate`, a newtype around `tempfile::TempPath`: a private file, created owner-only under an unpredictable name in the binary directory, deleted when the value is dropped. A registry fetch writes each piece of the body to it as it arrives:
+
+```rust
+let (candidate, mut file) = Candidate::create(&self.candidate_directory()?).await?;
+while let Some(piece) = response
+    .chunk()
+    .await
+    .map_err(|e| unavailable(e.to_string()))?
+{
+    file.write_all(&piece).await?;
+}
+file.flush().await?;
+drop(file);
+Ok(candidate)
+```
+
+`response.chunk()` returns `Option<Bytes>`: the next piece of the body, or `None` at the end. `while let` loops for as long as the pattern matches, so the loop ends on `None`. A body cut off before its declared length comes back as an error, which the `map_err` turns into the same transient `FetchUnavailable` a dropped connection gives. The `flush` isn't decoration. A `tokio::fs::File` does its writes on the blocking pool, and `write_all` can return before the last one has landed. We also drop the handle on purpose, because Linux refuses to `exec` a file that something still holds open for writing (`ETXTBSY`), and the compatibility probe is about to run this very file.
+
+Every exit from that function that isn't `Ok` drops `candidate`, and its `Drop` deletes the file. So does a retry's timeout, which drops the whole `fetch_once` future mid-flight. A half-downloaded binary can't be mistaken for a whole one, and it can't pile up. A local-file upgrade (`relish upgrade start --binary` on a single node, or a download relish staged) goes through `Candidate::copy_from`, which copies the operator's file into a candidate with `std::io::copy`. On Linux that moves the bytes inside the kernel. The copy is the point: the operator's path can change after we read it, and the copy can't.
+
+### Verifying bytes you don't hold
+
+Hashing a file in pieces is easy. The signatures are the problem. Ed25519 signs the whole message, and `ring` checks a signature over one contiguous `&[u8]`. There's no streaming API to feed it pieces. We could have changed what gets signed (a signature over the SHA-256, say), but every release in the wild is signed over its raw bytes, so that would have been a new signing scheme to solve a memory problem.
+
+A read-only memory map gives `ring` its slice without putting the bytes on the heap:
+
+```rust
+let file = std::fs::File::open(&self.0)?;
+if file.metadata()?.len() == 0 {
+    return signing::verify_binary(&[], envelope, release_keys, external_key, network);
+}
+// SAFETY: the map is undefined behaviour only if the file changes
+// while it is mapped. This file is a private copy that this process
+// created owner-only, under an unpredictable name in the binary
+// directory, and has finished writing; nothing else writes it, and
+// the map is dropped before this function returns.
+let map = unsafe { memmap2::Mmap::map(&file)? };
+signing::verify_binary(&map, envelope, release_keys, external_key, network)
+```
+
+That `unsafe` block is worth reading slowly. `unsafe` doesn't switch off the borrow checker. It lets you call a function whose safety the compiler can't prove, and in exchange you write down why it holds. `Mmap::map` is `unsafe` because a `&[u8]` promises the bytes behind it won't change while it's alive, and the kernel makes no such promise about a file someone else can write (or truncate, which turns a read into a `SIGBUS`). Here nobody else can: we made the file, we stopped writing it, and nothing else knows its name. `Mmap` derefs to `&[u8]`, so `&map` passes straight to the existing `verify_binary`, and the old in-memory function is still the only place that decides whether a binary is trusted.
+
+Why is this better than reading the file? The mapped pages come from the page cache. They count as file-backed memory rather than anonymous memory, and under pressure the kernel can drop them and read them back later. The OOM killer's arithmetic in the journal (`anon-rss`) never sees them.
+
+The checked candidate then becomes the compatibility probe (`Candidate::into_probe` sets it to `0700`), and when the probe answers, `BinaryStore::stage_file` fsyncs it, makes it `0755` and renames it into place as `bun-v0.2.0`. The binary directory is on one filesystem, so that's a `rename(2)`, not a copy. There's a nice side effect: the bytes that run as the new Bun are the same file the signatures and the probe checked, not a second copy written from memory. The leader's `check_candidate` deletes its probe instead, on the blocking pool as before.
+
+A file Bun writes into the binary directory and then never removes is a new way to leak, this time on disk. A Bun killed mid-download can't run its `Drop`. So `startup_action` sweeps `.candidate-*` and `.staging-*` files left in the directory, but only ones nobody has touched for ten minutes: several local nodes can share one build directory, and one of them may be downloading right now.
+
+### The rest of the path
+
+Two more places held the whole binary. The registry's blob `GET` now opens the file and streams it with `tokio_util::io::ReaderStream` in 64 KiB pieces, with the length from the file's metadata. An open file stays readable even if garbage collection unlinks the blob halfway through, so the stream can't be cut short by GC. `pickle::api`'s `blob_get_streams_a_large_blob_in_bounded_pieces` reads a 3 MiB blob back and checks that no piece is bigger than the read buffer. Before, it arrived as one 3 MiB piece.
+
+And `relish` itself. It often runs on a node (the soak's harness does), and it read the operator's `--binary` into memory, then pushed `bytes.to_vec()`: two copies in a process on the same 2 GiB machine. Now it hashes the file in pieces, and `push_blob` streams it with `reqwest::Body::wrap_stream` and a declared `Content-Length`. The registry checks the digest, so a file that changed between the hash and the push is refused, not stored. A downloaded release still arrives in memory, because countersigning it with `--external-key` needs the bytes, but relish writes it to a private file straight after and frees them.
+
+The behaviour tests sit beside the memory ones in `upgrade::manager`. A registry that sends half the binary and closes the connection gets a transient refusal and leaves no file behind, and a retry after it stages the whole binary, not the first half with the second appended. A tampered binary is still a `HashMismatch`, now read from the file, and is deleted. A passed leader check leaves nothing in the binary directory.
+
+### What we decided not to do
+
+We didn't add a size limit to the download. The registry already refuses uploads over 512 MiB, and each attempt has a timeout, so a misbehaving registry can't stream into the file forever.
+
+We didn't stream the hash. `fetch_once` could feed SHA-256 as the pieces arrive and refuse a wrong hash before the signature check reads the file again. But `verify_binary` checks the hash first anyway, from the page cache, and one check in one place is easier to trust than two.

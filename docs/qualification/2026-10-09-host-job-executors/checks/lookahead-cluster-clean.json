@@ -1,0 +1,22 @@
+[
+  {
+    "name": "lookahead-cluster-clean-isolated",
+    "command": [
+      "cargo",
+      "nextest",
+      "run",
+      "--run-ignored=only",
+      "-E",
+      "binary(cluster_failover) & test(=decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change)"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "lookahead-cluster-clean-full",
+    "command": [
+      "make",
+      "test-cluster"
+    ],
+    "exit_code": 0
+  }
+]

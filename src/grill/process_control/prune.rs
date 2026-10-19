@@ -62,6 +62,107 @@ impl ProcessControl {
     }
 }
 
+impl ProcessControl {
+    /// Remove the retired generation of a reusable instance identity, so
+    /// identities that never run again leave nothing behind (#678).
+    ///
+    /// The caller must already exclude other lifecycle operations on `id`, as
+    /// an executor pool does for a slot it is retiring. A later `prepare`
+    /// publishes a fresh generation, exactly as on a new node. A generation
+    /// that may still own a process is refused and kept, and so is any but
+    /// `generation`, when the caller names the one it means (#850).
+    pub(crate) async fn forget_retired(
+        &self,
+        id: &InstanceId,
+        generation: Option<&super::super::RuntimeGeneration>,
+    ) -> io::Result<()> {
+        let generation = generation.cloned();
+        self.run(id, move |this, id| {
+            let directory = this.directory(&id)?;
+            let garbage = this
+                .root
+                .parent()
+                .ok_or_else(|| io::Error::other("process owners have no parent"))?
+                .join("forgotten-process-owners");
+            match std::fs::symlink_metadata(&garbage) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+                Ok(_) => reap_forgotten(&garbage)?,
+            }
+            match std::fs::symlink_metadata(&directory) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+                Ok(_) => validate_directory(&directory)?,
+            }
+            let _operation = operation_lock(&directory)?;
+            let _owner = wait_for_owner_lock(&directory)?;
+            let record = this.load(&id)?;
+            if !terminal(&record.phase) {
+                return Err(io::Error::other("process generation has not retired"));
+            }
+            if generation.is_some_and(|generation| {
+                generation != super::super::RuntimeGeneration::process(&record.nonce)
+            }) {
+                return Err(io::Error::other(
+                    "a successor process generation owns the identity",
+                ));
+            }
+            create_directory(&garbage)?;
+            let destination = garbage.join(format!("{}-{}", id.0, record.nonce));
+            // Atomic removal from the inventory first: an interrupted delete
+            // leaves a private garbage directory, never a partial record.
+            std::fs::rename(&directory, &destination)?;
+            File::open(&this.root)?.sync_all()?;
+            File::open(&garbage)?.sync_all()?;
+            remove_forgotten(&destination)?;
+            File::open(&garbage)?.sync_all()
+        })
+        .await
+    }
+}
+
+/// Finish deletions an earlier [`ProcessControl::forget_retired`] began.
+///
+/// Forgets of different generations run at once (an executor pool forgets
+/// each executor as it goes idle) and share this directory, so an entry can
+/// vanish under one of them while another deletes it.
+fn reap_forgotten(directory: &Path) -> io::Result<()> {
+    validate_directory(directory)?;
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        match validate_directory(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+        remove_forgotten(&path)?;
+    }
+    File::open(directory)?.sync_all()
+}
+
+/// Delete one forgotten generation's bytes, even while a concurrent
+/// [`reap_forgotten`] deletes the same tree (#924).
+///
+/// Publication into the garbage directory already removed the generation
+/// from the inventory, so whichever deletion finishes it, it is gone.
+fn remove_forgotten(path: &Path) -> io::Result<()> {
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            // The other deleter took part of the tree first. Each pass still
+            // removes what is left, so this ends once the tree is gone.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(path) {
+                    Err(absent) if absent.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(other) => return Err(other),
+                    Ok(_) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn terminal(phase: &OwnerPhase) -> bool {
     matches!(phase, OwnerPhase::Cancelled | OwnerPhase::Retired { .. })
 }

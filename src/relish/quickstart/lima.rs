@@ -3,10 +3,17 @@
 use anyhow::{Context, Result, bail};
 use std::{net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
 
+/// How long [`Lima::power_off`] waits for a guest to shut itself down before
+/// falling back to `limactl stop`. A clean shutdown takes a few seconds.
+pub const POWER_OFF_DEADLINE: Duration = Duration::from_secs(120);
+
 /// Runs a selected Lima binary; command errors never include its argument list.
 #[derive(Clone)]
 pub struct Lima {
     executable: PathBuf,
+    /// A script `executable` reads before each command's own arguments.
+    /// Only test stand-ins set it, through `Lima::shell_script`.
+    script: Option<PathBuf>,
     timeout: Duration,
     home: Option<PathBuf>,
     /// Shared by every clone, so only one VM restarts at a time; see `restart`.
@@ -18,9 +25,24 @@ impl Lima {
     pub fn new(executable: PathBuf, timeout: Duration) -> Self {
         Self {
             executable,
+            script: None,
             timeout,
             home: None,
             restarts: Arc::default(),
+        }
+    }
+
+    /// A test stand-in for `limactl`: every command runs `/bin/sh script
+    /// <args>`, so the script is read as data and never launched itself.
+    /// macOS assesses each newly written executable on its first launch, one
+    /// at a time across the whole host, so a fresh script can wait behind
+    /// another process's large binary for over a minute (#762). `/bin/sh` is
+    /// part of the system and never waits.
+    #[cfg(test)]
+    pub(crate) fn shell_script(script: PathBuf, timeout: Duration) -> Self {
+        Self {
+            script: Some(script),
+            ..Self::new(PathBuf::from("/bin/sh"), timeout)
         }
     }
 
@@ -43,6 +65,9 @@ impl Lima {
 
     async fn run(&self, args: &[&str], stdin: std::process::Stdio) -> Result<String> {
         let mut command = tokio::process::Command::new(&self.executable);
+        if let Some(script) = &self.script {
+            command.arg(script);
+        }
         if let Some(home) = &self.home {
             command.env("LIMA_HOME", home);
         }
@@ -63,9 +88,11 @@ impl Lima {
 
     /// Create Lima's shared SSH key before any VM starts.
     ///
-    /// Lima 2.1.0 generates `$LIMA_HOME/_config/user` on first start, but it
-    /// checks for the key before taking its lock and never checks again, so
-    /// VMs created concurrently can overwrite each other's key. We generate
+    /// Lima generates `$LIMA_HOME/_config/user` on first start, but it checks
+    /// for the key before taking its lock and never checks again, so VMs
+    /// created concurrently can overwrite each other's key. That is still true
+    /// of `DefaultPubKeys` in `pkg/sshutil` in 2.2.1 and on Lima's `master`
+    /// (checked 17 October 2026). We generate
     /// the same ed25519 key it would, publishing the public half first because
     /// Lima treats the private file as proof that both exist.
     pub async fn ensure_user_key(&self) -> Result<()> {
@@ -186,6 +213,41 @@ impl Lima {
         }
         drop(turn);
         start.await.map(drop)
+    }
+
+    /// Shut a VM down cleanly, keeping its disk consistent.
+    ///
+    /// `limactl stop` is not a clean shutdown with the vz driver: the Linux
+    /// guest ignores its `RequestStop()`, and after 30 s Lima kills the VM
+    /// (issue #1023). So the guest powers itself off through systemd, which
+    /// stops `bun` and unmounts the disks first, and we wait up to `deadline`
+    /// for Lima to report it `Stopped`. Only if the guest can't be asked, or
+    /// doesn't stop in time, do we fall back to `limactl stop`, and say so.
+    pub async fn power_off(&self, name: &str, deadline: Duration) -> Result<()> {
+        // `--no-block` queues the shutdown and returns, so the SSH session
+        // ends before systemd takes the network down under it.
+        let request = self
+            .command(&["shell", name, "sudo", "systemctl", "poweroff", "--no-block"])
+            .await;
+        if let Err(error) = request {
+            eprintln!(
+                "could not power {name} off from inside ({error:#}); falling back to limactl stop"
+            );
+            return self.command(&["stop", name]).await.map(drop);
+        }
+        let stopped = async {
+            while !matches!(self.status(name).await, Ok(Some(status)) if status == "Stopped") {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        };
+        if tokio::time::timeout(deadline, stopped).await.is_ok() {
+            return Ok(());
+        }
+        eprintln!(
+            "{name} did not power off within {} s; falling back to limactl stop",
+            deadline.as_secs()
+        );
+        self.command(&["stop", name]).await.map(drop)
     }
 
     /// Read the status of exactly one owned VM; absence is not a command failure.
@@ -569,6 +631,91 @@ mod tests {
         );
     }
 
+    /// A stand-in `limactl` for `power_off`: it logs each call, answers
+    /// `list --json` from `list.json`, and on `shell` either fails (when
+    /// `shell-fails` exists) or, when `guest-obeys` exists, marks the VM
+    /// `Stopped` the way a guest that powers off would.
+    fn power_off_fake(status: &str) -> (tempfile::TempDir, Lima) {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("limactl.sh");
+        std::fs::write(
+            &script,
+            r#"dir=${0%/*}
+printf '%s\n' "$*" >> "$dir/calls.log"
+case "$1" in
+  list) cat "$dir/list.json" ;;
+  shell)
+    if [ -f "$dir/shell-fails" ]; then exit 1; fi
+    if [ -f "$dir/guest-obeys" ]; then
+      printf '{"name":"%s","status":"Stopped"}\n' "$2" > "$dir/list.json"
+    fi ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("list.json"),
+            format!(r#"{{"name":"rb-laptop-1","status":"{status}"}}"#),
+        )
+        .unwrap();
+        let lima = Lima::shell_script(script, Duration::from_secs(5));
+        (directory, lima)
+    }
+
+    /// Every call except the `list` reads.
+    fn power_off_actions(directory: &Path) -> Vec<String> {
+        std::fs::read_to_string(directory.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.starts_with("list"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    const POWER_OFF: &str = "shell rb-laptop-1 sudo systemctl poweroff --no-block";
+
+    #[tokio::test]
+    async fn power_off_shuts_the_guest_down_from_inside_and_waits_for_stopped() {
+        let (directory, lima) = power_off_fake("Running");
+        std::fs::write(directory.path().join("guest-obeys"), "").unwrap();
+
+        lima.power_off("rb-laptop-1", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(power_off_actions(directory.path()), vec![POWER_OFF]);
+        assert_eq!(
+            lima.status("rb-laptop-1").await.unwrap().as_deref(),
+            Some("Stopped")
+        );
+    }
+
+    #[tokio::test]
+    async fn power_off_falls_back_to_limactl_stop_when_the_guest_keeps_running() {
+        let (directory, lima) = power_off_fake("Running");
+
+        lima.power_off("rb-laptop-1", Duration::from_millis(300))
+            .await
+            .unwrap();
+        assert_eq!(
+            power_off_actions(directory.path()),
+            vec![POWER_OFF, "stop rb-laptop-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn power_off_falls_back_to_limactl_stop_when_the_guest_shell_fails() {
+        let (directory, lima) = power_off_fake("Running");
+        std::fs::write(directory.path().join("shell-fails"), "").unwrap();
+
+        lima.power_off("rb-laptop-1", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            power_off_actions(directory.path()),
+            vec![POWER_OFF, "stop rb-laptop-1"]
+        );
+    }
+
     #[tokio::test]
     async fn command_input_reaches_the_child_standard_input() {
         let host = tempfile::tempdir().unwrap();
@@ -580,6 +727,20 @@ mod tests {
                 .await
                 .unwrap(),
             "secret-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shell_script_stand_in_runs_without_being_executable() {
+        // Mode 0644: executing the file itself would fail, so a pass shows
+        // the shell reads it as data and no new executable is launched.
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("limactl.sh");
+        std::fs::write(&script, "printf '%s|' \"$0\" \"$@\"\n").unwrap();
+        let lima = Lima::shell_script(script.clone(), Duration::from_secs(2));
+        assert_eq!(
+            lima.command(&["stop", "rb-laptop-1"]).await.unwrap(),
+            format!("{}|stop|rb-laptop-1|", script.display())
         );
     }
 

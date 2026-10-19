@@ -1,0 +1,221 @@
+{
+  "path": "DurableHost",
+  "image": "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
+  "executable_sha256": "f19470457088612bc3285404783d9f93533d917e869050aca13a4139b937c0a5",
+  "command": [
+    "/bin/busybox",
+    "true"
+  ],
+  "count": 1000,
+  "concurrency": 27,
+  "image_preparation_seconds_excluded": 0.147257313,
+  "warmth": "warm-images-after-disclosed-warmup",
+  "warmup_count": 108,
+  "warmup_seconds_excluded": 0.350462738,
+  "executor_timings_before": {
+    "admission": {
+      "samples": 108,
+      "total_microseconds": 8,
+      "maximum_microseconds": 4,
+      "buckets": [
+        108,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "startup": {
+      "samples": 27,
+      "total_microseconds": 4830530,
+      "maximum_microseconds": 199211,
+      "buckets": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        27,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "command": {
+      "samples": 108,
+      "total_microseconds": 254393,
+      "maximum_microseconds": 17760,
+      "buckets": [
+        40,
+        31,
+        22,
+        11,
+        3,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "cleanup": {
+      "samples": 108,
+      "total_microseconds": 29536,
+      "maximum_microseconds": 1680,
+      "buckets": [
+        101,
+        7,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "executor_timings_after": {
+    "admission": {
+      "samples": 1108,
+      "total_microseconds": 184,
+      "maximum_microseconds": 172,
+      "buckets": [
+        1108,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "startup": {
+      "samples": 27,
+      "total_microseconds": 4830530,
+      "maximum_microseconds": 199211,
+      "buckets": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        27,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "command": {
+      "samples": 1108,
+      "total_microseconds": 2481469,
+      "maximum_microseconds": 17760,
+      "buckets": [
+        220,
+        370,
+        394,
+        118,
+        5,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "cleanup": {
+      "samples": 1108,
+      "total_microseconds": 714082,
+      "maximum_microseconds": 6681,
+      "buckets": [
+        875,
+        134,
+        71,
+        28,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "elapsed_seconds": 0.339311807,
+  "verified_successes": 1000,
+  "failures": 0,
+  "retries": 0,
+  "verified_successes_per_second": 2947.141771580026,
+  "container_cpu_request_millicores": 100,
+  "container_cpu_limit_millicores": 1000,
+  "container_memory_bytes": 33554432,
+  "resource_enforcement": "per-command CPU, memory, swap and PID limits before user code",
+  "bare_process_resource_limits": "none; profile fields are comparison inputs only",
+  "node_job_budget_cpu_millicores": 3000,
+  "service_probe_latency_ms": [
+    0.712917
+  ],
+  "durability": "worker grant fence, per-task ledger/index, verified chunk receipts; no Raft admission",
+  "optimised_build": true,
+  "qualified_100m_per_day": false,
+  "namespace_policy_hook": "not injected in direct runner; full Bun dispatch includes live namespace supervision"
+}

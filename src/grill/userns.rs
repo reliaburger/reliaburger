@@ -28,6 +28,10 @@ pub const HOST_ID_BASE: u32 = 2_000_000_000;
 
 /// How many container ids map: 0..65535, the ids images actually use.
 pub const CONTAINER_ID_COUNT: u32 = 65_536;
+/// A helper-only identity outside all permitted image users.
+pub const EXECUTOR_CONTAINER_UID: u32 = 65_536;
+/// Host delegation identity, absent from ordinary containers' uid mappings.
+pub const EXECUTOR_HOST_UID: u32 = 2_100_000_000;
 
 /// Docker's default capability set. Inside a user namespace they only act
 /// on what the namespace owns (the container's files, processes and
@@ -95,18 +99,33 @@ pub fn apply(spec: &mut OciSpec) -> Result<(), UserNamespaceError> {
             path: None,
         });
     }
-    let mapping = vec![OciIdMapping {
+    let mut mapping = vec![OciIdMapping {
         container_id: 0,
         host_id: HOST_ID_BASE,
         size: CONTAINER_ID_COUNT,
     }];
+    if spec.reusable_executor {
+        mapping.push(OciIdMapping {
+            container_id: EXECUTOR_CONTAINER_UID,
+            host_id: EXECUTOR_HOST_UID,
+            size: 1,
+        });
+    }
     spec.linux.uid_mappings = Some(mapping.clone());
     spec.linux.gid_mappings = Some(mapping);
 
-    let capabilities: Vec<String> = DEFAULT_CAPABILITIES
-        .iter()
-        .map(|name| name.to_string())
-        .collect();
+    let names = if spec.reusable_executor {
+        &[
+            "CAP_KILL",
+            "CAP_SETUID",
+            "CAP_SETGID",
+            "CAP_SETPCAP",
+            "CAP_SYS_ADMIN",
+        ][..]
+    } else {
+        DEFAULT_CAPABILITIES
+    };
+    let capabilities: Vec<String> = names.iter().map(|name| name.to_string()).collect();
     spec.process.capabilities = Some(OciCapabilities {
         bounding: capabilities.clone(),
         effective: capabilities.clone(),
@@ -183,6 +202,52 @@ mod tests {
         spec.process.user.uid = 0;
         spec.process.user.gid = 0;
         spec
+    }
+
+    #[test]
+    fn executor_delegation_is_unavailable_to_any_image_user() {
+        let mut executor = spec();
+        executor.reusable_executor = true;
+        apply(&mut executor).unwrap();
+        let mappings = executor.linux.uid_mappings.as_ref().unwrap();
+        assert!(
+            mappings
+                .iter()
+                .any(|map| map.container_id == EXECUTOR_CONTAINER_UID
+                    && map.host_id == EXECUTOR_HOST_UID
+                    && map.size == 1)
+        );
+        assert_eq!(host_id(EXECUTOR_CONTAINER_UID), None);
+        assert_eq!(container_id(EXECUTOR_HOST_UID), None);
+        assert!(
+            executor
+                .process
+                .capabilities
+                .unwrap()
+                .effective
+                .iter()
+                .any(|value| value == "CAP_SYS_ADMIN")
+        );
+        let mut ordinary = spec();
+        apply(&mut ordinary).unwrap();
+        assert!(
+            !ordinary
+                .linux
+                .uid_mappings
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|map| map.host_id == EXECUTOR_HOST_UID)
+        );
+        assert!(
+            !ordinary
+                .process
+                .capabilities
+                .unwrap()
+                .effective
+                .iter()
+                .any(|value| value == "CAP_SYS_ADMIN")
+        );
     }
 
     #[test]

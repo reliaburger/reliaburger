@@ -6,7 +6,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use reliaburger::council::{
-    CouncilConfig, CouncilNode, CouncilNodeInfo,
+    CouncilConfig, CouncilNode, CouncilNodeInfo, DesiredState,
     log_store::MemLogStore,
     network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter},
     state_machine::CouncilStateMachine,
@@ -75,6 +75,7 @@ fn router_for_council(
                 timestamp: SystemTime::UNIX_EPOCH,
                 running_apps: vec![],
                 cached_specs: vec![],
+                rollouts: Vec::new(),
                 resource_usage: reliaburger::reporting::types::ResourceUsage {
                     cpu_total_millicores: 8000,
                     memory_total_mb: 16384,
@@ -82,6 +83,8 @@ fn router_for_council(
                 },
                 event_log: vec![],
                 has_buildah: false,
+                job_reservations: Default::default(),
+                capacity_refusals: Vec::new(),
             },
         );
         let (publisher, receiver) = tokio::sync::watch::channel(state);
@@ -95,6 +98,7 @@ fn router_for_council(
                 node_id: reliaburger::meat::NodeId::new("local"),
                 address: "127.0.0.1:1".parse().unwrap(),
                 api_advertised: true,
+                jobs: None,
             },
         ])))
     } else {
@@ -104,20 +108,8 @@ fn router_for_council(
     tokio::spawn(async move {
         let _capacity_publisher = capacity_publisher;
         while let Some(command) = rx.recv().await {
-            match command {
-                reliaburger::bun::agent::AgentCommand::RunJobsWithLabels {
-                    config,
-                    execution_labels,
-                    response,
-                    ..
-                } => {
-                    assert_eq!(config.job.len(), execution_labels.len());
-                    let _ = response.send(Ok(BTreeMap::new()));
-                }
-                reliaburger::bun::agent::AgentCommand::Status { response } => {
-                    let _ = response.send(Vec::new());
-                }
-                _ => {}
+            if let reliaburger::bun::agent::AgentCommand::Status { response } = command {
+                let _ = response.send(Vec::new());
             }
         }
     });
@@ -274,8 +266,14 @@ async fn batch_submission_enforces_deploy_and_host_execution_permissions() {
             vec!["logs"],
             serde_json::json!({"image":"busybox","command":["true"]}),
         ),
-        (vec!["deploy"], serde_json::json!({"script":"echo denied"})),
-        (vec!["deploy"], serde_json::json!({"exec":"/bin/true"})),
+        (
+            vec!["deploy"],
+            serde_json::json!({"runtime":"process","script":"echo denied"}),
+        ),
+        (
+            vec!["deploy"],
+            serde_json::json!({"runtime":"process","exec":"/bin/true"}),
+        ),
     ] {
         council
             .write(reliaburger::council::types::RaftRequest::PermissionSpec {
@@ -297,7 +295,7 @@ async fn batch_submission_enforces_deploy_and_host_execution_permissions() {
         request.extensions_mut().insert(owner());
         let response = router.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(council.desired_state().await.batch_state.get(1).is_none());
+        assert!(council.desired_state().await.task_arrays.ids().is_empty());
     }
     council
         .write(reliaburger::council::types::RaftRequest::PermissionSpec {
@@ -313,7 +311,7 @@ async fn batch_submission_enforces_deploy_and_host_execution_permissions() {
     let mut request = Request::post("/v1/batch")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({"jobs":[{"name":"migration","spec":{"exec":"/bin/true"}}]})
+            serde_json::json!({"jobs":[{"name":"migration","spec":{"runtime":"process","exec":"/bin/true"}}]})
                 .to_string(),
         ))
         .unwrap();
@@ -455,6 +453,7 @@ async fn follower_batch_submission_preserves_the_callers_credential_for_leader_a
             node_id: reliaburger::meat::NodeId::new("leader"),
             address,
             api_advertised: true,
+            jobs: None,
         },
     ]));
     let router = router_for_council(
@@ -763,6 +762,32 @@ async fn scoped_admin_cannot_release_another_credentials_lease() {
     check_lease_admin_override("DELETE", StatusCode::NO_CONTENT).await;
 }
 
+/// The top-level desired-state fields that differ between two reads,
+/// ignoring what the leader writes on its own (#849). The router's
+/// task-array leader loop records each new wall-clock minute it observes
+/// (`CronObserve`): its first tick lands late under load, and later ones
+/// whenever a request straddles a minute boundary. That entry moves the log
+/// position and `cron_observed_minute`, so neither can show whether a
+/// request wrote.
+fn changed_desired_fields(before: &DesiredState, after: &DesiredState) -> Vec<String> {
+    let fields = |state: &DesiredState| {
+        let serde_json::Value::Object(mut fields) = serde_json::to_value(state).unwrap() else {
+            panic!("desired state serialises as an object");
+        };
+        fields.remove("last_applied_log");
+        if let Some(serde_json::Value::Object(arrays)) = fields.get_mut("task_arrays") {
+            arrays.remove("cron_observed_minute");
+        }
+        fields
+    };
+    let (before, after) = (fields(before), fields(after));
+    before
+        .keys()
+        .filter(|key| before.get(*key) != after.get(*key))
+        .cloned()
+        .collect()
+}
+
 /// Router configuration from the existing api_tokens fixture, with its command
 /// sender exposed for authority observations. No runtime/terminal proof is claimed.
 fn shared_authority_router(
@@ -886,11 +911,13 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
             node_id: reliaburger::meat::NodeId::new(leader_name),
             address: leader_address,
             api_advertised: true,
+            jobs: None,
         },
         reliaburger::bun::api::NodeMembershipInfo {
             node_id: reliaburger::meat::NodeId::new(follower_name),
             address: follower_address,
             api_advertised: true,
+            jobs: None,
         },
     ]));
     let node = reliaburger::meat::NodeId::new(leader_name);
@@ -909,6 +936,7 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
             timestamp: SystemTime::UNIX_EPOCH,
             running_apps: vec![],
             cached_specs: vec![],
+            rollouts: Vec::new(),
             resource_usage: reliaburger::reporting::types::ResourceUsage {
                 cpu_total_millicores: 8000,
                 memory_total_mb: 16384,
@@ -916,6 +944,8 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
             },
             event_log: vec![],
             has_buildah: false,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         },
     );
     let (reports, report_rx) = tokio::sync::watch::channel(report);
@@ -927,25 +957,8 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
         loop {
             let command = tokio::select! { _ = actor_shutdown.cancelled() => break, command = incoming.recv() => command };
             match command {
-                Some(AgentCommand::BatchOwnedExecutions { response, .. }) => {
-                    let _ = response.send(Default::default());
-                }
                 Some(AgentCommand::Status { response }) => {
                     let _ = response.send(Vec::new());
-                }
-                Some(AgentCommand::RunJobsWithLabels {
-                    config,
-                    execution_labels,
-                    events,
-                    response,
-                    ..
-                }) => {
-                    counted_dispatches.fetch_add(1, Ordering::SeqCst);
-                    assert_eq!(config.job.len(), execution_labels.len());
-                    // Finite command/authority ACK, not a real child exit.
-                    let terminal = config.job.keys().map(|name| (name.clone(), 0)).collect();
-                    response.send(Ok(terminal)).unwrap();
-                    drop(events);
                 }
                 Some(_) => {
                     counted_dispatches.fetch_add(1, Ordering::SeqCst);
@@ -1089,8 +1102,13 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
                 .unwrap();
             let apply_status = apply.status();
             let apply_body = apply.text().await.unwrap();
+            let runtime = if fragment.starts_with("image") {
+                ""
+            } else {
+                "runtime='process'\n"
+            };
             let parsed = reliaburger::config::Config::parse(&format!(
-                "[job.{job_name}]\nnamespace='{namespace}'\n{fragment}\n"
+                "[job.{job_name}]\nnamespace='{namespace}'\n{runtime}{fragment}\n"
             ))
             .unwrap();
             let batch = client.post(format!("http://{follower_address}/v1/batch")).bearer_auth(&created.plaintext).json(&serde_json::json!({"jobs":[{"name":job_name,"namespace":namespace,"spec":parsed.job[&job_name]}]})).send().await.unwrap();
@@ -1143,11 +1161,11 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
                     .unwrap()
                     .unwrap();
                 let after = leader.desired_state().await;
-                assert_eq!(after.last_applied_log, before.last_applied_log);
                 assert_eq!(after.apps, before.apps);
                 assert_eq!(
-                    serde_json::to_value(after.batch_state).unwrap(),
-                    serde_json::to_value(before.batch_state).unwrap()
+                    changed_desired_fields(&before, &after),
+                    Vec::<String>::new(),
+                    "denied pair changed desired state"
                 );
                 assert_eq!(
                     dispatches.load(Ordering::SeqCst),
@@ -1168,7 +1186,7 @@ async fn common_run_cancellation_and_output_obey_current_permissions() {
         .write(RaftRequest::TaskArray(Box::new(TaskArrayWrite::Register {
             name: "migration".into(),
             namespace: "default".into(),
-            template: Box::new(toml::from_str("exec='/bin/true'").unwrap()),
+            template: Box::new(toml::from_str("runtime='process'\nexec='/bin/true'").unwrap()),
             spec: reliaburger::meat::task_array::TaskArraySpec::with_count(1),
             submitted_at_epoch_secs: 1,
         })))

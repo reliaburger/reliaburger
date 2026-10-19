@@ -24,6 +24,7 @@ use crate::relish::client::BunClient;
 
 use super::context::TestContext;
 use super::deadline::Deadline;
+use super::lease::LeaseScope;
 use super::registry::{CaseError, TestCase};
 use super::report::{
     CleanupOutcome, EvidenceKind, TestCaseResult, TestEvidence, TestGroup, TestOutcome,
@@ -60,20 +61,22 @@ fn lease_refusal_is_transient(error: &crate::relish::RelishError) -> bool {
     )
 }
 
-/// Create the case's lease, retrying a transient refusal for up to
-/// [`LEASE_RETRY_WINDOW`].
+/// Create the case's lease of the kind it declares, retrying a transient
+/// refusal for up to [`LEASE_RETRY_WINDOW`]. A job lease ignores
+/// `namespace`: the server picks its own `rbtest-node-*` namespace.
 async fn create_lease(
     client: &BunClient,
-    group: TestGroup,
+    scope: LeaseScope,
     ttl_seconds: u64,
     namespace: &str,
 ) -> Result<crate::testkit::lease::TestLease, crate::relish::RelishError> {
     let give_up = Instant::now() + LEASE_RETRY_WINDOW;
     loop {
-        let attempt = if group == TestGroup::Jobs {
-            client.create_node_job_lease(ttl_seconds).await
-        } else {
-            client.create_test_lease(ttl_seconds, Some(namespace)).await
+        let attempt = match scope {
+            LeaseScope::NodeJobs => client.create_node_job_lease(ttl_seconds).await,
+            LeaseScope::Applications => {
+                client.create_test_lease(ttl_seconds, Some(namespace)).await
+            }
         };
         match attempt {
             Err(error) if lease_refusal_is_transient(&error) && Instant::now() < give_up => {
@@ -445,7 +448,7 @@ async fn run_one(
             match deadline
                 .run(
                     "lease creation",
-                    create_lease(&client, case.group, ttl_seconds, &namespace),
+                    create_lease(&client, case.lease, ttl_seconds, &namespace),
                 )
                 .await
             {
@@ -699,6 +702,7 @@ mod tests {
             name,
             group: TestGroup::Scheduling,
             requires,
+            lease: LeaseScope::Applications,
             run,
         }
     }
@@ -712,6 +716,7 @@ mod tests {
             name,
             group: TestGroup::Chaos,
             requires,
+            lease: LeaseScope::Applications,
             run,
         }
     }
@@ -1145,6 +1150,7 @@ mod tests {
             id,
             fault_type: request.fault_type.to_string(),
             target_service: request.target_service,
+            namespace: request.namespace.clone(),
             target_instance: request.target_instance,
             target_node: request.target_node,
             remaining_secs: request.duration.as_secs(),
@@ -1553,6 +1559,7 @@ mod tests {
             pid: None,
             runtime_unknown: false,
             status_age_ms: None,
+            reason: None,
         }
     }
 

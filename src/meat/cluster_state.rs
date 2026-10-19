@@ -4,19 +4,65 @@
 /// the membership table and aggregated StateReports. The scheduler
 /// reads this cache during the Filter and Score phases and updates
 /// it after each placement to reflect reserved resources.
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::types::{AppId, NodeId, Resources};
 
 /// Live node capabilities that affect placement correctness.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCapabilities {
     /// Kernel hooks and runtime support for pre-start egress allowlists.
     pub egress: crate::sesame::egress::EgressEnforcementCapability,
     /// Ready resolver transports and workload reachability.
     pub dns: crate::onion::dns::DnsCapability,
+    /// The host process workloads (`exec` and `script` apps) the node runs.
+    #[serde(default)]
+    pub process: ProcessWorkloadCapability,
+    /// The node's runtime runs containers: runc, Apple Container or the
+    /// mixed runtime. A node on `--runtime process` runs only `exec` and
+    /// `script` apps, so the scheduler keeps image apps off it (#914).
+    #[serde(default)]
+    pub containers: bool,
+}
+
+#[cfg(test)]
+impl NodeCapabilities {
+    /// A node whose runtime runs containers, and nothing more: what most
+    /// scheduling tests assume of a node.
+    pub fn container_runtime() -> Self {
+        Self {
+            containers: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Which host process workloads a node runs: the `[process_workloads]`
+/// policy it enforces, reported so the scheduler places an `exec` or
+/// `script` app only where the node will start it (#702).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessWorkloadCapability {
+    /// The node runs host processes at all: its runtime can, and
+    /// `[process_workloads] mount_isolation` is off, since a node refuses
+    /// every host workload under mount isolation until #714 implements it.
+    pub enabled: bool,
+    /// `[process_workloads] allowed_binaries`: the only absolute paths it
+    /// runs. A `script` app runs the interpreter, `/bin/sh`.
+    pub allowed_binaries: Vec<PathBuf>,
+}
+
+impl ProcessWorkloadCapability {
+    /// Whether the node runs `binary` as a host process workload.
+    pub fn runs(&self, binary: &Path) -> bool {
+        self.enabled
+            && self
+                .allowed_binaries
+                .iter()
+                .any(|allowed| allowed == binary)
+    }
 }
 
 /// Per-node state as seen by the scheduler.
@@ -82,6 +128,8 @@ impl SchedulerNodeState {
 pub struct ClusterStateCache {
     nodes: HashMap<NodeId, SchedulerNodeState>,
     accounted_instances: HashMap<(NodeId, AppId, u32), Resources>,
+    /// The replica ordinals each node reported it couldn't start, per app.
+    capacity_refusals: HashMap<(NodeId, AppId), BTreeSet<u32>>,
 }
 
 impl ClusterStateCache {
@@ -90,7 +138,25 @@ impl ClusterStateCache {
         Self {
             nodes: HashMap::new(),
             accounted_instances: HashMap::new(),
+            capacity_refusals: HashMap::new(),
         }
+    }
+
+    /// Record that `node_id` reported it couldn't start `app_id`'s replicas
+    /// `ordinals` for lack of room.
+    pub fn record_capacity_refusal(&mut self, node_id: &NodeId, app_id: &AppId, ordinals: &[u32]) {
+        self.capacity_refusals
+            .entry((node_id.clone(), app_id.clone()))
+            .or_default()
+            .extend(ordinals.iter().copied());
+    }
+
+    /// Whether `node_id` reported it couldn't start `app_id`'s replica
+    /// `ordinal`. Its other replicas there are untouched by the refusal.
+    pub fn capacity_refused(&self, node_id: &NodeId, app_id: &AppId, ordinal: u32) -> bool {
+        self.capacity_refusals
+            .get(&(node_id.clone(), app_id.clone()))
+            .is_some_and(|refused| refused.contains(&ordinal))
     }
 
     /// Add or replace a node's state.
@@ -215,7 +281,7 @@ mod tests {
             allocated: Resources::default(),
             labels: BTreeMap::new(),
             ready: true,
-            capabilities: NodeCapabilities::default(),
+            capabilities: NodeCapabilities::container_runtime(),
             app_replicas: HashMap::new(),
             uptime_secs: 3600,
             cached_images: HashSet::new(),

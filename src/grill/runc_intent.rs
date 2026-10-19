@@ -201,23 +201,30 @@ impl IntentJournal {
             create_directory(&journal.directory.join("records"))?;
             let locks = journal.directory.join("locks");
             create_directory(&locks)?;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(locks.join(&instance.0))?;
-            validate_file(&file, Access::OwnerOnly)?;
-            // Never unlink or replace a lock file: another process may
-            // already hold it.
-            let lock = FileLock::try_lock(file).map_err(|error| match error {
-                FileLockError::Busy => {
-                    io::Error::new(io::ErrorKind::WouldBlock, "runtime lifecycle is busy")
+            let path = locks.join(&instance.0);
+            let lock = loop {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&path)?;
+                validate_file(&file, Access::OwnerOnly)?;
+                let lock = FileLock::try_lock(file).map_err(|error| match error {
+                    FileLockError::Busy => {
+                        io::Error::new(io::ErrorKind::WouldBlock, "runtime lifecycle is busy")
+                    }
+                    FileLockError::Io(error) => error,
+                })?;
+                // Only `IntentClaim::forget` unlinks a lock file, and only
+                // while holding it. A file unlinked after we opened it
+                // authorises nothing: lock the current one instead.
+                if lock.still_names(&path)? {
+                    break lock;
                 }
-                FileLockError::Io(error) => error,
-            })?;
+            };
             let record = journal.load(&instance)?;
             if record.as_ref().map(|record| &record.generation) != expected.as_ref() {
                 return Err(io::Error::other("runtime intent generation changed"));
@@ -254,14 +261,13 @@ impl IntentJournal {
                     .file_name()
                     .into_string()
                     .map_err(|_| io::Error::other("non-UTF-8 runtime intent identity"))?;
-                if name.starts_with(".preparing-") && entry.file_type()?.is_dir() {
+                if unpublished_entry(&name, &entry.path())? {
                     // No caller may allocate resources until atomic publication.
-                    validate_directory(&entry.path())?;
                     continue;
                 }
-                inventory.push(journal.load(&InstanceId(name))?.ok_or_else(|| {
-                    io::Error::other("runtime intent disappeared during inventory")
-                })?);
+                if let Some(record) = journal.load_published(&name, &entry.path())? {
+                    inventory.push(record);
+                }
             }
             inventory.sort_by(|left, right| left.instance_id.0.cmp(&right.instance_id.0));
             Ok(inventory)
@@ -285,6 +291,23 @@ impl IntentJournal {
         Ok(())
     }
 
+    // One published record an inventory enumerated at `path`, or none once
+    // it is gone. Only `IntentClaim::forget` removes a published record: it
+    // renames a retired generation away whole, under the instance's lock, so
+    // a record that vanished owned nothing and the inventory leaves it out,
+    // as it would have a moment later. Startup spawns that forget for every
+    // retirement it finishes and then reads the inventory, so the two do
+    // meet (#877). A directory that is still there but unreadable is corrupt
+    // and still refuses.
+    fn load_published(&self, name: &str, path: &Path) -> io::Result<Option<RuntimeIntent>> {
+        match self.load(&InstanceId(name.to_owned())) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !existing_directory(path)? => {
+                Ok(None)
+            }
+            result => result,
+        }
+    }
+
     fn load(&self, instance: &InstanceId) -> io::Result<Option<RuntimeIntent>> {
         validate_instance(instance)?;
         self.validate_configuration()?;
@@ -299,11 +322,22 @@ impl IntentJournal {
         if !existing_directory(&directory)? {
             return Ok(None);
         }
-        let record: RuntimeIntent = read_json(
+        let record: RuntimeIntent = match read_json(
             &directory.join("intent.json"),
             RECORD_LIMIT,
             Access::OwnerOnly,
-        )?;
+        ) {
+            Ok(record) => record,
+            // Publication is atomic, so a published directory always holds
+            // its record. One that vanished since the check above was
+            // forgotten in between (#924).
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && !existing_directory(&directory)? =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         if record.version != 5
             || record
                 .boot_id
@@ -546,6 +580,50 @@ impl IntentClaim {
     }
 }
 
+impl IntentClaim {
+    /// Delete a retired generation's journal and its lock file, so an
+    /// identity that never runs again leaves nothing behind (#678).
+    ///
+    /// Refuses, deleting nothing, unless the generation is retired and no
+    /// discovery publisher still holds its address. Afterwards the identity
+    /// has no intent at all, as before its first launch, and
+    /// [`IntentJournal::inventory`] no longer lists it.
+    pub async fn forget(self) -> io::Result<()> {
+        tokio::task::spawn_blocking(move || {
+            let locks = self.journal.directory.join("locks");
+            let lock = locks.join(&self.instance.0);
+            let Some(record) = &self.record else {
+                return self._lock.remove(&lock);
+            };
+            if !matches!(record.phase, IntentPhase::Retired { .. })
+                || matches!(
+                    record.network_reference,
+                    Some(NetworkReferenceState::Held(_))
+                )
+            {
+                return Err(io::Error::other(
+                    "runtime intent still owns resources; nothing was forgotten",
+                ));
+            }
+            let records = self.journal.directory.join("records");
+            // Unpublish first: inventory skips `.preparing-` names, so an
+            // interrupted delete never leaves a partial published record.
+            let staging = records.join(format!(
+                ".preparing-forgotten-{}",
+                record.generation.as_str()
+            ));
+            std::fs::rename(records.join(&self.instance.0), &staging)?;
+            File::open(&records)?.sync_all()?;
+            std::fs::remove_dir_all(&staging)?;
+            File::open(&records)?.sync_all()?;
+            self._lock.remove(&lock)?;
+            File::open(&locks)?.sync_all()
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+}
+
 fn persist(directory: &Path, record: &RuntimeIntent) -> io::Result<()> {
     let bytes = serde_json::to_vec(record)?;
     if bytes.len() as u64 > RECORD_LIMIT {
@@ -569,11 +647,9 @@ fn validate_instance(instance: &InstanceId) -> io::Result<()> {
 }
 
 fn existing_directory(path: &Path) -> io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {
-            validate_directory(path)?;
-            Ok(true)
-        }
+    match std::fs::symlink_metadata(path).and_then(|_| validate_directory(path)) {
+        Ok(()) => Ok(true),
+        // Gone before or while it was validated: a forget renamed it away.
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
@@ -591,4 +667,155 @@ fn create_directory(path: &Path) -> io::Result<()> {
         Err(error) => return Err(error),
     }
     validate_directory(path)
+}
+
+// A staging name may disappear between enumeration and atomic publication.
+// It has never authorised resource allocation. Every surviving entry still
+// needs the same private-directory checks. Published names never take this
+// exception; `IntentJournal::load_published` handles a forgotten one.
+fn unpublished_entry(name: &str, path: &Path) -> io::Result<bool> {
+    if !name.starts_with(".preparing-") {
+        return Ok(false);
+    }
+    match validate_directory(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+
+    fn journal(root: &Path) -> IntentJournal {
+        IntentJournal::new(
+            root.join("intents"),
+            IntentConfiguration {
+                bundle_directory: root.join("bundles"),
+                state_directory: root.join("state"),
+                image_directory: root.join("images"),
+                runc_program: "runc".into(),
+                rootless: false,
+                dns_nameserver: None,
+                node_index: 1,
+            },
+        )
+    }
+
+    fn spec() -> OciSpec {
+        use super::super::oci::{OciLinux, OciProcess, OciRoot, OciUser};
+        OciSpec {
+            reusable_executor: false,
+            host_process: false,
+            initialiser: false,
+            root: OciRoot {
+                path: "/".into(),
+                readonly: false,
+            },
+            process: OciProcess {
+                rlimits: Vec::new(),
+                args: vec!["sleep".into(), "60".into()],
+                env: vec![],
+                cwd: "/".into(),
+                user: OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                oom_score_adj: None,
+                overrides: None,
+            },
+            mounts: vec![],
+            linux: OciLinux {
+                namespaces: vec![],
+                resources: None,
+                cgroups_path: None,
+                uid_mappings: None,
+                gid_mappings: None,
+            },
+            port_mapping: None,
+        }
+    }
+
+    // Publishes and retires one generation, as a finished workload leaves it.
+    async fn retired_record(journal: &IntentJournal, instance: &InstanceId) -> IntentGeneration {
+        let claim = journal.claim(instance, None).await.unwrap();
+        let claim = claim.publish(&spec()).await.unwrap();
+        let claim = claim.retire(Some(0)).await.unwrap();
+        claim.record().unwrap().generation.clone()
+    }
+
+    #[tokio::test]
+    async fn record_forgotten_after_enumeration_is_absent_from_the_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = journal(root.path());
+        let instance = InstanceId("default__web-0".into());
+        let generation = retired_record(&journal, &instance).await;
+        let entry = std::fs::read_dir(journal.directory.join("records"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        // An inventory has enumerated the record while a forget, such as the
+        // one startup spawns for each retirement it finishes, deletes it.
+        let claim = journal.claim(&instance, Some(generation)).await.unwrap();
+        claim.forget().await.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        assert!(
+            journal
+                .load_published(&name, &entry.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(journal.inventory().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn published_record_without_its_intent_still_refuses_the_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = journal(root.path());
+        let instance = InstanceId("default__web-0".into());
+        retired_record(&journal, &instance).await;
+        let directory = journal.directory.join("records").join(&instance.0);
+        std::fs::remove_file(directory.join("intent.json")).unwrap();
+        assert!(journal.load_published(&instance.0, &directory).is_err());
+        assert!(journal.inventory().await.is_err());
+    }
+
+    #[test]
+    fn vanished_prepublication_directory_has_never_authorised_a_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join(".preparing-fixture");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&staging)
+            .unwrap();
+        let entry = std::fs::read_dir(root.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        // A reader has enumerated this entry while publication renames it.
+        std::fs::rename(&staging, root.path().join("published")).unwrap();
+        assert!(unpublished_entry(".preparing-fixture", &entry.path()).unwrap());
+        assert!(!unpublished_entry("published", &entry.path()).unwrap());
+    }
+
+    #[test]
+    fn prepublication_entries_still_refuse_corrupt_privacy_and_file_types() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join(".preparing-fixture");
+        std::fs::write(&staging, b"not a directory").unwrap();
+        assert!(unpublished_entry(".preparing-fixture", &staging).is_err());
+        std::fs::remove_file(&staging).unwrap();
+        std::os::unix::fs::symlink(root.path().join("missing-target"), &staging).unwrap();
+        assert!(unpublished_entry(".preparing-fixture", &staging).is_err());
+        std::fs::remove_file(&staging).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&staging)
+            .unwrap();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(unpublished_entry(".preparing-fixture", &staging).is_err());
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(unpublished_entry(".preparing-fixture", &staging).unwrap());
+    }
 }

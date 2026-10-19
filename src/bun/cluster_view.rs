@@ -150,6 +150,28 @@ pub fn merge_deploy_history(
     history
 }
 
+/// The spec `relish rollback` re-applies on a cluster: the newest spec that
+/// rolled out on every node and is a different version from `current`, at
+/// `current`'s scale (#692).
+///
+/// The council keeps these, so a rollback still has somewhere to go after
+/// every node restarts and their in-memory histories are gone.
+pub fn released_rollback_target(
+    rollouts: &crate::meat::deploy_types::AppRollouts,
+    current: &crate::config::app::AppSpec,
+) -> Option<crate::config::app::AppSpec> {
+    let version = crate::meat::deploy_types::rollout_fingerprint(current);
+    let mut target = rollouts
+        .released
+        .iter()
+        .rev()
+        .find(|released| crate::meat::deploy_types::rollout_fingerprint(released) != version)?
+        .clone();
+    target.replicas = current.replicas;
+    target.ordinals = None;
+    Some(target)
+}
+
 /// The spec `relish rollback` re-applies: the newest successful deploy whose
 /// spec differs from `current`, with `current`'s replica count.
 ///
@@ -260,6 +282,7 @@ mod tests {
             node: node.map(str::to_string),
             action: None,
             principal: None,
+            source_address: None,
             details: Default::default(),
             message: format!("event {sequence}"),
         }
@@ -321,6 +344,30 @@ mod tests {
         assert_eq!(target.replicas, crate::config::Replicas::Fixed(2));
     }
 
+    /// #692: on a cluster the target comes from the council's record of
+    /// fully rolled-out specs, newest first, skipping the current version,
+    /// at the app's current scale.
+    #[test]
+    fn rollback_on_a_cluster_takes_the_newest_released_spec_that_is_not_current() {
+        let mut rollouts = crate::meat::deploy_types::AppRollouts::default();
+        for image in ["web:v1", "web:v2", "web:v3"] {
+            rollouts.release(&spec(image, 2));
+        }
+        let target = released_rollback_target(&rollouts, &spec("web:v3", 5)).unwrap();
+        assert_eq!(target.image.as_deref(), Some("web:v2"));
+        assert_eq!(target.replicas, crate::config::Replicas::Fixed(5));
+        // A current spec that never rolled out everywhere rolls back to the
+        // newest that did.
+        let target = released_rollback_target(&rollouts, &spec("web:v4", 2)).unwrap();
+        assert_eq!(target.image.as_deref(), Some("web:v3"));
+        let only = {
+            let mut rollouts = crate::meat::deploy_types::AppRollouts::default();
+            rollouts.release(&spec("web:v1", 2));
+            rollouts
+        };
+        assert_eq!(released_rollback_target(&only, &spec("web:v1", 2)), None);
+    }
+
     #[test]
     fn rollback_skips_other_nodes_copies_of_the_current_version() {
         let history = [
@@ -367,7 +414,7 @@ mod tests {
             name: name.into(),
             namespace: "default".into(),
             instance_id: format!("{name}-0"),
-            image: "proc-grill:image-ignored".into(),
+            image: "app:v1".into(),
             state: "stopped".into(),
             restart_count: 0,
             age_seconds: 5,

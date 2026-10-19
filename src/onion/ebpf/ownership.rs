@@ -357,7 +357,8 @@ pub(super) fn load(
         let (kind, key, value, capacity) = match name {
             "backend_map" => (1, 8, 272, 65534),
             "firewall_map" => (1, 16, 4, 262144),
-            "cgroup_namespace_map" | "egress_enabled_map" => (1, 8, 4, 65536),
+            "cgroup_namespace_map" | "cgroup_source_map" | "egress_enabled_map" => (1, 8, 4, 65536),
+            "destination_map" => (1, 8, 8, 131072),
             "egress_map" => (1, 16, 4, 65536),
             "egress6_map" => (1, 32, 4, 65536),
             "egress_cidr4_map" => (11, 16, 20, 65536),
@@ -378,6 +379,12 @@ pub(super) fn load(
         }
         map_ids.insert(info.id());
     }
+    // The pinned maps outlive the Bun that wrote them, and faults don't:
+    // the new Bun's registry starts empty, so it would never delete a drop
+    // or partition entry its predecessor left, and the hook would keep
+    // applying it until its expiry with nothing in `fault list` (#699).
+    // Policy maps are kept; they are what this recovery exists to preserve.
+    crate::smoker::bpf_maps::cleanup_all_fault_maps(&mut bpf);
     let cgroup = File::open(&ownership.manifest.cgroup_path)?;
     for (index, name) in REQUIRED_PROGRAMS.iter().enumerate() {
         let program: &mut CgroupSockAddr = bpf

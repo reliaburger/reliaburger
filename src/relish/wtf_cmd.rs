@@ -136,7 +136,7 @@ fn render_report(report: &WtfReport, output: OutputFormat) -> Result<String, Rel
         OutputFormat::Json => {
             serde_json::to_string_pretty(report).map_err(RelishError::SerialiseJson)
         }
-        OutputFormat::Yaml => serde_yaml::to_string(report).map_err(RelishError::SerialiseYaml),
+        OutputFormat::Yaml => yaml_serde::to_string(report).map_err(RelishError::SerialiseYaml),
     }
 }
 

@@ -238,6 +238,7 @@ mod tests {
             let db = redb::Database::create(replacement.join("snapshot.redb")).unwrap();
             let mut state = DesiredState::default();
             state.config.insert("restored".into(), "yes".into());
+            state.enter_recovery_epoch(0);
             CouncilStateMachine::persist_recovered_snapshot(&db, state).unwrap();
             drop(db);
             fs::write(

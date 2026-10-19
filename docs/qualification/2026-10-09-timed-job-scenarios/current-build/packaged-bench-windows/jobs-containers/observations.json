@@ -1,0 +1,132 @@
+{
+  "application_probes": 68,
+  "application_failures": 0,
+  "resource_observations": [
+    {
+      "elapsed_seconds": 0.0009055049158632755,
+      "cpu_ticks": [
+        7319955,
+        5659,
+        7502992,
+        464694977,
+        1622937,
+        0,
+        646121,
+        0,
+        0,
+        0
+      ],
+      "storage": {
+        "/tmp/rb-host-executor-v4/data": {
+          "allocated_bytes_observed": 187981824,
+          "files_observed": 2438,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2652381184
+        }
+      },
+      "processes": [
+        {
+          "pid": 2960485,
+          "start_ticks": 119317256,
+          "complete": true,
+          "rss_bytes": 181882880,
+          "peak_rss_bytes": 303005696
+        },
+        {
+          "pid": 2960635,
+          "start_ticks": 119317979,
+          "complete": true,
+          "rss_bytes": 778240,
+          "peak_rss_bytes": 1703936
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 30.09067598800175,
+      "cpu_ticks": [
+        7321084,
+        5659,
+        7511515,
+        464696026,
+        1623941,
+        0,
+        646253,
+        0,
+        0,
+        0
+      ],
+      "storage": {
+        "/tmp/rb-host-executor-v4/data": {
+          "allocated_bytes_observed": 29229056,
+          "files_observed": 2426,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2811621376
+        }
+      },
+      "processes": [
+        {
+          "pid": 2960485,
+          "start_ticks": 119317256,
+          "complete": true,
+          "rss_bytes": 170987520,
+          "peak_rss_bytes": 303005696
+        },
+        {
+          "pid": 2960635,
+          "start_ticks": 119317979,
+          "complete": true,
+          "rss_bytes": 778240,
+          "peak_rss_bytes": 1703936
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 60.25071228900924,
+      "cpu_ticks": [
+        7322328,
+        5659,
+        7520721,
+        464696269,
+        1624951,
+        0,
+        646348,
+        0,
+        0,
+        0
+      ],
+      "storage": {
+        "/tmp/rb-host-executor-v4/data": {
+          "allocated_bytes_observed": 29196288,
+          "files_observed": 2433,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2811338752
+        }
+      },
+      "processes": [
+        {
+          "pid": 2960485,
+          "start_ticks": 119317256,
+          "complete": true,
+          "rss_bytes": 163524608,
+          "peak_rss_bytes": 303005696
+        },
+        {
+          "pid": 2960635,
+          "start_ticks": 119317979,
+          "complete": true,
+          "rss_bytes": 778240,
+          "peak_rss_bytes": 1703936
+        }
+      ]
+    }
+  ],
+  "service_latency_ms": {
+    "samples": 68,
+    "maximum": 7.44128692895174,
+    "p95": 5.645152879878879
+  },
+  "observation_boundary": "Service and resource observations span preparation, measured work and positive drain"
+}

@@ -585,11 +585,33 @@ pub async fn scenario(
     }
 
     println!("Executing scenario: {}", s.name);
-    let start = std::time::Instant::now();
     let client = BunClient::default_local();
+    run_scenario(timeline, acknowledged, |request| {
+        let client = &client;
+        async move { client.inject_fault(&request).await }
+    })
+    .await
+}
 
-    for entry in &timeline {
-        // Wait until activation time
+/// Inject each step of a validated timeline at its activation time.
+///
+/// A refused or failed step doesn't stop the steps after it, since the
+/// scenario's timeline still matters, but the run then ends in an error,
+/// so a script or CI job sees a non-zero exit instead of "complete".
+async fn run_scenario<F, Fut>(
+    timeline: Vec<crate::smoker::scenario::TimelineEntry>,
+    acknowledged: bool,
+    mut inject: F,
+) -> Result<(), RelishError>
+where
+    F: FnMut(FaultRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<FaultSummary, RelishError>>,
+{
+    let start = std::time::Instant::now();
+    let total = timeline.len();
+    let mut failed = Vec::new();
+
+    for (index, entry) in timeline.into_iter().enumerate() {
         let elapsed = start.elapsed();
         if entry.activation > elapsed {
             let wait = entry.activation - elapsed;
@@ -606,9 +628,9 @@ pub async fn scenario(
             entry.step.value,
         );
 
-        let mut req = scenario::step_to_fault_request(&entry.step, speed)?;
-        req.acknowledged = acknowledged;
-        match client.inject_fault(&req).await {
+        let mut request = entry.request;
+        request.acknowledged = acknowledged;
+        match inject(request).await {
             Ok(summary) => {
                 println!(
                     "    -> injected (id: {}, expires in {}s)",
@@ -617,14 +639,21 @@ pub async fn scenario(
             }
             Err(e) => {
                 println!("    -> FAILED: {e}");
+                failed.push(format!("step {} ({:?})", index + 1, entry.step.description));
             }
         }
     }
 
     println!();
+    if !failed.is_empty() {
+        return Err(RelishError::Scenario(format!(
+            "{} of {total} steps failed: {}",
+            failed.len(),
+            failed.join(", ")
+        )));
+    }
     println!(
-        "Scenario complete: {} steps in {:.1}s",
-        timeline.len(),
+        "Scenario complete: {total} steps in {:.1}s",
         start.elapsed().as_secs_f64()
     );
     Ok(())
@@ -671,6 +700,7 @@ mod tests {
             id,
             fault_type: "kill".to_string(),
             target_service: service.to_string(),
+            namespace: Some("default".to_string()),
             target_instance: None,
             target_node: Some(node.to_string()),
             remaining_secs: 0,
@@ -678,6 +708,63 @@ mod tests {
             node: Some(node.to_string()),
             routed: Vec::new(),
         }
+    }
+
+    fn two_step_timeline() -> Vec<crate::smoker::scenario::TimelineEntry> {
+        let scenario: crate::smoker::types::ScriptedScenario = toml::from_str(
+            r#"
+                name = "refusal"
+
+                [[step]]
+                description = "kill a replica"
+                fault = "kill"
+                target = "web"
+
+                [[step]]
+                description = "slow the rest"
+                fault = "delay"
+                target = "web"
+                value = "200ms"
+            "#,
+        )
+        .unwrap();
+        crate::smoker::scenario::build_timeline(&scenario, 1.0).unwrap()
+    }
+
+    /// A refused step printed `FAILED`, and the command still said
+    /// "Scenario complete" and exited 0, so CI couldn't use it.
+    #[tokio::test]
+    async fn scenario_exits_non_zero_when_a_step_is_refused() {
+        let mut sent = Vec::new();
+        let result = run_scenario(two_step_timeline(), true, |request: FaultRequest| {
+            sent.push(request.acknowledged);
+            let refused = matches!(request.fault_type, FaultType::Kill { .. });
+            async move {
+                if refused {
+                    Err(RelishError::ApiError {
+                        status: 400,
+                        body: "replica minimum".to_string(),
+                    })
+                } else {
+                    Ok(summary(7, "node-1", "web"))
+                }
+            }
+        })
+        .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("1 of 2 steps failed"), "{error}");
+        assert!(error.contains("kill a replica"), "{error}");
+        assert_eq!(sent, [true, true], "a refusal still runs the later steps");
+    }
+
+    #[tokio::test]
+    async fn scenario_succeeds_when_every_step_is_injected() {
+        let result = run_scenario(two_step_timeline(), false, |_request| async {
+            Ok(summary(7, "node-1", "web"))
+        })
+        .await;
+        assert!(result.is_ok());
     }
 
     #[test]

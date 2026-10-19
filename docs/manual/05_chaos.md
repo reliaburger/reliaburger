@@ -24,6 +24,17 @@ relish fault node-pressure node-03 --cpu 80% --memory 90% --acknowledge
 Workload faults take `--namespace` (default `default`), `--instance` to hit
 one instance, `--duration` and `--reason`, which is recorded with the fault.
 
+In 0.2.0 workload faults target apps only. `relish fault kill` or `pause`
+against a job is refused by the replica-minimum rail, and the attempts of an
+array or a shared executor are invisible to Smoker. To test jobs under
+failure, break the node instead: `node-kill`, `node-pressure`, or the
+node-level faults the release's job qualification uses (killing Bun on a
+worker or on the leader, delaying traffic between nodes, filling the disk,
+slowing fsync; see `scripts/release/qualify-jobs-sustained.sh`). Job-aware
+chaos, which exempts run-to-completion work from the rail and targets
+executors, is planned for 0.2.2
+([#704](https://github.com/reliaburger/reliaburger/issues/704)).
+
 Every fault has a duration (default 10 minutes) and cleans up after itself:
 
 ```sh
@@ -52,6 +63,17 @@ Admin doesn't override a missing grant. `node-pressure` also needs
 zero (both default to 0, and memory stops at 90%). Clearing needs the same role
 and grant, but no acknowledgement. Bun takes the audit identity from the
 authenticated credential, not `$USER` or the request body.
+
+Every injection, clear and expiry is in the audit log: `relish audit --action
+'fault.*'` lists them. `fault.injected` names the namespace, and its
+`include_leader` and `override_safety` details say whether you overrode a
+safety rail; an injection that did is recorded as critical. When a fault runs
+out its duration, the node that held it records `fault.expired` as `system`.
+
+A token with a `[permission]` block (see `security`) also needs the `fault`
+action. On one app it covers injecting and clearing that app's faults. A node
+fault targets no app, and `relish fault clear` with no service reaches every
+tenant, so those need `fault` with `apps = ["*"]` and no `namespaces`.
 
 `[testing] safety_class` is `development`, `staging`, `production` or, when
 unset, `unknown`. On `production` and `unknown` clusters every injection also
@@ -82,7 +104,9 @@ command prints each one. `relish fault list` shows every node's faults with a
 `NODE` column, and `relish fault clear <id>` finds the node that holds that
 id (pass `--node` if two nodes happen to use the same number). `relish fault
 clear` with no id, or with a service name, clears on every node; clearing
-everything needs an unscoped token.
+everything needs an unscoped token. So does `relish fault list`: a token
+scoped to some apps or namespaces sees only its own apps' faults on the node
+it asks, and the cluster-wide list refuses it.
 
 Network faults (`delay`, `drop`, `dns`, `partition`) are the other way round.
 They change what happens when something *calls* the target, and that happens
@@ -112,6 +136,24 @@ podinfo demo, `relish fault delay redis 300ms --from frontend --acknowledge`
 took a cache read (a couple of redis commands over the pool's open
 connections) from about 43 ms to about 945 ms, and `relish fault clear redis`
 brought it straight back.
+
+### When Bun restarts during a fault
+
+Faults live in the memory of the Bun that injected them, so a fault never
+outlives its Bun. If Bun crashes, is killed or upgrades while a fault is
+active, the fault is gone and so is its effect. `relish fault list` is empty
+afterwards, and there's nothing left to clear. The new Bun undoes what the old
+one left in the kernel before it takes the workloads back:
+
+- `cpu`, `memory` and `disk-io` faults: each adopted instance's `cpu.max` and
+  `memory.high` are rewritten from its recorded specification, and any
+  `io.max` throttle is lifted.
+- `pause`: every process in each adopted instance's cgroup gets SIGCONT.
+- `drop` and `partition`: the eBPF fault map is emptied, including on the
+  rootful runc path where the maps are pinned and outlive Bun.
+- `delay`: Bun removes the netem qdiscs it finds on its containers.
+
+If you still want the fault, inject it again.
 
 ## Recovery catalogue
 
@@ -177,6 +219,34 @@ relish fault scenario examples/phase-8/chaos-scenario.toml --dry-run
 relish fault scenario examples/phase-8/chaos-scenario.toml --acknowledge
 relish fault scenario examples/phase-8/chaos-scenario.toml --speed 2.0 --acknowledge
 ```
+
+A step's `fault` is any workload fault: `delay`, `drop`, `dns`, `partition`,
+`cpu`, `memory`, `disk-io`, `kill` or `pause`. `kill` and `pause` take no
+`value`. A step can also carry what the matching `relish fault` flags do:
+
+| Field | Flag | Steps |
+|-------|------|-------|
+| `namespace` | `--namespace` | all (default: `default`) |
+| `from` | `--from` | `delay`, `partition` |
+| `count` | `--count` | `kill` (default: 1) |
+| `instance` | `--instance` | all but `dns` |
+
+```toml
+[[step]]
+description = "Cut checkout off from the cache"
+fault = "partition"
+target = "redis"
+namespace = "shop"
+from = "checkout"
+start_after = "5m"
+duration = "1m"
+```
+
+Relish checks every step before it injects the first, so a typo in step three
+fails the whole scenario with nothing injected. So does a field the step's
+fault can't use, or one it doesn't know. If the server refuses a step, or it
+fails, the later steps still run on time, but the command exits non-zero and
+names the steps that failed, so a script or CI job can tell.
 
 Start small: one fault, one app, a hypothesis about what should happen. If
 the system surprises you, that's the experiment working.

@@ -38,7 +38,7 @@ For book, manual or website prose, follow [docs/book/STYLE.md](docs/book/STYLE.m
 
 ### 1. Follow the Plan
 
-Every roadmap phase is done; 0.1.0 was released on 29 September 2026, 0.1.1 on 30 September, 0.1.2 on 1 October, 0.1.3 and 0.1.4 on 3 October, 0.1.5 on 6 October and 0.1.6 on 7 October 2026. Status lives in [docs/roadmap.md](docs/roadmap.md) plus the GitHub milestones and issues it links: read its release list and "Known gaps" before starting. Releases after 0.1.0 follow its [release order](docs/roadmap.md#releases-after-010): one headline feature per minor release, starting with 0.2.0 ("A million jobs") and 0.3.0 ("Bare metal in an hour"). New work goes through a dated plan in `docs/plans/`; the plans that led to 0.1.0 are history in `docs/plans/archive/`. Releases follow [docs/releasing.md](docs/releasing.md).
+Every roadmap phase is done; 0.1.0 was released on 29 September 2026, 0.1.1 on 30 September, 0.1.2 on 1 October, 0.1.3 and 0.1.4 on 3 October, 0.1.5 on 6 October, 0.1.6 on 7 October and 0.2.0 ("A million jobs") on 16 October 2026. Status lives in [docs/roadmap.md](docs/roadmap.md) plus the GitHub milestones and issues it links: read its release list and "Known gaps" before starting. Releases after 0.1.0 follow its [release order](docs/roadmap.md#releases-after-010): patch releases 0.2.1 (cluster safety) and 0.2.2 (UX polish) next, then one headline feature per minor release, starting with 0.3.0 ("Bare metal in an hour"). New work goes through a dated plan in `docs/plans/`; the plans that led to 0.1.0 are history in `docs/plans/archive/`. Releases follow [docs/releasing.md](docs/releasing.md).
 
 ### 2. Tests First
 
@@ -87,6 +87,7 @@ Fixes and hardening update the existing chapter for that subsystem; they don't g
 | 14 | `14-changing-the-tyres.md` | "Changing the Tyres at Full Speed" |
 | 15 | `15-ready-for-production.md` | "Ready for Production" |
 | Appliance spike | `15a-becoming-the-os.md` | "Becoming the Operating System" |
+| 0.2.0 | `17-a-million-jobs.md` | "A Million Jobs" |
 | — | `16-appendix-rust.md` | "Appendix: Rust for C, Python, and Go Programmers" |
 
 ## Quality Standards
@@ -142,7 +143,7 @@ See [docs/testing.md](docs/testing.md) and [docs/design/test-harness.md](docs/de
 
 Example configs in `examples/phase-N/` use a runtime prefix so it's immediately clear what runtime they target:
 
-- **`proc-*`** — ProcessGrill (runs local processes, no container runtime needed). Uses `proc-grill:image-ignored` as the image name and `target/debug/testapp` or shell commands as the command.
+- **`proc-*`** — ProcessGrill (`--runtime process`; runs local processes, no container runtime needed). Host `exec` or `script` workloads with no `image`: ProcessGrill refuses an image app (#914). Use `exec = "target/debug/testapp"` (arguments in `command`) or an absolute host binary, and start Bun with `--config examples/node/process-runtime.toml` (or a node config whose `[process_workloads] allowed_binaries` names the binary, with `mount_isolation = false`).
 - **`container-*`** — Real OCI images pulled from Docker Hub. Works with runc (`--runtime runc`) or Apple Container (`--runtime apple`).
 - **`apple-*`** — Tests Apple Container-specific features (macOS only).
 - **`runc-*`** — Tests runc-specific features (Linux only).

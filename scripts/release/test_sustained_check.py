@@ -338,6 +338,24 @@ class Leaks(Evidence):
         self.assertEqual(self.failures(explained), [])
         self.assertIn("bun-restart", self.failures(unexplained))
 
+    def test_every_rise_in_unexplained_restarts_is_its_own_failure(self):
+        # #985: Bun restarted three times on node 1 without a harness kill
+        # in twenty minutes, and only the first became a failure; the other
+        # two were repeats inside the half-hour bundle window.
+        status = [{"node": "rb-a-1", "id": "default__web-0"}]
+        self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY}))
+        rises = []
+        for minute, count in ((5, 1), (12, 2), (20, 3)):
+            _, verdict = self.evaluate(self.snapshot(ts=NOW + 60 * minute, **{
+                "status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", f"nrestarts {count}")}))
+            rises.append([item for item in verdict["findings"] if item["check"] == "bun-restart"])
+        self.assertEqual([[item["severity"] for item in found] for found in rises], [["fail"]] * 3)
+        self.assertIn("NRestarts now 3", rises[2][0]["detail"])
+        # A count that stays put is not a new restart.
+        _, flat = self.evaluate(self.snapshot(ts=NOW + 60 * 25, **{
+            "status_json": status, "inventory__rb-a-1_txt": INVENTORY.replace("nrestarts 0", "nrestarts 3")}))
+        self.assertNotIn("bun-restart", [item["check"] for item in flat["findings"]])
+
     def test_a_check_between_the_kill_and_the_restart_keeps_the_expectation(self):
         status = [{"node": "rb-a-1", "id": "default__web-0"}]
         self.evaluate(self.snapshot(**{"status_json": status, "inventory__rb-a-1_txt": INVENTORY}))
@@ -589,6 +607,34 @@ class Recovery(Evidence):
         _, verdict = self.evaluate(self.snapshot(ts=NOW + 700, **{"wtf_json": report}))
         self.assertEqual(self.failures(verdict), [])
 
+    @staticmethod
+    def alerts(*rules):
+        return {"critical": [], "ok": [{"id": "replicas", "description": "replicas"}],
+                "warnings": [{"id": "alerts-firing", "title": f"{rule}: {rule} fired", "affected_resource": "cluster"}
+                             for rule in rules]}
+
+    def test_a_guest_cpu_alert_is_recorded_not_gated(self):
+        # The soak drives 2-vCPU guests at the job target rate on purpose,
+        # so Mayo's cpu_throttle alert says the load is the load (#1112).
+        report = self.alerts("cpu_throttle")
+        self.evaluate(self.snapshot(ts=NOW, **{"wtf_json": report}))
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 601, **{"wtf_json": report}))
+        self.assertEqual(self.failures(verdict), [])
+        self.assertIn("wtf-alert", [item["check"] for item in verdict["findings"] if item["severity"] == "info"])
+
+    def test_a_memory_alert_still_fails_after_ten_minutes(self):
+        report = self.alerts("memory_high")
+        self.evaluate(self.snapshot(ts=NOW, **{"wtf_json": report}))
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 601, **{"wtf_json": report}))
+        self.assertEqual(self.failures(verdict), ["wtf-warning"])
+
+    def test_each_cluster_alert_keeps_its_own_clock(self):
+        # Every cluster alert used to share one key, so an alert that had
+        # just started inherited the age of one that had been firing.
+        self.evaluate(self.snapshot(ts=NOW, **{"wtf_json": self.alerts("cpu_throttle")}))
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 601, **{"wtf_json": self.alerts("cpu_throttle", "memory_high")}))
+        self.assertEqual(self.failures(verdict), [])
+
     def test_a_repeated_failure_bundles_once_per_half_hour(self):
         _, first = self.evaluate(self.snapshot(ts=NOW, kind="light", **{"http_txt": "502 0.10\n"}))
         code, again = self.evaluate(self.snapshot(ts=NOW + 30, kind="light", **{"http_txt": "502 0.10\n"}))
@@ -724,6 +770,41 @@ class AgentLoopTurns(Evidence):
         self.assertEqual(code, 1)
         self.assertIn("agent-loop-turn", self.failures(verdict))
 
+    def slow_fsync_window(self, node):
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(["window", str(self.evidence), "open", "node-slow-fsync", "--node", node])
+
+    def test_slow_turns_on_a_node_whose_disk_the_soak_throttles_are_info(self):
+        # The jobs tier caps one node's writes at 20 IOPS (#972): a turn that
+        # journals there is slow by construction, not a regression.
+        self.slow_fsync_window("rb-a-2")
+        code, verdict = self.evaluate(self.snapshot(**{
+            "inventory__rb-a-2_txt": INVENTORY,
+            "turns__rb-a-2_json": turns(branch="follow_up", over=("10",))}))
+        self.assertNotIn("agent-loop-turn", self.failures(verdict))
+        note = next(item for item in verdict["findings"] if item["check"] == "agent-loop-turn")
+        self.assertEqual(note["severity"], "info")
+        self.assertIn("injected slow-fsync", note["detail"])
+        self.assertNotIn("rb-a-2", checker.load_state(self.evidence).get("turns_over_budget", {}))
+
+    def test_slow_turns_on_another_node_still_fail_during_a_slow_fsync_fault(self):
+        self.slow_fsync_window("rb-a-1")
+        code, verdict = self.evaluate(self.snapshot(**{
+            "inventory__rb-a-2_txt": INVENTORY,
+            "turns__rb-a-2_json": turns(branch="follow_up", over=("2.5",))}))
+        self.assertEqual(code, 1)
+        self.assertIn("agent-loop-turn", self.failures(verdict))
+
+    def test_slow_turns_fail_again_once_the_slow_fsync_window_closes(self):
+        self.slow_fsync_window("rb-a-2")
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(["window", str(self.evidence), "settled"])
+        code, verdict = self.evaluate(self.snapshot(**{
+            "inventory__rb-a-2_txt": INVENTORY,
+            "turns__rb-a-2_json": turns(branch="follow_up", over=("2.5",))}))
+        self.assertEqual(code, 1)
+        self.assertIn("agent-loop-turn", self.failures(verdict))
+
     def test_the_record_counts_turns_over_the_budget_per_node(self):
         self.evaluate(self.snapshot(**{"turns__rb-a-1_json": turns(over=("2.5", "5")),
                                        "turns__rb-a-2_json": turns()}))
@@ -848,7 +929,7 @@ class Record(Evidence):
             state["renewals"]["workload-identity"] = {name: 16 for name in NODES}
             checker.save_state(self.evidence, state)
         else:
-            run.update(duration_target=90 * 60)
+            run.update(duration_target=60 * 60)
         run.update(tier=tier, **metadata)
         (self.evidence / "metadata.json").write_text(json.dumps(run))
         record = self.evidence / "record.md"
@@ -900,3 +981,103 @@ class Record(Evidence):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GuestMemory(unittest.TestCase):
+    """#985: the OOM report that explained #982 was only found by hand on
+    the live VM. The soak keeps guest memory evidence itself."""
+
+    script = Path(__file__).parent / "sustained" / "guest-memory.sh"
+    KERNEL = """Oct 16 10:00:00 rb-a-1 kernel: eth0: link up
+Oct 16 10:01:00 rb-a-1 kernel: bun invoked oom-killer: gfp_mask=0x140cca(GFP_HIGHUSER_MOVABLE|__GFP_COMP), order=0, oom_score_adj=0
+Oct 16 10:01:00 rb-a-1 kernel: Mem-Info:
+Oct 16 10:01:00 rb-a-1 kernel: [  pid  ]   uid  tgid total_vm      rss pgtables_bytes swapents oom_score_adj name
+Oct 16 10:01:00 rb-a-1 kernel: [    812]     0   812   400000   262144   2400000        0          -999 lima-guestagent
+Oct 16 10:01:00 rb-a-1 kernel: [   1200]     0  1200   300000    97000   1100000        0             0 bun
+Oct 16 10:01:00 rb-a-1 kernel: oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),task=bun,pid=1200,uid=0
+Oct 16 10:01:00 rb-a-1 kernel: Out of memory: Killed process 1200 (bun) total-vm:1200000kB, anon-rss:388000kB
+Oct 16 10:02:00 rb-a-1 kernel: eth0: carrier ok
+"""
+
+    def run_script(self, mode):
+        import os, subprocess
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            proc = root / "proc"; (proc / "812" / "fd").mkdir(parents=True)
+            (proc / "meminfo").write_text("MemTotal: 2014000 kB\nMemAvailable: 51200 kB\n")
+            (proc / "812" / "status").write_text("Name: lima-guestagent\nVmRSS:\t1048576 kB\n")
+            for fd in range(5): (proc / "812" / "fd" / str(fd)).write_text("")
+            bin_dir = root / "bin"; bin_dir.mkdir()
+            calls = root / "calls"
+            stubs = {"ps": "printf '  PID   RSS COMMAND\\n  812 1048576 lima-guestagent\\n 1200 388000 bun\\n'",
+                     "systemctl": "echo 812",
+                     "journalctl": f"echo \"$*\" >> {calls}; cat <<'LOG'\n{self.KERNEL}LOG"}
+            for name, body in stubs.items():
+                (bin_dir / name).write_text("#!/bin/sh\n" + body + "\n"); (bin_dir / name).chmod(0o755)
+            result = subprocess.run(["bash", str(self.script), mode], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    timeout=30, env=dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", SOAK_PROC=str(proc)))
+            return result, calls.read_text()
+
+    def test_the_report_has_meminfo_top_rss_the_guest_agent_and_the_oom_report(self):
+        result, _ = self.run_script("recent")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = result.stdout
+        self.assertIn("MemAvailable: 51200 kB", text)
+        self.assertIn("1048576 lima-guestagent", text)
+        self.assertIn("lima_guestagent_rss_kb 1048576", text)
+        self.assertIn("lima_guestagent_fd 5", text)
+        self.assertIn("invoked oom-killer", text)
+        self.assertIn("-999 lima-guestagent", text)
+        self.assertIn("Out of memory: Killed process 1200 (bun)", text)
+        # Only the OOM report, not the rest of the kernel log.
+        self.assertNotIn("link up", text)
+        self.assertNotIn("carrier ok", text)
+
+    def test_heavy_checks_read_new_kernel_messages_and_bundles_the_last_half_hour(self):
+        _, heavy = self.run_script("cursor")
+        _, bundle = self.run_script("recent")
+        self.assertIn("--cursor-file=/var/tmp/soak-kernel.cursor", heavy)
+        self.assertIn("--since=-30min", bundle)
+
+    def test_heavy_checks_and_failure_bundles_collect_it(self):
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        heavy = script[script.index("collect() {"):script.index("registry() {")]
+        bundle = script[script.index("record_failure() {"):script.index("setup_fail() {")]
+        self.assertIn('memory_report "$node" cursor > "$directory/memory-${vm[node]}.txt"', heavy)
+        self.assertIn('memory_report "$node" recent > "$directory/memory-${vm[node]}.txt"', bundle)
+
+
+class TestFailures(unittest.TestCase):
+    """#1068: the chaos scenario recorded the JSON report's last three lines,
+    `} ] }`, which hid why `relish test` failed."""
+
+    REASON = "apply failed: API error (status 400): timeout (2s) must not be longer than interval (1s)"
+
+    def report(self):
+        return json.dumps({"schema_version": 1, "results": [
+            {"name": "dead_worker_node_has_workloads_rescheduled", "outcome": {"status": "fail", "reason": self.REASON}},
+            {"name": "passing_case", "outcome": {"status": "pass"}},
+        ]}, indent=2)
+
+    def test_a_report_names_each_failing_case_and_its_reason(self):
+        self.assertEqual(checker.test_failure_reasons(self.report()),
+                         f"dead_worker_node_has_workloads_rescheduled: fail: {self.REASON}")
+
+    def test_without_a_report_it_keeps_the_tail_of_stderr(self):
+        self.assertEqual(checker.test_failure_reasons("", "connecting\nerror: cluster unreachable\n"),
+                         "connecting error: cluster unreachable")
+
+    def test_the_subcommand_reads_the_report_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "chaos-3.log"
+            report.write_text(self.report())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(checker.main(["test-failures", str(report), str(report) + ".err"]), 0)
+        self.assertIn(self.REASON, out.getvalue())
+
+    def test_the_chaos_scenario_records_the_reason_not_the_tail(self):
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        chaos = script[script.index("chaos_one() {"):script.index("catalogue_pulse() {")]
+        self.assertIn('--timeout 600s > "$output" 2> "$output.err"', chaos)
+        self.assertIn('record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")"', chaos)

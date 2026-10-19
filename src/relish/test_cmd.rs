@@ -88,9 +88,8 @@ async fn run_with_client(
         testkit::chaos::select_scenarios(args.filter.as_deref())
             .map_err(|body| RelishError::ApiError { status: 0, body })?
     } else {
-        let groups = testkit::parse_filter(args.filter.as_deref().unwrap_or(""))
-            .map_err(|body| RelishError::ApiError { status: 0, body })?;
-        testkit::select(testkit::all_cases(), &groups)
+        testkit::select(testkit::all_cases(), args.filter.as_deref().unwrap_or(""))
+            .map_err(|body| RelishError::ApiError { status: 0, body })?
     };
 
     if args.chaos {
@@ -184,7 +183,7 @@ fn render(report: &TestReport, output: OutputFormat) -> Result<(), RelishError> 
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(report).map_err(RelishError::SerialiseYaml)?;
+            let yaml = yaml_serde::to_string(report).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
         OutputFormat::Human => print!("{}", render_human(report)),
