@@ -5399,7 +5399,7 @@ dependencies = [
  "prometheus-parse",
  "proptest",
  "pulldown-cmark",
- "rand 0.8.8",
+ "rand 0.10.3",
  "ratatui",
  "rcgen",
  "redb",

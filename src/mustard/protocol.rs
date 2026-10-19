@@ -29,9 +29,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use tokio_util::sync::CancellationToken;
 
 use tokio::sync::watch;
@@ -299,7 +298,7 @@ impl<T: MustardTransport> MustardNode<T> {
             directory: NodeDirectory::default(),
             directory_watch: None,
             node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
-            rng: StdRng::from_entropy(),
+            rng: rand::make_rng(),
             next_push_pull: Instant::now(),
             sync_cursor: 0,
             sequences: HashMap::new(),
@@ -1236,7 +1235,7 @@ impl<T: MustardTransport> MustardNode<T> {
 
         let count = self.config.indirect_probe_count.min(candidates.len());
         candidates
-            .choose_multiple(&mut self.rng, count)
+            .sample(&mut self.rng, count)
             .map(|m| m.address)
             .collect()
     }
@@ -1245,6 +1244,7 @@ impl<T: MustardTransport> MustardNode<T> {
     /// exactly one probe schedule.
     #[cfg(test)]
     fn seed_rng(&mut self, seed: u64) {
+        use rand::SeedableRng;
         self.rng = StdRng::seed_from_u64(seed);
     }
 

@@ -698,10 +698,9 @@ Why a round cap at all? Because gossip propagation depends on random target sele
 
 It wasn't. In one full-suite run the test finished with one node seeing four members instead of five. More rounds would not have helped, and that's the interesting part. We ran twenty thousand unseeded schedules and about one in 1,700 got stuck for good (a hundred thousand gave 73, one in 1,370): every update about some member spent its bounded re-broadcasts before reaching one particular node, every dissemination queue drained, and from then on the PINGs carried nothing new. Nothing in Mustard resynchronised full membership, so a stranded node stayed stranded until something changed. That's a property of the protocol, not of the test, and the fix belongs in Mustard rather than in a longer test. We'll get to the fix in a moment. First, we needed to be able to replay a failure.
 
-Each `MustardNode` owns its random number generator instead of reaching for `rand::thread_rng()` on every probe:
+Each `MustardNode` owns its random number generator instead of reaching for `rand::rng()` on every probe:
 
 ```rust
-use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 pub struct MustardNode<T: MustardTransport> {
@@ -710,15 +709,16 @@ pub struct MustardNode<T: MustardTransport> {
 }
 
 // in MustardNode::new
-rng: StdRng::from_entropy(),
+rng: rand::make_rng(),
 
 #[cfg(test)]
 fn seed_rng(&mut self, seed: u64) {
+    use rand::SeedableRng;
     self.rng = StdRng::seed_from_u64(seed);
 }
 ```
 
-`StdRng::from_entropy()` seeds from the operating system, so production behaves exactly as before. `seed_from_u64` comes from the `SeedableRng` trait, and here's a Rust rule that surprises Go and Python programmers: a trait's methods are only callable when the trait is in scope. Without `use rand::SeedableRng;` the compiler reports that `StdRng` has no function called `seed_from_u64`, even though the type implements it. The `#[cfg(test)]` attribute compiles `seed_rng` only into test builds, so the seam doesn't leak into the public API.
+`rand::make_rng()` builds any seedable generator from fresh operating-system randomness, so production behaves exactly as before. It's generic over the generator type, and the compiler works out which one we want from the field's type, `StdRng`. `seed_from_u64` comes from the `SeedableRng` trait, and here's a Rust rule that surprises Go and Python programmers: a trait's methods are only callable when the trait is in scope. Without `use rand::SeedableRng;` the compiler reports that `StdRng` has no function called `seed_from_u64`, even though the type implements it. The `#[cfg(test)]` attribute compiles `seed_rng` only into test builds, so the seam doesn't leak into the public API. That's also why the `use` sits inside the function: at the top of the file it would be an unused import in every non-test build, and we treat warnings as errors.
 
 A seed alone wasn't enough. The membership table is a `HashMap`, and Rust's `HashMap` randomises its hashing per instance to resist denial-of-service attacks, so the candidate list came out in a different order every run. The same random index then picked a different peer. `pick_probe_target()` now sorts candidates by node ID before choosing. The choice is still uniform; it just depends only on the generator. With the generator seeded, a schedule that strands a member strands it every time, so we can study it, and later prove it rescued.
 

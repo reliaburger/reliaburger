@@ -1119,6 +1119,23 @@ they'd fail the moment a new crate changed a single byte. The HMACs on gossip an
 and the API-token hash never moved: they use `ring`, whose `hmac::verify` already
 compares tags in constant time.
 
+`rand` wasn't on the original list at all; it turned up when we reread `Cargo.toml`. Going
+from 0.8 to 0.10 crossed two releases of renames: `thread_rng()` became `rng()`, `gen` and
+`gen_range` became `random` and `random_range`, the `Rng` trait became `RngExt`,
+`choose_multiple` became `sample`, and `OsRng` became `SysRng`. The compiler finds every
+one of those. What it can't find is a secret quietly moving to a weaker source, so the PR
+checked where each random value goes. API tokens, join tokens, session keys, nonces and
+signing keys come from `ring`'s `SystemRandom`, which the bump doesn't touch. The
+`relish dashboard` launch and session tokens were the exception: they read `OsRng`
+directly. They now read `SysRng`, the same operating-system source under its new name.
+`SysRng` can fail where `OsRng` panicked, so `DashboardSession::new` returns the error
+instead. Everything else, from registry upload ids to temporary file names, comes from
+`rand::random()`, which uses the thread-local generator: still ChaCha12, still seeded from
+the operating system and reseeded every 64 KiB, exactly as in 0.8. Port and peer choice
+use the same generators. The seeded gossip tests didn't care either: they
+start each run from an OS-random base seed, so no test pinned the exact sequence a seed
+produced.
+
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
 ## Asking the cluster what it can do
