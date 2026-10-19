@@ -1088,11 +1088,11 @@ fixtures' CRLFs, which would make the test check the wrong bytes. The bump also 
 
 And sometimes the compiler does all the reviewing. `nix`, our wrapper over Unix system
 calls, went from 0.29 to 0.31, and 0.30 moved its file-descriptor functions to *I/O
-safety*. In 0.29, `fcntl`, `fstat`, `fchown` and the `*at` calls took a `RawFd`, a bare
+safety*. In 0.29, `fcntl`, `fstat`, `fchown`, `syncfs` and the `*at` calls took a `RawFd`, a bare
 `i32`, so any integer would do, including one whose descriptor was already closed and
 reused. Now they take anything that implements the `AsFd` trait: a `File`, an `OwnedFd`,
 a `nix::dir::Dir`, or a `BorrowedFd` (Chapter 8 introduced the pair). The compiler refused
-ten call sites, all in the same shape: we'd called `.as_raw_fd()` to hand nix an
+eleven call sites, all in the same shape: we'd called `.as_raw_fd()` to hand nix an
 integer. The fix was to hand over the owner instead:
 
 ```rust
@@ -1104,7 +1104,10 @@ let stat = match fstatat(&*parent, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW
 `&top` borrows the open `Dir`, and the borrow checker now proves it stays open for the
 call. `&*parent` reaches through the `Rc<Dir>` (a reference-counted pointer, so several
 children can share one parent directory) to borrow the `Dir` inside it. In C the same
-code would compile with a stale integer and fail at run time, if you were lucky. The old
+code would compile with a stale integer and fail at run time, if you were lucky. One call
+site, the `syncfs` that flushes an unpacked image, carried a comment promising "`directory`
+stays open for the whole call, so the descriptor is valid". That promise is now the
+compiler's job, so the comment went. The old
 `*at` signatures also took `Option<RawFd>`, where `None` meant "the current directory";
 the new ones take a descriptor and leave that case to `AT_FDCWD`. We never passed `None`,
 so nothing moved. Raw descriptors are still around where nix kept them, such as

@@ -879,10 +879,8 @@ impl ImageStore {
 /// Flush every dirty page of the filesystem holding `path` to disk.
 #[cfg(target_os = "linux")]
 fn sync_filesystem(path: &Path) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
     let directory = std::fs::File::open(path)?;
-    // `directory` stays open for the whole call, so the descriptor is valid.
-    nix::unistd::syncfs(directory.as_raw_fd()).map_err(std::io::Error::from)
+    nix::unistd::syncfs(&directory).map_err(std::io::Error::from)
 }
 
 /// Flush every dirty page to disk. macOS has no per-filesystem sync.
