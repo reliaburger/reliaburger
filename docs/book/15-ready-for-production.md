@@ -1074,6 +1074,18 @@ maintainers stopped. No version clears its unmaintained advisory, so "bump it" b
 changed the wire and durable formats along with the crate (Chapter 2 has the details). A
 lag report can tell you you're behind. It can't tell you the road ahead still exists.
 
+Sometimes a major version changes nothing you can see. `pem` 4.0.0, the crate that turns
+our certificates and keys into the `-----BEGIN CERTIFICATE-----` text nodes keep on disk,
+has the same source code as 3.0.6. Only its `base64` dependency and its minimum Rust
+version moved. We still didn't take that on trust. A PEM file is a stored format: if the
+new crate wrote different line endings (3.0.6 writes CRLF) or wrapped lines at a different
+width, every node would rewrite every certificate it owns. So the PR checked in a root CA
+certificate and key written by the 3.0.6 build, and
+`pem_files_written_by_pem_3_parse_and_rewrite_byte_for_byte` reads them with 4.0.0 and
+writes them back, byte for byte. A one-line `.gitattributes` keeps git from "fixing" the
+fixtures' CRLFs, which would make the test check the wrong bytes. The bump also left one
+`pem` in `Cargo.lock` instead of two, since rcgen 0.14 had already moved to 4.
+
 The `sha2` bump from 0.10 to 0.11 had the opposite risk. RustCrypto's hash crates move
 together on a shared `digest` trait crate, and 0.11 swapped the fixed-size array type a
 hash returns: `generic-array` gave way to `hybrid-array`. Code that hex-encodes the
