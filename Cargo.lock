@@ -4069,7 +4069,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
- "memoffset",
 ]
 
 [[package]]
@@ -5436,7 +5435,7 @@ dependencies = [
  "axum",
  "aya",
  "aya-log",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "crc32fast",
  "criterion",
@@ -5455,7 +5454,7 @@ dependencies = [
  "libc",
  "memmap2",
  "mime_guess",
- "nix 0.29.0",
+ "nix 0.31.3",
  "nucleo-matcher",
  "object_store 0.14.2",
  "oci-client",
