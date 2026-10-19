@@ -45,7 +45,7 @@ project's workflow makes meaningful.
 | [Kueue](https://github.com/kubernetes-sigs/kueue) | Job admission and quota for Kubernetes | 3.0k | ~3,500 commits; v0.20.1 (Oct 2026) | Kubernetes SIG Scheduling | Netflix, Google Cloud, Red Hat, CoreWeave |
 | [Volcano](https://github.com/volcano-sh/volcano) | Replacement batch scheduler for Kubernetes | 6.0k | ~930 commits; v1.15.3 (Sep 2026) | CNCF Incubating (Huawei-led) | Huawei Cloud, Tencent, Baidu, ING |
 | [YuniKorn](https://github.com/apache/yunikorn-core) | YARN-style scheduler for Kubernetes | 1.0k | ~130 commits; v1.10.0 (Oct 2026) | Apache (Apple, Cloudera) | Apple, Cloudera, Pinterest |
-| [KAI](https://github.com/kai-scheduler/KAI-Scheduler) | GPU scheduler for Kubernetes (open-sourced Run:ai) | 1.6k | ~700 commits; v0.18.3 (Oct 2026) | CNCF Sandbox (NVIDIA) | NVIDIA Run:ai, Lightning AI |
+| [KAI](https://github.com/kai-scheduler/KAI-Scheduler) | GPU scheduler for Kubernetes (open-sourced Run:ai) | 1.6k | ~700 commits; v0.18.5 (Oct 2026) | CNCF Sandbox (NVIDIA) | NVIDIA Run:ai, Lightning AI |
 | [Armada](https://github.com/armadaproject/armada) | Batch meta-scheduler over many Kubernetes clusters | 635 | 437 merged PRs; v0.22.12 (Oct 2026) | CNCF Sandbox (G-Research) | G-Research only |
 | [Nomad](https://github.com/hashicorp/nomad) | General orchestrator, one binary | 17.0k | ~830 commits; 2.0.7 (Sep 2026) | IBM, source-available since 2023 | Roblox, Cloudflare |
 | [Mesos](https://github.com/apache/mesos) | Two-level cluster manager | 5.4k | Retired to the Apache Attic, 2025 | None | Twitter, Apple, Uber (all left or leaving) |
@@ -102,7 +102,7 @@ converting the accounting database can take hours
 ([ticket 13706](https://support.schedmd.com/show_bug.cgi?id=13706)). In
 February 2026 a MUNGE overflow let local users forge any credential, root
 included, and SchedMD told sites to "treat that security issue as if it were
-local-root exploit" ([advisory](https://advisories.egi.eu/Advisory-EGI-SVG-2026-04)).
+local-root exploit" ([SchedMD](https://lists.schedmd.com/mailman3/hyperkitty/list/slurm-announce@lists.schedmd.com/message/ASRIXRZ4TFSWRRH27RYPVORW2ZA263D4/), [advisory](https://advisories.egi.eu/Advisory-EGI-SVG-2026-04)).
 
 The complaints are about the model as much as the operations:
 
@@ -114,8 +114,8 @@ The complaints are about the model as much as the operations:
   versions… but it's an invaluable and reliable tool"
   ([HN](https://news.ycombinator.com/item?id=46277190)).
 
-Containers are a bolt-on (Pyxis and enroot, Apptainer, or `--container`
-since 23.02). There are no services, no ingress and no service discovery. So
+Containers are a bolt-on (Pyxis and enroot, Apptainer, `--container` since
+21.08, or `scrun` since 23.02). There are no services, no ingress and no service discovery. So
 the industry runs two schedulers and bridges them:
 [Slinky](https://github.com/SlinkyProject/slurm-operator) runs Slurm in
 Kubernetes pods, Nebius's [Soperator](https://github.com/nebius/soperator)
@@ -146,13 +146,13 @@ running job. The learning curve (ClassAds, many daemons) is its reputation.
   source line hasn't released since June 2023.
 - **LSF** is proprietary and priced per core. It has polished fair share and
   licence-aware scheduling for chip design tools. Cost is the recurring
-  complaint: one university admin moved to Slurm "when LSF started increasing
-  the costs for licensing" ([Beowulf](https://beowulf.org/pipermail/beowulf/2022-March/037071.html)).
+  complaint: one university admin's site moved to Slurm about a decade earlier
+  "when LSF started increasing the costs for licensing" ([Beowulf](https://beowulf.org/pipermail/beowulf/2022-March/037070.html)).
 - **Grid Engine** went closed under Oracle, then to Univa, then Altair. It
   survives at legacy life-science and chip design sites.
 - **Flux** (LLNL) nests schedulers: any job can be a Flux instance with its
   own scheduler, which lifts the throughput ceiling for large ensembles. It
-  runs El Capitan's early-access systems ([LLNL](https://software.llnl.gov/news/2024/03/21/flux/)). It's pre-1.0 with 691 open issues.
+  is the workload manager on El Capitan and its sister systems ([LLNL](https://hpc.llnl.gov/documentation/user-guides/using-el-capitan-systems/running-jobs-flux-and-mpi)). It's pre-1.0 with 691 open issues.
 
 ## Kubernetes batch add-ons
 
@@ -189,8 +189,9 @@ of work is a Pod object in etcd. Four projects fill the gap, and they stack.
 
 Underneath sit the job APIs: Indexed Job (Kubernetes' array, with per-index
 retry budgets), JobSet, Kubeflow Trainer and LeaderWorkerSet. Upstream is
-adding gang scheduling itself (KEP-4671, alpha in 1.35 and 1.36;
-[Kubernetes blog](https://kubernetes.io/blog/2026/05/13/kubernetes-v1-36-advancing-workload-aware-scheduling/)), which takes
+adding gang scheduling itself (KEP-4671, alpha in 1.35 and beta, off by
+default, in 1.37;
+[Kubernetes blog](https://kubernetes.io/blog/2026/09/08/kubernetes-v1-37-advancing-workload-aware-scheduling/)), which takes
 one selling point away from Volcano and YuniKorn. Quota and fair share stay
 out of tree.
 
@@ -275,7 +276,7 @@ retire it was reversed after a burst of interest that never produced a
 release ([The New Stack](https://thenewstack.io/apache-mesos-narrowly-avoids-a-move-to-the-attic-for-now/)), and in August 2025 the Apache board terminated the project; it moved
 to the [Attic](https://attic.apache.org/projects/mesos.html) that October.
 Marathon, Chronos, Aurora and Metronome are all archived. Uber finished
-moving to Kubernetes in 2024 and called the Mesos base "outdated"
+moving its ML stack to Ray on Kubernetes in 2024 and called the Mesos base "outdated"
 ([Uber](https://www.uber.com/blog/ubers-journey-to-ray-on-kubernetes-ray-setup/)).
 
 The lesson is about shape, not features. Mesos only offered resources; every
@@ -362,9 +363,9 @@ Sources: [AWS quotas](https://docs.aws.amazon.com/batch/latest/userguide/service
 The complaints are about latency and opacity. AWS users report jobs waiting
 in `RUNNABLE` for "3 to 6 hours"
 ([re:Post](https://repost.aws/questions/QU56MiZPbhR7W1Hor5CEHT-A/aws-batch-jobs-in-runnable-for-several-hours)),
-and even the happy path spends about a minute between `SUBMITTED` and
-`RUNNABLE` ([re:Post](https://www.repost.aws/questions/QUTDkVA7QGS-eSjVqicZ721Q/start-up-times-for-aws-batch-jobs-with-big-outliers)). Azure Batch isn't being retired, but it's shedding features
-(low-priority VMs, custom images, older GPU series; Microsoft's
+and another sees about six minutes from `RUNNABLE` to `RUNNING` normally,
+with outliers over an hour and a half ([re:Post](https://www.repost.aws/questions/QUTDkVA7QGS-eSjVqicZ721Q/start-up-times-for-aws-batch-jobs-with-big-outliers)). Azure Batch isn't being retired, but it's shedding features
+(low-priority VMs, pools from VHD and managed images, older GPU series; Microsoft's
 [retirement tracker](https://github.com/Azure/Batch/issues/140)), and Microsoft is ending
 HPC Pack support in August 2027
 ([announcement, reposted](https://argonsys.com/microsoft-cloud/library/retirement-of-microsoft-hpc-pack/)), which leaves on-premises Windows HPC sites
@@ -389,8 +390,8 @@ end up being used as job schedulers, and none of them is good at it at volume:
   "You cannot horizontally scale the controller"
   ([scaling docs](https://argo-workflows.readthedocs.io/en/latest/scaling/)).
 - **Airflow** caps dynamic task mapping at 1,024 by default, and its own
-  improvement proposal admits that "with thousands of tasks… it causes
-  starvation" ([AIP-100](https://cwiki.apache.org/confluence/spaces/AIRFLOW/pages/406618462/AIP-100+Eliminate+Scheduler+Queueing+Starvation+On+Concurrency+Limits)).
+  improvement proposal admits that large deployments mapping thousands of
+  tasks per DAG "suffer severe scheduler starvation" ([AIP-100](https://cwiki.apache.org/confluence/spaces/AIRFLOW/pages/406618462/AIP-100+Eliminate+Scheduler+Queueing+Starvation+On+Concurrency+Limits)).
 - **Flyte** has map tasks with
   [`min_success_ratio`](https://flyte.readthedocs.io/en/v1.11.0/api/flytekit/generated/flytekit.map_task.html), so an array can succeed
   if, say, 95% of its tasks do.
@@ -690,6 +691,7 @@ Every other source is linked where it's used, and listed here by section.
 - [slurm.schedmd.com: high_throughput](https://slurm.schedmd.com/high_throughput.html)
 - [support.schedmd.com: show_bug.cgi](https://support.schedmd.com/show_bug.cgi?id=13706)
 - [advisories.egi.eu: Advisory-EGI-SVG-2026-04](https://advisories.egi.eu/Advisory-EGI-SVG-2026-04)
+- [lists.schedmd.com: slurm-announce](https://lists.schedmd.com/mailman3/hyperkitty/list/slurm-announce@lists.schedmd.com/message/ASRIXRZ4TFSWRRH27RYPVORW2ZA263D4/)
 - [Hacker News item 25910178](https://news.ycombinator.com/item?id=25910178)
 - [SlinkyProject/slurm-operator](https://github.com/SlinkyProject/slurm-operator)
 - [nebius/soperator](https://github.com/nebius/soperator)
@@ -697,8 +699,8 @@ Every other source is linked where it's used, and listed here by section.
 - [indico.nikhef.nl: 09%2024%20Nikhef%20Phil](https://indico.nikhef.nl/event/5744/contributions/22865/attachments/8803/12882/09%2024%20Nikhef%20Phil.pdf)
 - [arXiv 2405.14631](https://arxiv.org/pdf/2405.14631)
 - [nafems.org: siemens-completes-10-billion-acquisition-of-altair-engineering](https://www.nafems.org/about-us/media/news/industrynews1003/siemens-completes-10-billion-acquisition-of-altair-engineering/)
-- [beowulf.org: 037071](https://beowulf.org/pipermail/beowulf/2022-March/037071.html)
-- [software.llnl.gov: flux](https://software.llnl.gov/news/2024/03/21/flux/)
+- [beowulf.org: 037070](https://beowulf.org/pipermail/beowulf/2022-March/037070.html)
+- [hpc.llnl.gov: running-jobs-flux-and-mpi](https://hpc.llnl.gov/documentation/user-guides/using-el-capitan-systems/running-jobs-flux-and-mpi)
 
 **Kubernetes batch add-ons**
 
@@ -706,7 +708,7 @@ Every other source is linked where it's used, and listed here by section.
 - [kubernetes-sigs/kueue release v0.20.1](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.20.1)
 - [volcano-sh/volcano issue #2700](https://github.com/volcano-sh/volcano/issues/2700)
 - [volcano-sh/volcano issue #4970](https://github.com/volcano-sh/volcano/issues/4970)
-- [kubernetes.io: kubernetes-v1-36-advancing-workload-aware-scheduling](https://kubernetes.io/blog/2026/05/13/kubernetes-v1-36-advancing-workload-aware-scheduling/)
+- [kubernetes.io: kubernetes-v1-37-advancing-workload-aware-scheduling](https://kubernetes.io/blog/2026/09/08/kubernetes-v1-37-advancing-workload-aware-scheduling/)
 - [skypilot.ai: slurm-vs-k8s](https://skypilot.ai/blog/slurm-vs-k8s/)
 
 **Armada**
