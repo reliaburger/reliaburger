@@ -1132,9 +1132,15 @@ directly. They now read `SysRng`, the same operating-system source under its new
 instead. Everything else, from registry upload ids to temporary file names, comes from
 `rand::random()`, which uses the thread-local generator: still ChaCha12, still seeded from
 the operating system and reseeded every 64 KiB, exactly as in 0.8. Port and peer choice
-use the same generators. The seeded gossip tests didn't care either: they
-start each run from an OS-random base seed, so no test pinned the exact sequence a seed
-produced.
+use the same generators.
+
+The seeded tests were the other thing to check, and one of them did care. Mustard's
+rescue test replays seed 830, a schedule that strands a gossip member until push-pull
+saves it. 0.10 changed how `choose` maps random bits to an index, so seed 830 now
+converges on its own. The test has a guard for exactly this, an assertion that the seed
+still strands without push-pull, and the guard failed. We rescanned the same 100,000
+seeds, picked the new first stranding schedule (seed 160) and updated the numbers in
+Chapter 2. What the test checks didn't change, only which seed it checks it with.
 
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
