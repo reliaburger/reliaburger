@@ -5435,7 +5435,7 @@ dependencies = [
  "axum",
  "aya",
  "aya-log",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "crc32fast",
  "criterion",

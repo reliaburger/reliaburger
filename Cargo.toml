@@ -67,7 +67,7 @@ ring = "0.17"
 x509-parser = { version = "0.18", features = ["verify"] }
 pem = "4"
 age = { version = "0.12", features = ["armor"] }
-base64 = "0.22"
+base64 = "0.23"
 datafusion = "55"
 # `relish logs --grep` patterns: validated with the same engine DataFusion's
 # `regexp_like` runs, so the server and the client agree on the syntax.
