@@ -255,13 +255,15 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 This is what 0.2.0, the release the installer fetches, does.
 
-**Runs Kubernetes YAML.** `relish apply -f` takes Deployments, StatefulSets,
-DaemonSets, Services, Ingresses, ConfigMaps, Secrets, Jobs, CronJobs, HPAs and
-Namespaces. It converts them on the way in and tells you what it had to
-change. ConfigMaps and Secrets aren't wired into workloads yet: each one gets
-a warning, `envFrom` is dropped, and their values have to move into `env` or
+**Runs Kubernetes YAML.** `relish apply -f` converts Deployments, StatefulSets,
+DaemonSets, Services, Ingresses, Jobs, CronJobs, HPAs and Namespaces on the
+way in and tells you everything it had to approximate or drop. Services attach
+to workloads by label selector, as they do in Kubernetes. A ConfigMap that a
+workload reads with `envFrom` is copied into its `env`; any other ConfigMap,
+and every Secret, only gets a warning, so those values move into `env` or
 `config_file` by hand.
-`relish import` writes the equivalent TOML if you'd rather keep that.
+`relish import` writes the equivalent TOML if you'd rather keep that, and
+`--strict` fails a CI run on anything it couldn't convert exactly.
 
 **Clustering without etcd.** Nodes find each other and detect failure with SWIM
 gossip. A small Raft council, embedded in the agent, holds cluster state. It
