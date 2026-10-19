@@ -90,6 +90,7 @@ mod task_array_recovery;
 mod task_arrays;
 mod tls_connection_lifetime;
 mod uninstall;
+mod user_directories;
 mod website;
 mod worker_desired_state;
 mod workload_trust_domain;
