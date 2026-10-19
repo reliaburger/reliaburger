@@ -164,6 +164,13 @@ Raft is **not** used for:
 - Failure detection (that is Mustard's job)
 - Communication with non-council nodes
 
+#### Forwarding leader-only API calls
+
+openraft doesn't forward client writes, so a node that can't confirm it leads (`CouncilNode::is_leader`, a quorum check) forwards leader-only API calls to the leader's API, carrying the caller's own credential. Two rules stop a forward from looping ([#1069](https://github.com/reliaburger/reliaburger/issues/1069)):
+
+- **Never to itself.** `leader_api_url` and `upgrade::leader_base_url` return `NoLeaderRoute::ThisNode` when Raft names this node as leader (`current_leader`, or its metrics). That node is a restored leader in the startup recovery probe, or a leader cut off from its quorum. The route answers 503 "this node holds the leader role but can't confirm it with a quorum" and makes no outbound request. `NoLeaderRoute::Unknown` keeps each route's "no cluster leader known yet" answer.
+- **Never twice.** Every forwarded request carries `x-reliaburger-forwarded: 1`. A node that receives a marked request and can't confirm it leads answers 503 (`NoLeaderRoute::AlreadyForwarded`) instead of forwarding again; a confirmed leader serves it. The header only ever turns a forward into a 503, so it needs no authentication of its own. The older per-route markers (`x-reliaburger-upgrade-forwarded`, `-lease-forwarded`, `-forwarded-sign`, `-desired-apps-forwarded`, `-webhook-forwarded`) still travel alongside it.
+
 #### Raft transport connections
 
 Raft RPCs travel over TCP with mTLS (`src/council/network.rs`). Each node keeps a small pool of established connections per peer (`src/council/connection_pool.rs`, [#928](https://github.com/reliaburger/reliaburger/issues/928)), so a heartbeat or append doesn't pay for a TCP and TLS handshake. This matters because a leader confirming its leadership for a linearizable read gives each heartbeat only `heartbeat_interval` (150 ms) to come back; on a debug-build Lima cluster a handshake per RPC exceeded that (found while proving [#870](https://github.com/reliaburger/reliaburger/issues/870)). One missed round doesn't make a settled leader refuse a read: the lease routes call `CouncilNode::confirm_leadership`, which repeats the check every heartbeat interval for up to 3 s while the node's own metrics still name it leader, and answers "not leader" at once on a node that names another voter or none ([#1009](https://github.com/reliaburger/reliaburger/issues/1009)).

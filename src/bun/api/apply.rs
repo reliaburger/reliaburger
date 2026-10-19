@@ -537,20 +537,17 @@ pub(super) async fn cluster_apply(
     // Follower? Forward to the leader rather than half-failing. The leader
     // binds images: a follower's binder (or lack of one) plays no part.
     if !council.is_leader().await {
-        let Some(leader_url) = leader_api_url(&state, &council).await else {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "no cluster leader known yet; retry shortly"
-                })),
-            )
-                .into_response();
+        let leader_url = match leader_api_url(&state, &council, &caller_headers).await {
+            Ok(url) => url,
+            Err(refusal) => return refusal.into_response(),
         };
-        let mut request = state
-            .cluster_http
-            .client()
-            .post(format!("{leader_url}/v1/apply"))
-            .body(raw_body);
+        let mut request = mark_leader_forwarded(
+            state
+                .cluster_http
+                .client()
+                .post(format!("{leader_url}/v1/apply"))
+                .body(raw_body),
+        );
         if let Some(lease_id) = &lease_id {
             request = request.header("x-reliaburger-test-lease", lease_id);
             if let Some(value) = caller_headers.get(CAPACITY_PROBE_HEADER) {
@@ -832,7 +829,89 @@ pub(super) fn describe_write(request: &crate::council::types::RaftRequest) -> St
     }
 }
 
-/// Resolve the current leader's API base URL.
+/// Marks a request one node has forwarded to the leader. A node that
+/// receives a marked request and can't confirm it leads answers 503 rather
+/// than forwarding it again, so no forwarding chain can loop (#1069).
+pub(crate) const LEADER_FORWARDED_HEADER: &str = "x-reliaburger-forwarded";
+
+/// Why a request that only the leader can serve can't be sent on to it.
+///
+/// Every variant answers 503: the caller should retry, and by then a leader
+/// may be known, or may have confirmed it leads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum NoLeaderRoute {
+    /// No node is known to lead yet.
+    #[error("no cluster leader known yet; retry shortly")]
+    Unknown,
+    /// Raft names this node as the leader, but it can't confirm that with a
+    /// quorum: a restored leader during the startup recovery probe, or one
+    /// cut off from its followers. Forwarding would send the request back to
+    /// this node's own API.
+    #[error("this node holds the leader role but can't confirm it with a quorum; retry shortly")]
+    ThisNode,
+    /// Another node already forwarded this request here, and this node
+    /// can't confirm it leads either. The two disagree about who leads, and
+    /// forwarding again could start a loop.
+    #[error(
+        "this request was already forwarded to this node, which can't confirm it leads; retry once the election settles"
+    )]
+    AlreadyForwarded,
+}
+
+impl IntoResponse for NoLeaderRoute {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": self.to_string() })),
+        )
+            .into_response()
+    }
+}
+
+/// Mark `request` as forwarded to the leader, so the node that receives it
+/// never forwards it again.
+pub(crate) fn mark_leader_forwarded(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    request.header(LEADER_FORWARDED_HEADER, "1")
+}
+
+/// The Raft id of the leader to forward a request to, or `None` when no
+/// leader is known yet. Refuses when the request was already forwarded once
+/// (`inbound` carries [`LEADER_FORWARDED_HEADER`]) and when the leader Raft
+/// names is this node.
+///
+/// Callers ask this only after this node failed to confirm it leads. The
+/// header can come from any client, but all it ever does is turn a forward
+/// into a 503: it grants nothing.
+pub(crate) async fn leader_to_forward_to(
+    council: &crate::council::CouncilNode,
+    inbound: &HeaderMap,
+) -> Result<Option<u64>, NoLeaderRoute> {
+    if inbound.contains_key(LEADER_FORWARDED_HEADER) {
+        return Err(NoLeaderRoute::AlreadyForwarded);
+    }
+    // Raft's metrics can name this node even when `current_leader` hides it
+    // (a fenced node), and the gossip directory resolves the leader from
+    // those metrics, so both views must rule this node out.
+    let (own_id, metrics_name_self) = {
+        let metrics = council.metrics();
+        let metrics = metrics.borrow();
+        (metrics.id, metrics.current_leader == Some(metrics.id))
+    };
+    match council.current_leader().await {
+        _ if metrics_name_self => Err(NoLeaderRoute::ThisNode),
+        Some(leader) if leader == own_id => Err(NoLeaderRoute::ThisNode),
+        leader => Ok(leader),
+    }
+}
+
+/// Resolve the current leader's API base URL, for a request this node
+/// can't serve because it can't confirm it leads.
+///
+/// It never names this node: a leader that can't prove it leads gets
+/// [`NoLeaderRoute::ThisNode`], and a request another node already
+/// forwarded gets [`NoLeaderRoute::AlreadyForwarded`] (see
+/// [`leader_to_forward_to`]). `inbound` is the request being forwarded;
+/// a request this node starts itself passes an empty map.
 ///
 /// Preferred source is the gossip-fed membership table (it stores real
 /// per-node API addresses); the fallback derives from the leader's
@@ -841,15 +920,19 @@ pub(super) fn describe_write(request: &crate::council::types::RaftRequest) -> St
 pub(crate) async fn leader_api_url(
     state: &ApiState,
     council: &crate::council::CouncilNode,
-) -> Option<String> {
-    let leader_id = council.current_leader().await?;
+    inbound: &HeaderMap,
+) -> Result<String, NoLeaderRoute> {
+    let leader_id = leader_to_forward_to(council, inbound)
+        .await?
+        .ok_or(NoLeaderRoute::Unknown)?;
     let (leader_name, leader_ip) = {
         let metrics = council.metrics();
         let metrics = metrics.borrow();
         let info = metrics
             .membership_config
             .membership()
-            .get_node(&leader_id)?;
+            .get_node(&leader_id)
+            .ok_or(NoLeaderRoute::Unknown)?;
         (info.name.clone(), info.addr.ip())
     };
 
@@ -859,13 +942,11 @@ pub(crate) async fn leader_api_url(
             .iter()
             .find(|m| m.node_id == crate::meat::NodeId::new(&leader_name))
         {
-            return Some(state.cluster_http.url(&info.address.to_string(), ""));
+            return Ok(state.cluster_http.url(&info.address.to_string(), ""));
         }
     }
 
-    Some(
-        state
-            .cluster_http
-            .url(&format!("{leader_ip}:{}", state.api_port), ""),
-    )
+    Ok(state
+        .cluster_http
+        .url(&format!("{leader_ip}:{}", state.api_port), ""))
 }

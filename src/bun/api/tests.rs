@@ -1745,7 +1745,8 @@ async fn lease_reads_forward_user_authority_and_refuse_an_isolated_leader() {
     }
 }
 
-/// One request the fake leader received: path, bearer, loop marker, body.
+/// One request the fake leader received: path, bearer, whether it carried
+/// the leader-forwarded marker, body.
 pub(super) type SeenAtLeader = (String, Option<String>, bool, String);
 
 /// Serve a fake leader API on `listener` that accepts every request and
@@ -1764,7 +1765,7 @@ pub(super) fn serve_recording_leader(
                 .get("authorization")
                 .and_then(|value| value.to_str().ok())
                 .map(String::from);
-            let looped = request.headers().contains_key(UPGRADE_FORWARDED_HEADER);
+            let looped = request.headers().contains_key(LEADER_FORWARDED_HEADER);
             let body = request.into_body().collect().await.unwrap().to_bytes();
             let body = String::from_utf8_lossy(&body).to_string();
             recorder.lock().await.push((path, bearer, looped, body));
@@ -2093,6 +2094,277 @@ async fn a_worker_outside_raft_forwards_upgrade_calls_to_the_leader_gossip_names
     assert_eq!(seen[0].0, "/v1/upgrade/abort");
     assert_eq!(seen[0].1, Some(format!("Bearer {admin_key}")));
     worker.shutdown().await.unwrap();
+}
+
+/// A three-node council whose node 1 still names itself the leader but has
+/// lost its quorum: a restored leader during the startup recovery probe, or a
+/// leader cut off from its followers (#1069). Returns node 1's router with
+/// `tokens` in its store, a count of the connections made to node 1's own API
+/// address, and the council nodes to shut down.
+async fn router_of_a_leader_without_quorum(
+    tokens: Vec<crate::sesame::types::ApiToken>,
+) -> (
+    Router,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Vec<Arc<crate::council::CouncilNode>>,
+) {
+    use crate::council::CouncilNode;
+    use crate::council::log_store::MemLogStore;
+    use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    use crate::council::state_machine::CouncilStateMachine;
+    use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+
+    // Node 1's own API address. Anything that connects here is node 1
+    // talking to itself.
+    let own_api = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let own_port = own_api.local_addr().unwrap().port();
+    let self_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = self_connections.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = own_api.accept().await {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+
+    let network = InMemoryRaftRouter::new();
+    let mut nodes = Vec::new();
+    let mut members = std::collections::BTreeMap::new();
+    for id in 1..=3 {
+        members.insert(
+            id,
+            CouncilNodeInfo {
+                addr: std::net::SocketAddr::from(([127, 0, 0, 1], 7000 + id as u16)),
+                name: format!("node-{id}"),
+            },
+        );
+        let node = Arc::new(
+            CouncilNode::new(
+                id,
+                CouncilConfig::default(),
+                InMemoryRaftNetworkFactory::new(id, network.clone()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        network.register(id, node.raft().clone()).await;
+        nodes.push(node);
+    }
+    nodes[0].initialize(members).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    network.partition(1, 2).await;
+    network.partition(1, 3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        nodes[0].current_leader().await,
+        Some(1),
+        "node 1 still names itself the leader"
+    );
+
+    let (commands, _receiver) = mpsc::channel(4);
+    let store = crate::sesame::auth::new_token_store();
+    *store.write().await = tokens;
+    let app = router(
+        commands,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(nodes[0].clone()),
+        Some(store),
+        Some("internal".into()),
+        None,
+        None,
+        None,
+        own_port,
+        None,
+    );
+    (app, self_connections, nodes)
+}
+
+/// Send one request with `bearer` and `extra` headers, giving up after 30 s
+/// so a request that loops fails the test instead of hanging it.
+async fn send_bounded(
+    app: Router,
+    method: &str,
+    uri: &str,
+    bearer: &str,
+    body: &str,
+    extra: &[(&str, &str)],
+) -> (StatusCode, String) {
+    let mut request = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {bearer}"));
+    if uri != "/v1/apply" && !body.is_empty() {
+        request = request.header("content-type", "application/json");
+    }
+    for (name, value) in extra {
+        request = request.header(*name, *value);
+    }
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        app.oneshot(request.body(Body::from(body.to_string())).unwrap()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{method} {uri} didn't answer in 30 s"))
+    .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).to_string())
+}
+
+/// A leader-only call from each family a follower forwards to the leader.
+const LEADER_ONLY_CALLS: &[(&str, &str, &str)] = &[
+    ("POST", "/v1/apply", "[app.web]\nimage = \"x:1\"\n"),
+    ("POST", "/v1/stop/web/default", ""),
+    (
+        "POST",
+        "/v1/batch",
+        r#"{"jobs":[{"name":"render","namespace":"default","spec":{"image":"x:1","command":["true"]}}]}"#,
+    ),
+    ("GET", "/v1/batch/1", ""),
+    (
+        "POST",
+        "/v1/upgrade/start",
+        r#"{"target_version":"v0.2.0"}"#,
+    ),
+    ("POST", "/v1/upgrade/abort", ""),
+    ("GET", "/v1/diagnostics/apps", ""),
+];
+
+#[tokio::test]
+async fn a_leader_without_quorum_answers_503_instead_of_forwarding_to_itself() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (app, self_connections, nodes) = router_of_a_leader_without_quorum(vec![admin]).await;
+
+    for (method, path, body) in LEADER_ONLY_CALLS {
+        let (status, reply) = send_bounded(app.clone(), method, path, &admin_key, body, &[]).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{method} {path}: {reply}"
+        );
+    }
+    // Node-to-node signing, which only the system principal may call.
+    let (status, reply) = send_bounded(
+        app.clone(),
+        "POST",
+        "/v1/build/sign",
+        "internal",
+        r#"{"build_id":1,"namespace":"default","digests":[]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "build sign: {reply}"
+    );
+
+    let (_, reply) = send_bounded(
+        app.clone(),
+        "POST",
+        "/v1/apply",
+        &admin_key,
+        "[app.web]\nimage = \"x:1\"\n",
+        &[],
+    )
+    .await;
+    assert!(
+        reply.contains("can't confirm it with a quorum"),
+        "the refusal says why: {reply}"
+    );
+    assert_eq!(
+        self_connections.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the node never connected to its own API"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_follower_never_forwards_a_request_another_node_already_forwarded() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (follower, seen, nodes) = follower_of_a_recording_leader(admin).await;
+
+    // A request that arrives already forwarded, at a node that isn't the
+    // confirmed leader: two nodes disagree about who leads, and passing it
+    // on again could start a loop.
+    for (method, path, body) in LEADER_ONLY_CALLS {
+        let (status, reply) = send_bounded(
+            follower.clone(),
+            method,
+            path,
+            &admin_key,
+            body,
+            &[(LEADER_FORWARDED_HEADER, "1")],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{method} {path}: {reply}"
+        );
+    }
+    assert!(seen.lock().await.is_empty(), "nothing reaches the leader");
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_follower_marks_every_request_it_forwards_to_the_leader() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (follower, seen, nodes) = follower_of_a_recording_leader(admin).await;
+
+    let forwarded = [
+        ("POST", "/v1/apply", "[app.web]\nimage = \"x:1\"\n"),
+        (
+            "POST",
+            "/v1/batch",
+            r#"{"jobs":[{"name":"render","namespace":"default","spec":{"image":"x:1","command":["true"]}}]}"#,
+        ),
+        ("GET", "/v1/batch/1", ""),
+        ("POST", "/v1/upgrade/abort", ""),
+    ];
+    for (method, path, body) in forwarded {
+        let (status, reply) =
+            send_bounded(follower.clone(), method, path, &admin_key, body, &[]).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{method} {path}: {reply}");
+    }
+    let seen = seen.lock().await.clone();
+    assert_eq!(
+        seen.iter()
+            .map(|(path, ..)| path.as_str())
+            .collect::<Vec<_>>(),
+        ["/v1/apply", "/v1/batch", "/v1/batch/1", "/v1/upgrade/abort"]
+    );
+    assert!(
+        seen.iter().all(|(_, _, marked, _)| *marked),
+        "every forwarded request carries {LEADER_FORWARDED_HEADER}: {seen:?}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

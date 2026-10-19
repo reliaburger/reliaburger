@@ -1509,7 +1509,7 @@ Pickle implements the push and pull subset of the OCI Distribution Specification
 
 | Crate | Purpose | Notes |
 |-------|---------|-------|
-| `oci-distribution` | OCI Distribution API client/server primitives | Provides types for manifests, layer descriptors, and registry protocol handling. May need forking/wrapping for the server-side (Pickle is both client and server). |
+| `oci-client` (formerly `oci-distribution`) | OCI Distribution API client primitives | Provides types for manifests, layer descriptors, and registry protocol handling. May need forking/wrapping for the server-side (Pickle is both client and server). |
 | `hyper` | HTTP server for the OCI Distribution API endpoint | The registry API is an HTTP endpoint on each node. `hyper` provides the low-level server. |
 | `axum` | HTTP framework layered on `hyper` | Routing for the `/v2/` API endpoints (blob uploads, manifest push/pull, tag listing). |
 | `reqwest` | HTTP client for external registry pull-through | Used to pull manifests and blobs from upstream registries (Docker Hub, GHCR, ECR). |

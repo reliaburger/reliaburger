@@ -28,6 +28,7 @@ Subcommands:
   keep-host-logs EVIDENCE --lima-home D --reason R VM...
                                         keep Lima's host-agent logs before a stop truncates them
   curl-reason CODE                      name a curl exit code (refused, timeout, TLS...)
+  test-failures REPORT [STDERR]         each failing case's reason from a `relish --output json test` report
   render EVIDENCE RECORD                write the Markdown record (refuses to overwrite)
 """
 import argparse
@@ -55,6 +56,10 @@ INGRESS_CERT_MARGIN = 300
 RETRYING_LIMIT = 600
 WTF_CRITICAL_LIMIT = 300
 WTF_WARNING_LIMIT = 600
+# Mayo alerts the soak raises by design: it drives 2-vCPU guests at the job
+# target rate, so guest CPU above 90% is the load, not a fault (#1112). They
+# are recorded, not gated. `memory_high` stays gated: it is a leak signal.
+UNGATED_ALERTS = {"cpu_throttle"}
 NO_LEADER_LIMIT = 30
 RSS_WARMUP = 3600
 RSS_GROWTH = 1.25
@@ -501,11 +506,19 @@ def wtf_findings(state, report, now, fault_window):
                                      ("warning", report.get("warnings", []), WTF_WARNING_LIMIT)):
         for entry in entries:
             key = f"{severity}|{entry['id']}|{entry.get('affected_resource', '')}"
+            # Every alert of one resource shares an id, so the rule names it.
+            rule = entry.get("title", "").split(":")[0] if entry["id"] == "alerts-firing" else None
+            if rule:
+                key += "|" + rule
             current.add(key)
             first = max(seen.setdefault(key, now), settled)
             if fault_window or now - first <= limit or key in reported:
                 continue
             reported.append(key)
+            if rule in UNGATED_ALERTS:
+                findings.append(finding("wtf-alert", "info", f"{rule} for {now - first} s (recorded, not gated)",
+                                        entry.get("affected_resource")))
+                continue
             findings.append(finding("wtf-" + severity, "fail",
                                     f"{entry['id']} for {now - first} s: {entry.get('title', '')}",
                                     entry.get("affected_resource")))
@@ -527,6 +540,27 @@ def settle_clean(report, nodes, nodes_problems, leaks, http_ok):
 
 
 # --- host forwards (#987) --------------------------------------------------------
+
+def test_failure_reasons(report_text, stderr_text=""):
+    """Why a `relish --output json test` run failed, in one line (#1068).
+
+    Names each case that did not pass with its outcome's reason. Without a
+    readable report it falls back to the tail of stderr, then of stdout."""
+    try:
+        results = json.loads(report_text)["results"]
+    except (ValueError, KeyError, TypeError):
+        results = None
+    if results is not None:
+        reasons = [f"{result.get('name', '?')}: {result.get('outcome', {}).get('status', '?')}: "
+                   f"{result.get('outcome', {}).get('reason', 'no reason given')}"
+                   for result in results if result.get("outcome", {}).get("status") != "pass"]
+        return "; ".join(reasons) if reasons else "no failing case in the report"
+    for text in (stderr_text, report_text):
+        tail = " ".join(line.strip() for line in text.strip().splitlines()[-3:])
+        if tail:
+            return tail
+    return "no output"
+
 
 def curl_reason(code):
     """What a curl exit code means for a probe, in a word or two."""
@@ -1716,6 +1750,9 @@ def main(argv=None):
     keep.add_argument("vms", nargs="+")
     reason = commands.add_parser("curl-reason")
     reason.add_argument("code", type=int)
+    failures = commands.add_parser("test-failures", help="why a relish test JSON run failed (#1068)")
+    failures.add_argument("report")
+    failures.add_argument("stderr", nargs="?")
     record = commands.add_parser("render")
     record.add_argument("evidence")
     record.add_argument("record")
@@ -1812,6 +1849,10 @@ def main(argv=None):
         return 0
     if args.command == "curl-reason":
         print(curl_reason(args.code))
+        return 0
+    if args.command == "test-failures":
+        stderr_text = Path(args.stderr).read_text(errors="replace") if args.stderr and Path(args.stderr).exists() else ""
+        print(test_failure_reasons(Path(args.report).read_text(errors="replace"), stderr_text))
         return 0
     if args.command == "render-charts":
         directory = Path(args.directory)

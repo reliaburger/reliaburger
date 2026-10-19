@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use std::collections::BTreeMap;
 
-use oci_distribution::manifest::OciDescriptor;
+use oci_client::manifest::OciDescriptor;
 
 use super::oci_pull::retry_registry_read;
 
@@ -116,11 +116,11 @@ impl ImageReference {
         }
     }
 
-    /// Convert to an `oci_distribution::Reference` for the client.
-    pub fn to_oci_reference(&self) -> Result<oci_distribution::Reference, ImageError> {
+    /// Convert to an `oci_client::Reference` for the client.
+    pub fn to_oci_reference(&self) -> Result<oci_client::Reference, ImageError> {
         self.full_reference()
             .parse()
-            .map_err(|e: oci_distribution::ParseError| {
+            .map_err(|e: oci_client::ParseError| {
                 ImageError::InvalidReference(format!("{}: {e}", self.full_reference()))
             })
     }
@@ -591,19 +591,17 @@ impl ImageStore {
         // local development registries and the hermetic test fixture do not
         // need a certificate merely to move bytes within the same host.
         let protocol = if is_loopback_registry(&source.registry) {
-            oci_distribution::client::ClientProtocol::HttpsExcept(vec![source.registry.clone()])
+            oci_client::client::ClientProtocol::HttpsExcept(vec![source.registry.clone()])
         } else {
-            oci_distribution::client::ClientProtocol::Https
+            oci_client::client::ClientProtocol::Https
         };
 
-        // The default ClientConfig also includes a platform resolver that
-        // picks the current host's architecture from manifest lists.
-        let client_config = oci_distribution::client::ClientConfig {
-            protocol,
-            ..Default::default()
-        };
-        let client = oci_distribution::Client::new(client_config);
-        let auth = oci_distribution::secrets::RegistryAuth::Anonymous;
+        let client =
+            super::oci_pull::registry_client(protocol).map_err(|e| ImageError::ManifestPull {
+                image: source.full_reference(),
+                reason: format!("cannot build registry client: {e}"),
+            })?;
+        let auth = oci_client::secrets::RegistryAuth::Anonymous;
 
         let oci_ref = source.to_oci_reference()?;
 
@@ -811,7 +809,7 @@ impl ImageStore {
         image_ref: &ImageReference,
         rootfs: &Path,
     ) -> Option<PulledImage> {
-        use oci_distribution::manifest::OciManifest;
+        use oci_client::manifest::OciManifest;
         if !image_ref.tag.starts_with("sha256:") {
             return None;
         }
