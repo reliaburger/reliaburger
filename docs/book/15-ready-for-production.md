@@ -1119,6 +1119,20 @@ they'd fail the moment a new crate changed a single byte. The HMACs on gossip an
 and the API-token hash never moved: they use `ring`, whose `hmac::verify` already
 compares tags in constant time.
 
+`base64` 0.22 to 0.23 got the same treatment. base64 sits under values we store and
+send: every `ENC[AGE:...]` secret, the join and workload certificate bundles, registry
+Basic credentials, cosign signatures, and each segment of the workload JWTs we mint. If
+0.23 had changed its alphabet or how strictly it reads padding, an old secret could stop
+decrypting or a new token could stop verifying somewhere else. So known answers went in
+first, worked out with Python's `base64` rather than with our own encoder: `"f"` must
+encode to `Zg==` in the standard alphabet and to `Zg` in the unpadded URL-safe one, and
+the bytes `fb ff bf` must come out as `+/+/` and `-_-_`. Decoding must still refuse a
+missing or non-canonical pad. The tests passed on 0.22 and pass unchanged on 0.23. The
+release's headline is a SIMD engine, but we still name `general_purpose::STANDARD` and
+`URL_SAFE_NO_PAD`, the scalar engines, so nothing we run changed underneath. pem 4 had
+already brought 0.23 into the lockfile; 0.22 stays there for now, because age, axum,
+k8s-openapi and oci-client still use it.
+
 `toml` 0.8 to 1.1 is the opposite case: a new parser and a new writer under an API that
 barely moved. Two call sites noticed. `relish fmt` hands `toml_edit` a table position,
 which is now an `Option<isize>` instead of a `usize`, and one test called
