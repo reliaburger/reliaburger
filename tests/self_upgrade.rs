@@ -22,6 +22,12 @@ mod bun_process;
 /// How long to wait for slow conditions (binary boots, verification).
 const WAIT: Duration = Duration::from_secs(30);
 
+/// How long an accepted upgrade may stay in flight before a version wait
+/// gives up. A hang guard, not a speed target: while the marker is on disk
+/// the node is still working on the swap, and the node itself commits or
+/// reverts it.
+const IN_FLIGHT_HANG_GUARD: Duration = Duration::from_secs(300);
+
 /// These tests spawn the real compiled binary under a supervisor loop and
 /// take minutes; they'd blow the default CI test job's timeout. Gated
 /// behind `RELIABURGER_UPGRADE_TESTS=1` (like the runc/eBPF suites), run
@@ -206,11 +212,40 @@ retain_versions = 3
         Some(value["version"].as_str()?.to_string())
     }
 
+    /// Wait until the node reports `expected`.
+    ///
+    /// While the upgrade marker is on disk the node hasn't decided the swap
+    /// yet: it is starting the new binary, hashing it (the version answer
+    /// carries the digest) and verifying. With a 600 MB debug build that
+    /// takes as long as the host allows, and on a loaded Mac it went past
+    /// 30 s (#1049). So the wait lasts as long as the marker does, up to a
+    /// hang guard. Once the marker is gone the node has settled, and the
+    /// version has `WAIT` to show.
     async fn wait_for_version(&self, expected: &str) {
-        wait_for(&format!("version {expected}"), WAIT, || async {
-            self.version().await.as_deref() == Some(expected)
-        })
-        .await;
+        let marker = self.data_dir.join("upgrade/marker.json");
+        let started = tokio::time::Instant::now();
+        let mut settled_at = None;
+        loop {
+            if self.version().await.as_deref() == Some(expected) {
+                return;
+            }
+            let now = tokio::time::Instant::now();
+            if marker.exists() {
+                settled_at = None;
+                assert!(
+                    now - started < IN_FLIGHT_HANG_GUARD,
+                    "timed out waiting for version {expected}: the upgrade was still in flight after {:?}",
+                    now - started
+                );
+            } else {
+                let settled = *settled_at.get_or_insert(now);
+                assert!(
+                    now - settled < WAIT,
+                    "timed out waiting for version {expected}: no upgrade in flight for {WAIT:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     /// Wait until no upgrade marker is in flight (commit or revert done).

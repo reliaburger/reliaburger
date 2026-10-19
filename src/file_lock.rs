@@ -19,7 +19,6 @@
 
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
@@ -149,10 +148,9 @@ impl Drop for FileLock {
 
 /// Set `FD_CLOEXEC` on `file` unless it's already set.
 fn close_on_exec(file: &File) -> io::Result<()> {
-    let descriptor = file.as_raw_fd();
-    let flags = FdFlag::from_bits_truncate(fcntl(descriptor, FcntlArg::F_GETFD)?);
+    let flags = FdFlag::from_bits_truncate(fcntl(file, FcntlArg::F_GETFD)?);
     if !flags.contains(FdFlag::FD_CLOEXEC) {
-        fcntl(descriptor, FcntlArg::F_SETFD(flags | FdFlag::FD_CLOEXEC))?;
+        fcntl(file, FcntlArg::F_SETFD(flags | FdFlag::FD_CLOEXEC))?;
     }
     Ok(())
 }
@@ -282,10 +280,9 @@ mod tests {
     fn a_descriptor_opened_without_close_on_exec_gets_it() {
         let directory = tempfile::tempdir().unwrap();
         let file = open(&directory.path().join("inherited.lock"));
-        fcntl(file.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+        fcntl(&file, FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
         let lock = FileLock::try_lock(file).unwrap();
-        let flags =
-            FdFlag::from_bits_truncate(fcntl(lock.file().as_raw_fd(), FcntlArg::F_GETFD).unwrap());
+        let flags = FdFlag::from_bits_truncate(fcntl(lock.file(), FcntlArg::F_GETFD).unwrap());
         assert!(flags.contains(FdFlag::FD_CLOEXEC));
     }
 
