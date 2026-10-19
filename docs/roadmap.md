@@ -412,11 +412,48 @@ migration and no feature gate
   only if the network-ownership spike (S11) passes; otherwise it comes off this
   page. VMs are its first target if the VM migration spike passes first
   ([#1185](https://github.com/reliaburger/reliaburger/issues/1185)).
+- [ ] **0.6.0: "GPUs"** (no milestone yet;
+  [research](plans/2026-10-11-research-llm-workloads.md#060-gpus)). GPUs as
+  devices with identities: per-device placement for apps and jobs, CDI
+  injection, topology inside a node, shared memory and memlock, a driver and
+  CUDA compatibility check, GPU health that cordons on errors, per-container
+  GPU metrics, `relish gpus` and existing MIG instances as devices. It takes
+  F01 ([#359](https://github.com/reliaburger/reliaburger/issues/359)) from "Later". Exit test: a tensor-parallel
+  vLLM and a fine-tune share an eight-GPU node with their own devices, and an
+  injected GPU fault cordons the node within two minutes.
+- [ ] **0.7.0: "Models"** (no milestone yet;
+  [research](plans/2026-10-11-research-llm-workloads.md#070-models)). From a
+  model name to an OpenAI-compatible endpoint: `[model.*]` and
+  `relish model run`, weights as OCI artifacts in Pickle with resumable peer
+  pulls and placement next to them, startup and generate-based readiness,
+  inference-aware routing in Wrapper, autoscaling on engine metrics and scale
+  to zero, API keys and token limits. Exit test: peer-loaded replicas start at
+  least five times faster than the first, prefix routing doubles shared-prefix
+  throughput, and a model scales to zero and back.
+- [ ] **0.7.1: GPU dev environments** (no milestone yet). `relish dev`: a GPU
+  container over SSH or VS Code with a persistent home and an idle timeout.
+- [ ] **0.8.0: "Groups"** (no milestone yet;
+  [research](plans/2026-10-11-research-llm-workloads.md#080-groups)).
+  Multi-node work as one unit: all-or-nothing placement with ranks, roles,
+  topology domains, RDMA, checkpoint-aware restarts, hot spares and health
+  checks around every run. Exit test: a two-node fine-tune survives a dead
+  node on a spare within five minutes, and a verl RL job runs as one group.
+- [ ] **0.9.0: "Pipelines"** (no milestone yet;
+  [research](plans/2026-10-11-research-llm-workloads.md#090-pipelines)).
+  Jobs that wait for jobs (all of, element by element, or a success ratio),
+  partial success, a Python client and OpenAPI spec, an Airflow provider and
+  a Nextflow executor in this repository, and an OpenAI-compatible batch API
+  over resident model workers ([#641](https://github.com/reliaburger/reliaburger/issues/641)). Exit test: Nextflow and
+  Airflow each run a three-stage pipeline through a node failure.
+- [ ] **0.10.0: "Fair share"** (no milestone yet;
+  [research](plans/2026-10-11-research-llm-workloads.md#0100-fair-share)).
+  Queues with weighted, decaying fair share, backfill, priority classes and
+  preemption with grace periods, node selectors for arrays, retries by
+  failure kind, and usage by queue. Exit test: an under-share team gets its
+  half of a flooded cluster within a minute, and no service loses a replica.
 - [ ] **Later**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/9)). The
-  fleet control plane ([#265](https://github.com/reliaburger/reliaburger/pull/265));
-  GPU capacity and cached-image placement (F01,
-  [#359](https://github.com/reliaburger/reliaburger/issues/359)); rootless
+  fleet control plane ([#265](https://github.com/reliaburger/reliaburger/pull/265)); rootless
   clusters (F02, [#360](https://github.com/reliaburger/reliaburger/issues/360));
   PromQL and the full metrics architecture (F06,
   [#364](https://github.com/reliaburger/reliaburger/issues/364)); bandwidth
@@ -424,8 +461,10 @@ migration and no feature gate
   the remaining Kubernetes translations (F11,
   [#368](https://github.com/reliaburger/reliaburger/issues/368)); gVisor for
   hosts without KVM ([#1186](https://github.com/reliaburger/reliaburger/issues/1186));
-  and Windows Server guests
-  ([#1187](https://github.com/reliaburger/reliaburger/issues/1187)).
+  Windows Server guests
+  ([#1187](https://github.com/reliaburger/reliaburger/issues/1187)); and, for
+  models, an external endpoint picker, disaggregated prefill and decode,
+  LoRA adapters from Pickle, AMD GPUs and GB200 compute domains.
 
 ## Known gaps
 
@@ -448,8 +487,8 @@ what's shipped and what's scheduled.
   F04 R1–R4, F05 I3–I4, landed),
   [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08),
   [0.4.3](https://github.com/reliaburger/reliaburger/milestone/20) (F10) and
-  [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F01, F02,
-  F06, F09, F11, and the rest of F03–F05).
+  [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F02,
+  F06, F09, F11, and the rest of F03–F05). F01 moves to 0.6.0.
 - **Whitepaper design ahead of the binary.** The [whitepaper](whitepaper.md)
   marks each of these as planned where it describes them: the reporting tree,
   resource-aware council selection, per-app rollups and remote-read
@@ -507,5 +546,7 @@ the item-by-item history.
 Deferred beyond the 0.x releases; the whitepaper (§22) has the reasoning and
 the [frozen roadmap](plans/archive/roadmap-to-0.1.0.md#future-v2) the detail:
 TPM sealing of the master secret, external secret managers, multi-cluster
-federation (Franchise), IPv6, sidecars, fractional GPU scheduling and a
-PromQL-to-SQL compatibility layer.
+federation (Franchise, which doesn't schedule batch work across clusters),
+IPv6, sidecars, GPU sharing beyond pre-partitioned MIG instances
+(time-slicing, MPS, changing MIG layouts) and a PromQL-to-SQL compatibility
+layer.
