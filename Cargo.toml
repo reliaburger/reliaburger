@@ -92,7 +92,7 @@ pulldown-cmark = "0.13.4"
 nucleo-matcher = "0.3.1"
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 libc = "0.2"
-ruzstd = "0.8"
+ruzstd = "0.9.1"
 mdns-sd = "0.21.4"
 # relish netboot's ProxyDHCP: DHCPv4 parsing and encoding.
 dhcproto = "0.15"
