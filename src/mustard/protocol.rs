@@ -29,9 +29,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use tokio_util::sync::CancellationToken;
 
 use tokio::sync::watch;
@@ -299,7 +298,7 @@ impl<T: MustardTransport> MustardNode<T> {
             directory: NodeDirectory::default(),
             directory_watch: None,
             node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
-            rng: StdRng::from_entropy(),
+            rng: rand::make_rng(),
             next_push_pull: Instant::now(),
             sync_cursor: 0,
             sequences: HashMap::new(),
@@ -1236,7 +1235,7 @@ impl<T: MustardTransport> MustardNode<T> {
 
         let count = self.config.indirect_probe_count.min(candidates.len());
         candidates
-            .choose_multiple(&mut self.rng, count)
+            .sample(&mut self.rng, count)
             .map(|m| m.address)
             .collect()
     }
@@ -1245,6 +1244,7 @@ impl<T: MustardTransport> MustardNode<T> {
     /// exactly one probe schedule.
     #[cfg(test)]
     fn seed_rng(&mut self, seed: u64) {
+        use rand::SeedableRng;
         self.rng = StdRng::seed_from_u64(seed);
     }
 
@@ -2095,11 +2095,12 @@ mod tests {
         // under parallel test load; see tokio #3709), and use try_recv()
         // to drain messages without timers.
         //
-        // Before anti-entropy, 73 schedules in 100,000 stranded a member for
+        // Before anti-entropy, 82 schedules in 100,000 stranded a member for
         // good: every update about it spent its bounded re-broadcasts before
         // reaching some node, the queues drained, and no later round helped.
-        // With push-pull all 100,000 converged by round 23, three rounds
-        // after the first exchange. So this runs 2,000 fresh schedules every
+        // With push-pull all 100,000 converged by round 22, two rounds
+        // after the first exchange. (Measured with rand 0.10; under 0.8 the
+        // same seeds gave 73 and round 23.) So this runs 2,000 fresh schedules every
         // time, from an OS-random base, and allows two exchanges' worth of
         // rounds; a failure prints the seed that replays it.
         let base: u64 = rand::random();
@@ -2115,17 +2116,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_stranding_schedule_is_rescued_by_push_pull() {
-        // Seed 830 is the first of the 73 schedules in 0..100,000 that
-        // stranded a member permanently with piggybacking alone. The
+        // Seed 160 is the first of the 82 schedules in 0..100,000 that
+        // strand a member permanently with piggybacking alone. (It was 830
+        // until rand 0.10 changed how `choose` turns random bits into an
+        // index, which reshuffled every seeded schedule.) The
         // simulation leaves the first exchange until round 20, so up to then
         // this replays the stranding schedule exactly, and push-pull has to
         // do the rescue.
         assert_eq!(
-            converge_five_node_ring(830, None).await,
+            converge_five_node_ring(160, None).await,
             None,
-            "seed 830 no longer strands without anti-entropy; pick another stranding seed"
+            "seed 160 no longer strands without anti-entropy; pick another stranding seed"
         );
-        let rounds = converge_five_node_ring(830, Some(PUSH_PULL_EVERY_ROUNDS)).await;
+        let rounds = converge_five_node_ring(160, Some(PUSH_PULL_EVERY_ROUNDS)).await;
         assert!(
             rounds.is_some_and(|round| round >= PUSH_PULL_EVERY_ROUNDS),
             "push-pull did not rescue the stranded member: {rounds:?}"

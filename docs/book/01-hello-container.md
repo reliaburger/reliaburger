@@ -829,8 +829,8 @@ pub async fn allocate(&self) -> Result<u16, PortError> {
         return Err(PortError::Exhausted { ... });
     }
 
-    let mut rng = rand::thread_rng();
-    let first = rng.gen_range(0..self.total_ports());
+    let mut rng = rand::rng();
+    let first = rng.random_range(0..self.total_ports());
     for offset in 0..self.total_ports() {
         let port = self.range_start + ((first + offset) % self.total_ports()) as u16;
         if allocated.insert(port) {
@@ -847,7 +847,7 @@ pub async fn allocate(&self) -> Result<u16, PortError> {
 
 Why random port selection instead of sequential? Two reasons. Sequential assignment is predictable, which is a minor security concern (an attacker who knows your allocation pattern can guess which ports are in use). And sequential assignment creates hot-spots when containers are frequently created and destroyed: you'd keep reusing the same low ports while the rest of the range sits idle.
 
-`rand::thread_rng()` creates a thread-local random number generator. `rng.gen_range(start..end)` picks a random number in the half-open range `[start, end)`. These come from the `rand` crate, which we added to our dependencies. `allocated.insert(port)` tries to add the port to the set. If it's already there (collision), `insert` returns `false` and we move on. If it succeeds, `insert` returns `true` and we return the port.
+`rand::rng()` returns a handle to a thread-local random number generator, seeded from the operating system. `rng.random_range(start..end)` picks a random number in the half-open range `[start, end)`. These come from the `rand` crate, which we added to our dependencies. `random_range` is a method of the `RngExt` trait, and a trait's methods are only callable when the trait is in scope, so the file starts with `use rand::RngExt;`. (Before `rand` 0.9 these were `thread_rng()` and `gen_range`, and the trait was called `Rng`; you'll still see the old names in older code.) `allocated.insert(port)` tries to add the port to the set. If it's already there (collision), `insert` returns `false` and we move on. If it succeeds, `insert` returns `true` and we return the port.
 
 Only the starting point is random. From there we walk the range once, wrapping around with `%`. Our first version kept guessing at random, capped at a thousand attempts. That's fine in an empty range and wrong in a nearly full one: with one free port in 64,000, a thousand guesses almost always miss it and report exhaustion that isn't there. Walking the range can't miss, and the regression test proves it by reserving 63,999 ports and asking for the last one, over and over.
 
