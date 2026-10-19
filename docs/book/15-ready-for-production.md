@@ -1151,6 +1151,29 @@ release's headline is a SIMD engine, but we still name `general_purpose::STANDAR
 already brought 0.23 into the lockfile; 0.22 stays there for now, because age, axum,
 k8s-openapi and oci-client still use it.
 
+`rand` wasn't on the original list at all; it turned up when we reread `Cargo.toml`. Going
+from 0.8 to 0.10 crossed two releases of renames: `thread_rng()` became `rng()`, `gen` and
+`gen_range` became `random` and `random_range`, the `Rng` trait became `RngExt`,
+`choose_multiple` became `sample`, and `OsRng` became `SysRng`. The compiler finds every
+one of those. What it can't find is a secret quietly moving to a weaker source, so the PR
+checked where each random value goes. API tokens, join tokens, session keys, nonces and
+signing keys come from `ring`'s `SystemRandom`, which the bump doesn't touch. The
+`relish dashboard` launch and session tokens were the exception: they read `OsRng`
+directly. They now read `SysRng`, the same operating-system source under its new name.
+`SysRng` can fail where `OsRng` panicked, so `DashboardSession::new` returns the error
+instead. Everything else, from registry upload ids to temporary file names, comes from
+`rand::random()`, which uses the thread-local generator: still ChaCha12, still seeded from
+the operating system and reseeded every 64 KiB, exactly as in 0.8. Port and peer choice
+use the same generators.
+
+The seeded tests were the other thing to check, and one of them did care. Mustard's
+rescue test replays seed 830, a schedule that strands a gossip member until push-pull
+saves it. 0.10 changed how `choose` maps random bits to an index, so seed 830 now
+converges on its own. The test has a guard for exactly this, an assertion that the seed
+still strands without push-pull, and the guard failed. We rescanned the same 100,000
+seeds, picked the new first stranding schedule (seed 160) and updated the numbers in
+Chapter 2. What the test checks didn't change, only which seed it checks it with.
+
 And sometimes the compiler does all the reviewing. `nix`, our wrapper over Unix system
 calls, went from 0.29 to 0.31, and 0.30 moved its file-descriptor functions to *I/O
 safety*. In 0.29, `fcntl`, `fstat`, `fchown`, `syncfs` and the `*at` calls took a
