@@ -141,7 +141,9 @@ fn onion_objects_use_only_the_original_bpf_instruction_set() {
     // longer knew the index was in bounds.
     const BPF_ALU: u8 = 0x04;
     const BPF_JMP32: u8 = 0x06;
-    let directory = find_bpf_obj_dir();
+    // This build's own objects, never a search of a shared target
+    // directory, which can find another worktree's (#878).
+    let directory = PathBuf::from(env!("OUT_DIR"));
     for name in [
         "onion_connect.bpf.o",
         "onion_connect_owned.bpf.o",
