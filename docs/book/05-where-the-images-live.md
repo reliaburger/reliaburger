@@ -991,6 +991,22 @@ found an unrecognised entry and returned an error, closing the file without
 unlocking it. So the claim now builds the `UploadDirectoryOwner` as it takes
 the lock, and every refusal after that point unlocks through the same `Drop`.
 
+`Drop` has one blind spot: `execv`. A self-upgrade or rollback (Chapter 14)
+replaces the Bun process image in place, and no destructor runs on the way.
+The descriptor is close-on-exec, so Bun's own copy goes, but a child another
+thread was forking at that moment still holds one until its own `exec`. In the
+0.2.1 qualification soak a rollback hit exactly that window. The new image's
+claim was a non-waiting `try_lock`, found the lock busy and exited, and systemd
+restarted Bun (#1198). The child holding the lock was still listed under the
+name of the Tokio worker thread that forked it. So startup now claims with
+`FileLock::lock_within` and waits up to ten seconds (`UPLOAD_OWNER_WAIT`). A
+forking child lets go within milliseconds, and a real second Bun on the same
+store keeps its lock and is still refused, just ten seconds later.
+`a_claim_waits_out_a_briefly_held_lock_and_refuses_a_lasting_one` holds the
+lock from another descriptor, releases it after 300 ms and expects the claim
+to succeed. It then expects a claim that waits 200 ms to fail against a lock
+that stays held.
+
 The test that ties this together launches the real binary, pushes the same
 content into an ordinary and a leased repository, leaves another upload half
 finished, and sends SIGKILL. A replacement Bun must retire the lease on its own,
