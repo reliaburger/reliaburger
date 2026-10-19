@@ -4329,6 +4329,24 @@ mod tests {
         assert!(challenge(&response).is_some_and(|value| value.starts_with("Basic ")));
     }
 
+    /// The header is fixed text, computed with Python's `base64`, not with
+    /// our own encoder, so a base64 release that read padding differently
+    /// would fail here (#1026).
+    #[test]
+    fn a_basic_header_decodes_to_its_known_answer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Basic cmVsaWFidXJnZXI6cmJ0XzAxMjM0NTY3ODlhYmNkZWY="
+                .parse()
+                .unwrap(),
+        );
+        assert!(matches!(
+            basic_credential(&headers),
+            BasicCredential::Token(token) if token == "rbt_0123456789abcdef"
+        ));
+    }
+
     #[tokio::test]
     async fn malformed_basic_credentials_are_unauthorised() {
         let (state, _dir, _deployer, _reader) = standard_client_state().await;

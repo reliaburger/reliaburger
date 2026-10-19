@@ -689,6 +689,35 @@ mod tests {
         assert_eq!(desired_replica_count(Replicas::DaemonSet, 0), 1);
     }
 
+    #[test]
+    fn disk_capacity_is_bytes_from_the_filesystem() {
+        // Pin sysinfo's unit against statvfs, read without sysinfo, so a
+        // crate bump to KiB or to the wrong block size can't slip through.
+        let path = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let storage = [DiagnosticStoragePath {
+            domain: "data".to_string(),
+            path: path.clone(),
+        }];
+        let result = collect_disk_usage(&storage, 1);
+        let evidence = &result.value().unwrap()[0];
+        let stat = nix::sys::statvfs::statvfs(&path).unwrap();
+        let expected = stat.blocks() as u64 * stat.fragment_size() as u64;
+        if evidence.filesystem_id == filesystem_identity(&path) {
+            // The mount sysinfo chose is the filesystem holding `path`.
+            assert_eq!(evidence.total_bytes, expected);
+        } else {
+            // macOS splits the APFS root into a sealed system volume and a
+            // data volume that share one container, so only the scale holds.
+            let ratio = evidence.total_bytes as f64 / expected as f64;
+            assert!(
+                (0.5..2.0).contains(&ratio),
+                "sysinfo says {} bytes, statvfs says {expected}",
+                evidence.total_bytes
+            );
+        }
+        assert!(evidence.used_bytes <= evidence.total_bytes);
+    }
+
     fn cpu_total(instance: &str, throttled_microseconds: u64) -> CpuThrottleTotal {
         CpuThrottleTotal {
             app: "api".to_string(),
