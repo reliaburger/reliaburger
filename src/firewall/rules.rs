@@ -539,7 +539,7 @@ mod tests {
         );
         assert!(rules.contains("ip6 saddr fd00::/64 tcp dport { 9117, 9443, 9444, 9445 } accept"));
         assert!(!rules.contains("ip saddr 192.168.104.0/24 accept"));
-        assert!(rules.contains("tcp dport 10000-60000 drop"));
+        assert!(rules.contains("tcp dport 10000-32767 drop"));
     }
 
     #[test]

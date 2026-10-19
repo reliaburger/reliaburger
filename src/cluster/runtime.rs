@@ -1732,7 +1732,7 @@ mod tests {
             None,
         )
         .await
-            .unwrap();
+        .unwrap();
         nodes[0].add_learner(2, info("node-2", 9002)).await.unwrap();
         router.partition(1, 2).await;
         let abandoned = tokio::time::timeout(

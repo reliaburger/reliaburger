@@ -818,6 +818,22 @@ pub(super) async fn join_token_revoke_handler(
                 .into_response();
         }
     }
+    record_caller_audit(
+        &state,
+        auth.as_deref(),
+        crate::bun::events::EventKind::Token,
+        "join_token.revoked",
+        std::collections::BTreeMap::from([
+            ("node_id".to_string(), req.node_id.clone()),
+            ("revoked".to_string(), hashes.len().to_string()),
+        ]),
+        format!(
+            "{} join token(s) revoked for node {}",
+            hashes.len(),
+            req.node_id
+        ),
+    )
+    .await;
     Json(serde_json::json!({ "node_id": req.node_id, "revoked": hashes.len() })).into_response()
 }
 

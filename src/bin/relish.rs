@@ -436,7 +436,8 @@ enum Command {
         file: PathBuf,
     },
     /// List images in the Pickle registry, or delete a tag.
-    #[command(visible_alias = "image")]
+    // `relish image` is the appliance OS command, so the registry's
+    // `image delete` spelling lives there as a subcommand, not an alias.
     Images {
         #[command(subcommand)]
         action: Option<ImagesAction>,
@@ -1141,6 +1142,11 @@ enum ImageAction {
         /// Each machine as MAC@IP.
         #[arg(required = true, value_parser = parse_machine)]
         machines: Vec<(String, std::net::IpAddr)>,
+    },
+    /// Delete a registry tag: the same as `relish images delete`.
+    Delete {
+        /// The tag to delete, as `repository:tag` (e.g. `team/web:v1`).
+        reference: String,
     },
 }
 
@@ -2691,6 +2697,7 @@ async fn main() -> ExitCode {
                     println!("wrote {} MB to {}", bytes / 1_000_000, device.display());
                 })
             }
+            ImageAction::Delete { reference } => commands::image_delete(&reference).await,
             ImageAction::Seed {
                 directory,
                 ttl,
@@ -4829,17 +4836,23 @@ mod tests {
         assert!(matches!(cli.command, Command::Images { action: None }));
     }
 
-    /// #697: `relish images delete` and its `relish image delete` alias.
+    /// #697: `relish images delete`, and `relish image delete` beside the
+    /// appliance OS image commands.
     #[test]
     fn parse_image_delete_under_either_spelling() {
-        for spelling in ["images", "image"] {
-            let cli = parse(&["relish", spelling, "delete", "team/web:v1"]).unwrap();
-            match cli.command {
-                Command::Images {
-                    action: Some(ImagesAction::Delete { reference }),
-                } => assert_eq!(reference, "team/web:v1"),
-                _ => panic!("expected images delete for {spelling}"),
-            }
+        let cli = parse(&["relish", "images", "delete", "team/web:v1"]).unwrap();
+        match cli.command {
+            Command::Images {
+                action: Some(ImagesAction::Delete { reference }),
+            } => assert_eq!(reference, "team/web:v1"),
+            _ => panic!("expected images delete"),
+        }
+        let cli = parse(&["relish", "image", "delete", "team/web:v1"]).unwrap();
+        match cli.command {
+            Command::Image {
+                action: ImageAction::Delete { reference },
+            } => assert_eq!(reference, "team/web:v1"),
+            _ => panic!("expected image delete"),
         }
     }
 

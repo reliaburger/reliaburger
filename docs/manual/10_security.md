@@ -272,8 +272,8 @@ What's recorded:
 |------|---------|
 | Workloads | `app.applied`, `app.stopped`, `app.deleted`, `app.exec`, `deploy.rolled_back`, `deploy.cancelled`, `snapshot.created`, `snapshot.restored`, `snapshot.deleted` |
 | Jobs and builds | `job.submitted`, `job.replayed`, `job.schedule_disabled`, `batch.submitted`, `array.submitted`, `batch.cancelled`, `build.submitted` |
-| The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
-| Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
+| The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `os.staged`, `os.rollout_started` (and `rollout_resumed`, `rollout_aborted`), `perimeter.admitted`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
+| Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `join_token.revoked`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
 | Chaos | `fault.injected`, `fault.cleared`, `fault.cleared-by-service`, `fault.cleared-all-workload`, `fault.expired` |
 
 The cluster's own actions (a fault expiring, an expired token being swept)

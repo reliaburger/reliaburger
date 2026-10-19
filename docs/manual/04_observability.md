@@ -232,7 +232,7 @@ Each job run records one event on the leader when it ends (`job-completed`,
 
 Besides deploys, restarts, health, jobs, alerts and faults, the events record
 who changed trust: creating or revoking an API token (`token.created`,
-`token.revoked`), creating a join token (`join_token.created`), and rotating
+`token.revoked`), creating or revoking a join token (`join_token.created`, `join_token.revoked`), and rotating
 or finalising the secret key (`secret.rotated`, `secret.rotation_finalised`).
 Each names the credential that did it, as the token's name in its details and
 a stable `principal`, and never carries a secret. Events are kept per node, in
