@@ -361,7 +361,7 @@ fn export_app(
                     namespace: app_namespace.clone(),
                     ..ObjectMeta::default()
                 },
-                spec: Some(HorizontalPodAutoscalerSpec {
+                spec: HorizontalPodAutoscalerSpec {
                     scale_target_ref:
                         k8s_openapi::api::autoscaling::v2::CrossVersionObjectReference {
                             api_version: Some("apps/v1".to_string()),
@@ -372,7 +372,7 @@ fn export_app(
                     max_replicas: auto.max as i32,
                     metrics,
                     ..HorizontalPodAutoscalerSpec::default()
-                }),
+                },
                 ..HorizontalPodAutoscaler::default()
             };
             docs.push(to_yaml(&hpa)?);
@@ -511,7 +511,7 @@ fn export_job(
                 namespace: app_namespace.clone(),
                 ..ObjectMeta::default()
             },
-            spec: Some(CronJobSpec {
+            spec: CronJobSpec {
                 schedule: schedule.clone(),
                 job_template: JobTemplateSpec {
                     spec: Some(JobSpec {
@@ -522,7 +522,7 @@ fn export_job(
                     ..JobTemplateSpec::default()
                 },
                 ..CronJobSpec::default()
-            }),
+            },
             ..CronJob::default()
         };
         docs.push(to_yaml(&cj)?);

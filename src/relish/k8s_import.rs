@@ -605,11 +605,8 @@ fn find_hpa_for_workload(
     hpas.iter()
         .filter(|(key, _)| key.namespace == workload.namespace)
         .find(|(_, hpa)| {
-            hpa.spec.as_ref().is_some_and(|spec| {
-                let target = &spec.scale_target_ref;
-                target.name == workload.name
-                    && (target.kind.is_empty() || target.kind == workload_kind)
-            })
+            let target = &hpa.spec.scale_target_ref;
+            target.name == workload.name && (target.kind.is_empty() || target.kind == workload_kind)
         })
         .map(|(key, _)| key.clone())
 }
@@ -772,13 +769,13 @@ fn import_env(
             warn(format!(
                 "envFrom Secret/{} is not imported; encrypt each value with `relish secret \
                  encrypt` and add it to env",
-                secret.name.as_deref().unwrap_or_default()
+                secret.name
             ));
         }
         let Some(reference) = &source.config_map_ref else {
             continue;
         };
-        let name = reference.name.as_deref().unwrap_or_default();
+        let name = reference.name.as_str();
         let key = ResourceKey::new(metadata_namespace.map(String::as_str), name);
         let Some(configmap) = configmaps.all.get(&key) else {
             warn(format!(
@@ -1577,51 +1574,48 @@ fn apply_hpa(
     hpa: &HorizontalPodAutoscaler,
     report: &mut MigrationReport,
 ) {
-    if let Some(spec) = &hpa.spec {
-        let min = spec.min_replicas.unwrap_or(1) as u32;
-        let max = spec.max_replicas as u32;
+    let spec = &hpa.spec;
+    let min = spec.min_replicas.unwrap_or(1) as u32;
+    let max = spec.max_replicas as u32;
 
-        // Try to extract metric and target from the first metric
-        let (metric, target) = spec
-            .metrics
-            .as_ref()
-            .and_then(|metrics| metrics.first())
-            .and_then(|m| {
-                m.resource.as_ref().map(|r| {
-                    let name = r.name.clone();
-                    let target_val = r
-                        .target
-                        .average_utilization
-                        .map(|v| format!("{v}%"))
-                        .unwrap_or_else(|| "70%".to_string());
-                    (name, target_val)
-                })
+    // Try to extract metric and target from the first metric
+    let (metric, target) = spec
+        .metrics
+        .as_ref()
+        .and_then(|metrics| metrics.first())
+        .and_then(|m| {
+            m.resource.as_ref().map(|r| {
+                let name = r.name.clone();
+                let target_val = r
+                    .target
+                    .average_utilization
+                    .map(|v| format!("{v}%"))
+                    .unwrap_or_else(|| "70%".to_string());
+                (name, target_val)
             })
-            .unwrap_or_else(|| ("cpu".to_string(), "70%".to_string()));
+        })
+        .unwrap_or_else(|| ("cpu".to_string(), "70%".to_string()));
 
-        let autoscale = AutoscaleSpec {
-            metric,
-            target,
-            min,
-            max,
-            evaluation_window: None,
-            cooldown: None,
-            scale_down_threshold: None,
-        };
-        // Reliaburger only scales on cpu/memory utilisation of a request. Say
-        // so now rather than let the imported config fail on apply.
-        if let Err(e) =
-            crate::meat::autoscaler::AutoscaleConfig::from_spec(&autoscale, app.cpu, app.memory)
-        {
-            report.warnings.push(MigrationWarning {
-                resource: resource.to_string(),
-                message: format!(
-                    "imported [autoscale] will not validate: {e}; fix it before applying"
-                ),
-            });
-        }
-        app.autoscale = Some(autoscale);
+    let autoscale = AutoscaleSpec {
+        metric,
+        target,
+        min,
+        max,
+        evaluation_window: None,
+        cooldown: None,
+        scale_down_threshold: None,
+    };
+    // Reliaburger only scales on cpu/memory utilisation of a request. Say
+    // so now rather than let the imported config fail on apply.
+    if let Err(e) =
+        crate::meat::autoscaler::AutoscaleConfig::from_spec(&autoscale, app.cpu, app.memory)
+    {
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message: format!("imported [autoscale] will not validate: {e}; fix it before applying"),
+        });
     }
+    app.autoscale = Some(autoscale);
 }
 
 // ---------------------------------------------------------------------------
@@ -1849,8 +1843,8 @@ fn cronjob_to_jobspec(
     configmaps: &mut ConfigMaps,
     report: &mut MigrationReport,
 ) -> JobSpec {
-    let spec = cj.spec.as_ref();
-    let job_template = spec.and_then(|s| s.job_template.spec.as_ref());
+    let spec = &cj.spec;
+    let job_template = spec.job_template.spec.as_ref();
     let pod_spec = job_template.and_then(|jt| jt.template.spec.as_ref());
 
     let mut job_spec = pod_to_jobspec(
@@ -1861,7 +1855,7 @@ fn cronjob_to_jobspec(
         report,
     );
     import_job_policy(resource, job_template, &mut job_spec, report);
-    job_spec.schedule = spec.map(|s| s.schedule.clone());
+    job_spec.schedule = Some(spec.schedule.clone());
 
     // Scheduling behaviour Reliaburger doesn't model — say so.
     let mut warn = |message: String| {
@@ -1870,20 +1864,20 @@ fn cronjob_to_jobspec(
             message,
         })
     };
-    if spec.and_then(|s| s.suspend) == Some(true) {
+    if spec.suspend == Some(true) {
         warn("suspend = true is not imported; the job will run on its schedule".to_string());
     }
-    if let Some(policy) = spec.and_then(|s| s.concurrency_policy.as_ref()) {
+    if let Some(policy) = spec.concurrency_policy.as_ref() {
         if policy != "Allow" {
             warn(format!("concurrencyPolicy {policy} is not imported"));
         }
     }
-    if let Some(zone) = spec.and_then(|s| s.time_zone.as_ref()) {
+    if let Some(zone) = spec.time_zone.as_ref() {
         warn(format!(
             "timeZone {zone} is not imported; a job's schedule runs in UTC"
         ));
     }
-    if let Some(seconds) = spec.and_then(|s| s.starting_deadline_seconds) {
+    if let Some(seconds) = spec.starting_deadline_seconds {
         warn(format!(
             "startingDeadlineSeconds {seconds} is not imported; a missed firing is skipped"
         ));
