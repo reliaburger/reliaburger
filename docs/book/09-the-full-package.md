@@ -617,39 +617,79 @@ In Kubernetes, a single application is split across multiple resource types. A w
 
 In Reliaburger, that same application is one `[app.web]` section with sub-sections for ingress, autoscale, env, and health. The importer needs to figure out which K8s resources belong together and merge them.
 
-The correlation rules use the same matching logic Kubernetes itself uses:
+The correlation rules use the same matching logic Kubernetes itself uses, and none of them cross a namespace:
 
-1. Service → Deployment by label selector
-2. Ingress → Service by backend service name
+1. Service → workload by label selector
+2. Ingress → Service by backend service name, then on to whatever that Service selected
 3. HPA → workload by `scaleTargetRef.name`
 
+That list was in this chapter, the design doc and the whitepaper for months before the code agreed with it. The first importer matched a Service to the Deployment with the same `metadata.name` and never read `spec.selector` at all. It worked on every hand-written example we tried, because hand-written examples name the Service after the Deployment. Real charts don't. A Helm chart's Service is called `release-web-http` and selects `app.kubernetes.io/name: web`; the old importer reported it as matching nothing and threw its port away. Worse, everything was collected in maps keyed by bare name, so a Service called `api` in `staging` overwrote the one in `prod` and then attached to both `api` Deployments. Two Jobs called `migrate` in different namespaces collapsed into one, and the report said "Converted" twice.
+
+The fix starts with the key. A Kubernetes object is identified by its namespace *and* its name, so the importer's maps are now keyed by exactly that:
+
 ```rust
-fn find_ingress_for_service(
-    ingresses: &BTreeMap<String, Ingress>,
-    service_name: &str,
-) -> Option<String> {
-    for (ing_name, ing) in ingresses {
-        if let Some(spec) = &ing.spec {
-            if let Some(rules) = &spec.rules {
-                for rule in rules {
-                    if let Some(http) = &rule.http {
-                        for path in &http.paths {
-                            if let Some(backend) = &path.backend.service {
-                                if backend.name == service_name {
-                                    return Some(ing_name.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ResourceKey {
+    namespace: String,
+    name: String,
 }
 ```
 
-Five levels of `if let Some`. That's what happens when you navigate the K8s API's deeply nested Option types. Each level is a field that might not be set. The k8s-openapi crate mirrors the Go API faithfully, including the optionality of everything.
+`PartialOrd` and `Ord` are there because the key goes into a `BTreeMap`, which keeps its keys sorted and so needs to compare them. Deriving them compares the fields in declaration order: namespace first, then name. That gives a deterministic report order for free. A `HashMap` would only need `Hash` and `Eq`, but its iteration order changes from run to run, and a migration report that shuffles itself between runs is hard to diff.
+
+Then the selector match itself, which is one line once you see it: a Service selects a workload when every `key: value` in its selector appears in the workload's pod template labels.
+
+```rust
+let matched: Vec<usize> = workloads
+    .iter()
+    .enumerate()
+    .filter(|(_, w)| w.key.namespace == svc_key.namespace)
+    .filter(|(_, w)| match selector {
+        Some(selector) => selector
+            .iter()
+            .all(|(label, value)| w.labels.get(label) == Some(value)),
+        None => w.key.name == svc_key.name,
+    })
+    .map(|(index, _)| index)
+    .collect();
+```
+
+This is an iterator chain, Rust's answer to a Python list comprehension or a Go `for` loop with an accumulator. `.iter()` borrows each workload in turn, `.enumerate()` pairs it with its index, each `.filter()` keeps the items its closure returns `true` for, and `.collect()` gathers what's left into the `Vec<usize>` the type annotation asks for. Nothing runs until `collect` pulls the items through, and the compiler usually turns the whole chain into the same loop you'd have written by hand. The `|(_, w)|` closure parameters destructure each `(index, workload)` pair, and `_` ignores the half we don't need.
+
+We collect indices rather than `&mut` references to the workloads because the next step mutates them, folding the Service's port into each app. Rust won't let us hold a list of mutable references into a slice while we're also reading other workloads' labels for the report message. An index is just a number, so it borrows nothing, and we take `&mut workloads[index]` for one workload at a time.
+
+A Service that selects several workloads is legal in Kubernetes (a blue/green pair behind one Service is a classic) but has no Reliaburger equivalent, because an app answers only to its own name. The importer still gives each selected workload the Service's port, then warns that clients have to call each app by name. A Service that selects nothing gets a warning too. And a Service with *no* selector, which Kubernetes routes nowhere (its endpoints are managed by hand), falls back to the old name match, with a warning saying so. That keeps a sloppy hand-written manifest working without pretending it's correct.
+
+An Ingress names a Service, not a workload, so Ingress correlation now follows the Service. The old lookup was five levels of `if let Some`, one per optional field in the K8s API's nesting. The new one flattens them with the same iterator tools:
+
+```rust
+fn ingress_backend_services(ing: &Ingress) -> impl Iterator<Item = &str> {
+    ing.spec
+        .iter()
+        .flat_map(|spec| spec.rules.iter().flatten())
+        .flat_map(|rule| rule.http.iter())
+        .flat_map(|http| http.paths.iter())
+        .filter_map(|path| path.backend.service.as_ref())
+        .map(|backend| backend.name.as_str())
+}
+```
+
+Calling `.iter()` on an `Option` gives an iterator of zero or one items, so `None` simply contributes nothing, and `flat_map` splices each inner iterator into the outer one. The return type `impl Iterator<Item = &str>` says "some iterator of string slices" without naming the long concrete type the chain builds, the way a Go function might return an interface, except that the compiler still knows the exact type and there's no dynamic dispatch. The `&str`s borrow from the `Ingress`, and the compiler ties their lifetime to `ing` without us writing it out.
+
+Same-named apps and jobs still need distinct TOML keys, since `[app.api]` can only mean one thing. Both tables go through one generic function now, where Jobs used to skip the rename:
+
+```rust
+fn insert_without_overwrite<T>(
+    table: &mut BTreeMap<String, T>,
+    table_name: &str,
+    report: &mut MigrationReport,
+    label: &str,
+    key: &ResourceKey,
+    value: T,
+) -> String
+```
+
+`<T>` makes it generic over the value type: the compiler stamps out one copy for `AppSpec` and one for `JobSpec`, like a C++ template but type-checked once, up front. The first `api` keeps its name, and the second becomes `[app.staging-api]` with a warning.
 
 ### Using k8s-openapi
 
@@ -699,13 +739,15 @@ DaemonSets become `replicas = "*"`. StatefulSets produce a warning because Relia
 
 Three of those rows have a history: `command`, `namespace`, and env values used to be silently dropped. A Deployment running `python -m worker.main` would import as an app running the image's default entrypoint. No error, no warning — the config just did something different from the original. Silent data loss during migration is the worst kind, because you only discover it when the workload misbehaves in production.
 
-`args` has a history of its own. For a long time the importer glued `command` and `args` into one vector, which was harmless while runc ignored the image's config anyway. Once runc started honouring `Entrypoint` and `Cmd` (Chapter 1), gluing became a bug: a manifest with only `args` would have replaced the image's entrypoint with its arguments. So they're separate fields now, on both sides.
+`args` has a history of its own. For a long time the importer glued `command` and `args` into one vector, which was harmless while runc ignored the image's config anyway. Once runc started honouring `Entrypoint` and `Cmd` (Chapter 1), gluing became a bug: a manifest with only `args` would have replaced the image's entrypoint with its arguments. So they're separate fields now, on both sides (the exporter took longer to catch up than it should have; see the third pass below).
 
-Ports are the other place where a quiet mapping would lie. A Kubernetes Service can listen on port 80 and forward to container port 9898, and it can expose several ports. A Reliaburger app has one port, and `frontend:9898` reaches it on the same number. The importer follows the Service's `targetPort` (resolving names like `http` against the container's ports) to pick the app's port, and then says what it couldn't keep: the Service port that clients used to dial, any further Service ports, container ports nothing routes to, a readiness probe that runs a command or opens a TCP socket, and a Service with no workload of the same name.
+Ports are the other place where a quiet mapping would lie. A Kubernetes Service can listen on port 80 and forward to container port 9898, and it can expose several ports. A Reliaburger app has one port, and `frontend:9898` reaches it on the same number. The importer follows the Service's `targetPort` (resolving names like `http` against the container's ports) to pick the app's port, and then says what it couldn't keep: the Service port that clients used to dial, any further Service ports, container ports nothing routes to, a readiness probe that runs a command or opens a TCP socket, and a Service that selects no workload.
 
 Env vars that use `valueFrom` (secret refs, configmap refs, field refs) still can't map automatically — there's no way to reach into another cluster's secret store. But now they land in the migration report as warnings naming each variable, instead of vanishing. The rule the importer follows: convert what you can, warn about what you can't, drop nothing silently.
 
-One more K8s-ism: names are scoped per namespace, so `api` in `alpha` and `api` in `beta` are different workloads. A flat TOML table has one key per name. When the importer sees a collision it keeps the first app under its own name and imports the second as `[app.beta-api]`, with a warning — rather than letting the second overwrite the first.
+`envFrom` used to vanish without a word. Now a `configMapRef` to a ConfigMap in the same input and namespace is flattened into `env`, applying its `prefix`, with explicit `env` entries winning the way they do in Kubernetes. That's still reported: a later edit to the ConfigMap won't reach the app any more, and the operator should know the link is gone. A `secretRef`, or a ConfigMap that isn't in the input, gets a warning naming it.
+
+Jobs had the same disease. A `completions: 50` Job imported as a single run, silently. `backoffLimit` and the pod's `activeDeadlineSeconds` now map onto `max_attempts` and `task_timeout_secs`, the run-policy fields 0.2.0 added (`backoffLimit` counts retries, so it's off by one from attempts, and anything above 9 is capped at Reliaburger's limit of 10, with a warning). A Job-wide `activeDeadlineSeconds` becomes the per-attempt timeout, with a warning, because the two don't mean the same thing. Everything else that changes how often a job runs (`completions`, `parallelism`, `completionMode`, a CronJob's `timeZone` and `startingDeadlineSeconds`) and everything a job's pod carries that a `[job.*]` can't (`workingDir`, the user, `nodeSelector`, tolerations, affinity, sidecars, volumes) gets a warning per field.
 
 ### The migration report
 
@@ -839,6 +881,14 @@ The rest of the import crop was the same shape as the export's: DaemonSets and S
 
 Can you see the pattern? Almost none of these were hard to fix. They existed because the correct code was written once, for the most common kind, and the other kinds were stubbed "for now". If you take one habit from this section: when you fix a mapping for Deployments, grep for the sibling that handles DaemonSets before you close the ticket.
 
+#### The third pass: a gate that didn't close
+
+The 0.2.2 audit found that lesson unlearned in one more place. The importer split `command` and `args` properly, but the exporter still set only `command`, so importing then exporting `examples/kubernetes/podinfo.yaml` lost Redis's `--maxmemory 64mb --save "" --appendonly no`. The working directory and `runAsUser`/`runAsGroup` went the same way. All four now reach the container, and a test in `tests/suite/relish_cli.rs` runs the real binary over the podinfo file, there and back, and compares Redis's arguments.
+
+Encrypted env values were the nastier case. They export as the placeholder `ENCRYPTED_VALUE`, which is right: the ciphertext is useless outside the cluster that holds the key. But nothing in the report said so, and the pod would start with `ENCRYPTED_VALUE` as its database password. Each one is now listed under "Not exported yet" as needing a Kubernetes Secret. A job's `max_attempts` and `task_timeout_secs` export too, as `backoffLimit` and the pod's `activeDeadlineSeconds`, the mirror image of the import mapping.
+
+And `--strict`, sold as the CI gate for migrations, checked only the warnings. A manifest of nothing but a NetworkPolicy and a PersistentVolumeClaim, both dropped whole, passed it. It now fails on any warning *or* any dropped resource, and the error counts both.
+
 ## Lessons learned
 
 **Test the order, not just the outcome.** Blue-green's whole promise is an order: every green instance healthy and published before any blue instance stops. A test that only checks the end state (green running, blue gone) passes for a rollout that stopped blue first and caused an outage on the way. `blue_green_publishes_green_before_stopping_blue` holds an in-flight request on a blue instance, so blue can't finish draining, and checks that green is already published while blue still serves.
@@ -897,7 +947,7 @@ make toml-demo          # compile -> fmt -> diff -> lint over a sample config tr
 make kubernetes-demo    # import K8s YAML to TOML and export it back
 ```
 
-`kubernetes-demo` is the honest test of the migration story: take real Kubernetes YAML, import it, look at the TOML and the migration report, export it again, and check the round-trip is sane. The correlation logic (Service → Deployment → Ingress → HPA) is exactly what unit tests struggle to cover convincingly, because the interesting bugs are in how resources *fit together*, not in any one conversion.
+`kubernetes-demo` is the honest test of the migration story: take real Kubernetes YAML, import it, look at the TOML and the migration report, export it again, and check the round-trip is sane. It used to end every `relish` call with `|| true`, so it could print a broken import and still exit 0; now each step greps its output for what it should contain, and `--strict` must fail on the example with dropped resources. The correlation logic (Service → Deployment → Ingress → HPA) is exactly what unit tests struggle to cover convincingly, because the interesting bugs are in how resources *fit together*, not in any one conversion.
 
 ### Running them
 
@@ -1682,6 +1732,34 @@ SSH key race above is still there in 2.2.1, and so is the missing zstd
 decompressor for qcow2 (Lima's `master` has added one since). The host agent
 still steps the guest clock every 10 s past 100 ms of drift. The workarounds
 stay.
+
+### A rotation while every node was down
+
+The soak rotates the operator's ingress certificate every few minutes, and
+after each reload it tells the checker which serial each node must now serve.
+The 0.2.1 candidate 6 jobs soak failed every node at once: "serves 100B, not
+the 100A reloaded 590 s ago". Bun was right; the harness had lost track.
+
+A rotation fired while the "every VM powered off at once" special held the
+whole cluster down. It skipped all three nodes, as it should, but it still
+made 100B the pair the harness calls current. On power-on, the special pushed
+that current pair to every node and never told the checker, which still
+expected 100A from the last rotation that had reached them. A single-node
+power-on did tell it, because it pushed the pair through code that also
+records the expectation. Now both paths use one helper,
+`push_current_pair`, and a test reads `qualify-sustained.sh` to check that
+every push of the current pair records what the node must serve
+([#1108](https://github.com/reliaburger/reliaburger/issues/1108)).
+
+The lesson is an old one: two copies of "do the thing, then record it" drift
+apart, and the copy that runs least is the one that's wrong. The all-off
+special runs once per soak.
+
+### An alert the load raises on purpose
+
+The checker fails a tier when a `relish wtf` warning outlasts ten minutes past the last settle. Candidate 6's 8 h jobs final failed that way on two warnings at once. One was a real bug (#1110, in Chapter 7). The other was Mayo's `cpu_throttle` alert, which fires once a guest's CPU stays above 90% for five minutes. The jobs soak drives 2-vCPU guests at the job target rate on purpose, so the alert fired nearly all run long, in passing runs too. It failed this one only because fourteen minutes went by without a settle to reset the clock (#1112).
+
+The alert said "the load is the load", which tells us nothing about the candidate, and whether it failed a tier came down to timing. So the checker now records `cpu_throttle` as an `info` finding instead of gating on it. `memory_high` stays gated, because a Bun that grows past 70% of its guest is the leak the soak exists to catch. The same fix caught a second bug: every cluster-wide alert shared one key, `warning|alerts-firing|cluster`, so an alert that had just started firing inherited the age of an older one. The key now ends in the rule's name, taken from the alert's title, so each alert keeps its own clock.
 
 ### Status from any node
 

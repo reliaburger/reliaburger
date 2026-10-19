@@ -379,19 +379,18 @@ pub(crate) async fn forward_to_leader(
     body: String,
     headers: &axum::http::HeaderMap,
 ) -> Response {
-    let Some(leader_url) = super::api::leader_api_url(state, council).await else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "no cluster leader known yet; retry shortly" })),
-        )
-            .into_response();
+    let leader_url = match super::api::leader_api_url(state, council, headers).await {
+        Ok(url) => url,
+        Err(refusal) => return refusal.into_response(),
     };
-    let request = state
-        .cluster_http
-        .client()
-        .post(format!("{leader_url}{path}"))
-        .header("content-type", "application/json")
-        .body(body);
+    let request = super::api::mark_leader_forwarded(
+        state
+            .cluster_http
+            .client()
+            .post(format!("{leader_url}{path}"))
+            .header("content-type", "application/json")
+            .body(body),
+    );
     let mut request = super::api::copy_forwarded_auth(request, headers);
     for key in [
         "idempotency-key",
@@ -426,18 +425,17 @@ pub(crate) async fn forward_get_to_leader(
     path: &str,
     headers: &axum::http::HeaderMap,
 ) -> Response {
-    let Some(leader_url) = super::api::leader_api_url(state, council).await else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "no cluster leader known yet; retry shortly" })),
-        )
-            .into_response();
+    let leader_url = match super::api::leader_api_url(state, council, headers).await {
+        Ok(url) => url,
+        Err(refusal) => return refusal.into_response(),
     };
     let request = super::api::copy_forwarded_auth(
-        state
-            .cluster_http
-            .client()
-            .get(format!("{leader_url}{path}")),
+        super::api::mark_leader_forwarded(
+            state
+                .cluster_http
+                .client()
+                .get(format!("{leader_url}{path}")),
+        ),
         headers,
     );
     proxy_response(request.send().await).await
