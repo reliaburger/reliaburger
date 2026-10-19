@@ -1119,6 +1119,21 @@ they'd fail the moment a new crate changed a single byte. The HMACs on gossip an
 and the API-token hash never moved: they use `ring`, whose `hmac::verify` already
 compares tags in constant time.
 
+`dirs` 6 to 7 is the smallest kind of bump, and the kind that's easiest to get wrong
+quietly. `dirs` answers "where is this user's home, data or cache directory?", and we
+build `~/.reliaburger` (contexts, tokens, dev clusters), bun's fallback stores and the job
+bench's image cache on its answers. If a new version returned a different directory,
+nothing would fail: users' files would just seem to vanish, because we'd be looking
+somewhere else. The 7.0 changelog has one breaking change, and it's Windows-only:
+`preference_dir` moved from local to roaming app data. We don't call `preference_dir`,
+and the macOS and Linux code didn't change. Even so, the tests came first.
+`tests/suite/user_directories.rs` re-runs its own test binary with a throwaway `HOME`
+(changing `HOME` inside a running test binary would race every other test) and pins each
+answer: the home directory is `$HOME`, the data and cache directories are
+`~/Library/Application Support` and `~/Library/Caches` on macOS and `~/.local/share` and
+`~/.cache` on Linux, the XDG overrides count on Linux only, and relish state and node data
+both land in `~/.reliaburger`. They passed on 6 before the version moved.
+
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
 ## Asking the cluster what it can do
