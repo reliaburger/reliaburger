@@ -1,0 +1,109 @@
+{
+  "id": "OPS-010",
+  "name": "A healthy change rolls out without downtime",
+  "feature": "features/operations/rolling_deploy.feature",
+  "axis": "operations",
+  "claim_ids": [
+    "claim_self_healing",
+    "claim_rolling_deploys_health_gated_auto_rollback"
+  ],
+  "source_refs": [
+    "docs/manual/08_five-minute-tour.md:164-164@v0.2.0",
+    "README.md:252-253@v0.2.0",
+    "docs/manual/01_deploy-an-app.md:244-244@v0.2.0",
+    "docs/manual/01_deploy-an-app.md:210-210@v0.2.0",
+    "docs/whitepaper.md:689-689@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "req_OPS-010",
+    "axis_operations",
+    "claim_self_healing",
+    "claim_rolling_deploys_health_gated_auto_rollback"
+  ],
+  "hypothesis": false,
+  "status": "FAIL",
+  "status_reason": "And availability during the rollout should meet the configured threshold: AssertionError: availability {'count': 39, 'ok': 30, 'ratio': 0.7692, 'longest_failure_streak': 3, 'p50_ms': 1.9, 'p99_ms': 2.9, 'errors': ['503']}",
+  "start_time": "2026-10-18T12:46:23.907+00:00",
+  "duration_ms": 32487,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "rollout_complete_s": "<= 300",
+    "availability_during_rollout": ">= 0.99"
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:46:24.232+00:00",
+      "nodes": {
+        "node-01": "alive",
+        "node-02": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-03"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "probe_before_fault": {
+      "count": 15,
+      "ok": 15,
+      "ratio": 1.0,
+      "longest_failure_streak": 0,
+      "p50_ms": 1.9,
+      "p99_ms": 4.0,
+      "errors": []
+    },
+    "rollout_complete_s": 12.3,
+    "availability_during_rollout": {
+      "count": 39,
+      "ok": 30,
+      "ratio": 0.7692,
+      "longest_failure_streak": 3,
+      "p50_ms": 1.9,
+      "p99_ms": 2.9,
+      "errors": [
+        "503"
+      ]
+    }
+  },
+  "evidence_paths": [
+    "scenarios/OPS-010/claims/claim_self_healing.json",
+    "scenarios/OPS-010/claims/claim_rolling_deploys_health_gated_auto_rollback.json",
+    "scenarios/OPS-010/cluster_state.json",
+    "scenarios/OPS-010/probe.jsonl",
+    "scenarios/OPS-010/cluster_state.jsonl",
+    "scenarios/OPS-010/frontend-variant.toml",
+    "scenarios/OPS-010/history-after.txt",
+    "scenarios/OPS-010/diagnostics/wtf.json",
+    "scenarios/OPS-010/diagnostics/status.json",
+    "scenarios/OPS-010/diagnostics/council.json",
+    "scenarios/OPS-010/diagnostics/nodes.json",
+    "scenarios/OPS-010/diagnostics/journal-node-01.txt",
+    "scenarios/OPS-010/diagnostics/journal-node-02.txt",
+    "scenarios/OPS-010/diagnostics/journal-node-03.txt",
+    "scenarios/OPS-010/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": "And availability during the rollout should meet the configured threshold"
+}

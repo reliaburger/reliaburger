@@ -1,0 +1,39 @@
+{
+  "claim": {
+    "id": "claim_integrated_platform",
+    "axis": "vision",
+    "statement": "A team without a platform team can run containers on a few machines with scheduler, ingress, PKI, secrets, registry, metrics, logs, GitOps and fault injection included, without assembling external infrastructure.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "README.md:12-12",
+        "quote": "metrics, logs, GitOps, jobs and fault injection are compiled into that agent."
+      },
+      {
+        "ref": "README.md:13-13",
+        "quote": "There's no control plane to assemble and no add-ons to install."
+      }
+    ],
+    "related": [
+      "claim_two_binaries_everything_inside",
+      "claim_target_users_2_to_200_nodes_no_platform_team"
+    ],
+    "measurable": "Following docs/linux-servers.md on clean Ubuntu 24.04 VMs, the only software installed beyond distro packages is bun and relish; three nodes become healthy and a two-service app answers through the built-in ingress and resolves its peer by name.",
+    "interfaces": [
+      "relish init",
+      "relish join",
+      "relish apply",
+      "relish nodes",
+      "relish council",
+      "relish status"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_integrated_platform",
+      "ref": "README.md:13-13",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

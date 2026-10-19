@@ -1,0 +1,114 @@
+{
+  "id": "OPS-002[settled]",
+  "name": "Delete and re-apply the fixture after relish status shows no instances -- @1.1 ",
+  "feature": "features/operations/redeploy_after_delete.feature",
+  "axis": "operations",
+  "claim_ids": [
+    "claim_self_healing",
+    "claim_apply_converges_after_delete"
+  ],
+  "source_refs": [
+    "docs/manual/08_five-minute-tour.md:164-164@v0.2.0",
+    "README.md:252-253@v0.2.0",
+    "docs/manual/01_deploy-an-app.md:128-128@v0.2.0",
+    "docs/manual/01_deploy-an-app.md:137-137@v0.2.0",
+    "docs/manual/01_deploy-an-app.md:142-145@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "req_OPS-002",
+    "axis_operations",
+    "claim_self_healing",
+    "claim_apply_converges_after_delete"
+  ],
+  "hypothesis": false,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:34:26.456+00:00",
+  "duration_ms": 169741,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "cycles_converged": "5 of 5, each <= 300 s",
+    "non_running_fixture_instances": 0
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:34:26.811+00:00",
+      "nodes": {
+        "node-01": "alive",
+        "node-02": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-03"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "placement_before": {
+      "backend": {
+        "node-01": [
+          "default__backend-1:running"
+        ],
+        "node-03": [
+          "default__backend-0:running"
+        ]
+      },
+      "frontend": {
+        "node-01": [
+          "default__frontend-0:running",
+          "default__frontend-2:running"
+        ],
+        "node-03": [
+          "default__frontend-1:running"
+        ]
+      }
+    },
+    "cycles_attempted": 5,
+    "cycles_converged": 5,
+    "converged_s_per_cycle": [
+      25.0,
+      20.8,
+      20.8,
+      21.1,
+      22.9
+    ],
+    "non_running_fixture_instances": [],
+    "deploy_retry_lines_node-01": 0,
+    "deploy_retry_lines_node-02": 0,
+    "deploy_retry_lines_node-03": 0
+  },
+  "evidence_paths": [
+    "scenarios/OPS-002[settled]/claims/claim_self_healing.json",
+    "scenarios/OPS-002[settled]/claims/claim_apply_converges_after_delete.json",
+    "scenarios/OPS-002[settled]/cluster_state.json",
+    "scenarios/OPS-002[settled]/cycles.json",
+    "scenarios/OPS-002[settled]/journal-node-01.txt",
+    "scenarios/OPS-002[settled]/journal-node-02.txt",
+    "scenarios/OPS-002[settled]/journal-node-03.txt",
+    "scenarios/OPS-002[settled]/wtf-after.txt",
+    "scenarios/OPS-002[settled]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": null
+}

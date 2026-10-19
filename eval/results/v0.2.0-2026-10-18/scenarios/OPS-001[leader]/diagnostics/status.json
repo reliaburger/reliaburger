@@ -1,0 +1,79 @@
+[
+  {
+    "node": "node-02",
+    "id": "apps__gitops-6f367e3a6ac8-0",
+    "app_name": "gitops-6f367e3a6ac8",
+    "namespace": "apps",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 14032,
+    "pid": 1856,
+    "status_age_ms": 126
+  },
+  {
+    "node": "node-02",
+    "id": "apps__gitops-6f367e3a6ac8-1",
+    "app_name": "gitops-6f367e3a6ac8",
+    "namespace": "apps",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 26232,
+    "pid": 1264,
+    "status_age_ms": 126
+  },
+  {
+    "node": "node-02",
+    "id": "default__backend-0",
+    "app_name": "backend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 27936,
+    "pid": 1383,
+    "status_age_ms": 126
+  },
+  {
+    "node": "node-02",
+    "id": "default__backend-1",
+    "app_name": "backend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 16299,
+    "pid": 1729,
+    "status_age_ms": 126
+  },
+  {
+    "node": "node-02",
+    "id": "default__frontend-0",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 19356,
+    "pid": 1982,
+    "status_age_ms": 126
+  },
+  {
+    "node": "node-02",
+    "id": "default__frontend-1",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 48684,
+    "pid": 1510,
+    "status_age_ms": 126
+  },
+  {
+    "node": "node-02",
+    "id": "default__frontend-2",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 51229,
+    "pid": 2105,
+    "status_age_ms": 126
+  }
+]

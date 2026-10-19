@@ -1,0 +1,63 @@
+{
+  "generated": "2026-10-18T11:57:00.735+00:00",
+  "harness_commit": "fb4615d202fb55b0d87254c723cc309403ed7cb3-dirty",
+  "product": {
+    "target": "v0.2.0",
+    "version": "0.2.0",
+    "commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+    "channel": "stable",
+    "release_tag": "v0.2.0",
+    "docs_ref": "v0.2.0",
+    "sha256": {
+      "SHA256SUMS": "343ffd3b3406541b41e537e3d20e744059709be4fc4e673b313917085e374be9",
+      "bun-linux-x86_64": "6dbda6ff67163e0103999d9bbf7433ff055f71e5d59ef24bdada6a779e5830a4",
+      "relish-linux-x86_64": "2a37047113068b3735e226fedb14322f3be0e9ecf621d4634837aaefad31d190"
+    }
+  },
+  "host": {
+    "kernel": "7.1.5-76070105-generic",
+    "os": "Pop!_OS 24.04 LTS",
+    "cpus": 24,
+    "memory_mib": 95975,
+    "qemu": "QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)\nCopyright (c) 2003-2023 Fabrice Bellard and the QEMU Project developers",
+    "libvirt": "10.0.0",
+    "python": "3.13.11",
+    "behave": "1.3.3"
+  },
+  "lab": {
+    "image": {
+      "url": "https://cloud-images.ubuntu.com/releases/noble/release-20260911/ubuntu-24.04-server-cloudimg-amd64.img",
+      "sha256": "612b2c0cc1bc413a6cb8c38fd611794caf0f2b436c50013d8b3794db12ad7354",
+      "cache_name": "ubuntu-24.04-server-cloudimg-amd64-20260911.img"
+    },
+    "node_spec": {
+      "vcpus": 4,
+      "memory_mib": 6144,
+      "disk_gib": 30
+    },
+    "nodes": [
+      {
+        "name": "node-01",
+        "ip": "10.77.0.11",
+        "mac": "52:54:00:77:00:11"
+      },
+      {
+        "name": "node-02",
+        "ip": "10.77.0.12",
+        "mac": "52:54:00:77:00:12"
+      },
+      {
+        "name": "node-03",
+        "ip": "10.77.0.13",
+        "mac": "52:54:00:77:00:13"
+      }
+    ],
+    "network": {
+      "name": "rbeval",
+      "bridge": "virbr-rbeval",
+      "gateway": "10.77.0.1",
+      "netmask": "255.255.255.0",
+      "cidr": "10.77.0.0/24"
+    }
+  }
+}

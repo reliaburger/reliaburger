@@ -1,0 +1,88 @@
+{
+  "id": "EXT-002[inspect]",
+  "name": "relish inspect frontend honours --output json -- @2.1 other read commands under the global --output flag",
+  "feature": "features/extensibility/cli_json_contract.feature",
+  "axis": "extensibility",
+  "claim_ids": [
+    "claim_cli_machine_readable_output",
+    "claim_batteries_included"
+  ],
+  "source_refs": [
+    "docs/manual/13_reference.md:13-13@v0.2.0",
+    "docs/design/cli-relish.md:1947-1947@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_cli_machine_readable_output",
+    "axis_extensibility",
+    "claim_batteries_included",
+    "req_EXT-002"
+  ],
+  "hypothesis": true,
+  "status": "FAIL",
+  "status_reason": "And its standard output should parse as JSON: AssertionError: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'App: frontend (namespace default)\\n  Replicas:  3 desired, 3 running\\n  Placed:    node-01 2, node-02 1\\n\\nInstance: default'",
+  "start_time": "2026-10-18T12:07:13.718+00:00",
+  "duration_ms": 4558,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run",
+    "command: relish --output json inspect frontend"
+  ],
+  "expected": {
+    "exit_code": 0,
+    "stdout_is_json": true
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:07:14.071+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-03": "alive",
+        "node-01": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "exit_code": 0,
+    "stdout_bytes": 541,
+    "stdout_is_json": false,
+    "stdout_head": "App: frontend (namespace default)\n  Replicas:  3 desired, 3 running\n  Placed:    node-01 2, node-02 1\n\nInstance: default__frontend-1\n  Node:      node-02\n  Namespace: default\n  State:     running\n  Re"
+  },
+  "evidence_paths": [
+    "scenarios/EXT-002[inspect]/claims/claim_cli_machine_readable_output.json",
+    "scenarios/EXT-002[inspect]/claims/claim_batteries_included.json",
+    "scenarios/EXT-002[inspect]/cluster_state.json",
+    "scenarios/EXT-002[inspect]/stdout.txt",
+    "scenarios/EXT-002[inspect]/stderr.txt",
+    "scenarios/EXT-002[inspect]/diagnostics/wtf.json",
+    "scenarios/EXT-002[inspect]/diagnostics/status.json",
+    "scenarios/EXT-002[inspect]/diagnostics/council.json",
+    "scenarios/EXT-002[inspect]/diagnostics/nodes.json",
+    "scenarios/EXT-002[inspect]/diagnostics/journal-node-01.txt",
+    "scenarios/EXT-002[inspect]/diagnostics/journal-node-02.txt",
+    "scenarios/EXT-002[inspect]/diagnostics/journal-node-03.txt",
+    "scenarios/EXT-002[inspect]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": "And its standard output should parse as JSON"
+}

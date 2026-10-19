@@ -1,0 +1,1122 @@
+# Testable product claims for Reliaburger v0.2.0. Line ranges were resolved against the exported docs and spot-checked with sed.
+# Release under test: Reliaburger v0.2.0, commit cc5f64393350f2081f7d88512b95a88316172e5a.
+# All refs are paths in the v0.2.0 export, relative to the repo root.
+# Optional fields beyond the base schema: gap (what the docs say instead, or "no mention found"
+# with the rg patterns tried) and limitation (true when the project itself admits the limit, so
+# observing it is not a defect).
+claims:
+- id: claim_two_binaries_everything_inside
+  axis: vision
+  statement: Reliaburger is two binaries, the node agent bun and the CLI relish, and scheduling, ingress, PKI, secrets, registry, metrics, logs, GitOps, jobs, fault injection and service discovery are compiled into bun.
+  kind: explicit
+  sources:
+  - ref: README.md:10-12
+    quote: Scheduling, clustering, service discovery, ingress, PKI, secrets, an image registry, metrics, logs, GitOps, jobs and fault injection are compiled into that agent.
+  - ref: docs/whitepaper.md:134-134
+    quote: There's no separate control-plane binary and no plugin to pick
+  - ref: README.md:13-13
+    quote: There's no control plane to assemble and no add-ons to install.
+  measurable: Install the release; only bun and relish exist and no control plane or add-on is installed (no other daemon or container is needed to reach a working cluster); every subsystem command (relish routes, images, metrics, logs, fault, batch, dashboard, resolve) answers against a cluster that has only bun running on each node.
+  interfaces:
+  - bun
+  - relish
+  - bun --cluster
+  - relish status
+- id: claim_scheduler_meat_spreads_and_reschedules
+  axis: vision
+  statement: The built-in scheduler (Meat) places replicas across nodes, numbers them cluster-wide, and moves a lost node's workloads to the survivors.
+  kind: explicit
+  sources:
+  - ref: docs/manual/08_five-minute-tour.md:40-40
+    quote: Three frontend replicas, one on
+  - ref: README.md:252-253
+    quote: Lose a node and the scheduler moves its workloads to the survivors.
+  measurable: Apply an app with replicas = 3 on three nodes; relish status shows -0, -1, -2 one per node. replicas = "*" places one per node (DaemonSet-like). Stop a node and the replica count recovers on survivors (timing in claim_node_loss_reschedules_in_about_a_minute).
+  interfaces:
+  - relish apply
+  - relish status
+  - relish inspect <app>
+  - '[app.NAME] replicas = 3'
+  - replicas = "*"
+- id: claim_wrapper_ingress
+  axis: vision
+  statement: Wrapper is a built-in ingress with host and path routing, TLS from the cluster's ingress CA or operator files, WebSocket and streaming passthrough, rate limiting and connection draining.
+  kind: explicit
+  sources:
+  - ref: docs/manual/03_networking.md:93-93
+    quote: The Wrapper proxy routes external HTTP and HTTPS to apps by host name and path
+  - ref: docs/manual/03_networking.md:125-125
+    quote: A stopping instance drains its connections before it goes.
+  measurable: With [ingress] enabled = true and [app.X.ingress] host/path, a request with the matching Host header reaches the app on ports 80/443 of any node; plain HTTP unless tls is set; tls = "cluster" serves a cert signed by the ingress CA; requests above rate_limit_rps per client IP are limited; a rolling deploy drops no in-flight connections.
+  interfaces:
+  - '[ingress] enabled'
+  - '[ingress] http_port / https_port (80, 443)'
+  - '[app.X.ingress] host, path, tls, websocket, rate_limit_rps, rate_limit_burst'
+  - relish routes
+- id: claim_pki_mtls_by_default
+  axis: vision
+  statement: A generated cluster requires mTLS between nodes, nodes join with single-use tokens and CSRs, certificates renew themselves, and workloads get SPIFFE certificates.
+  kind: explicit
+  sources:
+  - ref: README.md:266-266
+    quote: A generated cluster requires mTLS between nodes.
+  - ref: docs/manual/10_security.md:669-670
+    quote: Node certificates last a year and cluster-issued ingress certificates 90 days.
+  - ref: docs/whitepaper.md:621-621
+    quote: (1-hour lifetime, rotated every 30 minutes)
+  measurable: A plaintext connection to gossip/Raft/API ports of a clustered node is refused; join with a reused or expired (default 15 min, max 1 h) token fails; node leaf certificate lifetime is 1 year (renewed at 6 months), ingress leaf 90 days (renewed at 45), workload cert 1 hour rotated every 30 minutes; /run/reliaburger/identity/ holds cert.pem key.pem ca.pem bundle.pem token in a container.
+  interfaces:
+  - relish init
+  - relish join-token create --node-id --ttl
+  - relish join --token --ca-fingerprint
+  - '[security] require_mtls'
+  - /run/reliaburger/identity/
+  - ports 9117, 9443, 9444, 9445
+- id: claim_secrets_age_encrypted_in_config
+  axis: vision
+  statement: Secrets live in the user's config encrypted to the cluster's age public key (ENC[AGE:...] in env values), encrypted locally and decrypted only by the node that starts the instance.
+  kind: explicit
+  sources:
+  - ref: docs/manual/10_security.md:318-318
+    quote: Secrets live in your config, encrypted to the cluster's age public key.
+  - ref: docs/manual/10_security.md:339-339
+    quote: 'Encryption is local: `secret encrypt` never contacts the cluster.'
+  - ref: docs/manual/10_security.md:341-341
+    quote: it refuses to start the instance rather than pass the ciphertext
+  measurable: Encrypt a value offline with relish secret encrypt, apply, and the container sees the plaintext env var; no ciphertext reaches the container if decryption fails (instance does not start); only env values accept ENC[AGE:...]; relish secret rotate then --finalize refuses while stored secrets still need the old key.
+  interfaces:
+  - relish secret pubkey
+  - relish secret encrypt --pubkey
+  - relish secret rotate [--finalize]
+  - env = { X = "ENC[AGE:...]" }
+  - GET /v1/secret/public-key
+- id: claim_pickle_registry_every_node
+  axis: vision
+  statement: Pickle is an OCI registry on every node (port 5050) that caches upstream registries, shares layers peer to peer, and receives images built on the cluster with relish build; images are replicated asynchronously to a default of 2 copies.
+  kind: explicit
+  sources:
+  - ref: docs/manual/11_images-and-volumes.md:5-6
+    quote: Every node runs Pickle, the built-in registry
+  - ref: docs/whitepaper.md:663-663
+    quote: 'redundancy target (default 2 total copies: the pusher plus one peer)'
+  - ref: docs/whitepaper.md:667-667
+    quote: an image pushed and then immediately lost with its origin node before the heal tick runs is not guaranteed to survive
+  measurable: After pushing/building an image, curl the registry on port 5050 of each node (/v2/); a pull on a second node is served from a peer; the heal loop (roughly every 60 s) brings copies to 2 within the 30 s per layer target (the whitepaper marks that target unmeasured); killing the only origin node before the heal tick can lose the image.
+  interfaces:
+  - relish images
+  - relish build <path>
+  - '[images] registry_port (5050)'
+  - '[[images.external_registries]]'
+  - docker push
+- id: claim_mayo_metrics_builtin
+  axis: vision
+  statement: Mayo collects node and per-app CPU and memory every 10 seconds into a per-node Parquet store (7 days by default), scrapes apps' Prometheus endpoints, and evaluates five fixed alert rules; there is nothing to install.
+  kind: explicit
+  sources:
+  - ref: docs/manual/04_observability.md:93-93
+    quote: every 10 seconds, and keeps them for 7 days
+  - ref: docs/manual/04_observability.md:184-184
+    quote: Each node evaluates five built-in rules against its own metrics every 30
+  measurable: relish top shows a sample per workload per node within about 10 s; metrics older than retention_days (7) are pruned; max_storage_mb defaults (metrics 1024, logs 2048) cap disk; alert rules fire at CPU>90% for 5 min, memory>85% for 2 min (critical), memory>70% for 10 min, disk>80% for 5 min, CPU<5% for 30 min (warning).
+  interfaces:
+  - relish top
+  - relish metrics <app> [--name --since]
+  - '[metrics] retention_days, max_storage_mb, scrape_targets'
+  - '[[alerts.destinations]]'
+- id: claim_ketchup_logs_builtin
+  axis: vision
+  statement: Ketchup captures stdout and stderr of every instance on its node, serves cluster-wide queries and live follow through any node, and exports Parquet archives that SQL can query.
+  kind: explicit
+  sources:
+  - ref: docs/manual/04_observability.md:8-8
+    quote: You ask any node and
+  - ref: docs/manual/04_observability.md:78-78
+    quote: Exported Parquet archives answer SQL
+  measurable: relish logs <app> from each node returns the same merged lines; -f shows [node instance] prefixes and picks up replicas scheduled to new nodes; a node that fails to answer yields a warning line on stderr (timeout 10 s) while other nodes' lines still arrive; retention_days default 7, export_interval_secs default 3600.
+  interfaces:
+  - relish logs <app> [--tail --grep --since --until --instance --stream --json-field -f]
+  - relish logs-export --dest
+  - relish logs-search <source> <sql>
+  - '[logs] retention_days, export_path, export_interval_secs, max_storage_mb'
+- id: claim_lettuce_gitops_builtin
+  axis: vision
+  statement: The council leader polls a Git repository (every 30 s by default), reconciles apps, namespaces and permissions including deletions, undoes manual drift, and can require signed commits.
+  kind: explicit
+  sources:
+  - ref: docs/manual/12_operations.md:251-251
+    quote: Point the config at a repository and the council leader keeps the cluster in
+  - ref: docs/manual/12_operations.md:293-293
+    quote: a GitOps-managed app by hand and the next poll puts it back
+  - ref: docs/manual/12_operations.md:281-281
+    quote: a commit that doesn't verify
+  measurable: Push a commit changing replicas; the cluster converges within poll_interval_secs (30). Edit a GitOps-managed app by hand; the next poll reverts it. Delete an app from the repo; it is removed. An unsigned commit is not applied when require_signed_commits = true. A git command running over 2 minutes is killed and retried. Any [job.*] declaration refuses the whole commit.
+  interfaces:
+  - '[gitops] repo, branch, path, poll_interval_secs, require_signed_commits, trusted_signing_keys, webhook_secret'
+  - dashboard GitOps page (no relish gitops command)
+- id: claim_smoker_fault_injection_builtin
+  axis: vision
+  statement: relish fault injects latency, dropped connections, DNS failure, partitions, CPU/memory/disk-I/O pressure, killed or frozen instances, and drained or killed nodes, each with a duration (default 10 minutes) and automatic cleanup.
+  kind: explicit
+  sources:
+  - ref: docs/manual/05_chaos.md:38-38
+    quote: Every fault has a duration (default 10 minutes) and cleans up after itself
+  - ref: README.md:286-287
+    quote: Every fault has a duration and cleans up after itself.
+  measurable: relish fault delay redis 300ms --from frontend --duration 2m --acknowledge raises a cache read from about 43 ms to about 945 ms (docs example) and relish path shows DEGRADED; after the duration the fault disappears from relish fault list and latency recovers; fault kill restarts an instance within seconds.
+  interfaces:
+  - relish fault delay|drop|dns|partition|bandwidth|cpu|memory|disk-io|kill|pause|resume|node-drain|node-kill|node-pressure
+  - relish fault list
+  - relish fault clear [id|service]
+  - relish fault scenario <toml>
+  - relish test --chaos
+- id: claim_batch_jobs_one_lifecycle
+  axis: vision
+  statement: One-off jobs, cron schedules, deployment hooks (run_before) and task arrays run on a single durable lifecycle with retries (max_attempts default 4), per-attempt timeouts, quotas and admission shared with apps.
+  kind: explicit
+  sources:
+  - ref: README.md:356-356
+    quote: 'Every kind of job runs on one lifecycle: a one-off job, a cron'
+  - ref: docs/README.md:105-105
+    quote: '`max_attempts` (default 4, or 1 for a hook)'
+  measurable: relish apply a [job.X] with run_before = ["app.Y"]; the app is not published until the hook has an accepted successful outcome. A failing job retries up to max_attempts; overlap = "forbid" skips a cron occurrence while a run is active; a cron fire with no capacity is recorded as job-skipped, not dropped silently.
+  interfaces:
+  - '[job.NAME] runtime, image, command, schedule, run_before, max_attempts, task_timeout_secs, overlap, replay_unknown'
+  - relish jobs
+  - relish run --batch
+  - relish batch submit|watch|cancel|results|logs|replay
+  - relish apply <file> --rerun-jobs
+- id: claim_brioche_dashboard_and_tui
+  axis: vision
+  statement: A web dashboard (Brioche) and a terminal UI are built into the binary; relish dashboard opens a read-only browser session through the CLI's own authenticated connection.
+  kind: explicit
+  sources:
+  - ref: docs/manual/04_observability.md:244-244
+    quote: opens a one-time link to it. It forwards read-only requests using the CLI's own
+  - ref: README.md:322-322
+    quote: Run `relish` with no arguments for the
+  measurable: relish dashboard prints/opens a loopback URL; the page loads charts for CPU, memory, requests per second and latency; a state-changing request through it is refused; opening a node's :9117 in a browser with tokens configured asks for a token and grants a read-only session for 12 hours.
+  interfaces:
+  - relish dashboard [--no-open --port]
+  - relish (TUI)
+  - http://NODE:9117/
+  - port 9117
+- id: claim_onion_service_discovery
+  axis: vision
+  statement: Every app with a port gets a stable virtual IP and a .internal DNS name; an eBPF connect hook rewrites connections to a healthy backend with no proxy in the data path.
+  kind: explicit
+  sources:
+  - ref: docs/manual/03_networking.md:5-5
+    quote: Every app with a `port` gets a stable virtual IP (VIP).
+  - ref: docs/whitepaper.md:577-577
+    quote: No proxy in the data path.
+  measurable: relish resolve web returns a VIP in 127.128.0.0/16 and healthy backends; from a container, web.internal and (same namespace) bare web resolve and connect; app.namespace.internal reaches another namespace only with allow_from; killing a backend removes it from relish resolve; existing connections survive a bun crash.
+  interfaces:
+  - relish resolve <app>
+  - relish path <app> --to <app>
+  - '[dns] enabled, upstream (default 8.8.8.8:53), listen port 53'
+  - '[ebpf] enabled'
+- id: claim_process_runtime_processgrill
+  axis: vision
+  statement: A built-in process runtime (ProcessGrill) runs plain host binaries under the same scheduling, health checks and log capture, deny-by-default via an allowlist, but without sandboxing.
+  kind: explicit
+  sources:
+  - ref: docs/whitepaper.md:821-821
+    quote: Deny-by-default binary allowlist
+  - ref: docs/README.md:328-328
+    quote: without namespaces, cgroups or rootfs
+  measurable: With empty [process_workloads] allowed_binaries an exec workload is refused; with the binary listed and mount_isolation = false it runs and reports in relish status; the process is visible in the host process table and is not isolated (no namespace).
+  interfaces:
+  - bun --runtime process
+  - '[process_workloads] allowed_binaries, mount_isolation'
+  - '[app.X] exec = ...'
+  - '[job.X] runtime = "process"'
+- id: claim_target_users_2_to_200_nodes_no_platform_team
+  axis: vision
+  statement: The primary audience is teams with 2 to 200 nodes who want containers running reliably without a full-time platform engineering team.
+  kind: explicit
+  sources:
+  - ref: docs/whitepaper.md:88-88
+    quote: These teams typically have 2-200 nodes
+  - ref: docs/whitepaper.md:88-88
+    quote: without dedicating a full-time platform engineering team to the task
+  measurable: Whether one operator can bring up and run a 3-node cluster from the published docs alone, with only bun and relish, and perform deploy, rollback, node loss recovery and upgrade without any third-party component.
+  interfaces:
+  - relish setup
+  - relish init
+  - relish join
+  - docs/linux-servers.md
+- id: claim_homelab_edge_bare_metal_target
+  axis: vision
+  statement: Edge and resource-constrained environments are named as motivations, and bare-metal appliance installs are a roadmap goal, but the docs do not define a homelab or edge user profile and the v0.2.0 binary does not include the bare-metal installer.
+  kind: hypothesis
+  sources:
+  - ref: docs/whitepaper.md:160-160
+    quote: especially in resource-constrained and edge environments
+  - ref: docs/roadmap.md:356-356
+    quote: 'Exit test:'
+  gap: No mention found of "homelab" or "home lab" (rg -n -i "homelab|home lab|raspberry|platform team" README.md docs/whitepaper.md docs/roadmap.md docs/manual docs/quickstart.md docs/linux-servers.md docs/README.md). Bare metal is the 0.3.0 headline, "Bare metal in an hour" with exit test "ten Dell Wyse 3040s from power-on to a cluster"; the whitepaper says bare-metal time to first deploy is unmeasured. Released nodes need Ubuntu 24.04+ or Debian 12+, 2 CPU cores, 2 GiB RAM, 10 GiB disk, kernel 5.8+.
+  measurable: Run the 3-VM Linux servers guide on small hardware (2 vCPU, 2 GiB, 10 GiB per node) and record whether the cluster forms and runs the demo workload; record idle bun RSS on Linux (docs report only macOS - 63 MiB single-node cluster, 48 MiB standalone).
+  interfaces:
+  - docs/linux-servers.md
+  - relish setup
+  - bun --cluster
+- id: claim_quickstart_five_minutes
+  axis: vision
+  statement: A laptop goes from nothing to a three-node cluster running a real Kubernetes app in about five minutes; the measured install took 178 s and 282 s on Apple silicon, about 90 s with cached downloads and about 4 minutes cold.
+  kind: explicit
+  sources:
+  - ref: README.md:22-22
+    quote: Five minutes is the target.
+  - ref: docs/quickstart.md:5-5
+    quote: 178 s and 282 s from the first `curl`
+  - ref: docs/manual/08_five-minute-tour.md:19-19
+    quote: about a minute and a half once the downloads are cached, closer to
+  measurable: Time curl -fsSL https://reliaburger.com/install.sh | sh to a ready three-node cluster (relish nodes shows 3 alive, council 3/3 voters, sample app answers on http://localhost:18080/). Docs numbers - 178 s and 282 s (Apple silicon); Intel Mac and Linux are stated as unmeasured. Needs 8 GiB free memory and 15 GiB disk, QEMU/KVM on Linux.
+  interfaces:
+  - curl -fsSL https://reliaburger.com/install.sh | sh
+  - relish setup --quickstart [--nodes N]
+  - relish local status|stop|start|destroy
+  - ports 18080, 19117-19119, 15050
+  gap: The README at this commit still says 0.1.6 is the installer release and 0.2.0 "is in development"; the published installer fetches 0.1.6 until 0.2.0 is promoted, so a v0.2.0 evaluation needs a development or staged build.
+- id: claim_min_cluster_size_and_resources
+  axis: vision
+  statement: A single node works for development and small production; three nodes is the minimum for high availability; each node needs Linux 5.8+ with cgroup v2, 2 CPU cores, 2 GiB RAM and 10 GiB disk.
+  kind: explicit
+  sources:
+  - ref: docs/whitepaper.md:1278-1278
+    quote: A 3-node cluster is the minimum for high availability
+  - ref: docs/linux-servers.md:29-29
+    quote: At least 2 CPU cores, 2 GiB RAM, and 10 GiB available disk space per node.
+  measurable: A one-node cluster elects itself leader and council and runs apps. A two-node cluster has two voters and cannot write or schedule after losing either. Nodes below the stated minimums, or on a kernel older than 5.8 with [ebpf] enabled, refuse to start with a clear error.
+  interfaces:
+  - relish setup --quickstart --nodes 1
+  - relish council status
+  - bun --cluster
+- id: claim_http_api_on_9117
+  axis: extensibility
+  statement: Every bun exposes an HTTP(S) API on port 9117 (bearer-token authenticated) that the CLI itself uses and that users can call directly; docs list a route table and the job routes.
+  kind: explicit
+  sources:
+  - ref: docs/README.md:1159-1159
+    quote: 'The bun agent exposes a local HTTP API on port 9117:'
+  - ref: docs/README.md:1194-1194
+    quote: 'The CLI uses this API internally. You can also call it directly:'
+  - ref: docs/manual/14_batch-jobs.md:669-669
+    quote: '`POST /v1/jobs/runs` accepts'
+  measurable: curl with Authorization Bearer on /v1/status, /v1/cluster/nodes, /v1/cluster/council, /v1/audit, /v1/apply, /v1/logs/{app}/{namespace}, /v1/exec/{app}/{namespace}, /v1/jobs/runs, /v1/batch; calls without a valid token are refused (the docs name only /v1/health and the GitOps webhook as token-free); write routes honour role and scope.
+  interfaces:
+  - port 9117
+  - GET /v1/health
+  - GET /v1/status
+  - POST /v1/apply
+  - GET /v1/cluster/nodes
+  - GET /v1/cluster/council
+  - GET /v1/audit
+  - POST /v1/jobs/runs
+  - POST /v1/batch
+  - POST /v1/batch/array
+  - GET /v1/version
+  - relish --endpoint --token --ca-cert
+  gap: No OpenAPI or complete versioned API reference found (rg -n -i "openapi|swagger|api reference" across README.md docs/whitepaper.md docs/manual docs/README.md). The route table in docs/README.md is partial; metrics, events and several other routes appear only in design docs. No API stability guarantee is stated before 1.0.0.
+- id: claim_cli_machine_readable_output
+  axis: extensibility
+  statement: relish prints human, json or yaml output so scripts can drive the cluster, and the project's stated position is that custom automation is shell scripts calling relish with --output json.
+  kind: explicit
+  sources:
+  - ref: docs/manual/13_reference.md:13-13
+    quote: '`human` (default), `json` or `yaml`'
+  - ref: docs/design/cli-relish.md:1947-1947
+    quote: Custom automation is done via shell scripts that call `relish` with `--output json`. This is the current default position.
+  measurable: relish status|nodes|token list|council status|audit with --output json emit parseable JSON with stable field names; exit codes are 0 success, 1 error, 2 warnings for wtf and path.
+  interfaces:
+  - relish --output human|json|yaml
+  - RELIABURGER_ENDPOINT
+  - RELIABURGER_TOKEN
+  - RELIABURGER_CA_CERT
+- id: claim_alert_webhooks_outbound
+  axis: extensibility
+  statement: Alerts and failed or unknown-outcome job runs are delivered to configured webhook destinations (generic HTTP, Slack, PagerDuty), optionally HMAC-SHA256 signed, with 3 retries.
+  kind: explicit
+  sources:
+  - ref: docs/manual/04_observability.md:188-188
+    quote: Webhooks deliver them, optionally signed with HMAC-SHA256
+  - ref: docs/design/metrics-mayo.md:375-375
+    quote: failed deliveries are retried 3 times with backoff (1s, 5s, 25s)
+  - ref: docs/design/metrics-mayo.md:373-373
+    quote: 'the digest is sent as `X-Mayo-Signature-256: sha256=<hex>`'
+  measurable: Point [[alerts.destinations]] at a local HTTP listener; trigger an alert (cpu fault, node-pressure) and a failing job; verify the body, the X-Mayo-Signature-256 HMAC over it, severity filtering, retries at 1 s, 5 s, 25 s after a 500, and one job_run_failed per run not per task. Evaluate whether a user can add rules (docs - they cannot).
+  interfaces:
+  - '[[alerts.destinations]] type = webhook|slack|pagerduty, url, severity, secret'
+  - job_run_failed
+  - job_run_unknown_outcome
+  gap: 'The user manual only shows type = "webhook"; Slack and PagerDuty destination types appear only in docs/design/metrics-mayo.md (lines 17, 43, 225). Custom alert rules are not supported (manual: "You can''t define your own rules yet.").'
+- id: claim_gitops_inbound_webhook
+  axis: extensibility
+  statement: GitHub, Gitea or GitLab can trigger a sync on push through POST /v1/gitops/webhook, authenticated only by HMAC signature or GitLab token, rate limited (10 a minute) and replay protected.
+  kind: explicit
+  sources:
+  - ref: docs/manual/12_operations.md:299-299
+    quote: To sync on push rather than on the next poll, point a GitHub, Gitea or GitLab
+  - ref: docs/manual/12_operations.md:303-303
+    quote: (`webhook_rate_limit`, 10 a minute by default)
+  - ref: docs/manual/12_operations.md:314-314
+    quote: The cluster retains the most recent 1,000
+  measurable: POST a push payload signed with X-Hub-Signature-256 to https://NODE:9117/v1/gitops/webhook; a clustered cluster answers 202 once durably accepted; a bad signature is refused; a replayed delivery ID within the last 1,000 is refused; the 11th request in a minute is rate limited; a follower forwards to the leader; no leader answers 503; admission budget 5 s.
+  interfaces:
+  - POST /v1/gitops/webhook
+  - X-Hub-Signature-256
+  - X-Gitlab-Token
+  - '[gitops] webhook_secret, webhook_rate_limit'
+- id: claim_app_metrics_scraping_and_extra_targets
+  axis: extensibility
+  statement: Each node scrapes Prometheus text from apps that declare metrics = {} (every 10 s) and from fixed [[metrics.scrape_targets]] URLs (every 30 s); Kubernetes prometheus.io annotations enable it on import.
+  kind: explicit
+  sources:
+  - ref: docs/manual/04_observability.md:140-140
+    quote: each node scrapes its own
+  - ref: docs/manual/04_observability.md:179-179
+    quote: list fixed URLs as `[[metrics.scrape_targets]]` with a `job` and a
+  measurable: Deploy podinfo or any /metrics app; relish metrics <app> shows counters as per-second rates, histograms as mean, and up = 1; killing the target sets up = 0 within one 10 s scrape; a node-exporter listed under scrape_targets appears after about 30 s. Samples carry labels app, namespace, instance, node.
+  interfaces:
+  - metrics = {} / metrics = { port, path }
+  - '[[metrics.scrape_targets]] job, url'
+  - relish metrics <app> [--name --since]
+  - prometheus.io/scrape, port, path annotations
+- id: claim_no_prometheus_endpoint_remote_read_or_promql
+  axis: extensibility
+  statement: The cluster's own metrics cannot be scraped or remote-read by an external Prometheus; Mayo exposes no /metrics exposition endpoint, no remote-read, no remote_write and no PromQL, only /v1/metrics JSON endpoints, relish, the dashboards and SQL.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: docs/design/metrics-mayo.md:45-45
+    quote: Mayo does not expose its data in Prometheus exposition format.
+  - ref: docs/design/metrics-mayo.md:122-122
+    quote: There is no `/v1/read` remote-read endpoint and no `/metrics` Prometheus-exposition endpoint.
+  - ref: docs/manual/04_observability.md:177-177
+    quote: There's no PromQL.
+  measurable: curl -k https://NODE:9117/metrics and /v1/read are not served (no Prometheus exposition or remote-read); no remote_write sender exists in the config schema; an external Prometheus cannot federate the cluster. Admitted limitation, not a defect (roadmap lists PromQL and the full metrics architecture under Later, F06
+  interfaces:
+  - GET /metrics (absent)
+  - GET /v1/metrics* (internal JSON)
+  - relish metrics
+  - relish logs-search (SQL)
+  gap: rg -n -i "otlp|remote_write|federat" found only planned or negative statements (docs/design/metrics-mayo.md lines 44-45, 122, 501; docs/roadmap.md line 426).
+- id: claim_no_otlp_opentelemetry_export
+  axis: extensibility
+  statement: The platform has no OpenTelemetry or OTLP export for metrics, logs or traces; traces are left to applications' own OpenTelemetry SDKs and external collectors.
+  kind: hypothesis
+  sources:
+  - ref: docs/whitepaper.md:991-991
+    quote: Applications export traces to external collectors (Jaeger, Tempo, Datadog) using standard OpenTelemetry SDKs.
+  gap: No mention found of otlp (rg -n -i "otlp" README.md docs/whitepaper.md docs/manual docs/README.md docs/design returned nothing). The only OpenTelemetry mention is the whitepaper section 22 note that a distributed tracing backend is deliberately not included and apps should use OpenTelemetry SDKs directly.
+  measurable: Search the config schema and binary for an OTLP endpoint option; run an OTLP collector on a separate host and verify bun sends nothing to port 4317/4318. An app that exports spans to an external collector works through normal egress (an egress allow list needs the collector host:port).
+  interfaces:
+  - '[app.X.egress] allow = ["collector:4317"]'
+- id: claim_log_and_metric_export_to_object_storage
+  axis: extensibility
+  statement: Logs can be exported on a schedule as Parquet to a local path, file://, s3:// or gs://, metrics can be archived to an S3 bucket prefix, and council state and volume snapshots can be shipped to object storage; these are the documented off-node data interfaces.
+  kind: explicit
+  sources:
+  - ref: docs/manual/04_observability.md:61-61
+    quote: export_path = "s3://bucket/logs/"
+  - ref: docs/manual/04_observability.md:114-114
+    quote: object_store_url = "s3://bucket/reliaburger-metrics"
+  - ref: docs/manual/12_operations.md:332-332
+    quote: 'url = "s3://backups/prod-council"   # or file://, gs://'
+  measurable: Configure each key against a MinIO or GCS bucket; Parquet log files appear within export_interval_secs (default 3600); the checkpoint prevents repeat exports; metrics chunks appear under a per-node prefix and the bucket lifecycle (not bun) handles retention; council backup objects appear every interval_secs (300) and retain = 24 are kept. Credentials come from each backend's standard environment variables.
+  interfaces:
+  - '[logs] export_path, export_interval_secs'
+  - '[metrics] object_store_url'
+  - '[cluster.backup] url, interval_secs, retain'
+  - '[storage.snapshots]'
+  - relish logs-export
+  - relish logs-search
+- id: claim_no_syslog_loki_log_shipping
+  axis: extensibility
+  statement: There is no log forwarding to syslog, Loki, Fluentd or other shippers; logs leave the node only as Parquet exports, and cluster-wide reads go through relish logs and the log API.
+  kind: hypothesis
+  sources:
+  - ref: docs/design/logs-ketchup.md:485-485
+    quote: There is no central log store
+  gap: No mention found of a forwarder or shipper feature (rg -n -i -w "syslog|loki|fluent|vector|forward" README.md docs/whitepaper.md docs/manual docs/README.md; design hits are only comparisons with Loki and Vector in logs-ketchup.md, and the internal per-instance "agent forwarder task"). The README table says a log shipper and store are replaced by "Built-in capture, streaming and Parquet export".
+  measurable: Look for any config key that sends log lines to a remote endpoint; verify no outbound syslog or Loki traffic from bun. A workaround is an app that ships its own logs, or a job reading the Parquet exports.
+  interfaces:
+  - '[logs] export_path'
+  - GET /v1/logs/{app}/{namespace}?follow=true (SSE)
+  - GET /v1/ws/logs/{app}/{namespace} (WebSocket)
+- id: claim_external_registries_mirrors_and_oci_compat
+  axis: extensibility
+  statement: Apps can use any public or private OCI registry (credentials from named environment variables), digest-pinned pulls can use mirrors, and Pickle speaks the OCI Distribution API so standard docker push works.
+  kind: explicit
+  sources:
+  - ref: docs/manual/11_images-and-volumes.md:5-5
+    quote: An app's `image` can name any public or private OCI registry.
+  - ref: docs/manual/11_images-and-volumes.md:40-40
+    quote: '`mirrors` sends digest-pinned pulls to a mirror first, falling back to the'
+  - ref: docs/whitepaper.md:663-663
+    quote: (via standard `docker push`)
+  measurable: Deploy ghcr.io and Docker Hub images through the pull-through cache (relish images shows cache/<registry>/<repo>); configure [[images.external_registries]] with password_secret; push with docker/skopeo to a node on port 5050 using a token; a bad mirror cannot change digests (digest chain verified).
+  interfaces:
+  - '[[images.external_registries]] password_secret'
+  - '[images] mirrors'
+  - port 5050
+  - relish images
+  - relish sign
+  - '[images.trust_policy] keys'
+- id: claim_no_crds_operators_plugins_custom_schedulers
+  axis: extensibility
+  statement: There are no CRDs, operators, plugin system, custom scheduler scorers, Helm or sidecars by design; extension happens through the seven built-in resource types, scripts calling the CLI or API, and the integration points listed in the other extensibility claims.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: docs/whitepaper.md:982-982
+    quote: Without CRDs, there is no operator framework, by design.
+  - ref: docs/design/scheduler-meat.md:1447-1447
+    quote: Meat uses a fixed set of scoring dimensions with configurable weights
+  - ref: docs/design/cli-relish.md:1947-1947
+    quote: '**No plugins:** The built-in command set is comprehensive enough.'
+  - ref: docs/whitepaper.md:984-984
+    quote: When the configuration is already 15 lines of TOML, a package manager
+  measurable: Applying an unknown kind (a CRD) is rejected or reported as dropped; there is no relish plugin discovery (relish-<name> on PATH is not dispatched); scheduler weights are the only scheduling knob (placement labels, replicas = "*"); no admission webhook or controller registration API exists.
+  interfaces:
+  - placement.required labels
+  - relish apply (unknown kind -> Dropped in report)
+  gap: rg -n -i "plugin|extension|controller|CRD" docs/manual returned only docs/manual/09_kubernetes.md (CRDs listed as dropped on import).
+- id: claim_external_secret_managers_not_supported
+  axis: extensibility
+  statement: External secret manager integration (Vault, AWS Secrets Manager) is not included; the encrypted-in-git model is the only secret source and external managers are planned for v2.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: docs/whitepaper.md:985-985
+    quote: Vault/AWS Secrets Manager integration is planned for v2.
+  - ref: docs/roadmap.md:479-479
+    quote: external secret managers
+  measurable: Config has no secret-store provider key; only ENC[AGE:...] in env (apps and jobs) and encrypted config_file values are accepted; workload identity JWTs can be used toward external cloud IAM (OIDC federation) as the documented bridge.
+  interfaces:
+  - ENC[AGE:...]
+  - relish secret encrypt
+  - /run/reliaburger/identity/token
+- id: claim_external_dns_lb_acme_not_integrated
+  axis: extensibility
+  statement: External traffic reaches the cluster through a standard TCP load balancer or DNS round-robin that the user provides in front of any set of nodes; there is no cloud load balancer, external-dns or ACME integration.
+  kind: hypothesis
+  sources:
+  - ref: docs/whitepaper.md:566-566
+    quote: External traffic reaches the cluster via a standard TCP load balancer (or DNS round-robin) pointing to any set of nodes.
+  - ref: docs/manual/03_networking.md:121-121
+    quote: 'There''s no ACME: `auto` and `acme` fail route validation.'
+  gap: No mention found of external-dns, metallb or cloud load balancer controllers (rg -n -i "external-dns|metallb|load balancer" README.md docs/whitepaper.md docs/manual docs/README.md docs/linux-servers.md; only the whitepaper line above). Automatic ACME certificates are planned for 0.3.0 (#369).
+  measurable: Put HAProxy or DNS round-robin in front of three nodes; every node serves any app's ingress route (Wrapper routes for any app); tls = "acme" or "auto" is rejected at validation; Service VIPs and published host ports are TCP only (UDP services unsupported).
+  interfaces:
+  - '[ingress] enabled'
+  - '[app.X.ingress] tls = "cluster"|"explicit"'
+  - tls_cert / tls_key in [ingress]
+- id: claim_event_and_log_streaming_apis
+  axis: extensibility
+  statement: Events (deploys, restarts, health, jobs, alerts, faults, token changes) are kept per node in memory (newest 1024) and shown by the TUI, dashboard and relish; live log follow is exposed as server-sent events and a WebSocket; the durable record is the audit log.
+  kind: explicit
+  sources:
+  - ref: docs/manual/04_observability.md:238-238
+    quote: Events are kept per node, in
+  - ref: docs/design/logs-ketchup.md:124-124
+    quote: open `GET /v1/logs/{app}/{namespace}?follow=true` (SSE)
+  measurable: Generate more than 1024 events on one node and verify the oldest are gone while relish audit still has them; curl -N the SSE log follow endpoint; each job run raises exactly one event (job-completed, job-failed, job-cancelled, job-unknown, job-skipped).
+  interfaces:
+  - relish events
+  - relish audit
+  - GET /v1/logs/{app}/{namespace}?follow=true
+  - GET /v1/ws/logs/{app}/{namespace}
+  gap: No documented external event subscription or watch API for cluster state (rg -n -i "watch stream|event stream|/v1/events" README.md docs/whitepaper.md docs/manual docs/README.md found no user-facing route). The Brioche design lists /events and /events/stream (docs/design/ui-brioche.md lines 1940, 1948) but the user docs do not.
+- id: claim_workload_identity_for_external_integration
+  axis: extensibility
+  statement: Every container gets a SPIFFE X.509 identity and an OIDC JWT that apps can use for mTLS between services and for cloud identity federation (AWS, GCP, Azure); the JWT is also a read-only API credential scoped to the workload's own app and namespace.
+  kind: explicit
+  sources:
+  - ref: docs/manual/10_security.md:520-520
+    quote: Every container gets a SPIFFE identity
+  - ref: docs/whitepaper.md:622-622
+    quote: for cloud provider identity federation (AWS, GCP, Azure)
+  measurable: Inside a container read /run/reliaburger/identity/{cert.pem,key.pem,ca.pem,bundle.pem,token}; verify the SPIFFE URI spiffe://CLUSTER/ns/NAMESPACE/app/NAME; call the API with the JWT as bearer - own app status works, cluster-wide lists are filtered and tenant-spanning routes (events, /v1/logs/sql, raw metric store) are refused. Delegated job tasks get no identity yet.
+  interfaces:
+  - /run/reliaburger/identity/
+  - 'Authorization: Bearer <workload JWT>'
+- id: claim_k8s_apply_converts_eleven_kinds
+  axis: interoperability
+  statement: relish apply takes Kubernetes YAML directly (file or https URL under 1 MiB, 30 s) and converts eleven kinds in memory - Deployment, StatefulSet, DaemonSet, Service, Ingress, ConfigMap, Secret, Job, CronJob, HorizontalPodAutoscaler and Namespace.
+  kind: explicit
+  sources:
+  - ref: docs/manual/09_kubernetes.md:20-20
+    quote: 'Eleven kinds: Deployment, StatefulSet, DaemonSet, Service, Ingress, ConfigMap,'
+  - ref: docs/manual/09_kubernetes.md:14-14
+    quote: URLs must be `https://` (redirects
+  - ref: docs/manual/09_kubernetes.md:15-15
+    quote: The migration report
+  measurable: Apply examples/kubernetes/podinfo.yaml and https://reliaburger.com/demo/podinfo.yaml; a Deployment+Service+Ingress+HPA with matching names becomes one [app.NAME]; DaemonSet gets replicas = "*"; a file is treated as Kubernetes only if it has apiVersion and kind lines; http:// URLs, responses over 1 MiB or slower than 30 s are refused; --dry-run applies nothing; the report goes to stderr before apply.
+  interfaces:
+  - relish apply -f <file|https-url> [--dry-run]
+  - relish import -f
+  - examples/kubernetes/podinfo.yaml
+- id: claim_k8s_drops_reported_not_silent
+  axis: interoperability
+  statement: Unsupported or approximated Kubernetes features are reported, not silently ignored; dropped items include NetworkPolicy, PVC, CRDs, sidecars (only the first container imports), liveness probes, non-HTTP readiness probes, valueFrom env, and ConfigMap/Secret wiring.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: docs/manual/09_kubernetes.md:22-22
+    quote: (NetworkPolicy, PersistentVolumeClaim, CRDs) lands in the report's Dropped list
+  - ref: docs/manual/09_kubernetes.md:54-54
+    quote: 'ConfigMaps and Secrets: not wired into workloads'
+  - ref: docs/manual/09_kubernetes.md:45-45
+    quote: 'sidecars: only the first container is imported;'
+  - ref: docs/whitepaper.md:997-997
+    quote: Matching on label selectors, the way Kubernetes itself does, is planned
+  measurable: Apply a manifest with a NetworkPolicy, PVC, CRD instance, a 2-container pod, livenessProbe, envFrom/valueFrom, a ConfigMap-backed env; each appears in the Dropped or warnings list and is not applied; import --strict exits non-zero on any warning; same-name apps in two namespaces become [app.NAMESPACE-NAME] with a warning; Services are matched to Deployments by name, not by label selector.
+  interfaces:
+  - relish apply -f
+  - relish import -f --strict
+- id: claim_k8s_import_export_roundtrip
+  axis: interoperability
+  statement: relish import writes equivalent Reliaburger TOML to stdout and relish export writes Kubernetes YAML (Deployments or DaemonSets, Services, Ingresses, HPAs, Jobs, CronJobs, Namespaces), reporting what it cannot express.
+  kind: explicit
+  sources:
+  - ref: docs/manual/09_kubernetes.md:71-71
+    quote: '`relish export -f app.toml` goes the other way'
+  - ref: docs/manual/09_kubernetes.md:73-73
+    quote: 'It reports what it can''t express: firewall and egress'
+  - ref: docs/whitepaper.md:156-156
+    quote: These are migration tools, not runtime interfaces.
+  measurable: relish import -f deploy.yaml > app.toml; relish apply app.toml; relish export -f app.toml > out.yaml; diff semantically against deploy.yaml; the export report lists firewall and egress rules, process workloads, run_before, and for now health checks, metrics, volumes, init containers, config files and placement as unexpressed; a runtime = "process" job yields no Job; a shared-runc job becomes an ordinary Job.
+  interfaces:
+  - relish import -f <files> [--strict]
+  - relish export -f <toml>
+  - relish lint
+  - relish compile
+  - relish diff
+- id: claim_k8s_no_api_compatibility_kubectl_helm
+  axis: interoperability
+  statement: Reliaburger is not API compatible with Kubernetes, kubectl or Helm; compatibility is limited to manifest conversion, and neither Helm nor a Kubernetes API endpoint is offered.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: docs/whitepaper.md:156-156
+    quote: But it isn't API-compatible with any of them.
+  - ref: docs/whitepaper.md:984-984
+    quote: Helm / package manager
+  measurable: kubectl against a node on 9117 does not work (no kube-apiserver); helm install is not supported; users can still render a chart with helm template and relish apply -f the output, subject to the eleven-kind and dropped-feature limits.
+  interfaces:
+  - relish apply -f <rendered k8s yaml>
+  gap: The docs make no kubectl or helm compatibility claim; the kubectl hits in docs/whitepaper.md (22) are comparison-table text, plus one use in docs/manual/08_five-minute-tour.md as a baseline for relish path.
+- id: claim_k8s_semantics_podinfo_runs_unmodified
+  axis: interoperability
+  statement: A real Kubernetes app (podinfo frontend, backend, Redis, load generator) runs from its unmodified manifest, with three frontends spread one per node, reachable through the built-in ingress, and reading Prometheus annotations for metrics.
+  kind: explicit
+  sources:
+  - ref: README.md:38-38
+    quote: frontend-0, -1 and -2, one on each node
+  - ref: docs/manual/08_five-minute-tour.md:108-108
+    quote: The manifest carries
+  measurable: relish apply -f https://reliaburger.com/demo/podinfo.yaml on three nodes; after about 30 s frontend-0..2 run, one per node; http://podinfo.localhost:18080 answers and the hostname changes across reloads; relish metrics frontend shows podinfo metrics from all three replicas; the burger service calls http://backend:9898/ by name.
+  interfaces:
+  - relish apply -f https://reliaburger.com/demo/podinfo.yaml
+  - http://podinfo.localhost:18080
+  - relish metrics frontend
+  - relish path frontend --to redis
+- id: claim_oci_images_and_builds
+  axis: interoperability
+  statement: Standard OCI images run unmodified; relish build builds a Dockerfile on a node with Buildah for linux/amd64 and linux/arm64 into Pickle and signs the result with the cluster build key.
+  kind: explicit
+  sources:
+  - ref: docs/manual/08_five-minute-tour.md:67-67
+    quote: Builds target `linux/amd64` and `linux/arm64` by default.
+  - ref: docs/linux-servers.md:31-31
+    quote: '`buildah` on at least one node, for `relish build`'
+  measurable: relish build burger/burger.toml produces burger:v1 in relish images with both platforms; a node of each architecture pulls its own; the image deploys even where require_signatures is set. Needs buildah on one node.
+  interfaces:
+  - relish build <toml>
+  - '[build.NAME]'
+  - relish images
+  - '[images.trust_policy] require_signatures'
+- id: claim_node_loss_reschedules_in_about_a_minute
+  axis: operations
+  statement: After a whole machine is lost, about a minute later the cluster again runs the desired replica count on the survivors, with no operator action; the measured discharge of the silent node was 52 to 57 seconds.
+  kind: explicit
+  sources:
+  - ref: docs/manual/08_five-minute-tour.md:161-161
+    quote: About a minute later there are three running
+  - ref: docs/qualification/2026-09-24-node-loss.md:83-83
+    quote: the leader waits 80 s from after it served that request
+  measurable: With 3 frontends on 3 nodes, power off one node and time until three running frontends exist on the two survivors (qualification - step 12 took 24 to 27 s after a graceful VM stop that itself takes about 30 s; node-3 discharged +52 to +57 s after the old replica was deferred). The old replica shows stopped until its release completes. Consumer view lease 60 s, leader waits 80 s. Hard power loss may differ from graceful stop.
+  interfaces:
+  - relish local stop node-3
+  - relish inspect frontend
+  - relish nodes
+  - relish wtf
+- id: claim_swim_failure_detection_timings
+  axis: operations
+  statement: Nodes are probed by SWIM gossip (protocol interval 500 ms, probe timeout 200 ms in the design), move through alive, suspect and dead, and a dead node stays listed for up to a day; the suspicion-to-dead timeout itself is a compile-time constant that the user docs do not state.
+  kind: hypothesis
+  sources:
+  - ref: docs/manual/02_cluster-basics.md:85-86
+    quote: A dead node stays listed for up to a day after it was last heard from
+  - ref: docs/design/gossip-mustard.md:68-68
+    quote: 'Protocol interval: 500ms    Probe timeout: 200ms'
+  - ref: docs/design/gossip-mustard.md:968-968
+    quote: are **compile-time constants**, not tunable config
+  gap: No numeric suspicion timeout found in user-facing docs (rg -n -i "suspicion_timeout|suspect_timeout" docs/manual docs/whitepaper.md README.md found nothing; docs/design/gossip-mustard.md names suspicion_timeout only as a symbol, and says the historical timing table is now compile-time). The user-visible bound is "about a minute" for replacement (claim_node_loss_reschedules_in_about_a_minute).
+  measurable: Sample relish nodes every second after killing a node; record the time to suspect and to dead; confirm there is no [mustard] or [raft] TOML section (unknown keys are errors); dead nodes drop off sooner if they return, leave on purpose or are decommissioned.
+  interfaces:
+  - relish nodes
+  - relish wtf
+  - '[cluster] gossip_port 9443'
+  - GET /v1/cluster/nodes
+- id: claim_council_raft_quorum_and_self_healing
+  axis: operations
+  statement: The Raft council starts on the first node, grows to at most seven voters, replaces a lost minority automatically (promoting a caught-up node), and hands over leadership before a voter with a 95 percent full disk is replaced; losing a majority stops writes and scheduling but not running apps.
+  kind: explicit
+  sources:
+  - ref: docs/manual/02_cluster-basics.md:6-6
+    quote: and grows as nodes join, up to seven voters.
+  - ref: docs/manual/02_cluster-basics.md:98-98
+    quote: 'The council heals itself: lose a voter and the reconciler promotes a caught-up'
+  - ref: docs/whitepaper.md:529-529
+    quote: There's no quorum, so nothing can be elected, scheduled or written; apps keep running.
+  measurable: On 3 nodes stop one council voter - relish council status shows quorum ok (2/3 or replaced) without operator action and apps keep serving. Stop two - no applies commit (writes fail), existing apps and ingress keep serving. Two-voter councils cannot roll an upgrade. Election target under 5 s and full operability under 20 s are listed as unmeasured targets.
+  interfaces:
+  - relish council status [--output json]
+  - relish status
+  - relish wtf
+  - ports 9444 (Raft)
+  - GET /v1/cluster/council
+- id: claim_leader_election_and_learning_period_targets
+  axis: operations
+  statement: Leader election should take under 5 seconds and full operability after leader loss under 20 seconds (5 s election plus up to a 15 s learning period during which no new work is placed); neither target has been measured.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: docs/whitepaper.md:106-106
+    quote: Time to full operability after leader loss
+  - ref: docs/whitepaper.md:522-522
+    quote: or a 15-second timeout fires
+  measurable: Kill the leader process; time to new leader in relish council status (<5 s) and until a new app apply places replicas (<20 s). The learning period ends when 95 percent of alive nodes have reported or 15 s pass; applies commit but are unplaced meanwhile; the data plane is unaffected.
+  interfaces:
+  - relish council status
+  - relish fault node-kill <leader> --acknowledge
+  - relish test --chaos
+  gap: Whitepaper section 2 table marks leader election, operability after leader loss, cold-start state reconstruction (<30 s) and node cold start (<60 s) as "Target (unmeasured)".
+- id: claim_council_loss_recovery_from_sealed_backup
+  axis: operations
+  statement: The leader writes encrypted council backups to object storage every 300 s (retain 24 by default); after losing every voter an operator runs relish council recover on a stopped survivor, anything written after the last backup is lost, and returning old voters fence themselves by recovery epoch.
+  kind: explicit
+  sources:
+  - ref: docs/manual/12_operations.md:361-361
+    quote: Anything written after the backup is lost.
+  - ref: docs/manual/12_operations.md:391-391
+    quote: A fenced node serves no Raft, refuses writes, claims no leader, and stays
+  - ref: docs/manual/12_operations.md:338-338
+    quote: Volumes aren't in it; snapshot those separately
+  measurable: Enable [cluster.backup] to a file:// path; kill all voters; run relish council recover --data-dir --from <url> --master-key on a stopped survivor; the cluster comes back with one voter, tokens and apps from the backup, and grows as nodes rejoin. Restart an old voter - it shows fenced in relish council status and relish wtf reports CRITICAL until relish council re-enrol. Recovery is operator-triggered by design. The root CA key is not in the backup (relish ca backup).
+  interfaces:
+  - '[cluster.backup] url, interval_secs (300), retain (24)'
+  - relish council recover --data-dir --from --master-key [--force]
+  - relish council re-enrol --data-dir
+  - relish ca backup|verify
+  - relish council status
+- id: claim_partitions_no_split_brain_and_degradation
+  axis: operations
+  statement: Network partitions cannot split the brain because Raft needs a majority; minority-side nodes keep running apps but cannot deploy, and during a sustained partition certificate rotation fails at 30 minutes and workload certificates expire at 1 hour (4 hours with the grace period).
+  kind: explicit
+  sources:
+  - ref: docs/whitepaper.md:532-532
+    quote: 'Network partitions can''t cause split-brain: Raft requires a majority quorum'
+  - ref: docs/whitepaper.md:536-536
+    quote: certificate rotation fails (at 30 minutes), and workload certificates expire (at 1 hour, or 4 hours with the grace period)
+  measurable: Partition one of three nodes with nftables or relish fault; the majority keeps serving writes, the minority refuses them; existing connections and apps keep working; verify the progressive degradation timeline (stale service map for new cross-partition connections immediately, cert rotation failing at 30 min, workload cert expiry at 1 h or 4 h). After heal the council converges. relish test --chaos scenario minority_partition_degrades_and_heals covers the council case.
+  interfaces:
+  - relish fault partition <svc> --from <svc>
+  - relish test --chaos --filter minority_partition_degrades_and_heals
+  - relish council status
+- id: claim_rolling_upgrade_signed_with_rollback
+  axis: operations
+  statement: relish upgrade rolls a new bun across the cluster (workers first, then council members one at a time, leader last), adopts running workloads without restart, reverts a crash-looping binary by itself, supports rollback to retained versions, and requires two Ed25519 signatures for network upgrades.
+  kind: explicit
+  sources:
+  - ref: docs/manual/12_operations.md:8-8
+    quote: workers first
+  - ref: docs/manual/12_operations.md:11-11
+    quote: crash-loops on boot reverts to the previous version by itself
+  - ref: docs/manual/12_operations.md:52-52
+    quote: '**Two signatures for network upgrades**'
+  measurable: With a patch build that keeps the protocol and state pair (bun --compatibility), relish upgrade plan then start --external-key; running containers are not restarted; nodes swap in rolling order and relish upgrade status shows progress; relish upgrade rollback <ver> returns every node to a retained version (retain_versions default 3); a candidate that does not answer bun --compatibility within 60 s is refused; a two-voter council refuses a cluster upgrade.
+  interfaces:
+  - relish upgrade check|plan|start|status|resume|abort|rollback
+  - --external-key
+  - --binary
+  - --sig
+  - --allow-downgrade
+  - '[upgrades] external_signing_key, retain_versions'
+  - bun --compatibility
+  - GET /v1/version
+  - GET /v1/upgrade/cluster
+- id: claim_pre_1_0_no_upgrade_path_between_releases
+  axis: operations
+  statement: Before 1.0.0 there are no migrations or mixed-version clusters; every release from 0.1.0 to 0.2.0 changed the protocol or state format, so none can roll onto the previous one and moving between releases means a fresh cluster, losing everything the council held.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: docs/manual/12_operations.md:198-198
+    quote: So no published release has yet rolled in place onto another
+  - ref: docs/manual/12_operations.md:195-195
+    quote: moving means recreating the cluster, which loses
+  - ref: docs/roadmap.md:328-328
+    quote: 46 and 63 in 0.1.6; 51 and 68 now
+  measurable: relish upgrade start v0.2.0 against a 0.1.6 cluster is refused before anything is recorded, with protocol 51/state 68 versus 46/63; bun refuses a data directory with an older state format at startup; relish upgrade check reports a fresh cluster is needed.
+  interfaces:
+  - bun --compatibility
+  - relish upgrade check
+  - relish upgrade start <version>
+  - state-format.json
+- id: claim_rolling_deploys_health_gated_auto_rollback
+  axis: operations
+  statement: Applying a changed app replaces instances one at a time behind a health gate (max_surge 1, max_unavailable 0, health_timeout 60 s, drain_timeout 30 s), auto-rolls back on failure, and relish rollback restores the previous version while keeping the scale; rollouts are node-local, so a one-replica-per-node app can be briefly down everywhere.
+  kind: explicit
+  sources:
+  - ref: docs/manual/01_deploy-an-app.md:244-244
+    quote: A new instance that doesn't turn healthy within `health_timeout` fails the
+  - ref: docs/manual/01_deploy-an-app.md:210-210
+    quote: 'health_timeout = "60s"    # default 60s'
+  - ref: docs/whitepaper.md:689-689
+    quote: an app with one replica per node is briefly down everywhere on each redeploy
+  measurable: Deploy a version whose health check never passes; it fails after 60 s and the previous version is restored on that node; the desired spec in Raft still names the new version and the reconciler keeps retrying (admitted, RolloutFailed state planned for 0.2.1,
+  interfaces:
+  - '[app.X.deploy] strategy, max_surge, max_unavailable, health_timeout, drain_timeout, auto_rollback'
+  - relish deploy
+  - relish history <app>
+  - relish rollback <app>
+  - relish cancel-deploy <id>
+- id: claim_token_roles_and_scoped_rbac
+  axis: operations
+  statement: API tokens carry one of three roles (admin, deployer, read-only), can be scoped to apps and namespaces, live 90 days by default (admin no expiry), rotate with a 24 hour grace for the old secret, and the last admin token cannot be revoked.
+  kind: explicit
+  sources:
+  - ref: docs/manual/10_security.md:83-83
+    quote: Deployer and read-only tokens live **90 days** unless you say otherwise
+  - ref: docs/manual/10_security.md:77-77
+    quote: '`revoke` refuses to remove the last admin token'
+  - ref: docs/manual/10_security.md:105-105
+    quote: 'relish token rotate ci-deploy                  # old secret works for 24 hours'
+  measurable: Create tokens per role and verify allowed and denied routes (read-only cannot apply; deployer cannot manage tokens, rotate secrets, sign images or decommission; only unscoped admin can). A namespace-scoped token cannot see or touch another namespace (403 and an api.refused audit record). Old secret works for 24 h after rotate (--grace-hours 0 stops it now) then returns 401 token rotated; the new one propagates to other nodes within 5 s.
+  interfaces:
+  - relish token create --name --role --namespaces --apps --ttl-days --no-expiry
+  - relish token list|rotate|revoke
+  - '[security.tokens] default_ttl'
+  - '[permission] block'
+- id: claim_network_perimeter_firewall
+  axis: operations
+  statement: On clustered rootful Linux, bun runs an nftables perimeter that drops the API (9117), gossip, Raft and reporting ports (9443 to 9445) and the host port range for everyone but cluster members, bootstrap_peers and operator_cidrs.
+  kind: explicit
+  sources:
+  - ref: docs/manual/13_reference.md:66-66
+    quote: Bun's perimeter firewall drops 9117,
+  - ref: docs/manual/10_security.md:43-43
+    quote: Bun refuses to start on a malformed entry, a `/0`
+  measurable: From a non-member host nmap ports 9117, 9443, 9444, 9445 and 10000-60000; all filtered. Add the host to [security] operator_cidrs and restart; only 9117 opens and a token is still required; /0 and host-bit CIDRs make bun refuse to start; no live reload. Rootless bun and macOS do not run the perimeter.
+  interfaces:
+  - '[security] operator_cidrs, bootstrap_peers'
+  - bun --listen 0.0.0.0:9117 (allowed only once an API token exists)
+  - ports 9117, 9443, 9444, 9445
+- id: claim_namespace_isolation_and_egress_allowlists
+  axis: operations
+  statement: Namespaces cannot reach each other at a virtual IP or at a real address unless allow_from names the caller, and an egress allow list denies everything else; both are enforced by eBPF and refused (not silently skipped) on nodes that cannot enforce them.
+  kind: explicit
+  sources:
+  - ref: docs/manual/03_networking.md:34-34
+    quote: Apps in the same namespace can reach each other; other namespaces can't.
+  - ref: docs/manual/03_networking.md:75-75
+    quote: Egress is open unless an app lists what it may reach.
+  measurable: From namespace A, connect to a backend in B by VIP, by container IP on any port, and by published host port on another node; all fail. Add allow_from = ["A/app"] and all three succeed. With egress allow set, an unlisted destination is blocked while DNS port 53 to the node responder still works. Apps with allow_from or egress are refused on rootless runc, ProcessGrill and macOS nodes. Host daemons and root on the node are outside the policy.
+  interfaces:
+  - '[app.X.firewall] allow_from = ["ns/app"]'
+  - '[app.X.egress] allow = ["host:port"]'
+  - '[ebpf] enabled'
+  - relish path
+- id: claim_chaos_safety_policy
+  axis: operations
+  statement: Fault injection is guarded by --acknowledge, a role (Deployer for workload faults, Admin for node faults), an operator opt-in in [testing].allowed_operations on each node, a safety_class (production and unknown also need allow_protected_mutation), and rails that refuse faults that would take out every replica or put council quorum at risk.
+  kind: explicit
+  sources:
+  - ref: docs/manual/05_chaos.md:81-81
+    quote: A server install writes no `[testing]` section, so every fault is refused until
+  - ref: docs/manual/05_chaos.md:98-98
+    quote: '`kill web --count 3` on a three-replica app is refused'
+  - ref: docs/manual/05_chaos.md:169-169
+    quote: '`--yes` records consent. It doesn''t grant permission and there is no'
+  measurable: On a server-installed cluster every relish fault is refused; after setting [testing] allowed_operations = ["inject_workload_faults"] and safety_class = "development" workload faults work but node-kill does not; kill web --count 3 on a three-replica app is refused; pause without --instance is refused; node-pressure needs a non-zero max_node_pressure_* and memory caps at 90 percent; every injection, clear and expiry is in relish audit --action 'fault.*'; fault.injected with override_safety is recorded as critical.
+  interfaces:
+  - --acknowledge
+  - '[testing] safety_class, allowed_operations, allow_protected_mutation, max_node_pressure_cpu_percent, max_node_pressure_memory_percent'
+  - relish audit --action 'fault.*'
+  - relish test --chaos --yes
+- id: claim_chaos_known_limits
+  axis: operations
+  statement: Bandwidth faults are refused, delay needs runc containers, drop and partition need the Linux eBPF hook, workload faults cannot target jobs until 0.2.2, and CPU, memory, disk-I/O, pause and eBPF fault entries can outlive a bun crash without showing in fault list.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: docs/manual/05_chaos.md:49-49
+    quote: accepted by the parser as a forward-compatible contract, but Bun refuses it for
+  - ref: docs/manual/05_chaos.md:34-34
+    quote: chaos, which exempts run-to-completion work from the rail and targets
+  - ref: docs/whitepaper.md:857-857
+    quote: can outlive a Bun
+  measurable: relish fault bandwidth returns a refusal (no fault injected); fault kill against a job is refused by the replica-minimum rail; kill bun mid-fault and check whether tc netem, cgroup caps or SIGSTOP persist and are absent from relish fault list (#699 revert on restart is planned).
+  interfaces:
+  - relish fault bandwidth
+  - relish fault delay
+  - relish fault kill <job>
+  - relish fault list
+- id: claim_local_volumes_and_btrfs_snapshots
+  axis: operations
+  statement: Managed volumes are node-local with no distributed storage; an app stays pinned to its volume's node and waits when the node is away; Btrfs-backed volumes give instant copy-on-write snapshots with scheduled upload to object storage.
+  kind: explicit
+  sources:
+  - ref: docs/manual/11_images-and-volumes.md:243-243
+    quote: It stays on its node, so it's local storage, not a
+  - ref: docs/manual/11_images-and-volumes.md:306-306
+    quote: snapshots are instant copy-on-write
+  - ref: docs/manual/11_images-and-volumes.md:254-254
+    quote: Either way the app
+  measurable: Deploy a stateful app with a managed volume, write data, power off its node; the app stays pending (relish status names the waiting node, relish wtf CRITICAL) rather than restarting elsewhere on an empty volume. relish decommission-node writes the volume off and the app starts elsewhere empty. Snapshot create/restore round-trips data on Btrfs and errors on other filesystems. A redeploy of such an app is stop-first, so it has downtime.
+  interfaces:
+  - '[app.X.volume]'
+  - relish snapshot create|list|restore|delete
+  - '[storage.snapshots]'
+  - relish decommission-node <node> --workloads-stopped --reason
+  - '[storage] volumes'
+- id: claim_audit_log_durable_bounded
+  axis: operations
+  statement: Each node keeps a durable JSON Lines audit log (64 MiB by default, eight segments, synced before the request is answered) of applies, deletes, execs, upgrades, faults, token and secret changes and refused requests, with refusals rate limited to 5 a minute per source and 100 a minute per node; it is per node, with no central copy.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: docs/manual/10_security.md:279-279
+    quote: at most five refusals a minute from one
+  - ref: docs/manual/10_security.md:306-306
+    quote: There's no central copy yet, so a node you
+  - ref: docs/manual/10_security.md:294-294
+    quote: 'The log is bounded: 64 MiB per node by default'
+  measurable: Perform an apply and a refused call with a bad token; relish audit --cluster shows app.applied with principal and api.refused with reason unauthenticated. Flood 1000 bad-token calls and see at most 5 per minute per source plus one api.refusals_suppressed. kill -9 bun after an acknowledged action and the record survives. Decommission a node and its history goes with it.
+  interfaces:
+  - relish audit [--cluster --since --action --principal --namespace --output json]
+  - GET /v1/audit
+  - '[storage] audit_max_bytes'
+- id: claim_diagnostics_wtf_path_test_bench
+  axis: operations
+  statement: relish wtf correlates cluster health into one screen of problems and next steps, relish path walks DNS, VIP, eBPF map, firewall, faults and a real TCP connect hop by hop, and relish test and bench run a live-cluster catalogue and performance scenarios; exit code 2 means warnings or incomplete evidence.
+  kind: explicit
+  sources:
+  - ref: docs/manual/13_reference.md:223-223
+    quote: '`wtf` and `path` exit `2` for'
+  - ref: docs/manual/08_five-minute-tour.md:172-172
+    quote: Here it warns that a
+  measurable: Kill a council node and run relish wtf; it warns that a member is missing and one more failure loses quorum, exits 2. Start a fault delay and run relish path frontend --to redis; DEGRADED with the fault named, each connect near 300 ms. relish test runs the 39 case catalogue; relish test --chaos --yes runs the five recovery checks and needs at least three nodes.
+  interfaces:
+  - relish wtf
+  - relish path <src> --to <dst> [--count]
+  - relish test [--chaos --yes --filter]
+  - relish bench [--scenario --compare]
+- id: claim_scale_targets_10k_nodes_500_apps
+  axis: operations
+  statement: The architecture targets 10,000 nodes per cluster and 500 apps per node, but neither has been measured; only simulated gossip membership has run at 10,000, and every node still reports to the leader directly.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: docs/whitepaper.md:102-102
+    quote: Maximum nodes per cluster | 10,000 | Target (unmeasured).
+  - ref: docs/whitepaper.md:103-103
+    quote: Maximum apps per node | 500 | Target (unmeasured)
+  measurable: On a 3-VM lab only small counts are testable. Record leader CPU/memory and report latency as node count grows, and bun RSS with N apps per node (documented soak - bun RSS 180 to 583 MB with workloads, peak 810 MB in 0.1.6). Claims above the tested size are admitted targets, not defects. The hierarchical reporting tree is planned (#364).
+  interfaces:
+  - relish top
+  - relish nodes
+  - relish bench
+  - relish status
+  gap: Whitepaper section 2 flags both as "Target (unmeasured)"; "The architecture is designed for 10,000 nodes to provide headroom".
+- id: claim_a_million_jobs_task_arrays
+  axis: operations
+  statement: 0.2.0 stores a task array as a template and a count (not a record per task), accepts up to 16 profiles and 16,777,216 indexes per submission, and holds at most about 50 bytes of disk per accepted task on a worker (measured 22.4 plus 25.0 bytes at a million tasks).
+  kind: explicit
+  sources:
+  - ref: docs/manual/14_batch-jobs.md:209-209
+    quote: There are at most 16 profiles and 16,777,216 total indexes
+  - ref: docs/manual/14_batch-jobs.md:415-415
+    quote: A worker holds at most 50 bytes of disk per accepted task
+  - ref: README.md:359-359
+    quote: An array is stored
+  measurable: relish run --batch with --count 1000000 completes and relish batch results pages outcomes; a manifest over 16 profiles or 16,777,216 indexes is refused; ledger plus index disk per task stays under 50 bytes (make bench-task-arrays); job limits - 128 active runs cluster-wide (32 reserved for cron and hooks), 64 active arrays per namespace, 64 definitions per namespace, 1,024 cluster-wide, 2,048 retained run receipts, 64 named jobs per finite batch.
+  interfaces:
+  - relish run --batch NAME --count N --image IMG -- CMD
+  - relish batch submit <toml> [--dry-run --idempotency-key]
+  - relish batch watch|results|logs|cancel <id>
+  - relish jobs
+  - relish bench --scenario jobs-shared-containers
+- id: claim_100m_jobs_per_day_unqualified
+  axis: operations
+  statement: The sustained target of 100 million jobs a day (about 1,158 accepted successes a second) is a target; its 12-hour, three-node qualification (qualify-jobs-sustained.sh --tier final) had not passed when 0.2.0 was cut, so the project does not claim it.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: README.md:373-373
+    quote: target of 100 million jobs a day needs a 12-hour qualification that hasn't
+  - ref: docs/roadmap.md:343-343
+    quote: Until the run
+  - ref: docs/manual/14_batch-jobs.md:651-651
+    quote: 100 million unique successes per day is about 1,158/s sustained.
+  measurable: On the lab, run relish bench --scenario jobs-shared-containers (and siblings) and compare per-job overhead; try a sustained accepted-success rate near 1,158/s for 12 h with faults only if hardware allows. Treat a shortfall below target as expected; the docs state the host rate remained below the target in the demo.
+  interfaces:
+  - scripts/release/qualify-jobs-sustained.sh --tier final
+  - relish bench --scenario jobs-shared-containers
+  - relish bench --compare OLD.json --tolerance
+  gap: 'docs/roadmap.md marks 0.2.0 as "ready for release, qualification to follow" with an unchecked box; whitepaper Q8: "100M jobs a day remains an unqualified design target".'
+- id: claim_job_unknown_outcome_never_silently_replayed
+  axis: operations
+  statement: A job whose outcome becomes unknown (the node holding it went quiet) stays unknown across restarts and is never replayed unless the job sets replay_unknown = true or the operator acknowledges the exact grant with batch replay; cron does not catch up missed firings.
+  kind: explicit
+  sources:
+  - ref: docs/README.md:108-108
+    quote: unknown outcome stays `unknown` across restarts and is never replayed
+  - ref: README.md:401-401
+    quote: It skips firings missed during a crash
+  measurable: Run a non-idempotent job, kill its worker node before it reports; the run shows unknown (event job-unknown, alert job_run_unknown_outcome), nothing reruns on its own. relish batch replay --node --grant-digest --acknowledge-side-effects reruns it. A cron occurrence missed during a leader crash is skipped, not run late.
+  interfaces:
+  - replay_unknown
+  - relish batch replay <id> --node --grant-digest --acknowledge-side-effects
+  - relish apply <file> --rerun-jobs
+  - job_run_unknown_outcome
+- id: claim_known_gap_platform_requirements
+  axis: operations
+  statement: Container clusters require rootful runc on Linux with eBPF (kernel 5.8+, cgroup v2, bpffs); rootless runc is standalone only, macOS runs containers in managed Linux VMs, native macOS bun runs plain processes only, and releases are glibc builds needing runc, nftables, iproute2, btrfs-progs and uidmap on the host.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: docs/README.md:17-17
+    quote: Container clusters run on rootful Linux Runc with eBPF.
+  - ref: docs/README.md:25-25
+    quote: Bun refuses `--cluster` when Runc runs
+  - ref: docs/whitepaper.md:136-136
+    quote: The binaries aren't static.
+  measurable: bun --cluster as non-root with runc is refused; a rootful node with [ebpf] enabled on a kernel below 5.8 refuses to start with an error; an ldd on bun shows glibc; a node missing runc, nftables or iproute2 fails to start workloads. Ubuntu 24.04+ and Debian 12+ on x86_64 and aarch64 are the tested distributions.
+  interfaces:
+  - bun --cluster --runtime runc
+  - '[ebpf] enabled'
+  - bpffs /sys/fs/bpf
+- id: claim_known_gap_unimplemented_whitepaper_features
+  axis: vision
+  statement: Several whitepaper designs are not in the binary - multi-cluster Franchise, GPU scheduling, ACME certificates, IPv6, UDP services, sidecars, distributed volumes, hierarchical reporting tree, PromQL and custom alerts, odd-size council guard, and an offline root CA.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: docs/whitepaper.md:926-926
+    quote: Nothing in this section runs today.
+  - ref: docs/roadmap.md:424-424
+    quote: Whitepaper design ahead of the binary.
+  - ref: docs/whitepaper.md:124-124
+    quote: no release allocates a GPU
+  - ref: docs/whitepaper.md:987-987
+    quote: The current networking model (virtual IPs, eBPF hooks) is IPv4-only.
+  measurable: relish franchise is not a command; an app with gpu = 1 is refused or never placed; tls = "acme" is rejected; UDP service VIPs do not work; an IPv6-only workload is unsupported; app egress.allow_franchise is refused at deploy. These are admitted gaps with issues (#369,
+  interfaces:
+  - relish fault bandwidth (refused)
+  - allow_franchise (refused)
+  - gpu = N
+- id: claim_known_gap_security_hardening_admitted
+  axis: operations
+  statement: The project admits the Raft snapshot (snapshot.redb) and vote metadata are not encrypted, the root CA key is sealed on the init node rather than offline, host workloads are trusted and not sandboxed, and the audit log has no central retention or tamper evidence.
+  kind: explicit
+  limitation: true
+  sources:
+  - ref: docs/whitepaper.md:647-647
+    quote: isn't encrypted, and neither are Raft's vote and
+  - ref: docs/whitepaper.md:611-611
+    quote: A truly offline root, never written to the node, is
+  - ref: docs/manual/03_networking.md:65-65
+    quote: isolation keeps honest host commands honest, it
+  measurable: strings on snapshot.redb after creating an API token shows token hashes and wrapped keys readable without the master key; root-ca.age sits next to master.key on the init node; a host exec job runs as Bun's user with host filesystem access. Raft log entries are AES-256-GCM encrypted under a key derived from the master key (HKDF-SHA256).
+  interfaces:
+  - snapshot.redb
+  - relish ca backup|verify|rotate
+  - '[process_workloads]'
+  - relish audit
+# ---------------------------------------------------------------------------
+# Seed claims: the product's headline promises, each paired with the
+# repository claim that states the same thing precisely.
+# ---------------------------------------------------------------------------
+- id: claim_integrated_platform
+  axis: vision
+  statement: A team without a platform team can run containers on a few machines with scheduler, ingress, PKI, secrets, registry, metrics, logs, GitOps and fault injection included, without assembling external infrastructure.
+  kind: explicit
+  sources:
+  - ref: README.md:12-12
+    quote: metrics, logs, GitOps, jobs and fault injection are compiled into that agent.
+  - ref: README.md:13-13
+    quote: There's no control plane to assemble and no add-ons to install.
+  related: [claim_two_binaries_everything_inside, claim_target_users_2_to_200_nodes_no_platform_team]
+  measurable: Following docs/linux-servers.md on clean Ubuntu 24.04 VMs, the only software installed beyond distro packages is bun and relish; three nodes become healthy and a two-service app answers through the built-in ingress and resolves its peer by name.
+  interfaces: [relish init, relish join, relish apply, relish nodes, relish council, relish status]
+- id: claim_batteries_included
+  axis: extensibility
+  statement: The built-in subsystems cover common operational needs; the seed hypothesis is that application telemetry can be exported to an external collector through a supported interface.
+  kind: hypothesis
+  sources:
+  - ref: README.md:12-12
+    quote: metrics, logs, GitOps, jobs and fault injection are compiled into that agent.
+  gap: The repository documents no OTLP/OpenTelemetry, remote_write or log shipping (see claim_no_otlp_opentelemetry_export, claim_no_prometheus_endpoint_remote_read_or_promql, claim_no_syslog_loki_log_shipping). Documented outbound interfaces are alert webhooks, the HTTP API with --output json, Parquet export to object storage and SSE log streaming.
+  related: [claim_no_otlp_opentelemetry_export, claim_alert_webhooks_outbound, claim_log_and_metric_export_to_object_storage, claim_event_and_log_streaming_apis, claim_http_api_on_9117]
+  measurable: An external collector on the lab network receives telemetry attributable to a fixture app; the integration is classified native, configured, workaround, source_change or unsupported.
+  interfaces: []
+- id: claim_smooth_k8s_transition
+  axis: interoperability
+  statement: Teams that choose to can move from Kubernetes smoothly, reusing existing manifests where supported, with what does not convert reported rather than silently lost.
+  kind: explicit
+  sources:
+  - ref: docs/manual/09_kubernetes.md:3-3
+    quote: You don't have to rewrite your manifests to try Reliaburger.
+  related: [claim_k8s_apply_converts_eleven_kinds, claim_k8s_drops_reported_not_silent]
+  measurable: A fixture validated on Kubernetes (Deployment, Service, ConfigMap, Secret, Ingress) imports through relish apply -f; accepted and rejected kinds are recorded; after the documented manual steps the app passes the same functional probes as on Kubernetes; the count of manifest changes and manual steps is recorded.
+  interfaces: [relish apply -f, relish apply --dry-run, relish import, relish export]
+- id: claim_self_healing
+  axis: operations
+  statement: A single machine failure does not require manual repair; desired workloads recover on the surviving nodes.
+  kind: explicit
+  sources:
+  - ref: docs/manual/08_five-minute-tour.md:164-164
+    quote: Nobody had to notice first.
+  - ref: README.md:252-253
+    quote: Lose a node and the scheduler moves its workloads to the survivors.
+  related: [claim_node_loss_reschedules_in_about_a_minute, claim_council_raft_quorum_and_self_healing]
+  measurable: Hard power-off of a node hosting a replica; the node is detected missing, the replica count is restored on survivors, and an external probe records availability once per second throughout.
+  interfaces: [relish nodes, relish inspect, relish status, virsh destroy]
+- id: claim_apps_export_traces_to_external_collectors
+  axis: extensibility
+  statement: Applications export traces to external collectors with standard OpenTelemetry SDKs, and egress is open unless an app lists what it may reach, so an app can reach a collector outside the cluster.
+  kind: explicit
+  sources:
+  - ref: docs/whitepaper.md:991-991
+    quote: Applications export traces to external collectors (Jaeger, Tempo, Datadog) using standard OpenTelemetry SDKs.
+  - ref: docs/manual/03_networking.md:75-75
+    quote: Egress is open unless an app lists what it may reach.
+  measurable: An OpenTelemetry-instrumented fixture configured only through env vars in its app config sends spans for 100 uniquely tagged requests to a collector on the lab network.
+  interfaces: ['[app.NAME.env] OTEL_EXPORTER_OTLP_ENDPOINT', '[app.NAME.egress]']
+- id: claim_apply_converges_after_delete
+  axis: operations
+  statement: relish apply deploys or converges everything in the file, and relish delete removes the app while each node retires its instances on its own; re-applying a deleted app therefore converges to the file again.
+  kind: explicit
+  sources:
+  - ref: docs/manual/01_deploy-an-app.md:128-128
+    quote: deploy (or converge) everything in the file
+  - ref: docs/manual/01_deploy-an-app.md:137-137
+    quote: remove the app from the cluster
+  - ref: docs/manual/01_deploy-an-app.md:142-145
+    quote: Each node then retires its instances on its own
+  measurable: Delete a running 2-service app and apply the same file again, either at once or after relish status shows no instances; every cycle reaches the desired running replica count and serves through every ingress within the pre-registered budget, with no stopped instances left behind.
+  interfaces: [relish apply, relish delete, relish status, relish inspect]

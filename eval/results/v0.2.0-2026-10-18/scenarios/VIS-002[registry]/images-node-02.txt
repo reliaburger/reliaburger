@@ -1,0 +1,2 @@
+REPOSITORY                          TAG     PLATFORMS                 LAYERS     SIZE
+cache/ghcr.io/stefanprodan/podinfo  <none>  linux/amd64, linux/arm64       -  34.8 MB

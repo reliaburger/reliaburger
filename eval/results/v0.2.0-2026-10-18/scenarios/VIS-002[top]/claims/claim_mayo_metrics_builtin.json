@@ -1,0 +1,39 @@
+{
+  "claim": {
+    "id": "claim_mayo_metrics_builtin",
+    "axis": "vision",
+    "statement": "Mayo collects node and per-app CPU and memory every 10 seconds into a per-node Parquet store (7 days by default), scrapes apps' Prometheus endpoints, and evaluates five fixed alert rules; there is nothing to install.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/04_observability.md:93-93",
+        "quote": "every 10 seconds, and keeps them for 7 days"
+      },
+      {
+        "ref": "docs/manual/04_observability.md:184-184",
+        "quote": "Each node evaluates five built-in rules against its own metrics every 30"
+      }
+    ],
+    "measurable": "relish top shows a sample per workload per node within about 10 s; metrics older than retention_days (7) are pruned; max_storage_mb defaults (metrics 1024, logs 2048) cap disk; alert rules fire at CPU>90% for 5 min, memory>85% for 2 min (critical), memory>70% for 10 min, disk>80% for 5 min, CPU<5% for 30 min (warning).",
+    "interfaces": [
+      "relish top",
+      "relish metrics <app> [--name --since]",
+      "[metrics] retention_days, max_storage_mb, scrape_targets",
+      "[[alerts.destinations]]"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_mayo_metrics_builtin",
+      "ref": "docs/manual/04_observability.md:93-93",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_mayo_metrics_builtin",
+      "ref": "docs/manual/04_observability.md:184-184",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

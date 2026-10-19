@@ -1,0 +1,190 @@
+{
+  "id": "OPS-001[worker]",
+  "name": "Recover replicas after a non-leader node is forcibly stopped -- @1.1 ",
+  "feature": "features/operations/node_loss_recovery.feature",
+  "axis": "operations",
+  "claim_ids": [
+    "claim_node_loss_reschedules_in_about_a_minute",
+    "claim_self_healing"
+  ],
+  "source_refs": [
+    "docs/manual/08_five-minute-tour.md:161-161@v0.2.0",
+    "docs/qualification/2026-09-24-node-loss.md:83-83@v0.2.0",
+    "docs/manual/08_five-minute-tour.md:164-164@v0.2.0",
+    "README.md:252-253@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_node_loss_reschedules_in_about_a_minute",
+    "axis_operations",
+    "destructive",
+    "req_OPS-001",
+    "claim_self_healing",
+    "smoke"
+  ],
+  "hypothesis": false,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:28:14.247+00:00",
+  "duration_ms": 87927,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "detection_s": "<= 30",
+    "recovery_s": "<= 120",
+    "availability_ratio_via_surviving_ingresses": ">= 0.95"
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:28:14.625+00:00",
+      "nodes": {
+        "node-03": "alive",
+        "node-01": "alive",
+        "node-02": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "node_capacity": {
+      "node-01": {
+        "available_mib": 5332,
+        "cpus": 4
+      },
+      "node-02": {
+        "available_mib": 5476,
+        "cpus": 4
+      },
+      "node-03": {
+        "available_mib": 5311,
+        "cpus": 4
+      }
+    },
+    "placement_before": {
+      "node-01": [
+        "default__frontend-0:running"
+      ],
+      "node-03": [
+        "default__frontend-1:running",
+        "default__frontend-2:running"
+      ]
+    },
+    "probe_before_fault": {
+      "count": 15,
+      "ok": 15,
+      "ratio": 1.0,
+      "longest_failure_streak": 0,
+      "p50_ms": 2.4,
+      "p99_ms": 4.3,
+      "errors": []
+    },
+    "victim": {
+      "node": "node-03",
+      "role": "non-leader",
+      "leader_before": "node-01",
+      "replicas": [
+        "default__frontend-1:running",
+        "default__frontend-2:running"
+      ]
+    },
+    "power_off": {
+      "command": "virsh -c qemu:///system destroy rbeval-node-03",
+      "rc": 0,
+      "ts": "2026-10-18T12:28:22.638+00:00"
+    },
+    "detection_s": 5.9,
+    "detected_state": "dead",
+    "recovery_s": 31.4,
+    "placement_after": {
+      "node-01": [
+        "default__frontend-0:running",
+        "default__frontend-2:running"
+      ],
+      "node-02": [
+        "default__frontend-1:running"
+      ]
+    },
+    "availability_via_survivors": {
+      "count": 66,
+      "ok": 65,
+      "ratio": 0.9848,
+      "longest_failure_streak": 1,
+      "p50_ms": 1.9,
+      "p99_ms": 3.0,
+      "errors": [
+        "TimeoutError: timed out"
+      ]
+    },
+    "availability_per_ingress": {
+      "node-01": {
+        "count": 33,
+        "ok": 33,
+        "ratio": 1.0,
+        "longest_failure_streak": 0,
+        "p50_ms": 1.9,
+        "p99_ms": 2.7,
+        "errors": []
+      },
+      "node-02": {
+        "count": 33,
+        "ok": 32,
+        "ratio": 0.9697,
+        "longest_failure_streak": 1,
+        "p50_ms": 1.9,
+        "p99_ms": 3.0,
+        "errors": [
+          "TimeoutError: timed out"
+        ]
+      },
+      "node-03": {
+        "count": 32,
+        "ok": 0,
+        "ratio": 0.0,
+        "longest_failure_streak": 32,
+        "p50_ms": null,
+        "p99_ms": null,
+        "errors": [
+          "OSError: [Errno 113] No route to host",
+          "TimeoutError: timed out"
+        ]
+      }
+    },
+    "state_transitions_count": 8,
+    "node-03_rejoined_after_power_on_s": 13.9
+  },
+  "evidence_paths": [
+    "scenarios/OPS-001[worker]/claims/claim_node_loss_reschedules_in_about_a_minute.json",
+    "scenarios/OPS-001[worker]/claims/claim_self_healing.json",
+    "scenarios/OPS-001[worker]/cluster_state.json",
+    "scenarios/OPS-001[worker]/probe.jsonl",
+    "scenarios/OPS-001[worker]/cluster_state.jsonl",
+    "scenarios/OPS-001[worker]/state_transitions.json",
+    "scenarios/OPS-001[worker]/wtf-after.txt",
+    "scenarios/OPS-001[worker]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [
+    "probes through node-03's own ingress fail while it is off; the lab has no load balancer or floating address in front of the nodes, so they are excluded from the ratio"
+  ],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": null
+}

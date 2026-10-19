@@ -1,0 +1,50 @@
+{
+  "claim": {
+    "id": "claim_k8s_import_export_roundtrip",
+    "axis": "interoperability",
+    "statement": "relish import writes equivalent Reliaburger TOML to stdout and relish export writes Kubernetes YAML (Deployments or DaemonSets, Services, Ingresses, HPAs, Jobs, CronJobs, Namespaces), reporting what it cannot express.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/09_kubernetes.md:71-71",
+        "quote": "`relish export -f app.toml` goes the other way"
+      },
+      {
+        "ref": "docs/manual/09_kubernetes.md:73-73",
+        "quote": "It reports what it can't express: firewall and egress"
+      },
+      {
+        "ref": "docs/whitepaper.md:156-156",
+        "quote": "These are migration tools, not runtime interfaces."
+      }
+    ],
+    "measurable": "relish import -f deploy.yaml > app.toml; relish apply app.toml; relish export -f app.toml > out.yaml; diff semantically against deploy.yaml; the export report lists firewall and egress rules, process workloads, run_before, and for now health checks, metrics, volumes, init containers, config files and placement as unexpressed; a runtime = \"process\" job yields no Job; a shared-runc job becomes an ordinary Job.",
+    "interfaces": [
+      "relish import -f <files> [--strict]",
+      "relish export -f <toml>",
+      "relish lint",
+      "relish compile",
+      "relish diff"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_k8s_import_export_roundtrip",
+      "ref": "docs/manual/09_kubernetes.md:71-71",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_k8s_import_export_roundtrip",
+      "ref": "docs/manual/09_kubernetes.md:73-73",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_k8s_import_export_roundtrip",
+      "ref": "docs/whitepaper.md:156-156",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

@@ -1,0 +1,359 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="kubernetes_kinds.Kubernetes kind coverage of the importer" tests="17" errors="0" failures="0" skipped="0" time="2.677865" timestamp="2026-10-18T14:12:56.230374" hostname="serval"><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a Deployment manifest -- @1.1 Documented as converted" status="passed" time="0.204353"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a Deployment manifest -- @1.1 Documented as converted
+    Given the single-kind Kubernetes manifest "Deployment" ... passed in 0.002s
+    When I convert it with relish import ... passed in 0.202s
+    Then the importer outcome should be "converted" ... passed in 0.000s
+    And the converted configuration should contain "[app.web]" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[Deployment]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a StatefulSet manifest -- @1.2 Documented as converted" status="passed" time="0.160908"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a StatefulSet manifest -- @1.2 Documented as converted
+    Given the single-kind Kubernetes manifest "StatefulSet" ... passed in 0.001s
+    When I convert it with relish import ... passed in 0.160s
+    Then the importer outcome should be "converted" ... passed in 0.000s
+    And the converted configuration should contain "[app.db]" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[StatefulSet]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a DaemonSet manifest -- @1.3 Documented as converted" status="passed" time="0.144819"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a DaemonSet manifest -- @1.3 Documented as converted
+    Given the single-kind Kubernetes manifest "DaemonSet" ... passed in 0.001s
+    When I convert it with relish import ... passed in 0.144s
+    Then the importer outcome should be "converted" ... passed in 0.000s
+    And the converted configuration should contain "replicas = "*"" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[DaemonSet]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a Service manifest -- @1.4 Documented as converted" status="passed" time="0.158993"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a Service manifest -- @1.4 Documented as converted
+    Given the single-kind Kubernetes manifest "Service" ... passed in 0.002s
+    When I convert it with relish import ... passed in 0.157s
+    Then the importer outcome should be "converted" ... passed in 0.000s
+    And the converted configuration should contain "port = 9898" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[Service]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a Ingress manifest -- @1.5 Documented as converted" status="passed" time="0.157548"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a Ingress manifest -- @1.5 Documented as converted
+    Given the single-kind Kubernetes manifest "Ingress" ... passed in 0.002s
+    When I convert it with relish import ... passed in 0.155s
+    Then the importer outcome should be "converted" ... passed in 0.000s
+    And the converted configuration should contain "host = "web.kinds.test"" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[Ingress]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a HorizontalPodAutoscaler manifest -- @1.6 Documented as converted" status="passed" time="0.159047"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a HorizontalPodAutoscaler manifest -- @1.6 Documented as converted
+    Given the single-kind Kubernetes manifest "HorizontalPodAutoscaler" ... passed in 0.002s
+    When I convert it with relish import ... passed in 0.157s
+    Then the importer outcome should be "converted" ... passed in 0.000s
+    And the converted configuration should contain "[app.web.autoscale]" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[HorizontalPodAutoscaler]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a Job manifest -- @1.7 Documented as converted" status="passed" time="0.149127"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a Job manifest -- @1.7 Documented as converted
+    Given the single-kind Kubernetes manifest "Job" ... passed in 0.001s
+    When I convert it with relish import ... passed in 0.148s
+    Then the importer outcome should be "converted" ... passed in 0.000s
+    And the converted configuration should contain "[job.migrate]" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[Job]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a CronJob manifest -- @1.8 Documented as converted" status="passed" time="0.153104"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a CronJob manifest -- @1.8 Documented as converted
+    Given the single-kind Kubernetes manifest "CronJob" ... passed in 0.001s
+    When I convert it with relish import ... passed in 0.152s
+    Then the importer outcome should be "converted" ... passed in 0.000s
+    And the converted configuration should contain "schedule = "*/5 * * * *"" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[CronJob]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a Namespace manifest -- @1.9 Documented as converted" status="passed" time="0.156034"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a Namespace manifest -- @1.9 Documented as converted
+    Given the single-kind Kubernetes manifest "Namespace" ... passed in 0.000s
+    When I convert it with relish import ... passed in 0.155s
+    Then the importer outcome should be "converted" ... passed in 0.000s
+    And the converted configuration should contain "[namespace.shop]" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[Namespace]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a ConfigMap manifest -- @2.1 Documented as not wired into workloads" status="passed" time="0.157056"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a ConfigMap manifest -- @2.1 Documented as not wired into workloads
+    Given the single-kind Kubernetes manifest "ConfigMap" ... passed in 0.001s
+    When I convert it with relish import ... passed in 0.156s
+    Then the importer outcome should be "reported" ... passed in 0.000s
+    And the converted configuration should contain "-" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[ConfigMap]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a Secret manifest -- @2.2 Documented as not wired into workloads" status="passed" time="0.15287"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a Secret manifest -- @2.2 Documented as not wired into workloads
+    Given the single-kind Kubernetes manifest "Secret" ... passed in 0.001s
+    When I convert it with relish import ... passed in 0.152s
+    Then the importer outcome should be "reported" ... passed in 0.000s
+    And the converted configuration should contain "-" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[Secret]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a NetworkPolicy manifest -- @3.1 Documented as dropped" status="passed" time="0.155172"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a NetworkPolicy manifest -- @3.1 Documented as dropped
+    Given the single-kind Kubernetes manifest "NetworkPolicy" ... passed in 0.001s
+    When I convert it with relish import ... passed in 0.154s
+    Then the importer outcome should be "dropped" ... passed in 0.000s
+    And the converted configuration should contain "-" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[NetworkPolicy]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a PersistentVolumeClaim manifest -- @3.2 Documented as dropped" status="passed" time="0.154101"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a PersistentVolumeClaim manifest -- @3.2 Documented as dropped
+    Given the single-kind Kubernetes manifest "PersistentVolumeClaim" ... passed in 0.001s
+    When I convert it with relish import ... passed in 0.153s
+    Then the importer outcome should be "dropped" ... passed in 0.000s
+    And the converted configuration should contain "-" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[PersistentVolumeClaim]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a CustomResourceDefinition manifest -- @3.3 Documented as dropped" status="passed" time="0.155225"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a CustomResourceDefinition manifest -- @3.3 Documented as dropped
+    Given the single-kind Kubernetes manifest "CustomResourceDefinition" ... passed in 0.001s
+    When I convert it with relish import ... passed in 0.154s
+    Then the importer outcome should be "dropped" ... passed in 0.000s
+    And the converted configuration should contain "-" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[CustomResourceDefinition]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a CustomResource manifest -- @3.4 Documented as dropped" status="passed" time="0.154672"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a CustomResource manifest -- @3.4 Documented as dropped
+    Given the single-kind Kubernetes manifest "CustomResource" ... passed in 0.001s
+    When I convert it with relish import ... passed in 0.154s
+    Then the importer outcome should be "dropped" ... passed in 0.000s
+    And the converted configuration should contain "-" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[CustomResource]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a ServiceAccount manifest -- @3.5 Documented as dropped" status="passed" time="0.152213"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a ServiceAccount manifest -- @3.5 Documented as dropped
+    Given the single-kind Kubernetes manifest "ServiceAccount" ... passed in 0.000s
+    When I convert it with relish import ... passed in 0.152s
+    Then the importer outcome should be "dropped" ... passed in 0.000s
+    And the converted configuration should contain "-" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[ServiceAccount]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="kubernetes_kinds.Kubernetes kind coverage of the importer" name="Import a Role manifest -- @3.6 Documented as dropped" status="passed" time="0.152622"><system-out>
+
+@scenario.begin
+
+  @req_INT-002 @offline
+  Scenario Outline: Import a Role manifest -- @3.6 Documented as dropped
+    Given the single-kind Kubernetes manifest "Role" ... passed in 0.001s
+    When I convert it with relish import ... passed in 0.152s
+    Then the importer outcome should be "dropped" ... passed in 0.000s
+    And the converted configuration should contain "-" ... passed in 0.000s
+    And no resource in the manifest should be silently lost ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-002[Role]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase></testsuite>

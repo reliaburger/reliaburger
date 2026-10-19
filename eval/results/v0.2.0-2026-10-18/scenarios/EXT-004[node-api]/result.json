@@ -1,0 +1,90 @@
+{
+  "id": "EXT-004[node-api]",
+  "name": "Collect metrics through the node API path /metrics -- @1.1 ",
+  "feature": "features/extensibility/metrics_surfaces.feature",
+  "axis": "extensibility",
+  "claim_ids": [
+    "claim_app_metrics_scraping_and_extra_targets",
+    "claim_batteries_included",
+    "claim_no_prometheus_endpoint_remote_read_or_promql"
+  ],
+  "source_refs": [
+    "docs/manual/04_observability.md:140-140@v0.2.0",
+    "docs/manual/04_observability.md:179-179@v0.2.0",
+    "docs/design/metrics-mayo.md:45-45@v0.2.0",
+    "docs/design/metrics-mayo.md:122-122@v0.2.0",
+    "docs/manual/04_observability.md:177-177@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_app_metrics_scraping_and_extra_targets",
+    "axis_extensibility",
+    "claim_batteries_included",
+    "req_EXT-004",
+    "claim_no_prometheus_endpoint_remote_read_or_promql"
+  ],
+  "hypothesis": true,
+  "status": "UNSUPPORTED",
+  "status_reason": "no Prometheus surface: HTTP None; body starts 'URLError: <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Missing Authority Key Identifier (_ssl.c:1032)>'",
+  "start_time": "2026-10-18T12:12:15.322+00:00",
+  "duration_ms": 33555,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "prometheus_exposition": true
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:12:15.651+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-01": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-02"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "http_status": null,
+    "content_type": null,
+    "prometheus_exposition": false
+  },
+  "evidence_paths": [
+    "scenarios/EXT-004[node-api]/claims/claim_app_metrics_scraping_and_extra_targets.json",
+    "scenarios/EXT-004[node-api]/claims/claim_batteries_included.json",
+    "scenarios/EXT-004[node-api]/claims/claim_no_prometheus_endpoint_remote_read_or_promql.json",
+    "scenarios/EXT-004[node-api]/cluster_state.json",
+    "scenarios/EXT-004[node-api]/response.txt",
+    "scenarios/EXT-004[node-api]/diagnostics/wtf.json",
+    "scenarios/EXT-004[node-api]/diagnostics/status.json",
+    "scenarios/EXT-004[node-api]/diagnostics/council.json",
+    "scenarios/EXT-004[node-api]/diagnostics/nodes.json",
+    "scenarios/EXT-004[node-api]/diagnostics/journal-node-01.txt",
+    "scenarios/EXT-004[node-api]/diagnostics/journal-node-02.txt",
+    "scenarios/EXT-004[node-api]/diagnostics/journal-node-03.txt",
+    "scenarios/EXT-004[node-api]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": "unsupported",
+  "confidence": "high",
+  "failed_step": "Then the response should be in the Prometheus text exposition format"
+}

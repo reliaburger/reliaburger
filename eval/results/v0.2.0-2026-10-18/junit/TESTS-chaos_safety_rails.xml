@@ -1,0 +1,158 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="chaos_safety_rails.Chaos safety rails" tests="6" errors="1" failures="0" skipped="0" time="40.328559" timestamp="2026-10-18T14:25:30.988719" hostname="serval"><testcase classname="chaos_safety_rails.Chaos safety rails" name="relish fault kill frontend --count 1 --acknowledge as admin -- @1.1 " status="passed" time="21.128177"><system-out>
+
+@scenario.begin
+
+  @req_OPS-005 @claim_chaos_safety_policy
+  Scenario Outline: relish fault kill frontend --count 1 --acknowledge as admin -- @1.1 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.577s
+    And the native fixture application is running ... passed in 0.154s
+    When I request the fault "kill frontend --count 1 --acknowledge" with a admin token ... passed in 0.415s
+    Then the fault injector should accept it ... passed in 0.000s
+    And the fixture should be back to 3 running frontend replicas within the configured recovery time ... passed in 19.761s
+    And an accepted fault should appear in the audit log ... passed in 0.222s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-005[kill-one]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="chaos_safety_rails.Chaos safety rails" name="relish fault kill frontend --count 3 --acknowledge as admin -- @1.2 " status="passed" time="4.355992"><system-out>
+
+@scenario.begin
+
+  @req_OPS-005 @claim_chaos_safety_policy
+  Scenario Outline: relish fault kill frontend --count 3 --acknowledge as admin -- @1.2 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.509s
+    And the native fixture application is running ... passed in 0.128s
+    When I request the fault "kill frontend --count 3 --acknowledge" with a admin token ... passed in 0.439s
+    Then the fault injector should refuse it ... passed in 0.000s
+    And the fixture should be back to 3 running frontend replicas within the configured recovery time ... passed in 3.152s
+    And an accepted fault should appear in the audit log ... passed in 0.128s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-005[kill-all]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="chaos_safety_rails.Chaos safety rails" name="relish fault kill frontend --count 1 as admin -- @1.3 " status="passed" time="4.642713"><system-out>
+
+@scenario.begin
+
+  @req_OPS-005 @claim_chaos_safety_policy
+  Scenario Outline: relish fault kill frontend --count 1 as admin -- @1.3 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.606s
+    And the native fixture application is running ... passed in 0.177s
+    When I request the fault "kill frontend --count 1" with a admin token ... passed in 0.529s
+    Then the fault injector should refuse it ... passed in 0.000s
+    And the fixture should be back to 3 running frontend replicas within the configured recovery time ... passed in 3.177s
+    And an accepted fault should appear in the audit log ... passed in 0.154s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-005[no-ack]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="chaos_safety_rails.Chaos safety rails" name="relish fault pause frontend --acknowledge as admin -- @1.4 " status="passed" time="4.44163"><system-out>
+
+@scenario.begin
+
+  @req_OPS-005 @claim_chaos_safety_policy
+  Scenario Outline: relish fault pause frontend --acknowledge as admin -- @1.4 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.602s
+    And the native fixture application is running ... passed in 0.108s
+    When I request the fault "pause frontend --acknowledge" with a admin token ... passed in 0.436s
+    Then the fault injector should refuse it ... passed in 0.000s
+    And the fixture should be back to 3 running frontend replicas within the configured recovery time ... passed in 3.174s
+    And an accepted fault should appear in the audit log ... passed in 0.121s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-005[pause-all]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="chaos_safety_rails.Chaos safety rails" name="relish fault kill frontend --count 1 --acknowledge as read-only -- @1.5 " status="error" time="1.205456"><error type="CommandFailed" message="command failed rc=1: relish token create --name rbeval-read-only-1ab6c349b86d --role read-only  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout:">
+
+Failing step: When I request the fault "kill frontend --count 1 --acknowledge" with a read-only token ... error in 0.449s
+Location: features/operations/chaos_safety_rails.feature:11
+Traceback (most recent call last):
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/model.py", line 1991, in run
+    match.run(runner.context)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/matchers.py", line 105, in run
+    self.func(context, *args, **kwargs)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 214, in step_request_fault
+    secret = None if role == "admin" else make_token(context, role)
+                                          ~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 29, in make_token
+    r = cl.relish.run(*args, check=True, operator=f"relish token create --role {role}"
+                      + (f" --namespaces {namespaces}" if namespaces else ""))
+  File "/home/decoder/dev/reliaburger-eval/harness/cluster.py", line 156, in run
+    raise CommandFailed(result)
+harness.core.CommandFailed: command failed rc=1: relish token create --name rbeval-read-only-1ab6c349b86d --role read-only  # https://10.77.0.11:9117
+stderr: error: API error (status 503): not the leader (the leader is node-02)
+
+stdout: 
+
+</error><system-out>
+
+@scenario.begin
+
+  @req_OPS-005 @claim_chaos_safety_policy
+  Scenario Outline: relish fault kill frontend --count 1 --acknowledge as read-only -- @1.5 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.608s
+    And the native fixture application is running ... passed in 0.149s
+    When I request the fault "kill frontend --count 1 --acknowledge" with a read-only token ... error in 0.449s
+    Then the fault injector should refuse it ... skipped in 0.000s
+    And the fixture should be back to 3 running frontend replicas within the configured recovery time ... skipped in 0.000s
+    And an accepted fault should appear in the audit log ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-005[readonly-kill]: FAIL (When I request the fault "kill frontend --count 1 --acknowledge" with a read-only token: CommandFailed: command failed rc=1: relish token create --name rbeval-r)
+
+
+</system-err></testcase><testcase classname="chaos_safety_rails.Chaos safety rails" name="relish fault node-kill LEADER --acknowledge as admin -- @1.6 " status="passed" time="4.554591"><system-out>
+
+@scenario.begin
+
+  @req_OPS-005 @claim_chaos_safety_policy
+  Scenario Outline: relish fault node-kill LEADER --acknowledge as admin -- @1.6 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.667s
+    And the native fixture application is running ... passed in 0.179s
+    When I request the fault "node-kill LEADER --acknowledge" with a admin token ... passed in 0.461s
+    Then the fault injector should refuse it ... passed in 0.000s
+    And the fixture should be back to 3 running frontend replicas within the configured recovery time ... passed in 3.129s
+    And an accepted fault should appear in the audit log ... passed in 0.119s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-005[leader-node-kill]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase></testsuite>

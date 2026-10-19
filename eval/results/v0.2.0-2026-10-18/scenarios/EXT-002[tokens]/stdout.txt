@@ -1,0 +1,16 @@
+{
+  "tokens": [
+    {
+      "name": "admin",
+      "role": "admin",
+      "scope": {
+        "apps": null,
+        "namespaces": null
+      },
+      "created_at": 1792324962,
+      "expires_at": null,
+      "last_used": 1792325232
+    }
+  ],
+  "warnings": []
+}

@@ -1,0 +1,39 @@
+{
+  "claim": {
+    "id": "claim_cli_machine_readable_output",
+    "axis": "extensibility",
+    "statement": "relish prints human, json or yaml output so scripts can drive the cluster, and the project's stated position is that custom automation is shell scripts calling relish with --output json.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/13_reference.md:13-13",
+        "quote": "`human` (default), `json` or `yaml`"
+      },
+      {
+        "ref": "docs/design/cli-relish.md:1947-1947",
+        "quote": "Custom automation is done via shell scripts that call `relish` with `--output json`. This is the current default position."
+      }
+    ],
+    "measurable": "relish status|nodes|token list|council status|audit with --output json emit parseable JSON with stable field names; exit codes are 0 success, 1 error, 2 warnings for wtf and path.",
+    "interfaces": [
+      "relish --output human|json|yaml",
+      "RELIABURGER_ENDPOINT",
+      "RELIABURGER_TOKEN",
+      "RELIABURGER_CA_CERT"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_cli_machine_readable_output",
+      "ref": "docs/manual/13_reference.md:13-13",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_cli_machine_readable_output",
+      "ref": "docs/design/cli-relish.md:1947-1947",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

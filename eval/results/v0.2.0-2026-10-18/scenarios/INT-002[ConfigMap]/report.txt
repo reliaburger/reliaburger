@@ -1,0 +1,3 @@
+
+Approximated (review recommended):
+  ~ ConfigMap/settings — not referenced by any workload; import manually if needed

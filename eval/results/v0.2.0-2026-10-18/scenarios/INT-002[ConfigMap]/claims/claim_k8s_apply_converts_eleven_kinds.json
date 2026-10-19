@@ -1,0 +1,48 @@
+{
+  "claim": {
+    "id": "claim_k8s_apply_converts_eleven_kinds",
+    "axis": "interoperability",
+    "statement": "relish apply takes Kubernetes YAML directly (file or https URL under 1 MiB, 30 s) and converts eleven kinds in memory - Deployment, StatefulSet, DaemonSet, Service, Ingress, ConfigMap, Secret, Job, CronJob, HorizontalPodAutoscaler and Namespace.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/09_kubernetes.md:20-20",
+        "quote": "Eleven kinds: Deployment, StatefulSet, DaemonSet, Service, Ingress, ConfigMap,"
+      },
+      {
+        "ref": "docs/manual/09_kubernetes.md:14-14",
+        "quote": "URLs must be `https://` (redirects"
+      },
+      {
+        "ref": "docs/manual/09_kubernetes.md:15-15",
+        "quote": "The migration report"
+      }
+    ],
+    "measurable": "Apply examples/kubernetes/podinfo.yaml and https://reliaburger.com/demo/podinfo.yaml; a Deployment+Service+Ingress+HPA with matching names becomes one [app.NAME]; DaemonSet gets replicas = \"*\"; a file is treated as Kubernetes only if it has apiVersion and kind lines; http:// URLs, responses over 1 MiB or slower than 30 s are refused; --dry-run applies nothing; the report goes to stderr before apply.",
+    "interfaces": [
+      "relish apply -f <file|https-url> [--dry-run]",
+      "relish import -f",
+      "examples/kubernetes/podinfo.yaml"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_k8s_apply_converts_eleven_kinds",
+      "ref": "docs/manual/09_kubernetes.md:20-20",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_k8s_apply_converts_eleven_kinds",
+      "ref": "docs/manual/09_kubernetes.md:14-14",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_k8s_apply_converts_eleven_kinds",
+      "ref": "docs/manual/09_kubernetes.md:15-15",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

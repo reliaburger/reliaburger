@@ -1,0 +1,89 @@
+[
+  {
+    "node": "node-01",
+    "id": "default__backend-1",
+    "app_name": "backend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 25243,
+    "pid": 11956,
+    "status_age_ms": 761
+  },
+  {
+    "node": "node-01",
+    "id": "default__frontend-g1-1",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 43717,
+    "pid": 12211,
+    "status_age_ms": 761
+  },
+  {
+    "node": "node-01",
+    "id": "run-1",
+    "app_name": "rbeval-fail-c21f631bccb2",
+    "namespace": "default",
+    "state": "failed",
+    "restart_count": 0,
+    "host_port": null,
+    "pid": null
+  },
+  {
+    "node": "node-02",
+    "id": "default__frontend-g1-2",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 24193,
+    "pid": 9793,
+    "status_age_ms": 780
+  },
+  {
+    "node": "node-03",
+    "id": "apps__gitops-6f367e3a6ac8-0",
+    "app_name": "gitops-6f367e3a6ac8",
+    "namespace": "apps",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 57470,
+    "pid": 3864,
+    "status_age_ms": 31
+  },
+  {
+    "node": "node-03",
+    "id": "apps__gitops-6f367e3a6ac8-1",
+    "app_name": "gitops-6f367e3a6ac8",
+    "namespace": "apps",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 24302,
+    "pid": 1712,
+    "status_age_ms": 31
+  },
+  {
+    "node": "node-03",
+    "id": "default__backend-0",
+    "app_name": "backend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 31340,
+    "pid": 3987,
+    "status_age_ms": 31
+  },
+  {
+    "node": "node-03",
+    "id": "default__frontend-g2-0",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 48718,
+    "pid": 4235,
+    "status_age_ms": 31
+  }
+]

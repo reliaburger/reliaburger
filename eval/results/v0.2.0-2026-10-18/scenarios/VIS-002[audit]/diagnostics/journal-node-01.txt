@@ -1,0 +1,47 @@
+Oct 18 11:58:53 node-01 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 11:58:53 node-01 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 11:58:53 node-01 bun[2384]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 11:58:53 node-01 bun[2384]: bun: using runc runtime (root)
+Oct 18 11:58:53 node-01 bun[2384]: bun: workloads use DNS nameserver 10.77.0.11
+Oct 18 11:58:53 node-01 bun[2384]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 11:58:53 node-01 bun[2384]: bun: cluster mode — gossip on 10.77.0.11:9443, 0 seed(s)
+Oct 18 11:58:53 node-01 bun[2384]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 11:58:53 node-01 bun[2384]: bun: eBPF data path loaded (attached=true)
+Oct 18 11:58:53 node-01 bun[2384]: bun: dns responder ready on 10.77.0.11:53
+Oct 18 11:58:53 node-01 bun[2384]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 11:58:53 node-01 bun[2384]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 11:58:53 node-01 bun[2384]: bun: API server listening on 127.0.0.1:9117
+Oct 18 11:58:53 node-01 bun[2384]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 11:58:53 node-01 bun[2384]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 11:58:53 node-01 bun[2384]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.11:9117/v1/registry/query)
+Oct 18 11:58:54 node-01 bun[2384]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.11:9117/v1/registry/query)
+Oct 18 11:58:55 node-01 systemd[1]: Stopping reliaburger.service - Reliaburger node...
+Oct 18 11:58:55 node-01 bun[2384]: bun: received shutdown signal
+Oct 18 11:58:55 node-01 bun[2384]: bun: shutdown complete
+Oct 18 11:58:55 node-01 systemd[1]: reliaburger.service: Deactivated successfully.
+Oct 18 11:58:55 node-01 systemd[1]: Stopped reliaburger.service - Reliaburger node.
+Oct 18 11:58:55 node-01 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 11:58:55 node-01 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 11:58:55 node-01 bun[2778]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 11:58:55 node-01 bun[2778]: bun: using runc runtime (root)
+Oct 18 11:58:55 node-01 bun[2778]: bun: workloads use DNS nameserver 10.77.0.11
+Oct 18 11:58:55 node-01 bun[2778]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 11:58:55 node-01 bun[2778]: bun: cluster mode — gossip on 10.77.0.11:9443, 0 seed(s)
+Oct 18 11:58:58 node-01 bun[2778]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 11:58:58 node-01 bun[2778]: bun: eBPF data path loaded (attached=true)
+Oct 18 11:58:58 node-01 bun[2778]: bun: dns responder ready on 10.77.0.11:53
+Oct 18 11:58:58 node-01 bun[2778]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 11:58:58 node-01 bun[2778]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 11:58:58 node-01 bun[2778]: bun: API server listening on 0.0.0.0:9117
+Oct 18 11:58:58 node-01 bun[2778]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 11:58:58 node-01 bun[2778]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 11:59:03 node-01 bun[2778]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 11:59:18 node-01 bun[2778]: scheduler: placement pass refused: admission revision changed
+Oct 18 11:59:46 node-01 bun[2778]: scheduler: placement pass refused: admission revision changed
+Oct 18 11:59:48 node-01 bun[2778]: scheduler: placement pass refused: admission revision changed
+Oct 18 11:59:50 node-01 bun[2778]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:00:04 node-01 bun[2778]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:00:06 node-01 bun[2778]: orchestrator: retirement of secretprobe/default failed, will retry: cannot retire artifacts for default__secretprobe-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:00:06 node-01 bun[2778]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:00:08 node-01 bun[2778]: bun: agent loop turn took 502 ms in stop_wait: journal write 12 ms, runtime inventory 0 ms
+Oct 18 12:00:08 node-01 bun[2778]: scheduler: placement pass refused: admission revision changed

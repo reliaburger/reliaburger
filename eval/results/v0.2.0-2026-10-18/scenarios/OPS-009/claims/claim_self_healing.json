@@ -1,0 +1,43 @@
+{
+  "claim": {
+    "id": "claim_self_healing",
+    "axis": "operations",
+    "statement": "A single machine failure does not require manual repair; desired workloads recover on the surviving nodes.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/08_five-minute-tour.md:164-164",
+        "quote": "Nobody had to notice first."
+      },
+      {
+        "ref": "README.md:252-253",
+        "quote": "Lose a node and the scheduler moves its workloads to the survivors."
+      }
+    ],
+    "related": [
+      "claim_node_loss_reschedules_in_about_a_minute",
+      "claim_council_raft_quorum_and_self_healing"
+    ],
+    "measurable": "Hard power-off of a node hosting a replica; the node is detected missing, the replica count is restored on survivors, and an external probe records availability once per second throughout.",
+    "interfaces": [
+      "relish nodes",
+      "relish inspect",
+      "relish status",
+      "virsh destroy"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_self_healing",
+      "ref": "docs/manual/08_five-minute-tour.md:164-164",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_self_healing",
+      "ref": "README.md:252-253",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

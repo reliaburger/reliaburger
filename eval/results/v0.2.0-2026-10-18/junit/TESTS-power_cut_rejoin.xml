@@ -1,0 +1,22 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="power_cut_rejoin.Power cut under write load" tests="1" errors="0" failures="0" skipped="0" time="103.467436" timestamp="2026-10-18T14:34:26.454976" hostname="serval"><testcase classname="power_cut_rejoin.Power cut under write load" name="A council voter loses power repeatedly while the cluster takes writes" status="passed" time="103.467436"><system-out>
+
+@scenario.begin
+
+  @req_OPS-008 @claim_council_raft_quorum_and_self_healing @destructive
+  Scenario: A council voter loses power repeatedly while the cluster takes writes
+    Given a healthy disposable 3-node Reliaburger cluster with sufficient spare capacity ... passed in 2.664s
+    When I cut the power to one non-leader voter under write load for the configured number of cycles ... passed in 99.481s
+    Then the voter should rejoin after every cycle within the configured rejoin time ... passed in 0.000s
+    And its journal should show no store corruption or refused start ... passed in 1.322s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-008: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase></testsuite>

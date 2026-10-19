@@ -1,0 +1,49 @@
+{
+  "claim": {
+    "id": "claim_token_roles_and_scoped_rbac",
+    "axis": "operations",
+    "statement": "API tokens carry one of three roles (admin, deployer, read-only), can be scoped to apps and namespaces, live 90 days by default (admin no expiry), rotate with a 24 hour grace for the old secret, and the last admin token cannot be revoked.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/10_security.md:83-83",
+        "quote": "Deployer and read-only tokens live **90 days** unless you say otherwise"
+      },
+      {
+        "ref": "docs/manual/10_security.md:77-77",
+        "quote": "`revoke` refuses to remove the last admin token"
+      },
+      {
+        "ref": "docs/manual/10_security.md:105-105",
+        "quote": "relish token rotate ci-deploy                  # old secret works for 24 hours"
+      }
+    ],
+    "measurable": "Create tokens per role and verify allowed and denied routes (read-only cannot apply; deployer cannot manage tokens, rotate secrets, sign images or decommission; only unscoped admin can). A namespace-scoped token cannot see or touch another namespace (403 and an api.refused audit record). Old secret works for 24 h after rotate (--grace-hours 0 stops it now) then returns 401 token rotated; the new one propagates to other nodes within 5 s.",
+    "interfaces": [
+      "relish token create --name --role --namespaces --apps --ttl-days --no-expiry",
+      "relish token list|rotate|revoke",
+      "[security.tokens] default_ttl",
+      "[permission] block"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_token_roles_and_scoped_rbac",
+      "ref": "docs/manual/10_security.md:83-83",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_token_roles_and_scoped_rbac",
+      "ref": "docs/manual/10_security.md:77-77",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_token_roles_and_scoped_rbac",
+      "ref": "docs/manual/10_security.md:105-105",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

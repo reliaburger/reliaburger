@@ -1,0 +1,49 @@
+{
+  "claim": {
+    "id": "claim_audit_log_durable_bounded",
+    "axis": "operations",
+    "statement": "Each node keeps a durable JSON Lines audit log (64 MiB by default, eight segments, synced before the request is answered) of applies, deletes, execs, upgrades, faults, token and secret changes and refused requests, with refusals rate limited to 5 a minute per source and 100 a minute per node; it is per node, with no central copy.",
+    "kind": "explicit",
+    "limitation": true,
+    "sources": [
+      {
+        "ref": "docs/manual/10_security.md:279-279",
+        "quote": "at most five refusals a minute from one"
+      },
+      {
+        "ref": "docs/manual/10_security.md:306-306",
+        "quote": "There's no central copy yet, so a node you"
+      },
+      {
+        "ref": "docs/manual/10_security.md:294-294",
+        "quote": "The log is bounded: 64 MiB per node by default"
+      }
+    ],
+    "measurable": "Perform an apply and a refused call with a bad token; relish audit --cluster shows app.applied with principal and api.refused with reason unauthenticated. Flood 1000 bad-token calls and see at most 5 per minute per source plus one api.refusals_suppressed. kill -9 bun after an acknowledged action and the record survives. Decommission a node and its history goes with it.",
+    "interfaces": [
+      "relish audit [--cluster --since --action --principal --namespace --output json]",
+      "GET /v1/audit",
+      "[storage] audit_max_bytes"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_audit_log_durable_bounded",
+      "ref": "docs/manual/10_security.md:279-279",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_audit_log_durable_bounded",
+      "ref": "docs/manual/10_security.md:306-306",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_audit_log_durable_bounded",
+      "ref": "docs/manual/10_security.md:294-294",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

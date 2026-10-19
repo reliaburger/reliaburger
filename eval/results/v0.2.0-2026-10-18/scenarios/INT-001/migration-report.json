@@ -1,0 +1,57 @@
+{
+  "converted": [
+    {
+      "kind": "Namespace",
+      "name": "rbeval-shop",
+      "detail": "",
+      "marker": "+",
+      "line": "+ Namespace/rbeval-shop"
+    },
+    {
+      "kind": "Deployment",
+      "name": "backend",
+      "detail": "[app.backend]",
+      "marker": "+",
+      "line": "+ Deployment/backend \u2192 [app.backend]"
+    },
+    {
+      "kind": "Deployment",
+      "name": "frontend",
+      "detail": "[app.frontend]",
+      "marker": "+",
+      "line": "+ Deployment/frontend \u2192 [app.frontend]"
+    }
+  ],
+  "approximated": [
+    {
+      "kind": "Deployment",
+      "name": "frontend",
+      "detail": "env PODINFO_UI_MESSAGE uses valueFrom (secret/configmap/field ref) \u2014 set the value manually or use `relish secret encrypt`",
+      "marker": "~",
+      "line": "~ Deployment/frontend \u2014 env PODINFO_UI_MESSAGE uses valueFrom (secret/configmap/field ref) \u2014 set the value manually or use `relish secret encrypt`"
+    },
+    {
+      "kind": "Deployment",
+      "name": "frontend",
+      "detail": "env FIXTURE_TOKEN uses valueFrom (secret/configmap/field ref) \u2014 set the value manually or use `relish secret encrypt`",
+      "marker": "~",
+      "line": "~ Deployment/frontend \u2014 env FIXTURE_TOKEN uses valueFrom (secret/configmap/field ref) \u2014 set the value manually or use `relish secret encrypt`"
+    },
+    {
+      "kind": "ConfigMap",
+      "name": "fixture-config",
+      "detail": "not referenced by any workload; import manually if needed",
+      "marker": "~",
+      "line": "~ ConfigMap/fixture-config \u2014 not referenced by any workload; import manually if needed"
+    },
+    {
+      "kind": "Secret",
+      "name": "fixture-secret",
+      "detail": "re-encrypt values with `relish secret encrypt`",
+      "marker": "~",
+      "line": "~ Secret/fixture-secret \u2014 re-encrypt values with `relish secret encrypt`"
+    }
+  ],
+  "dropped": [],
+  "other": []
+}

@@ -1,0 +1,76 @@
+{
+  "id": "INT-002[Deployment]",
+  "name": "Import a Deployment manifest -- @1.1 Documented as converted",
+  "feature": "features/interoperability/kubernetes_kinds.feature",
+  "axis": "interoperability",
+  "claim_ids": [
+    "claim_k8s_drops_reported_not_silent",
+    "claim_k8s_apply_converts_eleven_kinds"
+  ],
+  "source_refs": [
+    "docs/manual/09_kubernetes.md:22-22@v0.2.0",
+    "docs/manual/09_kubernetes.md:54-54@v0.2.0",
+    "docs/manual/09_kubernetes.md:45-45@v0.2.0",
+    "docs/whitepaper.md:997-997@v0.2.0",
+    "docs/manual/09_kubernetes.md:20-20@v0.2.0",
+    "docs/manual/09_kubernetes.md:14-14@v0.2.0",
+    "docs/manual/09_kubernetes.md:15-15@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "offline",
+    "req_INT-002",
+    "claim_k8s_drops_reported_not_silent",
+    "axis_interoperability",
+    "claim_k8s_apply_converts_eleven_kinds"
+  ],
+  "hypothesis": false,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:12:53.523+00:00",
+  "duration_ms": 206,
+  "observations": [],
+  "expected": {
+    "outcome": "converted",
+    "toml_contains": "[app.web]"
+  },
+  "measured": {
+    "import_rc": 0,
+    "report": {
+      "converted": [
+        {
+          "kind": "Deployment",
+          "name": "web",
+          "detail": "[app.web]",
+          "marker": "+",
+          "line": "+ Deployment/web \u2192 [app.web]"
+        }
+      ],
+      "approximated": [],
+      "dropped": [],
+      "other": []
+    },
+    "outcome_sections": [
+      "converted"
+    ],
+    "toml_contains": true,
+    "silently_lost": []
+  },
+  "evidence_paths": [
+    "scenarios/INT-002[Deployment]/claims/claim_k8s_drops_reported_not_silent.json",
+    "scenarios/INT-002[Deployment]/claims/claim_k8s_apply_converts_eleven_kinds.json",
+    "scenarios/INT-002[Deployment]/input.yaml",
+    "scenarios/INT-002[Deployment]/converted.toml",
+    "scenarios/INT-002[Deployment]/report.txt",
+    "scenarios/INT-002[Deployment]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": null
+}

@@ -1,0 +1,33 @@
+Relish apply plan:
+
+  + app.rbeval-shop/backend
+      image     ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da
+      replicas  2
+      port      9898
+      health    /readyz
+      memory    33554432-268435456
+      cpu       100m-1000m
+      namespace rbeval-shop
+
+  + app.rbeval-shop/frontend
+      image     ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da
+      replicas  3
+      port      9898
+      health    /readyz
+      memory    33554432-268435456
+      cpu       100m-1000m
+      namespace rbeval-shop
+
+  + namespace.rbeval-shop
+
+  * app.apps/gitops-6f367e3a6ac8
+
+  * app.backend
+
+  * app.frontend
+
+  * job.rbeval-fail-c21f631bccb2
+Plan: 3 to create, 0 to update, 0 unchanged.
+4 running resource(s) not in this config (apply leaves them; `relish stop` removes).
+
+(dry run — nothing deployed)

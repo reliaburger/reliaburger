@@ -1,0 +1,273 @@
+{
+  "id": "INT-001",
+  "name": "Import a baseline Kubernetes application",
+  "feature": "features/interoperability/kubernetes_migration.feature",
+  "axis": "interoperability",
+  "claim_ids": [
+    "claim_k8s_drops_reported_not_silent",
+    "claim_smooth_k8s_transition",
+    "claim_k8s_apply_converts_eleven_kinds"
+  ],
+  "source_refs": [
+    "docs/manual/09_kubernetes.md:22-22@v0.2.0",
+    "docs/manual/09_kubernetes.md:54-54@v0.2.0",
+    "docs/manual/09_kubernetes.md:45-45@v0.2.0",
+    "docs/whitepaper.md:997-997@v0.2.0",
+    "docs/manual/09_kubernetes.md:3-3@v0.2.0",
+    "docs/manual/09_kubernetes.md:20-20@v0.2.0",
+    "docs/manual/09_kubernetes.md:14-14@v0.2.0",
+    "docs/manual/09_kubernetes.md:15-15@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "req_INT-001",
+    "smoke",
+    "claim_k8s_drops_reported_not_silent",
+    "claim_smooth_k8s_transition",
+    "axis_interoperability",
+    "claim_k8s_apply_converts_eleven_kinds"
+  ],
+  "hypothesis": false,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:12:56.231+00:00",
+  "duration_ms": 37267,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run",
+    "report says ConfigMap/fixture-config is 'not referenced by any workload' although the frontend references it through configMapKeyRef"
+  ],
+  "expected": {
+    "silently_lost": [],
+    "probes": {
+      "healthz": true,
+      "configmap_message": true,
+      "secret_env": true,
+      "backend_by_name": true
+    },
+    "manual_steps_total": "<= 6"
+  },
+  "measured": {
+    "baseline_kinds": [
+      "ConfigMap",
+      "Deployment",
+      "Ingress",
+      "Namespace",
+      "Secret",
+      "Service"
+    ],
+    "baseline_probes": {
+      "healthz": {
+        "ok": true,
+        "status": 200
+      },
+      "configmap_message": {
+        "ok": true,
+        "got": "rbeval-config-7f3a"
+      },
+      "secret_env": {
+        "ok": true,
+        "present": true
+      },
+      "backend_by_name": {
+        "ok": true,
+        "status": 200
+      }
+    },
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:12:59.652+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-01": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-02"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "zero_touch_probes": {
+      "healthz": {
+        "ok": true,
+        "status": 200
+      },
+      "configmap_message": {
+        "ok": false,
+        "got": "greetings from podinfo v6.15.0"
+      },
+      "secret_env": {
+        "ok": false,
+        "present": false
+      },
+      "backend_by_name": {
+        "ok": false,
+        "status": 200
+      }
+    },
+    "migrated_rollout_s": 15.1,
+    "resource_accounting": {
+      "Namespace/rbeval-shop": {
+        "reported_in": [
+          "converted"
+        ],
+        "reflected_in_toml": false
+      },
+      "ConfigMap/fixture-config": {
+        "reported_in": [
+          "approximated"
+        ],
+        "reflected_in_toml": false
+      },
+      "Secret/fixture-secret": {
+        "reported_in": [
+          "approximated"
+        ],
+        "reflected_in_toml": false
+      },
+      "Deployment/backend": {
+        "reported_in": [
+          "converted"
+        ],
+        "reflected_in_toml": false
+      },
+      "Service/backend": {
+        "reported_in": [],
+        "reflected_in_toml": true
+      },
+      "Deployment/frontend": {
+        "reported_in": [
+          "approximated",
+          "converted"
+        ],
+        "reflected_in_toml": false
+      },
+      "Service/frontend": {
+        "reported_in": [],
+        "reflected_in_toml": true
+      },
+      "Ingress/frontend": {
+        "reported_in": [],
+        "reflected_in_toml": true
+      }
+    },
+    "accepted_kinds": [
+      "ConfigMap",
+      "Deployment",
+      "Ingress",
+      "Namespace",
+      "Secret",
+      "Service"
+    ],
+    "rejected_kinds": [],
+    "silently_lost": [],
+    "diagnostics_count": {
+      "dropped": 0,
+      "approximated": 4
+    },
+    "diagnostics_without_explanation": [],
+    "migrated_probes": {
+      "10.77.0.11": {
+        "healthz": {
+          "ok": true,
+          "status": 200
+        },
+        "configmap_message": {
+          "ok": true,
+          "got": "rbeval-config-7f3a"
+        },
+        "secret_env": {
+          "ok": true,
+          "present": true
+        },
+        "backend_by_name": {
+          "ok": true,
+          "status": 200
+        }
+      },
+      "10.77.0.12": {
+        "healthz": {
+          "ok": true,
+          "status": 200
+        },
+        "configmap_message": {
+          "ok": true,
+          "got": "rbeval-config-7f3a"
+        },
+        "secret_env": {
+          "ok": true,
+          "present": true
+        },
+        "backend_by_name": {
+          "ok": true,
+          "status": 200
+        }
+      },
+      "10.77.0.13": {
+        "healthz": {
+          "ok": true,
+          "status": 200
+        },
+        "configmap_message": {
+          "ok": true,
+          "got": "rbeval-config-7f3a"
+        },
+        "secret_env": {
+          "ok": true,
+          "present": true
+        },
+        "backend_by_name": {
+          "ok": true,
+          "status": 200
+        }
+      }
+    },
+    "manifest_changes": [
+      "[app.frontend.env] PODINFO_UI_MESSAGE: copy value from ConfigMap/fixture-config",
+      "[app.frontend.env] FIXTURE_TOKEN: relish secret encrypt the Secret/fixture-secret value"
+    ],
+    "manual_steps_total": 4,
+    "zero_touch_probes_passing": 1
+  },
+  "evidence_paths": [
+    "scenarios/INT-001/claims/claim_k8s_drops_reported_not_silent.json",
+    "scenarios/INT-001/claims/claim_smooth_k8s_transition.json",
+    "scenarios/INT-001/claims/claim_k8s_apply_converts_eleven_kinds.json",
+    "scenarios/INT-001/baseline.yaml",
+    "scenarios/INT-001/cluster_state.json",
+    "scenarios/INT-001/migration-report.txt",
+    "scenarios/INT-001/dry-run-plan.txt",
+    "scenarios/INT-001/zero-touch-apply.txt",
+    "scenarios/INT-001/converted.toml",
+    "scenarios/INT-001/migrated.toml",
+    "scenarios/INT-001/manifest.diff",
+    "scenarios/INT-001/migration-report.json",
+    "scenarios/INT-001/commands.jsonl"
+  ],
+  "manual_steps": [
+    "read the migration report and decide what to fix",
+    "[app.frontend.env] PODINFO_UI_MESSAGE: copy value from ConfigMap/fixture-config",
+    "[app.frontend.env] FIXTURE_TOKEN: relish secret encrypt the Secret/fixture-secret value",
+    "relish apply the edited TOML (the YAML is no longer the source of truth)"
+  ],
+  "external_dependencies": [
+    "kind kindest/node:v1.34.0 (baseline only, not used by Reliaburger)"
+  ],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": null
+}

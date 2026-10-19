@@ -1,0 +1,46 @@
+{
+  "images": [
+    {
+      "repository": "cache/ghcr.io/stefanprodan/podinfo",
+      "digest": "sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da",
+      "tags": [],
+      "layers": 0,
+      "total_size": 34756483,
+      "platforms": [
+        {
+          "platform": "linux/amd64",
+          "digest": "sha256:72611294759dc6b304d1f3efa2d4b1de212ce422866244f31bc29f731e3b2079",
+          "layers": 7,
+          "total_size": 34756483
+        },
+        {
+          "platform": "linux/arm64",
+          "digest": "sha256:29186ab823274ed31b94c55f533f63402c33c506d7be1666b303b398e5adc204",
+          "layers": 0,
+          "total_size": 0
+        }
+      ]
+    },
+    {
+      "repository": "cache/public.ecr.aws/docker/library/busybox",
+      "digest": "sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
+      "tags": [],
+      "layers": 0,
+      "total_size": 2211507,
+      "platforms": [
+        {
+          "platform": "linux/amd64",
+          "digest": "sha256:7a3ebe5bfd1a4a19797d20b0c0bb39d44393e9a03fd852c0865b0f540d868df0",
+          "layers": 1,
+          "total_size": 2211507
+        },
+        {
+          "platform": "linux/arm64/v8",
+          "digest": "sha256:f10e809bcf667d8e9f01d2baf82869049a495cd448cdfe1f4dee94078b960ae9",
+          "layers": 0,
+          "total_size": 0
+        }
+      ]
+    }
+  ]
+}

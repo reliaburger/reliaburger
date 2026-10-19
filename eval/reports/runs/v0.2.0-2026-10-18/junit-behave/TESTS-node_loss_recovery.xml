@@ -1,0 +1,55 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="node_loss_recovery.Recovery after abrupt node loss" tests="2" errors="0" failures="1" skipped="0" time="152.000465" timestamp="2026-10-18T14:31:21.106515" hostname="serval"><testcase classname="node_loss_recovery.Recovery after abrupt node loss" name="Recover replicas after a non-leader node is forcibly stopped -- @1.1 " status="passed" time="73.156231"><system-out>
+
+@scenario.begin
+
+  @req_OPS-001 @claim_node_loss_reschedules_in_about_a_minute @destructive
+  Scenario Outline: Recover replicas after a non-leader node is forcibly stopped -- @1.1 
+    Given a healthy disposable 3-node Reliaburger cluster with sufficient spare capacity ... passed in 2.792s
+    And a 3-replica fixture application distributed across at least 2 nodes ... passed in 0.260s
+    And an external probe recording availability once per second ... passed in 5.001s
+    When I forcibly power off a non-leader node hosting at least 1 fixture replica ... passed in 0.666s
+    Then the cluster should detect the missing node within the configured detection timeout ... passed in 6.001s
+    And the desired healthy replica count should be restored within the configured recovery timeout ... passed in 25.128s
+    And the application should satisfy the configured availability threshold during recovery ... passed in 30.005s
+    And the evidence should contain replica placements, probe results, and cluster state transitions ... passed in 3.303s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-001[worker]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="node_loss_recovery.Recovery after abrupt node loss" name="Recover replicas after a council-leader node is forcibly stopped -- @1.2 " status="failed" time="78.844234"><failure type="AssertionError" message="availability 0.9412 &lt; 0.95 ({'count': 68, 'ok': 64, 'ratio': 0.9412, 'longest_failure_streak': 2, 'p50_ms': 2.1, 'p99_ms': 3.7, 'errors': ['TimeoutError: timed out']})">
+
+Failing step: And the application should satisfy the configured availability threshold during recovery ... failed in 30.006s
+Location: features/operations/node_loss_recovery.feature:15
+ASSERT FAILED: availability 0.9412 &lt; 0.95 ({'count': 68, 'ok': 64, 'ratio': 0.9412, 'longest_failure_streak': 2, 'p50_ms': 2.1, 'p99_ms': 3.7, 'errors': ['TimeoutError: timed out']})
+</failure><system-out>
+
+@scenario.begin
+
+  @req_OPS-001 @claim_node_loss_reschedules_in_about_a_minute @destructive
+  Scenario Outline: Recover replicas after a council-leader node is forcibly stopped -- @1.2 
+    Given a healthy disposable 3-node Reliaburger cluster with sufficient spare capacity ... passed in 3.635s
+    And a 3-replica fixture application distributed across at least 2 nodes ... passed in 0.209s
+    And an external probe recording availability once per second ... passed in 5.001s
+    When I forcibly power off a council-leader node hosting at least 1 fixture replica ... passed in 0.687s
+    Then the cluster should detect the missing node within the configured detection timeout ... passed in 6.001s
+    And the desired healthy replica count should be restored within the configured recovery timeout ... passed in 33.304s
+    And the application should satisfy the configured availability threshold during recovery ... failed in 30.006s
+    And the evidence should contain replica placements, probe results, and cluster state transitions ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-001[leader]: FAIL (And the application should satisfy the configured availability threshold during recovery: AssertionError: availability 0.9412 &lt; 0.95 ({'count': 68, 'ok': 64, 'r)
+
+
+</system-err></testcase></testsuite>

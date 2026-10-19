@@ -1,0 +1,89 @@
+[
+  {
+    "node": "node-01",
+    "id": "default__backend-0",
+    "app_name": "backend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 42126,
+    "pid": 4971,
+    "status_age_ms": 207
+  },
+  {
+    "node": "node-01",
+    "id": "default__ctrl-202597313e89-0",
+    "app_name": "ctrl-202597313e89",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 21180,
+    "pid": 5766,
+    "status_age_ms": 207
+  },
+  {
+    "node": "node-01",
+    "id": "default__frontend-0",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 29736,
+    "pid": 5094,
+    "status_age_ms": 207
+  },
+  {
+    "node": "node-01",
+    "id": "default__frontend-2",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 32619,
+    "pid": 5221,
+    "status_age_ms": 207
+  },
+  {
+    "node": "node-01",
+    "id": "run-1",
+    "app_name": "rbeval-fail-c21f631bccb2",
+    "namespace": "default",
+    "state": "failed",
+    "restart_count": 0,
+    "host_port": null,
+    "pid": null
+  },
+  {
+    "node": "node-02",
+    "id": "default__backend-1",
+    "app_name": "backend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 54405,
+    "pid": 4362,
+    "status_age_ms": 614
+  },
+  {
+    "node": "node-02",
+    "id": "default__ctrl-202597313e89-g1-1",
+    "app_name": "ctrl-202597313e89",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 36914,
+    "pid": 5178,
+    "status_age_ms": 614
+  },
+  {
+    "node": "node-02",
+    "id": "default__frontend-1",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 39556,
+    "pid": 4486,
+    "status_age_ms": 614
+  }
+]

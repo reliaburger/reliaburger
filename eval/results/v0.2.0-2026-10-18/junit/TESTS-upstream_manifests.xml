@@ -1,0 +1,81 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="upstream_manifests.Unmodified upstream Kubernetes applications" tests="3" errors="0" failures="2" skipped="0" time="626.495746" timestamp="2026-10-18T14:24:11.049329" hostname="serval"><testcase classname="upstream_manifests.Unmodified upstream Kubernetes applications" name="Import podinfo 6.15.0 deploy/webapp as published -- @1.1 " status="failed" time="0.72763"><failure type="AssertionError" message="relish apply -f refused the upstream manifests: error: format failed: YAML parse error: duplicate entry with key &quot;apiVersion&quot; at line 19 column 1">
+
+Failing step: When I apply them with relish apply -f in their own namespace ... failed in 0.042s
+Location: features/interoperability/upstream_manifests.feature:11
+ASSERT FAILED: relish apply -f refused the upstream manifests: error: format failed: YAML parse error: duplicate entry with key "apiVersion" at line 19 column 1
+</failure><system-out>
+
+@scenario.begin
+
+  @req_INT-003 @claim_k8s_apply_converts_eleven_kinds @claim_k8s_drops_reported_not_silent
+  Scenario Outline: Import podinfo 6.15.0 deploy/webapp as published -- @1.1 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.670s
+    And the unmodified upstream manifests for podinfo 6.15.0 deploy/webapp ... passed in 0.016s
+    When I apply them with relish apply -f in their own namespace ... failed in 0.042s
+    Then the migration report should account for every upstream resource ... skipped in 0.000s
+    And every imported workload should be running within the configured time ... skipped in 0.000s
+    When I add an ingress for the front service as the only manual change ... skipped in 0.000s
+    Then the front page should answer through that ingress within the configured time ... skipped in 0.000s
+    And the manual changes should not exceed the configured maximum ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-003[podinfo-webapp]: FAIL (When I apply them with relish apply -f in their own namespace: AssertionError: relish apply -f refused the upstream manifests: error: format failed: YAML parse )
+
+
+</system-err></testcase><testcase classname="upstream_manifests.Unmodified upstream Kubernetes applications" name="Import Online Boutique v0.10.7 as published -- @1.2 " status="failed" time="614.111032"><failure type="AssertionError" message="not running after 600 s: boutique/loadgenerator">
+
+Failing step: And every imported workload should be running within the configured time ... failed in 603.541s
+Location: features/interoperability/upstream_manifests.feature:13
+ASSERT FAILED: not running after 600 s: boutique/loadgenerator
+</failure><system-out>
+
+@scenario.begin
+
+  @req_INT-003 @claim_k8s_apply_converts_eleven_kinds @claim_k8s_drops_reported_not_silent
+  Scenario Outline: Import Online Boutique v0.10.7 as published -- @1.2 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.783s
+    And the unmodified upstream manifests for Online Boutique v0.10.7 ... passed in 0.085s
+    When I apply them with relish apply -f in their own namespace ... passed in 9.701s
+    Then the migration report should account for every upstream resource ... passed in 0.001s
+    And every imported workload should be running within the configured time ... failed in 603.541s
+    When I add an ingress for the front service as the only manual change ... skipped in 0.000s
+    Then the front page should answer through that ingress within the configured time ... skipped in 0.000s
+    And the manual changes should not exceed the configured maximum ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-003[online-boutique]: FAIL (And every imported workload should be running within the configured time: AssertionError: not running after 600 s: boutique/loadgenerator)
+
+
+</system-err></testcase><testcase classname="upstream_manifests.Unmodified upstream Kubernetes applications" name="A Reliaburger app exported to Kubernetes YAML runs on Kubernetes" status="passed" time="11.657084"><system-out>
+
+@scenario.begin
+
+  @req_INT-004 @claim_k8s_import_export_roundtrip
+  Scenario: A Reliaburger app exported to Kubernetes YAML runs on Kubernetes
+    Given a validated fixture application defined by Kubernetes Deployment, Service, ConfigMap, and Secret manifests ... passed in 8.745s
+    When I export the native fixture with relish export ... passed in 0.021s
+    Then the export report should name what it could not express ... passed in 0.000s
+    And the exported YAML should pass a server-side dry run on the Kubernetes baseline ... passed in 0.379s
+    And the exported app should roll out on the Kubernetes baseline and answer by service name ... passed in 2.511s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-004: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase></testsuite>

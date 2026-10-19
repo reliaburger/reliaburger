@@ -1,0 +1,96 @@
+{"ts": "2026-10-18T12:46:24.666+00:00", "mono": 22339.040429832, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.3, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:24.667+00:00", "mono": 22339.041456737, "target": "node-02", "ok": true, "status": 200, "latency_ms": 0.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:24.668+00:00", "mono": 22339.042532859, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:25.666+00:00", "mono": 22340.041034654, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:25.668+00:00", "mono": 22340.043121792, "target": "node-02", "ok": true, "status": 200, "latency_ms": 2.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:25.670+00:00", "mono": 22340.045299183, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:26.667+00:00", "mono": 22341.042145111, "target": "node-01", "ok": true, "status": 200, "latency_ms": 3.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:26.669+00:00", "mono": 22341.043722029, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:26.671+00:00", "mono": 22341.045394549, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:27.667+00:00", "mono": 22342.041594533, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.4, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:27.669+00:00", "mono": 22342.044142948, "target": "node-02", "ok": true, "status": 200, "latency_ms": 2.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:27.671+00:00", "mono": 22342.046113653, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:28.668+00:00", "mono": 22343.043205551, "target": "node-01", "ok": true, "status": 200, "latency_ms": 4.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:28.670+00:00", "mono": 22343.045203383, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:28.671+00:00", "mono": 22343.046294333, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:29.668+00:00", "mono": 22344.042573447, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:29.670+00:00", "mono": 22344.04488515, "target": "node-02", "ok": true, "status": 200, "latency_ms": 2.2, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:29.672+00:00", "mono": 22344.046787396, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:30.666+00:00", "mono": 22345.041374782, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.2, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:30.668+00:00", "mono": 22345.042845171, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.3, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:30.670+00:00", "mono": 22345.044495105, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:31.666+00:00", "mono": 22346.041039694, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:31.668+00:00", "mono": 22346.043106818, "target": "node-02", "ok": true, "status": 200, "latency_ms": 2.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:31.671+00:00", "mono": 22346.046015936, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:32.666+00:00", "mono": 22347.04073961, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:32.668+00:00", "mono": 22347.0425235, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:32.669+00:00", "mono": 22347.043529625, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:33.666+00:00", "mono": 22348.041376035, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:33.668+00:00", "mono": 22348.043143024, "target": "node-02", "ok": false, "status": 503, "latency_ms": 1.7, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:33.670+00:00", "mono": 22348.04472532, "target": "node-03", "ok": false, "status": 503, "latency_ms": 1.5, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:34.666+00:00", "mono": 22349.041164624, "target": "node-01", "ok": false, "status": 503, "latency_ms": 2.0, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:34.668+00:00", "mono": 22349.043142602, "target": "node-02", "ok": false, "status": 503, "latency_ms": 1.9, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:34.670+00:00", "mono": 22349.045065932, "target": "node-03", "ok": false, "status": 503, "latency_ms": 1.9, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:35.667+00:00", "mono": 22350.041841645, "target": "node-01", "ok": false, "status": 503, "latency_ms": 2.6, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:35.669+00:00", "mono": 22350.043926432, "target": "node-02", "ok": false, "status": 503, "latency_ms": 2.0, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:35.671+00:00", "mono": 22350.046327377, "target": "node-03", "ok": false, "status": 503, "latency_ms": 2.3, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:36.666+00:00", "mono": 22351.041139993, "target": "node-01", "ok": false, "status": 503, "latency_ms": 2.0, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:36.668+00:00", "mono": 22351.043045138, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:36.670+00:00", "mono": 22351.04496551, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:37.667+00:00", "mono": 22352.041715749, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:37.669+00:00", "mono": 22352.044153816, "target": "node-02", "ok": true, "status": 200, "latency_ms": 2.3, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:37.671+00:00", "mono": 22352.04573445, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:38.666+00:00", "mono": 22353.040685116, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:38.668+00:00", "mono": 22353.042635992, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:38.669+00:00", "mono": 22353.044287302, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:39.667+00:00", "mono": 22354.041637845, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.4, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:39.669+00:00", "mono": 22354.043614752, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:39.670+00:00", "mono": 22354.045248444, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:40.667+00:00", "mono": 22355.041718354, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:40.669+00:00", "mono": 22355.043493374, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:40.671+00:00", "mono": 22355.045512812, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:41.666+00:00", "mono": 22356.041055935, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:41.668+00:00", "mono": 22356.04320142, "target": "node-02", "ok": true, "status": 200, "latency_ms": 2.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:41.670+00:00", "mono": 22356.045151745, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:42.666+00:00", "mono": 22357.041207943, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:42.668+00:00", "mono": 22357.043159626, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:42.670+00:00", "mono": 22357.044611375, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.4, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:43.666+00:00", "mono": 22358.040889394, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:43.668+00:00", "mono": 22358.042721982, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:43.670+00:00", "mono": 22358.044482109, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:44.666+00:00", "mono": 22359.041223009, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:44.670+00:00", "mono": 22359.044791127, "target": "node-02", "ok": true, "status": 200, "latency_ms": 3.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:44.671+00:00", "mono": 22359.046261246, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.4, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:45.666+00:00", "mono": 22360.040595504, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.4, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:45.668+00:00", "mono": 22360.04248199, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:45.669+00:00", "mono": 22360.043650282, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:46.666+00:00", "mono": 22361.041378873, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.2, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:46.668+00:00", "mono": 22361.042625296, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.2, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:46.669+00:00", "mono": 22361.043884923, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.2, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:47.666+00:00", "mono": 22362.04105961, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:47.668+00:00", "mono": 22362.042897328, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:47.670+00:00", "mono": 22362.044590866, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:48.666+00:00", "mono": 22363.040572746, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.4, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:48.667+00:00", "mono": 22363.042091632, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.4, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:48.668+00:00", "mono": 22363.042761906, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:49.666+00:00", "mono": 22364.040829652, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:49.668+00:00", "mono": 22364.042944172, "target": "node-02", "ok": true, "status": 200, "latency_ms": 2.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:49.670+00:00", "mono": 22364.044824013, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:50.666+00:00", "mono": 22365.040624537, "target": "node-01", "ok": false, "status": 503, "latency_ms": 1.4, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:50.668+00:00", "mono": 22365.042647457, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:50.670+00:00", "mono": 22365.045385194, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:51.667+00:00", "mono": 22366.042219692, "target": "node-01", "ok": false, "status": 503, "latency_ms": 3.0, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:51.669+00:00", "mono": 22366.043734821, "target": "node-02", "ok": false, "status": 503, "latency_ms": 1.3, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:51.671+00:00", "mono": 22366.045900437, "target": "node-03", "ok": false, "status": 503, "latency_ms": 2.1, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:52.666+00:00", "mono": 22367.041230103, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:52.669+00:00", "mono": 22367.043820327, "target": "node-02", "ok": false, "status": 503, "latency_ms": 2.5, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:52.671+00:00", "mono": 22367.045766572, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:53.666+00:00", "mono": 22368.040985783, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:53.669+00:00", "mono": 22368.043968198, "target": "node-02", "ok": false, "status": 502, "latency_ms": 2.9, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:53.671+00:00", "mono": 22368.046074306, "target": "node-03", "ok": false, "status": 503, "latency_ms": 2.0, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:54.666+00:00", "mono": 22369.041268271, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:54.667+00:00", "mono": 22369.042227793, "target": "node-02", "ok": false, "status": 502, "latency_ms": 0.8, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:54.669+00:00", "mono": 22369.043408176, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:55.666+00:00", "mono": 22370.040687588, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:46:55.666+00:00", "mono": 22370.041317685, "target": "node-02", "ok": false, "status": 502, "latency_ms": 0.5, "error": null, "body_head": ""}
+{"ts": "2026-10-18T12:46:55.670+00:00", "mono": 22370.045178716, "target": "node-03", "ok": true, "status": 200, "latency_ms": 3.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}

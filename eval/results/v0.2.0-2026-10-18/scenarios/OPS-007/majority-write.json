@@ -1,0 +1,12 @@
+{
+  "attempts": [
+    {
+      "t_rel_s": 0.0,
+      "rc": 0,
+      "err": "app wprobe-3c928725154b: committed to the cluster"
+    }
+  ],
+  "commit_s": 0.2,
+  "placed_s": 9.8,
+  "app": "wprobe-3c928725154b"
+}

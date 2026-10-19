@@ -1,0 +1,37 @@
+{
+  "product_key": "v0.2.0",
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "created": "2026-10-18T12:03:06.894+00:00",
+  "ca_fingerprint": "sha256:626676bcede20df67ee89b000cd755be5cdc2788b5d5c805f1bc85f9f8db8ce4",
+  "timings": {
+    "install_s": 88.4,
+    "token_after_start_s": 0.5,
+    "procedure_s": 103.4,
+    "formation_after_last_start_s": 13.0,
+    "total_s": 115.5
+  },
+  "health": {
+    "ts": "2026-10-18T12:03:06.017+00:00",
+    "nodes": {
+      "node-01": "alive",
+      "node-02": "alive",
+      "node-03": "alive"
+    },
+    "leaders": [
+      "node-01"
+    ],
+    "voters": [
+      "node-01",
+      "node-02",
+      "node-03"
+    ],
+    "voters_answering": [
+      "node-01",
+      "node-02",
+      "node-03"
+    ],
+    "unanswered": [],
+    "fenced": [],
+    "ok": true
+  }
+}

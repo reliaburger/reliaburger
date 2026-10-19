@@ -1,0 +1,5 @@
+deployment.apps/backend created (server dry run)
+service/backend created (server dry run)
+deployment.apps/frontend created (server dry run)
+service/frontend created (server dry run)
+ingress.networking.k8s.io/frontend-ingress created (server dry run)

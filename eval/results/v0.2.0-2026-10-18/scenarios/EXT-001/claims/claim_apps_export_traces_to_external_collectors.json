@@ -1,0 +1,37 @@
+{
+  "claim": {
+    "id": "claim_apps_export_traces_to_external_collectors",
+    "axis": "extensibility",
+    "statement": "Applications export traces to external collectors with standard OpenTelemetry SDKs, and egress is open unless an app lists what it may reach, so an app can reach a collector outside the cluster.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/whitepaper.md:991-991",
+        "quote": "Applications export traces to external collectors (Jaeger, Tempo, Datadog) using standard OpenTelemetry SDKs."
+      },
+      {
+        "ref": "docs/manual/03_networking.md:75-75",
+        "quote": "Egress is open unless an app lists what it may reach."
+      }
+    ],
+    "measurable": "An OpenTelemetry-instrumented fixture configured only through env vars in its app config sends spans for 100 uniquely tagged requests to a collector on the lab network.",
+    "interfaces": [
+      "[app.NAME.env] OTEL_EXPORTER_OTLP_ENDPOINT",
+      "[app.NAME.egress]"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_apps_export_traces_to_external_collectors",
+      "ref": "docs/whitepaper.md:991-991",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_apps_export_traces_to_external_collectors",
+      "ref": "docs/manual/03_networking.md:75-75",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

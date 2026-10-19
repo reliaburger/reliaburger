@@ -1,0 +1,84 @@
+{
+  "id": "EXT-004[app-ingress]",
+  "name": "Collect metrics through the application's own ingress at /metrics -- @1.3 ",
+  "feature": "features/extensibility/metrics_surfaces.feature",
+  "axis": "extensibility",
+  "claim_ids": [
+    "claim_app_metrics_scraping_and_extra_targets",
+    "claim_batteries_included",
+    "claim_no_prometheus_endpoint_remote_read_or_promql"
+  ],
+  "source_refs": [
+    "docs/manual/04_observability.md:140-140@v0.2.0",
+    "docs/manual/04_observability.md:179-179@v0.2.0",
+    "docs/design/metrics-mayo.md:45-45@v0.2.0",
+    "docs/design/metrics-mayo.md:122-122@v0.2.0",
+    "docs/manual/04_observability.md:177-177@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_app_metrics_scraping_and_extra_targets",
+    "axis_extensibility",
+    "claim_batteries_included",
+    "req_EXT-004",
+    "claim_no_prometheus_endpoint_remote_read_or_promql"
+  ],
+  "hypothesis": true,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:12:52.798+00:00",
+  "duration_ms": 718,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "prometheus_exposition": true
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:12:53.103+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-01": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-02"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "http_status": 200,
+    "content_type": null,
+    "prometheus_exposition": true
+  },
+  "evidence_paths": [
+    "scenarios/EXT-004[app-ingress]/claims/claim_app_metrics_scraping_and_extra_targets.json",
+    "scenarios/EXT-004[app-ingress]/claims/claim_batteries_included.json",
+    "scenarios/EXT-004[app-ingress]/claims/claim_no_prometheus_endpoint_remote_read_or_promql.json",
+    "scenarios/EXT-004[app-ingress]/cluster_state.json",
+    "scenarios/EXT-004[app-ingress]/response.txt"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [
+    "this is the application's own /metrics exposed through its public ingress; it carries no cluster or node metrics and is reachable by anyone who can reach the ingress"
+  ],
+  "deviations": [],
+  "classification": "workaround",
+  "confidence": "high",
+  "failed_step": null
+}

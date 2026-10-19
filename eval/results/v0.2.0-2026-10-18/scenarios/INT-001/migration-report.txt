@@ -1,0 +1,11 @@
+Converted:
+  + Namespace/rbeval-shop
+  + Deployment/backend → [app.backend]
+  + Deployment/frontend → [app.frontend]
+
+Approximated (review recommended):
+  ~ Deployment/frontend — env PODINFO_UI_MESSAGE uses valueFrom (secret/configmap/field ref) — set the value manually or use `relish secret encrypt`
+  ~ Deployment/frontend — env FIXTURE_TOKEN uses valueFrom (secret/configmap/field ref) — set the value manually or use `relish secret encrypt`
+  ~ ConfigMap/fixture-config — not referenced by any workload; import manually if needed
+  ~ Secret/fixture-secret — re-encrypt values with `relish secret encrypt`
+

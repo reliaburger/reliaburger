@@ -1,0 +1,149 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="network_perimeter.Network perimeter" tests="7" errors="0" failures="0" skipped="0" time="50.836591" timestamp="2026-10-18T14:28:14.244673" hostname="serval"><testcase classname="network_perimeter.Network perimeter" name="Port the API port 9117 as seen from the operator -- @1.1 " status="passed" time="0.682916"><system-out>
+
+@scenario.begin
+
+  @req_OPS-004 @claim_network_perimeter_firewall
+  Scenario Outline: Port the API port 9117 as seen from the operator -- @1.1 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.537s
+    And the native fixture application is running ... passed in 0.145s
+    And a probe source address for the operator ... passed in 0.000s
+    When I open a TCP connection to the API port 9117 on every node from that address ... passed in 0.001s
+    Then every node should answer open ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-004[operator-api]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="network_perimeter.Network perimeter" name="Port gossip port 9443 as seen from the operator -- @1.2 " status="passed" time="9.647549"><system-out>
+
+@scenario.begin
+
+  @req_OPS-004 @claim_network_perimeter_firewall
+  Scenario Outline: Port gossip port 9443 as seen from the operator -- @1.2 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.485s
+    And the native fixture application is running ... passed in 0.117s
+    And a probe source address for the operator ... passed in 0.000s
+    When I open a TCP connection to gossip port 9443 on every node from that address ... passed in 9.046s
+    Then every node should answer filtered ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-004[operator-gossip]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="network_perimeter.Network perimeter" name="Port Raft port 9444 as seen from the operator -- @1.3 " status="passed" time="9.757743"><system-out>
+
+@scenario.begin
+
+  @req_OPS-004 @claim_network_perimeter_firewall
+  Scenario Outline: Port Raft port 9444 as seen from the operator -- @1.3 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.574s
+    And the native fixture application is running ... passed in 0.138s
+    And a probe source address for the operator ... passed in 0.000s
+    When I open a TCP connection to Raft port 9444 on every node from that address ... passed in 9.046s
+    Then every node should answer filtered ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-004[operator-raft]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="network_perimeter.Network perimeter" name="Port reporting port 9445 as seen from the operator -- @1.4 " status="passed" time="9.80381"><system-out>
+
+@scenario.begin
+
+  @req_OPS-004 @claim_network_perimeter_firewall
+  Scenario Outline: Port reporting port 9445 as seen from the operator -- @1.4 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.581s
+    And the native fixture application is running ... passed in 0.178s
+    And a probe source address for the operator ... passed in 0.000s
+    When I open a TCP connection to reporting port 9445 on every node from that address ... passed in 9.045s
+    Then every node should answer filtered ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-004[operator-reporting]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="network_perimeter.Network perimeter" name="Port the API port 9117 as seen from a non-member -- @1.6 " status="passed" time="9.610076"><system-out>
+
+@scenario.begin
+
+  @req_OPS-004 @claim_network_perimeter_firewall
+  Scenario Outline: Port the API port 9117 as seen from a non-member -- @1.6 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.480s
+    And the native fixture application is running ... passed in 0.073s
+    And a probe source address for a non-member ... passed in 0.013s
+    When I open a TCP connection to the API port 9117 on every node from that address ... passed in 9.045s
+    Then every node should answer filtered ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-004[outsider-api]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="network_perimeter.Network perimeter" name="Port Raft port 9444 as seen from a non-member -- @1.7 " status="passed" time="9.762723"><system-out>
+
+@scenario.begin
+
+  @req_OPS-004 @claim_network_perimeter_firewall
+  Scenario Outline: Port Raft port 9444 as seen from a non-member -- @1.7 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.556s
+    And the native fixture application is running ... passed in 0.148s
+    And a probe source address for a non-member ... passed in 0.013s
+    When I open a TCP connection to Raft port 9444 on every node from that address ... passed in 9.045s
+    Then every node should answer filtered ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-004[outsider-raft]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="network_perimeter.Network perimeter" name="Port ingress port 80 as seen from a non-member -- @1.8 " status="passed" time="0.776656"><system-out>
+
+@scenario.begin
+
+  @req_OPS-004 @claim_network_perimeter_firewall
+  Scenario Outline: Port ingress port 80 as seen from a non-member -- @1.8 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.616s
+    And the native fixture application is running ... passed in 0.143s
+    And a probe source address for a non-member ... passed in 0.016s
+    When I open a TCP connection to ingress port 80 on every node from that address ... passed in 0.001s
+    Then every node should answer open ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-004[outsider-ingress]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase></testsuite>

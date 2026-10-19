@@ -1,0 +1,122 @@
+{
+  "id": "OPS-007",
+  "name": "One non-leader node is partitioned from its peers",
+  "feature": "features/operations/partition.feature",
+  "axis": "operations",
+  "claim_ids": [
+    "claim_partitions_no_split_brain_and_degradation",
+    "claim_self_healing"
+  ],
+  "source_refs": [
+    "docs/whitepaper.md:532-532@v0.2.0",
+    "docs/whitepaper.md:536-536@v0.2.0",
+    "docs/manual/08_five-minute-tour.md:164-164@v0.2.0",
+    "README.md:252-253@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "axis_operations",
+    "claim_partitions_no_split_brain_and_degradation",
+    "destructive",
+    "claim_self_healing",
+    "req_OPS-007"
+  ],
+  "hypothesis": false,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:31:21.107+00:00",
+  "duration_ms": 67944,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "majority_write_placed_s": "<= 20",
+    "minority_apply": "refused",
+    "minority_ingress_ratio": ">= 0.9",
+    "rejoin_s": "<= 120"
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:31:21.458+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-01": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-03"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "node_capacity": {
+      "node-01": {
+        "available_mib": 5430,
+        "cpus": 4
+      },
+      "node-02": {
+        "available_mib": 5216,
+        "cpus": 4
+      },
+      "node-03": {
+        "available_mib": 5442,
+        "cpus": 4
+      }
+    },
+    "partitioned": {
+      "node": "node-02",
+      "from": [
+        "10.77.0.11",
+        "10.77.0.13"
+      ],
+      "leader": "node-03"
+    },
+    "majority_write_placed_s": 9.8,
+    "majority_write_placement": {
+      "node-03": [
+        "default__wprobe-3c928725154b-0:running"
+      ]
+    },
+    "minority_apply": {
+      "rc": 1,
+      "secs": 0.1,
+      "stdout": "",
+      "stderr": "error: API error (status 503): {\"error\":\"no cluster leader known yet; retry shortly\"}"
+    },
+    "minority_ingress_ratio": 1.0,
+    "isolated_for_s": 60.0,
+    "rejoin_s": 2.5,
+    "leaders_after_heal": [
+      "node-03"
+    ],
+    "minority_app_exists_after_heal": false
+  },
+  "evidence_paths": [
+    "scenarios/OPS-007/claims/claim_partitions_no_split_brain_and_degradation.json",
+    "scenarios/OPS-007/claims/claim_self_healing.json",
+    "scenarios/OPS-007/cluster_state.json",
+    "scenarios/OPS-007/majority-write.json",
+    "scenarios/OPS-007/nodes-during-partition.txt",
+    "scenarios/OPS-007/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": null
+}

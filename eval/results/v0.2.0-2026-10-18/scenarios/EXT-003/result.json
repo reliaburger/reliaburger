@@ -1,0 +1,99 @@
+{
+  "id": "EXT-003",
+  "name": "A failed job run raises one signed webhook alert",
+  "feature": "features/extensibility/alert_webhooks.feature",
+  "axis": "extensibility",
+  "claim_ids": [
+    "claim_alert_webhooks_outbound",
+    "claim_batteries_included"
+  ],
+  "source_refs": [
+    "docs/manual/04_observability.md:188-188@v0.2.0",
+    "docs/design/metrics-mayo.md:375-375@v0.2.0",
+    "docs/design/metrics-mayo.md:373-373@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_alert_webhooks_outbound",
+    "reconfigures",
+    "axis_extensibility",
+    "claim_batteries_included",
+    "req_EXT-003"
+  ],
+  "hypothesis": true,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:03:38.689+00:00",
+  "duration_ms": 191891,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "delivery_s": "<= 90",
+    "alert_fields": "version 1, name job_run_failed, severity critical, status firing, timestamps set",
+    "signature_valid": true,
+    "job_run_failed_alerts": 1
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:03:39.044+00:00",
+      "nodes": {
+        "node-01": "alive",
+        "node-02": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "node_toml_changed": true,
+    "delivery_s": 10.5,
+    "requests_received": 1,
+    "alert_fields": {
+      "version": "1",
+      "alert.name": "job_run_failed",
+      "alert.severity": "critical",
+      "alert.status": "firing",
+      "alert.fired_at": 1792325153,
+      "cluster": "rbeval",
+      "timestamp": 1792325153
+    },
+    "signature_header_present": true,
+    "signature_valid": true,
+    "job_run_failed_alerts": 1
+  },
+  "evidence_paths": [
+    "scenarios/EXT-003/claims/claim_alert_webhooks_outbound.json",
+    "scenarios/EXT-003/claims/claim_batteries_included.json",
+    "scenarios/EXT-003/cluster_state.json",
+    "scenarios/EXT-003/receiver.jsonl",
+    "scenarios/EXT-003/run.txt",
+    "scenarios/EXT-003/alert-body.json",
+    "scenarios/EXT-003/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [
+    "HTTP receiver on 10.77.0.1:18090 (harness, stands in for a paging tool)",
+    "container registry: public.ecr.aws"
+  ],
+  "limitations": [],
+  "deviations": [],
+  "classification": "configured",
+  "confidence": "high",
+  "failed_step": null
+}

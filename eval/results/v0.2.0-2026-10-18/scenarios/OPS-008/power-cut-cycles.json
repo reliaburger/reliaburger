@@ -1,0 +1,35 @@
+[
+  {
+    "cycle": 1,
+    "node": "node-02",
+    "cut_at": "12:32:42",
+    "load": {
+      "applies_ok": 25,
+      "applies_failed": 0,
+      "deletes": 24
+    },
+    "rejoin_s": 11.8
+  },
+  {
+    "cycle": 2,
+    "node": "node-02",
+    "cut_at": "12:33:15",
+    "load": {
+      "applies_ok": 25,
+      "applies_failed": 0,
+      "deletes": 24
+    },
+    "rejoin_s": 11.8
+  },
+  {
+    "cycle": 3,
+    "node": "node-02",
+    "cut_at": "12:33:48",
+    "load": {
+      "applies_ok": 25,
+      "applies_failed": 0,
+      "deletes": 24
+    },
+    "rejoin_s": 11.7
+  }
+]

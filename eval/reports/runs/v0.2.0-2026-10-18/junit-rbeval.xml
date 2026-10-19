@@ -1,0 +1,212 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuites name="rbeval v0.2.0-2026-10-18">
+<testsuite name="extensibility" tests="26" failures="8" errors="0" skipped="4">
+<testcase classname="extensibility" name="EXT-003 A failed job run raises one signed webhook alert" time="191.891">
+</testcase>
+<testcase classname="extensibility" name="EXT-002[status] relish status honours --output json -- @1.1 commands the claim names" time="19.516">
+</testcase>
+<testcase classname="extensibility" name="EXT-002[nodes] relish nodes honours --output json -- @1.2 commands the claim names" time="0.885">
+</testcase>
+<testcase classname="extensibility" name="EXT-002[council] relish council honours --output json -- @1.3 commands the claim names" time="0.968">
+</testcase>
+<testcase classname="extensibility" name="EXT-002[tokens] relish token list honours --output json -- @1.4 commands the claim names" time="0.855">
+</testcase>
+<testcase classname="extensibility" name="EXT-002[audit] relish audit --since 1h honours --output json -- @1.5 commands the claim names" time="0.898">
+</testcase>
+<testcase classname="extensibility" name="EXT-002[inspect] relish inspect frontend honours --output json -- @2.1 other read commands under the global --output flag" time="4.558">
+<failure message="And its standard output should parse as JSON: AssertionError: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'App: frontend (namespace default)\n  Replicas:  3 desired, 3 running\n  Placed:    node-01 2, node-02 1\n\nInstance: default'">{"cluster_health_at_start": {"ts": "2026-10-18T12:07:14.071+00:00", "nodes": {"node-02": "alive", "node-03": "alive", "node-01": "alive"}, "leaders": ["node-01"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "exit_code": 0, "stdout_bytes": 541, "stdout_is_json": false, "stdout_head": "App: frontend (namespace default)\n  Replicas:  3 desired, 3 running\n  Placed:    node-01 2, node-02 1\n\nInstance: default__frontend-1\n  Node:      node-02\n  Namespace: default\n  State:     running\n  Re"}</failure>
+</testcase>
+<testcase classname="extensibility" name="EXT-002[routes] relish routes honours --output json -- @2.2 other read commands under the global --output flag" time="3.998">
+<failure message="And its standard output should parse as JSON: AssertionError: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'HOST                           PATH       APP             BACKENDS     WS    \nfixture.rbeval.test            /          '">{"cluster_health_at_start": {"ts": "2026-10-18T12:07:18.637+00:00", "nodes": {"node-02": "alive", "node-03": "alive", "node-01": "alive"}, "leaders": ["node-01"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "exit_code": 0, "stdout_bytes": 156, "stdout_is_json": false, "stdout_head": "HOST                           PATH       APP             BACKENDS     WS    \nfixture.rbeval.test            /          frontend        3/3          no    \n"}</failure>
+</testcase>
+<testcase classname="extensibility" name="EXT-002[resolve] relish resolve backend honours --output json -- @2.3 other read commands under the global --output flag" time="3.989">
+<failure message="And its standard output should parse as JSON: AssertionError: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'Service:  backend\nVIP:      127.128.131.21\nPort:     9898\nBackends: 2/2 healthy\n\n  INSTANCE             NODE            '">{"cluster_health_at_start": {"ts": "2026-10-18T12:07:22.608+00:00", "nodes": {"node-02": "alive", "node-03": "alive", "node-01": "alive"}, "leaders": ["node-01"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "exit_code": 0, "stdout_bytes": 330, "stdout_is_json": false, "stdout_head": "Service:  backend\nVIP:      127.128.131.21\nPort:     9898\nBackends: 2/2 healthy\n\n  INSTANCE             NODE               PORT     HEALTH  \n  default__backend-0   10.167.36.2        9898     healthy "}</failure>
+</testcase>
+<testcase classname="extensibility" name="EXT-002[faults] relish fault list honours --output json -- @2.4 other read commands under the global --output flag" time="4.751">
+<failure message="And its standard output should parse as JSON: AssertionError: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'No active faults\n'">{"cluster_health_at_start": {"ts": "2026-10-18T12:07:26.570+00:00", "nodes": {"node-02": "alive", "node-03": "alive", "node-01": "alive"}, "leaders": ["node-01"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "exit_code": 0, "stdout_bytes": 17, "stdout_is_json": false, "stdout_head": "No active faults\n"}</failure>
+</testcase>
+<testcase classname="extensibility" name="EXT-002[history] relish history frontend honours --output json -- @2.5 other read commands under the global --output flag" time="0.702">
+</testcase>
+<testcase classname="extensibility" name="EXT-002[jobs] relish jobs honours --output json -- @2.6 other read commands under the global --output flag" time="0.840">
+</testcase>
+<testcase classname="extensibility" name="EXT-002[images] relish images honours --output json -- @2.7 other read commands under the global --output flag" time="0.816">
+</testcase>
+<testcase classname="extensibility" name="EXT-002[top] relish top honours --output json -- @2.8 other read commands under the global --output flag" time="0.894">
+</testcase>
+<testcase classname="extensibility" name="EXT-002[metrics] relish metrics frontend honours --output json -- @2.9 other read commands under the global --output flag" time="0.785">
+</testcase>
+<testcase classname="extensibility" name="EXT-002[wtf] relish wtf honours --output json -- @2.10 other read commands under the global --output flag" time="2.521">
+</testcase>
+<testcase classname="extensibility" name="EXT-005[custom-kind] Extend the platform with a custom resource kind in the app config -- @1.1 " time="4.174">
+<skipped message="UNSUPPORTED: relish apply refuses a table it does not know: error: failed to parse TOML: TOML parse error at line 1, column 2&#10;  |&#10;1 | [widget.rbeval]&#10;  |  ^^^^^^&#10;unknown field `widget`, expected one of `app`, `job`, `namespace`, `permission`, `build`" />
+</testcase>
+<testcase classname="extensibility" name="EXT-005[cli-plugin] Extend the platform with a relish plugin executable on PATH -- @1.2 " time="3.840">
+<skipped message="UNSUPPORTED: relish does not dispatch relish-&lt;name&gt; executables on PATH: error: unrecognized subcommand 'rbevalhello'&#10;&#10;Usage: relish-linux-x86_64 [OPTIONS] [COMMAND]&#10;&#10;For more information, try '--help'." />
+</testcase>
+<testcase classname="extensibility" name="EXT-005[admission] Extend the platform with an admission or validation webhook -- @1.3 " time="3.694">
+<failure message="When I try to extend the platform with an admission or validation webhook: AssertionError: documentation mentions admission or validation hooks but the harness has no check: {'--help': ['lint               Validate a config file without deploying'], 'docs/manual/01_deploy-an-app.md': ['&quot;acknowledge replay before another admission&quot;.']}">{"cluster_health_at_start": {"ts": "2026-10-18T12:07:45.892+00:00", "nodes": {"node-02": "alive", "node-03": "alive", "node-01": "alive"}, "leaders": ["node-01"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "mechanism": "an admission or validation webhook"}</failure>
+</testcase>
+<testcase classname="extensibility" name="EXT-006 An external controller reconciles a custom spec over the API" time="34.617">
+<failure message="And the cluster event API should list events for the app: AssertionError: GET /v1/events returned None">{"cluster_health_at_start": {"ts": "2026-10-18T12:07:49.594+00:00", "nodes": {"node-02": "alive", "node-03": "alive", "node-01": "alive"}, "leaders": ["node-01"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "controller_converge_s": 12.7, "scale_down_observed": true, "drift_revert_s": 17.6, "events_status": null, "events_naming_app": 0}</failure>
+</testcase>
+<testcase classname="extensibility" name="EXT-001 Export application telemetry to an external collector" time="40.258">
+</testcase>
+<testcase classname="extensibility" name="EXT-008 The cluster follows commits, reverts drift and honours deletes" time="181.753">
+<failure message="Then the app should run with 2 replicas within the configured sync time: AssertionError: gitops-6f367e3a6ac8 not running with 2 replicas within 90 s of the commit">{"cluster_health_at_start": {"ts": "2026-10-18T12:09:04.543+00:00", "nodes": {"node-02": "alive", "node-03": "alive", "node-01": "alive"}, "leaders": ["node-01"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "node_toml_changed": true, "commit": "712ef7f99bbca69e8dbc8c08f9e1e0c28407583f", "sync_s": null}</failure>
+</testcase>
+<testcase classname="extensibility" name="EXT-007 Exported Parquet logs are readable by a standard tool" time="9.377">
+<failure message="When I export the logs of the node running it to the workstation with relish logs-export: AssertionError: relish logs-export exit 0, 0 files: ">{"cluster_health_at_start": {"ts": "2026-10-18T12:12:06.307+00:00", "nodes": {"node-02": "alive", "node-01": "alive", "node-03": "alive"}, "leaders": ["node-02"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "marker_node": "node-01", "export_rc": 0, "exported_files": [], "export_s": 0.3}</failure>
+</testcase>
+<testcase classname="extensibility" name="EXT-004[node-api] Collect metrics through the node API path /metrics -- @1.1 " time="33.555">
+<skipped message="UNSUPPORTED: no Prometheus surface: HTTP None; body starts 'URLError: &lt;urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Missing Authority Key Identifier (_ssl.c:1032)&gt;'" />
+</testcase>
+<testcase classname="extensibility" name="EXT-004[remote-read] Collect metrics through the node API path /v1/read -- @1.2 " time="3.918">
+<skipped message="UNSUPPORTED: no Prometheus surface: HTTP None; body starts 'URLError: &lt;urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Missing Authority Key Identifier (_ssl.c:1032)&gt;'" />
+</testcase>
+<testcase classname="extensibility" name="EXT-004[app-ingress] Collect metrics through the application's own ingress at /metrics -- @1.3 " time="0.718">
+</testcase>
+</testsuite>
+<testsuite name="interoperability" tests="21" failures="2" errors="0" skipped="0">
+<testcase classname="interoperability" name="INT-002[Deployment] Import a Deployment manifest -- @1.1 Documented as converted" time="0.206">
+</testcase>
+<testcase classname="interoperability" name="INT-002[StatefulSet] Import a StatefulSet manifest -- @1.2 Documented as converted" time="0.161">
+</testcase>
+<testcase classname="interoperability" name="INT-002[DaemonSet] Import a DaemonSet manifest -- @1.3 Documented as converted" time="0.145">
+</testcase>
+<testcase classname="interoperability" name="INT-002[Service] Import a Service manifest -- @1.4 Documented as converted" time="0.159">
+</testcase>
+<testcase classname="interoperability" name="INT-002[Ingress] Import a Ingress manifest -- @1.5 Documented as converted" time="0.158">
+</testcase>
+<testcase classname="interoperability" name="INT-002[HorizontalPodAutoscaler] Import a HorizontalPodAutoscaler manifest -- @1.6 Documented as converted" time="0.159">
+</testcase>
+<testcase classname="interoperability" name="INT-002[Job] Import a Job manifest -- @1.7 Documented as converted" time="0.150">
+</testcase>
+<testcase classname="interoperability" name="INT-002[CronJob] Import a CronJob manifest -- @1.8 Documented as converted" time="0.153">
+</testcase>
+<testcase classname="interoperability" name="INT-002[Namespace] Import a Namespace manifest -- @1.9 Documented as converted" time="0.157">
+</testcase>
+<testcase classname="interoperability" name="INT-002[ConfigMap] Import a ConfigMap manifest -- @2.1 Documented as not wired into workloads" time="0.157">
+</testcase>
+<testcase classname="interoperability" name="INT-002[Secret] Import a Secret manifest -- @2.2 Documented as not wired into workloads" time="0.153">
+</testcase>
+<testcase classname="interoperability" name="INT-002[NetworkPolicy] Import a NetworkPolicy manifest -- @3.1 Documented as dropped" time="0.156">
+</testcase>
+<testcase classname="interoperability" name="INT-002[PersistentVolumeClaim] Import a PersistentVolumeClaim manifest -- @3.2 Documented as dropped" time="0.154">
+</testcase>
+<testcase classname="interoperability" name="INT-002[CustomResourceDefinition] Import a CustomResourceDefinition manifest -- @3.3 Documented as dropped" time="0.156">
+</testcase>
+<testcase classname="interoperability" name="INT-002[CustomResource] Import a CustomResource manifest -- @3.4 Documented as dropped" time="0.155">
+</testcase>
+<testcase classname="interoperability" name="INT-002[ServiceAccount] Import a ServiceAccount manifest -- @3.5 Documented as dropped" time="0.153">
+</testcase>
+<testcase classname="interoperability" name="INT-002[Role] Import a Role manifest -- @3.6 Documented as dropped" time="0.153">
+</testcase>
+<testcase classname="interoperability" name="INT-001 Import a baseline Kubernetes application" time="37.267">
+</testcase>
+<testcase classname="interoperability" name="INT-003[podinfo-webapp] Import podinfo 6.15.0 deploy/webapp as published -- @1.1 " time="4.429">
+<failure message="When I apply them with relish apply -f in their own namespace: AssertionError: relish apply -f refused the upstream manifests: error: format failed: YAML parse error: duplicate entry with key &quot;apiVersion&quot; at line 19 column 1">{"cluster_health_at_start": {"ts": "2026-10-18T12:13:33.866+00:00", "nodes": {"node-02": "alive", "node-01": "alive", "node-03": "alive"}, "leaders": ["node-02"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "upstream_kinds": ["Deployment", "HorizontalPodAutoscaler", "Namespace", "RoleBinding", "Service", "ServiceAccount"], "upstream_documents": 9, "zero_touch_apply_rc": 1, "imported_apps": []}</failure>
+</testcase>
+<testcase classname="interoperability" name="INT-003[online-boutique] Import Online Boutique v0.10.7 as published -- @1.2 " time="621.365">
+<failure message="And every imported workload should be running within the configured time: AssertionError: not running after 600 s: boutique/loadgenerator">{"cluster_health_at_start": {"ts": "2026-10-18T12:13:38.364+00:00", "nodes": {"node-02": "alive", "node-01": "alive", "node-03": "alive"}, "leaders": ["node-02"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "upstream_kinds": ["Deployment", "Service", "ServiceAccount"], "upstream_documents": 35, "harness_isolation_edits": 1, "zero_touch_apply_rc": 0, "imported_apps": ["boutique/adservice", "boutique/cartservice", "boutique/checkoutservice", "boutique/currencyservice", "boutique/emailservice", "boutique/frontend", "boutique/loadgenerator", "boutique/paymentservice", "boutique/productcatalogservice", "boutique/recommendationservice", "boutique/redis-cart", "boutique/shippingservice"], "report_counts": {"converted": 13, "merged into the app (no report line)": 9, "dropped": 11, "approximated": 3}, "silently_dropped": [], "workloads_running": "11 of 12", "workload_progress": {"boutique/adservice": {"want": 1, "running": 1}, "boutique/cartservice": {"want": 1, "running": 1}, "boutique/checkoutservice": {"want": 1, "running": 1}, "boutique/currencyservice": {"want": 1, "running": 1}, "boutique/emailservice": {"want": 1, "running": 1}, "boutique/frontend": {"want": 1, "running": 1}, "boutique/loadgenerator": {"want": 1, "running": 0}, "boutique/paymentservice": {"want": 1, "running": 1}, "boutique/productcatalogservice": {"want": 1, "running": 1}, "boutique/recommendationservice": {"want": 1, "running": 1}, "boutique/redis-cart": {"want": 1, "running": 1}, "boutique/shippingservice": {"want": 1, "running": 1}}, "all_running_s": null}</failure>
+</testcase>
+<testcase classname="interoperability" name="INT-004 A Reliaburger app exported to Kubernetes YAML runs on Kubernetes" time="11.746">
+</testcase>
+</testsuite>
+<testsuite name="operations" tests="30" failures="6" errors="7" skipped="0">
+<testcase classname="operations" name="OPS-003[readonly-status] A read-only token scoped to all tries to read cluster status -- @1.1 " time="5.834">
+<error message="setup: And a read-only API token scoped to all: CommandFailed: command failed rc=1: relish token create --name rbeval-read-only-52af59fda403 --role read-only  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout: " />
+</testcase>
+<testcase classname="operations" name="OPS-003[readonly-apply] A read-only token scoped to all tries to apply an app in rbeval-rbac -- @1.2 " time="4.033">
+<error message="setup: And a read-only API token scoped to all: CommandFailed: command failed rc=1: relish token create --name rbeval-read-only-46cbe2fd3f3f --role read-only  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout: " />
+</testcase>
+<testcase classname="operations" name="OPS-003[deployer-apply-own] A deployer token scoped to rbeval-rbac tries to apply an app in rbeval-rbac -- @1.3 " time="7.749">
+<error message="setup: And a deployer API token scoped to rbeval-rbac: CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-7d471c7a736a --role deployer --namespaces rbeval-rbac  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout: " />
+</testcase>
+<testcase classname="operations" name="OPS-003[deployer-apply-other] A deployer token scoped to rbeval-rbac tries to apply an app in default -- @1.4 " time="4.129">
+<error message="setup: And a deployer API token scoped to rbeval-rbac: CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-506b6b5e3390 --role deployer --namespaces rbeval-rbac  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout: " />
+</testcase>
+<testcase classname="operations" name="OPS-003[deployer-see-other] A deployer token scoped to rbeval-rbac tries to inspect an app in default -- @1.5 " time="4.362">
+<error message="setup: And a deployer API token scoped to rbeval-rbac: CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-dd90bdee7a0d --role deployer --namespaces rbeval-rbac  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout: " />
+</testcase>
+<testcase classname="operations" name="OPS-003[deployer-tokens] A deployer token scoped to all tries to create an API token -- @1.6 " time="4.146">
+<error message="setup: And a deployer API token scoped to all: CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-d88f91afdd67 --role deployer  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout: " />
+</testcase>
+<testcase classname="operations" name="OPS-003[deployer-namespace] A deployer token scoped to all tries to apply a namespace block -- @1.7 " time="4.483">
+<error message="setup: And a deployer API token scoped to all: CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-207b5bf27f83 --role deployer  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout: " />
+</testcase>
+<testcase classname="operations" name="OPS-005[kill-one] relish fault kill frontend --count 1 --acknowledge as admin -- @1.1 " time="21.140">
+</testcase>
+<testcase classname="operations" name="OPS-005[kill-all] relish fault kill frontend --count 3 --acknowledge as admin -- @1.2 " time="4.368">
+</testcase>
+<testcase classname="operations" name="OPS-005[no-ack] relish fault kill frontend --count 1 as admin -- @1.3 " time="4.653">
+</testcase>
+<testcase classname="operations" name="OPS-005[pause-all] relish fault pause frontend --acknowledge as admin -- @1.4 " time="4.647">
+</testcase>
+<testcase classname="operations" name="OPS-005[readonly-kill] relish fault kill frontend --count 1 --acknowledge as read-only -- @1.5 " time="5.800">
+<failure message="When I request the fault &quot;kill frontend --count 1 --acknowledge&quot; with a read-only token: CommandFailed: command failed rc=1: relish token create --name rbeval-read-only-1ab6c349b86d --role read-only  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout: ">{"cluster_health_at_start": {"ts": "2026-10-18T12:25:20.948+00:00", "nodes": {"node-02": "alive", "node-01": "alive", "node-03": "alive"}, "leaders": ["node-02"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}}</failure>
+</testcase>
+<testcase classname="operations" name="OPS-005[leader-node-kill] relish fault node-kill LEADER --acknowledge as admin -- @1.6 " time="4.565">
+</testcase>
+<testcase classname="operations" name="OPS-009 Every node loses power at once and is powered on again" time="52.414">
+<failure message="And the applied apps should still be defined: AssertionError: running after power cycle: {'backend': 1, 'frontend': 1}">{"cluster_health_at_start": {"ts": "2026-10-18T12:25:31.291+00:00", "nodes": {"node-02": "alive", "node-01": "alive", "node-03": "alive"}, "leaders": ["node-02"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "node_capacity": {"node-01": {"available_mib": 5259, "cpus": 4}, "node-02": {"available_mib": 5352, "cpus": 4}, "node-03": {"available_mib": 5192, "cpus": 4}}, "powered_off": {"node-01": "shut off", "node-02": "shut off", "node-03": "shut off"}, "council_healthy_s": 12.7, "health_after": {"ts": "2026-10-18T12:25:58.583+00:00", "nodes": {"node-03": "alive", "node-01": "alive", "node-02": "alive"}, "leaders": ["node-02"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "fixture_serving_s": 32.7, "fixture_before": {"backend": {"node-01": ["default__backend-1:running"], "node-03": ["default__backend-0:running"]}, "frontend": {"node-01": ["default__frontend-0:running"], "node-02": ["default__frontend-2:running"], "node-03": ["default__frontend-1:running"]}}, "fixture_after": {"backend": {"node-01": ["default__backend-1:running"], "node-03": ["default__backend-0:preparing"]}, "frontend": {"node-01": ["default__frontend-0:health-wait"], "node-02": ["default__frontend-2:running"]}}, "running_after": {"backend": 1, "frontend": 1}}</failure>
+</testcase>
+<testcase classname="operations" name="OPS-006 Writes resume after the council leader loses power" time="55.330">
+<failure message="Then a new leader should be elected within the configured election target: AssertionError: election took 11.6 s &gt; 5 s">{"cluster_health_at_start": {"ts": "2026-10-18T12:26:23.732+00:00", "nodes": {"node-03": "alive", "node-01": "alive", "node-02": "alive"}, "leaders": ["node-02"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "node_capacity": {"node-01": {"available_mib": 5350, "cpus": 4}, "node-02": {"available_mib": 5394, "cpus": 4}, "node-03": {"available_mib": 5392, "cpus": 4}}, "probe_before_fault": {"count": 15, "ok": 15, "ratio": 1.0, "longest_failure_streak": 0, "p50_ms": 2.3, "p99_ms": 3.3, "errors": []}, "power_off": {"node": "node-02", "rc": 0, "ts": "2026-10-18T12:26:41.198+00:00"}, "election_s": 11.6, "new_leader": "node-01", "node-02_rejoined_after_power_on_s": 11.9}</failure>
+</testcase>
+<testcase classname="operations" name="OPS-004[operator-api] Port the API port 9117 as seen from the operator -- @1.1 " time="0.685">
+</testcase>
+<testcase classname="operations" name="OPS-004[operator-gossip] Port gossip port 9443 as seen from the operator -- @1.2 " time="9.649">
+</testcase>
+<testcase classname="operations" name="OPS-004[operator-raft] Port Raft port 9444 as seen from the operator -- @1.3 " time="9.759">
+</testcase>
+<testcase classname="operations" name="OPS-004[operator-reporting] Port reporting port 9445 as seen from the operator -- @1.4 " time="9.805">
+</testcase>
+<testcase classname="operations" name="OPS-004[outsider-api] Port the API port 9117 as seen from a non-member -- @1.6 " time="9.627">
+</testcase>
+<testcase classname="operations" name="OPS-004[outsider-raft] Port Raft port 9444 as seen from a non-member -- @1.7 " time="9.779">
+</testcase>
+<testcase classname="operations" name="OPS-004[outsider-ingress] Port ingress port 80 as seen from a non-member -- @1.8 " time="0.791">
+</testcase>
+<testcase classname="operations" name="OPS-001[worker] Recover replicas after a non-leader node is forcibly stopped -- @1.1 " time="87.927">
+</testcase>
+<testcase classname="operations" name="OPS-001[leader] Recover replicas after a council-leader node is forcibly stopped -- @1.2 " time="98.927">
+<failure message="And the application should satisfy the configured availability threshold during recovery: AssertionError: availability 0.9412 &lt; 0.95 ({'count': 68, 'ok': 64, 'ratio': 0.9412, 'longest_failure_streak': 2, 'p50_ms': 2.1, 'p99_ms': 3.7, 'errors': ['TimeoutError: timed out']})">{"cluster_health_at_start": {"ts": "2026-10-18T12:29:42.545+00:00", "nodes": {"node-03": "alive", "node-01": "alive", "node-02": "alive"}, "leaders": ["node-01"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "node_capacity": {"node-01": {"available_mib": 5273, "cpus": 4}, "node-02": {"available_mib": 5356, "cpus": 4}, "node-03": {"available_mib": 5435, "cpus": 4}}, "placement_before": {"node-01": ["default__frontend-0:running", "default__frontend-2:running"], "node-02": ["default__frontend-1:running"]}, "probe_before_fault": {"count": 15, "ok": 15, "ratio": 1.0, "longest_failure_streak": 0, "p50_ms": 2.2, "p99_ms": 2.9, "errors": []}, "victim": {"node": "node-01", "role": "council-leader", "leader_before": "node-01", "replicas": ["default__frontend-0:running", "default__frontend-2:running"]}, "power_off": {"command": "virsh -c qemu:///system destroy rbeval-node-01", "rc": 0, "ts": "2026-10-18T12:29:51.383+00:00"}, "detection_s": 0.6, "detected_state": "suspect", "new_leader_observed_s": 5.9, "new_leader": ["node-03"], "recovery_s": 39.6, "placement_after": {"node-02": ["default__frontend-0:running", "default__frontend-1:running", "default__frontend-2:running"]}, "availability_via_survivors": {"count": 68, "ok": 64, "ratio": 0.9412, "longest_failure_streak": 2, "p50_ms": 2.1, "p99_ms": 3.7, "errors": ["TimeoutError: timed out"]}, "availability_per_ingress": {"node-01": {"count": 34, "ok": 0, "ratio": 0.0, "longest_failure_streak": 34, "p50_ms": null, "p99_ms": null, "errors": ["OSError: [Errno 113] No route to host", "TimeoutError: timed out"]}, "node-02": {"count": 34, "ok": 32, "ratio": 0.9412, "longest_failure_streak": 2, "p50_ms": 2.0, "p99_ms": 3.2, "errors": ["TimeoutError: timed out"]}, "node-03": {"count": 34, "ok": 32, "ratio": 0.9412, "longest_failure_streak": 2, "p50_ms": 2.3, "p99_ms": 3.7, "errors": ["TimeoutError: timed out"]}}, "node-01_rejoined_after_power_on_s": 14.0}</failure>
+</testcase>
+<testcase classname="operations" name="OPS-007 One non-leader node is partitioned from its peers" time="67.944">
+</testcase>
+<testcase classname="operations" name="OPS-008 A council voter loses power repeatedly while the cluster takes writes" time="117.399">
+</testcase>
+<testcase classname="operations" name="OPS-002[settled] Delete and re-apply the fixture after relish status shows no instances -- @1.1 " time="169.741">
+</testcase>
+<testcase classname="operations" name="OPS-002[immediate] Delete and re-apply the fixture immediately after relish delete returns -- @1.2 " time="547.705">
+<failure message="Then every cycle should reach the desired replicas within the configured convergence timeout: AssertionError: cycle 4 of 5 never converged; instances: ['node-01:default__backend-g3-0:running', 'node-01:default__backend-g5-0:stopped', 'node-01:default__frontend-g2-0:stopped', 'node-02:default__backend-1:running', 'node-02:default__frontend-g3-1:stopped', 'node-02:default__frontend-g4-1:stopped', 'node-03:default__frontend-2:running']">{"cluster_health_at_start": {"ts": "2026-10-18T12:37:16.524+00:00", "nodes": {"node-01": "alive", "node-02": "alive", "node-03": "alive"}, "leaders": ["node-03"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "placement_before": {"backend": {"node-01": ["default__backend-0:running"], "node-02": ["default__backend-1:running"]}, "frontend": {"node-01": ["default__frontend-0:running"], "node-02": ["default__frontend-1:running"], "node-03": ["default__frontend-2:running"]}}, "cycles_attempted": 4, "cycles_converged": 3, "converged_s_per_cycle": [0.1, 18.1, 0.1, null], "recovery": {"restarted_nodes": ["node-01", "node-02"]}}</failure>
+</testcase>
+<testcase classname="operations" name="OPS-010 A healthy change rolls out without downtime" time="32.487">
+<failure message="And availability during the rollout should meet the configured threshold: AssertionError: availability {'count': 39, 'ok': 30, 'ratio': 0.7692, 'longest_failure_streak': 3, 'p50_ms': 1.9, 'p99_ms': 2.9, 'errors': ['503']}">{"cluster_health_at_start": {"ts": "2026-10-18T12:46:24.232+00:00", "nodes": {"node-01": "alive", "node-02": "alive", "node-03": "alive"}, "leaders": ["node-03"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "probe_before_fault": {"count": 15, "ok": 15, "ratio": 1.0, "longest_failure_streak": 0, "p50_ms": 1.9, "p99_ms": 4.0, "errors": []}, "rollout_complete_s": 12.3, "availability_during_rollout": {"count": 39, "ok": 30, "ratio": 0.7692, "longest_failure_streak": 3, "p50_ms": 1.9, "p99_ms": 2.9, "errors": ["503"]}}</failure>
+</testcase>
+<testcase classname="operations" name="OPS-011 A change whose health check never passes is rolled back" time="80.053">
+</testcase>
+</testsuite>
+<testsuite name="vision" tests="9" failures="2" errors="0" skipped="0">
+<testcase classname="vision" name="VIS-002[secrets] The built-in secrets works with nothing else installed -- @1.1 secrets" time="179.897">
+</testcase>
+<testcase classname="vision" name="VIS-002[registry] The built-in registry works with nothing else installed -- @2.1 registry" time="1.041">
+</testcase>
+<testcase classname="vision" name="VIS-002[metrics] The built-in metrics works with nothing else installed -- @3.1 metrics" time="0.863">
+</testcase>
+<testcase classname="vision" name="VIS-002[top] The built-in resource top works with nothing else installed -- @3.2 metrics" time="0.764">
+</testcase>
+<testcase classname="vision" name="VIS-002[logs] The built-in logs works with nothing else installed -- @4.1 logs" time="15.941">
+</testcase>
+<testcase classname="vision" name="VIS-002[batch] The built-in task array works with nothing else installed -- @5.1 batch" time="16.038">
+</testcase>
+<testcase classname="vision" name="VIS-002[dashboard] The built-in dashboard works with nothing else installed -- @6.1 dashboard" time="5.111">
+<failure message="Then it should give the documented result within the configured time: AssertionError: GET loopback dashboard: 403">{"cluster_health_at_start": {"ts": "2026-10-18T12:00:35.641+00:00", "nodes": {"node-01": "alive", "node-02": "alive", "node-03": "alive"}, "leaders": ["node-01"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "dashboard_status": 403, "dashboard_ready_s": 0.0, "dashboard_is_html": false, "result": "GET loopback dashboard: 403", "documented_result": false}</failure>
+</testcase>
+<testcase classname="vision" name="VIS-002[audit] The built-in audit log works with nothing else installed -- @7.1 audit" time="4.075">
+<failure message="Then it should give the documented result within the configured time: AssertionError: 0 audit line(s) name the fixture's frontend">{"cluster_health_at_start": {"ts": "2026-10-18T12:00:40.743+00:00", "nodes": {"node-01": "alive", "node-02": "alive", "node-03": "alive"}, "leaders": ["node-01"], "voters": ["node-01", "node-02", "node-03"], "voters_answering": ["node-01", "node-02", "node-03"], "unanswered": [], "fenced": [], "ok": true}, "audit_lines_naming_frontend": 0, "result": "0 audit line(s) name the fixture's frontend", "documented_result": false}</failure>
+</testcase>
+<testcase classname="vision" name="VIS-001 Bootstrap and serve a multi-service application" time="174.146">
+</testcase>
+</testsuite>
+</testsuites>

@@ -1,0 +1,8 @@
+# The same app in namespace default, outside the scoped tokens' reach.
+[app.rbacprobe-default]
+image = "ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da"
+command = ["./podinfo", "--port=9898", "--level=info"]
+replicas = 1
+port = 9898
+cpu = "50m-500m"
+memory = "32Mi-128Mi"
