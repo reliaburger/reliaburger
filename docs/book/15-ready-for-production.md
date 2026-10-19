@@ -1103,6 +1103,22 @@ has no HTTP version setting, so registry pulls offer HTTP/2 and use it when the 
 agrees. Chapter 1 shows the code. A test pins the HTTP/2 offer, so the difference stays a
 known one rather than a surprise.
 
+The `sha2` bump from 0.10 to 0.11 had the opposite risk. RustCrypto's hash crates move
+together on a shared `digest` trait crate, and 0.11 swapped the fixed-size array type a
+hash returns: `generic-array` gave way to `hybrid-array`. Code that hex-encodes the
+result or turns it into a `[u8; 32]` either compiles or it doesn't. But SHA-256 is
+everywhere in Reliaburger: image and blob digests, the self-upgrade binary hash in every
+signature envelope, the Raft snapshot checksum, the export checkpoint's file ids. Every
+one of those is stored or compared with a value written by an older build, so a digest
+that came out different would be an outage, not a compile error. Most of the existing
+tests compared one hash with another computed by the same code, and that proves nothing
+across an upgrade. So the PR first pinned each use to a *known answer*: the published
+SHA-256 test vector for `"abc"`, `ba7816bf…20015ad`, or a fixed input with its digest
+worked out once, outside our code. Those tests passed on 0.10 before the version moved, and
+they'd fail the moment a new crate changed a single byte. The HMACs on gossip and webhooks
+and the API-token hash never moved: they use `ring`, whose `hmac::verify` already
+compares tags in constant time.
+
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
 ## Asking the cluster what it can do

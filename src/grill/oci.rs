@@ -933,6 +933,14 @@ mod tests {
     use super::*;
     use crate::config::types::{ConfigFileSpec, VolumeSpec};
 
+    #[test]
+    fn inline_config_file_name_is_the_first_eight_bytes_of_the_path_digest() {
+        assert_eq!(
+            inline_config_file_name(Path::new("/etc/app.conf")),
+            "8670dcb679766bcc"
+        );
+    }
+
     fn minimal_app() -> AppSpec {
         toml::from_str(r#"image = "test:v1""#).unwrap()
     }

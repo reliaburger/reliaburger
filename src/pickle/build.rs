@@ -209,7 +209,7 @@ pub fn tar_context(context_dir: &Path) -> Result<Vec<u8>, BuildError> {
 pub fn digest_of(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(data);
-    format!("sha256:{hash:x}")
+    format!("sha256:{}", hex::encode(hash))
 }
 
 /// Prepare a buildah build job from a BuildSpec.
@@ -1208,6 +1208,14 @@ mod tests {
     #[test]
     fn digest_of_different_data_differs() {
         assert_ne!(digest_of(b"hello"), digest_of(b"world"));
+    }
+
+    #[test]
+    fn digest_of_matches_the_fips_known_answer() {
+        assert_eq!(
+            digest_of(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     // --- execute_build ---

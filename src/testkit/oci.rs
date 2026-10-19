@@ -23,7 +23,7 @@ pub struct SyntheticImage {
 
 /// `sha256:<hex>` for `data`, the digest form the registry keys blobs by.
 pub fn sha256_digest(data: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(data))
+    format!("sha256:{}", hex::encode(Sha256::digest(data)))
 }
 
 /// One gzipped tar layer carrying a single marker file.
