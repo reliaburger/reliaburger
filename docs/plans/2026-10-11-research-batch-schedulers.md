@@ -423,8 +423,9 @@ Across all these projects, the complaints group into five themes:
 
 ## Where Reliaburger stands
 
-On `main`, 0.2.0 ("A million jobs") has its task-array foundation and common
-job lifecycle merged but isn't released.
+0.2.0 ("A million jobs"), with the task-array foundation and the common job
+lifecycle, was released on 16 October 2026, after this research was written.
+The rows below were rechecked against it on 19 October.
 
 ### What we already do better
 
@@ -453,9 +454,9 @@ Against the best of each family:
 
 | Capability | Best in class | Reliaburger on `main` |
 |---|---|---|
-| GPUs | Slurm GRES with MIG; KAI fractions | Refused for jobs; the leader sets every node's GPUs to 0 (`src/cluster/orchestrate.rs`). F01, [#359](https://github.com/reliaburger/reliaburger/issues/359) |
+| GPUs | Slurm GRES with MIG; KAI fractions | Refused for apps and jobs; the leader sets every node's GPUs to 0 (`src/cluster/orchestrate.rs`). F01, [#359](https://github.com/reliaburger/reliaburger/issues/359) |
 | Queues with weights | Armada, Kueue, Slurm partitions | One chunk queue per array |
-| Fair share | Slurm's account tree; Armada's DRF; KAI's time-based | FIFO per node. Namespace quotas for jobs are coming in 0.2.0 ([#679](https://github.com/reliaburger/reliaburger/issues/679)) |
+| Fair share | Slurm's account tree; Armada's DRF; KAI's time-based | FIFO per node, no DRF. Since 0.2.0, namespace quotas and per-namespace run caps hold jobs too ([#679](https://github.com/reliaburger/reliaburger/issues/679)) |
 | Backfill | Slurm | No |
 | Priority and preemption | Slurm, Armada, Volcano | None |
 | Gangs | Volcano, KAI, Ray placement groups | None |
@@ -463,23 +464,23 @@ Against the best of each family:
 | Retries by failure kind | Armada, AWS Batch | One attempt budget per array |
 | Array dependencies | AWS `N_TO_N`, Azure ranges, Slurm `afterok` | None |
 | Partial success | Flyte `min_success_ratio` | `max_failed_indexes` stops an array, but can't succeed one |
-| Usage accounting | `sacct` | Aggregate counts in Brioche |
+| Usage accounting | `sacct` | Per-node job metrics in Mayo (outcomes, CPU, memory); no resource-hours by team |
 | Clients and integrations | Armada's six SDKs; AWS Batch in Airflow and Nextflow | HTTP API and `relish`; no OpenAPI spec |
 | Multi-cluster | Armada, MultiKueue, Slurm federation | None; Franchise is v2 ([#711](https://github.com/reliaburger/reliaburger/issues/711)) |
-| Proven throughput | Slurm 500 jobs/s validated; Nomad ~1,500/s claimed | Unqualified ([#640](https://github.com/reliaburger/reliaburger/issues/640), [#668](https://github.com/reliaburger/reliaburger/issues/668)) |
+| Proven throughput | Slurm 500 jobs/s validated; Nomad ~1,500/s claimed | 4,600 accepted a second for 12 hours on three VMs on one laptop, with apps and faults ([#668](https://github.com/reliaburger/reliaburger/issues/668), [record](../qualification/2026-10-17-v0.2.0-job-qualification.md)) |
 | Proven scale | Slurm and Armada at tens of thousands of nodes | Three-node clusters |
 | Adopters | Everyone above | None yet |
 
-The last three rows matter most and no milestone fixes them quickly. Our
-real-container evidence ([qualification](../qualification/2026-10-04-delegated-jobs/README.md)) is 1,064 tasks in 747 seconds on a 4-vCPU VM with a
-debug build. That shows correctness, not throughput.
+The last three rows matter most. 0.2.0's exit gate met its daily throughput
+target, but only on three nodes; scale and adopters have no milestone that
+fixes them quickly.
 
 We also found a stale claim of our own. `docs/design/scheduler-meat.md` §9.1
 has a "Measured (12-node bench)" column with 2,847 jobs/s. No qualification
-record supports it, and 0.2.0's own docs say throughput is unqualified. The
+record supports it, and 0.2.0's measured rate came from three nodes. The
 whitepaper honesty pass
-([#690](https://github.com/reliaburger/reliaburger/issues/690)) should remove
-or relabel it.
+([#690](https://github.com/reliaburger/reliaburger/issues/690)) closed without
+changing it, so it still needs removing or relabelling.
 
 ## What we won't do
 
@@ -513,12 +514,12 @@ Three releases, after the migration releases (0.4.0, 0.4.1 and 0.5.0), each
 with one headline in the usual style: GPUs, then pipelines, then fair share.
 Pipelines come before fair share because they bring users in through Airflow
 and Nextflow; fair share is what keeps them once a second team shares the
-cluster. The throughput qualification already in
-0.2.0 ([#640](https://github.com/reliaburger/reliaburger/issues/640),
+cluster. The throughput qualification
+([#640](https://github.com/reliaburger/reliaburger/issues/640),
 [#668](https://github.com/reliaburger/reliaburger/issues/668),
 [#680](https://github.com/reliaburger/reliaburger/issues/680)) and namespace
 quotas for jobs ([#679](https://github.com/reliaburger/reliaburger/issues/679))
-come first; without numbers there's nothing to compare.
+came first and shipped in 0.2.0; without numbers there's nothing to compare.
 
 ### 0.6.0: GPUs
 
