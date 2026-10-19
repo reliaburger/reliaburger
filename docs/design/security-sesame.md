@@ -482,7 +482,7 @@ pub enum AgeKeyScope {
     /// Cluster-wide default keypair.
     ClusterWide,
 
-    /// Namespace-scoped keypair (planned — no code creates one yet; see §5.5).
+    /// Namespace-scoped keypair, for a namespace with `secret_key = true` (§5.5).
     Namespace(String),
 }
 ```
@@ -1542,7 +1542,7 @@ council_size = 3
 
 **Response:**
 
-1. Immediately run `relish ca rotate` for the compromised CA. **(Planned — CA rotation is not implemented yet, §5.8. Until it ships, the practical response is CRL-revoking affected certificates and, in the worst case, re-bootstrapping the PKI.)**
+1. Immediately run `relish ca rotate --role ROLE --root-backup FILE` for the compromised intermediate CA (§5.8). Root rotation is planned ([#362](https://github.com/reliaburger/reliaburger/issues/362)).
 2. Revoke all certificates issued by the compromised CA (via the CRL, §5.7).
 3. The dual-signing period ensures existing legitimate certificates continue working during the transition.
 4. Investigate how the key was exfiltrated. Council nodes should have restricted access. At-rest encryption covers Raft log entries only, under the master key on the same host (§5.6); TPM sealing is planned hardening, not yet active.
@@ -1661,9 +1661,9 @@ The threat model assumes:
 **Response:**
 
 1. Isolate the compromised council node immediately.
-2. Rotate all intermediate CAs: `relish ca rotate`. **(Planned — not implemented, §5.8.)**
+2. Rotate all intermediate CAs: `relish ca rotate --role ROLE --root-backup FILE` for each role (§5.8).
 3. Rotate the age keypair: `relish secret rotate`.
-4. Rotate the OIDC signing keypair (re-minting all JWTs).
+4. Rotate the OIDC signing keypair, re-minting all JWTs. **(Planned, [#709](https://github.com/reliaburger/reliaburger/issues/709): there's no OIDC key rotation yet.)**
 5. Rotate all API tokens.
 6. Audit all cluster activity during the compromise window: `relish audit --cluster --since <start> --until <end>` lists every node's records, with the principal and source address of each action (§5.11). Read the compromised node's log before you rebuild it; there is no central copy yet.
 7. Investigate the attack vector and harden council node access.

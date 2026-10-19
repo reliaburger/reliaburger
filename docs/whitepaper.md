@@ -1038,17 +1038,17 @@ The following features are intentionally excluded from Reliaburger v1. Each is a
 
 Reliaburger provides bidirectional Kubernetes migration tooling. Neither direction is a perfect translation (the systems have different abstractions), but the goal is to preserve as much as possible and clearly report what was lost.
 
-**Importing from Kubernetes** (`relish import`) converts Kubernetes YAML into Reliaburger TOML. The importer correlates related resources automatically: a Deployment + Service + Ingress + HPA that Kubernetes treats as four separate objects becomes a single `[app.*]` block in TOML. Today it groups them by name: a Service with the Deployment's name, an Ingress whose backend names that Service, and an HPA whose scale target names the Deployment. Matching on label selectors, the way Kubernetes itself does, is planned ([#703](https://github.com/reliaburger/reliaburger/issues/703)). Every import produces a migration report with three sections: what was converted directly, what was approximated (review recommended), and what was dropped (no Reliaburger equivalent) with guidance on alternatives.
+**Importing from Kubernetes** (`relish import`) converts Kubernetes YAML into Reliaburger TOML. The importer correlates related resources automatically: a Deployment + Service + Ingress + HPA that Kubernetes treats as four separate objects becomes a single `[app.*]` block in TOML. It matches them the way Kubernetes routes them, within one namespace: a Service attaches to every workload whose pod template labels include its selector, an Ingress follows its backend Service to that workload, and an HPA joins the workload its scale target names. Everything is keyed by namespace and name, so same-named resources in two namespaces never overwrite each other. A ConfigMap a workload reads with `envFrom` is flattened into its env, and a Job's `backoffLimit` and `activeDeadlineSeconds` become its attempt limit and timeout. Every import produces a migration report with three sections: what was converted directly, what was approximated (review recommended), and what was dropped (no Reliaburger equivalent) with guidance on alternatives.
 
 ```bash
 # From files (repeat -f for multiple manifests)
 relish import -f deployment.yaml -f service.yaml
 
-# Fail on any conversion warning (CI gate)
+# Fail if anything was approximated or dropped (CI gate)
 relish import -f deployment.yaml --strict
 ```
 
-**Exporting to Kubernetes** (`relish export`) generates standard Kubernetes manifests from Reliaburger configuration. Each `[app.*]` produces a Deployment + Service, plus Ingress and HPA if the app defines ingress and autoscale blocks. Each `[job.*]` produces a Job or CronJob. Features with no Kubernetes equivalent (auto-rollback, Smoker fault rules, process workloads) are noted in the export report.
+**Exporting to Kubernetes** (`relish export`) generates standard Kubernetes manifests from Reliaburger configuration. Each `[app.*]` produces a Deployment + Service, plus Ingress and HPA if the app defines ingress and autoscale blocks. Each `[job.*]` produces a Job or CronJob. Containers keep their command, arguments, working directory and user. Features with no Kubernetes equivalent (auto-rollback, Smoker fault rules, process workloads) are noted in the export report, and so is every encrypted env value, which exports as a placeholder that needs a Kubernetes Secret.
 
 ```bash
 relish export -f myapp.toml > k8s-manifests.yaml
@@ -1203,7 +1203,7 @@ new app deployments still require free capacity and rollout headroom.
 
 **Implementation status:** this is the architecture implemented in
 [#266](https://github.com/reliaburger/reliaburger/pull/266), following the
-[resource-aware jobs plan](plans/2026-10-04-plan-delegated-jobs.md). The daily
+[resource-aware jobs plan](plans/archive/2026-10-04-plan-delegated-jobs.md). The daily
 throughput target remains unqualified until real workloads sustain at least
 1,158 unique successful completions per second with headroom, concurrent apps,
 failure recovery and bounded memory and storage. A short simulated burst doesn't
@@ -1229,7 +1229,7 @@ task cgroups; helper resources stay charged while idle. Other platforms retain
 the original owned process backend and refuse unsupported explicit limits.
 Host commands retain host access and Bun's user; they require trusted workloads.
 Neither path removes process creation, durable outcomes or external-effect
-idempotency costs. See the [execution and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md).
+idempotency costs. See the [execution and qualification plan](plans/archive/2026-10-07-plan-reusable-executors-and-throughput.md).
 
 Fast delegated jobs use bounded grant lookahead derived from verified duration
 summaries, covering receipt acceptance and grant delivery without increasing
@@ -1291,7 +1291,7 @@ GPU cluster placement and container device assignment remain tracked in F01
 ([#359](https://github.com/reliaburger/reliaburger/issues/359)). Their validation
 must measure useful records/tokens or training samples per second, queue and
 serving latency, accelerator utilisation and recovery, as well as task counts.
-See the [AI implementation sequence](plans/2026-10-04-plan-delegated-jobs.md#ai-training-and-inference).
+See the [AI implementation sequence](plans/archive/2026-10-04-plan-delegated-jobs.md#ai-training-and-inference).
 
 ### Q8: Can a single leader actually schedule 100M+ jobs per day while doing everything else?
 

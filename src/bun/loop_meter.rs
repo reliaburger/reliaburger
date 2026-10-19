@@ -98,6 +98,10 @@ impl LoopBranch {
 pub enum TurnPart {
     /// An fsync'd discovery journal write.
     JournalWrite,
+    /// Waiting for a discovery journal write that an earlier turn left in
+    /// flight off the loop. The write's own time was that earlier turn's
+    /// journal write; this is the wait a later turn paid for it (#1100).
+    InFlightWrite,
     /// A read of the runtime's launch inventory.
     RuntimeInventory,
     /// Waiting for the eBPF handle's lock, which job tasks, faults and
@@ -111,8 +115,9 @@ pub enum TurnPart {
 
 impl TurnPart {
     /// Every part, in the order a slow turn's line lists them.
-    const ALL: [TurnPart; 5] = [
+    const ALL: [TurnPart; 6] = [
         TurnPart::JournalWrite,
+        TurnPart::InFlightWrite,
         TurnPart::RuntimeInventory,
         TurnPart::KernelLock,
         TurnPart::ViewInstall,
@@ -123,6 +128,7 @@ impl TurnPart {
     fn label(self) -> &'static str {
         match self {
             TurnPart::JournalWrite => "journal write",
+            TurnPart::InFlightWrite => "wait for a write in flight",
             TurnPart::RuntimeInventory => "runtime inventory",
             TurnPart::KernelLock => "kernel lock wait",
             TurnPart::ViewInstall => "view install",
@@ -561,6 +567,22 @@ mod tests {
             Some(Duration::from_millis(200))
         );
         assert_eq!(last.part(TurnPart::ViewInstall), None);
+    }
+
+    /// The 0.2.1 soak logged `4987 ms in deploy_op (health_probe_result):
+    /// journal write 22 ms` (#1100): the other 4.96 s went to waiting for a
+    /// write an earlier turn left in flight, and the line didn't say so.
+    #[test]
+    fn a_slow_turn_line_names_a_wait_for_a_write_in_flight() {
+        let meter = LoopTurnMeter::new();
+        let turn = meter.begin(LoopBranch::DeployOp, Some("health_probe_result"));
+        meter.add_part(TurnPart::InFlightWrite, Duration::from_millis(4965));
+        meter.add_part(TurnPart::JournalWrite, Duration::from_millis(22));
+        assert_eq!(
+            meter.slow_turn_line(&turn, Duration::from_millis(4987)),
+            "bun: agent loop turn took 4987 ms in deploy_op (health_probe_result): \
+             journal write 22 ms, wait for a write in flight 4965 ms"
+        );
     }
 
     #[test]

@@ -573,6 +573,8 @@ We split rendering into two layers:
 1. **Full page renders** (`render_dashboard`, `render_app_detail`, `render_node_detail`) produce complete HTML documents with `<head>`, `<body>`, and all the script/CSS links.
 2. **Fragment renders** (`render_apps_table_fragment`, `render_instance_table_fragment`, etc.) produce bare HTML that HTMX can swap in. The full-page renders call these internally, so the initial page load and subsequent HTMX updates use the same rendering code.
 
+Jobs got a card of their own once every job ran on the common lifecycle of Chapter 17. "Job runs and schedules" polls `/ui/fragment/batches` every three seconds and renders the same scoped summaries as `GET /v1/batch/summaries`: one row per retained run, with its counts, backlog and accepted success rate, and one row per cron schedule with its last five outcomes from the definition's durable history (#684). It shows retained runs only. There's no standalone jobs page, so a run whose receipt has been pruned survives only in its schedule's history.
+
 ### uPlot for charts
 
 uPlot is a 10KB JavaScript library that renders time-series charts on a canvas element. It handles millions of data points at 60fps — massively overkill for our use case, but that means it'll never be the bottleneck.

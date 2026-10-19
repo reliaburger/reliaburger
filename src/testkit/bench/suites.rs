@@ -387,6 +387,47 @@ async fn discovery_latency(context: &SuiteContext) -> Result<BenchMetric, String
     )
 }
 
+/// The network-throughput target: an HTTP server holding a `payload_mib`
+/// payload, health-checked on a file it writes itself.
+fn network_target_spec(target: &str, namespace: &str, port: u16, payload_mib: u32) -> String {
+    format!(
+        "[app.{target}]\n\
+         image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
+         command = [\"sh\", \"-c\", \"mkdir -p /tmp/payload && echo ok > /tmp/payload/health && dd if=/dev/zero of=/tmp/payload/payload.bin bs=1048576 count={payload_mib} 2>/dev/null && exec httpd -f -p {port} -h /tmp/payload\"]\n\
+         port = {port}\n\
+         namespace = \"{namespace}\"\n\n\
+         [app.{target}.health]\n\
+         path = \"/health\"\n\
+         interval = 2\n\
+         timeout = 2\n\
+         threshold_unhealthy = 3\n\
+         threshold_healthy = 1\n"
+    )
+}
+
+/// The image-distribution workload: one idle replica on every node.
+fn image_distribution_spec(app: &str, namespace: &str) -> String {
+    format!(
+        "[app.{app}]\n\
+         image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
+         command = [\"sleep\", \"infinity\"]\n\
+         replicas = \"*\"\n\
+         namespace = \"{namespace}\"\n"
+    )
+}
+
+/// One cluster-capacity app: the smallest request the scheduler accepts.
+fn capacity_spec(app: &str, namespace: &str) -> String {
+    format!(
+        "[app.{app}]\n\
+         image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
+         command = [\"sleep\", \"infinity\"]\n\
+         cpu = \"1m\"\n\
+         memory = \"1Mi\"\n\
+         namespace = \"{namespace}\"\n"
+    )
+}
+
 async fn network_throughput(context: &SuiteContext) -> Result<BenchMetric, String> {
     let test = context.test_context();
     let source = "network-source";
@@ -394,20 +435,7 @@ async fn network_throughput(context: &SuiteContext) -> Result<BenchMetric, Strin
     let payload_mib = if context.options.quick { 8 } else { 64 };
     let sample_count = if context.options.quick { 1 } else { 3 };
     let port = test.container_port(target);
-    let target_spec = format!(
-        "[app.{target}]\n\
-         image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
-         command = [\"sh\", \"-c\", \"mkdir -p /tmp/payload && echo ok > /tmp/payload/health && dd if=/dev/zero of=/tmp/payload/payload.bin bs=1048576 count={payload_mib} 2>/dev/null && exec httpd -f -p {port} -h /tmp/payload\"]\n\
-         port = {port}\n\
-         namespace = \"{}\"\n\n\
-         [app.{target}.health]\n\
-         path = \"/health\"\n\
-         interval = 2\n\
-         timeout = 2\n\
-         threshold_unhealthy = 3\n\
-         threshold_healthy = 1\n",
-        context.namespace
-    );
+    let target_spec = network_target_spec(target, &context.namespace, port, payload_mib);
     test.apply(&format!(
         "{target_spec}\n{}",
         test.container_idle_spec(source)
@@ -527,14 +555,7 @@ async fn reconstruction_time(context: &SuiteContext) -> Result<BenchMetric, Stri
 async fn image_distribution(context: &SuiteContext) -> Result<BenchMetric, String> {
     let test = context.test_context();
     let app = "image-distribution";
-    let spec = format!(
-        "[app.{app}]\n\
-         image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
-         command = [\"sleep\", \"infinity\"]\n\
-         replicas = \"*\"\n\
-         namespace = \"{}\"\n",
-        context.namespace
-    );
+    let spec = image_distribution_spec(app, &context.namespace);
     let start = Instant::now();
     test.apply(&spec).await?;
     test.wait_running_cluster(app, context.capabilities.node_count)
@@ -602,15 +623,8 @@ async fn cluster_capacity(context: &SuiteContext) -> Result<BenchMetric, String>
             lease_id = lease.lease_id;
         }
         let app = format!("capacity-{}", placed % CAPACITY_APPS_PER_LEASE);
-        let config = Config::parse(&format!(
-            "[app.{app}]\n\
-             image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
-             command = [\"sleep\", \"infinity\"]\n\
-             cpu = \"1m\"\n\
-             memory = \"1Mi\"\n\
-             namespace = \"{namespace}\"\n"
-        ))
-        .map_err(|error| format!("capacity config: {error}"))?;
+        let config = Config::parse(&capacity_spec(&app, &namespace))
+            .map_err(|error| format!("capacity config: {error}"))?;
         match context
             .client
             .apply_capacity_with_lease(&config, &lease_id)
@@ -763,6 +777,24 @@ fn network_command(url: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every bench workload must be one the API accepts, or the suite fails
+    /// at apply instead of measuring anything (#1068).
+    #[test]
+    fn bench_workloads_pass_the_validation_the_api_applies() {
+        let namespace = "rbtest-bench-00";
+        let specs = [
+            network_target_spec("network-target", namespace, 18080, 8),
+            image_distribution_spec("image-distribution", namespace),
+            capacity_spec("capacity-0", namespace),
+        ];
+        for spec in specs {
+            let config = Config::parse(&spec).unwrap();
+            if let Err(error) = config.validate_intrinsic() {
+                panic!("the API would refuse this bench workload: {error}\n{spec}");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn capacity_does_not_score_an_untyped_error_message_as_saturation() {

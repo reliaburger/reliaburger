@@ -963,9 +963,10 @@ classic layout. For an image bound to `repo@sha256:<hex>`:
     listing why each payload failed.
 ```
 
-The verifier uses `ring`, as Pickle's own signing does. Out of scope:
-keyless signatures (Fulcio certificates, Rekor proofs), which need Sigstore's
-trust roots; and the Sigstore bundle stored as an OCI referrer, which cosign 3
+The verifier uses `ring`, as Pickle's own signing does. Planned for a later
+release ([#619](https://github.com/reliaburger/reliaburger/issues/619), F03c):
+keyless cosign signatures (Fulcio certificates, Rekor proofs), which need
+Sigstore's trust roots; and the Sigstore bundle stored as an OCI referrer, which cosign 3
 writes by default (sign with `--new-bundle-format=false` for the classic
 layout). A survey of public images on 4 October 2026 found `.sig` tags on
 Chainguard, distroless, cosign's and Flux's images, all keyless, no cosign
@@ -1509,7 +1510,7 @@ Pickle implements the push and pull subset of the OCI Distribution Specification
 
 | Crate | Purpose | Notes |
 |-------|---------|-------|
-| `oci-distribution` | OCI Distribution API client/server primitives | Provides types for manifests, layer descriptors, and registry protocol handling. May need forking/wrapping for the server-side (Pickle is both client and server). |
+| `oci-client` (formerly `oci-distribution`) | OCI Distribution API client primitives | Provides types for manifests, layer descriptors, and registry protocol handling. May need forking/wrapping for the server-side (Pickle is both client and server). |
 | `hyper` | HTTP server for the OCI Distribution API endpoint | The registry API is an HTTP endpoint on each node. `hyper` provides the low-level server. |
 | `axum` | HTTP framework layered on `hyper` | Routing for the `/v2/` API endpoints (blob uploads, manifest push/pull, tag listing). |
 | `reqwest` | HTTP client for external registry pull-through | Used to pull manifests and blobs from upstream registries (Docker Hub, GHCR, ECR). |
@@ -1561,7 +1562,7 @@ OCI supports manifest lists (also called "fat manifests" or image indices) that 
 
 ### 13.4 Registry Quotas
 
-Should Pickle enforce per-repository or per-namespace storage quotas? The current `max_storage` is a per-node global limit. In multi-tenant environments, a single team pushing large images could exhaust the Pickle storage for the entire node.
+Should Pickle enforce per-repository or per-namespace storage quotas? The current `max_storage` is a per-node global limit. (A per-repository quota existed in the code until 0.2.1, but nothing could configure it, so 0.2.1 deleted it.) In multi-tenant environments, a single team pushing large images could exhaust the Pickle storage for the entire node.
 
 ### 13.5 Image Vulnerability Scanning
 

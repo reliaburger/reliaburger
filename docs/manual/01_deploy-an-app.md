@@ -491,6 +491,34 @@ applies a v3 that fails its health check and shows it rolled back and marked
 scripts/demo/rollout.sh
 ```
 
+The demo measures what it costs as it goes. Before each step it prints Bun's
+latest memory and CPU, and its workloads', on one line, and it ends with each
+measure's average and peak:
+
+```text
+    resources: bun 109.5 MiB, 66.7 % CPU · 2 workloads 23.8 MiB, 1.0 % CPU
+
+==> Resource use: 25 samples over 24 s on demo-node
+                     average           peak
+  bun CPU               70.4 %         94.6 %
+  bun memory           109.7 MiB      117.3 MiB
+  ...
+```
+
+CPU is a percentage of one core. The numbers come from the operating system
+(`/proc` on Linux, `ps` on macOS), sampled once a second, and anything it
+can't measure is left out rather than guessed: network traffic isn't
+measured, because a one-node demo talks to itself over loopback. Workloads
+are everything Bun started: each app, the owner process that keeps it
+running, and a GitOps sync's `git`. Those numbers are from a debug build on a
+busy laptop, which is what the demo builds by default. For numbers you'd
+quote, point `BUN` at a release build (`cargo build --release --bin bun`). Set
+`DEMO_RESOURCES_OUT` to a directory to keep the samples as `resources.csv`,
+with `cpu.svg` and `memory.svg` charts that mark each step on the time axis,
+or `DEMO_RESOURCES=0` to turn the measuring off. Every demo in
+`scripts/demo/` does the same, and so does the [five-minute
+tour](08_five-minute-tour.md)'s script.
+
 `examples/phase-1/container-rollout.toml` is the same story with real
 containers and `strategy = "blue-green"`, for a cluster with runc.
 
@@ -536,8 +564,10 @@ definition and claims every matching UTC minute itself, so a leader change
 neither loses nor repeats an occurrence. An app or job whose name an unsettled
 deployment still owns is refused until that deployment settles, and apply
 refuses an overlapping app or job while an earlier run of it still has an
-uncertain outcome. Leadership changes or recovery preserve that fence; there is no automatic expiry or replay of an
-uncertain migration.
+uncertain outcome. Leadership changes or recovery preserve that fence, and
+nothing replays an uncertain migration on its own: after checking its side
+effects, acknowledge it with `relish batch replay` (see [batch
+jobs](14_batch-jobs.md)).
 
 A failed ordinary job gets four attempts in all, unless it sets `max_attempts`.
 A job whose exit Bun couldn't observe (say, the node crashed) is `unknown`, and

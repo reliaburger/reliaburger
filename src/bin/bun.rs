@@ -348,8 +348,8 @@ fn metrics_archive_owner(
     if let Some(live) = load_node_identity(config)? {
         let identity = live.snapshot();
         return Ok(format!(
-            "tls:{:x}:{}",
-            Sha256::digest(&identity.root_ca_der),
+            "tls:{}:{}",
+            hex::encode(Sha256::digest(&identity.root_ca_der)),
             identity.node_id
         ));
     }
@@ -1515,7 +1515,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 use sha2::{Digest, Sha256};
                 let directory = std::fs::canonicalize(&data_base)?;
                 let identity = Sha256::digest(directory.as_os_str().as_encoded_bytes());
-                let pins = PathBuf::from(format!("/sys/fs/bpf/reliaburger-{identity:x}"));
+                let pins =
+                    PathBuf::from(format!("/sys/fs/bpf/reliaburger-{}", hex::encode(identity)));
                 let cgroup = config.ebpf.cgroup_path.clone();
                 let program = config.ebpf.resolve_program_dir();
                 tokio::task::spawn_blocking(move || {

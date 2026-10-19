@@ -1541,8 +1541,8 @@ mod capacity_contract {
         let layer = archive.into_inner().unwrap().finish().unwrap();
         let config = br#"{"config":{"User":"65534:65534","WorkingDir":"/","Env":["PATH=/bin"]}}"#;
         let store = ImageStore::new(root.join("images"));
-        let layer_digest = format!("sha256:{:x}", Sha256::digest(&layer));
-        let config_digest = format!("sha256:{:x}", Sha256::digest(config));
+        let layer_digest = format!("sha256:{}", hex::encode(Sha256::digest(&layer)));
+        let config_digest = format!("sha256:{}", hex::encode(Sha256::digest(config)));
         let layer_path = store.blob_path(&layer_digest);
         let config_path = store.blob_path(&config_digest);
         for (path, data) in [

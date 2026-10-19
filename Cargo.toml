@@ -41,11 +41,11 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }
 toml = "0.8"
 toml_edit = "0.22"
-oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
 flate2 = "1"
 crc32fast = "1"
 tar = "0.4"
-sha2 = "0.10"
+sha2 = "0.11"
 siphasher = "1"
 hex = "0.4"
 dirs = "6"

@@ -1295,83 +1295,36 @@ Every fault has a mandatory expiry. Cleanup happens through three independent me
 
 1. **eBPF-level expiry check.** Every eBPF fault map lookup compares `bpf_ktime_get_ns()` against the entry's `expires_ns`. Expired entries are skipped (treated as no-fault). This means faults stop having effect immediately at expiry even if userspace cleanup is delayed.
 
-2. **Bun userspace timer.** Bun maintains a priority queue of active faults sorted by expiry time. A background task wakes at each expiry and deletes the corresponding BPF map entry via `bpf_map_delete_elem()`. It also cleans up any resource faults (kills CPU burn processes, releases mlock'd memory, resets blkio limits).
+2. **Bun userspace timer.** Bun maintains a priority queue of active faults sorted by expiry time. A background task wakes at each expiry and deletes the corresponding BPF map entry via `bpf_map_delete_elem()`. It also undoes any resource fault from the reversal it recorded at injection, restoring the saved cgroup values (below).
 
 3. **Startup cleanup.** On Bun startup, the fault registry is empty (in-process state only). Bun iterates all fault BPF maps and deletes any entries it finds. This handles the case where Bun crashed while faults were active.
 
+Undoing a fault doesn't recompute anything from the fault's type. When Bun injects a fault, it records what it changed as a `FaultReversal` (`src/smoker/types.rs`), and expiry, `relish fault clear` and startup recovery all replay that record:
+
 ```rust
-/// Background task that enforces fault expiry in userspace.
-async fn fault_expiry_task(fault_registry: Arc<Mutex<FaultRegistry>>) {
-    loop {
-        let next_expiry = {
-            let registry = fault_registry.lock().unwrap();
-            registry.next_expiry()
-        };
-
-        match next_expiry {
-            Some(expiry) => {
-                let now = monotonic_now();
-                if expiry > now {
-                    tokio::time::sleep(Duration::from_nanos(expiry - now)).await;
-                }
-                // Clean up all expired faults
-                let mut registry = fault_registry.lock().unwrap();
-                let expired = registry.drain_expired(monotonic_now());
-                for fault in expired {
-                    cleanup_fault(&fault);
-                }
-            }
-            None => {
-                // No active faults, sleep until woken by new fault activation
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-}
-
-/// Clean up a single fault: remove BPF map entries, kill helper processes.
-fn cleanup_fault(fault: &FaultRule) {
-    match &fault.fault_type {
-        FaultType::Delay { .. } | FaultType::Drop { .. } | FaultType::Partition { .. } => {
-            // Delete from fault_connect_map
-            let key = build_connect_fault_key(fault);
-            bpf_map_delete_elem(&fault_connect_map_fd, &key);
-        }
-        FaultType::DnsNxdomain => {
-            // Userspace fault: republish the (now smaller) faulted-service
-            // set so the DNS responder stops returning NXDOMAIN for it.
-            republish_dns_faults();
-        }
-        FaultType::Bandwidth { .. } => {
-            let key = build_bw_fault_key(fault);
-            bpf_map_delete_elem(&fault_bw_map_fd, &key);
-        }
-        FaultType::CpuStress { .. } => {
-            // Kill the burn loop process
-            kill_helper_process(fault.id, Signal::SIGKILL);
-        }
-        FaultType::MemoryPressure { .. } => {
-            // Kill the mlock process (kernel reclaims pages)
-            kill_helper_process(fault.id, Signal::SIGKILL);
-        }
-        FaultType::DiskIoThrottle { .. } => {
-            // Reset blkio limits to unlimited
-            reset_blkio_limits(&fault.target_service);
-        }
-        FaultType::Pause => {
-            // Send SIGCONT to unfreeze
-            if let Some(pid) = get_container_pid(&fault.target_service, &fault.target_instance) {
-                nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid),
-                    Signal::SIGCONT,
-                );
-            }
-        }
-        // Kill, NodeDrain, NodeKill: no cleanup needed (effect is immediate and permanent)
-        _ => {}
-    }
+pub enum FaultReversal {
+    /// Nothing to undo (Kill and honest-rejection faults).
+    None,
+    /// A CPU-stress cap: restore each instance's saved `cpu.max`.
+    CpuMax(Vec<(String, String)>),
+    /// A memory-pressure squeeze: restore each instance's saved `memory.high`.
+    MemoryHigh(Vec<(String, String)>),
+    /// A disk-I/O throttle: lift the `io.max` cap on each instance's cgroup.
+    DiskIo { instances: Vec<(String, String)> },
+    /// A Pause: SIGCONT every instance that was frozen.
+    Pause(Vec<i32>),
+    /// A network partition: unblock the named peers on both transports.
+    Partition { peers: Vec<String> },
+    /// A scheduler drain: restore readiness when the final drain owner clears.
+    NodeDrain,
+    /// A simulated node failure: reopen gossip, Raft and reporting transports.
+    NodeQuiesce,
+    /// Bounded node-capacity consumers: terminate the owned helper and cgroup.
+    NodePressure,
 }
 ```
+
+There are no helper processes to kill: CPU stress and memory pressure are cgroup caps (`cpu.max`, `memory.high`), and disk throttling is `io.max`, so restoring the saved value ends the fault. Network faults have no reversal of their own, because the agent converges on them: it recomputes what the eBPF `fault_connect_map` and each caller's netem delay bands should hold from the faults still active (`src/smoker/network.rs`), so an expired drop disappears from the map and an expired delay's `tc` qdisc is taken away on the next pass. `DnsNxdomain` works the same way, by republishing the smaller faulted-service set to the DNS responder. Bandwidth is a reserved fault: it's refused at injection, so there's nothing to clean up.
 
 ---
 

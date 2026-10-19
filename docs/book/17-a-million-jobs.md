@@ -172,7 +172,7 @@ The first derived index was a redb database with a 1 MiB cache per profile, rath
 
 The default view is a summary, not a task list. Watch, JSON status and the dashboard show counts and rates. Histograms merge before p50/p95/p99 are read; those are bucket upper bounds for final attempts, not end-to-end latency. Detail pages inspect at most 4,096 indexes, return at most 1,000 rows and contact at most eight workers, with a cursor even for an empty failure page. Retention starts at terminal acceptance and groups a parent with its profiles. Worker loss can lose detail without changing replicated accepted counts.
 
-The manual's burger manifest runs 8 small and 2 larger hashing jobs beside the web service; the executable homepage tour checks both the app and all accepted outcomes. It used to run 1,000 small and 64 larger ones, but fresh containers start at about 12.7 a second on the quickstart VM ([throughput record](../qualification/2026-10-17-v0.2.0-job-throughput/README.md)), so most of the tour's recording was `relish batch watch` waiting. Ten tasks in two profiles still show both cohorts in `relish jobs` and finish in seconds; the [throughput demo](https://reliaburger.com/#job-throughput) has its own scenarios for showing rate. The tour demonstrates the path, not the whitepaper's daily target. Qualifying 100 million unique successes needs a real sustained run with resource profiles, concurrent apps, retries, failures and storage measurements. The [implementation plan](../plans/2026-10-04-plan-delegated-jobs.md) records that gate.
+The manual's burger manifest runs 8 small and 2 larger hashing jobs beside the web service; the executable homepage tour checks both the app and all accepted outcomes. It used to run 1,000 small and 64 larger ones, but fresh containers start at about 12.7 a second on the quickstart VM ([throughput record](../qualification/2026-10-17-v0.2.0-job-throughput/README.md)), so most of the tour's recording was `relish batch watch` waiting. Ten tasks in two profiles still show both cohorts in `relish jobs` and finish in seconds; the [throughput demo](https://reliaburger.com/#job-throughput) has its own scenarios for showing rate. The tour demonstrates the path, not the whitepaper's daily target. Qualifying 100 million unique successes needs a real sustained run with resource profiles, concurrent apps, retries, failures and storage measurements. The [implementation plan](../plans/archive/2026-10-04-plan-delegated-jobs.md) records that gate.
 
 
 Control reports carry exact failed counts and a capped preview of 256 index
@@ -1525,7 +1525,7 @@ next to what they do and don't prove.
 
 The fix isn't one trick. It's two cheaper runtimes, an explicit way to choose
 between them, and a lot of care about when a reused process is really safe to
-reuse. The [plan](../plans/2026-10-07-plan-reusable-executors-and-throughput.md)
+reuse. The [plan](../plans/archive/2026-10-07-plan-reusable-executors-and-throughput.md)
 sets out the qualification we still owe before claiming 100 million successes
 a day.
 
@@ -3048,7 +3048,7 @@ powers off nodes and loses quorum while data-bearing apps run. It now drives
 all three job runtimes through the same faults, within the existing fast and
 final tiers (90 minutes and eight hours then; an hour and eight hours now).
 
-The [extension plan](../plans/2026-10-10-plan-release-job-soak.md) describes a
+The [extension plan](../plans/archive/2026-10-10-plan-release-job-soak.md) describes a
 bounded controller with two resource profiles per runtime. It persists each
 submission intent before sending it, then reuses that exact request ID after
 a lost reply or controller restart. Accepted counters must conserve indexes
