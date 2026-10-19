@@ -372,6 +372,20 @@ class BenchBaselineTests(unittest.TestCase):
         self.assertIn(f"`{ON_DISK}` is report only", text)
         self.assertIn("| `executor/fake_64k` |", text)
 
+    def test_criterion_0_8_output_reads_under_the_names_a_criterion_0_5_baseline_saved(self):
+        # A real task_arrays run under Criterion 0.8 (its new/estimates.json
+        # files, nothing else) and the baseline `save` wrote from a run of
+        # the same benchmarks under 0.5 (#1026). If Criterion moved its files,
+        # renamed a directory or a JSON field, main's saved baseline would
+        # quietly stop gating anything.
+        fixtures = Path(__file__).parent / "fixtures" / "criterion-0.5-to-0.8"
+        current = bench_baseline.read_means(fixtures / "criterion-0.8")
+        baseline = bench_baseline.load(fixtures / "baseline-criterion-0.5.json")
+        self.assertEqual(sorted(current), sorted(baseline))
+        comparison = bench_baseline.compare(current, baseline, 2.0, [ON_DISK])
+        self.assertTrue(all(row[3] is not None for row in comparison.rows))
+        self.assertFalse(comparison.failed)
+
     def test_an_empty_criterion_directory_is_an_error(self):
         empty = self.root / "empty"
         empty.mkdir()
