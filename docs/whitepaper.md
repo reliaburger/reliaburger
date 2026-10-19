@@ -1171,16 +1171,16 @@ The Reliaburger column describes 0.2.0. Rows marked *Target* are design goals fr
 
 ### 23.1 Batch and AI workloads
 
-Batch and GPU work have their own incumbents. Every Reliaburger entry below except array size is planned; the release is in brackets. The [batch scheduler](plans/2026-10-11-research-batch-schedulers.md) and [LLM workloads](plans/2026-10-11-research-llm-workloads.md) research have the evidence for the other columns.
+Batch and GPU work have their own incumbents. Most Reliaburger entries below are planned, with the release in brackets; services, task arrays and the proven scale are in 0.2.0. The [batch scheduler](plans/2026-10-11-research-batch-schedulers.md) and [LLM workloads](plans/2026-10-11-research-llm-workloads.md) research have the evidence for the other columns.
 
 | | Slurm | Kubernetes + Kueue or Volcano | Nomad | **Reliaburger** |
 |---|---|---|---|---|
-| **What you install** | `slurmctld`, `slurmd`, `slurmdbd` with MySQL, MUNGE, usually a shared filesystem | Kubernetes, GPU operator, Kueue or Volcano, JobSet or Trainer, plus a gateway for serving | One binary plus a device plugin | **One binary** |
+| **What you install** | `slurmctld`, `slurmd`, `slurmdbd` with MySQL, MUNGE, usually a shared filesystem | Kubernetes, GPU operator, Kueue or Volcano, JobSet or Trainer, plus a gateway for serving | One binary plus a device plugin | **One agent binary (`bun`), plus the `relish` CLI** |
 | **Services** | No | Yes | Yes | **Yes** |
 | **Queues and fair share** | Fair-share tree, multifactor priority | Cohorts and fair sharing (Kueue), DRF (Volcano) | No; quotas are Enterprise-only | **Planned (0.10.0)** |
 | **Preemption** | Yes | Yes | Yes, off by default for batch | **Planned (0.10.0)** |
 | **Gangs** | Yes (a job's allocation) | Volcano and KAI atomic; Kueue admission with a timeout | No ([#18773](https://github.com/hashicorp/nomad/issues/18773)) | **Planned: groups with roles and spares (0.8.0)** |
-| **Job arrays** | Up to 4,000,001 tasks | Indexed Job, one Pod object per index | None; one child job per dispatch | **Up to 16,777,216 tasks, compact in Raft (0.2.0 development)** |
+| **Job arrays** | Up to 4,000,001 tasks | Indexed Job, one Pod object per index | None; one child job per dispatch | **Up to 16,777,216 tasks, compact in Raft (0.2.0)** |
 | **Job dependencies** | `afterok` and friends | Via Argo Workflows | No | **Planned (0.9.0)** |
 | **GPU devices** | GRES, MIG | Device plugin or DRA via the GPU operator | Device plugin; MIG since 1.9 | **Planned: CDI, MIG instances (0.6.0)** |
 | **GPU fault handling** | Health-check scripts plus DCGM | NVSentinel (separate) | Device re-fingerprinting | **Planned (0.6.0)** |
