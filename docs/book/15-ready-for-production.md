@@ -5836,6 +5836,92 @@ what to do next from what it wrote. Health probes were different: they run
 on every interval for every checked instance, and what they publish can
 always wait for the next one.
 
+#### And then its own write
+
+#1100 stopped a probe from waiting for somebody else's write. It still
+waited for its own. The 0.2.1 candidate 9 jobs final ran with no fault on
+the node, and the host's disk stalled under all three VMs at once:
+
+```
+19:00:59 node-1: agent loop turn took 500 ms in follow_up (consumer_sync/journal): journal write 500 ms
+19:00:59 node-2: agent loop turn took 500 ms in follow_up (consumer_sync/journal): journal write 500 ms
+19:01:02 node-3: agent loop turn took 3950 ms in deploy_op (health_probe_result): journal write 3950 ms
+```
+
+Read the first two lines again. The consumer steps met the same stall and
+gave up on it at exactly 500 ms, the turn's runtime budget, leaving their
+writes in flight. The probe journalled with no deadline, under the
+allowance #351 made for fsync'd writes on the loop, so it sat out all
+3,950 ms. A run later the same thing happened during an upgrade walk, at
+1,289 ms. So it wasn't one unlucky stall.
+
+The fix gives the probe the consumer step's deal (#1255). Its write waits
+until the turn's deadline, and a write still going then carries on off the
+loop. Once the write is in flight, the loop has to know who it belongs to,
+because the turn that takes it back does different things for each:
+
+```rust
+pub(super) enum WriteOwner {
+    ConsumerStep,
+    HealthProbe(super::health_checks::HealthWrite),
+}
+```
+
+`HealthProbe` carries a value, which a C enum can't: a `HealthWrite`
+holding the instance, its registration time, the service and the health
+the write records. The probe returns `Deferred`, exactly as it does when
+someone else's write is in flight. `service_map` is unchanged, the kernel
+still routes to the backend, and the restart code doesn't run. When the
+write lands, the loop's `select!` takes a turn for it:
+
+```rust
+match self.land_discovery_write(outcome).await {
+    Some(LandedWrite::ConsumerStep) | None => self.continue_consumer_sync().await,
+    Some(LandedWrite::HealthProbe(Some(write))) => {
+        self.finish_health_publication(write).await;
+    }
+    Some(LandedWrite::HealthProbe(None)) => {}
+}
+```
+
+Patterns nest. `Some(LandedWrite::HealthProbe(Some(write)))` matches only
+an `Option` holding the health variant holding a durable write, and binds
+the innermost value to `write` in the same step. The arm with `None`
+inside is a write that failed: it has already fenced discovery, so there's
+nothing to install. `finish_health_publication` checks that the instance
+is still the one the probe was for, installs the new health in
+`service_map` and the kernel, and, for a withdrawal, runs the same restart
+the probe would have. Journal before kernel still holds, and so does
+"no restart before the withdrawal is on disk". They just happen a turn
+later. The slow-turn log names that turn `health_probe_result/landed`.
+
+There's one case where nobody installs it. A deploy or a retirement that
+journals while the probe's write is in flight settles it inline first, as
+it always has. We don't install a health change in the middle of
+somebody else's publication, which may already hold its own copy of the
+service map. So the write lands and `service_map` still says the old
+health. The next probe sees the difference and publishes again. That's
+one more fsync, on a path that has just waited for a disk anyway.
+
+Is a health write safe to leave in flight, given what the consumer's
+argument above said? Readers of the journal meanwhile see the inventory
+before the write. The probe changes one backend's health flag, and the
+only services it can add are ones the kernel has never seen, because
+every kernel publication journals the whole service map first. So the
+runtime references are the same either side of it, and the services still
+list everything a withdrawal would need.
+
+`a_health_probe_publication_leaves_its_own_slow_journal_write_in_flight`
+stalls the write for 1.6 s and delivers an unhealthy probe in a turn. The
+turn must end inside the 1 s budget, but the verdict that can't flake on a
+busy machine doesn't time anything: the write must still be in flight
+when the turn ends, which it can't be if the turn waited for it. It also checks
+that a second probe meanwhile journals nothing, and that the landing turn
+installs the withdrawal for readers and restarts the instance.
+`a_health_probe_write_that_fails_off_the_turn_installs_nothing_and_restarts_nothing`
+fails the write instead, and checks that discovery is fenced, the backend
+still reads healthy and the instance hasn't restarted.
+
 #### A 503 is an answer, not a verdict
 
 Candidate 7's jobs soak failed a pulse on one line: `deploy_from_cluster_registry`
