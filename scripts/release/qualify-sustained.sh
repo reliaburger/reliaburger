@@ -179,7 +179,8 @@ unset LIMA_SSH_PORT_FORWARDER
 # schedule (required_execution), and a test compares the two. The run always
 # completes min_cycles cycles, even when faults overrun their slots: every
 # hour of a full run (so every special its length schedules), and cycles 0-3
-# of a compressed one, which carry every fault kind and every special.
+# of a compressed one, which carry every special, every slot fault and eight
+# of the nine chaos kinds (the hour-long fast tier reaches all nine).
 case $schedule in
     full) cycle=3600; hold_min=60; hold_max=180; rotation=900; kill_offset=20
           quorum_hold=300; pulse_every=1; export_every=6; push_every=1; chaos_per_slot=3
