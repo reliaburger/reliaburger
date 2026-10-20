@@ -1,0 +1,61 @@
+total 39921
+ 55.87% incl   0.00% self  el0t_64_sync_handler
+ 55.87% incl   0.00% self  el0t_64_sync
+ 47.41% incl   0.00% self  tokio-rt-worker
+ 47.35% incl   7.21% self  [libc.so.6]
+ 44.40% incl   1.10% self  el0_svc
+ 42.38% incl   0.05% self  do_el0_svc
+ 42.30% incl   0.05% self  el0_svc_common.constprop.0
+ 41.89% incl   0.27% self  invoke_syscall
+ 38.40% incl   0.00% self  <std::sys::thread::unix::Thread>::new::thread_start
+ 38.38% incl   0.00% self  <std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>::{closure} as core::ops::function::FnOnce<()>>:
+ 38.38% incl   0.00% self  std::sys::backtrace::__rust_begin_short_backtrace<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>
+ 38.31% incl   0.00% self  tokio::runtime::task::raw::poll<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure}>, toki
+ 38.31% incl   0.18% self  tokio::runtime::scheduler::multi_thread::worker::run
+ 36.12% incl   0.08% self  <tokio::runtime::scheduler::multi_thread::worker::Context>::run_task
+ 28.24% incl   0.00% self  busybox
+ 23.31% incl   7.21% self  [busybox]
+ 15.68% incl   0.03% self  tokio::runtime::task::raw::poll<reliaburger::lettuce::runner::spawn_gitops_sync::{closure}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Ha
+ 15.62% incl   0.14% self  reliaburger::lettuce::runner::spawn_gitops_sync::{closure}
+ 13.34% incl   0.01% self  tokio::runtime::task::raw::poll<reliaburger::relish::bench_jobs::measure_raw::{closure}::{closure}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::ha
+ 13.07% incl   0.05% self  reliaburger::relish::bench_jobs::measure_raw::{closure}::{closure}
+ 12.91% incl   0.02% self  __arm64_sys_execve
+ 12.86% incl   0.02% self  do_execveat_common.isra.0
+ 12.84% incl   0.00% self  __arm64_sys_exit_group
+ 12.82% incl   0.00% self  do_group_exit
+ 12.74% incl   0.01% self  execve
+ 12.70% incl   0.06% self  do_exit
+ 12.52% incl   0.00% self  :
+ 11.61% incl   0.31% self  handle_mm_fault
+ 11.47% incl   0.02% self  do_mem_abort
+ 11.39% incl   0.10% self  do_page_fault
+ 11.24% incl   0.11% self  __handle_mm_fault
+ 10.75% incl   0.01% self  bprm_execve
+ 10.47% incl   0.03% self  bprm_execve.part.0
+ 10.38% incl   0.01% self  exit_mm
+ 10.36% incl   0.06% self  handle_pte_fault
+ 10.33% incl   0.01% self  mmput
+ 10.30% incl   0.01% self  __mmput
+ 10.17% incl   0.02% self  exit_mmap
+ 10.14% incl   0.03% self  do_translation_fault
+  9.43% incl   0.02% self  <reliaburger::council::node::CouncilNode>::desired_state::{closure}
+  9.42% incl   0.02% self  <reliaburger::council::state_machine::CouncilStateMachine>::desired_state::{closure}
+  9.39% incl   0.01% self  <std::process::Command>::spawn
+  9.26% incl   0.28% self  <reliaburger::council::types::DesiredState as core::clone::Clone>::clone
+  9.02% incl   0.05% self  do_pte_missing
+  7.64% incl   0.00% self  swapper
+  7.64% incl   0.01% self  cpu_startup_entry
+  7.61% incl   0.01% self  do_idle
+  7.44% incl   0.01% self  exec_binprm
+  7.42% incl   7.18% self  cpuidle_idle_call
+  7.34% incl   0.02% self  search_binary_handler
+  6.98% incl   0.06% self  load_elf_binary
+  6.74% incl   0.05% self  do_read_fault
+  6.33% incl   0.36% self  filemap_map_pages
+  6.13% incl   0.81% self  el0_da
+  5.82% incl   0.01% self  unmap_vmas
+  5.77% incl   0.02% self  unmap_single_vma.isra.0
+  5.76% incl   0.00% self  __secondary_switched
+  5.76% incl   0.00% self  secondary_start_kernel
+  5.74% incl   0.02% self  unmap_page_range
+  5.58% incl   2.13% self  malloc
