@@ -18,6 +18,11 @@ mod bun_process;
 
 /// Run one demo script to completion and return its stdout.
 fn run_demo(script: &str) -> String {
+    run_demo_with(script, &[])
+}
+
+/// Run one demo script with extra environment and return its stdout.
+fn run_demo_with(script: &str, environment: &[(&str, &str)]) -> String {
     assert!(
         std::env::var_os("RELIABURGER_CLUSTER_TESTS").is_some(),
         "set RELIABURGER_CLUSTER_TESTS=1 (make test-cluster)"
@@ -37,6 +42,7 @@ fn run_demo(script: &str) -> String {
         .env_remove("RELIABURGER_ENDPOINT")
         .env_remove("RELIABURGER_TOKEN")
         .env_remove("RELIABURGER_CA_CERT")
+        .envs(environment.iter().copied())
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -69,6 +75,19 @@ fn rollout_demo_rolls_back_a_bad_version_and_marks_it_failed() {
     let stdout = run_demo("rollout.sh");
     assert!(stdout.contains("RolloutFailed"), "{stdout}");
     assert!(stdout.contains("serving v1 after the rollback"), "{stdout}");
+    assert!(stdout.contains("serving v1 after the bad v3"), "{stdout}");
+}
+
+/// #1067: on a credential-free plaintext cluster the node has no service
+/// token, yet its rollout-failure report still reaches the leader, so the
+/// bad version is marked `RolloutFailed` and isn't retried.
+#[test]
+#[ignore = "starts a real one-node cluster; run with make test-cluster"]
+fn rollout_demo_on_a_plaintext_cluster_marks_a_bad_version_failed_and_stops_retrying() {
+    let stdout = run_demo_with("rollout.sh", &[("DEMO_PLAINTEXT", "1")]);
+    assert!(stdout.contains("plaintext, no credentials"), "{stdout}");
+    assert!(stdout.contains("RolloutFailed"), "{stdout}");
+    assert!(stdout.contains("v3 is not retried"), "{stdout}");
     assert!(stdout.contains("serving v1 after the bad v3"), "{stdout}");
 }
 

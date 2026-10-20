@@ -112,11 +112,23 @@ dropped resource, and the error says how many of each.
 DaemonSets), Services, Ingresses, HPAs, Jobs, CronJobs and Namespaces as
 multi-document YAML. Containers keep their `command`, `args`, `workingDir`
 and `runAsUser`/`runAsGroup`; a job's `max_attempts` becomes `backoffLimit` and
-`task_timeout_secs` the pod's `activeDeadlineSeconds`. It reports what it
-can't express: firewall and egress rules, process workloads, `run_before`, a
-job's `pids`, and for now health checks, metrics, volumes, init containers,
-config files and placement. An encrypted env value exports as the placeholder
-`ENCRYPTED_VALUE`, and each one is listed as needing a Kubernetes Secret. A `runtime = "process"`
-job produces no Job at all, since Kubernetes needs an image. A
-`runtime = "shared-runc"` job becomes an ordinary Job, which starts a fresh Pod
-for every attempt.
+`task_timeout_secs` the pod's `activeDeadlineSeconds`. A scheduled job's
+`overlap` becomes the CronJob's `concurrencyPolicy` (`allow` → `Allow`,
+`forbid` → `Forbid`); an omitted `overlap` still exports as `Forbid`, because
+that's Reliaburger's default and Kubernetes' is `Allow`. It reports what it
+can't express: firewall and egress rules on apps and jobs, process workloads,
+`run_before`, a job's `pids` and `replay_unknown`, and for now health checks,
+metrics, volumes, init containers, config files and placement. An encrypted env
+value exports as the placeholder `ENCRYPTED_VALUE`, and each one is listed as
+needing a Kubernetes Secret. A `runtime = "process"` job produces no Job at
+all, since Kubernetes needs an image. A `runtime = "shared-runc"` job becomes
+an ordinary Job, which starts a fresh Pod for every attempt.
+
+`relish export --strict` is the same CI gate in the other direction: it exits
+1 when the report lists anything unsupported or not exported yet, and the
+error says how many of each.
+
+```sh
+relish export -f app.toml > k8s.yaml
+relish export -f app.toml --strict             # exit 1 if anything isn't exported
+```

@@ -71,6 +71,18 @@ Granting is a separate pure function, `plan_grants`, which tops each node up to 
 
 The test that matters most here is another property test: a random mix of plans, completions, node losses and cancels, after each of which every chunk must be in exactly one of queued, held or done, and every task counted exactly once. Then there's a plain unit test that runs a whole million-task array with 1% of indices failing for good on three nodes. The leader's state at the end is well under the 256 KiB budget, and the number of rounds depends on the number of chunks. At a fixed chunk size this still grows with task count; the gain is amortisation, not constant cost.
 
+That property test only sees one array's state. The store around it has more ways in: an `Idempotency-Key` sent twice, or reused with different content, a stale completion, an unknown outcome and the operator's replay acknowledgement, a cron fire, pruning, and a snapshot taken and reopened. A second property test in `task_array_store.rs` generates sequences of all of them. Every step is a real `TaskArrayWrite` through `TaskArrays::apply`, the same call a Raft replica makes, so there's no second model of the rules to drift away from the first. A small model sits beside the store, holding which key got which run and how many tasks each run has had accepted. After every step the test checks:
+
+- a refused write left the store exactly as it was and took no id;
+- a retried key gets its run back, and a changed one is refused;
+- no new run starts while an unknown outcome is unacknowledged;
+- a stale report is counted as refused and changes no count;
+- every task is still counted exactly once;
+- a terminal run stays terminal;
+- the store survives a JSON round trip unchanged.
+
+Its first run found a real bug in under twenty cases. Lose a node, so its chunks go back in the queue at attempt 2, then cancel: `stop` moved the queued chunks to done but kept their attempt numbers. Nothing misbehaved at once. The next reopen did, because snapshot validation (rightly) refuses an attempt number on a retired chunk. A follower installing that snapshot, or a standalone node restarting, would have refused the whole state. `stop` now drops those attempts. A unit test in `task_array_state.rs` pins the case down, and proptest's minimised sequence is saved in `proptest-regressions/meat/task_array_store.txt`. Proptest replays every saved seed before it generates new cases, so the failing sequence runs on every CI run.
+
 ### The node: slots, not chunks
 
 On the node, a `TaskPool` runs tasks through a `tokio::sync::Semaphore` whose permits are the node's slots. Every chunk the node holds draws from the same permits, so the tail of one chunk overlaps the head of the next instead of leaving slots idle. Each task is a tokio task in a `JoinSet` holding an *owned* permit, the same RAII trick Chapter 4 used for connections: dropping the permit frees the slot, so there's no release call to forget on an error path.
@@ -280,7 +292,23 @@ so a spawned task can hold it without borrowing a departed stack frame.
 Standalone writes clone the checkpoint, preflight identities and progress
 capacity, then publish private JSON with file and directory fsync. Only durable
 publication replaces the in-memory value. An I/O error fences later writes and
-dispatch. Compact initial ranges can expand into sparse progress; admission
+dispatch.
+
+A timeout fences them too, and that case is harder. The write runs on a
+blocking thread, so when its caller gives up after the write timeout the thread
+carries on, and the run can reach the disk after the client has been told
+"unavailable". The node can't tell whether it did, so it refuses every
+admission and stops leading until it restarts. A test holds the real writer
+after it has built its checkpoint and before it publishes (a `#[cfg(test)]`
+barrier in the store), lets the caller's deadline pass, and checks that
+admission returns 503 and nothing is dispatched. It then lets the write land,
+restarts the node and retries with the same `Idempotency-Key`. The retry gets
+the late write's run back, every task of it runs exactly once, and the next
+new submission gets a fresh id. The `Idempotency-Key` is what makes "unavailable"
+safe to retry: one durable run identity, whichever side of the timeout the
+write landed on.
+
+Compact initial ranges can expand into sparse progress; admission
 reserves that representation before accepting work. Reopen validates the chunk
 partition, counts and exact hook identities. Omitted metadata must never open
 an app gate. Expired results are pruned before capacity preflight; otherwise the
@@ -3505,6 +3533,23 @@ keeps its own copy of the schedule, and a test holds it against the harness's
 The hosted workflow can't sign a soak build, so its runs can never complete a
 tier. It now says so: it passes `--tier custom`, and the record calls the run
 a diagnostic.
+
+Two smaller blind spots sat next to the inventory
+([#1062](https://github.com/reliaburger/reliaburger/issues/1062)). Fault
+choices came from bash's `$RANDOM`, unseeded, so nobody could replay the run
+that found a bug. Worse, `$RANDOM` inside `$(...)` runs in a subshell, and
+bash reseeds a subshell's generator, so even a seed at the top wouldn't have
+helped. Now every choice goes through `sustained_check.py choose`, which takes
+draw *n* of the run's seed from a fresh `random.Random(f"{seed}:{n}")` and
+counts draws in `choices.json`. Same seed, same choices, in the same order,
+and a resumed run picks up at the next draw.
+
+The other was the leak checkers. `leak-rss` starts judging a Bun process an
+hour after it appears, and every kill, power-off or upgrade exec makes a new
+one. The 0.2.0 final's own evidence shows the gap: the longest Bun on node 2
+lived 48 minutes, so `leak-rss` never once judged that node in eight hours.
+The record now reports each checker's armed minutes per node. Making that a
+gate needs a quieter schedule, which is the maintainer's call.
 
 ### A task that failed before it ran
 
