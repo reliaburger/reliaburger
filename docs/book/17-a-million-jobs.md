@@ -71,6 +71,18 @@ Granting is a separate pure function, `plan_grants`, which tops each node up to 
 
 The test that matters most here is another property test: a random mix of plans, completions, node losses and cancels, after each of which every chunk must be in exactly one of queued, held or done, and every task counted exactly once. Then there's a plain unit test that runs a whole million-task array with 1% of indices failing for good on three nodes. The leader's state at the end is well under the 256 KiB budget, and the number of rounds depends on the number of chunks. At a fixed chunk size this still grows with task count; the gain is amortisation, not constant cost.
 
+That property test only sees one array's state. The store around it has more ways in: an `Idempotency-Key` sent twice, or reused with different content, a stale completion, an unknown outcome and the operator's replay acknowledgement, a cron fire, pruning, and a snapshot taken and reopened. A second property test in `task_array_store.rs` generates sequences of all of them. Every step is a real `TaskArrayWrite` through `TaskArrays::apply`, the same call a Raft replica makes, so there's no second model of the rules to drift away from the first. A small model sits beside the store, holding which key got which run and how many tasks each run has had accepted. After every step the test checks:
+
+- a refused write left the store exactly as it was and took no id;
+- a retried key gets its run back, and a changed one is refused;
+- no new run starts while an unknown outcome is unacknowledged;
+- a stale report is counted as refused and changes no count;
+- every task is still counted exactly once;
+- a terminal run stays terminal;
+- the store survives a JSON round trip unchanged.
+
+Its first run found a real bug in under twenty cases. Lose a node, so its chunks go back in the queue at attempt 2, then cancel: `stop` moved the queued chunks to done but kept their attempt numbers. Nothing misbehaved at once. The next reopen did, because snapshot validation (rightly) refuses an attempt number on a retired chunk. A follower installing that snapshot, or a standalone node restarting, would have refused the whole state. `stop` now drops those attempts. A unit test in `task_array_state.rs` pins the case down, and proptest's minimised sequence is saved in `proptest-regressions/meat/task_array_store.txt`. Proptest replays every saved seed before it generates new cases, so the failing sequence runs on every CI run.
+
 ### The node: slots, not chunks
 
 On the node, a `TaskPool` runs tasks through a `tokio::sync::Semaphore` whose permits are the node's slots. Every chunk the node holds draws from the same permits, so the tail of one chunk overlaps the head of the next instead of leaving slots idle. Each task is a tokio task in a `JoinSet` holding an *owned* permit, the same RAII trick Chapter 4 used for connections: dropping the permit frees the slot, so there's no release call to forget on an error path.

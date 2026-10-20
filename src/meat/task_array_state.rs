@@ -697,6 +697,8 @@ impl TaskArrayState {
         }
         self.stopped = Some(reason);
         let queued = std::mem::take(&mut self.queued);
+        // Requeued chunks carry a later attempt; a retired chunk has none.
+        self.attempts.retain(|chunk, _| !queued.contains(*chunk));
         self.not_run += self.tasks_in(&queued);
         self.done.extend_from(&queued);
     }
@@ -1220,6 +1222,25 @@ mod tests {
         let state = TaskArrayState::new(spec(1000, 100), 1).unwrap();
         let plan = plan_grants(&state, &slots(&[("n1", 4), ("n1", 4)]), true);
         assert_eq!(plan, vec![(node("n1"), chunks(0..=1))]);
+    }
+
+    /// Found by the store's generated lifecycle test (#1060): a stop wrote
+    /// off requeued chunks but kept their attempt numbers, and the snapshot
+    /// refused to reopen.
+    #[test]
+    fn a_stop_after_a_requeue_leaves_a_snapshot_that_reopens() {
+        for stop in [TaskArrayState::cancel, TaskArrayState::refuse_unrunnable] {
+            let mut state = TaskArrayState::new(spec(5, 2), 1).unwrap();
+            state.grant(&node("a"), &chunks(0..=1)).unwrap();
+            state.requeue_node(&node("a"));
+            assert_eq!(state.attempt_of(ChunkId(0)), 2);
+            stop(&mut state);
+            assert!(state.status().is_terminal());
+            state.validate_snapshot().unwrap();
+            let reopened: TaskArrayState =
+                serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+            reopened.validate_snapshot().unwrap();
+        }
     }
 
     #[test]
