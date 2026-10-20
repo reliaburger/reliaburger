@@ -298,6 +298,7 @@ resource demand, storage and service quality. See the [job manual](manual/14_bat
 
 **Dependencies (planned, 0.9.0):** an `after` key makes one job wait for another: for all of it, element by element (task *i* after task *i*), or for a share of its tasks to succeed. The condition is stored on the job definition and evaluated against compact index sets, not as per-task edges, so a 16-million-task pipeline costs no more Raft state than two arrays. There's no DAG language: full workflows stay in Airflow or Nextflow, which drive Reliaburger through a Python client and their own provider and executor (see §22).
 
+<!-- snippet: planned #1238 -->
 ```toml
 [job.embed]
 image = "embed:v1"
@@ -400,6 +401,7 @@ max_replicas = 200
 
 A Group is several members that start together, fail together and restart together: a training job across nodes, a model too big for one node, or an RL job that mixes trainers, inference servers and sandboxes. Kubernetes needs JobSet, LeaderWorkerSet and a gang scheduler for this; Slurm gets it from allocating nodes to a job. It earns its own type because none of an App's or a Job's rules (independent replicas, independent retries) hold for it.
 
+<!-- snippet: planned #1223 -->
 ```toml
 [group.finetune]
 members = 2                       # nodes
@@ -418,6 +420,7 @@ The leader places every member in one decision or none, injects each member's ra
 
 A Queue is a weighted share of the cluster for batch work. Jobs, arrays and groups name a queue; the leader orders their grants by each queue's dominant share of CPU, memory and GPUs (dominant resource fairness), with usage that decays over time, so a team that ran a lot yesterday yields to one that didn't. Backfill lets small work run in front of a large waiting group without delaying it. Priority classes and preemption take capacity back for an under-share queue, with a grace period for checkpoints, and a preempted attempt doesn't spend a retry. Apps always rank above batch. Namespace quotas stay as hard caps on top of queues.
 
+<!-- snippet: planned #1238 -->
 ```toml
 [queue.research]
 weight = 2
@@ -433,6 +436,7 @@ See the [batch scheduler research](plans/2026-10-11-research-batch-schedulers.md
 
 `[model.*]` is shorthand for serving an LLM, not a new type. It expands to an ordinary App with an inference engine image (vLLM, SGLang or llama.cpp), a read-only mount of the model's weights from Pickle, readiness checked with a real generation, the engine's metrics endpoint, inference-aware routing in Wrapper and autoscaling on engine metrics. `relish apply --dry-run` shows the expansion.
 
+<!-- snippet: planned #1221 -->
 ```toml
 [model.qwen3]
 source = "models/qwen3-32b:2026-09"
