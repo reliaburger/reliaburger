@@ -7163,3 +7163,41 @@ cover it. The reaping wasn't involved at all: on macOS there is no subreaper,
 `launchd` adopts the orphans, and the test saw no zombies in any run. So
 `Owner::start` now calls `first_launch` on `bun --version` before it starts
 the owner, and the 15 seconds go back to timing the owner.
+
+One test fixed is one test. How many others start `bun` or `relish` under a
+deadline that includes the launch
+([#1149](https://github.com/reliaburger/reliaburger/issues/1149))? We went
+looking, and the answer was most of the black-box suite. Every Bun the shared
+fixture starts gets 30 seconds to listen. `relish` gets 30 seconds to reach
+it. Every command, role and process the owned runtimes start has a `bun`
+owner with 15 seconds to answer. To make it fail on demand, we replaced
+`bun`, `relish` and `testapp` with fresh copies of themselves before each
+round, which makes each one a new file to assess, and ran thirteen exposed
+tests under nextest. Three loops kept the assessment queue busy with fresh
+copies of an 840 MB test binary. In three rounds of four, both
+`owned_commands` tests we picked failed at exactly their 15-second bound.
+
+The fix lives where the deadlines do. `bun_process.rs` gained
+`first_launch_binaries()`, which pays all three first launches at once, and
+`BunProcess::spawn_runtime`, `wait_for_relish` and `wait_for_relish_output`
+call it before their clocks start. That covers every test that goes through
+the fixture, in the suite and in the separate `tests/*.rs` binaries. The
+module includes `first_launch.rs` itself:
+
+```rust
+#[path = "first_launch.rs"]
+mod first_launch;
+```
+
+`#[path]` on a module declared in a file (rather than inside an inline
+`mod { }` block) is relative to that file's directory, so this finds the
+sibling in `tests/support/` whichever binary includes `bun_process.rs`. The
+suite used to declare `first_launch` itself as well, and Clippy refuses a
+file loaded as two modules (`duplicate_mod`): each would be a separate module
+with its own `static` set of launched paths. So the suite now writes
+`use bun_process::first_launch;` instead, and `crate::first_launch` still
+names the one copy. Tests that spawn `bun` or
+`relish` themselves, or hand `bun` to the owned runtimes, call the helper
+before their own deadline. No deadline changed, and the same thirteen tests
+passed all eight rounds we ran under the same conditions. The PR lists every
+test the audit found and what happened to each.

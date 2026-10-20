@@ -10,7 +10,13 @@ use reliaburger::grill::runc_intent::{
 };
 use reliaburger::grill::{InstanceId, OciSpec};
 
+#[path = "support/first_launch.rs"]
+mod first_launch;
+
+/// The owner executable, its first launch paid: every role's owner is a
+/// `bun` that `start` gives 15 s to answer (#1149).
 fn bun() -> PathBuf {
+    first_launch::first_launch(&[(Path::new(env!("CARGO_BIN_EXE_bun")), &["--version"])]);
     env!("CARGO_BIN_EXE_bun").into()
 }
 
@@ -330,6 +336,9 @@ async fn stale_shared_handle_cannot_start_roles_after_sealing() {
 #[tokio::test]
 async fn launcher_and_helper_survive_caller_sigkill_until_recovered_retirement() {
     let root = tempfile::tempdir().unwrap();
+    // The fixture child starts `bun` as its owner inside the wait below, so
+    // pay that first launch here (#1149).
+    let _ = bun();
     let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "runtime_roles_fixture", "--nocapture"])
         .env("RELIABURGER_ROLES_FIXTURE", root.path())

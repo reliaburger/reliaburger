@@ -786,6 +786,9 @@ enum Command {
         /// Path to a Reliaburger TOML config file.
         #[arg(short = 'f', long = "file")]
         file: PathBuf,
+        /// Exit non-zero if anything is unsupported or not exported.
+        #[arg(long)]
+        strict: bool,
     },
     /// List images in the Pickle registry, or delete a tag.
     #[command(visible_alias = "image")]
@@ -2211,7 +2214,7 @@ async fn main() -> ExitCode {
         #[cfg(feature = "kubernetes")]
         Command::Import { ref files, strict } => commands::import_k8s(files, strict),
         #[cfg(feature = "kubernetes")]
-        Command::Export { ref file } => commands::export_k8s(file),
+        Command::Export { ref file, strict } => commands::export_k8s(file, strict),
         Command::Images { action: None } => commands::images(cli.output).await,
         Command::Images {
             action: Some(ImagesAction::Delete { reference }),

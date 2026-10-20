@@ -29,6 +29,8 @@ Subcommands:
                                         keep Lima's host-agent logs before a stop truncates them
   curl-reason CODE                      name a curl exit code (refused, timeout, TLS...)
   test-failures REPORT [STDERR]         each failing case's reason from a `relish --output json test` report
+  seed EVIDENCE [--seed N]              start (or resume) the run's fault and node choices; prints the seed
+  choose EVIDENCE WHAT LOW HIGH         the run's next choice between LOW and HIGH, logged as an event
   render EVIDENCE RECORD                write the Markdown record (refuses to overwrite)
 """
 import argparse
@@ -39,7 +41,9 @@ import http.client
 import json
 import os
 from pathlib import Path
+import random
 import re
+import secrets
 import socket
 import ssl
 import statistics
@@ -79,6 +83,9 @@ FD_RISES = 3
 FD_STEP = 10
 FD_GROWTH = 1.25
 REPEAT_WINDOW = 1800
+# When each leak checker can first judge a process (#1062): leak-rss after
+# its warm-up, leak-fd once it has the warm-up and FD_RISES + 1 full windows.
+CHECKER_ARMED_AFTER = (("leak-rss", "rss_kb", RSS_WARMUP), ("leak-fd", "fd", FD_WARMUP + (FD_RISES + 1) * FD_BUCKET))
 # Snapshot kinds that collect the guest inventories (collect in qualify-sustained.sh).
 INVENTORY_KINDS = ("settle", "heavy")
 LEAK_KINDS = ("runc", "netns", "lease", "veth", "cgroup", "bpf", "listen")
@@ -119,6 +126,45 @@ def save_state(evidence, state):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(state, indent=1, sort_keys=True))
     os.replace(temporary, path)
+
+
+# --- seeded choices (#1062) -----------------------------------------------------
+
+def start_choices(evidence, seed):
+    """Start the run's choices from `seed` (a new random one when None), or
+    resume them. A resumed run keeps its seed and its place in the sequence;
+    asking it for a different seed is an error. Returns the seed."""
+    path = Path(evidence) / "choices.json"
+    if path.exists():
+        recorded = json.loads(path.read_text())
+        if seed is not None and seed != recorded["seed"]:
+            raise ValueError(f"this run's choices come from seed {recorded['seed']}, not {seed}")
+        return recorded["seed"]
+    if seed is None:
+        seed = secrets.randbelow(2 ** 32)
+    write_choices(path, {"seed": seed, "draws": 0})
+    return seed
+
+
+def write_choices(path, data):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, sort_keys=True))
+    os.replace(temporary, path)
+
+
+def choose(evidence, what, low, high):
+    """The run's next choice between `low` and `high`, inclusive.
+
+    Draw n of seed s is always the same number, so the same seed makes the
+    same choices in the same order. Each choice is logged as a `choice`
+    event naming what it chose."""
+    path = Path(evidence) / "choices.json"
+    data = json.loads(path.read_text())
+    draw = data["draws"]
+    value = random.Random(f"{data['seed']}:{draw}").randint(low, high)
+    write_choices(path, dict(data, draws=draw + 1))
+    append_event(evidence, phase="choice", target=what, detail=f"{value} of {low}-{high}, draw {draw}, seed {data['seed']}")
+    return value
 
 
 def append_event(evidence, **fields):
@@ -1092,9 +1138,11 @@ def resource_trend_findings(state, node, inventory, now):
     rss = inventory_number(inventory, "bun_rss_kb")
     # An upgrade walk execs bun in place: same pid, a new image whose RSS
     # starts from nothing. Either change is a new process to warm up.
-    if pid != node_state.get("pid") or image != node_state.get("image"):
+    changed = pid != node_state.get("pid") or image != node_state.get("image")
+    if changed:
         node_state.update(pid=pid, image=image, fd_samples=[], started=now)
         node_state.pop("rss_warm_kb", None)
+    record_exposure(state, node, changed, dict(rss_kb=rss, fd=fd), now - node_state["started"], now)
     if fd is not None:
         node_state["fd_samples"] = [sample for sample in node_state["fd_samples"] if sample[0] >= now - (FD_RISES + 3) * FD_BUCKET] + [[now, fd]]
     trend = state.setdefault("trends", {}).setdefault(node, {})
@@ -1113,6 +1161,49 @@ def resource_trend_findings(state, node, inventory, now):
     findings = [dict(item, target=node) for item in fd_findings(node_state["fd_samples"], node_state["started"], now)]
     findings += [dict(item, target=node) for item in rss_findings(node_state, rss, now, node_state["started"])]
     return findings
+
+
+def record_exposure(state, node, changed, values, age, now):
+    """How long each leak checker could judge this node (#1062).
+
+    A checker is armed once the Bun process it watches has lived past the
+    checker's warm-up; a new pid or image starts the warm-up again. The
+    time between two armed samples of one process counts as armed; the
+    record reports the total, the longest unbroken window, the samples
+    judged and how many processes ever armed it. Reported only."""
+    for check, key, armed_after in CHECKER_ARMED_AFTER:
+        entry = state.setdefault("exposure", {}).setdefault(node, {}).setdefault(check, dict(
+            armed_seconds=0, longest_seconds=0, samples=0, processes_armed=0, window_seconds=0, last=None))
+        if changed:
+            entry.update(last=None, window_seconds=0)
+        if values[key] is None or age < armed_after:
+            continue
+        if entry["last"] is None:
+            entry["processes_armed"] += 1
+        else:
+            entry["armed_seconds"] += now - entry["last"]
+            entry["window_seconds"] += now - entry["last"]
+            entry["longest_seconds"] = max(entry["longest_seconds"], entry["window_seconds"])
+        entry["samples"] += 1
+        entry["last"] = now
+
+
+def exposure_lines(state):
+    """The record's table of armed time per node and leak checker."""
+    lines = ["## Leak-checker exposure (reported, not gated)", "",
+             "How long each leak checker could judge each node's Bun. `leak-rss` arms after "
+             f"{RSS_WARMUP // 60} minutes in one process and `leak-fd` after "
+             f"{(FD_WARMUP + (FD_RISES + 1) * FD_BUCKET) // 60}; a restart, kill or upgrade exec starts the warm-up "
+             "again. Nothing is gated on these yet (#1062).", "",
+             "| Node | Checker | Armed | Longest armed window | Evaluated samples | Processes armed |",
+             "|---|---|---|---|---|---|"]
+    for node in state.get("nodes", []):
+        for check, _, _ in CHECKER_ARMED_AFTER:
+            entry = state.get("exposure", {}).get(node, {}).get(check, {})
+            lines.append(f"| {node} | {check} | {entry.get('armed_seconds', 0) // 60} min | "
+                         f"{entry.get('longest_seconds', 0) // 60} min | {entry.get('samples', 0)} | "
+                         f"{entry.get('processes_armed', 0)} |")
+    return lines + [""]
 
 
 def job_metric_samples(state, node, inventory, now):
@@ -1657,6 +1748,11 @@ def render(evidence, record):
     if paused:
         lines.append(f"- Soak clock paused for {duration_text(paused)} (environment)")
     lines.append(f"- Cycles completed: {metadata.get('cycles', 0)}")
+    choices_path = evidence / "choices.json"
+    if choices_path.exists():
+        choices = json.loads(choices_path.read_text())
+        lines.append(f"- Fault and node choices: {choices['draws']}, from seed {choices['seed']} "
+                     f"(`--seed {choices['seed']}` repeats them)")
     if metadata.get("teardown"):
         lines.append(f"- Teardown: {metadata['teardown']}")
     lines.append("")
@@ -1688,6 +1784,13 @@ def render(evidence, record):
               "| Item | Required | Completed | Verdict |", "|---|---|---|---|"]
     lines += [f"| {item} | {need} | {done} | {'ok' if done >= need else 'MISSING'} |" for item, need, done in inventory]
     lines.append("")
+    effects = [event for event in events if event.get("phase", "").startswith("effect:")]
+    if effects:
+        lines += ["## Observed fault effects", "", "What each injected fault was seen to do, read back from the node.", "",
+                  "| Fault | Target | Observed |", "|---|---|---|"]
+        lines += [f"| {event['phase']} | {event.get('target', '')} | "
+                  f"{str(event.get('detail', '')).replace('|', '/').replace(chr(10), ' ')} |" for event in effects]
+        lines.append("")
     lines += ["## Renewals and rotations", "", "| Measure | Observed | Required | Verdict |", "|---|---|---|---|"]
     lines += [f"| {label} | {observed} | {need} | {verdict} |" for label, observed, need, verdict in gates]
     lines.append("")
@@ -1733,6 +1836,7 @@ def render(evidence, record):
     if progress:
         lines.append(f"- Last observed progress: {', '.join(f'{key} {value}' for key, value in sorted(progress.items()))}")
     lines.append("")
+    lines += exposure_lines(state)
     lines += ["## Resource trends", "", "| Node | Measure | First | Last | Max |", "|---|---|---|---|---|"]
     for node, trend in sorted(state.get("trends", {}).items()):
         for measure, entry in sorted(trend.items()):
@@ -1921,6 +2025,14 @@ def main(argv=None):
     failures = commands.add_parser("test-failures", help="why a relish test JSON run failed (#1068)")
     failures.add_argument("report")
     failures.add_argument("stderr", nargs="?")
+    seed = commands.add_parser("seed", help="start or resume the run's seeded choices (#1062)")
+    seed.add_argument("evidence")
+    seed.add_argument("--seed", type=int)
+    choice = commands.add_parser("choose", help="the run's next seeded choice, logged")
+    choice.add_argument("evidence")
+    choice.add_argument("what")
+    choice.add_argument("low", type=int)
+    choice.add_argument("high", type=int)
     record = commands.add_parser("render")
     record.add_argument("evidence")
     record.add_argument("record")
@@ -2021,6 +2133,16 @@ def main(argv=None):
     if args.command == "test-failures":
         stderr_text = Path(args.stderr).read_text(errors="replace") if args.stderr and Path(args.stderr).exists() else ""
         print(test_failure_reasons(Path(args.report).read_text(errors="replace"), stderr_text))
+        return 0
+    if args.command == "seed":
+        try:
+            print(start_choices(args.evidence, args.seed))
+        except ValueError as error:
+            print(f"sustained_check: {error}", file=sys.stderr)
+            return 1
+        return 0
+    if args.command == "choose":
+        print(choose(args.evidence, args.what, args.low, args.high))
         return 0
     if args.command == "render-charts":
         directory = Path(args.directory)
