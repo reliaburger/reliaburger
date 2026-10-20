@@ -343,7 +343,10 @@ Evidence there binds to the queue's temporary group commit
 
 A newer push to the same pull request, or to the same train, cancels the
 older run; pushes to `main`, merge-queue groups and nightly runs each keep
-their own. When GitHub retargets a stacked pull request,
+their own. Closing (or merging) a pull request cancels its run too: the
+`closed` event starts a run in the same group whose only job is a no-op, and
+every other job skips it
+([#1054](https://github.com/reliaburger/reliaburger/issues/1054)). When GitHub retargets a stacked pull request,
 [`ci-retarget.yml`](../.github/workflows/ci-retarget.yml) reruns CI with the
 new base, so the new base's set applies without another push. The fixtures in
 [`test_select_jobs.py`](../scripts/ci/test_select_jobs.py) cover each case.

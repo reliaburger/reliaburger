@@ -12,8 +12,10 @@ on:
     # train run everything.
     branches: [main, "codex/**", "fix/**", "release-*"]
     # labeled lets a `full-ci` label start the heavy suites on any PR (on a
-    # PR into a train, everything but the macOS shards).
-    types: [opened, synchronize, reopened, labeled]
+    # PR into a train, everything but the macOS shards). closed starts a
+    # no-op run in the PR's concurrency group, which cancels the run still
+    # working on the closed (or merged) PR; every other job skips it.
+    types: [opened, synchronize, reopened, labeled, closed]
   merge_group:
     # The merge queue on release-* tests each batch, merged onto the train,
     # with every job before any of it lands. It requires one check:
@@ -24,8 +26,9 @@ on:
     - cron: "17 3 * * *"
 
 # A newer push to a PR, or to a merge train, supersedes the older run: the
-# newer commit contains the older one. Main, merge-queue and called runs each
-# keep their own group; the queue cancels its own groups when it re-forms.
+# newer commit contains the older one, and closing a PR supersedes its run.
+# Main, merge-queue and called runs each keep their own group; the queue
+# cancels its own groups when it re-forms.
 # Fixed prefixes also keep reusable source CI separate from its release caller,
 # and github.workflow (the caller's name when called) keeps a retarget run
 # (ci-retarget.yml) from cancelling the pull request's own run.
@@ -61,9 +64,21 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
+  closed-pull-request:
+    # A closed PR's run exists only to cancel the older run in its
+    # concurrency group. Every job that doesn't need select jobs has its own
+    # guard; the rest are skipped with select jobs.
+    name: closed pull request
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo "The pull request was closed; its older CI run is cancelled."
+
   changes:
     # Which job groups this run needs; see scripts/ci/select-jobs.sh.
     name: select jobs
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.select.outputs.code }}
@@ -92,6 +107,7 @@ jobs:
     # keeping) and the rule that every #[ignore] names who runs it. Cheap,
     # so it runs on every change, documentation included.
     name: CI policy
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -108,6 +124,7 @@ jobs:
 
   dependency-audit:
     name: dependency advisory audit
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -605,10 +622,11 @@ jobs:
     # The final gate, and the one check the merge queue requires: it waits
     # for every other job, fails if any of them failed, and then checks that
     # every selected evidence owner completed its exact cases this run. It
-    # always reports, so a skipped owner can never stand in for a pass.
+    # always reports, so a skipped owner can never stand in for a pass. A
+    # closed PR's run has nothing to report.
     name: ignored-test evidence
     needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, portable, linux, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks]
-    if: ${{ always() }}
+    if: ${{ always() && github.event.action != 'closed' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
