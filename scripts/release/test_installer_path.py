@@ -6,20 +6,73 @@ give the installer a pseudo-terminal as its controlling terminal.
 """
 import base64
 import fcntl
+import hashlib
 import os
 from pathlib import Path
 import pty
 import select
 import shutil
+import stat
 import subprocess
 import tempfile
 import termios
+import time
 import unittest
 
 from package import package_release
 
 POSIX_SHELLS = [shell for shell in ("sh", "dash") if shutil.which(shell)]
 STORE_LINE = 'export PATH="$HOME/.reliaburger/bin:$PATH"'
+
+# Fake `uname` and `curl`, first on the installer's PATH.
+TOOLS = {
+    "uname": '#!/bin/sh\ncase "$1" in -s) echo "$FAKE_SYSTEM";; -m) echo arm64;; esac\n',
+    "curl": '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then cp "$FIXTURE" "$2"; exit; fi; shift; done\nexit 1\n',
+}
+
+# Bounds only an installer that hangs. A slow one still passes (#1140).
+HANG_BOUND_SECONDS = 300
+
+
+def shared_tools():
+    """The fake tools, written once per user and content, and launched once.
+
+    On macOS the first exec of a new file waits for `syspolicyd` to assess
+    it, and assessments queue host-wide behind other fresh executables, such
+    as freshly linked test binaries (#1140, #1149). Fresh copies in every
+    test's temporary directory made each test pay that wait inside its prompt
+    wait. One shared copy per content is assessed once, and the warm-up
+    launch here pays for it before any test waits on a prompt, as
+    `install_script` in `tests/support/first_launch.rs` does for Rust tests.
+    """
+    digest = hashlib.sha256(repr(sorted(TOOLS.items())).encode()).hexdigest()[:16]
+    directory = Path(tempfile.gettempdir()) / f"reliaburger-installer-tools-{os.getuid()}-{digest}"
+    if not directory.exists():
+        staging = Path(tempfile.mkdtemp(prefix="reliaburger-installer-tools-"))
+        for name, body in TOOLS.items():
+            (staging / name).write_text(body)
+            (staging / name).chmod(0o755)
+        try:
+            staging.rename(directory)
+        except OSError:
+            # Another test process published the same tools first.
+            shutil.rmtree(staging)
+    status = directory.lstat()
+    if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid() or status.st_mode & 0o022:
+        raise RuntimeError(f"{directory} is not a private directory of this user")
+    for name, body in TOOLS.items():
+        if (directory / name).read_text() != body:
+            raise RuntimeError(f"{directory / name} does not hold the expected tool")
+        subprocess.run([str(directory / name)], stdin=subprocess.DEVNULL, capture_output=True, check=False)
+    return directory
+
+
+def read_terminal(controller):
+    """What the terminal has for us, or nothing once its far side closed."""
+    try:
+        return os.read(controller, 1024)
+    except OSError:
+        return b""
 
 
 class InstallerPathTests(unittest.TestCase):
@@ -40,12 +93,7 @@ class InstallerPathTests(unittest.TestCase):
         package_release(assets, "v0.1.0", "reliaburger/reliaburger", key,
                         ["ed25519:" + base64.b64encode(public[-32:]).decode()], pins)
         self.installer = assets / "install.sh"
-        self.tools = self.root / "tools"
-        self.tools.mkdir()
-        (self.tools / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo "$FAKE_SYSTEM";; -m) echo arm64;; esac\n')
-        (self.tools / "curl").write_text('#!/bin/sh\nwhile [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then cp "$FIXTURE" "$2"; exit; fi; shift; done\nexit 1\n')
-        for tool in self.tools.iterdir():
-            tool.chmod(0o755)
+        self.tools = shared_tools()
         self.fixture = assets / "relish-macos-aarch64"
         self.homes = 0
 
@@ -77,27 +125,36 @@ class InstallerPathTests(unittest.TestCase):
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    preexec_fn=attach_terminal, pass_fds=(terminal,))
         os.close(terminal)
+        # The verdict is whether the prompt comes before the installer exits,
+        # not how soon: a loaded machine only makes it later (#1140).
+        hang = time.monotonic() + HANG_BOUND_SECONDS
         seen = b""
         while b"[y/N]" not in seen:
-            ready, _, _ = select.select([controller], [], [], 10)
-            if not ready:
+            ready, _, _ = select.select([controller], [], [], 0.1)
+            chunk = read_terminal(controller) if ready else b""
+            seen += chunk
+            if chunk:
+                continue
+            exited = process.poll() is not None
+            if exited or time.monotonic() > hang:
                 process.kill()
-                self.fail(f"no prompt on the terminal; saw {seen!r}")
-            seen += os.read(controller, 1024)
+                process.wait()
+                self.fail(f"no prompt on the terminal before the installer "
+                          f"{'exited' if exited else 'hung'}; saw {seen!r}")
         os.write(controller, answer.encode() + b"\n")
         process.stdin.close()
-        # Keep draining the terminal: closing a terminal waits for its unread
-        # output (here the echoed answer), so an undrained one hangs the exit.
-        deadline = 100
-        while process.poll() is None and deadline:
-            deadline -= 1
+        # Keep draining the terminal until the installer exits: closing a
+        # terminal waits for its unread output (here the echoed answer), so
+        # an undrained one hangs the exit.
+        while process.poll() is None:
+            if time.monotonic() > hang:
+                process.kill()
+                process.wait()
+                self.fail(f"the installer hung after the answer; saw {seen!r}")
             ready, _, _ = select.select([controller], [], [], 0.1)
             if ready:
-                try:
-                    seen += os.read(controller, 1024)
-                except OSError:
-                    pass
-        process.wait(timeout=10)
+                seen += read_terminal(controller)
+        process.wait()
         stdout, stderr = process.stdout.read(), process.stderr.read()
         process.stdout.close()
         process.stderr.close()

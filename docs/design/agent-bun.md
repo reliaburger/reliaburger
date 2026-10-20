@@ -1640,7 +1640,7 @@ bun: a discovery journal write took 1574 ms; the agent loop went on meanwhile
 
 **Impact:** Status, commands and deploy steps on that node no longer wait for a slow consumer write. A command that itself journals something waits for the write in flight first, as it would for its own. The view stays correct: the steps keep their order, the kernel sees a view only after the write that records it has landed, and readers meanwhile see the journal as it is on disk, plus the view under way for `own_view_names`. A write that fails off the loop fences discovery as an inline failure does (`discovery:journal` degraded, reopened on the next tick) and the leader hears the error.
 
-**Recovery:** Automatic. The view's size isn't the cost: a thousand services, first published and then with every backend moved, take each turn well within the budget less its journal write (`a_large_consumer_view_change_takes_each_turn_well_within_the_budget`), and the soak runs a handful. Only consumer steps leave a write in flight; deploys, retirements and releases still wait for theirs inline (#890).
+**Recovery:** Automatic. The view's size isn't the cost: a thousand services, first published and then with every backend moved, use less than half the turn budget's worth of CPU in each turn (`a_large_consumer_view_change_takes_each_turn_well_within_the_budget`, which counts CPU time rather than wall clock so a busy machine can't fail it, #1140), and the soak runs a handful. Only consumer steps leave a write in flight; deploys, retirements and releases still wait for theirs inline (#890).
 
 ### 7.13 Task Attempt Fails to Launch
 

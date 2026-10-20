@@ -1141,6 +1141,24 @@ async fn the_first_consumer_sync_after_a_restart_takes_one_slow_await_a_turn() {
     );
 }
 
+/// The CPU time this process has used so far, user and system, on every
+/// thread. Unlike the wall clock, it doesn't grow while a busy machine
+/// leaves the test waiting for a core, so it measures work.
+fn process_cpu_time() -> std::time::Duration {
+    // SAFETY: `rusage` is plain old data, for which all-zero bytes are a
+    // valid value, and `getrusage` only writes into the struct we pass.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `RUSAGE_SELF` is a valid target and `usage` a valid,
+    // exclusively borrowed out-pointer for the duration of the call.
+    let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    assert_eq!(status, 0, "getrusage failed");
+    let duration = |time: libc::timeval| {
+        std::time::Duration::from_secs(time.tv_sec as u64)
+            + std::time::Duration::from_micros(time.tv_usec as u64)
+    };
+    duration(usage.ru_utime) + duration(usage.ru_stime)
+}
+
 /// Take a leader answer through the loop's consumer-sync turns, one step a
 /// turn as `run_loop` does, and return each turn as the meter saw it.
 async fn consumer_sync_turns(
@@ -1149,6 +1167,21 @@ async fn consumer_sync_turns(
     catalog: crate::onion::catalog::EndpointCatalog,
     ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
 ) -> Vec<crate::bun::loop_meter::TurnRecord> {
+    consumer_sync_turns_and_work(agent, generation, catalog, ingress)
+        .await
+        .into_iter()
+        .map(|(turn, _)| turn)
+        .collect()
+}
+
+/// [`consumer_sync_turns`], with the CPU time the process spent in each
+/// turn: the loop's own work and any blocking-pool work it waited on.
+async fn consumer_sync_turns_and_work(
+    agent: &mut BunAgent<MockGrill>,
+    generation: u64,
+    catalog: crate::onion::catalog::EndpointCatalog,
+    ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
+) -> Vec<(crate::bun::loop_meter::TurnRecord, std::time::Duration)> {
     let (response, reply) = oneshot::channel();
     agent
         .handle_command(AgentCommand::SyncClusterConsumer {
@@ -1162,12 +1195,14 @@ async fn consumer_sync_turns(
         .await;
     let mut turns = Vec::new();
     while !agent.consumer_syncs.is_idle() {
+        let cpu = process_cpu_time();
         let turn = agent.begin_consumer_sync_turn();
         agent.continue_consumer_sync().await;
         agent.consumer_syncs.end_turn();
         agent.turn_deadline = None;
         agent.loop_meter.finish(turn);
-        turns.push(agent.loop_meter.last_turn().unwrap());
+        let work = process_cpu_time().saturating_sub(cpu);
+        turns.push((agent.loop_meter.last_turn().unwrap(), work));
     }
     let update = reply.await.unwrap().unwrap();
     assert!(
@@ -1259,9 +1294,15 @@ fn large_catalogue(services: usize, port_base: u16) -> crate::onion::catalog::En
 /// node consumes at once. Building, journalling and installing a view does
 /// scale with its size, so a thousand services (the soak runs a handful),
 /// first published after a recovery and then with every backend moved,
-/// must leave each turn well inside the budget once the disk's share is
-/// taken out. The disk's share is the slow-disk scenarios' business; this
-/// one measures what the view's size costs the loop.
+/// must leave each turn well inside the budget. The disk's share is the
+/// slow-disk scenarios' business; this one measures what the view's size
+/// costs the loop.
+///
+/// It counts work, not wall clock (#1140): the CPU time the process spent
+/// in each turn, which a machine too busy to give the test a core doesn't
+/// inflate. Timing the turn beside its journal write would have failed 33
+/// of 120 runs at load average 285 to 310, with turns of up to 673 ms,
+/// while no turn used more than 116 ms of CPU.
 #[tokio::test]
 async fn a_large_consumer_view_change_takes_each_turn_well_within_the_budget() {
     let (mut agent, _root, _catalog, _ingress) = recovered_consumer().await;
@@ -1269,12 +1310,12 @@ async fn a_large_consumer_view_change_takes_each_turn_well_within_the_budget() {
         (1, large_catalogue(1000, 30000)),
         (2, large_catalogue(1000, 31000)),
     ] {
-        for turn in consumer_sync_turns(&mut agent, generation, catalog, vec![]).await {
-            let disk = turn.part(TurnPart::JournalWrite).unwrap_or_default();
-            let view = turn.took.saturating_sub(disk);
+        for (turn, work) in
+            consumer_sync_turns_and_work(&mut agent, generation, catalog, vec![]).await
+        {
             assert!(
-                view < TURN_BUDGET / 2,
-                "generation {generation}: {turn} spent {view:?} beside its journal write"
+                work < TURN_BUDGET / 2,
+                "generation {generation}: {turn} used {work:?} of CPU"
             );
         }
     }
