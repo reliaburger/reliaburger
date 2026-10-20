@@ -1123,6 +1123,16 @@ types: `file.try_lock()` anywhere except inside `FileLock` is a lint error, and
 CI treats warnings as errors. Two checks, one syntactic and one type-aware,
 for a bug we'd otherwise keep fixing one lock at a time.
 
+Parsing every file is honest but not cheap. `src/` grew to 524 files and
+15 MB, about five seconds of CPU for `syn` in a debug build, and on a Mac
+shared with other agents' builds the test once ran into nextest's one-minute
+limit (#1140). Every name and method the rule flags has to appear in the
+source text, so a file that contains none of them can't break the rule, and
+the test now skips it unread by the parser (`may_take_a_lock`). That leaves
+34 files to parse. A unit test feeds each forbidden name and method through
+both checks, so a new entry the text check missed would fail it. Twenty-four
+copies in parallel used to take 31 to 38 s each; now they take 4 to 8.
+
 ### Download before you trust, verify before you replace
 
 The installer needs a guest image and prebuilt binaries. A partial download
@@ -2046,6 +2056,8 @@ The binary always lives in one place we own, `~/.reliaburger/bin`. Then there ar
 Why a link rather than a second copy? One real file means one checksum to verify, one atomic rename on upgrade, and an uninstaller that can tell our link from someone else's `relish`: it only removes a link that points into the store. For the same reason the installer never replaces anything already at `~/.local/bin/relish` unless it's our own link.
 
 Asking has a catch. With `curl … | sh`, the shell's standard input *is* the script, so `read` would swallow the next line of the installer instead of your answer. We ask on `/dev/tty`, the controlling terminal, and only if the subshell `(exec </dev/tty)` can open it; in CI or over a pipe with no terminal, we print the line and move on. The default answer is no, the line is added at most once, and `--no-modify-path` keeps everything inside `~/.reliaburger`. The tests give the installer a pseudo-terminal as its controlling terminal and type the answer, which is the only honest way to exercise that prompt.
+
+That test used to give the prompt ten seconds to appear, and on a Mac busy with other agents' builds it once didn't ([#1140](https://github.com/reliaburger/reliaburger/issues/1140)). The installer runs against a fake `uname` and `curl`, and each test wrote fresh copies into its own temporary directory. On macOS the first `exec` of a new file waits while `syspolicyd` assesses it, in a queue the whole host shares (Chapter 15 tells that story), so the ten seconds were really timing whatever else the host was launching. With three loops starting fresh copies of an 840 MB test binary beside it, the test failed 38 runs out of 40 with nothing at all on the terminal. Now the fake tools live in one directory per user, named after a hash of their contents, and a warm-up runs each once before any test waits. The wait itself counts work, not seconds: the test fails if the installer exits without asking, and a five-minute bound is there only for one that hangs. Under the same three loops it passed 40 of 40.
 
 The last step is the quickstart's own "next:" message. Straight after installation your current shell still has the old `PATH`, so `relish status` would fail. `relish::install::invocation()` looks up `relish` on `PATH` the way a shell would, canonicalises both paths (resolving the link), and prints `relish` only if the lookup lands on the running executable. Otherwise it prints the full path, quoted for the shell if it contains a space.
 
