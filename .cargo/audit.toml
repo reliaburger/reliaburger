@@ -25,9 +25,14 @@
 #     metadata moved to postcard (#1026). Removed.
 #   - RUSTSEC-2024-0370 (proc-macro-error): age 0.10 -> 0.12 (#1026) moves to
 #     i18n-embed-fl 0.10, which uses proc-macro-error2. Removed.
+#
+# RUSTSEC-2026-0374 (basic-toml) was added 20 October 2026 (see
+# docs/qualification/2026-10-20-dependency-exceptions.md): unmaintained, no
+# patched release, reached only at compile time through age's i18n proc macros.
 # Next review: 18 November 2026.
 [advisories]
 ignore = [
+    "RUSTSEC-2026-0374",
 ]
 
 [output]
