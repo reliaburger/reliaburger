@@ -5574,6 +5574,34 @@ and `a_large_consumer_view_change_takes_each_turn_well_within_the_budget`
 keeps it that way: every turn, less its journal write, must stay under half
 the budget.
 
+Or it did, until a Mac running several agents' builds failed it with turns
+of 500 to 700 ms (#1140). Wall clock is the wrong ruler for "what the view's
+size costs": a turn that spends 40 ms working and 600 ms waiting for a core
+looks just like one that works for 640 ms. So the test now asks the kernel
+how much CPU the process used across each turn, with `getrusage`:
+
+```rust
+fn process_cpu_time() -> std::time::Duration {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    assert_eq!(status, 0, "getrusage failed");
+    // user time plus system time, from two `timeval`s
+}
+```
+
+Both `unsafe` blocks carry a `// SAFETY:` comment in the source, cut here.
+`std::mem::zeroed` makes a value whose bytes are all zero. That's undefined
+behaviour for a reference or an enum, so the compiler can't vouch for it,
+but `rusage` is a C struct of integers, and zero is a fine integer.
+`getrusage` is a C function, and every foreign call is `unsafe` because Rust
+can't check what the other side does with the pointer. User plus system time
+counts the loop's own work and any blocking-pool work it waited for, and none
+of the waiting. Instrumented under the load that failed it, the old verdict
+would have failed 33 runs out of 120, while no turn used more than 116 ms of
+CPU. Now each turn must use less than half the budget in CPU time. A mutant
+that adds two seconds of arithmetic to every turn fails it at once, and 240
+loaded runs passed.
+
 That leaves the disk, the lock and the host. The same second, node 2 logged
 a 489 ms snapshot turn and node 3 an executor that "did not retire within
 1s", on three VMs sharing one Mac's disk while the leader ran a job campaign.
