@@ -3474,6 +3474,38 @@ its run budget ([#989](https://github.com/reliaburger/reliaburger/issues/989)),
 while the memory chart beside it stays flat. The table said the same thing, but
 you had to know where to look.
 
+Charts show what happened. They don't show what *didn't*. Until 0.2.3 the
+final verdict checked four things: no open failures, the full schedule, eight
+hours on the clock and a candidate digest string in `metadata.json`. Forget
+`--soak-bun` and every upgrade slot logged "skipped" and moved on; the record
+still said the gate passed. Adopt an existing cluster with `--home` and the
+digest was whatever you typed, since nothing had downloaded the candidate. A
+quiet run and a thorough one looked the same
+([#1061](https://github.com/reliaburger/reliaburger/issues/1061)).
+
+So the record now carries an execution inventory: what the schedule owes
+against what the run completed, built from its events and the bytes it kept.
+A fault counts once it was injected (a chaos fault the rails refused doesn't)
+and the cluster settled after it. A walk counts once the nodes reached the soak
+build, rolled back and settled. Quorum loss needs quorum back. The candidate
+counts only if this run bootstrapped it and the `candidate.json` it kept
+hashes to the qualified digest. A final tier is held to the 8-hour full
+schedule whatever its metadata says, so relabelling a fast run as final, or a
+V02 final as the job final, lowers nothing. Anything short fails the record.
+The harness refuses to start a final without a soak build, a digest or with
+an adopted home, because such a run could only end incomplete.
+
+Writing the inventory turned up a gap nobody had noticed. The final ran two
+chaos kinds in each of its four chaos slots, eight in all, and there are nine
+kinds since `cpu` and `memory` arrived (#699). Every 8-hour final had quietly
+skipped the memory fault. A full-schedule slot now runs three. The checker
+keeps its own copy of the schedule, and a test holds it against the harness's
+`--plan` output, so the two can't drift apart again.
+
+The hosted workflow can't sign a soak build, so its runs can never complete a
+tier. It now says so: it passes `--tier custom`, and the record calls the run
+a diagnostic.
+
 ### A task that failed before it ran
 
 Candidate 3's fast soak failed one fresh-runc task of ordinary work, out of

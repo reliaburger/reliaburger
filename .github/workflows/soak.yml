@@ -9,7 +9,10 @@ name: V02 soak
 # a long-running host. See docs/releasing.md, "Soaking a candidate in CI".
 #
 # No soak build is signed here, so the upgrade slots are skipped and the
-# record says so.
+# record says so. That makes every run here a diagnostic: it passes
+# `--tier custom`, and the record says it proves nothing about the V02 gate
+# or the release gate's final soak (#1061). A final tier needs a soak build,
+# which only a long-running host holding the key can supply.
 on:
   workflow_dispatch:
     inputs:
@@ -115,11 +118,10 @@ jobs:
 
       - name: Soak
         # A record that says FAIL fails this step (and the job); the later
-        # steps still publish it. When the harness gains `--tier fast|final`,
-        # a `tier` choice input passes straight through here, and the
-        # budget check above maps it to its duration and schedule.
+        # steps still publish it. The run is a diagnostic (`--tier custom`):
+        # without upgrade walks it can't complete a tier's inventory.
         run: |
-          scripts/release/qualify-sustained.sh \
+          scripts/release/qualify-sustained.sh --tier custom \
               --base-url "$BASE_URL" --qualified-digest "$QUALIFIED_DIGEST" \
               --duration "$SOAK_DURATION" --schedule "$SOAK_SCHEDULE" \
               --evidence "$EVIDENCE"

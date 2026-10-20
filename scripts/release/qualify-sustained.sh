@@ -20,11 +20,18 @@
 #                           beside it; the harness adds the operator signature
 #                           to a copy (OpenSSL 3 needed); each walk upgrades to
 #                           it and rolls back to the version the candidate's
-#                           nodes report; without it the upgrade slots are skipped
+#                           nodes report; without it the upgrade slots are
+#                           skipped, and a final tier refuses to start
 #   --tier T                fast (compressed schedule, 60m: the iteration loop
-#                           after each round of fixes) or final (full schedule,
-#                           8h); the release gate's final soak is the job
-#                           final, qualify-jobs-sustained.sh --tier final
+#                           after each round of fixes), final (full schedule,
+#                           8h) or custom (the default: a diagnostic run that
+#                           says nothing about either gate); the release
+#                           gate's final soak is the job final,
+#                           qualify-jobs-sustained.sh --tier final. A final
+#                           needs --soak-bun, --qualified-digest and its own
+#                           bootstrap (no --home), and its record fails unless
+#                           every walk, fault kind and special its schedule
+#                           owes completed (the execution inventory, #1061)
 #   --duration D            soak length: 40m, 8h, 2d (default: the tier's, or 24h)
 #   --schedule S            full (hourly cycle) or compressed (10-minute cycle);
 #                           default: the tier's, or full
@@ -135,8 +142,21 @@ case $tier in
     fast) : "${schedule:=compressed}" "${duration_text:=60m}" ;;
     final) : "${schedule:=full}" "${duration_text:=8h}" ;;
     ''|custom) tier=custom; : "${schedule:=full}" "${duration_text:=24h}" ;;
-    *) fail '--tier must be fast or final' ;;
+    *) fail '--tier must be fast, final or custom' ;;
 esac
+# A final tier owes every upgrade walk and a candidate it verified itself
+# (#1061), so one that could only finish incomplete never starts.
+if [ "$tier" = final ] && [ "$plan" = false ]; then
+    [ -n "$soak_bun" ] || fail 'a final tier needs --soak-bun: its upgrade walks are part of the gate'
+    if [ "$resume" = false ]; then
+        [ -n "$qualified_digest" ] || fail 'a final tier needs --qualified-digest: the record names the candidate it checked'
+        [ -z "$home" ] || fail 'a final tier bootstraps its own cluster from the candidate; --home adopts one whose candidate this run cannot verify'
+    fi
+fi
+# Upgrade walks run with a soak build. A final tier's plan shows them too,
+# since a final can't start without one.
+walks=false
+if [ -n "$soak_bun" ] || { [ "$plan" = true ] && [ "$tier" = final ]; }; then walks=true; fi
 
 case $duration_text in
     *[0-9]m) duration=$(( ${duration_text%m} * 60 )) ;;
@@ -153,14 +173,16 @@ esac
 unset LIMA_SSH_PORT_FORWARDER
 # Schedule parameters: cycle length, power-off hold, TLS rotation period, how
 # often the catalogue pulse, offline export and registry push run, and how many
-# chaos kinds each chaos slot runs. Two a slot lets an 8-hour full run (four
-# chaos slots with upgrade walks) reach all seven kinds. The run always
+# chaos kinds each chaos slot runs. Three a slot lets an 8-hour full run (four
+# chaos slots with upgrade walks) reach all nine kinds, which its execution
+# inventory requires (#1061); sustained_check.py keeps a copy of this
+# schedule (required_execution), and a test compares the two. The run always
 # completes min_cycles cycles, even when faults overrun their slots: every
 # hour of a full run (so every special its length schedules), and cycles 0-3
 # of a compressed one, which carry every fault kind and every special.
 case $schedule in
     full) cycle=3600; hold_min=60; hold_max=180; rotation=900; kill_offset=20
-          quorum_hold=300; pulse_every=1; export_every=6; push_every=1; chaos_per_slot=2
+          quorum_hold=300; pulse_every=1; export_every=6; push_every=1; chaos_per_slot=3
           min_cycles=$(( duration / cycle )) ;;
     compressed) cycle=600; hold_min=20; hold_max=40; rotation=300; kill_offset=10
           quorum_hold=60; pulse_every=0; export_every=2; push_every=1; chaos_per_slot=2
@@ -307,6 +329,12 @@ bootstrap() {
     "${staged[@]}" > "$evidence/bootstrap.log" 2>&1 || result=$?
     home=$(sed -n 's/^RELIABURGER_HOME: //p' "$evidence/bootstrap.log" | head -n 1)
     [ -z "$home" ] || bootstrapped=true
+    # Keep the candidate record's bytes the staged install checked against
+    # --qualified-digest: the record's verdict hashes them again (#1061).
+    local staged_evidence
+    staged_evidence=$(sed -n 's/^Evidence (logs, timings, candidate record): `\(.*\)`$/\1/p' "$evidence/bootstrap-record.md" 2>/dev/null | head -n 1)
+    [ -z "$staged_evidence" ] || [ ! -f "$staged_evidence/candidate.json" ] \
+        || cp "$staged_evidence/candidate.json" "$evidence/candidate.json"
     [ "$result" -ne 0 ] || return 0
     # A failed tour step after a finished install still leaves a cluster to
     # soak; the staged-install qualification owns that step, so note it.
@@ -1235,14 +1263,15 @@ PY
 }
 
 chaos_index=0
+chaos_kinds=(kill delay partition scenario pause drop dns cpu memory)
 slot_chaos() {
     local round
     for (( round = 0; round < chaos_per_slot; round++ )); do chaos_one; done
 }
 
 chaos_one() {
-    local kinds=(kill delay partition scenario pause drop dns cpu memory) kind instance result=0 output=$evidence/snapshots/chaos-$chaos_index.log
-    kind=${kinds[chaos_index % ${#kinds[@]}]}
+    local kind instance result=0 output=$evidence/snapshots/chaos-$chaos_index.log
+    kind=${chaos_kinds[chaos_index % ${#chaos_kinds[@]}]}
     chaos_index=$(( chaos_index + 1 ))
     say "fault: chaos $kind"
     open_window "chaos-$kind"
@@ -1503,9 +1532,9 @@ run_cycle() {
     say "cycle $index"
     current_slot="$index:follower-kill"; wait_until "$start"; run_slot slot_bun_kill follower
     current_slot="$index:leader-kill"; wait_until $(( start + slot )); run_slot slot_bun_kill leader
-    if [ $(( index % 2 )) -eq 1 ] && [ -n "$soak_bun" ]; then
+    if [ $(( index % 2 )) -eq 1 ] && [ "$walks" = true ]; then
         current_slot="$index:upgrade"; wait_until $(( start + 2 * slot )); run_slot slot_upgrade
-        # Compressed runs chaos after the walk too, so cycles 0-3 cover all seven kinds.
+        # Compressed runs chaos after the walk too, so cycles 0-3 run eight of the nine kinds.
         if [ "$schedule" = compressed ]; then
             current_slot="$index:chaos"; wait_until $(( start + 4 * slot )); run_slot slot_chaos
         fi
@@ -1644,6 +1673,7 @@ start_run() {
     meta ingress_rotation_secs "json:$rotation"
     [ -z "$base_url" ] || meta base_url "<$base_url>"
     meta candidate_digest "\`${qualified_digest:-not checked}\`"
+    [ -z "$qualified_digest" ] || meta qualified_digest "$qualified_digest"
     if [ -n "$soak_bun" ]; then
         meta soak_bun "\`${soak_bun##*/}\`, SHA-256 \`$(sha256 "$soak_bun")\`"
     else
@@ -1664,6 +1694,12 @@ if [ "$plan" = true ]; then
         case $1 in
             special_for_cycle) "$@" ;;
             slot_bun_kill) printf 'plan: cycle %s %s-kill\n' "$index" "$2" ;;
+            slot_chaos) printf 'plan: cycle %s chaos' "$index"
+                        for (( round = 0; round < chaos_per_slot; round++ )); do
+                            printf ' %s' "${chaos_kinds[chaos_index % ${#chaos_kinds[@]}]}"
+                            chaos_index=$(( chaos_index + 1 ))
+                        done
+                        printf '\n' ;;
             slot_node_fault) printf 'plan: cycle %s node-fault %s node %s\n' "$index" "$(node_fault_kind "$node_fault_index")" \
                                  "$(node_fault_node "$node_fault_index")"
                              node_fault_index=$(( node_fault_index + 1 )) ;;

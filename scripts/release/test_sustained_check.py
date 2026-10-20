@@ -944,7 +944,7 @@ class Record(Evidence):
         code, text = self.render_tier("final")
         self.assertEqual(code, 1)
         self.assertIn("final tier, full schedule, 8 h 02 min", text)
-        self.assertIn("**Final tier: incomplete. Neither the V02 gate nor the release gate's final soak passes:**", text)
+        self.assertIn("**Final tier: incomplete. It passes neither the V02 gate nor the release gate's final soak:**", text)
         self.assertNotIn("gate passes", text)
 
     def test_a_final_tier_with_an_open_failure_does_not_pass_the_gate(self):
@@ -1118,7 +1118,8 @@ class ExecutionInventory(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertTrue(text.startswith("# Sustained soak (V02): FAIL"))
                 self.assertIn(row, text)
-                self.assertIn("**Final tier: incomplete.", text)
+                # A missing drain fails the job gate too, so that record also says "not clean".
+                self.assertIn("incomplete", text.split("\n")[4])
                 self.assertNotIn("gate passes", text)
                 self.assertNotIn("final soak passes", text)
 
