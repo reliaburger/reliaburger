@@ -6276,17 +6276,6 @@
           ]
         },
         {
-          "id": "legacy-ci-reliaburger-self_upgrade_cluster-upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader",
-          "binary": "reliaburger::self_upgrade_cluster",
-          "test": "upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader",
-          "requires": [
-            "upgrade-cluster"
-          ],
-          "sources": [
-            "tests/self_upgrade_cluster.rs"
-          ]
-        },
-        {
           "id": "legacy-ci-reliaburger-self_upgrade_cluster-start_refuses_same_version_other_bytes_and_unrequested_downgrades",
           "binary": "reliaburger::self_upgrade_cluster",
           "test": "start_refuses_same_version_other_bytes_and_unrequested_downgrades",

@@ -392,6 +392,49 @@ retain_versions = 3
             .collect()
     }
 
+    /// `node`'s own view of the council: the Raft membership it holds and
+    /// the part it plays in it.
+    async fn council_from(
+        &self,
+        node: &ClusterNode,
+    ) -> Option<reliaburger::bun::agent::CouncilStatus> {
+        self.client
+            .get(format!("http://{}/v1/cluster/council", node.api))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()
+    }
+
+    /// A council voter that is not the leader, by its own account: it
+    /// reports the `Follower` role and names `leader` as the leader. The
+    /// node must also know every member's API, or it can't forward a plan.
+    async fn wait_for_follower(&self, leader: &str) -> String {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            for node in self.nodes.iter().filter(|node| node.name != leader) {
+                let Some(council) = self.council_from(node).await else {
+                    continue;
+                };
+                if council.role == reliaburger::bun::agent::CouncilRole::Follower
+                    && council.leader.as_deref() == Some(leader)
+                    && self.knows_every_member(node).await
+                {
+                    return node.name.clone();
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for a follower of {leader}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     async fn leader_from(&self, node: &ClusterNode) -> Option<String> {
         let response = self
             .client
@@ -860,7 +903,24 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
     // cluster the scheduler owns placement and a single-replica app on a
     // bouncing node is inherently at risk for its ~1s window, so it's the
     // wrong thing to pin here.
-    let (upgrade_id, old_leader, worker) = harness.start_upgrade().await;
+    //
+    // The start goes to a council follower, not the leader: the walk also
+    // proves that a follower forwards the plan to the leader Raft names
+    // (#250), so no separate forwarding walk is needed (#1055).
+    let leader = harness.wait_for_idle_leader().await;
+    let follower = harness.wait_for_follower(&leader).await;
+    let (upgrade_id, old_leader, worker) = harness
+        .start_upgrade_fetching_from(None, Some(&follower))
+        .await;
+    assert_ne!(follower, old_leader, "the start must not go to the leader");
+    assert_eq!(
+        harness
+            .leader_from(harness.node(&follower))
+            .await
+            .as_deref(),
+        Some(old_leader.as_str()),
+        "{follower} must still follow {old_leader} after forwarding the start"
+    );
 
     // The leader derives each node's role from the Raft voter set. Every
     // node but the leader must be walked as a council member, or this run
@@ -1123,46 +1183,6 @@ async fn version_form_rolls_the_nodes_platform_build_countersigned_by_relish() {
         .as_str()
         .unwrap()
         .to_string();
-    let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
-    assert_eq!(phase, "Completed");
-    harness.wait_for_versions("v0.2.0").await;
-
-    harness.shutdown().await;
-}
-
-/// The V02 soak ran `relish upgrade start` against node 1 after a leader
-/// kill had made it a follower, and got 409 "could not record the upgrade
-/// (are we the leader?)". A node that isn't the leader now forwards the call,
-/// with the caller's credential, and the run it starts completes.
-///
-/// Every node in this harness is a voter, so the node here is a Raft
-/// follower and forwards to the leader Raft names. A worker outside Raft
-/// finds the leader through the gossip directory instead; that case is
-/// `bun::api`'s
-/// `a_worker_outside_raft_forwards_upgrade_calls_to_the_leader_gossip_names`.
-#[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
-async fn upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader() {
-    assert!(
-        upgrade_tests_enabled(),
-        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
-    );
-    let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(3).await;
-    let leader = harness.wait_for_idle_leader().await;
-    let other = harness
-        .nodes
-        .iter()
-        .find(|node| node.name != leader)
-        .unwrap();
-    wait_for("the node to know every member's API", WAIT, || async {
-        harness.knows_every_member(other).await
-    })
-    .await;
-
-    let (upgrade_id, _, _) = harness
-        .start_upgrade_fetching_from(None, Some(&other.name))
-        .await;
     let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
     assert_eq!(phase, "Completed");
     harness.wait_for_versions("v0.2.0").await;

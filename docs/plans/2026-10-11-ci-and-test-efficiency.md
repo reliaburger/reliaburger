@@ -147,7 +147,7 @@ issue until new evidence appears.
 | Q2 one extraction per consumer job | **Done**, [#1050](https://github.com/reliaburger/reliaburger/issues/1050) | See Q2 below |
 | Q3 cancel superseded work | Partly done; **proposed** for closed PRs | `ci.yml` cancels older runs on PR updates and train pushes, but its `pull_request` types have no `closed`, so a closed PR's run keeps going (the #768 case). The benchmark gate's separate treatment is done (#857, #859, #865) |
 | Q4 duplicate 65,536-chunk fixture | **Proposed** | `src/meat/task_array_state.rs` still calls `run_one_task_chunks_on_ten_nodes` from both tests |
-| Q5 consolidate upgrade walks | **Proposed**, pairs with [#1049](https://github.com/reliaburger/reliaburger/issues/1049) | The retention test still walks four transitions; the separate forwarding walk remains in `tests/self_upgrade_cluster.rs`. #1049 is that retention test flaking under load |
+| Q5 consolidate upgrade walks | **Done** ([#1055](https://github.com/reliaburger/reliaburger/issues/1055)) | Retention starts on v0.4 and makes one real upgrade; the rolling walk submits through a follower and the separate forwarding walk is retired |
 | B1 merge queue | Partly done; **proposed, urgent** | `ci.yml` handles `merge_group` and binds evidence to its head SHA. But the only queue ruleset targets `refs/heads/release-0-2-1` by name, so `release-0-2-2` has no rules at all: its PRs merge after the light checks alone, though [releasing.md](../releasing.md) and [testing.md](../testing.md) say every train has a queue |
 | B2 manual-clock cron capacity | **Done** | `tests/cluster_task_arrays.rs` uses `CronClock::manual`; the leadership test keeps the real UTC clock (#748, #868) |
 | B2 placement sleeps | **Proposed** | `tests/placement.rs` still has fixed 3 s and 6 s settle sleeps |
@@ -361,9 +361,15 @@ compile or whole-run gain is promised.
 
 **Scope:** `tests/self_upgrade.rs` and `tests/self_upgrade_cluster.rs`.
 
-**Status:** open. The retention test still performs four transitions, and the
-successful forwarding walk remains separate. Rolling fixtures now use three
-voters rather than four; preserve that current quorum regression coverage.
+**Status:** done ([#1055](https://github.com/reliaburger/reliaburger/issues/1055)).
+The retention test starts on v0.4 with v0.1–v0.3 and their `.sig` envelopes
+installed, makes one real upgrade to v0.5 and checks GC the moment the node
+reports settled; it took about 40 s on a Mac (137.7 s for four transitions in
+#1049's sample), so its 720 s nextest override is gone. The rolling walk
+sends its start through a node that reports itself a Raft follower of the
+leader, and
+`upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader` is
+retired from the test file, the bindings, the manifest and the matrix.
 
 **Tasks:** start retention testing on v0.4 with v0.1–v0.3 already installed,
 then perform one real upgrade to v0.5. Do not seed while still running v0.1:
@@ -379,13 +385,13 @@ current saving forecast.
 
 **Acceptance criteria**
 
-- [ ] Retention still exercises real exec, verification, commit and deletion of
+- [x] Retention still exercises real exec, verification, commit and deletion of
   old binaries and signature sidecars; the settled marker cannot precede GC.
-- [ ] The main rolling test proves follower forwarding and retains ordering,
+- [x] The main rolling test proves follower forwarding and retains ordering,
   version convergence and surviving-leader assertions.
-- [ ] Pause/resume, rollback, interrupted download and role-correction coverage
+- [x] Pause/resume, rollback, interrupted download and role-correction coverage
   remain. Actual worker topology is handled explicitly in B3.
-- [ ] Smaller API forwarding/authentication tests and protected-version store
+- [x] Smaller API forwarding/authentication tests and protected-version store
   tests remain; the retired names are reconciled with their required owners.
 
 ## Larger changes
