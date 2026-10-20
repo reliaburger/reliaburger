@@ -706,9 +706,9 @@
           ]
         },
         {
-          "id": "issue-534-hung_failed_hook_settlement_preserves_the_exact_failure_and_app_gate",
+          "id": "issue-534-hung_cancel_after_a_failed_hook_preserves_the_exact_failure_and_app_gate",
           "binary": "reliaburger",
-          "test": "bun::api::tests::hung_failed_hook_settlement_preserves_the_exact_failure_and_app_gate",
+          "test": "bun::api::tests::hung_cancel_after_a_failed_hook_preserves_the_exact_failure_and_app_gate",
           "requires": [
             "portable-linux",
             "portable-darwin"
@@ -732,9 +732,9 @@
           ]
         },
         {
-          "id": "issue-534-hung_common_commit_preserves_the_exact_successful_hook_and_app_gate",
+          "id": "issue-534-hung_cancel_after_a_successful_hook_preserves_the_exact_intent_and_app_gate",
           "binary": "reliaburger",
-          "test": "bun::api::tests::hung_common_commit_preserves_the_exact_successful_hook_and_app_gate",
+          "test": "bun::api::tests::hung_cancel_after_a_successful_hook_preserves_the_exact_intent_and_app_gate",
           "requires": [
             "portable-linux",
             "portable-darwin"
@@ -742,6 +742,34 @@
           "sources": [
             "src/bun/api/tests.rs",
             "src/meat/job_deploy.rs"
+          ]
+        },
+        {
+          "id": "issue-1058-hung_common_commit_is_bounded_and_preserves_the_exact_successful_hook_and_app_gate",
+          "binary": "reliaburger",
+          "test": "bun::api::tests::hung_common_commit_is_bounded_and_preserves_the_exact_successful_hook_and_app_gate",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/api/tests.rs",
+            "src/bun/job_apply.rs",
+            "src/bun/task_array_leader.rs"
+          ]
+        },
+        {
+          "id": "issue-1058-hung_failed_hook_settlement_is_bounded_and_preserves_the_exact_failure_and_app_gate",
+          "binary": "reliaburger",
+          "test": "bun::api::tests::hung_failed_hook_settlement_is_bounded_and_preserves_the_exact_failure_and_app_gate",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/api/tests.rs",
+            "src/bun/job_apply.rs",
+            "src/bun/task_array_leader.rs"
           ]
         },
         {
