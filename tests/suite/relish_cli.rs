@@ -520,6 +520,61 @@ spec:
     assert!(String::from_utf8_lossy(&output.stdout).contains("[app.web]"));
 }
 
+/// #1132: `export --strict` is the same CI gate as `import --strict`: a job
+/// whose egress rules Kubernetes can't carry must fail it, and the error says
+/// how many lines of each kind the report has.
+#[cfg(feature = "kubernetes")]
+#[test]
+fn export_strict_fails_when_a_field_is_not_exported() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("job.toml");
+    std::fs::write(
+        &config,
+        r#"
+[job.fetch]
+image = "fetcher:v1"
+
+[job.fetch.egress]
+allow = ["api.example.com:443"]
+"#,
+    )
+    .unwrap();
+    let path = config.to_str().unwrap();
+
+    let lenient = run(&["export", "-f", path]);
+    assert!(
+        lenient.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lenient.stderr)
+    );
+    assert!(String::from_utf8_lossy(&lenient.stderr).contains("[job.fetch.egress]"));
+
+    let strict = run(&["export", "--strict", "-f", path]);
+    assert_eq!(strict.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(stderr.contains("[job.fetch.egress]"), "{stderr}");
+    assert!(stderr.contains("1 unsupported"), "{stderr}");
+}
+
+#[cfg(feature = "kubernetes")]
+#[test]
+fn export_strict_passes_a_config_that_exports_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("cron.toml");
+    std::fs::write(
+        &config,
+        "[job.cleanup]\nimage = \"cleanup:v1\"\nschedule = \"0 3 * * *\"\noverlap = \"allow\"\n",
+    )
+    .unwrap();
+    let output = run(&["export", "--strict", "-f", config.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("concurrencyPolicy: Allow"));
+}
+
 /// #703: exporting used to keep `command` only, so Redis came back without
 /// `--maxmemory 64mb --save "" --appendonly no`.
 #[cfg(feature = "kubernetes")]
