@@ -29,6 +29,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use crate::config::Config;
 use crate::config::app::AppSpec;
+use crate::config::job::OverlapPolicy;
 use crate::config::types::Replicas;
 
 use super::RelishError;
@@ -465,6 +466,23 @@ fn export_job(
             "[job.{name}] pids — a Pod spec has no process limit; the kubelet sets one per node (podPidsLimit)"
         ));
     }
+    // #1132: these used to vanish without a report line. Firewall and egress
+    // read the same as the app exporter's, since they mean the same thing.
+    if job.firewall.is_some() {
+        report.unsupported.push(format!(
+            "[job.{name}.firewall] — use NetworkPolicy manually"
+        ));
+    }
+    if job.egress.is_some() {
+        report
+            .unsupported
+            .push(format!("[job.{name}.egress] — use NetworkPolicy manually"));
+    }
+    if job.replay_unknown {
+        report.unsupported.push(format!(
+            "[job.{name}] replay_unknown — a Job retries failed Pods (backoffLimit) but has no switch for runs whose node was lost"
+        ));
+    }
     let app_namespace = job.namespace.clone();
     // Env and resources go through the same helpers as the app path — the job
     // exporter used to drop both, so a job with a memory limit and database
@@ -513,6 +531,7 @@ fn export_job(
             },
             spec: CronJobSpec {
                 schedule: schedule.clone(),
+                concurrency_policy: Some(concurrency_policy(job.overlap).to_string()),
                 job_template: JobTemplateSpec {
                     spec: Some(JobSpec {
                         template,
@@ -555,6 +574,17 @@ fn export_job(
         ));
     }
     Ok(())
+}
+
+/// The CronJob `concurrencyPolicy` for a job's `overlap`.
+///
+/// Always set, never left to Kubernetes: an omitted `overlap` means `forbid`
+/// in Reliaburger but an omitted `concurrencyPolicy` means `Allow`.
+fn concurrency_policy(overlap: Option<OverlapPolicy>) -> &'static str {
+    match overlap.unwrap_or_default() {
+        OverlapPolicy::Allow => "Allow",
+        OverlapPolicy::Forbid => "Forbid",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -933,9 +963,10 @@ mod tests {
         let unsupported = &result.report.unsupported;
         for field in ["firewall", "egress"] {
             assert!(
-                unsupported.iter().any(
-                    |u| u.contains(&format!("[job.fetch.{field}]")) && u.contains("NetworkPolicy")
-                ),
+                unsupported
+                    .iter()
+                    .any(|u| u.contains(&format!("[job.fetch.{field}]"))
+                        && u.contains("NetworkPolicy")),
                 "{field} missing from {unsupported:?}"
             );
         }
