@@ -697,6 +697,8 @@ impl TaskArrayState {
         }
         self.stopped = Some(reason);
         let queued = std::mem::take(&mut self.queued);
+        // Requeued chunks carry a later attempt; a retired chunk has none.
+        self.attempts.retain(|chunk, _| !queued.contains(*chunk));
         self.not_run += self.tasks_in(&queued);
         self.done.extend_from(&queued);
     }

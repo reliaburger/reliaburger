@@ -157,7 +157,7 @@ issue until new evidence appears.
 | B3 stalled TLS reclamation | **Proposed** | `stalled_tls_handshakes_are_bounded_and_reclaimed` in `src/wrapper/proxy.rs` only checks a five-byte write after the stall, which passes without reclamation |
 | B3 real worker in the rolling walk | **Proposed**, with Q5 | The walk starts three voters and relabels one as the worker |
 | B4 late publication | **Proposed** | No test pauses the blocking writer past its caller's deadline |
-| B4 broader lifecycle property test | **Proposed** | The task-array proptest model has only plan, complete, lose and cancel |
+| B4 broader lifecycle property test | **Done** ([#1060](https://github.com/reliaburger/reliaburger/issues/1060)) | `generated_lifecycles_keep_identity_conservation_and_fences` in `src/meat/task_array_store.rs` drives repeated and changed requests, grants, stale completions, worker loss, unknown outcomes, replay acknowledgements, cancellation, cron fires, pruning and reopen through `TaskArrays::apply`. It found that a stop after a requeue kept attempts on retired chunks, so the snapshot refused to reopen |
 | B5 per-record fragments | Deferred | Only worth doing if conflicts in the shared manifest, bindings and flakes files are measured as frequent |
 | B6 repeated macOS compilation | **Done** (decided) | [#846](https://github.com/reliaburger/reliaburger/issues/846) and PR #903 removed the double compile; a shared macOS archive was measured and rejected, because the build stays on the critical path |
 | B6 small-crate pilot | Deferred | Speculative; the single crate is deliberate |
