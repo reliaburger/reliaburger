@@ -8858,83 +8858,81 @@ async fn cluster_scheduled_apply_commits_apps_and_a_definition_without_an_immedi
     council.shutdown().await.unwrap();
 }
 
-/// Actual Raft writes with the lost-quorum test hook; synthetic results are
-/// transition evidence only. Owned runtime tests separately qualify exits.
-#[derive(Clone, Copy)]
-enum HangingPrerequisiteWrite {
-    Begin,
-    Commit,
-    KnownFailed,
-}
+/// The deployment the hung-write tests share: one app gated behind one hook.
+const HUNG_DEPLOYMENT_ID: &str = "55555555555555555555555555555555";
+const HUNG_DEPLOYMENT_MANIFEST: &str =
+    "[app.web]\nimage='web:v2'\n[job.migrate]\nimage='migration:v1'\nrun_before=['app.web']\n";
 
-async fn assert_hung_prerequisite_write_has_a_bounded_error(boundary: HangingPrerequisiteWrite) {
+/// Begin the shared deployment and drive its `migrate` hook to a terminal
+/// result through real Raft writes. Synthetic results are transition evidence
+/// only; owned runtime tests separately qualify exits. Returns the hook's run.
+async fn seed_finished_hook(council: &crate::council::CouncilNode, failed: bool) -> u64 {
     use crate::council::{CouncilResponse, RaftRequest};
     use crate::meat::task_array_store::TaskArrayWrite;
-    let council = seeded_council("common-hung-deployment").await;
-    let operation_id = "55555555555555555555555555555555";
-    let manifest =
-        "[app.web]\nimage='web:v2'\n[job.migrate]\nimage='migration:v1'\nrun_before=['app.web']\n";
-    if !matches!(boundary, HangingPrerequisiteWrite::Begin) {
-        let result = council
-            .write(RaftRequest::TaskArray(Box::new(
-                TaskArrayWrite::DeployBegin {
-                    operation_id: operation_id.into(),
-                    config: Box::new(crate::config::Config::parse(manifest).unwrap()),
-                    now_epoch_secs: 1,
-                },
-            )))
-            .await
-            .unwrap();
-        assert!(!matches!(result, CouncilResponse::Refused { .. }));
-        let arrays = council.desired_state().await.task_arrays;
-        let run = arrays.deployment(operation_id).unwrap().hook_runs["migrate"];
-        let owner = crate::meat::NodeId::new("worker");
-        let result = council
-            .write(RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
-                batch_id: run,
-                now_epoch_secs: 2,
-                results: vec![],
-                grants: vec![(
-                    owner.clone(),
-                    crate::meat::index_set::IndexRangeSet::from_range(0..=0),
-                )],
-            })))
-            .await
-            .unwrap();
-        assert!(!matches!(result, CouncilResponse::Refused { .. }));
-        let failed = matches!(boundary, HangingPrerequisiteWrite::KnownFailed);
-        let result = council
-            .write(RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
-                batch_id: run,
-                now_epoch_secs: 3,
-                grants: vec![],
-                results: vec![(
-                    owner,
-                    crate::meat::task_array_state::ChunkResult {
-                        chunk: crate::meat::task_array::ChunkId(0),
-                        attempt: 1,
-                        succeeded: u32::from(!failed),
-                        failed_count: u32::from(failed),
-                        failed_indices: if failed {
-                            crate::meat::index_set::IndexRangeSet::from_range(0..=0)
-                        } else {
-                            Default::default()
-                        },
-                        not_run: 0,
-                        retried: 0,
-                        retry_causes: Default::default(),
-                        duration_counts: [0; 16],
+    let result = council
+        .write(RaftRequest::TaskArray(Box::new(
+            TaskArrayWrite::DeployBegin {
+                operation_id: HUNG_DEPLOYMENT_ID.into(),
+                config: Box::new(crate::config::Config::parse(HUNG_DEPLOYMENT_MANIFEST).unwrap()),
+                now_epoch_secs: 1,
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(!matches!(result, CouncilResponse::Refused { .. }));
+    let arrays = council.desired_state().await.task_arrays;
+    let run = arrays.deployment(HUNG_DEPLOYMENT_ID).unwrap().hook_runs["migrate"];
+    let owner = crate::meat::NodeId::new("worker");
+    let result = council
+        .write(RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
+            batch_id: run,
+            now_epoch_secs: 2,
+            results: vec![],
+            grants: vec![(
+                owner.clone(),
+                crate::meat::index_set::IndexRangeSet::from_range(0..=0),
+            )],
+        })))
+        .await
+        .unwrap();
+    assert!(!matches!(result, CouncilResponse::Refused { .. }));
+    let result = council
+        .write(RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
+            batch_id: run,
+            now_epoch_secs: 3,
+            grants: vec![],
+            results: vec![(
+                owner,
+                crate::meat::task_array_state::ChunkResult {
+                    chunk: crate::meat::task_array::ChunkId(0),
+                    attempt: 1,
+                    succeeded: u32::from(!failed),
+                    failed_count: u32::from(failed),
+                    failed_indices: if failed {
+                        crate::meat::index_set::IndexRangeSet::from_range(0..=0)
+                    } else {
+                        Default::default()
                     },
-                )],
-            })))
-            .await
-            .unwrap();
-        assert!(!matches!(result, CouncilResponse::Refused { .. }));
-    }
-    let before = council.desired_state().await;
-    council.hang_writes();
+                    not_run: 0,
+                    retried: 0,
+                    retry_causes: Default::default(),
+                    duration_counts: [0; 16],
+                },
+            )],
+        })))
+        .await
+        .unwrap();
+    assert!(!matches!(result, CouncilResponse::Refused { .. }));
+    run
+}
+
+/// A stand-in agent for the hung-write tests: it answers the deploy-operations
+/// query and forwards every other command, so a test can prove none arrived.
+fn hung_write_router(
+    council: Arc<crate::council::CouncilNode>,
+) -> (axum::Router, mpsc::Receiver<AgentCommand>) {
     let (tx, mut incoming) = mpsc::channel(16);
-    let (trace, mut commands) = mpsc::channel(16);
+    let (trace, commands) = mpsc::channel(16);
     tokio::spawn(async move {
         while let Some(command) = incoming.recv().await {
             match command {
@@ -8957,7 +8955,7 @@ async fn assert_hung_prerequisite_write_has_a_bounded_error(boundary: HangingPre
         None,
         None,
         None,
-        Some(council.clone()),
+        Some(council),
         None,
         None,
         None,
@@ -8966,14 +8964,44 @@ async fn assert_hung_prerequisite_write_has_a_bounded_error(boundary: HangingPre
         0,
         None,
     );
-    let request = if matches!(boundary, HangingPrerequisiteWrite::Begin) {
+    (app, commands)
+}
+
+/// The operator-facing write a hung-quorum test sends over HTTP.
+#[derive(Clone, Copy)]
+enum HungOperatorWrite {
+    /// `POST /v1/apply` begins a deployment.
+    Begin,
+    /// `POST .../cancel` after the hook succeeded.
+    CancelAfterSuccess,
+    /// `POST .../cancel` after the hook failed.
+    CancelAfterFailure,
+}
+
+async fn assert_hung_operator_write_has_a_bounded_error(boundary: HungOperatorWrite) {
+    let council = seeded_council("common-hung-deployment").await;
+    match boundary {
+        HungOperatorWrite::Begin => {}
+        HungOperatorWrite::CancelAfterSuccess => {
+            seed_finished_hook(&council, false).await;
+        }
+        HungOperatorWrite::CancelAfterFailure => {
+            seed_finished_hook(&council, true).await;
+        }
+    }
+    let before = council.desired_state().await;
+    council.hang_writes();
+    let (app, mut commands) = hung_write_router(council.clone());
+    let request = if matches!(boundary, HungOperatorWrite::Begin) {
         axum::http::Request::post("/v1/apply")
-            .body(Body::from(manifest))
+            .body(Body::from(HUNG_DEPLOYMENT_MANIFEST))
             .unwrap()
     } else {
-        axum::http::Request::post(format!("/v1/deploys/operations/{operation_id}/cancel"))
-            .body(Body::empty())
-            .unwrap()
+        axum::http::Request::post(format!(
+            "/v1/deploys/operations/{HUNG_DEPLOYMENT_ID}/cancel"
+        ))
+        .body(Body::empty())
+        .unwrap()
     };
     let response = tokio::time::timeout(std::time::Duration::from_secs(15), app.oneshot(request))
         .await
@@ -8986,25 +9014,138 @@ async fn assert_hung_prerequisite_write_has_a_bounded_error(boundary: HangingPre
         after.task_arrays, before.task_arrays,
         "uncertain publication or cancellation discarded durable intent"
     );
-    assert!(matches!(
-        commands.try_recv(),
-        Ok(AgentCommand::DeployOperations { .. }) | Err(_)
-    ));
     assert!(commands.try_recv().is_err());
     council.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn hung_common_begin_returns_bounded_unavailability_without_publication() {
-    assert_hung_prerequisite_write_has_a_bounded_error(HangingPrerequisiteWrite::Begin).await;
+    assert_hung_operator_write_has_a_bounded_error(HungOperatorWrite::Begin).await;
 }
 #[tokio::test]
-async fn hung_common_commit_preserves_the_exact_successful_hook_and_app_gate() {
-    assert_hung_prerequisite_write_has_a_bounded_error(HangingPrerequisiteWrite::Commit).await;
+async fn hung_cancel_after_a_successful_hook_preserves_the_exact_intent_and_app_gate() {
+    assert_hung_operator_write_has_a_bounded_error(HungOperatorWrite::CancelAfterSuccess).await;
 }
 #[tokio::test]
-async fn hung_failed_hook_settlement_preserves_the_exact_failure_and_app_gate() {
-    assert_hung_prerequisite_write_has_a_bounded_error(HangingPrerequisiteWrite::KnownFailed).await;
+async fn hung_cancel_after_a_failed_hook_preserves_the_exact_failure_and_app_gate() {
+    assert_hung_operator_write_has_a_bounded_error(HungOperatorWrite::CancelAfterFailure).await;
+}
+
+/// The settlement write the leader issues on its own once a deployment's
+/// hook has finished. No operator request carries either one.
+#[derive(Clone, Copy, PartialEq)]
+enum StalledSettlement {
+    /// The hook succeeded: `JobApplyCommit` publishes the apps.
+    Commit,
+    /// The hook failed: `DeployCancel` settles the deployment.
+    FailedHook,
+}
+
+/// Stall the leader's real settlement write and prove it is bounded: the
+/// leader abandons the hung write at `WRITE_TIMEOUT` and tries again on a
+/// later tick, rather than wedging its loop. Meanwhile the durable intent
+/// stays exactly as it was, no agent is told to publish, and a failed hook
+/// never even attempts publication.
+async fn assert_stalled_settlement_is_bounded(settlement: StalledSettlement) {
+    use crate::bun::task_array_leader::WRITE_TIMEOUT;
+    use crate::council::RaftRequest;
+    use crate::meat::task_array_state::TaskArrayStatus;
+    use crate::meat::task_array_store::TaskArrayWrite;
+
+    let council = seeded_council("stalled-settlement").await;
+    let failed = settlement == StalledSettlement::FailedHook;
+    let run = seed_finished_hook(&council, failed).await;
+    let before = council.desired_state().await;
+    let record = before.task_arrays.deployment(HUNG_DEPLOYMENT_ID).unwrap();
+    assert!(!record.apps_committed && !record.cancelled && !record.completed);
+    assert_eq!(
+        before.task_arrays.get(run).unwrap().state.status(),
+        if failed {
+            TaskArrayStatus::CompletedWithFailures
+        } else {
+            TaskArrayStatus::Succeeded
+        }
+    );
+
+    council.hang_writes();
+    // The router starts the leader loop, whose first tick settles.
+    let (_app, mut commands) = hung_write_router(council.clone());
+
+    let is_commit = |request: &RaftRequest| {
+        matches!(request, RaftRequest::JobApplyCommit { operation_id, .. }
+            if operation_id == HUNG_DEPLOYMENT_ID)
+    };
+    let is_cancel = |request: &RaftRequest| {
+        matches!(request, RaftRequest::TaskArray(write)
+            if matches!(write.as_ref(), TaskArrayWrite::DeployCancel { operation_id, .. }
+                if operation_id == HUNG_DEPLOYMENT_ID))
+    };
+    let attempts = || {
+        council
+            .hung_writes()
+            .into_iter()
+            .filter(|(_, request)| match settlement {
+                StalledSettlement::Commit => is_commit(request),
+                StalledSettlement::FailedHook => is_cancel(request),
+            })
+            .map(|(at, _)| at)
+            .collect::<Vec<_>>()
+    };
+    // The second attempt can only come once the first is abandoned. The rest
+    // of the tick hangs for one more `WRITE_TIMEOUT` in between (its
+    // `CronObserve` write), so a healthy leader retries after about two;
+    // the bound leaves room for a loaded runner.
+    let bound = WRITE_TIMEOUT * 4;
+    let started = tokio::time::Instant::now();
+    while attempts().len() < 2 {
+        let seen = attempts().len();
+        assert!(
+            started.elapsed() < bound,
+            "{} (waited {bound:?})",
+            if seen == 0 {
+                "the leader never attempted the settlement write"
+            } else {
+                "the leader never retried its hung settlement write: the stall wedged settlement"
+            }
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let attempts = attempts();
+    assert!(
+        attempts[1] - attempts[0] >= WRITE_TIMEOUT,
+        "the leader gave up on the settlement write before WRITE_TIMEOUT: {:?}",
+        attempts[1] - attempts[0]
+    );
+    if failed {
+        assert!(
+            !council
+                .hung_writes()
+                .iter()
+                .any(|(_, request)| is_commit(request)),
+            "a failed hook must never attempt app publication"
+        );
+    }
+
+    let after = council.desired_state().await;
+    assert_eq!(after.apps, before.apps, "the app gate opened");
+    assert_eq!(
+        after.task_arrays, before.task_arrays,
+        "a stalled settlement changed the durable intent"
+    );
+    assert!(
+        commands.try_recv().is_err(),
+        "an agent was told to act while settlement was stalled"
+    );
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn hung_common_commit_is_bounded_and_preserves_the_exact_successful_hook_and_app_gate() {
+    assert_stalled_settlement_is_bounded(StalledSettlement::Commit).await;
+}
+#[tokio::test]
+async fn hung_failed_hook_settlement_is_bounded_and_preserves_the_exact_failure_and_app_gate() {
+    assert_stalled_settlement_is_bounded(StalledSettlement::FailedHook).await;
 }
 
 async fn write_admission_fixture(
