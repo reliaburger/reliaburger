@@ -65,6 +65,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         services: &crate::onion::service_map::ServiceMap,
     ) -> Result<(), BunError> {
         self.persist_discovery_publication(id, services).await?;
+        self.publish_journalled_backends(id, services).await
+    }
+
+    /// Publish a candidate the discovery journal already records: to the
+    /// kernel, or, while the consumer controls the views, by marking its
+    /// view stale.
+    pub(super) async fn publish_journalled_backends(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+        services: &crate::onion::service_map::ServiceMap,
+    ) -> Result<(), BunError> {
         if self.consumer_controls_views() {
             return self.mark_consumer_view_stale();
         }
