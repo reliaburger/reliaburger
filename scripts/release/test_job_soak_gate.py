@@ -323,9 +323,10 @@ class JobQualification(unittest.TestCase):
         budget=next(line for line in lines if line[0]=="job-runs")[1:]
         budget=dict(zip(budget[::2],budget[1::2]))
         cycles=len({line[1] for line in lines if line[0]=="cycle"})
-        # The campaign is sized for the whole schedule the plan prints...
+        # The campaign is sized for the whole schedule the plan prints, the
+        # quiet tail after the faults included (#1062)...
         self.assertEqual(cycles*int(header["cycle"]),int(header["duration"]))
-        plan=jobs.run_budget(cycles*int(header["cycle"]))
+        plan=jobs.run_budget(cycles*int(header["cycle"])+int(header["quiet-tail"]))
         self.assertEqual((int(budget["expected"]),int(budget["retained-peak"])),(plan["expected_runs"],plan["peak_retained"]))
         # ...and what it holds at once fits its limit.
         self.assertLessEqual(int(budget["retained-peak"]),int(budget["limit"]))
