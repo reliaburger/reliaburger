@@ -15,6 +15,9 @@ WORKFLOWS = REPO / ".github" / "workflows"
 NEXTEST_TARGETS = re.compile(r"\bmake (coverage|test(?:-[a-z-]+)?)(?![\w-])")
 NOT_NEXTEST = {"test-doc", "test-images", "test-ci-scripts"}
 
+# The no-op job a closed pull request's run starts instead of CI.
+CLOSED_JOB = "closed-pull-request"
+
 
 def jobs(text):
     """{job id: the job's lines}, for the top-level jobs of a workflow."""
@@ -421,12 +424,49 @@ class TrainAndQueueTests(unittest.TestCase):
         # Main and merge-queue runs fall back to their own run id.
         self.assertTrue(group.rstrip().endswith("|| github.run_id }}"), group)
 
+    def test_closing_a_pull_request_starts_a_run_that_cancels_its_older_one(self):
+        types = re.search(r"\n  pull_request:\n(?:\s+#.*\n|\s+branches: .*\n)*\s+types: \[(.*)\]\n",
+                          self.triggers).group(1).split(", ")
+        self.assertIn("closed", types)
+        # The closed run joins the pull request's group, so cancel-in-progress
+        # ends the run that was still working on the closed PR.
+        cancel = re.search(r"\n  cancel-in-progress: (.*)", self.ci).group(1)
+        self.assertNotIn("github.event.action", cancel)
+        closed = self.jobs[CLOSED_JOB]
+        self.assertIn("    if: github.event.action == 'closed'\n", closed)
+        self.assertNotIn("needs:", closed)
+        # A no-op: it neither checks out nor builds anything.
+        self.assertEqual([step for step in steps(closed) if "uses:" in step], [])
+        self.assertLessEqual(int(re.search(r"timeout-minutes: (\d+)", closed).group(1)), 5)
+
+    def test_a_closed_pull_requests_run_does_no_other_work(self):
+        guard = "github.event.action != 'closed'"
+        for name, job in self.jobs.items():
+            if name == CLOSED_JOB:
+                continue
+            condition = re.search(r"\n    if: (.*)\n", "\n" + job + "\n")
+            if condition and guard in condition.group(1):
+                continue
+            # Without the guard, a job may only run after select jobs ran,
+            # and only when that succeeded: a status function such as
+            # always() would start it on a closed run too.
+            needs = re.search(r"\n    needs: (.*)\n", "\n" + job + "\n")
+            self.assertIsNotNone(needs, name)
+            self.assertIn("changes", needs.group(1), name)
+            if condition:
+                self.assertNotRegex(condition.group(1), r"always\(\)|failure\(\)|cancelled\(\)", name)
+        for name in ["changes", "ci-policy", "dependency-audit", "ignored-evidence"]:
+            self.assertIn(guard, self.jobs[name], name)
+
     def test_the_final_gate_waits_for_every_other_job_and_always_reports(self):
         gate = self.jobs["ignored-evidence"]
         needs = set(re.search(r"needs: \[([^\]]*)\]", gate).group(1).split(", "))
-        self.assertEqual(needs, set(self.jobs) - {"ignored-evidence"})
+        # The closed-PR job never runs alongside the gate.
+        self.assertEqual(needs, set(self.jobs) - {"ignored-evidence", CLOSED_JOB})
         self.assertIn("    name: ignored-test evidence\n", gate)
-        self.assertIn("    if: ${{ always() }}\n", gate)
+        # It reports whatever the other jobs did, except on a closed PR's
+        # run, where there is nothing to report.
+        self.assertIn("    if: ${{ always() && github.event.action != 'closed' }}\n", gate)
         blocks = steps(gate)
         first = next(index for index, step in enumerate(blocks) if "every_job.py" in step)
         aggregate = next(index for index, step in enumerate(blocks) if "workflow_adapter.py aggregate" in step)

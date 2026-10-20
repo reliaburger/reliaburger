@@ -1188,21 +1188,25 @@ def record_exposure(state, node, changed, values, age, now):
         entry["last"] = now
 
 
-def exposure_lines(state):
-    """The record's table of armed time per node and leak checker."""
-    lines = ["## Leak-checker exposure (reported, not gated)", "",
+def exposure_lines(state, gated):
+    """The record's table of armed time per node and leak checker; a final
+    tier gates on it, other tiers record it."""
+    short = set(exposure_shortfalls(state))
+    lines = [f"## Leak-checker exposure ({'gated' if gated else 'recorded, not gated'})", "",
              "How long each leak checker could judge each node's Bun. `leak-rss` arms after "
              f"{RSS_WARMUP // 60} minutes in one process and `leak-fd` after "
              f"{(FD_WARMUP + (FD_RISES + 1) * FD_BUCKET) // 60}; a restart, kill or upgrade exec starts the warm-up "
-             "again. Nothing is gated on these yet (#1062).", "",
-             "| Node | Checker | Armed | Longest armed window | Evaluated samples | Processes armed |",
-             "|---|---|---|---|---|---|"]
+             f"again. A final needs each armed for {EXPOSURE_ARMED_SECONDS // 60} minutes on every node, with one "
+             f"unbroken window of {EXPOSURE_WINDOW_SECONDS // 60} (#1062); its quiet tail gives them that.", "",
+             "| Node | Checker | Armed | Longest armed window | Evaluated samples | Processes armed | Verdict |",
+             "|---|---|---|---|---|---|---|"]
     for node in state.get("nodes", []):
         for check, _, _ in CHECKER_ARMED_AFTER:
             entry = state.get("exposure", {}).get(node, {}).get(check, {})
+            verdict = ("SHORT" if gated else "short") if (node, check) in short else "ok"
             lines.append(f"| {node} | {check} | {entry.get('armed_seconds', 0) // 60} min | "
                          f"{entry.get('longest_seconds', 0) // 60} min | {entry.get('samples', 0)} | "
-                         f"{entry.get('processes_armed', 0)} |")
+                         f"{entry.get('processes_armed', 0)} | {verdict} |")
     return lines + [""]
 
 
@@ -1487,6 +1491,16 @@ def expected_renewals(elapsed, period):
 
 
 FINAL_TIER_SECONDS = 8 * 3600
+# A final ends with a quiet tail after its 8 hours of faults: no faults, walks
+# or specials, so every node's Bun lives long enough to arm the leak checkers
+# and give them comparison samples (#1062, maintainer decision 20 October
+# 2026). Each checker must be armed this long on every node, with one
+# unbroken window at least EXPOSURE_WINDOW_SECONDS long; a fast or custom run
+# records its exposure without gating on it. qualify-sustained.sh has the
+# same tail length.
+QUIET_TAIL_SECONDS = 2 * 3600
+EXPOSURE_ARMED_SECONDS = 3600
+EXPOSURE_WINDOW_SECONDS = 1800
 
 # The execution inventory (#1061). The schedule below mirrors run_cycle and
 # special_for_cycle in qualify-sustained.sh; test_sustained_check compares
@@ -1500,6 +1514,7 @@ WALK_ITEM = "upgrade walk (to the soak build and back)"
 PULSE_ITEM = "catalogue pulse"
 EXPORT_ITEM = "offline export"
 DRAIN_ITEM = "job campaign drained in its final two minutes"
+QUIET_ITEM = "quiet tail with no faults, walks or specials"
 SLOT_FAULTS = ("fault:bun-kill-follower", "fault:bun-kill-leader", "fault:deploy-kill", "fault:power-off")
 SPECIALS = ("special:graceful-stop", "special:quorum-loss", "special:all-off")
 
@@ -1570,6 +1585,8 @@ def required_execution(metadata):
         required[PULSE_ITEM] = pulses
     if exports:
         required[EXPORT_ITEM] = exports
+    if final:
+        required[QUIET_ITEM] = 1
     required[DRAIN_ITEM] = 1
     if not required[WALK_ITEM]:
         del required[WALK_ITEM]
@@ -1618,7 +1635,37 @@ def completed_execution(evidence, metadata, events, job_report):
     drained = (metadata.get("job_soak") is True and report.get("stopped") is True and not report.get("active")
                and type(stop) is int and stop >= metadata.get("job_stop_at", 0))
     completed[DRAIN_ITEM] = 1 if drained else 0
+    completed[QUIET_ITEM] = quiet_tails(events)
     return completed
+
+
+def quiet_tails(events):
+    """Quiet tails that lasted QUIET_TAIL_SECONDS (a minute's slack for the
+    clock) with no fault, walk or special inside them."""
+    complete, started, disturbed = 0, None, False
+    for event in events:
+        phase = event.get("phase", "")
+        if phase == "quiet" and event.get("verdict") is None:
+            started, disturbed = event.get("ts"), False
+        elif phase == "quiet" and started is not None:
+            if event.get("verdict") == "ok" and (event.get("duration") or 0) >= QUIET_TAIL_SECONDS - 60 and not disturbed:
+                complete += 1
+            started = None
+        elif started is not None and phase.startswith(("fault:", "upgrade", "special:")):
+            disturbed = True
+    return complete
+
+
+def exposure_shortfalls(state):
+    """(node, checker) pairs armed too briefly, or never for one unbroken window."""
+    short = []
+    for node in state.get("nodes", []):
+        for check, _, _ in CHECKER_ARMED_AFTER:
+            entry = state.get("exposure", {}).get(node, {}).get(check, {})
+            if (entry.get("armed_seconds", 0) < EXPOSURE_ARMED_SECONDS
+                    or entry.get("longest_seconds", 0) < EXPOSURE_WINDOW_SECONDS):
+                short.append((node, check))
+    return short
 
 
 def execution_inventory(evidence, metadata, events, job_report):
@@ -1635,7 +1682,7 @@ def job_final_ran(metadata, job_report, missing):
             and not [item for item in missing if item.startswith("fault:node-")])
 
 
-def acceptance_line(metadata, result, elapsed, missing=(), job_final=False):
+def acceptance_line(metadata, result, elapsed, missing=(), job_final=False, exposure=()):
     """What the run says about the V02 gate (plan D3) and the release gate's
     final soak (#991): only a clean, complete final tier passes either."""
     tier = metadata.get("tier") or "custom"
@@ -1653,14 +1700,17 @@ def acceptance_line(metadata, result, elapsed, missing=(), job_final=False):
         shortfalls.append(f"it ran the {metadata['schedule']} schedule")
     if min(elapsed, metadata.get("duration_target") or 0) < FINAL_TIER_SECONDS:
         shortfalls.append(f"it soaked for {duration_text(elapsed)}")
+    gaps = (["missing from the execution inventory: " + ", ".join(missing)] if missing else []) + (
+        ["leak-checker exposure too short: " + ", ".join(f"{node} {check}" for node, check in exposure)]
+        if exposure else [])
     if not clean:
         return ("**Final tier: not clean. The V02 gate does not pass.** A product fix means a fresh fast-tier run, "
-                "then a fresh final-tier run."
-                + (" It is incomplete too: " + ", ".join(missing) + " missing." if missing else ""))
-    if missing:
+                "then a fresh final-tier run." + (" It is incomplete too: " + "; ".join(gaps) + "." if gaps else ""))
+    if gaps:
         return ("**Final tier: incomplete. It passes neither the V02 gate nor the release gate's final soak:** "
-                + "; ".join(shortfalls + ["missing from the execution inventory: " + ", ".join(missing)])
-                + ". A final tier owes every walk, fault kind and special of its 8-hour schedule.")
+                + "; ".join(shortfalls + gaps)
+                + ". A final tier owes every walk, fault kind and special of its 8-hour schedule, then a quiet tail "
+                "long enough to arm every leak checker on every node.")
     if shortfalls:
         return (f"**Final tier: clean, but not acceptance:** {'; '.join(shortfalls)}. The V02 gate needs 8 h on "
                 "the full schedule against a pinned candidate.")
@@ -1717,7 +1767,8 @@ def render(evidence, record):
     inventory = execution_inventory(evidence, metadata, events, job_report)
     missing = [item for item, need, done in inventory if done < need]
     final_tier = metadata.get("tier") == "final"
-    gate_failed = any(row[3] == "FAIL" for row in gates) or (final_tier and bool(missing))
+    exposure = exposure_shortfalls(state)
+    gate_failed = any(row[3] == "FAIL" for row in gates) or (final_tier and bool(missing or exposure))
     open_failures = [row for row in failures if row.get("disposition", "open") == "open"]
     result = metadata.get("result") or ("FAIL" if open_failures or gate_failed else "PASS")
     if (open_failures or gate_failed) and result == "PASS":
@@ -1731,7 +1782,7 @@ def render(evidence, record):
     clean_apart_from_inventory = "FAIL" if open_failures or metadata.get("result") == "FAIL" or any(
         row[3] == "FAIL" for row in gates) else "PASS"
     lines += [acceptance_line(metadata, clean_apart_from_inventory, elapsed, missing if final_tier else (),
-                              job_final_ran(metadata, job_report, missing)), ""]
+                              job_final_ran(metadata, job_report, missing), exposure if final_tier else ()), ""]
     lines += ["## Candidate and host", "", "| | |", "|---|---|"]
     for key, label in (("base_url", "Staged base URL"), ("candidate_digest", "`candidate.json` SHA-256"),
                        ("versions", "Running versions"), ("soak_bun", "Soak build"),
@@ -1836,7 +1887,7 @@ def render(evidence, record):
     if progress:
         lines.append(f"- Last observed progress: {', '.join(f'{key} {value}' for key, value in sorted(progress.items()))}")
     lines.append("")
-    lines += exposure_lines(state)
+    lines += exposure_lines(state, final_tier)
     lines += ["## Resource trends", "", "| Node | Measure | First | Last | Max |", "|---|---|---|---|---|"]
     for node, trend in sorted(state.get("trends", {}).items()):
         for measure, entry in sorted(trend.items()):
