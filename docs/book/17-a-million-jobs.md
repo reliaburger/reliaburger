@@ -3548,8 +3548,24 @@ The other was the leak checkers. `leak-rss` starts judging a Bun process an
 hour after it appears, and every kill, power-off or upgrade exec makes a new
 one. The 0.2.0 final's own evidence shows the gap: the longest Bun on node 2
 lived 48 minutes, so `leak-rss` never once judged that node in eight hours.
-The record now reports each checker's armed minutes per node. Making that a
-gate needs a quieter schedule, which is the maintainer's call.
+The record now reports each checker's armed minutes per node, and a final
+gates on them. The fix wasn't in the checker. Its hour-long warm-up is there
+for a reason: a young process's memory is still growing for honest reasons.
+The fault schedule was the problem, since it never let any Bun get old. So a
+final now ends with a quiet tail, two hours after the last cycle with no
+faults, walks or specials. The apps and jobs keep running, so there's still
+something to leak. Every node gets an hour to arm `leak-rss` and an hour of
+comparison samples, and the final fails unless each checker was armed for an
+hour on every node, with one unbroken half-hour among them. The final grew
+from eight hours to about ten. We chose that over cutting the faults to six,
+because the faults are what the eight hours were for.
+
+My first proposal for the tail was 90 minutes, an hour to arm and half an
+hour to compare, beside a 60-minute exposure threshold. Do the arithmetic and
+that fails every final. The last cycle ends with an upgrade walk and a
+graceful whole-cluster stop, so the tail is all the exposure a node gets, and
+90 minutes arms `leak-rss` for 30. Writing the fixture first caught it before
+an eight-hour run did.
 
 ### A task that failed before it ran
 

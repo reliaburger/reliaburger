@@ -5,8 +5,9 @@ name: V02 soak
 # three-node quickstart cluster (three Lima QEMU VMs on KVM) with `curl | sh`
 # from the staging pre-release, injects faults on a schedule and writes a
 # Markdown record. Hosted jobs stop at 6 h, so this covers the compressed
-# schedule and full-schedule runs of up to about 4 h; the 8 h final tier needs
-# a long-running host. See docs/releasing.md, "Soaking a candidate in CI".
+# schedule and full-schedule runs of up to about 4 h; the final tier (8 h of
+# faults and a 2 h quiet tail) needs a long-running host. See
+# docs/releasing.md, "Soaking a candidate in CI".
 #
 # No soak build is signed here, so the upgrade slots are skipped and the
 # record says so. That makes every run here a diagnostic: it passes

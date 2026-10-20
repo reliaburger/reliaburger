@@ -985,6 +985,7 @@ CHAOS_KINDS = ("kill", "delay", "partition", "scenario", "pause", "drop", "dns",
 NODE_FAULT_KINDS = ("delay", "disk-full", "slow-fsync")
 CANDIDATE = b'{"assets": {}, "version": "0.2.3"}\n'
 FINAL = 8 * 3600
+QUIET = checker.QUIET_TAIL_SECONDS
 
 
 def passing_job_report(load, node_faults):
@@ -1025,11 +1026,11 @@ class ExecutionInventory(unittest.TestCase):
         self.evidence = Path(self.temp.name) / str(self.runs)
         self.evidence.mkdir()
         digest = hashlib.sha256(CANDIDATE).hexdigest()
-        run = dict(tier="final", schedule="full", started_at=NOW, finished_at=NOW + FINAL + 120,
+        run = dict(tier="final", schedule="full", started_at=NOW, finished_at=NOW + FINAL + QUIET + 120,
                    duration_target=FINAL, candidate_digest=f"`{digest}`", qualified_digest=digest,
                    bootstrapped="true", soak_bun="`bun-v0.2.3-soak.1`, SHA-256 `ff`", release_version="0.2.3",
                    job_soak=True, job_stop_at=NOW + FINAL - 120, job_load="target" if job_final else "calibration",
-                   node_faults=job_final, cycles=8, ingress_rotation_secs=None)
+                   node_faults=job_final, cycles=8, ingress_rotation_secs=None, quiet_tail=QUIET)
         run.update(metadata)
         (self.evidence / "metadata.json").write_text(json.dumps(run))
         if candidate is not None and "candidate" not in drop:
@@ -1039,9 +1040,12 @@ class ExecutionInventory(unittest.TestCase):
         if "drain" in drop:
             report.update(stopped=False, stop_requested_at=None)
         (self.evidence / "jobs" / "snapshot.json").write_text(json.dumps(report))
+        armed = {check: dict(armed_seconds=checker.EXPOSURE_ARMED_SECONDS, longest_seconds=checker.EXPOSURE_WINDOW_SECONDS,
+                             samples=30, processes_armed=1) for check in ("leak-rss", "leak-fd")}
         checker.save_state(self.evidence, {
-            "nodes": NODES, "renewals": {"workload-identity": {name: 16 for name in NODES}},
-            "job_resources": {name: {"complete": True, "ts": NOW + FINAL + 60, "live_owners": 0} for name in NODES}})
+            "nodes": NODES, "renewals": {"workload-identity": {name: 24 for name in NODES}},
+            "exposure": {} if "exposure" in drop else {name: armed for name in NODES},
+            "job_resources": {name: {"complete": True, "ts": NOW + FINAL + QUIET + 60, "live_owners": 0} for name in NODES}})
         if "baseline" not in drop:
             self.event("baseline", verdict="ok", detail="1")
         for phase in ("fault:bun-kill-follower", "fault:bun-kill-leader", "fault:deploy-kill", "fault:power-off"):
@@ -1068,6 +1072,15 @@ class ExecutionInventory(unittest.TestCase):
             self.event("pulse", exit=0, verdict="ok")
         if "export" not in drop:
             self.event("storage:offline-export", target="rb-a-2", verdict="ok")
+        if "quiet" not in drop:
+            self.quiet_tail()
+
+    def quiet_tail(self, interruption=None):
+        """The quiet tail after the faults: nothing injected, walked or stopped."""
+        self.event("quiet", detail=f"no faults for {QUIET} s")
+        if interruption:
+            self.event(interruption, target="rb-a-2")
+        self.event("quiet", verdict="ok", duration=QUIET)
 
     def render(self):
         record = self.evidence / "record.md"
@@ -1101,6 +1114,7 @@ class ExecutionInventory(unittest.TestCase):
             "drain": "| job campaign drained in its final two minutes | 1 | 0 | MISSING |",
             "pulse": "| catalogue pulse | 8 | 7 | MISSING |",
             "export": "| offline export | 1 | 0 | MISSING |",
+            "quiet": "| quiet tail with no faults, walks or specials | 1 | 0 | MISSING |",
             "special:graceful-stop": "| special:graceful-stop | 2 | 1 | MISSING |",
             "special:quorum-loss": "| special:quorum-loss | 2 | 1 | MISSING |",
             "special:all-off": "| special:all-off | 1 | 0 | MISSING |",
@@ -1180,6 +1194,55 @@ class ExecutionInventory(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("| job campaign drained in its final two minutes | 1 | 0 | MISSING |", text)
 
+    def test_a_fault_inside_the_quiet_tail_breaks_it(self):
+        self.final_run(drop=("quiet",))
+        self.quiet_tail(interruption="fault:bun-kill-follower")
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| quiet tail with no faults, walks or specials | 1 | 0 | MISSING |", text)
+
+    def test_a_final_whose_leak_checkers_lack_exposure_fails(self):
+        # #1062: a final that never armed leak-rss on a node can't claim it
+        # found no leak there.
+        self.final_run()
+        state = checker.load_state(self.evidence)
+        state["exposure"]["rb-a-2"]["leak-rss"] = dict(armed_seconds=30 * 60, longest_seconds=30 * 60, samples=7,
+                                                      processes_armed=1)
+        checker.save_state(self.evidence, state)
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertTrue(text.startswith("# Sustained soak (V02): FAIL"))
+        self.assertIn("## Leak-checker exposure (gated)", text)
+        self.assertIn("| rb-a-2 | leak-rss | 30 min | 30 min | 7 | 1 | SHORT |", text)
+        self.assertIn("leak-checker exposure too short: rb-a-2 leak-rss", text)
+        self.assertNotIn("passes**", text)
+
+    def test_a_final_needs_one_unbroken_armed_window(self):
+        self.final_run()
+        state = checker.load_state(self.evidence)
+        state["exposure"]["rb-a-3"]["leak-fd"] = dict(armed_seconds=90 * 60, longest_seconds=20 * 60, samples=30,
+                                                     processes_armed=4)
+        checker.save_state(self.evidence, state)
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| rb-a-3 | leak-fd | 90 min | 20 min | 30 | 4 | SHORT |", text)
+
+    def test_a_final_with_no_exposure_recorded_fails(self):
+        self.final_run(drop=("exposure",))
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| rb-a-1 | leak-rss | 0 min | 0 min | 0 | 0 | SHORT |", text)
+
+    def test_fast_and_custom_runs_record_exposure_without_gating_on_it(self):
+        for tier in ("fast", "custom"):
+            with self.subTest(tier=tier):
+                self.final_run(drop=("walk", "exposure", "quiet"), tier=tier, schedule="compressed",
+                               finished_at=NOW + 3600, duration_target=3600, cycles=6)
+                code, text = self.render()
+                self.assertEqual(code, 0, text)
+                self.assertIn("## Leak-checker exposure (recorded, not gated)", text)
+                self.assertIn("| rb-a-1 | leak-rss | 0 min | 0 min | 0 | 0 | short |", text)
+
     def test_relabelling_a_fast_run_as_final_does_not_promote_it(self):
         # A fast run's evidence: two walks, one of each special, one pulse,
         # four cycles. Its labels now say final, full, 8 h.
@@ -1213,7 +1276,8 @@ class ExecutionInventory(unittest.TestCase):
                                 env=dict(os.environ, RELIABURGER_SOAK_CAFFEINATED="1"))
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = [line.split()[1:] for line in result.stdout.splitlines() if line.startswith("plan: cycle ")]
-        planned = {}
+        planned = {"quiet-tail": sum(1 for line in result.stdout.splitlines()
+                                     if line.startswith(f"plan: quiet-tail {QUIET} s "))}
         for line in lines:
             slot = line[2]
             if slot == "chaos":
@@ -1230,6 +1294,7 @@ class ExecutionInventory(unittest.TestCase):
         self.assertEqual(planned.get("upgrade"), required["upgrade walk (to the soak build and back)"])
         self.assertEqual(planned.get("catalogue-pulse"), required["catalogue pulse"])
         self.assertEqual(planned.get("offline-export"), required["offline export"])
+        self.assertEqual(planned.get("quiet-tail"), required["quiet tail with no faults, walks or specials"])
         for name in ("special:graceful-stop", "special:quorum-loss", "special:all-off"):
             self.assertEqual(planned.get(name), required[name], name)
         for kind in CHAOS_KINDS:
@@ -1285,6 +1350,21 @@ class FinalTierDriver(unittest.TestCase):
         self.assertEqual(sum(1 for line in lines if line[2] == "upgrade"), 4)
         kinds = {kind for line in lines if line[2] == "chaos" for kind in line[3:]}
         self.assertEqual(kinds, set(CHAOS_KINDS))
+
+    def test_a_final_adds_its_quiet_tail_after_eight_hours_of_faults(self):
+        result = self.run_script("--tier", "final", "--plan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        header = result.stdout.splitlines()[0].split()[1:]
+        header = dict(zip(header[::2], header[1::2]))
+        self.assertEqual((header["duration"], header["quiet-tail"]), ("28800", str(QUIET)))
+        self.assertIn(f"plan: quiet-tail {QUIET} s with no faults, walks or specials after the last cycle", result.stdout)
+
+    def test_fast_and_custom_tiers_have_no_quiet_tail(self):
+        for arguments in (("--tier", "fast"), ("--duration", "2h")):
+            result = self.run_script(*arguments, "--plan")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(" quiet-tail 0", result.stdout.splitlines()[0])
+            self.assertNotIn("plan: quiet-tail", result.stdout)
 
     def test_the_hosted_soak_is_an_explicit_diagnostic(self):
         workflow = (self.release.parent.parent / ".github" / "workflows" / "soak.yml").read_text()
@@ -1416,10 +1496,10 @@ class CheckerExposure(Evidence):
         record = self.evidence / "record.md"
         checker.render(self.evidence, record)
         text = record.read_text()
-        self.assertIn("## Leak-checker exposure (reported, not gated)", text)
-        self.assertIn("| rb-a-1 | leak-rss | 30 min | 30 min | 7 | 1 |", text)
-        self.assertIn("| rb-a-1 | leak-fd | 40 min | 40 min | 9 | 1 |", text)
-        self.assertIn("| rb-a-2 | leak-rss | 0 min | 0 min | 0 | 0 |", text)
+        self.assertIn("## Leak-checker exposure (recorded, not gated)", text)
+        self.assertIn("| rb-a-1 | leak-rss | 30 min | 30 min | 7 | 1 | short |", text)
+        self.assertIn("| rb-a-1 | leak-fd | 40 min | 40 min | 9 | 1 | short |", text)
+        self.assertIn("| rb-a-2 | leak-rss | 0 min | 0 min | 0 | 0 | short |", text)
 
 
 class SeedInTheRecord(Evidence):
