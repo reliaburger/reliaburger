@@ -893,6 +893,23 @@ Encrypted env values were the nastier case. They export as the placeholder `ENCR
 
 And `--strict`, sold as the CI gate for migrations, checked only the warnings. A manifest of nothing but a NetworkPolicy and a PersistentVolumeClaim, both dropped whole, passed it. It now fails on any warning *or* any dropped resource, and the error counts both.
 
+Fixing all that turned up one more hole, in the job exporter. Jobs had grown `[firewall]`, `[egress]` and `overlap` since the exporter was written, and it ignored all three without a word. The app exporter already reported its firewall and egress as needing a NetworkPolicy, so the job exporter now says the same, and `replay_unknown` (Kubernetes has no switch for replaying a run whose node vanished) joins `pids` in the unsupported list. `overlap` is different: it has a home. A CronJob's `concurrencyPolicy` says whether a new run may start while the last one is still going, which is exactly what `overlap` means:
+
+```rust
+fn concurrency_policy(overlap: Option<OverlapPolicy>) -> &'static str {
+    match overlap.unwrap_or_default() {
+        OverlapPolicy::Allow => "Allow",
+        OverlapPolicy::Forbid => "Forbid",
+    }
+}
+```
+
+The return type `&'static str` is a borrowed string slice that lives for the whole program, which is what a string literal is: it's baked into the binary, so there's nothing to allocate or free.
+
+`unwrap_or_default()` on an `Option<T>` returns the value if there is one and `T::default()` if not. Here `OverlapPolicy` derives `Default` with `#[default]` on `Forbid`, so a job that never mentions `overlap` exports as `Forbid`. That's the whole point of writing it out: Kubernetes' default is `Allow`, so leaving the field unset would have quietly let a nightly backup start on top of the previous night's slow one. A translation that copies only the fields the user typed misses that the two systems disagree about defaults.
+
+The other half was making `--strict` symmetrical. `relish export --strict` now exits 1 when the report has anything unsupported or not exported yet, so a CI job can check that a config still exports whole, the same way it checks an import.
+
 ## Lessons learned
 
 **Test the order, not just the outcome.** Blue-green's whole promise is an order: every green instance healthy and published before any blue instance stops. A test that only checks the end state (green running, blue gone) passes for a rollout that stopped blue first and caused an outage on the way. `blue_green_publishes_green_before_stopping_blue` holds an in-flight request on a blue instance, so blue can't finish draining, and checks that green is already published while blue still serves.

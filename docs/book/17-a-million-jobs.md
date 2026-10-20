@@ -292,7 +292,23 @@ so a spawned task can hold it without borrowing a departed stack frame.
 Standalone writes clone the checkpoint, preflight identities and progress
 capacity, then publish private JSON with file and directory fsync. Only durable
 publication replaces the in-memory value. An I/O error fences later writes and
-dispatch. Compact initial ranges can expand into sparse progress; admission
+dispatch.
+
+A timeout fences them too, and that case is harder. The write runs on a
+blocking thread, so when its caller gives up after the write timeout the thread
+carries on, and the run can reach the disk after the client has been told
+"unavailable". The node can't tell whether it did, so it refuses every
+admission and stops leading until it restarts. A test holds the real writer
+after it has built its checkpoint and before it publishes (a `#[cfg(test)]`
+barrier in the store), lets the caller's deadline pass, and checks that
+admission returns 503 and nothing is dispatched. It then lets the write land,
+restarts the node and retries with the same `Idempotency-Key`. The retry gets
+the late write's run back, every task of it runs exactly once, and the next
+new submission gets a fresh id. The `Idempotency-Key` is what makes "unavailable"
+safe to retry: one durable run identity, whichever side of the timeout the
+write landed on.
+
+Compact initial ranges can expand into sparse progress; admission
 reserves that representation before accepting work. Reopen validates the chunk
 partition, counts and exact hook identities. Omitted metadata must never open
 an app gate. Expired results are pruned before capacity preflight; otherwise the
@@ -3517,6 +3533,23 @@ keeps its own copy of the schedule, and a test holds it against the harness's
 The hosted workflow can't sign a soak build, so its runs can never complete a
 tier. It now says so: it passes `--tier custom`, and the record calls the run
 a diagnostic.
+
+Two smaller blind spots sat next to the inventory
+([#1062](https://github.com/reliaburger/reliaburger/issues/1062)). Fault
+choices came from bash's `$RANDOM`, unseeded, so nobody could replay the run
+that found a bug. Worse, `$RANDOM` inside `$(...)` runs in a subshell, and
+bash reseeds a subshell's generator, so even a seed at the top wouldn't have
+helped. Now every choice goes through `sustained_check.py choose`, which takes
+draw *n* of the run's seed from a fresh `random.Random(f"{seed}:{n}")` and
+counts draws in `choices.json`. Same seed, same choices, in the same order,
+and a resumed run picks up at the next draw.
+
+The other was the leak checkers. `leak-rss` starts judging a Bun process an
+hour after it appears, and every kill, power-off or upgrade exec makes a new
+one. The 0.2.0 final's own evidence shows the gap: the longest Bun on node 2
+lived 48 minutes, so `leak-rss` never once judged that node in eight hours.
+The record now reports each checker's armed minutes per node. Making that a
+gate needs a quieter schedule, which is the maintainer's call.
 
 ### A task that failed before it ran
 

@@ -8383,6 +8383,34 @@
           ]
         }
       ]
+    },
+    {
+      "id": "issue-1067-plaintext-rollout-failure-report",
+      "issue": 1067,
+      "promise": "On a credential-free plaintext cluster a bad version reaches RolloutFailed and the node stops retrying it.",
+      "supported_paths": [
+        "scripts/demo/rollout.sh with DEMO_PLAINTEXT=1: require_mtls = false, no master key, no token, relish over plain HTTP."
+      ],
+      "refused_paths": [
+        "Without credentials the leader takes a rollout-failure report only for a node the app is placed on.",
+        "A cluster with a service token or a token keeps requiring the service token for the report."
+      ],
+      "boundaries": [
+        "One node on the process runtime; the portable suite covers the handler's refusals."
+      ],
+      "cases": [
+        {
+          "id": "issue-1067-rollout_demo_on_a_plaintext_cluster_marks_a_bad_version_failed_and_stops_retrying",
+          "binary": "reliaburger::demos",
+          "test": "rollout_demo_on_a_plaintext_cluster_marks_a_bad_version_failed_and_stops_retrying",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/demos.rs"
+          ]
+        }
+      ]
     }
   ]
 }
