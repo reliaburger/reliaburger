@@ -1855,6 +1855,12 @@
   },
   {
     "source": "tests/demos.rs",
+    "function": "rollout_demo_on_a_plaintext_cluster_marks_a_bad_version_failed_and_stops_retrying",
+    "binary": "reliaburger::demos",
+    "test": "rollout_demo_on_a_plaintext_cluster_marks_a_bad_version_failed_and_stops_retrying"
+  },
+  {
+    "source": "tests/demos.rs",
     "function": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone",
     "binary": "reliaburger::demos",
     "test": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone"

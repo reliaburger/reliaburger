@@ -233,6 +233,15 @@ A new cluster starts with no tokens, and until the first one exists the API is
 open. Bun only allows that on a loopback listener, so mint the first admin
 token on the node itself before exposing the API (see `cluster-basics`).
 
+Node-to-node calls carry the service token, which every node derives from the
+master key. A plaintext cluster started with no master key and no tokens has
+no credential anywhere, and there the leader takes two node calls without one:
+a node's poll for its placements and its report that a rollout failed (see
+`deploy-an-app`). The report is taken only for a node the app is placed on,
+which is less than an anonymous caller can already do in that window. The
+moment the cluster has a master key or a first token, both need the service
+token again.
+
 ## Audit log
 
 Every node keeps a log of who changed what on it, on disk, so you can answer
