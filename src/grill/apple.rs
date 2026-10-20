@@ -600,15 +600,16 @@ mod tests {
 
     #[tokio::test]
     async fn adoption_requires_positive_runtime_evidence() {
-        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("container-fixture");
-        std::fs::write(
+        // A shared, already-launched script, so the ten-second inspection
+        // bound times the inspection rather than macOS assessing a new file
+        // (#1149). A timeout would also pass the first, refusing case
+        // silently.
+        crate::first_launch::install_script(
             &program,
             "#!/bin/sh\ndir=${0%/*}\ncat \"$dir/output\"\nexit \"$(cat \"$dir/status\")\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let id = InstanceId("apple-evidence".into());
         let record = serde_json::from_value(serde_json::json!({
             "schema": crate::grill::records::RECORD_SCHEMA, "instance_id": id.0, "namespace": "default",
