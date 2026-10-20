@@ -154,7 +154,7 @@ issue until new evidence appears.
 | B2 upgrade rejection matrices and proxy/Council deadlines | **Proposed**, as one issue | Each rejection case still starts a real `ClusterHarness`; the proxy inactivity tests use production timeouts |
 | B3 legacy callback routes | **Done** | `legacy_batch_routes_are_gone` in `src/bun/api/tests.rs` |
 | B3 settlement helpers | **Proposed** | The hung commit and failed-hook settlement tests in `src/bun/api/tests.rs` still send a cancel request |
-| B3 stalled TLS reclamation | **Proposed** | `stalled_tls_handshakes_are_bounded_and_reclaimed` in `src/wrapper/proxy.rs` only checks a five-byte write after the stall, which passes without reclamation |
+| B3 stalled TLS reclamation | **Done**, [#1057](https://github.com/reliaburger/reliaburger/issues/1057) | `stalled_tls_handshakes_are_bounded_and_reclaimed` in `src/wrapper/proxy.rs` now proves a real `rustls` client is refused while the slots are full, that the server closes the stalled sockets, and that a real handshake and request then succeed; it fails with the bound or the deadline removed |
 | B3 real worker in the rolling walk | **Proposed**, with Q5 | The walk starts three voters and relabels one as the worker |
 | B4 late publication | **Proposed** | No test pauses the blocking writer past its caller's deadline |
 | B4 broader lifecycle property test | **Proposed** | The task-array proptest model has only plan, complete, lose and cancel |
