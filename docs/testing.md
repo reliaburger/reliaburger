@@ -239,8 +239,11 @@ bench-task-arrays`. Both run nightly on `main` and on pushes to it. A pull
 request runs the first when it touches the gossip protocol or its benchmarks,
 and the second when it touches what `benches/task_arrays.rs` measures: the
 task-array leader and node pool, the executor, range sets, the benchmark
-itself or `bench_baseline.py` ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)), unless it targets a
-merge train: there both wait for the merge queue and the push. The gossip numbers
+itself or `bench_baseline.py` ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)). A change to
+`criterion`'s version, in `Cargo.toml` or only in `Cargo.lock`, runs both,
+because both parse its output and use its filter syntax
+([#1151](https://github.com/reliaburger/reliaburger/issues/1151)). A pull request into a
+merge train without the `full-ci` label runs neither: there both wait for the merge queue and the push. The gossip numbers
 gate nothing. The task-array job compares each benchmark's mean with the
 baseline the last `main` run saved
 ([`bench_baseline.py`](../scripts/ci/bench_baseline.py)). Hosted runners
