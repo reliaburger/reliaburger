@@ -43,6 +43,11 @@ const OPEN_ISSUES: &[(u32, &str)] = &[
     (362, "CA status and revocation"),
     (656, "drain: cordon, drain and uncordon"),
     (711, "Franchise multi-cluster"),
+    (1209, "GPU metrics and relish gpus"),
+    (1210, "relish fault gpu"),
+    (1221, "model shorthand and relish model"),
+    (1223, "group type"),
+    (1238, "pipelines and fair share, after 0.8.0"),
 ];
 
 /// Inline `relish …` spans in prose for commands an open issue is adding.
@@ -55,6 +60,11 @@ const INLINE_PENDING: &[(&str, u32)] = &[
     ("relish franchise join", 711),
     ("relish franchise status", 711),
     ("relish top --franchise", 711),
+    ("relish gpus", 1209),
+    ("relish fault gpu <node>/<device> --xid <code>", 1210),
+    ("relish model run qwen3-32b", 1221),
+    ("relish model run <name>", 1221),
+    ("relish usage", 1238),
 ];
 
 /// Chapters of the manual, which ships inside `relish`.

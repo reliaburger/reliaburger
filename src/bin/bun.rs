@@ -993,10 +993,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     .context("state compatibility check failed")??;
 
     // Recover temporary uploads before any registry or replication writer starts.
+    // `execv` runs no destructors: after a self-upgrade the old image's lock
+    // lives on in any child another thread was forking at that moment, until
+    // that child's own `exec`, so wait a little before calling it busy (#1198).
     let pickle_dir = storage_directory(&config.storage.images, "images").await?;
     let blob_store = Arc::new(BlobStore::new(&pickle_dir));
     let _upload_owner = blob_store
-        .claim_upload_directory()
+        .claim_upload_directory(UPLOAD_OWNER_WAIT)
         .await
         .context("cannot recover registry upload ownership")?;
     blob_store
@@ -3706,6 +3709,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// How long startup waits for the registry upload lock before refusing to
+/// start beside another owner.
+const UPLOAD_OWNER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 const APPLE_RUNTIME_DEFERRED: &str = "direct Apple Container is disabled for 0.1.0; use the managed Linux VM with `relish setup --quickstart`";
 

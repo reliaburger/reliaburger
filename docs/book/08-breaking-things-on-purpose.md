@@ -716,6 +716,19 @@ namespace, not in Bun, so a Bun that crashed mid-experiment would leave its
 callers slow forever. The first reconcile after start-up sweeps any `fa01:`
 root it finds.
 
+Programming a delay runs `tc` once per band in every caller's namespace, all
+callers at once, under the agent turn's time budget. On a loaded node six
+callers don't always finish inside one turn. The ones cut short are marked
+unknown, and the next tick rebuilds them. That's fine for the reconcile, but
+the injection used to treat a cut-short caller as a failure. `relish fault
+delay` then got a 400 saying the fault was rejected, and a tick later the delay
+was in place anyway (#1199). Now `reconcile_delays` returns a `DelayFailure`
+enum rather than a bare string. `Pending` covers a caller that ran out of turn
+or is waiting on the start-up sweep; `Failed` covers a `tc` that actually
+failed. `delay_injection_outcome` refuses the injection only for a `Failed`
+caller of this rule. A `match` on the enum, rather than a search through the
+message text, is what keeps the two from being confused.
+
 On the podinfo demo, `relish fault delay redis 300ms --from frontend` took a
 cache read from 43 ms to 945 ms: about three redis round trips (podinfo's
 read runs `EXISTS` and then `GET`, and its pool talks to redis too), each

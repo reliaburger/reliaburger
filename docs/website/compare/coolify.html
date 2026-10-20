@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="An evidence-based comparison of Coolify application delivery and Reliaburger cluster operations, with installation, daily workflows and upgrade boundaries.">
+  <meta name="theme-color" content="#181b19">
+  <title>Reliaburger and Coolify · Reliaburger comparisons</title>
+  <link rel="stylesheet" href="../style.css">
+  <link rel="stylesheet" href="../comparisons.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <div class="page">
+    <header class="masthead">
+      <a class="wordmark" href="../" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
+      <nav aria-label="Main navigation">
+        <a href="../#install">Install</a>
+        <a href="./index.html">Comparisons</a>
+        <a href="./methodology.html">Methodology</a>
+      </nav>
+    </header>
+    <main id="main" class="comparison-page">
+      <section class="comparison-intro" id="intro" aria-labelledby="title">
+        <p class="eyebrow">APPLICATION DELIVERY / COOLIFY</p>
+        <h1 id="title">Reliaburger and Coolify</h1>
+        <p class="lede">Deploy and diagnose a cluster through one command line. Reliaburger brings scheduling, identity, discovery, logs and incident tools into its node agent, so the same application names carry from deployment into investigation. Coolify offers a browser-led path from Git repository to a public web application.</p>
+        <p class="evidence">Basis: <a href="https://coolify.io/docs/applications/deployments/overview">Coolify deployment workflow</a> and <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/README.md#whats-in-the-binary">Reliaburger architecture</a>.</p>
+        <aside class="comparison-note"><strong>Two Reliaburger baselines.</strong> The public installer supplies <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.6">0.1.6</a>. Feature analysis below uses the <strong>unreleased release-0-2-1 snapshot</strong>, <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/roadmap.md"><code>32effd9</code></a>, and labels its rollout changes. Coolify is pinned to <a href="https://github.com/coollabsio/coolify/releases/tag/v4.4.6">4.4.6</a>, with current official documentation for workflows.</aside>
+      </section>
+      <nav class="comparison-toc" aria-label="On this page">
+        <a href="#summary">At a glance</a><a href="#concepts">Concepts</a><a href="#install">Installation</a><a href="#workflows">Daily work</a><a href="#upgrades">Upgrades</a><a href="#tradeoffs">Where it fits</a><a href="#sources">Evidence</a>
+      </nav>
+
+      <section id="summary">
+        <h2>Where each wins <a class="permalink" href="#summary" aria-label="Link to where each wins">#</a></h2>
+        <div class="verdict-grid">
+          <div><h3>Reliaburger: the integrated cluster</h3><p>The Bun node agent bundles Raft, scheduling, registry caching, network discovery, metrics and logs. Its CLI adds network-path diagnosis and controlled fault injection. Operators get a shared application model across these tasks and fewer separately operated platform components. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/06_under-the-hood.md">Architecture</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/07_diagnostics.md">diagnostics</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/05_chaos.md">chaos</a>.</p></div>
+          <div><h3>Coolify: the application product</h3><p>Git sources, preview environments, automatic public TLS and engine-aware database backups form an immediately useful delivery workflow. These are concrete advantages over assembling equivalent workflows around Reliaburger. <a href="https://coolify.io/docs/applications/sources/overview">Sources</a> · <a href="https://coolify.io/docs/applications/deployments/preview-deployments">previews</a> · <a href="https://coolify.io/docs/core/networking/domains">TLS</a> · <a href="https://coolify.io/docs/databases/backups">backups</a>.</p></div>
+        </div>
+        <p>Coolify's additional deployment servers are standalone destinations: an external load balancer and shared application state remain your responsibility. Its documented multi-server application flow excludes Compose applications and resources with persistent storage. This is materially different from Reliaburger scheduling replicas within one cluster. <a href="https://coolify.io/docs/core/infrastructure/scaling/multi-server-deployments">Coolify limits</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/02_cluster-basics.md">Reliaburger cluster model</a>.</p>
+      </section>
+
+      <section id="concepts">
+        <h2>Translate the concepts <a class="permalink" href="#concepts" aria-label="Link to concepts">#</a></h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th scope="col">Concern</th><th scope="col">Coolify</th><th scope="col">Reliaburger</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Application definition</th><td>Resource settings, source and build method; a Compose application keeps a Compose definition. <a href="https://coolify.io/docs/applications/builds/docker-compose">Guide</a></td><td>TOML app or supported Kubernetes YAML converted at admission. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/09_kubernetes.md">Import contract</a></td></tr>
+            <tr><th scope="row">Organization</th><td>Project and environment containing resources. <a href="https://coolify.io/docs/applications/what-is-an-application">Application model</a></td><td>Namespaces, scoped credentials and resource quotas; not an exact project/environment hierarchy. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/10_security.md">Access</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/01_deploy-an-app.md#namespace-quotas">quotas</a></td></tr>
+            <tr><th scope="row">Execution target</th><td>Connected Docker server and destination. <a href="https://coolify.io/docs/core/infrastructure/scaling/multi-server-deployments">Server model</a></td><td>Cluster placement based on requests and placement rules. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/01_deploy-an-app.md#the-rest-of-an-app">App fields</a></td></tr>
+            <tr><th scope="row">Browser interface</th><td>Deployment and configuration controls. <a href="https://coolify.io/docs/applications/deployments/overview">Workflow</a></td><td>Authenticated, read-only dashboard; mutations use CLI/API. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/04_observability.md">Dashboard contract</a></td></tr>
+          </tbody>
+        </table></div>
+        <p><strong>Learning curve, our assessment:</strong> developers familiar with hosted deployment platforms should recognize Coolify's resource pages sooner. Reliaburger asks them to learn manifests, namespaces and quorum, but gives operators a consistent command surface for those concepts. This is an interface-based judgment, not a timed usability study. <a href="https://coolify.io/docs/applications/deployments/overview">Coolify flow</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/02_cluster-basics.md">cluster concepts</a>.</p>
+      </section>
+
+      <section id="install">
+        <h2>Install the platform <a class="permalink" href="#install" aria-label="Link to installation">#</a></h2>
+        <div class="command-grid">
+          <div class="terminal"><div class="terminal-heading">COOLIFY <span>root shell · Linux server</span></div><pre><code>curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash</code></pre></div>
+          <div class="terminal"><div class="terminal-heading">RELIABURGER <span>laptop quickstart</span></div><pre><code>curl -fsSL https://reliaburger.com/install.sh | sh
+relish status
+relish nodes</code></pre></div>
+        </div>
+        <p>Run the Coolify script as root on a supported Linux server. Open the printed dashboard URL, create the administrator and save the generated installation secrets. Its documented minimum is 2 CPU cores, 2 GB RAM and 10 GB disk, before application capacity. <a href="https://coolify.io/docs/start-with-self-hosted">Official installation</a>.</p>
+        <p>Reliaburger's default install builds a three-node Linux VM cluster on macOS or Linux with QEMU/KVM, requiring roughly 8 GiB free memory and 15 GiB disk. That is a laptop demonstration with three nodes, so comparing these requirements as equivalent overhead would be misleading. Production container clusters require rootful Linux runc and eBPF. <a href="https://github.com/reliaburger/reliaburger/blob/v0.1.6/docs/quickstart.md">Stable quickstart</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/README.md#scope-and-limits">runtime limits</a>.</p>
+      </section>
+
+      <section id="workflows">
+        <h2>Deploy, inspect and recover <a class="permalink" href="#workflows" aria-label="Link to daily workflows">#</a></h2>
+        <h3>Coolify's browser workflow</h3>
+        <ol>
+          <li>Connect a public repository, deploy key or GitHub App; choose the build method and configure the application. <a href="https://coolify.io/docs/applications/sources/overview">Source access</a>.</li>
+          <li>Select Deploy, then inspect the queued operation under Deployment Logs. Set a domain and redeploy to activate its route; HTTPS uses the configured proxy's certificate automation. <a href="https://coolify.io/docs/applications/deployments/overview">Deployments</a> · <a href="https://coolify.io/docs/core/networking/domains">domains</a>.</li>
+          <li>Enable Preview Deployments with separate preview variables, then verify creation and cleanup against repository events. A database's Backups page separately configures scheduled dumps and optional S3 storage. <a href="https://coolify.io/docs/applications/deployments/preview-deployments">Previews</a> · <a href="https://coolify.io/docs/databases/backups">database backups</a>.</li>
+        </ol>
+        <h3>Reliaburger's command workflow</h3>
+        <p>With an authored <code>web.toml</code> containing <code>app.web</code> and a reachable cluster, these commands validate, apply, inspect and diagnose it. <code>apply</code> accepting cluster state is distinct from every replica becoming healthy. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/01_deploy-an-app.md">Deployment contract</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/07_diagnostics.md">diagnostics</a>.</p>
+        <div class="terminal"><div class="terminal-heading">RELIABURGER <span>existing web.toml</span></div><pre><code>relish lint web.toml
+relish apply web.toml
+relish inspect web
+relish logs web
+relish wtf --app web
+relish dashboard</code></pre></div>
+        <p>The advantage is cluster-aware explanation in the same tool: placement refusal, missing evidence and network-path problems are surfaced explicitly. Coolify's advantage is fewer bespoke steps between repository, preview URL and database backup. Neither interface removes the need to test the application's actual behavior. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/07_diagnostics.md">Diagnostic evidence</a> · <a href="https://coolify.io/docs/applications/deployments/preview-deployments">preview lifecycle</a>.</p>
+      </section>
+
+      <section id="upgrades">
+        <h2>Application releases versus platform upgrades <a class="permalink" href="#upgrades" aria-label="Link to upgrades">#</a></h2>
+        <p><strong>Coolify applications:</strong> eligible non-Compose deployments can start a replacement, wait for health and retain the old container if the new one fails. Compose uses its own reconciliation; published host ports and fixed container names also prevent overlap. A rollback selects a retained old image but uses current runtime settings and does not reverse database migrations. <a href="https://coolify.io/docs/applications/deployments/rolling-updates">Replacement rules</a> · <a href="https://coolify.io/docs/applications/deployments/rollbacks">rollback semantics</a>.</p>
+        <p><strong>Reliaburger applications, unreleased snapshot:</strong> the leader advances a changed spec one node at a time after that node becomes healthy. Surge/unavailable limits are per node. The council retains successful versions for rollback across restarts; failed rollouts remain halted until a changed spec or rollback. Managed volumes force stop-first replacement. These findings belong to <code>32effd9</code>, not an assertion about the 0.1.6 installer. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/01_deploy-an-app.md#rolling-deploys">Pinned rollout contract</a>.</p>
+        <div class="command-grid">
+          <div class="terminal"><div class="terminal-heading">APP RELEASE <span>Reliaburger</span></div><pre><code>relish deploy web.toml
+relish history web
+relish rollback web</code></pre></div>
+          <div class="terminal"><div class="terminal-heading">PLATFORM CHECK <span>Reliaburger</span></div><pre><code>relish upgrade check
+relish upgrade status</code></pre></div>
+        </div>
+        <p><strong>Coolify itself:</strong> Settings → Updates controls instance updates. They replace the control plane, not managed applications or operating systems; active deployments can fail during the update. <strong>Bun itself:</strong> compatible updates roll workers first and council members individually, with signatures and automatic crash-loop reversion. Protocol/state mismatches require a fresh cluster; upgrading 0.1.6 into this development train is not an in-place path. <a href="https://coolify.io/docs/core/instance-management/update">Coolify update boundary</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/12_operations.md#upgrading-bun">Bun compatibility and upgrade rules</a>.</p>
+      </section>
+
+      <section id="tradeoffs">
+        <h2>Where Reliaburger fits <a class="permalink" href="#tradeoffs" aria-label="Link to where Reliaburger fits">#</a></h2>
+        <p><strong>Choose Reliaburger for an integrated cluster workflow:</strong> place replicas across nodes, inspect why an application is unhealthy, trace its network path and test a controlled failure with the same toolset. Our assessment is that this fits operators who value cluster behavior and evidence-rich diagnosis. Coolify fits teams whose priority is a self-service browser workflow for builds, previews and domains. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/07_diagnostics.md">Reliaburger diagnostics</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/05_chaos.md">controlled faults</a> · <a href="https://coolify.io/docs/applications/deployments/overview">Coolify workflow</a>.</p>
+        <p>Coolify operates a web application with PostgreSQL and Redis alongside Docker and its proxy. Reliaburger embeds more functions, but remains a prototype with rootful/eBPF cluster requirements and no built-in ACME. The operational choice is between maintaining composed services and accepting a young integrated platform's constraints. <a href="https://github.com/coollabsio/coolify/blob/f55efc859dfcbbf79274c4907b3df89f9767c11d/docker-compose.yml">Coolify services</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/README.md">Reliaburger status</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/03_networking.md">TLS limits</a>.</p>
+        <p>Backups need precision: current Coolify supports eligible application storage-mount archives as well as engine-aware dumps. Reliaburger provides Btrfs snapshots and separate council backups; a council backup excludes application volumes. None of those facts proves a successful restore of your database. <a href="https://coolify.io/docs/core/persistent-storage/storage-mounts/backups">Storage archives</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/11_images-and-volumes.md">volume snapshots</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/12_operations.md#backing-up-the-council">council recovery</a>.</p>
+      </section>
+
+      <section id="sources">
+        <h2>Evidence and limits <a class="permalink" href="#sources" aria-label="Link to evidence">#</a></h2>
+        <p class="source">Reviewed <a href="https://github.com/coollabsio/coolify/blob/f55efc859dfcbbf79274c4907b3df89f9767c11d/app/Jobs/ApplicationDeploymentJob.php">Coolify's deployment implementation</a>, <a href="https://github.com/coollabsio/coolify/blob/f55efc859dfcbbf79274c4907b3df89f9767c11d/app/Jobs/DatabaseBackupJob.php">database backup job</a>, <a href="https://github.com/coollabsio/coolify/blob/f55efc859dfcbbf79274c4907b3df89f9767c11d/app/Jobs/VolumeBackupJob.php">volume backup job</a> and the pinned Reliaburger manuals linked above. Current documentation can change independently of a tagged release; implementation claims use the stated snapshots. No comparative uptime, throughput, memory or recovery-time result was measured.</p>
+      </section>
+    </main>
+    <footer class="footer">
+      <p>Reviewed 15 October 2026. Source and documentation review, not a deployment benchmark. Learning-curve and suitability judgments are qualitative.</p>
+      <p>Static HTML and CSS. The only script copies commands and section links. <a href="./index.html">All comparisons</a> · <a href="./methodology.html#method">Sources and method</a></p>
+    </footer>
+  </div>
+  <script src="../assets/copy.js" defer></script>
+</body>
+</html>
