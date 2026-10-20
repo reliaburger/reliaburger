@@ -1397,9 +1397,156 @@ def expected_renewals(elapsed, period):
 
 FINAL_TIER_SECONDS = 8 * 3600
 
+# The execution inventory (#1061). The schedule below mirrors run_cycle and
+# special_for_cycle in qualify-sustained.sh; test_sustained_check compares
+# it with the harness's --plan, so the two can't drift apart unnoticed.
+CHAOS_KINDS = ("kill", "delay", "partition", "scenario", "pause", "drop", "dns", "cpu", "memory")
+SCHEDULES = {"full": dict(cycle=3600, chaos_per_slot=3, pulse_every=1, export_every=6),
+             "compressed": dict(cycle=600, chaos_per_slot=2, pulse_every=0, export_every=2)}
+CANDIDATE_ITEM = "candidate.json bytes match the qualified digest"
+BASELINE_ITEM = "app workloads settled at the baseline"
+WALK_ITEM = "upgrade walk (to the soak build and back)"
+PULSE_ITEM = "catalogue pulse"
+EXPORT_ITEM = "offline export"
+DRAIN_ITEM = "job campaign drained in its final two minutes"
+SLOT_FAULTS = ("fault:bun-kill-follower", "fault:bun-kill-leader", "fault:deploy-kill", "fault:power-off")
+SPECIALS = ("special:graceful-stop", "special:quorum-loss", "special:all-off")
 
-def acceptance_line(metadata, result, elapsed):
-    """What the run says about the V02 gate (plan D3): only a clean final tier passes it."""
+
+def required_execution(metadata):
+    """What a run must have completed, as {item: count}.
+
+    A final tier is held to the 8-hour full schedule with upgrade walks
+    whatever its metadata says about schedule, length or soak build, so
+    relabelling a shorter run can't lower the bar. Node faults are required
+    when the run says it injected them. Other tiers get the schedule they
+    say they ran; their inventory is recorded, not gated. The counts are the
+    cycles every run completes (min_cycles in the harness), so a run whose
+    slots overran still owes them. Each fault kind is owed once; walks,
+    specials, pulses and exports are owed as often as the schedule runs them."""
+    final = metadata.get("tier") == "final"
+    schedule = "full" if final else metadata.get("schedule", "full")
+    if schedule not in SCHEDULES:
+        schedule = "full"
+    plan = SCHEDULES[schedule]
+    duration = FINAL_TIER_SECONDS if final else int(metadata.get("duration_target") or 0)
+    walks = final or not str(metadata.get("soak_bun", "")).startswith("not supplied")
+    cycles = duration // plan["cycle"] if schedule == "full" else 4
+    hours = max(duration // 3600, 1)
+    half = max(hours // 2, 1)
+    required = {CANDIDATE_ITEM: 1, BASELINE_ITEM: 1, WALK_ITEM: 0}
+    slots = {phase: 0 for phase in SLOT_FAULTS}
+    specials = {phase: 0 for phase in SPECIALS}
+    node_kinds = {}
+    pulses = exports = chaos_rounds = 0
+    for index in range(cycles):
+        slots["fault:bun-kill-follower"] += 1
+        slots["fault:bun-kill-leader"] += 1
+        if index % 2 == 1 and walks:
+            required[WALK_ITEM] += 1
+            if schedule == "compressed":
+                chaos_rounds += plan["chaos_per_slot"]
+        else:
+            slots["fault:deploy-kill"] += 1
+            slots["fault:power-off"] += 1
+            chaos_rounds += plan["chaos_per_slot"]
+        if metadata.get("node_faults") is True:
+            kind = "fault:node-" + job_soak.NODE_FAULT_KINDS[index % 3]
+            node_kinds[kind] = 1
+        if (plan["pulse_every"] and index % plan["pulse_every"] == 0) or (schedule == "compressed" and index == 0):
+            pulses += 1
+        if index % plan["export_every"] == plan["export_every"] - 1:
+            exports += 1
+        if schedule == "compressed":
+            if 1 <= index <= 3:
+                specials[SPECIALS[index - 1]] += 1
+            continue
+        hour = index + 1
+        if hour % half == 0:
+            specials["special:graceful-stop"] += 1
+        if hour in ((hours * 40 + 50) // 100, (hours * 85 + 50) // 100):
+            specials["special:quorum-loss"] += 1
+        if hour == (hours * 70 + 50) // 100:
+            specials["special:all-off"] += 1
+    for phase, count in slots.items():
+        if count:
+            required[phase] = 1
+    for round_index in range(min(chaos_rounds, len(CHAOS_KINDS))):
+        required["fault:chaos-" + CHAOS_KINDS[round_index]] = 1
+    required.update(node_kinds)
+    required.update({phase: count for phase, count in specials.items() if count})
+    if pulses:
+        required[PULSE_ITEM] = pulses
+    if exports:
+        required[EXPORT_ITEM] = exports
+    required[DRAIN_ITEM] = 1
+    if not required[WALK_ITEM]:
+        del required[WALK_ITEM]
+    return required
+
+
+def candidate_verified(evidence, metadata):
+    """The candidate is known only when this run bootstrapped from it and the
+    bytes it kept hash to the digest it was asked to qualify. An adopted
+    --home installed whatever it installed before this run looked."""
+    digest = str(metadata.get("qualified_digest") or "")
+    path = Path(evidence) / "candidate.json"
+    if metadata.get("bootstrapped") not in (True, "true") or not re.fullmatch(r"[0-9a-f]{64}", digest) or not path.is_file():
+        return False
+    return hashlib.sha256(path.read_bytes()).hexdigest() == digest
+
+
+def completed_execution(evidence, metadata, events, job_report):
+    """What the run actually completed, as {item: count}, from its events,
+    the candidate bytes it kept and the job controller's final snapshot.
+
+    A fault counts once it was injected (no failed or refused injection) and
+    the cluster settled after it; a walk once it reached the soak build,
+    rolled back and settled; quorum loss once quorum came back too."""
+    def count(phase, **match):
+        return sum(1 for event in events if event.get("phase") == phase
+                   and all(event.get(key) == value for key, value in match.items()))
+
+    def injected(phase):
+        return sum(1 for event in events if event.get("phase") == phase and event.get("settle_seconds") is None
+                   and event.get("verdict") in (None, "ok") and event.get("exit") in (None, 0))
+
+    completed = {CANDIDATE_ITEM: 1 if candidate_verified(evidence, metadata) else 0,
+                 BASELINE_ITEM: min(count("baseline", verdict="ok"), 1),
+                 WALK_ITEM: min(count("upgrade:upgrade", verdict="ok"), count("upgrade:rollback", verdict="ok"),
+                                count("upgrade:settle", verdict="settled")),
+                 PULSE_ITEM: count("pulse", verdict="ok"),
+                 EXPORT_ITEM: count("storage:offline-export", verdict="ok")}
+    phases = {event.get("phase", "") for event in events}
+    for phase in phases | set(SLOT_FAULTS) | set(SPECIALS):
+        if phase.startswith(("fault:", "special:")) and phase != "special:quorum-back":
+            completed[phase] = min(injected(phase), count(phase, verdict="settled"))
+    completed["special:quorum-loss"] = min(completed["special:quorum-loss"], count("special:quorum-back", verdict="ok"))
+    report = job_report if isinstance(job_report, dict) else {}
+    stop = report.get("stop_requested_at")
+    drained = (metadata.get("job_soak") is True and report.get("stopped") is True and not report.get("active")
+               and type(stop) is int and stop >= metadata.get("job_stop_at", 0))
+    completed[DRAIN_ITEM] = 1 if drained else 0
+    return completed
+
+
+def execution_inventory(evidence, metadata, events, job_report):
+    """Rows of (item, required, completed) in the order the record lists them."""
+    required = required_execution(metadata)
+    completed = completed_execution(evidence, metadata, events, job_report)
+    return [(item, need, completed.get(item, 0)) for item, need in required.items()]
+
+
+def job_final_ran(metadata, job_report, missing):
+    """A job final is the job controller at the target load with every node
+    fault completed; the labels alone don't make one."""
+    return (metadata.get("node_faults") is True and isinstance(job_report, dict) and job_report.get("load") == "target"
+            and not [item for item in missing if item.startswith("fault:node-")])
+
+
+def acceptance_line(metadata, result, elapsed, missing=(), job_final=False):
+    """What the run says about the V02 gate (plan D3) and the release gate's
+    final soak (#991): only a clean, complete final tier passes either."""
     tier = metadata.get("tier") or "custom"
     clean = result == "PASS"
     if tier == "fast":
@@ -1408,23 +1555,31 @@ def acceptance_line(metadata, result, elapsed):
                     "final-tier run (8 h, full schedule) on the final candidate.")
         return "**Fast tier: not clean.** Fix what failed and run the fast tier again before a final-tier run."
     if tier != "final":
-        return "**No tier (a custom run).** Neither tier's evidence, so it says nothing about the V02 gate."
-    if not clean:
-        return ("**Final tier: not clean. The V02 gate does not pass.** A product fix means a fresh fast-tier run, "
-                "then a fresh final-tier run.")
+        return ("**Custom run: diagnostic only.** It ran no tier, so it says nothing about the V02 gate or the "
+                "release gate's final soak.")
     shortfalls = []
     if metadata.get("schedule", "full") != "full":
         shortfalls.append(f"it ran the {metadata['schedule']} schedule")
     if min(elapsed, metadata.get("duration_target") or 0) < FINAL_TIER_SECONDS:
         shortfalls.append(f"it soaked for {duration_text(elapsed)}")
-    digest = metadata.get("candidate_digest") or "`not checked`"
-    if "not checked" in digest:
-        shortfalls.append("the candidate digest was not checked (--qualified-digest)")
+    if not clean:
+        return ("**Final tier: not clean. The V02 gate does not pass.** A product fix means a fresh fast-tier run, "
+                "then a fresh final-tier run."
+                + (" It is incomplete too: " + ", ".join(missing) + " missing." if missing else ""))
+    if missing:
+        return ("**Final tier: incomplete. It passes neither the V02 gate nor the release gate's final soak:** "
+                + "; ".join(shortfalls + ["missing from the execution inventory: " + ", ".join(missing)])
+                + ". A final tier owes every walk, fault kind and special of its 8-hour schedule.")
     if shortfalls:
         return (f"**Final tier: clean, but not acceptance:** {'; '.join(shortfalls)}. The V02 gate needs 8 h on "
                 "the full schedule against a pinned candidate.")
-    return (f"**Final tier: clean. The V02 soak gate passes** for the candidate whose `candidate.json` has "
-            f"SHA-256 {digest}, if it is the final candidate.")
+    digest = f"`{metadata.get('qualified_digest')}`"
+    if job_final:
+        return (f"**Final job tier: clean. The release gate's final soak passes** for the candidate whose "
+                f"`candidate.json` has SHA-256 {digest}, if it is the final candidate.")
+    return (f"**Final tier (V02 alone): clean. The V02 soak gate passes** for the candidate whose `candidate.json` "
+            f"has SHA-256 {digest}, if it is the final candidate. It is not the release gate's final soak, which is "
+            "the job final (`qualify-jobs-sustained.sh --tier final`, #991).")
 
 
 def render(evidence, record):
@@ -1468,7 +1623,10 @@ def render(evidence, record):
             if observed.get("complete") is not True or observed.get("ts",0)<(job_report or {}).get("heartbeat",0) or observed.get("live_owners")!=0:
                 job_missing.append(node+" lacks a complete empty owner inventory after campaign drain")
         gates.append(("mixed job campaign and positive drain",str(len(job_missing))+" missing/failing checks","0","FAIL" if job_missing else "PASS"))
-    gate_failed = any(row[3] == "FAIL" for row in gates)
+    inventory = execution_inventory(evidence, metadata, events, job_report)
+    missing = [item for item, need, done in inventory if done < need]
+    final_tier = metadata.get("tier") == "final"
+    gate_failed = any(row[3] == "FAIL" for row in gates) or (final_tier and bool(missing))
     open_failures = [row for row in failures if row.get("disposition", "open") == "open"]
     result = metadata.get("result") or ("FAIL" if open_failures or gate_failed else "PASS")
     if (open_failures or gate_failed) and result == "PASS":
@@ -1478,7 +1636,11 @@ def render(evidence, record):
     lines = [f"# Sustained soak (V02): {result}", ""]
     lines += [f"{time.strftime('%-d %B %Y', time.gmtime(started))}. {tier} tier, {metadata.get('schedule', 'full')} "
               f"schedule, {duration_text(elapsed)} of soak on a three-node quickstart cluster.", ""]
-    lines += [acceptance_line(metadata, result, elapsed), ""]
+    # The acceptance line tells a failed check apart from a run that was clean but incomplete.
+    clean_apart_from_inventory = "FAIL" if open_failures or metadata.get("result") == "FAIL" or any(
+        row[3] == "FAIL" for row in gates) else "PASS"
+    lines += [acceptance_line(metadata, clean_apart_from_inventory, elapsed, missing if final_tier else (),
+                              job_final_ran(metadata, job_report, missing)), ""]
     lines += ["## Candidate and host", "", "| | |", "|---|---|"]
     for key, label in (("base_url", "Staged base URL"), ("candidate_digest", "`candidate.json` SHA-256"),
                        ("versions", "Running versions"), ("soak_bun", "Soak build"),
@@ -1519,6 +1681,12 @@ def render(evidence, record):
         seconds = sorted(entry["seconds"])
         timing = f"{seconds[len(seconds) // 2]} s / {seconds[-1]} s" if seconds else "n/a"
         lines.append(f"| {phase} | {entry['runs']} | {entry['settled']} | {entry['failed']} | {entry['skipped']} | {timing} |")
+    lines.append("")
+    lines += [f"## Execution inventory ({'gated' if final_tier else 'recorded, not gated'})", "",
+              "What the run completed, from its events and kept bytes, against what its schedule owes. "
+              "A fault counts once it was injected and the cluster settled after it.", "",
+              "| Item | Required | Completed | Verdict |", "|---|---|---|---|"]
+    lines += [f"| {item} | {need} | {done} | {'ok' if done >= need else 'MISSING'} |" for item, need, done in inventory]
     lines.append("")
     lines += ["## Renewals and rotations", "", "| Measure | Observed | Required | Verdict |", "|---|---|---|---|"]
     lines += [f"| {label} | {observed} | {need} | {verdict} |" for label, observed, need, verdict in gates]

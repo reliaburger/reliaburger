@@ -641,8 +641,25 @@ the real `curl … | sh` install against it on every host we advertise.
    release step.
 
    The record's second paragraph states the verdict. A fast run can only say
-   "fast tier: clean"; only a clean final-tier run, 8 hours on the full
-   schedule with the digest checked, says the V02 gate passes. A product fix
+   "fast tier: clean", and a run without a tier is a diagnostic that says
+   nothing about either gate. Only a clean, complete final-tier run, 8 hours
+   on the full schedule, says a gate passes: "the V02 soak gate passes" for
+   `qualify-sustained.sh --tier final`, "the release gate's final soak
+   passes" only for the job final, whose job controller ran the target load
+   and whose node faults all completed. Complete means the record's execution
+   inventory has nothing missing
+   ([#1061](https://github.com/reliaburger/reliaburger/issues/1061)): every
+   upgrade walk the schedule owes (to the soak build, back and settled), every
+   fault kind and node fault injected and settled, every special (quorum loss
+   with quorum back), every catalogue pulse and offline export, the app
+   workloads settled at the baseline, the job campaign drained in its final
+   two minutes, and the `candidate.json` bytes this run downloaded hashing to
+   `--qualified-digest`. The checker counts these from the run's events and
+   kept bytes against the 8-hour full schedule, whatever the metadata says, so
+   relabelling a shorter run can't promote it. A final tier refuses to start
+   without `--soak-bun` or `--qualified-digest`, or with `--home`, since it
+   could only end incomplete. Fast and custom runs show their inventory too,
+   recorded but not gated. A product fix
    found during the final run means a new candidate, a fresh fast run and
    then a fresh final run. `--resume --evidence DIR` continues an interrupted
    run with its original tier. The [0.1.0 release closure
@@ -910,10 +927,14 @@ What it covers, and what it doesn't:
   the full schedule. That covers the compressed (fast) tier and full-schedule
   runs of about four hours. The 8-hour final tier, and the 12-hour lane A run,
   still need a long-running host or a self-hosted runner.
-- **No upgrade walks.** They need a private soak build (`0.1.0-soak.1`) signed
-  with the release key (D2), and nothing in CI signs with it, so the harness
-  skips the upgrade slots and the record says so. Run those on a host that
-  holds the key.
+- **No upgrade walks, so it's a diagnostic.** They need a private soak build
+  (`0.1.0-soak.1`) signed with the release key (D2), and nothing in CI signs
+  with it, so the harness skips the upgrade slots and the record says so.
+  Without them no run can complete a tier's execution inventory, so the
+  workflow passes `--tier custom` and the record calls the run a diagnostic
+  that says nothing about either gate
+  ([#1061](https://github.com/reliaburger/reliaburger/issues/1061)). Run the
+  tiers on a host that holds the key.
 - **One platform.** Linux x86_64 with Lima's QEMU driver. The macOS VZ path is
   lane A's host.
 

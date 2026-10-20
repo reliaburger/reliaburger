@@ -163,7 +163,7 @@ issue until new evidence appears.
 | B6 small-crate pilot | Deferred | Speculative; the single crate is deliberate |
 | B6 explicit build targets | **Done** as far as it goes | [#904](https://github.com/reliaburger/reliaburger/issues/904) fixed the Make recipes' double compiles |
 | B6 light/full split against branch rules | Folded into B1 | A light-green PR on `release-0-2-2` merges without a queue today |
-| S1 executed coverage in RC verdicts | **Proposed** | `sustained_check.py`'s final verdict checks a clean result, schedule, duration and digest; without `--soak-bun` the upgrade slots are skipped without a shortfall; `soak.yml` passes no tier |
+| S1 executed coverage in RC verdicts | **Done** for the final verdict ([#1061](https://github.com/reliaburger/reliaburger/issues/1061)) | The record's execution inventory counts completed walks, faults, specials, pulses, exports, the baseline, the final drain and the verified candidate bytes against the 8-hour schedule; a final refuses to start without a soak build, a digest or its own bootstrap; `soak.yml` passes `--tier custom` as a diagnostic |
 | S2 accumulation exposure | Partly done; **proposed** | Per-runtime accepted successes are reported. The RSS baseline resets on a pid or image change and gives no finding while warming up, and fault choice uses an unseeded `$RANDOM` |
 | S3 one final campaign | **Done** (maintainer decision) | [#991](https://github.com/reliaburger/reliaburger/issues/991) and PR #996: one eight-hour job final replaces the separate V02 final. The loop-lane bounds are [#287](https://github.com/reliaburger/reliaburger/issues/287) |
 
