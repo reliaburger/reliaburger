@@ -57,6 +57,10 @@
 #   --node-faults           add one node-level fault to every cycle, in
 #                           rotation: inter-node delay, a full disk, slow
 #                           fsync (#686); jobs must overlap each kind
+#   --seed N                seed for every fault and node choice (which node,
+#                           how long, after how many seconds); the record names
+#                           the seed, and the same seed repeats a run's choices
+#                           in order (default: a new random seed, #1062)
 #   --plan                  print the fault schedule these options give and
 #                           exit, touching nothing
 #
@@ -95,6 +99,7 @@ keep=false
 job_load=
 target_rate=
 node_faults=
+seed=
 plan=false
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -112,6 +117,7 @@ while [ "$#" -gt 0 ]; do
         --job-load) job_load=${2:-}; shift 2 ;;
         --target-rate) target_rate=${2:-}; shift 2 ;;
         --node-faults) node_faults=true; shift ;;
+        --seed) seed=${2:-}; shift 2 ;;
         --plan) plan=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; fail "unknown argument: $1" ;;
@@ -144,6 +150,7 @@ case $tier in
     ''|custom) tier=custom; : "${schedule:=full}" "${duration_text:=24h}" ;;
     *) fail '--tier must be fast, final or custom' ;;
 esac
+[ -z "$seed" ] || [[ $seed =~ ^[0-9]+$ ]] || fail '--seed must be a whole number'
 # A final tier owes every upgrade walk and a candidate it verified itself
 # (#1061), so one that could only finish incomplete never starts.
 if [ "$tier" = final ] && [ "$plan" = false ]; then
@@ -1129,7 +1136,9 @@ settle() {
     done
 }
 
-random_between() { echo $(( $1 + RANDOM % ($2 - $1 + 1) )); }
+# Every choice comes from the run's seed and is logged as a `choice` event
+# (#1062): random_between WHAT LOW HIGH.
+random_between() { check choose "$evidence" "$1" "$2" "$3"; }
 
 current_leader() {
     rel --output json nodes > "$evidence/.nodes.json" 2>/dev/null || return 1
@@ -1139,36 +1148,43 @@ random_follower() {
     local leader candidates=() i
     leader=$(current_leader) || leader=0
     for i in 1 2 3; do [ "$i" = "$leader" ] || [ "${down[i]}" = 1 ] || candidates+=("$i"); done
-    echo "${candidates[RANDOM % ${#candidates[@]}]}"
+    echo "${candidates[$(random_between follower 0 $(( ${#candidates[@]} - 1 )))]}"
 }
 
+# Bun's main pid on a node, to show a kill replaced the process.
+main_pid() { gsh "$1" 'systemctl show -p MainPID --value reliaburger.service' 2>/dev/null || echo '?'; }
+
 slot_bun_kill() {
-    local role=$1 node
+    local role=$1 node before
     if [ "$role" = leader ]; then node=$(current_leader) || node=1; else node=$(random_follower); fi
     say "fault: SIGKILL bun on the $role ${vm[node]}"
     open_window "bun-kill-$role"
     avoid=$node
+    before=$(main_pid "$node")
     kill_bun "$node"
     event --phase "fault:bun-kill-$role" --target "${vm[node]}" --command 'kill -9 MainPID'
     settle "fault:bun-kill-$role" 300 || true
+    event --phase "effect:bun-kill-$role" --target "${vm[node]}" --detail "MainPID $before -> $(main_pid "$node")"
     avoid=0
 }
 
 slot_deploy_kill() {
-    local node offset
+    local node offset before
     generation=$(( generation + 1 ))
     meta generation "$generation"
     write_workloads
-    node=$(random_between 1 3)
-    offset=$(random_between 0 "$kill_offset")
+    node=$(random_between deploy-kill-node 1 3)
+    offset=$(random_between deploy-kill-offset 0 "$kill_offset")
     say "fault: rolling deploy (generation $generation), SIGKILL bun on ${vm[node]} after $offset s"
     open_window deploy-kill
     rel apply -f "$evidence/workloads.toml" > "$evidence/snapshots/apply-$generation.log" 2>&1 || true
     sleep "$offset"
     avoid=$node
+    before=$(main_pid "$node")
     kill_bun "$node"
     event --phase fault:deploy-kill --target "${vm[node]}" --detail "generation $generation, kill after $offset s"
     settle fault:deploy-kill 300 || true
+    event --phase effect:deploy-kill --target "${vm[node]}" --detail "MainPID $before -> $(main_pid "$node")"
     avoid=0
 }
 
@@ -1192,12 +1208,14 @@ power_on() {
 slot_power_off() {
     local node hold
     power_offs=$(( power_offs + 1 ))
-    if [ $(( power_offs % 4 )) -eq 0 ]; then node=1; else node=$(random_between 2 3); fi
-    hold=$(random_between "$hold_min" "$hold_max")
+    if [ $(( power_offs % 4 )) -eq 0 ]; then node=1; else node=$(random_between power-off-node 2 3); fi
+    hold=$(random_between power-off-hold "$hold_min" "$hold_max")
     say "fault: power off ${vm[node]} for $hold s"
     open_window power-off 1
     power_off "$node"
     event --phase fault:power-off --target "${vm[node]}" --command 'limactl stop --force' --detail "held $hold s"
+    event --phase effect:power-off --target "${vm[node]}" \
+        --detail "Lima status $("$limactl" list --format '{{.Status}}' "${vm[node]}" 2>/dev/null || echo unknown)"
     wait_until $(( $(date +%s) + hold ))
     power_on "$node" || event --phase fault:power-off --target "${vm[node]}" --verdict fail --detail 'relish local start failed'
     settle fault:power-off 480 || true
@@ -1222,6 +1240,10 @@ node_fault_script() {
         disk-full:stop) printf '%s\n' 'rm -f /var/lib/reliaburger/soak-disk-fill' ;;
         slow-fsync:start) printf '%s\n' 'source=$(findmnt -no SOURCE --target /var/lib/reliaburger); disk=$(lsblk -no PKNAME "$source" | head -n 1); disk=/dev/${disk:-${source#/dev/}}; systemctl set-property --runtime reliaburger.service "IOWriteIOPSMax=$disk 20" "IOWriteBandwidthMax=$disk 1M"' ;;
         slow-fsync:stop) printf '%s\n' 'systemctl set-property --runtime reliaburger.service IOWriteIOPSMax= IOWriteBandwidthMax=' ;;
+        # What the fault is seen to do once injected, for the record (#1062).
+        delay:effect) printf '%s\n' 'tc qdisc show dev "$(cat /run/soak-delay-dev)" root | grep -o "netem.*" || echo "no netem qdisc"' ;;
+        disk-full:effect) printf '%s\n' 'echo "available $(df --output=avail -B1 /var/lib/reliaburger | tail -n 1) bytes"' ;;
+        slow-fsync:effect) printf '%s\n' 'systemctl show -p IOWriteIOPSMax -p IOWriteBandwidthMax reliaburger.service | tr "\n" " "' ;;
     esac
 }
 slot_node_fault() {
@@ -1231,7 +1253,7 @@ slot_node_fault() {
     node_fault_index=$(( node_fault_index + 1 ))
     [ "${down[node]}" = 0 ] || node=1
     peer=$(( node % 3 + 1 ))
-    hold=$(random_between "$hold_min" "$hold_max")
+    hold=$(random_between node-fault-hold "$hold_min" "$hold_max")
     log=$evidence/snapshots/node-$kind-$node_fault_index.log
     say "fault: $kind on ${vm[node]} for $hold s"
     # The checker excuses slow turns only on the node the fault throttles (#972).
@@ -1241,6 +1263,8 @@ slot_node_fault() {
     gsh "$node" "PEER=${address[peer]}; $(node_fault_script "$kind" start)" > "$log" 2>&1 || result=$?
     event --phase "fault:node-$kind" --target "${vm[node]}" --exit "$result" --command "$kind" --detail "held $hold s"
     [ "$result" -eq 0 ] || record_failure "node-$kind" "could not inject $kind on ${vm[node]}; see ${log##*/}"
+    event --phase "effect:node-$kind" --target "${vm[node]}" \
+        --detail "$(gsh "$node" "$(node_fault_script "$kind" effect)" 2>&1 | tr '\n' ' ' | cut -c1-200)"
     wait_until $(( $(date +%s) + hold ))
     gsh "$node" "$(node_fault_script "$kind" stop)" >> "$log" 2>&1 \
         || record_failure "node-$kind" "could not remove $kind from ${vm[node]}; see ${log##*/}"
@@ -1333,7 +1357,7 @@ catalogue_pulse() {
 offline_export() {
     local node output result=0
     output=$evidence/snapshots/offline-export-$(date +%s).log
-    node=$(random_between 2 3)
+    node=$(random_between export-node 2 3)
     [ "${down[node]}" = 0 ] || node=1
     gsh "$node" 'relish logs-export --source /var/lib/reliaburger/logs/parquet --dest /var/lib/reliaburger/soak-export/offline --node-id offline 2>&1; echo "export exit $?"
         relish logs-search /var/lib/reliaburger/soak-export/logs/'"${vm[node]}"' "SELECT count(*) AS n FROM logs" 2>&1; echo "search exit $?"' \
@@ -1423,9 +1447,9 @@ slot_upgrade() {
     gsh 1 "RELIABURGER_TOKEN=\$(cat /root/.soak-token) relish --endpoint https://127.0.0.1:9117 --ca-cert /etc/reliaburger/identity/root-ca.crt upgrade start --binary /var/tmp/$name --registry ${address[1]}:5050 --allow-downgrade" \
         > "$evidence/snapshots/upgrade-$upgrade_walks-start.log" 2>&1 || record_failure upgrade "upgrade start failed; see upgrade-$upgrade_walks-start.log"
     if [ "$inject" -eq 1 ]; then
-        sleep "$(random_between 10 60)"
+        sleep "$(random_between walk-fault-delay 10 60)"
         if [ $(( upgrade_walks % 4 )) -eq 1 ]; then kill_bun "$(current_leader || echo 1)"; else
-            local node; node=$(random_between 2 3); power_off "$node"; sleep "$hold_min"; power_on "$node" || true
+            local node; node=$(random_between walk-power-off-node 2 3); power_off "$node"; sleep "$hold_min"; power_on "$node" || true
         fi
     fi
     # Every node reporting the target isn't the end of the run: the leader
@@ -1718,6 +1742,7 @@ if [ "$plan" = true ]; then
     plan_cycles=$(( (duration + cycle - 1) / cycle ))
     [ "$plan_cycles" -ge "$min_cycles" ] || plan_cycles=$min_cycles
     printf 'plan: %s\n' "$job_runs"
+    printf 'plan: seed %s for every fault and node choice\n' "${seed:-random}"
     for (( index = 0; index < plan_cycles; index++ )); do run_cycle "$index" 0; done
     rm -rf "$evidence"
     exit 0
@@ -1726,6 +1751,11 @@ fi
 trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
+
+# Every fault and node choice comes from one seed (#1062). A resumed run
+# carries on with its own seed and its place in the sequence.
+seed=$(check seed "$evidence" ${seed:+--seed "$seed"}) || fail 'cannot start the seeded fault choices'
+say "fault and node choices from seed $seed (--seed $seed repeats them)"
 
 if [ "$resume" = true ]; then
     home=$(meta_get home_path)

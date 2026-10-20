@@ -3506,6 +3506,23 @@ The hosted workflow can't sign a soak build, so its runs can never complete a
 tier. It now says so: it passes `--tier custom`, and the record calls the run
 a diagnostic.
 
+Two smaller blind spots sat next to the inventory
+([#1062](https://github.com/reliaburger/reliaburger/issues/1062)). Fault
+choices came from bash's `$RANDOM`, unseeded, so nobody could replay the run
+that found a bug. Worse, `$RANDOM` inside `$(...)` runs in a subshell, and
+bash reseeds a subshell's generator, so even a seed at the top wouldn't have
+helped. Now every choice goes through `sustained_check.py choose`, which takes
+draw *n* of the run's seed from a fresh `random.Random(f"{seed}:{n}")` and
+counts draws in `choices.json`. Same seed, same choices, in the same order,
+and a resumed run picks up at the next draw.
+
+The other was the leak checkers. `leak-rss` starts judging a Bun process an
+hour after it appears, and every kill, power-off or upgrade exec makes a new
+one. The 0.2.0 final's own evidence shows the gap: the longest Bun on node 2
+lived 48 minutes, so `leak-rss` never once judged that node in eight hours.
+The record now reports each checker's armed minutes per node. Making that a
+gate needs a quieter schedule, which is the maintainer's call.
+
 ### A task that failed before it ran
 
 Candidate 3's fast soak failed one fresh-runc task of ordinary work, out of
