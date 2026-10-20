@@ -1350,6 +1350,9 @@ async fn gather_statuses(state: &ApiState) -> Vec<InstanceStatus> {
 mod audit_tests;
 
 #[cfg(test)]
+mod late_publication_tests;
+
+#[cfg(test)]
 mod permission_tests;
 
 #[cfg(test)]

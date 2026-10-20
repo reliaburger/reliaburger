@@ -280,7 +280,23 @@ so a spawned task can hold it without borrowing a departed stack frame.
 Standalone writes clone the checkpoint, preflight identities and progress
 capacity, then publish private JSON with file and directory fsync. Only durable
 publication replaces the in-memory value. An I/O error fences later writes and
-dispatch. Compact initial ranges can expand into sparse progress; admission
+dispatch.
+
+A timeout fences them too, and that case is harder. The write runs on a
+blocking thread, so when its caller gives up after the write timeout the thread
+carries on, and the run can reach the disk after the client has been told
+"unavailable". The node can't tell whether it did, so it refuses every
+admission and stops leading until it restarts. A test holds the real writer
+after it has built its checkpoint and before it publishes (a `#[cfg(test)]`
+barrier in the store), lets the caller's deadline pass, and checks that
+admission returns 503 and nothing is dispatched. It then lets the write land,
+restarts the node and retries with the same `Idempotency-Key`. The retry gets
+the late write's run back, every task of it runs exactly once, and the next
+new submission gets a fresh id. The `Idempotency-Key` is what makes "unavailable"
+safe to retry: one durable run identity, whichever side of the timeout the
+write landed on.
+
+Compact initial ranges can expand into sparse progress; admission
 reserves that representation before accepting work. Reopen validates the chunk
 partition, counts and exact hook identities. Omitted metadata must never open
 an app gate. Expired results are pruned before capacity preflight; otherwise the

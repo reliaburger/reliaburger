@@ -156,7 +156,7 @@ issue until new evidence appears.
 | B3 settlement helpers | **Proposed** | The hung commit and failed-hook settlement tests in `src/bun/api/tests.rs` still send a cancel request |
 | B3 stalled TLS reclamation | **Proposed** | `stalled_tls_handshakes_are_bounded_and_reclaimed` in `src/wrapper/proxy.rs` only checks a five-byte write after the stall, which passes without reclamation |
 | B3 real worker in the rolling walk | **Proposed**, with Q5 | The walk starts three voters and relabels one as the worker |
-| B4 late publication | **Proposed** | No test pauses the blocking writer past its caller's deadline |
+| B4 late publication | **Done** ([#1059](https://github.com/reliaburger/reliaburger/issues/1059)) | `src/bun/api/late_publication_tests.rs` holds the standalone writer past its caller's deadline, checks admission and dispatch stay fenced, then reopens and retries the same `Idempotency-Key` |
 | B4 broader lifecycle property test | **Proposed** | The task-array proptest model has only plan, complete, lose and cancel |
 | B5 per-record fragments | Deferred | Only worth doing if conflicts in the shared manifest, bindings and flakes files are measured as frequent |
 | B6 repeated macOS compilation | **Done** (decided) | [#846](https://github.com/reliaburger/reliaburger/issues/846) and PR #903 removed the double compile; a shared macOS archive was measured and rejected, because the build stays on the critical path |
