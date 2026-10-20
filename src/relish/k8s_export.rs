@@ -911,6 +911,81 @@ mod tests {
         assert!(plain.report.unsupported.is_empty());
     }
 
+    /// #1132: a job's firewall and egress have no field on a Job or its Pod
+    /// (NetworkPolicy is a separate resource), so they must be reported, not
+    /// silently dropped as they used to be.
+    #[test]
+    fn a_jobs_firewall_and_egress_are_reported_as_unsupported() {
+        let config = parse_config(
+            r#"
+            [job.fetch]
+            image = "fetcher:v1"
+
+            [job.fetch.firewall]
+            allow_from = ["web"]
+
+            [job.fetch.egress]
+            allow = ["api.example.com:443"]
+            "#,
+        );
+        let result = export_kubernetes(&config).unwrap();
+        assert_eq!(result.report.resources_created, vec!["Job/fetch"]);
+        let unsupported = &result.report.unsupported;
+        for field in ["firewall", "egress"] {
+            assert!(
+                unsupported.iter().any(
+                    |u| u.contains(&format!("[job.fetch.{field}]")) && u.contains("NetworkPolicy")
+                ),
+                "{field} missing from {unsupported:?}"
+            );
+        }
+    }
+
+    /// #1132: `overlap` is a CronJob's `concurrencyPolicy`. Reliaburger's
+    /// default is `forbid` and Kubernetes' is `Allow`, so an omitted overlap
+    /// must still export as `Forbid` or the CronJob would start overlapping.
+    #[test]
+    fn a_cron_jobs_overlap_exports_as_its_concurrency_policy() {
+        for (overlap, expected) in [
+            ("overlap = \"allow\"\n", "Allow"),
+            ("overlap = \"forbid\"\n", "Forbid"),
+            ("", "Forbid"),
+        ] {
+            let config = parse_config(&format!(
+                "[job.cleanup]\nimage = \"cleanup:v1\"\nschedule = \"0 3 * * *\"\n{overlap}"
+            ));
+            let result = export_kubernetes(&config).unwrap();
+            let cron: CronJob = yaml_serde::from_str(&result.yaml).unwrap();
+            assert_eq!(
+                cron.spec.concurrency_policy.as_deref(),
+                Some(expected),
+                "overlap {overlap:?}"
+            );
+            assert!(
+                result.report.unsupported.is_empty() && result.report.dropped.is_empty(),
+                "{:?}",
+                result.report
+            );
+        }
+    }
+
+    /// #1132: Kubernetes has no "replay a run whose worker vanished" switch,
+    /// so `replay_unknown` is reported rather than lost.
+    #[test]
+    fn a_jobs_replay_unknown_is_reported_as_unsupported() {
+        let config = parse_config("[job.worker]\nimage='fixture:v1'\nreplay_unknown=true");
+        let result = export_kubernetes(&config).unwrap();
+        assert!(
+            result
+                .report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("[job.worker] replay_unknown")),
+            "{:?}",
+            result.report.unsupported
+        );
+    }
+
     #[test]
     fn host_process_jobs_are_reported_but_not_exported_without_an_image() {
         let config = parse_config("[job.backup]\nruntime='process'\nexec='/usr/bin/backup'");
