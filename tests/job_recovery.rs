@@ -31,6 +31,8 @@ impl Node {
             .append(true)
             .open(log)
             .unwrap();
+        // Pay `bun`'s first launch before the readiness deadline (#1149).
+        bun_process::first_launch_binaries();
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"))
             .arg("--config")
             .arg(config)

@@ -211,6 +211,8 @@ async fn cancel_deploy_waits_for_terminal_evidence_and_refuses_unknown_success()
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+        crate::bun_process::first_launch_binaries();
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
@@ -273,6 +275,8 @@ async fn image_delete_parses_repo_and_tag() {
             .with_state(deleted.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
+    // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(60),
         tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
@@ -395,6 +399,8 @@ spec:
     )
     .unwrap();
 
+    // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(60),
         tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
@@ -647,6 +653,9 @@ async fn relish_batch(endpoint: &str, jobs: &str) -> u64 {
 async fn hung_toml_job_times_out() {
     let harness = crate::batch::Harness::start().await;
     let hang = "runtime = \"process\"\nexec = \"/bin/sleep\"\ncommand = [\"60\"]\ntask_timeout_secs = 1\nmax_attempts = 1\n";
+    // The elapsed-time check below times the jobs, not `relish`'s first
+    // launch, so pay that before the clock starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let started = std::time::Instant::now();
 
     // A job that is safe to repeat counts the timeout as a failed attempt.
