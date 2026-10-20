@@ -178,6 +178,47 @@ pub(super) fn delay_error_hint(error: &crate::smoker::network::NetnsCommandError
     }
 }
 
+/// Why a caller's delay wasn't programmed on this pass.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DelayFailure {
+    /// Programming ran out of turn, or waits on an earlier Bun's sweep; the
+    /// next tick finishes it.
+    Pending(String),
+    /// Programming the interface failed.
+    Failed(String),
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl std::fmt::Display for DelayFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DelayFailure::Pending(reason) => write!(formatter, "{reason}; the next tick retries"),
+            DelayFailure::Failed(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+/// Decide a delay injection from one reconcile pass: the rule is already in
+/// the registry, so a caller still being programmed is accepted, and only a
+/// real failure for one of `callers` refuses it.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn delay_injection_outcome(
+    callers: &[String],
+    failures: &[(String, DelayFailure)],
+) -> Result<(), String> {
+    let failed = failures
+        .iter()
+        .find_map(|(instance, failure)| match failure {
+            DelayFailure::Failed(reason) if callers.contains(instance) => Some(reason),
+            _ => None,
+        });
+    match failed {
+        None => Ok(()),
+        Some(reason) => Err(format!("cannot delay traffic: {reason}")),
+    }
+}
+
 /// Delays shape each caller's own container `eth0`. A host process on a
 /// mixed node shares the host's network, so it has nothing to shape: leave it
 /// out instead of failing the whole injection on it.
@@ -1392,17 +1433,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "no running instance of source app {source} runs on this node"
             ));
         }
-        let failures: Vec<String> = self
-            .reconcile_delays()
-            .await
-            .into_iter()
-            .filter(|(instance, _)| callers.contains(instance))
-            .map(|(_, error)| error)
-            .collect();
-        match failures.first() {
-            None => Ok(()),
-            Some(error) => Err(format!("cannot delay traffic: {error}")),
+        let failures = self.reconcile_delays().await;
+        for (instance, failure) in &failures {
+            if matches!(failure, DelayFailure::Pending(_)) {
+                eprintln!("smoker: delay on {instance}: {failure}");
+            }
         }
+        delay_injection_outcome(&callers, &failures)
     }
 
     /// Instances with their own container address, the only ones a delay
@@ -1480,14 +1517,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Converge every local caller's netem delays on what the active delay
-    /// faults ask for. Returns `(instance, error)` for each caller whose
-    /// interface couldn't be programmed; those are retried next tick.
+    /// faults ask for. Returns `(instance, failure)` for each caller whose
+    /// interface wasn't programmed; those are retried next tick.
     ///
     /// The callers are programmed at once, under the turn's runtime budget
-    /// (#351, stage 3). One that doesn't finish in time is a failure, and
-    /// its interface is marked unknown so the next pass rebuilds it.
+    /// (#351, stage 3). One that doesn't finish in time is pending, not
+    /// failed, and its interface is marked unknown so the next pass rebuilds
+    /// it.
     #[cfg(target_os = "linux")]
-    pub(super) async fn reconcile_delays(&mut self) -> Vec<(String, String)> {
+    pub(super) async fn reconcile_delays(&mut self) -> Vec<(String, DelayFailure)> {
         use crate::smoker::network::{NetnsCommandError, desired_delays};
 
         let delaying = self.fault_registry.iter().any(|rule| {
@@ -1548,7 +1586,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .map(|instance| {
                     (
                         instance,
-                        "the sweep of delays an earlier Bun left is still running".to_string(),
+                        DelayFailure::Pending(
+                            "the sweep of delays an earlier Bun left is still running".to_string(),
+                        ),
                     )
                 })
                 .collect();
@@ -1579,8 +1619,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .insert(instance.clone(), (u32::MAX, Vec::new()));
                 failures.push((
                     instance,
-                    "programming the delay did not finish within the turn; the next tick retries"
-                        .to_string(),
+                    DelayFailure::Pending(
+                        "programming the delay did not finish within the turn".to_string(),
+                    ),
                 ));
                 continue;
             };
@@ -1603,14 +1644,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         self.network_faults
                             .delays
                             .insert(instance.clone(), (restart, wanted.clone()));
-                        failures.push((instance, error.to_string()));
+                        failures.push((instance, DelayFailure::Failed(error.to_string())));
                     } else {
                         self.network_faults.delays.remove(&instance);
                     }
                 }
                 Err(error) => {
                     self.network_faults.delays.remove(&instance);
-                    failures.push((instance, delay_error_hint(&error)));
+                    failures.push((instance, DelayFailure::Failed(delay_error_hint(&error))));
                 }
             }
         }

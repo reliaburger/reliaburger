@@ -157,3 +157,39 @@ fn delays_shape_container_callers_and_skip_host_processes() {
     );
     assert_eq!(kept, vec![caller("default__frontend-0")]);
 }
+
+/// Programming a delay that outlasts the turn, or waits on an earlier Bun's
+/// sweep, finishes on the next tick: the rule is in the registry. Refusing
+/// the injection for it told the client a fault had failed that then went
+/// ahead (#1199). Only a real failure for one of this rule's callers refuses.
+#[test]
+fn a_delay_still_being_programmed_is_accepted_and_only_a_real_failure_refuses() {
+    use super::super::faults::{DelayFailure, delay_injection_outcome};
+    let callers = vec!["default__frontend-0".to_string()];
+    let pending = vec![(
+        "default__frontend-0".to_string(),
+        DelayFailure::Pending("programming the delay did not finish within the turn".into()),
+    )];
+    assert_eq!(delay_injection_outcome(&callers, &pending), Ok(()));
+
+    let failed = vec![
+        (
+            "default__frontend-0".to_string(),
+            DelayFailure::Pending("programming the delay did not finish within the turn".into()),
+        ),
+        (
+            "default__frontend-0".to_string(),
+            DelayFailure::Failed("RTNETLINK answers: File exists".into()),
+        ),
+    ];
+    assert_eq!(
+        delay_injection_outcome(&callers, &failed),
+        Err("cannot delay traffic: RTNETLINK answers: File exists".to_string())
+    );
+
+    let elsewhere = vec![(
+        "default__backend-0".to_string(),
+        DelayFailure::Failed("RTNETLINK answers: File exists".into()),
+    )];
+    assert_eq!(delay_injection_outcome(&callers, &elsewhere), Ok(()));
+}
