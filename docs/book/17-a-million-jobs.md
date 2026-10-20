@@ -2927,6 +2927,110 @@ The price of lookahead is ownership. More granted work may need reconciliation
 or replay after a worker is lost. That window is bounded, and stale attempts
 keep their existing fences.
 
+### Sixteen chunks in lockstep
+
+Lookahead gave the node more to hold. It didn't make the node any busier,
+and the [0.2.3 host-job profile](../qualification/2026-10-20-host-job-profile/README.md)
+(#1029) showed why. Polling `relish batch-status` every 150 ms on a node
+running BusyBox tasks at the default cap of 27 gave a sawtooth:
+
+```
+   t(s)   held  accepted  started   active
+   2.37  16000     34000    44106       24
+   3.49  16000     50000    50000        0    <- all 16 chunks done together
+   5.39  16000     50000    60157       19    <- 1.9 s with nothing running
+```
+
+Inside a burst the node ran about 10,000 tasks a second. Averaged over the
+three-second cycle it ran 5,100, and a third of the VM's CPU sat idle. The
+node held sixteen chunks, finished all sixteen at the same moment, sent sixteen
+receipts in one sync, and then waited for the leader's next grant with nothing
+to run.
+
+Why would sixteen chunks finish together? Each held chunk had its own dispatch
+loop, and each loop asked the pool's semaphore for a permit, one task at a
+time. Tokio's semaphore is fair: waiters get permits in the order they asked.
+So the sixteen loops queued behind one another, took one permit each, went to
+the back of the queue, and took the next. That's round-robin. Every chunk
+advanced by one task per round, so none got ahead, and the first one finished
+only when nearly every task of every chunk had started. A fair semaphore did
+exactly what it promised, and that was the problem.
+
+The leader wasn't the bottleneck. `plan_sync` already applies a node's
+receipts and plans the replacement grants in the same entry, so a node that
+reports one finished chunk gets the next one a tick later. It just never had
+an early receipt to report.
+
+So for #1030 a chunk now waits its turn before it takes any slots. The pool
+hands out a `DispatchTurn` when the node accepts the grant, and a chunk starts
+asking for permits only once every chunk ahead of it has a permit for each of
+its tasks. The tail of one chunk still overlaps the head of the next, since a
+chunk lets the next one go as soon as its last task *starts*, not when it
+ends. But the first chunk now finishes first, its receipt goes out on the
+next sync, and the leader tops the node up while the other fifteen still run.
+
+The turn is a chain of one-shot channels:
+
+```rust
+pub fn take_turn(&self) -> DispatchTurn {
+    let (next, closed) = tokio::sync::oneshot::channel();
+    let previous = match self.last_turn.lock() {
+        Ok(mut last) => last.replace(closed),
+        Err(poisoned) => poisoned.into_inner().replace(closed),
+    };
+    DispatchTurn { previous, next }
+}
+```
+
+A `tokio::sync::oneshot` channel carries at most one value, and its receiver
+also wakes when the sender is *dropped*, with an error saying so. We never
+send anything. Each turn keeps the sender of its own channel and the receiver
+of the turn before it, and the pool keeps the newest receiver for whoever comes
+next. A chunk waits on `previous`, dispatches, and drops `next`, and that drop
+is the signal. Drop runs on every path out of the function, including an early
+return and a panic, so there's no "release" call to forget. It's the same RAII
+trick as the semaphore's owned permits.
+
+`last_turn` is a `std::sync::Mutex`, not tokio's. Our rule is tokio locks for
+shared state in async code, because a std lock held across an `.await` blocks a
+whole runtime thread. Here the lock covers one `Option::replace` in a plain
+function and is never held across an await, so the cheaper std lock is fine.
+`lock()` returns a `Result` because a std mutex is *poisoned* if a thread
+panics while holding it. Go's `sync.Mutex` has no such idea. The value here is
+just a receiver, so `into_inner()` takes it anyway rather than panic.
+
+The turn is taken in `reconcile`, when the grant arrives, not inside the
+spawned task. Tokio may poll freshly spawned tasks in any order on a
+multi-threaded runtime, so taking it there would make the order whatever the
+scheduler felt like. Taking it before `tokio::spawn` makes it the grant order,
+lowest chunk first within one sync.
+
+Cancellation needed one more step. A chunk the leader takes back while it's
+still queued should end at once, with every task counted as not run. But if it
+simply dropped `next`, the chunk behind it would stop waiting for the chunks
+ahead and run alongside them. So a cancelled turn hands its `previous` and
+`next` to a small spawned task that waits for the one and then drops the other.
+The order holds, and the cancelled chunk doesn't wait.
+
+Nothing else moved. Retries still ask the same semaphore for a permit, so a
+retried task competes with the next chunk's first tasks rather than jumping
+the queue. Each task still holds an owned permit, the node's admission
+semaphore and its resource lease. Records still stream to the ledger, and the
+receipt still goes out only once every record of the chunk is durable.
+
+Three tests pin it down. `chunks_sharing_slots_finish_in_the_order_they_arrived`
+runs four eight-task chunks through two slots and checks the first one
+finishes after at most twelve of the 32 attempts have started. Before the
+change, it finished after 24. `the_first_held_chunk_is_reported_long_before_the_last_one_starts`
+does the same through a node's `sync`: eight held chunks, a cap of two, and
+the first receipt has to arrive before 40 of 80 attempts start (it used to be
+68). `a_chunk_cancelled_while_queued_ends_at_once_and_keeps_the_order_behind_it`
+cancels a queued chunk and checks the one behind it still waits.
+
+The profile predicts the node runs at its burst rate all the time, about
+10,000 host jobs a second on that rig. The five-round bench measurement is
+still to come.
+
 ### What the measurements do and don't show
 
 Measuring this turned out to be as instructive as building it, mostly because

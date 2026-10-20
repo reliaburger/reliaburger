@@ -1179,6 +1179,9 @@ impl TaskArrayNode {
                 .into_iter()
                 .filter(|r| r.grant_attempt == attempt)
                 .collect();
+            // Taken here, in grant and then chunk order, so the earliest
+            // held chunk takes slots first and finishes first (#1030).
+            let turn = run.pool.take_turn();
             tokio::spawn(run_chunk(
                 Arc::clone(&run.pool),
                 run.ledger.clone(),
@@ -1190,7 +1193,7 @@ impl TaskArrayNode {
                     syncs: Arc::clone(&self.output_syncs),
                 },
                 work,
-                resumed,
+                (resumed, turn),
                 cancel,
                 (Arc::clone(&self.telemetry), assignment.labels.clone()),
             ));
@@ -1617,7 +1620,7 @@ async fn run_chunk(
     array_cancel: CancellationToken,
     sink: OutputSink,
     work: ChunkWork,
-    resumed: Vec<TaskRecord>,
+    (resumed, turn): (Vec<TaskRecord>, super::task_executor::DispatchTurn),
     cancel: CancellationToken,
     (telemetry, labels): (
         Arc<crate::mayo::job_metrics::JobTelemetry>,
@@ -1667,7 +1670,7 @@ async fn run_chunk(
         result
     };
     let (outcome, persisted) = tokio::join!(
-        pool.resume_chunk_streaming(&work, resumed, &cancel, Some(sender)),
+        pool.resume_chunk_streaming(&work, resumed, &cancel, Some(sender), turn),
         stream_work
     );
     let durable = async {
@@ -2520,6 +2523,30 @@ mod tests {
             .collect();
         assert_eq!(finished, vec![(0, 1, 10), (2, 3, 5)]);
         assert_eq!(progress.counters.succeeded, 15);
+    }
+
+    #[tokio::test]
+    async fn the_first_held_chunk_is_reported_long_before_the_last_one_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new(Duration::from_millis(5), |_| AttemptOutcome::Exited {
+            code: 0,
+        });
+        let node = fake_node(root.path(), runner);
+        let held: Vec<(u32, u64)> = (0..8).map(|chunk| (chunk, 1)).collect();
+        let mut capped = assignment(1, 80, &held);
+        capped.spec.per_node_concurrency = Some(2);
+        let sync = request(vec![capped]);
+        let progress = sync_until_finished(&node, &sync, 1).await;
+        // Its receipt goes to the leader at once, so the leader can top
+        // the node up while the other seven chunks still run.
+        assert_eq!(progress.finished[0].chunk, ChunkId(0), "{progress:?}");
+        assert!(
+            progress.counters.attempts_started <= 40,
+            "the first receipt came only after {} of 80 attempts started",
+            progress.counters.attempts_started
+        );
+        let progress = sync_until_finished(&node, &sync, 8).await;
+        assert_eq!(progress.counters.succeeded, 80);
     }
 
     #[tokio::test]
