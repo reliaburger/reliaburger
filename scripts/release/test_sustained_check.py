@@ -1292,6 +1292,188 @@ class FinalTierDriver(unittest.TestCase):
         self.assertIn("diagnostic", workflow)
 
 
+class Choices(unittest.TestCase):
+    """#1062: every fault and node choice comes from a recorded seed, so a
+    run's choices can be repeated, and each one is logged."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+
+    def evidence(self, name):
+        directory = Path(self.temp.name) / name
+        directory.mkdir()
+        return directory
+
+    def draws(self, evidence, seed):
+        checker.start_choices(evidence, seed)
+        return [checker.choose(evidence, what, low, high) for what, low, high in
+                (("deploy-kill-node", 1, 3), ("deploy-kill-offset", 0, 20), ("power-off-hold", 60, 180),
+                 ("follower", 0, 1), ("export-node", 2, 3))]
+
+    def test_the_same_seed_repeats_every_choice(self):
+        self.assertEqual(self.draws(self.evidence("a"), 1234), self.draws(self.evidence("b"), 1234))
+
+    def test_another_seed_gives_other_choices(self):
+        first = [self.draws(self.evidence(f"a{seed}"), seed) for seed in (1, 2, 3)]
+        self.assertGreater(len({tuple(draw) for draw in first}), 1)
+
+    def test_choices_stay_in_their_range(self):
+        evidence = self.evidence("range")
+        checker.start_choices(evidence, 99)
+        values = [checker.choose(evidence, "hold", 60, 180) for _ in range(200)]
+        self.assertTrue(all(60 <= value <= 180 for value in values))
+        self.assertEqual(len(set(values)) > 50, True)
+
+    def test_each_choice_is_logged_with_what_it_chose(self):
+        evidence = self.evidence("log")
+        checker.start_choices(evidence, 7)
+        value = checker.choose(evidence, "deploy-kill-node", 1, 3)
+        events = [event for event in checker.read_events(evidence) if event["phase"] == "choice"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["target"], "deploy-kill-node")
+        self.assertEqual(events[0]["detail"], f"{value} of 1-3, draw 0, seed 7")
+
+    def test_without_a_seed_one_is_made_and_recorded(self):
+        evidence = self.evidence("fresh")
+        seed = checker.start_choices(evidence, None)
+        self.assertIsInstance(seed, int)
+        self.assertEqual(json.loads((evidence / "choices.json").read_text())["seed"], seed)
+
+    def test_a_resumed_run_continues_its_sequence(self):
+        whole = self.evidence("whole")
+        expected = self.draws(whole, 42)
+        resumed = self.evidence("resumed")
+        checker.start_choices(resumed, 42)
+        got = [checker.choose(resumed, "deploy-kill-node", 1, 3), checker.choose(resumed, "deploy-kill-offset", 0, 20)]
+        self.assertEqual(checker.start_choices(resumed, None), 42)
+        got += [checker.choose(resumed, "power-off-hold", 60, 180), checker.choose(resumed, "follower", 0, 1),
+                checker.choose(resumed, "export-node", 2, 3)]
+        self.assertEqual(got, expected)
+
+    def test_a_resumed_run_refuses_a_different_seed(self):
+        evidence = self.evidence("conflict")
+        checker.start_choices(evidence, 1)
+        with self.assertRaises(ValueError):
+            checker.start_choices(evidence, 2)
+
+    def test_the_command_line_prints_the_choice(self):
+        evidence = self.evidence("cli")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(checker.main(["seed", str(evidence), "--seed", "5"]), 0)
+            self.assertEqual(checker.main(["choose", str(evidence), "power-off-node", "2", "3"]), 0)
+        seed, value = out.getvalue().split()
+        self.assertEqual(seed, "5")
+        self.assertIn(int(value), (2, 3))
+
+
+class CheckerExposure(Evidence):
+    """#1062: the record says how long each leak checker was armed on each
+    node. Reported only; nothing is gated on it yet."""
+
+    def sample(self, ts, pid, rss_kb=300000, fd=300):
+        inventory = INVENTORY.replace("bun_pid 100", f"bun_pid {pid}").replace(
+            "bun_rss_kb 300000", f"bun_rss_kb {rss_kb}").replace("bun_fd 300", f"bun_fd {fd}")
+        checker.resource_trend_findings(self.state, "rb-a-1", checker.parse_inventory(inventory), ts)
+
+    def setUp(self):
+        super().setUp()
+        self.state = {"nodes": NODES}
+
+    def exposure(self, check):
+        return self.state["exposure"]["rb-a-1"][check]
+
+    def test_one_long_process_arms_each_checker_after_its_warm_up(self):
+        for minute in range(0, 91, 5):
+            self.sample(NOW + minute * 60, 100)
+        self.assertEqual(self.exposure("leak-rss")["armed_seconds"], 30 * 60)
+        self.assertEqual(self.exposure("leak-rss")["samples"], 7)
+        self.assertEqual(self.exposure("leak-fd")["armed_seconds"], 40 * 60)
+        self.assertEqual(self.exposure("leak-fd")["longest_seconds"], 40 * 60)
+
+    def test_a_restart_ends_the_window_and_starts_the_warm_up_again(self):
+        for minute in range(0, 71, 5):
+            self.sample(NOW + minute * 60, 100)
+        for minute in range(75, 146, 5):
+            self.sample(NOW + minute * 60, 200)
+        rss = self.exposure("leak-rss")
+        self.assertEqual(rss["armed_seconds"], 20 * 60)
+        self.assertEqual(rss["longest_seconds"], 10 * 60)
+        self.assertEqual(rss["processes_armed"], 2)
+
+    def test_short_lived_processes_never_arm_the_checkers(self):
+        for start in range(0, 300, 45):
+            for minute in range(start, start + 45, 5):
+                self.sample(NOW + minute * 60, 1000 + start)
+        self.assertEqual(self.exposure("leak-rss")["armed_seconds"], 0)
+        self.assertEqual(self.exposure("leak-fd")["armed_seconds"], 0)
+
+    def test_the_record_reports_armed_minutes_per_node_and_checker(self):
+        (self.evidence / "metadata.json").write_text(json.dumps({"started_at": NOW, "finished_at": NOW + 7200}))
+        for minute in range(0, 91, 5):
+            self.sample(NOW + minute * 60, 100)
+        checker.save_state(self.evidence, self.state)
+        record = self.evidence / "record.md"
+        checker.render(self.evidence, record)
+        text = record.read_text()
+        self.assertIn("## Leak-checker exposure (reported, not gated)", text)
+        self.assertIn("| rb-a-1 | leak-rss | 30 min | 30 min | 7 | 1 |", text)
+        self.assertIn("| rb-a-1 | leak-fd | 40 min | 40 min | 9 | 1 |", text)
+        self.assertIn("| rb-a-2 | leak-rss | 0 min | 0 min | 0 | 0 |", text)
+
+
+class SeedInTheRecord(Evidence):
+    def test_the_record_names_the_seed_and_the_observed_effects(self):
+        (self.evidence / "metadata.json").write_text(json.dumps({"started_at": NOW, "finished_at": NOW + 600}))
+        checker.start_choices(self.evidence, 31337)
+        checker.choose(self.evidence, "power-off-node", 2, 3)
+        checker.append_event(self.evidence, ts=NOW + 5, phase="effect:node-disk-full", target="rb-a-2",
+                             detail="available 67108864 bytes")
+        record = self.evidence / "record.md"
+        checker.render(self.evidence, record)
+        text = record.read_text()
+        self.assertIn("- Fault and node choices: 1, from seed 31337 (`--seed 31337` repeats them)", text)
+        self.assertIn("| effect:node-disk-full | rb-a-2 | available 67108864 bytes |", text)
+
+
+class SeededHarness(unittest.TestCase):
+    """#1062: the harness draws nothing from bash's unseeded $RANDOM."""
+
+    release = Path(__file__).parent
+
+    def run_script(self, *arguments):
+        import subprocess
+        return subprocess.run([str(self.release / "qualify-sustained.sh"), *arguments],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60,
+                              env=dict(os.environ, RELIABURGER_SOAK_CAFFEINATED="1"))
+
+    def test_the_harness_never_uses_bash_random(self):
+        script = (self.release / "qualify-sustained.sh").read_text()
+        code = [line for line in script.splitlines() if not line.lstrip().startswith("#")]
+        self.assertFalse([line for line in code if "RANDOM" in line])
+
+    def test_the_plan_prints_the_seed_it_was_given(self):
+        result = self.run_script("--tier", "fast", "--plan", "--seed", "77")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("plan: seed 77", result.stdout)
+
+    def test_a_seed_must_be_a_whole_number(self):
+        result = self.run_script("--tier", "fast", "--plan", "--seed", "lucky")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--seed must be a whole number", result.stderr)
+
+    def test_every_node_fault_has_a_parseable_effect_probe(self):
+        import subprocess
+        script = (self.release / "qualify-sustained.sh").read_text()
+        function = script[script.index("node_fault_script() {"):]
+        function = function[:function.index("\n}\n") + 3]
+        for kind in ("delay", "disk-full", "slow-fsync"):
+            probe = subprocess.run(["bash", "-c", function + f'node_fault_script {kind} effect'],
+                                   stdout=subprocess.PIPE, text=True, check=True).stdout
+            self.assertTrue(probe.strip(), kind)
+            subprocess.run(["bash", "-n"], input=probe, text=True, check=True)
+
+
 class GuestMemory(unittest.TestCase):
     """#985: the OOM report that explained #982 was only found by hand on
     the live VM. The soak keeps guest memory evidence itself."""
