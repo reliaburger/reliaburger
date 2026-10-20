@@ -659,7 +659,20 @@ the real `curl … | sh` install against it on every host we advertise.
    relabelling a shorter run can't promote it. A final tier refuses to start
    without `--soak-bun` or `--qualified-digest`, or with `--home`, since it
    could only end incomplete. Fast and custom runs show their inventory too,
-   recorded but not gated. A product fix
+   recorded but not gated.
+
+   Every fault and node choice (which node, how long, after how many
+   seconds) comes from one seed, and each is logged as a `choice` event
+   ([#1062](https://github.com/reliaburger/reliaburger/issues/1062)). The
+   record names the seed; `--seed N` repeats a run's choices in the same
+   order, and `--resume` carries on with the run's own seed. The record also
+   lists what each fault was seen to do (Bun's pid before and after a kill,
+   Lima's status after a power-off, the netem qdisc, free bytes or I/O limits
+   a node fault left), and how long each leak checker (`leak-rss`,
+   `leak-fd`) could judge each node: a restart, kill or upgrade exec starts
+   its warm-up again. That exposure is reported only. Whether a final should
+   fail when it's too short, and how the schedule would make room for it, is
+   still open in #1062. A product fix
    found during the final run means a new candidate, a fresh fast run and
    then a fresh final run. `--resume --evidence DIR` continues an interrupted
    run with its original tier. The [0.1.0 release closure
