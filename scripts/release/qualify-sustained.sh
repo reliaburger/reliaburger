@@ -31,7 +31,10 @@
 #                           needs --soak-bun, --qualified-digest and its own
 #                           bootstrap (no --home), and its record fails unless
 #                           every walk, fault kind and special its schedule
-#                           owes completed (the execution inventory, #1061)
+#                           owes completed (the execution inventory, #1061).
+#                           After its 8h of faults a final runs a 2h quiet
+#                           tail, and fails unless every leak checker was
+#                           armed long enough on every node (#1062)
 #   --duration D            soak length: 40m, 8h, 2d (default: the tier's, or 24h)
 #   --schedule S            full (hourly cycle) or compressed (10-minute cycle);
 #                           default: the tier's, or full
@@ -200,7 +203,15 @@ esac
 slot=$(( cycle / 6 ))
 # The job controller holds a bounded number of runs (#989): refuse a soak
 # whose job load wouldn't fit, now rather than hours in.
-job_runs=$(python3 "$job_controller" budget --duration "$duration") || fail 'the job campaign would outgrow its retained-run limit'
+# A final ends with a quiet tail after its faults (#1062, maintainer decision
+# 20 October 2026): no faults, walks or specials, so every node's Bun lives
+# long enough to arm leak-rss (an hour) and leak-fd and give them an hour of
+# comparison samples. The final's record fails unless both were armed long
+# enough on every node. sustained_check.py has the same length
+# (QUIET_TAIL_SECONDS). The jobs keep running through it.
+quiet_tail=0
+[ "$tier" != final ] || quiet_tail=7200
+job_runs=$(python3 "$job_controller" budget --duration "$(( duration + quiet_tail ))") || fail 'the job campaign would outgrow its retained-run limit'
 light_every=30
 heavy_every=300
 leaf_lifetime=3600
@@ -1692,6 +1703,7 @@ start_run() {
     meta evidence "\`$evidence\`"
     meta started_at "json:$(date +%s)"
     meta duration_target "json:$duration"
+    meta quiet_tail "json:$quiet_tail"
     meta job_load "$job_load"
     [ -z "$target_rate" ] || meta target_rate "$target_rate"
     meta node_faults "json:$node_faults"
@@ -1737,13 +1749,14 @@ if [ "$plan" = true ]; then
     special_quorum_loss() { printf 'plan: cycle %s special quorum-loss\n' "$index"; }
     # shellcheck disable=SC2329
     special_all_off() { printf 'plan: cycle %s special all-off\n' "$index"; }
-    printf 'plan: tier %s schedule %s duration %s cycle %s job-load %s target-rate %s node-faults %s\n' \
-        "$tier" "$schedule" "$duration" "$cycle" "$job_load" "${target_rate:-none}" "$node_faults"
+    printf 'plan: tier %s schedule %s duration %s cycle %s job-load %s target-rate %s node-faults %s quiet-tail %s\n' \
+        "$tier" "$schedule" "$duration" "$cycle" "$job_load" "${target_rate:-none}" "$node_faults" "$quiet_tail"
     plan_cycles=$(( (duration + cycle - 1) / cycle ))
     [ "$plan_cycles" -ge "$min_cycles" ] || plan_cycles=$min_cycles
     printf 'plan: %s\n' "$job_runs"
     printf 'plan: seed %s for every fault and node choice\n' "${seed:-random}"
     for (( index = 0; index < plan_cycles; index++ )); do run_cycle "$index" 0; done
+    [ "$quiet_tail" -eq 0 ] || printf 'plan: quiet-tail %s s with no faults, walks or specials after the last cycle\n' "$quiet_tail"
     rm -rf "$evidence"
     exit 0
 fi
@@ -1827,7 +1840,7 @@ PY
     end=$(( started_at + duration ))
     next_rotation=$(( started_at + rotation ))
 fi
-meta job_stop_at "json:$(( end - 120 ))"
+meta job_stop_at "json:$(( end + quiet_tail - 120 ))"
 [ -n "$jobs_pid" ] || start_jobs
 
 next_light=$(date +%s)
@@ -1845,5 +1858,16 @@ while :; do
 done
 current_slot=final
 wait_until "$end"
+if [ "$quiet_tail" -gt 0 ]; then
+    # The tail starts when the last cycle has finished, however late, and
+    # always runs its full length; the jobs drain in its last two minutes.
+    quiet_started=$(date +%s)
+    meta job_stop_at "json:$(( quiet_started + quiet_tail - 120 ))"
+    say "quiet tail: no faults for $quiet_tail s, so every leak checker arms"
+    event --phase quiet --detail "no faults, walks or specials for $quiet_tail s"
+    current_slot=quiet
+    wait_until $(( quiet_started + quiet_tail ))
+    event --phase quiet --verdict ok --duration $(( $(date +%s) - quiet_started ))
+fi
 observe heavy || true
 say "soak finished after $index cycles"

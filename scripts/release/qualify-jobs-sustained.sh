@@ -16,7 +16,8 @@
 #
 #   --tier fast    compressed schedule, one hour: every fault kind in the
 #                  first cycles, for the fix-and-rerun loop and CI hosts
-#   --tier final   full schedule, 8 hours, on the final candidate: the release
+#   --tier final   full schedule, 8 hours of faults and a 2-hour quiet tail
+#                  (#1062), on the final candidate: the release
 #                  gate's one final soak. It runs everything the V02 final
 #                  checks, plus the jobs, so it replaces it (maintainer
 #                  decision, 17 October 2026, #991)

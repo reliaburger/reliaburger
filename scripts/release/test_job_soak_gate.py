@@ -39,7 +39,8 @@ class Gate(unittest.TestCase):
         script=(Path(__file__).parent/"qualify-sustained.sh").read_text()
         self.assertIn("duration_text:=60m",script)
         self.assertIn("duration_text:=8h",script)
-        self.assertIn("end - 120",script)
+        self.assertIn("end + quiet_tail - 120",script)
+        self.assertIn("quiet_started + quiet_tail - 120",script)
         self.assertNotIn("sleep 120",script)
         self.assertIn("mark \"$evidence/jobs\"",script)
 
@@ -628,7 +629,9 @@ class RunBudget(unittest.TestCase):
                               stderr=subprocess.PIPE,text=True,timeout=60,env=dict(os.environ,RELIABURGER_SOAK_CAFFEINATED="1"))
         self.assertEqual(result.returncode,0,result.stderr)
         header=next(line for line in result.stdout.splitlines() if line.startswith("plan: tier ")).split()[1:]
-        duration=int(dict(zip(header[::2],header[1::2]))["duration"])
+        header=dict(zip(header[::2],header[1::2]))
+        # The campaign also runs through the final's quiet tail (#1062).
+        duration=int(header["duration"])+int(header["quiet-tail"])
         line=next(line for line in result.stdout.splitlines() if line.startswith("plan: job-runs "))
         fields=line.split()[2:]
         fields=dict(zip(fields[::2],fields[1::2]))

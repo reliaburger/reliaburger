@@ -629,12 +629,13 @@ the real `curl … | sh` install against it on every host we advertise.
      --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.1.0-soak.1
    ```
 
-   The final tier is 8 hours on the full schedule, which catches slow
-   accumulation. The release gate runs it once, as the job final below
+   The final tier is 8 hours of faults on the full schedule, then a 2-hour
+   quiet tail (about 10 hours in all), which catches slow accumulation. The
+   release gate runs it once, as the job final below
    (`qualify-jobs-sustained.sh --tier final`): that's the same soak with the
    job campaign and a node fault added to each cycle, so it checks
    everything the V02 final does, plus the jobs. All the final soaks fit in
-   one 8-hour slot that way (maintainer decision, 17 October 2026,
+   one 10-hour slot that way (maintainer decision, 17 October 2026,
    [#991](https://github.com/reliaburger/reliaburger/issues/991)).
    `qualify-sustained.sh --tier final` still runs the V02 final on its own,
    for example to separate a job problem from a cluster one, but it isn't a
@@ -643,7 +644,7 @@ the real `curl … | sh` install against it on every host we advertise.
    The record's second paragraph states the verdict. A fast run can only say
    "fast tier: clean", and a run without a tier is a diagnostic that says
    nothing about either gate. Only a clean, complete final-tier run, 8 hours
-   on the full schedule, says a gate passes: "the V02 soak gate passes" for
+   of faults on the full schedule and its quiet tail, says a gate passes: "the V02 soak gate passes" for
    `qualify-sustained.sh --tier final`, "the release gate's final soak
    passes" only for the job final, whose job controller ran the target load
    and whose node faults all completed. Complete means the record's execution
@@ -653,7 +654,8 @@ the real `curl … | sh` install against it on every host we advertise.
    fault kind and node fault injected and settled, every special (quorum loss
    with quorum back), every catalogue pulse and offline export, the app
    workloads settled at the baseline, the job campaign drained in its final
-   two minutes, and the `candidate.json` bytes this run downloaded hashing to
+   two minutes, the quiet tail with nothing injected, walked or stopped in
+   it, and the `candidate.json` bytes this run downloaded hashing to
    `--qualified-digest`. The checker counts these from the run's events and
    kept bytes against the 8-hour full schedule, whatever the metadata says, so
    relabelling a shorter run can't promote it. A final tier refuses to start
@@ -670,9 +672,15 @@ the real `curl … | sh` install against it on every host we advertise.
    Lima's status after a power-off, the netem qdisc, free bytes or I/O limits
    a node fault left), and how long each leak checker (`leak-rss`,
    `leak-fd`) could judge each node: a restart, kill or upgrade exec starts
-   its warm-up again. That exposure is reported only. Whether a final should
-   fail when it's too short, and how the schedule would make room for it, is
-   still open in #1062. A product fix
+   its warm-up again, and the fault schedule restarts every node's Bun more
+   often than `leak-rss`'s hour-long warm-up. So a final ends with a quiet
+   tail: two hours after the last cycle with no faults, walks or specials,
+   while the apps and jobs keep running and the checks carry on. That's an
+   hour to arm `leak-rss` and an hour of comparison samples. A final fails
+   unless both checkers were armed for at least 60 minutes on every node,
+   with one unbroken window of at least 30 (maintainer decision, 20 October
+   2026, [#1062](https://github.com/reliaburger/reliaburger/issues/1062)).
+   Fast and custom runs record their exposure without gating on it. A product fix
    found during the final run means a new candidate, a fresh fast run and
    then a fresh final run. `--resume --evidence DIR` continues an interrupted
    run with its original tier. The [0.1.0 release closure
@@ -698,7 +706,8 @@ the real `curl … | sh` install against it on every host we advertise.
    three nodes, at 1,158 accepted successes a second or more (the rate of
    100 million a day) plus headroom, with concurrent apps, several resource
    profiles, worker and leader loss, delayed messages and disk faults. The
-   final tier runs 8 hours on the 3-node quickstart cluster, with every fault
+   final tier runs 8 hours of faults and a 2-hour quiet tail on the 3-node
+   quickstart cluster, with every fault
    and at the default 1,390 a second, and it is the release gate's only final
    soak ([#991](https://github.com/reliaburger/reliaburger/issues/991),
    above). `qualify-jobs-sustained.sh` runs it through the same soak,
@@ -725,7 +734,8 @@ the real `curl … | sh` install against it on every host we advertise.
    scripts/release/qualify-jobs-sustained.sh --tier fast \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
      --qualified-digest QUALIFIED_DIGEST
-   # 8 hours on the full schedule, on the final candidate: the one final soak.
+   # 8 hours of faults on the full schedule, then a 2-hour quiet tail, on the
+   # final candidate: the one final soak.
    scripts/release/qualify-jobs-sustained.sh --tier final \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
      --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.2.0-soak.1 \
@@ -938,7 +948,7 @@ What it covers, and what it doesn't:
   wouldn't fit next to about 45 minutes of setup, one cycle that starts just
   before the end and teardown: up to 285 minutes compressed, 235 minutes on
   the full schedule. That covers the compressed (fast) tier and full-schedule
-  runs of about four hours. The 8-hour final tier, and the 12-hour lane A run,
+  runs of about four hours. The final tier (about 10 hours), and the 12-hour lane A run,
   still need a long-running host or a self-hosted runner.
 - **No upgrade walks, so it's a diagnostic.** They need a private soak build
   (`0.1.0-soak.1`) signed with the release key (D2), and nothing in CI signs
