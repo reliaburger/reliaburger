@@ -134,6 +134,9 @@ pub struct TaskArrayService {
     require_council: bool,
     standalone: Option<Arc<std::sync::Mutex<super::job_store::JobStore>>>,
     storage_fenced: std::sync::atomic::AtomicBool,
+    /// How long a standalone publication may take before its caller gives
+    /// up and fences admission and dispatch: [`WRITE_TIMEOUT`] outside tests.
+    write_timeout: Duration,
     /// Time between syncs.
     pub sync_interval: Duration,
     /// Silence before a node's chunks are taken back.
@@ -202,6 +205,7 @@ impl TaskArrayService {
             require_council: false,
             standalone: None,
             storage_fenced: std::sync::atomic::AtomicBool::new(false),
+            write_timeout: WRITE_TIMEOUT,
             node,
             sync_interval,
             silence_timeout,
@@ -227,6 +231,26 @@ impl TaskArrayService {
     pub fn with_cron_clock(mut self, clock: CronClock) -> Self {
         self.cron_clock = clock;
         self
+    }
+
+    /// Give up on a standalone publication after `timeout`, so a test can
+    /// expire its caller without waiting the production [`WRITE_TIMEOUT`].
+    #[cfg(test)]
+    pub(crate) fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout;
+        self
+    }
+
+    /// Hold the durable store's next publication before it writes, until
+    /// `pause` is released. Nothing happens without durable storage.
+    #[cfg(test)]
+    pub(crate) fn pause_next_publication(&self, pause: Arc<std::sync::Barrier>) {
+        if let Some(store) = &self.standalone {
+            store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pause_next_publication(pause);
+        }
     }
 
     /// Open private durable standalone state before admitting or dispatching work.
@@ -411,7 +435,7 @@ async fn commit_standalone(
                 }
             })
         });
-        return match tokio::time::timeout(WRITE_TIMEOUT, publication).await {
+        return match tokio::time::timeout(service.write_timeout, publication).await {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => {
                 service
