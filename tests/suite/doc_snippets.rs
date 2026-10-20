@@ -47,7 +47,7 @@ const OPEN_ISSUES: &[(u32, &str)] = &[
     (1210, "relish fault gpu"),
     (1221, "model shorthand and relish model"),
     (1223, "group type"),
-    (1238, "0.9.0 pipelines and 0.10.0 fair share, revisited after 0.8.0"),
+    (1238, "pipelines and fair share, after 0.8.0"),
 ];
 
 /// Inline `relish …` spans in prose for commands an open issue is adding.
