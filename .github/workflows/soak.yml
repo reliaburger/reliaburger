@@ -151,7 +151,7 @@ jobs:
 
       - name: Upload the evidence
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           # The cluster token and the soak CA's keys stay behind.
@@ -167,7 +167,7 @@ jobs:
 
       - name: Upload the record
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-record-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.EVIDENCE }}/record.md
@@ -176,7 +176,7 @@ jobs:
 
       - name: Upload the failure bundles
         if: ${{ failure() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-failures-${{ github.run_id }}-${{ github.run_attempt }}
           path: |

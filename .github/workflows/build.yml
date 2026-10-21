@@ -77,7 +77,7 @@ jobs:
         run: make pdf
 
       - name: Upload PDF artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: reliaburger-pdfs
           path: docs/_book/*.pdf
@@ -132,7 +132,7 @@ jobs:
             cp target/${{ matrix.target }}/release/bun dist/bun-${{ matrix.suffix }}
           fi
       - name: Upload binary artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.suffix }}
           path: dist/*
@@ -167,7 +167,7 @@ jobs:
           sudo scripts/release/build_guest_image.sh --output guest > guest-record.json
           { echo "### Guest image ($ARCH)"; echo '```json'; cat guest-record.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload guest image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: guest-image-${{ matrix.arch }}
           path: guest/*.qcow2
@@ -233,14 +233,14 @@ jobs:
         # A few kilobytes that hash to the digest above, so qualification
         # can read it without the whole candidate. Staging and promotion
         # still download the full artefact and verify every byte.
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: candidate-manifest-${{ github.sha }}-${{ github.run_attempt }}
           path: dist/candidate.json
           if-no-files-found: error
           retention-days: 1
       - name: Preserve signed candidate without publishing a release
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: candidate-${{ github.sha }}-${{ github.run_attempt }}
           path: dist/*

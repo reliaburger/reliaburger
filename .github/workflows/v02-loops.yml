@@ -57,7 +57,7 @@ jobs:
           shared-key: ${{ matrix.os == 'ubuntu-latest' && 'linux-debug' || format('v02-{0}', matrix.os) }}
           save-if: false
       - run: cargo nextest archive --locked --archive-file tests.tar.zst
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: nextest-archive-${{ matrix.os }}
           path: tests.tar.zst
@@ -106,7 +106,7 @@ jobs:
       - name: Summarise
         if: ${{ !cancelled() }}
         run: python3 scripts/release/loop_summary.py --lane "${{ matrix.target }} (${{ matrix.os }})" --junit target/nextest/ci/junit.xml --log loop.log --candidate "$GITHUB_SHA" --output summary.md
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: loop-${{ matrix.target }}-${{ matrix.os }}
@@ -156,7 +156,7 @@ jobs:
       - name: Summarise
         if: ${{ !cancelled() }}
         run: python3 scripts/release/loop_summary.py --lane "${{ matrix.binary }} (ubuntu-latest)" --junit target/nextest/ci/junit.xml --log loop.log --candidate "$GITHUB_SHA" --output summary.md
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: loop-${{ matrix.binary }}-ubuntu-latest
@@ -243,7 +243,7 @@ jobs:
       - name: Summarise
         if: ${{ !cancelled() }}
         run: python3 scripts/release/loop_summary.py --lane "${{ matrix.case }} (${{ matrix.os }})" --junit target/nextest/ci/junit.xml --log loop.log --candidate "$GITHUB_SHA" --expected-iterations "$LOOP_COUNT" --output summary.md
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: loop-${{ matrix.case }}-${{ matrix.os }}
@@ -286,7 +286,7 @@ jobs:
           --output v02-loops-summary.md
       - run: cat v02-loops-summary.md >> "$GITHUB_STEP_SUMMARY"
         if: ${{ !cancelled() }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: v02-loops-summary

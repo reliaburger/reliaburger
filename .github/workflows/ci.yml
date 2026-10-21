@@ -226,7 +226,7 @@ jobs:
           python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-linux --host linux --directory target/contracts/linux/portable-linux --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Retain portable-linux current execution envelope
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contract-linux-portable-linux
           path: target/contracts/linux/portable-linux
@@ -236,7 +236,7 @@ jobs:
         run: make test-doc
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: target/coverage
@@ -292,7 +292,7 @@ jobs:
           python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate rootless-linux --host linux --directory target/contracts/linux/rootless-linux --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Retain rootless-linux current execution envelope
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contract-linux-rootless-linux
           path: target/contracts/linux/rootless-linux
@@ -333,7 +333,7 @@ jobs:
           fi
       - name: Retain oci-interruptions current execution envelope
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contract-linux-oci-interruptions
           path: target/contracts/linux/oci-interruptions
@@ -351,7 +351,7 @@ jobs:
           fi
       - name: Retain linux-root-storage current execution envelope
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contract-linux-linux-root-storage
           path: target/contracts/linux/linux-root-storage
@@ -387,7 +387,7 @@ jobs:
           python3 scripts/ci/workflow_adapter.py archive --root . --host linux
           --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID"
           --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: nextest-archive
           path: |
@@ -447,7 +447,7 @@ jobs:
           python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate cluster-tests --host linux --directory target/contracts/linux/cluster-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain cluster-tests current execution envelope
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contract-linux-cluster-tests
           path: target/contracts/linux/cluster-tests
@@ -505,7 +505,7 @@ jobs:
           python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate slow-tests --host linux --directory target/contracts/linux/slow-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain slow-tests current execution envelope
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contract-linux-slow-tests
           path: target/contracts/linux/slow-tests
@@ -520,7 +520,7 @@ jobs:
           python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-node --host linux --directory target/contracts/linux/upgrade-node --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain upgrade-node current execution envelope
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contract-linux-upgrade-node
           path: target/contracts/linux/upgrade-node
@@ -535,7 +535,7 @@ jobs:
           python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-cluster --host linux --directory target/contracts/linux/upgrade-cluster --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain upgrade-cluster current execution envelope
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contract-linux-upgrade-cluster
           path: target/contracts/linux/upgrade-cluster
@@ -569,7 +569,7 @@ jobs:
           python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate standard-clients --host linux --directory target/contracts/linux/standard-clients --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain standard-clients current execution envelope
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contract-linux-standard-clients
           path: target/contracts/linux/standard-clients
@@ -594,7 +594,7 @@ jobs:
           python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate optimized-cron --host linux --directory target/contracts/linux/optimized-cron --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Retain optimized-cron current execution envelope
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contract-linux-optimized-cron
           path: target/contracts/linux/optimized-cron
@@ -689,7 +689,7 @@ jobs:
           python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-darwin --shard "${{ matrix.shard }}/3" --host darwin --directory "target/contracts/darwin/portable-darwin-${{ matrix.shard }}" --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Retain portable-darwin current execution envelope
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contract-darwin-portable-darwin-${{ matrix.shard }}
           path: target/contracts/darwin/portable-darwin-${{ matrix.shard }}
@@ -717,7 +717,7 @@ jobs:
           cache-on-failure: true
       - run: make bench
       - run: make bench-large
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: criterion
           path: target/criterion
@@ -769,7 +769,7 @@ jobs:
           path: target/task-array-baseline
           key: task-array-bench-${{ github.run_id }}
       # Kept 90 days, not 14: #668's cost trend is read from these.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: criterion-task-arrays
