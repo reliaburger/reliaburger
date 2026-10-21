@@ -29,10 +29,16 @@
 # RUSTSEC-2026-0374 (basic-toml) was added 20 October 2026 (see
 # docs/qualification/2026-10-20-dependency-exceptions.md): unmaintained, no
 # patched release, reached only at compile time through age's i18n proc macros.
+# RUSTSEC-2026-0381 (webpki-roots, distrusted emSign intermediates) was added
+# 21 October 2026 (see docs/qualification/2026-10-21-dependency-exceptions.md)
+# for the webpki-roots 0.26.11 shim only: it has no patched 0.26 release and
+# re-exports webpki-roots 1.x, which Cargo.lock holds at the patched 1.0.10.
+# `make audit` fails if 1.x drops below 1.0.10.
 # Next review: 18 November 2026.
 [advisories]
 ignore = [
     "RUSTSEC-2026-0374",
+    "RUSTSEC-2026-0381",
 ]
 
 [output]
