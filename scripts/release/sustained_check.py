@@ -946,8 +946,6 @@ def evaluate(evidence, snapshot):
         if text is not None:
             findings += export_findings(state, node, text)
             findings += snapshot_archive_findings(state, node, text)
-        # After the inventory, so a new bun process is known before its
-        # turn counters are compared with the old one's.
         turns = read_json(snapshot, f"turns-{node}.json")
         if turns is not None:
             findings += turn_findings(state, node, turns)
@@ -1002,10 +1000,11 @@ def suppress_repeats(state, findings, now):
     return result
 
 
-def turn_buckets(samples):
-    """The latest cumulative bucket count per (branch, le) of a node's
-    bun_agent_loop_turn_seconds_bucket samples, as /v1/metrics returns them."""
-    latest = {}
+def turn_scrapes(samples):
+    """A node's bun_agent_loop_turn_seconds_bucket samples, as /v1/metrics
+    returns them, grouped per branch into scrapes, oldest first:
+    {branch: [(timestamp, {le: cumulative count})]}."""
+    scrapes = {}
     for sample in samples if isinstance(samples, list) else []:
         labels = sample.get("labels") or {}
         if isinstance(labels, str):
@@ -1013,48 +1012,49 @@ def turn_buckets(samples):
                 labels = json.loads(labels)
             except json.JSONDecodeError:
                 continue
-        key = (labels.get("branch"), labels.get("le"))
-        if None in key:
+        branch, le = labels.get("branch"), labels.get("le")
+        if branch is None or le is None:
             continue
         stamp = sample.get("timestamp", 0)
-        if key not in latest or stamp >= latest[key][0]:
-            latest[key] = (stamp, sample.get("value", 0))
-    return {key: value for key, (_, value) in latest.items()}
+        scrapes.setdefault(branch, {}).setdefault(stamp, {})[le] = sample.get("value", 0)
+    return {branch: sorted(by_stamp.items()) for branch, by_stamp in scrapes.items()}
 
 
 def turn_findings(state, node, samples):
     """Fail on every agent-loop turn over the 1 s budget since the last check.
 
     The buckets count from the bun process's start, so the check remembers
-    what it last saw per branch, and starts again from zero when the process
-    changes (a kill, an upgrade's exec), as the resource trends do.
+    the last scrape it counted per branch and adds up only the scrapes after
+    it, the way Prometheus's increase() does. A count going down is a new
+    process (a kill, an upgrade's exec), whose turns all count. A branch the
+    new process hasn't reported yet still shows the old process's last
+    scrapes, which add nothing (#1261).
 
     On the node whose writes the soak throttles (`node-slow-fsync`), a turn
     that journals is slow by construction: those turns are info, and stay out
     of the record's over-budget count, while the window lasts (#972)."""
     throttled = state.get("window") == "node-slow-fsync" and state.get("window_node") == node
-    buckets = turn_buckets(samples)
-    resources = state.get("resources", {}).get(node, {})
-    process = [resources.get("pid"), resources.get("image")]
     seen = state.setdefault("turns", {}).setdefault(node, {})
-    if seen.get("process") != process:
-        seen.update(process=process, over={})
     findings = []
-    for branch in sorted({branch for branch, _ in buckets}):
-        total = buckets.get((branch, "+Inf"))
-        within = buckets.get((branch, TURN_BUDGET_LE))
-        if total is None or within is None:
-            continue
-        over = int(total - within)
-        previous = seen["over"].get(branch, 0)
-        # Counters only go down when bun restarted between two checks
-        # without its pid changing; count that process from zero.
-        new = over - previous if over >= previous else over
-        seen["over"][branch] = over
+    for branch, scrapes in sorted(turn_scrapes(samples).items()):
+        last = seen.get(branch, {})
+        new, buckets = 0, None
+        for stamp, counts in scrapes:
+            total, within = counts.get("+Inf"), counts.get(TURN_BUDGET_LE)
+            if total is None or within is None or stamp <= last.get("at", float("-inf")):
+                continue
+            over = int(total - within)
+            restarted = total < last.get("total", 0) or over < last.get("over", 0)
+            previous = 0 if restarted else last.get("over", 0)
+            if over > previous:
+                new, buckets = new + over - previous, counts
+            last = {"at": stamp, "total": total, "over": over}
+        seen[branch] = last
         if new <= 0:
             continue
+        total = buckets["+Inf"]
         worst = next((bound for bound in TURN_BUCKET_BOUNDS
-                      if buckets.get((branch, bound)) == total), "+Inf")
+                      if buckets.get(bound) == total), "+Inf")
         lower = {"2.5": "1", "5": "2.5", "10": "5", "+Inf": "10"}[worst]
         span = f"over {lower} s" if worst == "+Inf" else f"between {lower} and {worst} s"
         detail = f"{new} {branch} turn(s) over the 1 s budget, the worst {span}"

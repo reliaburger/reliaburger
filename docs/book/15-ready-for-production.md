@@ -5104,8 +5104,16 @@ And the meter finally has teeth. The V02 checker reads each node's
 heavy check. A histogram counts cumulatively, so `+Inf` minus `le="1"` is the
 number of turns over the budget since the process started, and the checker
 fails the tier on any increase since its last look. A bun that restarted
-starts its counters from zero, which the checker notices the way its resource
-trends do, by the pid and image changing. The finding says which bucket the
+starts its counters from zero. The checker first noticed that the way its
+resource trends do, by the pid and image changing, and then counted each
+branch from zero. That was wrong for a branch the new process hadn't run
+yet: it exports nothing, so the newest sample in the window was still the
+old process's, and the 0.2.1 final tier reported an old slow `deploy_op`
+turn a second time after the whole-cluster restart (#1261). Now the checker
+remembers the last scrape it counted per branch and adds up only the scrapes
+after it, the way Prometheus's `increase()` does: a count going down is a
+new process, whose turns all count, and an old scrape repeated adds nothing.
+The finding says which bucket the
 worst turn landed in, `1 deploy_op turn(s) over the 1 s budget, the worst
 between 2.5 and 5 s`, and Bun's own log line from the meter says which op it
 was.
@@ -5949,6 +5957,154 @@ installs the withdrawal for readers and restarts the instance.
 `a_health_probe_write_that_fails_off_the_turn_installs_nothing_and_restarts_nothing`
 fails the write instead, and checks that discovery is fenced, the backend
 still reads healthy and the instance hasn't restarted.
+
+#### And a start's write
+
+The same candidate's jobs final had a second line we'd let through as a
+known issue, a few minutes into a slow-disk spell on node-1:
+
+```
+03:53:47 node-1: a discovery journal write took 1444 ms; the agent loop went on meanwhile
+03:56:25 node-1: a discovery journal write took 1632 ms; the agent loop went on meanwhile
+04:00:41 node-1: agent loop turn took 2493 ms in deploy_op (apply_network_pre_start)
+```
+
+The first two lines are writes that did the right thing and left the loop
+alone. The third is a workload start. Before a container that publishes an
+address may run, the loop records its network reference (the runtime's
+hold on the address) in the discovery journal. That's the rule that lets a
+restarted node tell an address it handed out from one it never did. The
+path there, `apply_network_pre_start` → `retain_network_reference` →
+`persist_discovery_reference`, wrote with no deadline. It first settled any
+write already in flight, then waited for its own fsync, both inside the
+turn. And the line names nothing else, so we couldn't even tell whether
+the 2.5 s went on the journal, the egress owners checkpoint or the eBPF
+lock.
+
+The rule itself can't bend. A workload must never start before its
+reference is on disk. So the start can't carry on without the write, the
+way a consumer step's remainder or a probe's install can wait for a later
+turn. What it can do is not start *yet*. The reference write now waits
+until the turn's deadline, like the other two (#1266). If it's still going,
+the loop answers the deploy worker with `StillRunning`, the error that
+already means "ask me again" for disk and runtime work (#351), and the
+write goes on off the loop under a third owner:
+
+```rust
+/// A workload start recording the instance's network reference (#1266).
+NetworkReference(crate::grill::InstanceId),
+```
+
+The landing turn, `deploy_op (apply_network_pre_start/landed)`, runs
+nothing for it. The worker's next ask does the rest. It finds the journal
+already holding exactly this reference, skips the write, and the start
+goes on. A write that's in flight when the start arrives, its own or
+anyone's, gets the same answer without a wait, which removes the other
+half of the 2.5 s. The worker side reuses the loop it already had:
+
+```rust
+Ok(retained) => {
+    deploy_ops::retry_while_still_running(|| {
+        self.ops.apply_network_pre_start(
+            instance_id,
+            app_name,
+            spec,
+            cgroup_path,
+            Ok(retained.clone()),
+            egress.clone(),
+        )
+    })
+    .await
+}
+```
+
+`retry_while_still_running` takes a closure (`|| ...`, an anonymous
+function that can use the variables around it) and calls it once per
+attempt. Each call builds a new future, and each future sends an op over a
+channel, which takes ownership of what it carries. The first attempt can't
+give `retained` away and still have it for the second, so every attempt
+sends a clone. In Go you'd copy the struct without thinking about it. Rust
+makes the copy visible, and that's the cost you pay for the compiler
+knowing who owns what. A failed retain never reaches the journal, so
+that case calls the op once, without the loop.
+
+Two other places had to learn the new answer. The op handler used to mark
+the instance `Failed` on any error, and now skips `StillRunning`:
+
+```rust
+if result
+    .as_ref()
+    .is_err_and(|error| !matches!(error, BunError::StillRunning { .. }))
+```
+
+`as_ref()` turns a `&Result<(), BunError>` into a `Result<&(), &BunError>`
+so `is_err_and` can look at the error without taking it. `reply.send`
+still needs it afterwards. A restart records its replacement's reference
+in the same way, in the loop's turn between Create and Start, so it
+couldn't just refuse the restart on `StillRunning` either. It puts a step
+on the restart's task set that sleeps 100 ms and hands back the same
+Create result, so the turn runs again, as a stop or a retirement would
+expect of any restart step.
+
+Then there's what readers see while the write is in flight. The journal's
+"durable" view is the inventory *before* the write, and for the consumer's
+and the probe's writes the runtime references read the same either side.
+This write adds one. A retirement that came along meanwhile would read the
+old inventory, see no record of the hold, decide the instance never
+started, and release the address while the write is busy recording it.
+So `release_network_reference` asks first:
+
+```rust
+None if self.reference_write_in_flight(id) => {
+    return Err(BunError::StillRunning { /* ... */ });
+}
+```
+
+A `match` arm can carry an `if` guard, and the arm only matches when the
+guard is true too. The retirement asks again once the write has landed,
+and by then the journal can answer. The same thinking changed the
+hand-back: a start whose write failed used to give the hold back unless
+discovery was fenced, and now it also keeps any hold the journal already
+records, because only retirement may release one of those.
+
+The egress owners checkpoint, `persist_egress_owners`, also waits inline
+on the start's turn on a Linux node with eBPF, and it's the same kind of
+fsync. We didn't move it off the loop in this change. That store has a
+single fence (`egress_store_uncertain`) and no notion of a write in
+flight: every other egress mutation, from a retirement's `clear_egress` to
+adoption, would have to learn to wait rather than fence. And the binding it
+records must stay invisible to a co-tenant's map rebuild until it's on
+disk, or the kernel gets ahead of the durable owner. What the turn line
+does now is name it. The pre-start path takes the eBPF lock through the
+timed `lock_kernel`, and the checkpoint write is a part of its own, so the
+next slow start says which wait it was:
+
+```
+bun: agent loop turn took 2493 ms in deploy_op (apply_network_pre_start): journal write 500 ms, egress owners write 1990 ms, kernel lock wait 3 ms
+```
+
+(That line comes from `a_slow_start_line_names_its_egress_owners_write`,
+not a soak. We haven't seen one yet.)
+
+`a_workload_start_leaves_its_slow_network_reference_write_in_flight` uses
+the probe test's trick. It stalls the reference write for 1.6 s and hands
+the loop an `ApplyNetworkPreStart` in a turn. Before the fix it failed
+with `the start's turn waited for its own journal write: 1.615s in
+deploy_op (apply_network_pre_start)`. Now the write is still in flight
+when the turn ends, the answer is `StillRunning`, the instance isn't
+failed and the runtime still holds the address. A retirement meanwhile
+gets `StillRunning` too. A second ask before the landing writes nothing
+and waits for nothing, and the ask after it finds the reference recorded
+and goes on without writing it again.
+`a_workload_start_whose_reference_write_fails_off_the_turn_records_it_again`
+fails the write instead: discovery is fenced, the hold isn't handed back,
+and the next ask reopens the journal and records the reference before the
+start may go on. `a_deploy_completes_when_its_network_reference_write_outlasts_the_turn`
+and `a_restart_waits_for_its_slow_network_reference_write_instead_of_refusing`
+run the whole loop with the stall on, and check that a deploy and a
+restart still finish, with the reference in the journal. The restart one
+failed before the restart learned to ask again: `restart of default__web-0
+refused: journalling default__web-0's network reference is still running`.
 
 #### A 503 is an answer, not a verdict
 
