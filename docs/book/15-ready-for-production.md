@@ -935,6 +935,20 @@ carries `rkyv` at all, so the guard's own `cargo tree -i rkyv` failed with "did 
 any packages", and we deleted the exception and the guard together. A test in the suite
 now fails if `rkyv` ever comes back.
 
+Then, the day after 0.2.1 finished qualifying, the opposite case arrived. The private keys
+of some emSign intermediate certificates had leaked, and RustSec flagged both the root list
+we bundle (`webpki-roots`) and the verifier (`rustls-webpki`). Every outbound HTTPS call to a
+public endpoint trusts that list: image pulls, object storage, `relish` over `wss://`. A
+`cargo update` fixed the verifier and the 1.x root list. But one copy of `webpki-roots`
+stayed at 0.26.11, because `tokio-tungstenite` still asks for 0.26, and the audit still
+failed on it. That release's source is one line, `pub use parent::TLS_SERVER_ROOTS;`, where
+`parent` is the 1.x crate under another name. Rust lets a crate re-export another crate's
+items, so 0.26.11 serves exactly the roots of whichever 1.x the lockfile picked, and that's
+now the fixed 1.0.10. So the flagged version was safe, but only because of what it
+re-exported. We gave the advisory a narrow exception, and a test in `tests/suite/` reads
+`Cargo.lock` and fails if any copy of the three crates is older than its fix. The exception
+leans on that test.
+
 The repository audit denies every new vulnerability and maintenance warning. Its short
 exception list expires on 18 November 2026, and the Make target fails after that date until we
 review it. CI runs the audit on changes and releases; a weekly job catches a new advisory
