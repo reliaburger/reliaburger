@@ -1,7 +1,7 @@
-# What relish v0.2.0 accepts, read from its -h pages by
+# What relish v0.2.1 accepts, read from its -h pages by
 # scripts/release/released_cli.py. Regenerate it when docs/website/install.sh's
 # default version changes; tests/suite/website.rs checks the two match.
-version	v0.2.0
+version	v0.2.1
 argument	relish apply	[PATH_OR_URL]
 argument	relish batch	[PATH]
 argument	relish batch cancel	<ID>
@@ -55,8 +55,10 @@ argument	relish fault pause	<TARGET>
 argument	relish fault resume	<TARGET>
 argument	relish fault scenario	<PATH>
 argument	relish fmt	<PATH>
+argument	relish gitops set	<PATH>
 argument	relish help	[COMMAND]...
 argument	relish history	<APP>
+argument	relish images delete	<REFERENCE>
 argument	relish init	[DIR]
 argument	relish inspect	<NAME>
 argument	relish join	<ADDR>
@@ -108,6 +110,7 @@ command	relish ca verify
 command	relish cancel-deploy
 command	relish compile
 command	relish council
+command	relish council backups
 command	relish council re-enrol
 command	relish council recover
 command	relish council status
@@ -150,9 +153,14 @@ command	relish fault pause
 command	relish fault resume
 command	relish fault scenario
 command	relish fmt
+command	relish gitops
+command	relish gitops disable
+command	relish gitops set
+command	relish gitops status
 command	relish help
 command	relish history
 command	relish images
+command	relish images delete
 command	relish import
 command	relish init
 command	relish inspect
@@ -295,8 +303,11 @@ option	relish ca verify	Print help (see more with	'--help')
 option	relish ca verify	Read the passphrase from the first line of this file instead of	asking	
 option	relish ca verify	The cluster's root CA fingerprint	(`sha256:...`)	
 option	relish ca verify	Your age identity file,for a backup sealed with	`--recipient`	
+option	relish council backups	--from	<FROM>	
 option	relish council re-enrol	--data-dir	<DATA_DIR>	
 option	relish council re-enrol	--force		
+option	relish council recover	--api-port	<API_PORT>	
+option	relish council recover	--backup	<BACKUP>	
 option	relish council recover	--data-dir	<DATA_DIR>	
 option	relish council recover	--force		
 option	relish council recover	--from	<FROM>	
@@ -305,6 +316,7 @@ option	relish dashboard	--no-open
 option	relish dashboard	--port	<PORT>	
 option	relish decommission-node	--reason	<REASON>	
 option	relish decommission-node	--workloads-stopped		
+option	relish delete	--force		
 option	relish delete	--namespace	<NAMESPACE>	
 option	relish deploy	--dry-run		
 option	relish dev countersign-binary	--external-key	<EXTERNAL_KEY>	
@@ -477,6 +489,7 @@ option	relish path	--namespace	<NAMESPACE>
 option	relish path	--port	<PORT>	
 option	relish path	--to	<TO>	
 option	relish path	--to-namespace	<TO_NAMESPACE>	
+option	relish rollback	--force		
 option	relish rollback	--namespace	<NAMESPACE>	
 option	relish run	--batch	<NAME>	
 option	relish run	--chunk	<CHUNK>	
