@@ -4,6 +4,17 @@ Release gate step 5's power-cut and reboot lanes ([releasing.md](../releasing.md
 
 **Result: every lane passed 25 of 25.** No iteration needed the VM start retry.
 
+Every lane ran 25 times rather than 10, because 0.2.1 changes both paths they
+cover. It upgrades redb to 4.x so that a power cut while the Raft store grows
+can't leave it unopenable
+([#1024](https://github.com/reliaburger/reliaburger/issues/1024),
+[#1028](https://github.com/reliaburger/reliaburger/pull/1028)), and
+`relish local stop` now powers VMs off from inside rather than cutting their
+power ([#1023](https://github.com/reliaburger/reliaburger/issues/1023),
+[#1025](https://github.com/reliaburger/reliaburger/pull/1025)). Nothing else
+loaded the host: the soak cluster had been torn down and no build or test was
+running.
+
 ## Environment
 
 | Item | Value |
