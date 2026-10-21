@@ -41,7 +41,7 @@ jobs:
       # Scripts come from main (the workflow's own ref), never from the tag:
       # this job holds a write token, and anyone who can push a tag could
       # otherwise put their own candidate.py in front of it.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check version and capture the tagged source commit
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \

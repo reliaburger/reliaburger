@@ -30,7 +30,7 @@ jobs:
       matrix: ${{ steps.select.outputs.matrix }}
       guest_images: ${{ steps.select.outputs.guest_images }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: select
@@ -61,7 +61,7 @@ jobs:
     if: needs.changes.outputs.pdf == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Quarto
         uses: quarto-dev/quarto-actions/setup@v2
@@ -86,7 +86,7 @@ jobs:
   test-packaging:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Test signing and metadata with ephemeral keys
         run: python3 -m unittest discover -s scripts/release -p 'test_*.py'
       - name: Require main for a manually signed candidate
@@ -106,7 +106,7 @@ jobs:
     env:
       RELIABURGER_GIT_SHA: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: ${{ matrix.target }}
@@ -155,7 +155,7 @@ jobs:
             runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install image tools
         run: |
           sudo apt-get update -qq
@@ -181,7 +181,7 @@ jobs:
     needs: [validate-release, build-pdf, build-binaries, build-guest-images, test-packaging]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download PDFs
         uses: actions/download-artifact@v4
         with:

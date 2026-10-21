@@ -55,7 +55,7 @@ jobs:
       SOAK_DURATION: ${{ inputs.duration }}
       SOAK_SCHEDULE: ${{ inputs.schedule }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check the inputs fit in one hosted job
         run: |

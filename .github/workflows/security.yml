@@ -13,7 +13,7 @@ jobs:
     name: weekly RustSec advisory audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: taiki-e/install-action@cargo-audit
       - run: make audit
 
@@ -23,7 +23,7 @@ jobs:
     name: weekly dependency lag report
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.98.0
       - name: Report the lag in the job summary
         run: |

@@ -38,7 +38,7 @@ jobs:
       QUALIFIED_DIGEST: ${{ inputs.qualified_digest }}
     steps:
       # Scripts come from main, like promotion: this job holds a write token.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download and verify the candidate
         run: |
           python3 scripts/release/candidate.py stage-fetch --directory dist \
