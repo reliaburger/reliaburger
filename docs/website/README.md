@@ -156,7 +156,11 @@ cp -R docs/qualification/<app soak record>-charts docs/qualification/<job soak r
   docs/website/assets/soak/
 ```
 
-then point the `<img>` and record links at them. `tests/suite/website.rs`
+then point the `<img>` and record links at them. From 0.2.1 the gate's only
+final soak is the 8-hour job soak ([#991](https://github.com/reliaburger/reliaburger/issues/991)),
+so the app soak's charts come from the V02 fast tier, and the section says so.
+The page shows an app soak's memory, fds and CPU but not its job rate, so
+delete the `jobs.svg` an app soak record also draws. `tests/suite/website.rs`
 fails while a chart differs from its record's copy, comes from another
 release, lacks alt text, a size or lazy loading, or sits in `assets/soak/`
 without being shown, and while the section misses any of the seven charts.
@@ -171,7 +175,7 @@ written from the published binary's own help by
 `tests/suite/website.rs` checks every `relish …` command on this page, in the
 README and in the tour chapter against it. The tour may only use released
 commands. Anything else has to say which release adds it, in the words
-"0.3.0, not in 0.2.0" (the build's version, then the installer's), in the
+"0.3.0, not in 0.2.1" (the build's version, then the installer's), in the
 same paragraph, `<details>` or section. The README's generated command list
 labels such commands itself. When the installer's default changes, regenerate
 the snapshot; the test refuses a snapshot for another version.
@@ -186,7 +190,7 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.2.0` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.2.1` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. If the requested release isn't
 published, it fails with a message saying so. The generated installer itself
 lives in the GitHub release, with native CLI checksums supplied by release
