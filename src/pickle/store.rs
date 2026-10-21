@@ -580,6 +580,28 @@ mod tests {
         (store, dir)
     }
 
+    // Blob digests are content addresses on disk and on the wire, so their
+    // bytes are pinned to known answers, not just to each other.
+    #[test]
+    fn compute_sha256_matches_the_fips_known_answer() {
+        assert_eq!(
+            compute_sha256(b"abc").as_str(),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn a_blob_file_spanning_read_chunks_hashes_to_its_known_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        std::fs::write(&path, vec![b'a'; 2 * 64 * 1024 + 3]).unwrap();
+
+        assert_eq!(
+            sha256_file(&path).unwrap().as_str(),
+            "sha256:ebd89615d7dd639f1f3770972ad171d88182c2860e67cafece1c3a0da3be7dba"
+        );
+    }
+
     async fn repository_upload(
         store: &BlobStore,
         bytes: &[u8],

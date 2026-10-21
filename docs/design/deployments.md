@@ -169,7 +169,7 @@ The deploy orchestration loop runs on the leader node inside Meat. For each roll
 7. Bun reports `Stopped` for the old instance.
 8. The leader advances to the next step.
 
-All communication uses the existing reporting tree and Raft log. Deploy state is persisted in Raft so that if the leader fails mid-deploy, the new leader can resume from the last committed state (see Section 7: Failure Modes).
+All communication uses the existing reporting tree and Raft log. Deploy progress isn't persisted in Raft: Raft holds only each app's rollout targets (the last specs that rolled out everywhere) and its `RolloutFailed` mark. A new leader reads each node's converged version and health from its reports and carries on from there (see Section 7: Failure Modes).
 
 ### 3.3 Wrapper Routing Pool Updates During Transition
 
@@ -218,7 +218,7 @@ For internal (service-to-service) traffic via Onion, the eBPF service map is upd
 
 ## 4. Data Structures
 
-All structures are persisted in Raft as part of the cluster state. Field types use standard Rust conventions.
+These structures are the original design. What ships keeps less: `DeployState` and its phases live in `src/meat/deploy_types.rs` as a tested model the agent doesn't drive, deploy history is a capped per-node list, and Raft holds only `AppRollouts` (rollout targets and `RolloutFailed`). Field types use standard Rust conventions.
 
 ```rust
 use std::collections::BTreeMap;
@@ -258,7 +258,7 @@ pub enum DeployActor {
     Rollback { from_deploy_id: u64 },               // explicit rollback
 }
 
-/// Full deploy state, persisted in Raft.
+/// Full deploy state (designed for Raft; not persisted today).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployState {
     pub request: DeployRequest,
@@ -790,10 +790,11 @@ For internal service-to-service traffic (via Onion), the eBPF service map entry 
 
 > **Status: implemented.** A config that sets `strategy = "blue-green"` now
 > dispatches to the agent's `blue_green_redeploy`: the whole green fleet comes up
-> and health-checks while blue keeps serving, then an atomic routing swap retires
-> blue. A green failure tears green down and leaves blue untouched (or halts for
-> inspection when `auto_rollback = false`). The `meat::blue_green` library state
-> machine remains as a standalone, separately-tested model of the same sequence.
+> and health-checks, one instance at a time, while blue keeps serving. Then every
+> green backend is published and blue is drained and retired. A green failure
+> tears green down and leaves blue untouched (or halts for inspection when
+> `auto_rollback = false`). The separate `meat::blue_green` model was deleted in
+> 1e514421, so the agent's path is the only implementation.
 
 Blue-green deployment starts an entirely new set of instances (the "green" set) alongside the existing set (the "blue" set), verifies health on all green instances, then switches all traffic at once:
 
@@ -810,7 +811,7 @@ Phase 3: Drain complete — stop blue set
   green: web-4 (v2, :3004), web-5 (v2, :3005), web-6 (v2, :3006)   <-- serving traffic
 ```
 
-Blue-green requires `2 * replicas` worth of resources during the transition. The advantage is that the traffic switch is atomic (all instances flip at once) and rollback is instant (switch traffic back to blue before stopping it). The disadvantage is the resource overhead.
+Blue-green requires `2 * replicas` worth of resources during the transition. The advantage is that the switch is quick (green is published as a whole, then blue drains) and nothing of blue is touched until green is healthy. The disadvantage is the resource overhead.
 
 Blue-green is configured via:
 
@@ -848,7 +849,9 @@ max = 10            # never scale above 10 replicas
 
 **Scale-up** starts new instances using the same placement logic as a deploy (Meat picks nodes, Bun starts containers, health checks run, Wrapper/Onion add to pools). Scale-up doesn't drain or stop any existing instances: a node whose share grows receives the same spec with a higher count, and its agent starts only the added replicas beside the running ones (#346).
 
-**Scale-down** removes excess instances using the drain protocol (remove from routing, wait for drain, stop). Meat keeps the first placements and drops the rest. A node whose share shrinks still rolls its replicas at the lower count rather than stopping only the surplus.
+**Scale-down** removes excess instances using the drain protocol (remove from routing, wait for drain, stop). Meat keeps the first placements and drops the rest. A node whose share shrinks stops only the replicas whose ordinals left it, and leaves the rest running (#1111).
+
+**Moving replicas** between nodes (a lost node's replicas re-placed, an upgrade walk, a capacity refusal) changes a node's share without changing the version. The agent compares the new share with the one it runs: if nothing but the fixed count and the assigned ordinals changed, and every replica of the old share is running, it retires the departing ordinals first and then starts the arriving ones, so a full node frees the room the new replica needs. Replicas that stay in the share aren't touched. Any other change, a new version included, still rolls every replica (#1111).
 
 **GitOps interaction (Lettuce):**
 
@@ -940,7 +943,7 @@ In a cluster either outcome marks the app `RolloutFailed` (Section 5.2), so the 
 - **RoutingUpdate / Draining:** The old instance was already removed from the routing pool. The new instance may or may not be healthy. The leader checks whether the new instance was added to the routing pool before the node failed. If yes, the routing entry is stale (points to a dead node) and must be removed. The leader reschedules the app instance to a surviving node.
 - **Any phase:** If the failed node was running already-completed steps (instances from earlier steps that are now on the new version), those instances are lost and must be rescheduled to surviving nodes. This is handled by the normal Meat rescheduling logic, independent of the deploy system.
 
-**Mitigation:** Deploy state is persisted in Raft after every phase transition. If the leader itself fails, the new leader reads the deploy state from Raft and resumes from the last committed phase.
+**Mitigation (original design):** deploy state persisted in Raft after every phase transition, so a new leader could resume from the last committed phase.
 
 **Shipped (0.2.1):** there is no leader-held deploy state to persist. A node's own rollout carries on whatever happens to the leader, and a new leader reads each node's converged version and health from its reports and releases the next node from there (`new_leader_resumes_node_by_node_release_from_reports`).
 
@@ -1022,11 +1025,11 @@ Automatic rollback (triggered by `auto_rollback = true`) is a system-initiated a
 
 Every deploy event is recorded in three places:
 
-1. **Raft log:** The deploy state machine transitions are persisted as Raft entries. This is the authoritative record. Raft entries are replicated across council members and survive leader failures.
+1. **Raft log:** Rollout outcomes (`RolloutReleased`, `RolloutFailed`) are Raft entries, replicated across council members. Individual phase transitions aren't.
 2. **Ketchup structured logs:** Each phase transition emits a structured log event with deploy ID, app name, phase, actor, and timestamp. These logs can be forwarded to external systems (Datadog, Splunk, etc.) for compliance.
-3. **Deploy history:** The `DeployHistory` structure in Raft provides a queryable summary accessible via `relish history`.
+3. **Deploy history:** each node keeps the newest fifty entries per app, merged across the cluster by `relish history`.
 
-The Raft log is append-only by design. Past deploy records can't be modified or deleted through the API. An attacker who compromises a single node can't alter the deploy history because Raft requires a quorum of council members to accept writes.
+The Raft log is append-only by design, and Raft requires a quorum of council members to accept writes, so one compromised node can't rewrite the rollout records. The per-node deploy history has no such protection.
 
 ---
 

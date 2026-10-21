@@ -166,7 +166,7 @@ pub enum AgentCommand {
         app_name: String,
         namespace: String,
         command: Vec<String>,
-        response: oneshot::Sender<Result<String, BunError>>,
+        response: oneshot::Sender<Result<crate::grill::ExecOutput, BunError>>,
     },
     /// Run the fixed Phase 15 connectivity probe from a local workload.
     Trace {
@@ -907,6 +907,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     let _ = response.send(Err(BunError::FaultRejected {
                         reason: "workload faults require a namespace".into(),
                     }));
+                    return;
+                }
+
+                // An app or a job? This node's own evidence decides, before
+                // the rails see the request (#704).
+                if let Err(reason) = self.scope_local_workload_fault(&mut request) {
+                    let _ = response.send(Err(BunError::FaultRejected { reason }));
                     return;
                 }
 

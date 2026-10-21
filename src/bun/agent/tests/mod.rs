@@ -10,6 +10,7 @@ use crate::grill::mock::MockGrill;
 #[cfg(target_os = "linux")]
 mod cgroup_faults;
 mod fault_coverage;
+mod job_faults;
 mod loop_harness;
 mod loop_rule;
 mod namespace_secrets;
@@ -142,6 +143,8 @@ async fn a_trace_lists_only_the_faults_that_act_on_its_own_path() {
         agent
             .fault_registry
             .insert(&FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type,
                 target_service: service.to_string(),
                 namespace: Some(namespace.to_string()),
@@ -9317,6 +9320,142 @@ async fn instances_are_created_with_their_assigned_ordinals() {
     assert_eq!(ordinals, [2, 4, 5], "{rolled:?}");
 }
 
+/// The calls `grill` saw that stop or kill one of `ids`.
+fn stops_of(grill: &MockGrill, ids: &[&str]) -> Vec<(String, InstanceId)> {
+    grill
+        .calls()
+        .into_iter()
+        .filter(|(call, id)| (call == "stop" || call == "kill") && ids.contains(&id.0.as_str()))
+        .collect()
+}
+
+/// Whether any of the deploy's progress lines says it rolled the app.
+fn rolled(events: &[ApplyEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(event, ApplyEvent::Progress { message } if message.contains("rolling redeploy"))
+    })
+}
+
+/// #1111: when the leader moves one of a node's replicas elsewhere and
+/// gives it another, the version is the same, so only the two ordinals
+/// change hands. It used to roll every replica on the node to a new
+/// generation of the same spec.
+#[tokio::test]
+async fn a_moved_replica_starts_the_arriving_ordinal_and_retires_the_departing_one() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[0, 2])).await);
+
+    let events = drain_deploy(&mut agent, web_with_ordinals(&[0, 3])).await;
+
+    expect_complete(&events);
+    assert!(!rolled(&events), "a share move must not roll: {events:?}");
+    assert_eq!(live_web_ids(&agent), ["default__web-0", "default__web-3"]);
+    assert_eq!(
+        agent.supervisor.list_instances().len(),
+        2,
+        "the departing replica is gone"
+    );
+    assert!(stops_of(&grill, &["default__web-0"]).is_empty());
+    assert!(!stops_of(&grill, &["default__web-2"]).is_empty());
+}
+
+/// #1111: a share that loses a replica stops only that one.
+#[tokio::test]
+async fn a_shrunk_share_retires_only_the_departing_replica() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[0, 1, 2])).await);
+
+    let events = drain_deploy(&mut agent, web_with_ordinals(&[0, 2])).await;
+
+    expect_complete(&events);
+    assert!(
+        !rolled(&events),
+        "a smaller share must not roll: {events:?}"
+    );
+    assert_eq!(live_web_ids(&agent), ["default__web-0", "default__web-2"]);
+    assert!(stops_of(&grill, &["default__web-0", "default__web-2"]).is_empty());
+    let backends = agent
+        .service_map
+        .resolve(&crate::onion::service_id::ServiceId::new("default", "web"))
+        .map(|entry| entry.backends.len())
+        .unwrap_or(0);
+    assert_eq!(backends, 2, "the retired replica stops serving");
+}
+
+/// #1111: a node whose whole share is swapped for other ordinals of the
+/// same version starts the new ones under their own ordinals, without a
+/// generation.
+#[tokio::test]
+async fn a_swapped_share_starts_the_new_ordinals_without_a_new_generation() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[0, 2])).await);
+
+    let events = drain_deploy(&mut agent, web_with_ordinals(&[1, 3])).await;
+
+    expect_complete(&events);
+    assert!(
+        !rolled(&events),
+        "a swapped share must not roll: {events:?}"
+    );
+    assert_eq!(live_web_ids(&agent), ["default__web-1", "default__web-3"]);
+    assert_eq!(agent.supervisor.list_instances().len(), 2);
+}
+
+/// #1111: a share that moves in the same deploy as a new version still
+/// rolls every replica, under the new assignment.
+#[tokio::test]
+async fn a_moved_share_with_a_new_version_still_rolls() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[0, 2])).await);
+
+    let mut changed = web_with_ordinals(&[0, 3]);
+    changed.app.get_mut("web").unwrap().image = Some("myapp:v2".into());
+    let events = drain_deploy(&mut agent, changed).await;
+
+    expect_complete(&events);
+    assert!(rolled(&events), "{events:?}");
+    let ordinals: Vec<u32> = live_web_ids(&agent)
+        .iter()
+        .map(|id| {
+            let identity = crate::grill::InstanceIdentity::parse(id).unwrap();
+            assert!(identity.generation.is_some(), "{id} was not rolled");
+            identity.ordinal
+        })
+        .collect();
+    assert_eq!(ordinals, [0, 3]);
+}
+
+/// `budgeted_web` under the ordinals the leader assigned this node.
+fn budgeted_web_with_ordinals(image: &str, ordinals: &[u32]) -> Config {
+    let mut config = budgeted_web(image, ordinals.len() as u32);
+    config.app.get_mut("web").unwrap().ordinals = Some(ordinals.to_vec());
+    config
+}
+
+/// #1111, from the 0.2.1 jobs soak (#1110): on a full node, a rolling
+/// redeploy needs room for a new replica before an old one goes, so moving
+/// a replica failed and rolled back. Retiring the departing replica first
+/// frees the room the arriving one needs.
+#[tokio::test]
+async fn a_replica_moves_onto_a_full_node_where_a_redeploy_would_not_fit() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    let budget = agent.execution_budget();
+    budget.set_capacity(crate::meat::Resources::new(1000, 1 << 30, 0));
+    expect_complete(&drain_deploy(&mut agent, budgeted_web_with_ordinals("web:v1", &[0, 2])).await);
+
+    let events = drain_deploy(&mut agent, budgeted_web_with_ordinals("web:v1", &[0, 3])).await;
+
+    expect_complete(&events);
+    assert_eq!(live_web_ids(&agent), ["default__web-0", "default__web-3"]);
+    assert!(stops_of(&grill, &["default__web-0"]).is_empty());
+    assert!(reported_refusals(&mut agent).await.is_empty());
+}
+
 #[tokio::test]
 async fn redeploy_does_not_overwrite_a_stopped_or_failed_cleanup_owner() {
     for state in [ContainerState::Stopped, ContainerState::Failed] {
@@ -9543,6 +9682,7 @@ pub(super) fn limited_adoption_record(
     let mut record = adoption_record(instance, app, false);
     record.oci_spec.linux.cgroups_path = Some(format!("/reliaburger/default/{app}/0"));
     record.oci_spec.linux.resources = Some(crate::grill::oci::OciResources {
+        pids: None,
         cpu: Some(crate::grill::oci::OciCpuResources {
             quota: 50_000,
             period: 100_000,
@@ -10690,6 +10830,8 @@ fn register_fault(
     agent
         .fault_registry
         .insert(&crate::smoker::types::FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type,
             target_service: String::new(),
             namespace: None,
@@ -10715,6 +10857,8 @@ async fn dns_fault_refuses_unknown_namespace_or_instance_scope_without_recording
                 reservation: None,
                 replica_evidence: None,
                 request: crate::smoker::types::FaultRequest {
+                    workload: Default::default(),
+                    task_index: None,
                     fault_type: crate::smoker::types::FaultType::DnsNxdomain,
                     target_service: "redis".into(),
                     namespace,
@@ -10744,6 +10888,8 @@ async fn workload_fault_without_a_namespace_is_refused_before_recording() {
             reservation: None,
             replica_evidence: None,
             request: crate::smoker::types::FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: crate::smoker::types::FaultType::Pause,
                 target_service: "web".into(),
                 namespace: None,
@@ -10807,6 +10953,8 @@ async fn dns_fault_keeps_its_namespace_and_each_owner_until_clear() {
                 reservation: None,
                 replica_evidence: None,
                 request: crate::smoker::types::FaultRequest {
+                    workload: Default::default(),
+                    task_index: None,
                     fault_type: crate::smoker::types::FaultType::DnsNxdomain,
                     target_service: "redis".into(),
                     namespace: Some("red".into()),
@@ -10856,6 +11004,8 @@ async fn node_fault_fence_reverses_before_acknowledging_and_blocks_late_activati
     };
     let (mut agent, gate, _) = test_cluster_fault_agent().await;
     let request = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::NodeKill {
             kill_containers: false,
         },
@@ -10932,6 +11082,8 @@ async fn clearing_a_reserved_node_fault_reports_its_reservation_until_fenced() {
     };
     let (mut agent, gate, _) = test_cluster_fault_agent().await;
     let request = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::NodeKill {
             kill_containers: false,
         },
@@ -11310,6 +11462,8 @@ async fn kill_all_is_refused_for_the_last_replica_without_a_cluster() {
     // `--count 0` means "all replicas"; killing all of a single-replica
     // service leaves zero survivors.
     let request = crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::Kill { count: 0 },
         target_service: "web".into(),
         namespace: Some("default".into()),
@@ -11347,6 +11501,8 @@ async fn cluster_replica_evidence_replaces_the_local_count() {
     while ev_rx.recv().await.is_some() {}
 
     let request = crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::Kill { count: 1 },
         target_service: "web".into(),
         namespace: Some("default".into()),

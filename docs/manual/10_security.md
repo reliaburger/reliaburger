@@ -126,8 +126,8 @@ caller and the end of the grace period.
 `relish token list` shows, for each token, its role, when it was created, when
 it expires (`never`, `(in 30d)` or `(expired)`), when it was **last used** and
 its **scope** (`all`, or `apps=… namespaces=…`). New columns are added on the
-right, so a script that cuts the older ones out keeps working; `-o json` gives
-the same fields (`scope`, `expires_at`, `last_used` in Unix seconds, `null` for
+right, so a script that cuts the older ones out keeps working;
+`relish -o json token list` gives the same fields (`scope`, `expires_at`, `last_used` in Unix seconds, `null` for
 never) plus a `principal` id that matches the `principal` of that token's audit
 events.
 
@@ -165,6 +165,8 @@ Roles and scopes are coarse. A `[permission.<token-name>]` block narrows one
 token further, to named actions on named apps:
 
 ```toml
+[namespace.shop]
+
 [permission.ci-deploy]
 actions = ["deploy", "logs"]
 apps = ["web"]
@@ -193,7 +195,8 @@ Some reads span every app: `/v1/logs/sql`, the raw metric store, the cluster
 metric rollups and alerts. They need the action granted with `apps = ["*"]` and
 no `namespaces` list. So do the admin routes, test leases among them. A build
 whose destination names no namespace (`pickle://web:v1`) could belong to
-anyone, so it needs `deploy` granted the same way. A block that grants `metrics` on
+anyone, so it needs `deploy` granted the same way, and a build that sets
+`namespace` can't use one at all (see `images-and-volumes`). A block that grants `metrics` on
 one app still shows that app's charts on its dashboard page, but the dashboard
 leaves out the alert panel, and `relish top` shows only that app's rows.
 
@@ -335,6 +338,9 @@ relish secret pubkey                  # ask the cluster
 relish secret pubkey cluster          # offline, from `relish init` output
 relish secret encrypt --pubkey "$(relish secret pubkey)" 'the plaintext'
 ```
+
+`examples/phase-1/container-secrets.toml` is a job that reads an encrypted
+value and prints its length, never the value; its header has the commands.
 
 Encryption is local: `secret encrypt` never contacts the cluster. The node
 that starts the instance decrypts the value into its environment. If it can't
@@ -643,7 +649,8 @@ cosign sign --key cosign.key --new-bundle-format=false ghcr.io/acme/web@sha256:�
 Keyless signatures (a Fulcio certificate, as Chainguard and distroless images
 carry) aren't checked: there's no key to trust.
 
-Turn the check on per upstream rule, with the public keys you trust:
+Turn the check on per upstream rule, with the public keys you trust (the
+contents of `cosign.pub`; the key below is an example, so use your own):
 
 ```toml
 [[images.trust_policy.upstream]]
@@ -651,7 +658,8 @@ match = "ghcr.io/acme/*"
 require_signatures = true
 cosign_keys = ["""
 -----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEM2FSvMifnaVs8ixlQa4A/6G/czA9
+mQg4Lf8nqtraD+h85AjbewyGb4rteSrJkIgw1nYFr5kFzOYXzD8zUz4LBg==
 -----END PUBLIC KEY-----
 """]
 ```

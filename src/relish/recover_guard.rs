@@ -168,7 +168,7 @@ pub async fn check_voters_gone(
 /// The client the guard probes with: no certificate verification (see
 /// [`probe_voter`]), and nothing else from the CLI's configuration.
 pub fn probe_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
+    crate::http_client::builder()
         .danger_accept_invalid_certs(true)
         .connect_timeout(PROBE_TIMEOUT)
         .build()

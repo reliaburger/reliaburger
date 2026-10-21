@@ -159,7 +159,7 @@ use super::message::MAX_DATAGRAM_BYTES;
 /// Real UDP transport for gossip messages.
 ///
 /// Binds a single UDP socket that handles both sending and receiving.
-/// Messages are serialised with bincode. Datagrams exceeding
+/// Messages are serialised with postcard. Datagrams exceeding
 /// [`MAX_DATAGRAM_BYTES`] are refused with an error to avoid
 /// fragmentation; the protocol sizes every message to fit first.
 ///

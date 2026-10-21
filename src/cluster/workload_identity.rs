@@ -274,4 +274,39 @@ mod tests {
         bad.cert_der = "!!!".into();
         assert!(bad.decode().is_err());
     }
+
+    /// The expected strings come from Python's `base64`, not our encoder,
+    /// so a base64 release that changed the alphabet or the padding would
+    /// fail here rather than change what goes on the wire (#1026).
+    #[test]
+    fn the_wire_form_matches_its_known_answer() {
+        let signed = SignedWorkload {
+            cert_der: vec![0xfb, 0xff, 0xbf],
+            workload_ca_cert_der: vec![4],
+            root_ca_cert_der: vec![5, 6],
+            ca_bundle_der: vec![vec![1, 2, 3], vec![]],
+            jwt_token: None,
+        };
+        let wire = WorkloadCsrResponse::encode(&signed);
+        assert_eq!(wire.cert_der, "+/+/");
+        assert_eq!(wire.workload_ca_cert_der, "BA==");
+        assert_eq!(wire.root_ca_cert_der, "BQY=");
+        assert_eq!(wire.ca_bundle_der, vec!["AQID".to_string(), String::new()]);
+    }
+
+    #[test]
+    fn the_wire_form_refuses_missing_or_non_canonical_padding() {
+        let signed = SignedWorkload {
+            cert_der: vec![4],
+            workload_ca_cert_der: vec![4],
+            root_ca_cert_der: vec![4],
+            ca_bundle_der: vec![],
+            jwt_token: None,
+        };
+        for cert in ["BA", "BB=="] {
+            let mut wire = WorkloadCsrResponse::encode(&signed);
+            wire.cert_der = cert.into();
+            assert!(wire.decode().is_err(), "{cert}");
+        }
+    }
 }

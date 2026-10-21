@@ -937,7 +937,14 @@ def main():
     marker=commands.add_parser("mark")
     marker.add_argument("directory",type=Path); marker.add_argument("target"); marker.add_argument("kind")
     options=parser.parse_args()
-    if options.command=="run": return run(options)
+    if options.command=="run":
+        # The harness reads this instead of `wait`: macOS bash 3.2 can forget
+        # a reaped background child once its pid is reused (#1035). A crash
+        # records 1; only SIGKILL leaves no file, which the harness fails.
+        status=1
+        try: status=run(options)
+        finally: atomic(options.evidence/"jobs/exit-status",status)
+        return status
     if options.command=="budget":
         plan=run_budget(options.duration,options.runs_per_hour)
         print("job-runs expected %(expected_runs)d retained-peak %(peak_retained)d limit %(limit)d" % plan)

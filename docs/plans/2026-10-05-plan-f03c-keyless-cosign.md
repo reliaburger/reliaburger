@@ -1,6 +1,6 @@
 # Plan: F03c, keyless cosign and Sigstore bundles (later)
 
-*Written 5 October 2026 for [#619](https://github.com/reliaburger/reliaburger/issues/619) (F03c), milestone "Later". [F03a](2026-10-02-plan-f03-upstream-image-trust.md) ships in 0.1.6 with key-based cosign in the classic `.sig` layout only. Its format check (#597) found that the signed public images people run are all signed keyless, and that cosign 3 writes a Sigstore bundle as an OCI referrer by default. The maintainer decided on 5 October 2026 to plan keyless verification for a later release. This is that plan. (F03b, taking the master key's authority off workers, is a separate plan.)*
+*Written 5 October 2026 for [#619](https://github.com/reliaburger/reliaburger/issues/619) (F03c), milestone "Later". [F03a](archive/2026-10-02-plan-f03-upstream-image-trust.md) ships in 0.1.6 with key-based cosign in the classic `.sig` layout only. Its format check (#597) found that the signed public images people run are all signed keyless, and that cosign 3 writes a Sigstore bundle as an OCI referrer by default. The maintainer decided on 5 October 2026 to plan keyless verification for a later release. This is that plan. (F03b, taking the master key's authority off workers, is a separate plan.)*
 
 ## Where we are
 

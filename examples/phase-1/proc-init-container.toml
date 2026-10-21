@@ -2,9 +2,11 @@
 #
 # Init containers run sequentially before the main app starts.
 # If any init container fails, the app transitions to Failed.
-# Here, the init runs "echo" (succeeds), then the main app starts. An init
+# Here, the init runs /bin/echo (succeeds), then the main app starts. An init
 # container of an `exec` app that names no image of its own runs on the
-# host, like its app; one with an image needs a container runtime.
+# host, like its app, so the node's allowed_binaries must name its binary
+# by path (examples/node/process-runtime.toml allows /bin/echo). One with an
+# image needs a container runtime.
 #
 # Build first:  cargo build
 # Start Bun with the process runtime and the node config that allows
@@ -18,7 +20,7 @@ command = ["--mode", "healthy", "--port", "8080"]
 port = 8080
 
 [[app.web.init]]
-command = ["echo", "initialising database"]
+command = ["/bin/echo", "initialising database"]
 
 [app.web.health]
 path = "/healthz"

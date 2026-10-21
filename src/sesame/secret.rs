@@ -90,7 +90,8 @@ pub fn encrypt_secret(plaintext: &str, public_key: &str) -> Result<String, Secre
         .map_err(|e| SecretError::EncryptFailed(format!("invalid public key: {e}")))?;
 
     let encryptor =
-        age::Encryptor::with_recipients(vec![Box::new(recipient)]).expect("at least one recipient");
+        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+            .map_err(|e| SecretError::EncryptFailed(e.to_string()))?;
 
     let mut encrypted = vec![];
     let mut writer = encryptor
@@ -131,16 +132,13 @@ pub fn decrypt_secret(
         .decode(inner)
         .map_err(|e| SecretError::InvalidFormat(format!("invalid base64: {e}")))?;
 
-    let decryptor = match age::Decryptor::new(age::armor::ArmoredReader::new(&armored_bytes[..]))
-        .map_err(|e| SecretError::DecryptFailed(e.to_string()))?
-    {
-        age::Decryptor::Recipients(d) => d,
-        _ => {
-            return Err(SecretError::DecryptFailed(
-                "expected recipients-based encryption".to_string(),
-            ));
-        }
-    };
+    let decryptor = age::Decryptor::new(age::armor::ArmoredReader::new(&armored_bytes[..]))
+        .map_err(|e| SecretError::DecryptFailed(e.to_string()))?;
+    if decryptor.is_scrypt() {
+        return Err(SecretError::DecryptFailed(
+            "expected recipients-based encryption".to_string(),
+        ));
+    }
 
     let mut reader = decryptor
         .decrypt(std::iter::once(identity as &dyn age::Identity))
@@ -238,7 +236,8 @@ pub fn seal_with_age(data: &[u8], public_key: &str) -> Result<Vec<u8>, SecretErr
         .map_err(|e| SecretError::EncryptFailed(format!("invalid public key: {e}")))?;
 
     let encryptor =
-        age::Encryptor::with_recipients(vec![Box::new(recipient)]).expect("at least one recipient");
+        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+            .map_err(|e| SecretError::EncryptFailed(e.to_string()))?;
 
     let mut output = vec![];
     let mut writer = encryptor
@@ -262,14 +261,12 @@ pub fn unseal_with_age(
     identity: &age::x25519::Identity,
 ) -> Result<Vec<u8>, SecretError> {
     let decryptor =
-        match age::Decryptor::new(sealed).map_err(|e| SecretError::DecryptFailed(e.to_string()))? {
-            age::Decryptor::Recipients(d) => d,
-            _ => {
-                return Err(SecretError::DecryptFailed(
-                    "expected recipients-based encryption".to_string(),
-                ));
-            }
-        };
+        age::Decryptor::new(sealed).map_err(|e| SecretError::DecryptFailed(e.to_string()))?;
+    if decryptor.is_scrypt() {
+        return Err(SecretError::DecryptFailed(
+            "expected recipients-based encryption".to_string(),
+        ));
+    }
 
     let mut reader = decryptor
         .decrypt(std::iter::once(identity as &dyn age::Identity))
@@ -497,5 +494,71 @@ mod tests {
         // Holding only the new key can't open the pre-rotation secret — the
         // data loss PKI8 guards against.
         assert!(try_all(&old_secret, &live[..1]).is_none());
+    }
+
+    // Values sealed by an age 0.10 build (Reliaburger 0.2.1 and earlier),
+    // checked in as fixtures. App configs carry `ENC[AGE:...]` values and
+    // every node keeps `<cluster>-root-ca.age`, so later age releases have
+    // to keep opening both (#1026).
+    const AGE_0_10_IDENTITY: &str = include_str!("../../tests/fixtures/age/identity.txt");
+
+    fn fixture_identity() -> age::x25519::Identity {
+        AGE_0_10_IDENTITY.trim().parse().unwrap()
+    }
+
+    #[test]
+    fn an_env_secret_sealed_by_age_0_10_still_decrypts() {
+        let sealed = include_str!("../../tests/fixtures/age/secret-env.txt").trim();
+        assert!(is_encrypted(sealed));
+        assert_eq!(
+            decrypt_secret(sealed, &fixture_identity()).unwrap(),
+            "fixture-secret-value"
+        );
+    }
+
+    /// `ENC[AGE:...]` wraps the armored age text in standard, padded
+    /// base64. age's own output is random, so pin the engine directly with
+    /// strings computed by Python's `base64`: a base64 release that changed
+    /// the alphabet or the padding would fail here rather than change every
+    /// value we seal (#1026).
+    #[test]
+    fn enc_base64_matches_the_rfc_4648_known_answers() {
+        let engine = base64::engine::general_purpose::STANDARD;
+        let cases: [(&[u8], &str); 6] = [
+            (b"", ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (&[0xfb, 0xff, 0xbf], "+/+/"),
+            (&[0, 1, 2, 3, 4], "AAECAwQ="),
+        ];
+        for (bytes, encoded) in cases {
+            assert_eq!(engine.encode(bytes), encoded);
+            assert_eq!(engine.decode(encoded).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn an_enc_value_without_canonical_padding_is_refused() {
+        let (identity, _) = test_keypair();
+        for inner in ["Zg", "Zh==", "-_-_"] {
+            let value = format!("{ENC_PREFIX}{inner}{ENC_SUFFIX}");
+            assert!(
+                matches!(
+                    decrypt_secret(&value, &identity),
+                    Err(SecretError::InvalidFormat(_))
+                ),
+                "{inner}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_root_key_sealed_by_age_0_10_still_unseals() {
+        let sealed = include_bytes!("../../tests/fixtures/age/sealed-root-key.age");
+        assert_eq!(
+            unseal_with_age(sealed, &fixture_identity()).unwrap(),
+            b"fixture sealed bytes"
+        );
     }
 }

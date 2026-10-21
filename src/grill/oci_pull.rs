@@ -1,13 +1,14 @@
 //! Bound upstream reads and verify OCI digests before either cache publishes them.
 
-use oci_distribution::errors::OciDistributionError;
-use oci_distribution::manifest::{
+use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol};
+use oci_client::errors::OciDistributionError;
+use oci_client::manifest::{
     IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, ImageIndexEntry,
     OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE, OciImageIndex, OciImageManifest, OciManifest,
     Versioned,
 };
-use oci_distribution::secrets::RegistryAuth;
-use oci_distribution::{Client, Reference};
+use oci_client::secrets::RegistryAuth;
+use oci_client::{Client, Reference};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
@@ -17,6 +18,42 @@ const MEDIA_TYPES: &[&str] = &[
     OCI_IMAGE_INDEX_MEDIA_TYPE,
     IMAGE_MANIFEST_LIST_MEDIA_TYPE,
 ];
+
+/// The configuration every upstream registry client is built from.
+///
+/// oci-client builds its own reqwest client and offers no builder hook, so
+/// this pins what its config exposes: trust is the Mozilla root list the
+/// binary ships, not the host's store that reqwest 0.13 defaults to. The
+/// default platform resolver stays unused: we pick platforms ourselves.
+pub(crate) fn registry_client_config(protocol: ClientProtocol) -> ClientConfig {
+    ClientConfig {
+        protocol,
+        tls_certs_only: bundled_roots(),
+        ..Default::default()
+    }
+}
+
+/// Build the client every upstream registry read goes through.
+///
+/// Errors instead of using `Client::new`, which quietly falls back to a bare
+/// reqwest client with reqwest's own trust and crypto defaults.
+pub(crate) fn registry_client(protocol: ClientProtocol) -> Result<Client, OciDistributionError> {
+    // reqwest asks rustls for the process provider before its aws-lc
+    // fallback. Installing ring fails harmlessly once one is in place.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Client::try_from(registry_client_config(protocol))
+}
+
+/// The Mozilla root programme as shipped in `webpki-root-certs`.
+fn bundled_roots() -> Vec<Certificate> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|der| Certificate {
+            encoding: CertificateEncoding::Der,
+            data: der.to_vec(),
+        })
+        .collect()
+}
 
 /// Platform-resolved metadata and the exact bytes authenticated by its digests.
 pub(crate) struct VerifiedImageManifest {
@@ -39,7 +76,7 @@ pub(crate) fn verify(
     expected: &str,
     size: Option<i64>,
 ) -> Result<(), OciDistributionError> {
-    let actual = format!("sha256:{:x}", Sha256::digest(bytes));
+    let actual = format!("sha256:{}", hex::encode(Sha256::digest(bytes)));
     if actual != expected {
         return Err(invalid(format!(
             "upstream content digest mismatch: expected {expected}, received {actual}"
@@ -104,9 +141,10 @@ pub(crate) async fn pull_verified_manifest_for_architecture(
 ) -> Result<VerifiedImageManifest, OciDistributionError> {
     let architecture = linux_architecture(architecture)?;
     // Headers are registry assertions, not evidence of the bytes received.
-    let (mut manifest_bytes, _) = client
+    let (manifest_bytes, _) = client
         .pull_manifest_raw(reference, auth, MEDIA_TYPES)
         .await?;
+    let mut manifest_bytes = manifest_bytes.to_vec();
     if let Some(expected) = reference.digest() {
         verify(&manifest_bytes, expected, None)?;
     }
@@ -125,7 +163,7 @@ pub(crate) async fn pull_verified_manifest_for_architecture(
                 .pull_manifest_raw(&child_reference, auth, MEDIA_TYPES)
                 .await?;
             verify(&child_bytes, &descriptor.digest, Some(descriptor.size))?;
-            index_bytes = Some(std::mem::replace(&mut manifest_bytes, child_bytes));
+            index_bytes = Some(std::mem::replace(&mut manifest_bytes, child_bytes.to_vec()));
             match parse_manifest(&manifest_bytes)? {
                 OciManifest::Image(manifest) => manifest,
                 OciManifest::ImageIndex(_) => {
@@ -152,7 +190,10 @@ pub(crate) fn platform_descriptor<'a>(
         .iter()
         .find(|entry| {
             entry.platform.as_ref().is_some_and(|platform| {
-                platform.os == "linux" && platform.architecture == architecture
+                // oci-client 0.18 parses these into enums; compare their
+                // OCI spellings so the match stays exactly what it was.
+                platform.os.to_string() == "linux"
+                    && platform.architecture.to_string() == architecture
             })
         })
         .ok_or_else(|| {
@@ -197,7 +238,7 @@ async fn verified_image(
     std::str::from_utf8(&config_bytes)
         .map_err(|e| invalid(format!("upstream configuration is not UTF-8: {e}")))?;
     Ok(VerifiedImageManifest {
-        digest: format!("sha256:{:x}", Sha256::digest(&manifest_bytes)),
+        digest: format!("sha256:{}", hex::encode(Sha256::digest(&manifest_bytes))),
         manifest,
         manifest_bytes,
         config_bytes,
@@ -239,6 +280,7 @@ pub(crate) async fn pull_verified_root(
     let (index_bytes, _) = client
         .pull_manifest_raw(reference, auth, MEDIA_TYPES)
         .await?;
+    let index_bytes = index_bytes.to_vec();
     if let Some(expected) = reference.digest() {
         verify(&index_bytes, expected, None)?;
     }
@@ -259,7 +301,8 @@ pub(crate) async fn pull_verified_root(
     let mut manifests = Vec::new();
     for entry in index.manifests {
         let runnable = entry.platform.as_ref().is_some_and(|platform| {
-            platform.os == "linux" && linux_architecture(&platform.architecture).is_ok()
+            platform.os.to_string() == "linux"
+                && linux_architecture(&platform.architecture.to_string()).is_ok()
         });
         if !runnable {
             continue;
@@ -273,10 +316,10 @@ pub(crate) async fn pull_verified_root(
             .pull_manifest_raw(&child_reference, auth, MEDIA_TYPES)
             .await?;
         verify(&bytes, &entry.digest, Some(entry.size))?;
-        manifests.push((entry, bytes));
+        manifests.push((entry, bytes.to_vec()));
     }
     Ok(VerifiedRoot::Index(VerifiedImageIndex {
-        digest: format!("sha256:{:x}", Sha256::digest(&index_bytes)),
+        digest: format!("sha256:{}", hex::encode(Sha256::digest(&index_bytes))),
         media_type: index
             .media_type
             .unwrap_or_else(|| OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
@@ -318,7 +361,7 @@ const MAX_ATTEMPTS: u32 = 4;
 /// service errors, and connections or response streams that broke. Denials,
 /// missing content and malformed or corrupt responses are terminal.
 fn is_transient(error: &OciDistributionError) -> bool {
-    use oci_distribution::errors::OciErrorCode;
+    use oci_client::errors::OciErrorCode;
     match error {
         OciDistributionError::RegistryError { envelope, .. } => {
             !envelope.errors.is_empty()
@@ -355,9 +398,9 @@ fn is_transient(error: &OciDistributionError) -> bool {
 pub(crate) async fn retry_registry_read<T, F>(
     budget: RegistryReadBudget,
     mut read: impl FnMut() -> F,
-) -> oci_distribution::errors::Result<T>
+) -> oci_client::errors::Result<T>
 where
-    F: std::future::Future<Output = oci_distribution::errors::Result<T>>,
+    F: std::future::Future<Output = oci_client::errors::Result<T>>,
 {
     use tokio::time::{Instant, sleep_until, timeout_at};
 
@@ -392,6 +435,16 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::time::Instant;
+
+    #[test]
+    fn verify_accepts_content_whose_digest_is_the_known_answer() {
+        let expected = concat!(
+            "sha256:",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(verify(b"abc", expected, Some(3)).is_ok());
+        assert!(verify(b"abd", expected, Some(3)).is_err());
+    }
 
     const BUDGET: RegistryReadBudget = RegistryReadBudget {
         attempt: Duration::from_secs(10),
@@ -439,7 +492,7 @@ mod tests {
         let started = Instant::now();
         let error = retry_registry_read(BUDGET, || {
             attempts.fetch_add(1, Ordering::SeqCst);
-            std::future::pending::<oci_distribution::errors::Result<()>>()
+            std::future::pending::<oci_client::errors::Result<()>>()
         })
         .await
         .unwrap_err();
@@ -458,7 +511,7 @@ mod tests {
         let started = Instant::now();
         retry_registry_read(budget, || {
             attempts.fetch_add(1, Ordering::SeqCst);
-            std::future::pending::<oci_distribution::errors::Result<()>>()
+            std::future::pending::<oci_client::errors::Result<()>>()
         })
         .await
         .unwrap_err();
@@ -499,7 +552,7 @@ mod tests {
             let message = error.to_string();
             let mut error = Some(error);
             let attempts = AtomicU32::new(0);
-            let result: oci_distribution::errors::Result<()> = retry_registry_read(BUDGET, || {
+            let result: oci_client::errors::Result<()> = retry_registry_read(BUDGET, || {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 let error = error.take();
                 async move { Err(error.unwrap_or_else(|| invalid("called twice"))) }
@@ -513,7 +566,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn persistent_transient_errors_stop_after_four_attempts() {
         let attempts = AtomicU32::new(0);
-        let result: oci_distribution::errors::Result<()> = retry_registry_read(BUDGET, || {
+        let result: oci_client::errors::Result<()> = retry_registry_read(BUDGET, || {
             attempts.fetch_add(1, Ordering::SeqCst);
             async { Err(server_error(503)) }
         })
@@ -527,5 +580,158 @@ mod tests {
         for budget in [METADATA_READ, LAYER_READ] {
             assert!(budget.total >= budget.attempt * 2 + Duration::from_secs(2));
         }
+    }
+
+    /// A `localhost` registry certificate signed by a private CA, as rustls
+    /// server material offering both HTTP/2 and HTTP/1.1.
+    fn private_ca_server_config() -> rustls::ServerConfig {
+        let hierarchy = crate::sesame::ca::generate_ca_hierarchy("registry-ca", b"ikm").unwrap();
+        let (leaf_der, key_der, _) = crate::sesame::ca::issue_end_entity_cert(
+            "localhost",
+            crate::sesame::types::SerialNumber(7),
+            Duration::from_secs(3600),
+            &["localhost".to_string()],
+            &[rcgen::ExtendedKeyUsagePurpose::ServerAuth],
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        let mut config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![rustls::pki_types::CertificateDer::from(leaf_der)],
+            rustls::pki_types::PrivateKeyDer::try_from(key_der).unwrap(),
+        )
+        .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config
+    }
+
+    /// Accept TLS connections on `localhost`, record the ALPN protocols the
+    /// client first offered, then try to finish each handshake with a private-CA cert.
+    async fn spawn_private_ca_registry() -> (u16, tokio::sync::oneshot::Receiver<Vec<Vec<u8>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (offered_tx, offered_rx) = tokio::sync::oneshot::channel();
+        let config = std::sync::Arc::new(private_ca_server_config());
+        tokio::spawn(async move {
+            // oci-client may probe `/v2/` before the manifest request, so
+            // keep accepting; the first handshake answers the ALPN question.
+            let mut offered_tx = Some(offered_tx);
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor =
+                    tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp);
+                let Ok(start) = acceptor.await else {
+                    continue;
+                };
+                let offered = start
+                    .client_hello()
+                    .alpn()
+                    .map(|protocols| protocols.map(<[u8]>::to_vec).collect())
+                    .unwrap_or_default();
+                if let Some(tx) = offered_tx.take() {
+                    let _ = tx.send(offered);
+                }
+                let _ = start.into_stream(config.clone()).await;
+            }
+        });
+        (port, offered_rx)
+    }
+
+    async fn pull_from_localhost(port: u16) -> Result<(), OciDistributionError> {
+        let client = registry_client(ClientProtocol::Https).unwrap();
+        let reference = Reference::with_tag(
+            format!("localhost:{port}"),
+            "library/alpine".into(),
+            "latest".into(),
+        );
+        client
+            .pull_manifest_raw(&reference, &RegistryAuth::Anonymous, MEDIA_TYPES)
+            .await
+            .map(|_| ())
+    }
+
+    /// reqwest 0.13 checks public certificates against the host's trust
+    /// store by default, and refuses to build a client on a host without a CA
+    /// bundle. Registry pulls keep the Mozilla roots the binary ships, as
+    /// reqwest 0.12 did, and nothing else.
+    #[test]
+    fn registry_client_trusts_only_the_bundled_mozilla_roots() {
+        for protocol in [
+            ClientProtocol::Https,
+            ClientProtocol::Http,
+            ClientProtocol::HttpsExcept(vec!["127.0.0.1:5000".into()]),
+        ] {
+            let config = registry_client_config(protocol);
+            assert_eq!(
+                config.tls_certs_only.len(),
+                webpki_root_certs::TLS_SERVER_ROOT_CERTS.len()
+            );
+            assert!(config.extra_root_certificates.is_empty());
+            assert!(!config.accept_invalid_certificates);
+        }
+    }
+
+    /// oci-client's `Client::new` quietly falls back to a bare reqwest client,
+    /// with reqwest's own trust and crypto defaults, when the config fails to
+    /// build. Ours must build exactly as configured.
+    #[test]
+    fn registry_client_builds_from_its_config_without_falling_back() {
+        for protocol in [ClientProtocol::Https, ClientProtocol::Http] {
+            Client::try_from(registry_client_config(protocol)).unwrap();
+        }
+    }
+
+    /// reqwest's fallback provider is aws-lc; registry TLS uses ring, like
+    /// every other rustls config in the binary.
+    #[test]
+    fn building_a_registry_client_uses_ring() {
+        registry_client(ClientProtocol::Https).unwrap();
+
+        let installed = rustls::crypto::CryptoProvider::get_default()
+            .expect("a process crypto provider is installed");
+        let suites = |provider: &rustls::crypto::CryptoProvider| {
+            provider
+                .cipher_suites
+                .iter()
+                .map(|suite| suite.suite())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            suites(installed),
+            suites(&rustls::crypto::ring::default_provider())
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_client_refuses_a_registry_signed_by_a_private_ca() {
+        let (port, _) = spawn_private_ca_registry().await;
+
+        let error = pull_from_localhost(port).await.unwrap_err();
+
+        assert!(
+            format!("{error:?}").contains("UnknownIssuer"),
+            "expected an untrusted-issuer refusal, got {error:?}"
+        );
+    }
+
+    /// oci-client has no `http1_only` knob, and `object_store` turns on
+    /// reqwest's `http2` feature for the whole build, so registry pulls offer
+    /// HTTP/2 where reqwest 0.12 offered HTTP/1.1 only. This pins that known
+    /// difference: if it changes, revisit the registry passage in chapter 1.
+    #[tokio::test]
+    async fn registry_client_offers_http2_alongside_http1() {
+        let (port, offered) = spawn_private_ca_registry().await;
+
+        let _ = pull_from_localhost(port).await;
+
+        assert_eq!(
+            offered.await.unwrap(),
+            [b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 }

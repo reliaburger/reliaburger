@@ -755,8 +755,11 @@ class AgentLoopTurns(Evidence):
         self.evaluate(self.snapshot(**evidence))
         code, verdict = self.evaluate(self.snapshot(ts=NOW + 3600, **evidence))
         self.assertNotIn("agent-loop-turn", self.failures(verdict))
+        code, verdict = self.evaluate(self.snapshot(ts=NOW + 5400, **{
+            "inventory__rb-a-1_txt": INVENTORY, "turns__rb-a-1_json": turns(over=("2.5",), ts=NOW + 5390)}))
+        self.assertNotIn("agent-loop-turn", self.failures(verdict))
         code, verdict = self.evaluate(self.snapshot(ts=NOW + 7200, **{
-            "inventory__rb-a-1_txt": INVENTORY, "turns__rb-a-1_json": turns(over=("2.5", "+Inf"))}))
+            "inventory__rb-a-1_txt": INVENTORY, "turns__rb-a-1_json": turns(over=("2.5", "+Inf"), ts=NOW + 7190)}))
         self.assertEqual(code, 1)
         failure = next(item for item in verdict["findings"] if item["check"] == "agent-loop-turn")
         self.assertIn("1 command turn(s) over the 1 s budget, the worst over 10 s", failure["detail"])
@@ -766,9 +769,56 @@ class AgentLoopTurns(Evidence):
                                        "turns__rb-a-1_json": turns(over=("2.5",))}))
         code, verdict = self.evaluate(self.snapshot(ts=NOW + 3600, **{
             "inventory__rb-a-1_txt": INVENTORY.replace("bun_pid 100", "bun_pid 200"),
-            "turns__rb-a-1_json": turns(within=3, over=("2.5",))}))
+            "turns__rb-a-1_json": turns(within=3, over=("2.5",), ts=NOW + 3590)}))
         self.assertEqual(code, 1)
         self.assertIn("agent-loop-turn", self.failures(verdict))
+
+    def test_a_restart_with_no_new_slow_turns_finds_nothing(self):
+        # The new bun hasn't run a deploy_op turn yet, so the newest
+        # deploy_op samples in the window are still the old process's, with
+        # the slow turn the first check already reported (#1261).
+        restarted = INVENTORY.replace("bun_pid 100", "bun_pid 200")
+        self.evaluate(self.snapshot(**{"inventory__rb-a-2_txt": INVENTORY,
+                                       "turns__rb-a-2_json": turns(branch="deploy_op", over=("2.5",))}))
+        code, verdict = self.evaluate(self.snapshot(ts=NOW + 1800, **{
+            "inventory__rb-a-2_txt": restarted,
+            "turns__rb-a-2_json": turns(branch="deploy_op", over=("2.5",), ts=NOW + 1500)
+            + turns(branch="command", within=3, ts=NOW + 1790)}))
+        self.assertNotIn("agent-loop-turn", self.failures(verdict))
+        self.assertEqual(checker.load_state(self.evidence)["turns_over_budget"], {"rb-a-2": 1})
+
+    def test_a_slow_turn_after_a_restart_counts_once_beside_the_old_process_samples(self):
+        # The window holds both processes: the old one's last samples, then
+        # the new one's counters starting again from zero.
+        restarted = INVENTORY.replace("bun_pid 100", "bun_pid 200")
+        self.evaluate(self.snapshot(**{"inventory__rb-a-2_txt": INVENTORY,
+                                       "turns__rb-a-2_json": turns(branch="deploy_op", over=("2.5",))}))
+        code, verdict = self.evaluate(self.snapshot(ts=NOW + 1800, **{
+            "inventory__rb-a-2_txt": restarted,
+            "turns__rb-a-2_json": turns(branch="deploy_op", over=("2.5",), ts=NOW + 1500)
+            + turns(branch="deploy_op", within=3, over=("5",), ts=NOW + 1790)}))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "agent-loop-turn")
+        self.assertIn("1 deploy_op turn(s) over the 1 s budget, the worst between 2.5 and 5 s", failure["detail"])
+        self.assertEqual(checker.load_state(self.evidence)["turns_over_budget"], {"rb-a-2": 2})
+        # The next check still sees the restart in its window: counted once.
+        code, verdict = self.evaluate(self.snapshot(ts=NOW + 3600, **{
+            "inventory__rb-a-2_txt": restarted,
+            "turns__rb-a-2_json": turns(branch="deploy_op", over=("2.5",), ts=NOW + 1500)
+            + turns(branch="deploy_op", within=3, over=("5",), ts=NOW + 1790)
+            + turns(branch="deploy_op", within=9, over=("5",), ts=NOW + 3590)}))
+        self.assertNotIn("agent-loop-turn", self.failures(verdict))
+        self.assertEqual(checker.load_state(self.evidence)["turns_over_budget"], {"rb-a-2": 2})
+
+    def test_a_bun_restarted_under_the_same_pid_counts_from_zero(self):
+        self.evaluate(self.snapshot(**{"inventory__rb-a-1_txt": INVENTORY,
+                                       "turns__rb-a-1_json": turns(within=50, over=("2.5", "5"))}))
+        code, verdict = self.evaluate(self.snapshot(ts=NOW + 1800, **{
+            "inventory__rb-a-1_txt": INVENTORY,
+            "turns__rb-a-1_json": turns(within=3, over=("2.5",), ts=NOW + 1790)}))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "agent-loop-turn")
+        self.assertIn("1 command turn(s) over the 1 s budget", failure["detail"])
 
     def slow_fsync_window(self, node):
         with contextlib.redirect_stdout(io.StringIO()):

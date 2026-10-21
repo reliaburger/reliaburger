@@ -33,7 +33,7 @@
           <p class="lede">Kubernetes gave us container orchestration, and gave every team an accidental
             platform engineering department. Reliaburger compiles the platform into one Rust agent:
             scheduling, mTLS, ingress, a registry, metrics, logs, GitOps, jobs and chaos testing.
-            It’s a prototype. Try it on a laptop cluster, on macOS or on Linux with KVM; five
+            It’s a prototype. Try it on a laptop cluster, on an Apple silicon Mac or on Linux with KVM; five
             minutes from install to cluster is the target.</p>
           <div class="intro-links">
             <a class="primary-link" href="#install">Install 0.2.1 <span aria-hidden="true">↓</span></a>
@@ -64,13 +64,16 @@
         <div class="install-grid">
           <div class="terminal">
             <div class="terminal-heading">INSTALL <span>sh</span></div>
-            <pre><code>curl -fsSL https://reliaburger.com/install.sh | sh</code></pre>
+            <pre><code>curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop</code></pre>
           </div>
           <div class="install-copy">
             <p>One line installs <code>relish</code>, then builds a three-node cluster in Linux
               VMs on your laptop, running real containers. It checks every download against a
-              pinned digest or the release’s signing key.</p>
-            <p>You’ll need macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory
+              pinned digest or the release’s signing key. Without <code>--laptop</code> it only
+              explains the choices, such as Linux machines you already have, and installs nothing.</p>
+            <p>Until 1.0.0, Reliaburger is for developers and enthusiasts trying it out, not for
+              production.</p>
+            <p>You’ll need a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB of free memory
               and 15 GiB of disk. No Rust, no checkout.</p>
             <p class="install-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a>
               · <a href="install.sh">Read the bootstrap script</a>
@@ -153,7 +156,7 @@
             <summary>Show the commands <span class="tour-commands-note">every step, with what to look for</span></summary>
             <ol class="tour-steps">
               <li>
-                <pre><code data-tour>curl -fsSL https://reliaburger.com/install.sh | sh</code></pre>
+                <pre><code data-tour>curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop</code></pre>
                 <p>Installs <code>relish</code>, then builds a three-node cluster in Linux VMs on your
                   laptop. It checks every download against a pinned digest, and it’s the only step
                   that takes minutes.</p>

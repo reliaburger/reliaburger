@@ -415,6 +415,8 @@ allowed_operations = ["inject_workload_faults"]
     .await;
     let client = demo.client();
     let fault = |fault_type| FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type,
         target_service: "redis".to_string(),
         namespace: Some("default".to_string()),

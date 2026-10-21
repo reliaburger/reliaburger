@@ -68,6 +68,9 @@ listed in `reference`.
 ## Health checks
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.health]
 path = "/healthz"
 port = 8081               # default: the app's `port`
@@ -87,6 +90,9 @@ probes (about ten minutes at the default interval) and restarted.
 ## Init containers
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [[app.api.init]]
 image = "ghcr.io/example/migrate:2.1"   # default: the app's image
 command = ["migrate", "up"]
@@ -101,9 +107,35 @@ migration can read `DATABASE_URL` and a config generator can write a volume.
 The volume stays the app's: an init container doesn't take it over, so run it
 as root (most images do) or as the app's user.
 
+An `exec` or `script` app's init container that names no image runs its
+command on the host, like the app. The node's `[process_workloads]
+allowed_binaries` must name the command's first word by its full path, or the
+deploy is refused, and the scheduler only places the app where it does:
+
+```toml
+[app.worker]
+exec = "/usr/bin/python3"
+command = ["worker.py"]
+
+[[app.worker.init]]
+command = ["/bin/sh", "-c", "mkdir -p /tmp/worker"]   # /bin/sh must be allowed
+```
+
+`relish lint` and `relish apply` warn about a host init whose command starts
+with a bare name such as `echo`, and suggest the full path. It's a warning,
+not a refusal: a node that allowlists the bare name word for word runs it,
+looking it up on its `PATH`.
+
+```text
+warning: app default/worker: init container command "echo" is a bare name, but it runs on the host, where allowed_binaries names binaries by full path; use the full path (`command -v echo` on the node prints it)
+```
+
 ## Config files
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [[app.api.config_file]]
 path = "/etc/api/config.yaml"
 content = """
@@ -137,6 +169,9 @@ different from the config:
 An `autoscale` block lets the leader move `replicas` between `min` and `max`:
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.autoscale]
 metric = "cpu"            # or "memory" (needs a memory request)
 target = "70%"            # of each replica's request
@@ -275,12 +310,18 @@ relish apply app.toml            # deploy (or converge) everything in the file
 relish apply app.toml --dry-run  # preview; no-agent output states its offline assumption
 relish lint app.toml             # validate only
 relish logs web -f               # stream logs from every node (--tail 20 for the last 20)
-relish exec web env              # run a command inside an instance, on whichever node runs it
+relish exec web env              # run a command once inside an instance; exits with its exit code
+relish events --app web          # the cluster's recent events for one app
 relish top                       # every workload on every node, with CPU and memory
 relish inspect web               # every instance on every node, desired vs running
 relish stop web                  # scale to zero; `relish apply` starts it again
 relish delete web                # remove the app from the cluster
 ```
+
+`relish exec` runs its command once, with no stdin and no terminal, so
+`relish exec web sh` exits straight away: name the command you want, as in
+`relish exec web ls /data`. Relish prints the output and exits with the
+command's exit code.
 
 `apply` and `deploy` check the file's syntax and field values locally. In a cluster, the leader checks permission/build namespace references against both the file and namespaces already created. You don't need to repeat a namespace declaration, which could replace its existing budget. `relish lint` works offline, so it requires those references to be declared in the file. Applying a build declaration validates its namespace; use `relish build` to execute the build.
 
@@ -314,7 +355,7 @@ standalone node with no cluster numbers its replicas from 0.
 ```sh
 relish compile config/ > all.toml   # merge, apply _defaults.toml, derive namespaces
 relish diff old.toml all.toml       # structural diff between two configs
-relish fmt all.toml --check         # canonical ordering; drop --check to rewrite
+relish fmt all.toml --check         # canonical ordering, comments kept; drop --check to rewrite
 relish apply all.toml
 ```
 
@@ -358,6 +399,9 @@ one node rolls. A brand-new app, a node getting its first replica and a change
 to `replicas` alone don't wait.
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.deploy]
 strategy = "rolling"      # or "blue-green"
 max_surge = 1             # default 1
@@ -437,6 +481,47 @@ returns once the council has recorded the spec, and prints no operation id,
 because each node runs its own deploy later. `examples/phase-1/proc-restarts.toml`
 shows the health checker restarting an app that goes unhealthy.
 
+To watch all of this happen, run the rollout demo from a checkout. It starts a
+one-node cluster on the process runtime, applies
+`examples/phase-1/proc-rollout.toml` as v1, rolls it to v2, rolls it back, then
+applies a v3 that fails its health check and shows it rolled back and marked
+`RolloutFailed`. Every step checks what the app really serves:
+
+```sh
+scripts/demo/rollout.sh
+```
+
+The demo measures what it costs as it goes. Before each step it prints Bun's
+latest memory and CPU, and its workloads', on one line, and it ends with each
+measure's average and peak:
+
+```text
+    resources: bun 109.5 MiB, 66.7 % CPU · 2 workloads 23.8 MiB, 1.0 % CPU
+
+==> Resource use: 25 samples over 24 s on demo-node
+                     average           peak
+  bun CPU               70.4 %         94.6 %
+  bun memory           109.7 MiB      117.3 MiB
+  ...
+```
+
+CPU is a percentage of one core. The numbers come from the operating system
+(`/proc` on Linux, `ps` on macOS), sampled once a second, and anything it
+can't measure is left out rather than guessed: network traffic isn't
+measured, because a one-node demo talks to itself over loopback. Workloads
+are everything Bun started: each app, the owner process that keeps it
+running, and a GitOps sync's `git`. Those numbers are from a debug build on a
+busy laptop, which is what the demo builds by default. For numbers you'd
+quote, point `BUN` at a release build (`cargo build --release --bin bun`). Set
+`DEMO_RESOURCES_OUT` to a directory to keep the samples as `resources.csv`,
+with `cpu.svg` and `memory.svg` charts that mark each step on the time axis,
+or `DEMO_RESOURCES=0` to turn the measuring off. Every demo in
+`scripts/demo/` does the same, and so does the [five-minute
+tour](08_five-minute-tour.md)'s script.
+
+`examples/phase-1/container-rollout.toml` is the same story with real
+containers and `strategy = "blue-green"`, for a cluster with runc.
+
 `relish lint` and `apply` refuse a `[deploy]` table they can't honour: a
 `strategy` other than `rolling` or `blue-green`, and a `drain_timeout` or
 `health_timeout` that isn't a whole number of seconds, minutes or hours
@@ -449,6 +534,9 @@ shows the health checker restarting an app that goes unhealthy.
 image = "ghcr.io/example/api:1.4.2"
 command = ["./migrate", "up"]
 run_before = ["app.api"]  # finish before the api starts
+
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
 
 [job.report]
 image = "ghcr.io/example/report:2"
@@ -476,8 +564,10 @@ definition and claims every matching UTC minute itself, so a leader change
 neither loses nor repeats an occurrence. An app or job whose name an unsettled
 deployment still owns is refused until that deployment settles, and apply
 refuses an overlapping app or job while an earlier run of it still has an
-uncertain outcome. Leadership changes or recovery preserve that fence; there is no automatic expiry or replay of an
-uncertain migration.
+uncertain outcome. Leadership changes or recovery preserve that fence, and
+nothing replays an uncertain migration on its own: after checking its side
+effects, acknowledge it with `relish batch replay` (see [batch
+jobs](14_batch-jobs.md)).
 
 A failed ordinary job gets four attempts in all, unless it sets `max_attempts`.
 A job whose exit Bun couldn't observe (say, the node crashed) is `unknown`, and
@@ -532,8 +622,13 @@ lost with a worker's disk; accepted aggregate counts remain replicated.
 - Volumes (managed + host path): `examples/phase-1/container-volumes.toml`
   (volumes need a container runtime)
 - Several apps per file: `examples/phase-1/proc-multi-app.toml`
-- Batch scheduling: `relish batch examples/phase-8/batch-jobs.toml`, then
-  `relish batch-status <ID> --wait`
+- Rolling deploys and rollback: `examples/phase-1/proc-rollout.toml`
+  (`scripts/demo/rollout.sh` runs it), `container-rollout.toml` (blue-green)
+- An encrypted secret: `examples/phase-1/container-secrets.toml`
+- A migration that gates its app: `examples/phase-8/proc-run-before.toml`
+- A host binary as an app: `examples/phase-8/proc-exec-app.toml`
+- Batch scheduling: `relish batch examples/phase-8/container-batch-jobs.toml`,
+  then `relish batch-status <ID> --wait`
   Batch jobs must be non-scheduled and have no `run_before` declarations. Use
   ordinary apply for cron schedules and jobs that gate apps in the same manifest.
 

@@ -24,16 +24,50 @@ relish fault node-pressure node-03 --cpu 80% --memory 90% --acknowledge
 Workload faults take `--namespace` (default `default`), `--instance` to hit
 one instance, `--duration` and `--reason`, which is recorded with the fault.
 
-In 0.2.0 workload faults target apps only. `relish fault kill` or `pause`
-against a job is refused by the replica-minimum rail, and the attempts of an
-array or a shared executor are invisible to Smoker. To test jobs under
-failure, break the node instead: `node-kill`, `node-pressure`, or the
-node-level faults the release's job qualification uses (killing Bun on a
-worker or on the leader, delaying traffic between nodes, filling the disk,
-slowing fsync; see `scripts/release/qualify-jobs-sustained.sh`). Job-aware
-chaos, which exempts run-to-completion work from the rail and targets
-executors, is planned for 0.2.2
-([#704](https://github.com/reliaburger/reliaburger/issues/704)).
+### Jobs and task arrays
+
+A workload fault can name a job or a task array as well as an app. It reaches
+the attempts running now, on whichever nodes run them:
+
+```sh
+relish fault kill render --count 2 --acknowledge         # two running attempts
+relish fault kill render --instance 41 --acknowledge     # task 41's attempt
+relish fault pause migrate --duration 30s --acknowledge  # freeze a job
+relish fault delay redis 200ms --from render --acknowledge
+```
+
+For a job or an array, `--instance` takes a task index. A killed attempt goes
+the way a crash would. A command in a reusable executor reports the signal,
+so it's a failed attempt and retries under `max_attempts`. An attempt in its
+own container or process leaves no exit status when a signal kills it, so it
+is `Unknown`: task arrays and jobs with `replay_unknown = true` run it again,
+and other jobs wait for `relish batch replay`. A paused attempt carries on
+when the pause ends, or meets its `task_timeout_secs` as usual. That's how you
+test retries, timeouts and `Unknown` outcomes from the job's side.
+
+The replica-minimum rail doesn't apply: it keeps one replica of an app
+serving, and a job is meant to finish. So `relish fault kill migrate --count 0`
+kills every attempt of `migrate`. Bun decides what the target is from what
+runs, not from the request, so a caller can't label an app as a job to get
+past the rail. Every other rail still applies: the council, leader and node
+rails, `--acknowledge`, `[testing].allowed_operations` and the token's
+namespace scope.
+
+What reaches one task depends on how the job runs:
+
+- An attempt in its own container or process (`runtime = "runc"`, or a
+  process job without Linux limits) takes every fault: kill, pause, `cpu`,
+  `memory`, `disk-io`, and as a caller (`--from`) `delay`, `drop` and
+  `partition`.
+- A command in a reusable executor (`shared-runc`, or a process job with
+  Linux limits) shares that container's cgroup and network with the tasks
+  that run there before and after it. Kill and pause act on the task's own
+  processes only. Bun refuses `cpu`, `memory`, `disk-io` and network faults on
+  it, and names the executor in the reason, because they would slow the next
+  tasks too.
+
+To fault a whole node under a job, use `node-kill` or `node-pressure`, or the
+node-level faults in `scripts/release/qualify-jobs-sustained.sh`.
 
 Every fault has a duration (default 10 minutes) and cleans up after itself:
 
@@ -196,28 +230,35 @@ A scenario file lists faults with their targets, values, start offsets and
 durations, and Relish injects each one when its time comes:
 
 ```toml
-name = "Payment cascade failure"
+name = "Cache cascade"
 
 [[step]]
-description = "Database latency spike"
+description = "The cache slows down for the frontend"
 fault = "delay"
-target = "pg"
-value = "500ms"
+target = "redis"
+from = "frontend"
+value = "300ms"
 duration = "2m"
 
 [[step]]
-description = "Database starts dropping connections"
+description = "The cache starts dropping connections"
 fault = "drop"
-target = "pg"
+target = "redis"
 value = "25%"
 start_after = "2m"
-duration = "3m"
+duration = "2m"
 ```
 
+That's the start of `examples/phase-8/container-chaos-scenario.toml`, which
+goes on to squeeze the backend's memory and kill a frontend replica. It
+targets the tour's podinfo apps, so apply `examples/kubernetes/podinfo.yaml`
+first. `--dry-run` prints the timeline and injects nothing; a real run needs
+`--acknowledge`, like every fault:
+
 ```sh
-relish fault scenario examples/phase-8/chaos-scenario.toml --dry-run
-relish fault scenario examples/phase-8/chaos-scenario.toml --acknowledge
-relish fault scenario examples/phase-8/chaos-scenario.toml --speed 2.0 --acknowledge
+relish fault scenario examples/phase-8/container-chaos-scenario.toml --dry-run
+relish fault scenario examples/phase-8/container-chaos-scenario.toml --acknowledge
+relish fault scenario examples/phase-8/container-chaos-scenario.toml --speed 2.0 --acknowledge
 ```
 
 A step's `fault` is any workload fault: `delay`, `drop`, `dns`, `partition`,
@@ -231,7 +272,12 @@ A step's `fault` is any workload fault: `delay`, `drop`, `dns`, `partition`,
 | `count` | `--count` | `kill` (default: 1) |
 | `instance` | `--instance` | all but `dns` |
 
+A step's `target` can be a job or a task array, as on the command line; its
+`instance` is then a task index, written as a string (`instance = "41"`).
+
 ```toml
+name = "Checkout loses its cache"
+
 [[step]]
 description = "Cut checkout off from the cache"
 fault = "partition"

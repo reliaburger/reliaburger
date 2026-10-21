@@ -50,6 +50,15 @@ cluster's real state where the tour says to wait. `tests/suite/website.rs`
 runs `tour.sh --check`, which fails if the page gains a command the script
 doesn't know how to run.
 
+Once the cluster is up, the script samples every node VM every five seconds
+through `limactl shell` (`scripts/demo/resources.py`): Bun's memory and CPU,
+the whole guest's, and the guest's network traffic. Each wait ends with a
+one-line readout of the latest sample, so the recording shows the cluster's
+footprint at the moment it describes, whatever idle time the player trims, and
+the tour ends with each measure's average and peak. Set `DEMO_RESOURCES_OUT`
+to keep the samples as CSV with SVG charts in the soak charts' style, or
+`DEMO_RESOURCES=0` to leave the measuring out.
+
 Every promoted release re-records the tour against its published install
 ([releasing step 9](../releasing.md#staging-a-candidate)). With no other
 quickstart cluster on the default ports, and a throwaway `RELIABURGER_HOME`
@@ -193,7 +202,12 @@ Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
 It installs `v0.2.1` unless `RELIABURGER_VERSION` names another release; bump
-that default when you promote a newer one. If the requested release isn't
+that default when you promote a newer one. Every line the site shows names a
+mode (`sh -s -- --laptop`): with no arguments both scripts only explain the
+choices and exit 2, and the bootstrap does it before downloading anything.
+Asked for a release from before 0.2.2, which doesn't know `--laptop`, the
+bootstrap drops the flag, so the site's line works while the default still
+names an older release. If the requested release isn't
 published, it fails with a message saying so. The generated installer itself
 lives in the GitHub release, with native CLI checksums supplied by release
 packaging.

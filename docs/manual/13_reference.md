@@ -10,7 +10,7 @@ The flags, variables, files and ports you'll reach for. `relish help COMMAND`
 | `--endpoint URL` | `RELIABURGER_ENDPOINT` | Bun API to talk to |
 | `--token TOKEN` | `RELIABURGER_TOKEN` | API bearer token |
 | `--ca-cert PATH` | `RELIABURGER_CA_CERT` | cluster root CA; switches the default to HTTPS |
-| `--output FORMAT` | | `human` (default), `json` or `yaml` |
+| `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; a command with no machine output refuses `json` and `yaml` |
 
 A flag beats its variable. With neither, `relish` uses the laptop cluster's
 saved context, then `http://127.0.0.1:9117`.
@@ -151,6 +151,7 @@ A `[job.NAME]` table takes these fields. Unknown fields are refused.
 | `exec`, `script` | Host binary or inline script, for `process` only |
 | `command` | Command and arguments |
 | `cpu`, `memory` | Request–limit ranges, as for apps |
+| `pids` | Most processes and threads one command may hold (`pids.max`), 1–32768. Default 256 for `shared-runc` and host executor commands; no limit for a fresh `runc` container |
 | `env` | Environment variables, plain or encrypted |
 | `namespace` | Namespace; `default` when omitted |
 | `schedule` | Cron schedule in UTC: five fields or a macro such as `@daily` |
@@ -160,8 +161,9 @@ A `[job.NAME]` table takes these fields. Unknown fields are refused.
 | `max_attempts` | 1–10. Default 4, or 1 for a hook |
 | `task_timeout_secs` | 0–86400 per attempt; 0 means no deadline. Default none, or 600 for a hook |
 | `overlap` | Cron only: `forbid` (default) skips an occurrence while a run is active; `allow` starts another |
-| `replay_unknown` | `true` replays automatically after an unknown outcome and counts a timeout as an ordinary failure; hooks refuse it. Default `false` | Ordinary TOML jobs,
-cron and hooks use the same executor as arrays. See [batch jobs](14_batch-jobs.md)
+| `replay_unknown` | `true` replays automatically after an unknown outcome and counts a timeout as an ordinary failure; hooks refuse it. Default `false` |
+
+Ordinary TOML jobs, cron and hooks use the same executor as arrays. See [batch jobs](14_batch-jobs.md)
 for retry, overlap, retention, supported runtimes and API shapes.
 
 Job limits, all enforced by the council:
@@ -250,6 +252,14 @@ lacks the setting renews once per half-override instead of spinning.
 
 ## Exit codes
 
-Most commands exit `0` on success and `1` on error. `wtf`, `path`, `test` and
-`bench` exit `1` when they find a failure, and `wtf` and `path` exit `2` for
-warnings, degraded paths or incomplete evidence.
+Most commands exit `0` on success and `1` on error. A usage error (an
+unknown flag, a missing argument, or `--output json` on a command that has no
+JSON) exits `2`.
+
+`wtf`, `path`, `test` and `bench` exit `1` when they find a failure, and `wtf`
+and `path` exit `3` for warnings, degraded paths or incomplete evidence. Before
+0.2.2 that was `2`, which a script couldn't tell from a usage error.
+
+`relish exec` exits with the remote command's own exit code, so
+`relish exec web ls /ready` works in a shell `if`. It exits `1` when it
+can't run the command at all, with an `error:` line on stderr.

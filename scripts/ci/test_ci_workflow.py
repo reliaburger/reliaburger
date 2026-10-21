@@ -476,6 +476,27 @@ class BenchmarkTests(unittest.TestCase):
         compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
         self.assertIn("--remeasure 'cargo bench --bench task_arrays --'", compare)
 
+    def test_the_on_disk_ledger_benchmark_is_reported_not_gated(self):
+        # Its speed is the runner's disk, which varies several-fold within one
+        # job (#1038); the tmpfs variant beside it is gated instead.
+        job = self.jobs["task-array-benchmarks"]
+        compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
+        self.assertEqual(re.findall(r"--report-only (\S+)", compare),
+                         ["storage/ledger_and_index_64k"])
+
+    def test_every_report_only_benchmark_has_a_gated_variant_in_the_bench(self):
+        job = self.jobs["task-array-benchmarks"]
+        compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
+        bench = (REPO / "benches" / "task_arrays.rs").read_text()
+        names = re.findall(r"--report-only (\S+)", compare)
+        self.assertTrue(names)
+        for name in names:
+            with self.subTest(benchmark=name):
+                group, function = name.split("/", 1)
+                self.assertIn(f'benchmark_group("{group}")', bench)
+                self.assertIn(f'"{function}"', bench)
+                self.assertIn(f'"{function}_tmpfs"', bench)
+
     def test_only_main_saves_the_task_array_baseline(self):
         job = self.jobs["task-array-benchmarks"]
         restore = next(step for step in steps(job) if "actions/cache/restore@" in step)
@@ -499,6 +520,159 @@ class BenchmarkTests(unittest.TestCase):
         for target in targets:
             with self.subTest(target=target):
                 self.assertRegex(workflows, rf"(?m)run: make {re.escape(target)}$")
+
+
+class ArtifactDownloadTests(unittest.TestCase):
+    """A stalled artefact download fails fast and is retried once (#977).
+
+    `actions/download-artifact` normally takes a minute or two, but one run
+    took 13 minutes and pushed `acceptance` past its 40-minute limit. Each
+    download gets its own short limit and one retry, so a stall costs at most
+    two short limits instead of the job's whole budget.
+    """
+
+    # The longest any one attempt may take; downloads normally take 1 to 2.
+    LIMIT_MINUTES = 5
+    WORKFLOW_FILES = ("ci.yml", "v02-loops.yml")
+
+    def setUp(self):
+        self.workflows = {name: jobs((WORKFLOWS / name).read_text())
+                          for name in self.WORKFLOW_FILES}
+
+    @staticmethod
+    def with_block(step):
+        """The step's `with:` inputs, as text."""
+        found = re.search(r"\n        with:\n((?:          .*\n?)*)", step)
+        return found.group(1).rstrip() if found else ""
+
+    def assert_downloads_retried(self, workflow_jobs):
+        """Every download is a bounded attempt followed by one bounded retry.
+
+        No subTest here: the detection test expects the first failure to raise.
+        """
+        pairs = 0
+        for name, job in workflow_jobs.items():
+            blocks = steps(job)
+            downloads = [index for index, step in enumerate(blocks)
+                         if "uses: actions/download-artifact@" in step]
+            remaining = list(downloads)
+            while remaining:
+                first = remaining.pop(0)
+                attempt = blocks[first]
+                self.assertIn("\n        continue-on-error: true", attempt, f"{name}: the first attempt must not fail the job")
+                step_id = re.search(r"\n        id: ([a-z_]+)\n", attempt)
+                self.assertIsNotNone(step_id, "the first attempt needs an id")
+                self.assertTrue(remaining and remaining[0] == first + 1,
+                                "the first attempt must be followed by its retry")
+                retry = blocks[remaining.pop(0)]
+                self.assertNotIn("continue-on-error", retry)
+                condition = re.search(r"\n        if: (.*)", retry)
+                self.assertIsNotNone(condition, "the retry runs only when the first attempt failed")
+                # !cancelled(): an earlier failed step in the job must not
+                # skip the retry of a download that runs regardless.
+                self.assertIn("!cancelled()", condition.group(1))
+                self.assertIn(f"steps.{step_id.group(1)}.outcome == 'failure'", condition.group(1))
+                self.assertEqual(self.with_block(attempt), self.with_block(retry))
+                self.assertNotEqual(self.with_block(attempt), "")
+                for step in (attempt, retry):
+                    limit = re.search(r"\n        timeout-minutes: (\d+)\n", step + "\n")
+                    self.assertIsNotNone(limit, "each attempt needs its own timeout-minutes")
+                    self.assertLessEqual(int(limit.group(1)), self.LIMIT_MINUTES)
+                pairs += 1
+        return pairs
+
+    def test_a_stalled_artefact_download_fails_fast_and_is_retried_once(self):
+        for name, workflow_jobs in self.workflows.items():
+            with self.subTest(workflow=name):
+                self.assertGreater(self.assert_downloads_retried(workflow_jobs), 0)
+
+    def test_the_jobs_that_download_the_test_archive_keep_their_own_limits(self):
+        ci = self.workflows["ci.yml"]
+        for name, minutes in (("cluster", 30), ("acceptance", 40), ("ignored-evidence", 10)):
+            with self.subTest(job=name):
+                self.assertIn(f"\n    timeout-minutes: {minutes}\n", ci[name])
+
+    def test_an_unbounded_unretried_or_skippable_download_is_detected(self):
+        ci = self.workflows["ci.yml"]
+        self.assert_downloads_retried(ci)
+        original = ci["acceptance"]
+        blocks = steps(original)
+        downloads = [step for step in blocks if "uses: actions/download-artifact@" in step]
+        self.assertEqual(len(downloads), 2)
+        attempt, retry = downloads
+        changes = [
+            original.replace(retry + "\n", ""),
+            original.replace(attempt, re.sub(r"\n        timeout-minutes: \d+", "", attempt)),
+            original.replace(retry, re.sub(r"timeout-minutes: \d+", "timeout-minutes: 15", retry)),
+            original.replace(attempt, attempt.replace("\n        continue-on-error: true", "")),
+            original.replace(retry, retry.replace("!cancelled() && ", "")),
+            original.replace(retry, retry.replace("outcome == 'failure'", "outcome == 'success'")),
+            original.replace(retry, retry.replace("name: nextest-archive", "name: something-else")),
+            original.replace(retry, retry + "\n" + retry),
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_downloads_retried(dict(ci, acceptance=changed))
+
+
+class ArchiveExtractionTests(unittest.TestCase):
+    """Each archive consumer extracts the test archive once (#1050).
+
+    `acceptance` has four owners and `cluster` one, and each owner used to
+    extract the 2.9 GB archive twice, for its discovery and for its run. Now
+    one step per job extracts it, and every owner names that step's receipt
+    digest, so its evidence is bound to the archive the step checked.
+    """
+
+    CONSUMERS = ("cluster", "acceptance")
+
+    def setUp(self):
+        self.ci = jobs((WORKFLOWS / "ci.yml").read_text())
+
+    def assert_extracts_once(self, job):
+        """No subTest here: the detection test expects the first failure to raise."""
+        blocks = steps(job)
+        extracts = [index for index, step in enumerate(blocks) if "workflow_adapter.py extract" in step]
+        self.assertEqual(len(extracts), 1, "exactly one extraction per consumer job")
+        extract = blocks[extracts[0]]
+        step_id = re.search(r"\n        id: ([a-z_]+)\n", extract)
+        self.assertIsNotNone(step_id, "the extraction needs an id for its output")
+        self.assertNotIn("\n        if:", extract, "a skipped extraction must fail the owners")
+        downloads = [index for index, step in enumerate(blocks) if "uses: actions/download-artifact@" in step]
+        self.assertTrue(downloads and max(downloads) < extracts[0],
+                        "extract after the download and its retry")
+        producers = [index for index, step in enumerate(blocks) if "workflow_adapter.py produce" in step]
+        self.assertTrue(producers and extracts[0] < min(producers), "extract before every owner")
+        reference = ('--archive-extraction "${{ steps.' + step_id.group(1)
+                     + '.outputs.archive_extraction_sha256 }}"')
+        for index in producers:
+            self.assertIn(reference, blocks[index], "every owner names the job's extraction")
+        for option in ("--archive-file", "--extract-to", "--extract-overwrite"):
+            self.assertNotIn(option, job, "an owner must not open the archive again")
+        return len(producers)
+
+    def test_each_archive_consumer_extracts_once_before_its_owners(self):
+        owners = {name: self.assert_extracts_once(self.ci[name]) for name in self.CONSUMERS}
+        self.assertEqual(owners, {"cluster": 1, "acceptance": 4})
+
+    def test_a_missing_repeated_late_or_unreferenced_extraction_is_detected(self):
+        original = self.ci["acceptance"]
+        blocks = steps(original)
+        extract = next(step for step in blocks if "workflow_adapter.py extract" in step)
+        first = next(step for step in blocks if "workflow_adapter.py produce" in step)
+        last = [step for step in blocks if "workflow_adapter.py produce" in step][-1]
+        changes = [
+            original.replace(extract + "\n", ""),
+            original.replace(extract, extract + "\n" + extract.replace("id: ", "id: again_")),
+            original.replace(extract + "\n", "").replace(first, first + "\n" + extract),
+            original.replace(extract, extract.replace("\n        id: ", "\n        if: ${{ !cancelled() }}\n        id: ")),
+            original.replace(last, last.replace(" --archive-extraction", " --unrelated")),
+            original.replace(last, last.replace("outputs.archive_extraction_sha256", "outputs.something_else")),
+            original + "\n    env:\n      ARCHIVED: cargo nextest run --archive-file tests.tar.zst",
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_extracts_once(changed)
 
 
 class RetargetTests(unittest.TestCase):

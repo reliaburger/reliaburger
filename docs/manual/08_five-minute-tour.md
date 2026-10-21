@@ -5,16 +5,17 @@ Kubernetes app on a three-node laptop cluster, build and run an app of your
 own next to it, run ten jobs beside them, walk its network path,
 measure it, break it and watch it heal. Open it any time with `relish manual tour`.
 
-It needs macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
-15 GiB of disk. The one-line install fetches the signed 0.2.1 release.
+It needs a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB
+of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.1 release.
 
 ## Install and build the cluster
 
 ```sh
-curl -fsSL https://reliaburger.com/install.sh | sh
+curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
 ```
 
-This installs `relish`, then builds a three-node cluster in Linux VMs. Every
+This installs `relish`, then builds a three-node cluster in Linux VMs on this
+computer. Without `--laptop` the installer only explains the choices. Every
 download is checked against a pinned digest. It's the only step that takes
 minutes: about a minute and a half once the downloads are cached, closer to
 four the first time. If `relish` isn't on your `PATH` yet, the installer says how to

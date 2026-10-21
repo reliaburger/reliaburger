@@ -44,7 +44,7 @@ Not every runtime needs the same approach:
 
 **RuncGrill (rootless mode):** Uses `slirp4netns`, the same tool Podman relies on. It creates a TAP device inside the user namespace with a userspace TCP/IP stack. No root needed. Port forwarding goes through its API socket.
 
-**AppleContainerGrill (macOS):** Apple Container already runs each container in a lightweight VM with its own vmnet interface. The network isolation is free. We just need to discover the container's IP via `container inspect`.
+**AppleContainerGrill (macOS):** Apple Container already runs each container in a lightweight VM with its own vmnet interface, so the network isolation would be free. We say "would" because Bun refuses `--runtime apple` and has since 0.1.0 (#367): on a Mac you run the managed Linux VM that `relish setup --quickstart` builds, and runc inside it. The code below is still in the tree, but no running node takes this path.
 
 **ProcessGrill:** No network isolation. Processes share the host network. This is the cross-platform dev/test fallback.
 
@@ -246,7 +246,7 @@ The helper is a process, not kernel state, so it needs an owner that outlives an
 
 What happens when the helper dies? Every `state()` call supervises it: if the helper's owner reports it gone, Grill starts a new one and reinstalls the forward. The awkward case is the gap in between. The owner polls its child every 10 ms, so for a moment it still says "running" about a helper whose API socket already refuses connections. Our first version treated that moment as fatal. It waited for the API, saw the owner finally report the exit, and returned "helper exited before readiness", quoting the *old* helper's log. A CI flake caught it three times, always under load. The fix is to stop asking "did it die?" and ask "did it die before we could use it?" A helper that dies after we saw it running is simply replaced. A helper this call started gets three attempts, with a short backoff between them. Only if all three die before serving their API does `state()` report an error, now quoting the latest attempt's own stderr. Refusals such as a conflicting forward still fail straight away, because retrying can't fix them.
 
-### Apple Container: the easy case
+### Apple Container: the easy case we switched off
 
 Apple Container runs each container in a lightweight VM with its own vmnet interface. The network isolation comes for free. We just need to discover the IP:
 
@@ -261,6 +261,8 @@ async fn discover_container_ip(instance: &InstanceId) -> Result<Ipv4Addr, GrillE
 ```
 
 After `container start`, we call `container inspect` and fish out the IP from the JSON output. The IP is stored on the `AppleEntry` and exposed via `container_ip()`.
+
+That was the easy part. The hard parts were everything around it: Apple Container has no hook for our DNS resolver injection, no managed-volume retirement to match runc's, and no eBPF connect hook, so an app that worked on a Mac could behave differently on Linux. Rather than ship a runtime with a different contract, we disabled it for 0.1.0. `bun --runtime apple` fails with a message that points at the managed VM, and #367 tracks bringing it back with parity.
 
 ### Testing without root
 
@@ -391,7 +393,7 @@ pub struct BackendInstance {
 
 When Bun deploys an app with a port, it calls `service_map.register(&ServiceId::new("default", "redis"), 6379, None)`. That computes the namespaced VIP and creates an entry with an empty backend list. Every method that mutates or reads a service takes a `&ServiceId`, so the namespace is threaded through the whole path — the compiler won't let a call site forget it. As instances start and reach the Running state, Bun calls `add_backend()` with the real node IP and host port. When health checks fail, `set_backend_health()` flips the flag. When an app is stopped, `unregister()` removes everything and releases the VIP.
 
-There's one deliberate escape hatch. The `relish resolve <name>` CLI and Smoker's fault-injection targeting still take a bare name — a human typing `relish resolve redis` doesn't want to spell out the namespace. Those go through `resolve_by_name()`, which returns the first match in any namespace. Everything on the deploy and routing path uses the namespaced `resolve()`; the bare-name lookup is only for the human-facing edges.
+There's one deliberate escape hatch. Smoker's fault-injection targeting still takes a bare name, and so did `relish resolve <name>` until 0.2.2 — a human typing `relish resolve redis` doesn't want to spell out the namespace. Those go through `resolve_by_name()`, which returns the first match in any namespace (the `relish resolve` section below says why the CLI stopped). Everything on the deploy and routing path uses the namespaced `resolve()`; the bare-name lookup is only for the human-facing edges.
 
 On Linux, every mutation to the `ServiceMap` gets synced to the BPF hash maps in the kernel. On macOS and for ProcessGrill, the map still works — it powers `relish resolve` — but there are no eBPF programs reading it.
 
@@ -436,17 +438,20 @@ You can query the service map from the CLI:
 
 ```
 $ relish resolve redis
-Service:  redis
-VIP:      127.128.0.3
-Port:     6379
-Backends: 2/2 healthy
+Service:   redis
+Namespace: default
+VIP:       127.128.0.3
+Port:      6379
+Backends:  2/2 healthy
 
   INSTANCE             NODE               PORT     HEALTH
   redis-0              10.0.2.2           30891    healthy
   redis-1              10.0.4.2           31022    healthy
 ```
 
-This calls the Bun agent's `/v1/resolve/{name}` endpoint, which reads from the userspace `ServiceMap`. It works on all platforms, even without eBPF — useful for verifying that the service map is correct before debugging the kernel-side programs.
+This calls the Bun agent's `/v1/resolve` endpoint, which lists the services in the userspace `ServiceMap` that the caller's token may see. It works on all platforms, even without eBPF — useful for verifying that the service map is correct before debugging the kernel-side programs.
+
+The bare-name escape hatch above had a catch: with `redis` in both `prod` and `staging`, "the first match in any namespace" meant whichever the map's hash order happened to put first, and the output didn't say which. The 0.2.2 CLI review fixed it in the CLI rather than the agent. Relish fetches the whole list and `select_service` filters it: `--namespace` picks one, a unique name needs nothing, and an ambiguous name is refused with every namespace it exists in, so the human chooses instead of the hash function. The output now names the namespace too.
 
 ### Wiring the service map into the agent
 
@@ -474,7 +479,7 @@ Wiring it in production comes down to three questions, and each has a slightly a
 
 **What if it fails?** A node that can't load eBPF logs the error and keeps running without kernel enforcement. Refusing to start would be worse: the data plane (containers, health checks, the userspace service map) is entirely independent of the connect hook. Losing the hook degrades service resolution to "no VIP rewriting"; it doesn't take the node down.
 
-The verification for all of this lives in `tests/ebpf.rs`, gated twice — behind the `ebpf` feature *and* `RELIABURGER_EBPF_TESTS=1` — and run inside the Lima VM, never in `make ci`. Nine tests load the real program into a real kernel and check the whole chain: attach to the cgroup, write and read the backend map, rewrite a `connect()` to a VIP, deny a VIP with no backends (`EPERM`, remember), pass a non-VIP through untouched, and resolve `.internal` names through the DNS responder. Green there is the only proof that counts — the loader is Linux-kernel code, and no amount of macOS unit testing substitutes for the kernel actually accepting the program.
+The verification for all of this lives in `tests/ebpf.rs`, gated twice — behind the `ebpf` feature *and* `RELIABURGER_EBPF_TESTS=1` — and run inside the Lima VM, never in `make ci`. Its tests load the real program into a real kernel and check the whole chain: attach to the cgroup, write and read the backend map, rewrite a `connect()` to a VIP, deny a VIP with no backends (`EPERM`, remember), pass a non-VIP through untouched, and resolve `.internal` names through the DNS responder. Green there is the only proof that counts — the loader is Linux-kernel code, and no amount of macOS unit testing substitutes for the kernel actually accepting the program.
 
 ### Making the service map cluster-wide: the endpoint catalogue
 
@@ -1087,7 +1092,7 @@ pub fn generate_self_signed_cert()
     let cert = rcgen::generate_simple_self_signed(
         vec!["localhost".to_string(), "127.0.0.1".to_string()]
     )?;
-    Ok((CertificateDer::from(cert.cert), PrivateKeyDer::try_from(cert.key_pair.serialize_der())?))
+    Ok((CertificateDer::from(cert.cert), PrivateKeyDer::try_from(cert.signing_key.serialize_der())?))
 }
 ```
 
@@ -1287,7 +1292,7 @@ The rule for a forwarding header is: the proxy owns it. We strip whatever the cl
 
 ## Test count
 
-Phase 3 adds 114 tests, bringing the total to 702. The new tests cover IP calculation (boundary cases, wrapping, max containers per node), service map operations (register, resolve, backend health, unregister), routing table lookups (longest prefix match, round-robin, case insensitivity), firewall rule generation (policy, ordering, SSH exclusion), the DNS responder (`.internal` resolution, upstream passthrough), and eBPF integration (BPF map ops, connect rewrite, backend failover).
+Phase 3's new tests cover IP calculation (boundary cases, wrapping, max containers per node), service map operations (register, resolve, backend health, unregister), routing table lookups (longest prefix match, round-robin, case insensitivity), firewall rule generation (policy, ordering, SSH exclusion), the DNS responder (`.internal` resolution, upstream passthrough), and eBPF integration (BPF map ops, connect rewrite, backend failover).
 
 Most of these run under a plain `cargo test` on any machine. The privileged ones split by gate: `RELIABURGER_NETNS_TESTS=1` (network namespaces, needs root on Linux), `RELIABURGER_RUNC_TESTS=1` (runc containers), and `RELIABURGER_EBPF_TESTS=1` together with `--features ebpf` (the connect-rewrite tests, needs Linux and cgroup v2). On a Mac, `relish dev test` sets all three env vars and the feature flag inside the Lima VM, so one command runs the lot — no need to remember the matrix.
 

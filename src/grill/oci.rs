@@ -280,6 +280,9 @@ pub struct OciResources {
     pub cpu: Option<OciCpuResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<OciMemoryResources>,
+    /// The process and thread ceiling (`pids.max`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids: Option<OciPidsResources>,
     /// cgroup v2 native controller keys, written verbatim by runc into
     /// the workload's cgroup. We use it for the resource *requests* that
     /// the classic `cpu`/`memory` blocks can't express:
@@ -310,6 +313,12 @@ pub struct OciCpuResources {
 /// Memory resource limits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OciMemoryResources {
+    pub limit: i64,
+}
+
+/// Process-count limit: runc writes `limit` to the cgroup's `pids.max`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OciPidsResources {
     pub limit: i64,
 }
 
@@ -749,6 +758,7 @@ fn build_resources_from_ranges(
 
     if cpu_res.is_some() || memory_res.is_some() {
         Some(OciResources {
+            pids: None,
             cpu: cpu_res,
             memory: memory_res,
             unified,
@@ -802,6 +812,20 @@ pub fn generate_job_oci_spec(
             .unified
             .insert("memory.swap.max".into(), "0".into());
     }
+    if let Some(limit) = spec.pids {
+        // Only a reused executor's commands get a default; a fresh container
+        // without `pids` keeps no limit, like one without `cpu` or `memory`.
+        resources
+            .get_or_insert_with(|| OciResources {
+                cpu: None,
+                memory: None,
+                pids: None,
+                unified: BTreeMap::new(),
+            })
+            .pids = Some(OciPidsResources {
+            limit: i64::from(limit.get()),
+        });
+    }
 
     OciSpec {
         reusable_executor: false,
@@ -852,7 +876,7 @@ pub fn generate_job_oci_spec(
 /// `app`.
 ///
 /// The init runs `init.command` in its own image, or the app's when it names
-/// none, with the app's environment (secrets already decrypted), the app's
+/// none (on the host, for an `exec` or `script` app), with the app's environment (secrets already decrypted), the app's
 /// mounts (volumes, config files and identity, host paths already approved)
 /// and the app's cgroup. It takes nothing from the app's process settings and
 /// publishes no port. Building on the app's finished spec rather than its
@@ -867,7 +891,9 @@ pub fn generate_init_oci_spec(
     let from_image = init.image.is_some() || app.process.overrides.is_some();
     OciSpec {
         reusable_executor: false,
-        host_process: false,
+        // A host app's init that names no image runs on the host like its
+        // app, so the mixed runtime routes it there too (#935).
+        host_process: app.host_process && init.image.is_none(),
         initialiser: true,
         root: OciRoot {
             path: root,
@@ -906,6 +932,14 @@ pub fn generate_init_oci_spec(
 mod tests {
     use super::*;
     use crate::config::types::{ConfigFileSpec, VolumeSpec};
+
+    #[test]
+    fn inline_config_file_name_is_the_first_eight_bytes_of_the_path_digest() {
+        assert_eq!(
+            inline_config_file_name(Path::new("/etc/app.conf")),
+            "8670dcb679766bcc"
+        );
+    }
 
     fn minimal_app() -> AppSpec {
         toml::from_str(r#"image = "test:v1""#).unwrap()
@@ -952,6 +986,32 @@ mod tests {
         // Without an image of its own it inherits the app's.
         let inherited = generate_init_oci_spec(&init_container(None, &["true"]), &app);
         assert_eq!(inherited.root.path, "myapp:v1");
+    }
+
+    /// #935: an `exec` or `script` app's init container that names no image
+    /// runs on the host like its app, so it records as a host spec. One
+    /// that names an image, or an image app's init, stays a container.
+    #[test]
+    fn an_init_container_of_a_host_app_records_as_a_host_spec() {
+        for host_app in [r#"exec = "/bin/sleep""#, r#"script = "sleep 60""#] {
+            let app = app_oci(&toml::from_str(host_app).unwrap());
+            assert!(app.host_process, "{host_app}");
+
+            let init = generate_init_oci_spec(&init_container(None, &["/bin/true"]), &app);
+            assert!(init.host_process, "{host_app}: init must be a host spec");
+            assert_eq!(init.root.path, HOST_ROOT);
+
+            let own_image =
+                generate_init_oci_spec(&init_container(Some("migrate:v2"), &["migrate"]), &app);
+            assert!(
+                !own_image.host_process,
+                "{host_app}: an init with its own image is a container"
+            );
+        }
+
+        let image_app = app_oci(&minimal_app());
+        let init = generate_init_oci_spec(&init_container(None, &["true"]), &image_app);
+        assert!(!init.host_process, "an image app's init is a container");
     }
 
     #[test]
@@ -1877,6 +1937,31 @@ mod tests {
         );
         assert!(oci.process.env.is_empty());
         assert!(oci.linux.resources.is_none());
+    }
+
+    #[test]
+    fn a_fresh_job_container_enforces_an_explicit_pids_limit() {
+        let mut spec = minimal_job();
+        spec.pids = Some(crate::config::types::PidsLimit::try_from(512).unwrap());
+        let oci = generate_job_oci_spec("migrate", "default", &spec, "/cg", None);
+        let resources = oci.linux.resources.clone().unwrap();
+        assert_eq!(resources.pids, Some(OciPidsResources { limit: 512 }));
+        // A pids limit alone sets no CPU or memory limit.
+        assert_eq!((resources.cpu, resources.memory), (None, None));
+        // runc reads the OCI field `linux.resources.pids.limit`.
+        let json = serde_json::to_value(&oci).unwrap();
+        assert_eq!(
+            json["linux"]["resources"]["pids"],
+            serde_json::json!({ "limit": 512 })
+        );
+        // It combines with CPU and memory rather than replacing them.
+        spec.memory = Some(ResourceRange::parse_memory("64Mi").unwrap());
+        let combined = generate_job_oci_spec("migrate", "default", &spec, "/cg", None)
+            .linux
+            .resources
+            .unwrap();
+        assert_eq!(combined.pids, Some(OciPidsResources { limit: 512 }));
+        assert!(combined.memory.is_some());
     }
 
     // -- OOM score (#984) -----------------------------------------------------

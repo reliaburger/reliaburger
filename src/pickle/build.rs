@@ -122,10 +122,8 @@ pub enum BuildError {
     #[error("destination validation failed: {0}")]
     InvalidDestination(#[from] ConfigError),
 
-    #[error(
-        "namespace mismatch: build is in namespace {build_ns:?} but destination would push to {dest_ns:?}"
-    )]
-    NamespaceMismatch { build_ns: String, dest_ns: String },
+    #[error("destination pushes to namespace {namespace:?}, which does not exist")]
+    UnknownNamespace { namespace: String },
 
     #[error("failed to tar build context: {reason}")]
     TarFailed { reason: String },
@@ -211,7 +209,7 @@ pub fn tar_context(context_dir: &Path) -> Result<Vec<u8>, BuildError> {
 pub fn digest_of(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(data);
-    format!("sha256:{hash:x}")
+    format!("sha256:{}", hex::encode(hash))
 }
 
 /// Prepare a buildah build job from a BuildSpec.
@@ -938,28 +936,25 @@ pub fn destination_repository(spec: &BuildSpec) -> Result<String, BuildError> {
     Ok(parse_pickle_destination(&spec.destination)?.name)
 }
 
-/// Check that a build's namespace is allowed to push to the destination.
+/// Check that a build's namespace is allowed to push to the destination,
+/// and that the namespace the destination names exists.
+///
+/// A build that declares a `namespace` must push into it
+/// ([`crate::config::build::check_destination_namespace`]); the submit
+/// handler also runs that check on its own, without a council.
 pub fn check_namespace_scope(
     spec: &BuildSpec,
     existing_namespaces: &[String],
 ) -> Result<(), BuildError> {
+    crate::config::build::check_destination_namespace(spec)?;
     let dest = parse_pickle_destination(&spec.destination)?;
 
-    if let Some((ns_prefix, _)) = dest.name.split_once('/') {
-        if let Some(build_ns) = &spec.namespace
-            && ns_prefix != build_ns
-        {
-            return Err(BuildError::NamespaceMismatch {
-                build_ns: build_ns.clone(),
-                dest_ns: ns_prefix.to_string(),
-            });
-        }
-        if !existing_namespaces.iter().any(|n| n == ns_prefix) {
-            return Err(BuildError::NamespaceMismatch {
-                build_ns: spec.namespace.clone().unwrap_or_default(),
-                dest_ns: ns_prefix.to_string(),
-            });
-        }
+    if let Some((ns_prefix, _)) = dest.name.split_once('/')
+        && !existing_namespaces.iter().any(|n| n == ns_prefix)
+    {
+        return Err(BuildError::UnknownNamespace {
+            namespace: ns_prefix.to_string(),
+        });
     }
 
     Ok(())
@@ -1213,6 +1208,14 @@ mod tests {
     #[test]
     fn digest_of_different_data_differs() {
         assert_ne!(digest_of(b"hello"), digest_of(b"world"));
+    }
+
+    #[test]
+    fn digest_of_matches_the_fips_known_answer() {
+        assert_eq!(
+            digest_of(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     // --- execute_build ---
@@ -1859,8 +1862,26 @@ mod tests {
         let namespaces = vec!["production".to_string(), "staging".to_string()];
         assert!(matches!(
             check_namespace_scope(&spec, &namespaces),
-            Err(BuildError::NamespaceMismatch { .. })
+            Err(BuildError::InvalidDestination(_))
         ));
+    }
+
+    #[test]
+    fn namespace_scope_rejects_a_destination_namespace_that_does_not_exist() {
+        let spec = spec_with_destination("pickle://ghost/myapp:v1");
+        let namespaces = vec!["production".to_string()];
+        assert!(matches!(
+            check_namespace_scope(&spec, &namespaces),
+            Err(BuildError::UnknownNamespace { .. })
+        ));
+    }
+
+    #[test]
+    fn namespace_scope_rejects_a_bare_destination_in_a_namespace() {
+        let mut spec = spec_with_destination("pickle://myapp:v1");
+        spec.namespace = Some("production".into());
+        let namespaces = vec!["production".to_string()];
+        assert!(check_namespace_scope(&spec, &namespaces).is_err());
     }
 
     // --- destination scope / push authorisation (Phase 16 B) ---

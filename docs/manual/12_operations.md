@@ -209,6 +209,59 @@ up, so setup refuses and names both versions:
 cluster "laptop" was set up with v0.1.0, and this installer is v0.1.1. Before 1.0, a release that changes the cluster's protocol or state format can't take over an older cluster: run `relish local destroy --yes` and set it up again, then re-apply your apps. …
 ```
 
+### A walk through an upgrade
+
+The same steps in order, for a three-node cluster moving to a release that
+keeps its formats (`v0.2.1` stands for that release). No published release
+can roll onto its predecessor yet, so there's no script for this walk: run it
+when your cluster and the release share a pair.
+
+1. Check that it can roll. `upgrade check` compares the release's pair with
+   the cluster's; `bun --compatibility` on the downloaded binary says the
+   same thing locally.
+
+   ```sh
+   relish upgrade check
+   ```
+
+2. Make your countersigning key, once. Put the `ed25519:…` public key it
+   prints in every node's `[upgrades] external_signing_key` and restart them.
+
+   ```sh
+   relish dev keygen --out keys/
+   ```
+
+3. Read the plan: workers first, then council members, the leader last.
+
+   ```sh
+   relish upgrade plan v0.2.1
+   ```
+
+4. Start it. relish downloads each node's build, countersigns it with your
+   key and pushes it to the cluster's registry; each node fetches it, checks
+   both signatures and swaps itself.
+
+   ```sh
+   relish upgrade start v0.2.1 --external-key keys/release.key
+   relish upgrade status
+   ```
+
+5. Confirm every node runs the new commit.
+
+   ```sh
+   relish nodes
+   relish wtf
+   ```
+
+6. If a node refused or reverted, the upgrade pauses. Fix the cause and
+   resume, end it if no node moved yet, or walk every node back.
+
+   ```sh
+   relish upgrade resume
+   relish upgrade abort
+   relish upgrade rollback v0.2.0
+   ```
+
 ### When bun refuses its data directory
 
 Swap in a binary with a different state format and bun won't start. The first
@@ -275,6 +328,21 @@ as `relish compile`. The configured `path` is the root: its own name adds no
 namespace, and defaults outside it are not inherited. A workload's explicit
 namespace wins. GitOps reconciles deletions too: delete an app from the
 repository and it goes from the cluster.
+
+To see it on your laptop, run the GitOps demo from a checkout. It starts a
+one-node cluster, pushes `examples/gitops/repository` (a repository with
+`_defaults.toml` and two namespace directories) to a `file://` repository,
+applies an app by hand, and turns GitOps on with `examples/node/gitops.toml`.
+Then it deletes an app from the repository and checks that GitOps deleted it
+from the cluster, and that the hand-applied app survived every sync:
+
+```sh
+scripts/demo/gitops.sh
+```
+
+Like the rollout demo, it shows Bun's memory and CPU at every step and ends
+with their average and peak ([measuring a
+demo](01_deploy-an-app.md#rolling-deploys) has the details).
 
 ### What GitOps owns
 
@@ -509,6 +577,41 @@ When a majority is gone but not every voter (two of three, say), the survivor
 can't regrow the council alone, because changing membership needs a quorum
 too. Stop it and recover it as above: the dead voters don't answer, so the
 check passes without `--force`.
+
+### A walk through a recovery
+
+The whole council is gone, and one worker survives with backups turned on
+(`[cluster.backup] url = "file:///var/backups/council"` here):
+
+1. See what the backups hold.
+
+   ```sh
+   relish council backups --from file:///var/backups/council
+   ```
+
+2. Stop Bun on the surviving node (`systemctl stop reliaburger`, say), then
+   restore the newest usable backup into its data directory.
+
+   ```sh
+   relish council recover --data-dir /var/lib/reliaburger/data \
+     --from file:///var/backups/council --master-key /etc/reliaburger/master.key
+   ```
+
+3. Start Bun again. It comes up as a one-voter council on a new recovery
+   epoch, and the reconciler regrows the council as nodes join.
+
+   ```sh
+   relish council status
+   relish status
+   ```
+
+4. Before an old voter comes back, stop it and wipe its replaced council
+   state, so it rejoins as a fresh member (next section). It never heard of
+   the recovery, so it isn't fenced yet, hence `--force`.
+
+   ```sh
+   relish council re-enrol --data-dir /var/lib/reliaburger/data --force
+   ```
 
 ### When the old voters come back
 

@@ -17,9 +17,11 @@ run it.
 | Snapshot tests | CLI output, rendered config and TUI frames stay exactly as reviewed | [`insta`](https://insta.rs) snapshots, e.g. [`src/relish/snapshots/`](../src/relish/snapshots) | `make test` |
 | Integration suite | Real Bun and Relish processes over HTTP, TLS and the registry | [`tests/suite/`](../tests/suite) | `make test` |
 | Doctests | Examples in doc comments compile and run | `///` blocks | `make test-doc` |
+| Doc snippets | Every `relish` command and TOML block a reader copies from the manual, the READMEs and the whitepaper parses with the real code ([below](#doc-snippets)) | [`tests/suite/doc_snippets.rs`](../tests/suite/doc_snippets.rs) | `make test` |
 | Lint and format | Clippy with warnings as errors, all features and none; the macOS job runs the all-features pass only, because that one holds the macOS-only code | [`Makefile`](../Makefile) | `make lint`, `make lint-macos`, `make fmt-check` |
 | Coverage floor | Line coverage of the portable suite never drops below 78.65% | `COVERAGE_MIN_LINES` in the [`Makefile`](../Makefile) | `make coverage` |
 | Dependency audit | No new RustSec advisory; every exception is dated | [`security.yml`](../.github/workflows/security.yml), [exceptions](qualification/2026-09-18-dependency-exceptions.md) ([12 Oct](qualification/2026-10-12-dependency-exceptions.md) and [21 Oct](qualification/2026-10-21-dependency-exceptions.md) additions) | `make audit` |
+| Dependency lag | Nothing: a report, never a failure. It lists what `cargo update` would move and every crate a major version behind, for the refresh at the start of each minor release ([`releasing.md`](releasing.md#refreshing-dependencies)); [Dependabot](../.github/dependabot.yml) opens the weekly compatible refresh | [`security.yml`](../.github/workflows/security.yml) prints it in the weekly job summary | `make outdated` |
 | CI scripts | Job selection, ignored-test owners, JUnit keeping, the benchmark baseline and the flakes register, against fixture repositories and the real workflow | [`scripts/ci/test_*.py`](../scripts/ci) | `make test-ci-scripts` |
 | Flakes register | Every open row of [`flakes.md`](flakes.md) links an issue that is still open | [`flakes_register.py`](../scripts/ci/flakes_register.py), run by [`flakes.yml`](../.github/workflows/flakes.yml) nightly and on pull requests that edit the register | `python3 scripts/ci/flakes_register.py check` (needs `gh`) |
 | Ignored-test owners | Every `#[ignore]` reason names who runs it ([below](#who-runs-an-ignored-test)) | [`ignored_owners.py`](../scripts/ci/ignored_owners.py) | `make check-ignored` |
@@ -71,6 +73,48 @@ nothing before nextest: in CI the cluster and acceptance suites run from the
 `build tests` job's nextest archive, and the `qualify-*.sh` scripts already
 build with `cargo test --no-run`.
 
+### Doc snippets
+
+The manual ships inside `relish`, so a wrong snippet ships in the binary.
+[`doc_snippets.rs`](../tests/suite/doc_snippets.rs) reads
+`docs/manual/*.md`, `README.md`, `docs/README.md` and `docs/whitepaper.md`
+and checks three things:
+
+- **Shell blocks** (`sh`, `bash`, `shell`, `console`): every `relish`
+  invocation parses with the real CLI under `RELISH_PARSE_ONLY=1`. It finds
+  them as the shell would: after a `$ ` prompt, across `\` continuations,
+  behind `sudo`, `VAR=…` or `limactl shell VM`, inside `$(…)`, and as
+  `target/debug/relish` or `cargo run --bin relish --`. Comments and
+  redirections are dropped, and a `<PLACEHOLDER>` becomes `1`. In a
+  `console` block only prompt lines count.
+- **TOML blocks**: each top-level table goes to the type that reads it.
+  `[app.*]`, `[job.*]`, `[namespace.*]`, `[permission.*]` and `[build.*]`
+  go through `Config::parse` and `validate()`; `[[step]]` files through the
+  chaos scenario loader; `[[cohort]]` files through the batch manifest type;
+  everything else through `NodeConfig::parse`, which rejects a misspelt
+  table by name. A block mixing workload and node tables is split and both
+  halves are checked.
+- **Inline spans** in prose (`` `relish …` ``): the leading words must name a
+  real subcommand, and every flag must be one that subcommand takes. Missing
+  arguments are fine; prose rarely spells out a whole command.
+
+A snippet that can't pass says why, on the line before its fence:
+
+| Marker | Meaning | Checked? |
+|---|---|---|
+| `<!-- snippet: fragment -->` | Not complete enough to parse alone. Prefer completing it (add the `[app.NAME]` and `image` lines a sub-table needs) | No |
+| `<!-- snippet: planned #N -->` | Shows a feature issue N will build | No |
+| `<!-- snippet: pending #N -->` | Shows CLI or config issue N is adding | Yes, and it must still fail: when issue N lands the test asks for the marker to go |
+
+An inline span for a command that doesn't exist yet is either followed by
+` *(planned)*` in the text or listed in `INLINE_PENDING` with its issue, and
+it too must keep failing. `planned` and `pending` must name an issue in the
+test's `OPEN_ISSUES` list (CI has no GitHub token to ask); when an issue
+closes, drop it from that list and the markers naming it fail. An unknown
+marker, or a marker that isn't right before a fence, fails the test rather
+than skipping anything. Run the marker test with `--no-capture` to see every
+opt-out.
+
 ## The agent loop's turn budget
 
 Each node's agent runs one loop that owns all of the node's state, one turn at
@@ -108,10 +152,17 @@ ignored by default and run by their own targets and CI jobs
 | Linux runtime | runc, user namespaces, eBPF service discovery, nftables, Btrfs, rootless runc | [`tests/owned_runc.rs`](../tests/owned_runc.rs), [`tests/ebpf.rs`](../tests/ebpf.rs), [`tests/owned_network.rs`](../tests/owned_network.rs), [`tests/owned_rootless.rs`](../tests/owned_rootless.rs) | `make test-linux` |
 | Crash recovery | Bun killed at every awkward moment: before adoption, mid-rollout, with owners alive | [`tests/oci_crash.rs`](../tests/oci_crash.rs), [`tests/job_recovery.rs`](../tests/job_recovery.rs), [`tests/registry_recovery.rs`](../tests/registry_recovery.rs), [`qualify-oci-interruptions.sh`](../scripts/release/qualify-oci-interruptions.sh) | `make test-linux` |
 | Multi-node clusters | Leader failover, council self-healing and full-loss recovery, placement, gossip, an image surviving the loss of the node it was pushed to (Linux only) | [`tests/cluster_failover.rs`](../tests/cluster_failover.rs), [`tests/council_self_healing.rs`](../tests/council_self_healing.rs), [`tests/council_disaster_recovery.rs`](../tests/council_disaster_recovery.rs), [`tests/placement.rs`](../tests/placement.rs), [`tests/cluster_task_arrays.rs`](../tests/cluster_task_arrays.rs), [`tests/registry_durability.rs`](../tests/registry_durability.rs) | `make test-cluster` |
+| Feature demos | [`scripts/demo/rollout.sh`](../scripts/demo/rollout.sh) (roll forward, roll back, a bad version rolled back and marked `RolloutFailed`) and [`scripts/demo/gitops.sh`](../scripts/demo/gitops.sh) (a `file://` repository synced, an app deleted from it, a hand-applied app left alone) run to completion on a one-node cluster each starts through [`lib.sh`](../scripts/demo/lib.sh); a step that doesn't do what it says fails the demo, and each must print the resource readout and summary [`resources.py`](../scripts/demo/resources.py) samples ([`test_demo_resources.py`](../scripts/ci/test_demo_resources.py) covers its parsing and arithmetic). [`test_demo_scripts.py`](../scripts/ci/test_demo_scripts.py) checks on every run that they stop on the first error and swallow nothing | [`tests/demos.rs`](../tests/demos.rs) | `make test-cluster`; by hand `make rollout-demo`, `make gitops-demo` |
 | Self-upgrade | Rolling binary upgrades and rollbacks with real signed binaries, workloads kept running | [`tests/self_upgrade.rs`](../tests/self_upgrade.rs), [`tests/self_upgrade_cluster.rs`](../tests/self_upgrade_cluster.rs) | `make test-upgrade` |
 | Wall-clock acceptance | Timeouts, back-offs and leases that can't be tested with a paused clock | ignored tests in [`tests/integration.rs`](../tests/integration.rs) | `make test-slow` |
 | Standard registry clients | docker, podman, skopeo and crane log in with an API token, verify the cluster CA, push and pull layers back through Pickle's TLS listener; a wrong token, another cluster's CA and an out-of-namespace push are refused | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (Linux, with the four clients and `sudo scripts/standard-clients-host.sh --provision`) |
 | Benchmarks | Gossip convergence from 5 to 1,000 nodes, one scheduling pass (`plan_pass`) over 1,000 and 10,000 nodes, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` ([which job](#benchmarks-in-ci)) |
+
+A test that runs a host command names a path every Unix host has. macOS has
+`/bin/sh`, `/bin/echo` and `/bin/sleep`, but keeps `true` and `false` only in
+`/usr/bin`, so a job naming `/bin/false` is refused there as a missing binary
+([#934](https://github.com/reliaburger/reliaburger/issues/934)). For a command
+that fails, use `/bin/sh -c "exit 1"`.
 
 The eBPF tests load the object embedded in the library under test, as Bun
 does, and never search the target directory. Worktrees can share one
@@ -151,7 +202,12 @@ The image-backed delegated-job cases live in `tests/owned_task_arrays.rs` and
 run through `make test-linux`, where the warmed digest-pinned mirror remains
 reachable. The shared-runc leader-loss case refuses to start without it: its
 cold executors read the image manifest dozens of times, which trips the public
-registry's anonymous rate limit (#786). Two of them start three in-process nodes (gossip, Raft, the API
+registry's anonymous rate limit (#786). Cases that must interrupt a real
+cold pull put `tests/support/slow_registry.rs` in front of that mirror: a
+loopback registry that forwards manifests at full speed and paces every blob
+body to 64 KiB a second, so the pinned workload image takes about half a
+minute to pull and a test can cancel it, or let a deadline expire, mid-layer
+(#740). Two of them start three in-process nodes (gossip, Raft, the API
 and the leader loop, as `bun --cluster` wires them) with real shared-runc or
 cgroup host executors, and stop the leader's control plane while it runs its
 own share of an array: no accepted outcome may be lost or counted twice, and
@@ -201,13 +257,41 @@ October, #936), so a benchmark over the limit gets one more chance: the step
 re-runs just those benchmarks (`--remeasure`, which appends an anchored
 Criterion filter naming them to `cargo bench --bench task_arrays --`), compares
 again, and fails a benchmark only when it's over the limit on both
-measurements. The median check isn't re-measured. The job summary shows each
-benchmark's ratio, its ratio against the rest and the runner factor (the
-median), plus both measurements of any benchmark it re-measured. The means of the 12 October runs are
-a fixture in
+measurements. The median check isn't re-measured.
+
+That didn't save `storage/ledger_and_index_64k` (#1038). Most of its time
+goes on more than 30 fsyncs, so it measures the runner's disk, and a slow disk
+can stay slow for the whole job: in the 0.2.1 merge queue for PR #992 it was
+3.20× the rest of its run and 2.93× on the re-measure. In the eight runs from
+12 to 18 October where it alone was over the limit, its ten samples ranged from about 15 ms to as much as 134 ms
+within one benchmark, where a healthy runner keeps them within a few per cent,
+and no other benchmark in those runs was above 1.11× the rest. So the compare
+step names it with `--report-only`: it's measured and shown, marked "report
+only", but never fails the run, is never re-measured, and isn't part of the
+median any other benchmark is measured against. Its twin,
+`storage/ledger_and_index_64k_tmpfs`, does the same writes in a directory on
+`/dev/shm`, where an fsync costs nothing, and is gated like everything else
+once `main` has recorded a baseline for it (until then it's listed as new).
+That still catches a ledger or index change that makes encoding, writing or
+indexing the records slower. What it can't catch is a change that adds
+fsyncs, since those cost nothing on tmpfs; that shows up only in the on-disk
+benchmark's reported ratio. The tmpfs twin runs on Linux only: on macOS
+`make bench-task-arrays` skips it with a note. A normalising disk reference in
+the same job was the other option, and the samples ruled it out: the disk's
+speed changes several-fold within one benchmark's few seconds, so a reference
+measured before or after it sees a different disk.
+
+The job summary shows each benchmark's ratio, its ratio against the rest and
+the runner factor (the median), plus both measurements of any benchmark it
+re-measured. The means of the 12 October runs are a fixture in
 [`fixtures/task-array-runs-2026-10-12.json`](../scripts/ci/fixtures/task-array-runs-2026-10-12.json):
 `make test-ci-scripts` checks that they pass and that a benchmark pushed to
-2.1× the rest of any of them fails. The gate matches benchmarks by name, so
+2.1× the rest of any of them fails. The eight disk-stall runs are a second
+fixture,
+[`fixtures/task-array-disk-stalls-2026-10.json`](../scripts/ci/fixtures/task-array-disk-stalls-2026-10.json):
+each fails with every benchmark gated, passes with the on-disk ledger report
+only, and still fails when any gated benchmark, the tmpfs twin included, is
+pushed to 2.1× the rest. The gate matches benchmarks by name, so
 a benchmark whose workload changes gets a new name (as
 `state/json_encode_1m_x64` did, #872): under its old name it would be
 compared with `main`'s baseline for the old workload, and a new name starts
@@ -263,6 +347,17 @@ their own. When GitHub retargets a stacked pull request,
 [`ci-retarget.yml`](../.github/workflows/ci-retarget.yml) reruns CI with the
 new base, so the new base's set applies without another push. The fixtures in
 [`test_select_jobs.py`](../scripts/ci/test_select_jobs.py) cover each case.
+
+Every job that downloads an artefact (the cluster and acceptance jobs fetch
+the nextest archive, the evidence gate fetches every envelope, and the V02
+loops do both) gives each download 5 minutes and retries a failed one once.
+A download normally takes a minute or two, but one stalled for 13 minutes and
+pushed `acceptance` past its 40-minute limit
+([#977](https://github.com/reliaburger/reliaburger/issues/977)). Now a stall
+costs at most 10 minutes, and the second attempt usually recovers it. The
+jobs keep their own limits.
+[`test_ci_workflow.py`](../scripts/ci/test_ci_workflow.py) fails any download
+step without its own limit or its retry.
 
 ### Portable macOS in three shards
 
@@ -326,6 +421,23 @@ required case, a failed whole command, or mismatched commit, run, attempt, host,
 selector or artifact. Archived suites also bind their executable/archive bytes
 to the successful current builder. Keep the failure artifacts; they explain a
 failure but cannot qualify another gate.
+
+The cluster and acceptance jobs extract the downloaded archive once each
+([#1050](https://github.com/reliaburger/reliaburger/issues/1050)).
+`workflow_adapter.py extract` checks the archive's digest against the build
+job's output, runs `cargo nextest list --archive-file tests.tar.zst
+--extract-to . --list-type binaries-only`, and writes
+`target/archive-extraction.json`: the archive digest, the command and the
+digests of `target/nextest/binaries-metadata.json` and `cargo-metadata.json`.
+Its step output carries the receipt's digest, and every owner in the job takes
+it as `--archive-extraction`. Each owner's `list` and `run` then use
+`--binaries-metadata`, `--cargo-metadata`, `--target-dir-remap target` and
+`--workspace-remap .`, and check the two metadata files before discovery. The
+extracted binaries aren't rehashed: they never leave the job. `aggregate`
+refuses an archived owner whose selectors open the archive again, whose
+metadata differs from its job's receipt, or whose receipt names another
+archive or another nextest. A re-run job extracts again for its own attempt,
+even when the archive came from an earlier one.
 
 "Re-run failed jobs" works without a new commit. GitHub gives the re-run jobs
 attempt N+1 and carries over the outputs and artifacts of the jobs that passed
@@ -439,7 +551,7 @@ after the first step.
 |---|---|---|
 | Staged install | `curl \| sh` against the exact signed candidate, from empty caches, then the homepage tour and a full teardown | [`qualify-staged-install.sh`](../scripts/release/qualify-staged-install.sh), [records](qualification/) |
 | Sustained soak, fast tier | About an hour on a 10-minute cycle: every fault kind (killed agents, powered-off VMs, chaos faults, upgrade round trips) and every special (graceful restart, quorum loss, every VM off), with invariants checked every 30 seconds. Run after each round of fixes; it catches what shows up in the first hour | [`qualify-sustained.sh --tier fast`](../scripts/release/qualify-sustained.sh), [plan](plans/2026-09-25-v02-sustained.md); up to about 4 h without upgrade walks on a hosted Linux runner with [`soak.yml`](../.github/workflows/soak.yml) ([runbook](releasing.md#soaking-a-candidate-in-ci)) |
-| Job qualification, fast tier (0.2.0 exit gate, D18-C) | The same soak with jobs at the #668 target (1,390 accepted a second by default) and a node-level fault every cycle: inter-node delay, a full disk, slow fsync. About an hour compressed; every job mode overlaps every fault kind | [`qualify-jobs-sustained.sh --tier fast`](../scripts/release/qualify-jobs-sustained.sh), [plan](plans/2026-10-10-plan-release-job-soak.md#job-qualification-tiers-686-decision-d18-c) |
+| Job qualification, fast tier (0.2.0 exit gate, D18-C) | The same soak with jobs at the #668 target (1,390 accepted a second by default) and a node-level fault every cycle: inter-node delay, a full disk, slow fsync. About an hour compressed; every job mode overlaps every fault kind | [`qualify-jobs-sustained.sh --tier fast`](../scripts/release/qualify-jobs-sustained.sh), [plan](plans/archive/2026-10-10-plan-release-job-soak.md#job-qualification-tiers-686-decision-d18-c) |
 | Final soak | 8 hours on the hourly schedule, once per final candidate: the job soak above on the full schedule, so it checks everything the V02 final does as well as the jobs, and it's the only final soak the gate runs (maintainer decision, 17 October 2026, [#991](https://github.com/reliaburger/reliaburger/issues/991)). It's there for slow accumulation: bun memory growth, a registry 503 and a memory alert first showed up between 4.8 and 6.2 hours into the 12-hour run of 25 September. Only a clean final-tier run passes V02. Records the September plan's measurements without gating on them, against targets restated for a soak (maintainer decision, 15 October 2026, [#668](https://github.com/reliaburger/reliaburger/issues/668)). `qualify-sustained.sh --tier final` still runs the V02 final alone, outside the gate | [`qualify-jobs-sustained.sh --tier final`](../scripts/release/qualify-jobs-sustained.sh), [plans](plans/2026-09-25-v02-sustained.md), [runbook](releasing.md#staging-a-candidate) |
 | Loops | Upgrade, council recovery and lease tests repeated for hours on Linux x86, Linux Arm and macOS | [`v02-loops.yml`](../.github/workflows/v02-loops.yml) |
 | Power cut and reboot | A disposable VM forced off mid-write for each storage path (exporters, leases, council backups), and rebooted with containers and eBPF network rules in place, 10 times per lane, or 25 when the release changes storage, locking or ownership (0.2.0 and 0.2.1 ran 25); every acknowledged write and every owned resource must survive ([above](#pulling-the-plug)) | [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh), [`qualify-oci-reboot.sh`](../scripts/release/qualify-oci-reboot.sh), [`qualify-discovery-reboot.sh`](../scripts/release/qualify-discovery-reboot.sh), [0.2.1 record](qualification/2026-10-21-power-cut-reboot.md) |
@@ -531,5 +643,5 @@ content and image catalogue into the new fixture to avoid registry rate
 limits. It preserves shifted rootfs ownership and the catalogue's format stamp,
 so incompatible candidates still refuse it. It never reuses the
 job state or owner journals. The small smoke run is not release
-qualification. The [mixed job soak plan](plans/2026-10-10-plan-release-job-soak.md)
+qualification. The [mixed job soak plan](plans/archive/2026-10-10-plan-release-job-soak.md)
 describes the job gates included in the unchanged staged fast/final tiers.

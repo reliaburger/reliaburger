@@ -174,6 +174,7 @@ impl TestContext {
                         return client
                             .exec(app, &self.namespace, command)
                             .await
+                            .map(|answer| answer.output)
                             .map_err(|error| {
                                 format!("workload inspection failed on {node}: {error}")
                             });
@@ -1561,7 +1562,7 @@ mod tests {
         .with_no_client_auth()
         .with_single_cert(
             vec![certificate.cert.der().clone()],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der())
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der())
                 .into(),
         )
         .unwrap();

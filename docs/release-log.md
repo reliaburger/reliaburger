@@ -63,7 +63,8 @@ the distrusted emSign intermediates on outbound HTTPS, as 0.2.0's do. Cluster
 mTLS isn't affected, `main` has the patched versions, and 0.2.2 is the first
 release built with them
 ([#1269](https://github.com/reliaburger/reliaburger/issues/1269)). It's also
-the last release with an Intel macOS build
+the last release with an Intel macOS CLI (`relish-macos-x86_64`); from
+0.2.2 the macOS build is Apple silicon only
 ([#1018](https://github.com/reliaburger/reliaburger/issues/1018)).
 
 ## 0.2.0: A million jobs

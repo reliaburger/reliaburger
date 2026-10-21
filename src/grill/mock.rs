@@ -953,7 +953,11 @@ impl super::Grill for MockGrill {
         Ok(*self.pid.lock().unwrap())
     }
 
-    async fn exec(&self, instance: &InstanceId, _command: &[String]) -> Result<String, GrillError> {
+    async fn exec(
+        &self,
+        instance: &InstanceId,
+        _command: &[String],
+    ) -> Result<super::ExecOutput, GrillError> {
         self.calls
             .lock()
             .unwrap()
@@ -967,6 +971,10 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .pop_front()
+            .map(|output| super::ExecOutput {
+                output,
+                exit_code: 0,
+            })
             .ok_or_else(|| GrillError::NotFound {
                 instance: instance.clone(),
             })

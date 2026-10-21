@@ -14,9 +14,11 @@ import re
 import subprocess
 import tempfile
 
+# macOS is Apple silicon only: 0.2.1 was the last release with an Intel macOS
+# build (#1018).
 PLATFORMS = {
     "bun": ("linux-aarch64", "linux-x86_64"),
-    "relish": ("linux-aarch64", "linux-x86_64", "macos-aarch64", "macos-x86_64"),
+    "relish": ("linux-aarch64", "linux-x86_64", "macos-aarch64"),
 }
 GUEST_METADATA = "guest-image-metadata.json"
 # SubjectPublicKeyInfo header for a 32-byte Ed25519 public key (RFC 8410).

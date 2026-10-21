@@ -491,6 +491,8 @@ mod tests {
         let task_guard = guard.clone();
         let injection = tokio::spawn(async move {
             let request = FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: crate::smoker::types::FaultType::CouncilPartition {
                     peers: vec!["node-b".to_string()],
                 },
@@ -567,6 +569,7 @@ mod tests {
             .complete_injection(
                 &operation,
                 &FaultSummary {
+                    task_index: None,
                     id: 7,
                     fault_type: "node-kill".into(),
                     target_service: String::new(),
@@ -635,6 +638,7 @@ mod tests {
                 .complete_injection(
                     &operation,
                     &FaultSummary {
+                        task_index: None,
                         id,
                         fault_type: "node-kill".to_string(),
                         target_service: String::new(),
