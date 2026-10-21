@@ -1597,20 +1597,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     // (#505). Its steps take turns with everything below:
                     // this branch yields once after each step, and the one
                     // under commands takes the step when nothing else waits.
-                    // No step runs while a step's write is in flight.
+                    // No step runs while a step's or a probe's write is in
+                    // flight.
                     _ = std::future::ready(()), if self.consumer_syncs.step_first()
                         && !self.discovery_write_in_flight() => {
                         let turn = self.begin_consumer_sync_turn();
                         self.continue_consumer_sync().await;
                         turn
                     }
-                    // A step's write that outlasted its turn has landed
-                    // (#890): take the step's remainder now.
+                    // A step's or a health probe's write that outlasted its
+                    // turn has landed (#890, #1255): take the step's
+                    // remainder, or install the probe's publication, now.
                     outcome = Self::discovery_write_done(&mut self.discovery_ownership),
                         if self.discovery_write_in_flight() => {
-                        let turn = self.begin_consumer_sync_turn();
-                        self.land_discovery_write(outcome).await;
-                        self.continue_consumer_sync().await;
+                        let turn = self.begin_landing_turn();
+                        self.land_write_in_flight(outcome).await;
                         turn
                     }
                     Some(op) = self.deploy_ops_rx.recv() => {
@@ -1670,6 +1671,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     fn begin_consumer_sync_turn(&mut self) -> super::loop_meter::Turn {
         let step = self.consumer_syncs.next_step_label();
         self.begin_turn(LoopBranch::FollowUp, Some(step))
+    }
+
+    /// Start the turn that takes a write in flight once it has landed,
+    /// named after whoever waited for the write.
+    fn begin_landing_turn(&mut self) -> super::loop_meter::Turn {
+        if self.health_write_in_flight() {
+            return self.begin_turn(LoopBranch::DeployOp, Some("health_probe_result/landed"));
+        }
+        self.begin_consumer_sync_turn()
     }
 
     /// When the turn in progress must give up on a runtime read or other

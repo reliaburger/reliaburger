@@ -1,6 +1,6 @@
 //! Durable consumer publication, complete view withdrawal and receipt permissions.
 
-use super::discovery_ownership::Landing;
+use super::discovery_ownership::{Landing, WriteOwner};
 use super::{BunAgent, BunError, DiscoveryOwnership, Grill};
 use crate::bun::consumer_owners::{
     ConsumerIdentity, ConsumerOwnership, ConsumerPhase, ConsumerPublication, ConsumerReceipt,
@@ -234,6 +234,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             &ServiceId::new("system", "discovery"),
             |inventory| inventory.consumer = Some(next),
             deadline,
+            WriteOwner::ConsumerStep,
         )
         .await
     }
