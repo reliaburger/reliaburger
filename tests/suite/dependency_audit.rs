@@ -71,3 +71,44 @@ fn lock_file_has_no_unsafe_libyaml_and_audit_needs_no_exception_for_it() {
         ".cargo/audit.toml still ignores RUSTSEC-2024-0449"
     );
 }
+
+/// RUSTSEC-2026-0381, -0382 and -0383: older rustls-webpki accepts paths
+/// through the distrusted emSign intermediates, whose private keys are public,
+/// and older webpki-roots and webpki-root-certs bundle the root they chain to.
+/// Every locked copy must be a patched release (#1269).
+#[test]
+fn lock_file_has_only_webpki_releases_that_distrust_emsign() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    // The first patched release of each. webpki-roots 0.26.x is a shim that
+    // re-exports the 1.x roots (`pub use parent::TLS_SERVER_ROOTS`), so 1.x
+    // decides; `.cargo/audit.toml` ignores RUSTSEC-2026-0381 for the shim on
+    // that basis.
+    let patched = [
+        ("rustls-webpki", [0, 103, 16]),
+        ("webpki-roots", [1, 0, 10]),
+        ("webpki-root-certs", [1, 0, 10]),
+    ];
+    for (name, first_patched) in patched {
+        let versions: Vec<Vec<u64>> = lock
+            .split("[[package]]")
+            .filter(|package| package.contains(&format!("\nname = \"{name}\"\n")))
+            .filter_map(|package| package.split("\nversion = \"").nth(1))
+            .filter_map(|rest| rest.split('"').next())
+            .map(|version| {
+                version
+                    .split('.')
+                    .map(|part| part.parse().unwrap())
+                    .collect()
+            })
+            .collect();
+        assert!(!versions.is_empty(), "Cargo.lock has no {name}");
+        for version in versions {
+            let shim = name == "webpki-roots" && version[0] == 0;
+            assert!(
+                shim || version.as_slice() >= first_patched.as_slice(),
+                "Cargo.lock locks {name} {version:?}"
+            );
+        }
+    }
+}
