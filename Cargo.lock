@@ -5546,7 +5546,7 @@ dependencies = [
  "sha2 0.11.1",
  "siphasher",
  "socket2",
- "syn 2.0.119",
+ "syn 3.0.9",
  "sysinfo",
  "tar",
  "tempfile",
