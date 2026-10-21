@@ -417,14 +417,14 @@ jobs:
         # One attempt normally takes a minute or two. One stalled for 13
         # minutes and pushed acceptance past its limit (#977), so each
         # attempt gets 5 minutes and a failed one is retried once.
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         timeout-minutes: 5
         continue-on-error: true
         with:
           name: nextest-archive
       - name: Retry downloading the test archive
         if: ${{ !cancelled() && steps.test_archive.outcome == 'failure' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         timeout-minutes: 5
         with:
           name: nextest-archive
@@ -475,14 +475,14 @@ jobs:
           tool: cargo-nextest@0.9.145
       - name: Download the test archive
         id: test_archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         timeout-minutes: 5
         continue-on-error: true
         with:
           name: nextest-archive
       - name: Retry downloading the test archive
         if: ${{ !cancelled() && steps.test_archive.outcome == 'failure' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         timeout-minutes: 5
         with:
           name: nextest-archive
@@ -621,7 +621,7 @@ jobs:
       - name: Download every evidence envelope
         id: evidence
         if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         timeout-minutes: 5
         continue-on-error: true
         with:
@@ -630,7 +630,7 @@ jobs:
           merge-multiple: false
       - name: Retry downloading every evidence envelope
         if: ${{ !cancelled() && steps.evidence.outcome == 'failure' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         timeout-minutes: 5
         with:
           pattern: contract-*

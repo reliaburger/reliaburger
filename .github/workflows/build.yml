@@ -183,18 +183,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Download PDFs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: reliaburger-pdfs
           path: dist
       - name: Download all native binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: binaries-*
           merge-multiple: true
           path: dist
       - name: Download both built guest images
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: guest-image-*
           merge-multiple: true
