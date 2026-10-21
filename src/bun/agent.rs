@@ -1605,9 +1605,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         self.continue_consumer_sync().await;
                         turn
                     }
-                    // A step's or a health probe's write that outlasted its
-                    // turn has landed (#890, #1255): take the step's
-                    // remainder, or install the probe's publication, now.
+                    // A step's, a health probe's or a workload start's write
+                    // that outlasted its turn has landed (#890, #1255,
+                    // #1266): take the step's remainder, or install the
+                    // probe's publication, now. A start's next ask collects
+                    // its own.
                     outcome = Self::discovery_write_done(&mut self.discovery_ownership),
                         if self.discovery_write_in_flight() => {
                         let turn = self.begin_landing_turn();
@@ -1676,8 +1678,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Start the turn that takes a write in flight once it has landed,
     /// named after whoever waited for the write.
     fn begin_landing_turn(&mut self) -> super::loop_meter::Turn {
-        if self.health_write_in_flight() {
-            return self.begin_turn(LoopBranch::DeployOp, Some("health_probe_result/landed"));
+        if let Some(landed) = self.deploy_op_write_in_flight() {
+            return self.begin_turn(LoopBranch::DeployOp, Some(landed));
         }
         self.begin_consumer_sync_turn()
     }

@@ -201,11 +201,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Set this before awaiting the worker. An error after rename/fsync may
         // have changed durable state; no later mutation may overwrite it blindly.
         self.egress_store_uncertain = true;
+        let started = std::time::Instant::now();
         #[cfg(test)]
         self.loop_stalls.hold(super::LoopStall::Persist).await;
         // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
-        tokio::task::spawn_blocking(move || crate::bun::egress_owners::persist(&directory, owners))
-            .await
+        let persisted = tokio::task::spawn_blocking(move || {
+            crate::bun::egress_owners::persist(&directory, owners)
+        })
+        .await;
+        // Timed apart from the discovery journal's write, so a slow start's
+        // line says which store held it (#1266).
+        self.loop_meter.add_part(
+            crate::bun::loop_meter::TurnPart::EgressWrite,
+            started.elapsed(),
+        );
+        persisted
             .map_err(|error| BunError::AdoptionState(error.to_string()))?
             .map_err(|error| BunError::AdoptionState(error.to_string()))?;
         self.egress_store_uncertain = false;

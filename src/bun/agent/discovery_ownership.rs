@@ -15,22 +15,26 @@ pub(super) enum DiscoveryOwnership {
     Disabled,
     Ready(DiscoveryJournal),
     Recovered(DiscoveryJournal),
-    /// A consumer step's or a health probe's write outlasted its turn and
-    /// goes on off the loop (#890, #1255). The journal itself is inside the
-    /// write's task until it lands.
+    /// A consumer step's, a health probe's or a workload start's write
+    /// outlasted its turn and goes on off the loop (#890, #1255, #1266). The
+    /// journal itself is inside the write's task until it lands.
     Writing(Box<DiscoveryWrite>),
     Uncertain,
 }
 
 impl DiscoveryOwnership {
     /// The inventory on disk: the journal's, or while a write is in flight,
-    /// the one before it. Only consumer steps and health probes leave a
-    /// write in flight. A consumer step changes only the consumer's
-    /// ownership. A health probe changes one backend's health, and can add
-    /// only services the kernel has never seen, since every kernel
-    /// publication journals the whole service map first. So the runtime
-    /// references read the same either side of a write in flight, and the
-    /// services list everything that could need withdrawing.
+    /// the one before it. Only consumer steps, health probes and workload
+    /// starts leave a write in flight. A consumer step changes only the
+    /// consumer's ownership. A health probe changes one backend's health,
+    /// and can add only services the kernel has never seen, since every
+    /// kernel publication journals the whole service map first. A workload
+    /// start adds one network reference, for an instance that can't run
+    /// until it lands; [`BunAgent::reference_write_in_flight`] tells a
+    /// retirement to ask again rather than read it as unrecorded. So the
+    /// services list everything that could need withdrawing, and every
+    /// other runtime reference reads the same either side of a write in
+    /// flight.
     pub(super) fn durable(&self) -> Option<&DiscoveryInventory> {
         match self {
             DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal) => {
@@ -70,6 +74,10 @@ pub(super) enum WriteOwner {
     ConsumerStep,
     /// A health probe's publication (#1255), installed once its write lands.
     HealthProbe(super::health_checks::HealthWrite),
+    /// A workload start recording the instance's network reference (#1266).
+    /// Nothing runs on landing: the start stays pending until its deploy
+    /// worker or restart asks again and finds the reference recorded.
+    NetworkReference(crate::grill::InstanceId),
 }
 
 /// What waited for a write in flight that has just landed.
@@ -79,6 +87,8 @@ pub(super) enum LandedWrite {
     ConsumerStep,
     /// A health probe's publication: `Some` when the write is durable.
     HealthProbe(Option<super::health_checks::HealthWrite>),
+    /// A workload start's network reference, which its next ask collects.
+    NetworkReference,
 }
 
 /// How a discovery write ended, as the loop's `select!` branch sees it.
@@ -256,14 +266,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         .await
     }
 
-    /// Record the original held runtime generation before allowing its launch.
+    /// Record the original held runtime generation before allowing its
+    /// launch, waiting for the write until the turn's runtime budget runs
+    /// out at most (#1266). [`Landing::InFlight`] means the launch must wait:
+    /// the hold isn't durable yet, and asking again once the write has
+    /// landed finds it recorded. A write already in flight, anyone's, is
+    /// `InFlight` too, without waiting for it here.
     pub(super) async fn persist_discovery_reference(
         &mut self,
         reference: &crate::grill::runc_intent::NetworkReference,
-    ) -> Result<(), BunError> {
+    ) -> Result<Landing, BunError> {
         use crate::bun::discovery_owners::{ReferenceOwner, ReferencePhase};
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
-            return Ok(());
+            return Ok(Landing::Landed);
+        }
+        if self.discovery_write_in_flight() {
+            return Ok(Landing::InFlight);
+        }
+        // An earlier ask's write recorded exactly this hold.
+        if self.journal_holds(reference) {
+            return Ok(Landing::Landed);
         }
         let instance = self
             .supervisor
@@ -273,23 +295,57 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })?;
         let service =
             crate::onion::service_id::ServiceId::new(&instance.namespace, &instance.app_name);
-        self.update_discovery_inventory(&service, |next| {
-            let owner = ReferenceOwner {
-                service: service.clone(),
-                reference: reference.clone(),
-                phase: ReferencePhase::Held,
-            };
-            if let Some(previous) = next
-                .references
-                .iter_mut()
-                .find(|previous| previous.reference.instance_id == reference.instance_id)
-            {
-                *previous = owner;
-            } else {
-                next.references.push(owner);
-            }
-        })
+        let deadline = self.turn_deadline();
+        self.write_discovery_inventory(
+            &service,
+            |next| {
+                let owner = ReferenceOwner {
+                    service: service.clone(),
+                    reference: reference.clone(),
+                    phase: ReferencePhase::Held,
+                };
+                if let Some(previous) = next
+                    .references
+                    .iter_mut()
+                    .find(|previous| previous.reference.instance_id == reference.instance_id)
+                {
+                    *previous = owner;
+                } else {
+                    next.references.push(owner);
+                }
+            },
+            Some(deadline),
+            WriteOwner::NetworkReference(reference.instance_id.clone()),
+        )
         .await
+    }
+
+    /// Whether the journal itself, not the one before a write in flight,
+    /// records `reference` as held.
+    pub(super) fn journal_holds(
+        &self,
+        reference: &crate::grill::runc_intent::NetworkReference,
+    ) -> bool {
+        use crate::bun::discovery_owners::ReferencePhase;
+        let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+            &self.discovery_ownership
+        else {
+            return false;
+        };
+        journal
+            .inventory()
+            .references
+            .iter()
+            .any(|owner| owner.reference == *reference && owner.phase == ReferencePhase::Held)
+    }
+
+    /// Whether a write in flight may be recording `id`'s network reference.
+    pub(super) fn reference_write_in_flight(&self, id: &crate::grill::InstanceId) -> bool {
+        matches!(
+            &self.discovery_ownership,
+            DiscoveryOwnership::Writing(write)
+                if matches!(&write.owner, WriteOwner::NetworkReference(owner) if owner == id)
+        )
     }
 
     /// Persist release permission after local withdrawal and exact cluster confirmation.
@@ -662,19 +718,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|()| Landing::Landed)
     }
 
-    /// Whether a consumer step's or a health probe's write is still going
-    /// on off the loop.
+    /// Whether a consumer step's, a health probe's or a workload start's
+    /// write is still going on off the loop.
     pub(super) fn discovery_write_in_flight(&self) -> bool {
         matches!(self.discovery_ownership, DiscoveryOwnership::Writing(_))
     }
 
-    /// Whether the write in flight, if any, is a health probe's.
-    pub(super) fn health_write_in_flight(&self) -> bool {
-        matches!(
-            &self.discovery_ownership,
-            DiscoveryOwnership::Writing(write)
-                if matches!(write.owner, WriteOwner::HealthProbe(_))
-        )
+    /// The deploy op whose write is in flight, naming the turn that lands
+    /// it; `None` for a consumer step's, or with no write in flight.
+    pub(super) fn deploy_op_write_in_flight(&self) -> Option<&'static str> {
+        let DiscoveryOwnership::Writing(write) = &self.discovery_ownership else {
+            return None;
+        };
+        match write.owner {
+            WriteOwner::ConsumerStep => None,
+            WriteOwner::HealthProbe(_) => Some("health_probe_result/landed"),
+            WriteOwner::NetworkReference(_) => Some("apply_network_pre_start/landed"),
+        }
     }
 
     /// Resolves when the write in flight lands; never, if there is none.
@@ -688,7 +748,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Wait for a write a consumer step or a health probe left in flight.
+    /// Wait for a write a consumer step, a health probe or a workload start
+    /// left in flight.
     /// Every journal write and every decision made against the journal
     /// itself settles first.
     ///
@@ -720,7 +781,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Some(LandedWrite::HealthProbe(Some(write))) => {
                 self.finish_health_publication(write).await;
             }
-            Some(LandedWrite::HealthProbe(None)) => {}
+            Some(LandedWrite::HealthProbe(None) | LandedWrite::NetworkReference) => {}
         }
     }
 
@@ -764,6 +825,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Some(LandedWrite::HealthProbe(None))
                 }
             },
+            WriteOwner::NetworkReference(id) => {
+                if let Err(error) = landed {
+                    eprintln!("bun: recording {id}'s network reference: {error}");
+                }
+                Some(LandedWrite::NetworkReference)
+            }
         }
     }
 

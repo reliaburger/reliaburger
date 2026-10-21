@@ -269,6 +269,40 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         );
     }
 
+    /// Take the restart's Create result again after a short wait, off the
+    /// loop, so the turn between Create and Start runs again once the
+    /// network reference's journal write may have landed (#1266). A stop or
+    /// retirement that takes the instance back meanwhile cancels it as it
+    /// would any step.
+    fn recheck_restart_create(
+        &mut self,
+        id: InstanceId,
+        launch: RestartLaunch,
+        gate: RestartGate,
+        retained: Option<NetworkReference>,
+        egress: EgressResolution,
+    ) {
+        let task = self
+            .restart_steps
+            .spawn(async move {
+                tokio::time::sleep(deploy_ops::STILL_RUNNING_RECHECK).await;
+                StepResult::Created {
+                    retained: Ok(retained),
+                    egress: Box::new(egress),
+                }
+            })
+            .id();
+        self.restarts.insert(
+            id,
+            RestartInFlight {
+                step: RestartStep::Create,
+                launch: Some(launch),
+                gate,
+                task,
+            },
+        );
+    }
+
     /// Whether `id` has a restart step in flight.
     pub(super) fn restarting(&self, id: &InstanceId) -> bool {
         self.restarts.contains_key(id)
@@ -455,8 +489,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .is_none_or(|instance| instance.state != ContainerState::Preparing)
         {
             // A reference the step retained for an instance that moved on
-            // is handed back, as a refused one is.
-            if let Ok(Some(reference)) = retained {
+            // is handed back, as a refused one is, unless an earlier turn's
+            // write recorded it or may be recording it (#1266): then it is
+            // the journal's, and only retirement releases it.
+            if let Ok(Some(reference)) = retained
+                && !self.journal_holds(&reference)
+                && !self.reference_write_in_flight(&id)
+            {
                 self.hand_back_network_reference(reference);
             }
             return;
@@ -479,6 +518,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // this hold; give it back rather than leave it untracked.
             self.hand_back_network_reference(reference.clone());
         }
+        // What asking again needs, if the reference's journal write
+        // outlasts this turn. A failed retain never reaches the journal.
+        let again = retained
+            .as_ref()
+            .ok()
+            .map(|retained| (retained.clone(), egress.clone()));
         let restart_egress = match cgroup_path {
             Some(cgroup_path) => {
                 self.apply_network_pre_start(
@@ -507,6 +552,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             None => Ok(()),
         };
+        if let (Err(BunError::StillRunning { .. }), Some((retained, egress))) =
+            (&restart_egress, again)
+        {
+            // The recreated instance's network reference is still being
+            // journalled (#1266). It mustn't start before that lands, so ask
+            // again shortly, as a deploy worker does, rather than refuse.
+            self.recheck_restart_create(id, launch, gate, retained, egress);
+            return;
+        }
         if let Err(error) = restart_egress {
             eprintln!("bun: restart of {} refused: {error}", id.0);
             self.spawn_restart_step(id, RestartStep::Refuse, Some(launch), gate);

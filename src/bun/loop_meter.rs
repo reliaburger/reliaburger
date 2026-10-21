@@ -102,6 +102,9 @@ pub enum TurnPart {
     /// flight off the loop. The write's own time was that earlier turn's
     /// journal write; this is the wait a later turn paid for it (#1100).
     InFlightWrite,
+    /// An fsync'd egress owners checkpoint write, which programming a
+    /// workload's egress before it starts waits for (#1266).
+    EgressWrite,
     /// A read of the runtime's launch inventory.
     RuntimeInventory,
     /// Waiting for the eBPF handle's lock, which job tasks, faults and
@@ -115,9 +118,10 @@ pub enum TurnPart {
 
 impl TurnPart {
     /// Every part, in the order a slow turn's line lists them.
-    const ALL: [TurnPart; 6] = [
+    const ALL: [TurnPart; 7] = [
         TurnPart::JournalWrite,
         TurnPart::InFlightWrite,
+        TurnPart::EgressWrite,
         TurnPart::RuntimeInventory,
         TurnPart::KernelLock,
         TurnPart::ViewInstall,
@@ -129,6 +133,7 @@ impl TurnPart {
         match self {
             TurnPart::JournalWrite => "journal write",
             TurnPart::InFlightWrite => "wait for a write in flight",
+            TurnPart::EgressWrite => "egress owners write",
             TurnPart::RuntimeInventory => "runtime inventory",
             TurnPart::KernelLock => "kernel lock wait",
             TurnPart::ViewInstall => "view install",
@@ -567,6 +572,26 @@ mod tests {
             Some(Duration::from_millis(200))
         );
         assert_eq!(last.part(TurnPart::ViewInstall), None);
+    }
+
+    /// The 0.2.1 candidate 9 soak logged `2493 ms in deploy_op
+    /// (apply_network_pre_start)` and nothing else (#1266). A workload's
+    /// start can wait for two fsync'd stores and the eBPF lock; its line
+    /// now says which.
+    #[test]
+    fn a_slow_start_line_names_its_egress_owners_write() {
+        let meter = LoopTurnMeter::new();
+        let mut turn = meter.begin(LoopBranch::DeployOp, Some("apply_network_pre_start"));
+        turn.started -= Duration::from_millis(2493);
+        meter.add_part(TurnPart::KernelLock, Duration::from_millis(3));
+        meter.add_part(TurnPart::EgressWrite, Duration::from_millis(1990));
+        meter.add_part(TurnPart::JournalWrite, Duration::from_millis(500));
+        assert_eq!(
+            meter.slow_turn_line(&turn, Duration::from_millis(2493)),
+            "bun: agent loop turn took 2493 ms in deploy_op (apply_network_pre_start): \
+             journal write 500 ms, egress owners write 1990 ms, kernel lock wait 3 ms"
+        );
+        meter.finish(turn);
     }
 
     /// The 0.2.1 soak logged `4987 ms in deploy_op (health_probe_result):

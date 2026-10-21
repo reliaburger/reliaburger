@@ -105,10 +105,36 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await
             .map_err(BunError::from);
         let egress = self.egress.resolve(spec).await;
-        let result = self
-            .ops
-            .apply_network_pre_start(instance_id, app_name, spec, cgroup_path, retained, egress)
-            .await;
+        let result = match retained {
+            // A failed retain fails the step without touching the journal.
+            Err(error) => {
+                self.ops
+                    .apply_network_pre_start(
+                        instance_id,
+                        app_name,
+                        spec,
+                        cgroup_path,
+                        Err(error),
+                        egress,
+                    )
+                    .await
+            }
+            // The loop answers `StillRunning` while the reference's journal
+            // write is in flight (#1266); ask again until it has landed.
+            Ok(retained) => {
+                deploy_ops::retry_while_still_running(|| {
+                    self.ops.apply_network_pre_start(
+                        instance_id,
+                        app_name,
+                        spec,
+                        cgroup_path,
+                        Ok(retained.clone()),
+                        egress.clone(),
+                    )
+                })
+                .await
+            }
+        };
         if result.is_err() {
             let _ = self.grill.stop(instance_id).await;
         }
