@@ -32,7 +32,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
       - name: Publish the tutorial's demo manifest and app
         # The homepage tour applies https://reliaburger.com/demo/podinfo.yaml.
         # Copying the tested example at deploy time means the site can never
