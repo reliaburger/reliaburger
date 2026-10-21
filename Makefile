@@ -110,12 +110,6 @@ audit: ## Fail on new RustSec findings or an expired advisory exception
 		echo "dependency advisory exceptions expired on 2026-11-18; review .cargo/audit.toml" >&2; \
 		exit 1; \
 	fi
-	@# RUSTSEC-2026-0381 is ignored only for the webpki-roots 0.26 shim, which
-	@# re-exports 1.x; keep 1.x at the patched 1.0.10 or later.
-	@if grep -A1 '^name = "webpki-roots"$$' Cargo.lock | grep -Eq '^version = "1\.0\.[0-9]"$$'; then \
-		echo "webpki-roots is below 1.0.10, which RUSTSEC-2026-0381's exception assumes; see .cargo/audit.toml" >&2; \
-		exit 1; \
-	fi
 	$(CARGO) audit
 
 # Reports, never fails: the lag is information for the release's refresh

@@ -100,7 +100,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish council`: Show the council (Raft) on every node, or recover from full loss
   - `relish council status`: Show every node's view of the council (the default)
   - `relish council recover --data-dir <DATA_DIR>`: Recover a cluster whose entire council was lost
-  - `relish council backups --from <FROM>`: List the sealed council backups at an object-store URL *(0.2.1, not in 0.2.0)*
+  - `relish council backups --from <FROM>`: List the sealed council backups at an object-store URL *(0.2.2, not in 0.2.0)*
   - `relish council re-enrol --data-dir <DATA_DIR>`: Re-enrol a voter fenced out by `council recover`
 - `relish decommission-node --workloads-stopped --reason <REASON> <NODE_ID>`: Permanently retire a stopped or fenced node; return requires fresh enrolment
 - `relish uninstall`: Remove the CLI, its PATH link, the managed Lima tools and the image cache
@@ -151,7 +151,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish logs <NAME>`: Stream logs from an app or job
 - `relish logs-export --dest <DEST>`: Export Parquet log files to a destination directory
 - `relish logs-search <SOURCE> <SQL>`: Search exported Parquet log archives with SQL
-- `relish events`: Show the cluster's recent events: deploys, restarts, health, faults, tokens, secrets and audited operations, newest last *(0.2.1, not in 0.2.0)*
+- `relish events`: Show the cluster's recent events: deploys, restarts, health, faults, tokens, secrets and audited operations, newest last *(0.2.2, not in 0.2.0)*
 
 **Diagnose and test** ([diagnostics](docs/manual/07_diagnostics.md))
 
@@ -203,7 +203,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 **Images and volumes** ([images and volumes](docs/manual/11_images-and-volumes.md))
 
 - `relish images`: List images in the Pickle registry, or delete a tag
-  - `relish images delete <REFERENCE>`: Delete a tag (`repository:tag`). The image stays pullable by digest until it has been untagged for `[images] gc_retain_days`; then it expires, unless an app or job pins it, and GC reclaims its layers *(0.2.1, not in 0.2.0)*
+  - `relish images delete <REFERENCE>`: Delete a tag (`repository:tag`). The image stays pullable by digest until it has been untagged for `[images] gc_retain_days`; then it expires, unless an app or job pins it, and GC reclaims its layers *(0.2.2, not in 0.2.0)*
 - `relish build <PATH>`: Build an OCI image and push to Pickle
 - `relish snapshot`: Manage volume snapshots (Btrfs-backed volumes only)
   - `relish snapshot create <APP>`: Snapshot an app's managed volumes
@@ -221,10 +221,10 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish upgrade rollback [VERSION]`: Roll back to a previous version (cluster: version required)
   - `relish upgrade resume`: Resume a paused upgrade
   - `relish upgrade abort`: End a paused upgrade in which no node has moved. When some nodes already swapped, use `rollback <version>` instead
-- `relish gitops`: Show or change the cluster's GitOps configuration *(0.2.1, not in 0.2.0)*
-  - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown *(0.2.1, not in 0.2.0)*
-  - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft *(0.2.1, not in 0.2.0)*
-  - `relish gitops disable`: Turn GitOps off for the whole cluster (admin only; audited). What GitOps wrote stays in place *(0.2.1, not in 0.2.0)*
+- `relish gitops`: Show or change the cluster's GitOps configuration *(0.2.2, not in 0.2.0)*
+  - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown *(0.2.2, not in 0.2.0)*
+  - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft *(0.2.2, not in 0.2.0)*
+  - `relish gitops disable`: Turn GitOps off for the whole cluster (admin only; audited). What GitOps wrote stays in place *(0.2.2, not in 0.2.0)*
 
 **Learn** ([under the hood](docs/manual/06_under-the-hood.md))
 
