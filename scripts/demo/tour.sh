@@ -246,6 +246,18 @@ show_in_work() {
     sleep 1.5
 }
 
+# Whether the published demo archive holds exactly the repository's
+# examples/demo/burger, so the tour can show the real download.
+live_burger_matches_repository() {
+    local live
+    live=$(mktemp -d)
+    curl -fsSL "${BURGER_URL}" 2>/dev/null | tar xz -C "${live}" 2>/dev/null \
+        && diff -rq "${live}/burger" "${REPO_DIR}/examples/demo/burger" >/dev/null 2>&1
+    local matches=$?
+    rm -rf "${live}"
+    return "${matches}"
+}
+
 # Poll a check function until it succeeds, then say how long it took.
 # $1: what we're waiting for, $2: timeout in seconds, $3...: the check.
 wait_for() {
@@ -397,9 +409,9 @@ while IFS= read -r command <&3; do
         "${BURGER_FETCH}")
             # The site publishes the demo from the tag the installer fetches,
             # so until a promotion's site change deploys, the live archive is
-            # the previous release's: published, but missing what this tour
-            # uses (0.1.6's had no jobs.toml).
-            if curl -fsSL "${BURGER_URL}" 2>/dev/null | tar tz 2>/dev/null | grep -qx 'burger/jobs.toml'; then
+            # the previous release's: published, but not what this tour uses
+            # (0.1.6's had no jobs.toml, and 0.2.0's ran 1,064 tasks).
+            if live_burger_matches_repository; then
                 show_in_work "${command}"
             else
                 say "${BURGER_URL} is published with the site, and this release's"
