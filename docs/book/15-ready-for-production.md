@@ -5104,8 +5104,16 @@ And the meter finally has teeth. The V02 checker reads each node's
 heavy check. A histogram counts cumulatively, so `+Inf` minus `le="1"` is the
 number of turns over the budget since the process started, and the checker
 fails the tier on any increase since its last look. A bun that restarted
-starts its counters from zero, which the checker notices the way its resource
-trends do, by the pid and image changing. The finding says which bucket the
+starts its counters from zero. The checker first noticed that the way its
+resource trends do, by the pid and image changing, and then counted each
+branch from zero. That was wrong for a branch the new process hadn't run
+yet: it exports nothing, so the newest sample in the window was still the
+old process's, and the 0.2.1 final tier reported an old slow `deploy_op`
+turn a second time after the whole-cluster restart (#1261). Now the checker
+remembers the last scrape it counted per branch and adds up only the scrapes
+after it, the way Prometheus's `increase()` does: a count going down is a
+new process, whose turns all count, and an old scrape repeated adds nothing.
+The finding says which bucket the
 worst turn landed in, `1 deploy_op turn(s) over the 1 s budget, the worst
 between 2.5 and 5 s`, and Bun's own log line from the meter says which op it
 was.

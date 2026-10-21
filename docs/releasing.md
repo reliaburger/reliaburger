@@ -740,7 +740,9 @@ the real `curl … | sh` install against it on every host we advertise.
    Either tier also fails on a slow agent loop. Every settle and heavy check
    reads each node's `bun_agent_loop_turn_seconds` histogram from
    `/v1/metrics`, and the checker fails the tier (`agent-loop-turn`) on any
-   turn longer than 1 s since the last check, naming the node, the branch
+   turn longer than 1 s since the last check (a Bun restart counts the new
+   process from zero, and never counts the old one's turns twice), naming
+   the node, the branch
    (`command`, `deploy_op`, `health_tick`, …) and how long the worst one
    took. A turn that long holds every caller on the node, the way the stalls
    behind 0.1.0's soak failures did; the budget comes from the [agent-loop
