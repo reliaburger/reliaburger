@@ -52,7 +52,7 @@ jobs:
           cp examples/kubernetes/podinfo.yaml docs/website/demo/podinfo.yaml
           tar -czf docs/website/demo/burger.tar.gz -C examples/demo burger
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           # Publish only the static website assets
           path: './docs/website'
