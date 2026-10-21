@@ -2216,3 +2216,279 @@ async fn a_health_probe_write_that_fails_off_the_turn_installs_nothing_and_resta
         "restarted on a withdrawal that never reached disk"
     );
 }
+
+/// A discovery-owning agent with a Pending `web` instance whose runtime
+/// holds an address, for a service the journal already owns, so the start
+/// may record the hold.
+async fn published_hold_fixture() -> (
+    TestAgent,
+    MockGrill,
+    tempfile::TempDir,
+    crate::grill::runc_intent::NetworkReference,
+) {
+    let (mut agent, grill, root, reference) = unpublished_hold_fixture().await;
+    let (reply, registered) = oneshot::channel();
+    agent
+        .handle_deploy_op(
+            crate::bun::agent::deploy_ops::DeployOp::RegisterServiceApp {
+                app_name: "web".into(),
+                namespace: "default".into(),
+                port: 8080,
+                firewall: None,
+                reply,
+            },
+        )
+        .await;
+    registered.await.unwrap().unwrap();
+    (agent, grill, root, reference)
+}
+
+/// Hand the loop a workload's `ApplyNetworkPreStart` in a `deploy_op` turn
+/// of its own, as a deploy worker does, with the hold the runtime retained
+/// for it. Returns the turn the meter saw and the loop's answer.
+async fn pre_start_turn(
+    agent: &mut TestAgent,
+    grill: &MockGrill,
+    root: &tempfile::TempDir,
+    reference: &crate::grill::runc_intent::NetworkReference,
+) -> (crate::bun::loop_meter::TurnRecord, Result<(), BunError>) {
+    let spec = basic_config().app.remove("web").unwrap();
+    let retained = grill
+        .retain_network_reference(&reference.instance_id)
+        .await
+        .map_err(BunError::from);
+    let (reply, result) = oneshot::channel();
+    let turn = agent.begin_turn(LoopBranch::DeployOp, Some("apply_network_pre_start"));
+    agent
+        .handle_deploy_op(
+            crate::bun::agent::deploy_ops::DeployOp::ApplyNetworkPreStart {
+                instance_id: reference.instance_id.clone(),
+                app_name: "web".into(),
+                spec: Some(Box::new(spec)),
+                cgroup_path: root.path().join("cgroup"),
+                retained,
+                egress: Box::default(),
+                reply,
+            },
+        )
+        .await;
+    agent.turn_deadline = None;
+    agent.loop_meter.finish(turn);
+    (agent.loop_meter.last_turn().unwrap(), result.await.unwrap())
+}
+
+/// The 0.2.1 candidate 9 jobs final, run 2: a slow host disk held one
+/// `deploy_op (apply_network_pre_start)` turn for 2,493 ms (#1266). A
+/// workload's start journals its network reference before it may run, and
+/// that write had no deadline. It now waits for its write only until the
+/// turn's runtime budget runs out, as a health probe's publication does
+/// (#1255). The start stays pending meanwhile, and the deploy worker's next
+/// ask finds the reference recorded and goes on. The workload never starts
+/// before its reference is on disk.
+#[tokio::test]
+async fn a_workload_start_leaves_its_slow_network_reference_write_in_flight() {
+    let (mut agent, grill, root, reference) = published_hold_fixture().await;
+    let id = reference.instance_id.clone();
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (start, result) = pre_start_turn(&mut agent, &grill, &root, &reference).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "the start didn't journal its network reference: {start}, {result:?}"
+    );
+    // The write sleeps 1.6 s and the turn's deadline is 500 ms, so a turn
+    // that waited for it would find it landed.
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the start's turn waited for its own journal write: {start}"
+    );
+    assert!(start.took < TURN_BUDGET, "{start}");
+    assert!(
+        start.part(TurnPart::JournalWrite).is_some(),
+        "the turn's line doesn't name the journal write: {start}"
+    );
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "a start whose reference isn't on disk yet must be asked again: {result:?}"
+    );
+    assert_ne!(
+        agent.supervisor.get_instance(&id).unwrap().state,
+        ContainerState::Failed,
+        "a pending start was failed"
+    );
+    assert!(!agent.network_references.contains_key(&id));
+    assert!(
+        grill.network_reference(&id).await.unwrap().is_some(),
+        "a hold the journal may be recording was handed back"
+    );
+    // A retirement meanwhile can't read the journal as not recording the
+    // hold: the write in flight may be recording it.
+    assert!(matches!(
+        agent.release_network_reference(&id, None).await,
+        Err(BunError::StillRunning { .. })
+    ));
+
+    // The worker asks again before the write lands: still pending, with no
+    // second write and no wait.
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (again, result) = pre_start_turn(&mut agent, &grill, &root, &reference).await;
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert!(again.took < TURN_BUDGET, "{again}");
+
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(landed.branch, LoopBranch::DeployOp, "{landed}");
+    assert_eq!(landed.detail, Some("apply_network_pre_start/landed"));
+    assert!(!agent.discovery_write_in_flight());
+    assert_eq!(
+        agent.journal_reference(&reference),
+        crate::bun::agent::discovery_ownership::JournalReference::Recorded
+    );
+
+    // The next ask finds the reference on disk: the start goes on without
+    // writing it again.
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, result) = pre_start_turn(&mut agent, &grill, &root, &reference).await;
+    result.unwrap();
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert_eq!(agent.network_references.get(&id), Some(&reference));
+}
+
+/// A start's reference write that fails after its turn moved on fences
+/// discovery like any failed write. The hold isn't handed back, since the
+/// write may have reached disk, and the start's next ask records the
+/// reference again before the workload may run.
+#[tokio::test]
+async fn a_workload_start_whose_reference_write_fails_off_the_turn_records_it_again() {
+    let (mut agent, grill, root, reference) = published_hold_fixture().await;
+    let id = reference.instance_id.clone();
+    let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+        &mut agent.discovery_ownership
+    else {
+        panic!("discovery ownership is not ready before the start");
+    };
+    journal.fail_next_write();
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let (start, result) = pre_start_turn(&mut agent, &grill, &root, &reference).await;
+    assert!(agent.discovery_write_in_flight(), "{start}");
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+
+    landing_turn(&mut agent).await;
+    assert!(matches!(
+        agent.discovery_ownership,
+        DiscoveryOwnership::Uncertain
+    ));
+    assert!(!agent.network_references.contains_key(&id));
+    assert!(
+        grill.network_reference(&id).await.unwrap().is_some(),
+        "a hold whose write may have reached disk was handed back"
+    );
+
+    let (_, result) = pre_start_turn(&mut agent, &grill, &root, &reference).await;
+    result.unwrap();
+    assert_eq!(
+        agent.journal_reference(&reference),
+        crate::bun::agent::discovery_ownership::JournalReference::Recorded
+    );
+    assert_eq!(agent.network_references.get(&id), Some(&reference));
+}
+
+/// End to end: a deploy whose start meets a slow discovery journal still
+/// completes. Its worker asks again while the reference write is in flight,
+/// rather than failing the start (#1266).
+#[tokio::test]
+async fn a_deploy_completes_when_its_network_reference_write_outlasts_the_turn() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    let reference = original_test_network_reference();
+    grill.set_network_reference(reference.clone()).await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let task = tokio::spawn(async move {
+        agent.run().await;
+        agent
+    });
+    expect_complete(&send_deploy(&tx, replicated("web", 1)).await);
+    shutdown.cancel();
+    let agent = task.await.unwrap();
+    assert_eq!(
+        agent.network_references.get(&reference.instance_id),
+        Some(&reference)
+    );
+    assert_eq!(
+        agent.journal_reference(&reference),
+        crate::bun::agent::discovery_ownership::JournalReference::Recorded
+    );
+}
+
+/// A restart records its recreated instance's network reference in the
+/// loop's turn between Create and Start, so it meets the same slow journal.
+/// A write that outlasts that turn holds the restart until it has landed;
+/// it doesn't refuse the restart (#1266).
+#[tokio::test]
+async fn a_restart_waits_for_its_slow_network_reference_write_instead_of_refusing() {
+    let (mut agent, _tx, shutdown, grill) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    let original = original_test_network_reference();
+    grill.set_network_reference(original.clone()).await;
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let successor: crate::grill::runc_intent::NetworkReference =
+        serde_json::from_value(serde_json::json!({
+            "instance_id": "default__web-0",
+            "generation": "fedcba0987654321fedcba0987654321",
+            "container_index": 8
+        }))
+        .unwrap();
+    let stalls = Arc::clone(&agent.loop_stalls);
+    let task = tokio::spawn(async move {
+        agent.run().await;
+        agent
+    });
+    // Hold the create, so the successor's hold is in place before the
+    // restart retains it.
+    grill.set_call_delay(
+        MockCall::Create,
+        Some(std::time::Duration::from_millis(500)),
+    );
+    let released = calls_of(&grill, "release_network_reference");
+    let started = calls_of(&grill, "start");
+    crash(&grill);
+    wait_for_calls(&grill, "release_network_reference", released, 1).await;
+    grill.set_network_reference(successor.clone()).await;
+    stalls.set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    wait_for_calls(&grill, "start", started, 1).await;
+    stalls.set(LoopStall::Persist, std::time::Duration::ZERO);
+    shutdown.cancel();
+    let agent = task.await.unwrap();
+    assert_eq!(
+        agent.network_references.get(&successor.instance_id),
+        Some(&successor)
+    );
+    assert!(agent.journal_holds(&successor));
+}

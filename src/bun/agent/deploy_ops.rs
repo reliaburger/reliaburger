@@ -1439,8 +1439,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .await;
                 // On failure, mark the instance Failed. The worker stops the
                 // created container, off the loop, so no half-started
-                // workload lingers.
-                if result.is_err()
+                // workload lingers. A start whose network reference is still
+                // being journalled isn't failed: the worker asks again (#1266).
+                if result
+                    .as_ref()
+                    .is_err_and(|error| !matches!(error, BunError::StillRunning { .. }))
                     && let Some(instance) = self.supervisor.get_instance_mut(&instance_id)
                     && let Ok(state) = instance.state.transition_to(ContainerState::Failed)
                 {
