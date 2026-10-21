@@ -278,7 +278,7 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - name: Restore the pinned test images
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/test-images
           key: test-images-${{ runner.arch }}-${{ hashFiles('tests/fixtures/pinned-images.txt') }}
@@ -751,7 +751,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - name: Restore the last baseline main saved
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: target/task-array-baseline
           key: task-array-bench-${{ github.run_id }}
@@ -764,7 +764,7 @@ jobs:
         run: python3 scripts/ci/bench_baseline.py save --criterion target/criterion --baseline target/task-array-baseline/baseline.json
       - name: Keep the baseline for the next run
         if: github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: target/task-array-baseline
           key: task-array-bench-${{ github.run_id }}
