@@ -263,28 +263,38 @@ makes you say it. `#[derive(...)]` is the compiler writing that `impl` for
 you. Here we'd rather it didn't.
 
 Opening the file needs the right kind of key, and `age` tells you which kind
-from the header. We match on both at once:
+from the header. Since `age` 0.11 a passphrase is an identity like any other
+(`age::scrypt::Identity`), and the decryptor is one opaque type with an
+`is_scrypt()` question on it. We match on the answer and the opener at once:
 
 ```rust
-let mut reader = match (decryptor, with) {
-    (age::Decryptor::Passphrase(d), BackupOpener::Passphrase(passphrase)) => {
-        d.decrypt(passphrase, None).map_err(|e| open_failed(&e))?
+let mut reader = match (decryptor.is_scrypt(), with) {
+    (true, BackupOpener::Passphrase(passphrase)) => {
+        let identity = age::scrypt::Identity::new(passphrase.clone());
+        decryptor
+            .decrypt(std::iter::once(&identity as &dyn age::Identity))
+            .map_err(|e| open_failed(&e))?
     }
-    (age::Decryptor::Recipients(d), BackupOpener::Identity(identity)) => d
+    (false, BackupOpener::Identity(identity)) => decryptor
         .decrypt(std::iter::once(identity as &dyn age::Identity))
         .map_err(|e| open_failed(&e))?,
-    (age::Decryptor::Passphrase(_), BackupOpener::Identity(_)) => {
-        return Err(RootBackupError::NeedsPassphrase);
-    }
-    (age::Decryptor::Recipients(_), BackupOpener::Passphrase(_)) => {
-        return Err(RootBackupError::NeedsIdentity);
-    }
+    (true, BackupOpener::Identity(_)) => return Err(RootBackupError::NeedsPassphrase),
+    (false, BackupOpener::Passphrase(_)) => return Err(RootBackupError::NeedsIdentity),
 };
 ```
 
 Matching on a tuple lays out all four combinations as a table, and the
-compiler checks that the table has no holes. Add a third kind of seal and
-this stops compiling until you've said what happens.
+compiler checks that the table has no holes. Add a third kind of opener and
+this stops compiling until you've said what happens. Why check the header at
+all, when `decrypt` would just fail with the wrong key? Because "no matching
+key" doesn't tell an operator at 3am that they passed an identity file to a
+passphrase backup. The two `Needs...` errors do.
+
+`std::iter::once(&identity as &dyn age::Identity)` is worth a second look.
+`decrypt` takes any iterator of *trait objects*: references to "something that
+implements `Identity`", with the concrete type erased. `as &dyn age::Identity`
+does the erasing, and `once` makes a one-item iterator. It's how Go would pass
+an interface value, except that in Rust you ask for the indirection out loud.
 
 The passphrase itself travels as a `SecretString`, from the `secrecy` crate
 that `age` re-exports. It has no `Display`, its `Debug` prints nothing useful,
@@ -292,6 +302,19 @@ and it wipes its memory when dropped. Reading the value takes an explicit
 `.expose_secret()`, which is easy to search for. At the terminal, `relish`
 turns echo off with `termios` before asking, and turns it back on whether or
 not the read worked.
+
+### The backup has to outlive the library
+
+An operator files the backup away and may not open it for years, by which
+time we'll have bumped `age` a few more times. The 0.2.2 bump from `age` 0.10
+to 0.12 rewrote the API we just walked through, so we checked in backups that
+an `age` 0.10 build sealed, one to a passphrase and one to a recipient, under
+`tests/fixtures/age/`. The tests `a_passphrase_backup_sealed_by_age_0_10_still_opens`
+and `a_recipient_backup_sealed_by_age_0_10_still_opens` open and verify them on
+every build. A round-trip test can't catch this: it seals and opens with the
+same version, so a format change on both sides passes. The same fixtures pin
+the `ENC[AGE:...]` secrets apps carry in their config and the
+`<cluster>-root-ca.age` file every node keeps.
 
 ### Verifying without a cluster
 
@@ -431,7 +454,9 @@ Because every node applies the log serially, exactly one entry for a given token
 
 The `Option<CouncilResponse>` return is Rust's way of saying "this entry might carry a verdict back to whoever proposed it". Most log entries return `None` (applied, nothing to report). This one returns `Some(...)` so the proposer learns which serial it won, or why it was turned away, without racing to read shared state back — the same pattern the plain serial allocator already used.
 
-One more thing changed while we were in here. The old code hard-coded the issuer's distinguished name as a string literal when it rebuilt the CA for signing. If that string ever drifted from the actual Node CA's subject, the issued leaf wouldn't chain. We now derive it straight from the stored CA certificate with rcgen's `CertificateParams::from_ca_cert_der`, so the issuer field always matches the CA that's really in the trust store.
+One more thing changed while we were in here. The old code hard-coded the issuer's distinguished name as a string literal when it rebuilt the CA for signing. If that string ever drifted from the actual Node CA's subject, the issued leaf wouldn't chain. We now derive it straight from the stored CA certificate with `ca::issuer_params_from_der`, so the issuer field always matches the CA that's really in the trust store.
+
+That helper used to be one call to rcgen's `CertificateParams::from_ca_cert_der`. rcgen 0.14 removed it in favour of `Issuer::from_ca_cert_der`, which is fine for signing but keeps the CA's name and validity private, and we need the validity to clamp each leaf. So we read what an issuer needs off the certificate ourselves with `x509-parser`: the subject name, the validity window and the subject key identifier. The name is the fiddly one. A verifier compares the leaf's issuer with the CA's subject byte for byte, so each attribute keeps its original ASN.1 string type (a `UTF8String` stays a `UTF8String`, a `PrintableString` stays printable). Re-encode one as the wrong type and the names look identical when printed but don't match. The test `a_leaf_signed_with_issuer_params_rebuilt_from_the_ca_der_chains_to_that_ca` compares the raw bytes and runs the chain through rustls's own verifier, because that's the kind of break that would otherwise only show up as a failed handshake.
 
 ### Binding a connection to a node
 
@@ -1085,14 +1110,14 @@ Same master key on every node, same derived key, no key exchange. (The original 
 Signing happens in the transport, not in the forty-odd places that build a message. The `GossipMessage` already had a `hmac: [u8; 32]` field sitting zeroed "until Phase 4". The trick is what you sign over: the message *with that field zeroed*, so sender and receiver compute identical bytes.
 
 ```rust
-pub fn canonical_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+pub fn canonical_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
     let mut canonical = self.clone();
     canonical.hmac = [0u8; 32];   // sign over the message minus the signature slot
-    bincode::serialize(&canonical)
+    postcard::to_stdvec(&canonical)
 }
 ```
 
-This carries a quiet load-bearing assumption: bincode has to produce the *same* bytes on both nodes. It does, but only because the payload is `Vec`s and scalars. The day someone adds a `HashMap` to a gossip message, its iteration order will differ per process, the bytes will differ, and every node will silently reject every other node's gossip — a cluster that dissolves for no visible reason. So `canonical_bytes` carries a comment that says, in effect: *if you put a map here, make it a `BTreeMap`.* The send path signs; the receive path drops anything that doesn't verify, reusing the exact `continue` that already skipped malformed datagrams. A node with the wrong master key now simply doesn't exist as far as its peers are concerned.
+This carries a quiet load-bearing assumption: postcard has to produce the *same* bytes on both nodes. It does, but only because the payload is `Vec`s and scalars. The day someone adds a `HashMap` to a gossip message, its iteration order will differ per process, the bytes will differ, and every node will silently reject every other node's gossip — a cluster that dissolves for no visible reason. So `canonical_bytes` carries a comment that says, in effect: *if you put a map here, make it a `BTreeMap`.* The send path signs; the receive path drops anything that doesn't verify, reusing the exact `continue` that already skipped malformed datagrams. A node with the wrong master key now simply doesn't exist as far as its peers are concerned.
 
 One honest caveat we wrote down rather than hid: during a rolling upgrade, a node that's learned to verify will drop gossip from a peer that hasn't yet learned to sign (it's still sending zeroes). Because signing and verifying ship in the same binary and the key was already on every node, a coordinated restart converges in seconds. If we ever needed zero-downtime upgrades, we'd add an "accept unsigned during the transition" flag. We didn't need it, so we didn't build it — but we said so.
 
@@ -1128,7 +1153,7 @@ The `ring` crate makes this even stricter. An `aead::LessSafeKey` can't be clone
 
 ## Tests
 
-Cryptography is a dream to unit-test and a nightmare to test any other way. The functions are pure: same input, same output, every time. HKDF is deterministic, AES-GCM round-trips, a tampered ciphertext always fails the tag check. None of it needs a network, a second node, or root. So Phase 4 is almost entirely unit-tested — 119 tests living next to the code in `src/sesame/`.
+Cryptography is a dream to unit-test and a nightmare to test any other way. The functions are pure: same input, same output, every time. HKDF is deterministic, AES-GCM round-trips, a tampered ciphertext always fails the tag check. None of it needs a network, a second node, or root. So Phase 4 is almost entirely unit-tested, with the tests living next to the code in `src/sesame/`.
 
 ### What the unit tests prove
 
@@ -1153,8 +1178,6 @@ cargo test --lib sesame
 ```
 
 The one thing the unit tests *don't* cover is the full token-and-revocation lifecycle across a running cluster — single-use enforcement in the agent, secret rotation windows, certificate revocation lists. That needs `SecurityState` in Raft, so its integration test (`tests/suite/security_integration.rs`, labelled "Phase 10") arrives with Chapter 10. It drives the `sesame` library directly — no running agent — so it too runs under a plain `cargo test`.
-
-Phase 4 adds 85 tests to the suite, bringing the total to 795.
 
 ### Private files need private temporary files too
 

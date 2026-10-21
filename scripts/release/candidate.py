@@ -212,7 +212,7 @@ def staging_notes(document, tag, qualified_digest):
         f"`candidate.json` SHA-256: `{qualified_digest}`\n\n"
         f"Qualification only:\n\n"
         f"```sh\ncurl -fsSL https://reliaburger.com/install.sh | "
-        f"RELIABURGER_RELEASE_BASE_URL={base} sh\n```\n"
+        f"RELIABURGER_RELEASE_BASE_URL={base} sh -s -- --laptop\n```\n"
     )
 
 

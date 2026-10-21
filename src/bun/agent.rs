@@ -81,6 +81,7 @@ use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 // to `BunAgent` (or owns a type the loop drives); `run_loop` stays here.
 mod adopted_placements;
 mod app_stop;
+mod attempt_faults;
 mod commands;
 mod consumer;
 mod council_requests;
@@ -507,6 +508,9 @@ pub struct BunAgent<G: Grill> {
     trust_domain: String,
     /// Smoker fault registry — active faults on this node.
     fault_registry: crate::smoker::registry::FaultRegistry,
+    /// Job and task-array attempts running on this node, shared with the
+    /// task runtime that lists them, so faults can target them.
+    live_attempts: Arc<crate::bun::live_attempts::LiveAttempts>,
     /// Kernel state this node has installed for its active network faults.
     network_faults: InstalledNetworkFaults,
     /// Smoker duration limits (`[smoker]`): default + maximum fault lifetime.
@@ -843,6 +847,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster: None,
             trust_domain: "default".to_string(),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
+            live_attempts: crate::bun::live_attempts::LiveAttempts::new(),
             network_faults: InstalledNetworkFaults::default(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
@@ -992,6 +997,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster: Some(cluster),
             trust_domain,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
+            live_attempts: crate::bun::live_attempts::LiveAttempts::new(),
             network_faults: InstalledNetworkFaults::default(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
@@ -1328,7 +1334,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) -> std::io::Result<super::task_runtime::OwnedRunner<G>> {
         let mut runner =
             super::task_runtime::OwnedRunner::for_data_dir(self.supervisor.grill().clone(), data)?
-                .with_log_sink(self.log_tx.clone(), self.capture_offsets.clone());
+                .with_log_sink(self.log_tx.clone(), self.capture_offsets.clone())
+                .with_live_attempts(self.live_attempts.clone());
         if let Some(cluster) = &self.cluster
             && let (Some(council), Some(ikm)) = (&cluster.council, cluster.wrapping_ikm)
         {
@@ -1336,6 +1343,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         Ok(runner)
     }
+    /// The job and task-array attempts running on this node, as the task
+    /// runtime lists them.
+    pub fn live_attempts(&self) -> Arc<crate::bun::live_attempts::LiveAttempts> {
+        self.live_attempts.clone()
+    }
+
     /// The network state delegated job runtimes share with this agent.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub fn delegated_network(
@@ -1584,20 +1597,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     // (#505). Its steps take turns with everything below:
                     // this branch yields once after each step, and the one
                     // under commands takes the step when nothing else waits.
-                    // No step runs while a step's write is in flight.
+                    // No step runs while a step's or a probe's write is in
+                    // flight.
                     _ = std::future::ready(()), if self.consumer_syncs.step_first()
                         && !self.discovery_write_in_flight() => {
                         let turn = self.begin_consumer_sync_turn();
                         self.continue_consumer_sync().await;
                         turn
                     }
-                    // A step's write that outlasted its turn has landed
-                    // (#890): take the step's remainder now.
+                    // A step's, a health probe's or a workload start's write
+                    // that outlasted its turn has landed (#890, #1255,
+                    // #1266): take the step's remainder, or install the
+                    // probe's publication, now. A start's next ask collects
+                    // its own.
                     outcome = Self::discovery_write_done(&mut self.discovery_ownership),
                         if self.discovery_write_in_flight() => {
-                        let turn = self.begin_consumer_sync_turn();
-                        self.land_discovery_write(outcome).await;
-                        self.continue_consumer_sync().await;
+                        let turn = self.begin_landing_turn();
+                        self.land_write_in_flight(outcome).await;
                         turn
                     }
                     Some(op) = self.deploy_ops_rx.recv() => {
@@ -1657,6 +1673,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     fn begin_consumer_sync_turn(&mut self) -> super::loop_meter::Turn {
         let step = self.consumer_syncs.next_step_label();
         self.begin_turn(LoopBranch::FollowUp, Some(step))
+    }
+
+    /// Start the turn that takes a write in flight once it has landed,
+    /// named after whoever waited for the write.
+    fn begin_landing_turn(&mut self) -> super::loop_meter::Turn {
+        if let Some(landed) = self.deploy_op_write_in_flight() {
+            return self.begin_turn(LoopBranch::DeployOp, Some(landed));
+        }
+        self.begin_consumer_sync_turn()
     }
 
     /// When the turn in progress must give up on a runtime read or other

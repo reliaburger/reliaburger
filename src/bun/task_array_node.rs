@@ -192,7 +192,8 @@ pub fn capability_refusal(
                 .into(),
         );
     }
-    let limits = template.is_some_and(|t| t.cpu.is_some() || t.memory.is_some());
+    let limits =
+        template.is_some_and(|t| t.cpu.is_some() || t.memory.is_some() || t.pids.is_some());
     if let Some(template) = template {
         if template.runtime == JobRuntime::SharedRunc {
             return (!capabilities.containers)
@@ -217,7 +218,8 @@ pub fn capability_refusal(
     }
     if limits && !capabilities.host_limits {
         return Some(
-            "the host process runtime cannot enforce CPU or memory limits; use image tasks".into(),
+            "the host process runtime cannot enforce CPU, memory or pids limits; use image tasks"
+                .into(),
         );
     }
     if !binary_allowed {
@@ -836,6 +838,15 @@ impl TaskArrayNode {
         let default = self.config.default_concurrency.max(1);
         spec.per_node_concurrency
             .map_or(default, |cap| cap.min(default).max(1))
+    }
+
+    /// What this node reports about the attempts it runs, for routing a
+    /// fault to them. Empty for runners that don't list attempts.
+    pub fn attempt_statuses(&self) -> Vec<super::live_attempts::AttemptStatus> {
+        match self.runner.as_ref() {
+            NodeRunner::Owned(runner) => runner.live_attempts().statuses(),
+            NodeRunner::Process(_) | NodeRunner::Fake(_) => Vec::new(),
+        }
     }
 
     /// The kinds of job this node runs, as it advertises them over gossip

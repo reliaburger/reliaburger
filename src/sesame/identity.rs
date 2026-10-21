@@ -198,14 +198,9 @@ pub fn validate_and_sign_csr(
         }
     };
 
-    // Reconstruct the CA certificate object for signing
-    let ca_cert = workload_ca_params
-        .clone()
-        .self_signed(workload_ca_keypair)
-        .map_err(|e| IdentityError::SignFailed(format!("failed to reconstruct CA cert: {e}")))?;
-
+    let issuer = rcgen::Issuer::from_params(workload_ca_params, workload_ca_keypair);
     let signed = params
-        .signed_by(&csr_params.public_key, &ca_cert, workload_ca_keypair)
+        .signed_by(&csr_params.public_key, &issuer)
         .map_err(|e| IdentityError::SignFailed(e.to_string()))?;
 
     Ok(signed.der().to_vec())

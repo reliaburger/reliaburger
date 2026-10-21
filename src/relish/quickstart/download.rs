@@ -79,7 +79,7 @@ impl Downloader {
     /// progress: a slow link is not a broken one, and the caller owns the
     /// overall deadline.
     pub fn new(stall: Duration) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .connect_timeout(stall.min(Duration::from_secs(15)))
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 if attempt.previous().len() >= 10 {
@@ -258,7 +258,7 @@ impl Downloader {
         }
         let expected = digest.to_ascii_lowercase();
         if let Some((hash, _)) = hash_file(path.to_owned(), limit).await?
-            && format!("{:x}", hash.finalize()) == expected
+            && hex::encode(hash.finalize()) == expected
         {
             if let Some(step) = step {
                 step.note("cached");
@@ -318,7 +318,7 @@ impl Downloader {
         let mut failures = 0;
         let mut attempt = 0;
         loop {
-            if file.length > 0 && format!("{:x}", file.hash.clone().finalize()) == expected {
+            if file.length > 0 && hex::encode(file.hash.clone().finalize()) == expected {
                 // Everything arrived before the connection went, perhaps in
                 // an earlier run that stopped before publishing.
                 if attempt == 0
@@ -347,7 +347,7 @@ impl Downloader {
             tokio::time::sleep(self.delay(failures)).await;
             attempt += 1;
         }
-        if format!("{:x}", file.hash.finalize()) != expected {
+        if hex::encode(file.hash.finalize()) != expected {
             return Err(Unrecoverable("download SHA-256 does not match release metadata").into());
         }
         Ok(())
@@ -506,6 +506,28 @@ mod tests {
         (format!("http://{address}/asset"), calls, task)
     }
 
+    // Release checksums are published hex strings, so the computed digest
+    // must keep their exact lowercase form, not just agree with itself.
+    #[tokio::test]
+    async fn fetch_accepts_a_file_whose_digest_is_the_known_answer() {
+        let (url, _calls, task) = server(b"abc").await;
+        let downloader = Downloader::new(Duration::from_secs(2)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("download");
+        downloader
+            .fetch(
+                &url,
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                &path,
+                1024,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"abc");
+        task.abort();
+    }
+
     #[tokio::test]
     async fn release_mirror_fetches_exact_candidate_bytes_and_retains_checksums() {
         let (mirror, calls, task) = server(b"candidate bytes").await;
@@ -516,7 +538,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("download");
         let original = "https://github.com/reliaburger/reliaburger/releases/download/v0.1.0/asset";
-        let digest = format!("{:x}", Sha256::digest(b"candidate bytes"));
+        let digest = hex::encode(Sha256::digest(b"candidate bytes"));
         downloader
             .fetch(original, &digest, &path, 1024, None)
             .await
@@ -552,7 +574,7 @@ mod tests {
         downloader
             .fetch(
                 &other,
-                &format!("{:x}", Sha256::digest(b"separate tooling")),
+                &hex::encode(Sha256::digest(b"separate tooling")),
                 &root.path().join("tool"),
                 1024,
                 None,

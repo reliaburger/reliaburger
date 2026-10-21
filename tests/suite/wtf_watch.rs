@@ -82,8 +82,8 @@ async fn watch_recovers_from_collection_failure_and_retains_warning_exit() {
             .await
             .map_err(|_| "watch ignored interrupt".to_string())?
             .map_err(|error| error.to_string())?;
-        if status.code() != Some(2) {
-            return Err(format!("expected warning exit 2, got {status}"));
+        if status.code() != Some(3) {
+            return Err(format!("expected warning exit 3, got {status}"));
         }
         Ok(())
     }

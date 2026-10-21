@@ -413,7 +413,7 @@ async fn role_exec_does_not_hold_the_adapter_lock_while_cleanup_retires_it() {
         )
         .await
         .unwrap();
-    assert_eq!(output, "auxiliary");
+    assert_eq!(output.output, "auxiliary");
     let ready = root.path().join("exec-ready");
     let running = executor.clone();
     let arguments = vec![

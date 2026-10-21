@@ -1904,6 +1904,7 @@ mod tests {
 
     fn template() -> Box<JobSpec> {
         Box::new(JobSpec {
+            pids: None,
             runtime: crate::config::job::JobRuntime::Process,
             image: None,
             command: None,

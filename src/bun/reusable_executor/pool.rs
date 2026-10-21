@@ -66,6 +66,8 @@ pub(crate) struct CommandReporting<'a> {
     pub singletons: &'a std::sync::Mutex<
         std::collections::BTreeMap<u64, Arc<crate::bun::task_runtime::SingletonRuntime>>,
     >,
+    /// Where each running command is listed for Smoker, if anywhere.
+    pub attempts: Option<&'a Arc<crate::bun::live_attempts::LiveAttempts>>,
 }
 
 struct Slot {
@@ -820,6 +822,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             request: HELPER_MEMORY_BYTES,
             limit: HELPER_MEMORY_BYTES,
         });
+        // The job's `pids` is for its commands. runc would write it over the
+        // helper's own limit, which `prepare_cgroups` already set.
+        helper_profile.pids = None;
         spec.linux.resources = crate::grill::oci::generate_job_oci_spec(
             "helper",
             "default",
@@ -894,7 +899,11 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     where
         F: std::future::Future<Output = Result<JobSpec, String>> + Send,
     {
-        let CommandReporting { sink, singletons } = reporting;
+        let CommandReporting {
+            sink,
+            singletons,
+            attempts,
+        } = reporting;
         // The command never ran, so the reason is the only output the task
         // keeps: without it a failed task shows nothing at all (#786). A
         // refusal about the job fails the task; a runtime, host, registry or
@@ -1186,6 +1195,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         };
         let run_id = task.run.as_ref().map(|run| run.batch_id);
         let executor_cgroup = context.base.clone();
+        let context_id = context.id.clone();
         // Only the command's own run time, from the helper's start receipt to
         // its exit: not slot queueing, admission, image pulls or cleanup.
         let mut ran = None;
@@ -1207,6 +1217,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             let mut started = false;
             let mut began = tokio::time::Instant::now();
             let mut logs = CommandLogs::new(task, &template, sink);
+            // Listed for Smoker from the start receipt until this future
+            // ends, however it ends (#704).
+            let mut _listed = None;
             if let Some(run) = task
                 .run
                 .as_ref()
@@ -1239,6 +1252,18 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                         let mut slots = self.slots.lock().await;
                         slots[index].active_run = run_id;
                         slots[index].cgroup = Some(executor_cgroup.clone());
+                        drop(slots);
+                        _listed = attempts
+                            .zip(crate::bun::live_attempts::LiveAttempt::of_task(
+                                task,
+                                template.namespace.as_deref().unwrap_or("default"),
+                                crate::bun::live_attempts::AttemptHandle::TaskGroup(
+                                    executor_cgroup.join("task"),
+                                ),
+                                None,
+                                Some(context_id.clone()),
+                            ))
+                            .map(|(attempts, attempt)| attempts.register(attempt));
                     }
                     protocol::Event::Output { stream, bytes } if started => {
                         output.push(&bytes);
@@ -1597,7 +1622,7 @@ fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()>
     std::fs::write(task.join("memory.swap.max"), "0")?;
     std::fs::write(task.join("memory.high"), profile.memory.request.to_string())?;
     std::fs::write(task.join("memory.oom.group"), "1")?;
-    std::fs::write(task.join("pids.max"), "256")?;
+    std::fs::write(task.join("pids.max"), profile.pids.to_string())?;
     std::fs::write(
         base.join("helper/cpu.max"),
         crate::grill::cpu_max_from_millicores(100),
@@ -1611,7 +1636,7 @@ fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()>
         HELPER_MEMORY_BYTES.to_string(),
     )?;
     std::fs::write(base.join("helper/memory.swap.max"), "0")?;
-    std::fs::write(base.join("helper/pids.max"), "16")?;
+    std::fs::write(base.join("helper/pids.max"), super::HELPER_PIDS.to_string())?;
     std::fs::write(
         base.join("helper/memory.max"),
         HELPER_MEMORY_BYTES.to_string(),
@@ -2535,6 +2560,7 @@ mod tests {
                 CommandReporting {
                     sink: None,
                     singletons: &singletons,
+                    attempts: None,
                 },
             )
             .await;
@@ -2581,6 +2607,7 @@ mod tests {
                 CommandReporting {
                     sink: None,
                     singletons: &singletons,
+                    attempts: None,
                 },
             )
             .await;

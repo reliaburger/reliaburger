@@ -783,7 +783,11 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
             }
         }
     }
-    async fn exec(&self, id: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+    async fn exec(
+        &self,
+        id: &InstanceId,
+        command: &[String],
+    ) -> Result<super::ExecOutput, GrillError> {
         // Like follow_logs, exec doesn't take the lifecycle claim: it may run
         // for minutes, and stop/kill need the claim. It also stays in the
         // caller's future, so the agent's exec timeout drops the backend call.
@@ -1104,6 +1108,7 @@ mod tests {
         let id = InstanceId("default__worker-0".into());
         let mut limited = spec(true);
         limited.linux.resources = Some(crate::grill::oci::OciResources {
+            pids: None,
             cpu: None,
             memory: None,
             unified: Default::default(),
@@ -1172,7 +1177,7 @@ mod tests {
         drop(exec);
         runtime.host.release_execs(1);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(runtime.exec(&id, &command).await.unwrap(), "first");
+        assert_eq!(runtime.exec(&id, &command).await.unwrap().output, "first");
     }
 
     fn launch(id: &InstanceId, host: bool) -> RuntimeLaunch {
@@ -1378,6 +1383,64 @@ mod tests {
             // Routing is idempotent: a second start finds nothing to route.
             assert!(runtime.route_unrouted_launches().await.unwrap().is_empty());
         }
+    }
+
+    /// The spec of an `exec` app's init container that names no image.
+    fn host_init_spec() -> OciSpec {
+        let app: crate::config::app::AppSpec =
+            toml::from_str("exec = \"/bin/sleep\"\ncommand = [\"60\"]").unwrap();
+        let app = crate::grill::oci::generate_oci_spec(
+            "tool",
+            "default",
+            &app,
+            "default__tool-0",
+            None,
+            "/sys/fs/cgroup/reliaburger/tool",
+            None,
+            None,
+        );
+        let init: crate::config::app::InitContainerSpec =
+            toml::from_str("command = [\"/bin/true\"]").unwrap();
+        crate::grill::oci::generate_init_oci_spec(&init, &app)
+    }
+
+    /// #935: an `exec` app's image-less init container runs on the host.
+    /// Caught mid-run when Bun restarts from `--runtime process` to `mixed`,
+    /// its launch must route to the host backend that ran it, as its app's
+    /// does, rather than stay unrouted as an image workload the host ran.
+    #[tokio::test]
+    async fn a_host_apps_init_container_routes_after_a_switch_from_process_to_mixed() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = pair(root.path()).await;
+        let id = InstanceId("default__tool-0-init-0".into());
+        let mut running = launch(&id, true);
+        running.spec = host_init_spec();
+        runtime.host.set_launch_inventory(vec![running]).await;
+
+        assert_eq!(
+            runtime.route_unrouted_launches().await.unwrap(),
+            vec![id.clone()]
+        );
+        runtime.host.set_state(&id, ContainerState::Running);
+        assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Running);
+        assert!(
+            runtime
+                .host
+                .calls()
+                .contains(&("state".to_string(), id.clone())),
+            "the init container was routed away from the host backend"
+        );
+
+        // A fresh one under `mixed` goes to the host backend too.
+        let fresh = InstanceId("default__tool-1-init-0".into());
+        runtime.create(&fresh, &host_init_spec()).await.unwrap();
+        assert!(
+            runtime
+                .host
+                .calls()
+                .contains(&("create".to_string(), fresh.clone())),
+            "mixed sent a host app's init container to the container backend"
+        );
     }
 
     #[tokio::test]

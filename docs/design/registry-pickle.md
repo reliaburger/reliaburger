@@ -116,6 +116,18 @@ the repositories the caller may read. Before this, a namespace-scoped Deployer c
 to any repository through `docker push`, and a bare build destination counted as
 `default`.
 
+A build that declares a `namespace` must push into it, whoever submits it: the
+destination's repository must be `<namespace>/<name>` by the same
+`repository_namespace` rule. `pickle://production/api:v1` in namespace `production` is
+admitted; `pickle://staging/api:v1` and a bare `pickle://api:v1` are refused with a 400
+whose error names the scoped destination to use. A bare name isn't quietly scoped,
+because the build would then push somewhere other than the destination it names, and
+pushing it as written would put a namespace's build in a repository every namespace
+pulls (#1066). `/v1/build` runs this check before the scope check, with or without a
+council, and `relish` config validation runs the same function first. A build with no
+`namespace` is held only by its caller's token, so an unscoped admin can still build a
+shared bare-named image.
+
 What works where:
 
 | Listener | Bearer clients (`relish build`) | Basic clients (docker, crane) |
@@ -951,9 +963,10 @@ classic layout. For an image bound to `repo@sha256:<hex>`:
     listing why each payload failed.
 ```
 
-The verifier uses `ring`, as Pickle's own signing does. Out of scope:
-keyless signatures (Fulcio certificates, Rekor proofs), which need Sigstore's
-trust roots; and the Sigstore bundle stored as an OCI referrer, which cosign 3
+The verifier uses `ring`, as Pickle's own signing does. Planned for a later
+release ([#619](https://github.com/reliaburger/reliaburger/issues/619), F03c):
+keyless cosign signatures (Fulcio certificates, Rekor proofs), which need
+Sigstore's trust roots; and the Sigstore bundle stored as an OCI referrer, which cosign 3
 writes by default (sign with `--new-bundle-format=false` for the classic
 layout). A survey of public images on 4 October 2026 found `.sig` tags on
 Chainguard, distroless, cosign's and Flux's images, all keyless, no cosign
@@ -1024,7 +1037,7 @@ By the time Meat schedules a new replica on a node, the image may already be cac
 
 Build jobs interact with Pickle through a scoped access model:
 
-1. **`pickle://` URI scheme.** Build jobs reference the Pickle registry using `pickle://` URIs (e.g., `pickle://api:v1.4.3`). Bun translates this to the local Pickle registry endpoint.
+1. **`pickle://` URI scheme.** Build jobs reference the Pickle registry using `pickle://` URIs (e.g., `pickle://api:v1.4.3`). Bun translates this to the local Pickle registry endpoint. A `[build.*]` that declares a `namespace` must name a repository in it (`pickle://<namespace>/api:v1.4.3`); see the registry authorisation section above.
 
 2. **Scoped Unix socket.** When a job has `build = true`, Bun mounts a Unix socket into the job container that provides write access to the local Pickle registry. This socket:
    - Is scoped to the repositories listed in `build_push_to` (e.g., `build_push_to = ["api"]` allows pushing only to `pickle://api:*`).
@@ -1497,7 +1510,7 @@ Pickle implements the push and pull subset of the OCI Distribution Specification
 
 | Crate | Purpose | Notes |
 |-------|---------|-------|
-| `oci-distribution` | OCI Distribution API client/server primitives | Provides types for manifests, layer descriptors, and registry protocol handling. May need forking/wrapping for the server-side (Pickle is both client and server). |
+| `oci-client` (formerly `oci-distribution`) | OCI Distribution API client primitives | Provides types for manifests, layer descriptors, and registry protocol handling. May need forking/wrapping for the server-side (Pickle is both client and server). |
 | `hyper` | HTTP server for the OCI Distribution API endpoint | The registry API is an HTTP endpoint on each node. `hyper` provides the low-level server. |
 | `axum` | HTTP framework layered on `hyper` | Routing for the `/v2/` API endpoints (blob uploads, manifest push/pull, tag listing). |
 | `reqwest` | HTTP client for external registry pull-through | Used to pull manifests and blobs from upstream registries (Docker Hub, GHCR, ECR). |
@@ -1549,7 +1562,7 @@ OCI supports manifest lists (also called "fat manifests" or image indices) that 
 
 ### 13.4 Registry Quotas
 
-Should Pickle enforce per-repository or per-namespace storage quotas? The current `max_storage` is a per-node global limit. In multi-tenant environments, a single team pushing large images could exhaust the Pickle storage for the entire node.
+Should Pickle enforce per-repository or per-namespace storage quotas? The current `max_storage` is a per-node global limit. (A per-repository quota existed in the code until 0.2.1, but nothing could configure it, so 0.2.1 deleted it.) In multi-tenant environments, a single team pushing large images could exhaust the Pickle storage for the entire node.
 
 ### 13.5 Image Vulnerability Scanning
 

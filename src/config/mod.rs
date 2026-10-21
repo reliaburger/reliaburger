@@ -141,6 +141,22 @@ mod tests {
         );
     }
 
+    /// With two mistakes in a file, the error names the one nearer the top,
+    /// the way a compiler reads. toml 0.9 stopped visiting keys in document
+    /// order unless the `preserve_order` feature is on, so without it this
+    /// reported `colour` on line 4, alphabetically first, before `replcias`
+    /// on line 3 (#1026).
+    #[test]
+    fn parse_config_reports_the_first_mistake_in_the_file() {
+        let error = Config::parse("[app.web]\nimage = \"nginx\"\nreplcias = 3\ncolour = \"red\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("replcias") && error.contains("line 3"),
+            "error should name the first mistake, got: {error}"
+        );
+    }
+
     #[test]
     fn parse_config_only_apps() {
         let config = Config::parse(

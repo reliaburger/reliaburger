@@ -180,10 +180,19 @@ pub fn resolve_credentials(
     credentials
 }
 
-/// The real upstream client, wrapping `oci_distribution`.
+/// Build an upstream client with the registry trust and crypto settings.
+fn build_client(
+    protocol: oci_client::client::ClientProtocol,
+) -> Result<oci_client::Client, String> {
+    crate::grill::oci_pull::registry_client(protocol).map_err(|e| e.to_string())
+}
+
+/// The real upstream client, wrapping `oci_client`.
 pub struct OciUpstream {
     architecture: String,
-    client: oci_distribution::Client,
+    /// The registry client, or why it couldn't be built. Each read returns
+    /// the error rather than falling back to reqwest's own defaults.
+    client: Result<oci_client::Client, String>,
     /// host → (username, password); anonymous when absent.
     credentials: HashMap<String, (String, String)>,
     /// Tried before the origin for digest-pinned images.
@@ -195,29 +204,26 @@ pub struct OciUpstream {
 impl OciUpstream {
     /// HTTPS client for real upstreams (Docker Hub, GHCR, ECR).
     pub fn new(credentials: HashMap<String, (String, String)>) -> Self {
-        Self::with_protocol(credentials, oci_distribution::client::ClientProtocol::Https)
+        Self::with_protocol(credentials, oci_client::client::ClientProtocol::Https)
     }
 
     /// Plain-HTTP client — integration tests point this at an
     /// in-process registry standing in for the upstream.
     pub fn insecure_http(credentials: HashMap<String, (String, String)>) -> Self {
-        Self::with_protocol(credentials, oci_distribution::client::ClientProtocol::Http)
+        Self::with_protocol(credentials, oci_client::client::ClientProtocol::Http)
     }
 
     fn with_protocol(
         credentials: HashMap<String, (String, String)>,
-        protocol: oci_distribution::client::ClientProtocol,
+        protocol: oci_client::client::ClientProtocol,
     ) -> Self {
-        let config = oci_distribution::client::ClientConfig {
-            protocol: protocol.clone(),
-            ..Default::default()
-        };
+        let plain_http = matches!(protocol, oci_client::client::ClientProtocol::Http);
         Self {
             architecture: std::env::consts::ARCH.into(),
-            client: oci_distribution::Client::new(config),
+            client: build_client(protocol),
             credentials,
             mirrors: ImageMirrors::default(),
-            plain_http: matches!(protocol, oci_distribution::client::ClientProtocol::Http),
+            plain_http,
         }
     }
 
@@ -226,10 +232,7 @@ impl OciUpstream {
     pub fn with_mirrors(mut self, mirrors: ImageMirrors) -> Self {
         let loopback = mirrors.loopback_hosts();
         if !self.plain_http && !loopback.is_empty() {
-            self.client = oci_distribution::Client::new(oci_distribution::client::ClientConfig {
-                protocol: oci_distribution::client::ClientProtocol::HttpsExcept(loopback),
-                ..Default::default()
-            });
+            self.client = build_client(oci_client::client::ClientProtocol::HttpsExcept(loopback));
         }
         self.mirrors = mirrors;
         self
@@ -244,16 +247,22 @@ impl OciUpstream {
         Ok(self)
     }
 
-    fn auth_for(&self, host: &str) -> oci_distribution::secrets::RegistryAuth {
+    fn client(&self) -> Result<&oci_client::Client, PickleError> {
+        self.client
+            .as_ref()
+            .map_err(|e| PickleError::ReplicationFailed(format!("upstream client: {e}")))
+    }
+
+    fn auth_for(&self, host: &str) -> oci_client::secrets::RegistryAuth {
         match self.credentials.get(host) {
             Some((user, pass)) => {
-                oci_distribution::secrets::RegistryAuth::Basic(user.clone(), pass.clone())
+                oci_client::secrets::RegistryAuth::Basic(user.clone(), pass.clone())
             }
-            None => oci_distribution::secrets::RegistryAuth::Anonymous,
+            None => oci_client::secrets::RegistryAuth::Anonymous,
         }
     }
 
-    fn oci_reference(image: &ImageReference) -> Result<oci_distribution::Reference, PickleError> {
+    fn oci_reference(image: &ImageReference) -> Result<oci_client::Reference, PickleError> {
         image
             .to_oci_reference()
             .map_err(|e| PickleError::ReplicationFailed(format!("bad upstream reference: {e}")))
@@ -265,8 +274,9 @@ impl UpstreamRegistry for OciUpstream {
         Box::pin(async move {
             let reference = Self::oci_reference(image)?;
             let auth = self.auth_for(&image.registry);
+            let client = self.client()?;
             let digest = retry_registry_read(METADATA_READ, || {
-                self.client.fetch_manifest_digest(&reference, &auth)
+                client.fetch_manifest_digest(&reference, &auth)
             })
             .await
             .map_err(|e| {
@@ -341,13 +351,9 @@ impl OciUpstream {
     ) -> Result<UpstreamManifest, PickleError> {
         let reference = Self::oci_reference(image)?;
         let auth = self.auth_for(&image.registry);
+        let client = self.client()?;
         let verified = retry_registry_read(METADATA_READ, || {
-            pull_verified_manifest_for_architecture(
-                &self.client,
-                &reference,
-                &auth,
-                &self.architecture,
-            )
+            pull_verified_manifest_for_architecture(client, &reference, &auth, &self.architecture)
         })
         .await
         .map_err(|e| {
@@ -363,8 +369,9 @@ impl OciUpstream {
     async fn fetch_root_from(&self, image: &ImageReference) -> Result<UpstreamRoot, PickleError> {
         let reference = Self::oci_reference(image)?;
         let auth = self.auth_for(&image.registry);
+        let client = self.client()?;
         let root = retry_registry_read(METADATA_READ, || {
-            pull_verified_root(&self.client, &reference, &auth)
+            pull_verified_root(client, &reference, &auth)
         })
         .await
         .map_err(|e| {
@@ -466,17 +473,18 @@ impl OciUpstream {
                 layer.digest
             ))
         })?;
-        let descriptor = oci_distribution::manifest::OciDescriptor {
+        let descriptor = oci_client::manifest::OciDescriptor {
             digest: layer.digest.as_str().to_string(),
             media_type: layer.media_type.clone(),
             size,
             ..Default::default()
         };
+        let client = self.client()?;
         let bytes = retry_registry_read(LAYER_READ, || async {
             // Each attempt owns an empty buffer; partial responses cannot leak
             // into the next attempt. Metadata is not an allocation budget.
             let mut bytes = Vec::new();
-            self.client
+            client
                 .pull_blob(&reference, &descriptor, &mut bytes)
                 .await?;
             Ok(bytes)

@@ -28,6 +28,12 @@ process-heavy = { max-threads = 2 }
 upgrade-heavy = { max-threads = 1 }
 crash-recovery = { max-threads = 1 }
 
+# Each scripted demo (scripts/demo/) starts its own cluster and walks
+# several rollouts or GitOps syncs, each waiting on real health checks.
+[[profile.default.overrides]]
+filter = 'binary(demos)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 # The podinfo demo pulls three real images on a cold cache before it can
 # check anything, so it gets longer than the other host-network tests.
 [[profile.default.overrides]]
@@ -81,6 +87,17 @@ filter = 'binary(integration) | binary(placement) | binary(job_recovery)'
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# Retention GC needs four full upgrades of the debug `bun` (about 600 MB
+# each: copy, hash, two signature checks, a first exec that macOS assesses,
+# then a boot that hashes it again). On a Mac at load average 190 to 520 one
+# upgrade took 50 to 135 s, so four outlast the other upgrade tests' 360 s
+# (#1049); 720 s covers four at the slowest. The first matching override
+# wins, so this precedes theirs.
+[[profile.default.overrides]]
+filter = 'binary(self_upgrade) & test(=version_retention_gc_keeps_last_three)'
+test-group = "upgrade-heavy"
+slow-timeout = { period = "120s", terminate-after = 6 }
+
 [[profile.default.overrides]]
 filter = 'binary(self_upgrade) | binary(self_upgrade_cluster)'
 test-group = "upgrade-heavy"
@@ -92,6 +109,12 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 [[profile.default.overrides]]
 filter = 'binary(node_pressure)'
 threads-required = "num-test-threads"
+
+# Each scripted demo (scripts/demo/) starts its own cluster and walks
+# several rollouts or GitOps syncs, each waiting on real health checks.
+[[profile.ci.overrides]]
+filter = 'binary(demos)'
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 # The podinfo demo pulls three real images on a cold cache before it can
 # check anything, so it gets longer than the other host-network tests.
@@ -141,6 +164,17 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 filter = 'binary(integration) | binary(placement) | binary(job_recovery)'
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Retention GC needs four full upgrades of the debug `bun` (about 600 MB
+# each: copy, hash, two signature checks, a first exec that macOS assesses,
+# then a boot that hashes it again). On a Mac at load average 190 to 520 one
+# upgrade took 50 to 135 s, so four outlast the other upgrade tests' 360 s
+# (#1049); 720 s covers four at the slowest. The first matching override
+# wins, so this precedes theirs.
+[[profile.ci.overrides]]
+filter = 'binary(self_upgrade) & test(=version_retention_gc_keeps_last_three)'
+test-group = "upgrade-heavy"
+slow-timeout = { period = "120s", terminate-after = 6 }
 
 [[profile.ci.overrides]]
 filter = 'binary(self_upgrade) | binary(self_upgrade_cluster)'

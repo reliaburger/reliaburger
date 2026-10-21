@@ -1248,6 +1248,18 @@
     "test": "runc_warm_pinned_executor_cold_starts_make_no_registry_requests"
   },
   {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_cancelling_an_array_interrupts_a_slow_cold_pull",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_cancelling_an_array_interrupts_a_slow_cold_pull"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_a_deadline_interrupts_a_slow_cold_pull",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_a_deadline_interrupts_a_slow_cold_pull"
+  },
+  {
     "source": "tests/placement.rs",
     "function": "apply_on_any_node_places_across_the_cluster",
     "binary": "reliaburger::placement",
@@ -1675,6 +1687,12 @@
   },
   {
     "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
     "function": "cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
     "binary": "reliaburger::owned_task_arrays",
     "test": "cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart"
@@ -1810,5 +1828,35 @@
     "function": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
     "binary": "reliaburger::placement",
     "test": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace"
+  },
+  {
+    "source": "tests/cluster_task_arrays.rs",
+    "function": "killing_attempts_mid_array_still_completes_every_task",
+    "binary": "reliaburger::cluster_task_arrays",
+    "test": "killing_attempts_mid_array_still_completes_every_task"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_array_attempt_can_be_paused_and_resumed",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_array_attempt_can_be_paused_and_resumed"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "partition_from_an_array_attempt_blocks_its_cgroup",
+    "binary": "reliaburger::ebpf",
+    "test": "partition_from_an_array_attempt_blocks_its_cgroup"
+  },
+  {
+    "source": "tests/demos.rs",
+    "function": "rollout_demo_rolls_back_a_bad_version_and_marks_it_failed",
+    "binary": "reliaburger::demos",
+    "test": "rollout_demo_rolls_back_a_bad_version_and_marks_it_failed"
+  },
+  {
+    "source": "tests/demos.rs",
+    "function": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone",
+    "binary": "reliaburger::demos",
+    "test": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone"
   }
 ]

@@ -40,13 +40,14 @@ pub(super) enum DeployOp {
         namespace: String,
         reply: oneshot::Sender<Vec<InstanceId>>,
     },
-    /// How many replicas a deploy adds beside the running ones, when it
-    /// only raises the replica count. Asked before the spec is stored.
-    ReplicasToAddInPlace {
+    /// What a deploy that changes only this node's share of the same
+    /// version does to the running replicas (#1111). Asked before the spec
+    /// is stored.
+    ShareChangeInPlace {
         app_name: String,
         namespace: String,
         spec: Box<AppSpec>,
-        reply: oneshot::Sender<Option<u32>>,
+        reply: oneshot::Sender<Option<super::scale_in_place::InPlaceChange>>,
     },
     /// Create Pending instances for the replicas a scale-up adds.
     AddAppReplicas {
@@ -281,7 +282,7 @@ impl DeployOp {
             DeployOp::EnforceImageSignature { .. } => "enforce_image_signature",
             DeployOp::StoreDeployedSpec { .. } => "store_deployed_spec",
             DeployOp::ListExistingOwned { .. } => "list_existing_owned",
-            DeployOp::ReplicasToAddInPlace { .. } => "replicas_to_add_in_place",
+            DeployOp::ShareChangeInPlace { .. } => "share_change_in_place",
             DeployOp::AddAppReplicas { .. } => "add_app_replicas",
             DeployOp::NextDeployGen { .. } => "next_deploy_gen",
             DeployOp::SupervisorDeployApp { .. } => "supervisor_deploy_app",
@@ -519,14 +520,14 @@ impl DeployOps {
         .await
     }
 
-    pub(super) async fn replicas_to_add_in_place(
+    pub(super) async fn share_change_in_place(
         &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
-    ) -> Option<u32> {
+    ) -> Option<super::scale_in_place::InPlaceChange> {
         self.call(
-            |reply| DeployOp::ReplicasToAddInPlace {
+            |reply| DeployOp::ShareChangeInPlace {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
                 spec: Box::new(spec.clone()),
@@ -1191,13 +1192,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .collect();
                 let _ = reply.send(ids);
             }
-            DeployOp::ReplicasToAddInPlace {
+            DeployOp::ShareChangeInPlace {
                 app_name,
                 namespace,
                 spec,
                 reply,
             } => {
-                let _ = reply.send(self.replicas_to_add_in_place(&app_name, &namespace, &spec));
+                let _ = reply.send(self.share_change_in_place(&app_name, &namespace, &spec));
             }
             DeployOp::AddAppReplicas {
                 app_name,
@@ -1438,8 +1439,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .await;
                 // On failure, mark the instance Failed. The worker stops the
                 // created container, off the loop, so no half-started
-                // workload lingers.
-                if result.is_err()
+                // workload lingers. A start whose network reference is still
+                // being journalled isn't failed: the worker asks again (#1266).
+                if result
+                    .as_ref()
+                    .is_err_and(|error| !matches!(error, BunError::StillRunning { .. }))
                     && let Some(instance) = self.supervisor.get_instance_mut(&instance_id)
                     && let Ok(state) = instance.state.transition_to(ContainerState::Failed)
                 {

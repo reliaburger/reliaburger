@@ -1049,7 +1049,14 @@ async fn exec_returns_output_only_after_retiring_surviving_children() {
     let gone = exec_process_is_gone(pid).await;
     grill.kill(&id).await.unwrap();
     stopped(&grill, &id).await;
-    assert_eq!(output.unwrap(), "stdout\nstderr");
+    // D34: the command's own exit code comes back with its output.
+    assert_eq!(
+        output.unwrap(),
+        reliaburger::grill::ExecOutput {
+            output: "stdout\nstderr".into(),
+            exit_code: 7,
+        }
+    );
     assert!(gone, "exec returned while its descendant remained");
 }
 
@@ -1089,9 +1096,12 @@ async fn exec_rejects_empty_commands_and_excessive_output() {
             .to_string()
             .contains("request exceeds")
     );
-    assert_eq!(long_request.unwrap(), format!("{}\n", "x".repeat(2048)));
+    assert_eq!(
+        long_request.unwrap().output,
+        format!("{}\n", "x".repeat(2048))
+    );
     assert!(oversized.unwrap_err().to_string().contains("1 MiB"));
-    assert_eq!(following.unwrap(), "still-running\n");
+    assert_eq!(following.unwrap().output, "still-running\n");
 }
 
 #[tokio::test]
@@ -1242,7 +1252,7 @@ async fn exec_owner_can_launch_after_its_binary_has_been_unlinked() {
         .await;
     grill.kill(&id).await.unwrap();
     stopped(&grill, &id).await;
-    assert_eq!(result.unwrap(), "mapped-image\n");
+    assert_eq!(result.unwrap().output, "mapped-image\n");
 }
 
 /// A variable in this test process that host commands must not inherit
@@ -1282,7 +1292,7 @@ async fn exec_runs_with_the_workloads_environment_and_none_of_buns() {
     let resolved = grill.exec(&id, &["rb-exec-tool".into()]).await;
     grill.kill(&id).await.unwrap();
     stopped(&grill, &id).await;
-    let env = env.unwrap();
+    let env = env.unwrap().output;
     let lines: Vec<&str> = env.lines().collect();
     assert!(lines.contains(&"JOB=1"), "{env}");
     assert!(
@@ -1299,7 +1309,7 @@ async fn exec_runs_with_the_workloads_environment_and_none_of_buns() {
             .any(|line| line.starts_with(&format!("{private}="))),
         "{private} leaked: {env}"
     );
-    assert_eq!(resolved.unwrap(), "found");
+    assert_eq!(resolved.unwrap().output, "found");
 }
 
 /// An agent with a durable process runtime and records under `directory`,
@@ -1474,15 +1484,21 @@ async fn scaling_down_removes_the_ownership_journals_of_retired_instances() {
     let directory = tempfile::tempdir().unwrap();
     let (sender, shutdown, task) = running_agent(directory.path(), &[]);
     deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 3\n")).await;
-    let before = ["default__web-0", "default__web-1", "default__web-2"];
+    // A smaller share of the same version retires only the replicas that
+    // leave it; `web-0` stays as it was (#1111).
+    let retired = ["default__web-1", "default__web-2"];
     deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 1\n")).await;
-    owners_forgotten(directory.path(), &before).await;
-    let kept = std::fs::read_dir(directory.path().join("process-owners"))
+    owners_forgotten(directory.path(), &retired).await;
+    let kept: Vec<String> = std::fs::read_dir(directory.path().join("process-owners"))
         .unwrap()
         .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
         .filter(|name| name.starts_with("default__web"))
-        .count();
-    assert_eq!(kept, 1, "the remaining replica keeps its journal");
+        .collect();
+    assert_eq!(
+        kept,
+        ["default__web-0"],
+        "the remaining replica keeps its journal"
+    );
 
     shutdown.cancel();
     task.await.unwrap();
@@ -1587,19 +1603,25 @@ async fn an_owned_start_refuses_a_binary_made_unexecutable_before_exec() {
 /// restart budget and ending `Failed` without a reason.
 #[tokio::test]
 async fn a_restart_after_the_binary_vanished_ends_failed_with_binary_not_found() {
-    use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let tool = directory.path().join("self-deleting-tool");
-    // It runs long enough for the deploy to see it start, then removes
-    // its own file and exits, so the restart finds no binary.
-    std::fs::write(&tool, "#!/bin/sh\nsleep 1\nrm -f \"$0\"\nexit 1\n").unwrap();
-    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // It runs until the test has seen the deploy finish, then removes its
+    // own name and exits, so the restart finds no binary. It used to sleep
+    // one second instead, and a deploy that took longer than that to record
+    // the running process failed with "runtime process identity is
+    // unavailable" (#1130). A shared, already-launched script (#582) keeps
+    // macOS's first-launch assessment out of the deploy as well.
+    first_launch::install_script(
+        &tool,
+        "#!/bin/sh\ndir=${0%/*}\ndeadline=$(( $(date +%s) + 60 ))\nwhile [ ! -f \"$dir/vanish\" ]; do [ $(date +%s) -lt $deadline ] || exit 71; sleep 0.05; done\nrm -f \"$0\"\nexit 1\n",
+    );
     let (sender, shutdown, task) = running_agent(directory.path(), &[&tool]);
     deploy(
         &sender,
         &format!("[app.ghost]\nexec = {:?}\n", tool.display().to_string()),
     )
     .await;
+    std::fs::write(directory.path().join("vanish"), b"").unwrap();
 
     let reason = format!("binary not found: {}", tool.display());
     let failed = tokio::time::timeout(Duration::from_secs(20), async {

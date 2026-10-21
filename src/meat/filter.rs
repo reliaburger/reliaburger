@@ -27,8 +27,10 @@ pub struct WorkloadRequirements {
     /// The cluster runs internal DNS, so every placement needs a node whose
     /// resolver is ready and reachable from workloads.
     pub requires_dns: bool,
-    /// The host binary an `exec` or `script` app runs (see [`host_binary`]).
-    pub host_binary: Option<PathBuf>,
+    /// The host binaries an `exec` or `script` app runs: its own (see
+    /// [`host_binary`]) and those of its image-less init containers (see
+    /// [`host_init_binaries`]). Empty for a container.
+    pub host_binaries: Vec<PathBuf>,
     /// The app runs an image: its own (or, with only a `command`, a root
     /// filesystem), or an init container's. Only a node whose runtime runs
     /// containers may take it (#914).
@@ -48,7 +50,11 @@ impl WorkloadRequirements {
                 .unwrap_or_default(),
             requires_egress: spec.requires_network_policy(),
             requires_dns,
-            host_binary: host_binary(spec).map(Path::to_path_buf),
+            host_binaries: host_binary(spec)
+                .into_iter()
+                .chain(host_init_binaries(spec))
+                .map(Path::to_path_buf)
+                .collect(),
             requires_containers: (spec.exec.is_none() && spec.script.is_none())
                 || spec.init.iter().any(|init| init.image.is_some()),
         }
@@ -71,6 +77,20 @@ pub fn host_binary(spec: &AppSpec) -> Option<&Path> {
     })
 }
 
+/// The host binaries a process workload's init containers run: the first
+/// word of each image-less init's command. An `exec` or `script` app's init
+/// that names no image runs on the host like its app (#935), so the node
+/// must allow its binary too. Empty for a container, whose inits run in an
+/// image. An init with no command names no binary; the runtime refuses it.
+pub fn host_init_binaries(spec: &AppSpec) -> impl Iterator<Item = &Path> {
+    let host = host_binary(spec).is_some();
+    spec.init
+        .iter()
+        .filter(move |init| host && init.image.is_none())
+        .filter_map(|init| init.command.first())
+        .map(Path::new)
+}
+
 /// Whether `node` can run a workload with these requirements, room and
 /// labels aside: it's ready, runs containers when the workload is one, and
 /// can enforce egress, resolve internal DNS and run the host binary when
@@ -81,9 +101,9 @@ pub fn node_can_run(node: &SchedulerNodeState, requirements: &WorkloadRequiremen
         && (!requirements.requires_egress || node.capabilities.egress.can_enforce_allowlist())
         && (!requirements.requires_dns || node.capabilities.dns.can_resolve_internal())
         && requirements
-            .host_binary
-            .as_deref()
-            .is_none_or(|binary| node.capabilities.process.runs(binary))
+            .host_binaries
+            .iter()
+            .all(|binary| node.capabilities.process.runs(binary))
 }
 
 /// Whether `node` runs this kind of workload at all: a container needs a
@@ -95,7 +115,9 @@ fn runs_its_kind(node: &SchedulerNodeState, requirements: &WorkloadRequirements)
 /// Filter the cluster to nodes eligible for placing this workload.
 ///
 /// A node passes the filter if:
-/// 1. It is ready (not unknown, draining, or cordoned).
+/// 1. It is ready: it has a fresh readiness report, its egress enforcement
+///    isn't degraded, and it hasn't been retired. Drain and cordon don't
+///    exist yet (#656).
 /// 2. It matches all required placement labels.
 /// 3. It runs containers if the workload is one, can enforce any security
 ///    capability the workload requires, and runs its host binary if it has
@@ -217,7 +239,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 requires_egress: false,
                 requires_dns: false,
-                host_binary: None,
+                host_binaries: Vec::new(),
                 requires_containers: false,
             },
             &cluster,
@@ -252,7 +274,7 @@ mod tests {
                 labels: required.clone(),
                 requires_egress: false,
                 requires_dns: false,
-                host_binary: None,
+                host_binaries: Vec::new(),
                 requires_containers: false,
             },
             &cluster,
@@ -274,7 +296,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 requires_egress: false,
                 requires_dns: false,
-                host_binary: None,
+                host_binaries: Vec::new(),
                 requires_containers: false,
             },
             &cluster,
@@ -303,7 +325,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 requires_egress: false,
                 requires_dns: false,
-                host_binary: None,
+                host_binaries: Vec::new(),
                 requires_containers: false,
             },
             &cluster,
@@ -340,7 +362,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 requires_egress: false,
                 requires_dns: true,
-                host_binary: None,
+                host_binaries: Vec::new(),
                 requires_containers: false,
             },
             &cluster,
@@ -392,7 +414,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 requires_egress: false,
                 requires_dns: false,
-                host_binary: None,
+                host_binaries: Vec::new(),
                 requires_containers: false,
             },
             &cluster,
@@ -438,6 +460,28 @@ mod tests {
         assert_eq!(result.len(), 4);
     }
 
+    /// #935: a host app's image-less init container runs its command on the
+    /// host, so the app lands only where the node allows that binary too,
+    /// or the node would refuse it after placement.
+    #[test]
+    fn a_host_apps_init_binary_must_be_allowlisted_for_placement() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(running("app-only", true, &["/usr/bin/python3"]));
+        cluster.set_node(running(
+            "both",
+            true,
+            &["/usr/bin/python3", "/usr/bin/migrate"],
+        ));
+        let spec: AppSpec = toml::from_str(
+            "exec = \"/usr/bin/python3\"\n[[init]]\ncommand = [\"/usr/bin/migrate\"]",
+        )
+        .unwrap();
+
+        let result = filter_nodes(&WorkloadRequirements::for_app(&spec, false), &cluster);
+
+        assert_eq!(result, vec![NodeId::new("both")]);
+    }
+
     #[test]
     fn an_empty_cluster_says_no_node_is_ready() {
         let mut cluster = ClusterStateCache::new();
@@ -456,7 +500,7 @@ mod tests {
         cluster.set_node(running("ruby", true, &["/usr/bin/ruby"]));
         let mut needs = WorkloadRequirements {
             labels: labels(&[("zone", "east")]),
-            host_binary: Some(PathBuf::from("/usr/bin/python3")),
+            host_binaries: vec![PathBuf::from("/usr/bin/python3")],
             resources: Resources::new(9000, 0, 0),
             ..Default::default()
         };
@@ -471,7 +515,7 @@ mod tests {
             UnplacedReason::NoCapableNode
         );
 
-        needs.host_binary = None;
+        needs.host_binaries.clear();
         assert_eq!(unplaced_reason(&needs, &cluster), UnplacedReason::NoRoom);
         assert!(filter_nodes(&needs, &cluster).is_empty());
     }

@@ -1,0 +1,27 @@
+# Real containers: build an image on the cluster.
+#
+# A node with Buildah builds examples/demo/burger's Dockerfile (for
+# linux/amd64 and linux/arm64) and pushes it to Pickle, the cluster's own
+# registry, as production/burger:v1. `relish build` tars the context
+# (relative to this file) and uploads it, so the source never has to be on
+# the node first.
+#
+# The destination names the namespace, pickle://production/..., and the
+# build declares the same `namespace`: Pickle refuses a build that pushes
+# into another namespace's repositories.
+#
+# Requires a node with Buildah (on macOS, the managed Linux VM from
+# `relish setup --quickstart` has it). A build has 15 minutes per stage.
+#
+# Build:
+#   relish apply examples/phase-8/container-build-job.toml   # creates the namespace
+#   relish build examples/phase-8/container-build-job.toml
+#   relish images                         # production/burger:v1
+
+[namespace.production]
+
+[build.burger]
+context = "../demo/burger"
+dockerfile = "Dockerfile"
+destination = "pickle://production/burger:v1"
+namespace = "production"

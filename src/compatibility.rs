@@ -140,9 +140,23 @@ pub struct Compatibility {
 /// couldn't start, so a refused scale-up moves only those (#971).
 /// The Raft `log.redb` and `snapshot.redb` files are redb's v3 file format
 /// (redb 4), which can't open the v2 files redb 2 wrote (#1024).
+///
+/// 0.2.2, UX patch (53/70): one bump for the whole release, made when the
+/// train opened. Each 0.2.2 change to the wire or durable state adds its
+/// line below this one, not another bump.
+/// An exec answer, from `POST /v1/exec` and from a process owner's
+/// exec socket, carries the command's `exit_code` beside its `output` (#522).
+/// `JobSpec::pids`, the per-command process limit, in Raft desired state,
+/// task-array templates and node syncs, and the OCI `linux.resources.pids`
+/// block in fresh job containers' specs and their owner records (#741).
+/// `FaultRequest`, `FaultRule` and routed workload faults carry a `workload`
+/// kind and a `task_index`, `FaultSummary` a `task_index`, and nodes answer
+/// `GET /v1/fault/attempts` with their running job attempts (#704).
+/// Gossip datagrams, reporting frames and the Raft log's vote, log ids and
+/// encrypted-entry envelope are postcard, not bincode (#1026).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 52,
-    state: 69,
+    protocol: 53,
+    state: 70,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

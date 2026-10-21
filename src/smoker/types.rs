@@ -329,6 +329,56 @@ impl FaultType {
 }
 
 // ---------------------------------------------------------------------------
+// WorkloadKind
+// ---------------------------------------------------------------------------
+
+/// What kind of workload a fault targets.
+///
+/// The replica-minimum rail exists to keep a long-running service up, so it
+/// applies only to apps. A job or a task-array attempt is meant to finish,
+/// and a killed attempt is retried under its own policy, so the rail stands
+/// aside for them. The API works this out from live evidence and overwrites
+/// whatever a caller sent: a caller can't relabel an app as a job to dodge
+/// the rail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadKind {
+    /// A long-running app with replicas.
+    #[default]
+    App,
+    /// A job: a run of one task.
+    Job,
+    /// A task array: a run of many indexed tasks.
+    TaskArray,
+}
+
+impl WorkloadKind {
+    /// Whether the workload runs to completion rather than staying up.
+    pub fn runs_to_completion(self) -> bool {
+        matches!(self, Self::Job | Self::TaskArray)
+    }
+
+    /// The kind of a run with `task_count` tasks.
+    pub fn of_run(task_count: u32) -> Self {
+        if task_count == 1 {
+            Self::Job
+        } else {
+            Self::TaskArray
+        }
+    }
+}
+
+impl fmt::Display for WorkloadKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::App => write!(f, "app"),
+            Self::Job => write!(f, "job"),
+            Self::TaskArray => write!(f, "task array"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FaultReversal
 // ---------------------------------------------------------------------------
 
@@ -390,6 +440,12 @@ pub struct FaultRule {
     pub namespace: Option<String>,
     /// Optional: target a specific instance by name (e.g. "redis-1").
     pub target_instance: Option<String>,
+    /// What kind of workload the target is.
+    #[serde(default)]
+    pub workload: WorkloadKind,
+    /// Optional: the one task of a job or task array to target.
+    #[serde(default)]
+    pub task_index: Option<u32>,
     /// Optional: restrict fault to a specific node.
     pub target_node: Option<String>,
     /// When this fault was activated (monotonic clock, nanoseconds).
@@ -433,6 +489,8 @@ impl FaultRule {
             target_service,
             namespace: None,
             target_instance: None,
+            workload: WorkloadKind::App,
+            task_index: None,
             target_node: None,
             activated_at_ns: now_ns,
             expires_at_ns: now_ns.saturating_add(duration_ns),
@@ -521,8 +579,16 @@ pub struct FaultRequest {
     /// scoped Deployer cannot fault another tenant's same-named service. The
     /// agent refuses a workload fault that reaches it without one.
     pub namespace: Option<String>,
-    /// Optional: target a specific instance.
+    /// Optional: target a specific instance. For a job or task array this
+    /// may be a task index, which the API moves into `task_index`.
     pub target_instance: Option<String>,
+    /// What kind of workload the target is. The API sets it from live
+    /// evidence and ignores what a caller sent.
+    #[serde(default)]
+    pub workload: WorkloadKind,
+    /// Optional: the one task of a job or task array to target.
+    #[serde(default)]
+    pub task_index: Option<u32>,
     /// Optional: restrict to a specific node.
     pub target_node: Option<String>,
     /// Fault duration.
@@ -638,6 +704,9 @@ pub struct SafetyContext {
     pub target_service_replicas: u32,
     /// How many replicas of the target service already have active faults.
     pub target_service_faulted_replicas: u32,
+    /// What kind of workload the target is. Only apps meet the
+    /// replica-minimum rail.
+    pub workload: WorkloadKind,
 }
 
 /// Cluster-wide replica counts for a workload fault's target service.
@@ -727,6 +796,9 @@ pub struct FaultSummary {
     pub namespace: Option<String>,
     /// Target instance, if scoped.
     pub target_instance: Option<String>,
+    /// Target task index, for a fault scoped to one task of a job or array.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_index: Option<u32>,
     /// Target node, for routed node faults.
     pub target_node: Option<String>,
     /// Seconds remaining before auto-expiry.
@@ -751,6 +823,7 @@ impl From<&FaultRule> for FaultSummary {
             target_service: rule.target_service.clone(),
             namespace: rule.namespace.clone(),
             target_instance: rule.target_instance.clone(),
+            task_index: rule.task_index,
             target_node: rule.target_node.clone(),
             remaining_secs: rule.remaining().as_secs(),
             injected_by: rule.injected_by.clone(),
@@ -1106,6 +1179,8 @@ mod tests {
     #[test]
     fn fault_request_serialization_round_trip() {
         let req = FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 0,

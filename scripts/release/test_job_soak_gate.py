@@ -938,3 +938,91 @@ class CurrentPairExpectations(unittest.TestCase):
             with self.subTest(function=name):
                 self.assertIn("push_current_pair",bodies[name])
                 self.assertNotIn('push_pair "$node" "$tls/current/',bodies[name])
+
+
+class ControllerExitStatus(unittest.TestCase):
+    """#1035: macOS runs the harness under /bin/bash 3.2. Once the pid space
+    wraps and a later command gets the job controller's old pid, bash 3.2
+    drops the controller from its job table without saving its status, so
+    finish()'s `wait` failed with "not a child of this shell" (127) and the
+    controller's real exit status never reached the verdict. The controller
+    now records its own status in jobs/exit-status and finish() reads that."""
+
+    release=Path(__file__).parent
+    # The shell macOS runs the harness with; elsewhere this is bash 5.
+    bash="/bin/bash" if Path("/bin/bash").exists() else "bash"
+
+    def harness_functions(self, *names):
+        source=(self.release/"qualify-sustained.sh").read_text()
+        functions=""
+        for name in names:
+            start=re.search(rf"^{name}\(\) \{{",source,re.M).start()
+            # One-line helpers end on their own line; the rest at a closing brace in column 0.
+            line=source[start:source.index("\n",start)+1]
+            functions+=line if line.rstrip().endswith("}") else source[start:source.index("\n}\n",start)+3]
+        return functions
+
+    def finish(self, status=None):
+        """Run the harness's finish() for a controller that has already exited
+        and that the shell no longer knows: its pid is one this shell never
+        started, which is what bash 3.2 sees after the pid is reused."""
+        import os,subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); evidence=root/"evidence"; (evidence/"jobs").mkdir(parents=True)
+            (evidence/"metadata.json").write_text(json.dumps(dict(tier="fast")))
+            if status is not None: (evidence/"jobs/exit-status").write_text(f"{status}\n")
+            script=("set -euo pipefail\n"+self.harness_functions("meta","meta_get","real_home_state","finish")
+                    +"check() { return 0; }\n"
+                    +'keep=true; vm=(); home=; real_before=$(real_home_state)\n'
+                    # A pid that has exited and was never this shell's child.
+                    +"jobs_pid=$(/bin/sh -c 'echo $$')\n"
+                    +"trap finish EXIT\n")
+            result=subprocess.run([self.bash,"-c",script],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+                                  env=dict(PATH=os.environ["PATH"],HOME=directory,evidence=str(evidence),record=str(root/"record.md")))
+            return result,json.loads((evidence/"metadata.json").read_text())
+
+    def test_a_controller_that_exited_cleanly_passes_after_the_shell_forgot_it(self):
+        result,metadata=self.finish(status=0)
+        self.assertNotIn("not a child",result.stderr)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertNotIn("result",metadata)
+
+    def test_a_controller_that_failed_fails_the_run_and_names_its_status(self):
+        result,metadata=self.finish(status=1)
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(metadata["result"],"FAIL")
+        self.assertIn("Job controller exited with status 1",metadata["notes"])
+
+    def test_a_controller_that_left_no_status_fails_the_run(self):
+        result,metadata=self.finish()
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(metadata["result"],"FAIL")
+        self.assertIn("Job controller exited without recording its exit status",metadata["notes"])
+
+    def test_starting_the_controller_clears_a_status_left_by_an_earlier_run(self):
+        import os,subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); evidence=root/"evidence"; (evidence/"jobs").mkdir(parents=True)
+            (evidence/"jobs/exit-status").write_text("0\n")
+            controller=root/"controller.py"; controller.write_text("import time\ntime.sleep(5)\n")
+            script=(self.harness_functions("start_jobs")+'start_jobs\nkill "$jobs_pid"\n')
+            subprocess.run([self.bash,"-c",script],check=True,
+                           env=dict(PATH=os.environ["PATH"],evidence=str(evidence),job_controller=str(controller),
+                                    job_load="target",target_rate="",api_port="1",ca="ca",limactl="limactl"))
+            self.assertFalse((evidence/"jobs/exit-status").exists())
+
+    def test_the_run_command_records_its_exit_status_for_the_harness(self):
+        import sys
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            evidence=Path(directory); (evidence/"jobs").mkdir()
+            argv=["job_soak.py","run","--evidence",str(evidence),"--api-port","1","--ca","ca","--limactl","limactl"]
+            with mock.patch.object(sys,"argv",argv), mock.patch.object(jobs,"run",return_value=1):
+                self.assertEqual(jobs.main(),1)
+            self.assertEqual((evidence/"jobs/exit-status").read_text().strip(),"1")
+            with mock.patch.object(sys,"argv",argv), mock.patch.object(jobs,"run",side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError): jobs.main()
+            self.assertEqual((evidence/"jobs/exit-status").read_text().strip(),"1")
+            with mock.patch.object(sys,"argv",argv), mock.patch.object(jobs,"run",return_value=0):
+                self.assertEqual(jobs.main(),0)
+            self.assertEqual((evidence/"jobs/exit-status").read_text().strip(),"0")

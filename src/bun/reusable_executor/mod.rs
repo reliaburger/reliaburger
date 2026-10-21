@@ -28,6 +28,10 @@ pub(crate) const DEFAULT_REUSABLE_CONCURRENCY: u32 = 27;
 pub const HELPER_CPU_REQUEST: u64 = 10;
 /// The helper is independently capped, outside each command's memory limit.
 pub const HELPER_MEMORY_BYTES: u64 = 8 << 20;
+/// A command's `pids.max` when its job doesn't set `pids`.
+pub const DEFAULT_COMMAND_PIDS: u32 = 256;
+/// The helper's own `pids.max`, outside every command's limit.
+pub const HELPER_PIDS: u32 = 16;
 
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,6 +41,8 @@ pub(crate) struct ExecutorKey([u8; 32]);
 pub(crate) struct ExecutorProfile {
     pub cpu: ResourceRange,
     pub memory: ResourceRange,
+    /// The command cgroup's `pids.max`.
+    pub pids: u32,
     pub reservation: Resources,
 }
 
@@ -145,6 +151,10 @@ impl ExecutorKey {
         compatible.script = None;
         compatible.cpu = Some(profile.cpu);
         compatible.memory = Some(profile.memory);
+        // An omitted limit and an explicit 256 build the same task cgroup.
+        compatible.pids = template
+            .pids
+            .filter(|limit| limit.get() != DEFAULT_COMMAND_PIDS);
         let encoded = serde_json::to_vec(&compatible)?;
         Ok(Self(Sha256::digest(encoded).into()))
     }
@@ -197,6 +207,9 @@ impl ExecutorProfile {
         Ok(Self {
             cpu,
             memory,
+            pids: template
+                .pids
+                .map_or(DEFAULT_COMMAND_PIDS, crate::config::types::PidsLimit::get),
             reservation,
         })
     }
@@ -274,6 +287,15 @@ mod tests {
     use super::*;
     fn template() -> JobSpec {
         toml::from_str("image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nnamespace='tenant-a'\nruntime='shared-runc'\ncpu='100m-1000m'\nmemory='32Mi-64Mi'\n[env]\nTOKEN='first'").unwrap()
+    }
+    #[test]
+    fn executor_key_for_a_job_matches_its_known_answer() {
+        // SHA-256 of 32 zero bytes followed by "x".
+        let key = ExecutorKey([0; 32]).for_job(Some("x"));
+        assert_eq!(
+            hex::encode(key.0),
+            "fdded6faced1af47fdaaac589602f58e0e040a882627806c42ddcc38da604cf0"
+        );
     }
     #[test]
     fn startup_retries_runtime_host_and_helper_failures_but_not_refusals() {
@@ -426,6 +448,40 @@ mod tests {
             crate::config::types::EnvValue::Encrypted("sealed".into()),
         );
         assert!(ExecutorKey::new(&job).is_err());
+    }
+    #[test]
+    fn command_pids_default_to_256_and_follow_the_jobs_limit() {
+        let profile = ExecutorProfile::new(&template()).unwrap();
+        assert_eq!(profile.pids, 256);
+        let mut threaded = template();
+        threaded.pids = Some(crate::config::types::PidsLimit::try_from(4096).unwrap());
+        assert_eq!(ExecutorProfile::new(&threaded).unwrap().pids, 4096);
+        // The helper's limit isn't the job's to raise, and the reservation
+        // doesn't change: processes aren't a schedulable resource.
+        assert_eq!(HELPER_PIDS, 16);
+        assert_eq!(
+            ExecutorProfile::new(&threaded).unwrap().reservation,
+            profile.reservation
+        );
+    }
+    #[test]
+    fn executors_with_different_pids_limits_never_share_but_omitted_means_256() {
+        let first = template();
+        let key = ExecutorKey::new(&first).unwrap();
+        let mut explicit = first.clone();
+        explicit.pids = Some(crate::config::types::PidsLimit::try_from(256).unwrap());
+        assert_eq!(
+            ExecutorKey::new(&explicit).unwrap(),
+            key,
+            "pids = 256 is the default, so it shares with an omitted limit"
+        );
+        let mut more = first;
+        more.pids = Some(crate::config::types::PidsLimit::try_from(512).unwrap());
+        assert_ne!(
+            ExecutorKey::new(&more).unwrap(),
+            key,
+            "a warm executor's task cgroup keeps the limit it was built with"
+        );
     }
     #[test]
     fn idle_profile_reservation_includes_the_helper_without_weakening_task_limits() {

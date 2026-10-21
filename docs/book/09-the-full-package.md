@@ -16,44 +16,41 @@ Blue-green eliminates the mixed-version window. The approach: start an entirely 
 
 Rolling deploys are sequential. Each step is: start new, health check, swap routing, drain old, stop old. One at a time. Safe, but slow, and both versions serve traffic during the transition.
 
-Blue-green deploys are batched. All new instances start in parallel. All get health-checked. If every green instance passes, routing swaps atomically. If any green instance fails, the entire green fleet gets torn down and blue keeps serving as if nothing happened.
+Blue-green deploys bring the whole new fleet up first. Every green instance starts and passes its health check while blue keeps serving, and nothing is published to routing yet: green comes up dark. Only when every green instance is healthy does the cut-over happen. If any green instance fails, the green fleet gets torn down and blue keeps serving as if nothing happened.
+
+`blue_green_redeploy` in `src/bun/agent/deploy_worker.rs` does it in three moves. Stripped of its error handling:
 
 ```rust
-pub fn execute_blue_green<D: DeployDriver>(
-    state: &mut DeployState,
-    driver: &D,
-) -> Result<DeployResult, DeployError> {
-    state.transition(DeployEvent::GreenStarting)?;
+// Start and health check the entire green fleet before touching blue.
+for &ordinal in &ordinals {
+    // create, start and probe one green instance; on failure, mark it
+    // and stop starting more
+}
 
-    // Start ALL green instances
-    for step in &mut state.steps {
-        let (id, _) = driver.start_instance(...)?;
-        step.new_instance = Some(id);
-    }
+// Nothing of blue has retired yet, so an abort only tears green down.
+if new_failed {
+    self.abort_rollout(aborted(&green), events).await;
+    return std::ops::ControlFlow::Break(());
+}
 
-    // Health check ALL green instances
-    state.transition(DeployEvent::GreenAllStarted)?;
-    for step in &state.steps {
-        driver.await_healthy(step.new_instance.as_deref().unwrap(), timeout)?;
-    }
-
-    // Atomic routing swap
-    state.transition(DeployEvent::GreenAllHealthy)?;
-    for step in &state.steps {
-        driver.add_to_routing(app, step.new_instance...)?;
-    }
-    for step in &state.steps {
-        driver.remove_from_routing(app, step.old_instance...);
-    }
-
-    // Drain and stop all blue instances
-    // ...
+// The whole green fleet is healthy. Publish every green backend so
+// routing picks them up while blue still serves...
+for new_id in new_ids {
+    self.ops.publish_new_backend(/* ... */).await;
+}
+// ...then drain and stop blue.
+for old_id in &existing {
+    self.retire_old_instance(old_id, deploy_config.drain_timeout).await;
 }
 ```
 
-The state machine got three new phases: `StartingGreen`, `HealthCheckingGreen`, `RoutingSwitching`. Each phase has a failure path. If a green instance fails health, the state machine transitions to `Reverting` (with auto-rollback) or `Halted` (without). The abort logic stops all green instances that were started and returns.
+`std::ops::ControlFlow` is a standard-library enum with two variants, `Continue` and `Break`, for a function whose caller needs to know whether to carry on. It reads better than a `bool` whose meaning you'd have to look up.
 
-The key insight: the abort function doesn't need to "restore" anything. Blue was never touched. The routing table still points to blue. Aborting green is pure cleanup.
+The key insight: the abort doesn't need to "restore" anything. Blue was never touched. The routing table still points to blue. Aborting green is pure cleanup, which is why the closure that builds the `AbortedRollout` says nothing has retired.
+
+There's one exception to "green beside blue". A managed volume must never have two writers, so a volume app rolls stop-first even under `strategy = "blue-green"`: `blue_green_volume_app_redeploys_stop_first` pins it.
+
+The first version lived in a separate model, `execute_blue_green`, driven by Chapter 7's synchronous driver trait, and the same story applies: the agent couldn't use it, so it grew its own path, and we deleted the model in August 2026.
 
 ### Choosing between strategies
 
@@ -268,7 +265,7 @@ Invalid files produce warnings, not errors. One broken TOML file shouldn't block
 
 ### `relish fmt`
 
-Reformats a TOML config with canonical section ordering. The order is: namespace, permission, app, job, build. Within each section, keys are alphabetical (courtesy of `BTreeMap`'s ordering when we round-trip through `toml`).
+Reformats a TOML config with canonical section ordering. The order is: namespace, permission, app, job, build. Within each section, keys are alphabetical. Comments survive, which took a rewrite; "Keeping the comments" below tells that story.
 
 `relish fmt app.toml` rewrites the file in place. `relish fmt app.toml --check` exits non-zero if the file needs formatting, without modifying it. Use `--check` in CI to enforce consistent formatting.
 
@@ -326,7 +323,34 @@ Write the whole thing somewhere else, then `rename` it over the target. `rename(
 
 Worth noticing how the two protections differ. The round-trip guard is about *correctness*: is this output the same config? The atomic rename is about *atomicity*: is there any instant where an observer sees neither? A tool that rewrites files in place needs both, and having one makes it very easy to assume you have the other.
 
-The third thing `fmt` did quietly was eat comments. That part is by design — the formatter round-trips through `toml`'s typed representation, which has nowhere to keep them — but "by design" is not the same as "the operator knows". It now says so, once, when the input had comments to lose. Design decisions that destroy user data should be announced by the program, not by the documentation.
+The third thing `fmt` did quietly was eat comments. The formatter parsed the file into `toml::Value`, a tree of plain data with nowhere to keep a `#` line, and printed the tree back out. For a while it printed a warning when the input had comments to lose, on the theory that a design decision that destroys user data should at least be announced. The 2026-10-10 audit (D35) asked the obvious next question: why destroy it at all?
+
+#### Keeping the comments
+
+The `toml` crate has a sibling, `toml_edit`, built for exactly this: editing a TOML file the way a person would, leaving everything it doesn't touch alone. It was already in our dependency tree, because `toml` 0.8 used it to parse, so adding it as a direct dependency cost no new code. (Since 0.9, both crates parse with a smaller shared crate, `toml_parser`, and `toml` no longer depends on `toml_edit`.) Where `toml::Value` is the *meaning* of a file, `toml_edit::DocumentMut` is the file: every key, value and header carries its *decor*, the whitespace and comments around it. A comment line above `image = ...` is the prefix decor of the key `image`; a `# one per zone` after `replicas = 3` is the suffix decor of the value.
+
+That turns formatting from "print a tree" into "tidy a document in place". Sorting reorders keys, and since a comment lives in its key's decor, it moves with its key. Reordering sections is the one part that needs care. `toml_edit` prints tables by a *position* number, the order they appeared in the input, so the formatter sorts the root table's keys into canonical order, then walks the tree in that order handing out fresh positions:
+
+```rust
+fn visit(&mut self, item: &mut Item) {
+    match item {
+        Item::Table(table) => self.visit_table(table),
+        // The elements of `[[x]]` keep their order: it's meaningful.
+        Item::ArrayOfTables(array) => {
+            for table in array.iter_mut() {
+                self.visit_table(table);
+            }
+        }
+        Item::None | Item::Value(_) => {}
+    }
+}
+```
+
+`Item` is an enum, and `match` makes the walk say what happens to every kind of item, including the two it ignores. `&mut Item` is a *mutable borrow*: the walk changes the document in place, and while it holds that borrow nothing else can read the document, so there's no way to observe a half-renumbered tree. An array of tables (`[[app.web.volume]]`) has its elements visited in order but never sorted, because their order is data.
+
+Each table on the walk then gets its spacing normalised: comment lines are kept, unindented, and blank lines go; `=` gets one space either side; each header gets one blank line above it except the first. Values keep their own spelling, so `0x1F` stays `0x1F` and a multi-line array keeps its layout. A comment written above a section header belongs to that header, so when `[namespace.team]` moves to the top of the file, its `# Team budget.` comes with it.
+
+The round-trip guard stays, unchanged. It compares meaning, not text, so it's just as good a check on `toml_edit` output as it was on ours. The new tests are the comment cases: `fmt_keeps_every_comment` (full-line, trailing and end-of-file comments), `fmt_moves_a_section_with_the_comment_above_it`, `fmt_normalises_spacing_and_blank_lines`, `fmt_with_comments_is_idempotent` and `fmt_keeps_array_of_tables_in_order`. One cost to note: a file formatted by an older relish may fail `relish fmt --check` once, because the new formatter ends a file with one newline, not a blank line. Before 1.0 we don't keep compatibility, and a single reformat fixes it.
 
 `compile` had the same shape of problem one level up. It merged files with `extend` on name-keyed maps, so a second `[app.web]` in a second file silently replaced the first, and the output looked complete. It now warns on every overwrite — while leaving two apps of the same name in *different* namespaces alone, since that's been legal since instance identity gained namespaces. And a malformed `_defaults.toml` used to be swallowed by `.ok()?`, making a typo indistinguishable from "there are no defaults": the default image vanished from every app in the directory and the error resurfaced much later as a missing field. `Option` is a lovely type for "there isn't one" and a terrible one for "there is one but I couldn't read it".
 
@@ -433,7 +457,7 @@ The idea: a module inside Bun watches a git repository. When a commit changes a 
 
 ### Architecture
 
-Lettuce runs on a single council member elected as the **GitOps coordinator**. Not the Raft leader -- a separate election that distributes load. If the coordinator dies, another council member takes over within seconds, inheriting the last sync state from Raft.
+Lettuce runs on the Raft leader, which is also the **GitOps coordinator**. Only the leader can write desired state, so only the leader can apply a sync. If it dies, Raft elects a new leader within a couple of seconds, and that node's sync loop takes over, picking up the last sync state from Raft.
 
 The sync loop:
 
@@ -450,31 +474,29 @@ A GitOps engine that treats the repository as the whole truth deletes everything
 
 ### Coordinator election
 
+The sync loop is leader-gated, so naming the coordinator is one line of logic. `coordinator_for_leader` in `src/lettuce/sync.rs` records the leader and says whether this is the first election or a handover:
+
 ```rust
-pub fn select_coordinator(
-    council_members: &[String],
-    leader_id: &str,
-    reason: CoordinatorElectionReason,
-) -> Option<CoordinatorElection> {
-    let non_leaders: Vec<_> = council_members.iter()
-        .filter(|id| id.as_str() != leader_id)
-        .collect();
-
-    let selected = if non_leaders.is_empty() {
-        leader_id.to_string()  // single-node: leader is coordinator
-    } else {
-        let mut sorted = non_leaders;
-        sorted.sort();
-        sorted[0].clone()  // deterministic: first non-leader
+pub fn coordinator_for_leader(
+    leader: &str,
+    previous: Option<&str>,
+    now_ms: u64,
+) -> CoordinatorElection {
+    let reason = match previous {
+        Some(prev) if prev != leader => CoordinatorElectionReason::Failover,
+        _ => CoordinatorElectionReason::Initial,
     };
-
-    Some(CoordinatorElection { node_id: selected, reason, ... })
+    CoordinatorElection {
+        node_id: leader.to_string(),
+        reason,
+        timestamp: now_ms,
+    }
 }
 ```
 
-Why prefer non-leaders? The Raft leader already handles write requests, log replication, and heartbeats. Adding the sync loop on top means the leader does more I/O during every sync cycle (git fetch, file read, Raft write). Putting it on another council member spreads the work across two nodes instead of concentrating it on one.
+`Some(prev) if prev != leader` is a *match guard*: the arm matches only when the pattern fits and the condition holds. Anything else (no previous coordinator, or the same leader again) is `Initial`. The reason is there for operators: the dashboard's GitOps page shows the coordinator, and a `Failover` says it moved because leadership did.
 
-Why deterministic? If two nodes simultaneously decide the coordinator needs replacing, they must agree on who the replacement is. Sorting alphabetically and picking the first non-leader means every node arrives at the same answer independently.
+What we tried first was cleverer. `select_coordinator` sorted the council and picked the first non-leader alphabetically, to take the sync loop's fetches off the busy leader. The trouble was that only the leader can write to Raft, so the loop stayed on the leader anyway, and the coordinator field named a node that never ran a sync. The code's own comment ended up calling it "fiction". We deleted the function and made the field tell the truth. Spreading load is a fine goal, but not for a role that does one fetch every 30 seconds, and never at the price of a status field that lies.
 
 ### Webhook validation
 
@@ -595,39 +617,79 @@ In Kubernetes, a single application is split across multiple resource types. A w
 
 In Reliaburger, that same application is one `[app.web]` section with sub-sections for ingress, autoscale, env, and health. The importer needs to figure out which K8s resources belong together and merge them.
 
-The correlation rules use the same matching logic Kubernetes itself uses:
+The correlation rules use the same matching logic Kubernetes itself uses, and none of them cross a namespace:
 
-1. Service → Deployment by label selector
-2. Ingress → Service by backend service name
+1. Service → workload by label selector
+2. Ingress → Service by backend service name, then on to whatever that Service selected
 3. HPA → workload by `scaleTargetRef.name`
 
+That list was in this chapter, the design doc and the whitepaper for months before the code agreed with it. The first importer matched a Service to the Deployment with the same `metadata.name` and never read `spec.selector` at all. It worked on every hand-written example we tried, because hand-written examples name the Service after the Deployment. Real charts don't. A Helm chart's Service is called `release-web-http` and selects `app.kubernetes.io/name: web`; the old importer reported it as matching nothing and threw its port away. Worse, everything was collected in maps keyed by bare name, so a Service called `api` in `staging` overwrote the one in `prod` and then attached to both `api` Deployments. Two Jobs called `migrate` in different namespaces collapsed into one, and the report said "Converted" twice.
+
+The fix starts with the key. A Kubernetes object is identified by its namespace *and* its name, so the importer's maps are now keyed by exactly that:
+
 ```rust
-fn find_ingress_for_service(
-    ingresses: &BTreeMap<String, Ingress>,
-    service_name: &str,
-) -> Option<String> {
-    for (ing_name, ing) in ingresses {
-        if let Some(spec) = &ing.spec {
-            if let Some(rules) = &spec.rules {
-                for rule in rules {
-                    if let Some(http) = &rule.http {
-                        for path in &http.paths {
-                            if let Some(backend) = &path.backend.service {
-                                if backend.name == service_name {
-                                    return Some(ing_name.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ResourceKey {
+    namespace: String,
+    name: String,
 }
 ```
 
-Five levels of `if let Some`. That's what happens when you navigate the K8s API's deeply nested Option types. Each level is a field that might not be set. The k8s-openapi crate mirrors the Go API faithfully, including the optionality of everything.
+`PartialOrd` and `Ord` are there because the key goes into a `BTreeMap`, which keeps its keys sorted and so needs to compare them. Deriving them compares the fields in declaration order: namespace first, then name. That gives a deterministic report order for free. A `HashMap` would only need `Hash` and `Eq`, but its iteration order changes from run to run, and a migration report that shuffles itself between runs is hard to diff.
+
+Then the selector match itself, which is one line once you see it: a Service selects a workload when every `key: value` in its selector appears in the workload's pod template labels.
+
+```rust
+let matched: Vec<usize> = workloads
+    .iter()
+    .enumerate()
+    .filter(|(_, w)| w.key.namespace == svc_key.namespace)
+    .filter(|(_, w)| match selector {
+        Some(selector) => selector
+            .iter()
+            .all(|(label, value)| w.labels.get(label) == Some(value)),
+        None => w.key.name == svc_key.name,
+    })
+    .map(|(index, _)| index)
+    .collect();
+```
+
+This is an iterator chain, Rust's answer to a Python list comprehension or a Go `for` loop with an accumulator. `.iter()` borrows each workload in turn, `.enumerate()` pairs it with its index, each `.filter()` keeps the items its closure returns `true` for, and `.collect()` gathers what's left into the `Vec<usize>` the type annotation asks for. Nothing runs until `collect` pulls the items through, and the compiler usually turns the whole chain into the same loop you'd have written by hand. The `|(_, w)|` closure parameters destructure each `(index, workload)` pair, and `_` ignores the half we don't need.
+
+We collect indices rather than `&mut` references to the workloads because the next step mutates them, folding the Service's port into each app. Rust won't let us hold a list of mutable references into a slice while we're also reading other workloads' labels for the report message. An index is just a number, so it borrows nothing, and we take `&mut workloads[index]` for one workload at a time.
+
+A Service that selects several workloads is legal in Kubernetes (a blue/green pair behind one Service is a classic) but has no Reliaburger equivalent, because an app answers only to its own name. The importer still gives each selected workload the Service's port, then warns that clients have to call each app by name. A Service that selects nothing gets a warning too. And a Service with *no* selector, which Kubernetes routes nowhere (its endpoints are managed by hand), falls back to the old name match, with a warning saying so. That keeps a sloppy hand-written manifest working without pretending it's correct.
+
+An Ingress names a Service, not a workload, so Ingress correlation now follows the Service. The old lookup was five levels of `if let Some`, one per optional field in the K8s API's nesting. The new one flattens them with the same iterator tools:
+
+```rust
+fn ingress_backend_services(ing: &Ingress) -> impl Iterator<Item = &str> {
+    ing.spec
+        .iter()
+        .flat_map(|spec| spec.rules.iter().flatten())
+        .flat_map(|rule| rule.http.iter())
+        .flat_map(|http| http.paths.iter())
+        .filter_map(|path| path.backend.service.as_ref())
+        .map(|backend| backend.name.as_str())
+}
+```
+
+Calling `.iter()` on an `Option` gives an iterator of zero or one items, so `None` simply contributes nothing, and `flat_map` splices each inner iterator into the outer one. The return type `impl Iterator<Item = &str>` says "some iterator of string slices" without naming the long concrete type the chain builds, the way a Go function might return an interface, except that the compiler still knows the exact type and there's no dynamic dispatch. The `&str`s borrow from the `Ingress`, and the compiler ties their lifetime to `ing` without us writing it out.
+
+Same-named apps and jobs still need distinct TOML keys, since `[app.api]` can only mean one thing. Both tables go through one generic function now, where Jobs used to skip the rename:
+
+```rust
+fn insert_without_overwrite<T>(
+    table: &mut BTreeMap<String, T>,
+    table_name: &str,
+    report: &mut MigrationReport,
+    label: &str,
+    key: &ResourceKey,
+    value: T,
+) -> String
+```
+
+`<T>` makes it generic over the value type: the compiler stamps out one copy for `AppSpec` and one for `JobSpec`, like a C++ template but type-checked once, up front. The first `api` keeps its name, and the second becomes `[app.staging-api]` with a warning.
 
 ### Using k8s-openapi
 
@@ -641,10 +703,14 @@ default = ["kubernetes"]
 kubernetes = ["dep:k8s-openapi"]
 
 [dependencies]
-k8s-openapi = { version = "0.22", default-features = false, features = ["latest"], optional = true }
+k8s-openapi = { version = "0.28", default-features = false, features = ["std", "v1_36"], optional = true }
 ```
 
-We disable `default-features` on k8s-openapi because we only need the type definitions, not the API client operations. That shaves off a chunk of compile time.
+k8s-openapi builds its types for exactly one Kubernetes API version, picked by a feature: `v1_32` to `v1_36` in 0.28. We name the newest one, `v1_36`, rather than the `latest` alias. That alias moves under you: when we went from 0.22 to 0.28, `latest` quietly jumped from Kubernetes 1.30 to 1.36. Naming the version puts that choice in the diff, where a reviewer can see it.
+
+Why the newest? Because we only read the stable `v1` and `v2` kinds (Deployment, StatefulSet, DaemonSet, Job, CronJob, Service, Ingress, ConfigMap, Secret, Namespace and HorizontalPodAutoscaler), and Kubernetes doesn't remove fields from stable APIs. Each release only adds fields. A newer version reads every manifest an older one could, and it knows about fields like `Job.spec.successPolicy` too, which an older version would silently drop. We turn `default-features` off and switch `std` back on by name, so the feature list says everything we enable.
+
+The bump also took some `Option`s away. Kubernetes' OpenAPI document now marks `spec` as required on HorizontalPodAutoscaler and CronJob, and `name` as required on the `configMapRef` and `secretRef` of an `envFrom` entry, so k8s-openapi 0.28 makes them plain `HorizontalPodAutoscalerSpec`, `CronJobSpec` and `String`. A document that leaves one out still parses: the generated deserialiser fills in the type's default, an empty spec or an empty name. Our code lost an `if let Some(spec)` level in a few places, and the compiler found every one of them for us.
 
 ### Reading the YAML
 
@@ -677,13 +743,15 @@ DaemonSets become `replicas = "*"`. StatefulSets produce a warning because Relia
 
 Three of those rows have a history: `command`, `namespace`, and env values used to be silently dropped. A Deployment running `python -m worker.main` would import as an app running the image's default entrypoint. No error, no warning — the config just did something different from the original. Silent data loss during migration is the worst kind, because you only discover it when the workload misbehaves in production.
 
-`args` has a history of its own. For a long time the importer glued `command` and `args` into one vector, which was harmless while runc ignored the image's config anyway. Once runc started honouring `Entrypoint` and `Cmd` (Chapter 1), gluing became a bug: a manifest with only `args` would have replaced the image's entrypoint with its arguments. So they're separate fields now, on both sides.
+`args` has a history of its own. For a long time the importer glued `command` and `args` into one vector, which was harmless while runc ignored the image's config anyway. Once runc started honouring `Entrypoint` and `Cmd` (Chapter 1), gluing became a bug: a manifest with only `args` would have replaced the image's entrypoint with its arguments. So they're separate fields now, on both sides (the exporter took longer to catch up than it should have; see the third pass below).
 
-Ports are the other place where a quiet mapping would lie. A Kubernetes Service can listen on port 80 and forward to container port 9898, and it can expose several ports. A Reliaburger app has one port, and `frontend:9898` reaches it on the same number. The importer follows the Service's `targetPort` (resolving names like `http` against the container's ports) to pick the app's port, and then says what it couldn't keep: the Service port that clients used to dial, any further Service ports, container ports nothing routes to, a readiness probe that runs a command or opens a TCP socket, and a Service with no workload of the same name.
+Ports are the other place where a quiet mapping would lie. A Kubernetes Service can listen on port 80 and forward to container port 9898, and it can expose several ports. A Reliaburger app has one port, and `frontend:9898` reaches it on the same number. The importer follows the Service's `targetPort` (resolving names like `http` against the container's ports) to pick the app's port, and then says what it couldn't keep: the Service port that clients used to dial, any further Service ports, container ports nothing routes to, a readiness probe that runs a command or opens a TCP socket, and a Service that selects no workload.
 
 Env vars that use `valueFrom` (secret refs, configmap refs, field refs) still can't map automatically — there's no way to reach into another cluster's secret store. But now they land in the migration report as warnings naming each variable, instead of vanishing. The rule the importer follows: convert what you can, warn about what you can't, drop nothing silently.
 
-One more K8s-ism: names are scoped per namespace, so `api` in `alpha` and `api` in `beta` are different workloads. A flat TOML table has one key per name. When the importer sees a collision it keeps the first app under its own name and imports the second as `[app.beta-api]`, with a warning — rather than letting the second overwrite the first.
+`envFrom` used to vanish without a word. Now a `configMapRef` to a ConfigMap in the same input and namespace is flattened into `env`, applying its `prefix`, with explicit `env` entries winning the way they do in Kubernetes. That's still reported: a later edit to the ConfigMap won't reach the app any more, and the operator should know the link is gone. A `secretRef`, or a ConfigMap that isn't in the input, gets a warning naming it.
+
+Jobs had the same disease. A `completions: 50` Job imported as a single run, silently. `backoffLimit` and the pod's `activeDeadlineSeconds` now map onto `max_attempts` and `task_timeout_secs`, the run-policy fields 0.2.0 added (`backoffLimit` counts retries, so it's off by one from attempts, and anything above 9 is capped at Reliaburger's limit of 10, with a warning). A Job-wide `activeDeadlineSeconds` becomes the per-attempt timeout, with a warning, because the two don't mean the same thing. Everything else that changes how often a job runs (`completions`, `parallelism`, `completionMode`, a CronJob's `timeZone` and `startingDeadlineSeconds`) and everything a job's pod carries that a `[job.*]` can't (`workingDir`, the user, `nodeSelector`, tolerations, affinity, sidecars, volumes) gets a warning per field.
 
 ### The migration report
 
@@ -711,7 +779,9 @@ Import-then-apply is two commands and a file you didn't want. So `relish apply` 
 relish apply -f https://reliaburger.com/demo/podinfo.yaml
 ```
 
-How does it know? A top-level `apiVersion:` line isn't valid TOML, so a document with `apiVersion:` and `kind:` at the start of a line can only be Kubernetes. That document goes through the same importer in memory, its migration report still lands on stderr (applying mustn't hide what it approximated), and the resulting `Config` is validated and applied like any TOML file.
+How does it know? A top-level `apiVersion:` line isn't valid TOML, so a document with `apiVersion:` and `kind:` at the start of a line can only be Kubernetes. So is a document that opens with `{` and names `"apiVersion"` and `"kind"`: TOML can't start with a brace, and JSON is YAML, so the same importer reads it unchanged. That document goes through the importer in memory, its migration report still lands on stderr (applying mustn't hide what it approximated), and the resulting `Config` is validated and applied like any TOML file.
+
+For a while only `apply` knew this. `lint`, `deploy`, `diff` and `compile` called `Config::from_file`, so `relish lint podinfo.yaml` failed on the first line of a file `relish apply` would have run. Now all four go through `manifest::load_file`, which reads the file and hands it to the same `manifest::parse` that `apply` uses. One parser means one definition of "a manifest", and `local_config_commands_accept_kubernetes_yaml` holds the four commands to it.
 
 The download is where a convenience turns into an attack surface, so it's deliberately narrow: HTTPS only (redirects too, via reqwest's `https_only`), a 30-second timeout and a 1 MiB cap enforced while reading, not just from the `Content-Length` header a server can lie about. The CLI accepts the manifest positionally or with `-f`, and clap's `ArgGroup` makes exactly one of them required:
 
@@ -815,9 +885,17 @@ The rest of the import crop was the same shape as the export's: DaemonSets and S
 
 Can you see the pattern? Almost none of these were hard to fix. They existed because the correct code was written once, for the most common kind, and the other kinds were stubbed "for now". If you take one habit from this section: when you fix a mapping for Deployments, grep for the sibling that handles DaemonSets before you close the ticket.
 
+#### The third pass: a gate that didn't close
+
+The 0.2.2 audit found that lesson unlearned in one more place. The importer split `command` and `args` properly, but the exporter still set only `command`, so importing then exporting `examples/kubernetes/podinfo.yaml` lost Redis's `--maxmemory 64mb --save "" --appendonly no`. The working directory and `runAsUser`/`runAsGroup` went the same way. All four now reach the container, and a test in `tests/suite/relish_cli.rs` runs the real binary over the podinfo file, there and back, and compares Redis's arguments.
+
+Encrypted env values were the nastier case. They export as the placeholder `ENCRYPTED_VALUE`, which is right: the ciphertext is useless outside the cluster that holds the key. But nothing in the report said so, and the pod would start with `ENCRYPTED_VALUE` as its database password. Each one is now listed under "Not exported yet" as needing a Kubernetes Secret. A job's `max_attempts` and `task_timeout_secs` export too, as `backoffLimit` and the pod's `activeDeadlineSeconds`, the mirror image of the import mapping.
+
+And `--strict`, sold as the CI gate for migrations, checked only the warnings. A manifest of nothing but a NetworkPolicy and a PersistentVolumeClaim, both dropped whole, passed it. It now fails on any warning *or* any dropped resource, and the error counts both.
+
 ## Lessons learned
 
-**The mock driver refactor was worth it.** When we added blue-green deploys, the existing `MockDriver` broke. It tracked steps by counting `stop_instance` calls, which worked for rolling (one stop per step). In blue-green, all starts happen before any stops. The fix: separate counters for start and health check calls. A small change, but it highlighted why the mock should model *operation counts*, not *lifecycle phases*.
+**Test the order, not just the outcome.** Blue-green's whole promise is an order: every green instance healthy and published before any blue instance stops. A test that only checks the end state (green running, blue gone) passes for a rollout that stopped blue first and caused an outage on the way. `blue_green_publishes_green_before_stopping_blue` holds an in-flight request on a blue instance, so blue can't finish draining, and checks that green is already published while blue still serves.
 
 **Hysteresis is not optional.** The first autoscaler version scaled down as soon as the metric dropped below target. It oscillated wildly. CPU drops, scale down, CPU spikes, scale up, CPU drops, scale down. The hysteresis threshold (scale down only below target * 0.8) eliminated the oscillation. The cooldown (3 minutes between scale events) added stability. Both are required. Neither is clever -- they're standard control theory, applied.
 
@@ -825,7 +903,7 @@ Can you see the pattern? Almost none of these were hard to fix. They existed bec
 
 **WebSocket is 95% detection, 5% proxying.** We spent most of the time on header detection edge cases (case-insensitive matching, multi-value Connection headers, routes that don't opt in). The actual proxying -- connect to backend, forward upgrade, bidirectional copy -- is straightforward. The drain Close frame is 4 bytes of hand-built binary (built and tested, though not yet sent on the live drain path -- see above). No WebSocket library needed.
 
-**Coordinator election should be boring.** Our first design for Lettuce's coordinator election had scoring heuristics: CPU load, memory availability, network latency to the git remote. We replaced it with "first non-leader alphabetically." It's deterministic, requires no measurement, and produces the same result on every node without communication. The scoring approach might produce slightly better placement, but the added complexity wasn't worth it for a role that does one git fetch every 30 seconds.
+**Coordinator election should be boring.** Our first design for Lettuce's coordinator election had scoring heuristics: CPU load, memory availability, network latency to the remote. We replaced it with "first non-leader alphabetically", which was deterministic and needed no measurement. Then we noticed it named a node that couldn't apply a sync, because only the leader writes to Raft. The boring answer turned out to be the leader itself: no election of its own, and failover for free from Raft.
 
 **`skip_serializing_if` is not optional for config output.** The first version of `relish compile` and `relish import` produced TOML with dozens of empty sections: `[app.web.env]` with nothing in it, `command = []`, `config_file = []`, `[job]`, `[namespace]`, `[permission]`, `[build]`. Every `#[serde(default)]` field got serialised to its default value. The fix was adding `#[serde(skip_serializing_if = "Vec::is_empty")]` and friends to every collection and Option field on `AppSpec`, `JobSpec`, and `Config`. One attribute per field, mechanical work, but the output went from 30 lines of noise per app to just the fields that matter.
 
@@ -835,16 +913,16 @@ Can you see the pattern? Almost none of these were hard to fix. They existed bec
 
 ## Tests
 
-Six features, and nearly all of them turn out to be pure functions hiding inside an operational story. `compute_desired` is arithmetic. `is_websocket_upgrade` reads headers. `select_coordinator` sorts a list. The blue-green orchestrator runs against the same `MockDriver` from Chapter 7. So Phase 9 is, once again, mostly unit tests — 117 of them.
+Six features, and nearly all of them turn out to be pure functions hiding inside an operational story. `compute_desired` is arithmetic. `is_websocket_upgrade` reads headers. `coordinator_for_leader` compares two names. Blue-green runs the real deploy worker against the same `MockGrill` as Chapter 7. So Phase 9 is, once again, mostly unit tests.
 
 ### Unit tests by feature
 
-- **Blue-green** — the orchestrator against `MockDriver` (6), plus the new state-machine transitions (`StartingGreen`, `HealthCheckingGreen`, `RoutingSwitching` and their failure paths, 7). The mock had to be refactored to count operations rather than lifecycle phases — see the lessons below.
-- **Autoscaling** — `compute_desired` with hysteresis and cooldown is the heart of it (12 tests covering scale-up, scale-down-only-below-threshold, clamping to min/max, oscillation), plus config parsing and the `AutoscaleTracker` baseline/override logic (6), and the metric mapping: `cpu`/`memory` to the collector series, utilisation of the request (or of one core), and refusing unsupported metrics or memory scaling without a request (7).
-- **WebSocket** — header detection edge cases (case-insensitive, multi-value `Connection`, opt-in routes) and the 4-byte close frame (8).
-- **Config tooling** — compilation and defaults merging (7), `fmt` idempotency and section ordering (4), structural `diff` (8).
-- **Lettuce** — types serde (4), git clone/fetch/list (4), webhook HMAC/replay/rate-limit (7), autoscaler-aware diff (7), sync-loop TOML parsing (3), coordinator election (5), signature verification (1).
-- **Kubernetes** — import (10) and export (6).
+- **Blue-green**: the deploy worker against `MockGrill` (`blue_green_redeploy_swaps_to_the_green_fleet`, `blue_green_publishes_green_before_stopping_blue`, `blue_green_rolls_back_when_green_fails_its_probe`, `blue_green_volume_app_redeploys_stop_first`), plus the new state-machine transitions (`StartingGreen`, `HealthCheckingGreen`, `RoutingSwitching` and their failure paths).
+- **Autoscaling**: `compute_desired` with hysteresis and cooldown is the heart of it (scale-up, scale-down-only-below-threshold, clamping to min/max, oscillation), plus config parsing and the `AutoscaleTracker` baseline/override logic, and the metric mapping: `cpu`/`memory` to the collector series, utilisation of the request (or of one core), and refusing unsupported metrics or memory scaling without a request.
+- **WebSocket**: header detection edge cases (case-insensitive, multi-value `Connection`, opt-in routes) and the 4-byte close frame.
+- **Config tooling**: compilation and defaults merging, `fmt` idempotency and section ordering, structural `diff`.
+- **Lettuce**: types serde, clone/fetch/list, webhook HMAC/replay/rate-limit, autoscaler-aware diff, sync-loop TOML parsing, the coordinator, signature verification.
+- **Kubernetes**: import and export.
 
 ### Feature-gated: Kubernetes import/export
 
@@ -873,19 +951,17 @@ make toml-demo          # compile -> fmt -> diff -> lint over a sample config tr
 make kubernetes-demo    # import K8s YAML to TOML and export it back
 ```
 
-`kubernetes-demo` is the honest test of the migration story: take real Kubernetes YAML, import it, look at the TOML and the migration report, export it again, and check the round-trip is sane. The correlation logic (Service → Deployment → Ingress → HPA) is exactly what unit tests struggle to cover convincingly, because the interesting bugs are in how resources *fit together*, not in any one conversion.
+`kubernetes-demo` is the honest test of the migration story: take real Kubernetes YAML, import it, look at the TOML and the migration report, export it again, and check the round-trip is sane. It used to end every `relish` call with `|| true`, so it could print a broken import and still exit 0; now each step greps its output for what it should contain, and `--strict` must fail on the example with dropped resources. The correlation logic (Service → Deployment → Ingress → HPA) is exactly what unit tests struggle to cover convincingly, because the interesting bugs are in how resources *fit together*, not in any one conversion.
 
 ### Running them
 
 ```sh
-cargo test --lib meat::blue_green meat::autoscaler   # deploy + scaling
+cargo test --lib blue_green meat::autoscaler         # deploy + scaling
 cargo test --lib lettuce                             # GitOps engine
 cargo test --lib wrapper                             # WebSocket proxying
 cargo test --no-default-features                      # prove it builds without K8s
 make toml-demo && make kubernetes-demo                # end-to-end round-trips
 ```
-
-Phase 9 adds 117 tests, bringing the total to 1380.
 
 ## Release integration: keep the laptop outside the VM
 
@@ -931,7 +1007,7 @@ bundle and reuses it. A missing commit marker, mismatched CA or wrong master key
 is an error, never a reason to generate another identity for running VMs.
 
 Checkpoints use the durable writer described in Chapter 4. Async callers send
-writes to Tokio's blocking pool. An `Arc<File>` keeps the operation lock alive
+writes to Tokio's blocking pool. An `Arc<FileLock>` keeps the operation lock alive
 until a write finishes, even if its awaiting task is cancelled. The tests cover
 exclusive writers, stable identity and names, changed parameters, invalid
 ownership, private bootstrap files and damaged bundles.
@@ -949,7 +1025,8 @@ often with "another operation is using cluster". A loop of 100 reopens with two
 threads spawning `true` in the background was refused 69 times.
 
 So the lock became a small type of its own whose `Drop` (the destructor we met
-in Chapter 1) unlocks before the file closes:
+in Chapter 1) unlocks before the file closes. This was the first version; it's
+a plain `FileLock` now, for reasons a few paragraphs on:
 
 ```rust
 struct OperationLock(std::fs::File);
@@ -1306,7 +1383,11 @@ start three VMs on a 32 GiB Mac because it saw half a GiB available. The
 free in the first place, so on a busy Mac with ten GiB compressed the result
 is nearly zero while `memory_pressure` reports 60% free. We now ask the kernel
 for that same figure, `kern.memorystatus_level`, and keep `sysinfo` on Linux,
-where `MemAvailable` means what it says.
+where `MemAvailable` means what it says. When 0.2.2 moved us from sysinfo
+0.33 to 0.39, its macOS "available" changed again: it's now active plus
+inactive plus free pages, which follows the XNU documentation but counts
+memory that running apps are actively using. That errs the other way, so
+the preflight still asks the kernel.
 
 The second lesson was about variance. Two warm runs out of four had one VM
 boot 90 seconds late. The journal showed why: our own provisioning script
@@ -1867,6 +1948,94 @@ Now every download announces itself first, with what it is, the version, the pla
 The bar itself is curl's `--progress-bar`, but only when standard error is a terminal (`[ -t 2 ]`). The bar redraws itself with carriage returns, which a terminal turns into animation and a log file turns into one enormous line of hashes. Piped into `tee`, as `qualify-staged-install.sh` does, the installer prints the plain lines and nothing else. A test feeds the installer's output through the same `grep` and `sed` that script uses, so a chattier installer can't quietly break qualification.
 
 Both scripts now carry the same `download` helper, word for word. Keeping two copies of a shell function in step by hand is how one of them ends up with a bug the other fixed, so a test compares them.
+
+### One Mac, not two
+
+Until 0.2.1, every release carried two macOS CLIs: `relish-macos-aarch64` for
+Apple silicon and `relish-macos-x86_64` for Intel. Nobody ever installed the
+Intel one end to end. Every staged install, soak and tour ran on Apple
+silicon, so each release shipped a binary that only a compiler had looked at.
+Meanwhile it cost the most of anything we built: Intel macOS runners
+(`macos-15-intel`) are the scarcest on GitHub Actions, and 0.2.1's candidate
+build waited over an hour for one. On a Mac the cluster runs in Linux VMs
+anyway, so the CLI was the only thing the Intel build gave anyone. From 0.2.2
+it's gone ([#1018](https://github.com/reliaburger/reliaburger/issues/1018)).
+The x86_64 guest image stays, because Linux x86_64 hosts boot it.
+
+Dropping a platform means three lists in step: the build matrix in
+`build.yml`, `PLATFORMS` in `package.py` (which signs every binary and which
+`candidate.py` reads to decide what a complete candidate contains), and the
+installer's `case` on `uname`. A new test in `test_build_workflow.py` reads
+the matrix out of `build.yml` and checks it builds exactly what `PLATFORMS`
+signs, so the next time one list changes without the other, a test says so
+instead of a release candidate that waits for a binary nobody builds.
+
+The installer can't just fall through to "unsupported platform" on an Intel
+Mac. That person needs to know what to do next, so it says: use a Linux host,
+or install 0.2.1, the last release built for Intel Macs, with
+`RELIABURGER_VERSION=v0.2.1`. There's a trap, though. A Terminal running under
+Rosetta (Apple's x86_64 translator) sees `uname -m` print `x86_64` on an Apple
+silicon Mac. Trusting `uname` would turn away people with perfectly good
+hardware. So on `Darwin-x86_64` the installer asks the hardware instead:
+`sysctl -n hw.optional.arm64` prints `1` on Apple silicon, even under
+Rosetta, and an Intel Mac doesn't have that key at all. Apple silicon gets
+the native arm64 build, which runs fine from a translated shell. The tests
+fake both answers, plus the missing key, and check that an Intel Mac never
+reaches a download or creates `~/.reliaburger`.
+
+### Asking what you want
+
+Until 0.2.2 the one-liner on the homepage piped the installer to a bare `sh`,
+and it did one thing:
+install `relish`, then build three Lima VMs on your laptop. That's a fine
+first five minutes. But it looked like *the* way to install Reliaburger, and
+someone with three Linux servers waiting would reasonably run it there and get
+a laptop cluster they didn't ask for
+([#670](https://github.com/reliaburger/reliaburger/issues/670)).
+
+Reliaburger will eventually install in three ways: a development cluster in
+Lima on a laptop, `bun` on machines you already have, and machines netbooted
+straight into a cluster. Only the first two exist today, and none of them is
+production quality before 1.0.0. So the installer now asks. The homepage line
+is `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop`; `sh -s`
+reads the script from standard input, and everything after `--` becomes its
+arguments. With no flag at all, both the bootstrap and the versioned installer
+print the choices (`--laptop`, `--install-only` with a pointer to the Linux
+servers guide, netbooting as future work, and the not-for-production line) and
+exit. Nothing downloads, and `~/.reliaburger` isn't created.
+
+Which exit status? We picked 2, the conventional "you used me wrong". Zero is
+friendlier at a prompt, where nobody sees the status anyway. But old CI scripts
+and blog posts say `curl … | sh && relish apply …`, and with zero that `&&`
+carries on as if there were a cluster. An unknown option also gets 2, with the
+usage. Any option after `--laptop` that the installer doesn't know still goes
+to `relish setup --quickstart`, so `sh -s -- --laptop --nodes 1` works as
+before. Before `--laptop`, `--nodes` is just an unknown option.
+
+The Intel Mac check from the previous section runs before any of this, so an
+Intel Mac hears about Intel Macs, not about modes. Its advice now reads
+`RELIABURGER_VERSION=v0.2.1 sh -s -- --laptop`, which raised a compatibility
+question. The bootstrap on the website is shared by every release, but 0.2.1's
+installer has never heard of `--laptop`. It hands options it doesn't know to
+`relish setup`, which refuses them. So the bootstrap checks the version it's
+about to fetch and, before 0.2.2, drops the flag:
+
+```sh
+for argument do
+  shift
+  [ "$argument" = --laptop ] || set -- "$@" "$argument"
+done
+```
+
+POSIX sh has no arrays, only the positional parameters. `for argument do`
+iterates over a copy of them taken when the loop starts, so the body can
+`shift` each original off the front and `set --` the keepers back onto the
+end. The same shim covers the window between merging this change and
+promoting 0.2.2, while the bootstrap's default still names 0.2.0.
+
+The explanation lives in both scripts, because the bootstrap must answer
+before it downloads anything. Two copies of a function drift, so a test
+compares them, the same way it compares the `download` helpers.
 
 ### Getting onto `PATH` without editing your files behind your back
 

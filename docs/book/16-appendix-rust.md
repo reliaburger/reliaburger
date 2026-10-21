@@ -205,41 +205,60 @@ These are *newtypes*. A `NodeId` is just a `String` at runtime (zero overhead), 
 A `trait` defines behaviour a type can implement. If you know Go interfaces or Java interfaces, you're 80% there:
 
 ```rust
-pub trait DeployDriver {
-    fn start_instance(&self, app: &AppId, node: &NodeId, image: &str)
-        -> Result<(InstanceId, u16), DeployError>;
-    fn await_healthy(&self, instance_id: &str, timeout: Duration) -> Result<(), DeployError>;
-    fn stop_instance(&self, instance_id: &str) -> Result<(), DeployError>;
-    // ...
+pub trait TaskRunner: Send + Sync + 'static {
+    /// Run `task`, killing it after a nonzero `timeout` or when `cancel` fires.
+    fn run(
+        &self,
+        task: &TaskInvocation,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> impl Future<Output = Attempt> + Send;
+    // ... a few methods with default bodies
 }
 ```
 
-(from `src/meat/orchestrator.rs`)
+(from `src/bun/task_executor.rs`)
 
-Any type that implements all the methods *is a* `DeployDriver`. Reliaburger has two: `MockDriver` for tests and the real driver for production. The orchestrator is written against the trait, so the same deploy logic runs against a mock in microseconds or against real containers in production.
+Any type that implements `run` *is a* `TaskRunner`. Reliaburger has several. `ProcessRunner` spawns each task attempt as a host process. `FakeRunner` computes outcomes without starting anything, for tests and benchmarks. `OwnedRunner` runs attempts as containers through the node's runtime. The code that runs a million-task job array is written against the trait, so the same scheduling logic runs real processes on a node or fake ones in a test that finishes in seconds.
 
-The big difference from Go: in Go a type satisfies an interface implicitly, just by having the methods. In Rust you write `impl DeployDriver for MockDriver { ... }` explicitly. More typing, but the intent is on the page, and the compiler tells you exactly which method you forgot.
+`Send + Sync + 'static` after the colon are *supertraits*: anything that implements `TaskRunner` must also be safe to move to another thread (`Send`), safe to share between threads (`Sync`), and hold no borrowed references (`'static`). The async runtime needs all three to run attempts on its worker threads. The return type `impl Future<Output = Attempt> + Send` says `run` is an async method: it hands back some future that eventually yields an `Attempt`, and implementations can simply write `async fn run(...)`.
 
-The book's central trait is `Grill`, the container-runtime abstraction. `ProcessGrill`, `RuncGrill`, and `AppleContainerGrill` all implement it, so the agent runs processes, runc containers, or Apple containers through one interface (`src/grill/mod.rs`).
+The big difference from Go: in Go a type satisfies an interface implicitly, just by having the methods. In Rust you write `impl TaskRunner for ProcessRunner { ... }` explicitly. More typing, but the intent is on the page, and the compiler tells you exactly which method you forgot.
 
-A rule worth absorbing from the coding guide: "Don't write a trait until you have two implementations." Traits are for genuine polymorphism, not speculative abstraction. `DeployDriver` exists because there really are two drivers; write the concrete version first and extract the trait when the second implementation arrives.
+The book's central trait is `Grill`, the container-runtime abstraction. `ProcessGrill`, `RuncGrill`, and `AppleContainerGrill` all implement it, so the agent runs processes or runc containers through one interface (`src/grill/mod.rs`), and the tests swap in `MockGrill`.
+
+A rule worth absorbing from the coding guide: "Don't write a trait until you have two implementations." Traits are for genuine polymorphism, not speculative abstraction. `TaskRunner`'s own doc comment says why it exists: "there are two real implementations: the process runner the node uses, and the fake the tests and benchmarks use." Chapter 7 tells the other side of that rule: a `DeployDriver` trait whose production implementation never arrived, so it was deleted. Write the concrete version first and extract the trait when the second implementation arrives.
 
 ### Generics and monomorphisation
 
 Generics let you write code once that works for many types, with the concrete type filled in by the caller:
 
 ```rust
-pub struct DeployOrchestrator<D: DeployDriver> {
-    state: DeployState,
-    driver: D,
+pub struct OwnedRunner<G: Grill + Clone> {
+    runtime: G,
+    // ...
 }
 ```
 
-(from `src/meat/orchestrator.rs`)
+(from `src/bun/task_runtime.rs`)
 
-`<D: DeployDriver>` reads "for any type `D` that implements `DeployDriver`." Build a `DeployOrchestrator<MockDriver>` and the compiler stamps out a dedicated copy with every `driver.start_instance(...)` call wired straight to `MockDriver`'s method. This is *monomorphisation*: one generic, compiled into one concrete version per type actually used. C++ templates work the same way. There's no runtime dispatch and no boxing — the generic version is exactly as fast as if you'd written it by hand for that type.
+`<G: Grill + Clone>` reads "for any type `G` that implements `Grill` and can be cloned." Build an `OwnedRunner<MockGrill>` in a test and the compiler stamps out a dedicated copy with every `self.runtime.create(...)` call wired straight to `MockGrill`'s method; build an `OwnedRunner<AnyGrill>` on a node and it stamps out another. This is *monomorphisation*: one generic, compiled into one concrete version per type actually used. C++ templates work the same way. There's no runtime dispatch and no boxing: the generic version is exactly as fast as if you'd written it by hand for that type. The task pool that drives a job array is generic the same way, `TaskPool<R: TaskRunner>`, so the hot loop that hands out a million attempts calls the runner's `run` directly.
 
 This is the opposite trade-off from Java generics (which erase to `Object` and dispatch at runtime) and from Go's older interface-based polymorphism. Rust pays in compile time and binary size (N copies of the code) and gets zero runtime cost.
+
+Generics have a cost of their own, though: the type parameter spreads to everything that holds one. The API state that serves a node's job arrays wants one concrete type, whatever runner the node was built with, so `src/bun/task_array_node.rs` wraps the choices in an enum instead:
+
+```rust
+pub enum NodeRunner {
+    Owned(Box<super::task_runtime::OwnedRunner<crate::grill::AnyGrill>>),
+    Process(ProcessRunner),
+    Fake(FakeRunner),
+}
+```
+
+(from `src/bun/task_array_node.rs`)
+
+`NodeRunner` implements `TaskRunner` itself by `match`ing on the variant and forwarding the call. A closed set of alternatives known at compile time is what Rust enums are for, and it keeps the generic parameter from leaking into the API layer. `Box` puts the large `OwnedRunner` on the heap, so a `NodeRunner` stays small whichever variant it holds.
 
 ### Trait objects: when you need runtime variety
 
@@ -253,7 +272,7 @@ pub type SecretDecryptor = Box<dyn Fn(&str) -> Result<String, String>>;
 
 `Box<dyn Fn(...)>` is a heap-allocated, type-erased closure: the concrete type is forgotten, and calls go through a vtable (a pointer table) at runtime — exactly how Go interfaces and C++ virtual methods work. The trade-off is a pointer indirection per call in exchange for runtime flexibility.
 
-The rule of thumb the book uses: a generic (`<D: DeployDriver>`) when each value is one known type for its whole life; a trait object (`Box<dyn ...>`) when you need a runtime-varying mix. The deploy chapter even records switching from `Box<dyn DeployDriver>` to a generic once it was clear each orchestrator owns exactly one driver.
+The rule of thumb the book uses: a generic (`<G: Grill>`) when each value is one known type for its whole life; an enum like `NodeRunner` when the alternatives are a closed set you know at compile time; a trait object (`Box<dyn ...>`) when you need an open, runtime-varying mix.
 
 ## 4. Error handling: no exceptions, just values
 
@@ -272,7 +291,7 @@ The coding guide insists on it: "`Option<T>`, not sentinels. No `-1` meaning 'no
 ### `Result<T, E>`: success or a typed error
 
 ```rust
-pub fn write_blob(&self, data: &[u8], expected: &Digest) -> Result<(), PickleError> { ... }
+pub fn write_blob(&self, data: &[u8], expected_digest: &Digest) -> Result<(), PickleError> { ... }
 ```
 
 `Result<T, E>` is either `Ok(value)` or `Err(error)`. The error type is part of the signature, so callers know exactly what can go wrong. There's no invisible control flow, no stack-unwinding exception that skips ten frames. A failure is a value you return.
@@ -282,16 +301,20 @@ pub fn write_blob(&self, data: &[u8], expected: &Digest) -> Result<(), PickleErr
 Checking every `Result` by hand would be as tedious as Go's `if err != nil { return err }` after every call. The `?` operator is the cure: it unwraps an `Ok`, or returns the `Err` early from the current function.
 
 ```rust
-let data = tokio::fs::read(&upload_path).await?;   // on error, return it
-let actual = compute_sha256(&data);
-if actual.as_str() != expected_digest.as_str() {
+let mut file = std::fs::File::open(&upload)?;   // on error, return it
+let mut hasher = Sha256::new();
+// ... read the upload in 64 KiB chunks into the hasher ...
+let actual = Digest::new(&format!("sha256:{}", hex::encode(hasher.finalize())))?;
+if actual != expected {
+    budget.remove(&upload)?;
     return Err(PickleError::DigestMismatch { expected, actual });
 }
-tokio::fs::rename(&upload_path, &blob_path).await?;
+drop(file);
+budget.publish(&root, &upload, &destination)?;
 Ok(())
 ```
 
-(from `src/pickle/blob_store.rs`)
+(from `src/pickle/store.rs`)
 
 Each `?` says "give me the value or bail with the error." It's Go's error-check boilerplate compressed to one character, and because it's part of the type system the compiler ensures you can't forget it — a `Result` you ignore is a warning.
 

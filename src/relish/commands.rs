@@ -35,6 +35,17 @@ pub async fn apply(
     apply_with_client(source, output, dry_run, &BunClient::default_local()).await
 }
 
+/// Read a local config file for `lint`, `deploy`, `diff` and `compile`:
+/// Reliaburger TOML, or Kubernetes YAML or JSON imported the way `apply`
+/// imports it, with the migration report on stderr.
+pub(crate) fn load_config_file(path: &Path) -> Result<Config, RelishError> {
+    let loaded = super::manifest::load_file(path)?;
+    if let Some(report) = &loaded.migration_report {
+        eprintln!("{report}");
+    }
+    Ok(loaded.config)
+}
+
 /// Read a manifest for `apply`, printing any migration report to stderr.
 async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Config, RelishError> {
     let loaded = super::manifest::load(source).await?;
@@ -43,6 +54,9 @@ async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Confi
         eprintln!();
     }
     loaded.config.validate_intrinsic()?;
+    for warning in loaded.config.warnings() {
+        eprintln!("warning: {warning}");
+    }
     Ok(loaded.config)
 }
 
@@ -506,7 +520,14 @@ pub async fn logs_search(source: &str, sql: &str) -> Result<(), RelishError> {
 }
 
 /// Execute a command inside a running container.
-pub async fn exec(app: &str, command: &[String], namespace: &str) -> Result<(), RelishError> {
+///
+/// One-shot: no stdin and no terminal, so an interactive shell exits at
+/// once. Relish exits with the command's own exit code (D34).
+pub async fn exec(
+    app: &str,
+    command: &[String],
+    namespace: &str,
+) -> Result<super::CommandOutcome, RelishError> {
     exec_with_client(app, namespace, command, &BunClient::default_local()).await
 }
 
@@ -515,15 +536,25 @@ async fn exec_with_client(
     namespace: &str,
     command: &[String],
     client: &BunClient,
-) -> Result<(), RelishError> {
+) -> Result<super::CommandOutcome, RelishError> {
     // The entry node only runs its own instances; exec on the node that
     // runs this app (through the entry node's relay on a laptop cluster).
     let target = super::path_cmd::find_source_client(client, app, namespace).await?;
-    let output = target.exec(app, namespace, command).await?;
-    if !output.is_empty() {
-        print!("{output}");
+    let answer = target.exec(app, namespace, command).await?;
+    if !answer.output.is_empty() {
+        print!("{}", answer.output);
     }
-    Ok(())
+    Ok(exec_outcome(answer.exit_code))
+}
+
+/// The outcome that makes relish exit with a remote command's exit code.
+/// A code no process could exit with still fails rather than reading as 0.
+fn exec_outcome(exit_code: i32) -> super::CommandOutcome {
+    match u8::try_from(exit_code) {
+        Ok(0) => super::CommandOutcome::Clean,
+        Ok(code) => super::CommandOutcome::Exited(code),
+        Err(_) => super::CommandOutcome::Problems,
+    }
 }
 
 /// Stop all instances of an app.
@@ -731,7 +762,9 @@ pub fn init_with_security(
         "# Reliaburger node configuration.\n\
          # See docs/README.md for full reference.\n\
          {security_header}\n{}",
-        toml::to_string_pretty(&node_config).expect("failed to serialise default node config")
+        toml::to_string_pretty(&node_config).map_err(|error| RelishError::InitFailed(format!(
+            "default node config doesn't serialise: {error}"
+        )))?
     );
 
     let app_toml = r#"# Sample Reliaburger app configuration.
@@ -906,7 +939,7 @@ pub async fn join(
     // a mismatch is refused *here*, before the one-time token is ever sent — so
     // a man-in-the-middle cannot capture and replay a token the real cluster
     // never consumed.
-    let tofu_client = reqwest::Client::builder()
+    let tofu_client = crate::http_client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -1273,37 +1306,85 @@ fn print_council_human(council: &CouncilStatus) {
 }
 
 /// Resolve a service name to its VIP and backends.
-pub async fn resolve(name: &str) -> Result<(), RelishError> {
-    resolve_with_client(name, &BunClient::default_local()).await
+pub async fn resolve(
+    name: &str,
+    namespace: Option<&str>,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    let services = BunClient::default_local().resolve_all().await?;
+    let service = select_service(services, name, namespace)?;
+    println!("{}", format_output(&ResolvedService(service), output)?);
+    Ok(())
 }
 
-async fn resolve_with_client(name: &str, client: &BunClient) -> Result<(), RelishError> {
-    let info = client.resolve(name).await?;
-
-    println!("Service:  {}", info.app_name);
-    println!("VIP:      {}", info.vip);
-    println!("Port:     {}", info.port);
-    println!(
-        "Backends: {}/{} healthy",
-        info.healthy_backends, info.total_backends
-    );
-
-    if !info.backends.is_empty() {
-        println!();
-        println!(
-            "  {:<20} {:<18} {:<8} {:<8}",
-            "INSTANCE", "NODE", "PORT", "HEALTH"
-        );
-        for b in &info.backends {
-            let health = if b.healthy { "healthy" } else { "unhealthy" };
-            println!(
-                "  {:<20} {:<18} {:<8} {:<8}",
-                b.instance_id, b.node_ip, b.host_port, health
-            );
-        }
+/// Pick `name` out of every service the caller may see. Without a
+/// namespace the name must be unique; a name in several namespaces is
+/// refused rather than answered from whichever came first.
+fn select_service(
+    services: Vec<crate::onion::types::ResolveResponse>,
+    name: &str,
+    namespace: Option<&str>,
+) -> Result<crate::onion::types::ResolveResponse, RelishError> {
+    let mut matches: Vec<_> = services
+        .into_iter()
+        .filter(|service| {
+            service.app_name == name && namespace.is_none_or(|wanted| service.namespace == wanted)
+        })
+        .collect();
+    if matches.len() > 1 {
+        let mut namespaces: Vec<_> = matches.iter().map(|s| s.namespace.as_str()).collect();
+        namespaces.sort_unstable();
+        return Err(RelishError::InvalidFlag {
+            flag: "namespace".to_string(),
+            reason: format!(
+                "service {name:?} exists in namespaces {}; pass --namespace",
+                namespaces.join(", ")
+            ),
+        });
     }
+    matches.pop().ok_or_else(|| RelishError::ApiError {
+        status: 404,
+        body: match namespace {
+            Some(namespace) => format!("service {name:?} not found in namespace {namespace:?}"),
+            None => format!("service {name:?} not found"),
+        },
+    })
+}
 
-    Ok(())
+/// A resolved service, rendered for people.
+#[derive(Debug, serde::Serialize)]
+#[serde(transparent)]
+struct ResolvedService(crate::onion::types::ResolveResponse);
+
+impl std::fmt::Display for ResolvedService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let info = &self.0;
+        writeln!(f, "Service:   {}", info.app_name)?;
+        writeln!(f, "Namespace: {}", info.namespace)?;
+        writeln!(f, "VIP:       {}", info.vip)?;
+        writeln!(f, "Port:      {}", info.port)?;
+        write!(
+            f,
+            "Backends:  {}/{} healthy",
+            info.healthy_backends, info.total_backends
+        )?;
+        if !info.backends.is_empty() {
+            write!(
+                f,
+                "\n\n  {:<20} {:<18} {:<8} {:<8}",
+                "INSTANCE", "NODE", "PORT", "HEALTH"
+            )?;
+            for b in &info.backends {
+                let health = if b.healthy { "healthy" } else { "unhealthy" };
+                write!(
+                    f,
+                    "\n  {:<20} {:<18} {:<8} {:<8}",
+                    b.instance_id, b.node_ip, b.host_port, health
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Show ingress routing table.
@@ -1341,7 +1422,7 @@ async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
 /// With `--dry-run`, prints the plan and exits 0 without deploying;
 /// otherwise an unreachable agent is an error (X5).
 pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(), RelishError> {
-    let config = Config::from_file(path)?;
+    let config = load_config_file(path)?;
     config.validate_intrinsic()?;
 
     let client = BunClient::default_local();
@@ -1527,8 +1608,11 @@ pub async fn rollback(app: &str, namespace: &str, force: bool) -> Result<(), Rel
 
 /// Validate a config file without deploying.
 pub fn lint(path: &Path) -> Result<(), RelishError> {
-    let config = Config::from_file(path)?;
+    let config = load_config_file(path)?;
     config.validate()?;
+    for warning in config.warnings() {
+        eprintln!("warning: {warning}");
+    }
 
     // Count resources
     let app_count = config.app.len();
@@ -1578,9 +1662,9 @@ pub fn compile(path: &Path) -> Result<(), RelishError> {
 
 /// Show structural diff between two configs.
 pub fn diff(path_a: &Path, path_b: Option<&Path>) -> Result<(), RelishError> {
-    let old = Config::from_file(path_a)?;
+    let old = load_config_file(path_a)?;
     let new = match path_b {
-        Some(p) => Config::from_file(p)?,
+        Some(p) => load_config_file(p)?,
         None => Config::default(),
     };
     let diff = super::diff::diff_configs(&old, &new);
@@ -1611,21 +1695,6 @@ pub fn fmt(path: &Path, check: bool) -> Result<(), RelishError> {
     }
 
     let formatted = super::fmt::format_toml(&content)?;
-
-    // O10: comment loss is by design (the formatter round-trips through the
-    // `toml` crate's typed representation), but silently eating an
-    // operator's annotations is not. Say so, once, when there was something
-    // to lose.
-    if content
-        .lines()
-        .any(|line| line.trim_start().starts_with('#'))
-    {
-        eprintln!(
-            "warning: {} had comments; the formatter round-trips through TOML's \
-             typed representation, which discards them",
-            path.display()
-        );
-    }
 
     // O10: write atomically. `fs::write` truncates first, so an interrupted
     // or failing write leaves a half-file where a valid config used to be —
@@ -1680,10 +1749,13 @@ pub fn import_k8s(files: &[std::path::PathBuf], strict: bool) -> Result<(), Reli
         eprint!("{}", result.report);
     }
 
-    if strict && !result.report.warnings.is_empty() {
-        return Err(RelishError::FormatFailed(
-            "import produced warnings (--strict mode)".to_string(),
-        ));
+    // #703: a dropped resource is a bigger loss than an approximated one, so
+    // `--strict` (a CI gate) fails on either.
+    let (warnings, dropped) = (result.report.warnings.len(), result.report.dropped.len());
+    if strict && (warnings > 0 || dropped > 0) {
+        return Err(RelishError::FormatFailed(format!(
+            "import produced {warnings} warning(s) and {dropped} dropped resource(s) (--strict mode)"
+        )));
     }
 
     Ok(())
@@ -2672,12 +2744,12 @@ pub fn task_array_request(
     {
         return Err(RelishError::InvalidFlag { flag: "runtime".into(), reason: "process requires --exec and refuses --image; runc/shared-runc require --image and refuse --exec".into() });
     }
-    if run.exec.as_ref().is_some_and(|path| !path.is_absolute()) {
+    if let Some(path) = run.exec.as_ref().filter(|path| !path.is_absolute()) {
         return Err(RelishError::InvalidFlag {
             flag: "exec".to_string(),
             reason: format!(
                 "{} isn't an absolute path; nodes allow binaries by absolute path",
-                run.exec.as_ref().expect("checked").display()
+                path.display()
             ),
         });
     }
@@ -2698,6 +2770,7 @@ pub fn task_array_request(
         name: run.name,
         namespace: Some(run.namespace),
         template: crate::config::job::JobSpec {
+            pids: None,
             runtime: run.runtime,
             image: run.image,
             command: Some(run.args),
@@ -3819,7 +3892,7 @@ mod tests {
     async fn manifest_loading_defers_namespace_existence_to_live_admission() {
         for manifest in [
             "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['existing']\n",
-            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'existing'\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://existing/web:v1'\nnamespace = 'existing'\n",
         ] {
             let file = write_temp_config(manifest);
             let loaded = load_manifest(&source(file.path())).await;
@@ -3833,7 +3906,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_loading_defers_build_namespace_existence_to_live_admission() {
         let file = write_temp_config(
-            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'existing'\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://existing/web:v1'\nnamespace = 'existing'\n",
         );
         let loaded = load_manifest(&source(file.path())).await;
         assert!(
@@ -3847,7 +3920,7 @@ mod tests {
         for manifest in [
             "[permission.reader]\nactions = ['teleport']\napps = ['web']\nnamespaces = ['existing']\n",
             "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['Existing']\n",
-            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'Existing'\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://Existing/web:v1'\nnamespace = 'Existing'\n",
             "[app.web]\nnamespace = 'existing'\n",
         ] {
             let file = write_temp_config(manifest);
@@ -3913,6 +3986,79 @@ mod tests {
     /// are refused immediately without waiting for a timeout.
     fn bogus_client() -> BunClient {
         BunClient::new("http://127.0.0.1:1")
+    }
+
+    #[cfg(feature = "kubernetes")]
+    const K8S_DEPLOYMENT: &str = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    spec:\n      containers:\n      - name: web\n        image: nginx:1\n";
+
+    /// `lint`, `diff` and `compile` read Kubernetes YAML the way `apply`
+    /// does, through `manifest::parse`.
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn local_config_commands_accept_kubernetes_yaml() {
+        let file = write_temp_config(K8S_DEPLOYMENT);
+        lint(file.path()).unwrap();
+        diff(file.path(), None).unwrap();
+        compile(file.path()).unwrap();
+        let config = load_config_file(file.path()).unwrap();
+        assert!(config.app.contains_key("web"));
+    }
+
+    fn service(namespace: &str) -> crate::onion::types::ResolveResponse {
+        crate::onion::types::ResolveResponse {
+            app_name: "redis".into(),
+            namespace: namespace.into(),
+            vip: "127.128.0.2".into(),
+            port: 6379,
+            healthy_backends: 1,
+            total_backends: 1,
+            backends: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_picks_the_named_namespace() {
+        let services = vec![service("prod"), service("staging")];
+        let found = select_service(services, "redis", Some("staging")).unwrap();
+        assert_eq!(found.namespace, "staging");
+    }
+
+    #[test]
+    fn resolve_refuses_a_name_in_several_namespaces() {
+        let services = vec![service("prod"), service("staging")];
+        let message = select_service(services, "redis", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("prod")
+                && message.contains("staging")
+                && message.contains("--namespace"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn resolve_without_a_namespace_takes_the_only_match() {
+        let found = select_service(vec![service("prod")], "redis", None).unwrap();
+        assert_eq!(found.namespace, "prod");
+        assert!(select_service(vec![service("prod")], "redis", Some("dev")).is_err());
+    }
+
+    #[test]
+    fn resolve_prints_the_namespace() {
+        let shown = ResolvedService(service("prod")).to_string();
+        assert!(shown.contains("Namespace: prod"), "{shown}");
+    }
+
+    #[test]
+    fn exec_passes_the_remote_exit_code_through() {
+        use crate::relish::CommandOutcome;
+        assert_eq!(exec_outcome(0), CommandOutcome::Clean);
+        assert_eq!(exec_outcome(3), CommandOutcome::Exited(3));
+        assert_eq!(exec_outcome(255), CommandOutcome::Exited(255));
+        // Outside a process exit code's range: still a failure, never 0.
+        assert_eq!(exec_outcome(256), CommandOutcome::Problems);
+        assert_eq!(exec_outcome(-1), CommandOutcome::Problems);
     }
 
     #[test]

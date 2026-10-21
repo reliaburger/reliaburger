@@ -105,10 +105,36 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await
             .map_err(BunError::from);
         let egress = self.egress.resolve(spec).await;
-        let result = self
-            .ops
-            .apply_network_pre_start(instance_id, app_name, spec, cgroup_path, retained, egress)
-            .await;
+        let result = match retained {
+            // A failed retain fails the step without touching the journal.
+            Err(error) => {
+                self.ops
+                    .apply_network_pre_start(
+                        instance_id,
+                        app_name,
+                        spec,
+                        cgroup_path,
+                        Err(error),
+                        egress,
+                    )
+                    .await
+            }
+            // The loop answers `StillRunning` while the reference's journal
+            // write is in flight (#1266); ask again until it has landed.
+            Ok(retained) => {
+                deploy_ops::retry_while_still_running(|| {
+                    self.ops.apply_network_pre_start(
+                        instance_id,
+                        app_name,
+                        spec,
+                        cgroup_path,
+                        Ok(retained.clone()),
+                        egress.clone(),
+                    )
+                })
+                .await
+            }
+        };
         if result.is_err() {
             let _ = self.grill.stop(instance_id).await;
         }
@@ -233,7 +259,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // Asked before the new spec replaces the one the replicas run.
             let in_place = self
                 .ops
-                .replicas_to_add_in_place(app_name, namespace, spec)
+                .share_change_in_place(app_name, namespace, spec)
                 .await;
             // The spec the running replicas came from: what an aborted
             // rollout restores.
@@ -255,14 +281,14 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
             let existing = self.ops.list_existing_owned(app_name, namespace).await;
 
-            if let Some(count) = in_place.filter(|_| !existing.is_empty()) {
+            if let Some(change) = in_place.filter(|_| !existing.is_empty()) {
                 if self
-                    .add_replicas_in_place(
+                    .change_share_in_place(
                         app_name,
                         namespace,
                         spec,
                         previous.as_ref(),
-                        count,
+                        change,
                         &events,
                     )
                     .await
@@ -678,36 +704,77 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await
     }
 
-    /// Start `count` more replicas beside the ones an app already runs, the
-    /// way a fresh deploy starts its replicas. The running ones aren't
-    /// touched. Returns `Break` when the caller must stop the whole deploy.
+    /// Change this node's share of an app without touching the replicas
+    /// that stay in it (#1111): retire the replicas whose ordinals left,
+    /// then start the arriving ones the way a fresh deploy starts its
+    /// replicas. Retiring first gives a full node back the room the arriving
+    /// replicas need. Returns `Break` when the caller must stop the whole
+    /// deploy.
     ///
     /// An admission refused here (no room, say) starts nothing, so the node
-    /// still runs `previous`, and that's the spec it records again. The
-    /// retry then adds the same replicas in place, rather than seeing its
-    /// own spec already stored and rolling every replica, which would need
-    /// room for all of them twice over (#971).
-    pub(super) async fn add_replicas_in_place(
+    /// still runs `previous`, less any replica that already left, and that's
+    /// the spec it records again. The retry then adds the same replicas in
+    /// place, rather than seeing its own spec already stored and rolling
+    /// every replica, which would need room for all of them twice over
+    /// (#971).
+    pub(super) async fn change_share_in_place(
         &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
         previous: Option<&AppSpec>,
-        count: u32,
+        change: super::scale_in_place::InPlaceChange,
         events: &mpsc::Sender<ApplyEvent>,
     ) -> std::ops::ControlFlow<()> {
-        let message = if count == 0 {
-            format!(
+        let super::scale_in_place::InPlaceChange { add: count, retire } = change;
+        let message = match (count, retire.len()) {
+            (0, 0) => format!(
                 "{app_name} already runs its replicas (replicas: {})",
                 spec.replicas
-            )
-        } else {
-            format!(
+            ),
+            (_, 0) => format!(
                 "adding {count} replica(s) of {app_name} beside the running ones (replicas: {})",
                 spec.replicas
-            )
+            ),
+            (_, leaving) => format!(
+                "moving {app_name}'s share in place: {leaving} replica(s) leave, \
+                 {count} arrive (replicas: {})",
+                spec.replicas
+            ),
         };
         let _ = events.send(ApplyEvent::Progress { message }).await;
+        let drain_timeout = crate::meat::deploy_types::DeployConfig::for_app(spec).drain_timeout;
+        let mut retired: Vec<InstanceId> = Vec::new();
+        for old_id in &retire {
+            let _ = events
+                .send(ApplyEvent::Progress {
+                    message: format!("stopping instance {}: its replica left this node", old_id.0),
+                })
+                .await;
+            let outcome = match self.retire_old_instance(old_id, drain_timeout).await {
+                Ok(()) => match self.ops.finish_retire(old_id).await {
+                    // Only other nodes' confirmations are outstanding; the
+                    // agent loop finishes the release when they arrive.
+                    Err(BunError::ProducerReleasePending { .. }) => {
+                        self.ops.defer_retire(old_id).await;
+                        Ok(())
+                    }
+                    other => other,
+                },
+                Err(error) => Err(error),
+            };
+            if let Err(error) = outcome {
+                self.record_share_left(app_name, namespace, previous, &retired)
+                    .await;
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!("could not retire {}: {error}", old_id.0),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
+            retired.push(old_id.clone());
+        }
         let ids = match self
             .ops
             .add_app_replicas(app_name, namespace, spec, count)
@@ -715,16 +782,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         {
             Ok(ids) => ids,
             Err(error) => {
-                if let Some(previous) = previous
-                    && let Err(restore) = self
-                        .ops
-                        .store_deployed_spec(app_name, namespace, previous)
-                        .await
-                {
-                    eprintln!(
-                        "deploy: could not record {namespace}/{app_name}'s previous spec: {restore}"
-                    );
-                }
+                self.record_share_left(app_name, namespace, previous, &retired)
+                    .await;
                 let _ = events
                     .send(ApplyEvent::Error {
                         message: error.to_string(),
@@ -779,6 +838,28 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             })
             .await;
         std::ops::ControlFlow::Continue(())
+    }
+
+    /// Record what the node runs after a share change stopped partway: the
+    /// previous share, less the replicas in `retired` that already left.
+    async fn record_share_left(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        previous: Option<&AppSpec>,
+        retired: &[InstanceId],
+    ) {
+        let Some(previous) = previous else {
+            return;
+        };
+        let running = super::scale_in_place::share_without(previous, retired);
+        if let Err(error) = self
+            .ops
+            .store_deployed_spec(app_name, namespace, &running)
+            .await
+        {
+            eprintln!("deploy: could not record {namespace}/{app_name}'s previous spec: {error}");
+        }
     }
 
     /// Rolling redeploy: start generation-tagged new instances, health check
