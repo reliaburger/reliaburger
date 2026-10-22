@@ -184,11 +184,11 @@ gates. Any incompatible wire or durable-state change bumps `protocol` or
 so an upgrade across that bump means starting a fresh cluster. So
 `relish upgrade` works only between builds of the same format (maintainer
 decision D31 in [#674](https://github.com/reliaburger/reliaburger/issues/674),
-10 October 2026). Every release from 0.1.0 to 0.2.0 bumped a format, so no
+10 October 2026). Every release from 0.1.0 to 0.2.1 bumped a format, so no
 rolling upgrade between two published releases has run yet. A release that
-keeps 0.2.0's pair could roll in place, and qualifying a real
+keeps 0.2.1's pair could roll in place, and qualifying a real
 published-to-published rolling walk on such a patch release is a goal, not a
-0.2.0 gate. The pre-1.0 rule for known harness artefacts in
+release gate. The pre-1.0 rule for known harness artefacts in
 the V02 soak (step 4 of [staging a candidate](#staging-a-candidate))
 stays as it is.
 
@@ -416,6 +416,23 @@ The steps:
 `relish upgrade check` from 0.2.0 on reads each release's pair from the
 metadata and says when a release needs this instead of a rolling upgrade.
 
+### Upgrading from 0.2.0
+
+0.2.1 can't roll onto a 0.2.0 cluster either. Its fixes change what the
+council and the nodes store and send: GitOps ownership and configuration in
+Raft, recovery ids on every Raft message, durable registry tags, node-by-node
+rollouts, partial placement, gossip replay protection, compacted task results,
+new fence files, SHA-256 token hashes and redb 4's file format for the Raft
+store (the full list is in `src/compatibility.rs`). So the protocol moved from
+51 to 52 and the state format from 68 to 69, and a 0.2.0 leader refuses
+`relish upgrade start v0.2.1` before it records a run.
+
+The move is a fresh cluster, as [from 0.1.6](#upgrading-from-016), with the
+same steps and the same losses: secrets re-encrypted to the new keys, tokens
+created again, a new CA, job history exported first and volumes restored from
+snapshots. Tokens have to be reissued anyway, because 0.2.1 stores their
+hashes differently.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
@@ -521,7 +538,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.2.0` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.1` today), so
 bump that default in the same change that announces a newer release. Both
 scripts need a mode, `--laptop` or `--install-only`; with none they explain the
 choices and exit 2. For a release from before 0.2.2 the bootstrap drops
@@ -902,7 +919,8 @@ the real `curl … | sh` install against it on every host we advertise.
    section (`#release-testing` in `index.html`) to the new release: its
    latest-release paragraph, its headline numbers with links to this
    release's records, and the soak charts beside them. The charts are copies
-   of the final app soak's and the final job soak's `-charts/` directories in
+   of the app soak's (the V02 fast tier, now that the gate has no V02 final)
+   and the final job soak's `-charts/` directories in
    `docs/website/assets/soak/`, which holds only this release's
    ([how](website/README.md#soak-charts)). `tests/suite/website.rs`
    fails while the section names a version older than the installer's
