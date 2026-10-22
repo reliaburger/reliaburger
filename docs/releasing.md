@@ -622,7 +622,8 @@ the real `curl … | sh` install against it on every host we advertise.
    ran). It checks `candidate.json` against the digest, `SHA256SUMS` against
    `candidate.json`, that setup used the mirror, and that the installed CLI,
    both Linux binaries and the guest image are candidate assets. Then it
-   applies the podinfo tour, runs `status`, `path` and `metrics`, destroys the
+   applies the podinfo tour, runs `status`, `path` and `metrics`, requires
+   `relish wtf` to report GitOps OK from every node (#1286), destroys the
    cluster, uninstalls, and writes a Markdown record with the timings. It never
    uses `~/.reliaburger` and fails if that directory's top level or
    `~/.local/bin/relish` changed. Pass `setup --quickstart` options after
