@@ -1026,3 +1026,18 @@ class ControllerExitStatus(unittest.TestCase):
             with mock.patch.object(sys,"argv",argv), mock.patch.object(jobs,"run",return_value=0):
                 self.assertEqual(jobs.main(),0)
             self.assertEqual((evidence/"jobs/exit-status").read_text().strip(),"0")
+
+
+class NodeFaultOverlap(unittest.TestCase):
+    """A mark records the job modes running on the faulted node in the last
+    15 s. One mark at injection left runc, whose attempts are sparse, a coin
+    toss: the 0.2.2 jobs fast tier missed its only slow-fsync overlap."""
+
+    def test_node_faults_mark_job_overlap_throughout_the_hold(self):
+        source=(Path(__file__).parent/"qualify-sustained.sh").read_text()
+        slot=source[source.index("\nslot_node_fault() {"):]; slot=slot[:slot.index("\n}\n")]
+        injected=slot.index('node_fault_script "$kind" start')
+        removed=slot.index('node_fault_script "$kind" stop')
+        hold=slot[injected:removed]
+        self.assertIn("job_mark_fault",hold)
+        self.assertRegex(hold,r"while \[")
