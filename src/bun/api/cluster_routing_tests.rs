@@ -1004,6 +1004,18 @@ fn the_relay_forwards_each_nodes_version_for_wtf() {
     assert!(!relay_allows(&axum::http::Method::POST, "v1/version"));
 }
 
+/// `relish wtf` asks every node for its GitOps view, since only a node knows
+/// whether its own `[gitops]` drifts; without this every cluster's check
+/// came back UNKNOWN (#1286). Configuring GitOps stays off the relay.
+#[test]
+fn the_relay_forwards_each_nodes_gitops_status_for_wtf() {
+    let get = axum::http::Method::GET;
+    assert!(relay_allows(&get, "v1/gitops"));
+    assert!(!relay_allows(&axum::http::Method::POST, "v1/gitops"));
+    assert!(!relay_allows(&axum::http::Method::POST, "v1/gitops/config"));
+    assert!(!relay_allows(&get, "v1/gitops/config"));
+}
+
 #[test]
 fn the_relay_forwards_exec_to_one_app_and_nothing_nested() {
     let post = axum::http::Method::POST;
