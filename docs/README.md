@@ -1353,7 +1353,7 @@ it measures per-job overhead rather than real work; see the batch manual for
 prerequisites and resource profiles. `--compare OLD.json` checks a scenario
 against an earlier report of the same scenario and fails on a drop beyond
 `--tolerance` (10% by default). The 100-million-a-day claim itself needs the
-job final: 8 hours of faults and a 2-hour quiet tail (`scripts/release/qualify-jobs-sustained.sh --tier final`).
+job final: 8 hours of faults and a 2¼-hour quiet tail (`scripts/release/qualify-jobs-sustained.sh --tier final`).
 
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,

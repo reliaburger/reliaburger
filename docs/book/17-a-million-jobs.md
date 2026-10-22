@@ -3656,12 +3656,12 @@ The record now reports each checker's armed minutes per node, and a final
 gates on them. The fix wasn't in the checker. Its hour-long warm-up is there
 for a reason: a young process's memory is still growing for honest reasons.
 The fault schedule was the problem, since it never let any Bun get old. So a
-final now ends with a quiet tail, two hours after the last cycle with no
-faults, walks or specials. The apps and jobs keep running, so there's still
+final now ends with a quiet tail, two hours and a quarter after the last
+cycle with no faults, walks or specials. The apps and jobs keep running, so there's still
 something to leak. Every node gets an hour to arm `leak-rss` and an hour of
 comparison samples, and the final fails unless each checker was armed for an
 hour on every node, with one unbroken half-hour among them. The final grew
-from eight hours to about ten. We chose that over cutting the faults to six,
+from eight hours to about ten and a half. We chose that over cutting the faults to six,
 because the faults are what the eight hours were for.
 
 My first proposal for the tail was 90 minutes, an hour to arm and half an
@@ -3670,6 +3670,18 @@ that fails every final. The last cycle ends with an upgrade walk and a
 graceful whole-cluster stop, so the tail is all the exposure a node gets, and
 90 minutes arms `leak-rss` for 30. Writing the fixture first caught it before
 an eight-hour run did.
+
+The fixed two hours had the same mistake one size smaller, and the fixture
+didn't catch it, because the fixture wrote the exposure straight into the
+checker's state instead of producing it from samples. The checker can only
+date a Bun from the first sample that shows it, and samples come every five
+minutes. The graceful stop runs after the last cycle's sample, so each new
+Bun is first seen up to five minutes into the tail. And the harness sets the
+next sample's time *after* each observe finishes, so a 30-second observe
+stretches every interval to 330 seconds. Feeding the checker that grid, from
+a restart at the tail's start to the observe after it, gave `leak-rss` 54
+minutes of the hour it needs. The tail is now two hours and a quarter, and the
+test that guards it drives the sampling, not the result.
 
 ### A task that failed before it ran
 

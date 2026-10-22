@@ -207,10 +207,11 @@ slot=$(( cycle / 6 ))
 # 20 October 2026): no faults, walks or specials, so every node's Bun lives
 # long enough to arm leak-rss (an hour) and leak-fd and give them an hour of
 # comparison samples. The final's record fails unless both were armed long
-# enough on every node. sustained_check.py has the same length
+# enough on every node. The 15 minutes past two hours cover the heavy
+# sampling grid; sustained_check.py has the same length and says why
 # (QUIET_TAIL_SECONDS). The jobs keep running through it.
 quiet_tail=0
-[ "$tier" != final ] || quiet_tail=7200
+[ "$tier" != final ] || quiet_tail=8100
 job_runs=$(python3 "$job_controller" budget --duration "$(( duration + quiet_tail ))") || fail 'the job campaign would outgrow its retained-run limit'
 light_every=30
 heavy_every=300

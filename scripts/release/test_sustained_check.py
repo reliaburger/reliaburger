@@ -1538,6 +1538,22 @@ class CheckerExposure(Evidence):
         self.assertEqual(self.exposure("leak-rss")["armed_seconds"], 0)
         self.assertEqual(self.exposure("leak-fd")["armed_seconds"], 0)
 
+    def test_a_finals_quiet_tail_arms_both_checkers_long_enough_after_the_last_special(self):
+        # The last cycle ends with a graceful stop after its heavy sample, so
+        # each Bun is first seen up to one heavy interval into the tail, and
+        # every heavy observe pushes the next one back by however long it
+        # took (wait_until in qualify-sustained.sh). The tail's last sample
+        # is the observe after it.
+        heavy_every, observe_takes = 300, 30
+        tail_end = NOW + checker.QUIET_TAIL_SECONDS
+        ts = NOW + heavy_every
+        while ts < tail_end:
+            self.sample(ts, 200)
+            ts += heavy_every + observe_takes
+        self.sample(tail_end, 200)
+        short = [check for node, check in checker.exposure_shortfalls(self.state) if node == "rb-a-1"]
+        self.assertEqual(short, [], self.state["exposure"]["rb-a-1"])
+
     def test_the_record_reports_armed_minutes_per_node_and_checker(self):
         (self.evidence / "metadata.json").write_text(json.dumps({"started_at": NOW, "finished_at": NOW + 7200}))
         for minute in range(0, 91, 5):
