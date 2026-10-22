@@ -1663,7 +1663,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .supervisor
             .list_instances()
             .into_iter()
-            .map(|instance| instance.id.0)
+            .map(|instance| instance.id.0.clone())
             .collect();
         for instance in changed {
             let wanted = desired.get(&instance);
