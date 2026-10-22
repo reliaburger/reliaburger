@@ -296,7 +296,7 @@ migration and no feature gate
   - [x] compact task arrays, a template and a count rather than a record per
     task ([#266](https://github.com/reliaburger/reliaburger/pull/266), #588);
   - [x] the common job lifecycle (#638, [#642](https://github.com/reliaburger/reliaburger/pull/642),
-    [plan](plans/2026-10-07-plan-common-job-lifecycle.md),
+    [plan](plans/archive/2026-10-07-plan-common-job-lifecycle.md),
     [qualification](qualification/2026-10-07-common-jobs/README.md));
   - [x] fresh, shared and host executors, and the timed throughput scenarios in
     `relish bench` ([#654](https://github.com/reliaburger/reliaburger/pull/654),
@@ -323,10 +323,24 @@ migration and no feature gate
   ([upgrading from 0.1.6](releasing.md#upgrading-from-016)). The September
   plan is [archived](plans/archive/2026-09-28-plan-million-jobs.md).
   [Chapter 17](book/17-a-million-jobs.md).
-- [ ] **0.2.1: cluster safety**
+- [x] **0.2.1: cluster safety.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.1)
+  on 21 October 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/16)). The
   bug-fix release after 0.2.0, as 0.1.5 was: the data-loss and availability
-  bugs the 10 October audit found that predate jobs.
+  bugs the 10 October audit found that predate jobs. It's the first release on
+  the shorter gate, one 8-hour jobs final in place of separate V02 and job
+  finals ([#991](https://github.com/reliaburger/reliaburger/issues/991)).
+  Candidate 9 passed it
+  ([record](qualification/2026-10-21-v0.2.1-job-qualification.md), [closure](qualification/2026-10-21-v0.2.1-release-closure.md),
+  [release log](release-log.md#021-cluster-safety)), with slow agent-loop
+  turns from fsync'd discovery journal writes accepted as known issues
+  ([#1255](https://github.com/reliaburger/reliaburger/issues/1255),
+  [#1266](https://github.com/reliaburger/reliaburger/issues/1266)). It ships
+  with RUSTSEC-2026-0381 to -0383, which 0.2.0 has too
+  ([#1269](https://github.com/reliaburger/reliaburger/issues/1269)); both are
+  fixed in 0.2.2. 0.2.1 changes the cluster's formats, so a 0.2.0 cluster
+  can't roll to it: recreate the cluster
+  ([upgrading from 0.2.0](releasing.md#upgrading-from-020)).
 - [ ] **0.2.2: UX polish**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/15)). The
   CLI review pass ([#522](https://github.com/reliaburger/reliaburger/issues/522)),
@@ -487,8 +501,11 @@ what's shipped and what's scheduled.
   independent runc nodes ([#286](https://github.com/reliaburger/reliaburger/issues/286));
   the V02 leftovers, the snapshot uploader under power cuts and the
   `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287));
-  V04, cold installs on Intel macOS, Linux x86_64 and Linux arm64
+  V04, cold installs on Linux x86_64 and Linux arm64
   ([#288](https://github.com/reliaburger/reliaburger/issues/288)). All in 0.3.0.
+  Intel macOS left V04 when 0.2.2 dropped its build: 0.2.1 is the last release
+  with `relish-macos-x86_64`
+  ([#1018](https://github.com/reliaburger/reliaburger/issues/1018)).
 - **Missing capabilities F01–F11**, one issue each, placed in
   [0.1.3](https://github.com/reliaburger/reliaburger/milestone/4) (F07 part 1, landed),
   [0.1.4](https://github.com/reliaburger/reliaburger/milestone/8) (F07 part 2

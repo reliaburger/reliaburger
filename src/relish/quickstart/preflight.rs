@@ -86,10 +86,12 @@ pub async fn resources(to_start: usize, to_create: usize, root: &Path) -> Result
 /// The percentage of memory macOS considers free before it comes under
 /// pressure (`memory_pressure` prints the same figure).
 ///
-/// sysinfo's macOS "available" subtracts the pages holding compressed memory
-/// from free and inactive pages, which never held them. On a busy Mac with a
-/// few GiB compressed it reports almost nothing available while the kernel
-/// reports 60% free, and we'd refuse to start. Linux's MemAvailable is fine.
+/// sysinfo 0.33's macOS "available" subtracted the pages holding compressed
+/// memory from free and inactive pages, which never held them: on a busy Mac
+/// it reported almost nothing while the kernel reported 60% free. Since 0.38
+/// it's active + inactive + free, which counts pages running apps are using
+/// and overstates what a VM can take. The kernel's own level is the figure
+/// `memory_pressure` prints. Linux's MemAvailable is fine.
 async fn macos_memory_level() -> Result<Option<u64>> {
     if !cfg!(target_os = "macos") {
         return Ok(None);

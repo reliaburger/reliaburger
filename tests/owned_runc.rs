@@ -280,7 +280,8 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
                 &["/bin/busybox".into(), "echo".into(), "adopted".into()]
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .output,
         "adopted\n"
     );
     record.log_stem = Some(root.path().join("older-generation/output"));
@@ -1540,8 +1541,8 @@ mod capacity_contract {
         let layer = archive.into_inner().unwrap().finish().unwrap();
         let config = br#"{"config":{"User":"65534:65534","WorkingDir":"/","Env":["PATH=/bin"]}}"#;
         let store = ImageStore::new(root.join("images"));
-        let layer_digest = format!("sha256:{:x}", Sha256::digest(&layer));
-        let config_digest = format!("sha256:{:x}", Sha256::digest(config));
+        let layer_digest = format!("sha256:{}", hex::encode(Sha256::digest(&layer)));
+        let config_digest = format!("sha256:{}", hex::encode(Sha256::digest(config)));
         let layer_path = store.blob_path(&layer_digest);
         let config_path = store.blob_path(&config_digest);
         for (path, data) in [

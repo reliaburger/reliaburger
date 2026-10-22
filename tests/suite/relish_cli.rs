@@ -433,6 +433,149 @@ spec:
     assert_eq!(web.replicas, reliaburger::config::Replicas::Fixed(2));
 }
 
+/// #703: `--strict` is sold as a CI gate, so a dropped resource must fail it
+/// as surely as an approximated one.
+#[cfg(feature = "kubernetes")]
+#[test]
+fn import_strict_fails_when_a_resource_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("dropped.yaml");
+    std::fs::write(
+        &manifest,
+        r#"
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all
+spec:
+  podSelector: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+spec:
+  accessModes: ["ReadWriteOnce"]
+"#,
+    )
+    .unwrap();
+    let path = manifest.to_str().unwrap();
+
+    let lenient = run(&["import", "-f", path]);
+    assert!(
+        lenient.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lenient.stderr)
+    );
+
+    let strict = run(&["import", "--strict", "-f", path]);
+    assert_eq!(strict.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(stderr.contains("NetworkPolicy/deny-all"), "{stderr}");
+    assert!(stderr.contains("2 dropped"), "{stderr}");
+}
+
+#[cfg(feature = "kubernetes")]
+#[test]
+fn import_strict_passes_a_manifest_that_converts_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("clean.yaml");
+    std::fs::write(
+        &manifest,
+        r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+  ports:
+  - port: 8080
+"#,
+    )
+    .unwrap();
+    let output = run(&["import", "--strict", "-f", manifest.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("[app.web]"));
+}
+
+/// #703: exporting used to keep `command` only, so Redis came back without
+/// `--maxmemory 64mb --save "" --appendonly no`.
+#[cfg(feature = "kubernetes")]
+#[test]
+fn podinfo_import_then_export_round_trips_args() {
+    let podinfo = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/kubernetes/podinfo.yaml"
+    );
+    let imported = run(&["import", "-f", podinfo]);
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let toml = dir.path().join("podinfo.toml");
+    std::fs::write(&toml, &imported.stdout).unwrap();
+
+    let exported = run(&["export", "-f", toml.to_str().unwrap()]);
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let yaml = String::from_utf8_lossy(&exported.stdout);
+    let redis = yaml
+        .split("\n---\n")
+        .filter_map(|document| yaml_serde::from_str::<yaml_serde::Value>(document).ok())
+        .find(|document| {
+            document["kind"].as_str() == Some("Deployment")
+                && document["metadata"]["name"].as_str() == Some("redis")
+        })
+        .unwrap_or_else(|| panic!("no redis Deployment in:\n{yaml}"));
+    let args: Vec<&str> = redis["spec"]["template"]["spec"]["containers"][0]["args"]
+        .as_sequence()
+        .unwrap_or_else(|| panic!("redis lost its args:\n{yaml}"))
+        .iter()
+        .filter_map(|arg| arg.as_str())
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "redis-server",
+            "--maxmemory",
+            "64mb",
+            "--maxmemory-policy",
+            "allkeys-lru",
+            "--save",
+            "",
+            "--appendonly",
+            "no",
+        ]
+    );
+}
+
 #[test]
 fn apply_refuses_plain_http_manifest_urls() {
     let output = run(&["apply", "-f", "http://example.com/app.yaml", "--dry-run"]);

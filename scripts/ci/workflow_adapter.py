@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -137,7 +138,114 @@ def verify_archive_runtime(root, context, needs):
     return runtime
 
 
-def validate_expected(manifest, gate, context, expected, shard=None):
+# The job's one archive extraction: what it extracted, from which archive.
+EXTRACTION = 'target/archive-extraction.json'
+EXTRACTION_LISTING = 'target/archive-binaries.json'
+
+
+def check_extraction(row, context, origin):
+    """Refuse an extraction receipt that is not this job's, of this archive.
+
+    The extraction and every owner that uses it run in one job, so the
+    receipt carries the job's exact attempt, even when the archive came from
+    an earlier one.
+    """
+    c.fields(row, ('schema_version', 'context', 'archive_sha256', 'archive_origin_sha256',
+                   'command', 'exit_code', 'metadata'))
+    current = {key: context[key] for key in ('commit', 'run_id', 'attempt', 'host')}
+    c.require(type(row['schema_version']) is int and row['schema_version'] == 1
+              and row['context'] == current and current['host'] == 'linux'
+              and row['archive_sha256'] == origin['builder']['archive_sha256']
+              and row['archive_origin_sha256'] == origin['sha256']
+              and type(row['exit_code']) is int and row['exit_code'] == 0,
+              'wrong current archive extraction')
+    command = row['command']
+    c.require(isinstance(command, list) and len(command) > 2 and isinstance(command[0], str)
+              and Path(command[0]).is_absolute() and command == w.extraction_command(command[0]),
+              'wrong archive extraction command')
+    metadata = row['metadata']
+    c.require(isinstance(metadata, dict) and set(metadata) == set(w.ARCHIVE_METADATA)
+              and all(isinstance(value, str) and re.fullmatch('[0-9a-f]{64}', value) is not None
+                      for value in metadata.values()), 'wrong extracted nextest metadata')
+
+
+def extract(root, context, needs, tools, environment=None, run=subprocess.run):
+    """Extract the builder's archive once for every owner of this job.
+
+    The archive's bytes are hashed here, once, against the successful
+    builder's output. The owners then check only the two metadata files that
+    name the extracted build, never the multi-GB test binaries (#1050).
+    Returns the receipt's digest, which the workflow passes to each owner.
+    """
+    root = Path(root).resolve()
+    runtime = verify_archive_runtime(root, context, needs)
+    origin = archive_origin(context, needs, runtime)
+    gates.archive_origin(context, {'archive_origin': origin}, root)
+    receipt = root / EXTRACTION
+    c.require(not receipt.exists(), 'archive already extracted in this job')
+    c.require(c.digest(root / 'tests.tar.zst') == origin['builder']['archive_sha256'],
+              'archive differs from successful builder')
+    # Metadata left by anything else must not stand in for this extraction.
+    for name in w.ARCHIVE_METADATA:
+        gates.inside(root, name).unlink(missing_ok=True)
+    make_owner.tool_bytes(tools)
+    command = w.extraction_command(tools['nextest']['path'])
+    base = dict(os.environ if environment is None else environment)
+    for name in list(base):
+        if name.startswith('NEXTEST_'):
+            del base[name]
+    listing = gates.inside(root, EXTRACTION_LISTING)
+    listing.parent.mkdir(parents=True, exist_ok=True)
+    # nextest's progress, its "Extracted N files in Ts" line or its error,
+    # goes to the step log, where a reader looks first.
+    with listing.open('wb') as output:
+        result = run(command, cwd=root, env=base, stdout=output)
+    c.require(result.returncode == 0, 'archive extraction failed')
+    metadata = {}
+    for name in w.ARCHIVE_METADATA:
+        path = gates.inside(root, name)
+        c.require(path.is_file(), 'extraction wrote no nextest metadata: ' + name)
+        metadata[name] = c.digest(path)
+    row = dict(schema_version=1, context={key: context[key] for key in ('commit', 'run_id', 'attempt', 'host')},
+               archive_sha256=origin['builder']['archive_sha256'], archive_origin_sha256=origin['sha256'],
+               command=command, exit_code=0, metadata=metadata)
+    check_extraction(row, context, origin)
+    with receipt.open('x') as output:
+        output.write(json.dumps(row, sort_keys=True, indent=2) + '\n')
+    return c.digest(receipt)
+
+
+def load_extraction(root, digest, context, origin):
+    """The job's extraction receipt, chosen by its trusted step output."""
+    c.require(isinstance(digest, str) and re.fullmatch('[0-9a-f]{64}', digest) is not None,
+              'trusted archive extraction digest required')
+    path = Path(root) / EXTRACTION
+    c.require(path.is_file() and c.digest(path) == digest,
+              'archive extraction differs from its trusted step output')
+    row = c.read_json(path)
+    check_extraction(row, context, origin)
+    return row
+
+
+def validate_archived(entry, context, tools, archive):
+    """An archived owner ran its job's extraction of the builder's archive."""
+    origin = entry.get('archive_origin')
+    extraction = entry.get('archive_extraction')
+    c.require(isinstance(origin, dict) and isinstance(extraction, dict), 'archived owner lacks its extraction')
+    c.require(isinstance(archive, str) and origin['builder']['archive_sha256'] == archive,
+              "archived owner differs from the builder's archive")
+    check_extraction(extraction, context, origin)
+    c.require(extraction['command'][0] == tools['nextest']['path'],
+              'archive extracted by another nextest')
+    selectors = entry['selectors']
+    c.require(selectors[:len(w.ARCHIVED_SELECTORS)] == w.ARCHIVED_SELECTORS
+              and not any(word.startswith(('--archive-file', '--extract-to', '--extract-overwrite'))
+                          for word in selectors), 'archived owner did not reuse the extracted build')
+    c.require(all(entry['inputs'].get(name) == digest for name, digest in extraction['metadata'].items()),
+              'archived owner ran other nextest metadata')
+
+
+def validate_expected(manifest, gate, context, expected, shard=None, archive=None):
     """Recheck static identity around runtime values approved by the producer."""
     c.require(expected['context'] == context, 'wrong current producer context')
     if gate in w.SHARDS:
@@ -162,10 +270,12 @@ def validate_expected(manifest, gate, context, expected, shard=None):
                   and expected['entry']['owner_command'] == w.OWNERS[gate]
                   and expected['entry']['source_files'] == source_files(manifest, gate),
                   'wrong source-bound Make owner entry')
+        if gate in w.ARCHIVED_GATES:
+            validate_archived(expected['entry'], context, expected['tools'], archive)
 
 
-def verify_owner(manifest, gate, context, expected, directory, shard=None):
-    validate_expected(manifest, gate, context, expected, shard)
+def verify_owner(manifest, gate, context, expected, directory, shard=None, archive=None):
+    validate_expected(manifest, gate, context, expected, shard, archive)
     required = required_cases(manifest, gate)
     if gate == 'portable-linux':
         return coverage.evidence(expected, directory, required)
@@ -182,10 +292,10 @@ def verify_owner(manifest, gate, context, expected, directory, shard=None):
     return make_owner.evidence(expected, directory, required)
 
 
-def seal(manifest_path, manifest, gate, context, expected, directory, shard=None):
+def seal(manifest_path, manifest, gate, context, expected, directory, shard=None, archive=None):
     """Seal only a successful current producer, then expose its approved digest."""
     directory = Path(directory)
-    verify_owner(manifest, gate, context, expected, directory, shard)
+    verify_owner(manifest, gate, context, expected, directory, shard, archive)
     approved = directory / 'approved.json'
     approved.write_text(json.dumps(expected, sort_keys=True, indent=2) + '\n')
     payloads = {}
@@ -258,7 +368,14 @@ def cron_dependencies(root, directory=None, run=subprocess.run, tools=None):
     return observations
 
 
-def produce(root, manifest_path, gate, context, directory, needs=None, shard=None):
+def builder_archive(gate, needs):
+    """The successful builder's archive digest, for an archived owner only."""
+    if gate not in w.ARCHIVED_GATES:
+        return None
+    return (needs or {}).get('build-tests', {}).get('outputs', {}).get('archive_sha256')
+
+
+def produce(root, manifest_path, gate, context, directory, needs=None, shard=None, extraction=None):
     root, directory = Path(root).resolve(), Path(directory).resolve()
     manifest = c.inventory(c.read_json(manifest_path), root)
     c.require(gate in JOBS and gate in manifest['gates'], 'unknown required workflow gate')
@@ -281,14 +398,18 @@ def produce(root, manifest_path, gate, context, directory, needs=None, shard=Non
         expected = dict(context=context, tools=tools, plans=approved,
                         origin_path='target/contracts/linux/oci-interruptions/build/build-origin.json')
     else:
-        archived = JOBS[gate] in ('cluster', 'acceptance')
+        archived = gate in w.ARCHIVED_GATES
         runtime = verify_archive_runtime(root, context, needs or {}) if archived else None
         origin = archive_origin(context, needs or {}, runtime) if archived else None
-        entry = w.entry_from_make(root, manifest, gate, context['host'], archive_origin=origin, shard=shard)
+        received = load_extraction(root, extraction, context, origin) if archived else None
+        entry = w.entry_from_make(root, manifest, gate, context['host'], archive_origin=origin,
+                                  archive_extraction=received, shard=shard)
         if runtime is not None:
             entry['archive_runtime'] = runtime
         approved = []
         tools = make_owner.capture_tools(dict(os.environ), subprocess.run)
+        c.require(received is None or received['command'][0] == tools['nextest']['path'],
+                  'archive extracted by another nextest')
         dependencies = cron_dependencies(root, tools=tools) if gate == 'optimized-cron' else None
         status = make_owner.execute(root, directory, context, entry, tools=tools, on_expected=approved.append)
         if status:
@@ -297,7 +418,8 @@ def produce(root, manifest_path, gate, context, directory, needs=None, shard=Non
         expected = approved[0]
         if dependencies is not None:
             (directory / 'dependency-comparison.json').write_text(json.dumps(dependencies, indent=2) + '\n')
-    return 0, seal(manifest_path, manifest, gate, context, expected, directory, shard)
+    return 0, seal(manifest_path, manifest, gate, context, expected, directory, shard,
+                   builder_archive(gate, needs))
 
 
 def sealed_context(sealed, current):
@@ -374,7 +496,8 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None,
                 'sealed owner payload changed',
             )
         approved = c.read_json(directory / 'approved.json')
-        cases = verify_owner(manifest, gate, current, approved, directory, shard)
+        cases = verify_owner(manifest, gate, current, approved, directory, shard,
+                             builder_archive(gate, needs))
         if shard is None:
             verified[(gate, host)] = cases
         else:
@@ -413,11 +536,11 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None,
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['produce', 'aggregate', 'archive'])
+    parser.add_argument('operation', choices=['produce', 'aggregate', 'archive', 'extract'])
     for name in ('root', 'commit', 'run-id', 'attempt'):
         parser.add_argument('--' + name, required=True)
     for name in ('manifest', 'gate', 'host', 'directory', 'needs', 'github-output', 'ignored-bindings',
-                 'shard', 'event'):
+                 'shard', 'event', 'archive-extraction'):
         parser.add_argument('--' + name)
     args = parser.parse_args(argv)
     context = dict(commit=args.commit, run_id=args.run_id, attempt=args.attempt)
@@ -454,6 +577,14 @@ def main(argv=None):
             c.digest(Path(args.root) / 'archive-runtime.json'),
         )
         return 0
+    if args.operation == 'extract':
+        c.require(args.host == 'linux' and args.needs and args.github_output,
+                  'current Linux archive consumer outputs required')
+        context['host'] = args.host
+        tools = make_owner.capture_tools(dict(os.environ), subprocess.run)
+        digest = extract(args.root, context, c.read_json(args.needs), tools)
+        write_output(args.github_output, 'archive_extraction_sha256', digest)
+        return 0
     c.require(args.manifest and args.directory, 'manifest and owner artifact directory required')
     if args.operation == 'aggregate':
         c.require(args.needs, 'trusted workflow needs object required')
@@ -472,7 +603,8 @@ def main(argv=None):
     context['host'] = args.host
     needs = c.read_json(args.needs) if args.needs else None
     shard = parse_shard(args.gate, args.shard)
-    status, digest = produce(args.root, args.manifest, args.gate, context, args.directory, needs, shard)
+    status, digest = produce(args.root, args.manifest, args.gate, context, args.directory, needs, shard,
+                             args.archive_extraction)
     if status:
         return status
     write_output(args.github_output, output_name(args.gate, shard), digest)

@@ -117,7 +117,7 @@ Each PING/ACK message piggybacks a bounded number of membership updates (new joi
 
 **Refutation first.** The dissemination queue sends this node's own refutation (Alive about itself at a raised incarnation) ahead of everything else, then Dead/Left, Suspect and Alive about others. A newer update about a node supersedes any queued older one (incarnation first, then state), which is then discarded unsent. Without both rules, a falsely suspected node's refutation waited behind a rack failure's backlog of Suspect and Dead rumours, and it flapped.
 
-**Anti-entropy push-pull.** Piggybacking alone is not enough. Each update is re-broadcast a bounded number of times (`3 * ceil(log2(N))`, minimum 6), and nothing guarantees those broadcasts reach every node: in the five-node ring simulation, 73 of 100,000 random probe schedules spent every re-broadcast about some member before one particular node heard it. Once the dissemination queues drain, PINGs carry nothing new and the gap is permanent. So, like HashiCorp's memberlist, Mustard runs a periodic push-pull:
+**Anti-entropy push-pull.** Piggybacking alone is not enough. Each update is re-broadcast a bounded number of times (`3 * ceil(log2(N))`, minimum 6), and nothing guarantees those broadcasts reach every node: in the five-node ring simulation, 82 of 100,000 random probe schedules spent every re-broadcast about some member before one particular node heard it. Once the dissemination queues drain, PINGs carry nothing new and the gap is permanent. So, like HashiCorp's memberlist, Mustard runs a periodic push-pull:
 
 ```
 Node A                                   Node B (random live peer)
@@ -606,10 +606,10 @@ struct EncryptedRecoveryCandidateList {
 
 | Layer | Transport | Encoding | Max Message Size |
 |-------|-----------|----------|------------------|
-| Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | bincode (serde) | 1400 bytes (avoids IP fragmentation); piggybacked updates fill the room left after the header and directory extension |
-| Mustard anti-entropy (Sync push-pull) | UDP | bincode (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange |
+| Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | postcard (serde) | 1400 bytes (avoids IP fragmentation); piggybacked updates fill the room left after the header and directory extension |
+| Mustard anti-entropy (Sync push-pull) | UDP | postcard (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange |
 | Raft (AppendEntries, Vote, InstallSnapshot) | TCP + mTLS, connections pooled and reused across RPCs (§3.3) | JSON (serde), length-prefixed, in an envelope carrying the compatibility version and recovery epoch | 64 MiB per frame (snapshots can be large) |
-| Reporting tree (StateReports) | TCP + mTLS | bincode | 1 MiB (bounded by max events per report) |
+| Reporting tree (StateReports) | TCP + mTLS | postcard | 1 MiB (bounded by max events per report) |
 
 All TCP connections use mTLS via Sesame's Node CA certificates.
 
@@ -847,7 +847,7 @@ fn select_council_candidates(
     // (seeded by leader node_id + current term)
     let top = candidates.iter().take(needed * 3).collect::<Vec<_>>();
     let mut rng = StdRng::seed_from_u64(hash(leader_id, current_term));
-    let selected = top.choose_multiple(&mut rng, needed);
+    let selected = top.sample(&mut rng, needed);
 
     selected.map(|n| n.node_id).collect()
 }
@@ -1420,7 +1420,7 @@ There is no production-quality Rust equivalent of HashiCorp's `memberlist` (Go).
 
 | Crate | Purpose |
 |-------|---------|
-| [`bincode`](https://crates.io/crates/bincode) | Binary serialisation for wire protocol messages. Compact and fast. |
+| [`postcard`](https://crates.io/crates/postcard) | Binary serialisation for gossip datagrams and reporting frames: compact varints over serde. Replaced the unmaintained `bincode` in 0.2.2 (RUSTSEC-2025-0141). |
 | [`serde`](https://crates.io/crates/serde) | Serialisation framework. All data structures derive Serialize/Deserialize. |
 | [`ring`](https://crates.io/crates/ring) | HMAC-SHA256 for gossip message authentication. SHA-256 for spec hashing. |
 | [`age`](https://crates.io/crates/age) | Encryption for the recovery candidate list and Raft log at-rest encryption. |

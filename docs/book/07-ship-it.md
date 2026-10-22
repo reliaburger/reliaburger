@@ -14,7 +14,7 @@ Picture the alternative. You write a function that starts the new version, waits
 
 The fix is to make the progress data, not control flow. Write down the current phase, commit it somewhere durable, and let any node read it back and continue. That's a state machine: an enum with a `transition` method that takes an event and produces the next state, or rejects the transition. The enum is the written-down progress; Raft (from Chapter 2) is the durable somewhere.
 
-We also rejected shelling out to an external tool. A deploy needs to know the cluster's current placements, talk to the health checker, and rewrite the ingress routing table — all things the orchestrator already has in-process. Spawning `kubectl`-equivalent would mean re-plumbing all of that across a process boundary. Keeping it in `meat` is both simpler and faster.
+We also rejected shelling out to an external tool. A deploy needs to know the cluster's current placements, talk to the health checker, and rewrite the ingress routing table: all things the agent already has in-process. Spawning `kubectl`-equivalent would mean re-plumbing all of that across a process boundary. Keeping it in `meat` is both simpler and faster.
 
 ## The deploy state machine
 
@@ -99,146 +99,119 @@ Each instance replacement follows five sub-steps:
 
 If the health check fails at step 2, we stop the new instance and don't touch the old one. The old instance is still serving traffic. Nothing broke. That's the whole point.
 
-## The DeployDriver trait
+## The rolling planner
 
-The orchestrator doesn't call the supervisor directly. It uses a `DeployDriver` trait that abstracts every instance operation:
+Which of those steps comes next? On a three-replica app with `max_surge = 1`, the answer changes as the rollout goes: start a replacement, retire an old instance, start another. The agent asks one pure function, `plan_rolling_step` in `src/meat/deploy_types.rs`, every time round its loop:
 
 ```rust
-pub trait DeployDriver {
-    fn start_instance(&self, app, node, image) -> Result<InstanceId>;
-    fn await_healthy(&self, instance, timeout) -> Result<()>;
-    fn add_to_routing(&self, app, instance) -> Result<()>;
-    fn drain_instance(&self, instance, timeout) -> Result<()>;
-    fn stop_instance(&self, instance) -> Result<()>;
-    fn run_dependency_job(&self, job, image) -> Result<()>;
-    fn current_placements(&self, app) -> Vec<(NodeId, InstanceId)>;
+pub fn plan_rolling_step(
+    target: u32,
+    new_healthy: u32,
+    new_pending: u32,
+    old_remaining: u32,
+    max_surge: u32,
+    max_unavailable: u32,
+) -> RollingStep {
+    if new_healthy >= target && old_remaining == 0 {
+        return RollingStep::Done;
+    }
+
+    let serving = new_healthy + old_remaining;
+    let total = new_healthy + new_pending + old_remaining;
+
+    // Start a replacement when one is still owed and surge allows it.
+    let owed = new_healthy + new_pending < target;
+    if owed && total < target.saturating_add(max_surge) {
+        return RollingStep::StartNew;
+    }
+
+    // Otherwise retire an old instance, provided serving stays within the
+    // unavailable budget.
+    if old_remaining > 0 && serving > target.saturating_sub(max_unavailable) {
+        return RollingStep::RetireOld;
+    }
+    // ... Wait while replacements come up, Stuck if neither move is allowed
 }
 ```
 
-Why a trait instead of calling the supervisor directly? Testability. The state machine has a dozen edge cases (health failure at step 2 of 5 with rollback enabled, dependency job timeout, drain timeout with force-kill). Testing these against a real supervisor would be slow and flaky. With a mock driver, each test runs in microseconds.
+The two bounds are the whole decision. `max_surge` caps how far *above* the target the total may go, so it decides whether another replacement may start. `max_unavailable` caps how far *below* the target the serving count may fall, so it decides whether an old instance may retire. `saturating_add` and `saturating_sub` stop at the numeric limits instead of overflowing, which matters for `u32`: `0 - 1` would panic in a debug build and wrap to four billion in a release one.
 
-This trait was earned, not speculative. We have exactly two implementations: `MockDriver` (for tests) and eventually `LocalDeployDriver` (for production). The abstraction exists because we need it, not because we might need it.
+`RollingStep` is a five-variant enum (`StartNew`, `RetireOld`, `Wait`, `Done`, `Stuck`), and the agent `match`es on it, so the compiler makes sure every answer is handled. `Stuck` is only reachable with both bounds at zero, which `DeployConfig::validate` refuses. It exists to fail loudly rather than spin.
 
-The orchestrator takes the driver as a *generic type parameter*, not a trait object:
+Why a pure function? Because every combination is a one-line unit test, with no runtime, no containers and no clock. `default_surge_keeps_one_spare_and_never_dips`, `zero_surge_replaces_in_place` and `full_surge_matches_the_old_all_at_once_behaviour` each walk a whole rollout through the planner and check the serving count never drops below the floor.
 
-```rust
-pub struct DeployOrchestrator<D: DeployDriver> {
-    state: DeployState,
-    request: DeployRequest,
-    driver: D,
-}
-```
+### What we tried first: a driver trait
 
-`<D: DeployDriver>` reads "for any type `D` that implements `DeployDriver`". When you build a `DeployOrchestrator<MockDriver>`, the compiler stamps out a dedicated copy of the orchestrator with every `self.driver.start_instance(...)` call wired straight to `MockDriver::start_instance`. No vtable, no runtime indirection. This is *monomorphisation*: one generic written once, compiled into N concrete versions, one per type you actually use. C++ templates do the same thing; Java generics do not (they erase to `Object` and dispatch dynamically); Go only grew generics in 1.18 and still often reaches for interfaces.
+The first version of this chapter had a different shape. A `DeployOrchestrator` drove the steps through a `DeployDriver` trait, with a `MockDriver` for tests and a production driver to come. It was a tidy design: the orchestrator was generic over the driver, so tests ran the same deploy logic against the mock in microseconds.
 
-The alternative would be `driver: Box<dyn DeployDriver>` — a trait object, where the concrete type is erased and each call goes through a pointer table at runtime. We use those elsewhere (the secret decryptor in Chapter 5 is one). Here, the orchestrator owns exactly one driver for its whole life and we know the type at construction, so the generic is both faster and simpler. Reach for `dyn` when you need a *collection* of mixed types behind one interface; reach for a generic when each instance is one known type.
+The production driver never came. Every method on the trait was a plain synchronous `fn`, and the agent is `async` top to bottom: starting a container, waiting on a health probe and draining connections are all `.await` points. A synchronous trait can't `.await`, and bridging the two (blocking on a runtime handle inside an async task) is exactly the kind of thing that deadlocks under load. So the agent grew its own hand-rolled rollout against the async runtime, and the orchestrator stayed behind as a model that only tests ever ran. Two implementations of the same rules can drift apart without anyone noticing, and these did: the model knew about `max_surge` long before the agent honoured it.
+
+In August 2026 we deleted the orchestrator, the trait, the mock and the model's blue-green path, about 800 lines. What survived is what the agent could actually use: the pure planner above, and the agent's own deploy worker, tested against a fake container runtime instead of a fake driver. The lesson isn't "traits are bad". It's that an abstraction has to fit the runtime it serves, and a trait with one real implementation that never arrives is a model, not an interface.
 
 ## Automatic rollback
 
-When `auto_rollback = true` (the default) and a step fails, the orchestrator reverses direction. For each step that already completed, it:
+When a replacement fails its health check, the deploy worker calls `abort_rollout`. With `auto_rollback = false` it stops there, keeps the healthy replacements, and records the deploy as `Halted`, so the operator decides. With `auto_rollback = true` (the default), what happens depends on how far the rollout got. If no old instance has retired yet, the abort tears the replacements down and the old fleet carries on as if nothing happened. If some have, it rolls *backwards*: it starts previous-spec instances to make up the capacity, through the same planner, before it retires a healthy replacement. If the previous spec won't start either, the deploy ends `Halted` with the reason.
 
-1. Removes the new instance from routing
-2. Stops the new instance
-3. Starts a fresh instance with the old image
-4. Adds it to routing
-
-The same `DeployDriver` methods, called in reverse order. The rollback itself can fail (if the old image is also broken), in which case the deploy enters the `Failed` state and the operator must intervene.
-
-That's the model. The wired path on a node got this wrong for a long time, in a way the model never could: see "A rollback must not cost capacity" at the end of the chapter.
-
-There was a leak here worth calling out. Rollback reverts the steps that *completed*, but a step can fail partway: `start_instance` succeeds, then `await_healthy` times out. That leaves a new instance running — started, unhealthy, recorded — that the rollback loop skipped, because it only walks completed steps, not the failed one. So every failed deploy orphaned a container and leaked its port. The fix is three lines in the failure branch: when a step fails, stop *its own* new instance before rolling back the earlier ones. The regression test starts two replicas, fails the second's health check, and asserts the second's new instance appears in the driver's stopped set — the assertion the original tests never made.
+That second case took us a while to get right: see "A rollback must not cost capacity" at the end of the chapter.
 
 ## Dependency ordering
 
 Jobs can declare `run_before = ["app.web"]`, meaning they must complete before the rolling phase begins. Database migrations are the classic example: you want `migrate` to finish before `web` gets the new code.
 
-The orchestrator models this as a `RunningPreDeps` phase. If any pre-deploy job fails, the deploy fails immediately and no instances are modified.
-
-Cluster apply has another gate to protect: the app spec in Raft. Once that spec
-commits, another node can schedule the new app. The agent first reserves the
-local operation and checks image trust for the complete manifest. Raft then
-records a bounded claim owning every app and job identity, without publishing
-the new desired state. Prerequisites must reference an app in the same apply
-and effective namespace.
-
-A migration opens the gate only after a positive zero exit and a durable job
-checkpoint. A negative exit is recorded before reporting failure; failed
-migrations never enter the ordinary automatic retry path. The claim's original
-leadership term and recovery epoch fence an old worker. A new leader cannot
-infer the outcome from its own local records, so uncertainty retains ownership
-and prevents a changed app-only or job-only submission from repeating the work.
-
-After success, one Raft entry checks the complete manifest again and publishes
-its desired writes atomically. If ordinary jobs remain, their identities stay
-reserved until exact namespace, spec and generation receipts establish positive
-terminal outcomes. A startup acknowledgment or an empty receipt cannot release
-that ownership. Registered cron work has no finite execution receipt, so this
-chapter's first version of cluster apply refused recurring schedules outright.
-In 0.2.0 that refusal went away: once the apps publish, the same Raft
-transaction that admits ordinary jobs registers each schedule as a durable
-definition, and the leader claims every matching UTC minute itself. Chapter 17
-tells that story.
+The gate is the app spec in Raft. Once that spec commits, any node can start the new version, so the migration has to finish first. Apply records a deployment intent (`JobApplyCommit`), admits the prerequisite hooks as runs of the common job lifecycle, and waits for their accepted results. A migration opens the gate only after a positive zero exit. Then one Raft entry publishes the apps and admits the ordinary jobs together, and registers each cron schedule as a durable definition whose UTC minutes the leader claims itself. Prerequisites must reference an app in the same apply and effective namespace. A failed hook fails the deploy with no instance touched, and an unknown outcome never opens the gate: someone has to look first (see "Jobs that might already have run", below).
 
 Migration cancellation also needs a boundary after the job settles. An accepted cancellation remains meaningful when the child subsequently exits zero: check it after settlement and immediately before proposing the desired-state transaction. A proposal already submitted to Raft can still commit; cancellation cannot roll that transaction back. Each replicated ownership write has a five-second caller deadline. A timeout does not tell us whether Raft committed, so we keep the uncertain fence and report an error. This is why the terminal job watcher ends without inventing a release when its settlement write stalls.
 
-The tests hold real Process migrations while inspecting desired state, forward
-a failed migration through a follower and change leaders while an old runner
-is blocked. A cold restart preserves a failed generation; an explicitly
-corrected apply launches a new one. State-machine and actor tests also cover
-atomic refusals, overlapping identities, malformed snapshots, pending retries
-and missing or uncertain ordinary-job receipts. Old-term or recovered claims
-stay held; there is no automatic expiry or replay, and administrator recovery
-is a separately proposed extension.
+The first version held the gate differently. Raft recorded a bounded *claim* owning every app and job identity in the apply, with the leadership term that admitted it, until the jobs settled. A claim from an earlier term could never be released, each one reserved its jobs' resources on every candidate node, and a few leader changes during leased applies quietly leaked capacity. In 0.2.0 the claims went (#681), along with the agent's own job runner: Chapter 17's "Retiring the batch engine from Chapter 12" tells that story.
 
+## What actually runs
 
-Held migration and ordinary-job claims also protect placement capacity. These
-jobs run on the receiving leader; the claim records no authoritative worker
-assignment. Both app and batch planners therefore reserve the complete held
-CPU/memory request on every candidate, without crediting a guessed replica or
-an unrelated report. Before app publication this includes all jobs; afterwards
-it includes only the ordinary tail. This can over-reserve capacity, including
-capacity already reported locally. It prevents new placements from spending
-uncertain commitments; it does not add initial job capacity or quota admission.
-Positive terminal settlement releases the corresponding held request.
+The path that deploys your app lives in the Bun agent, in `src/bun/agent/deploy_worker.rs`: `rolling_redeploy` and `blue_green_redeploy`, each calling the supervisor and the container runtime directly.
 
-## From the model to the wired path
-
-Here's a honesty note that's easy to skip past. Everything above — `DeployOrchestrator`, the `DeployDriver` trait, `execute_blue_green`, the exhaustive rollback tests — is a *model* of the deploy state machine. It's driven in tests by `MockDriver`, and it's where we work out the tricky transitions in microseconds. But it is not the code that runs on a node. The path that actually deploys your app lives in the Bun agent: `rolling_redeploy`, `blue_green_redeploy`, and an inline `run_before` gate, each calling the supervisor and the container runtime directly.
-
-Why two versions of the same logic? Look back at the `DeployDriver` trait — every method is a plain `fn`, synchronous. The agent is `async` top to bottom: starting a container, waiting on a health probe, draining connections are all `.await` points. A synchronous trait can't `.await`, and bridging the two (blocking on a runtime handle inside an async task) is exactly the kind of thing that deadlocks under load. So the wired path is hand-rolled against the async supervisor, and the synchronous orchestrator stays as the model we test against. That's the honest state of it — the same trade-off you'll hit any time a clean synchronous abstraction meets an async runtime.
-
-So what's actually wired:
-
-- **`run_before`** — before an app deploys, the agent runs every job naming it in `run_before` to completion, polling the runtime until the job exits and gating on a clean exit code. A failure aborts the deploy; a gating job runs exactly once and is skipped in the regular jobs loop.
-- **Blue-green** — `strategy = "blue-green"` dispatches to `blue_green_redeploy`, which brings the whole green fleet up and health-checks it while blue keeps serving, then swaps routing over and retires blue in one move. A green failure leaves blue untouched.
-- **Scheduled jobs** — a job with a `schedule = "0 3 * * *"` doesn't run at deploy time at all. It's parsed by a small dependency-free cron matcher (`meat::cron`) and fired by the agent's one-second event-loop tick when its UTC minute matches, at most once per minute.
+- **`run_before`**: the hooks run on the common job lifecycle before the app is published, as "Dependency ordering" describes. The agent itself no longer runs jobs; a deploy that names one is refused before it touches a runtime.
+- **Rolling**: `rolling_redeploy` loops on `plan_rolling_step`, starting a replacement or retiring an old instance as the planner says, until it answers `Done`.
+- **Blue-green**: `strategy = "blue-green"` dispatches to `blue_green_redeploy`, which brings the whole green fleet up and health-checks it while blue keeps serving, then publishes green and retires blue. A green failure leaves blue untouched. Chapter 9 covers it.
+- **Scheduled jobs**: a job with a `schedule = "0 3 * * *"` doesn't run at deploy time at all. It's parsed by a small dependency-free cron matcher (`meat::cron`), and the leader claims each matching UTC minute as one run.
 
 ## Raft persistence
 
-Deploy state is committed to Raft at every phase transition. If the leader dies mid-deploy, the new leader reads the last known state and can resume. This is why the phase is an enum we write down rather than a position in the code: a value survives a process death, a stack frame doesn't.
+The original plan was to commit deploy state to Raft at every phase transition, so that a new leader could read the last known state and resume a half-finished deploy. That's why the phase is an enum we can write down rather than a position in the code: a value survives a process death, a stack frame doesn't.
 
-That's the model again. The wired cluster path keeps no deploy state in Raft at all: each node rolls its own share, and the leader reads progress from the nodes' reports (more on that at the end of the chapter). What it does keep in Raft is small: the last ten specs of each app that rolled out everywhere, and the spec whose rollout failed.
+The wired cluster path ended up keeping no deploy state in Raft at all. Each node rolls its own share, and the leader reads progress from the nodes' reports (more on that at the end of the chapter). What it does keep in Raft is small: the last ten specs of each app that rolled out everywhere, and the spec whose rollout failed.
 
-Finished deploys move into a per-app history so `relish history` and the API can show what shipped when. We don't keep it forever — an app that deploys fifty times a day would grow the Raft log without bound. The state machine caps it:
+Finished deploys move into a per-app history on each node, so `relish history` and the API can show what shipped when. We don't keep it forever. An app that deploys fifty times a day, or a bad version the reconciler retries every five minutes, would grow it without bound. `record_deploy_history` in `src/bun/agent/deploy_ops.rs` caps it:
 
 ```rust
-// Add to history (cap at 50 per app)
-let history = self.deploy_history.entry(app_key).or_default();
-history.push(DeployHistoryEntry::from_state(&state));
-if history.len() > 50 {
-    history.remove(0);
+pub(crate) fn record_deploy_history(
+    history: &mut Vec<crate::meat::deploy_types::DeployHistoryEntry>,
+    entry: crate::meat::deploy_types::DeployHistoryEntry,
+) {
+    let app_id = entry.app_id.clone();
+    history.push(entry);
+    let kept = history
+        .iter()
+        .filter(|entry| entry.app_id == app_id)
+        .count();
+    let mut excess = kept.saturating_sub(DEPLOY_HISTORY_PER_APP);
+    history.retain(|entry| {
+        if excess > 0 && entry.app_id == app_id {
+            excess -= 1;
+            return false;
+        }
+        true
+    });
 }
 ```
 
-`entry(app_key).or_default()` is the Rust idiom for "get the vector for this app, creating an empty one if it's the first deploy". It's `HashMap`'s answer to Python's `dict.setdefault([])` or Go's check-then-insert dance, in one call. `remove(0)` drops the oldest entry once we pass fifty, so history is a sliding window of the last fifty deploys per app. A unit test (`deploy_history_capped_at_50`) deploys fifty-one times and asserts the length stays at fifty.
+`retain` keeps the elements its closure says yes to, in order, like Python's `[e for e in history if keep(e)]` but in place. The closure is `FnMut`: it captures `excess` by mutable reference and counts it down, so it drops exactly the app's oldest surplus entries and keeps everyone else's. `DEPLOY_HISTORY_PER_APP` is fifty.
 
-For a long time that cap lived only in the model. The agent's real history was a plain `Vec` that every deploy, retry and abort pushed a whole `AppSpec` onto, and nothing ever trimmed. A bad version that the reconciler retried every five minutes added an entry every five minutes, forever, and a restart threw the lot away, so `relish rollback` answered 404 after an upgrade. Now `record_deploy_history` keeps the newest fifty per app on each node, and the rollback source moved to the council (see the end of the chapter).
+For a long time there was no cap. The agent's history was a plain `Vec` that every deploy, retry and abort pushed a whole `AppSpec` onto, and nothing ever trimmed it. A bad version that the reconciler retried every five minutes added an entry every five minutes, forever, and a restart threw the lot away, so `relish rollback` answered 404 after an upgrade. Now the history is capped on each node, and the rollback source moved to the council (see the end of the chapter).
 
 ## Under the hood: key patterns
 
 ### The transition function
 
-The state machine's core is a single `match` on `(current_phase, event)`:
+The phase enum and its transition function live on in `src/meat/deploy_types.rs`. The agent doesn't drive a `DeployState` through them (it reports each outcome as a `DeployResult`: `Completed`, `RolledBack`, `Halted` or `Failed`), but the table is still the clearest statement of the rules, and its tests pin them. The core is a single `match` on `(current_phase, event)`:
 
 ```rust
 pub fn transition(&mut self, event: DeployEvent) -> Result<(), DeployError> {
@@ -253,7 +226,7 @@ pub fn transition(&mut self, event: DeployEvent) -> Result<(), DeployError> {
         (DeployPhase::Pending, DeployEvent::Cancel) => DeployPhase::Cancelled,
         (DeployPhase::RunningPreDeps, DeployEvent::PreDepsComplete) => DeployPhase::Rolling,
         (DeployPhase::RunningPreDeps, DeployEvent::PreDepsFailed) => DeployPhase::Failed,
-        (DeployPhase::Rolling, DeployEvent::StepFailed) => {
+        (DeployPhase::Rolling, DeployEvent::StepFailed(_)) => {
             if self.request.config.auto_rollback {
                 DeployPhase::Reverting
             } else {
@@ -275,66 +248,55 @@ pub fn transition(&mut self, event: DeployEvent) -> Result<(), DeployError> {
 }
 ```
 
-The wildcard `_` catches every `(phase, event)` combination not explicitly listed. In Go or Java, that would be a `default:` case that's easy to forget. In Rust, the compiler enforces exhaustiveness. Add a tenth state and every `match` that doesn't handle it becomes a compile error. You can't ship a deploy that forgets what to do when a new phase is reached.
+The wildcard `_` catches every `(phase, event)` combination not explicitly listed. In Go or Java, that would be a `default:` case that's easy to forget. In Rust, the compiler enforces exhaustiveness. Add a tenth state and every `match` that doesn't handle it becomes a compile error.
 
 The conditional logic within arms (checking `pre_deploy_jobs.is_empty()`, `config.auto_rollback`) keeps the state machine compact. Each arm is a function from (state, event, context) to next state. No separate transition table, no matrix to maintain.
 
-### The drive loop
+### The rollout loop
 
-`transition` only moves the phase marker. Something has to actually *do* the work and feed events back in. That's `execute`:
+`plan_rolling_step` only says what to do. `rolling_redeploy` does it, and feeds the result back in on the next pass. Stripped of its error handling, the loop looks like this:
 
 ```rust
-pub fn execute(&mut self) -> Result<DeployResult, DeployError> {
-    self.state.transition(DeployEvent::Start)?;
-
-    if self.state.phase == DeployPhase::RunningPreDeps {
-        match self.execute_pre_deps() {
-            Ok(()) => self.state.transition(DeployEvent::PreDepsComplete)?,
-            Err(e) => {
-                let _ = self.state.transition(DeployEvent::PreDepsFailed);
-                return Err(e);
-            }
-        }
+loop {
+    if self.report_cancellation(events).await {
+        new_failed = true;
+        break;
     }
-
-    let total = self.state.steps.len();
-    for i in 0..total {
-        self.state.current_step = i;
-        match self.execute_step(i) {
-            Ok(()) => {
-                self.state.steps[i].phase = StepPhase::Completed;
-                self.state.transition(DeployEvent::StepCompleted(i))?;
+    let step = crate::meat::deploy_types::plan_rolling_step(
+        replica_count,
+        started.healthy.len() as u32,
+        0, // the start path health-waits inline, so nothing is ever pending here
+        (existing.len() - retired) as u32,
+        deploy_config.max_surge,
+        deploy_config.max_unavailable,
+    );
+    match step {
+        RollingStep::Done | RollingStep::Wait => break,
+        RollingStep::Stuck => { /* report and fail */ }
+        RollingStep::RetireOld => {
+            let old_id = existing[retired].clone();
+            if let Err(error) = self
+                .retire_old_instance(&old_id, deploy_config.drain_timeout)
+                .await
+            {
+                // keep the started replacements for cleanup, report, stop
             }
-            Err(_e) => {
-                self.state.steps[i].phase = StepPhase::Failed;
-                let _ = self.state.transition(DeployEvent::StepFailed(i));
-                if self.state.phase == DeployPhase::Reverting {
-                    match self.execute_rollback(i) {
-                        Ok(()) => {
-                            let _ = self.state.transition(DeployEvent::RollbackComplete);
-                        }
-                        Err(_) => {
-                            let _ = self.state.transition(DeployEvent::RollbackFailed);
-                        }
-                    }
-                }
-                return self.terminal_result();
-            }
+            retired += 1;
+            continue;
         }
+        RollingStep::StartNew => {}
     }
-
-    self.state.transition(DeployEvent::AllStepsComplete)?;
-    self.terminal_result()
+    // start the next ordinal's replacement and wait for its health check
 }
 ```
 
-The shape is: do an operation, then feed the result back as an event. A successful step emits `StepCompleted`; a failed one emits `StepFailed`, and the *state machine* decides whether that means `Reverting` or `Halted` based on the config. The drive loop doesn't encode that policy — it just asks the state machine where it is now (`if self.state.phase == DeployPhase::Reverting`) and acts accordingly. Notice how the two responsibilities stay separate: `transition` knows the *rules*, `execute` knows the *actions*. That split is what makes the rules testable without doing any actual I/O, which we'll lean on heavily in the tests.
+The shape is: ask the planner, act, count what changed, ask again. The planner knows the *rules*; the loop knows the *actions*. That split is what lets the rules be tested without any I/O, while the loop is tested against a fake runtime.
 
-One subtlety in the failure arm: when we transition into a terminal failure state we use `let _ = self.state.transition(...)` rather than `?`. We're already returning an error result; if recording the failure transition itself failed, propagating *that* error would mask the real one. So we deliberately discard it.
+The five sub-steps are spread over three functions. `start_replacement` starts the new instance (1), waits for its health probe (2) and publishes it as a backend so routing picks it up (3). `retire_old_instance` drains the old one (4) and stops it (5). Every retirement waits for its replacement to be serving first, unless `max_unavailable` lets the old one go early or a managed volume forces stop-first (two processes must never write the same directory).
 
 ### `relish deploy`, `history`, and `rollback`
 
-The CLI is a thin client over the agent's HTTP API. On a single node, `relish deploy` streams the agent's progress lines to your terminal as the rollout goes ("starting new instance", "healthy ✓", "stopping old instance"). On a cluster it can't: the API returns as soon as the council has recorded the spec, and each node rolls its share later, so you get one line and watch the rest with `relish status`. `relish history <app>` prints the sliding window of past deploys. And `relish lint` validates an app's config, including the deploy section, before you ship it.
+The CLI is a thin client over the agent's HTTP API. On a single node, `relish deploy` streams the agent's progress lines to your terminal as the rollout goes ("starting new instance", "healthy ✓", "stopping old instance") and ends with a one-line summary, `deploy started: N instance(s): …`. On a cluster it can't: the API returns as soon as the council has recorded the spec, and each node rolls its share later, so you get one line and watch the rest with `relish status`. `relish history <app>` prints the sliding window of past deploys. And `relish lint` validates an app's config, including the deploy section, before you ship it.
 
 That last claim used to be half true. `strategy` was a free string, and anything but `"blue-green"` meant rolling, so `"bluegreen"` rolled without a word. A `drain_timeout` of `"1m30s"` or `"500ms"` failed to parse and quietly became the 30-second default. Neither reached `relish lint`. Now `strategy` deserialises into the `DeployStrategy` enum, with `#[serde(rename_all = "kebab-case")]` mapping `BlueGreen` to `"blue-green"`, so an unknown value fails to parse at all; and `DeployConfig::parse` refuses a duration that doesn't parse, the same "refuse, don't clamp" rule `[autoscale]` follows. `unknown_deploy_strategy_is_rejected` and `unparseable_drain_timeout_is_rejected` pin both.
 
@@ -346,71 +308,25 @@ This is a small feature with a sharp lesson: a command that describes an action 
 
 "Last-but-one" was right on one node and wrong on a cluster, in three ways. The handler read only the history of the node you asked, which may never have run the app. Every node records its own rollout, so once history merged across the cluster (F07), the last-but-one entry was usually another node's copy of the *current* deploy. And a node records the spec it deployed, whose `replicas` is that node's share. Re-applying it as the app's spec would roll a three-replica app back to one replica. `rollback_target` now reads the merged history, treats the spec in Raft as the current version, compares specs with the replica count set aside (which collapses the per-node copies), and returns the newest one that differs, at the current scale. `rollback_skips_other_nodes_copies_of_the_current_version` and `rollback_keeps_the_apps_replica_count` pin both halves.
 
-### Mock driver with failure injection
+### Failure injection with `MockGrill`
 
-The `MockDriver` uses the builder pattern to configure failures at specific steps:
+The deploy worker's tests run the real worker against `MockGrill` (`src/grill/mock.rs`), a fake container runtime that implements the same `Grill` trait as runc. Setters inject the failures a test needs: `set_fail_create`, `set_fail_stop`, `set_ignore_kill`, `set_call_delay`. Health failures come from a tiny HTTP responder the test spawns, answering `500` to make a replacement fail its probe:
 
 ```rust
-pub struct MockDriver {
-    placements: Vec<(NodeId, String)>,
-    next_instance_id: RefCell<u32>,
-    fail_health_at_step: Option<usize>,
-    step_counter: RefCell<usize>,
-}
-
-impl MockDriver {
-    pub fn fail_health_at(mut self, step: usize) -> Self {
-        self.fail_health_at_step = Some(step);
-        self
-    }
+async fn rolling_redeploy_rolls_back_when_the_probe_fails() {
+    let port = spawn_health_responder(500).await;
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    // ...
+    let events = send_deploy(&tx, health_gated_config(port, "rolling")).await;
+    // the error event names the failed probe, and the old instance still runs
 }
 ```
 
-`RefCell<u32>` is Rust's way of getting interior mutability when the borrow checker won't let you take `&mut self`. The `DeployDriver` trait methods take `&self` (because the orchestrator borrows the driver immutably during the deploy), but the mock needs to mutate its counters. `RefCell` moves the borrow check to runtime — it panics if you try to borrow mutably twice, but in single-threaded test code, that never happens.
-
-You could avoid `RefCell` by making the trait methods take `&mut self`. But then every test needs exclusive access to the driver, which means the orchestrator can't hold a reference during the deploy. The `RefCell` compromise is the standard pattern for test mocks in Rust.
-
-### Rolling deploy: five sub-steps per instance
-
-```rust
-fn execute_step(&mut self, idx: usize) -> Result<(), DeployError> {
-    // 1. Start new instance
-    self.state.steps[idx].phase = StepPhase::Starting;
-    let (new_id, _port) = self.driver.start_instance(app_id, &node, image)?;
-
-    // 2. Health check
-    self.state.steps[idx].phase = StepPhase::HealthChecking;
-    self.driver.await_healthy(&new_id, config.health_timeout)?;
-
-    // 3. Routing update
-    self.state.steps[idx].phase = StepPhase::RoutingUpdate;
-    self.driver.add_to_routing(&app_id.name, &new_id)?;
-    if let Some(ref old_id) = self.state.steps[idx].old_instance {
-        self.driver.remove_from_routing(&app_id.name, old_id)?;
-    }
-
-    // 4. Drain old instance
-    self.state.steps[idx].phase = StepPhase::Draining;
-    if let Some(ref old_id) = self.state.steps[idx].old_instance {
-        let _ = self.driver.drain_instance(old_id, config.drain_timeout);
-    }
-
-    // 5. Stop old instance
-    if let Some(ref old_id) = self.state.steps[idx].old_instance {
-        let _ = self.driver.stop_instance(old_id);
-    }
-
-    Ok(())
-}
-```
-
-Two things worth noticing. First, the step phase is updated *before* each operation. If the process crashes between phase update and operation completion, the new leader knows exactly where the deploy was interrupted. The state is always slightly ahead of reality, which is safe — retrying an idempotent operation is fine; skipping one is not.
-
-Second, drain and stop errors are silently ignored (`let _ = ...`). A drain timeout means in-flight requests may get cut off, but the deploy should continue. A stop failure means the old container might linger, but the new one is already serving traffic. These are operator-visible problems, not deploy-blocking failures.
+The setters take `&self`, not `&mut self`, because the test and the agent both hold the mock. Inside, it keeps its state behind `Arc<Mutex<…>>`, so a test can change a failure mode while the agent is mid-deploy. That's *interior mutability*: mutation through a shared reference, with the borrow check moved from compile time to the lock.
 
 ## Wiring drain, surge and rollback into the live path
 
-Everything above describes the deploy *state machine* — the library that decides what should happen. For a long time that machine was the honest part and the live Bun agent was the shortcut. When you redeployed a running app, the agent started the new instances, then reached straight for `kill` on the old ones. No drain. In-flight HTTP and WebSocket traffic got the rug pulled out from under it mid-request. The `DrainTracker` we built in the Wrapper existed, had tests, and was wired to nothing.
+For a long time the deploy model was the honest part and the live Bun agent was the shortcut. When you redeployed a running app, the agent started the new instances, then reached straight for `kill` on the old ones. No drain. In-flight HTTP and WebSocket traffic got the rug pulled out from under it mid-request. The `DrainTracker` we built in the Wrapper existed, had tests, and was wired to nothing.
 
 Two problems, then, and both are about the gap between "we told it to stop" and "it actually stopped".
 
@@ -578,11 +494,9 @@ The tests pin all three behaviours honestly. One holds an in-flight request open
 
 ## What we learned
 
-### Traits earn their keep when you have two implementations
+### An abstraction has to fit its runtime
 
-The CLAUDE.md says "Don't write a trait until you have two implementations." The `DeployDriver` trait has exactly two: `MockDriver` and `LocalDeployDriver`. The mock runs tests in microseconds. The local driver calls the real supervisor. Same orchestration logic, same state machine, different I/O. The trait abstraction carries its weight.
-
-If we'd only had one implementation, a direct function call to the supervisor would have been simpler. The trait exists because we need it, not because someone might need it someday.
+The CLAUDE.md says "Don't write a trait until you have two implementations." The `DeployDriver` trait followed the letter of that rule (a mock and a production driver) and broke its spirit: the production driver was always "eventually", and when the agent turned out to be async it never arrived. A trait with one live implementation is a model, and a model that the production code doesn't run drifts. We'd rather have one deploy path with a pure planner in the middle than two that might disagree.
 
 ### Drain errors are non-fatal for a reason
 
@@ -590,51 +504,35 @@ The first version treated drain failures as deploy errors. A deploy would fail b
 
 Making drain non-fatal was a one-character change (`?` to `let _ =`). It fixed the false-failure problem completely. Sometimes the right abstraction is less error handling, not more.
 
-### Rollback uses the same driver, backwards
+### Rollback uses the same planner, backwards
 
-We considered a separate `RollbackDriver` trait. Then we realised rollback is just: stop the new instance, start the old one, update routing. The exact same operations, in reverse order. Adding a second trait would have doubled the interface surface for zero benefit.
-
-### A generic beat a trait object here
-
-The first sketch stored the driver as `Box<dyn DeployDriver>`. It worked. But the orchestrator only ever holds one driver of one known type, so the dynamic dispatch bought us nothing — just a pointer indirection on every call and a heap allocation we didn't need. Switching to `DeployOrchestrator<D: DeployDriver>` made the tests read identically and the production path a hair faster. The lesson isn't "generics good, `dyn` bad". It's: match the tool to the shape. One known type for the lifetime of the struct wants a generic; a runtime-varying mix wants `dyn`.
+We considered a separate rollback procedure. Then we realised rollback is a rollout in reverse: the previous spec is the "new" version, the healthy replacements are the "old" instances, and `plan_rolling_step` decides the order within the same surge and unavailable budget. One planner, two directions, no second set of rules to keep in step.
 
 ## Tests
 
-We wrote the tests before the orchestrator, as the roadmap demands, and they fall into three layers.
+We wrote the tests before the code, as the roadmap demands, and they fall into three layers.
 
-### Transition tests — the rules in isolation
+### Planner and transition tests: the rules in isolation
 
-The state machine is pure: feed it an event, check the resulting phase. No I/O, no async, no mocks. So `src/meat/deploy_types.rs` holds one tiny test per edge of the graph, named as sentences:
+`plan_rolling_step` and the phase transitions are pure: feed them numbers or an event, check the answer. No I/O, no async, no mocks. So `src/meat/deploy_types.rs` holds one small test per rule, named as sentences:
 
 ```rust
 #[test]
 fn step_failed_with_auto_rollback_goes_to_reverting() { ... }
 
 #[test]
-fn step_failed_without_auto_rollback_goes_to_halted() { ... }
+fn surge_exhausted_by_pending_instances_waits() { ... }
 ```
 
-Every valid transition gets a test, and so do the forks that depend on config (`auto_rollback` on versus off). Because the `match` is exhaustive, we don't need a test for "what happens on an undefined transition" beyond one check that it returns `DeployError::InvalidTransition` — the compiler already proved every `(phase, event)` pair is handled. There's also `deploy_history_capped_at_50`, which deploys fifty-one times and asserts the window holds at fifty.
+Every valid transition gets a test, and so do the forks that depend on config (`auto_rollback` on versus off). Because the `match` is exhaustive, we don't need a test for "what happens on an undefined transition" beyond one check that it returns `DeployError::InvalidTransition`. The planner tests walk whole rollouts (`default_surge_keeps_one_spare_and_never_dips`, `zero_surge_replaces_in_place`, `extra_old_instances_are_retired`) and the one combination validation must refuse (`both_bounds_zero_is_stuck_and_rejected_by_validation`). In `src/bun/agent/deploy_ops.rs`, `deploy_history_keeps_the_newest_fifty_entries_per_app` records 120 deploys of one app and checks the window holds the newest fifty without pushing out another app's entries.
 
-### Orchestrator tests — the actions, with a mock driver
+### Agent tests: the real worker, a fake runtime
 
-`src/meat/orchestrator.rs` tests the drive loop against `MockDriver`, configured to fail at a chosen step:
+`src/bun/agent/tests/` drives the real deploy worker against `MockGrill`: `rolling_redeploy_completes_when_the_probe_passes`, `rolling_redeploy_rolls_back_when_the_probe_fails`, `rolling_redeploy_halts_without_reverting_when_auto_rollback_is_false`, `rolling_redeploy_honours_max_surge` and `rolling_redeploy_honours_zero_surge`. These run in milliseconds too, because no container is ever started, and they test the code that ships, not a model of it.
 
-```rust
-#[test]
-fn health_failure_with_auto_rollback() {
-    let driver = MockDriver::new(placements(1)).fail_health_at(1);
-    let mut orch = DeployOrchestrator::new(id, request("v2"), driver);
-    let result = orch.execute().unwrap();
-    assert_eq!(result, DeployResult::RolledBack);
-}
-```
+### Integration tests: the real agent
 
-The roster covers `happy_path_single_replica`, `no_existing_instances_creates_one`, `health_failure_with_auto_rollback`, `health_failure_without_auto_rollback`, `start_failure_at_step`, `dependency_job_success`, `dependency_job_failure`, and `rollback_restores_previous_instances` (which checks the old instance IDs come back after a revert). Each runs in microseconds because no container is ever started — that's the whole reason the `DeployDriver` trait exists.
-
-### Integration tests — the real agent
-
-`tests/integration.rs` exercises the agent end to end with a real (process-backed) runtime: `deploy_app_reaches_running`, `health_check_failing_app_marked_unhealthy`, `job_runs_to_completion`, `job_failed_retries_then_fails`, `init_container_success_allows_app_start`, and `init_container_failure_prevents_start`. These are slower (they spin up the agent and poll real state) but they prove the wiring the mocks can't.
+`tests/integration.rs` exercises the agent end to end with a real (process-backed) runtime: `deploy_app_reaches_running`, `health_check_failing_app_never_reaches_running`, `job_runs_to_completion`, `job_failed_retries_then_fails`, `init_container_success_allows_app_start`, and `init_container_failure_prevents_start`. These are slower (they spin up the agent and poll real state) but they prove the wiring the fake runtime can't.
 
 ### Running them
 
@@ -644,15 +542,15 @@ Everything in this chapter runs under a plain:
 cargo test
 ```
 
-There are no gated tests here — no eBPF, no root, no network, no platform-specific runtime. (Those arrive in the networking, registry, and chaos chapters.) To run just this chapter's suites:
+There are no gated tests here: no eBPF, no root, no network, no platform-specific runtime. (Those arrive in the networking, registry, and chaos chapters.) To run just this chapter's suites:
 
 ```sh
-cargo test --lib meat::deploy_types     # transition tests
-cargo test --lib meat::orchestrator     # orchestrator + mock driver
+cargo test --lib meat::deploy_types     # planner and transition tests
+cargo test --lib bun::agent::tests      # the deploy worker against MockGrill
 cargo test --test integration           # full agent lifecycle
 ```
 
-Read the output bottom-up: cargo prints `test result: ok. N passed` per binary. A failing transition test names the exact edge that broke (`step_failed_without_auto_rollback_goes_to_halted`), which tells you which `match` arm regressed without reading a stack trace.
+A failing planner or transition test names the exact rule that broke (`step_failed_without_auto_rollback_goes_to_halted`), which tells you which `match` arm regressed without reading a stack trace.
 
 ## Applied means done, not queued
 
@@ -1047,7 +945,7 @@ async fn record_failure(council: &CouncilNode, desired: &DesiredState, error: &s
 
 The failure count does double duty. It feeds a *back-off*: instead of retrying a broken remote every poll interval and tight-looping against a dead server, the runner waits `poll × 2^failures`, capped, before the next attempt. The `backoff_delay` function was already written and tested — it just had no caller. Wiring it in is the difference between a sync loop that degrades gracefully and one that spins. When a sync finally succeeds, the count resets to zero, the error clears, and the applied commit advances (the atomicity rule from earlier).
 
-Success also stamps the *coordinator*: the runner elects a GitOps coordinator from the council membership and records who it is, so the UI can show which node is meant to be driving syncs. The election prefers a non-leader to spread load, falling back to the leader on a single node. It *complements* the leader rather than replacing it, because only the leader can write to Raft — so the leader still drives the sync, and the coordinator field is a signpost, not a second scheduler. That's a deliberate scope choice, documented here so the next person doesn't go looking for a coordinator that runs the loop.
+Success also stamps the *coordinator*: the runner records which node drove the sync, so the dashboard can show it. That node is always the leader, because only the leader can write to Raft and the sync loop is leader-gated. An earlier version picked a non-leader to "spread load" and so named a node that never ran a sync; Chapter 9's "Coordinator election" tells why we deleted it.
 
 The test points the runner at a repo path that doesn't exist and waits for `SyncState` to carry a non-empty `last_error` and a non-zero failure count. Before the fix, it would wait forever: the failure never left stderr.
 
@@ -1133,7 +1031,7 @@ GitOpsWrite {
 },
 ```
 
-That's an enum variant holding a boxed value of its own enum. In C you'd reach for a pointer to a struct of the same type; in Rust the `Box` is what makes it legal at all. An enum is laid out inline, as big as its largest variant, so a variant that contained a `RaftRequest` directly would need infinite size. `Box` puts the inner request on the heap and leaves a pointer-sized field behind. Serde and bincode follow the box without noticing it's there.
+That's an enum variant holding a boxed value of its own enum. In C you'd reach for a pointer to a struct of the same type; in Rust the `Box` is what makes it legal at all. An enum is laid out inline, as big as its largest variant, so a variant that contained a `RaftRequest` directly would need infinite size. `Box` puts the inner request on the heap and leaves a pointer-sized field behind. Serde follows the box without noticing it's there.
 
 The state machine unwraps it, checks the inner change is one of the six declarative writes (an app, namespace or permission, spec or delete), applies it through the ordinary handler, and then updates `gitops_owned`:
 
@@ -1187,6 +1085,8 @@ A sync reads desired state, then spends seconds (or minutes, on a slow remote) i
 Last, a smaller decision (D8). A repository with `DB_PASSWORD = "hunter2"` in it works, and always has. Refusing it would turn a bad habit into an outage with no migration path. So the sync applies it and warns: any env key containing `PASSWORD`, `SECRET`, `TOKEN` or `CREDENTIAL`, or ending in `_KEY`, whose value isn't `ENC[AGE:...]`, produces a warning naming the app and the key, never the value. It lands in the log (once, when the set of warnings changes), in `SyncState.warnings` and in `relish wtf`.
 
 The tests follow the findings. In `diff.rs`, `diff_never_removes_resources_gitops_did_not_write`, `diff_skips_test_lease_namespaces` and `diff_orders_namespaces_before_apps_and_removes_in_reverse`. In the state machine, `gitops_write_records_ownership`, `prune_clears_ownership`, `a_gitops_write_from_an_earlier_term_is_refused` and `app_delete_in_a_leased_namespace_needs_the_lease`. In the runner, `one_refused_change_does_not_block_the_others`, `partial_sync_names_every_offender` and `sync_is_abandoned_when_the_term_changed`. And end to end on a real council in `tests/suite/gitops.rs`: `enabling_gitops_keeps_manually_applied_apps` (the thirty-apps scenario, in miniature), `manual_apply_of_a_gitops_app_warns`, `delete_of_a_gitops_app_refuses_without_force`, `gitops_config_in_raft_survives_a_leader_without_local_config` and `differing_local_gitops_config_is_reported_not_used`.
+
+`scripts/demo/gitops.sh` shows the same thing to a person. It pushes `examples/gitops/repository` (a `_defaults.toml` and two directories, `shop/` and `ops/`, that become namespaces) to a `file://` bare repository, applies an app by hand, and only then turns GitOps on with `relish gitops set examples/node/gitops.toml`. The sync creates the repository's two apps and leaves the hand-applied one where it is. `relish delete` of a GitOps app is refused. Deleting the file from the repository deletes the app from the cluster, and the hand-applied app survives that sync too. `tests/demos.rs` runs both demos under `make test-cluster`, so a demo that stops matching the product fails a gate instead of a talk. It paid for itself on the first CI run. The demo picked rows out of `relish status` with `awk -v namespace=shop`, which macOS's awk accepts and GNU awk 5 refuses outright (`namespace` is a gawk keyword), so on Linux the check never matched and the demo timed out waiting for an app that was running all along. It reads the columns with bash's own `read` now.
 
 ## Stopping the work, not just the wait
 
@@ -1301,29 +1201,30 @@ Most of these were found by tests that hold a runtime call open (a `kill` that d
 
 ## Jobs that might already have run
 
-Apps are easy to recover: if a web server's fate is unclear, you start it again. Jobs aren't. A job that sends invoices, migrates a schema or charges a card must not run twice just because bun crashed at an awkward moment. So bun records each attempt in a durable checkpoint, and it's honest about what it doesn't know:
+Apps are easy to recover: if a web server's fate is unclear, you start it again. Jobs aren't. A job that sends invoices, migrates a schema or charges a card must not run twice just because bun crashed at an awkward moment. So every attempt ends in an outcome that's honest about what it doesn't know (from `src/bun/task_executor.rs`, trimmed):
 
 ```rust
-pub(super) enum JobPhase {
-    /// Budget claimed before create; execution has not been authorised.
-    Preparing,
-    /// Runtime preparation completed and execution was authorised durably.
-    Launching,
-    /// The runtime reported an actual exit status.
-    Exited {
-        /// Observed process exit code, including zero for success.
-        code: i32,
-    },
-    /// The attempt may have run, but its outcome cannot be established.
-    Unknown,
-    /// Operator stop intent; retirement must still be confirmed.
-    Stopping,
-    /// Operator stop completed without authorising another automatic retry.
-    Stopped,
+pub enum AttemptOutcome {
+    /// The process exited with this code; 0 is success.
+    Exited { code: i32 },
+    /// The process was killed by a signal it didn't choose.
+    Signalled { signal: i32 },
+    /// The attempt ran past the task timeout and was killed.
+    TimedOut,
+    /// Refused before its command ran: retrying can't fix the spec.
+    Refused { reason: String },
+    /// The runtime failed before the command ran, so a retry can't run it twice.
+    LaunchFailed { reason: String },
+    /// Execution may have occurred, but its exit status could not be established.
+    Unknown { reason: String },
+    /// The array was cancelled while the attempt ran.
+    Cancelled,
 }
 ```
 
-(`pub(super)` makes the enum visible to the parent module, `bun`, and nowhere else; it's finer-grained than Go's upper-case export rule.) After a restart, bun adopts a job that's still running. A job that has gone, with an exit code the runtime can still report, becomes `Exited`. Anything else caught in `Preparing` or `Launching` becomes `Unknown`, and stays that way. Bun never guesses "probably failed, let's retry".
+The variants that carry data are little structs inside the enum, and `match` won't let you read `code` without first proving the attempt `Exited`. The distinction that matters here is between `LaunchFailed` and `Unknown`. A launch failure happened before the command was authorised to run, so retrying it is safe. Once the command was authorised, a failure to learn how it ended is `Unknown`: it might have charged the card. Unless the job sets `replay_unknown = true`, an `Unknown` or a timeout stops the run instead of retrying it. Bun never guesses "probably failed, let's retry".
+
+The first version of this lived in the agent, as a per-job checkpoint with its own `Preparing`, `Launching` and `Unknown` phases. In 0.2.0 every job moved onto the common lifecycle of Chapter 17 and the agent stopped running jobs itself, but the rule came along unchanged.
 
 `relish apply` refuses to start a job whose previous outcome is unknown. Our first answer was `--rerun-jobs`, the human saying "I've checked, run it again". In 0.2.0 that flag lost its recovery role. It now only mints a fresh apply operation, so jobs that already succeeded run again; a run that still has an unknown owner refuses the new admission with "acknowledge replay before another admission". The way out is `relish batch replay ID --node NODE --grant-digest DIGEST --acknowledge-side-effects`, which names the exact grant the operator checked, so an old acknowledgement can't authorise a later unknown attempt. The API accepts it only from a user with the Deployer role; GitOps, the reconciler and the service principal never can. Cron gets no exception any more either: while a definition has an unknown owner, the leader skips its occurrences, even with `overlap = "allow"`, because a new occurrence could repeat the uncertain one's side effects. Chapter 8 covers the retry budget and the crash tests behind the first version, and chapter 17 the replay that replaced it.
 
@@ -1615,9 +1516,7 @@ Four tests pin this down, each with a stand-in leader whose answer the test rewr
 
 ## What we deferred
 
-Blue-green deploys, autoscaling, the Lettuce GitOps engine, and Kubernetes migration tools are all Phase 9. The `DeployPhase` enum already carries the blue-green states (you'll have spotted `StartingGreen` and friends in the transition tests), and `execute` delegates to a separate blue-green path — but we'll cover that in Chapter 9. Rolling deploys with automatic rollback cover the vast majority of production deployment needs, and they're the foundation everything else builds on.
-
-Phase 7 adds 48 tests, bringing the total to 1047.
+Blue-green deploys, autoscaling, the Lettuce GitOps engine, and Kubernetes migration tools are all Phase 9. The `DeployPhase` enum already carries the blue-green states (you'll have spotted `StartingGreen` and friends in the transition tests), and the agent dispatches `strategy = "blue-green"` to its own path, but we'll cover that in Chapter 9. Rolling deploys with automatic rollback cover the vast majority of production deployment needs, and they're the foundation everything else builds on.
 
 ### Queueing a webhook is an observable operation
 
@@ -1803,13 +1702,84 @@ if !identical && let Some(rollouts) = self.state.rollouts.get_mut(app_id) {
 
 The leader also commits `RolloutReleased` once every node an app is placed on runs its current spec healthy. That gives the council the last ten distinct specs that rolled out everywhere, which is both what held nodes fall back on and where `relish rollback` now looks first, so a rollback still works after every node has restarted.
 
-The two records then met in the 0.2.1 jobs soak (#1110). An upgrade walk restarts each node, and each restart gives up that node's replicas, so the leader moves them around. The version doesn't change, but a node's share does, and a node redeploys its share when that changes (#1111 makes a move cheaper). Mid-walk, the VMs were full, node 1's redeploy of frontend failed and rolled back, and node 1 reported the failure. The state machine checked only that the report named the current spec, which it did, and marked the version `RolloutFailed`. That version had already rolled out on every node. The leader had no previous spec to hold the app on, because it *was* the previous spec, and the mark stayed until someone applied a different one. `relish wtf` warned about it for as long as the soak ran, while every replica kept serving.
+The two records then met in the 0.2.1 jobs soak (#1110). An upgrade walk restarts each node, and each restart gives up that node's replicas, so the leader moves them around. The version doesn't change, but a node's share does, and a node redeployed its share when that changed (the next section fixes that). Mid-walk, the VMs were full, node 1's redeploy of frontend failed and rolled back, and node 1 reported the failure. The state machine checked only that the report named the current spec, which it did, and marked the version `RolloutFailed`. That version had already rolled out on every node. The leader had no previous spec to hold the app on, because it *was* the previous spec, and the mark stayed until someone applied a different one. `relish wtf` warned about it for as long as the soak ran, while every replica kept serving.
 
 So the state machine now refuses a failure report whose fingerprint matches the newest released spec. A node that can't redeploy a healthy version has hit a capacity or runtime problem, not a bad version: it logs the refusal, backs off and tries again, and the replica checks report any shortfall. A failure of a *new* version after a release is still marked, since the released spec is the old one.
 
+### Moving a replica isn't a rollout
+
+That refusal stopped the false mark. It didn't stop node 1 from tearing down a healthy frontend to start an identical one, which is where the trouble began (#1111).
+
+Why did it redeploy at all? The placement reconciler hands a node its share of an app as the app's spec with `replicas` set to the share and `ordinals` naming the replicas (Chapter 2 tells how ordinals got there). The fingerprint the reconciler compares includes the ordinals, so a move is a new assignment. Then the agent asks whether it can take the change in place, and the only change it used to accept was a bigger count with every old ordinal kept, the #346 scale-up. Anything else, two ordinals swapped, one leaving while another arrives, went to `rolling_redeploy`, which starts `frontend-g1-0` beside `frontend-0` for every replica on the node. Same image, same everything, a new generation. On a node with room that's only churn. On a full node it can't even start, because a rolling replacement surges: it needs room for the new replica before the old one goes. Starting the one arriving ordinal would have fitted, since the departing one was about to free exactly that much.
+
+So the agent now looks at what actually changed:
+
+```rust
+fn share_change(previous: &AppSpec, wanted: &AppSpec) -> Option<ShareChange> {
+    let (Replicas::Fixed(_), Replicas::Fixed(_)) = (previous.replicas, wanted.replicas) else {
+        return None;
+    };
+    let mut same_version = previous.clone();
+    same_version.replicas = wanted.replicas;
+    same_version.ordinals.clone_from(&wanted.ordinals);
+    if same_version != *wanted {
+        return None;
+    }
+    let before: BTreeSet<u32> = previous.replica_ordinals().into_iter().collect();
+    let after: BTreeSet<u32> = wanted.replica_ordinals().into_iter().collect();
+    Some(ShareChange {
+        arriving: after.difference(&before).copied().collect(),
+        departing: before.difference(&after).copied().collect(),
+    })
+}
+```
+
+The first half asks "is this the same version?" by copying the old spec, overwriting the two share fields with the new ones, and comparing the result with the whole new spec. If anything else differs, an image, an environment variable, a health check, it's a new version and it rolls. The second half is set arithmetic. `BTreeSet` is the standard library's ordered set, and `difference` returns an iterator over the elements of one set that aren't in the other, like Python's `after - before`. The iterator yields `&u32` references into the set, and `copied()` turns them into plain `u32` values so `collect()` can build an owned `Vec`. Using an ordered set also means `[2, 0]` and `[0, 2]` are the same share, whichever order the leader listed them in.
+
+`share_change_in_place` then checks the node itself: one running instance per ordinal of the previous share, and none of them waiting on a restart. A node halfway through a failed rollout, or with a crash-looping replica, still rolls, because "start what's missing" only makes sense when what's there is healthy. If it all checks out, the agent retires the departing replicas through the same drain-and-stop path a rollout uses, and only then starts the arriving ones. Retiring first is deliberate. The leader has already given the departing ordinal to another node, so this node isn't its home any more, and stopping it first hands a full node back the room the new replica needs. The replicas that stay in the share are never touched.
+
+What if it stops partway, say a replica left and then the arriving one was refused for capacity? The node no longer runs its previous share, so recording that would be a lie, and the retry would see too few instances and roll. It records the previous share minus the replicas that already left, and the retry starts only what's missing. A version change still takes the old road: `a_moved_share_with_a_new_version_still_rolls` moves a share and changes the image in the same deploy, and every replica comes back as a new generation.
+
+The soak taught us one more thing. When a rollout did abort, the node told the leader `rolled back — old instances preserved`, which says what happened to the instances but not why. The real cause, "node capacity cannot admit cpu=100m mem=32Mi", was in the error event just before the abort, and the reconciler dropped it. Now `deploy_outcome` puts the first error in front of the abort's own reason, so the `RolloutFailed` mark and `relish wtf` say why a rollout failed as well as what it left behind.
+
 ### Tests
 
-The agent tests drive the real deploy worker against a `MockGrill` with a state override that makes one named replacement fail its health wait: `auto_rollback_after_a_retirement_restores_old_capacity` (three replicas, scenario A above), `auto_rollback_of_a_stop_first_volume_app_restarts_the_old_instance` (scenario B) and `abort_keeps_healthy_new_instances_when_old_capacity_cannot_return`. The planner tests in `src/cluster/rollout.rs` cover one-node-at-a-time release, waiting on an unhealthy share, resuming from reports, ungated first placements and scale changes, and a failed spec that nobody new receives. The state machine tests cover the `RolloutFailed` mark surviving an identical re-apply, clearing on a new spec and on a scale change (`scale_change_clears_rollout_failed`), being set again when the same version fails again, refusing a stale report, refusing a failure of the spec that already rolled out (`a_failure_of_the_released_spec_is_refused`) while still marking a new version's failure after a release, and the ten-target cap. Two tests in the portable suite (`tests/suite/rollout_failed.rs`) apply through the real API against a one-node council: an identical re-apply keeps the mark and prints the warning, and a scale change clears it without one. The cluster tests in `tests/placement.rs` (`make test-cluster`) run three real nodes: a one-replica-per-node app keeps two replicas serving through a redeploy, a bad version becomes `RolloutFailed` and stops retrying, a scale change starts a new rollout that fails and is marked again, and `relish rollback` works after every node restarts.
+The agent tests drive the real deploy worker against a `MockGrill` with a state override that makes one named replacement fail its health wait: `auto_rollback_after_a_retirement_restores_old_capacity` (three replicas, scenario A above), `auto_rollback_of_a_stop_first_volume_app_restarts_the_old_instance` (scenario B) and `abort_keeps_healthy_new_instances_when_old_capacity_cannot_return`. The share-move tests sit beside them: `a_moved_replica_starts_the_arriving_ordinal_and_retires_the_departing_one` checks that the replica that stays is never stopped, `a_shrunk_share_retires_only_the_departing_replica` and `a_swapped_share_starts_the_new_ordinals_without_a_new_generation` cover the other shapes, and `a_replica_moves_onto_a_full_node_where_a_redeploy_would_not_fit` gives the node a budget its two replicas fill, the soak's situation. All four failed before the change. The unit tests in `src/bun/agent/scale_in_place.rs` pin `share_change` itself for a pure increase, a pure decrease, a swap, one out and one in, an empty share, a reordered share, a version change and a daemon set, and `a_rollout_abort_reason_keeps_the_first_error` in `src/cluster/orchestrate.rs` checks the cause reaches the leader. The planner tests in `src/cluster/rollout.rs` cover one-node-at-a-time release, waiting on an unhealthy share, resuming from reports, ungated first placements and scale changes, and a failed spec that nobody new receives. The state machine tests cover the `RolloutFailed` mark surviving an identical re-apply, clearing on a new spec and on a scale change (`scale_change_clears_rollout_failed`), being set again when the same version fails again, refusing a stale report, refusing a failure of the spec that already rolled out (`a_failure_of_the_released_spec_is_refused`) while still marking a new version's failure after a release, and the ten-target cap. Two tests in the portable suite (`tests/suite/rollout_failed.rs`) apply through the real API against a one-node council: an identical re-apply keeps the mark and prints the warning, and a scale change clears it without one. The cluster tests in `tests/placement.rs` (`make test-cluster`) run three real nodes: a one-replica-per-node app keeps two replicas serving through a redeploy, a bad version becomes `RolloutFailed` and stops retrying, a scale change starts a new rollout that fails and is marked again, and `relish rollback` works after every node restarts.
+
+### Watching it on a laptop
+
+Tests prove the rules; they don't let someone evaluating Reliaburger watch a bad version bounce off. `scripts/demo/rollout.sh` does. It applies `examples/phase-1/proc-rollout.toml` as v1, rolls it to v2, runs `relish rollback`, then applies a v3 whose testapp fails every health check, and checks each step against what the app really serves on its port (testapp's `/env/VERSION` route answers with the instance's `VERSION` variable). The last steps are the ones this section is about: v3 marked `RolloutFailed` with v1 still serving, a second identical apply that only warns, and a v2 that clears the mark.
+
+The demo needs a cluster, because `RolloutFailed` is the council's mark, and the first draft started one the quick way: `bun --cluster` with plaintext transports and no `relish init`. Every step passed except the one that mattered. The node rolled v3 back, then logged `the leader refused the rollout failure of default/web: 403 Forbidden` and went back to retrying. The report to `/v1/rollouts/failed` carries the node's service token, and a cluster that never ran `relish init` has none to give it. So `scripts/demo/lib.sh` sets the node up the way the manual does: `relish init` writes the CA and keys, a few `sed` lines point the generated config at a temporary directory and loopback ports, and the first `relish token create` mints the demo's admin token. A demo that takes a shortcut the product doesn't support ends up demonstrating the shortcut.
+
+`examples/phase-1/container-rollout.toml` is the container version, with `strategy = "blue-green"` on podinfo. The process version can't roll surge-first: two testapp instances can't both listen on one host port, so it sets `max_surge = 0` and `max_unavailable = 1` and the planner retires before it starts.
+
+### What the demo costs
+
+Reliaburger says it's light. A demo that rolls three versions and never shows what that cost the laptop asks the audience to take the claim on trust, so the demos measure themselves (#671). `scripts/demo/resources.py` runs in the background from the moment `demo_start` launches Bun to the moment `demo_stop` shuts it down, which is why it lives in `lib.sh`: the rollout and GitOps demos gained it without a line changing in either. Before each heading, `demo_step` prints the latest sample on one line, and the demo ends with a table:
+
+```text
+    resources: bun 109.5 MiB, 66.7 % CPU · 2 workloads 23.8 MiB, 1.0 % CPU
+
+==> Roll back: the council remembers the last version that rolled out healthy
+...
+==> Resource use: 25 samples over 24 s on demo-node
+                     average           peak
+  bun CPU               70.4 %         94.6 %
+  bun memory           109.7 MiB      117.3 MiB
+  workload CPU           0.3 %          1.0 %
+  workload memory       17.2 MiB       24.3 MiB
+  CPU is a percentage of one core.
+  network: not measured (a local node talks over loopback, which neither Linux nor macOS counts per process)
+```
+
+That's a debug build on a laptop running a dozen other builds, and the first run's numbers were the first surprise: Bun at two thirds of a core to roll one app. A debug build of anything Tokio-heavy is slow, which is why the manual tells you to point `BUN` at a release build before quoting a number. The measurement is the point. Before it, nobody could have told you what the demo cost at all.
+
+The issue's first wish was a graph that moves with the asciinema recording. That turns out to be the hard version. The tour's recording trims idle time to two seconds and plays setup four times faster, so a chart drawn against the wall clock drifts away from the terminal it's meant to sit beside, and keeping the two in step would mean a custom player. The readout line gets the same effect for free: it's part of the terminal output, so it lands in the recording at exactly the moment it describes, whatever the player cuts. For a chart, `DEMO_RESOURCES_OUT=dir` keeps the samples as `resources.csv` and draws `cpu.svg` and `memory.svg` with the soak charts' code from `scripts/release/soak_charts.py`, the demo's steps marked along the time axis where the soak marks its faults. Reusing it took three small changes there: time steps of seconds for a run that lasts a minute, a `key` argument so the legend says "demo step" instead of "upgrade walk", and a `step` mark that draws as a tick.
+
+Two details decide whether the numbers are honest. The first is what counts as a workload. The obvious answer, Bun's descendants, misses most of them: the process runtime runs each workload under an owner process that outlives Bun on purpose (so a Bun restart doesn't kill your app), and an owner that outlives its parent gets re-parented to `init` or `launchd`. The sampler finds them by their command lines, which name the node's data directory, and adds their descendants. The second is what isn't measured. A one-node demo talks to itself over loopback, and neither Linux nor macOS keeps per-process byte counts for that without eBPF or `nettop` parsing. Rather than print a system-wide loopback figure that includes the browser in the next window, the summary says network wasn't measured. The tour is different: its nodes are Lima VMs, so `scripts/demo/tour.sh` samples each guest through `limactl shell` every five seconds and reports Bun, the whole guest (Bun, its workloads and the operating system together) and the guest's network links. A VM's traffic is its own, so there it's worth counting.
+
+The sampler is a Python script, like the soak's tooling, not a `relish` subcommand. It reads `/proc` on Linux and `ps` on macOS, and whatever it can't read it leaves blank instead of failing the demo: a demo that dies because `ps` printed a column differently would be measuring the wrong thing. `scripts/ci/test_demo_resources.py` covers the parsing (macOS's `1:02.50` and Linux's `00:01:02` for the same minute of CPU, a `/proc/PID/stat` whose command name has spaces and parentheses in it), the CPU arithmetic, a restarted Bun whose tick count went backwards, the CSV and the summary. `tests/demos.rs` checks every live run prints both the readout and the summary, so a sampler that silently stops sampling fails `make test-cluster`.
 
 ### What we learned
 

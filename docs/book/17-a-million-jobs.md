@@ -151,7 +151,7 @@ let run = match arrays.entry(assignment.batch_id) {
 
 On the node, a restart replays the ledger and each held chunk runs only the tasks with no terminal record (`TaskPool::resume_chunk`). The binary has to be on the node's `[process_workloads]` allowlist, like any host process, and a node that can't run an array answers with zero slots and the reason, which `relish batch-status` prints. The integration test pushes 20,000 fake tasks through a real single-node council and allows three Raft entries per thousand tasks; a run usually costs about ten. It used to push 100,000, and the whole array cost 51 entries, but that was 4.4 seconds of CPU in a debug build, and on a laptop shared with other test runs it crept up to the 60-second test timeout. Entries follow chunks and leader ticks, not tasks, so a fifth of the work shows the same ratio (#896).
 
-What we didn't do is as telling. No per-task Raft entries, obviously. No bitmap for the done set: a million-bit bitmap is 122 KiB whatever it holds, while ranges are eight bytes in the common case. No progress over the reporting tree: it's bincode, so a new field there would drag a binary format along, and a pull over HTTP puts the leader in charge of the cadence. Image tasks now use rootful Linux OCI isolation and resource limits. Host tasks still refuse mount isolation and explicit resource limits, and require the owned process runtime and an allowlist. And no speculative duplicates of slow chunks. At-least-once would allow them, but we'd rather measure a tail before we optimise one.
+What we didn't do is as telling. No per-task Raft entries, obviously. No bitmap for the done set: a million-bit bitmap is 122 KiB whatever it holds, while ranges are eight bytes in the common case. No progress over the reporting tree: it's a positional binary format, so a new field there would drag a binary format along, and a pull over HTTP puts the leader in charge of the cadence. Image tasks now use rootful Linux OCI isolation and resource limits. Host tasks still refuse mount isolation and explicit resource limits, and require the owned process runtime and an allowlist. And no speculative duplicates of slow chunks. At-least-once would allow them, but we'd rather measure a tail before we optimise one.
 
 ### Packing profiles and querying outcomes
 
@@ -172,7 +172,7 @@ The first derived index was a redb database with a 1 MiB cache per profile, rath
 
 The default view is a summary, not a task list. Watch, JSON status and the dashboard show counts and rates. Histograms merge before p50/p95/p99 are read; those are bucket upper bounds for final attempts, not end-to-end latency. Detail pages inspect at most 4,096 indexes, return at most 1,000 rows and contact at most eight workers, with a cursor even for an empty failure page. Retention starts at terminal acceptance and groups a parent with its profiles. Worker loss can lose detail without changing replicated accepted counts.
 
-The manual's burger manifest runs 8 small and 2 larger hashing jobs beside the web service; the executable homepage tour checks both the app and all accepted outcomes. It used to run 1,000 small and 64 larger ones, but fresh containers start at about 12.7 a second on the quickstart VM ([throughput record](../qualification/2026-10-17-v0.2.0-job-throughput/README.md)), so most of the tour's recording was `relish batch watch` waiting. Ten tasks in two profiles still show both cohorts in `relish jobs` and finish in seconds; the [throughput demo](https://reliaburger.com/#job-throughput) has its own scenarios for showing rate. The tour demonstrates the path, not the whitepaper's daily target. Qualifying 100 million unique successes needs a real sustained run with resource profiles, concurrent apps, retries, failures and storage measurements. The [implementation plan](../plans/2026-10-04-plan-delegated-jobs.md) records that gate.
+The manual's burger manifest runs 8 small and 2 larger hashing jobs beside the web service; the executable homepage tour checks both the app and all accepted outcomes. It used to run 1,000 small and 64 larger ones, but fresh containers start at about 12.7 a second on the quickstart VM ([throughput record](../qualification/2026-10-17-v0.2.0-job-throughput/README.md)), so most of the tour's recording was `relish batch watch` waiting. Ten tasks in two profiles still show both cohorts in `relish jobs` and finish in seconds; the [throughput demo](https://reliaburger.com/#job-throughput) has its own scenarios for showing rate. The tour demonstrates the path, not the whitepaper's daily target. Qualifying 100 million unique successes needs a real sustained run with resource profiles, concurrent apps, retries, failures and storage measurements. The [implementation plan](../plans/archive/2026-10-04-plan-delegated-jobs.md) records that gate.
 
 
 Control reports carry exact failed counts and a capped preview of 256 index
@@ -1463,7 +1463,7 @@ holding a `String` can't have it.
 The summary rides the gossip directory extension, beside the node's labels
 and endpoints, on every probe. Since #696 a probe fills a fixed byte budget,
 and whatever the extension costs is room a membership update can't use. So
-the summary is small on purpose: bincode writes a `bool` as one byte, which
+the summary is small on purpose: postcard writes a `bool` as one byte, which
 makes the whole thing ten bytes with its `Option` tag. A test stamps the
 biggest extension a node can send (63-byte names, IPv6 endpoints, sixteen
 labels using the whole label budget, a leader hint, a recovery claim and
@@ -1542,7 +1542,7 @@ next to what they do and don't prove.
 
 The fix isn't one trick. It's two cheaper runtimes, an explicit way to choose
 between them, and a lot of care about when a reused process is really safe to
-reuse. The [plan](../plans/2026-10-07-plan-reusable-executors-and-throughput.md)
+reuse. The [plan](../plans/archive/2026-10-07-plan-reusable-executors-and-throughput.md)
 sets out the qualification we still owe before claiming 100 million successes
 a day.
 
@@ -1963,11 +1963,52 @@ template with the per-command fields removed.
 `ExecutorKey::new` clones the template, clears `command`, `exec`, `script`,
 `schedule` and `run_before`, fills in the default namespace and resource
 ranges, serialises the result to JSON and hashes it. What's left is the pinned
-image digest, the namespace, the environment and the CPU and memory ranges. Two
+image digest, the namespace, the environment, the CPU and memory ranges and
+the process limit. Two
 different commands with the same image and limits share a key. A different
 memory limit or a rotated credential gets a different container. The key also
 refuses an image that isn't pinned by digest: `myimage:latest` can move under a
 warm container, and then "compatible" would be a lie.
+
+The profile has a third limit. Every command's task cgroup got `pids.max =
+256` from the day executors shipped, and threads count against it. A JVM
+starts dozens of threads before it reads a byte, so a heavily threaded command
+could hit `EAGAIN` on `clone` with no way out except a fresh container. Issue
+#741 made it a job field, `pids = 2048`, beside `cpu` and `memory`:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
+pub struct PidsLimit(u32);
+
+impl TryFrom<u32> for PidsLimit {
+    type Error = ConfigError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if !(1..=Self::MAX).contains(&value) {
+            return Err(ConfigError::InvalidResourceValue { /* ... */ });
+        }
+        Ok(Self(value))
+    }
+}
+```
+
+That's the `try_from` trick from Chapter 5's image mirrors. serde reads a
+plain `u32`, then hands it to our `TryFrom`, and a failure there is a
+deserialisation error. So there's no separate validation pass to forget: TOML,
+the JSON API and a Raft entry all go through the same check, and code that
+holds a `PidsLimit` knows it's between 1 and 32,768. Why refuse 0? Because
+`pids.max = 0` means a command that can't even be born. Why 32,768? It's the
+kernel's traditional `pid_max`, and a command that wants more threads than a
+small machine has PIDs wants to be an app.
+
+The default stays 256 for reused executors, and the key treats an omitted
+limit and an explicit `pids = 256` as the same container. A fresh `runc` job
+takes the limit as the OCI `pids.limit` when it sets one and has none
+otherwise, which is exactly what an omitted `memory` does there too. One line
+in the executor start is easy to miss. The helper's OCI resources are built
+from a clone of the job template, so without `helper_profile.pids = None`
+runc would write the job's 2,048 over the helper's own limit of 16.
 
 A pool holds at most 32 of these containers per node, each running one command
 at a time. A chunk of a thousand indexes is still a queue, not a thousand
@@ -2228,6 +2269,52 @@ way the half-started context is retired, and the slot and reservation come
 back. The same change moved the start-up filesystem work (creating
 directories, permissions, `chown`, preparing cgroups) onto the blocking pool
 with `spawn_blocking`, off the async worker threads.
+
+For a while only half of that was tested. The gated pool tests used a helper
+that never connects, which proves the wait for the helper is interruptible.
+Nothing proved the pull was, because the test mirror serves a 2 MB layer from
+loopback in milliseconds. How do you cancel something mid-pull when the pull
+is over before you can blink? You slow the registry down (#740).
+`tests/support/slow_registry.rs` is a small axum server that sits in front of
+the pinned-image mirror, the way the mirror sits in front of a public
+registry. It forwards manifests at full speed and trickles every blob out at
+64 KiB a second, so the bytes are still the mirror's own and the client still
+checks every digest. The pacing is a stream adaptor:
+
+```rust
+let paced = chunks.then(move |chunk| {
+    let shared = Arc::clone(&in_flight.0);
+    async move {
+        tokio::time::sleep(pause).await;
+        // ... count the bytes ...
+        chunk
+    }
+});
+response.body(Body::from_stream(paced)).unwrap()
+```
+
+`then` comes from the `StreamExt` trait and works like `map` on an iterator,
+except each item goes through an `async` block, so a `sleep` between chunks
+holds the next one back. The `move` closure owns `in_flight`, a guard whose
+`Drop` takes one off the count of blobs still being sent. The closure lives
+inside the stream and the stream lives inside the response body, so when a
+client hangs up mid-blob, hyper drops the body and the count goes down. Go's
+`defer` would need the handler to still be running; in Rust the cleanup goes
+wherever the value goes.
+
+Two tests in `tests/owned_task_arrays.rs` use it, under `make test-linux`.
+`runc_cancelling_an_array_interrupts_a_slow_cold_pull` starts a two-task
+shared-runc array on a node that has never seen the image, waits until the
+registry is partway through the layer, then cancels. The chunk has to return
+within five seconds, with both tasks counted as not run, the reservation
+back, and no executor, network namespace or slot cgroup left over.
+`runc_a_deadline_interrupts_a_slow_cold_pull` gives its task a three-second
+deadline instead, and expects it to fail at the deadline rather than half a
+minute later when the pull would have finished. Both also check that a blob
+is still on the wire when the attempt returns. That proves two things: the
+attempt really did stop mid-pull, and the pull carries on filling the cache
+without it. We checked the tests can fail, too. With the pool's pull put
+back outside the `select!`, both waited out the whole pull.
 
 **Retrying a cold start that failed.** On 11 October a privileged CI run failed
 one task out of six with `container rbtest-batch__executor-…-1 state
@@ -2978,7 +3065,7 @@ powers off nodes and loses quorum while data-bearing apps run. It now drives
 all three job runtimes through the same faults, within the existing fast and
 final tiers (90 minutes and eight hours then; an hour and eight hours now).
 
-The [extension plan](../plans/2026-10-10-plan-release-job-soak.md) describes a
+The [extension plan](../plans/archive/2026-10-10-plan-release-job-soak.md) describes a
 bounded controller with two resource profiles per runtime. It persists each
 submission intent before sending it, then reuses that exact request ID after
 a lost reply or controller restart. Accepted counters must conserve indexes
@@ -3118,6 +3205,23 @@ the drain is asked for, or within a minute of it, because an apply's schedules
 commit after its hooks. Apply doesn't delete job definitions a file leaves
 out, so they stay exactly as the drain left them (#963).
 
+The harness lost a verdict of its own too. It starts the job controller with
+`&` and, at teardown, used to `wait` on the controller's pid to learn how it
+exited. At the end of one 0.2.1 fast soak that `wait` printed `pid 16852 is
+not a child of this shell` and returned 127. The harness runs under
+`#!/usr/bin/env bash`, which on macOS is `/bin/bash` 3.2, and an hour of soak
+forks enough short-lived commands (`date`, `python3`, `limactl`) to wrap the
+pid space. When a new child gets the controller's old pid, bash 3.2 deletes
+the controller's dead job without saving its status, so the shell forgets it
+ever had that child. That soak had already failed, but any
+run whose controller drained and exited on its own would have been failed
+whatever its status. Now the controller writes its exit status to
+`jobs/exit-status` as it returns, crash included, and `finish()` reads that
+file instead of calling `wait`. A missing file means something killed the
+controller, and fails the run. The file also tells the harness that the
+controller has gone, so it never signals a pid that now belongs to someone
+else (#1035).
+
 Candidate 7's jobs fast tier then turned one refused summary into eight
 failures. A shared-runc run reported two active commands against one held
 task. The run-level count adds up what each node said at its last sync, and
@@ -3229,11 +3333,14 @@ shifts them along by one, which reaches every node in the first three cycles
 and every kind on every node in nine. The 8-hour final's eight node faults
 cover eight of those nine pairs.
 
-Why node-level faults only? `relish fault kill` against a job is refused by the
-same replica rail that protects apps, and an array's attempts inside a shared
-executor aren't anything Smoker can name. Making chaos job-aware is real work
-(#704, in 0.2.2). Killing Bun, delaying a node or filling its disk needs no
-per-job targeting, and it's what an operator's hardware does anyway.
+Why node-level faults only? In 0.2.0, `relish fault kill` against a job was
+refused by the same replica rail that protects apps, and an array's attempts
+inside a shared executor weren't anything Smoker could name. Killing Bun,
+delaying a node or filling its disk needs no per-job targeting, and it's what
+an operator's hardware does anyway. 0.2.2 made chaos job-aware (#704): a
+fault can now name a job and a task index, and the replica rail stands aside
+for work that is meant to finish. Chapter 8's "Faults for things that finish"
+tells how.
 
 Two measurements needed a little product code. A retry used to be a number:
 the bulk ledger keeps final outcomes, so when four fresh-container retries
@@ -3446,6 +3553,19 @@ is the spec's fault as surely as a bad image reference, so `refuses_spec`
 gained a third arm, `Self::LaunchRefused { .. }`. Without it, a job whose
 image can't run on a process-only node would have been launched
 `max_attempts` times, refused for the same reason each time.
+
+That arm showed up a test that had only ever run on Linux (#934). The
+wall-clock acceptance test for job retries ran `exec = "/bin/false"` and
+expected at least one retry. On macOS it failed every time: the job failed in
+a third of a second with `restart_count` 0. The cause wasn't the retry path.
+macOS keeps `false` in `/usr/bin` and has no `/bin/false`, so `create`'s
+binary check refused the launch as `binary not found`, exactly as it should.
+Linux has both paths, so CI, which runs that test only on Linux, never saw it.
+The test now runs `/bin/sh -c "exit 1"`, a command at the same path on every
+Unix host. A portable suite test pins the behaviour too, so the macOS shards
+check it on every train: a process job whose command starts and exits
+non-zero is a failed attempt, retried up to `max_attempts`, and its retries
+show as the run's `restart_count`.
 
 What about errors that could be either? A runc failure might be a bug in the
 spec or a busy host. A full disk might clear in a minute. We picked "retry"
@@ -3830,7 +3950,10 @@ Matching on a tuple lets one `match` look at two values at once, and the `if`
 after the second pattern is a match guard: that arm only matches when the
 condition holds too. The zero-replica admission succeeds, which clears the
 refusal, so it can't push a replica off this node the next time the leader
-puts one here. Any other identical redeploy still rolls, as before.
+puts one here. Any other identical redeploy still rolls, as before. (In
+0.2.2 this check became `share_change_in_place`, which also takes a replica
+moving off or onto the node without rolling, and the exception lives on as
+"an unchanged share while a refusal stands": Chapter 7 has the new version.)
 
 The issue also said the leader logged `cannot place` on every pass while a
 refusal stood with nowhere to go. That was the 0.2.0 scheduler. In 0.2.1 the

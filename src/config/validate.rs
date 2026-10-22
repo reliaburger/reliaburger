@@ -108,6 +108,34 @@ impl Config {
         self.validate_with_namespace_context(Some(&declared))
     }
 
+    /// Things in a valid config that will probably go wrong on a node, one
+    /// line each. `relish lint` and `relish apply` print them and carry on.
+    ///
+    /// Today that's a host app's image-less init container whose command
+    /// starts with a bare name such as `echo` (#1044). It runs on the host
+    /// (#935), and `[process_workloads] allowed_binaries` names binaries by
+    /// full path, so the node or the scheduler refuses it unless that bare
+    /// name is allowlisted word for word. That's possible, so this warns
+    /// rather than refuses.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for (name, app) in &self.app {
+            let namespace = app.namespace.as_deref().unwrap_or("default");
+            for binary in crate::meat::filter::host_init_binaries(app) {
+                let binary = binary.to_string_lossy();
+                if binary.contains('/') {
+                    continue;
+                }
+                warnings.push(format!(
+                    "app {namespace}/{name}: init container command {binary:?} is a bare name, \
+                     but it runs on the host, where allowed_binaries names binaries by full \
+                     path; use the full path (`command -v {binary}` on the node prints it)"
+                ));
+            }
+        }
+        warnings
+    }
+
     fn validate_with_namespace_context(
         &self,
         namespaces: Option<&[String]>,
@@ -941,6 +969,58 @@ mod tests {
 
     fn app_with_metrics(extra: &str) -> AppSpec {
         toml::from_str(&format!("image = \"test:v1\"\n{extra}")).unwrap()
+    }
+
+    /// #1044: a host app's image-less init runs its command on the host,
+    /// where the allowlist names binaries by their full path.
+    fn host_app_with_init(init: &str) -> Config {
+        config_with_app(
+            "worker",
+            toml::from_str(&format!(
+                "exec = \"/usr/bin/python3\"\ncommand = [\"worker.py\"]\n[[init]]\n{init}"
+            ))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_host_apps_init_with_a_bare_command_name_is_warned() {
+        let config = host_app_with_init("command = [\"echo\", \"hi\"]");
+        config.validate().unwrap();
+
+        let warnings = config.warnings();
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("default/worker")
+                && warnings[0].contains("\"echo\"")
+                && warnings[0].contains("full path"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn a_host_apps_init_with_a_full_path_is_not_warned() {
+        let config = host_app_with_init("command = [\"/bin/echo\", \"hi\"]");
+
+        assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+    }
+
+    #[test]
+    fn an_init_with_its_own_image_is_never_warned() {
+        let host = host_app_with_init("image = \"busybox:1\"\ncommand = [\"echo\", \"hi\"]");
+        let container = config_with_app(
+            "web",
+            toml::from_str("image = \"web:v1\"\n[[init]]\ncommand = [\"echo\", \"hi\"]").unwrap(),
+        );
+
+        assert!(host.warnings().is_empty(), "{:?}", host.warnings());
+        assert!(
+            container.warnings().is_empty(),
+            "{:?}",
+            container.warnings()
+        );
     }
 
     #[test]
@@ -2101,7 +2181,7 @@ exec = "/usr/bin/python3""#,
             r#"
             [build.img]
             context = "."
-            destination = "pickle://img:v1"
+            destination = "pickle://ghost/img:v1"
             namespace = "ghost"
         "#,
         )
@@ -2113,6 +2193,23 @@ exec = "/usr/bin/python3""#,
     }
 
     #[test]
+    fn validate_build_bare_destination_in_a_namespace_rejected() {
+        let config = Config::parse(
+            r#"
+            [namespace.prod]
+
+            [build.img]
+            context = "."
+            destination = "pickle://img:v1"
+            namespace = "prod"
+        "#,
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("pickle://prod/img:v1"), "{error}");
+    }
+
+    #[test]
     fn validate_build_existing_namespace_passes() {
         let config = Config::parse(
             r#"
@@ -2121,7 +2218,7 @@ exec = "/usr/bin/python3""#,
 
             [build.img]
             context = "."
-            destination = "pickle://img:v1"
+            destination = "pickle://prod/img:v1"
             namespace = "prod"
         "#,
         )

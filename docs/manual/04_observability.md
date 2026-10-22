@@ -143,6 +143,7 @@ needn't be published:
 
 ```toml
 [app.web]
+image = "ghcr.io/example/web:1.0"
 port = 8080
 metrics = {}                     # http://<instance>:8080/metrics
 # metrics = { port = 9797, path = "/prom" }
@@ -210,7 +211,15 @@ fleet.
 ```sh
 relish                           # the terminal dashboard (TUI)
 relish dashboard                 # authenticated, read-only browser session
+relish events                    # the newest 100 events across the cluster
+relish events --app web --severity warning --limit 20
 ```
+
+`relish events` asks every live node for its events and merges them by time,
+oldest first, with each event's node; a node that doesn't answer is named on
+stderr. `--severity` keeps events at least that severe (`info`, `warning`,
+`critical`) and `-o json` prints the API's answer. Reading events needs a
+token that isn't scoped to some apps or namespaces.
 
 The TUI shows apps, nodes, jobs, routes, live logs and events; press `?`
 inside for keys. It needs a terminal of at least 80×24.

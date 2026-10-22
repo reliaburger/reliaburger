@@ -32,9 +32,18 @@
 #       the tour's requests use the ingress port. The recording says so and
 #       shows the commands with the ports it really used.
 #
+# Once the cluster exists, scripts/demo/resources.py samples every node VM
+# every five seconds (#671): Bun's memory and CPU, the whole guest's, and the
+# guest's network traffic. Each wait ends with a one-line readout of the
+# latest sample, so a recording shows the cluster's footprint at the moment
+# it describes, and the tour ends with each measure's average and peak.
+#
 # Environment:
 #   RELISH             the relish binary to run (default: the one on PATH)
 #   RELIABURGER_HOME   where --install puts relish (default: ~/.reliaburger)
+#   DEMO_RESOURCES=0   don't measure the tour's resource use
+#   DEMO_RESOURCES_OUT keep the samples there as resources.csv and steps.tsv,
+#                      with cpu.svg, memory.svg and network.svg charts
 #
 # The script needs bash 3.2 (macOS's /bin/bash), so no associative arrays.
 
@@ -98,7 +107,7 @@ tour_commands() {
 # script learns it.
 known_command() {
     case "$1" in
-        "curl -fsSL https://reliaburger.com/install.sh | sh" \
+        "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop" \
         | "relish apply -f ${DEMO_URL}" \
         | "relish status" \
         | "relish council status" \
@@ -203,7 +212,35 @@ fi
 # points back at the repository for the unpublished-tarball fallback.
 BURGER_WORK=$(mktemp -d)
 ln -s "${REPO_DIR}/examples" "${BURGER_WORK}/examples"
-trap 'rm -rf "${BURGER_WORK}"' EXIT
+
+RESOURCES="${REPO_DIR}/scripts/demo/resources.py"
+RESOURCES_HOME="${RELIABURGER_HOME:-${HOME}/.reliaburger}"
+SAMPLER_PID=""
+SAMPLER_START=""
+
+stop_sampling() {
+    if [[ -n "${SAMPLER_PID}" ]]; then
+        kill -TERM "${SAMPLER_PID}" 2>/dev/null || true
+        wait "${SAMPLER_PID}" 2>/dev/null || true
+        SAMPLER_PID=""
+    fi
+}
+trap 'stop_sampling; rm -rf "${BURGER_WORK}"' EXIT
+
+# Start sampling the quickstart cluster's VMs, once it exists. Without
+# python3 or a cluster the tour runs unmeasured.
+start_sampling() {
+    if [[ -n "${SAMPLER_PID}" || "${DEMO_RESOURCES:-1}" == 0 ]] \
+        || [[ ! -f "${RESOURCES_HOME}/clusters/laptop/state.json" ]] \
+        || ! command -v python3 >/dev/null; then
+        return 0
+    fi
+    SAMPLER_START=$(date +%s)
+    printf '0\tcluster up\n' >"${BURGER_WORK}/steps.tsv"
+    python3 "${RESOURCES}" sample --quickstart "${RESOURCES_HOME}" --interval 5 \
+        --start "${SAMPLER_START}" --csv "${BURGER_WORK}/resources.csv" 2>"${BURGER_WORK}/resources.log" &
+    SAMPLER_PID=$!
+}
 
 BOLD=$'\033[1m'
 DIM=$'\033[2m'
@@ -246,6 +283,18 @@ show_in_work() {
     sleep 1.5
 }
 
+# Whether the published demo archive holds exactly the repository's
+# examples/demo/burger, so the tour can show the real download.
+live_burger_matches_repository() {
+    local live
+    live=$(mktemp -d)
+    curl -fsSL "${BURGER_URL}" 2>/dev/null | tar xz -C "${live}" 2>/dev/null \
+        && diff -rq "${live}/burger" "${REPO_DIR}/examples/demo/burger" >/dev/null 2>&1
+    local matches=$?
+    rm -rf "${live}"
+    return "${matches}"
+}
+
 # Poll a check function until it succeeds, then say how long it took.
 # $1: what we're waiting for, $2: timeout in seconds, $3...: the check.
 wait_for() {
@@ -263,6 +312,40 @@ wait_for() {
     done
     elapsed=$(( $(date +%s) - start ))
     say "done after ${elapsed} s"
+    resource_readout "${what}"
+}
+
+# Note step $1 for the charts and narrate the latest sample.
+resource_readout() {
+    local line
+    if [[ -z "${SAMPLER_PID}" ]]; then
+        return 0
+    fi
+    printf '%s\t%s\n' "$(( $(date +%s) - SAMPLER_START ))" "$1" >>"${BURGER_WORK}/steps.tsv"
+    line=$(python3 "${RESOURCES}" readout --csv "${BURGER_WORK}/resources.csv" 2>/dev/null || true)
+    if [[ -n "${line}" ]]; then
+        say "${line}"
+    fi
+}
+
+# The average and peak of each measure, narrated; the samples and charts are
+# kept in DEMO_RESOURCES_OUT if it's set.
+resource_summary() {
+    local line
+    if [[ -z "${SAMPLER_PID}" ]]; then
+        return 0
+    fi
+    stop_sampling
+    while IFS= read -r line; do
+        say "${line}"
+    done < <(python3 "${RESOURCES}" summary --csv "${BURGER_WORK}/resources.csv")
+    if [[ -n "${DEMO_RESOURCES_OUT:-}" ]]; then
+        mkdir -p "${DEMO_RESOURCES_OUT}"
+        cp "${BURGER_WORK}/resources.csv" "${BURGER_WORK}/steps.tsv" "${DEMO_RESOURCES_OUT}/"
+        python3 "${RESOURCES}" chart --csv "${BURGER_WORK}/resources.csv" \
+            --steps "${BURGER_WORK}/steps.tsv" --out "${DEMO_RESOURCES_OUT}" >/dev/null || true
+    fi
+    printf '\n'
 }
 
 # Running instances of an app, from `relish status` (NODE INSTANCE APP
@@ -339,8 +422,9 @@ sleep 2
 # can't swallow the rest of the tour.
 previous=""
 while IFS= read -r command <&3; do
+    start_sampling
     case "${command}" in
-        "curl -fsSL https://reliaburger.com/install.sh | sh")
+        "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop")
             if [[ -n "${INSTALL_VERSION}" ]]; then
                 say "Step 1 installs the published ${INSTALL_VERSION} release, then runs"
                 say "\`relish setup --quickstart\`. The times on the right are real."
@@ -348,7 +432,7 @@ while IFS= read -r command <&3; do
                     say "This step plays ${SETUP_SPEEDUP}× faster than it ran."
                 fi
                 if [[ -n "${SETUP_PORTS}" ]]; then
-                    show "${command} -s --${SETUP_PORTS}"
+                    show "${command}${SETUP_PORTS}"
                 else
                     show "${command}"
                 fi
@@ -397,9 +481,9 @@ while IFS= read -r command <&3; do
         "${BURGER_FETCH}")
             # The site publishes the demo from the tag the installer fetches,
             # so until a promotion's site change deploys, the live archive is
-            # the previous release's: published, but missing what this tour
-            # uses (0.1.6's had no jobs.toml).
-            if curl -fsSL "${BURGER_URL}" 2>/dev/null | tar tz 2>/dev/null | grep -qx 'burger/jobs.toml'; then
+            # the previous release's: published, but not what this tour uses
+            # (0.1.6's had no jobs.toml, and 0.2.0's ran 1,064 tasks).
+            if live_burger_matches_repository; then
                 show_in_work "${command}"
             else
                 say "${BURGER_URL} is published with the site, and this release's"
@@ -435,6 +519,7 @@ while IFS= read -r command <&3; do
             relish --output json batch-status "${BATCH_ID}" >"${BURGER_WORK}/summary.json"
             python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); assert s["done"] and s["succeeded"]==10 and s["failed"]==0 and s["not_run"]==0, s' "${BURGER_WORK}/summary.json"
             say "All 10 tasks succeeded; the burger app kept serving orders."
+            resource_readout "the batch"
             printf '\n'
             sleep 1.5
             ;;
@@ -483,6 +568,7 @@ while IFS= read -r command <&3; do
     previous="${command}"
 done 3< <(tour_commands)
 
+resource_summary
 say "That's the tour. \`relish local destroy --yes\` removes the cluster,"
 say "and \`relish uninstall\` removes relish itself."
 sleep 3

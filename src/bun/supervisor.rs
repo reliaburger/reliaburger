@@ -265,11 +265,13 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.host_paths = policy;
     }
 
-    /// Full admission check for an app: host-exec/script allowlist, host-path
-    /// allowlist, GPU availability, rootless resource limits and egress
-    /// enforcement. Returns the first refusal.
+    /// Full admission check for an app: host-exec/script allowlist (for the
+    /// app and its host init containers), host-path allowlist, GPU
+    /// availability, rootless resource limits and egress enforcement.
+    /// Returns the first refusal.
     fn admit_app(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
         self.admit_process_workload(app_name, spec.exec.as_deref(), spec.script.as_deref())?;
+        self.admit_host_inits(app_name, spec)?;
         self.admit_host_paths(app_name, spec)?;
         self.admit_gpu(app_name, spec.gpu.unwrap_or(0))?;
         self.admit_rootless_limits(
@@ -428,6 +430,21 @@ impl<G: Grill> WorkloadSupervisor<G> {
                          as a container instead"
                     .to_string(),
             });
+        }
+        Ok(())
+    }
+
+    /// Refuse a host app whose image-less init container runs a binary the
+    /// allowlist doesn't name. Such an init runs its command on the host,
+    /// like its app (#935), so the same deny-by-default rule applies.
+    fn admit_host_inits(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
+        for binary in crate::meat::filter::host_init_binaries(spec) {
+            self.process_manager
+                .prepare_exec(binary)
+                .map_err(|e| BunError::DeployFailed {
+                    app_name: app_name.to_string(),
+                    reason: format!("init container rejected: {e}"),
+                })?;
         }
         Ok(())
     }
@@ -1973,6 +1990,55 @@ mod tests {
         let mut image = basic_app_spec(None);
         image.memory = host.memory;
         sup.admit_app("image", &image).unwrap();
+    }
+
+    /// #935: a host app's init container that names no image runs its
+    /// command on the host, so its binary needs the allowlist as the app's
+    /// does. One with its own image is a container and needs no entry.
+    #[test]
+    fn a_host_apps_init_container_is_refused_when_its_binary_isnt_allowlisted() {
+        let root = tempfile::tempdir().unwrap();
+        let image = MockGrill::new();
+        image.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        let runtime = crate::grill::mixed::MixedGrill::new(
+            image,
+            MockGrill::new(),
+            root.path().join("routes"),
+        );
+        let sup = WorkloadSupervisor::with_process_config(
+            runtime,
+            PortAllocator::new(30000, 31000),
+            crate::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: vec!["/bin/sh".into()],
+                mount_isolation: false,
+                script_dir: root.path().join("scripts"),
+            },
+        );
+        let host = |init: &str| {
+            crate::config::Config::parse(&format!(
+                "[app.host]\nexec='/bin/sh'\n[[app.host.init]]\n{init}"
+            ))
+            .unwrap()
+            .app
+            .remove("host")
+            .unwrap()
+        };
+
+        let error = sup
+            .admit_app("host", &host("command = ['/usr/bin/migrate']"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("/usr/bin/migrate") && error.contains("allowlist"),
+            "{error}"
+        );
+        sup.admit_app("host", &host("command = ['/bin/sh', '-c', 'true']"))
+            .unwrap();
+        sup.admit_app(
+            "host",
+            &host("image = 'migrate:v2'\ncommand = ['/usr/bin/migrate']"),
+        )
+        .unwrap();
     }
 
     #[test]

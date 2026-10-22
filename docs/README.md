@@ -5,11 +5,13 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.2.0 was released on 16 October 2026. Its signed binaries, guest images and
-installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.0),
-and `curl -fsSL https://reliaburger.com/install.sh | sh` installs it. Every
+0.2.1 was released on 21 October 2026. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.1),
+and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs it
+and builds a laptop cluster; without a flag the installer explains the choices.
+Until 1.0.0 Reliaburger is for developers and enthusiasts, not production. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
-The limits below are the ones 0.2.0 ships with; the [roadmap](roadmap.md) tracks
+The limits below are the ones 0.2.1 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.
 
 The [platform comparisons](website/compare/index.html) and
@@ -36,6 +38,9 @@ and trade-offs against other projects, with dated evidence and explicit release 
 - **macOS runs containers through a managed Linux VM**
   ([quickstart](quickstart.md)). Direct Apple Container is disabled; native
   macOS Bun runs process workloads.
+- **The released macOS CLI is Apple silicon only.** 0.2.1 is the last release
+  with an Intel macOS build; on an Intel Mac, use a Linux host
+  ([#1018](https://github.com/reliaburger/reliaburger/issues/1018)).
 - **Native processes are foreground-only.** See the
   [ProcessGrill contract](#processgrill-built-in-fallback).
 - **Clusters start fresh.** There's no upgrade path from development builds:
@@ -102,8 +107,9 @@ Stopped.
 
 ### Jobs and cron
 
-0.2.0 changes the cluster's formats, so a 0.1.6 cluster can't roll to it: start a
-fresh cluster ([upgrading from 0.1.6](releasing.md#upgrading-from-016)). The
+Jobs arrived in 0.2.0, and 0.2.1 changes the cluster's formats again, so a 0.2.0
+cluster can't roll to it: start a fresh cluster
+([upgrading from 0.2.0](releasing.md#upgrading-from-020)). The
 [job manual](manual/14_batch-jobs.md) covers jobs in full.
 
 Every job, cron occurrence, hook and task array runs on one lifecycle: a durable
@@ -278,7 +284,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-For 0.2.0, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.2.1, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -317,7 +323,7 @@ or operator firewall rules when diagnosing direct-host connectivity.
 
 ### macOS containers: managed Linux VMs
 
-For 0.2.0, run containers through the [managed laptop quickstart](quickstart.md):
+For 0.2.1, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
 relish setup --quickstart --nodes 3
@@ -328,7 +334,7 @@ foreground process workloads. Direct Apple Container selection is disabled,
 even when its CLI is installed: interrupted CLI requests can outlive Bun and
 mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
-work; they are outside the 0.2.0 runtime profile.
+work; they are outside the 0.2.1 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -348,7 +354,7 @@ sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
 limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
 environment and run without container isolation.
 
-**0.2.0 contract: foreground workloads only.** The main process stays under Bun's
+**0.2.1 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
 Use the application's foreground/no-daemon option. A shell wrapper should `exec`
@@ -384,6 +390,7 @@ make test-linux  # provisioned Linux runtime/kernel suite
 make test-rootless-runc # non-root runc/slirp replacement proof
 make lint        # clippy with warnings as errors
 make audit       # RustSec advisory and dependency-maintenance gate
+make outdated    # report crates behind crates.io (never fails)
 make fmt         # format with rustfmt
 make ci          # portable format, lint, test, doctest and CI-script checks
 make ci-bench    # make ci, then the gossip benchmarks
@@ -444,7 +451,9 @@ task-array benchmarks when it touches the task-array leader, node pool,
 executor, range sets or `benches/task_arrays.rs`. The gossip numbers gate
 nothing; the task-array job fails only on a benchmark more than twice as slow
 against main's last baseline as the rest of its run, or on a run whose median
-benchmark is, and keeps its Criterion output for 90 days
+benchmark is. The on-disk ledger benchmark only reports, since it measures
+the runner's disk; its tmpfs twin is gated. The job keeps its Criterion output
+for 90 days
 ([how](testing.md#benchmarks-in-ci)).
 
 The fast benchmarks (`cargo bench --bench gossip`) are the ones to run regularly — they catch performance regressions in the gossip protocol. Results are stored in `target/criterion/` and criterion reports whether performance changed between runs.
@@ -721,7 +730,7 @@ terminal dashboard. The TUI needs a terminal of at least 80×24 cells.
 ```sh
 cargo run --bin relish              # interactive TUI
 cargo run --bin relish -- tui       # the same, explicitly
-cargo run --bin relish -- <command>
+cargo run --bin relish -- status    # or any other command
 ```
 
 Every command, grouped by task with a link to the manual chapter that explains
@@ -992,6 +1001,11 @@ See [`examples/`](../examples/) for ready-to-apply configs:
 | [`proc-init-container.toml`](../examples/phase-1/proc-init-container.toml) | App with init container |
 | [`proc-full-featured.toml`](../examples/phase-1/proc-full-featured.toml) | All Phase 1 features |
 | [`proc-multi-app.toml`](../examples/phase-1/proc-multi-app.toml) | Multiple apps in one config |
+| [`proc-rollout.toml`](../examples/phase-1/proc-rollout.toml) | Rolling deploy, rollback and automatic rollback ([`scripts/demo/rollout.sh`](../scripts/demo/rollout.sh) runs it) |
+| [`proc-exec-app.toml`](../examples/phase-8/proc-exec-app.toml) | A host binary as an app, and the allowlist it needs |
+| [`proc-run-before.toml`](../examples/phase-8/proc-run-before.toml) | A migration job that gates its app |
+| [`proc-script-job.toml`](../examples/phase-8/proc-script-job.toml) | A cron job written as an inline script (a template: needs Postgres) |
+| [`gitops/repository/`](../examples/gitops/repository) | A GitOps repository with directory namespaces ([`scripts/demo/gitops.sh`](../scripts/demo/gitops.sh) syncs it; [`node/gitops.toml`](../examples/node/gitops.toml) is its `[gitops]` section) |
 | **Real containers** (`container-*`) | **Pulls OCI images — requires Linux runc** |
 | [`container-hello.toml`](../examples/phase-1/container-hello.toml) | Alpine hello world job |
 | [`container-nginx.toml`](../examples/phase-1/container-nginx.toml) | nginx with health check |
@@ -1001,6 +1015,14 @@ See [`examples/`](../examples/) for ready-to-apply configs:
 | [`container-multi-app.toml`](../examples/phase-1/container-multi-app.toml) | Multiple apps in one config |
 | [`container-volumes.toml`](../examples/phase-1/container-volumes.toml) | Managed and HostPath volumes |
 | [`container-egress.toml`](../examples/phase-1/container-egress.toml) | Job egress allowlist that resolves and reaches one host |
+| [`container-allow-from.toml`](../examples/phase-1/container-allow-from.toml) | One cross-namespace path opened with `allow_from` |
+| [`container-tls-ingress.toml`](../examples/phase-1/container-tls-ingress.toml) | HTTPS ingress with the cluster's own certificates |
+| [`container-rollout.toml`](../examples/phase-1/container-rollout.toml) | Blue-green deploy with automatic rollback |
+| [`container-secrets.toml`](../examples/phase-1/container-secrets.toml) | An encrypted `ENC[AGE:...]` environment value |
+| [`container-batch-jobs.toml`](../examples/phase-8/container-batch-jobs.toml) | Named jobs submitted as one batch |
+| [`container-shared-runc-array.toml`](../examples/phase-8/container-shared-runc-array.toml) | A task array on reusable containers |
+| [`container-build-job.toml`](../examples/phase-8/container-build-job.toml) | Building the burger image on the cluster |
+| [`container-chaos-scenario.toml`](../examples/phase-8/container-chaos-scenario.toml) | A scripted chaos scenario against the tour's podinfo apps |
 
 ### Images, the pull-through cache, and cluster registries (Phase 12)
 
@@ -1124,6 +1146,9 @@ The image's `Env` is merged under the app's `env` (the app wins on a clash). Eve
 Volumes follow the container's user:
 
 ```toml
+[app.cache]
+image = "redis:7"
+
 [[app.cache.volumes]]
 path = "/data"                      # managed: handed to the container user on first mount
 
@@ -1164,7 +1189,7 @@ command = ["migration complete"]
 
 ### Init containers
 
-Init containers run sequentially before the main app starts. If any init container fails, the app transitions to Failed. Each runs its own `image` (the app's when it names none) with the app's env, secrets and volume and config-file mounts. An init of an `exec` or `script` app that names no image runs on the host, like its app; one that names an image needs a container runtime.
+Init containers run sequentially before the main app starts. If any init container fails, the app transitions to Failed. Each runs its own `image` (the app's when it names none) with the app's env, secrets and volume and config-file mounts. An init of an `exec` or `script` app that names no image runs on the host, like its app, so `[process_workloads] allowed_binaries` must name its command's binary by path; one that names an image needs a container runtime.
 
 ```toml
 [app.web]
@@ -1351,12 +1376,19 @@ map; use `--namespace`, `--to-namespace` and `--port` when needed. The five
 steps cover the actual DNS answer, live userspace and attached eBPF service
 state, live attached firewall state, the faults active on the path, and the TCP
 result. Each step is labelled `observed`, `inferred` or `unavailable`. A
-failure exits 1; missing evidence or missing probe tools exits 2 rather than
+failure exits 1; missing evidence or missing probe tools exits 3 rather than
 pretending the path is healthy.
 
 `relish inspect <app>` lists every instance of the app on every node, with its
 node, under a desired vs running replica count; a node that did not answer or
 that gossip reports dead is named rather than silently left out.
+
+`relish events` lists the cluster's recent events, merged from every node
+(`--app`, `--severity`, `--limit`). `relish exec <app> <cmd>` runs a command
+once, without stdin or a terminal, and exits with its exit code. `relish
+resolve <name> --namespace <ns>` picks a service whose name exists in several
+namespaces. `-o json` works wherever a command has machine output, and a
+command without it refuses `-o json` (exit 2). `relish fmt` keeps comments.
 
 External probes are denied by default. They require an Admin credential,
 `probe_external_destination` in `[testing].allowed_operations`, the protected
@@ -1447,7 +1479,7 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Direct Apple Container is disabled for 0.2.0 while interrupted daemon-command
+Direct Apple Container is disabled for 0.2.1 while interrupted daemon-command
 recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide

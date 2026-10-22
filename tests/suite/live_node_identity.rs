@@ -208,17 +208,11 @@ async fn expired_client_identity_is_rejected_by_optional_mtls_instead_of_omitted
     ];
     params.not_before = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
     params.not_after = time::OffsetDateTime::now_utc() + time::Duration::seconds(5);
-    let issuer = hierarchy
-        .node
-        .certificate_params
-        .clone()
-        .self_signed(&hierarchy.node.signing_keypair)
-        .unwrap();
-    client_identity.certificate_der = params
-        .signed_by(&key, &issuer, &hierarchy.node.signing_keypair)
-        .unwrap()
-        .der()
-        .to_vec();
+    let issuer = rcgen::Issuer::from_params(
+        &hierarchy.node.certificate_params,
+        &hierarchy.node.signing_keypair,
+    );
+    client_identity.certificate_der = params.signed_by(&key, &issuer).unwrap().der().to_vec();
     client_identity.private_key_der = key.serialize_der();
     let directory = tempfile::tempdir().unwrap();
     let live = installed(directory.path(), &client_identity);

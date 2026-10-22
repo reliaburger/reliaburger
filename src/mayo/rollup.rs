@@ -193,10 +193,10 @@ mod tests {
     }
 
     #[test]
-    fn node_rollup_bincode_round_trip() {
+    fn node_rollup_postcard_round_trip() {
         let rollup = sample_rollup();
-        let encoded = bincode::serialize(&rollup).unwrap();
-        let decoded: NodeRollup = bincode::deserialize(&encoded).unwrap();
+        let encoded = postcard::to_stdvec(&rollup).unwrap();
+        let decoded: NodeRollup = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(rollup, decoded);
     }
 

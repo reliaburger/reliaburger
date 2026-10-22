@@ -222,13 +222,17 @@ def label_number(value):
 
 
 def time_step(duration):
-    for step in (300, 600, 1800, 3600, 7200, 14400):
+    # The demos (#671) run for minutes; a soak's shortest step is five minutes.
+    for step in (10, 30, 60, 120, 300, 600, 1800, 3600, 7200, 14400):
         if duration / step <= 13:
             return step
     return 28800
 
 
 def time_label(offset, step):
+    if step < 60:
+        return f"{offset:g} s"
+    offset = int(offset)
     return f"{offset // 3600} h" if step >= 3600 else f"{offset // 60} min"
 
 
@@ -247,8 +251,15 @@ def spread(positions, gap=13):
     return dict(placed)
 
 
-def draw(title, unit, lines, duration, marks, targets=(), floor_max=0):
-    """One chart: `lines` is [(label, slot, [(offset, value)])], `targets` [(value, label)]."""
+# What a soak's marks mean, drawn along the bottom of each chart.
+SOAK_KEY = (("fault", "fault"), ("upgrade", "upgrade walk"), ("special", "special"), ("failure", "failure"))
+
+
+def draw(title, unit, lines, duration, marks, targets=(), floor_max=0, key=SOAK_KEY):
+    """One chart: `lines` is [(label, slot, [(offset, value)])], `targets` [(value, label)].
+
+    `key` lists the mark kinds to explain under the chart, as (kind, label).
+    """
     values = [value for _, _, points in lines for _, value in points] + [value for value, _ in targets]
     top = max(values + [floor_max, 1e-9])
     step = nice_step(top * 1.08)
@@ -309,9 +320,9 @@ def draw(title, unit, lines, duration, marks, targets=(), floor_max=0):
     for offset, kind, label in marks:
         if 0 <= offset <= duration:
             out.append(mark_shape(kind, x(offset), strip,
-                                  f"{escape(kind)}: {escape(label)} at {time_label(offset, 60)}"))
+                                  f"{escape(kind)}: {escape(label)} at {time_label(offset, min(tstep, 60))}"))
     key_x, key_y = LEFT, HEIGHT - 9
-    for kind, label in (("fault", "fault"), ("upgrade", "upgrade walk"), ("special", "special"), ("failure", "failure")):
+    for kind, label in key:
         out.append(mark_shape(kind, key_x + 5, key_y - 4, None)
                    + f'<text x="{fmt(key_x + 14)}" y="{key_y}">{label}</text>')
         key_x += 24 + 6.5 * len(label)
@@ -320,8 +331,8 @@ def draw(title, unit, lines, duration, marks, targets=(), floor_max=0):
 
 
 def mark_shape(kind, cx, cy, title):
-    """A fault tick, upgrade triangle, special diamond or failure cross centred on (cx, cy)."""
-    if kind == "fault":
+    """A fault or demo-step tick, upgrade triangle, special diamond or failure cross centred on (cx, cy)."""
+    if kind in ("fault", "step"):
         tag, shape = "line", f'x1="{fmt(cx)}" y1="{fmt(cy - 4)}" x2="{fmt(cx)}" y2="{fmt(cy + 4)}"'
     elif kind == "upgrade":
         tag, shape = "path", f'd="M{fmt(cx)},{fmt(cy - 5)} L{fmt(cx + 5)},{fmt(cy + 4)} L{fmt(cx - 5)},{fmt(cy + 4)} Z"'

@@ -9,21 +9,36 @@
 # docs/qualification/2026-10-12-dependency-exceptions.md) and removed the same
 # month: relish moved from serde_yaml to yaml_serde, which uses libyaml-rs (#817).
 # rustls-pemfile was removed in favour of the existing Rustls PEM parser.
-# The rkyv exception additionally requires an empty active graph in make audit.
 # Earlier exceptions were
 # fixed by upgrades rather than re-ignored:
 #   - RUSTSEC-2026-0002 + RUSTSEC-2026-0253 (lru): ratatui 0.29 -> 0.30 pulls
 #     lru 0.18.2, which patches both. Removed.
 #   - RUSTSEC-2026-0190 (anyhow::Error::downcast_mut): anyhow 1.0.102 -> 1.0.104.
 #     Removed.
+#   - RUSTSEC-2026-0235 (rkyv 0.7): the October 2026 dependency refresh (#1026)
+#     dropped rust_decimal's lock-only rkyv from Cargo.lock, so the exception
+#     and make audit's empty-graph guard went with it. Removed.
 #   - RUSTSEC-2024-0436 (paste): DataFusion 45 -> 55 drops paste from the
 #     graph, along with the Thrift crate behind GHSA-2f9f-gq7v-9h6m. Removed.
+#   - RUSTSEC-2025-0141 (bincode): no release fixes it, and bincode 3.0.0 is
+#     a compile_error! tombstone, so gossip, reporting frames and the Raft
+#     metadata moved to postcard (#1026). Removed.
+#   - RUSTSEC-2024-0370 (proc-macro-error): age 0.10 -> 0.12 (#1026) moves to
+#     i18n-embed-fl 0.10, which uses proc-macro-error2. Removed.
+#
+# RUSTSEC-2026-0374 (basic-toml) was added 20 October 2026 (see
+# docs/qualification/2026-10-20-dependency-exceptions.md): unmaintained, no
+# patched release, reached only at compile time through age's i18n proc macros.
+# RUSTSEC-2026-0381 (webpki-roots, distrusted emSign intermediates) was added
+# 21 October 2026 (see docs/qualification/2026-10-21-dependency-exceptions.md)
+# for the webpki-roots 0.26.11 shim only: it has no patched 0.26 release and
+# re-exports webpki-roots 1.x, which Cargo.lock holds at the patched 1.0.10.
+# tests/suite/dependency_audit.rs fails if 1.x is unpatched (#1269).
 # Next review: 18 November 2026.
 [advisories]
 ignore = [
-  "RUSTSEC-2024-0370", # proc-macro-error: unmaintained, no patched release; build-time only, reached through age
-  "RUSTSEC-2025-0141", # bincode 1: unmaintained, no patched release; durable-format migration required to move off
-  "RUSTSEC-2026-0235", # rkyv 0.7: patched in 0.8, but rust_decimal 1.x pins the 0.7 optional feature. `cargo tree -i rkyv` finds no active path — lock-only, never compiled
+    "RUSTSEC-2026-0374",
+    "RUSTSEC-2026-0381",
 ]
 
 [output]

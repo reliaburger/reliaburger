@@ -12,6 +12,8 @@ use std::time::Duration;
 mod bun_process;
 #[path = "support/cluster.rs"]
 mod cluster_support;
+#[path = "support/slow_registry.rs"]
+mod slow_registry;
 
 /// Retired, and then forgotten once that retirement is proven (#678).
 async fn assert_retired(runtime: &impl Grill, id: &reliaburger::grill::InstanceId) {
@@ -493,6 +495,232 @@ async fn runc_warm_pinned_executor_cold_starts_make_no_registry_requests() {
     for id in &executors {
         assert_retired(&runtime, id).await;
     }
+}
+
+/// Blob bytes per second the slow registry allows. The pinned workload
+/// image's layer is about 2 MB, so a cold pull takes half a minute.
+const SLOW_PULL_RATE: u64 = 64 << 10;
+
+/// More blob bytes than the image's config holds, so a pull that has sent
+/// this much is partway through its layer.
+const INTO_THE_LAYER: u64 = 32 << 10;
+
+/// A shared-runc array whose image comes from a slow registry, on a node
+/// that has never pulled it, so every task starts with a real cold pull.
+struct SlowColdPull {
+    registry: slow_registry::SlowRegistry,
+    runtime: RuncGrill,
+    pool: reliaburger::bun::task_executor::TaskPool<
+        reliaburger::bun::task_runtime::OwnedRunner<RuncGrill>,
+    >,
+    budget: std::sync::Arc<reliaburger::bun::execution_budget::ExecutionBudget>,
+    work: reliaburger::bun::task_executor::ChunkWork,
+    // Last, so it drops after the runtime and still releases what a failed
+    // assertion left behind.
+    residue: ExecutorResidue,
+}
+
+impl SlowColdPull {
+    async fn new(namespace: &str, tasks: u32, task_timeout_secs: u32) -> Self {
+        use reliaburger::bun::execution_budget::ExecutionBudget;
+        use reliaburger::bun::task_executor::{ChunkWork, PoolConfig, TaskPool};
+        use reliaburger::bun::task_runtime::OwnedRunner;
+        use reliaburger::grill::ImageMirrors;
+        use reliaburger::grill::image::ImageReference;
+        use reliaburger::meat::Resources;
+        use reliaburger::meat::task_array::{ChunkId, TaskArraySpec};
+        use std::sync::Arc;
+        assert!(nix::unistd::geteuid().is_root());
+        let mirror_env = reliaburger::testkit::pinned_images::TEST_IMAGE_MIRROR_ENV;
+        let mirror = std::env::var(mirror_env).unwrap_or_else(|_| {
+            panic!(
+                "{mirror_env} is unset: run with make test-linux, which serves the pinned images"
+            )
+        });
+        let registry = slow_registry::SlowRegistry::start(mirror, SLOW_PULL_RATE).await;
+        let root = tempfile::Builder::new()
+            .prefix("rb-740-slow-pull-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let residue = ExecutorResidue { root: root.clone() };
+        let node = root.join("node-0");
+        std::fs::create_dir_all(&node).unwrap();
+        let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
+        let origin = ImageReference::parse(image).unwrap().registry;
+        // A fresh image store: nothing is cached, so the pool must pull.
+        let images = ImageStore::new(root.join("images"))
+            .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
+            .with_mirrors(ImageMirrors::new([(origin, registry.address.clone())].into()).unwrap());
+        let runtime = RuncGrill::new(
+            root.join("bundles"),
+            images,
+            false,
+            root.join("state"),
+            env!("CARGO_BIN_EXE_bun").into(),
+        )
+        .unwrap();
+        let budget = ExecutionBudget::new(Resources::new(1000, 512 << 20, 0));
+        let runner = Arc::new(
+            OwnedRunner::for_data_dir(runtime.clone(), &node)
+                .unwrap()
+                .with_budget(budget.clone()),
+        );
+        let pool = TaskPool::with_node_slots(
+            runner,
+            PoolConfig::with_concurrency(tasks),
+            Arc::new(tokio::sync::Semaphore::new(tasks as usize)),
+        )
+        .with_budget(budget.clone(), Resources::new(100, 32 << 20, 0));
+        let work = ChunkWork {
+            replay_unknown: true,
+            batch_id: 740,
+            template: Some(Box::new(
+                toml::from_str(&format!(
+                    "image='{image}'\nnamespace='{namespace}'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"
+                ))
+                .unwrap(),
+            )),
+            spec: TaskArraySpec {
+                chunk_size: tasks,
+                max_attempts: 1,
+                task_timeout_secs,
+                ..TaskArraySpec::with_count(tasks)
+            },
+            chunk: ChunkId(0),
+            grant_attempt: 1,
+            program: "/unused".into(),
+            args: vec!["/bin/sh".into(), "-c".into(), "printf ran".into()],
+            env: vec![],
+        };
+        Self {
+            registry,
+            runtime,
+            pool,
+            budget,
+            work,
+            residue,
+        }
+    }
+
+    /// The interrupted attempts left nothing behind: no reservation, no
+    /// executor, no network namespace and no slot cgroup. The pull itself
+    /// goes on filling the image cache, so it is still mid-layer.
+    async fn assert_interrupted_and_clean(&self) {
+        assert_eq!(
+            self.budget.available(),
+            self.budget.capacity(),
+            "an interrupted cold pull kept its reservation"
+        );
+        let executors = self
+            .runtime
+            .launch_inventory()
+            .await
+            .unwrap()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|launch| launch.instance_id.0.contains("__executor-"))
+            .map(|launch| launch.instance_id)
+            .collect::<Vec<_>>();
+        for id in &executors {
+            assert_retired(&self.runtime, id).await;
+        }
+        assert_eq!(self.residue.namespaces(), Vec::<String>::new());
+        assert_eq!(self.residue.slot_cgroups(), Vec::<String>::new());
+        assert!(
+            self.registry.blobs_in_flight() > 0,
+            "the pull finished before the interruption, so nothing was interrupted"
+        );
+    }
+}
+
+/// Cancelling an array while its tasks are still pulling a cold image
+/// returns promptly, counts every task as not run and holds nothing, while
+/// the pull itself carries on filling the cache (#682, #740).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires root, runc, pinned test image, ip and nft; run with make test-linux"]
+async fn runc_cancelling_an_array_interrupts_a_slow_cold_pull() {
+    use reliaburger::bun::task_executor::TaskFinal;
+    use tokio_util::sync::CancellationToken;
+    const TASKS: u32 = 2;
+    let fixture = SlowColdPull::new("rbtest-slow-cancel", TASKS, 600).await;
+    let cancel = CancellationToken::new();
+    let running = {
+        let pool = &fixture.pool;
+        let work = &fixture.work;
+        let cancel = cancel.clone();
+        async move { pool.run_chunk(work, &cancel).await }
+    };
+    tokio::pin!(running);
+    // Run the chunk until the registry is partway through a layer.
+    tokio::select! {
+        outcome = &mut running => panic!("the chunk ended before its pull did: {outcome:?}"),
+        () = fixture.registry.wait_for_blob_bytes(INTO_THE_LAYER, Duration::from_secs(60)) => {}
+    }
+    cancel.cancel();
+    let cancelled_at = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(30), running)
+        .await
+        .expect("cancel did not interrupt the cold pull");
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(5),
+        "cancel waited {:?} for the cold pull",
+        cancelled_at.elapsed()
+    );
+    assert_eq!(outcome.result.not_run, TASKS, "{outcome:?}");
+    assert_eq!(outcome.result.succeeded, 0, "{outcome:?}");
+    assert_eq!(outcome.result.failed_count, 0, "{outcome:?}");
+    assert!(
+        outcome
+            .records
+            .iter()
+            .all(|record| record.outcome == TaskFinal::NotRun),
+        "{outcome:?}"
+    );
+    fixture.assert_interrupted_and_clean().await;
+}
+
+/// A task whose deadline expires while its image is still being pulled
+/// fails as timed out at the deadline, not when the pull would have ended,
+/// and holds nothing afterwards (#682, #740).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires root, runc, pinned test image, ip and nft; run with make test-linux"]
+async fn runc_a_deadline_interrupts_a_slow_cold_pull() {
+    use reliaburger::bun::task_executor::TaskFinal;
+    use tokio_util::sync::CancellationToken;
+    const TASKS: u32 = 1;
+    const DEADLINE_SECS: u32 = 3;
+    let fixture = SlowColdPull::new("rbtest-slow-deadline", TASKS, DEADLINE_SECS).await;
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        fixture
+            .pool
+            .run_chunk(&fixture.work, &CancellationToken::new()),
+    )
+    .await
+    .expect("the deadline did not interrupt the cold pull");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(u64::from(DEADLINE_SECS))
+            && elapsed < Duration::from_secs(u64::from(DEADLINE_SECS) + 5),
+        "the attempt ended after {elapsed:?}, not at its {DEADLINE_SECS}s deadline"
+    );
+    assert!(
+        fixture.registry.blob_bytes() > INTO_THE_LAYER,
+        "the deadline fired before the pull reached its layer"
+    );
+    assert_eq!(outcome.result.failed_count, TASKS, "{outcome:?}");
+    assert!(
+        outcome
+            .records
+            .iter()
+            .all(|record| record.outcome == TaskFinal::Failed
+                && record.attempts == 1
+                && record.exit_code.is_none()),
+        "{outcome:?}"
+    );
+    fixture.assert_interrupted_and_clean().await;
 }
 
 /// Delegated sources inherit their tenant before their first connect; losing
@@ -1831,6 +2059,117 @@ async fn runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// #704: a task-array command in a reusable runc executor is listed for
+/// Smoker while it runs, by its executor's task cgroup, and that cgroup holds
+/// the command's processes and nothing else: stopping every process in it
+/// freezes the task, and continuing them lets it finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc and pinned images; run with make test-linux"]
+async fn runc_array_attempt_can_be_paused_and_resumed() {
+    use reliaburger::bun::live_attempts::AttemptHandle;
+    use reliaburger::bun::task_executor::{AttemptOutcome, TaskInvocation, TaskRunner};
+    use reliaburger::bun::{execution_budget::ExecutionBudget, task_runtime::OwnedRunner};
+    use reliaburger::meat::Resources;
+    use reliaburger::smoker::types::WorkloadKind;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::Builder::new()
+        .prefix("rb-704-pause-")
+        .tempdir()
+        .unwrap();
+    let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
+    let images = ImageStore::new(root.path().join("images"))
+        .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
+        .with_mirrors(reliaburger::testkit::pinned_images::local_test_mirrors().unwrap());
+    images.pull_and_unpack(image).await.unwrap();
+    let runtime = RuncGrill::new(
+        root.path().join("bundles"),
+        images,
+        false,
+        root.path().join("state"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    )
+    .unwrap();
+    let budget = ExecutionBudget::new(Resources::new(1000, 128 << 20, 0));
+    let runner = Arc::new(
+        OwnedRunner::for_data_dir(runtime.clone(), root.path())
+            .unwrap()
+            .with_budget(budget.clone()),
+    );
+    let attempts = runner.live_attempts();
+    let template: reliaburger::config::job::JobSpec = toml::from_str(&format!(
+        "image='{image}'\nnamespace='rbtest-pause'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"
+    ))
+    .unwrap();
+    // Two seconds of work, then a marker: a frozen task can't print it.
+    let task = TaskInvocation {
+        template: Some(Box::new(template)),
+        index: 2,
+        attempt: 1,
+        program: "/unused".into(),
+        args: vec!["/bin/sh".into(), "-c".into(), "sleep 2; printf done".into()],
+        env: vec![],
+        run: Some(reliaburger::bun::task_executor::RunIdentity {
+            batch_id: 704,
+            task_count: 3,
+            job_name: Some("render".into()),
+        }),
+    };
+    let running = {
+        let runner = runner.clone();
+        tokio::spawn(async move {
+            runner
+                .run(&task, Duration::from_secs(60), &CancellationToken::new())
+                .await
+        })
+    };
+    wait_until("the command is listed", || !attempts.snapshot().is_empty()).await;
+    let listed = attempts.snapshot().remove(0);
+    assert_eq!(listed.job, "render");
+    assert_eq!(listed.index, 2);
+    assert_eq!(listed.kind(), WorkloadKind::TaskArray);
+    assert!(listed.shared_executor.is_some(), "{listed:?}");
+    let AttemptHandle::TaskGroup(group) = &listed.handle else {
+        panic!("a shared command is reached by its task cgroup: {listed:?}");
+    };
+    let pids: Vec<i32> = std::fs::read_to_string(group.join("cgroup.procs"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+    assert!(!pids.is_empty(), "the task cgroup holds the command");
+    let signal = |signal| {
+        for pid in &pids {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid), signal);
+        }
+    };
+
+    signal(nix::sys::signal::Signal::SIGSTOP);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!running.is_finished(), "the paused task finished anyway");
+    signal(nix::sys::signal::Signal::SIGCONT);
+
+    let finished = tokio::time::timeout(Duration::from_secs(30), running)
+        .await
+        .expect("the resumed task never finished")
+        .unwrap();
+    assert_eq!(
+        finished.outcome,
+        AttemptOutcome::Exited { code: 0 },
+        "{finished:?}"
+    );
+    assert!(String::from_utf8_lossy(&finished.output.head).contains("done"));
+    assert!(
+        attempts.snapshot().is_empty(),
+        "a finished task stayed listed"
+    );
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}
+
 /// Warm capacity remains usable while its reservation is retained; queued
 /// commands must resolve secrets again after that wait, before execution.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2350,6 +2689,87 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
     eprintln!("native cancellation returned {outcome:?}");
     assert_retired(&runtime, &id).await;
     assert_eq!(budget.available(), budget.capacity());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A job's `pids` becomes its command cgroup's `pids.max` (#741), and the
+/// kernel refuses the fork past it. The helper keeps its own 16.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup() {
+    use reliaburger::bun::{
+        execution_budget::ExecutionBudget,
+        task_executor::{TaskInvocation, TaskRunner},
+        task_runtime::OwnedRunner,
+    };
+    use reliaburger::grill::{AnyGrill, ProcessGrill};
+    use reliaburger::meat::Resources;
+    use tokio_util::sync::CancellationToken;
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-pids-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    eprintln!("native pids fixture: {}", root.display());
+    let runtime = ProcessGrill::with_owner(root.join("owners"), env!("CARGO_BIN_EXE_bun").into());
+    let budget = ExecutionBudget::new(Resources::new(1000, 128 << 20, 0));
+    let runner = OwnedRunner::with_slot_count(AnyGrill::Process(runtime.clone()), 1)
+        .with_budget(budget.clone());
+    let template: reliaburger::config::job::JobSpec = toml::from_str(
+        "runtime='process'\nexec='/bin/sh'\nnamespace='rbtest-native-pids'\ncpu='100m-1000m'\nmemory='32Mi'\npids=8",
+    )
+    .unwrap();
+    // Everything after the subshell is a shell builtin, so reading the
+    // results never needs a fork the limit could refuse. The subshell
+    // forks sleeps until the kernel says no.
+    let script = r#"
+        ( i=0; while [ $i -lt 32 ]; do sleep 2 & i=$((i+1)); done; wait ) 2>/dev/null
+        read -r line < /proc/self/cgroup
+        group=/sys/fs/cgroup${line#0::}
+        read -r limit < "$group/pids.max"
+        read -r helper < "${group%/task}/helper/pids.max"
+        echo "group=$group"
+        echo "limit=$limit"
+        echo "helper=$helper"
+        while read -r key value; do echo "event_$key=$value"; done < "$group/pids.events"
+    "#;
+    let task = TaskInvocation {
+        template: Some(Box::new(template)),
+        index: 0,
+        attempt: 1,
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: vec![],
+        run: None,
+    };
+    let cancel = CancellationToken::new();
+    let outcome = runner.run(&task, Duration::from_secs(20), &cancel).await;
+    assert!(outcome.outcome.succeeded(), "{outcome:?}");
+    let text = String::from_utf8_lossy(&outcome.output.head).into_owned();
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("no {name} in {text}"))
+            .to_string()
+    };
+    let group = field("group");
+    assert!(
+        group.ends_with("/task"),
+        "command escaped its cgroup: {text}"
+    );
+    assert_eq!(field("limit"), "8", "{text}");
+    let refused: u64 = field("event_max").parse().unwrap();
+    assert!(refused > 0, "the kernel never refused a fork: {text}");
+    assert_eq!(field("helper"), "16", "{text}");
+    // The idle executor retires on its own and returns its reservation.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while budget.available() != budget.capacity() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the idle executor kept its reservation");
+    drop(runner);
     std::fs::remove_dir_all(root).unwrap();
 }
 

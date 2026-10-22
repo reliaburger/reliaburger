@@ -1338,6 +1338,7 @@ mod tests {
 
     fn template() -> JobSpec {
         JobSpec {
+            pids: None,
             runtime: crate::config::job::JobRuntime::Process,
             image: None,
             command: Some(vec!["{index}".to_string()]),

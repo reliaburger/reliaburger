@@ -1,0 +1,301 @@
+{
+ "comment": "Task-array benchmark means (ns) from the criterion-task-arrays artefacts of every run from 12 to 18 October 2026 where storage/ledger_and_index_64k was more than 2x the rest of its run (#936, #1038): main's saved baseline and the run's own means. ledger_sample_ms is the fastest and slowest of that benchmark's ten Criterion samples, per iteration: on a healthy runner they are within a few per cent. Run 38951415295 had been re-measured (#941), so its ledger mean is the second measurement.",
+ "runs": [
+  {
+   "run": 38360618481,
+   "created": "2026-10-13T07:20:35Z",
+   "branch": "0-2-1/745-fence-fsync",
+   "ledger_sample_ms": [
+    17.5,
+    106.9
+   ],
+   "baseline": {
+    "executor/fake_64k": 100256197.7,
+    "executor/process_true_256/1": 206196257.4,
+    "executor/process_true_256/16": 72031301.9,
+    "executor/process_true_256/4": 81078476.7,
+    "index_set/insert_sequential_1m": 6713617.6,
+    "index_set/insert_sparse_10k": 492233.4,
+    "leader_tick/64_arrays_3_nodes": 1377472.3,
+    "leader_tick/one_task_chunks_10_nodes": 190090.3,
+    "state/json_encode_1m": 281120.2,
+    "state/plan_and_complete_1m/200": 2724937.3,
+    "state/plan_and_complete_1m/3": 1817910.5,
+    "storage/ledger_and_index_64k": 18811968.9
+   },
+   "current": {
+    "executor/fake_64k": 79262351.4,
+    "executor/process_true_256/1": 178815908.8,
+    "executor/process_true_256/16": 59598502.6,
+    "executor/process_true_256/4": 67105137.8,
+    "index_set/insert_sequential_1m": 4915173.8,
+    "index_set/insert_sparse_10k": 421313.9,
+    "leader_tick/64_arrays_3_nodes": 960223.2,
+    "leader_tick/one_task_chunks_10_nodes": 133224.0,
+    "state/json_encode_1m": 151351.1,
+    "state/plan_and_complete_1m/200": 2136187.2,
+    "state/plan_and_complete_1m/3": 1386386.0,
+    "storage/ledger_and_index_64k": 41691528.0
+   }
+  },
+  {
+   "run": 38384393698,
+   "created": "2026-10-13T10:48:58Z",
+   "branch": "main",
+   "ledger_sample_ms": [
+    16.2,
+    80.3
+   ],
+   "baseline": {
+    "executor/fake_64k": 99689572.3,
+    "executor/process_true_256/1": 206313959.7,
+    "executor/process_true_256/16": 71801748.7,
+    "executor/process_true_256/4": 81055599.2,
+    "index_set/insert_sequential_1m": 6576433.0,
+    "index_set/insert_sparse_10k": 488507.1,
+    "leader_tick/64_arrays_3_nodes": 1375571.6,
+    "leader_tick/one_task_chunks_10_nodes": 188093.6,
+    "state/json_encode_1m": 199288.7,
+    "state/plan_and_complete_1m/200": 2738181.6,
+    "state/plan_and_complete_1m/3": 1816633.3,
+    "storage/ledger_and_index_64k": 19038292.4
+   },
+   "current": {
+    "executor/fake_64k": 78358871.6,
+    "executor/process_true_256/1": 177739944.3,
+    "executor/process_true_256/16": 59210432.6,
+    "executor/process_true_256/4": 66009049.2,
+    "index_set/insert_sequential_1m": 5128195.5,
+    "index_set/insert_sparse_10k": 419096.4,
+    "leader_tick/64_arrays_3_nodes": 963408.5,
+    "leader_tick/one_task_chunks_10_nodes": 132681.7,
+    "state/json_encode_1m": 150887.6,
+    "state/plan_and_complete_1m/200": 2155381.8,
+    "state/plan_and_complete_1m/3": 1416600.9,
+    "storage/ledger_and_index_64k": 53911847.9
+   }
+  },
+  {
+   "run": 38429331879,
+   "created": "2026-10-13T16:48:26Z",
+   "branch": "main",
+   "ledger_sample_ms": [
+    18.0,
+    133.6
+   ],
+   "baseline": {
+    "executor/fake_64k": 148170424.7,
+    "executor/process_true_256/1": 159688491.2,
+    "executor/process_true_256/16": 55314232.9,
+    "executor/process_true_256/4": 62956670.8,
+    "index_set/insert_sequential_1m": 5233075.6,
+    "index_set/insert_sparse_10k": 396849.3,
+    "leader_tick/64_arrays_3_nodes": 1042572.5,
+    "leader_tick/one_task_chunks_10_nodes": 143469.9,
+    "state/json_encode_1m": 177053.9,
+    "state/plan_and_complete_1m/200": 2233524.1,
+    "state/plan_and_complete_1m/3": 1537748.0,
+    "storage/ledger_and_index_64k": 18179121.8
+   },
+   "current": {
+    "executor/fake_64k": 82341564.0,
+    "executor/process_true_256/1": 178035404.7,
+    "executor/process_true_256/16": 58844889.0,
+    "executor/process_true_256/4": 66328976.7,
+    "index_set/insert_sequential_1m": 4940479.9,
+    "index_set/insert_sparse_10k": 429869.8,
+    "leader_tick/64_arrays_3_nodes": 956955.4,
+    "leader_tick/one_task_chunks_10_nodes": 134166.9,
+    "state/json_encode_1m": 178917.4,
+    "state/plan_and_complete_1m/200": 2107489.1,
+    "state/plan_and_complete_1m/3": 1379186.4,
+    "storage/ledger_and_index_64k": 63375475.2
+   }
+  },
+  {
+   "run": 38433591253,
+   "created": "2026-10-13T17:03:59Z",
+   "branch": "0-2-1/914-refuse-image-under-process",
+   "ledger_sample_ms": [
+    14.8,
+    121.1
+   ],
+   "baseline": {
+    "executor/fake_64k": 148170424.7,
+    "executor/process_true_256/1": 159688491.2,
+    "executor/process_true_256/16": 55314232.9,
+    "executor/process_true_256/4": 62956670.8,
+    "index_set/insert_sequential_1m": 5233075.6,
+    "index_set/insert_sparse_10k": 396849.3,
+    "leader_tick/64_arrays_3_nodes": 1042572.5,
+    "leader_tick/one_task_chunks_10_nodes": 143469.9,
+    "state/json_encode_1m": 177053.9,
+    "state/plan_and_complete_1m/200": 2233524.1,
+    "state/plan_and_complete_1m/3": 1537748.0,
+    "storage/ledger_and_index_64k": 18179121.8
+   },
+   "current": {
+    "executor/fake_64k": 77583774.5,
+    "executor/process_true_256/1": 177717693.4,
+    "executor/process_true_256/16": 59662500.4,
+    "executor/process_true_256/4": 66722106.2,
+    "index_set/insert_sequential_1m": 4916780.6,
+    "index_set/insert_sparse_10k": 424854.6,
+    "leader_tick/64_arrays_3_nodes": 961704.6,
+    "leader_tick/one_task_chunks_10_nodes": 133828.7,
+    "state/json_encode_1m_x64": 10015311.3,
+    "state/plan_and_complete_1m/200": 2133608.5,
+    "state/plan_and_complete_1m/3": 1382719.0,
+    "storage/ledger_and_index_64k": 52579196.6
+   }
+  },
+  {
+   "run": 38445079652,
+   "created": "2026-10-13T18:35:31Z",
+   "branch": "gh-readonly-queue/release-0-2-1",
+   "ledger_sample_ms": [
+    18.7,
+    75.2
+   ],
+   "baseline": {
+    "executor/fake_64k": 103206423.7,
+    "executor/process_true_256/1": 218017474.4,
+    "executor/process_true_256/16": 72702796.2,
+    "executor/process_true_256/4": 82349987.1,
+    "index_set/insert_sequential_1m": 6353498.5,
+    "index_set/insert_sparse_10k": 547939.4,
+    "leader_tick/64_arrays_3_nodes": 1284647.7,
+    "leader_tick/one_task_chunks_10_nodes": 185024.8,
+    "state/json_encode_1m": 200670.3,
+    "state/plan_and_complete_1m/200": 2803601.2,
+    "state/plan_and_complete_1m/3": 1771908.8,
+    "storage/ledger_and_index_64k": 15370726.2
+   },
+   "current": {
+    "executor/fake_64k": 79171389.7,
+    "executor/process_true_256/1": 179368200.5,
+    "executor/process_true_256/16": 59105548.2,
+    "executor/process_true_256/4": 66531494.6,
+    "index_set/insert_sequential_1m": 4931512.9,
+    "index_set/insert_sparse_10k": 424057.5,
+    "leader_tick/64_arrays_3_nodes": 965024.3,
+    "leader_tick/one_task_chunks_10_nodes": 132961.0,
+    "state/json_encode_1m_x64": 9922255.0,
+    "state/plan_and_complete_1m/200": 2142993.4,
+    "state/plan_and_complete_1m/3": 1385410.4,
+    "storage/ledger_and_index_64k": 39662598.6
+   }
+  },
+  {
+   "run": 38447578697,
+   "created": "2026-10-13T19:00:27Z",
+   "branch": "gh-readonly-queue/release-0-2-1",
+   "ledger_sample_ms": [
+    15.3,
+    101.9
+   ],
+   "baseline": {
+    "executor/fake_64k": 103206423.7,
+    "executor/process_true_256/1": 218017474.4,
+    "executor/process_true_256/16": 72702796.2,
+    "executor/process_true_256/4": 82349987.1,
+    "index_set/insert_sequential_1m": 6353498.5,
+    "index_set/insert_sparse_10k": 547939.4,
+    "leader_tick/64_arrays_3_nodes": 1284647.7,
+    "leader_tick/one_task_chunks_10_nodes": 185024.8,
+    "state/json_encode_1m": 200670.3,
+    "state/plan_and_complete_1m/200": 2803601.2,
+    "state/plan_and_complete_1m/3": 1771908.8,
+    "storage/ledger_and_index_64k": 15370726.2
+   },
+   "current": {
+    "executor/fake_64k": 79369565.2,
+    "executor/process_true_256/1": 180551635.3,
+    "executor/process_true_256/16": 59463762.1,
+    "executor/process_true_256/4": 67182494.0,
+    "index_set/insert_sequential_1m": 4911529.4,
+    "index_set/insert_sparse_10k": 419242.8,
+    "leader_tick/64_arrays_3_nodes": 958893.8,
+    "leader_tick/one_task_chunks_10_nodes": 133032.2,
+    "state/json_encode_1m_x64": 11675929.8,
+    "state/plan_and_complete_1m/200": 2134129.5,
+    "state/plan_and_complete_1m/3": 1380661.0,
+    "storage/ledger_and_index_64k": 50289692.8
+   }
+  },
+  {
+   "run": 38447583930,
+   "created": "2026-10-13T19:25:36Z",
+   "branch": "gh-readonly-queue/release-0-2-1",
+   "ledger_sample_ms": [
+    15.3,
+    62.2
+   ],
+   "baseline": {
+    "executor/fake_64k": 103206423.7,
+    "executor/process_true_256/1": 218017474.4,
+    "executor/process_true_256/16": 72702796.2,
+    "executor/process_true_256/4": 82349987.1,
+    "index_set/insert_sequential_1m": 6353498.5,
+    "index_set/insert_sparse_10k": 547939.4,
+    "leader_tick/64_arrays_3_nodes": 1284647.7,
+    "leader_tick/one_task_chunks_10_nodes": 185024.8,
+    "state/json_encode_1m": 200670.3,
+    "state/plan_and_complete_1m/200": 2803601.2,
+    "state/plan_and_complete_1m/3": 1771908.8,
+    "storage/ledger_and_index_64k": 15370726.2
+   },
+   "current": {
+    "executor/fake_64k": 78132068.8,
+    "executor/process_true_256/1": 178802906.5,
+    "executor/process_true_256/16": 58841617.6,
+    "executor/process_true_256/4": 65969474.0,
+    "index_set/insert_sequential_1m": 4938416.3,
+    "index_set/insert_sparse_10k": 422043.5,
+    "leader_tick/64_arrays_3_nodes": 955291.9,
+    "leader_tick/one_task_chunks_10_nodes": 131866.5,
+    "state/json_encode_1m_x64": 11509098.1,
+    "state/plan_and_complete_1m/200": 2132239.8,
+    "state/plan_and_complete_1m/3": 1379580.0,
+    "storage/ledger_and_index_64k": 30932892.6
+   }
+  },
+  {
+   "run": 38951415295,
+   "created": "2026-10-16T19:20:00Z",
+   "branch": "gh-readonly-queue/release-0-2-1",
+   "ledger_sample_ms": [
+    36.2,
+    120.5
+   ],
+   "baseline": {
+    "executor/fake_64k": 104791420.6,
+    "executor/process_true_256/1": 208380866.1,
+    "executor/process_true_256/16": 71881784.4,
+    "executor/process_true_256/4": 81187511.5,
+    "index_set/insert_sequential_1m": 6246311.2,
+    "index_set/insert_sparse_10k": 502785.2,
+    "leader_tick/64_arrays_3_nodes": 1319312.0,
+    "leader_tick/one_task_chunks_10_nodes": 188243.6,
+    "state/json_encode_1m": 203376.1,
+    "state/plan_and_complete_1m/200": 2726133.4,
+    "state/plan_and_complete_1m/3": 1779161.9,
+    "storage/ledger_and_index_64k": 19298427.7
+   },
+   "current": {
+    "executor/fake_64k": 82004945.1,
+    "executor/process_true_256/1": 180216458.7,
+    "executor/process_true_256/16": 59493659.0,
+    "executor/process_true_256/4": 67424095.7,
+    "index_set/insert_sequential_1m": 4926199.5,
+    "index_set/insert_sparse_10k": 422581.4,
+    "leader_tick/64_arrays_3_nodes": 958103.3,
+    "leader_tick/one_task_chunks_10_nodes": 135148.9,
+    "state/json_encode_1m_x64": 9671241.4,
+    "state/plan_and_complete_1m/200": 2159632.1,
+    "state/plan_and_complete_1m/3": 1423666.1,
+    "storage/ledger_and_index_64k": 56542112.7
+   }
+  }
+ ]
+}

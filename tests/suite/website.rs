@@ -22,15 +22,17 @@ const PENDING: &[(&str, &str)] = &[];
 
 const DEMO_MANIFEST_PENDING: bool = false;
 
-const INSTALL_LINE: &str = "curl -fsSL https://reliaburger.com/install.sh | sh";
+/// The one-line install names its mode: without one the installer only
+/// explains the choices (#670).
+const INSTALL_LINE: &str = "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop";
 const DEMO_URL: &str = "https://reliaburger.com/demo/podinfo.yaml";
 const DEMO_SOURCE: &str = "examples/kubernetes/podinfo.yaml";
 
-fn repository() -> PathBuf {
+pub(crate) fn repository() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn read(path: &str) -> String {
+pub(crate) fn read(path: &str) -> String {
     std::fs::read_to_string(repository().join(path)).unwrap()
 }
 
@@ -167,6 +169,47 @@ fn homepage_and_manual_show_the_same_tour() {
     );
 }
 
+/// Every place that shows someone how to pipe the installer to a shell
+/// names a mode, `--laptop` or `--install-only`. A bare `| sh` now only
+/// prints the choices, so a page showing one would leave its reader with
+/// nothing installed (#670).
+#[test]
+fn every_shown_install_line_names_a_mode() {
+    let mut pages = vec![
+        "README.md".to_string(),
+        "docs/website/index.html".to_string(),
+        "docs/website/README.md".to_string(),
+        "scripts/demo/tour.sh".to_string(),
+        "scripts/release/install.sh.in".to_string(),
+    ];
+    for directory in ["docs", "docs/manual", "docs/book"] {
+        for entry in std::fs::read_dir(repository().join(directory)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|extension| extension == "md") {
+                let relative = path.strip_prefix(repository()).unwrap();
+                pages.push(relative.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut failures = Vec::new();
+    for page in &pages {
+        for (number, line) in read(page).lines().enumerate() {
+            let Some(at) = line.find("reliaburger.com/install.sh |") else {
+                continue;
+            };
+            let rest = &line[at..];
+            if !rest.contains("sh -s -- --laptop") && !rest.contains("sh -s -- --install-only") {
+                failures.push(format!("{page}:{}: {}", number + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "these install lines name no mode; add `sh -s -- --laptop` or `--install-only`:\n{}",
+        failures.join("\n")
+    );
+}
+
 /// The recording's script (`scripts/demo/tour.sh`) reads its commands from
 /// the page, and knows how to run and wait for each one. A command added to
 /// the tour must be taught to the script too, or the recording drifts.
@@ -273,7 +316,10 @@ const TOUR_JOBS_MAX: i64 = 16;
 
 /// Each cohort's `count` in the tour's job manifest, by cohort name.
 fn burger_job_counts() -> std::collections::BTreeMap<String, i64> {
-    let manifest: toml::Value = read(&format!("{BURGER_SOURCE}/jobs.toml")).parse().unwrap();
+    // `toml::from_str`, not `.parse::<toml::Value>()`: since toml 0.9,
+    // `Value`'s `FromStr` reads a single value, not a whole document.
+    let manifest: toml::Table =
+        toml::from_str(&read(&format!("{BURGER_SOURCE}/jobs.toml"))).unwrap();
     manifest["cohort"]
         .as_array()
         .unwrap()
@@ -990,7 +1036,9 @@ fn release_cards_use_roadmap_release_names() {
         );
         cards.push(version.to_string());
     }
-    for release in ["0.2.0", "0.3.0", "0.4.0"] {
+    // The installed release's card, wherever the installer's default points.
+    let installed = installer_default();
+    for release in [installed.trim_start_matches('v'), "0.3.0", "0.4.0"] {
         assert!(
             cards.iter().any(|card| card == release),
             "no {release} card"

@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::Mutex;
 
 /// Concurrent-safe ephemeral port allocator.
@@ -86,10 +86,10 @@ impl PortAllocator {
             });
         }
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         // Visit every candidate once from a random starting point. Repeated
         // random guesses can miss the last free port and falsely exhaust.
-        let first = rng.gen_range(0..self.total_ports());
+        let first = rng.random_range(0..self.total_ports());
         for offset in 0..self.total_ports() {
             let port = self.range_start + ((first + offset) % self.total_ports()) as u16;
             if !allocated.contains(&port) && (!self.probe_host || host_port_is_free(port)) {

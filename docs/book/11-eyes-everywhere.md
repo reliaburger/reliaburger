@@ -179,7 +179,7 @@ That one stamp broke both directions of reassignment. Reassigned back to an aggr
 
 The fix wasn't cleverer dedup. It was making the data honest: `generate_backfill` emits five ordinary one-minute rollups, each stamped at its own minute start — exactly the keys the ordinary ticks would have used. Now dedup does the right thing with no new logic at all: an aggregator that already holds a minute drops that minute and keeps the rest. The worker clears its backfill flag only after every send succeeds; a partial failure re-sends some minutes next tick, and idempotent keys make the re-send free.
 
-We deliberately did *not* add a "window length" field to `NodeRollup`. The reporting messages cross the wire as bincode, where enum discriminants and struct layouts are part of the wire format: a new field means a new protocol generation, and nodes of different generations refuse to talk to each other at all. Five sends of the unchanged type cost a few extra kilobytes once per reassignment and keep the wire format stable. When a schema is pinned, change the *usage*, not the shape.
+We deliberately did *not* add a "window length" field to `NodeRollup`. The reporting messages cross the wire as postcard, where enum discriminants and struct layouts are part of the wire format: a new field means a new protocol generation, and nodes of different generations refuse to talk to each other at all. Five sends of the unchanged type cost a few extra kilobytes once per reassignment and keep the wire format stable. When a schema is pinned, change the *usage*, not the shape.
 
 That leaves the old and new aggregators both holding the same minutes. Rather than teach them to hand history over, the cluster query keeps each worker's identity until after it has removed duplicates, as we'll see in "Two merge strategies" below.
 
@@ -205,7 +205,7 @@ One honesty note baked into the field docs: "used" is the sum of *requested* res
 
 ### Reporting has an admission boundary
 
-How big can a report get? Counting series doesn't answer that, since one enormous label can outweigh a thousand small series. So the sender asks bincode for the exact encoded size and refuses anything over 1 MiB before it allocates a buffer; we don't truncate a batch and call it delivered. The receiver runs at most 16 connection tasks in a tokio `JoinSet` (a collection that owns spawned tasks and cancels them when dropped), queues at most 16 reports, and gives each connection ten seconds for handshake and body together.
+How big can a report get? Counting series doesn't answer that, since one enormous label can outweigh a thousand small series. So the sender asks postcard for the exact encoded size and refuses anything over 1 MiB before it allocates a buffer; we don't truncate a batch and call it delivered. The receiver runs at most 16 connection tasks in a tokio `JoinSet` (a collection that owns spawned tasks and cancels them when dropped), queues at most 16 reports, and gives each connection ten seconds for handshake and body together.
 
 A successful socket write doesn't prove the leader took the report, so the receiver answers with a one-byte acknowledgement once it has decoded and queued it. A lost acknowledgement can cause a duplicate, which is harmless: snapshots replace older ones and rollups are deduplicated by worker and minute. A failed rollup send asks for the same five-minute backfill a reassignment uses. Longer outages leave a gap in the cluster view; the node-local metrics keep the data until retention removes it.
 
@@ -573,6 +573,8 @@ We split rendering into two layers:
 1. **Full page renders** (`render_dashboard`, `render_app_detail`, `render_node_detail`) produce complete HTML documents with `<head>`, `<body>`, and all the script/CSS links.
 2. **Fragment renders** (`render_apps_table_fragment`, `render_instance_table_fragment`, etc.) produce bare HTML that HTMX can swap in. The full-page renders call these internally, so the initial page load and subsequent HTMX updates use the same rendering code.
 
+Jobs got a card of their own once every job ran on the common lifecycle of Chapter 17. "Job runs and schedules" polls `/ui/fragment/batches` every three seconds and renders the same scoped summaries as `GET /v1/batch/summaries`: one row per retained run, with its counts, backlog and accepted success rate, and one row per cron schedule with its last five outcomes from the definition's durable history (#684). It shows retained runs only. There's no standalone jobs page, so a run whose receipt has been pruned survives only in its schedule's history.
+
 ### uPlot for charts
 
 uPlot is a 10KB JavaScript library that renders time-series charts on a canvas element. It handles millions of data points at 60fps — massively overkill for our use case, but that means it'll never be the bottleneck.
@@ -913,8 +915,6 @@ cargo test --test suite metrics_aggregation::      # hierarchical correctness
 cargo test --test suite logs_cross_node::          # cross-node log fan-out
 cargo test --test suite log_export::               # Parquet export + remote SQL
 ```
-
-Phase 11 adds 147 tests, bringing the total to 1595.
 
 ## What's next
 

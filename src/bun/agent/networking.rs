@@ -155,7 +155,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         let capability = match self.onion_ebpf.as_ref() {
             Some(handle) => {
-                let handle = handle.lock().await;
+                let handle = self.lock_kernel(handle).await;
                 egress::EgressEnforcementCapability {
                     connect_ipv4: handle.is_attached(),
                     connect_ipv6: handle.connect6_attached(),
@@ -236,15 +236,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     reason: "original network reference still belongs to another generation".into(),
                 });
             }
-            if let Err(error) = self.persist_discovery_reference(&reference).await {
-                // A refusal decided in memory never reached the journal, so no
-                // publication can name this address yet. Hand it back now rather
-                // than leave a hold nothing tracks. After an uncertain write the
-                // journal may record it, so only retirement may release it.
-                if !matches!(self.discovery_ownership, DiscoveryOwnership::Uncertain) {
-                    self.hand_back_network_reference(reference);
+            match self.persist_discovery_reference(&reference).await {
+                Ok(discovery_ownership::Landing::Landed) => {}
+                // The write outlasted the turn, or another was in flight
+                // (#1266). The workload mustn't start before its hold is on
+                // disk, so the start stays pending, and whoever asked asks
+                // again. The hold stays too: the write may be recording it.
+                Ok(discovery_ownership::Landing::InFlight) => {
+                    return Err(BunError::StillRunning {
+                        work: format!("journalling {id}'s network reference"),
+                    });
                 }
-                return Err(error);
+                Err(error) => {
+                    // A refusal decided in memory never reached the journal, so
+                    // no publication can name this address yet. Hand it back now
+                    // rather than leave a hold nothing tracks. After an uncertain
+                    // write the journal may record it, and a hold an earlier
+                    // ask's write recorded is the journal's, so only retirement
+                    // may release either.
+                    if !matches!(self.discovery_ownership, DiscoveryOwnership::Uncertain)
+                        && !self.journal_holds(&reference)
+                    {
+                        self.hand_back_network_reference(reference);
+                    }
+                    return Err(error);
+                }
             }
             self.network_references.insert(id.clone(), reference);
         }
@@ -283,6 +299,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // generation, so one that lands late is harmless.
         let reference = match self.network_references.get(id).cloned() {
             Some(reference) => reference,
+            // Its start's write may be recording the hold right now (#1266):
+            // the journal before it would read as not recording it.
+            None if self.reference_write_in_flight(id) => {
+                return Err(BunError::StillRunning {
+                    work: format!("journalling {id}'s network reference"),
+                });
+            }
             None => {
                 let read = off_loop_work::WorkKey::ReadNetworkReference(id.clone());
                 let Some(held) = self.read_network_reference(read, id).await? else {
@@ -481,7 +504,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })?;
         self.cgroup_ns_bpf_keys.insert(cgroup_id);
         crate::sesame::firewall::write_cgroup_namespace_entry(
-            &mut handle.lock().await.bpf,
+            &mut self.lock_kernel(&handle).await.bpf,
             cgroup_id,
             source_namespace,
         )
@@ -503,11 +526,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // Remember partial publication before attempting the write. The
             // durable source owner retains every grant until confirmed cleanup.
             self.firewall_bpf_keys.insert(key);
-            crate::sesame::firewall::write_firewall_entry(&mut handle.lock().await.bpf, key, value)
-                .map_err(|error| BunError::DeployFailed {
-                    app_name: app_name.into(),
-                    reason: error.to_string(),
-                })?;
+            crate::sesame::firewall::write_firewall_entry(
+                &mut self.lock_kernel(&handle).await.bpf,
+                key,
+                value,
+            )
+            .map_err(|error| BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: error.to_string(),
+            })?;
         }
         if allow.is_empty() {
             return Ok(());
@@ -629,7 +656,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })
             .map(|(_, binding)| binding)
             .collect();
-        let mut ebpf = handle.lock().await;
+        let mut ebpf = self.lock_kernel(&handle).await;
         if survivors.is_empty() {
             return egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id);
         }

@@ -162,7 +162,7 @@ The acceptance test for the whole story reads like the incident report we never 
 
 Once an image is in the catalog, a worker that doesn't hold it locally fetches the layers from a peer that does. `pull.rs` reads the Raft layer-holder set, picks a peer, and downloads each missing blob over the same `GET /v2/{repository}/blobs/{digest}` endpoint, verifying the digest before storing. That's live in Phase 5 — push once, and every other node pulls internally.
 
-The tempting next step is a *pull-through cache*: your apps reference `alpine:latest` or `nginx:1.25`, and the first node to need one transparently pulls it from Docker Hub (via the `oci-distribution` client from Phase 1), stores the layers, and commits the manifest to Raft so the next node gets it from a peer. The plumbing is sketched in `pull.rs`, but wiring it end to end — intercepting the miss, caching upstream, committing to Raft — is deferred to Phase 12. For now, public base images are still pulled from Docker Hub per node; only images you've explicitly pushed to Pickle replicate across the cluster. We'll come back to it in Chapter 12.
+The tempting next step is a *pull-through cache*: your apps reference `alpine:latest` or `nginx:1.25`, and the first node to need one transparently pulls it from Docker Hub (via the `oci-client` crate from Phase 1), stores the layers, and commits the manifest to Raft so the next node gets it from a peer. The plumbing is sketched in `pull.rs`, but wiring it end to end — intercepting the miss, caching upstream, committing to Raft — is deferred to Phase 12. For now, public base images are still pulled from Docker Hub per node; only images you've explicitly pushed to Pickle replicate across the cluster. We'll come back to it in Chapter 12.
 
 (It landed there: the cache stores upstream images under `cache/<host>/<repository>` and serves them from peers. And since 0.1.6 an apply binds every tag to a digest, so the cache and every node agree on which bytes `nginx:1.25` means. Chapter 10's "A tag is a promise nobody keeps" tells that part.)
 
@@ -1349,7 +1349,7 @@ Pickle is almost entirely testable in-process. A blob store is a directory, the 
 
 ### Unit tests — the registry without the network
 
-The 104 tests in `src/pickle/` cover:
+The tests in `src/pickle/` cover:
 
 - **Digest and manifest** — `Digest::new` accepts well-formed digests and rejects everything else; manifests round-trip through serde unchanged.
 - **Blob store** — write/read, upload sessions, and the digest-mismatch rejection path (`PickleError::DigestMismatch`).
@@ -1393,8 +1393,6 @@ cargo test --lib pickle       # the whole registry, in-process
 ```
 
 Reach for the gated commands only when you want to exercise real images or real runtimes. The full env-var table lives in `docs/README.md`.
-
-Phase 5 adds 72 tests, bringing the total to 867.
 
 
 ### Sharing the authentication budget

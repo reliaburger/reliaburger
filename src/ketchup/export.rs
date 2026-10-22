@@ -345,6 +345,25 @@ async fn export_logs_locked(
 mod tests {
     use super::*;
 
+    // The durable id and export scope are stored in the checkpoint, so a
+    // changed digest would re-export every file. Pin both to known answers.
+    #[test]
+    fn durable_id_is_the_name_and_known_content_digest() {
+        assert_eq!(
+            durable_id("metrics.parquet", b"abc"),
+            "metrics.parquet@ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn export_scope_matches_its_known_answer() {
+        // SHA-256 of "file:///tmp/x", a zero byte, then "node-1".
+        assert_eq!(
+            export_scope("/tmp/x", "node-1").unwrap(),
+            "0ede71f7398200a7f2c851bbd4998c1ab588e01942ccaade21ed2864be37ccae"
+        );
+    }
+
     /// Read every object under `dir` (a local export destination) as a map of
     /// relative path → bytes, so tests can assert on what actually landed.
     fn exported_files(dir: &Path) -> Vec<std::path::PathBuf> {

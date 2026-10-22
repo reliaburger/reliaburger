@@ -25,12 +25,19 @@ requests, main and manual candidate builds:
 | `relish-linux-x86_64` | Ubuntu 22.04 x86_64 | Linux CLI |
 | `relish-linux-aarch64` | Ubuntu 22.04 arm64 | Linux CLI |
 | `relish-macos-aarch64` | macOS 15 Apple silicon | Laptop CLI |
-| `relish-macos-x86_64` | macOS 15 Intel | CLI build; cold-install qualification still required |
 | `reliaburger-guest-ubuntu-24.04-…-aarch64.qcow2` | Ubuntu 24.04 arm64 | Quickstart VM image |
 | `reliaburger-guest-ubuntu-24.04-…-x86_64.qcow2` | Ubuntu 24.04 x86_64 | Quickstart VM image |
 
 Pull requests build the guest images only when `build_guest_image.sh`,
 `guest-images.json` or the workflow changes.
+
+There's no Intel macOS build. 0.2.1 was the last release with
+`relish-macos-x86_64` (maintainer decision, 17 October 2026,
+[#1018](https://github.com/reliaburger/reliaburger/issues/1018)): nothing ever
+qualified it, Intel macOS runners are the scarcest on Actions, and the macOS
+CLI only drives Linux VMs anyway. The installer refuses an Intel Mac and
+points at a Linux host or at 0.2.1. The x86_64 guest image stays, because
+Linux x86_64 hosts use it.
 
 Native runners avoid depending on tools installed outside a cross-build
 container. Runner labels follow GitHub's
@@ -59,6 +66,42 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
 
 So nothing reaches a train, or `main`, without the full set having passed on
 that exact commit.
+
+## Refreshing dependencies
+
+The first PR on every minor release's train refreshes the dependencies, so
+the whole soak gate runs against the new set rather than a lockfile nobody
+has looked at since the last advisory
+([#1026](https://github.com/reliaburger/reliaburger/issues/1026)). 0.2.1's
+gate found why this matters: the soak bricked a Raft store with a redb crash
+that redb 4.2.0 had already fixed, while we still locked 2.6.3
+([#1024](https://github.com/reliaburger/reliaburger/issues/1024)).
+
+1. Run `make outdated` and save its output for the PR. It lists what `cargo
+   update` would move and every crate a major version behind.
+2. Run `cargo update`. It stays within the ranges in `Cargo.toml`, so it
+   never crosses a major version. Check that `Cargo.lock` has no `git`
+   sources.
+3. If `time` or `thiserror` moved, copy their new versions into the `=` pins in
+   `tests/contracts/cron/Cargo.toml` and run `cargo update --manifest-path
+   tests/contracts/cron/Cargo.toml`. CI's optimised cron contract fails
+   when the two graphs differ.
+4. Run `make audit`, `make ci` and every gated target, and add the `full-ci`
+   label to the PR.
+5. If one crate's update breaks something, pin it back with `cargo update -p
+   <crate> --precise <old version>`, name it in the PR, and open an issue.
+6. Pick the majors worth taking this release from the `make outdated` list
+   and bump them one crate per PR, security-relevant crates first. A bump
+   that changes a wire or durable format bumps `protocol` or `state` in
+   `CURRENT` (`src/compatibility.rs`).
+
+Between releases, [Dependabot](../.github/dependabot.yml) opens one grouped
+PR a week per ecosystem. Its Cargo PR is lockfile-only, the same `cargo
+update` as step 2; it never proposes a major version, which stays a
+deliberate PR of its own. It leaves the `dtolnay/rust-toolchain` tags alone,
+because those are the compiler pins below. The weekly
+[`security.yml`](../.github/workflows/security.yml) run prints `make
+outdated` in its job summary.
 
 ## Compiler baseline
 
@@ -141,11 +184,11 @@ gates. Any incompatible wire or durable-state change bumps `protocol` or
 so an upgrade across that bump means starting a fresh cluster. So
 `relish upgrade` works only between builds of the same format (maintainer
 decision D31 in [#674](https://github.com/reliaburger/reliaburger/issues/674),
-10 October 2026). Every release from 0.1.0 to 0.2.0 bumped a format, so no
+10 October 2026). Every release from 0.1.0 to 0.2.1 bumped a format, so no
 rolling upgrade between two published releases has run yet. A release that
-keeps 0.2.0's pair could roll in place, and qualifying a real
+keeps 0.2.1's pair could roll in place, and qualifying a real
 published-to-published rolling walk on such a patch release is a goal, not a
-0.2.0 gate. The pre-1.0 rule for known harness artefacts in
+release gate. The pre-1.0 rule for known harness artefacts in
 the V02 soak (step 4 of [staging a candidate](#staging-a-candidate))
 stays as it is.
 
@@ -373,6 +416,23 @@ The steps:
 `relish upgrade check` from 0.2.0 on reads each release's pair from the
 metadata and says when a release needs this instead of a rolling upgrade.
 
+### Upgrading from 0.2.0
+
+0.2.1 can't roll onto a 0.2.0 cluster either. Its fixes change what the
+council and the nodes store and send: GitOps ownership and configuration in
+Raft, recovery ids on every Raft message, durable registry tags, node-by-node
+rollouts, partial placement, gossip replay protection, compacted task results,
+new fence files, SHA-256 token hashes and redb 4's file format for the Raft
+store (the full list is in `src/compatibility.rs`). So the protocol moved from
+51 to 52 and the state format from 68 to 69, and a 0.2.0 leader refuses
+`relish upgrade start v0.2.1` before it records a run.
+
+The move is a fresh cluster, as [from 0.1.6](#upgrading-from-016), with the
+same steps and the same losses: secrets re-encrypted to the new keys, tokens
+created again, a new CA, job history exported first and volumes restored from
+snapshots. Tokens have to be reissued anyway, because 0.2.1 stores their
+hashes differently.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
@@ -478,8 +538,11 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.2.0` today), so
-bump that default in the same change that announces a newer release.
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.1` today), so
+bump that default in the same change that announces a newer release. Both
+scripts need a mode, `--laptop` or `--install-only`; with none they explain the
+choices and exit 2. For a release from before 0.2.2 the bootstrap drops
+`--laptop`, which that release's installer doesn't know.
 
 Before tagging a release, complete the managed-cluster and clean-install
 gates. Record timing from an empty cache, the actual artefact digests, host and
@@ -543,7 +606,7 @@ the real `curl … | sh` install against it on every host we advertise.
    again, and one whose bytes differ stops the run without changing anything.
    A rebuilt candidate (a new attempt) gets its own tag.
 
-3. **Qualify it on every host in the matrix**: Apple silicon, Intel macOS,
+3. **Qualify it on every host in the matrix**: macOS on Apple silicon,
    Linux x86_64 and Linux arm64. From a checkout of the same `main`:
 
    ```sh
@@ -553,7 +616,7 @@ the real `curl … | sh` install against it on every host we advertise.
    ```
 
    It creates a fresh, short `RELIABURGER_HOME` under `/tmp` and runs
-   `curl -fsSL https://reliaburger.com/install.sh | RELIABURGER_RELEASE_BASE_URL=… sh -s -- --timings`,
+   `curl -fsSL https://reliaburger.com/install.sh | RELIABURGER_RELEASE_BASE_URL=… sh -s -- --laptop --timings`,
    exactly as a user would. Use `--bootstrap docs/website/install.sh` if the
    website doesn't serve the current bootstrap yet (the record notes which one
    ran). It checks `candidate.json` against the digest, `SHA256SUMS` against
@@ -604,7 +667,7 @@ the real `curl … | sh` install against it on every host we advertise.
    runs found for 0.1.0, candidate by candidate, and the PR that fixed each
    failure.
 
-   The [job-soak extension plan](plans/2026-10-10-plan-release-job-soak.md)
+   The [job-soak extension plan](plans/archive/2026-10-10-plan-release-job-soak.md)
    runs fresh-container, shared-container and native host work alongside these
    apps and faults. Accounting, independent effects, heartbeat/progress, exact
    owner inventory, fault coverage and positive cleanup affect the verdict.
@@ -694,7 +757,9 @@ the real `curl … | sh` install against it on every host we advertise.
    Either tier also fails on a slow agent loop. Every settle and heavy check
    reads each node's `bun_agent_loop_turn_seconds` histogram from
    `/v1/metrics`, and the checker fails the tier (`agent-loop-turn`) on any
-   turn longer than 1 s since the last check, naming the node, the branch
+   turn longer than 1 s since the last check (a Bun restart counts the new
+   process from zero, and never counts the old one's turns twice), naming
+   the node, the branch
    (`command`, `deploy_op`, `health_tick`, …) and how long the worst one
    took. A turn that long holds every caller on the node, the way the stalls
    behind 0.1.0's soak failures did; the budget comes from the [agent-loop
@@ -814,7 +879,8 @@ the real `curl … | sh` install against it on every host we advertise.
    section (`#release-testing` in `index.html`) to the new release: its
    latest-release paragraph, its headline numbers with links to this
    release's records, and the soak charts beside them. The charts are copies
-   of the final app soak's and the final job soak's `-charts/` directories in
+   of the app soak's (the V02 fast tier, now that the gate has no V02 final)
+   and the final job soak's `-charts/` directories in
    `docs/website/assets/soak/`, which holds only this release's
    ([how](website/README.md#soak-charts)). `tests/suite/website.rs`
    fails while the section names a version older than the installer's
@@ -906,7 +972,7 @@ the candidate installer from empty caches:
 curl --fail --location --proto '=https' --proto-redir '=https' \
   https://YOUR_HOST/candidate/install.sh -o /tmp/reliaburger-candidate-install.sh
 RELIABURGER_RELEASE_BASE_URL=https://YOUR_HOST/candidate \
-  sh /tmp/reliaburger-candidate-install.sh
+  sh /tmp/reliaburger-candidate-install.sh --laptop
 ```
 
 The static bootstrap accepts the same environment variable and fetches the

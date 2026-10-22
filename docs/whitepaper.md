@@ -2,7 +2,7 @@
 
 **A whitepaper on the design, architecture, and vision for Reliaburger, a radically simplified container orchestration platform written in Rust.**
 
-**Version 0.2.0, October 2026**
+**Version 0.2.1, October 2026**
 
 ---
 
@@ -222,6 +222,9 @@ tls = "cluster"  # certificate from the cluster's Ingress CA; omit for plain HTT
 **Autoscaling:** Apps can declare an autoscale block to adjust replicas based on observed metrics:
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.autoscale]
 min = 2
 max = 10
@@ -238,6 +241,9 @@ CPU is the wrong signal for an inference server, which keeps its GPU busy whenev
 **Placement constraints:** Nodes carry labels (configured in `node.toml`). Apps can use `required` labels (hard constraints) and `preferred` labels (soft constraints) to control placement.
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.placement]
 required = ["region=us-east"]
 preferred = ["ssd=true"]
@@ -254,6 +260,9 @@ A Job is a run-to-completion task, either on-demand or scheduled, replacing Kube
 image = "myapp:v1.4.2"
 command = ["npm", "run", "migrate"]
 run_before = ["app.api"]
+
+[app.api]
+image = "myapp:v1.4.2"
 
 [job.cleanup]
 image = "cleanup:latest"
@@ -289,6 +298,7 @@ resource demand, storage and service quality. See the [job manual](manual/14_bat
 
 **Dependencies (planned, 0.9.0):** an `after` key makes one job wait for another: for all of it, element by element (task *i* after task *i*), or for a share of its tasks to succeed. The condition is stored on the job definition and evaluated against compact index sets, not as per-task edges, so a 16-million-task pipeline costs no more Raft state than two arrays. There's no DAG language: full workflows stay in Airflow or Nextflow, which drive Reliaburger through a Python client and their own provider and executor (see §22).
 
+<!-- snippet: planned #1238 -->
 ```toml
 [job.embed]
 image = "embed:v1"
@@ -309,6 +319,9 @@ after = { job = "embed", min_success = "95%" }
 Reliaburger stores secrets encrypted in git using asymmetric encryption (age). The cluster's public key is distributed freely; only the cluster holds the private key. Developers can encrypt secrets offline without cluster access.
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.env]
 DATABASE_URL = "ENC[AGE:YWdlLWVuY3J5cHRpb24...]"
 NODE_ENV = "production"
@@ -325,6 +338,9 @@ NODE_ENV = "production"
 A free-text file injected into a specific path inside the container. Unlike environment variables, ConfigFiles can contain arbitrary content (NGINX configs, application YAML, TLS certificates). Declared inline with `content`, which each instance gets as its own read-only copy (so two files with the same name can't collide, and a rollout never rewrites the file under a running instance), or with `source` naming a host path on the node, which the node bind-mounts. A `source` is gated like a host-path volume (§5.5): the node must list it under `[storage] allowed_host_paths`, and a token with a `[permission]` block needs `host-exec`.
 
 ```toml
+[app.nginx]
+image = "nginx:alpine"
+
 [[app.nginx.config_file]]
 path = "/etc/nginx/nginx.conf"
 content = """
@@ -385,6 +401,7 @@ max_replicas = 200
 
 A Group is several members that start together, fail together and restart together: a training job across nodes, a model too big for one node, or an RL job that mixes trainers, inference servers and sandboxes. Kubernetes needs JobSet, LeaderWorkerSet and a gang scheduler for this; Slurm gets it from allocating nodes to a job. It earns its own type because none of an App's or a Job's rules (independent replicas, independent retries) hold for it.
 
+<!-- snippet: planned #1223 -->
 ```toml
 [group.finetune]
 members = 2                       # nodes
@@ -403,6 +420,7 @@ The leader places every member in one decision or none, injects each member's ra
 
 A Queue is a weighted share of the cluster for batch work. Jobs, arrays and groups name a queue; the leader orders their grants by each queue's dominant share of CPU, memory and GPUs (dominant resource fairness), with usage that decays over time, so a team that ran a lot yesterday yields to one that didn't. Backfill lets small work run in front of a large waiting group without delaying it. Priority classes and preemption take capacity back for an under-share queue, with a grace period for checkpoints, and a preempted attempt doesn't spend a retry. Apps always rank above batch. Namespace quotas stay as hard caps on top of queues.
 
+<!-- snippet: planned #1238 -->
 ```toml
 [queue.research]
 weight = 2
@@ -418,6 +436,7 @@ See the [batch scheduler research](plans/2026-10-11-research-batch-schedulers.md
 
 `[model.*]` is shorthand for serving an LLM, not a new type. It expands to an ordinary App with an inference engine image (vLLM, SGLang or llama.cpp), a read-only mount of the model's weights from Pickle, readiness checked with a real generation, the engine's metrics endpoint, inference-aware routing in Wrapper and autoscaling on engine metrics. `relish apply --dry-run` shows the expansion.
 
+<!-- snippet: planned #1221 -->
 ```toml
 [model.qwen3]
 source = "models/qwen3-32b:2026-09"
@@ -477,7 +496,7 @@ short-lived token per node against the current leader:
 ```sh
 $ JOIN_TOKEN="$(relish --endpoint https://10.0.1.5:9117 \
     --ca-cert cluster/identity/root-ca.crt \
-    join-token create --ttl 15m)"
+    join-token create --node-id node-02 --ttl 15m)"
 ```
 
 The council stores only its hash and expiry. Relish prints the plaintext once;
@@ -633,6 +652,9 @@ This eliminates a large proportion of Kubernetes debugging pain: encapsulation o
 Wrapper can run on every node and handles TLS termination, host/path-based routing, health-aware load balancing, connection draining during deploys, and WebSocket support. It is opt-in in `node.toml`. The v1 TLS sources are the cluster's Ingress CA and an operator-supplied certificate/key pair. Automatic ACME/Let's Encrypt provisioning is deferred.
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.ingress]
 host = "myapp.com"
 tls = "cluster"     # clients must trust the cluster root CA
@@ -715,6 +737,9 @@ Isolation needs the eBPF data path. `relish init` enables it on rootful Linux ru
 **Egress is unrestricted by default.** An app with no `egress` block can reach any external destination. Declaring an `egress` block flips that app to deny-by-default: only the listed destinations are permitted, and everything else is blocked. Use it to contain data exfiltration from compromised containers.
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.egress]
 allow = ["api.stripe.com:443", "hooks.slack.com:443"]
 ```
@@ -757,6 +782,9 @@ Key properties:
 When an App's image changes, each node running it performs a rolling deployment of its own instances: start a new instance, wait for its health check, add it to Wrapper routing, drain the old instance, stop it. Old and new versions coexist on the same node without port conflicts.
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.deploy]
 strategy = "rolling"      # default; or "blue-green"
 max_surge = 1             # extra instances during the rollout (default 1)
@@ -853,7 +881,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish status` | One-line cluster summary | `kubectl cluster-info` + `kubectl get nodes` |
 | `relish compile <path>` | Resolve config to final form | (none — Helm template + kustomize build) |
 | `relish lint <path>` | Validate config files | `kubectl --dry-run=client` (barely) |
-| `relish fmt <path>` | Format and sort TOML files | (none) |
+| `relish fmt <path>` | Format and sort a TOML file, keeping its comments | (none) |
 | `relish plan <path>` *(planned)* | Preview changes before apply | `terraform plan` (K8s has nothing equivalent) |
 | `relish diff <a> <b>` | Structural diff between two configs (not live cluster drift) | `kubectl diff` (limited) |
 | `relish apply <path>` | Apply configuration | `kubectl apply` |
@@ -861,7 +889,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish batch` | Submit, watch, cancel and read results of task arrays and mixed manifests | (none) |
 | `relish jobs` | Job run summaries and rates, or schedule definitions | `kubectl get jobs,cronjobs` |
 | `relish deploy <path>` | Trigger a rolling deploy from a config file | `kubectl set image` |
-| `relish events` *(planned)* | Streaming event log | `kubectl get events` (1h expiry) |
+| `relish events` | Recent cluster-wide events (the TUI streams them) | `kubectl get events` (1h expiry) |
 | `relish logs <app>` | Stream/search logs | `kubectl logs` + `stern` |
 | `relish path <app> --to <app>` | Connectivity diagnosis | (none — manual iptables/DNS debugging) |
 | `relish inspect <resource>` | Deep resource inspection | `kubectl describe` |
@@ -869,7 +897,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish metrics <app>` | An app's own Prometheus metrics, scraped by its nodes | (none — requires Prometheus) |
 | `relish dashboard` | Read-only web dashboard through your authenticated CLI | `kubectl proxy` + a dashboard install |
 | `relish wtf` | Automated health check | (none — requires runbooks + Prometheus alerts) |
-| `relish exec` | Run a command inside a running container | `kubectl exec` |
+| `relish exec` | Run a command once inside a running container and exit with its code (interactive exec is planned) | `kubectl exec` |
 | `relish exec --debug` *(planned)* | Debug container (separate identity) | `kubectl debug` |
 | `relish resolve <name>` | Query eBPF service map | `kubectl get endpoints` + `nslookup` |
 | `relish firewall <app>` *(planned)* | Show effective firewall rules | `kubectl get networkpolicy` + CNI tools |
@@ -961,12 +989,18 @@ it injects any and exits non-zero if a step is refused. Admin doesn't
 override a disabled operation, and Bun attributes audit events to the
 authenticated credential rather than a client-supplied name.
 
-In 0.2.0 workload faults target apps only: the replica guard refuses a kill or
-pause aimed at a job, and array or shared-executor attempts aren't Smoker
-targets. Jobs are tested under node-level faults instead (Bun killed on a
-worker or the leader, delayed traffic between nodes, a full disk, slow
-fsync), which is how the release's job qualification breaks them. Job-aware
-chaos is planned for 0.2.2.
+Workload faults reach jobs and task arrays as well as apps. `relish fault
+kill render --instance 41` kills the attempt running task 41, wherever it
+runs, and the job handles it as it would a crash, under its own retry and
+`replay_unknown` policy. The replica guard applies
+only to apps, since a job is meant to finish; Bun decides what a target is
+from what runs, so a caller can't relabel an app to dodge the guard, and
+every other rail still applies. An attempt in its own container takes every
+fault. A command in a reusable executor takes kill and pause only, because a
+CPU, memory, I/O or network fault on the executor's shared cgroup would slow
+the tasks that run there next. The release's job qualification also breaks
+whole nodes under jobs (Bun killed on a worker or the leader, delayed traffic
+between nodes, a full disk, slow fsync).
 
 | | Chaos Mesh (K8s) | Litmus (K8s) | Gremlin (SaaS) | **Smoker** |
 |---|---|---|---|---|
@@ -1014,7 +1048,7 @@ guard, never a daily qualification: the 100-million-a-day claim needs the
 
 ## 20. Self-Upgrades
 
-Since every component of a node lives in the one `bun` binary, upgrading a node means replacing that binary and restarting the Bun process. The system automates this in a rolling fashion: workers upgrade first (with configurable parallelism), then council members one at a time to maintain quorum, then the leader upgrades last (in place — a council of three or more keeps quorum through the sub-second exec bounce; openraft 0.9 has no graceful leadership transfer). Application workloads are never interrupted, because the container runtime manages containers independently of Bun. During the rolling upgrade window, old and new binaries coexist, but only when both speak the same formats. Every binary carries a cluster protocol generation and a durable state generation (`src/compatibility.rs`), and nodes refuse peers, snapshots, backups and data directories stamped with a different pair. Before 1.0.0 we don't keep backwards compatibility at all: a release that changes a wire or storage format bumps a generation, and upgrading across that bump means starting a fresh cluster, with no migration (see [compatibility before 1.0.0](releasing.md#compatibility-before-100)). So until 1.0, self-upgrade works only between builds of the same format. Every release from 0.1.0 to 0.2.0 bumped one, so no rolling upgrade between two published releases has run yet; shipping a patch release that keeps its predecessor's formats, and qualifying a real published-to-published rolling walk on it, is a goal. A compatibility promise across versions is a post-1.0 goal.
+Since every component of a node lives in the one `bun` binary, upgrading a node means replacing that binary and restarting the Bun process. The system automates this in a rolling fashion: workers upgrade first (with configurable parallelism), then council members one at a time to maintain quorum, then the leader upgrades last (in place — a council of three or more keeps quorum through the sub-second exec bounce; openraft 0.9 has no graceful leadership transfer). Application workloads are never interrupted, because the container runtime manages containers independently of Bun. During the rolling upgrade window, old and new binaries coexist, but only when both speak the same formats. Every binary carries a cluster protocol generation and a durable state generation (`src/compatibility.rs`), and nodes refuse peers, snapshots, backups and data directories stamped with a different pair. Before 1.0.0 we don't keep backwards compatibility at all: a release that changes a wire or storage format bumps a generation, and upgrading across that bump means starting a fresh cluster, with no migration (see [compatibility before 1.0.0](releasing.md#compatibility-before-100)). So until 1.0, self-upgrade works only between builds of the same format. Every release from 0.1.0 to 0.2.1 bumped one, so no rolling upgrade between two published releases has run yet; shipping a patch release that keeps its predecessor's formats, and qualifying a real published-to-published rolling walk on it, is a goal. A compatibility promise across versions is a post-1.0 goal.
 
 Reliaburger verifies binary integrity via dual signatures: an embedded signing key set compiled into the binary AND an external signing key configured in `node.toml`. Network upgrades require both signatures. Published release metadata carries only the release signature, so `relish upgrade start <version>` countersigns each download with the operator's key (`--external-key`) or takes a countersigned envelope (`--sig`). It picks the build for the platform each node reports rather than the one relish runs on, and a cluster that mixes architectures gets one build per platform. Before staging, each node runs the verified candidate once with `--compatibility` and refuses a binary whose formats differ or that doesn't answer within 60 seconds, a hang guard sized for macOS, which assesses every new executable before its first run. Automatic rollback triggers if a node fails to start on the new version.
 
@@ -1030,6 +1064,7 @@ Reliaburger clusters are independent by design. Each has its own Raft consensus,
 
 Each cluster is a **franchise location**: independently operated, sharing standards and visibility. Peering is a single command:
 
+<!-- snippet: planned #711 -->
 ```bash
 relish franchise join https://prod-west.example.com --token <peer-token>
 ```
@@ -1046,6 +1081,7 @@ Onion's eBPF layer resolves a new DNS zone: `name.cluster.franchise` (e.g., `red
 
 Apps opt in explicitly:
 
+<!-- snippet: planned #711 -->
 ```toml
 [app.web.egress]
 allow_franchise = ["redis.prod-west"]
@@ -1101,17 +1137,17 @@ The following features are intentionally excluded from Reliaburger v1. Each is a
 
 Reliaburger provides bidirectional Kubernetes migration tooling. Neither direction is a perfect translation (the systems have different abstractions), but the goal is to preserve as much as possible and clearly report what was lost.
 
-**Importing from Kubernetes** (`relish import`) converts Kubernetes YAML into Reliaburger TOML. The importer correlates related resources automatically: a Deployment + Service + Ingress + HPA that Kubernetes treats as four separate objects becomes a single `[app.*]` block in TOML. Today it groups them by name: a Service with the Deployment's name, an Ingress whose backend names that Service, and an HPA whose scale target names the Deployment. Matching on label selectors, the way Kubernetes itself does, is planned ([#703](https://github.com/reliaburger/reliaburger/issues/703)). Every import produces a migration report with three sections: what was converted directly, what was approximated (review recommended), and what was dropped (no Reliaburger equivalent) with guidance on alternatives.
+**Importing from Kubernetes** (`relish import`) converts Kubernetes YAML into Reliaburger TOML. The importer correlates related resources automatically: a Deployment + Service + Ingress + HPA that Kubernetes treats as four separate objects becomes a single `[app.*]` block in TOML. It matches them the way Kubernetes routes them, within one namespace: a Service attaches to every workload whose pod template labels include its selector, an Ingress follows its backend Service to that workload, and an HPA joins the workload its scale target names. Everything is keyed by namespace and name, so same-named resources in two namespaces never overwrite each other. A ConfigMap a workload reads with `envFrom` is flattened into its env, and a Job's `backoffLimit` and `activeDeadlineSeconds` become its attempt limit and timeout. Every import produces a migration report with three sections: what was converted directly, what was approximated (review recommended), and what was dropped (no Reliaburger equivalent) with guidance on alternatives.
 
 ```bash
 # From files (repeat -f for multiple manifests)
 relish import -f deployment.yaml -f service.yaml
 
-# Fail on any conversion warning (CI gate)
+# Fail if anything was approximated or dropped (CI gate)
 relish import -f deployment.yaml --strict
 ```
 
-**Exporting to Kubernetes** (`relish export`) generates standard Kubernetes manifests from Reliaburger configuration. Each `[app.*]` produces a Deployment + Service, plus Ingress and HPA if the app defines ingress and autoscale blocks. Each `[job.*]` produces a Job or CronJob. Features with no Kubernetes equivalent (auto-rollback, Smoker fault rules, process workloads) are noted in the export report.
+**Exporting to Kubernetes** (`relish export`) generates standard Kubernetes manifests from Reliaburger configuration. Each `[app.*]` produces a Deployment + Service, plus Ingress and HPA if the app defines ingress and autoscale blocks. Each `[job.*]` produces a Job or CronJob. Containers keep their command, arguments, working directory and user. Features with no Kubernetes equivalent (auto-rollback, Smoker fault rules, process workloads) are noted in the export report, and so is every encrypted env value, which exports as a placeholder that needs a Kubernetes Secret.
 
 ```bash
 relish export -f myapp.toml > k8s-manifests.yaml
@@ -1123,7 +1159,7 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 
 ## 23. Comparison Matrix
 
-The Reliaburger column describes 0.2.0. Rows marked *Target* are design goals from §2 that no release has measured yet, and *Planned* rows aren't in the binary; the [scope and limits](README.md#scope-and-limits) and the [release order](roadmap.md#releases-after-010) say what ships and when the rest is due.
+The Reliaburger column describes 0.2.1. Rows marked *Target* are design goals from §2 that no release has measured yet, and *Planned* rows aren't in the binary; the [scope and limits](README.md#scope-and-limits) and the [release order](roadmap.md#releases-after-010) say what ships and when the rest is due.
 
 | | Kubernetes | k3s / k0s | Nomad | Docker Compose | **Reliaburger** |
 |---|---|---|---|---|---|
@@ -1228,7 +1264,7 @@ Not the gossip itself: Mustard carries only lightweight, bounded state (membersh
 
 ### Q4: With encrypted-in-git secrets, how do developers encrypt without cluster access?
 
-Reliaburger uses asymmetric encryption (age). The cluster's public key is committed to the git repository and can be distributed freely. Anyone with the public key can encrypt secrets offline, no cluster access needed. Only the cluster holds the private key for decryption. Reusing ciphertext with a replacement cluster currently requires an operator to provision the existing key material out of band; the previously proposed `relish init --import-key` command isn't implemented. Key rotation supports a graceful transition period where both old and new ciphertexts are accepted.
+Reliaburger uses asymmetric encryption (age). The cluster's public key is committed to the git repository and can be distributed freely. Anyone with the public key can encrypt secrets offline, no cluster access needed. Only the cluster holds the private key for decryption. Reusing ciphertext with a replacement cluster currently requires an operator to provision the existing key material out of band; the previously proposed `--import-key` flag for `relish init` isn't implemented. Key rotation supports a graceful transition period where both old and new ciphertexts are accepted.
 
 ### Q5: When a new leader is elected, can it make wrong scheduling decisions from incomplete state?
 
@@ -1285,7 +1321,7 @@ new app deployments still require free capacity and rollout headroom.
 
 **Implementation status:** this is the architecture implemented in
 [#266](https://github.com/reliaburger/reliaburger/pull/266), following the
-[resource-aware jobs plan](plans/2026-10-04-plan-delegated-jobs.md). The daily
+[resource-aware jobs plan](plans/archive/2026-10-04-plan-delegated-jobs.md). The daily
 throughput target remains unqualified until real workloads sustain at least
 1,158 unique successful completions per second with headroom, concurrent apps,
 failure recovery and bounded memory and storage. A short simulated burst doesn't
@@ -1311,7 +1347,7 @@ task cgroups; helper resources stay charged while idle. Other platforms retain
 the original owned process backend and refuse unsupported explicit limits.
 Host commands retain host access and Bun's user; they require trusted workloads.
 Neither path removes process creation, durable outcomes or external-effect
-idempotency costs. See the [execution and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md).
+idempotency costs. See the [execution and qualification plan](plans/archive/2026-10-07-plan-reusable-executors-and-throughput.md).
 
 Fast delegated jobs use bounded grant lookahead derived from verified duration
 summaries, covering receipt acceptance and grant delivery without increasing
@@ -1378,7 +1414,7 @@ fair share between teams in 0.10.0 ([roadmap](roadmap.md#releases-after-010),
 [LLM workloads research](plans/2026-10-11-research-llm-workloads.md)). Their validation
 must measure useful records/tokens or training samples per second, queue and
 serving latency, accelerator utilisation and recovery, as well as task counts.
-See the [AI implementation sequence](plans/2026-10-04-plan-delegated-jobs.md#ai-training-and-inference).
+See the [AI implementation sequence](plans/archive/2026-10-04-plan-delegated-jobs.md#ai-training-and-inference).
 
 ### Q8: Can a single leader actually schedule 100M+ jobs per day while doing everything else?
 

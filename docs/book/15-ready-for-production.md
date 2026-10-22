@@ -518,7 +518,7 @@ HTML report. On Linux CI that same run is the test gate, so we don't pay for the
 
 Instrumented programmes write their counters to a `.profraw` file as they exit. Our
 crash-recovery tests SIGKILL instrumented Bun processes on purpose, and one day a kill landed
-mid-write: all 4,708 tests passed, then `llvm-profdata` refused the truncated file and failed
+mid-write: every test passed, then `llvm-profdata` refused the truncated file and failed
 the whole report. The report steps now pass `--failure-mode all`, which skips an unreadable
 profile with a warning and only fails when none can be read. Skipping one killed process's
 partial counts can pull coverage down a hair. It can't push it up, so the floor still means
@@ -545,6 +545,38 @@ that variable at compile time to the path of the `relish` it built for the tests
 check costs nothing extra and runs on every platform `make test` does. It catches the same
 drift a reader would hit after copying an example.
 
+The docs are examples too, and for a long time only the five-minute tour was checked. The
+audit found the manual telling operators to run `relish events` three times (there's no such
+command yet), a whitepaper join transcript missing the `--node-id` that `join-token create`
+requires, and a dozen TOML blocks that failed validation because a sub-table like
+`[app.api.health]` had no app around it. The manual is compiled into `relish`, so those
+mistakes shipped inside the binary. `tests/suite/doc_snippets.rs` now reads every fenced
+block in the manual, both READMEs and the whitepaper. Shell blocks have each `relish`
+invocation run under `RELISH_PARSE_ONLY=1`. TOML blocks go to the type that really reads them:
+`Config` plus `validate()` for workloads, `NodeConfig` for node tables, the scenario loader
+for `[[step]]` files. Inline `` `relish …` `` spans in prose must at least name a real
+subcommand with real flags. Finding the commands means reading a little shell, and slice
+patterns make that short:
+
+```rust
+match rest {
+    [first, tail @ ..] if first == "sudo" || first == "export" || is_assignment(first) => {
+        rest = tail
+    }
+    [limactl, shell, _vm, tail @ ..] if limactl == "limactl" && shell == "shell" => {
+        rest = tail
+    }
+    _ => break,
+}
+```
+
+`tail @ ..` binds the rest of the slice to a name, so peeling `sudo` off the front is a
+pattern, not index arithmetic. A block that can't parse has to say so on the line before its
+fence: `<!-- snippet: fragment -->`, or `planned #N` and `pending #N` naming an open issue.
+A `pending` block is still checked and must still *fail*, so the marker can't outlive the
+issue. Markdown renderers drop HTML comments, and so does `relish manual`, so readers never
+see them.
+
 We apply the same rule to platform promises. The `ebpf` Cargo feature can be selected on
 macOS even though Aya and the kernel hooks exist only on Linux. An Aya-using branch therefore
 needs both conditions:
@@ -567,10 +599,10 @@ runner-minutes, and more than half of those minutes went to runs that a newer pu
 already cancelled. Nobody waits half an hour for feedback. They push again, which cancels the
 run, which makes the wait longer. So we measured where the time went before touching anything.
 
-Two-thirds of it was compiling. The portable suite, about 4,150 tests that take five minutes to
+Two-thirds of it was compiling. The portable suite, which takes five minutes to
 run, ran seven times per push: default and no-default features in three jobs, plus macOS. The
 only default feature is `kubernetes`, and nothing in the code depends on it being *off*, so the
-four no-default runs repeated the same 4,110 tests to prove the crate builds without one
+four no-default runs repeated the same tests to prove the crate builds without one
 dependency. A second `clippy --no-default-features` proves that in seconds. The coverage job
 compiled and ran the suite again under instrumentation, beside the uninstrumented run it
 duplicated. The 10,000-member scale test had its own 21-minute release build, because
@@ -598,6 +630,49 @@ The rest of the fix follows one idea: build once, then fan out.
   `cfg(target_os = "macos")`, and no feature switches it off, so the all-features pass covers
   it. Code that only the no-features pass compiles depends on a feature alone and builds the
   same on Linux. Dropping the second pass on macOS saves about three minutes.
+
+Building once still left a repeated cost. Each acceptance suite is a Make owner that runs
+nextest twice: `list`, to record which tests it selected, then `run`. Both passed
+`--archive-file`, so both unpacked the whole 2.9 GB archive. Four owners made eight
+extractions in `acceptance`, and the one cluster owner made two. On one October run those
+extractions took six minutes and 43 seconds, and only one per job was needed.
+
+Now each job extracts the archive once, in a step of its own, before any suite starts:
+
+```sh
+cargo nextest list --archive-file tests.tar.zst --extract-to . --extract-overwrite \
+    --workspace-remap . --list-type binaries-only --message-format json
+```
+
+`--list-type binaries-only` extracts and reads the archive's metadata without starting a test
+binary. The suites then use nextest's build reuse instead of the archive: `--binaries-metadata`
+and `--cargo-metadata` point at the two JSON files the extraction left in `target/nextest`,
+and `--target-dir-remap target --workspace-remap .` say where the build and the workspace
+live now. The Make recipes still choose the tests and own their prerequisites. Only the
+source of the executables changed.
+
+Our first attempt (#933) didn't survive hosted CI. It treated the extracted tree as
+untrusted: it hashed every extracted file into a receipt and had each owner rehash the lot
+before discovery, between discovery and execution, and afterwards. That's several passes over
+gigabytes of test binaries, which could easily eat the time we were trying to save. It also
+never ran a test. Its list of allowed paths expected only the two metadata files under
+`target/nextest`, and a real archive also carries `target/nextest/libdirs`, the Rust standard
+library the binaries link against. Both jobs stopped at "invalid immutable archive payload
+path".
+
+So what does the evidence actually need? The extracted tree lives in one job on one runner,
+and nothing outside that job can write to it. The job checks the archive's hash against the
+build job's output once, before extracting. Then it writes a small receipt: the archive's
+digest, the extraction command, and the digests of the two metadata files. The workflow
+passes the receipt's digest to each suite as a trusted step output. Each suite checks those
+two small files before it lists anything, and its sealed evidence carries the receipt. When
+the evidence gate aggregates, it checks that the suite reused exactly that metadata, from
+the builder's archive, with the same nextest. A suite that opened the archive again, or
+named different metadata, fails the gate. It's the same chain as before, archive to suite,
+with no multi-gigabyte rehashing.
+
+The local recipes work the same way, by the way: `make test-upgrade-node` followed by
+`make test-upgrade-cluster` shares one `target` directory too.
 
 The last piece is choosing what a run needs. A small script diffs a pull request against its
 base and sets three outputs, and every expensive job asks one of them:
@@ -702,6 +777,30 @@ is exactly what a disk stall *doesn't* cause. The step summary shows both measur
 anything it re-measured, so a benchmark that passed on its second try is still visible to
 anyone reading the trend.
 
+Measuring twice assumed the stall was brief. It isn't always. In the 0.2.1 merge queue the
+storage benchmark came out at 3.20 times the rest of its run, and at 2.93 on the re-measure a
+few minutes later: that runner's disk was slow for the whole job (#1038). We went back through
+every `criterion-task-arrays` artefact we still had, 179 runs over a week. Eight failed on this
+benchmark alone, and in none of them was any other benchmark above 1.11 times the rest. The
+giveaway was inside each failing benchmark: its ten Criterion samples ranged from about 15 ms to
+as much as 134 ms, where a healthy runner keeps them within a few per cent. Most of the
+benchmark's time goes on fsyncs, so what it really measures is the disk.
+
+We had three ways out. Normalising it against a disk-bound reference in the same job sounds
+like the median trick again, but the samples rule it out: the disk changes speed several times
+over within one benchmark's few seconds, so a reference measured just before or after sees a
+different disk. Dropping the benchmark from the gate would stop the failures and also stop it
+catching anything. So we split it. A twin, `storage/ledger_and_index_64k_tmpfs`, does exactly
+the same writes in a directory on `/dev/shm`. That's tmpfs, a filesystem held in memory, where
+an fsync returns at once, so what's left to measure is encoding, writing and indexing the
+records, which is what a change to the ledger code can actually make slower. The twin is
+gated like any other benchmark. The on-disk original is passed to `--report-only`: the summary
+shows its ratio, marked "report only", but it can't fail the run, isn't re-measured and isn't
+counted in the median the others are measured against. The one regression this no longer
+catches is a change that adds fsyncs, since those are free on tmpfs. It still shows up in the
+on-disk ratio for anyone reading the summary, but nothing fails on it. We accepted that: until
+the disk under the runner is steady, a gate on fsync time is a gate on the runner's disk.
+
 Why the median of the suite, and not a dedicated reference workload, a fixed loop measured
 alongside? We looked at it. Benchmarks bound by CPU, process spawning and disk speed up and
 slow down independently (2.07, 1.35 and 1.34 in the same run), so the verdict would hinge on
@@ -731,7 +830,7 @@ release had a dozen of them in flight. We timed twelve runs: 45 to 55 minutes of
 Runner queueing was mostly under ten minutes, so the runners weren't the problem. Portable
 macOS was the critical path in almost every run, at 35 to 49 minutes, then acceptance at about
 34. Everything else finished in about 15. Inside the macOS job, compiling the test binaries
-took 27 minutes; running all 6,288 tests took seven.
+took 27 minutes; running them took seven.
 
 So we asked what a pull request into a train actually needs to prove. That it compiles, lints
 clean on stable and on the minimum compiler, and passes the portable suite with the coverage
@@ -769,8 +868,8 @@ envelope can't be uploaded under another's name. A shard re-run on its own after
 keeps the attempt number GitHub gave it, so the check that one job's owners share an attempt
 treats each shard as its own job.
 
-Did splitting pay? Less than we hoped. The first full run with shards ran 2,094 tests in
-under three minutes per shard instead of seven, but each shard still compiled the whole suite
+Did splitting pay? Less than we hoped. The first full run with shards ran each shard's tests in
+under three minutes instead of seven, but each shard still compiled the whole suite
 for 38 minutes, so a shard took 42 to 44 minutes against the 45 before. That's level with
 acceptance, so macOS is no longer the only critical path, and no further. Three macOS jobs
 also wait longer for runners: one shard queued for 28 minutes behind other pull requests.
@@ -829,8 +928,26 @@ would enable it. `cargo tree --target all -i rkyv` found no active path, and Rel
 no rkyv archives. The advertised fix starts at the incompatible rkyv 0.8 API while
 `rust_decimal` 1.x deliberately pins its optional integration to 0.7. We recorded a temporary,
 expiring exception instead of pretending that changing an unused lockfile version was a fix.
-The exception has a condition attached: `make audit` asks Cargo for the active `rkyv`
-graph first, and fails if any feature or target activates it, or if Cargo can't answer.
+The exception had a condition attached: `make audit` asked Cargo for the active `rkyv`
+graph first, and failed if any feature or target activated it, or if Cargo couldn't answer.
+The October 2026 dependency refresh (below) retired it. The newer lockfile no longer
+carries `rkyv` at all, so the guard's own `cargo tree -i rkyv` failed with "did not match
+any packages", and we deleted the exception and the guard together. A test in the suite
+now fails if `rkyv` ever comes back.
+
+Then, the day after 0.2.1 finished qualifying, the opposite case arrived. The private keys
+of some emSign intermediate certificates had leaked, and RustSec flagged both the root list
+we bundle (`webpki-roots`) and the verifier (`rustls-webpki`). Every outbound HTTPS call to a
+public endpoint trusts that list: image pulls, object storage, `relish` over `wss://`. A
+`cargo update` fixed the verifier and the 1.x root list. But one copy of `webpki-roots`
+stayed at 0.26.11, because `tokio-tungstenite` still asks for 0.26, and the audit still
+failed on it. That release's source is one line, `pub use parent::TLS_SERVER_ROOTS;`, where
+`parent` is the 1.x crate under another name. Rust lets a crate re-export another crate's
+items, so 0.26.11 serves exactly the roots of whichever 1.x the lockfile picked, and that's
+now the fixed 1.0.10. So the flagged version was safe, but only because of what it
+re-exported. We gave the advisory a narrow exception, and a test in `tests/suite/` reads
+`Cargo.lock` and fails if any copy of the three crates is older than its fix. The exception
+leans on that test.
 
 The repository audit denies every new vulnerability and maintenance warning. Its short
 exception list expires on 18 November 2026, and the Make target fails after that date until we
@@ -841,6 +958,323 @@ quieter way to forget a problem.
 Now a green portable run means something narrow and valuable: the portable behaviour ran,
 without retries, on this machine. The privileged, cluster, upgrade, slow and benchmark jobs
 make their own claims. Smaller claims. Better evidence.
+
+### A fix you never picked up
+
+`cargo audit` answers one question: does a crate we lock have a published advisory? It
+says nothing about the bugs upstream fixed quietly, in a changelog line rather than a
+RustSec entry. The 0.2.1 release gate found one of those the hard way. A soak powered off a
+node while redb was growing the Raft log's file, and on the next start Bun panicked on an
+assertion in redb's page manager, every time, until we wiped the node
+([#1024](https://github.com/reliaburger/reliaburger/issues/1024)). redb 4.2.0's changelog
+describes exactly that crash, fixed. We were on 2.6.3. Nobody had chosen to stay there; we
+had just never asked to move.
+
+Two Cargo mechanisms got us there, and both are doing their job. The first is the version
+requirement. `redb = "2"` in `Cargo.toml` doesn't mean "version 2". It's a caret range,
+`>=2.0.0, <3.0.0`: any release that semantic versioning (semver) promises won't break our
+code. Below 1.0 the leftmost non-zero number counts as the major version, so `nix =
+"0.31"` takes any 0.31.x and never 0.32. If you know Go, this is close to a `go.mod`
+line, which also never crosses a major version, though Go makes that a new import path
+(`/v2`) where Cargo just refuses. Python's `~=` operator is the nearest pip equivalent.
+
+The second is the lockfile. When Cargo first resolves the graph it picks the newest
+version inside each range, then writes the exact choice, with a checksum, to `Cargo.lock`.
+A binary project commits that file, so every build, CI run and release uses the same bytes
+until someone runs `cargo update`. That's the point: a release we soaked for eight hours
+must be the release we ship. Go's minimal version selection reaches a similar place
+differently, by choosing the oldest version that satisfies everyone; Cargo chooses the
+newest and then freezes it.
+
+Put those together and the drift is obvious. Our lockfile moved when we added a crate or
+fixed an advisory, and at no other time. By October 2026 a plain `cargo update` had 244
+compatible updates waiting, and eighteen direct dependencies were a major version or more
+behind, redb among them. No range would ever have reached 4.x on its own.
+
+So we made moving routine
+([#1026](https://github.com/reliaburger/reliaburger/issues/1026)). The first PR of every
+minor release runs `cargo update`, which stays inside the ranges, and the release's soak
+then proves the new set. Dependabot opens the same lockfile-only refresh as one grouped PR
+each week between releases. Major versions stay deliberate, one crate per PR, because
+they're allowed to break an API or a wire format. `make outdated` lists them (it runs
+`cargo update --dry-run --verbose`, which changes nothing), and a weekly job prints the
+list, without ever failing the build. A lag report that broke builds would get muted
+within a week. One that nobody reads would rot just as fast, which is why the refresh is a
+numbered step in the release runbook, not a good intention.
+
+The first security-relevant major bump shows why. reqwest 0.12 to 0.13 needed two edits
+to compile: `query` is an opt-in feature now, and one test called the removed
+`tls_built_in_root_certs`. Everything else built first time. And three of its defaults had
+moved underneath us.
+
+reqwest 0.12, built with our `rustls-tls` feature, checked public certificates against
+the Mozilla root list compiled into the binary, did its crypto with *ring*, and spoke only
+HTTP/1.1. 0.13 checks them against the operating system's trust store, falls back to
+aws-lc for crypto, and the `http2` feature turns on HTTP/2 in the TLS handshake. We
+didn't ask for any of those. We switched off reqwest's default features and picked
+`rustls-no-provider`, which brings no crypto provider of its own. That doesn't help,
+because of *feature unification*. Cargo builds each crate version once per build, with the
+union of the features every dependant asked for. `object_store`, our backup crate, was
+already on reqwest 0.13 with `rustls` and `http2`, so our reqwest got them too. If you
+know Go modules, there's no equivalent: a Go package has no optional features to merge.
+In Cargo a feature is a one-way switch, and any crate in the graph can flip it on for
+everyone.
+
+The trust store is the one that bites. On Linux, reqwest 0.13 reads the host's CA bundle
+when it *builds* a client, before any request. On a host without one it refuses to build
+at all, even for a plain `http://` scrape, and `reqwest::Client::new()` panics. We had
+`.unwrap_or_default()` fallbacks that would have turned that into a panic on a node with
+a stripped-down image.
+
+So every production client now starts from one function, `http_client::builder()` in
+`src/http_client.rs`:
+
+```rust
+pub fn builder() -> reqwest::ClientBuilder {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .http1_only()
+        .tls_certs_only(bundled_roots().iter().cloned())
+}
+
+fn bundled_roots() -> &'static [reqwest::Certificate] {
+    static ROOTS: std::sync::LazyLock<Vec<reqwest::Certificate>> =
+        std::sync::LazyLock::new(|| {
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                .iter()
+                .filter_map(|der| reqwest::Certificate::from_der(der).ok())
+                .collect()
+        });
+    &ROOTS
+}
+```
+
+`tls_certs_only` trusts exactly the certificates we hand it: the same Mozilla list 0.12
+bundled, from `webpki-root-certs`. `http1_only` puts the handshake back to HTTP/1.1.
+Installing ring as the process's default provider matters because reqwest asks rustls for
+that default before it reaches for aws-lc. The `let _ =` throws away the error you get
+when a provider is already installed, which is the common case after the first call.
+
+`static` with `LazyLock` is Rust's answer to "compute this once, the first time someone
+needs it". In C you'd reach for a global and `pthread_once`; in Python, a module-level
+value. `LazyLock` runs the closure on first access, from whichever thread gets there
+first, and every later access gets the same `Vec`. Returning `&'static [Certificate]`
+promises callers the slice lives for the whole program, which a `static` does.
+
+The clients that pin the cluster CA (relish over HTTPS, node-to-node mTLS, certificate
+renewal) didn't change behaviour. They hand reqwest a complete rustls config through
+`use_preconfigured_tls`, and that config's roots replace reqwest's. They start from
+`builder()` anyway, so there's one rule to remember. A unit test enforces it by reading
+the source tree and failing on a bare `reqwest::Client::builder()`, `Client::new()` or
+`reqwest::get()` outside test code. Other tests check the parts a default could undo: a
+server offering `h2` gets `http/1.1`, ring is the installed provider, and a client handed
+the wrong cluster CA is still refused.
+
+Proxies, the other default people worry about, didn't move. Both versions read
+`HTTP_PROXY` and friends from the environment, and neither reads macOS or Windows proxy
+settings unless the `system-proxy` feature is on, and nothing in our graph enables it.
+
+The `age` bump from 0.10 to 0.12 shows what "deliberate" means. The API we seal the root
+CA backup with changed shape, which the compiler caught. What the compiler can't catch is
+whether 0.12 still opens a file 0.10 sealed years ago, so that PR first checked in files
+sealed by the old build and made the tests open them (chapter 4 has the details). It also
+paid a dividend: `age` 0.12 no longer pulls in the unmaintained `proc-macro-error`, so its
+`cargo audit` exception went too.
+
+Sometimes the next major version isn't there to take. bincode's list said 1→3, and bincode
+3.0.0 turned out to be a crate whose only code is a `compile_error!`, published when its
+maintainers stopped. No version clears its unmaintained advisory, so "bump it" became
+"replace it": gossip, reporting frames and the Raft metadata moved to postcard, which
+changed the wire and durable formats along with the crate (Chapter 2 has the details). A
+lag report can tell you you're behind. It can't tell you the road ahead still exists.
+
+Sometimes a major version changes nothing you can see. `pem` 4.0.0, the crate that turns
+our certificates and keys into the `-----BEGIN CERTIFICATE-----` text nodes keep on disk,
+has the same source code as 3.0.6. Only its `base64` dependency and its minimum Rust
+version moved. We still didn't take that on trust. A PEM file is a stored format: if the
+new crate wrote different line endings (3.0.6 writes CRLF) or wrapped lines at a different
+width, every node would rewrite every certificate it owns. So the PR checked in a root CA
+certificate and key written by the 3.0.6 build, and
+`pem_files_written_by_pem_3_parse_and_rewrite_byte_for_byte` reads them with 4.0.0 and
+writes them back, byte for byte. A one-line `.gitattributes` keeps git from "fixing" the
+fixtures' CRLFs, which would make the test check the wrong bytes. The bump also left one
+`pem` in `Cargo.lock` instead of two, since rcgen 0.14 had already moved to 4.
+
+One crate never showed up in `make outdated` at all. We were on `oci-distribution` 0.11,
+and upstream had renamed it `oci-client` and carried on publishing under the new name. No
+newer `oci-distribution` will ever exist, so `cargo update` saw nothing to do. A rename is
+invisible to every tool that compares version numbers; only reading the changelog, or the
+crate page, finds it
+([#1045](https://github.com/reliaburger/reliaburger/issues/1045)). Before we moved, we
+checked that `oci-client` 0.18 was a real, maintained release. bincode had just shown us
+that the next version can be a tombstone.
+
+`oci-client` 0.18 sits on reqwest 0.13, so the same three defaults moved, but
+`http_client::builder()` can't help: `oci-client` builds its reqwest client inside and
+takes only a config struct. That struct has a `tls_certs_only` field, so registry pulls
+trust the same bundled Mozilla roots, and we install ring before building the client. It
+has no HTTP version setting, so registry pulls offer HTTP/2 and use it when the registry
+agrees. Chapter 1 shows the code. A test pins the HTTP/2 offer, so the difference stays a
+known one rather than a surprise.
+
+The `sha2` bump from 0.10 to 0.11 had the opposite risk. RustCrypto's hash crates move
+together on a shared `digest` trait crate, and 0.11 swapped the fixed-size array type a
+hash returns: `generic-array` gave way to `hybrid-array`. Code that hex-encodes the
+result or turns it into a `[u8; 32]` either compiles or it doesn't. But SHA-256 is
+everywhere in Reliaburger: image and blob digests, the self-upgrade binary hash in every
+signature envelope, the Raft snapshot checksum, the export checkpoint's file ids. Every
+one of those is stored or compared with a value written by an older build, so a digest
+that came out different would be an outage, not a compile error. Most of the existing
+tests compared one hash with another computed by the same code, and that proves nothing
+across an upgrade. So the PR first pinned each use to a *known answer*: the published
+SHA-256 test vector for `"abc"`, `ba7816bf…20015ad`, or a fixed input with its digest
+worked out once, outside our code. Those tests passed on 0.10 before the version moved, and
+they'd fail the moment a new crate changed a single byte. The HMACs on gossip and webhooks
+and the API-token hash never moved: they use `ring`, whose `hmac::verify` already
+compares tags in constant time.
+
+`tokio-tungstenite`, the WebSocket client behind `relish logs -f` and the TUI's live log
+and event panes, went from 0.28 to 0.30 with nothing to fix. Its own source didn't change
+beyond a doc comment; it just follows `tungstenite`, whose two releases tightened the
+server's check on `Sec-WebSocket-Key` and let clients send header values that aren't
+visible ASCII. The question worth asking was the one reqwest raised: does a `wss://`
+connection still trust what it trusted before? With a cluster CA, `ws_connect` hands
+tokio-tungstenite our own rustls config, and two tests already prove it accepts the
+cluster's certificate and refuses an unrelated CA's. Without one, tokio-tungstenite builds
+its own config from the bundled `webpki-roots` (the `rustls-tls-webpki-roots` feature),
+using whichever crypto provider the process installed, and we install ring first. The new
+test `websocket_without_a_cluster_ca_refuses_a_private_certificate` pins that fallback: a
+server with a private certificate must fail verification, so a release that quietly
+stopped checking certificates would turn it red. A quiet switch to the OS store wouldn't,
+since a private CA isn't in that either, so for that we read the diff: the TLS code in
+0.30 is byte for byte the same as 0.28's. The bump also leaves two
+`tungstenite` versions in `Cargo.lock` for now. Our server side is axum's WebSocket
+support, which still uses 0.29, and the two meet only on the wire.
+
+`base64` 0.22 to 0.23 got the same treatment. base64 sits under values we store and
+send: every `ENC[AGE:...]` secret, the join and workload certificate bundles, registry
+Basic credentials, cosign signatures, and each segment of the workload JWTs we mint. If
+0.23 had changed its alphabet or how strictly it reads padding, an old secret could stop
+decrypting or a new token could stop verifying somewhere else. So known answers went in
+first, worked out with Python's `base64` rather than with our own encoder: `"f"` must
+encode to `Zg==` in the standard alphabet and to `Zg` in the unpadded URL-safe one, and
+the bytes `fb ff bf` must come out as `+/+/` and `-_-_`. Decoding must still refuse a
+missing or non-canonical pad. The tests passed on 0.22 and pass unchanged on 0.23. The
+release's headline is a SIMD engine, but we still name `general_purpose::STANDARD` and
+`URL_SAFE_NO_PAD`, the scalar engines, so nothing we run changed underneath. pem 4 had
+already brought 0.23 into the lockfile; 0.22 stays there for now, because age, axum,
+k8s-openapi and oci-client still use it.
+
+`toml` 0.8 to 1.1 is the opposite case: a new parser and a new writer under an API that
+barely moved. Two call sites noticed. `relish fmt` hands `toml_edit` a table position,
+which is now an `Option<isize>` instead of a `usize`, and one test called
+`.parse::<toml::Value>()` on a whole file. Since 0.9, `Value`'s `FromStr` reads a single
+value, like `3` or `"nginx"`, so a document has to go through `toml::from_str`. That test
+would still have compiled. It would have failed at run time, which is the worse kind of
+break.
+
+TOML is in every config file a user writes, so "it compiles" wasn't the bar. We parsed every
+`.toml` file in the repository and every TOML block in the docs, 408 of them, with both
+versions and compared the trees, then ran the old and new `relish fmt` and `relish export`
+over all of them. The parses matched, and so did every formatted file. Only the error
+messages moved. 0.9 stopped handing keys to serde in the order the file wrote them, unless
+you switch on the `preserve_order` feature. A file with two mistakes in it reported the one
+that sorts first, `colour` on line 4 before `replcias` on line 3, and an error that skips
+the first mistake you made reads like a bug. So we turned the feature on, and
+`parse_config_reports_the_first_mistake_in_the_file` pins it. The feature also makes
+`toml::Table` remember insertion order instead of sorting its keys, which changes one output:
+`relish setup` now writes `[node]` above `[cluster]`, in the order it asks the questions.
+Nothing stores TOML durably (the Raft log and the job store hold JSON), so no cluster
+format changed. And `toml_edit` moved to 0.25 with it, the release that shares `toml` 1's
+parser, so `Cargo.lock` holds one `toml_edit` instead of two.
+
+`rand` wasn't on the original list at all; it turned up when we reread `Cargo.toml`. Going
+from 0.8 to 0.10 crossed two releases of renames: `thread_rng()` became `rng()`, `gen` and
+`gen_range` became `random` and `random_range`, the `Rng` trait became `RngExt`,
+`choose_multiple` became `sample`, and `OsRng` became `SysRng`. The compiler finds every
+one of those. What it can't find is a secret quietly moving to a weaker source, so the PR
+checked where each random value goes. API tokens, join tokens, session keys, nonces and
+signing keys come from `ring`'s `SystemRandom`, which the bump doesn't touch. The
+`relish dashboard` launch and session tokens were the exception: they read `OsRng`
+directly. They now read `SysRng`, the same operating-system source under its new name.
+`SysRng` can fail where `OsRng` panicked, so `DashboardSession::new` returns the error
+instead. Everything else, from registry upload ids to temporary file names, comes from
+`rand::random()`, which uses the thread-local generator: still ChaCha12, still seeded from
+the operating system and reseeded every 64 KiB, exactly as in 0.8. Port and peer choice
+use the same generators.
+
+The seeded tests were the other thing to check, and one of them did care. Mustard's
+rescue test replays seed 830, a schedule that strands a gossip member until push-pull
+saves it. 0.10 changed how `choose` maps random bits to an index, so seed 830 now
+converges on its own. The test has a guard for exactly this, an assertion that the seed
+still strands without push-pull, and the guard failed. We rescanned the same 100,000
+seeds, picked the new first stranding schedule (seed 160) and updated the numbers in
+Chapter 2. What the test checks didn't change, only which seed it checks it with.
+
+And sometimes the compiler does all the reviewing. `nix`, our wrapper over Unix system
+calls, went from 0.29 to 0.31, and 0.30 moved its file-descriptor functions to *I/O
+safety*. In 0.29, `fcntl`, `fstat`, `fchown`, `syncfs` and the `*at` calls took a
+`RawFd`, a bare `i32`, so any integer would do, including one whose descriptor was already closed and
+reused. Now they take anything that implements the `AsFd` trait: a `File`, an `OwnedFd`,
+a `nix::dir::Dir`, or a `BorrowedFd` (Chapter 8 introduced the pair). The compiler refused
+eleven call sites, all in the same shape: we'd called `.as_raw_fd()` to hand nix an
+integer. The fix was to hand over the owner instead:
+
+```rust
+let stat = fstat(&top).map_err(io)?;
+// ...
+let stat = match fstatat(&*parent, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+```
+
+`&top` borrows the open `Dir`, and the borrow checker now proves it stays open for the
+call. `&*parent` reaches through the `Rc<Dir>` (a reference-counted pointer, so several
+children can share one parent directory) to borrow the `Dir` inside it. In C the same
+code would compile with a stale integer and fail at run time, if you were lucky. One call
+site, the `syncfs` that flushes an unpacked image, carried a comment promising "`directory`
+stays open for the whole call, so the descriptor is valid". That promise is now the
+compiler's job, so the comment went. The old `*at` signatures also took `Option<RawFd>`, where `None` meant "the current directory";
+the new ones take a descriptor and leave that case to `AT_FDCWD`. We never passed `None`,
+so nothing moved. Raw descriptors are still around where nix kept them, such as
+`connect`, and in our own `unsafe` blocks that call `libc` directly. nix 0.29 still has
+an entry in `Cargo.lock`, because `termwiz`, behind a ratatui backend we don't switch on,
+pins it. Cargo records every optional dependency it might need, but it compiles only
+those whose features are on, so `cargo tree -i nix@0.29.0` prints nothing.
+
+`dirs` 6 to 7 went the other way: nothing for the compiler to catch, and the kind of bump
+that's easiest to get wrong quietly. `dirs` answers "where is this user's home, data or
+cache directory?", and we build `~/.reliaburger` (contexts, tokens, dev clusters), bun's
+fallback stores and the job bench's image cache on its answers. If a new version returned a different directory,
+nothing would fail: users' files would just seem to vanish, because we'd be looking
+somewhere else. The 7.0 changelog has one breaking change, and it's Windows-only:
+`preference_dir` moved from local to roaming app data. We don't call `preference_dir`,
+and the macOS and Linux code didn't change. Even so, the tests came first.
+`tests/suite/user_directories.rs` re-runs its own test binary with a throwaway `HOME`
+(changing `HOME` inside a running test binary would race every other test) and pins each
+answer: the home directory is `$HOME`, the data and cache directories are
+`~/Library/Application Support` and `~/Library/Caches` on macOS and `~/.local/share` and
+`~/.cache` on Linux, the XDG overrides count on Linux only, and relish state and node data
+both land in `~/.reliaburger`. They passed on 6 before the version moved.
+
+`criterion` 0.5 to 0.8 is a dev-dependency, so no node ever runs it, and our benchmark code
+built unchanged. The risk sat somewhere else: the task-array gate doesn't read Criterion's
+console output, it reads the files Criterion leaves behind. `bench_baseline.py` walks
+`target/criterion` for `new/estimates.json`, names each benchmark by its directory, and takes
+`mean.point_estimate`. The re-measure hands Criterion an anchored regular expression as its
+filter. Any of those could have moved in three major versions, and the gate would then have
+compared nothing, or re-measured nothing, without failing. So the PR checked each one against
+both versions' source, then ran the suite under 0.5, saved a baseline from it, ran it again
+under 0.8 and had `bench_baseline.py compare` read the new run against the old baseline.
+Every benchmark found its baseline under the same name, so `main`'s saved baseline carries
+over and no run starts from scratch. The 0.8 run's estimates and the 0.5 baseline are now a
+fixture, so `make test-ci-scripts` fails if a later Criterion moves them. A forced re-measure
+with a tighter limit ran exactly the two benchmarks named in its anchored filter, and not
+their `executor/process_true_256` siblings. (The ratios themselves said more about the laptop
+than about Criterion: the 0.5 run shared it with other release builds, and the whole 0.8 run
+came out at 0.42 of it. That's the runner factor doing its job.) What
+did change is inside the measurement: before each sample, 0.8 moves the stack by a different
+number of bytes, so that one lucky memory alignment can't flatter a whole run.
+
+The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
 ## Asking the cluster what it can do
 
@@ -956,6 +1390,19 @@ you get to find out which moved.
 So the test workload ships *inside* the orchestrator. `bun testapp` runs a small
 HTTP server that every node already has, because every node already has `bun`.
 Version-locked by construction, no registry involved.
+
+There's one catch. Since 0.2.1 the process runtime runs no images (#914), so
+the `process-grill` profile launches `bun testapp` as an `exec` app of
+`/usr/local/bin/bun`, and that path has to be in the node's
+`[process_workloads] allowed_binaries` like any other. Shouldn't the profile
+just allowlist it itself? We looked at that in 0.2.2 (#935) and said no. The
+client can't touch a node's policy, which is the point of a policy. And Bun
+quietly allowing its own binary would let anyone who can deploy an `exec` app
+run the node agent, as root, with whatever arguments they like: a second agent,
+`bun testapp` on any port, every subcommand we add later. An operator who wants
+the catalogue on a process node adds the line and owns that choice. Without it,
+the cases fail at deploy, refused by the node or left unplaced by the
+scheduler, with a reason that points at the host binary.
 
 It's a hand-rolled TCP server rather than axum, which looks like the wrong call
 until you remember where it runs: inside a container, in its own network
@@ -1362,9 +1809,21 @@ So the diagnostic commands return a small enum instead:
 pub enum CommandOutcome {
     Clean,     // ran fine, nothing wrong — exit 0
     Problems,  // ran fine, found failures — exit 1
-    Warnings,  // ran fine, only warnings — exit 2
+    Warnings,  // ran fine, only warnings — exit 3
+    Exited(u8), // `relish exec`: the remote command's own exit code
 }
 ```
+
+`Warnings` exited 2 until the 0.2.2 CLI review (#522) noticed that clap
+already exits 2 for a usage error, so `relish wtf --aap web` (a typo) and a
+degraded cluster looked the same to a script. One of them had to move, and
+clap's 2 is the Unix convention scripts already expect, so warnings took 3.
+`Exited` came in the same review: `relish exec` used to turn every failure into
+an HTTP 404 and every success into exit 0, whatever the command did. Now the
+API answers `{"output", "exit_code"}` and the binary exits with that code,
+through the same `finish_outcome`. A `u8` payload is all a process exit code
+can carry; a code outside 0 to 255 maps to `Problems`, so it can never read as
+success.
 
 `relish test` maps a report rejected by its profile to `Problems` and a clean
 one to `Clean`. That includes assertion failures, unknown evidence, required
@@ -1389,6 +1848,41 @@ everything. Same exit code, two very different events, and the code says which
 is which. This is the sort of thing Rust's enums make pleasant: the states are
 named, the `match` is exhaustive, and there's no magic integer floating around
 that a reader has to decode.
+
+The same review looked at `--output`. It's a *global* flag (`global = true` in
+clap), so clap accepts it after any command, and that's the trap: `relish -o
+json inspect web` parsed, ran, and printed the human table, because `inspect`
+never looked at the flag. A script asking for JSON got text and broke on its
+first parse. So `main` now asks before dispatching:
+
+```rust
+fn output_refusal(command: &Command, output: OutputFormat) -> Option<String> {
+    if output == OutputFormat::Human || honours_output(command) {
+        return None;
+    }
+    // ... "this command has no json output; drop --output (or -o)"
+}
+```
+
+`honours_output` is one `match` over every `Command` variant, with no `_`
+arm. That's deliberate: add a command and the compiler refuses to build until
+you've said whether it prints JSON. A refusal exits 2, the usage-error code,
+since asking a command for output it doesn't have is a usage error. The flag
+also gained the short form the manual had been documenting all along, `-o`.
+
+Adding `relish events` and one flag broke every parser test on Linux CI with
+a stack overflow, while macOS passed. Clap's derive writes one function,
+`augment_subcommands`, that builds every subcommand of `Command` and every
+argument declared inline in a variant. In a debug build each builder call
+keeps its own copy of the `Arg` on the stack, about 8 KiB per argument, so that
+one function's frame had reached a megabyte, plus another half for the `fault`
+subcommands it calls. Linux gives test threads 2 MiB; macOS gives more. The
+fix moves the biggest variants' arguments into their own `#[derive(Args)]`
+structs and boxes them, `Run(Box<RunOptions>)`, so each struct gets its own
+small function, called one after another rather than all in one frame. The
+real binary was never at risk: `main` parses on the process's main thread,
+which has 8 MiB, before the runtime starts any other thread. The tests now pass
+with a 1.5 MiB stack.
 
 Two smaller choices round out the command. Selection: `--filter
 scheduling,firewall` picks those groups, and an entry that names an exact case,
@@ -4624,8 +5118,16 @@ And the meter finally has teeth. The V02 checker reads each node's
 heavy check. A histogram counts cumulatively, so `+Inf` minus `le="1"` is the
 number of turns over the budget since the process started, and the checker
 fails the tier on any increase since its last look. A bun that restarted
-starts its counters from zero, which the checker notices the way its resource
-trends do, by the pid and image changing. The finding says which bucket the
+starts its counters from zero. The checker first noticed that the way its
+resource trends do, by the pid and image changing, and then counted each
+branch from zero. That was wrong for a branch the new process hadn't run
+yet: it exports nothing, so the newest sample in the window was still the
+old process's, and the 0.2.1 final tier reported an old slow `deploy_op`
+turn a second time after the whole-cluster restart (#1261). Now the checker
+remembers the last scrape it counted per branch and adds up only the scrapes
+after it, the way Prometheus's `increase()` does: a count going down is a
+new process, whose turns all count, and an old scrape repeated adds nothing.
+The finding says which bucket the
 worst turn landed in, `1 deploy_op turn(s) over the 1 s budget, the worst
 between 2.5 and 5 s`, and Bun's own log line from the meter says which op it
 was.
@@ -5356,6 +5858,240 @@ what to do next from what it wrote. Health probes were different: they run
 on every interval for every checked instance, and what they publish can
 always wait for the next one.
 
+#### And then its own write
+
+#1100 stopped a probe from waiting for somebody else's write. It still
+waited for its own. The 0.2.1 candidate 9 jobs final ran with no fault on
+the node, and the host's disk stalled under all three VMs at once:
+
+```
+19:00:59 node-1: agent loop turn took 500 ms in follow_up (consumer_sync/journal): journal write 500 ms
+19:00:59 node-2: agent loop turn took 500 ms in follow_up (consumer_sync/journal): journal write 500 ms
+19:01:02 node-3: agent loop turn took 3950 ms in deploy_op (health_probe_result): journal write 3950 ms
+```
+
+Read the first two lines again. The consumer steps met the same stall and
+gave up on it at exactly 500 ms, the turn's runtime budget, leaving their
+writes in flight. The probe journalled with no deadline, under the
+allowance #351 made for fsync'd writes on the loop, so it sat out all
+3,950 ms. A run later the same thing happened during an upgrade walk, at
+1,289 ms. So it wasn't one unlucky stall.
+
+The fix gives the probe the consumer step's deal (#1255). Its write waits
+until the turn's deadline, and a write still going then carries on off the
+loop. Once the write is in flight, the loop has to know who it belongs to,
+because the turn that takes it back does different things for each:
+
+```rust
+pub(super) enum WriteOwner {
+    ConsumerStep,
+    HealthProbe(super::health_checks::HealthWrite),
+}
+```
+
+`HealthProbe` carries a value, which a C enum can't: a `HealthWrite`
+holding the instance, its registration time, the service and the health
+the write records. The probe returns `Deferred`, exactly as it does when
+someone else's write is in flight. `service_map` is unchanged, the kernel
+still routes to the backend, and the restart code doesn't run. When the
+write lands, the loop's `select!` takes a turn for it:
+
+```rust
+match self.land_discovery_write(outcome).await {
+    Some(LandedWrite::ConsumerStep) | None => self.continue_consumer_sync().await,
+    Some(LandedWrite::HealthProbe(Some(write))) => {
+        self.finish_health_publication(write).await;
+    }
+    Some(LandedWrite::HealthProbe(None)) => {}
+}
+```
+
+Patterns nest. `Some(LandedWrite::HealthProbe(Some(write)))` matches only
+an `Option` holding the health variant holding a durable write, and binds
+the innermost value to `write` in the same step. The arm with `None`
+inside is a write that failed: it has already fenced discovery, so there's
+nothing to install. `finish_health_publication` checks that the instance
+is still the one the probe was for, installs the new health in
+`service_map` and the kernel, and, for a withdrawal, runs the same restart
+the probe would have. Journal before kernel still holds, and so does
+"no restart before the withdrawal is on disk". They just happen a turn
+later. The slow-turn log names that turn `health_probe_result/landed`.
+
+There's one case where nobody installs it. A deploy or a retirement that
+journals while the probe's write is in flight settles it inline first, as
+it always has. We don't install a health change in the middle of
+somebody else's publication, which may already hold its own copy of the
+service map. So the write lands and `service_map` still says the old
+health. The next probe sees the difference and publishes again. That's
+one more fsync, on a path that has just waited for a disk anyway.
+
+Is a health write safe to leave in flight, given what the consumer's
+argument above said? Readers of the journal meanwhile see the inventory
+before the write. The probe changes one backend's health flag, and the
+only services it can add are ones the kernel has never seen, because
+every kernel publication journals the whole service map first. So the
+runtime references are the same either side of it, and the services still
+list everything a withdrawal would need.
+
+`a_health_probe_publication_leaves_its_own_slow_journal_write_in_flight`
+stalls the write for 1.6 s and delivers an unhealthy probe in a turn. The
+turn must end inside the 1 s budget, but the verdict that can't flake on a
+busy machine doesn't time anything: the write must still be in flight
+when the turn ends, which it can't be if the turn waited for it. It also checks
+that a second probe meanwhile journals nothing, and that the landing turn
+installs the withdrawal for readers and restarts the instance.
+`a_health_probe_write_that_fails_off_the_turn_installs_nothing_and_restarts_nothing`
+fails the write instead, and checks that discovery is fenced, the backend
+still reads healthy and the instance hasn't restarted.
+
+#### And a start's write
+
+The same candidate's jobs final had a second line we'd let through as a
+known issue, a few minutes into a slow-disk spell on node-1:
+
+```
+03:53:47 node-1: a discovery journal write took 1444 ms; the agent loop went on meanwhile
+03:56:25 node-1: a discovery journal write took 1632 ms; the agent loop went on meanwhile
+04:00:41 node-1: agent loop turn took 2493 ms in deploy_op (apply_network_pre_start)
+```
+
+The first two lines are writes that did the right thing and left the loop
+alone. The third is a workload start. Before a container that publishes an
+address may run, the loop records its network reference (the runtime's
+hold on the address) in the discovery journal. That's the rule that lets a
+restarted node tell an address it handed out from one it never did. The
+path there, `apply_network_pre_start` → `retain_network_reference` →
+`persist_discovery_reference`, wrote with no deadline. It first settled any
+write already in flight, then waited for its own fsync, both inside the
+turn. And the line names nothing else, so we couldn't even tell whether
+the 2.5 s went on the journal, the egress owners checkpoint or the eBPF
+lock.
+
+The rule itself can't bend. A workload must never start before its
+reference is on disk. So the start can't carry on without the write, the
+way a consumer step's remainder or a probe's install can wait for a later
+turn. What it can do is not start *yet*. The reference write now waits
+until the turn's deadline, like the other two (#1266). If it's still going,
+the loop answers the deploy worker with `StillRunning`, the error that
+already means "ask me again" for disk and runtime work (#351), and the
+write goes on off the loop under a third owner:
+
+```rust
+/// A workload start recording the instance's network reference (#1266).
+NetworkReference(crate::grill::InstanceId),
+```
+
+The landing turn, `deploy_op (apply_network_pre_start/landed)`, runs
+nothing for it. The worker's next ask does the rest. It finds the journal
+already holding exactly this reference, skips the write, and the start
+goes on. A write that's in flight when the start arrives, its own or
+anyone's, gets the same answer without a wait, which removes the other
+half of the 2.5 s. The worker side reuses the loop it already had:
+
+```rust
+Ok(retained) => {
+    deploy_ops::retry_while_still_running(|| {
+        self.ops.apply_network_pre_start(
+            instance_id,
+            app_name,
+            spec,
+            cgroup_path,
+            Ok(retained.clone()),
+            egress.clone(),
+        )
+    })
+    .await
+}
+```
+
+`retry_while_still_running` takes a closure (`|| ...`, an anonymous
+function that can use the variables around it) and calls it once per
+attempt. Each call builds a new future, and each future sends an op over a
+channel, which takes ownership of what it carries. The first attempt can't
+give `retained` away and still have it for the second, so every attempt
+sends a clone. In Go you'd copy the struct without thinking about it. Rust
+makes the copy visible, and that's the cost you pay for the compiler
+knowing who owns what. A failed retain never reaches the journal, so
+that case calls the op once, without the loop.
+
+Two other places had to learn the new answer. The op handler used to mark
+the instance `Failed` on any error, and now skips `StillRunning`:
+
+```rust
+if result
+    .as_ref()
+    .is_err_and(|error| !matches!(error, BunError::StillRunning { .. }))
+```
+
+`as_ref()` turns a `&Result<(), BunError>` into a `Result<&(), &BunError>`
+so `is_err_and` can look at the error without taking it. `reply.send`
+still needs it afterwards. A restart records its replacement's reference
+in the same way, in the loop's turn between Create and Start, so it
+couldn't just refuse the restart on `StillRunning` either. It puts a step
+on the restart's task set that sleeps 100 ms and hands back the same
+Create result, so the turn runs again, as a stop or a retirement would
+expect of any restart step.
+
+Then there's what readers see while the write is in flight. The journal's
+"durable" view is the inventory *before* the write, and for the consumer's
+and the probe's writes the runtime references read the same either side.
+This write adds one. A retirement that came along meanwhile would read the
+old inventory, see no record of the hold, decide the instance never
+started, and release the address while the write is busy recording it.
+So `release_network_reference` asks first:
+
+```rust
+None if self.reference_write_in_flight(id) => {
+    return Err(BunError::StillRunning { /* ... */ });
+}
+```
+
+A `match` arm can carry an `if` guard, and the arm only matches when the
+guard is true too. The retirement asks again once the write has landed,
+and by then the journal can answer. The same thinking changed the
+hand-back: a start whose write failed used to give the hold back unless
+discovery was fenced, and now it also keeps any hold the journal already
+records, because only retirement may release one of those.
+
+The egress owners checkpoint, `persist_egress_owners`, also waits inline
+on the start's turn on a Linux node with eBPF, and it's the same kind of
+fsync. We didn't move it off the loop in this change. That store has a
+single fence (`egress_store_uncertain`) and no notion of a write in
+flight: every other egress mutation, from a retirement's `clear_egress` to
+adoption, would have to learn to wait rather than fence. And the binding it
+records must stay invisible to a co-tenant's map rebuild until it's on
+disk, or the kernel gets ahead of the durable owner. What the turn line
+does now is name it. The pre-start path takes the eBPF lock through the
+timed `lock_kernel`, and the checkpoint write is a part of its own, so the
+next slow start says which wait it was:
+
+```
+bun: agent loop turn took 2493 ms in deploy_op (apply_network_pre_start): journal write 500 ms, egress owners write 1990 ms, kernel lock wait 3 ms
+```
+
+(That line comes from `a_slow_start_line_names_its_egress_owners_write`,
+not a soak. We haven't seen one yet.)
+
+`a_workload_start_leaves_its_slow_network_reference_write_in_flight` uses
+the probe test's trick. It stalls the reference write for 1.6 s and hands
+the loop an `ApplyNetworkPreStart` in a turn. Before the fix it failed
+with `the start's turn waited for its own journal write: 1.615s in
+deploy_op (apply_network_pre_start)`. Now the write is still in flight
+when the turn ends, the answer is `StillRunning`, the instance isn't
+failed and the runtime still holds the address. A retirement meanwhile
+gets `StillRunning` too. A second ask before the landing writes nothing
+and waits for nothing, and the ask after it finds the reference recorded
+and goes on without writing it again.
+`a_workload_start_whose_reference_write_fails_off_the_turn_records_it_again`
+fails the write instead: discovery is fenced, the hold isn't handed back,
+and the next ask reopens the journal and records the reference before the
+start may go on. `a_deploy_completes_when_its_network_reference_write_outlasts_the_turn`
+and `a_restart_waits_for_its_slow_network_reference_write_instead_of_refusing`
+run the whole loop with the stall on, and check that a deploy and a
+restart still finish, with the reference in the journal. The restart one
+failed before the restart learned to ask again: `restart of default__web-0
+refused: journalling default__web-0's network reference is still running`.
+
 #### A 503 is an answer, not a verdict
 
 Candidate 7's jobs soak failed a pulse on one line: `deploy_from_cluster_registry`
@@ -5730,7 +6466,7 @@ useful to report than a gap in the evidence. Missing evidence still can't
 quietly turn green.
 
 Relish preserves that contract in human, JSON and YAML output. Pass exits 0,
-Fail exits 1, and Unknown and Degraded exit 2, matching `wtf`'s warnings. The JSON schema is versioned
+Fail exits 1, and Unknown and Degraded exit 3, matching `wtf`'s warnings. The JSON schema is versioned
 and rejects unknown top-level fields so automation doesn't silently interpret
 a changed response as the old one.
 
@@ -6637,3 +7373,21 @@ warm-up helper. The provisioning tests put stub `apt-get`, `systemctl`,
 ahead of the provision script (`apt-get() { echo "$*" >> "$APT_LOG"; }`), and a
 function wins over anything on `PATH`, so nothing new is ever launched. Fixtures
 whose caller can only take one executable path still use `install_script`.
+
+`bun` itself waits in the same queue, and not only once per build. The process
+owner tests start `bun __process-owner` and give it 15 seconds to record that
+its workload is running. On a Mac at load average 300 to 440, where sibling
+agents were linking binaries of their own, the test that checks the owner
+reaps orphaned grandchildren failed 3 runs in 46 with "owner did not reach
+running" ([#1134](https://github.com/reliaburger/reliaburger/issues/1134)). It
+looked like the reaping loop had stalled, so we timed every step. The owner
+went from its own `main` to a settled record in under a second. All the time
+was before `main`: 6 to 13 seconds between `spawn` returning and `bun`'s first
+line of code, with the process asleep on zero CPU while `syspolicyd` and
+XProtect were busy. A second launch of the same file from the same test took
+33 ms. Run directly from a shell, the test passed in under 3 seconds. Under
+nextest, every new test process paid again, so `make test`'s warm-up can't
+cover it. The reaping wasn't involved at all: on macOS there is no subreaper,
+`launchd` adopts the orphans, and the test saw no zombies in any run. So
+`Owner::start` now calls `first_launch` on `bun --version` before it starts
+the owner, and the 15 seconds go back to timing the owner.
