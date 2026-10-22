@@ -166,7 +166,7 @@ pub(super) async fn program_delay_tree(
 }
 
 /// Say what to do when the kernel has no netem, rather than echo tc.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn delay_error_hint(error: &crate::smoker::network::NetnsCommandError) -> String {
     let text = error.to_string();
     if text.contains("netem") && (text.contains("Unknown") || text.contains("not found")) {
@@ -216,6 +216,47 @@ pub(super) fn delay_injection_outcome(
     match failed {
         None => Ok(()),
         Some(reason) => Err(format!("cannot delay traffic: {reason}")),
+    }
+}
+
+/// What a delay caller is once programming it has failed.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CallerNow {
+    /// No longer running here: it took its namespace, and its qdisc, with it.
+    Gone,
+    /// A job or task-array attempt, which starts and finishes in seconds.
+    Attempt,
+    /// An app instance.
+    Instance,
+}
+
+/// Decide what a failed delay program means for one caller.
+///
+/// Thousands of job attempts start and finish an hour, so one can lose its
+/// interface while `tc` runs (#1291). A caller that has gone drops out, and an
+/// attempt without its namespace or `eth0` waits for the next tick; any other
+/// failure, and every failure on an app instance, refuses.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn delay_program_failure(
+    caller: CallerNow,
+    error: &crate::smoker::network::NetnsCommandError,
+) -> Option<DelayFailure> {
+    use crate::smoker::network::NetnsCommandError;
+    let interface_missing = match error {
+        NetnsCommandError::NoNamespace { .. } => true,
+        NetnsCommandError::Failed { stderr, .. } => stderr.contains("Cannot find device"),
+        _ => false,
+    };
+    match caller {
+        CallerNow::Gone => None,
+        CallerNow::Attempt if interface_missing => Some(DelayFailure::Pending(format!(
+            "job attempt is starting or finishing ({error})"
+        ))),
+        _ if matches!(error, NetnsCommandError::NoNamespace { .. }) => {
+            Some(DelayFailure::Failed(error.to_string()))
+        }
+        _ => Some(DelayFailure::Failed(delay_error_hint(error))),
     }
 }
 
@@ -1608,6 +1649,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .unwrap_or_default();
         let mut outcomes = outcomes.into_iter();
         let mut failures = Vec::new();
+        // Asked after programming, so an attempt that finished meanwhile is gone.
+        let attempts: std::collections::HashSet<String> = self
+            .live_attempts
+            .snapshot()
+            .into_iter()
+            .filter_map(|attempt| match attempt.handle {
+                crate::bun::live_attempts::AttemptHandle::Instance(id) => Some(id.0),
+                crate::bun::live_attempts::AttemptHandle::TaskGroup(_) => None,
+            })
+            .collect();
+        let live: std::collections::HashSet<String> = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .map(|instance| instance.id.0)
+            .collect();
         for instance in changed {
             let wanted = desired.get(&instance);
             let restart = restarts.get(&instance).copied().unwrap_or_default();
@@ -1636,22 +1693,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         self.network_faults.delays.remove(&instance);
                     }
                 },
-                // A caller without its own namespace (host networking)
-                // can't be shaped; remember that so we don't retry every
-                // tick, and report it once.
-                Err(error @ NetnsCommandError::NoNamespace { .. }) => {
-                    if let Some(wanted) = wanted {
-                        self.network_faults
-                            .delays
-                            .insert(instance.clone(), (restart, wanted.clone()));
-                        failures.push((instance, DelayFailure::Failed(error.to_string())));
-                    } else {
-                        self.network_faults.delays.remove(&instance);
-                    }
-                }
                 Err(error) => {
-                    self.network_faults.delays.remove(&instance);
-                    failures.push((instance, DelayFailure::Failed(delay_error_hint(&error))));
+                    let now = if live.contains(&instance) {
+                        CallerNow::Instance
+                    } else if attempts.contains(&instance) {
+                        CallerNow::Attempt
+                    } else {
+                        CallerNow::Gone
+                    };
+                    let failure = delay_program_failure(now, &error);
+                    // An app instance without its own namespace (host
+                    // networking) can't be shaped; remember that so we don't
+                    // retry every tick, and report it once.
+                    match (&failure, &error, wanted) {
+                        (
+                            Some(DelayFailure::Failed(_)),
+                            NetnsCommandError::NoNamespace { .. },
+                            Some(wanted),
+                        ) => {
+                            self.network_faults
+                                .delays
+                                .insert(instance.clone(), (restart, wanted.clone()));
+                        }
+                        (_, NetnsCommandError::NoNamespace { .. }, None) => {
+                            self.network_faults.delays.remove(&instance);
+                            continue;
+                        }
+                        _ => {
+                            self.network_faults.delays.remove(&instance);
+                        }
+                    }
+                    if let Some(failure) = failure {
+                        failures.push((instance, failure));
+                    }
                 }
             }
         }
