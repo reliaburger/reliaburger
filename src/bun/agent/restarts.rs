@@ -169,6 +169,11 @@ struct CreateInput {
     /// allowlist the loop will program before the start.
     app_spec: Option<AppSpec>,
     egress: EgressResolver,
+    /// Who the instance is, for the secret providers it calls.
+    app_name: String,
+    namespace: String,
+    /// The node's secret providers: a restart asks them again (#1123).
+    secrets: crate::sesame::secret_provider::SecretProviders,
 }
 
 /// Run one step against the runtime, unless the restart was cancelled.
@@ -189,8 +194,19 @@ async fn run_step<G: Grill>(
             kill_runtime_instance(&grill, &id, confirmation_timeout).await
         }
         RestartStep::Create => match create {
-            Some(create) => match grill.create(&id, &create.oci_spec).await {
-                Ok(()) => {
+            Some(create) => match super::launch::create_with_secrets(
+                &grill,
+                &create.secrets,
+                super::launch::LaunchTarget {
+                    instance_id: &id,
+                    app_name: &create.app_name,
+                    namespace: &create.namespace,
+                },
+                &create.oci_spec,
+            )
+            .await
+            {
+                Ok(_) => {
                     let retained = if retains_network(create.app_spec.as_ref()) {
                         grill
                             .retain_network_reference(&id)
@@ -244,6 +260,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .get(&(launch.app_name.clone(), launch.namespace.clone()))
                     .cloned(),
                 egress: self.egress_resolver(),
+                app_name: launch.app_name.clone(),
+                namespace: launch.namespace.clone(),
+                secrets: self.secret_providers.clone(),
             }),
             _ => None,
         };

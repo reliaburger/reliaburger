@@ -753,7 +753,6 @@ interface" works the same way.
 So an env value can name a provider
 ([#1123](https://github.com/reliaburger/reliaburger/issues/1123)):
 
-<!-- snippet: planned #1123 -->
 ```toml
 [app.api]
 image = "registry.example.com/api:1.4"
@@ -976,6 +975,238 @@ and each moves the generation by one, so `admit` fences the apps on
 between, the numbers don't match, the fence trips, and the apply judges again,
 now with the committed set, which includes its own policies.
 
+### The exec secret provider
+
+([#1123](https://github.com/reliaburger/reliaburger/issues/1123)) The code
+lives in `src/sesame/secret_provider.rs`. It has three jobs: parse the
+reference, run the provider safely, and hand the launch either a secret or a
+reason.
+
+**A reference is a type, not a string.** `EnvValue` already had two variants,
+`Plain` and `Encrypted`. It gets a third:
+
+```rust
+pub enum EnvValue {
+    Plain(String),
+    Encrypted(String),
+    /// `PROVIDER[name:path]`: resolved on the node when an instance launches.
+    Provider(crate::sesame::secret_provider::SecretReference),
+}
+```
+
+Adding a variant to an enum is the cheapest code review you'll ever get.
+Every `match` on `EnvValue` that listed `Plain` and `Encrypted` stopped
+compiling, so the compiler walked us through each place that has to decide
+what a provider value means: the dashboard shows the reference (it names
+where the secret lives, not the secret), the Kubernetes exporter writes the
+reference and warns, the GitOps "this looks like a plaintext secret" check
+leaves it alone, and the job paths never see one, because validation refuses
+it. In Go you'd add a constant to a string-typed kind and grep for the
+switches; here, missing one is a build error.
+
+The deserialiser does the parsing, so a malformed reference never gets as far
+as Raft:
+
+```rust
+} else if crate::sesame::secret_provider::SecretReference::is_reference(&s) {
+    crate::sesame::secret_provider::SecretReference::parse(&s)
+        .map(EnvValue::Provider)
+        .map_err(serde::de::Error::custom)
+}
+```
+
+`serde::de::Error::custom` turns our `ReferenceError` into whatever error type
+the format in use (TOML, JSON, postcard) wants. The provider's name is a
+newtype, `ProviderName`, with `#[serde(try_from = "String", into = "String")]`,
+which tells serde to deserialise a `String` and then run our `TryFrom`, so a
+name that isn't a lowercase DNS label can't exist, whether it came from an
+env value or from `node.toml`.
+
+**Running the provider.** This is `tokio::process::Command`, the async twin of
+`std::process::Command`:
+
+```rust
+let mut command = tokio::process::Command::new(&config.binary);
+command
+    .env_clear()
+    .env("PATH", PROVIDER_PATH)
+    .envs(&config.env)
+    .current_dir("/")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .kill_on_drop(true);
+#[cfg(unix)]
+command.process_group(0);
+```
+
+`env_clear()` matters more than it looks. Bun runs as root with whatever its
+service manager handed it, and none of that is the provider's business, so
+the provider gets a default `PATH` and exactly the `env` the operator wrote.
+`process_group(0)` makes it the leader of a new process group, which pays off
+when it has to die. `kill_on_drop(true)` is a belt to go with those braces: if
+the future holding the child is dropped, say because the deploy is cancelled,
+tokio kills the process instead of leaking it.
+
+The exchange itself is one `async` function, and the timeout wraps all of it:
+
+```rust
+let outcome = tokio::time::timeout(timeout, exchange(&mut child, &request, limit)).await;
+```
+
+`exchange` writes the request, reads stdout and waits for the exit. The read
+is the interesting line:
+
+```rust
+stdout
+    .take(limit as u64 + 1)
+    .read_to_end(&mut output)
+    .await?;
+```
+
+`AsyncReadExt::take` wraps the reader in one that reports end-of-file after
+`limit + 1` bytes. If we get that extra byte, the provider wrote too much, and
+we never buffered more than one byte past the cap. A provider stuck in a loop
+printing `yes` costs Bun 64 KiB, not its memory.
+
+Our first version read to end-of-file and only then waited for the exit. It
+passed every test on its own, and timed out in a crowd. End-of-file on a pipe
+means every copy of its write end is closed, and on macOS a copy can leak:
+Rust's standard library creates the pipe and only then marks it close-on-exec,
+so a process spawned by another thread in between inherits it. One test's
+`sleep 30` was holding the stdout of every other test's provider. Linux
+creates the pipe close-on-exec in one call, but a provider that leaves a
+child running would do the same thing anywhere. So the read races the exit:
+
+```rust
+tokio::select! {
+    result = &mut read => {
+        result?;
+        None
+    }
+    status = child.wait() => {
+        if let Ok(result) = tokio::time::timeout(DRAIN_AFTER_EXIT, &mut read).await {
+            result?;
+        }
+        Some(status?)
+    }
+}
+```
+
+`tokio::select!` polls both futures and runs the branch of whichever finishes
+first, dropping the other. `read` is pinned with `tokio::pin!` and passed as
+`&mut read`, so losing the race doesn't drop it: when the exit wins, we keep
+reading for a tenth of a second, which is plenty to empty a pipe whose writer
+has gone. The request got the matching change: it ends in a newline, so a
+provider can answer after one line instead of waiting for end-of-file on
+stdin.
+
+`tokio::time::timeout` returns `Err(Elapsed)` when the deadline wins, and
+drops the inner future. Dropping a future in Rust cancels it: there's no
+thread to interrupt, the state machine just stops being polled. But the
+*process* is still running, and so is anything it started. A shell script
+that runs `sleep 30` has a child of its own, which `kill` on the script would
+orphan, and that orphan would hold stdout open. That's why we put the provider
+in its own group, and kill the group:
+
+```rust
+async fn kill_provider(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(group) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        // The child isn't reaped yet, so the group id can't have been reused.
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(group),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let _ = child.kill().await;
+}
+```
+
+The comment is the subtle part. A process group id is the leader's pid, and
+pids get reused. But a child that has exited and hasn't been waited for is a
+zombie, and a zombie still holds its pid. We only call `killpg` before
+`child.kill()` reaps it, so we can't hit some unrelated process that inherited
+the number.
+
+**Errors that can't leak.** The rule is that no error carries a secret. That
+sounds easy until you remember where errors come from. The provider's answer
+is parsed with serde:
+
+```rust
+// A parse error's message can quote the input, which is the secret, so
+// only whether it parsed is kept.
+let response = serde_json::from_slice::<ProviderResponse>(output).ok();
+```
+
+`serde_json`'s errors are helpful: `invalid type: string "hunter2", expected
+u32`. That's exactly what we can't print. `.ok()` turns the `Result` into an
+`Option` and throws the message away, and a malformed answer gets a fixed
+reason instead. `ProviderResponse` doesn't derive `Debug`, so nobody can
+`{:?}` a secret into a log by accident. The tests feed the provider answers
+designed to trip each of these, and check that the secret appears in no
+message.
+
+**Where it runs.** Building the OCI spec happens on the agent loop, which must
+never wait (chapter 14's loop rule). A provider can take five seconds. So
+`build_env_with_decryptor` passes a provider value straight through, and the
+call happens later, on the deploy or restart task, just before the runtime
+creates the instance:
+
+```rust
+pub(super) async fn create_with_secrets<'s, G: Grill>(
+    grill: &G,
+    providers: &crate::sesame::secret_provider::SecretProviders,
+    target: LaunchTarget<'_>,
+    spec: &'s crate::grill::oci::OciSpec,
+) -> Result<std::borrow::Cow<'s, crate::grill::oci::OciSpec>, crate::grill::GrillError> {
+```
+
+Two Rust things are going on in that signature. `'s` is a named lifetime: it
+says the returned value may borrow from `spec`, and so can't outlive it. And
+`Cow` (clone on write, which we met in chapter 5) is either `Borrowed(&'s
+OciSpec)` or `Owned(OciSpec)`. An app with no provider values gets the
+caller's spec back, borrowed, with no copy. One with provider values gets an
+owned copy with the secrets filled in. The caller uses either through `&*`
+without caring which.
+
+That copy is the only place the resolved environment lives. The supervisor
+keeps the original, references and all, so a restart asks the provider again.
+That means a secret rotated at the source reaches the next restart, and Bun's
+memory holds no secrets it doesn't need.
+
+**Failing closed.** A provider error becomes a new `LaunchProblem` variant:
+
+```rust
+/// A `PROVIDER[...]` env value couldn't be resolved (#1123). The launch
+/// fails closed: the instance never runs without its secret.
+#[error(transparent)]
+SecretUnavailable(#[from] crate::sesame::secret_provider::SecretResolutionError),
+```
+
+`LaunchProblem` is what a missing binary already produced (#881), and
+everything downstream already knew what to do with one: mark the instance
+`Failed` with the reason, show it in `/v1/status` and `relish wtf`, and not
+burn the restart budget on a launch that would fail the same way. The
+`#[from]` attribute generates `impl From<SecretResolutionError> for
+LaunchProblem`, which is why `create_with_secrets` can write
+`problem: error.into()`. We wrote no new failure path, just a new reason to
+take the existing one.
+
+**Placement.** A node advertises its providers in its capability report,
+`NodeCapabilities::secret_providers`, and `node_can_run` gains one line:
+
+```rust
+&& requirements
+    .secret_providers
+    .is_subset(&node.capabilities.secret_providers)
+```
+
+Both are `BTreeSet<ProviderName>`, and `is_subset` is the whole check. An app
+that names no provider has an empty set, which is a subset of anything.
+
+Still to come in this walkthrough:
+
 - fill-only defaults and the declared-versus-effective split
   ([#1118](https://github.com/reliaburger/reliaburger/issues/1118));
 - jobs, the audit action, `relish policy audit` and the `wtf` row
@@ -984,8 +1215,6 @@ now with the committed set, which includes its own policies.
   ([#1120](https://github.com/reliaburger/reliaburger/issues/1120),
   [#1121](https://github.com/reliaburger/reliaburger/issues/1121),
   [#1122](https://github.com/reliaburger/reliaburger/issues/1122));
-- the exec secret provider
-  ([#1123](https://github.com/reliaburger/reliaburger/issues/1123));
 - templates and the controller contract
   ([#1124](https://github.com/reliaburger/reliaburger/issues/1124),
   [#1125](https://github.com/reliaburger/reliaburger/issues/1125)).
@@ -1041,9 +1270,60 @@ Still to come from the plan:
 - a portable test that repeated syncs of a defaulted app don't re-apply;
 - a cluster test of an admin removing a policy that denies everything (the
   router test above covers it on one node);
-- Smoker faults under the secret provider binary;
 - the exit test on a real three-node cluster
   ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)).
+
+### Testing the exec secret provider
+
+The provider tests don't mock the provider. Each one writes a real `/bin/sh`
+script into a temporary directory, marks it executable, and points a
+`SecretProviders` at it. That's the only honest way to test a timeout that
+has to kill a process group, or a cap that has to stop reading a pipe.
+
+The unit tests in `src/sesame/secret_provider/tests.rs` cover:
+
+- **Parsing**: a good reference, a path holding `:` and `]`, and each kind of
+  malformed reference (no `]`, no `:`, a bad provider name, an empty path, a
+  control character, an over-long path), each with its own `ReferenceError`.
+- **Node config**: the defaults, an unknown field or a bad name refused, and
+  a relative binary or out-of-range bounds refused by `validate`.
+- **The protocol**: `a_provider_gets_one_versioned_request_and_its_value_is_the_secret`
+  has the script copy its stdin to a file, and compares it with the exact
+  JSON object the manual documents. Another checks the provider sees only its
+  configured environment, not Cargo's.
+- **The bounds**: `a_slow_provider_is_killed_with_everything_it_started`
+  starts `sleep 30 &`, records its pid, and asserts both that the call fails
+  in about a second and that the `sleep` is dead afterwards. Without
+  `process_group(0)` and `killpg`, that second assertion fails.
+  `a_provider_that_writes_too_much_is_killed_at_the_cap` runs `yes`.
+- **The faults the research asked Smoker for**: delay (the slow provider),
+  kill (`kill -9 $$`, which must read "was killed by signal 9") and a full
+  disk (a provider that reports `No space left on device` on stderr and exits
+  1, which must read "exited with status 1").
+- **No leaks**: answers in the wrong version, with the wrong types, or as
+  bare text, each carrying a marker secret, and an assertion that the marker
+  appears in neither the error's `Display` nor its `Debug`.
+
+The agent tests in `src/bun/agent/tests/secret_providers.rs` run whole deploys
+against `MockGrill`:
+
+- the secret reaches the spec the runtime creates, and the spec the
+  supervisor keeps still holds the reference;
+- a slow provider fails the deploy, the instance is `failed` with the reason
+  in its status, and the runtime is never asked to create it;
+- a provider the node doesn't run fails that app, and a plain app deployed
+  next starts normally;
+- a provider that answers in the wrong version never puts its value in an
+  event or a status;
+- a restart asks the provider again, and when the provider has started
+  failing, the restart fails closed at once with the reason;
+- the node's capability report lists its providers.
+
+Smoker's faults target workloads, nodes and the network, not a short-lived
+host process Bun spawns, so the delay, kill and full-disk cases are scripts
+rather than Smoker rules. A full disk is the one that only a script can fake
+here. On Linux, the honest version mounts a tiny tmpfs, fills it, and points
+the provider's cache at it.
 
 ## Lessons
 

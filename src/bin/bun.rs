@@ -1402,6 +1402,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // policy and an operator's allowlist would be silently ignored — a
     // config deploy could run an arbitrary host binary through ProcessGrill.
     agent.set_process_config(config.process_workloads.clone());
+    // `PROVIDER[...]` env values resolve only through the providers
+    // `[secret_providers.*]` names (#1123).
+    agent.set_secret_providers(reliaburger::sesame::secret_provider::SecretProviders::new(
+        config.secret_providers.clone(),
+    ));
     // Host-path sources are refused unless `[storage] allowed_host_paths`
     // covers them, and never reach the node's own directories.
     agent.set_host_path_policy(

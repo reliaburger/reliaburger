@@ -1516,6 +1516,15 @@ a token scoped to other namespaces gets 403. Rotate it with
 Admin. Until the master key is split, every node can still unwrap every
 namespace's key.
 
+### Secrets from an exec provider
+
+An app env value `PROVIDER[name:path]` is resolved when an instance launches,
+by a binary the node names in `[secret_providers.name]` in `node.toml`, over
+JSON on stdin and stdout with a timeout and an output cap. The scheduler places
+such an app only on nodes that run its provider, and a provider that fails
+keeps that instance from starting, with the reason in `relish status` and
+`relish wtf`. See [Secrets from a provider](manual/10_security.md#secrets-from-a-provider).
+
 ### OCI release qualification
 
 These scripts exercise crash and reboot recovery on real hosts. They're manual:

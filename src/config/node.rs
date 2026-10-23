@@ -24,6 +24,14 @@ pub struct NodeConfig {
     pub logs: LogsSection,
     pub alerts: AlertsSection,
     pub process_workloads: super::process_workloads::ProcessWorkloadsConfig,
+    /// `[secret_providers.<name>]`: the exec secret providers this node runs
+    /// for `PROVIDER[name:path]` env values, and the allowlist of their
+    /// binaries (#1123). Empty by default: a node runs no provider.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secret_providers: BTreeMap<
+        crate::sesame::secret_provider::ProviderName,
+        crate::sesame::secret_provider::SecretProviderConfig,
+    >,
     pub security: SecuritySection,
     /// GitOps configuration (optional — only needed if GitOps is enabled).
     #[serde(default)]
@@ -1321,6 +1329,47 @@ mod tests {
             listed.storage.allowed_host_paths,
             vec![PathBuf::from("/srv/import")]
         );
+    }
+
+    #[test]
+    fn secret_providers_default_to_none_and_parse_from_their_tables() {
+        let config = NodeConfig::parse("").unwrap();
+        assert!(config.secret_providers.is_empty());
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("secret_providers")
+        );
+
+        let config = NodeConfig::parse(
+            "[secret_providers.vault]\nbinary = \"/usr/local/bin/vault-provider\"\ntimeout_secs = 3\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let names: Vec<&str> = config
+            .secret_providers
+            .keys()
+            .map(|name| name.as_str())
+            .collect();
+        assert_eq!(names, ["vault"]);
+        assert_eq!(
+            config
+                .secret_providers
+                .values()
+                .next()
+                .unwrap()
+                .timeout_secs,
+            3
+        );
+    }
+
+    #[test]
+    fn a_secret_provider_with_a_relative_binary_fails_node_validation() {
+        let config =
+            NodeConfig::parse("[secret_providers.vault]\nbinary = \"vault-provider\"\n").unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("secret_providers.vault"), "{error}");
+        assert!(error.contains("absolute"), "{error}");
     }
 
     #[test]

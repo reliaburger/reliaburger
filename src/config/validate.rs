@@ -614,6 +614,21 @@ pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), 
         job.firewall.as_ref(),
         job.egress.as_ref(),
     )?;
+    // Providers resolve where an app's instance launches; the job runtimes
+    // don't call them yet, and a job must not run with the reference as its
+    // value (#1123).
+    if let Some(key) = job
+        .env
+        .iter()
+        .find_map(|(key, value)| value.is_provider().then_some(key))
+    {
+        return Err(ConfigError::Validation {
+            field: format!("env.{key}"),
+            context: format!("job {name:?}"),
+            reason: "PROVIDER[...] secrets resolve for apps only; a job can't use one yet"
+                .to_string(),
+        });
+    }
     validate_label(
         job.namespace.as_deref().unwrap_or("default"),
         name,
@@ -770,6 +785,17 @@ impl NodeConfig {
                     path: path.clone(),
                 });
             }
+        }
+
+        // Each secret provider runs an absolute binary within bounds (#1123).
+        for (name, provider) in &self.secret_providers {
+            provider
+                .validate()
+                .map_err(|reason| ConfigError::Validation {
+                    field: format!("secret_providers.{name}"),
+                    context: "node config".to_string(),
+                    reason,
+                })?;
         }
 
         // Port range validation
@@ -1970,6 +1996,20 @@ mod tests {
             .unwrap();
             config.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn a_job_with_a_provider_secret_is_refused_and_an_app_is_not() {
+        let raw = "[job.migrate]\nimage = \"busybox\"\n[job.migrate.env]\nDB_PASSWORD = \"PROVIDER[vault:secret/db]\"\n";
+        let error = Config::parse(raw).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(error, ConfigError::Validation { ref field, .. } if field == "env.DB_PASSWORD"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("apps only"), "{error}");
+
+        let raw = "[app.api]\nimage = \"api:v1\"\n[app.api.env]\nDB_PASSWORD = \"PROVIDER[vault:secret/db]\"\n";
+        Config::parse(raw).unwrap().validate().unwrap();
     }
 
     #[test]

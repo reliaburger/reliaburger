@@ -26,6 +26,10 @@ pub struct NodeCapabilities {
     /// `script` apps, so the scheduler keeps image apps off it (#914).
     #[serde(default)]
     pub containers: bool,
+    /// The `[secret_providers.*]` this node runs. An app whose env names a
+    /// provider is placed only where it's listed (#1123).
+    #[serde(default)]
+    pub secret_providers: BTreeSet<crate::sesame::secret_provider::ProviderName>,
 }
 
 #[cfg(test)]

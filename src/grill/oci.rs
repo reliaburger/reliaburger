@@ -463,6 +463,9 @@ pub fn build_env_with_decryptor(
     for (key, value) in &spec.env {
         match value {
             EnvValue::Plain(v) => env.push(format!("{key}={v}")),
+            // Passed through as written: the node resolves it just before
+            // the runtime creates the instance, off the agent loop (#1123).
+            EnvValue::Provider(reference) => env.push(format!("{key}={}", reference.as_str())),
             EnvValue::Encrypted(v) => {
                 if let Some(decrypt) = decryptor {
                     let plaintext =
@@ -785,6 +788,8 @@ pub fn generate_job_oci_spec(
         .map(|(key, value)| match value {
             EnvValue::Plain(v) => format!("{key}={v}"),
             EnvValue::Encrypted(v) => format!("{key}={v}"),
+            // Validation refuses provider values in jobs (#1123).
+            EnvValue::Provider(reference) => format!("{key}={}", reference.as_str()),
         })
         .collect();
 

@@ -25,6 +25,8 @@ pub(super) struct DeployWorker<G: Grill> {
     /// Resolves an instance's egress allowlist before the loop programs
     /// it, so the loop never waits on DNS (#419).
     pub(super) egress: launch_evidence::EgressResolver,
+    /// The node's secret providers, for `PROVIDER[...]` env values (#1123).
+    pub(super) secrets: crate::sesame::secret_provider::SecretProviders,
 }
 
 /// The replacement instances a rollout, or the restoration of an aborted
@@ -618,19 +620,29 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         Ok(())
     }
 
-    /// Create `instance_id` in the runtime. A launch the runtime refuses
-    /// (#881) fails the instance with the reason before the error returns.
-    async fn create_or_fail(
+    /// Resolve `spec`'s secret providers and create the instance in the
+    /// runtime, returning the spec it was created from. A launch the runtime
+    /// refuses (#881), or one whose secret a provider won't give (#1123),
+    /// fails the instance with the reason before the error returns.
+    async fn create_or_fail<'s>(
         &self,
-        instance_id: &InstanceId,
-        spec: &crate::grill::oci::OciSpec,
-    ) -> Result<(), BunError> {
-        let Err(error) = self.grill.create(instance_id, spec).await else {
-            return Ok(());
+        target: super::launch::LaunchTarget<'_>,
+        spec: &'s crate::grill::oci::OciSpec,
+    ) -> Result<std::borrow::Cow<'s, crate::grill::oci::OciSpec>, BunError> {
+        let error = match super::launch::create_with_secrets(
+            &self.grill,
+            &self.secrets,
+            target,
+            spec,
+        )
+        .await
+        {
+            Ok(launch) => return Ok(launch),
+            Err(error) => error,
         };
         if let Some(problem) = error.launch_problem() {
             self.ops
-                .record_launch_failure(instance_id, problem.to_string())
+                .record_launch_failure(target.instance_id, problem.to_string())
                 .await;
         }
         Err(error.into())
@@ -671,8 +683,15 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .prepare_fresh_instance(instance_id, app_name, namespace, spec)
             .await?;
 
-        // The image pull happens here, off the loop.
-        self.create_or_fail(instance_id, &prepared.oci_spec).await?;
+        // The image pull happens here, off the loop, and so does any secret
+        // provider call. The supervisor keeps the spec with its references,
+        // never the resolved secrets.
+        let target = super::launch::LaunchTarget {
+            instance_id,
+            app_name,
+            namespace,
+        };
+        let launch = self.create_or_fail(target, &prepared.oci_spec).await?;
         self.ops
             .store_oci_spec(instance_id, prepared.oci_spec.clone())
             .await;
@@ -683,14 +702,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await?;
 
         if prepared.has_init {
-            self.drive_initialisers(
-                instance_id,
-                app_name,
-                spec,
-                &prepared.oci_spec,
-                &prepared.cgroup_path,
-            )
-            .await?;
+            self.drive_initialisers(instance_id, app_name, spec, &launch, &prepared.cgroup_path)
+                .await?;
         }
 
         self.ops
@@ -1210,16 +1223,21 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         };
 
         started.runtime_attempted.insert(new_id.clone());
-        self.grill
-            .create(new_id, &oci_spec)
-            .await
-            .map_err(|error| format!("failed to create {}: {error}", new_id.0))?;
+        let target = super::launch::LaunchTarget {
+            instance_id: new_id,
+            app_name,
+            namespace,
+        };
+        let launch =
+            super::launch::create_with_secrets(&self.grill, &self.secrets, target, &oci_spec)
+                .await
+                .map_err(|error| format!("failed to create {}: {error}", new_id.0))?;
         // Same create → program → start ordering as the fresh path (#86).
         self.prepare_network(new_id, app_name, Some(spec), &cgroup_path)
             .await
             .map_err(|error| format!("failed to program egress for {}: {error}", new_id.0))?;
         let initialised = async {
-            self.drive_initialisers(new_id, app_name, spec, &oci_spec, &cgroup_path)
+            self.drive_initialisers(new_id, app_name, spec, &launch, &cgroup_path)
                 .await?;
             self.ops
                 .transition_state(new_id, ContainerState::Starting)
@@ -1788,7 +1806,15 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             };
 
             runtime_attempted.insert(new_id.clone());
-            if let Err(e) = self.grill.create(&new_id, &oci_spec).await {
+            let target = super::launch::LaunchTarget {
+                instance_id: &new_id,
+                app_name,
+                namespace,
+            };
+            if let Err(e) =
+                super::launch::create_with_secrets(&self.grill, &self.secrets, target, &oci_spec)
+                    .await
+            {
                 let _ = events
                     .send(ApplyEvent::Error {
                         message: format!("failed to create {}: {e}", new_id.0),
