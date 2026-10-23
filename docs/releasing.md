@@ -184,11 +184,11 @@ gates. Any incompatible wire or durable-state change bumps `protocol` or
 so an upgrade across that bump means starting a fresh cluster. So
 `relish upgrade` works only between builds of the same format (maintainer
 decision D31 in [#674](https://github.com/reliaburger/reliaburger/issues/674),
-10 October 2026). Every release from 0.1.0 to 0.2.0 bumped a format, so no
+10 October 2026). Every release from 0.1.0 to 0.2.1 bumped a format, so no
 rolling upgrade between two published releases has run yet. A release that
-keeps 0.2.0's pair could roll in place, and qualifying a real
+keeps 0.2.1's pair could roll in place, and qualifying a real
 published-to-published rolling walk on such a patch release is a goal, not a
-0.2.0 gate. The pre-1.0 rule for known harness artefacts in
+release gate. The pre-1.0 rule for known harness artefacts in
 the V02 soak (step 4 of [staging a candidate](#staging-a-candidate))
 stays as it is.
 
@@ -416,6 +416,23 @@ The steps:
 `relish upgrade check` from 0.2.0 on reads each release's pair from the
 metadata and says when a release needs this instead of a rolling upgrade.
 
+### Upgrading from 0.2.0
+
+0.2.1 can't roll onto a 0.2.0 cluster either. Its fixes change what the
+council and the nodes store and send: GitOps ownership and configuration in
+Raft, recovery ids on every Raft message, durable registry tags, node-by-node
+rollouts, partial placement, gossip replay protection, compacted task results,
+new fence files, SHA-256 token hashes and redb 4's file format for the Raft
+store (the full list is in `src/compatibility.rs`). So the protocol moved from
+51 to 52 and the state format from 68 to 69, and a 0.2.0 leader refuses
+`relish upgrade start v0.2.1` before it records a run.
+
+The move is a fresh cluster, as [from 0.1.6](#upgrading-from-016), with the
+same steps and the same losses: secrets re-encrypted to the new keys, tokens
+created again, a new CA, job history exported first and volumes restored from
+snapshots. Tokens have to be reissued anyway, because 0.2.1 stores their
+hashes differently.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
@@ -521,7 +538,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.2.0` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.1` today), so
 bump that default in the same change that announces a newer release. Both
 scripts need a mode, `--laptop` or `--install-only`; with none they explain the
 choices and exit 2. For a release from before 0.2.2 the bootstrap drops
@@ -629,13 +646,14 @@ the real `curl … | sh` install against it on every host we advertise.
      --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.1.0-soak.1
    ```
 
-   The final tier is 8 hours of faults on the full schedule, then a 2-hour
-   quiet tail (about 10 hours in all), which catches slow accumulation. The
+   The final tier is 8 hours of faults on the full schedule, then a quiet
+   tail of 2 hours 15 minutes (about 10½ hours in all), which catches slow
+   accumulation. The
    release gate runs it once, as the job final below
    (`qualify-jobs-sustained.sh --tier final`): that's the same soak with the
    job campaign and a node fault added to each cycle, so it checks
    everything the V02 final does, plus the jobs. All the final soaks fit in
-   one 10-hour slot that way (maintainer decision, 17 October 2026,
+   one slot of about 10 hours that way (maintainer decision, 17 October 2026,
    [#991](https://github.com/reliaburger/reliaburger/issues/991)).
    `qualify-sustained.sh --tier final` still runs the V02 final on its own,
    for example to separate a job problem from a cluster one, but it isn't a
@@ -674,9 +692,12 @@ the real `curl … | sh` install against it on every host we advertise.
    `leak-fd`) could judge each node: a restart, kill or upgrade exec starts
    its warm-up again, and the fault schedule restarts every node's Bun more
    often than `leak-rss`'s hour-long warm-up. So a final ends with a quiet
-   tail: two hours after the last cycle with no faults, walks or specials,
-   while the apps and jobs keep running and the checks carry on. That's an
-   hour to arm `leak-rss` and an hour of comparison samples. A final fails
+   tail: 2 hours 15 minutes after the last cycle with no faults, walks or
+   specials, while the apps and jobs keep running and the checks carry on.
+   That's an hour to arm `leak-rss`, an hour of comparison samples, and 15
+   minutes for the sampling: the last cycle's graceful stop comes after its
+   heavy sample, so a new Bun is first seen up to five minutes into the tail,
+   and each heavy observe delays the next by its own run time. A final fails
    unless both checkers were armed for at least 60 minutes on every node,
    with one unbroken window of at least 30 (maintainer decision, 20 October
    2026, [#1062](https://github.com/reliaburger/reliaburger/issues/1062)).
@@ -706,7 +727,7 @@ the real `curl … | sh` install against it on every host we advertise.
    three nodes, at 1,158 accepted successes a second or more (the rate of
    100 million a day) plus headroom, with concurrent apps, several resource
    profiles, worker and leader loss, delayed messages and disk faults. The
-   final tier runs 8 hours of faults and a 2-hour quiet tail on the 3-node
+   final tier runs 8 hours of faults and a 2¼-hour quiet tail on the 3-node
    quickstart cluster, with every fault
    and at the default 1,390 a second, and it is the release gate's only final
    soak ([#991](https://github.com/reliaburger/reliaburger/issues/991),
@@ -734,7 +755,7 @@ the real `curl … | sh` install against it on every host we advertise.
    scripts/release/qualify-jobs-sustained.sh --tier fast \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
      --qualified-digest QUALIFIED_DIGEST
-   # 8 hours of faults on the full schedule, then a 2-hour quiet tail, on the
+   # 8 hours of faults on the full schedule, then a 2¼-hour quiet tail, on the
    # final candidate: the one final soak.
    scripts/release/qualify-jobs-sustained.sh --tier final \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
@@ -902,7 +923,8 @@ the real `curl … | sh` install against it on every host we advertise.
    section (`#release-testing` in `index.html`) to the new release: its
    latest-release paragraph, its headline numbers with links to this
    release's records, and the soak charts beside them. The charts are copies
-   of the final app soak's and the final job soak's `-charts/` directories in
+   of the app soak's (the V02 fast tier, now that the gate has no V02 final)
+   and the final job soak's `-charts/` directories in
    `docs/website/assets/soak/`, which holds only this release's
    ([how](website/README.md#soak-charts)). `tests/suite/website.rs`
    fails while the section names a version older than the installer's
@@ -950,7 +972,7 @@ What it covers, and what it doesn't:
   wouldn't fit next to about 45 minutes of setup, one cycle that starts just
   before the end and teardown: up to 285 minutes compressed, 235 minutes on
   the full schedule. That covers the compressed (fast) tier and full-schedule
-  runs of about four hours. The final tier (about 10 hours), and the 12-hour lane A run,
+  runs of about four hours. The final tier (about 10½ hours), and the 12-hour lane A run,
   still need a long-running host or a self-hosted runner.
 - **No upgrade walks, so it's a diagnostic.** They need a private soak build
   (`0.1.0-soak.1`) signed with the release key (D2), and nothing in CI signs

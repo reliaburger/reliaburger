@@ -75,13 +75,18 @@ That property test only sees one array's state. The store around it has more way
 
 - a refused write left the store exactly as it was and took no id;
 - a retried key gets its run back, and a changed one is refused;
-- no new run starts while an unknown outcome is unacknowledged;
+- no new run starts while an unknown outcome is unacknowledged, or over a
+  run its schedule forbids overlapping;
+- a cron minute that nothing holds back either starts a run or is recorded
+  as skipped for want of room;
 - a stale report is counted as refused and changes no count;
 - every task is still counted exactly once;
 - a terminal run stays terminal;
 - the store survives a JSON round trip unchanged.
 
 Its first run found a real bug in under twenty cases. Lose a node, so its chunks go back in the queue at attempt 2, then cancel: `stop` moved the queued chunks to done but kept their attempt numbers. Nothing misbehaved at once. The next reopen did, because snapshot validation (rightly) refuses an attempt number on a retired chunk. A follower installing that snapshot, or a standalone node restarting, would have refused the whole state. `stop` now drops those attempts. A unit test in `task_array_state.rs` pins the case down, and proptest's minimised sequence is saved in `proptest-regressions/meat/task_array_store.txt`. Proptest replays every saved seed before it generates new cases, so the failing sequence runs on every CI run.
+
+The cron checks came later, and they show how a property test can look thorough and still not test something. At first the fire step only checked what *mustn't* happen: no second run in a minute already claimed, none past an unknown outcome. A fire that wrongly refused to start passed both. Two mutants proved it. One made an `Allow` schedule wait for its active run as if it said `Forbid`, and the other ignored `Forbid` altogether. Both passed 2,000 cases. The step now works out which of the store's reasons could hold an occurrence back, and when none applies, it requires a new run or a recorded skip. Both mutants now fail.
 
 ### The node: slots, not chunks
 
@@ -3021,11 +3026,24 @@ receipt still goes out only once every record of the chunk is durable.
 Three tests pin it down. `chunks_sharing_slots_finish_in_the_order_they_arrived`
 runs four eight-task chunks through two slots and checks the first one
 finishes after at most twelve of the 32 attempts have started. Before the
-change, it finished after 24. `the_first_held_chunk_is_reported_long_before_the_last_one_starts`
-does the same through a node's `sync`: eight held chunks, a cap of two, and
-the first receipt has to arrive before 40 of 80 attempts start (it used to be
-68). `a_chunk_cancelled_while_queued_ends_at_once_and_keeps_the_order_behind_it`
+change, it finished after 24. `held_chunks_run_one_after_another_and_the_first_is_reported_first`
+does the same through a node's `sync`: eight held chunks and a cap of two.
+Chunk 0's receipt has to come first, and every task of chunk 0 has to finish
+before any task past chunk 1 does. Run in lockstep, the chunks finish
+interleaved, `0, 1, 2, …, 7, 0, 1, …`, to the end.
+`a_chunk_cancelled_while_queued_ends_at_once_and_keeps_the_order_behind_it`
 cancels a queued chunk and checks the one behind it still waits.
+
+The node test's first version counted the attempts started when the first
+receipt arrived, and required fewer than 40. It failed both of CI's Linux
+coverage runs, at 49 and 80. The order was right. The count was timing the
+disk. A receipt goes out only once its records are durable, which means the
+ledger's group commit and an fsync, and with 5 ms fake tasks the whole array
+takes about 200 ms. On a runner whose disk was busy with coverage profiles,
+the fsync outlasted the array. Slowing the fake tasks only moved the line:
+at 50 ms each, six local writers doing full fsyncs still failed it one run in
+thirty. So the test now records the order in which tasks finish, which no
+disk can change, and checks the receipt only for which chunk comes first.
 
 The profile predicts the node runs at its burst rate all the time, about
 10,000 host jobs a second on that rig. The five-round bench measurement is
@@ -3656,12 +3674,12 @@ The record now reports each checker's armed minutes per node, and a final
 gates on them. The fix wasn't in the checker. Its hour-long warm-up is there
 for a reason: a young process's memory is still growing for honest reasons.
 The fault schedule was the problem, since it never let any Bun get old. So a
-final now ends with a quiet tail, two hours after the last cycle with no
-faults, walks or specials. The apps and jobs keep running, so there's still
+final now ends with a quiet tail, two hours and a quarter after the last
+cycle with no faults, walks or specials. The apps and jobs keep running, so there's still
 something to leak. Every node gets an hour to arm `leak-rss` and an hour of
 comparison samples, and the final fails unless each checker was armed for an
 hour on every node, with one unbroken half-hour among them. The final grew
-from eight hours to about ten. We chose that over cutting the faults to six,
+from eight hours to about ten and a half. We chose that over cutting the faults to six,
 because the faults are what the eight hours were for.
 
 My first proposal for the tail was 90 minutes, an hour to arm and half an
@@ -3670,6 +3688,18 @@ that fails every final. The last cycle ends with an upgrade walk and a
 graceful whole-cluster stop, so the tail is all the exposure a node gets, and
 90 minutes arms `leak-rss` for 30. Writing the fixture first caught it before
 an eight-hour run did.
+
+The fixed two hours had the same mistake one size smaller, and the fixture
+didn't catch it, because the fixture wrote the exposure straight into the
+checker's state instead of producing it from samples. The checker can only
+date a Bun from the first sample that shows it, and samples come every five
+minutes. The graceful stop runs after the last cycle's sample, so each new
+Bun is first seen up to five minutes into the tail. And the harness sets the
+next sample's time *after* each observe finishes, so a 30-second observe
+stretches every interval to 330 seconds. Feeding the checker that grid, from
+a restart at the tail's start to the observe after it, gave `leak-rss` 54
+minutes of the hour it needs. The tail is now two hours and a quarter, and the
+test that guards it drives the sampling, not the result.
 
 ### A task that failed before it ran
 

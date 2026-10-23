@@ -1497,8 +1497,12 @@ FINAL_TIER_SECONDS = 8 * 3600
 # 2026). Each checker must be armed this long on every node, with one
 # unbroken window at least EXPOSURE_WINDOW_SECONDS long; a fast or custom run
 # records its exposure without gating on it. qualify-sustained.sh has the
-# same tail length.
-QUIET_TAIL_SECONDS = 2 * 3600
+# same tail length. Two hours would be the warm-up plus the armed hour, but
+# the last cycle's graceful stop comes after its heavy sample, so each new Bun
+# is first seen up to one heavy interval (300 s) into the tail, and every
+# heavy observe pushes the next one back by its own run time. The extra
+# 15 minutes cover that sampling.
+QUIET_TAIL_SECONDS = 2 * 3600 + 15 * 60
 EXPOSURE_ARMED_SECONDS = 3600
 EXPOSURE_WINDOW_SECONDS = 1800
 

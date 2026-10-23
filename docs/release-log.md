@@ -8,8 +8,63 @@ release contains is in the [roadmap](roadmap.md#releases-after-010). A new
 paragraph goes at the top when a release is promoted
 ([release gate, step 9](releasing.md#staging-a-candidate)).
 
-Platforms change too. 0.2.1 is the last release with an Intel macOS CLI
-(`relish-macos-x86_64`); from 0.2.2 the macOS build is Apple silicon only
+## 0.2.1: cluster safety
+
+Promoted on 21 October 2026 as tag `v0.2.1` at `abec2c45`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/39575597952)).
+Qualification ran from 17 to 21 October 2026 (UTC) and took nine candidates
+([closure record](qualification/2026-10-21-v0.2.1-release-closure.md)), the
+first on the shorter gate: one 8-hour jobs final in place of 0.2.0's separate
+V02 and job finals ([#991](https://github.com/reliaburger/reliaburger/issues/991)).
+Candidate 1 never got past its staged install: 0.2.1 refuses a health timeout
+longer than its interval, and the quickstart's own `hello` app had one
+([#1019](https://github.com/reliaburger/reliaburger/issues/1019)). Candidate 2
+couldn't launch a fresh runc job
+([#1021](https://github.com/reliaburger/reliaburger/issues/1021)). Candidate 3
+found that `relish local stop` power-cut every VM, because Lima kills a guest
+that ignores its stop request after 30 s
+([#1023](https://github.com/reliaburger/reliaburger/issues/1023)), and that
+cut left a Raft store redb couldn't open
+([#1024](https://github.com/reliaburger/reliaburger/issues/1024)). Candidates 3
+and 4 both found a leader that couldn't prove its leadership forwarding API
+calls to itself until it ran out of memory
+([#1069](https://github.com/reliaburger/reliaburger/issues/1069)).
+Candidate 5 found a health-probe publication holding the agent loop for 5 s
+([#1100](https://github.com/reliaburger/reliaburger/issues/1100)). From
+candidate 6 on, the V02 fast tier passed and the failures moved to the job
+soaks: a failed redeploy that marked a released version failed for good
+([#1110](https://github.com/reliaburger/reliaburger/issues/1110)), a stale
+follower answering a batch cancel with 404
+([#1192](https://github.com/reliaburger/reliaburger/issues/1192)), and Bun
+exiting after a self-upgrade because a forking child held its upload lock
+([#1198](https://github.com/reliaburger/reliaburger/issues/1198)), plus a
+handful of harness bugs. Candidate 9 passed both staged installs, the V02 fast
+tier and the jobs fast tier at 3,520 accepted jobs a second
+([V02 fast](qualification/2026-10-20-v0.2.1-sustained-v02-fast.md),
+[jobs fast](qualification/2026-10-20-v0.2.1-job-qualification-fast.md)). Its
+first jobs final ran the full 8 hours at 3,840 accepted jobs a second and
+failed on one 3.95 s agent-loop turn: a health-probe journal write caught in a
+host disk stall ([#1255](https://github.com/reliaburger/reliaburger/issues/1255)).
+The maintainer re-ran it on the same candidate, and accepted slow turns from
+#1255 as a known issue for 0.2.1, provided everything else passed. Run 2 ran
+the full 8 hours at 3,764 accepted jobs a second, with every fault settled,
+nothing lost and Bun's memory within target
+([record](qualification/2026-10-21-v0.2.1-job-qualification.md)). Its only
+failures were slow agent-loop turns: #1255 again, which the checker counted
+twice ([#1261](https://github.com/reliaburger/reliaburger/issues/1261)), and
+the same fsync'd discovery journal write at a second call site
+([#1266](https://github.com/reliaburger/reliaburger/issues/1266)), which the
+maintainer accepted too. The power-cut and reboot lanes then passed 25 of 25 in
+every lane ([record](qualification/2026-10-21-power-cut-reboot.md)).
+0.2.1 ships with #1255 and #1266 (a slow disk can still hold a node's agent
+loop for seconds; the fixes are in 0.2.2), and with RUSTSEC-2026-0381, -0382
+and -0383, published after the gate: its rustls-webpki and webpki-roots trust
+the distrusted emSign intermediates on outbound HTTPS, as 0.2.0's do. Cluster
+mTLS isn't affected, `main` has the patched versions, and 0.2.2 is the first
+release built with them
+([#1269](https://github.com/reliaburger/reliaburger/issues/1269)). It's also
+the last release with an Intel macOS CLI (`relish-macos-x86_64`); from
+0.2.2 the macOS build is Apple silicon only
 ([#1018](https://github.com/reliaburger/reliaburger/issues/1018)).
 
 ## 0.2.0: A million jobs

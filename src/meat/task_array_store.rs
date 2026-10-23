@@ -3567,11 +3567,18 @@ mod tests {
                             .last_observed_minute
                             .is_some_and(|seen| seen >= minute),
                     );
+                    let forbids_overlap = record
+                        .definition
+                        .cron
+                        .as_ref()
+                        .is_some_and(|cron| cron.overlap == OverlapPolicy::Forbid);
                     let fenced = store.iter().any(|(id, _)| {
                         store.jobs().run(id).is_some_and(|run| {
                             run.name == SCHEDULED && !run.unknown_owners.is_empty()
                         })
                     });
+                    let overlapping = forbids_overlap
+                        && store.active().any(|(_, record)| record.name == SCHEDULED);
                     let before = model.next_id;
                     let write = TaskArrayWrite::Job(Box::new(JobWrite::Fire {
                         name: SCHEDULED.into(),
@@ -3589,6 +3596,25 @@ mod tests {
                     if fenced {
                         // An unknown outcome blocks the next occurrence.
                         assert_eq!(model.next_id, before, "fired past an unknown outcome");
+                    }
+                    if overlapping {
+                        assert_eq!(model.next_id, before, "fired over a forbidden overlap");
+                    }
+                    if !claimed && !fenced && !overlapping {
+                        // Nothing holds the occurrence back, so it runs, or
+                        // it's recorded as skipped for want of room.
+                        let skipped = store
+                            .jobs()
+                            .definition(NAMESPACE, SCHEDULED)
+                            .and_then(|record| record.skipped.as_ref())
+                            .is_some_and(|skip| skip.minute == minute);
+                        assert!(
+                            matches!(result, Ok(TaskArrayApplied::Registered { .. })) || skipped,
+                            "a free occurrence neither ran nor was skipped: {result:?}"
+                        );
+                        if !skipped {
+                            assert_eq!(model.next_id, before + 1);
+                        }
                     }
                 }
                 Step::Grant => {

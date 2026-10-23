@@ -66,7 +66,7 @@ so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.2.0
+  --record docs/website/assets/tour.cast --install v0.2.1
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -91,15 +91,17 @@ seconds) and then plays the setup step four times faster, because setup redraws
 its timers several times a second and idle trimming can't shorten it. The
 narration says both, and every wait prints how long it really took. It applies
 the demo URL when it answers, and `examples/kubernetes/podinfo.yaml` (with a
-note) when it doesn't; likewise it copies `examples/demo/burger` when the
-tarball isn't published yet. The build step runs in a scratch directory, so
+note) when it doesn't; likewise it copies `examples/demo/burger` unless the
+published tarball holds exactly that directory. Until a promotion's site
+change deploys, the live tarball is the previous release's, so a re-record
+always shows the repository copy, and says so on screen. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.2.0 --api-port 29117 --ingress-port 28080 --registry-port 25050`,
+`--install v0.2.1 --api-port 29117 --ingress-port 28080 --registry-port 25050`,
 beside a laptop cluster on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
 `--record` writes the installed version into the cast's title (`Reliaburger
-0.2.0: the five-minute tour`), and the caption under the player names it too.
+0.2.1: the five-minute tour`), and the caption under the player names it too.
 `tests/suite/website.rs` checks that both match `install.sh`'s default, so a
 promotion that forgets the re-record fails CI.
 
@@ -165,7 +167,11 @@ cp -R docs/qualification/<app soak record>-charts docs/qualification/<job soak r
   docs/website/assets/soak/
 ```
 
-then point the `<img>` and record links at them. `tests/suite/website.rs`
+then point the `<img>` and record links at them. From 0.2.1 the gate's only
+final soak is the 8-hour job soak ([#991](https://github.com/reliaburger/reliaburger/issues/991)),
+so the app soak's charts come from the V02 fast tier, and the section says so.
+The page shows an app soak's memory, fds and CPU but not its job rate, so
+delete the `jobs.svg` an app soak record also draws. `tests/suite/website.rs`
 fails while a chart differs from its record's copy, comes from another
 release, lacks alt text, a size or lazy loading, or sits in `assets/soak/`
 without being shown, and while the section misses any of the seven charts.
@@ -180,7 +186,7 @@ written from the published binary's own help by
 `tests/suite/website.rs` checks every `relish …` command on this page, in the
 README and in the tour chapter against it. The tour may only use released
 commands. Anything else has to say which release adds it, in the words
-"0.3.0, not in 0.2.0" (the build's version, then the installer's), in the
+"0.3.0, not in 0.2.1" (the build's version, then the installer's), in the
 same paragraph, `<details>` or section. The README's generated command list
 labels such commands itself. When the installer's default changes, regenerate
 the snapshot; the test refuses a snapshot for another version.
@@ -195,7 +201,7 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.2.0` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.2.1` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. Every line the site shows names a
 mode (`sh -s -- --laptop`): with no arguments both scripts only explain the
 choices and exit 2, and the bootstrap does it before downloading anything.
