@@ -251,7 +251,7 @@ pub(super) enum DeployOp {
     /// settle before it signals the runtime.
     BeginRetire {
         old_id: InstanceId,
-        reply: oneshot::Sender<Result<Option<restarts::TakenRestart>, BunError>>,
+        reply: oneshot::Sender<Result<super::retirement::BegunRetirement, BunError>>,
     },
     /// Hand a stopped old instance whose addresses still await remote
     /// withdrawal confirmations to the agent loop, so the rollout can finish.
@@ -1023,7 +1023,7 @@ impl DeployOps {
     pub(super) async fn begin_retire(
         &self,
         old_id: &InstanceId,
-    ) -> Result<Option<restarts::TakenRestart>, BunError> {
+    ) -> Result<super::retirement::BegunRetirement, BunError> {
         self.call(
             |reply| DeployOp::BeginRetire {
                 old_id: old_id.clone(),

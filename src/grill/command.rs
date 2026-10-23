@@ -159,6 +159,7 @@ impl OwnedCommands {
                 gid_mappings: None,
             },
             port_mapping: None,
+            stop: None,
         };
         self.control.prepare(&id.0, &spec).await?;
         Ok(id)

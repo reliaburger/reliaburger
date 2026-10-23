@@ -860,6 +860,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: "invalid.example/reliaburger/no-pull:latest".to_string(),
                 readonly: false,
@@ -924,6 +925,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: "./rootfs".into(),
                 readonly: true,
@@ -991,6 +993,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 // Use a path (not an image ref) to skip the image pull step
                 path: "./rootfs".to_string(),
@@ -1087,6 +1090,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
                 readonly: false,
@@ -1249,6 +1253,7 @@ mod tests {
                 host_process: false,
                 initialiser: false,
                 port_mapping: None,
+                stop: None,
                 root: crate::grill::oci::OciRoot {
                     path: ALPINE_IMAGE.to_string(),
                     readonly: false,
@@ -1417,6 +1422,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
                 readonly: false,
@@ -1479,6 +1485,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
                 readonly: false,
@@ -1676,6 +1683,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
                 readonly: true,

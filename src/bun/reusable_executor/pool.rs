@@ -1937,6 +1937,7 @@ mod tests {
             host_process: true,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: OciRoot {
                 path: crate::grill::oci::HOST_ROOT.into(),
                 readonly: false,

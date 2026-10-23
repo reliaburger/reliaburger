@@ -589,8 +589,10 @@ impl RuncGrill {
             ) {
                 return runtime.owned_cleanup(&id, &context).await;
             }
+            // The app's own stop signal (#1121), from its original intent.
+            let signal = context.intent().await?.spec.stop_signal().name();
             let output = runtime
-                .owned_runc_command(&context, &["kill", &id.0, "SIGTERM"])
+                .owned_runc_command(&context, &["kill", &id.0, signal])
                 .await?;
             if output.exit_code != Some(0) {
                 if matches!(

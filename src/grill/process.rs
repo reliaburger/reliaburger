@@ -917,15 +917,15 @@ impl super::Grill for ProcessGrill {
         if entry.state == ContainerState::Stopped {
             return Ok(());
         }
+        // The app's own stop signal (#1121), SIGTERM unless it names one.
+        let signal = entry.spec.stop_signal().to_nix();
         if entry.child.as_ref().and_then(|child| child.id()).is_some() {
-            signal_child_group(entry, nix::sys::signal::Signal::SIGTERM).map_err(error)?;
+            signal_child_group(entry, signal).map_err(error)?;
             if entry.state != ContainerState::Stopped {
                 entry.state = ContainerState::Stopping;
             }
         } else if entry.adopted.is_some() {
-            entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGTERM)
-                .map_err(error)?
-            {
+            entry.state = if signal_adopted_process(entry, signal).map_err(error)? {
                 ContainerState::Stopping
             } else {
                 ContainerState::Stopped
@@ -1275,10 +1275,13 @@ impl super::Grill for ProcessGrill {
         }
 
         // Spawn the command directly (no namespace entry for ProcessGrill)
+        // A caller's timeout drops this future (a pre-stop command's bound,
+        // #1121); the command mustn't outlive it.
         let output = Command::new(&command[0])
             .args(&command[1..])
             .env_clear()
             .envs(environment)
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| GrillError::StartFailed {
@@ -1447,6 +1450,7 @@ mod tests {
             host_process: true,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: OciRoot {
                 path: "/tmp/test".to_string(),
                 readonly: false,

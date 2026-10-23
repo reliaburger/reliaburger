@@ -1621,7 +1621,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         id: &InstanceId,
         runtime_attempted: bool,
     ) -> Result<(), BunError> {
-        if let Some(restart) = self.ops.begin_retire(id).await? {
+        if let Some(restart) = self.ops.begin_retire(id).await?.restart {
             restart.settle(self.stop_confirmation_timeout).await?;
         }
         // A failed create may already own runtime resources. Only a
@@ -1638,14 +1638,19 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         id: &InstanceId,
         drain_timeout: std::time::Duration,
     ) -> Result<(), BunError> {
-        if let Some(restart) = self.ops.begin_retire(id).await? {
+        let begun = self.ops.begin_retire(id).await?;
+        if let Some(restart) = begun.restart {
             restart.settle(self.stop_confirmation_timeout).await?;
         }
+        // Without its own grace the old instance gets the drain timeout, as
+        // it always has; with one, the drain and the grace are separate.
+        let stop = InstanceStop::for_policy(begun.stop.as_ref(), drain_timeout);
         drain_and_stop_instance(
             &self.drains,
             &self.grill,
             id,
             drain_timeout,
+            &stop,
             self.stop_confirmation_timeout,
         )
         .await

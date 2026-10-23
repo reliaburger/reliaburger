@@ -17,8 +17,9 @@ use k8s_openapi::api::autoscaling::v2::{
 };
 use k8s_openapi::api::batch::v1::{CronJob, CronJobSpec, Job, JobSpec, JobTemplateSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, Namespace, PodSpec, PodTemplateSpec, ResourceQuota,
-    ResourceQuotaSpec, ResourceRequirements, SecurityContext, Service, ServicePort, ServiceSpec,
+    Container, ContainerPort, EnvVar, ExecAction, Lifecycle, LifecycleHandler, Namespace, PodSpec,
+    PodTemplateSpec, ResourceQuota, ResourceQuotaSpec, ResourceRequirements, SecurityContext,
+    Service, ServicePort, ServiceSpec,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
@@ -172,9 +173,20 @@ fn export_app(
     // memory limit exported as an unlimited pod — the scheduler saw a
     // different workload from the one that was configured.
     container.resources = resource_requirements(app.memory.as_ref(), app.cpu.as_ref(), app.gpu);
+    container.lifecycle = stop_lifecycle(app);
+    // Kubernetes runs preStop inside terminationGracePeriodSeconds; it has
+    // no bound of its own to carry this one.
+    if let Some(timeout) = app.pre_stop_timeout {
+        report.unsupported.push(format!(
+            "[app.{name}] pre_stop_timeout = \"{}\" — Kubernetes bounds preStop by \
+             terminationGracePeriodSeconds instead",
+            String::from(timeout)
+        ));
+    }
 
     let pod_spec = PodSpec {
         containers: vec![container],
+        termination_grace_period_seconds: termination_grace(app),
         ..PodSpec::default()
     };
 
@@ -662,6 +674,31 @@ fn export_namespace(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// An app's stop signal and pre-stop command as a container lifecycle
+/// (#1121). `None` when it sets neither, so the pod keeps Kubernetes'
+/// defaults, which are the same as Reliaburger's.
+fn stop_lifecycle(app: &AppSpec) -> Option<Lifecycle> {
+    if app.stop_signal.is_none() && app.pre_stop.is_empty() {
+        return None;
+    }
+    Some(Lifecycle {
+        stop_signal: app.stop_signal.map(String::from),
+        pre_stop: (!app.pre_stop.is_empty()).then(|| LifecycleHandler {
+            exec: Some(ExecAction {
+                command: Some(app.pre_stop.clone()),
+            }),
+            ..LifecycleHandler::default()
+        }),
+        ..Lifecycle::default()
+    })
+}
+
+/// `terminationGracePeriodSeconds` from an app's `stop_grace` (#1121).
+fn termination_grace(app: &AppSpec) -> Option<i64> {
+    app.stop_grace
+        .map(|grace| i64::try_from(grace.duration().as_secs()).unwrap_or(i64::MAX))
+}
 
 fn label_selector(
     labels: &BTreeMap<String, String>,
