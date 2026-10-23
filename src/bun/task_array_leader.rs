@@ -134,8 +134,9 @@ pub struct TaskArrayService {
     require_council: bool,
     standalone: Option<Arc<std::sync::Mutex<super::job_store::JobStore>>>,
     storage_fenced: std::sync::atomic::AtomicBool,
-    /// How long a standalone publication may take before its caller gives
-    /// up and fences admission and dispatch: [`WRITE_TIMEOUT`] outside tests.
+    /// How long a task-array write may take before its caller gives up:
+    /// [`WRITE_TIMEOUT`] outside tests. A standalone publication then fences
+    /// admission and dispatch; a council write is left for a later tick.
     write_timeout: Duration,
     /// Time between syncs.
     pub sync_interval: Duration,
@@ -233,12 +234,17 @@ impl TaskArrayService {
         self
     }
 
-    /// Give up on a standalone publication after `timeout`, so a test can
-    /// expire its caller without waiting the production [`WRITE_TIMEOUT`].
+    /// Give up on a task-array write after `timeout`, so a test can expire
+    /// its caller without waiting the production [`WRITE_TIMEOUT`].
     #[cfg(test)]
     pub(crate) fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = timeout;
         self
+    }
+
+    /// How long a task-array write may take: [`WRITE_TIMEOUT`] outside tests.
+    pub(crate) fn write_timeout(&self) -> Duration {
+        self.write_timeout
     }
 
     /// Hold the durable store's next publication before it writes, until
@@ -376,7 +382,7 @@ async fn commit_task_array(
         return commit_standalone(&state.task_arrays, write).await;
     };
     let written = tokio::time::timeout(
-        WRITE_TIMEOUT,
+        state.task_arrays.write_timeout,
         council.write(RaftRequest::TaskArray(Box::new(write))),
     )
     .await

@@ -8930,6 +8930,7 @@ async fn seed_finished_hook(council: &crate::council::CouncilNode, failed: bool)
 /// query and forwards every other command, so a test can prove none arrived.
 fn hung_write_router(
     council: Arc<crate::council::CouncilNode>,
+    task_arrays: Option<Arc<crate::bun::task_array_leader::TaskArrayService>>,
 ) -> (axum::Router, mpsc::Receiver<AgentCommand>) {
     let (tx, mut incoming) = mpsc::channel(16);
     let (trace, commands) = mpsc::channel(16);
@@ -8948,7 +8949,7 @@ fn hung_write_router(
             }
         }
     });
-    let app = router(
+    let app = router_with_upgrade(
         tx,
         None,
         None,
@@ -8961,8 +8962,25 @@ fn hung_write_router(
         None,
         None,
         None,
+        None,
         0,
         None,
+        None,
+        None,
+        "default".into(),
+        None,
+        crate::bun::build_runner::BuildSettings::with_timeout(900),
+        crate::cluster::ClusterHttp::plaintext(),
+        5050,
+        "http",
+        256 * 1024 * 1024,
+        false,
+        crate::bun::capabilities::StaticCapabilities::default(),
+        crate::bun::readiness::ReadinessTracker::new(),
+        None,
+        None,
+        None,
+        task_arrays,
     );
     (app, commands)
 }
@@ -8991,7 +9009,7 @@ async fn assert_hung_operator_write_has_a_bounded_error(boundary: HungOperatorWr
     }
     let before = council.desired_state().await;
     council.hang_writes();
-    let (app, mut commands) = hung_write_router(council.clone());
+    let (app, mut commands) = hung_write_router(council.clone(), None);
     let request = if matches!(boundary, HungOperatorWrite::Begin) {
         axum::http::Request::post("/v1/apply")
             .body(Body::from(HUNG_DEPLOYMENT_MANIFEST))
@@ -9042,12 +9060,13 @@ enum StalledSettlement {
 }
 
 /// Stall the leader's real settlement write and prove it is bounded: the
-/// leader abandons the hung write at `WRITE_TIMEOUT` and tries again on a
-/// later tick, rather than wedging its loop. Meanwhile the durable intent
+/// leader abandons the hung write at its write timeout (`WRITE_TIMEOUT` in
+/// production, one second here) and tries again on a later tick, rather
+/// than wedging its loop. Meanwhile the durable intent
 /// stays exactly as it was, no agent is told to publish, and a failed hook
 /// never even attempts publication.
 async fn assert_stalled_settlement_is_bounded(settlement: StalledSettlement) {
-    use crate::bun::task_array_leader::WRITE_TIMEOUT;
+    use crate::bun::task_array_leader::TaskArrayService;
     use crate::council::RaftRequest;
     use crate::meat::task_array_state::TaskArrayStatus;
     use crate::meat::task_array_store::TaskArrayWrite;
@@ -9069,7 +9088,9 @@ async fn assert_stalled_settlement_is_bounded(settlement: StalledSettlement) {
 
     council.hang_writes();
     // The router starts the leader loop, whose first tick settles.
-    let (_app, mut commands) = hung_write_router(council.clone());
+    let write_timeout = std::time::Duration::from_secs(1);
+    let service = Arc::new(TaskArrayService::new(None).with_write_timeout(write_timeout));
+    let (_app, mut commands) = hung_write_router(council.clone(), Some(service));
 
     let is_commit = |request: &RaftRequest| {
         matches!(request, RaftRequest::JobApplyCommit { operation_id, .. }
@@ -9092,10 +9113,10 @@ async fn assert_stalled_settlement_is_bounded(settlement: StalledSettlement) {
             .collect::<Vec<_>>()
     };
     // The second attempt can only come once the first is abandoned. The rest
-    // of the tick hangs for one more `WRITE_TIMEOUT` in between (its
+    // of the tick hangs for one more write timeout in between (its
     // `CronObserve` write), so a healthy leader retries after about two;
     // the bound leaves room for a loaded runner.
-    let bound = WRITE_TIMEOUT * 4;
+    let bound = write_timeout * 10;
     let started = tokio::time::Instant::now();
     while attempts().len() < 2 {
         let seen = attempts().len();
@@ -9112,8 +9133,8 @@ async fn assert_stalled_settlement_is_bounded(settlement: StalledSettlement) {
     }
     let attempts = attempts();
     assert!(
-        attempts[1] - attempts[0] >= WRITE_TIMEOUT,
-        "the leader gave up on the settlement write before WRITE_TIMEOUT: {:?}",
+        attempts[1] - attempts[0] >= write_timeout,
+        "the leader gave up on the settlement write before its write timeout: {:?}",
         attempts[1] - attempts[0]
     );
     if failed {
