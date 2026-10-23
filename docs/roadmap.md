@@ -353,7 +353,8 @@ migration and no feature gate
   efficiency plan.
 - [ ] **0.2.4: extension points**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/19),
-  [research](plans/2026-10-19-research-extension-points.md)). One missing
+  [research](plans/2026-10-19-research-extension-points.md),
+  [plan](plans/2026-10-23-plan-0.2.4.md)). One missing
   feature shouldn't rule Reliaburger out, and the answer isn't CRDs or
   webhooks. Policies stored in the council (CEL deny and warn, fill-only
   defaults) on the one apply path that `relish apply` and GitOps share;
