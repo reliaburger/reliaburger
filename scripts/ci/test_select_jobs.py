@@ -143,6 +143,53 @@ class SelectJobsTests(unittest.TestCase):
                 self.assertEqual(repo.select(base_sha=main),
                                  {"code": True, "gossip": False, "heavy": True, "task_arrays": True, "macos": True})
 
+    def manifests(self, criterion, tokio):
+        self.repo.write("Cargo.toml",
+                        f'[dev-dependencies]\ncriterion = "{criterion}"\ntokio = "{tokio}"\n')
+        self.repo.write("Cargo.lock",
+                        f'[[package]]\nname = "criterion"\nversion = "{criterion}"\n\n'
+                        f'[[package]]\nname = "criterion-plot"\nversion = "0.5.0"\n\n'
+                        f'[[package]]\nname = "tokio"\nversion = "{tokio}"\n')
+
+    def test_a_criterion_bump_runs_both_benchmarks(self):
+        # #1151: the benchmarks' output format and filter syntax are
+        # criterion's, so bumping it must run the jobs that parse them.
+        self.manifests("0.5.1", "1.40.0")
+        main = self.repo.commit("manifests")
+        self.repo.branch("feature")
+        self.manifests("0.8.0", "1.40.0")
+        self.repo.commit("bump criterion")
+        selected = self.repo.select(base_sha=main)
+        self.assertTrue(selected["gossip"])
+        self.assertTrue(selected["task_arrays"])
+        # A full-ci PR into a train selects them too.
+        selected = self.repo.select(base_ref="release-0-2-3", base_sha=main, full_ci=True)
+        self.assertTrue(selected["gossip"])
+        self.assertTrue(selected["task_arrays"])
+
+    def test_a_criterion_bump_in_the_lockfile_alone_runs_both_benchmarks(self):
+        self.manifests("0.5.1", "1.40.0")
+        main = self.repo.commit("manifests")
+        self.repo.branch("feature")
+        self.repo.write("Cargo.lock",
+                        '[[package]]\nname = "criterion"\nversion = "0.5.2"\n\n'
+                        '[[package]]\nname = "criterion-plot"\nversion = "0.5.0"\n\n'
+                        '[[package]]\nname = "tokio"\nversion = "1.40.0"\n')
+        self.repo.commit("update criterion")
+        selected = self.repo.select(base_sha=main)
+        self.assertTrue(selected["gossip"])
+        self.assertTrue(selected["task_arrays"])
+
+    def test_another_dependency_bump_does_not_run_the_benchmarks(self):
+        self.manifests("0.5.1", "1.40.0")
+        main = self.repo.commit("manifests")
+        self.repo.branch("feature")
+        self.manifests("0.5.1", "1.41.0")
+        self.repo.commit("bump tokio")
+        selected = self.repo.select(base_sha=main)
+        self.assertFalse(selected["gossip"])
+        self.assertFalse(selected["task_arrays"])
+
     def test_a_gossip_change_does_not_run_the_task_array_benchmarks(self):
         self.pull_request("src/mustard/gossip.rs")
         self.assertFalse(self.repo.select(base_sha=self.main)["task_arrays"])

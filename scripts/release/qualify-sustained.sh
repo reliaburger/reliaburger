@@ -20,11 +20,21 @@
 #                           beside it; the harness adds the operator signature
 #                           to a copy (OpenSSL 3 needed); each walk upgrades to
 #                           it and rolls back to the version the candidate's
-#                           nodes report; without it the upgrade slots are skipped
+#                           nodes report; without it the upgrade slots are
+#                           skipped, and a final tier refuses to start
 #   --tier T                fast (compressed schedule, 60m: the iteration loop
-#                           after each round of fixes) or final (full schedule,
-#                           8h); the release gate's final soak is the job
-#                           final, qualify-jobs-sustained.sh --tier final
+#                           after each round of fixes), final (full schedule,
+#                           8h) or custom (the default: a diagnostic run that
+#                           says nothing about either gate); the release
+#                           gate's final soak is the job final,
+#                           qualify-jobs-sustained.sh --tier final. A final
+#                           needs --soak-bun, --qualified-digest and its own
+#                           bootstrap (no --home), and its record fails unless
+#                           every walk, fault kind and special its schedule
+#                           owes completed (the execution inventory, #1061).
+#                           After its 8h of faults a final runs a 2h quiet
+#                           tail, and fails unless every leak checker was
+#                           armed long enough on every node (#1062)
 #   --duration D            soak length: 40m, 8h, 2d (default: the tier's, or 24h)
 #   --schedule S            full (hourly cycle) or compressed (10-minute cycle);
 #                           default: the tier's, or full
@@ -50,6 +60,10 @@
 #   --node-faults           add one node-level fault to every cycle, in
 #                           rotation: inter-node delay, a full disk, slow
 #                           fsync (#686); jobs must overlap each kind
+#   --seed N                seed for every fault and node choice (which node,
+#                           how long, after how many seconds); the record names
+#                           the seed, and the same seed repeats a run's choices
+#                           in order (default: a new random seed, #1062)
 #   --plan                  print the fault schedule these options give and
 #                           exit, touching nothing
 #
@@ -88,6 +102,7 @@ keep=false
 job_load=
 target_rate=
 node_faults=
+seed=
 plan=false
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -105,6 +120,7 @@ while [ "$#" -gt 0 ]; do
         --job-load) job_load=${2:-}; shift 2 ;;
         --target-rate) target_rate=${2:-}; shift 2 ;;
         --node-faults) node_faults=true; shift ;;
+        --seed) seed=${2:-}; shift 2 ;;
         --plan) plan=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; fail "unknown argument: $1" ;;
@@ -135,8 +151,22 @@ case $tier in
     fast) : "${schedule:=compressed}" "${duration_text:=60m}" ;;
     final) : "${schedule:=full}" "${duration_text:=8h}" ;;
     ''|custom) tier=custom; : "${schedule:=full}" "${duration_text:=24h}" ;;
-    *) fail '--tier must be fast or final' ;;
+    *) fail '--tier must be fast, final or custom' ;;
 esac
+[ -z "$seed" ] || [[ $seed =~ ^[0-9]+$ ]] || fail '--seed must be a whole number'
+# A final tier owes every upgrade walk and a candidate it verified itself
+# (#1061), so one that could only finish incomplete never starts.
+if [ "$tier" = final ] && [ "$plan" = false ]; then
+    [ -n "$soak_bun" ] || fail 'a final tier needs --soak-bun: its upgrade walks are part of the gate'
+    if [ "$resume" = false ]; then
+        [ -n "$qualified_digest" ] || fail 'a final tier needs --qualified-digest: the record names the candidate it checked'
+        [ -z "$home" ] || fail 'a final tier bootstraps its own cluster from the candidate; --home adopts one whose candidate this run cannot verify'
+    fi
+fi
+# Upgrade walks run with a soak build. A final tier's plan shows them too,
+# since a final can't start without one.
+walks=false
+if [ -n "$soak_bun" ] || { [ "$plan" = true ] && [ "$tier" = final ]; }; then walks=true; fi
 
 case $duration_text in
     *[0-9]m) duration=$(( ${duration_text%m} * 60 )) ;;
@@ -153,14 +183,17 @@ esac
 unset LIMA_SSH_PORT_FORWARDER
 # Schedule parameters: cycle length, power-off hold, TLS rotation period, how
 # often the catalogue pulse, offline export and registry push run, and how many
-# chaos kinds each chaos slot runs. Two a slot lets an 8-hour full run (four
-# chaos slots with upgrade walks) reach all seven kinds. The run always
+# chaos kinds each chaos slot runs. Three a slot lets an 8-hour full run (four
+# chaos slots with upgrade walks) reach all nine kinds, which its execution
+# inventory requires (#1061); sustained_check.py keeps a copy of this
+# schedule (required_execution), and a test compares the two. The run always
 # completes min_cycles cycles, even when faults overrun their slots: every
 # hour of a full run (so every special its length schedules), and cycles 0-3
-# of a compressed one, which carry every fault kind and every special.
+# of a compressed one, which carry every special, every slot fault and eight
+# of the nine chaos kinds (the hour-long fast tier reaches all nine).
 case $schedule in
     full) cycle=3600; hold_min=60; hold_max=180; rotation=900; kill_offset=20
-          quorum_hold=300; pulse_every=1; export_every=6; push_every=1; chaos_per_slot=2
+          quorum_hold=300; pulse_every=1; export_every=6; push_every=1; chaos_per_slot=3
           min_cycles=$(( duration / cycle )) ;;
     compressed) cycle=600; hold_min=20; hold_max=40; rotation=300; kill_offset=10
           quorum_hold=60; pulse_every=0; export_every=2; push_every=1; chaos_per_slot=2
@@ -170,7 +203,16 @@ esac
 slot=$(( cycle / 6 ))
 # The job controller holds a bounded number of runs (#989): refuse a soak
 # whose job load wouldn't fit, now rather than hours in.
-job_runs=$(python3 "$job_controller" budget --duration "$duration") || fail 'the job campaign would outgrow its retained-run limit'
+# A final ends with a quiet tail after its faults (#1062, maintainer decision
+# 20 October 2026): no faults, walks or specials, so every node's Bun lives
+# long enough to arm leak-rss (an hour) and leak-fd and give them an hour of
+# comparison samples. The final's record fails unless both were armed long
+# enough on every node. The 15 minutes past two hours cover the heavy
+# sampling grid; sustained_check.py has the same length and says why
+# (QUIET_TAIL_SECONDS). The jobs keep running through it.
+quiet_tail=0
+[ "$tier" != final ] || quiet_tail=8100
+job_runs=$(python3 "$job_controller" budget --duration "$(( duration + quiet_tail ))") || fail 'the job campaign would outgrow its retained-run limit'
 light_every=30
 heavy_every=300
 leaf_lifetime=3600
@@ -307,6 +349,12 @@ bootstrap() {
     "${staged[@]}" > "$evidence/bootstrap.log" 2>&1 || result=$?
     home=$(sed -n 's/^RELIABURGER_HOME: //p' "$evidence/bootstrap.log" | head -n 1)
     [ -z "$home" ] || bootstrapped=true
+    # Keep the candidate record's bytes the staged install checked against
+    # --qualified-digest: the record's verdict hashes them again (#1061).
+    local staged_evidence
+    staged_evidence=$(sed -n 's/^Evidence (logs, timings, candidate record): `\(.*\)`$/\1/p' "$evidence/bootstrap-record.md" 2>/dev/null | head -n 1)
+    [ -z "$staged_evidence" ] || [ ! -f "$staged_evidence/candidate.json" ] \
+        || cp "$staged_evidence/candidate.json" "$evidence/candidate.json"
     [ "$result" -ne 0 ] || return 0
     # A failed tour step after a finished install still leaves a cluster to
     # soak; the staged-install qualification owns that step, so note it.
@@ -1100,7 +1148,9 @@ settle() {
     done
 }
 
-random_between() { echo $(( $1 + RANDOM % ($2 - $1 + 1) )); }
+# Every choice comes from the run's seed and is logged as a `choice` event
+# (#1062): random_between WHAT LOW HIGH.
+random_between() { check choose "$evidence" "$1" "$2" "$3"; }
 
 current_leader() {
     rel --output json nodes > "$evidence/.nodes.json" 2>/dev/null || return 1
@@ -1110,36 +1160,43 @@ random_follower() {
     local leader candidates=() i
     leader=$(current_leader) || leader=0
     for i in 1 2 3; do [ "$i" = "$leader" ] || [ "${down[i]}" = 1 ] || candidates+=("$i"); done
-    echo "${candidates[RANDOM % ${#candidates[@]}]}"
+    echo "${candidates[$(random_between follower 0 $(( ${#candidates[@]} - 1 )))]}"
 }
 
+# Bun's main pid on a node, to show a kill replaced the process.
+main_pid() { gsh "$1" 'systemctl show -p MainPID --value reliaburger.service' 2>/dev/null || echo '?'; }
+
 slot_bun_kill() {
-    local role=$1 node
+    local role=$1 node before
     if [ "$role" = leader ]; then node=$(current_leader) || node=1; else node=$(random_follower); fi
     say "fault: SIGKILL bun on the $role ${vm[node]}"
     open_window "bun-kill-$role"
     avoid=$node
+    before=$(main_pid "$node")
     kill_bun "$node"
     event --phase "fault:bun-kill-$role" --target "${vm[node]}" --command 'kill -9 MainPID'
     settle "fault:bun-kill-$role" 300 || true
+    event --phase "effect:bun-kill-$role" --target "${vm[node]}" --detail "MainPID $before -> $(main_pid "$node")"
     avoid=0
 }
 
 slot_deploy_kill() {
-    local node offset
+    local node offset before
     generation=$(( generation + 1 ))
     meta generation "$generation"
     write_workloads
-    node=$(random_between 1 3)
-    offset=$(random_between 0 "$kill_offset")
+    node=$(random_between deploy-kill-node 1 3)
+    offset=$(random_between deploy-kill-offset 0 "$kill_offset")
     say "fault: rolling deploy (generation $generation), SIGKILL bun on ${vm[node]} after $offset s"
     open_window deploy-kill
     rel apply -f "$evidence/workloads.toml" > "$evidence/snapshots/apply-$generation.log" 2>&1 || true
     sleep "$offset"
     avoid=$node
+    before=$(main_pid "$node")
     kill_bun "$node"
     event --phase fault:deploy-kill --target "${vm[node]}" --detail "generation $generation, kill after $offset s"
     settle fault:deploy-kill 300 || true
+    event --phase effect:deploy-kill --target "${vm[node]}" --detail "MainPID $before -> $(main_pid "$node")"
     avoid=0
 }
 
@@ -1163,12 +1220,14 @@ power_on() {
 slot_power_off() {
     local node hold
     power_offs=$(( power_offs + 1 ))
-    if [ $(( power_offs % 4 )) -eq 0 ]; then node=1; else node=$(random_between 2 3); fi
-    hold=$(random_between "$hold_min" "$hold_max")
+    if [ $(( power_offs % 4 )) -eq 0 ]; then node=1; else node=$(random_between power-off-node 2 3); fi
+    hold=$(random_between power-off-hold "$hold_min" "$hold_max")
     say "fault: power off ${vm[node]} for $hold s"
     open_window power-off 1
     power_off "$node"
     event --phase fault:power-off --target "${vm[node]}" --command 'limactl stop --force' --detail "held $hold s"
+    event --phase effect:power-off --target "${vm[node]}" \
+        --detail "Lima status $("$limactl" list --format '{{.Status}}' "${vm[node]}" 2>/dev/null || echo unknown)"
     wait_until $(( $(date +%s) + hold ))
     power_on "$node" || event --phase fault:power-off --target "${vm[node]}" --verdict fail --detail 'relish local start failed'
     settle fault:power-off 480 || true
@@ -1193,6 +1252,10 @@ node_fault_script() {
         disk-full:stop) printf '%s\n' 'rm -f /var/lib/reliaburger/soak-disk-fill' ;;
         slow-fsync:start) printf '%s\n' 'source=$(findmnt -no SOURCE --target /var/lib/reliaburger); disk=$(lsblk -no PKNAME "$source" | head -n 1); disk=/dev/${disk:-${source#/dev/}}; systemctl set-property --runtime reliaburger.service "IOWriteIOPSMax=$disk 20" "IOWriteBandwidthMax=$disk 1M"' ;;
         slow-fsync:stop) printf '%s\n' 'systemctl set-property --runtime reliaburger.service IOWriteIOPSMax= IOWriteBandwidthMax=' ;;
+        # What the fault is seen to do once injected, for the record (#1062).
+        delay:effect) printf '%s\n' 'tc qdisc show dev "$(cat /run/soak-delay-dev)" root | grep -o "netem.*" || echo "no netem qdisc"' ;;
+        disk-full:effect) printf '%s\n' 'echo "available $(df --output=avail -B1 /var/lib/reliaburger | tail -n 1) bytes"' ;;
+        slow-fsync:effect) printf '%s\n' 'systemctl show -p IOWriteIOPSMax -p IOWriteBandwidthMax reliaburger.service | tr "\n" " "' ;;
     esac
 }
 slot_node_fault() {
@@ -1202,7 +1265,7 @@ slot_node_fault() {
     node_fault_index=$(( node_fault_index + 1 ))
     [ "${down[node]}" = 0 ] || node=1
     peer=$(( node % 3 + 1 ))
-    hold=$(random_between "$hold_min" "$hold_max")
+    hold=$(random_between node-fault-hold "$hold_min" "$hold_max")
     log=$evidence/snapshots/node-$kind-$node_fault_index.log
     say "fault: $kind on ${vm[node]} for $hold s"
     # The checker excuses slow turns only on the node the fault throttles (#972).
@@ -1212,6 +1275,8 @@ slot_node_fault() {
     gsh "$node" "PEER=${address[peer]}; $(node_fault_script "$kind" start)" > "$log" 2>&1 || result=$?
     event --phase "fault:node-$kind" --target "${vm[node]}" --exit "$result" --command "$kind" --detail "held $hold s"
     [ "$result" -eq 0 ] || record_failure "node-$kind" "could not inject $kind on ${vm[node]}; see ${log##*/}"
+    event --phase "effect:node-$kind" --target "${vm[node]}" \
+        --detail "$(gsh "$node" "$(node_fault_script "$kind" effect)" 2>&1 | tr '\n' ' ' | cut -c1-200)"
     # A mark sees only the last 15 s, and runc attempts are sparse, so one mark
     # at injection was a coin toss for runc's overlap: mark all through the hold.
     local until=$(( $(date +%s) + hold )) next
@@ -1242,14 +1307,15 @@ PY
 }
 
 chaos_index=0
+chaos_kinds=(kill delay partition scenario pause drop dns cpu memory)
 slot_chaos() {
     local round
     for (( round = 0; round < chaos_per_slot; round++ )); do chaos_one; done
 }
 
 chaos_one() {
-    local kinds=(kill delay partition scenario pause drop dns cpu memory) kind instance result=0 output=$evidence/snapshots/chaos-$chaos_index.log
-    kind=${kinds[chaos_index % ${#kinds[@]}]}
+    local kind instance result=0 output=$evidence/snapshots/chaos-$chaos_index.log
+    kind=${chaos_kinds[chaos_index % ${#chaos_kinds[@]}]}
     chaos_index=$(( chaos_index + 1 ))
     say "fault: chaos $kind"
     open_window "chaos-$kind"
@@ -1310,7 +1376,7 @@ catalogue_pulse() {
 offline_export() {
     local node output result=0
     output=$evidence/snapshots/offline-export-$(date +%s).log
-    node=$(random_between 2 3)
+    node=$(random_between export-node 2 3)
     [ "${down[node]}" = 0 ] || node=1
     gsh "$node" 'relish logs-export --source /var/lib/reliaburger/logs/parquet --dest /var/lib/reliaburger/soak-export/offline --node-id offline 2>&1; echo "export exit $?"
         relish logs-search /var/lib/reliaburger/soak-export/logs/'"${vm[node]}"' "SELECT count(*) AS n FROM logs" 2>&1; echo "search exit $?"' \
@@ -1400,9 +1466,9 @@ slot_upgrade() {
     gsh 1 "RELIABURGER_TOKEN=\$(cat /root/.soak-token) relish --endpoint https://127.0.0.1:9117 --ca-cert /etc/reliaburger/identity/root-ca.crt upgrade start --binary /var/tmp/$name --registry ${address[1]}:5050 --allow-downgrade" \
         > "$evidence/snapshots/upgrade-$upgrade_walks-start.log" 2>&1 || record_failure upgrade "upgrade start failed; see upgrade-$upgrade_walks-start.log"
     if [ "$inject" -eq 1 ]; then
-        sleep "$(random_between 10 60)"
+        sleep "$(random_between walk-fault-delay 10 60)"
         if [ $(( upgrade_walks % 4 )) -eq 1 ]; then kill_bun "$(current_leader || echo 1)"; else
-            local node; node=$(random_between 2 3); power_off "$node"; sleep "$hold_min"; power_on "$node" || true
+            local node; node=$(random_between walk-power-off-node 2 3); power_off "$node"; sleep "$hold_min"; power_on "$node" || true
         fi
     fi
     # Every node reporting the target isn't the end of the run: the leader
@@ -1510,9 +1576,9 @@ run_cycle() {
     say "cycle $index"
     current_slot="$index:follower-kill"; wait_until "$start"; run_slot slot_bun_kill follower
     current_slot="$index:leader-kill"; wait_until $(( start + slot )); run_slot slot_bun_kill leader
-    if [ $(( index % 2 )) -eq 1 ] && [ -n "$soak_bun" ]; then
+    if [ $(( index % 2 )) -eq 1 ] && [ "$walks" = true ]; then
         current_slot="$index:upgrade"; wait_until $(( start + 2 * slot )); run_slot slot_upgrade
-        # Compressed runs chaos after the walk too, so cycles 0-3 cover all seven kinds.
+        # Compressed runs chaos after the walk too, so cycles 0-3 run eight of the nine kinds.
         if [ "$schedule" = compressed ]; then
             current_slot="$index:chaos"; wait_until $(( start + 4 * slot )); run_slot slot_chaos
         fi
@@ -1645,12 +1711,14 @@ start_run() {
     meta evidence "\`$evidence\`"
     meta started_at "json:$(date +%s)"
     meta duration_target "json:$duration"
+    meta quiet_tail "json:$quiet_tail"
     meta job_load "$job_load"
     [ -z "$target_rate" ] || meta target_rate "$target_rate"
     meta node_faults "json:$node_faults"
     meta ingress_rotation_secs "json:$rotation"
     [ -z "$base_url" ] || meta base_url "<$base_url>"
     meta candidate_digest "\`${qualified_digest:-not checked}\`"
+    [ -z "$qualified_digest" ] || meta qualified_digest "$qualified_digest"
     if [ -n "$soak_bun" ]; then
         meta soak_bun "\`${soak_bun##*/}\`, SHA-256 \`$(sha256 "$soak_bun")\`"
     else
@@ -1671,6 +1739,12 @@ if [ "$plan" = true ]; then
         case $1 in
             special_for_cycle) "$@" ;;
             slot_bun_kill) printf 'plan: cycle %s %s-kill\n' "$index" "$2" ;;
+            slot_chaos) printf 'plan: cycle %s chaos' "$index"
+                        for (( round = 0; round < chaos_per_slot; round++ )); do
+                            printf ' %s' "${chaos_kinds[chaos_index % ${#chaos_kinds[@]}]}"
+                            chaos_index=$(( chaos_index + 1 ))
+                        done
+                        printf '\n' ;;
             slot_node_fault) printf 'plan: cycle %s node-fault %s node %s\n' "$index" "$(node_fault_kind "$node_fault_index")" \
                                  "$(node_fault_node "$node_fault_index")"
                              node_fault_index=$(( node_fault_index + 1 )) ;;
@@ -1683,12 +1757,14 @@ if [ "$plan" = true ]; then
     special_quorum_loss() { printf 'plan: cycle %s special quorum-loss\n' "$index"; }
     # shellcheck disable=SC2329
     special_all_off() { printf 'plan: cycle %s special all-off\n' "$index"; }
-    printf 'plan: tier %s schedule %s duration %s cycle %s job-load %s target-rate %s node-faults %s\n' \
-        "$tier" "$schedule" "$duration" "$cycle" "$job_load" "${target_rate:-none}" "$node_faults"
+    printf 'plan: tier %s schedule %s duration %s cycle %s job-load %s target-rate %s node-faults %s quiet-tail %s\n' \
+        "$tier" "$schedule" "$duration" "$cycle" "$job_load" "${target_rate:-none}" "$node_faults" "$quiet_tail"
     plan_cycles=$(( (duration + cycle - 1) / cycle ))
     [ "$plan_cycles" -ge "$min_cycles" ] || plan_cycles=$min_cycles
     printf 'plan: %s\n' "$job_runs"
+    printf 'plan: seed %s for every fault and node choice\n' "${seed:-random}"
     for (( index = 0; index < plan_cycles; index++ )); do run_cycle "$index" 0; done
+    [ "$quiet_tail" -eq 0 ] || printf 'plan: quiet-tail %s s with no faults, walks or specials after the last cycle\n' "$quiet_tail"
     rm -rf "$evidence"
     exit 0
 fi
@@ -1696,6 +1772,11 @@ fi
 trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
+
+# Every fault and node choice comes from one seed (#1062). A resumed run
+# carries on with its own seed and its place in the sequence.
+seed=$(check seed "$evidence" ${seed:+--seed "$seed"}) || fail 'cannot start the seeded fault choices'
+say "fault and node choices from seed $seed (--seed $seed repeats them)"
 
 if [ "$resume" = true ]; then
     home=$(meta_get home_path)
@@ -1767,7 +1848,7 @@ PY
     end=$(( started_at + duration ))
     next_rotation=$(( started_at + rotation ))
 fi
-meta job_stop_at "json:$(( end - 120 ))"
+meta job_stop_at "json:$(( end + quiet_tail - 120 ))"
 [ -n "$jobs_pid" ] || start_jobs
 
 next_light=$(date +%s)
@@ -1785,5 +1866,16 @@ while :; do
 done
 current_slot=final
 wait_until "$end"
+if [ "$quiet_tail" -gt 0 ]; then
+    # The tail starts when the last cycle has finished, however late, and
+    # always runs its full length; the jobs drain in its last two minutes.
+    quiet_started=$(date +%s)
+    meta job_stop_at "json:$(( quiet_started + quiet_tail - 120 ))"
+    say "quiet tail: no faults for $quiet_tail s, so every leak checker arms"
+    event --phase quiet --detail "no faults, walks or specials for $quiet_tail s"
+    current_slot=quiet
+    wait_until $(( quiet_started + quiet_tail ))
+    event --phase quiet --verdict ok --duration $(( $(date +%s) - quiet_started ))
+fi
 observe heavy || true
 say "soak finished after $index cycles"

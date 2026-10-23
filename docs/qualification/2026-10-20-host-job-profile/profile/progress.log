@@ -1,0 +1,10 @@
+bun pid 21934
+2026-10-20T16:34:41Z c27-r1-host jobs-host-processes c=27 perf=none exit 0
+2026-10-20T16:35:54Z c27-r2-host jobs-host-processes c=27 perf=none exit 0
+2026-10-20T16:37:05Z c27-perfcpu-host jobs-host-processes c=27 perf=cpu exit 0
+2026-10-20T16:38:16Z c27-perfcpu-raw jobs-vm-baseline c=27 perf=cpu exit 0
+2026-10-20T16:39:27Z c27-perfoff-host jobs-host-processes c=27 perf=off exit 0
+2026-10-20T16:40:40Z c27-perfsched-host jobs-host-processes c=27 perf=sched exit 0
+2026-10-20T16:41:51Z c32-perfcpu-host jobs-host-processes c=32 perf=cpu exit 0
+2026-10-20T16:43:02Z c32-perfcpu-raw jobs-vm-baseline c=32 perf=cpu exit 0
+2026-10-20T16:43:12Z DONE

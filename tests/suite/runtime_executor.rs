@@ -7,6 +7,9 @@ use reliaburger::grill::runc_intent::{IntentConfiguration, IntentJournal, Intent
 use reliaburger::grill::{InstanceId, OciSpec};
 
 async fn executor(root: &Path) -> (IntentJournal, ClaimedCommandExecutor) {
+    // Each command's owner is `bun`, which `start` gives 15 s to answer, so
+    // pay its first launch before that clock starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let journal = IntentJournal::new(
         root.join("intents"),
         IntentConfiguration {

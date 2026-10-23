@@ -15,6 +15,25 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+// A `#[path]` here is relative to this file's directory, so every binary that
+// includes this module gets the helper without declaring it itself. A binary
+// that also needs it directly reaches it as `bun_process::first_launch`.
+#[path = "first_launch.rs"]
+pub mod first_launch;
+
+/// Pay the first launch of `bun`, `relish` and `testapp` in this test
+/// process, all at once, before any helper starts a deadline (#1149). On
+/// macOS a launch that `syspolicyd` hasn't assessed yet waits in a host-wide
+/// queue, and nextest runs each test in a process of its own; see
+/// `first_launch.rs`. Later calls in the same process return at once.
+pub fn first_launch_binaries() {
+    first_launch::first_launch(&[
+        (Path::new(env!("CARGO_BIN_EXE_bun")), &["--version"]),
+        (Path::new(env!("CARGO_BIN_EXE_relish")), &["--version"]),
+        (Path::new(env!("CARGO_BIN_EXE_testapp")), &["--version"]),
+    ]);
+}
+
 /// Keep a readable Bun log unchanged, or expose only the failed read's kind.
 /// Error text and paths can contain sensitive fixture data and are omitted.
 pub fn bun_log_diagnostic(log_path: &Path) -> String {
@@ -120,6 +139,7 @@ impl BunProcess {
         log_path: PathBuf,
         runtime: &str,
     ) -> Self {
+        first_launch_binaries();
         let _phase = fixture_phase("bun-child-spawn");
         let log = std::fs::File::create(&log_path).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_bun"));
@@ -430,6 +450,7 @@ pub fn assert_success(output: &Output, context: &str) {
 
 /// Retry a Relish command until it succeeds, failing if Bun exits first.
 pub fn wait_for_relish(bun: &mut BunProcess, args: &[&str]) -> Output {
+    first_launch_binaries();
     let _phase = fixture_phase("relish-endpoint-readiness");
     let deadline = Instant::now() + WAIT;
     loop {
@@ -453,6 +474,7 @@ pub fn wait_for_relish(bun: &mut BunProcess, args: &[&str]) -> Output {
 /// Retry a Relish command until it succeeds and its stdout contains
 /// `expected`, failing if Bun exits first.
 pub fn wait_for_relish_output(bun: &mut BunProcess, args: &[&str], expected: &str) -> Output {
+    first_launch_binaries();
     let deadline = Instant::now() + WAIT;
     loop {
         bun.assert_running();

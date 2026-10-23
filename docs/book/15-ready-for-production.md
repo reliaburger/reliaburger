@@ -5604,6 +5604,34 @@ and `a_large_consumer_view_change_takes_each_turn_well_within_the_budget`
 keeps it that way: every turn, less its journal write, must stay under half
 the budget.
 
+Or it did, until a Mac running several agents' builds failed it with turns
+of 500 to 700 ms (#1140). Wall clock is the wrong ruler for "what the view's
+size costs": a turn that spends 40 ms working and 600 ms waiting for a core
+looks just like one that works for 640 ms. So the test now asks the kernel
+how much CPU the process used across each turn, with `getrusage`:
+
+```rust
+fn process_cpu_time() -> std::time::Duration {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    assert_eq!(status, 0, "getrusage failed");
+    // user time plus system time, from two `timeval`s
+}
+```
+
+Both `unsafe` blocks carry a `// SAFETY:` comment in the source, cut here.
+`std::mem::zeroed` makes a value whose bytes are all zero. That's undefined
+behaviour for a reference or an enum, so the compiler can't vouch for it,
+but `rusage` is a C struct of integers, and zero is a fine integer.
+`getrusage` is a C function, and every foreign call is `unsafe` because Rust
+can't check what the other side does with the pointer. User plus system time
+counts the loop's own work and any blocking-pool work it waited for, and none
+of the waiting. Instrumented under the load that failed it, the old verdict
+would have failed 33 runs out of 120, while no turn used more than 116 ms of
+CPU. Now each turn must use less than half the budget in CPU time. A mutant
+that adds two seconds of arithmetic to every turn fails it at once, and 240
+loaded runs passed.
+
 That leaves the disk, the lock and the host. The same second, node 2 logged
 a 489 ms snapshot turn and node 3 an executor that "did not retire within
 1s", on three VMs sharing one Mac's disk while the leader ran a job campaign.
@@ -7399,3 +7427,41 @@ cover it. The reaping wasn't involved at all: on macOS there is no subreaper,
 `launchd` adopts the orphans, and the test saw no zombies in any run. So
 `Owner::start` now calls `first_launch` on `bun --version` before it starts
 the owner, and the 15 seconds go back to timing the owner.
+
+One test fixed is one test. How many others start `bun` or `relish` under a
+deadline that includes the launch
+([#1149](https://github.com/reliaburger/reliaburger/issues/1149))? We went
+looking, and the answer was most of the black-box suite. Every Bun the shared
+fixture starts gets 30 seconds to listen. `relish` gets 30 seconds to reach
+it. Every command, role and process the owned runtimes start has a `bun`
+owner with 15 seconds to answer. To make it fail on demand, we replaced
+`bun`, `relish` and `testapp` with fresh copies of themselves before each
+round, which makes each one a new file to assess, and ran thirteen exposed
+tests under nextest. Three loops kept the assessment queue busy with fresh
+copies of an 840 MB test binary. In three rounds of four, both
+`owned_commands` tests we picked failed at exactly their 15-second bound.
+
+The fix lives where the deadlines do. `bun_process.rs` gained
+`first_launch_binaries()`, which pays all three first launches at once, and
+`BunProcess::spawn_runtime`, `wait_for_relish` and `wait_for_relish_output`
+call it before their clocks start. That covers every test that goes through
+the fixture, in the suite and in the separate `tests/*.rs` binaries. The
+module includes `first_launch.rs` itself:
+
+```rust
+#[path = "first_launch.rs"]
+mod first_launch;
+```
+
+`#[path]` on a module declared in a file (rather than inside an inline
+`mod { }` block) is relative to that file's directory, so this finds the
+sibling in `tests/support/` whichever binary includes `bun_process.rs`. The
+suite used to declare `first_launch` itself as well, and Clippy refuses a
+file loaded as two modules (`duplicate_mod`): each would be a separate module
+with its own `static` set of launched paths. So the suite now writes
+`use bun_process::first_launch;` instead, and `crate::first_launch` still
+names the one copy. Tests that spawn `bun` or
+`relish` themselves, or hand `bun` to the owned runtimes, call the helper
+before their own deadline. No deadline changed, and the same thirteen tests
+passed all eight rounds we ran under the same conditions. The PR lists every
+test the audit found and what happened to each.

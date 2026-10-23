@@ -239,8 +239,11 @@ bench-task-arrays`. Both run nightly on `main` and on pushes to it. A pull
 request runs the first when it touches the gossip protocol or its benchmarks,
 and the second when it touches what `benches/task_arrays.rs` measures: the
 task-array leader and node pool, the executor, range sets, the benchmark
-itself or `bench_baseline.py` ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)), unless it targets a
-merge train: there both wait for the merge queue and the push. The gossip numbers
+itself or `bench_baseline.py` ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)). A change to
+`criterion`'s version, in `Cargo.toml` or only in `Cargo.lock`, runs both,
+because both parse its output and use its filter syntax
+([#1151](https://github.com/reliaburger/reliaburger/issues/1151)). A pull request into a
+merge train without the `full-ci` label runs neither: there both wait for the merge queue and the push. The gossip numbers
 gate nothing. The task-array job compares each benchmark's mean with the
 baseline the last `main` run saved
 ([`bench_baseline.py`](../scripts/ci/bench_baseline.py)). Hosted runners
@@ -343,7 +346,10 @@ Evidence there binds to the queue's temporary group commit
 
 A newer push to the same pull request, or to the same train, cancels the
 older run; pushes to `main`, merge-queue groups and nightly runs each keep
-their own. When GitHub retargets a stacked pull request,
+their own. Closing (or merging) a pull request cancels its run too: the
+`closed` event starts a run in the same group whose only job is a no-op, and
+every other job skips it
+([#1054](https://github.com/reliaburger/reliaburger/issues/1054)). When GitHub retargets a stacked pull request,
 [`ci-retarget.yml`](../.github/workflows/ci-retarget.yml) reruns CI with the
 new base, so the new base's set applies without another push. The fixtures in
 [`test_select_jobs.py`](../scripts/ci/test_select_jobs.py) cover each case.
@@ -550,9 +556,9 @@ after the first step.
 | Gate | What it does | Where |
 |---|---|---|
 | Staged install | `curl \| sh` against the exact signed candidate, from empty caches, then the homepage tour and a full teardown | [`qualify-staged-install.sh`](../scripts/release/qualify-staged-install.sh), [records](qualification/) |
-| Sustained soak, fast tier | About an hour on a 10-minute cycle: every fault kind (killed agents, powered-off VMs, chaos faults, upgrade round trips) and every special (graceful restart, quorum loss, every VM off), with invariants checked every 30 seconds. Run after each round of fixes; it catches what shows up in the first hour | [`qualify-sustained.sh --tier fast`](../scripts/release/qualify-sustained.sh), [plan](plans/2026-09-25-v02-sustained.md); up to about 4 h without upgrade walks on a hosted Linux runner with [`soak.yml`](../.github/workflows/soak.yml) ([runbook](releasing.md#soaking-a-candidate-in-ci)) |
+| Sustained soak, fast tier | About an hour on a 10-minute cycle: every fault kind (killed agents, powered-off VMs, chaos faults, upgrade round trips) and every special (graceful restart, quorum loss, every VM off), with invariants checked every 30 seconds. Run after each round of fixes; it catches what shows up in the first hour | [`qualify-sustained.sh --tier fast`](../scripts/release/qualify-sustained.sh), [plan](plans/2026-09-25-v02-sustained.md); up to about 4 h without upgrade walks on a hosted Linux runner with [`soak.yml`](../.github/workflows/soak.yml), as a diagnostic that passes no tier ([runbook](releasing.md#soaking-a-candidate-in-ci)) |
 | Job qualification, fast tier (0.2.0 exit gate, D18-C) | The same soak with jobs at the #668 target (1,390 accepted a second by default) and a node-level fault every cycle: inter-node delay, a full disk, slow fsync. About an hour compressed; every job mode overlaps every fault kind | [`qualify-jobs-sustained.sh --tier fast`](../scripts/release/qualify-jobs-sustained.sh), [plan](plans/archive/2026-10-10-plan-release-job-soak.md#job-qualification-tiers-686-decision-d18-c) |
-| Final soak | 8 hours on the hourly schedule, once per final candidate: the job soak above on the full schedule, so it checks everything the V02 final does as well as the jobs, and it's the only final soak the gate runs (maintainer decision, 17 October 2026, [#991](https://github.com/reliaburger/reliaburger/issues/991)). It's there for slow accumulation: bun memory growth, a registry 503 and a memory alert first showed up between 4.8 and 6.2 hours into the 12-hour run of 25 September. Only a clean final-tier run passes V02. Records the September plan's measurements without gating on them, against targets restated for a soak (maintainer decision, 15 October 2026, [#668](https://github.com/reliaburger/reliaburger/issues/668)). `qualify-sustained.sh --tier final` still runs the V02 final alone, outside the gate | [`qualify-jobs-sustained.sh --tier final`](../scripts/release/qualify-jobs-sustained.sh), [plans](plans/2026-09-25-v02-sustained.md), [runbook](releasing.md#staging-a-candidate) |
+| Final soak | 8 hours of faults on the hourly schedule, then a 2¼-hour quiet tail that arms every leak checker on every node ([#1062](https://github.com/reliaburger/reliaburger/issues/1062)), once per final candidate: the job soak above on the full schedule, so it checks everything the V02 final does as well as the jobs, and it's the only final soak the gate runs (maintainer decision, 17 October 2026, [#991](https://github.com/reliaburger/reliaburger/issues/991)). It's there for slow accumulation: bun memory growth, a registry 503 and a memory alert first showed up between 4.8 and 6.2 hours into the 12-hour run of 25 September. Only a clean final-tier run whose execution inventory is complete passes: every upgrade walk, fault kind, node fault and special its 8-hour schedule owes, the final job drain and the candidate bytes it verified, counted from what ran rather than from the run's labels ([#1061](https://github.com/reliaburger/reliaburger/issues/1061)). Fault and node choices come from a logged seed that `--seed` repeats, and every leak checker must be armed for 60 minutes on every node, with one unbroken 30-minute window, which the final's quiet tail makes possible ([#1062](https://github.com/reliaburger/reliaburger/issues/1062)). Records the September plan's measurements without gating on them, against targets restated for a soak (maintainer decision, 15 October 2026, [#668](https://github.com/reliaburger/reliaburger/issues/668)). `qualify-sustained.sh --tier final` still runs the V02 final alone, outside the gate | [`qualify-jobs-sustained.sh --tier final`](../scripts/release/qualify-jobs-sustained.sh), [plans](plans/2026-09-25-v02-sustained.md), [runbook](releasing.md#staging-a-candidate) |
 | Loops | Upgrade, council recovery and lease tests repeated for hours on Linux x86, Linux Arm and macOS | [`v02-loops.yml`](../.github/workflows/v02-loops.yml) |
 | Power cut and reboot | A disposable VM forced off mid-write for each storage path (exporters, leases, council backups), and rebooted with containers and eBPF network rules in place, 10 times per lane, or 25 when the release changes storage, locking or ownership (0.2.0 and 0.2.1 ran 25); every acknowledged write and every owned resource must survive ([above](#pulling-the-plug)) | [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh), [`qualify-oci-reboot.sh`](../scripts/release/qualify-oci-reboot.sh), [`qualify-discovery-reboot.sh`](../scripts/release/qualify-discovery-reboot.sh), [0.2.1 record](qualification/2026-10-21-power-cut-reboot.md) |
 | Task-array benchmarks | Nightly on `main`, failing on a regression of more than 2x against the last baseline | [Benchmarks in CI](#benchmarks-in-ci) |
@@ -606,8 +612,8 @@ accounting, unknown-owner fences, independent effects, stale observations,
 exact orphan detection and failure propagation into the final V02 verdict.
 For the job qualification tiers they also parse `--plan` output (an hour-long
 fast tier whose first four cycles carry every fault kind and every special,
-node faults on every node, an 8-hour final whose cycles and run budget fit
-together),
+node faults on every node, an 8-hour final whose cycles, quiet tail and run
+budget fit together),
 the target-load bodies and rate gate, retry-cause accounting (the harness's
 cause list must match the fields of the product's `RetryCauses`, and an
 unknown cause is refused by name), the retained-run limit (an 8- or 12-hour final
