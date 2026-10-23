@@ -17,6 +17,7 @@ mod namespace_secrets;
 mod published_status;
 mod restart_ownership;
 mod runtime_metadata;
+mod secret_providers;
 mod stop_hooks;
 mod upgrade_answer;
 
@@ -2675,6 +2676,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             operation: None,
             stop_confirmation_timeout: self.stop_confirmation_timeout,
             egress: self.egress_resolver(),
+            secrets: self.secret_providers.clone(),
         };
         let events = events.clone();
         let mut task = tokio::spawn(async move { worker.run_deploy(config, events).await });

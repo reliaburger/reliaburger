@@ -126,7 +126,7 @@ is a field the node can't honour; nothing is silently dropped.
 | `port` | Port the app listens on; published on the node and in service discovery |
 | `cpu`, `memory` | Request–limit ranges, such as `"250m-1000m"` and `"256Mi-512Mi"` |
 | `gpu` | Refused above 0 until GPU support lands ([#359](https://github.com/reliaburger/reliaburger/issues/359)) |
-| `env` | Environment variables, plain or encrypted |
+| `env` | Environment variables: plain, encrypted (`ENC[AGE:...]`) or from a secret provider (`PROVIDER[name:path]`, see `security`) |
 | `namespace` | Namespace; `default` when omitted |
 | `health` | `path`, `port` (default: the app's `port`), `protocol` (`http` or `https`), `interval` (10 s), `timeout` (5 s, at most `interval`), `threshold_unhealthy` (3), `threshold_healthy` (1), `initial_delay` (0 s). No zeros |
 | `[[init]]` | `image` (default: the app's) and `command`; runs before the app with its env and mounts |
@@ -155,7 +155,7 @@ A `[job.NAME]` table takes these fields. Unknown fields are refused.
 | `command` | Command and arguments |
 | `cpu`, `memory` | Request–limit ranges, as for apps |
 | `pids` | Most processes and threads one command may hold (`pids.max`), 1–32768. Default 256 for `shared-runc` and host executor commands; no limit for a fresh `runc` container |
-| `env` | Environment variables, plain or encrypted |
+| `env` | Environment variables, plain or encrypted; `PROVIDER[...]` values are refused (apps only) |
 | `namespace` | Namespace; `default` when omitted |
 | `schedule` | Cron schedule in UTC: five fields or a macro such as `@daily` |
 | `run_before` | `["app.NAME"]`: run as a hook before that app publishes |
@@ -220,6 +220,7 @@ startup instead of being ignored.
 | `[gitops]`, `[upgrades]` | see `operations` |
 | `[smoker]`, `[testing]` | fault durations and the fault and test policy (see `chaos`) |
 | `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none; a `script` needs `/bin/sh`), which the scheduler also places by; host commands inherit only `PATH`, `HOME`, `LANG`, `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun |
+| `[secret_providers.NAME]` | `binary` (absolute), `timeout_secs` (5, at most 60), `max_output_bytes` (64 KiB, at most 1 MiB), `env`: the exec secret providers this node runs for `PROVIDER[NAME:path]` values, which the scheduler also places by (see `security`) |
 | `[reporting_tree]` | `report_interval_secs` (5), `stale_report_timeout_secs` (30), `stale_node_grace_secs` (300: how long a live node whose reports stopped keeps its replicas before they move; see `deploy-an-app`) |
 | `[runtime]` | `stop_confirmation_timeout_secs` |
 

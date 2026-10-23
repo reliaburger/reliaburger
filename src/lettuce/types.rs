@@ -410,7 +410,11 @@ pub fn plaintext_secret_warnings(config: &crate::config::Config) -> Vec<String> 
     for (name, spec) in &config.app {
         let namespace = spec.namespace.as_deref().unwrap_or("default");
         for (key, value) in &spec.env {
-            if is_secret_looking_key(key) && !value.is_encrypted() && !value.as_str().is_empty() {
+            if is_secret_looking_key(key)
+                && !value.is_encrypted()
+                && !value.is_provider()
+                && !value.as_str().is_empty()
+            {
                 warnings.push(format!(
                     "app {namespace}/{name}: env {key} looks like a secret but is plaintext \
                      in git; encrypt it with `relish secret encrypt` (ENC[AGE:...])"

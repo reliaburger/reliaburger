@@ -156,6 +156,10 @@ pub struct Compatibility {
 /// encrypted-entry envelope are postcard, not bincode (#1026).
 ///
 /// 0.2.4, Extension points (55/72): one bump for the whole release, made by its first wire or state change. Each later 0.2.4 change adds its line below this one, not another bump.
+/// A node's capability report lists the secret providers it runs
+/// (`NodeCapabilities::secret_providers`), and an app's env value
+/// `PROVIDER[name:path]` is a provider reference in Raft desired state,
+/// not plain text (#1123).
 /// An app's `stop_signal`, `stop_grace`, `pre_stop` and `pre_stop_timeout`
 /// in Raft desired state and node syncs, and the `stop` policy in OCI
 /// specs, instance records, runtime intents and process owner records (#1121).

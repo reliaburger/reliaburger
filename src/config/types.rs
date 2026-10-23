@@ -372,14 +372,19 @@ impl<'de> Deserialize<'de> for Replicas {
 // EnvValue
 // ---------------------------------------------------------------------------
 
-/// An environment variable value — either plain text or an encrypted secret.
+/// An environment variable value: plain text, an encrypted secret, or a
+/// secret a provider resolves at launch.
 ///
 /// Values starting with `ENC[AGE:` are treated as age-encrypted secrets
-/// and decrypted at injection time. Everything else is plain text.
+/// and decrypted at injection time. Values starting with `PROVIDER[` name an
+/// exec secret provider and a path (#1123), and must parse as one. Everything
+/// else is plain text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvValue {
     Plain(String),
     Encrypted(String),
+    /// `PROVIDER[name:path]`: resolved on the node when an instance launches.
+    Provider(crate::sesame::secret_provider::SecretReference),
 }
 
 impl EnvValue {
@@ -390,10 +395,25 @@ impl EnvValue {
         matches!(self, EnvValue::Encrypted(_))
     }
 
-    /// Returns the raw string value (with prefix for encrypted values).
+    /// Returns `true` if this value names a secret provider.
+    pub fn is_provider(&self) -> bool {
+        matches!(self, EnvValue::Provider(_))
+    }
+
+    /// The provider reference, if this value is one.
+    pub fn provider_reference(&self) -> Option<&crate::sesame::secret_provider::SecretReference> {
+        match self {
+            EnvValue::Provider(reference) => Some(reference),
+            EnvValue::Plain(_) | EnvValue::Encrypted(_) => None,
+        }
+    }
+
+    /// Returns the raw string value (with prefix for encrypted and provider
+    /// values).
     pub fn as_str(&self) -> &str {
         match self {
             EnvValue::Plain(s) | EnvValue::Encrypted(s) => s,
+            EnvValue::Provider(reference) => reference.as_str(),
         }
     }
 }
@@ -409,6 +429,10 @@ impl<'de> Deserialize<'de> for EnvValue {
         let s = String::deserialize(deserializer)?;
         if s.starts_with(Self::ENCRYPTED_PREFIX) {
             Ok(EnvValue::Encrypted(s))
+        } else if crate::sesame::secret_provider::SecretReference::is_reference(&s) {
+            crate::sesame::secret_provider::SecretReference::parse(&s)
+                .map(EnvValue::Provider)
+                .map_err(serde::de::Error::custom)
         } else {
             Ok(EnvValue::Plain(s))
         }

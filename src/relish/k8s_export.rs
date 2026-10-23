@@ -733,6 +733,14 @@ fn env_vars(
             .map(|(k, v)| {
                 let value = match v {
                     crate::config::types::EnvValue::Plain(s) => s.clone(),
+                    crate::config::types::EnvValue::Provider(reference) => {
+                        report.dropped.push(format!(
+                            "[{table}] env {k} — resolved by a secret provider at launch, \
+                             exported as the reference; create a Secret and reference it with \
+                             valueFrom.secretKeyRef"
+                        ));
+                        reference.as_str().to_string()
+                    }
                     crate::config::types::EnvValue::Encrypted(_) => {
                         report.dropped.push(format!(
                             "[{table}] env {k} — encrypted, exported as the placeholder \

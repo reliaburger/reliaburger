@@ -808,6 +808,9 @@ pub struct BunAgent<G: Grill> {
     /// Per-step deadline for the runtime to confirm a stop or force-kill
     /// (`[runtime] stop_confirmation_timeout_secs`).
     stop_confirmation_timeout: std::time::Duration,
+    /// The `[secret_providers.*]` this node runs for `PROVIDER[...]` env
+    /// values, resolved off the loop just before a launch (#1123).
+    secret_providers: crate::sesame::secret_provider::SecretProviders,
     /// How long an ordinary stop waits after SIGTERM before SIGKILL.
     /// `STOP_GRACE_SECS` unless a test shortens it with `set_stop_grace`.
     stop_grace: std::time::Duration,
@@ -917,6 +920,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
+            secret_providers: Default::default(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: Default::default(),
@@ -1067,6 +1071,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
+            secret_providers: Default::default(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: Default::default(),
@@ -1325,6 +1330,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Set the node leaf lifetime this member signs joining nodes with.
     pub fn set_node_leaf_lifetime(&mut self, lifetime: std::time::Duration) {
         self.node_leaf_lifetime = lifetime;
+    }
+
+    /// Thread the `[secret_providers.*]` tables in. Without this the node
+    /// runs no provider, and every `PROVIDER[...]` launch fails closed.
+    pub fn set_secret_providers(
+        &mut self,
+        providers: crate::sesame::secret_provider::SecretProviders,
+    ) {
+        self.secret_providers = providers;
     }
 
     /// Thread `[runtime] stop_confirmation_timeout_secs` in: how long each
