@@ -1,0 +1,9 @@
+---
+source: src/relish/policy_cmd.rs
+expression: render_policy_list(&listing)
+---
+NAME               ACTION  OWNER   RULE
+no-latest          warn    gitops  deny app.image.endsWith(':latest')
+prod-needs-limits  deny    apply   match app.namespace == 'prod'; deny !has(app.memory)
+
+Generation 4.

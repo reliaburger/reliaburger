@@ -555,8 +555,8 @@ After bootstrap, cluster-wide token management, node join tokens, secret
 rotation, image signing, self-upgrades (start, apply, rollback, resume) and
 leader elections require an **unscoped Admin** credential. An Admin
 restricted by `--apps` or `--namespaces` cannot use those global operations.
-Ordinary `[namespace]` quota and `[permission]` declarations also require an
-unscoped Admin; a Deployer can apply workloads within its scope and configured
+Ordinary `[namespace]` quota, `[permission]` and `[policy]` declarations also
+require an unscoped Admin; a Deployer can apply workloads within its scope and configured
 permissions. Apps and jobs receive the same admission checks before any part
 of a manifest changes state. Lease-owned test namespace declarations retain
 their separate ownership checks. An administrator overriding another credential's

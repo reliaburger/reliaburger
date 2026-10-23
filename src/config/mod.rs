@@ -15,6 +15,7 @@ pub mod job;
 pub mod namespace;
 pub mod node;
 pub mod permission;
+pub mod policy;
 pub mod process_workloads;
 pub mod types;
 mod validate;
@@ -31,12 +32,13 @@ pub use job::JobSpec;
 pub use namespace::NamespaceSpec;
 pub use node::NodeConfig;
 pub use permission::{PermissionAction, PermissionSpec};
+pub use policy::{PolicyAction, PolicySpec};
 pub use types::{ConfigFileSpec, EnvValue, Replicas, ResourceRange, VolumeSpec};
 
 /// Top-level workload configuration.
 ///
 /// Parsed from a TOML file containing `[app.*]`, `[job.*]`,
-/// `[namespace.*]`, and `[permission.*]` tables.
+/// `[namespace.*]`, `[permission.*]` and `[policy.*]` tables.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -52,6 +54,9 @@ pub struct Config {
     /// Permission definitions keyed by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub permission: BTreeMap<String, PermissionSpec>,
+    /// Policy definitions keyed by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub policy: BTreeMap<String, PolicySpec>,
     /// Build job definitions keyed by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build: BTreeMap<String, build::BuildSpec>,

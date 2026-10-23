@@ -154,9 +154,16 @@ pub struct Compatibility {
 /// `GET /v1/fault/attempts` with their running job attempts (#704).
 /// Gossip datagrams, reporting frames and the Raft log's vote, log ids and
 /// encrypted-entry envelope are postcard, not bincode (#1026).
+///
+/// 0.2.4, Extension points (55/72): one bump for the whole release, made by its first wire or state change. Each later 0.2.4 change adds its line below this one, not another bump.
+/// Policies in the council: the `PolicySpec`, `PolicyDelete` and
+/// `PolicyFenced` Raft requests, the `PolicyGenerationMoved` response,
+/// `DesiredState::policies` and `policy_generation`, the GitOps ownership
+/// set's `policies`, `[policy.*]` in applied configs, `GET /v1/policies`
+/// and the 422 `PolicyRefusal` body of a refused apply (#1117).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 53,
-    state: 70,
+    protocol: 55,
+    state: 72,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

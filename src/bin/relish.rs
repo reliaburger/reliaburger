@@ -868,6 +868,11 @@ enum Command {
         #[command(subcommand)]
         action: GitopsAction,
     },
+    /// List or delete the cluster's policies, or test policies offline.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
     /// Back up the cluster's root CA, check the backup, and rotate intermediates.
     Ca {
         #[command(subcommand)]
@@ -1302,6 +1307,49 @@ enum GitopsAction {
     /// Turn GitOps off for the whole cluster (admin only; audited). What
     /// GitOps wrote stays in place.
     Disable,
+}
+
+#[derive(Subcommand)]
+enum PolicyAction {
+    /// List the cluster's policies, with their action and rule.
+    List,
+    /// Delete a policy (admin only; audited). Policies never judge
+    /// policies, so this works even when one refuses every app.
+    Delete {
+        /// The policy's name.
+        name: String,
+    },
+    /// Judge the apps in some files by the policies in them, offline, the
+    /// way the cluster would. Exits non-zero when an apply would be refused.
+    Test {
+        /// A TOML file of policies, apps or both. Repeat for more files.
+        #[arg(short = 'f', long = "file", required = true)]
+        files: Vec<PathBuf>,
+        /// How the change arrives, as a policy sees it in `source`.
+        #[arg(long, value_enum, default_value_t = PolicySourceArg::Apply)]
+        source: PolicySourceArg,
+        /// The token name a policy sees in `caller.name`.
+        #[arg(long, default_value = "ci")]
+        caller: String,
+        /// The role a policy sees in `caller.role`.
+        #[arg(long, value_enum, default_value_t = PolicyRoleArg::Deployer)]
+        role: PolicyRoleArg,
+    },
+}
+
+/// `relish policy test --source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum PolicySourceArg {
+    Apply,
+    Gitops,
+}
+
+/// `relish policy test --role`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum PolicyRoleArg {
+    Admin,
+    Deployer,
+    ReadOnly,
 }
 
 #[derive(Subcommand)]
@@ -2331,6 +2379,33 @@ async fn main() -> ExitCode {
             GitopsAction::Set { path } => commands::gitops_set(path).await,
             GitopsAction::Disable => commands::gitops_disable().await,
         },
+        Command::Policy { action } => match &action {
+            PolicyAction::List => reliaburger::relish::policy_cmd::policy_list(cli.output).await,
+            PolicyAction::Delete { name } => {
+                reliaburger::relish::policy_cmd::policy_delete(name).await
+            }
+            PolicyAction::Test {
+                files,
+                source,
+                caller,
+                role,
+            } => reliaburger::relish::policy_cmd::policy_test(
+                files,
+                &reliaburger::relish::policy_cmd::TestIdentity {
+                    caller: caller.clone(),
+                    role: match role {
+                        PolicyRoleArg::Admin => reliaburger::sesame::types::ApiRole::Admin,
+                        PolicyRoleArg::Deployer => reliaburger::sesame::types::ApiRole::Deployer,
+                        PolicyRoleArg::ReadOnly => reliaburger::sesame::types::ApiRole::ReadOnly,
+                    },
+                    source: match source {
+                        PolicySourceArg::Apply => reliaburger::policy::Source::Apply,
+                        PolicySourceArg::Gitops => reliaburger::policy::Source::GitOps,
+                    },
+                },
+                cli.output,
+            ),
+        },
         Command::Ca { action } => match &action {
             CaAction::Backup {
                 out,
@@ -2796,6 +2871,7 @@ fn honours_output(command: &Command) -> bool {
             Some(BatchAction::Submit { .. }) | Some(BatchAction::Results { .. })
         ),
         Command::Gitops { action } => matches!(action, GitopsAction::Status),
+        Command::Policy { action } => !matches!(action, PolicyAction::Delete { .. }),
         Command::Token { action } => matches!(action, TokenAction::List),
         Command::Status
         | Command::Top

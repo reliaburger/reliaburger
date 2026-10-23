@@ -87,6 +87,28 @@ fn apply_summary(created: usize, instances: &[String]) -> String {
     }
 }
 
+/// What the policies say about `config`'s apps, for `relish apply
+/// --dry-run`: the cluster's policies with the config's own replacing any
+/// of the same name, judged as a deployer applying by hand (#1117).
+pub(crate) fn plan_policies(
+    committed: &std::collections::BTreeMap<String, crate::config::PolicySpec>,
+    config: &Config,
+) -> super::plan::PolicyPlan {
+    let effective = crate::policy::effective_policies(committed, config);
+    match crate::policy::PolicySet::compile(&effective) {
+        Ok(set) => super::plan::PolicyPlan::from_verdict(&crate::policy::evaluate(
+            &set,
+            config,
+            &crate::policy::Caller::token("relish", crate::sesame::types::ApiRole::Deployer),
+            crate::policy::Source::Apply,
+        )),
+        Err(error) => super::plan::PolicyPlan {
+            denials: vec![error.to_string()],
+            warnings: Vec::new(),
+        },
+    }
+}
+
 async fn apply_with_client(
     source: &super::manifest::ManifestSource,
     output: OutputFormat,
@@ -99,11 +121,20 @@ async fn apply_with_client(
         // Diff against the live agent's current state when one answers, so
         // updates and unchanged resources render as such instead of every
         // resource claiming to be a create. No agent → the all-create plan.
-        let current = match client.health().await {
-            Ok(()) => Some(client.current_resources().await?),
-            Err(_) => None,
+        let (current, committed_policies) = match client.health().await {
+            Ok(()) => (
+                Some(client.current_resources().await?),
+                // A standalone node has no council and so no policies.
+                client
+                    .policies()
+                    .await
+                    .map(|listing| listing.policies)
+                    .unwrap_or_default(),
+            ),
+            Err(_) => (None, Default::default()),
         };
-        let plan = generate_plan(&config, current.as_deref());
+        let mut plan = generate_plan(&config, current.as_deref());
+        plan.policy = plan_policies(&committed_policies, &config);
         let formatted = format_output(&plan, output)?;
         println!("{formatted}");
         // Human-only trailer: appending it to --output json|yaml would

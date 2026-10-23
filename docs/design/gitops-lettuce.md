@@ -692,6 +692,19 @@ Per Section 17 of the whitepaper, Lettuce automatically enforces `require_signed
 
 ---
 
+### 5.9 Policies (#1117)
+
+Policies are a GitOps kind like permissions: the diff carries
+`ChangePayload::Policy`, and the ownership set records `policies`, so GitOps
+prunes only the policies it wrote. Policy writes and removals come before any
+app write, so every app in a commit is judged by the policies that commit
+declares. Each added or changed app is judged in `apply_changes` as the
+caller `gitops` with role `system` and source `gitops`, and written inside a
+`PolicyFenced` entry. A denied app is a refused change in the partial sync
+result, named `app.<namespace>/<name>: denied by policy <name>: <message>`,
+and the rest of the commit applies. The commit stays unadvanced, so the next
+sync tries the app again.
+
 ## 6. Configuration
 
 ### 6.1 Full Configuration Reference

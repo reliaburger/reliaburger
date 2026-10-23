@@ -401,7 +401,7 @@ enum TomlKind {
     Manifest,
 }
 
-const WORKLOAD_TABLES: &[&str] = &["app", "job", "namespace", "permission", "build"];
+const WORKLOAD_TABLES: &[&str] = &["app", "job", "namespace", "permission", "policy", "build"];
 
 /// Split a TOML document by the type that reads each top-level key. Anything
 /// that isn't a workload table, a scenario or a manifest is node config, so a

@@ -29,6 +29,7 @@ pub mod mustard;
 pub(crate) mod object_storage;
 pub mod onion;
 pub mod pickle;
+pub mod policy;
 pub mod reconstruction;
 pub mod relish;
 pub mod reporting;

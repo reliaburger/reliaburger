@@ -64,6 +64,17 @@ pub(super) async fn current_apps_handler(
                 },
             );
         }
+        for (name, spec) in &desired.policies {
+            let resource = format!("policy.{name}");
+            resources.insert(
+                resource.clone(),
+                CurrentResourceStatus {
+                    resource,
+                    image: None,
+                    fingerprint: spec_fingerprint(spec),
+                },
+            );
+        }
     }
     let common = crate::bun::task_array_leader::read_task_arrays(&state).await;
     for (key, definition) in common.jobs().definitions() {

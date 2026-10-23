@@ -329,11 +329,15 @@ mod tests {
         static PERMISSIONS: std::sync::OnceLock<
             std::collections::BTreeMap<String, crate::config::PermissionSpec>,
         > = std::sync::OnceLock::new();
+        static POLICIES: std::sync::OnceLock<
+            std::collections::BTreeMap<String, crate::config::PolicySpec>,
+        > = std::sync::OnceLock::new();
         static OWNED: std::sync::OnceLock<GitOpsOwnership> = std::sync::OnceLock::new();
         CurrentState {
             apps: APPS.get_or_init(HashMap::new),
             namespaces: NAMESPACES.get_or_init(Default::default),
             permissions: PERMISSIONS.get_or_init(Default::default),
+            policies: POLICIES.get_or_init(Default::default),
             owned: OWNED.get_or_init(Default::default),
         }
     }
@@ -646,6 +650,7 @@ mod tests {
         );
         let namespaces = std::collections::BTreeMap::new();
         let permissions = std::collections::BTreeMap::new();
+        let policies = std::collections::BTreeMap::new();
         let owned = crate::lettuce::types::GitOpsOwnership {
             apps: current.keys().cloned().collect(),
             ..Default::default()
@@ -658,6 +663,7 @@ mod tests {
                 apps: &current,
                 namespaces: &namespaces,
                 permissions: &permissions,
+                policies: &policies,
                 owned: &owned,
             },
             &[],

@@ -66,6 +66,7 @@ mod owned_commands;
 mod parquet_safety;
 mod pickle_cluster;
 mod pickle_integrity;
+mod policies;
 mod process_owner;
 mod reconstruction;
 mod recovery_from_log;

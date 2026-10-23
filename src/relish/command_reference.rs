@@ -154,7 +154,7 @@ pub const GROUPS: &[CommandGroup] = &[
             label: "security and access",
             path: "docs/manual/10_security.md",
         }],
-        commands: &["token", "secret", "ca", "sign", "audit"],
+        commands: &["token", "secret", "ca", "sign", "audit", "policy"],
     },
     CommandGroup {
         title: "Images and volumes",
