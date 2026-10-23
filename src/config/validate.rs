@@ -454,6 +454,8 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         });
     }
 
+    validate_app_stop(name, app)?;
+
     // Autoscale block: bounds, windows and threshold are validated up front
     // so a bad `[autoscale]` fails the deploy instead of silently clamping
     // at runtime (DEP8). An unsupported metric, or one the app has no request
@@ -469,6 +471,42 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         });
     }
 
+    Ok(())
+}
+
+/// Refuse stop hooks that parse but can't work (#1121). The signal and the
+/// durations are checked as they parse; what's left is how the fields fit
+/// together: a pre-stop bound needs a pre-stop command, the command needs
+/// a program, and a host app's program is named by its full path, because
+/// the node's `allowed_binaries` must name it.
+fn validate_app_stop(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    let refuse = |field: &str, reason: &str| ConfigError::Validation {
+        field: field.to_string(),
+        context: format!("app {name:?}"),
+        reason: reason.to_string(),
+    };
+    if app.pre_stop_timeout.is_some() && app.pre_stop.is_empty() {
+        return Err(refuse(
+            "pre_stop_timeout",
+            "pre_stop_timeout bounds a pre_stop command, and this app has none",
+        ));
+    }
+    let Some(program) = app.pre_stop.first() else {
+        return Ok(());
+    };
+    if program.trim().is_empty() {
+        return Err(refuse(
+            "pre_stop",
+            "the first word must be the program to run",
+        ));
+    }
+    if crate::meat::filter::host_binary(app).is_some() && !program.starts_with('/') {
+        return Err(refuse(
+            "pre_stop",
+            "an exec or script app's pre_stop runs on the host, where allowed_binaries \
+             names programs by full path; start it with an absolute path",
+        ));
+    }
     Ok(())
 }
 
@@ -1401,6 +1439,52 @@ mod tests {
         )
         .unwrap();
         config_with_app("web", app).validate().unwrap();
+    }
+
+    fn stop_refusal(app_toml: &str) -> Option<(String, String)> {
+        let app: AppSpec = toml::from_str(app_toml).unwrap();
+        match config_with_app("web", app).validate() {
+            Ok(()) => None,
+            Err(ConfigError::Validation { field, reason, .. }) => Some((field, reason)),
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_hooks_on_a_container_app_validate() {
+        assert_eq!(
+            stop_refusal(
+                "image = \"web:v1\"\nstop_signal = \"SIGQUIT\"\nstop_grace = \"45s\"\n\
+                 pre_stop = [\"nginx\", \"-s\", \"quit\"]\npre_stop_timeout = \"10s\"\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pre_stop_timeout_without_pre_stop_is_refused() {
+        let (field, reason) =
+            stop_refusal("image = \"web:v1\"\npre_stop_timeout = \"10s\"\n").unwrap();
+        assert_eq!(field, "pre_stop_timeout");
+        assert!(reason.contains("has none"), "{reason}");
+    }
+
+    #[test]
+    fn pre_stop_with_an_empty_program_is_refused() {
+        let (field, _) = stop_refusal("image = \"web:v1\"\npre_stop = [\" \", \"x\"]\n").unwrap();
+        assert_eq!(field, "pre_stop");
+    }
+
+    #[test]
+    fn a_host_apps_pre_stop_must_name_its_program_by_full_path() {
+        let (field, reason) =
+            stop_refusal("exec = \"/bin/sleep\"\npre_stop = [\"echo\", \"bye\"]\n").unwrap();
+        assert_eq!(field, "pre_stop");
+        assert!(reason.contains("absolute path"), "{reason}");
+        assert_eq!(
+            stop_refusal("exec = \"/bin/sleep\"\npre_stop = [\"/bin/echo\", \"bye\"]\n"),
+            None
+        );
     }
 
     #[test]

@@ -108,6 +108,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: OciRoot {
                 path: "rootfs".to_string(),
                 readonly: false,

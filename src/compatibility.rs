@@ -160,6 +160,9 @@ pub struct Compatibility {
 /// (`NodeCapabilities::secret_providers`), and an app's env value
 /// `PROVIDER[name:path]` is a provider reference in Raft desired state,
 /// not plain text (#1123).
+/// An app's `stop_signal`, `stop_grace`, `pre_stop` and `pre_stop_timeout`
+/// in Raft desired state and node syncs, and the `stop` policy in OCI
+/// specs, instance records, runtime intents and process owner records (#1121).
 /// Policies in the council: the `PolicySpec`, `PolicyDelete` and
 /// `PolicyFenced` Raft requests, the `PolicyGenerationMoved` response,
 /// `DesiredState::policies` and `policy_generation`, the GitOps ownership

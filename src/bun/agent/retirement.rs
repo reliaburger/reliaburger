@@ -3,6 +3,15 @@
 
 use super::*;
 
+/// What fencing an old instance for retirement hands the deploy worker.
+pub(super) struct BegunRetirement {
+    /// The restart in flight this retirement took the instance back from.
+    /// The worker lets its runtime step finish before it signals anything.
+    pub(super) restart: Option<restarts::TakenRestart>,
+    /// How the instance's launch spec says it stops (#1121).
+    pub(super) stop: Option<crate::grill::stop::StopPolicy>,
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Retire a workload inline: the same steps a `Retire` command takes, for
     /// tests that drive the agent without running its loop.
@@ -365,12 +374,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub(super) async fn begin_instance_retirement(
         &mut self,
         id: &InstanceId,
-    ) -> Result<Option<restarts::TakenRestart>, BunError> {
-        if self.supervisor.get_instance(id).is_none() {
+    ) -> Result<BegunRetirement, BunError> {
+        let Some(instance) = self.supervisor.get_instance(id) else {
             return Err(BunError::InstanceNotFound {
                 instance_id: id.clone(),
             });
-        }
+        };
+        // The stop policy the instance was launched with, not its app's
+        // current one: a deploy retires the old spec's instances (#1121).
+        let stop = instance
+            .oci_spec
+            .as_ref()
+            .and_then(|spec| spec.stop.clone());
         self.withdraw_instance_backend(id).await?;
         if let Some(instance) = self.supervisor.get_instance_mut(id) {
             instance.retry_pending = false;
@@ -379,7 +394,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
         self.supervisor.health_checker_mut().unregister(id);
-        Ok(self.take_back_from_restart(id))
+        Ok(BegunRetirement {
+            restart: self.take_back_from_restart(id),
+            stop,
+        })
     }
 
     /// Drain, stop and forget one old instance (M7).

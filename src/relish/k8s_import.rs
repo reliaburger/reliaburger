@@ -835,6 +835,7 @@ fn import_pod_template(
         app.working_dir = c.working_dir.clone().map(PathBuf::from);
     }
     import_security_context(resource, pod_spec, container, app, report);
+    import_stop_hooks(resource, pod_spec, container, app, report);
 
     let ports = container_ports(pod_spec);
     app.port = ports.first().map(|p| p.container_port as u16);
@@ -922,6 +923,75 @@ fn import_pod_template(
                 image: ic.image.clone(),
                 command: command.into_iter().chain(args).collect(),
             });
+        }
+    }
+}
+
+/// `terminationGracePeriodSeconds`, `lifecycle.stopSignal` and an exec
+/// `lifecycle.preStop` as the app's stop hooks (#1121). What has no
+/// equivalent is reported, never dropped quietly.
+fn import_stop_hooks(
+    resource: &str,
+    pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    container: Option<&k8s_openapi::api::core::v1::Container>,
+    app: &mut AppSpec,
+    report: &mut MigrationReport,
+) {
+    use crate::grill::stop::{MAX_STOP_DURATION, StopDuration};
+    let mut warn = |message: String| {
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message,
+        })
+    };
+    if let Some(seconds) = pod_spec.and_then(|ps| ps.termination_grace_period_seconds) {
+        // Reliaburger's grace is 1 s to an hour. Kubernetes allows 0
+        // (kill at once) and any length; the nearest bound stands in.
+        let max = MAX_STOP_DURATION.as_secs() as i64;
+        let clamped = seconds.clamp(1, max);
+        if clamped != seconds {
+            warn(format!(
+                "terminationGracePeriodSeconds {seconds} imported as stop_grace = \"{clamped}s\"; \
+                 a stop grace is 1s to {max}s"
+            ));
+        }
+        app.stop_grace = StopDuration::new(std::time::Duration::from_secs(clamped as u64)).ok();
+    }
+    let Some(lifecycle) = container.and_then(|c| c.lifecycle.as_ref()) else {
+        return;
+    };
+    if let Some(signal) = &lifecycle.stop_signal {
+        match signal.parse() {
+            Ok(signal) => app.stop_signal = Some(signal),
+            Err(error) => warn(format!("lifecycle.stopSignal is not imported: {error}")),
+        }
+    }
+    if lifecycle.post_start.is_some() {
+        warn("lifecycle.postStart is not imported; Reliaburger has no post-start hook".into());
+    }
+    let Some(pre_stop) = &lifecycle.pre_stop else {
+        return;
+    };
+    match pre_stop
+        .exec
+        .as_ref()
+        .and_then(|exec| exec.command.as_ref())
+    {
+        Some(command) if !command.is_empty() => {
+            app.pre_stop = command.clone();
+            warn(
+                "lifecycle.preStop imported as pre_stop with its own 30s bound \
+                 (pre_stop_timeout); Kubernetes counts it inside the grace instead"
+                    .into(),
+            );
+        }
+        _ if pre_stop.sleep.is_some() => warn(
+            "lifecycle.preStop sleep is not imported; Reliaburger withdraws an instance \
+             from routing and drains it before it signals it"
+                .into(),
+        ),
+        _ => {
+            warn("lifecycle.preStop is not imported; only an exec command maps to pre_stop".into())
         }
     }
 }
@@ -1130,9 +1200,9 @@ fn deployment_to_app(
                     }
                     _ => None,
                 }),
-                drain_timeout: pod_spec
-                    .and_then(|ps| ps.termination_grace_period_seconds)
-                    .map(|s| format!("{s}s")),
+                // terminationGracePeriodSeconds is the stop grace, not the
+                // drain (#1121); `import_stop_hooks` maps it.
+                drain_timeout: None,
                 health_timeout: None,
                 auto_rollback: None,
             });
@@ -1329,6 +1399,10 @@ fn empty_app_spec() -> AppSpec {
         ingress: None,
         placement: None,
         deploy: None,
+        stop_signal: None,
+        stop_grace: None,
+        pre_stop: Vec::new(),
+        pre_stop_timeout: None,
         firewall: None,
         egress: None,
         autoscale: None,
@@ -4120,5 +4194,154 @@ spec:
                 "no warning for {field}: {warnings:?}"
             );
         }
+    }
+
+    fn stop_hooks_deployment(lifecycle: &str, grace: &str) -> String {
+        format!(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  template:
+    spec:
+      terminationGracePeriodSeconds: {grace}
+      containers:
+      - name: web
+        image: web:v1
+        lifecycle:
+{lifecycle}
+"#
+        )
+    }
+
+    #[test]
+    fn import_maps_grace_stop_signal_and_an_exec_pre_stop() {
+        let yaml = stop_hooks_deployment(
+            "          stopSignal: SIGQUIT\n          preStop:\n            exec:\n              command: [\"/usr/sbin/nginx\", \"-s\", \"quit\"]",
+            "45",
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.stop_signal, Some(crate::grill::stop::StopSignal::Quit));
+        assert_eq!(
+            app.stop_grace.map(|grace| grace.duration()),
+            Some(std::time::Duration::from_secs(45))
+        );
+        assert_eq!(app.pre_stop, ["/usr/sbin/nginx", "-s", "quit"]);
+        assert_eq!(app.pre_stop_timeout, None);
+        assert!(
+            result
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("inside the grace")),
+            "{:?}",
+            result.report.warnings
+        );
+        result.config.validate().unwrap();
+    }
+
+    #[test]
+    fn grace_is_the_stop_grace_not_the_drain_timeout() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 2
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+  template:
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: web
+        image: web:v1
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.deploy.as_ref().unwrap().drain_timeout, None);
+        assert_eq!(app.stop_grace.map(String::from).as_deref(), Some("60s"));
+    }
+
+    #[test]
+    fn a_zero_or_huge_grace_is_clamped_and_reported() {
+        for (grace, expected) in [("0", "1s"), ("86400", "3600s")] {
+            let yaml = stop_hooks_deployment("          stopSignal: SIGTERM", grace);
+            let result = import_from_yaml(&yaml).unwrap();
+            let app = &result.config.app["web"];
+            assert_eq!(app.stop_grace.map(String::from).as_deref(), Some(expected));
+            assert!(
+                result
+                    .report
+                    .warnings
+                    .iter()
+                    .any(|w| w.message.contains("terminationGracePeriodSeconds")),
+                "{grace}: {:?}",
+                result.report.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn unmappable_lifecycle_hooks_are_reported_not_dropped() {
+        let yaml = stop_hooks_deployment(
+            "          stopSignal: SIGKILL\n          postStart:\n            exec:\n              command: [\"/bin/true\"]\n          preStop:\n            sleep:\n              seconds: 5",
+            "30",
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.stop_signal, None);
+        assert!(app.pre_stop.is_empty());
+        let messages: Vec<&str> = result
+            .report
+            .warnings
+            .iter()
+            .map(|w| w.message.as_str())
+            .collect();
+        for expected in ["stopSignal", "postStart", "preStop sleep"] {
+            assert!(
+                messages.iter().any(|m| m.contains(expected)),
+                "no warning for {expected}: {messages:?}"
+            );
+        }
+    }
+
+    /// #1121: an app's stop hooks leave as a pod's lifecycle and grace and
+    /// come back as the same fields.
+    #[test]
+    fn stop_hooks_survive_an_export_and_import_round_trip() {
+        let config = crate::config::Config::parse(
+            r#"
+            [app.web]
+            image = "web:v1"
+            stop_signal = "SIGINT"
+            stop_grace = "2m"
+            pre_stop = ["/bin/sh", "-c", "curl -X POST localhost:8080/drain"]
+            "#,
+        )
+        .unwrap();
+        let exported = crate::relish::k8s_export::export_kubernetes(&config).unwrap();
+        assert!(
+            exported.yaml.contains("terminationGracePeriodSeconds: 120"),
+            "{}",
+            exported.yaml
+        );
+        assert!(
+            exported.yaml.contains("stopSignal: SIGINT"),
+            "{}",
+            exported.yaml
+        );
+        let imported = import_from_yaml(&exported.yaml).unwrap();
+        let (original, back) = (&config.app["web"], &imported.config.app["web"]);
+        assert_eq!(back.stop_signal, original.stop_signal);
+        assert_eq!(back.stop_grace, original.stop_grace);
+        assert_eq!(back.pre_stop, original.pre_stop);
+        assert_eq!(back.pre_stop_timeout, original.pre_stop_timeout);
     }
 }

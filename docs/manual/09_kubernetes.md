@@ -48,6 +48,14 @@ From the pod template it takes the first container's image, `command`, `args`,
 `nodeSelector` (as `placement.required`), init containers, `runAsUser` and
 `runAsGroup`, and an `httpGet` readiness probe as the health check. The
 `prometheus.io/scrape`, `port` and `path` annotations turn on metrics scraping.
+Its stop hooks come across too: `terminationGracePeriodSeconds` becomes
+`stop_grace`, `lifecycle.stopSignal` becomes `stop_signal`, and an `exec`
+`lifecycle.preStop` becomes `pre_stop`. A grace of 0 is imported as 1 s and
+one over an hour as an hour, with a warning. Kubernetes counts preStop inside
+the grace, while Reliaburger gives `pre_stop` its own bound
+(`pre_stop_timeout`, 30 s by default) before the grace starts, so an imported
+`pre_stop` gets a warning saying so. `relish export` maps the same three back;
+`pre_stop_timeout` has no Kubernetes field and is listed as unsupported.
 
 Services attach the way Kubernetes routes them: a Service belongs to every
 workload in its namespace whose pod template labels include all of its
@@ -70,6 +78,9 @@ The report warns about everything it approximates or drops. The usual ones:
   `images-and-volumes`);
 - `tolerations`, `affinity` and `topologySpreadConstraints`;
 - `livenessProbe`, and `exec`, `tcpSocket` or gRPC readiness probes;
+- `lifecycle.postStart`, a `sleep`, `httpGet` or `tcpSocket` preStop (a node
+  already withdraws and drains an instance before it signals it), and a
+  `stopSignal` Reliaburger doesn't accept, such as `SIGKILL`;
 - `env` from `valueFrom`: set the value, or encrypt it with
   `relish secret encrypt` (see `security`);
 - `envFrom`: a ConfigMap in the same input and namespace is copied into `env`

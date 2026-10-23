@@ -434,9 +434,9 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(())
     }
 
-    /// Refuse a host app whose image-less init container runs a binary the
-    /// allowlist doesn't name. Such an init runs its command on the host,
-    /// like its app (#935), so the same deny-by-default rule applies.
+    /// Refuse a host app whose image-less init container or pre-stop command
+    /// runs a binary the allowlist doesn't name. Both run on the host, like
+    /// their app (#935, #1121), so the same deny-by-default rule applies.
     fn admit_host_inits(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
         for binary in crate::meat::filter::host_init_binaries(spec) {
             self.process_manager
@@ -444,6 +444,15 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 .map_err(|e| BunError::DeployFailed {
                     app_name: app_name.to_string(),
                     reason: format!("init container rejected: {e}"),
+                })?;
+        }
+        // A host app's pre-stop command runs on the host too (#1121).
+        if let Some(binary) = crate::meat::filter::host_pre_stop_binary(spec) {
+            self.process_manager
+                .prepare_exec(binary)
+                .map_err(|e| BunError::DeployFailed {
+                    app_name: app_name.to_string(),
+                    reason: format!("pre_stop rejected: {e}"),
                 })?;
         }
         Ok(())
@@ -1003,6 +1012,10 @@ mod tests {
             ingress: None,
             placement: None,
             deploy: None,
+            stop_signal: None,
+            stop_grace: None,
+            pre_stop: Vec::new(),
+            pre_stop_timeout: None,
             firewall: None,
             egress: None,
             autoscale: None,

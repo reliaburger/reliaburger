@@ -110,6 +110,12 @@ fn the_decision_table() {
             "image = 'w:1'\ncommand = ['sh', '-c', 'true']",
             vec![deny("rule")],
         ),
+        // Stop hooks are app fields like any other (#1121).
+        (
+            "deny = \"has(app.stop_signal) && size(app.pre_stop) == 0\"",
+            "image = 'w:1'\nstop_signal = 'SIGQUIT'",
+            vec![deny("rule")],
+        ),
         // The app's own name is visible.
         (
             "deny = \"app.name == 'web'\"",

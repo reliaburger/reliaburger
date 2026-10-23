@@ -780,7 +780,7 @@ When an instance is being replaced, Wrapper coordinates connection draining:
 3. **Wait for completion.** The system waits until either:
    - All in-flight connections complete (clean drain), OR
    - `drain_timeout` expires (forced drain).
-4. **On timeout:** Bun sends SIGTERM to the container. The application has a 10-second grace period to handle the signal and close connections. After the grace period, SIGKILL is sent.
+4. **Stop:** once the drain is clean or `drain_timeout` expires, Bun stops the instance with its stop hooks (5.8): its `pre_stop` command, then its `stop_signal` (SIGTERM by default), then its `stop_grace` (the `drain_timeout` again by default, 10 s for a stop outside a deploy), then SIGKILL.
 
 For WebSocket connections, the drain timeout applies equally. Long-lived WebSocket connections that exceed the drain timeout are forcefully closed. Applications that need longer drain times can configure `drain_timeout` accordingly.
 
@@ -865,7 +865,39 @@ This prevents Lettuce from fighting the autoscaler during traffic spikes, even w
 
 ---
 
-### 5.8 Policies on the Apply Path (#1117)
+### 5.8 Stop Hooks
+
+An app can say how its instances want to be stopped (#1121):
+
+```toml
+[app.worker]
+image = "registry.example.com/worker:2.1"
+stop_signal = "SIGQUIT"     # default SIGTERM
+stop_grace = "2m"           # 1s to 1h
+pre_stop = ["/app/bin/worker", "hand-back-jobs"]
+pre_stop_timeout = "20s"    # default 30s, 1s to 1h
+```
+
+**Where the policy lives.** `grill::oci::generate_oci_spec` copies the four fields into the instance's `OciSpec` as a `StopPolicy` (`stop`), so it's fixed per instance at launch, recorded with every instance record, runtime intent and process owner record, and survives adoption after a Bun restart. A rolling deploy retires each old instance with the policy that instance was launched with, not the new spec's, because the new spec's pre-stop command may not exist in the old image.
+
+**Who sends the signal.** Each runtime reads the signal from the spec it holds: `ProcessGrill` signals the process group itself or asks the process owner, which reads its launch spec; runc runs `runc kill <id> <SIGNAL>` from the runtime intent; Apple Container passes `container stop --signal`. Every graceful stop, including a Bun shutdown, therefore sends the app's signal, and `Grill::stop` keeps its one-argument shape.
+
+**Who runs the sequence.** `bun::agent::stop_runtime_instance` runs the four steps, each with its own bound:
+
+1. `pre_stop` through `Grill::exec`, within `pre_stop_timeout`. A non-zero exit, a refused exec or an overrun is logged and the stop carries on. Dropping the exec future ends the command (the owner closes it; the plain process runtime spawns it with `kill_on_drop`).
+2. `Grill::stop`, accepted within `[runtime] stop_confirmation_timeout_secs`.
+3. The grace: `stop_grace`, or the caller's default (`drain_timeout` in a deploy, 10 s otherwise).
+4. `Grill::kill` and a confirmed exit.
+
+Operator stops and retirements (`app_exit_wait`) read each instance's policy from the supervisor; the deploy worker gets it from the loop with `BeginRetire`, which already fences the instance from restarts.
+
+**Validation.** The signal and durations parse into `StopSignal` and `StopDuration`, so an unknown signal, a number, `SIGKILL`, a zero or an over-an-hour duration is a TOML parse error with the field's line. `validate_app` refuses a `pre_stop_timeout` without a `pre_stop`, an empty program, and, on an `exec` or `script` app, a program that isn't an absolute path. Such an app's pre-stop runs on the host, so it joins the app's host binaries for placement (`WorkloadRequirements::host_binaries`) and for the node's `allowed_binaries` check.
+
+**Deadlines.** The placement reconciler's deploy deadline adds `pre_stop_timeout` and `stop_grace` per replica. Its retirement deadline is still sized for the default grace; a longer stop overruns it, is retried on the next pass and joins the pending stop.
+
+**Kubernetes.** `relish import` maps `terminationGracePeriodSeconds`, `lifecycle.stopSignal` and an exec `lifecycle.preStop` to the three fields and warns about the difference in how the bound works; `relish export` maps them back. `pre_stop_timeout` has no Kubernetes field.
+
+### 5.9 Policies on the Apply Path (#1117)
 
 `[policy.*]` is a declarative kind committed to Raft like a permission
 (`RaftRequest::PolicySpec`, `PolicyDelete`; `DesiredState::policies`). A

@@ -732,6 +732,7 @@ mod inventory_tests {
                 gid_mappings: None,
             },
             port_mapping: None,
+            stop: None,
         }
     }
 

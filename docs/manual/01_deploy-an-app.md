@@ -541,6 +541,52 @@ containers and `strategy = "blue-green"`, for a cluster with runc.
 `health_timeout` that isn't a whole number of seconds, minutes or hours
 (`"90s"`, `"5m"`, `"1h"`; not `"1m30s"` or `"500ms"`).
 
+## Stopping gracefully
+
+Every stop goes the same way: Bun takes the instance out of routing, lets
+in-flight requests drain, sends SIGTERM, waits, and kills it if it's still
+running. Plenty of programs want something else. A dev server may only stop
+cleanly on Ctrl-C, nginx finishes its requests on SIGQUIT, and a queue worker
+may need a minute to hand back its jobs. An app says so with four fields:
+
+```toml
+[app.worker]
+image = "registry.example.com/worker:2.1"
+stop_signal = "SIGQUIT"     # default SIGTERM
+stop_grace = "2m"           # time to exit after the signal, 1s to 1h
+pre_stop = ["/app/bin/worker", "hand-back-jobs"]
+pre_stop_timeout = "20s"    # default 30s
+```
+
+A stop then runs four steps, each with its own limit:
+
+1. `pre_stop`, inside the instance, the way `relish exec` runs a command.
+   It gets `pre_stop_timeout`. If it fails, can't start or runs over, Bun
+   logs why and carries on: a broken hook never keeps an instance alive.
+2. `stop_signal`, sent to the workload's whole process group.
+3. `stop_grace`, while Bun waits for the instance to exit.
+4. SIGKILL, if it's still running.
+
+Without `stop_grace`, a deploy gives each old instance its `drain_timeout`,
+and any other stop (`relish stop`, or the leader moving a replica off a node)
+gives it 10 s, as before. The signal travels with the instance, so when Bun
+itself shuts down and stops its workloads they get it too, though with Bun's
+own 5 s grace and no `pre_stop`.
+
+The longest a stop can now take is `pre_stop_timeout` plus `stop_grace` plus
+a few seconds for the runtime. That can outlast the placement loop's deadline
+for one retirement, which is sized for the default grace. The loop then logs
+that the retirement ran over and asks again on its next pass, and that
+request joins the stop already running, so a long grace is still honoured.
+
+`relish lint` and `apply` refuse a signal outside that list (`SIGKILL`
+included, since that's what the grace ends in, and numbers, which differ
+between Linux and macOS), a grace or bound of zero or over an hour, a
+`pre_stop_timeout` without a `pre_stop`, and a `pre_stop` whose first word is
+empty. On an `exec` or `script` app `pre_stop` runs on the host, so it must
+start with an absolute path that the node's `[process_workloads]
+allowed_binaries` names, like the app's own binary.
+
 ## Jobs and cron
 
 ```toml
