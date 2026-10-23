@@ -289,6 +289,23 @@ step 'path' path frontend --to redis
 sleep 10
 step 'metrics' metrics frontend
 
+# `relish wtf` asks every node for its GitOps view through node 1's relay. A
+# route missing from the relay's list left that check UNKNOWN on every
+# cluster (#1286), so the check must be OK here. Only gitops is gated: wtf's
+# other verdicts on a cluster this young belong to the soak.
+stage='relish wtf checks GitOps on every node'
+printf '\n$ relish wtf\n' | tee -a "$evidence/tour.log"
+started=$(date +%s)
+wtf_status=0
+"$relish" wtf > "$evidence/wtf.txt" 2>&1 || wtf_status=$?
+tee -a "$evidence/tour.log" < "$evidence/wtf.txt"
+tour_rows+="| \`relish wtf\` | $(( $(date +%s) - started )) s | $wtf_status |"$'\n'
+awk '/^[A-Z]+ \([0-9]+\)$/ { section = $1 }
+     section == "OK" && $1 == "[gitops]" { found = 1 }
+     section == "UNKNOWN" && $1 == "[gitops]" { unknown = 1 }
+     END { exit !(found && !unknown) }' "$evidence/wtf.txt" \
+    || fail 'relish wtf did not report GitOps OK on every node (#1286)'
+
 # The tour's build step, unconditionally: the release's guest image carries
 # Buildah, so a candidate whose nodes can't build fails here rather than in
 # front of a user. The build's own wait bounds it (960 s by default).
