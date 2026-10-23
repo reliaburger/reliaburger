@@ -436,6 +436,91 @@ re-sealed, never the values), and every rotation or finalise records
 `secret.rotated` or `secret.rotation_finalised` with the namespace in its
 details. See them with `relish events`.
 
+### Secrets from a provider
+
+If your secrets already live in Vault, AWS Secrets Manager or something of
+your own, you don't have to copy them into your config. An app's env value
+can name a provider and a path instead, and the node asks the provider for
+the secret each time an instance launches:
+
+```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+env = { DB_PASSWORD = "PROVIDER[vault:secret/db#password]" }
+```
+
+`vault` is the provider's name, and everything after the first `:` is the path
+it's asked for. What the path means is up to the provider. A value that starts
+with `PROVIDER[` but doesn't parse is refused at apply. Jobs can't use
+providers yet: a job with one is refused at apply too.
+
+A provider is a binary on the node, named in `node.toml`. Nothing else runs:
+the table is the allowlist.
+
+```toml
+[secret_providers.vault]
+binary = "/usr/local/bin/reliaburger-vault"
+timeout_secs = 5
+max_output_bytes = 65536
+env = { VAULT_ADDR = "https://vault.internal:8200" }
+```
+
+`binary` must be an absolute path. `timeout_secs` (default 5, at most 60) and
+`max_output_bytes` (default 64 KiB, at most 1 MiB) bound each call. The
+provider runs as Bun's user, in `/`, in its own process group, with only a
+default `PATH` and the `env` you give it. Bun's own environment isn't passed
+on.
+
+The protocol is the one git and Docker credential helpers use. Bun writes one
+JSON object to the provider's stdin, on one line ending in a newline, and
+closes it. Read up to the newline rather than waiting for end-of-file:
+
+```json
+{"version":1,"provider":"vault","path":"secret/db#password","namespace":"default","app":"api","instance":"default__api-0","variable":"DB_PASSWORD"}
+```
+
+The provider writes one object to stdout and exits 0:
+
+```json
+{"version":1,"value":"the secret"}
+```
+
+or, when it won't give the secret, an `error` instead of the `value`, with any
+exit status:
+
+```json
+{"version":1,"error":"permission denied for default/api"}
+```
+
+The namespace and app are there so the provider can decide who may read what.
+Bun ignores the provider's stderr, and never logs a value. The answer is
+complete when the provider exits: Bun reads for at most a tenth of a second
+after that, so don't leave a child behind that writes later.
+
+A node advertises the providers it runs, and the scheduler only places an app
+that names a provider on a node that has it. If no node does, the app stays
+unplaced, and `relish wtf` says no node can run it.
+
+It fails closed. When the provider is missing, slow, killed, writes too much,
+exits unsuccessfully or answers with anything but the protocol, the instance
+doesn't start, and `relish status` and `relish wtf` give the reason:
+
+```text
+cannot resolve secret DB_PASSWORD: secret provider "vault" did not answer within 5s and was killed
+```
+
+A timeout kills the provider's whole process group. Only the apps that name
+that provider are affected; everything else on the node keeps starting. In a
+cluster, the node tries the deploy again with its usual backoff (5 seconds,
+doubling up to 5 minutes), so a provider that comes back is picked up. A
+restart the provider refuses leaves that instance failed, with the reason,
+rather than spending its restart budget on the same failure.
+
+The node keeps only the reference. The secret goes into the container's
+environment, the same way a decrypted `ENC[AGE:...]` value does, and every
+restart asks the provider again, so a secret you rotate at the source reaches
+the next restart without a redeploy.
+
 ## Backing up the root CA
 
 `<cluster>-root-ca.age` only opens with the master key and the cluster's own

@@ -605,6 +605,8 @@ pub fn assignment_for(batch_id: u64, record: &TaskArrayRecord, node: &NodeId) ->
                 EnvValue::Plain(value) => Some((key.clone(), value.clone())),
                 // The owned runner decrypts the original template at execution.
                 EnvValue::Encrypted(_) => None,
+                // Validation refuses provider values in jobs (#1123).
+                EnvValue::Provider(_) => None,
             })
             .chain(std::iter::once((
                 "RELIABURGER_JOB_NAME".into(),
