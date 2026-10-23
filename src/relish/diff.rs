@@ -93,6 +93,16 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
         &mut removed,
     );
 
+    // Diff policies
+    diff_resource_map(
+        &old.policy,
+        &new.policy,
+        "policy",
+        &mut added,
+        &mut modified,
+        &mut removed,
+    );
+
     // Diff builds
     diff_resource_map(
         &old.build,

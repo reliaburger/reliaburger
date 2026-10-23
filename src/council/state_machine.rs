@@ -1440,6 +1440,43 @@ impl StateMachineInner {
                 self.state.permissions.remove(name);
                 self.state.gitops_owned.permissions.remove(name);
             }
+            RaftRequest::PolicySpec { name, spec } => {
+                self.state.policies.insert(name.clone(), *spec.clone());
+                self.state.policy_generation = self.state.policy_generation.saturating_add(1);
+            }
+            RaftRequest::PolicyDelete { name } => {
+                if self.state.policies.remove(name).is_none() {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("there is no policy named {name}"),
+                    });
+                }
+                self.state.gitops_owned.policies.remove(name);
+                self.state.policy_generation = self.state.policy_generation.saturating_add(1);
+            }
+            RaftRequest::PolicyFenced { generation, change } => {
+                // Comparing two numbers is all the state machine does with
+                // policy: evaluating one here would let a log replayed under
+                // newer policies, or a newer `cel` crate, apply differently
+                // on different nodes (chapter 18).
+                let fenced_app = match change.as_ref() {
+                    RaftRequest::AppSpec { .. } | RaftRequest::TestLeaseAppSpec { .. } => true,
+                    RaftRequest::GitOpsWrite { change, .. } => {
+                        matches!(change.as_ref(), RaftRequest::AppSpec { .. })
+                    }
+                    _ => false,
+                };
+                if !fenced_app {
+                    return Some(CouncilResponse::Refused {
+                        reason: "a policy fence carries only an app write".into(),
+                    });
+                }
+                if *generation != self.state.policy_generation {
+                    return Some(CouncilResponse::PolicyGenerationMoved {
+                        current: self.state.policy_generation,
+                    });
+                }
+                return self.apply_request_at(change, position);
+            }
             RaftRequest::RegisterEndpointConsumer { node_id } => {
                 if let Err(reason) = crate::cluster::retirement::validate_node_id(node_id) {
                     return Some(CouncilResponse::Refused {
@@ -2475,7 +2512,8 @@ impl StateMachineInner {
         let unowned = match change {
             RaftRequest::AppSpec { .. }
             | RaftRequest::NamespaceSpec { .. }
-            | RaftRequest::PermissionSpec { .. } => None,
+            | RaftRequest::PermissionSpec { .. }
+            | RaftRequest::PolicySpec { .. } => None,
             RaftRequest::AppDelete { app_id } => {
                 (!owned.apps.contains(app_id)).then(|| format!("app {app_id}"))
             }
@@ -2485,10 +2523,14 @@ impl StateMachineInner {
             RaftRequest::PermissionDelete { name } => {
                 (!owned.permissions.contains(name)).then(|| format!("permission {name}"))
             }
+            RaftRequest::PolicyDelete { name } => {
+                (!owned.policies.contains(name)).then(|| format!("policy {name}"))
+            }
             _ => {
                 return Some(CouncilResponse::Refused {
-                    reason: "a GitOps write carries only app, namespace and permission changes"
-                        .into(),
+                    reason:
+                        "a GitOps write carries only app, namespace, permission and policy changes"
+                            .into(),
                 });
             }
         };
@@ -2513,6 +2555,9 @@ impl StateMachineInner {
             }
             RaftRequest::PermissionSpec { name, .. } => {
                 owned.permissions.insert(name.clone());
+            }
+            RaftRequest::PolicySpec { name, .. } => {
+                owned.policies.insert(name.clone());
             }
             _ => {}
         }
@@ -10501,6 +10546,186 @@ mod tests {
         let state = sm.desired_state().await;
         assert!(state.apps.is_empty());
         assert!(state.gitops_owned.apps.is_empty());
+    }
+
+    fn policy_spec(deny: &str) -> Box<crate::config::PolicySpec> {
+        Box::new(crate::config::PolicySpec {
+            match_expression: None,
+            deny: deny.to_string(),
+            message: None,
+            action: crate::config::PolicyAction::Deny,
+        })
+    }
+
+    fn fenced(generation: u64, change: RaftRequest) -> RaftRequest {
+        RaftRequest::PolicyFenced {
+            generation,
+            change: Box::new(change),
+        }
+    }
+
+    /// #1117: every policy write moves the generation by one, and so does
+    /// every delete; deleting a policy that isn't there is refused and
+    /// moves nothing.
+    #[test]
+    fn every_policy_write_moves_the_generation_by_one() {
+        let mut inner = StateMachineInner::default();
+        for _ in 0..2 {
+            assert_eq!(
+                inner.apply_request(&RaftRequest::PolicySpec {
+                    name: "no-latest".into(),
+                    spec: policy_spec("false"),
+                }),
+                None
+            );
+        }
+        assert_eq!(inner.state.policy_generation, 2);
+        assert_eq!(
+            inner.apply_request(&RaftRequest::PolicyDelete {
+                name: "no-latest".into()
+            }),
+            None
+        );
+        assert_eq!(inner.state.policy_generation, 3);
+        assert!(inner.state.policies.is_empty());
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::PolicyDelete {
+                name: "no-latest".into()
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(inner.state.policy_generation, 3);
+    }
+
+    /// #1117: an app write evaluated against the current policy generation
+    /// applies; one evaluated against an older generation is refused with
+    /// the current one, and leaves no trace.
+    #[test]
+    fn a_fenced_app_write_applies_only_at_the_current_policy_generation() {
+        let mut inner = StateMachineInner::default();
+        let web = AppId::new("web", "default");
+        let app = || RaftRequest::AppSpec {
+            app_id: AppId::new("web", "default"),
+            spec: Box::new(default_spec()),
+        };
+        inner.apply_request(&RaftRequest::PolicySpec {
+            name: "rule".into(),
+            spec: policy_spec("false"),
+        });
+        assert_eq!(
+            inner.apply_request(&fenced(0, app())),
+            Some(CouncilResponse::PolicyGenerationMoved { current: 1 })
+        );
+        assert!(inner.state.apps.is_empty());
+        assert_eq!(inner.apply_request(&fenced(1, app())), None);
+        assert!(inner.state.apps.contains_key(&web));
+    }
+
+    /// #1117: the fence carries only app writes. A policy, permission or
+    /// namespace is never fenced, so a policy can always be removed.
+    #[test]
+    fn a_policy_fence_carries_only_app_writes() {
+        let mut inner = StateMachineInner::default();
+        for change in [
+            RaftRequest::PolicyDelete {
+                name: "rule".into(),
+            },
+            RaftRequest::NamespaceSpec {
+                name: "prod".into(),
+                spec: namespace_spec(),
+            },
+            gitops_write(
+                0,
+                RaftRequest::PolicySpec {
+                    name: "rule".into(),
+                    spec: policy_spec("true"),
+                },
+            ),
+        ] {
+            assert!(
+                matches!(
+                    inner.apply_request(&fenced(0, change)),
+                    Some(CouncilResponse::Refused { .. })
+                ),
+                "a fence must refuse anything but an app"
+            );
+        }
+        assert_eq!(inner.state.policy_generation, 0);
+    }
+
+    /// #1117: a GitOps app write inside a fence checks the policy
+    /// generation first, then the term, and records ownership as usual. A
+    /// GitOps policy write is owned, and only an owned policy is pruned.
+    #[tokio::test]
+    async fn gitops_writes_policies_and_fenced_apps() {
+        let mut sm = CouncilStateMachine::new();
+        let web = AppId::new("web", "default");
+        let responses = sm
+            .apply_fixture(vec![
+                normal_entry(
+                    2,
+                    1,
+                    gitops_write(
+                        2,
+                        RaftRequest::PolicySpec {
+                            name: "rule".into(),
+                            spec: policy_spec("false"),
+                        },
+                    ),
+                ),
+                normal_entry(
+                    2,
+                    2,
+                    fenced(
+                        0,
+                        gitops_write(
+                            2,
+                            RaftRequest::AppSpec {
+                                app_id: web.clone(),
+                                spec: Box::new(default_spec()),
+                            },
+                        ),
+                    ),
+                ),
+                normal_entry(
+                    2,
+                    3,
+                    fenced(
+                        1,
+                        gitops_write(
+                            2,
+                            RaftRequest::AppSpec {
+                                app_id: web.clone(),
+                                spec: Box::new(default_spec()),
+                            },
+                        ),
+                    ),
+                ),
+                normal_entry(
+                    2,
+                    4,
+                    gitops_write(
+                        2,
+                        RaftRequest::PolicyDelete {
+                            name: "manual".into(),
+                        },
+                    ),
+                ),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses[1],
+            CouncilResponse::PolicyGenerationMoved { current: 1 }
+        );
+        assert!(
+            matches!(&responses[3], CouncilResponse::Refused { reason } if reason.contains("policy manual")),
+            "{responses:?}"
+        );
+        let state = sm.desired_state().await;
+        assert!(state.apps.contains_key(&web));
+        assert!(state.gitops_owned.apps.contains(&web));
+        assert!(state.gitops_owned.policies.contains("rule"));
     }
 
     /// Only declarative writes travel inside a GitOps write.

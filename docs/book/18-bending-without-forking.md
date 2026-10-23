@@ -333,9 +333,8 @@ the list this release answers.
 ## Policies in the council
 
 Let's start with the gap at the top of the chapter: "every app in `prod` must
-have a memory limit". Here's what it will look like:
+have a memory limit". Here's what it looks like:
 
-<!-- snippet: planned #1117 -->
 ```toml
 [policy.prod-needs-limits]
 match = "app.namespace == 'prod'"
@@ -352,10 +351,9 @@ with `relish apply`, it's committed to Raft, and every council member has a
 copy. `match` and `deny` are CEL expressions. When `match` is true (or absent)
 and `deny` is true, the apply is refused with the message, or, for
 `action = "warn"`, accepted with a warning. Only an admin token can write
-policies, and every write lands in the audit log. The field names are the
-design's; the issue that builds it
-([#1117](https://github.com/reliaburger/reliaburger/issues/1117)) may adjust
-them.
+policies, and every write lands in the audit log. The field names survived
+the build ([#1117](https://github.com/reliaburger/reliaburger/issues/1117))
+unchanged: `match`, `deny`, `message` and `action`.
 
 Three questions decide whether this is a good design: where does the check
 run, what language is it in, and what happens when things race? Let's take
@@ -377,15 +375,15 @@ same rules by construction. No proxy in front of the API, as Nomad's users had
 to build, and no second parser to disagree with the first, as Docker's
 authorisation plugin had.
 
-The evaluation itself will be one *pure function* in a new `policy` module.
-Roughly:
+The evaluation itself is one *pure function* in a new `policy` module. The
+design sketched it like this:
 
 ```text
 evaluate(&PolicySet, &Config, &Caller) -> Result<Evaluated, Denials>
 ```
 
-That's a sketch of a signature, not real code yet, but it's worth reading
-closely because it carries the whole design.
+The real one is close, and we'll see it in the walkthrough below. The sketch
+is worth reading closely first, because it carries the whole design.
 
 A pure function is one whose result depends only on its arguments, and which
 changes nothing else: no files, no network, no clock, no global state. You've
@@ -547,28 +545,42 @@ Reading it line by line:
 The `.unwrap()` calls are fine in a doc example. In Reliaburger they'd be
 `?`, because a broken policy must never panic the leader.
 
-Compile-once matters to us. A policy is compiled when it's committed, and the
-compiled programs are reused for every apply until the policy set changes.
+Compile-once matters to us. A policy is compiled when it's checked at apply
+time, and each apply compiles the set it runs under once and reuses the
+programs for every app in it. GitOps keeps its compiled set for a whole sync
+and compiles again only when the policy generation moves.
 
-There's a catch, and we won't hide it. We couldn't confirm from the crate's
-documentation how closely it follows the CEL conformance suite, or whether it
-tracks evaluation cost the way Kubernetes does. The crate's documentation also
-shows more than one way in (`Program::compile` as well as `Env::compile`), so
-the exact calls may differ from the example above. So the first slice
-([#1117](https://github.com/reliaburger/reliaburger/issues/1117)) checks
-before it builds:
+There was a catch, and we said we'd check it before building: we couldn't
+confirm how closely the crate follows the CEL conformance suite, or whether it
+tracks evaluation cost the way Kubernetes does. If CEL disappointed, the
+fallback was a much smaller predicate language (field, operator, value).
 
-- run the crate against CEL's conformance tests for the features policies use
-  (field access, `has()`, string functions, list functions);
-- check whether it offers any cost or step limit, and if it doesn't, rely on
-  our own expression size cap;
-- pin the exact compile, bind and execute calls, and how a Rust struct becomes
-  a CEL value.
+Here's what the check found, in `cel` 0.15:
 
-If CEL disappoints, the fallback is a much smaller predicate language (field,
-operator, value) that covers the common policies less flexibly. Either way the
-decision gets recorded in the plan, and this section will say which way it
-went.
+- **Conformance.** The crate runs the CEL conformance suite in its own
+  repository (the published package doesn't ship it, but its changelog and
+  source refer to the runner). We wrote our own table of the features
+  policies use, in `src/policy/tests.rs`: field access, `has()`, `in` on a
+  map, `startsWith` and `endsWith`, the `exists` and `all` macros, `size()`,
+  `type()`, and int comparisons. Every row passed on the first run.
+- **Cost.** There's no cost model and no step limit. The parser caps nesting
+  at 96 levels, and that's all. So our own cap does the bounding: an
+  expression of at most 1,024 bytes, over one app's spec. CEL has no loops of
+  its own, and a macro like `exists` iterates over a list that came from the
+  spec, so the work is bounded by expression size times input size.
+- **The calls.** `Env::stdlib()` plus the strings extension, `env.compile` to
+  get a `Program`, `Context::with_env` and `add_variable_from_value` to bind
+  `app`, `caller` and `source`, then `program.execute`. A spec becomes a CEL
+  value through `serde_json`, which we then walk ourselves, so whole numbers
+  become CEL `int` and `app.port == 8080` compares like with like.
+
+So CEL stays, and the fallback isn't needed. One surprise: `namespace` is a
+reserved word in CEL, so `namespace.cpu` doesn't even parse. That suits us,
+because a policy can't name a namespace anyway; it reads `app.namespace`.
+
+We also turn off the crate's default `chrono` feature. Policies see no clock,
+so they don't need timestamps, and it saves a time-zone database in the
+binary.
 
 ### Break-glass
 
@@ -818,22 +830,159 @@ reasons teams leave.
 
 ## Rust walkthrough
 
-*To be written as the code lands.* Each issue on the 0.2.4 train adds its
-part here, with real listings from the source:
+Each issue on the 0.2.4 train adds its part here, with real listings from the
+source.
 
-- the policy kind, the pure evaluation function and the generation fence
-  ([#1117](https://github.com/reliaburger/reliaburger/issues/1117));
-- fill-only defaults and the declared-versus-effective split
-  ([#1118](https://github.com/reliaburger/reliaburger/issues/1118));
-- jobs, the audit action, `relish policy audit` and the `wtf` row
-  ([#1119](https://github.com/reliaburger/reliaburger/issues/1119));
-- sidecars, stop hooks and runtime knobs
-  ([#1120](https://github.com/reliaburger/reliaburger/issues/1120),
-  [#1121](https://github.com/reliaburger/reliaburger/issues/1121),
-  [#1122](https://github.com/reliaburger/reliaburger/issues/1122));
-- templates and the controller contract
-  ([#1124](https://github.com/reliaburger/reliaburger/issues/1124),
-  [#1125](https://github.com/reliaburger/reliaburger/issues/1125)).
+### The policy kind and the pure function
+
+([#1117](https://github.com/reliaburger/reliaburger/issues/1117)) A policy is
+a plain struct in `src/config/policy.rs`:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicySpec {
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub match_expression: Option<String>,
+    pub deny: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub action: PolicyAction,
+}
+```
+
+`match` is a keyword in Rust, the way `switch` is in C, so the field can't be
+called that. `#[serde(rename = "match")]` keeps the Rust name readable and the
+TOML name what people expect. `deny_unknown_fields` turns a typo like
+`mesage` into an error rather than a policy without a message.
+
+The function the leader runs lives in `src/policy/mod.rs`. Its signature:
+
+```rust
+pub fn evaluate_app(
+    set: &PolicySet,
+    app_id: &AppId,
+    spec: &AppSpec,
+    caller: &Caller,
+    source: Source,
+) -> Verdict
+```
+
+Every parameter is a shared reference except `source`, which is a small
+`Copy` enum passed by value. `Verdict` holds two lists, `denials` and
+`warnings`. We didn't end up with `Result<Evaluated, Denials>` here, because
+GitOps needs both lists for every app, denied or not, and a `Result` gives you
+one side or the other. The `Result` lives one level up instead, in `admit`:
+
+```rust
+pub fn admit(
+    committed: &BTreeMap<String, PolicySpec>,
+    generation: u64,
+    config: &Config,
+    caller: &Caller,
+    source: Source,
+    writes: Vec<RaftRequest>,
+) -> Result<Admitted, AdmitError>
+```
+
+`writes` is a `Vec` passed by value, not a slice: `admit` *takes ownership* of
+the writes and hands them back wrapped. In Go you'd pass the slice and hope
+nobody kept using the old one. In Rust the caller's `writes` variable is moved
+into the call and can't be touched again, so nobody can accidentally send the
+unwrapped writes to Raft. A denied config gets `Err(AdmitError::Denied(..))`
+and the writes are dropped with it. There's no way to get them back out.
+
+Inside, one policy is two compiled programs and a decision:
+
+```rust
+fn decide(policy: &CompiledPolicy, context: &Context) -> Result<bool, String> {
+    if let Some(program) = &policy.match_program
+        && !run(PolicyField::Match, program, context)?
+    {
+        return Ok(false);
+    }
+    run(PolicyField::Deny, &policy.deny_program, context)
+}
+```
+
+`if let ... && ...` is a *let chain*, new in the 2024 edition: it binds
+`program` only when the policy has a `match`, and goes on to the condition in
+the same `if`. The `?` after `run(...)` returns early with the error, so an
+expression that fails to evaluate becomes an `Err`, which `evaluate_app` turns
+into a finding: a broken deny policy refuses the app. Failing closed is the
+point. A policy that can't decide must not wave things through.
+
+`run` itself wraps the crate's `execute` in `std::panic::catch_unwind`. Rust
+code shouldn't panic on bad input, and the crate is young. A panic inside the
+GitOps loop would kill the loop, so we turn one into a refused app instead.
+`catch_unwind` needs its closure to be *unwind safe*, a marker trait saying
+nothing half-updated is visible after a panic. Ours only reads, so we tell the
+compiler with `AssertUnwindSafe`.
+
+### Checking a policy before it's committed
+
+`check_policy` in `src/policy/check.rs` compiles each expression, then walks
+its syntax tree. The tree is the crate's `Expr` enum, and the walk is one
+`match` with an arm per variant:
+
+```rust
+Expr::Select(select) => {
+    if let Expr::Ident(variable) = &select.operand.expr
+        && !bound.contains(variable)
+    {
+        check_field(field, variable, &select.field)?;
+    }
+    check_names(field, &select.operand, bound)
+}
+```
+
+A `Select` is `app.memory`; when its operand is the bare identifier `app`, the
+field must be one of `APP_FIELDS`. A free identifier must be `app`, `caller`
+or `source`, and that's how a policy is stopped from matching policies: it
+can't name them. The `bound` vector holds the loop variables of the macros
+(`app.command.all(word, ...)` binds `word`), pushed on the way into a
+comprehension and truncated on the way out. Because `match` on an enum must
+cover every variant, a future crate version that adds an expression kind
+breaks our build, not our check. We'd rather find out that way.
+
+`APP_FIELDS` is a hand-written list, and hand-written lists drift. A test
+keeps it honest: it asks serde to parse an `AppSpec` with an unknown key, and
+reads the list of expected keys out of the error message.
+
+### The generation fence
+
+The state machine's side is short, as promised:
+
+```rust
+RaftRequest::PolicyFenced { generation, change } => {
+    // (checks that `change` is an app write)
+    if *generation != self.state.policy_generation {
+        return Some(CouncilResponse::PolicyGenerationMoved {
+            current: self.state.policy_generation,
+        });
+    }
+    return self.apply_request_at(change, position);
+}
+```
+
+`PolicyFenced` *wraps* another `RaftRequest` in a `Box`. An enum variant can't
+contain its own type directly, because the compiler needs to know the size of
+every value, and a type containing itself would be infinitely big. A `Box` is
+a pointer to the heap, a fixed size, so the recursion is fine. `GitOpsWrite`
+uses the same trick, and the two nest: GitOps sends a `PolicyFenced` around a
+`GitOpsWrite` around an `AppSpec`, and each layer checks one thing.
+
+Why a new response variant rather than a `Refused { reason }` string? Because
+the callers act on it. `cluster_apply` and the Lettuce runner `match` on
+`PolicyGenerationMoved` and judge the remaining apps again; matching on the
+text of a reason would break the first time someone rewords it.
+
+A config can carry policies and apps together. Its policy writes come first,
+and each moves the generation by one, so `admit` fences the apps on
+`generation + config.policy.len()`. If anyone else writes a policy in
+between, the numbers don't match, the fence trips, and the apply judges again,
+now with the committed set, which includes its own policies.
 
 ### The exec secret provider
 
@@ -1226,22 +1375,70 @@ one stop, with the caller's own grace wherever the app names none. That
 keeps the old behaviour exactly: a deploy still gives an old instance its
 `drain_timeout`, and any other stop still gives it 10 s.
 
+Still to come in this walkthrough:
+
+- fill-only defaults and the declared-versus-effective split
+  ([#1118](https://github.com/reliaburger/reliaburger/issues/1118));
+- jobs, the audit action, `relish policy audit` and the `wtf` row
+  ([#1119](https://github.com/reliaburger/reliaburger/issues/1119));
+- sidecars and runtime knobs
+  ([#1120](https://github.com/reliaburger/reliaburger/issues/1120),
+  [#1122](https://github.com/reliaburger/reliaburger/issues/1122));
+- templates and the controller contract
+  ([#1124](https://github.com/reliaburger/reliaburger/issues/1124),
+  [#1125](https://github.com/reliaburger/reliaburger/issues/1125)).
+
 ## Tests
 
-*To be written as the code lands.* The research sets out the plan, and each
-issue fills in what its tests check and how to read them:
+The research set out the plan, and each issue fills in what its tests check
+and how to read them.
 
-- a unit table of specs and policies with the expected decision, and every
-  kind of bad policy refused at commit;
-- property tests that defaulting is idempotent, never changes a field the user
-  set, and doesn't depend on map iteration order;
-- snapshot tests of `relish plan` and `relish policy test` output;
-- portable integration tests: a denied apply leaves no Raft write but an audit
-  entry, a GitOps commit with one denied app applies the rest, a policy that
-  changes mid-apply makes the write retry, and repeated syncs of a defaulted
-  app don't re-apply;
-- cluster tests for a leader kill during an apply under policy, and an admin
-  removing a policy that denies everything;
+### Policies
+
+([#1117](https://github.com/reliaburger/reliaburger/issues/1117))
+
+- **The decision table** (`policy::tests::the_decision_table`) is one `Vec`
+  of rows: a policy, an app, and the decisions expected. A failure prints the
+  row's policy and app, so you can see which kind of decision broke.
+- **Every kind of bad policy** (`every_kind_of_bad_policy_is_refused_at_commit`)
+  checks a bad name, an empty expression, invalid CEL, an expression or
+  message over the cap, an unknown field, a variable that isn't `app`,
+  `caller` or `source`, and a loop variable used outside its loop. Each case
+  also goes through `Config::validate`, so neither front door commits it.
+- **Property tests.** `a_denied_config_produces_no_writes` generates a handful
+  of apps and checks that `admit` refuses exactly when one breaks the rule,
+  and otherwise fences every app. `evaluation_order_does_not_depend_on_map_order`
+  inserts the same policies in a shuffled order, and through a `HashMap`, and
+  checks the verdict never changes.
+- **Snapshots** with `insta`: the `relish policy test` report, the `relish
+  policy list` table, and a `relish apply --dry-run` plan with its policy
+  section.
+- **The state machine**: every policy write moves the generation by one; a
+  fenced write at an old generation answers `PolicyGenerationMoved` and
+  leaves no trace; the fence carries nothing but app writes.
+- **Through the router** (`bun::api::policy_tests`): only an admin writes a
+  policy, a denial answers 422 and is audited, a warning streams and the apply
+  goes ahead, and an admin deletes a policy that refuses everything.
+- **The portable suite** (`tests/suite/policies.rs`): a denied apply leaves the
+  Raft log index where it was but an audit record behind; a GitOps commit with
+  one denied app applies the rest and names the policy; and a policy committed
+  between judging and writing makes the write retry. That second test found a
+  real bug on its first run: the config compiler that GitOps uses to merge a
+  repository's files dropped `[policy.*]` tables on the floor, so a
+  repository's policies never reached the cluster.
+- **The cluster** (`make test-cluster`): a three-node cluster whose leader is
+  killed during an apply under a policy. The new leader holds the same policy
+  at the same generation, refuses a breaking app, and accepts the interrupted
+  apply when it's sent again.
+
+Still to come from the plan:
+
+- property tests that defaulting is idempotent and never changes a field the
+  user set;
+- snapshot tests of `relish plan` showing filled fields;
+- a portable test that repeated syncs of a defaulted app don't re-apply;
+- a cluster test of an admin removing a policy that denies everything (the
+  router test above covers it on one node);
 - the exit test on a real three-node cluster
   ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)).
 

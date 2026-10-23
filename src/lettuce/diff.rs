@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::config::app::AppSpec;
-use crate::config::{Config, NamespaceSpec, PermissionSpec};
+use crate::config::{Config, NamespaceSpec, PermissionSpec, PolicySpec};
 use crate::meat::types::AppId;
 use crate::testkit::lease::valid_test_namespace;
 
@@ -31,6 +31,8 @@ pub struct CurrentState<'a> {
     pub namespaces: &'a BTreeMap<String, NamespaceSpec>,
     /// Permissions currently in Raft, keyed by name.
     pub permissions: &'a BTreeMap<String, PermissionSpec>,
+    /// Policies currently in Raft, keyed by name.
+    pub policies: &'a BTreeMap<String, PolicySpec>,
     /// The resources GitOps wrote: the only ones it may remove.
     pub owned: &'a GitOpsOwnership,
 }
@@ -67,14 +69,16 @@ pub enum ChangePayload {
     App(Box<AppSpec>),
     Namespace(Box<NamespaceSpec>),
     Permission(Box<PermissionSpec>),
+    Policy(Box<PolicySpec>),
     /// Jobs (run to completion) and builds (dispatched imperatively) are
     /// not reconciled desired state, so their diff carries no spec.
     Generic,
 }
 
 /// The changes for one resource kind, kept apart so `compute_diff` can
-/// order them: writes go namespaces, permissions, apps; removals go the
-/// other way.
+/// order them: writes go namespaces, permissions, policies, apps; removals
+/// go the other way, except that policies are removed before apps are
+/// written.
 #[derive(Default)]
 struct KindDiff {
     writes: Vec<ResourceChange>,
@@ -84,9 +88,11 @@ struct KindDiff {
 /// Compute the diff between git config and current Raft state.
 ///
 /// Adds and updates come out namespaces first, then permissions, then
-/// apps, the order manual apply writes them in, so a namespace's quota
-/// exists before an app schedules against it. Removals follow, in the
-/// reverse order (#693). Only resources in `current.owned` are removed,
+/// policies, then apps, the order manual apply writes them in, so a
+/// namespace's quota exists before an app schedules against it. Removed
+/// policies go before the apps too, so every app is judged by the
+/// policies the repository declares at this commit (#1117). The other
+/// removals follow, in the reverse order (#693). Only resources in `current.owned` are removed,
 /// and nothing in an `rbtest-*` namespace appears at all.
 ///
 /// The `autoscale_overrides` map is consulted to avoid resetting
@@ -148,6 +154,17 @@ pub fn compute_diff(
         &mut summary,
     );
 
+    let declared_policies: BTreeMap<&String, &PolicySpec> = git_config.policy.iter().collect();
+    let current_policies: BTreeMap<&String, &PolicySpec> = current.policies.iter().collect();
+    let policies = diff_named(
+        "policy",
+        &declared_policies,
+        &current_policies,
+        &current.owned.policies,
+        |spec| ChangePayload::Policy(Box::new(spec.clone())),
+        &mut summary,
+    );
+
     // Jobs are absent from desired-state diffs: no reconciled job map exists
     // in Raft. `execute_sync` explicitly refuses any tree containing jobs
     // before reaching this function, so dependent apps cannot be published
@@ -157,6 +174,8 @@ pub fn compute_diff(
         .writes
         .into_iter()
         .chain(permissions.writes)
+        .chain(policies.writes)
+        .chain(policies.removals)
         .chain(apps.writes)
         .chain(apps.removals)
         .chain(permissions.removals)
@@ -221,7 +240,7 @@ fn diff_apps(
     diff
 }
 
-/// Diff a kind keyed by name (namespaces, permissions): add what git has
+/// Diff a kind keyed by name (namespaces, permissions, policies): add what git has
 /// and Raft doesn't, update what differs, adopt what matches but GitOps
 /// didn't write, remove what GitOps wrote and git dropped.
 fn diff_named<S: PartialEq>(
@@ -385,6 +404,7 @@ mod tests {
             apps,
             namespaces: EMPTY_NS.get_or_init(BTreeMap::new),
             permissions: EMPTY_PERM.get_or_init(BTreeMap::new),
+            policies: EMPTY_POLICIES.get_or_init(BTreeMap::new),
             owned: Box::leak(Box::new(owned)),
         }
     }
@@ -392,6 +412,8 @@ mod tests {
     static EMPTY_NS: std::sync::OnceLock<BTreeMap<String, NamespaceSpec>> =
         std::sync::OnceLock::new();
     static EMPTY_PERM: std::sync::OnceLock<BTreeMap<String, PermissionSpec>> =
+        std::sync::OnceLock::new();
+    static EMPTY_POLICIES: std::sync::OnceLock<BTreeMap<String, PolicySpec>> =
         std::sync::OnceLock::new();
 
     fn ids(changes: &[ResourceChange]) -> Vec<(&'static str, &str)> {
@@ -434,11 +456,13 @@ mod tests {
             apps: [AppId::new("fromgit", "default")].into(),
             namespaces: ["git-ns".to_string()].into(),
             permissions: ["git-perm".to_string()].into(),
+            ..Default::default()
         };
         let current = CurrentState {
             apps: &apps,
             namespaces: &namespaces,
             permissions: &permissions,
+            policies: EMPTY_POLICIES.get_or_init(BTreeMap::new),
             owned: &owned,
         };
         let (changes, summary) = compute_diff(&git, &current, &[]);
@@ -484,6 +508,7 @@ mod tests {
             apps: &apps,
             namespaces: &namespaces,
             permissions: EMPTY_PERM.get_or_init(BTreeMap::new),
+            policies: EMPTY_POLICIES.get_or_init(BTreeMap::new),
             owned: &owned,
         };
         let (changes, summary) = compute_diff(&git, &current, &[]);
@@ -495,6 +520,52 @@ mod tests {
                 modified: 0,
                 removed: 0
             }
+        );
+    }
+
+    /// #1117: policies are written, and removed, before any app, so every
+    /// app in a commit is judged by the policies that commit declares. Only
+    /// a policy GitOps wrote is removed.
+    #[test]
+    fn diff_settles_policies_before_apps() {
+        let declared = parse_config(
+            r#"
+            [policy.new-rule]
+            deny = "false"
+            [app.web]
+            image = "web:v1"
+            "#,
+        );
+        let rule = PolicySpec {
+            match_expression: None,
+            deny: "true".into(),
+            message: None,
+            action: crate::config::PolicyAction::Deny,
+        };
+        let policies = BTreeMap::from([
+            ("old-rule".to_string(), rule.clone()),
+            ("manual-rule".to_string(), rule),
+        ]);
+        let owned = GitOpsOwnership {
+            policies: ["old-rule".to_string()].into(),
+            ..Default::default()
+        };
+        let apps = HashMap::new();
+        let current = CurrentState {
+            apps: &apps,
+            namespaces: EMPTY_NS.get_or_init(BTreeMap::new),
+            permissions: EMPTY_PERM.get_or_init(BTreeMap::new),
+            policies: &policies,
+            owned: &owned,
+        };
+        let (changes, _) = compute_diff(&declared, &current, &[]);
+        assert_eq!(
+            ids(&changes),
+            vec![
+                ("add", "policy.new-rule"),
+                ("remove", "policy.old-rule"),
+                ("add", "app.default/web"),
+            ]
         );
     }
 
@@ -531,11 +602,13 @@ mod tests {
             apps: [AppId::new("old", "default")].into(),
             namespaces: ["old-ns".to_string()].into(),
             permissions: ["old-perm".to_string()].into(),
+            ..Default::default()
         };
         let current = CurrentState {
             apps: &apps,
             namespaces: &namespaces,
             permissions: &permissions,
+            policies: EMPTY_POLICIES.get_or_init(BTreeMap::new),
             owned: &owned,
         };
         let (changes, _) = compute_diff(&git, &current, &[]);
@@ -565,6 +638,7 @@ mod tests {
             apps: &apps,
             namespaces: EMPTY_NS.get_or_init(BTreeMap::new),
             permissions: EMPTY_PERM.get_or_init(BTreeMap::new),
+            policies: EMPTY_POLICIES.get_or_init(BTreeMap::new),
             owned: &owned,
         };
         let (changes, summary) = compute_diff(&git, &current, &[]);

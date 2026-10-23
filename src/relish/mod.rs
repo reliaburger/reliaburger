@@ -41,6 +41,7 @@ pub mod metrics_cmd;
 pub mod output;
 pub mod path_cmd;
 pub mod plan;
+pub mod policy_cmd;
 pub mod quickstart;
 pub mod reader;
 pub mod readiness;
@@ -134,6 +135,13 @@ pub enum RelishError {
     /// The API returned an error.
     #[error("API error (status {status}): {body}")]
     ApiError { status: u16, body: String },
+
+    /// The cluster's policies refused the apply, or would (#1117).
+    #[error("the cluster's policies refuse this apply:\n  {}", denials.join("\n  "))]
+    PolicyDenied {
+        /// One line per denial, naming the policy and the app.
+        denials: Vec<String>,
+    },
 
     /// Explicit refusal from the live scheduler's capacity admission check.
     #[error("scheduler refused placement: {0}")]

@@ -476,6 +476,7 @@ pub(super) async fn rollback_handler(
             HeaderMap::new(),
             None,
             binder,
+            auth.map(|extension| extension.0),
         )
         .await;
     }

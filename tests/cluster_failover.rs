@@ -1106,3 +1106,128 @@ async fn decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_c
     assert!(!state.test_leases.contains_key(&lease.lease_id));
     fixture.root.cancel();
 }
+
+/// POST `manifest` to `node`'s apply route as `bearer`, answering the
+/// status and body, or `None` when the node is gone.
+async fn post_apply(node: &WiredNode, bearer: &str, manifest: &str) -> Option<(u16, String)> {
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/v1/apply", node.api_port))
+        .bearer_auth(bearer)
+        .body(manifest.to_string())
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .ok()?;
+    let status = response.status().as_u16();
+    Some((status, response.text().await.unwrap_or_default()))
+}
+
+/// #1117: a leader killed while it applies apps under a policy leaves the
+/// policy in force. The new leader holds the same policy set at the same
+/// generation, refuses an app that breaks it, and accepts the interrupted
+/// apply when it's sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn a_leader_killed_during_an_apply_under_policy_leaves_the_policy_enforced() {
+    assert!(cluster_tests_enabled());
+    let operator = reliaburger::sesame::token::create_token(
+        "operator",
+        reliaburger::sesame::types::ApiRole::Admin,
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    let mut fixture = Fixture::new();
+    let mut nodes = vec![
+        fixture
+            .start_node(400, vec![], false, Some(operator.token.clone()))
+            .await,
+    ];
+    for index in 401..403 {
+        let seed = fixture.gossip(400);
+        nodes.push(
+            fixture
+                .start_node(index, vec![seed], false, Some(operator.token.clone()))
+                .await,
+        );
+    }
+    let (leader, survivors) = settled_roles(&nodes).await;
+
+    let policy = "[policy.no-latest]\ndeny = \"app.image.endsWith(':latest')\"\n";
+    let (status, body) = post_apply(&nodes[leader], &operator.plaintext, policy)
+        .await
+        .expect("the leader answers");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("policy no-latest: committed"), "{body}");
+
+    // Twenty pinned apps, applied while the leader is killed.
+    let apps: String = (0..20)
+        .map(|index| format!("[app.web-{index}]\nimage = 'web:v{index}'\n"))
+        .collect();
+    let interrupted = {
+        let api_port = nodes[leader].api_port;
+        let bearer = operator.plaintext.clone();
+        let apps = apps.clone();
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{api_port}/v1/apply"))
+                .bearer_auth(bearer)
+                .body(apps)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .ok()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    kill(&nodes[leader]).await;
+    let _ = interrupted.await;
+
+    let successor = wait_for_leader(&nodes, &survivors, Duration::from_secs(90)).await;
+    let state = nodes[successor].council.desired_state().await;
+    assert!(state.policies.contains_key("no-latest"));
+    assert_eq!(state.policy_generation, 1);
+
+    // The new leader enforces the same set.
+    let mut refused = None;
+    wait_until(
+        "the new leader judges an apply",
+        Duration::from_secs(60),
+        async || {
+            let leader = wait_for_leader(&nodes, &survivors, Duration::from_secs(30)).await;
+            refused = post_apply(
+                &nodes[leader],
+                &operator.plaintext,
+                "[app.bad]\nimage = 'bad:latest'\n",
+            )
+            .await;
+            refused.as_ref().is_some_and(|(status, _)| *status != 503)
+        },
+    )
+    .await;
+    let (status, body) = refused.unwrap();
+    assert_eq!(status, 422, "{body}");
+    assert!(
+        body.contains("policy no-latest denies app default/bad"),
+        "{body}"
+    );
+
+    // Sending the interrupted apply again commits every app, fenced on the
+    // generation the new leader holds.
+    let leader = wait_for_leader(&nodes, &survivors, Duration::from_secs(30)).await;
+    let (status, body) = post_apply(&nodes[leader], &operator.plaintext, &apps)
+        .await
+        .expect("the new leader answers");
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("\"Error\""), "{body}");
+    let state = nodes[leader].council.desired_state().await;
+    for index in 0..20 {
+        assert!(
+            state
+                .apps
+                .contains_key(&AppId::new(format!("web-{index}"), "default"))
+        );
+    }
+    assert!(!state.apps.contains_key(&AppId::new("bad", "default")));
+    fixture.root.cancel();
+}
