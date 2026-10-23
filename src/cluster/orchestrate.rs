@@ -5076,6 +5076,7 @@ image = "busybox:latest"
                 dns: Default::default(),
                 process: Default::default(),
                 containers: true,
+                secret_providers: Default::default(),
             },
             egress_enforcement: Vec::new(),
             egress_degraded: false,

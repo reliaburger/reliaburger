@@ -291,6 +291,10 @@ pub enum LaunchProblem {
     /// The spec names nothing to execute.
     #[error("no command to run")]
     NoCommand,
+    /// A `PROVIDER[...]` env value couldn't be resolved (#1123). The launch
+    /// fails closed: the instance never runs without its secret.
+    #[error(transparent)]
+    SecretUnavailable(#[from] crate::sesame::secret_provider::SecretResolutionError),
 }
 
 impl GrillError {

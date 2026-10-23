@@ -35,6 +35,9 @@ pub struct WorkloadRequirements {
     /// filesystem), or an init container's. Only a node whose runtime runs
     /// containers may take it (#914).
     pub requires_containers: bool,
+    /// The secret providers the app's env names (`PROVIDER[name:...]`): the
+    /// node must run every one (#1123).
+    pub secret_providers: std::collections::BTreeSet<crate::sesame::secret_provider::ProviderName>,
 }
 
 impl WorkloadRequirements {
@@ -57,6 +60,12 @@ impl WorkloadRequirements {
                 .collect(),
             requires_containers: (spec.exec.is_none() && spec.script.is_none())
                 || spec.init.iter().any(|init| init.image.is_some()),
+            secret_providers: spec
+                .env
+                .values()
+                .filter_map(|value| value.provider_reference())
+                .map(|reference| reference.provider().clone())
+                .collect(),
         }
     }
 }
@@ -93,8 +102,8 @@ pub fn host_init_binaries(spec: &AppSpec) -> impl Iterator<Item = &Path> {
 
 /// Whether `node` can run a workload with these requirements, room and
 /// labels aside: it's ready, runs containers when the workload is one, and
-/// can enforce egress, resolve internal DNS and run the host binary when
-/// the workload needs them.
+/// can enforce egress, resolve internal DNS, run the host binary and call
+/// the secret providers when the workload needs them.
 pub fn node_can_run(node: &SchedulerNodeState, requirements: &WorkloadRequirements) -> bool {
     node.ready
         && runs_its_kind(node, requirements)
@@ -104,6 +113,9 @@ pub fn node_can_run(node: &SchedulerNodeState, requirements: &WorkloadRequiremen
             .host_binaries
             .iter()
             .all(|binary| node.capabilities.process.runs(binary))
+        && requirements
+            .secret_providers
+            .is_subset(&node.capabilities.secret_providers)
 }
 
 /// Whether `node` runs this kind of workload at all: a container needs a
@@ -241,6 +253,7 @@ mod tests {
                 requires_dns: false,
                 host_binaries: Vec::new(),
                 requires_containers: false,
+                secret_providers: Default::default(),
             },
             &cluster,
         );
@@ -276,6 +289,7 @@ mod tests {
                 requires_dns: false,
                 host_binaries: Vec::new(),
                 requires_containers: false,
+                secret_providers: Default::default(),
             },
             &cluster,
         );
@@ -298,6 +312,7 @@ mod tests {
                 requires_dns: false,
                 host_binaries: Vec::new(),
                 requires_containers: false,
+                secret_providers: Default::default(),
             },
             &cluster,
         );
@@ -327,6 +342,7 @@ mod tests {
                 requires_dns: false,
                 host_binaries: Vec::new(),
                 requires_containers: false,
+                secret_providers: Default::default(),
             },
             &cluster,
         );
@@ -364,6 +380,7 @@ mod tests {
                 requires_dns: true,
                 host_binaries: Vec::new(),
                 requires_containers: false,
+                secret_providers: Default::default(),
             },
             &cluster,
         );
@@ -416,6 +433,7 @@ mod tests {
                 requires_dns: false,
                 host_binaries: Vec::new(),
                 requires_containers: false,
+                secret_providers: Default::default(),
             },
             &cluster,
         );
@@ -431,6 +449,44 @@ mod tests {
             allowed_binaries: allowed.iter().map(PathBuf::from).collect(),
         };
         node
+    }
+
+    /// #1123: an app whose env names a secret provider lands only on nodes
+    /// that run that provider; an app without one lands anywhere.
+    #[test]
+    fn an_app_naming_a_secret_provider_skips_nodes_without_it() {
+        let provider = |name: &str| {
+            crate::sesame::secret_provider::ProviderName::try_from(name.to_string()).unwrap()
+        };
+        let mut cluster = ClusterStateCache::new();
+        let mut vault = node_state("vault", 2000, 4096, BTreeMap::new(), true);
+        vault.capabilities.secret_providers = [provider("vault")].into();
+        cluster.set_node(vault);
+        let mut aws = node_state("aws", 2000, 4096, BTreeMap::new(), true);
+        aws.capabilities.secret_providers = [provider("aws")].into();
+        cluster.set_node(aws);
+        cluster.set_node(node_state("plain", 2000, 4096, BTreeMap::new(), true));
+
+        let spec: AppSpec = toml::from_str(
+            "image = \"api:1\"\n[env]\nDB_PASSWORD = \"PROVIDER[vault:secret/db]\"\nMODE = \"x\"\n",
+        )
+        .unwrap();
+        let requirements = WorkloadRequirements::for_app(&spec, false);
+        assert_eq!(
+            filter_nodes(&requirements, &cluster),
+            vec![NodeId::new("vault")]
+        );
+
+        let mut cluster_without = ClusterStateCache::new();
+        cluster_without.set_node(node_state("plain", 2000, 4096, BTreeMap::new(), true));
+        assert_eq!(
+            unplaced_reason(&requirements, &cluster_without),
+            UnplacedReason::NoCapableNode
+        );
+
+        let plain: AppSpec = toml::from_str("image = \"api:1\"\n").unwrap();
+        let anywhere = filter_nodes(&WorkloadRequirements::for_app(&plain, false), &cluster);
+        assert_eq!(anywhere.len(), 3);
     }
 
     /// #702: nodes with different `[process_workloads]` policies. An exec
