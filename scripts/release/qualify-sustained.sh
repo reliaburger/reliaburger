@@ -1277,7 +1277,14 @@ slot_node_fault() {
     [ "$result" -eq 0 ] || record_failure "node-$kind" "could not inject $kind on ${vm[node]}; see ${log##*/}"
     event --phase "effect:node-$kind" --target "${vm[node]}" \
         --detail "$(gsh "$node" "$(node_fault_script "$kind" effect)" 2>&1 | tr '\n' ' ' | cut -c1-200)"
-    wait_until $(( $(date +%s) + hold ))
+    # A mark sees only the last 15 s, and runc attempts are sparse, so one mark
+    # at injection was a coin toss for runc's overlap: mark all through the hold.
+    local until=$(( $(date +%s) + hold )) next
+    while [ "$(date +%s)" -lt "$until" ]; do
+        next=$(( $(date +%s) + 5 ))
+        wait_until $(( next < until ? next : until ))
+        job_mark_fault "$node" "${current_slot%%:*}:$kind"
+    done
     gsh "$node" "$(node_fault_script "$kind" stop)" >> "$log" 2>&1 \
         || record_failure "node-$kind" "could not remove $kind from ${vm[node]}; see ${log##*/}"
     settle "fault:node-$kind" 300 || true

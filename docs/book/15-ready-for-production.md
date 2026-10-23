@@ -3123,6 +3123,14 @@ peer's `/v1/status` through the relay and gets back only that app's
 instances. If the relay had quietly used the node's identity, the peer would
 have shown everything.
 
+A short list has the opposite failure too: a new per-node read that nobody
+adds to it. 0.2.1 gave `relish wtf` a GitOps check that asks every node,
+because only a node knows whether its own `[gitops]` drifts from the
+cluster's, but `GET /v1/gitops` never joined the list. On every cluster the
+check came back UNKNOWN with "the node relay does not forward GET /v1/gitops"
+(#1286). It's on the list now, with a test beside the other per-node reads;
+`POST /v1/gitops/config`, which changes the configuration, stays off.
+
 ### The catalogue needed the same door
 
 `wtf` got its door in; `relish test` didn't. The V02 soak ran
