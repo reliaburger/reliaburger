@@ -1064,10 +1064,11 @@ before their Phase 15 cases can use this contract.
 
 1. Transition to `Stopping`. Remove from Onion service map.
 2. Wrapper stops routing new connections. Existing connections drain for `drain_timeout`.
-3. Send SIGTERM to the container's PID 1.
-4. Wait up to `drain_timeout` for the container to exit.
-5. If still running, send SIGKILL.
-6. Transition to `Stopped`. Release the host port back to PortAllocator. Remove the cgroup. Clean up the network namespace. Emit event.
+3. Run the app's `pre_stop` command inside it, if it has one, within `pre_stop_timeout`. Its failure is logged and ignored (#1121).
+4. Send the app's `stop_signal` (SIGTERM by default) to the container's PID 1.
+5. Wait up to `stop_grace` for the container to exit (`drain_timeout` in a deploy without one, 10 s for any other stop).
+6. If still running, send SIGKILL.
+7. Transition to `Stopped`. Release the host port back to PortAllocator. Remove the cgroup. Clean up the network namespace. Emit event.
 
 **Reconnect after Bun restart:**
 

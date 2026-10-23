@@ -51,6 +51,7 @@ fn spec(script: &str) -> OciSpec {
             gid_mappings: None,
         },
         port_mapping: None,
+        stop: None,
     }
 }
 

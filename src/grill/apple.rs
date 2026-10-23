@@ -17,7 +17,6 @@ use super::{GrillError, InstanceId};
 
 /// Entry for an Apple Container-managed instance.
 struct AppleEntry {
-    #[allow(dead_code)]
     spec: OciSpec,
     #[allow(dead_code)]
     image: String,
@@ -327,6 +326,17 @@ impl AppleContainerGrill {
         args.extend(command.iter().cloned());
         args
     }
+
+    /// Build `container stop` arguments. The default SIGTERM is left to the
+    /// CLI; any other stop signal (#1121) is named with `--signal`.
+    fn stop_command_args(instance: &InstanceId, signal: super::stop::StopSignal) -> Vec<String> {
+        let mut args = vec!["stop".to_string()];
+        if signal != super::stop::StopSignal::Term {
+            args.extend(["--signal".to_string(), signal.name().to_string()]);
+        }
+        args.push(instance.0.clone());
+        args
+    }
 }
 
 impl Default for AppleContainerGrill {
@@ -445,9 +455,16 @@ impl super::Grill for AppleContainerGrill {
     }
 
     async fn stop(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        let output = self
-            .container_command(&["stop", &instance.0], instance)
-            .await?;
+        let signal = self
+            .entries
+            .lock()
+            .await
+            .get(instance)
+            .map(|entry| entry.spec.stop_signal())
+            .unwrap_or_default();
+        let args = Self::stop_command_args(instance, signal);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self.container_command(&args, instance).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -926,6 +943,19 @@ mod tests {
     }
 
     #[test]
+    fn stop_names_only_a_non_default_signal() {
+        let id = InstanceId("apple-0".to_string());
+        assert_eq!(
+            AppleContainerGrill::stop_command_args(&id, super::super::stop::StopSignal::Term),
+            ["stop", "apple-0"]
+        );
+        assert_eq!(
+            AppleContainerGrill::stop_command_args(&id, super::super::stop::StopSignal::Int),
+            ["stop", "--signal", "SIGINT", "apple-0"]
+        );
+    }
+
+    #[test]
     fn exec_command_does_not_insert_a_docker_style_separator() {
         let id = InstanceId("apple-0".to_string());
         let args = AppleContainerGrill::exec_command_args(
@@ -958,6 +988,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
                 readonly: false,
@@ -1034,6 +1065,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
                 readonly: false,

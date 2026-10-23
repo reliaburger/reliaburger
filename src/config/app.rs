@@ -100,6 +100,22 @@ pub struct AppSpec {
     /// Deploy strategy configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deploy: Option<DeploySpec>,
+    /// The signal that asks an instance to stop, such as `"SIGINT"`.
+    /// SIGTERM when unset (#1121).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<crate::grill::stop::StopSignal>,
+    /// How long an instance gets to exit after its stop signal before it's
+    /// killed, such as `"45s"`. Unset keeps the deploy's `drain_timeout` for
+    /// a deploy and the node's stop grace otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_grace: Option<crate::grill::stop::StopDuration>,
+    /// A command run inside each instance before its stop signal, as
+    /// `relish exec` runs one. Its failure never prevents the stop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_stop: Vec<String>,
+    /// How long `pre_stop` may run. 30 s when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_stop_timeout: Option<crate::grill::stop::StopDuration>,
     /// Ingress firewall rules.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub firewall: Option<FirewallSpec>,

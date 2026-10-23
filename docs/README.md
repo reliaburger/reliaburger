@@ -105,6 +105,19 @@ Raise it on hosts where `runc kill` routinely answers slowly under load. A
 stop that outlasts it is reported as unconfirmed and retried, never as
 Stopped.
 
+An app can choose how it's stopped: its signal, its grace after the signal,
+and a command run inside it first, with its own bound (#1121). A failing
+`pre_stop` is logged and the stop carries on:
+
+```toml
+[app.web]
+image = "nginx:alpine"
+stop_signal = "SIGQUIT"
+stop_grace = "45s"
+pre_stop = ["/bin/sh", "-c", "sleep 2"]
+pre_stop_timeout = "10s"
+```
+
 ### Jobs and cron
 
 Jobs arrived in 0.2.0, and 0.2.1 changes the cluster's formats again, so a 0.2.0

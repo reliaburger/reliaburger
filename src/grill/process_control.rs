@@ -945,6 +945,7 @@ mod tests {
                 gid_mappings: None,
             },
             port_mapping: None,
+            stop: None,
         }
     }
 

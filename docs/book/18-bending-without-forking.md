@@ -719,7 +719,16 @@ sidecar's resources count towards the app's requests when it's scheduled.
 **Stop hooks** ([#1121](https://github.com/reliaburger/reliaburger/issues/1121)).
 A `stop_signal`, a grace period and a `pre_stop` command. They're cheap, and
 they remove a whole class of "we had to write a custom entrypoint" workarounds.
-A deploy's drain and a node drain both honour them.
+A deploy's drain and every other stop honour them:
+
+```toml
+[app.worker]
+image = "registry.example.com/worker:2.1"
+stop_signal = "SIGQUIT"
+stop_grace = "2m"
+pre_stop = ["/app/bin/worker", "hand-back-jobs"]
+pre_stop_timeout = "20s"
+```
 
 **Gated runtime knobs** ([#1122](https://github.com/reliaburger/reliaburger/issues/1122)).
 A small `[app.x.runtime]` allowlist: added capabilities, namespaced sysctls,
@@ -819,15 +828,175 @@ part here, with real listings from the source:
   ([#1118](https://github.com/reliaburger/reliaburger/issues/1118));
 - jobs, the audit action, `relish policy audit` and the `wtf` row
   ([#1119](https://github.com/reliaburger/reliaburger/issues/1119));
-- sidecars, stop hooks and runtime knobs
+- sidecars and runtime knobs
   ([#1120](https://github.com/reliaburger/reliaburger/issues/1120),
-  [#1121](https://github.com/reliaburger/reliaburger/issues/1121),
   [#1122](https://github.com/reliaburger/reliaburger/issues/1122));
 - the exec secret provider
   ([#1123](https://github.com/reliaburger/reliaburger/issues/1123));
 - templates and the controller contract
   ([#1124](https://github.com/reliaburger/reliaburger/issues/1124),
   [#1125](https://github.com/reliaburger/reliaburger/issues/1125)).
+
+### Stop hooks
+
+Stop hooks were the smallest escape hatch, so they landed first. Before
+them, every stop did the same thing: withdraw the instance from routing,
+drain it, send SIGTERM, wait, send SIGKILL. That's right for most programs.
+It's wrong for nginx, which finishes its requests on SIGQUIT and drops them
+on SIGTERM, and for a queue worker that needs a minute and a command to hand
+its jobs back. Teams worked round it with wrapper entrypoints that trapped
+SIGTERM and translated it. Now an app says what it wants, and Bun does it.
+
+#### Parsing is the validation
+
+The first question was where a bad value gets refused. A grace of `"0s"`
+makes no sense, `"SIGKILL"` defeats the point of a grace, and `"15"` is
+SIGTERM on both Linux and macOS but a guess in a config file. We could have
+kept the fields as strings and checked them in `validate_app`. Instead
+they're types that can't hold a bad value:
+
+```rust
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum StopSignal {
+    #[default]
+    Term,
+    Int,
+    Quit,
+    Hup,
+    Usr1,
+    Usr2,
+    Winch,
+}
+```
+
+`#[serde(try_from = "String", into = "String")]` tells serde to read the
+field as a plain `String` first and then convert it with our own
+`TryFrom<String>` implementation. If that returns an error, deserialising the
+whole `AppSpec` fails, and the error carries our message. Writing goes the
+other way, through `From<StopSignal> for String`. So the TOML, the Raft
+entry and the API JSON all hold `"SIGQUIT"`, and the Rust code holds an enum
+it can `match` on.
+
+The conversion itself is `FromStr`, the trait behind `str::parse`. It's
+Rust's version of Go's `strconv.Atoi` or Python's `int(s)`, except that you
+implement it for your own types, and `"SIGINT".parse::<StopSignal>()` picks
+yours from the type you ask for:
+
+```rust
+impl FromStr for StopSignal {
+    type Err = StopSettingError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let upper = value.trim().to_ascii_uppercase();
+        let bare = upper.strip_prefix("SIG").unwrap_or(&upper);
+        StopSignal::ALL
+            .into_iter()
+            .find(|signal| &signal.name()[3..] == bare)
+            .ok_or_else(|| StopSettingError::UnknownSignal(value.to_string()))
+    }
+}
+```
+
+`TryFrom<String>` then just calls `value.parse()`. Durations work the same
+way: `StopDuration` wraps a `Duration` and refuses anything under a second or
+over an hour. The payoff shows up in the error. A typo fails `relish lint`
+with the file's line and column, and with the list of signals that would
+have worked:
+
+```text
+failed to parse TOML: TOML parse error at line 3, column 15
+  |
+3 | stop_signal = "SIGFOO"
+  |               ^^^^^^^^
+unknown stop signal "SIGFOO": use one of SIGTERM, SIGINT, SIGQUIT, SIGHUP, SIGUSR1, SIGUSR2, SIGWINCH
+```
+
+What's left for `validate_app` is how the fields fit together: a
+`pre_stop_timeout` with no `pre_stop`, an empty program name, and an `exec`
+or `script` app whose pre-stop program isn't an absolute path. That last one
+matters because such an app's pre-stop runs on the host, so it has to pass
+the node's `allowed_binaries` like the app's own binary does. It joins the
+app's host binaries for placement too, so the scheduler won't pick a node
+that would refuse it.
+
+#### The signal travels with the instance
+
+The obvious design was a `signal` argument on `Grill::stop`. We didn't take
+it. Some callers of `stop` know nothing about apps (a Bun shutdown stops
+whatever is running), and threading a signal through every one of them is
+churn that buys nothing. Instead, `generate_oci_spec` copies the app's
+fields into the instance's spec as a `StopPolicy`:
+
+```rust
+pub struct StopPolicy {
+    #[serde(default)]
+    pub signal: StopSignal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace: Option<Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_stop: Option<PreStop>,
+}
+```
+
+Every runtime already keeps that spec. The process runtime signals the
+workload's process group with `entry.spec.stop_signal()`, the process owner
+reads the spec it was launched with, runc passes the name to `runc kill`, and
+Apple Container gets `container stop --signal`. Because the spec is in the
+instance record too, a Bun that restarts and adopts its instances still
+knows how to stop them. And a deploy retires an old instance with *its own*
+policy, not the new spec's. That matters when the new image has dropped the
+program the old one's pre-stop runs.
+
+The spec is durable state, so this is a format change: it's the change that
+moved `CURRENT` in `src/compatibility.rs` to 55/72 for 0.2.4.
+
+#### Four steps, four bounds
+
+The sequence lives in `stop_runtime_instance`, which every graceful stop
+already went through:
+
+```rust
+pub async fn stop_runtime_instance<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    stop: &InstanceStop,
+    confirmation_timeout: std::time::Duration,
+) -> Result<(), BunError> {
+    if let Some(pre_stop) = &stop.pre_stop {
+        run_pre_stop(grill, id, pre_stop).await;
+    }
+    tokio::time::timeout(confirmation_timeout, grill.stop(id))
+        .await
+        .map_err(|_| BunError::StopUnconfirmed {
+            instance_id: id.clone(),
+            reason: "graceful stop request timed out",
+        })??;
+    if observe_runtime_exit(grill, id, stop.grace).await? {
+        return Ok(());
+    }
+    kill_runtime_instance(grill, id, confirmation_timeout).await
+}
+```
+
+Notice that `run_pre_stop` returns nothing at all. It isn't allowed to fail
+the stop, so its type says it can't: a pre-stop command that exits non-zero,
+can't start or runs over its bound gets a line in `bun`'s log, and the
+signal goes out regardless. A broken hook must never keep an instance
+running.
+
+The bound is a `tokio::time::timeout` around `Grill::exec`. As chapter 2
+explained, a timeout cancels by dropping the future, so the exec has to
+clean up when it's dropped. The process owner already did: the exec's
+socket lives in the caller's future, and the owner retires the command when
+it closes. The plain process runtime didn't. It spawned the command with
+`tokio::process::Command`, whose child carries on after its handle is
+dropped unless you ask otherwise, so `exec` now sets `kill_on_drop(true)`.
+
+`InstanceStop::for_policy` turns a policy into the grace and pre-stop for
+one stop, with the caller's own grace wherever the app names none. That
+keeps the old behaviour exactly: a deploy still gives an old instance its
+`drain_timeout`, and any other stop still gives it 10 s.
 
 ## Tests
 
@@ -848,6 +1017,47 @@ issue fills in what its tests check and how to read them:
 - Smoker faults under the secret provider binary;
 - the exit test on a real three-node cluster
   ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)).
+
+### Testing stop hooks
+
+The stop hook tests use real processes, because a trap in a shell script is
+the only honest witness to which signal arrived. Each workload is a few
+lines of `sh`: it sets its traps, touches a `ready` file so the test can't
+signal it before the traps exist, and loops. A trap writes the signal's name
+to a log and exits.
+
+- `the_configured_signal_arrives_and_a_trapping_workload_exits_within_its_grace`
+  sets `stop_signal = SIGINT` and traps TERM, INT and QUIT. The log must
+  read `INT` alone, the exit code must be 0 (it left by itself), and the
+  stop must finish well inside its 10 s grace.
+- `a_workload_that_ignores_its_signal_is_killed_once_the_grace_runs_out`
+  ignores SIGTERM with a 1 s grace. The stop must take at least the grace,
+  and not much more, which also proves the app's grace beat the caller's
+  30 s default.
+- `pre_stop_runs_inside_the_workloads_environment_before_the_signal` has the
+  pre-stop command append to the same log, which must read `pre-stop`, then
+  `TERM`.
+- `a_failing_pre_stop_never_prevents_the_stop` tries a command that exits 3
+  and one that doesn't exist; both stops complete with the signal logged.
+- `a_pre_stop_that_overruns_costs_only_its_own_bound` runs `sleep 30` with
+  a 1 s bound and checks that the stop moved on after about a second.
+
+Those drive the in-process runtime. Two more in the integration suite,
+`an_owned_workload_gets_its_own_signal_after_its_pre_stop` and
+`an_owned_workload_that_ignores_its_signal_is_killed_after_its_grace`, run
+the same story through the production path, where every workload sits under
+its own `bun` owner process. There it's the owner, not Bun, that picks the
+signal, so only these tests prove the owner reads the spec.
+
+The wiring tests use the mock runtime and read its call log: an operator
+stop calls `exec` before `stop`, an app with no `pre_stop` never calls
+`exec`, and a rolling deploy runs the *old* instance's pre-stop before it
+signals it, even though the new spec has none. The parsing tests in
+`grill::stop` and `config::validate` cover each refusal, and
+`stop_hooks_survive_an_export_and_import_round_trip` sends an app through
+`relish export` and back in. To check the tests check something, we put
+SIGTERM back in both runtimes and skipped the pre-stop: eight of them failed,
+each saying what it saw instead.
 
 ## Lessons
 

@@ -28,8 +28,9 @@ pub struct WorkloadRequirements {
     /// resolver is ready and reachable from workloads.
     pub requires_dns: bool,
     /// The host binaries an `exec` or `script` app runs: its own (see
-    /// [`host_binary`]) and those of its image-less init containers (see
-    /// [`host_init_binaries`]). Empty for a container.
+    /// [`host_binary`]), those of its image-less init containers (see
+    /// [`host_init_binaries`]) and its pre-stop command's (see
+    /// [`host_pre_stop_binary`]). Empty for a container.
     pub host_binaries: Vec<PathBuf>,
     /// The app runs an image: its own (or, with only a `command`, a root
     /// filesystem), or an init container's. Only a node whose runtime runs
@@ -53,6 +54,7 @@ impl WorkloadRequirements {
             host_binaries: host_binary(spec)
                 .into_iter()
                 .chain(host_init_binaries(spec))
+                .chain(host_pre_stop_binary(spec))
                 .map(Path::to_path_buf)
                 .collect(),
             requires_containers: (spec.exec.is_none() && spec.script.is_none())
@@ -89,6 +91,14 @@ pub fn host_init_binaries(spec: &AppSpec) -> impl Iterator<Item = &Path> {
         .filter(move |init| host && init.image.is_none())
         .filter_map(|init| init.command.first())
         .map(Path::new)
+}
+
+/// The host binary a process workload's `pre_stop` runs (#1121). Like an
+/// image-less init, it runs on the host beside its app, so the node must
+/// allow it too. `None` for a container, whose pre-stop runs in its image.
+pub fn host_pre_stop_binary(spec: &AppSpec) -> Option<&Path> {
+    host_binary(spec)?;
+    spec.pre_stop.first().map(Path::new)
 }
 
 /// Whether `node` can run a workload with these requirements, room and
@@ -566,6 +576,26 @@ mod tests {
         assert_eq!(
             reason.to_string(),
             "no ready node has a container runtime to run its image"
+        );
+    }
+
+    /// #1121: a host app's pre-stop command runs on the host, so placement
+    /// needs a node that allows its program too. A container's runs in its
+    /// image and asks nothing of the node.
+    #[test]
+    fn a_host_apps_pre_stop_program_is_a_host_binary_it_needs() {
+        let host: AppSpec =
+            toml::from_str("exec = \"/bin/sleep\"\npre_stop = [\"/bin/echo\", \"bye\"]").unwrap();
+        assert_eq!(
+            WorkloadRequirements::for_app(&host, false).host_binaries,
+            vec![PathBuf::from("/bin/sleep"), PathBuf::from("/bin/echo")]
+        );
+        let container: AppSpec =
+            toml::from_str("image = \"web:1\"\npre_stop = [\"/bin/echo\"]").unwrap();
+        assert!(
+            WorkloadRequirements::for_app(&container, false)
+                .host_binaries
+                .is_empty()
         );
     }
 }

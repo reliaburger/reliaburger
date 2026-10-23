@@ -43,6 +43,7 @@ pub mod runc;
 pub mod runc_intent;
 pub mod snapshot;
 pub mod state;
+pub mod stop;
 pub mod userns;
 pub mod volume;
 

@@ -439,16 +439,29 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         stop: &AppStop,
     ) -> impl std::future::Future<Output = Result<(), BunError>> + Send + 'static {
-        let ids = stop.instances.clone();
+        let grace = self.stop_grace;
+        // Each instance stops the way its own launch spec says (#1121), so an
+        // operator stop and a retirement honour the app's stop hooks.
+        let stops: Vec<(InstanceId, InstanceStop)> = stop
+            .instances
+            .iter()
+            .map(|id| (id.clone(), self.instance_stop(id, grace)))
+            .collect();
         let grill = self.supervisor.grill().clone();
         let drains = self.drains.clone();
-        let grace = self.stop_grace;
         let confirmation_timeout = self.stop_confirmation_timeout;
         let taken_restarts = stop.taken_restarts.clone();
         async move {
             restarts::settle_all(&taken_restarts, confirmation_timeout).await?;
-            let waits = ids.iter().map(|id| {
-                drain_and_stop_instance(&drains, &grill, id, grace, confirmation_timeout)
+            let waits = stops.iter().map(|(id, instance_stop)| {
+                drain_and_stop_instance(
+                    &drains,
+                    &grill,
+                    id,
+                    grace,
+                    instance_stop,
+                    confirmation_timeout,
+                )
             });
             // Try every replica, but report the first failure: ownership and
             // enforcement stay until all exits are confirmed, and a later stop
@@ -459,6 +472,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .find_map(Result::err)
                 .map_or(Ok(()), Err)
         }
+    }
+
+    /// How `id` is stopped: its launch spec's stop policy (#1121), with
+    /// `default_grace` where the policy names no grace.
+    pub(super) fn instance_stop(
+        &self,
+        id: &InstanceId,
+        default_grace: std::time::Duration,
+    ) -> InstanceStop {
+        let policy = self
+            .supervisor
+            .get_instance(id)
+            .and_then(|instance| instance.oci_spec.as_ref())
+            .and_then(|spec| spec.stop.as_ref());
+        InstanceStop::for_policy(policy, default_grace)
     }
 
     /// Record a stop whose exits are confirmed and release what it owned.

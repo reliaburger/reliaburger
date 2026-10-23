@@ -61,9 +61,20 @@ pub struct OciSpec {
     /// the serialised spec, so `#[serde(default)]` reads it back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_mapping: Option<PortMapping>,
+    /// How the workload asks to be stopped (#1121): its signal, grace and
+    /// pre-stop command. Not part of the OCI runtime spec either; runtimes
+    /// read the signal from it on every graceful stop. `None` is SIGTERM,
+    /// the caller's grace and no pre-stop command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<super::stop::StopPolicy>,
 }
 
 impl OciSpec {
+    /// The signal a graceful stop sends this workload.
+    pub fn stop_signal(&self) -> super::stop::StopSignal {
+        super::stop::StopPolicy::signal_of(self.stop.as_ref())
+    }
+
     /// The same spec with every environment entry cut down to its variable
     /// name, so no value (decrypted secrets included) remains.
     ///
@@ -437,6 +448,7 @@ pub fn generate_oci_spec_with_decryptor(
             host_port: hp,
             container_port: cp,
         }),
+        stop: super::stop::StopPolicy::from_app(spec),
     })
 }
 
@@ -869,6 +881,7 @@ pub fn generate_job_oci_spec(
         },
         // Jobs run to completion and don't publish ports.
         port_mapping: None,
+        stop: None,
     }
 }
 
@@ -925,6 +938,7 @@ pub fn generate_init_oci_spec(
         },
         // Init containers run before the app and don't publish ports.
         port_mapping: None,
+        stop: None,
     }
 }
 

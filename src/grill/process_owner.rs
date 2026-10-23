@@ -742,7 +742,9 @@ fn respond(
                     }
                 }
                 action => match child.signal(match action {
-                    Action::Terminate => Signal::SIGTERM,
+                    // The app's own stop signal (#1121), from the spec this
+                    // owner was launched with.
+                    Action::Terminate => record.launch.spec.stop_signal().to_nix(),
                     _ => Signal::SIGKILL,
                 }) {
                     Ok(()) => serde_json::json!({"accepted": true}),
@@ -953,6 +955,7 @@ mod tests {
                         gid_mappings: None,
                     },
                     port_mapping: None,
+                    stop: None,
                 },
             },
         }

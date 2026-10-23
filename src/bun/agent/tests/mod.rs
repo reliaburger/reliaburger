@@ -17,6 +17,7 @@ mod namespace_secrets;
 mod published_status;
 mod restart_ownership;
 mod runtime_metadata;
+mod stop_hooks;
 mod upgrade_answer;
 
 #[test]
@@ -9097,6 +9098,7 @@ fn adoption_record(
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: "/tmp/test".to_string(),
                 readonly: false,
@@ -10397,11 +10399,13 @@ async fn retire_waits_for_in_flight_request_before_kill() {
     drains.increment_connections(&id.0).await;
 
     // Kick off the retire on a task; it must block on the drain.
+    let stop = InstanceStop::for_policy(None, std::time::Duration::from_secs(30));
     let retire = drain_and_stop_instance(
         &drains,
         &grill,
         &id,
         std::time::Duration::from_secs(30),
+        &stop,
         std::time::Duration::from_secs(10),
     );
     tokio::pin!(retire);
@@ -10457,11 +10461,13 @@ async fn retire_waits_for_in_flight_websocket_before_kill() {
     drains.increment_connections(&id.0).await;
     drains.increment_websocket(&id.0).await;
 
+    let stop = InstanceStop::for_policy(None, std::time::Duration::from_secs(30));
     let retire = drain_and_stop_instance(
         &drains,
         &grill,
         &id,
         std::time::Duration::from_secs(30),
+        &stop,
         std::time::Duration::from_secs(10),
     );
     tokio::pin!(retire);

@@ -223,6 +223,35 @@ fn new_shared_drains() -> crate::wrapper::draining::SharedDrains {
     ))
 }
 
+/// How one instance is stopped (#1121): the pre-stop command that runs
+/// first, if any, and how long the workload then gets to exit before it's
+/// killed. The stop signal itself travels in the instance's spec, where the
+/// runtime reads it, so even a stop that never builds one of these (a Bun
+/// shutdown) sends the app's own signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceStop {
+    /// Time to exit after the stop signal before the force-kill.
+    pub grace: std::time::Duration,
+    /// Run inside the instance before the signal, within its own bound.
+    pub pre_stop: Option<crate::grill::stop::PreStop>,
+}
+
+impl InstanceStop {
+    /// The stop an instance declared in `policy`, with the caller's
+    /// `default_grace` where it declares none.
+    pub fn for_policy(
+        policy: Option<&crate::grill::stop::StopPolicy>,
+        default_grace: std::time::Duration,
+    ) -> Self {
+        Self {
+            grace: policy
+                .and_then(|policy| policy.grace)
+                .unwrap_or(default_grace),
+            pre_stop: policy.and_then(|policy| policy.pre_stop.clone()),
+        }
+    }
+}
+
 /// Drain then stop a single instance using cloneable handles, so the wait can
 /// run on a spawned deploy task instead of the command loop (M7): start the
 /// drain (new traffic is routed away; the Wrapper proxy shares this drain
@@ -236,6 +265,7 @@ async fn drain_and_stop_instance<G: Grill>(
     grill: &G,
     id: &InstanceId,
     drain_timeout: std::time::Duration,
+    stop: &InstanceStop,
     confirmation_timeout: std::time::Duration,
 ) -> Result<(), BunError> {
     let cmd = crate::wrapper::draining::DrainCommand {
@@ -246,30 +276,64 @@ async fn drain_and_stop_instance<G: Grill>(
     drains.start_drain(&cmd).await;
     drains.wait_drained(&id.0).await;
 
-    stop_runtime_instance(grill, id, drain_timeout, confirmation_timeout).await
+    stop_runtime_instance(grill, id, stop, confirmation_timeout).await
 }
 
 /// Stop one instance, requiring observed exit even after force-kill.
 ///
+/// Four explicit steps, each with its own bound: the pre-stop command
+/// (`stop.pre_stop`, within its timeout), the stop signal (accepted within
+/// `confirmation_timeout`), the grace (`stop.grace`) and, if the workload is
+/// still running, the force-kill and its confirmation. A pre-stop command
+/// that fails, can't run or overruns costs at most its bound: the signal and
+/// the kill still follow.
+///
 /// `confirmation_timeout` (`[runtime] stop_confirmation_timeout_secs`) bounds
 /// the runtime's own work: accepting the stop request, accepting a kill, and
-/// reporting exit after it. `grace` is the workload's time to exit.
-async fn stop_runtime_instance<G: Grill>(
+/// reporting exit after it.
+pub async fn stop_runtime_instance<G: Grill>(
     grill: &G,
     id: &InstanceId,
-    grace: std::time::Duration,
+    stop: &InstanceStop,
     confirmation_timeout: std::time::Duration,
 ) -> Result<(), BunError> {
+    if let Some(pre_stop) = &stop.pre_stop {
+        run_pre_stop(grill, id, pre_stop).await;
+    }
     tokio::time::timeout(confirmation_timeout, grill.stop(id))
         .await
         .map_err(|_| BunError::StopUnconfirmed {
             instance_id: id.clone(),
             reason: "graceful stop request timed out",
         })??;
-    if observe_runtime_exit(grill, id, grace).await? {
+    if observe_runtime_exit(grill, id, stop.grace).await? {
         return Ok(());
     }
     kill_runtime_instance(grill, id, confirmation_timeout).await
+}
+
+/// Run an instance's pre-stop command inside it, within its bound.
+///
+/// The outcome is only reported: a pre-stop command is a courtesy to the
+/// workload, and a broken one must never keep an instance running. Dropping
+/// the exec at the bound ends the command, as an exec timeout always has.
+async fn run_pre_stop<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    pre_stop: &crate::grill::stop::PreStop,
+) {
+    match tokio::time::timeout(pre_stop.timeout, grill.exec(id, &pre_stop.command)).await {
+        Ok(Ok(output)) if output.exit_code == 0 => {}
+        Ok(Ok(output)) => eprintln!(
+            "bun: {id}: pre_stop exited with status {}; stopping anyway",
+            output.exit_code
+        ),
+        Ok(Err(error)) => eprintln!("bun: {id}: pre_stop could not run: {error}; stopping anyway"),
+        Err(_) => eprintln!(
+            "bun: {id}: pre_stop ran past its {}s bound; stopping anyway",
+            pre_stop.timeout.as_secs()
+        ),
+    }
 }
 
 /// Preserve ownership until both force-kill and observed runtime exit succeed.
