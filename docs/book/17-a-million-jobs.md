@@ -75,13 +75,18 @@ That property test only sees one array's state. The store around it has more way
 
 - a refused write left the store exactly as it was and took no id;
 - a retried key gets its run back, and a changed one is refused;
-- no new run starts while an unknown outcome is unacknowledged;
+- no new run starts while an unknown outcome is unacknowledged, or over a
+  run its schedule forbids overlapping;
+- a cron minute that nothing holds back either starts a run or is recorded
+  as skipped for want of room;
 - a stale report is counted as refused and changes no count;
 - every task is still counted exactly once;
 - a terminal run stays terminal;
 - the store survives a JSON round trip unchanged.
 
 Its first run found a real bug in under twenty cases. Lose a node, so its chunks go back in the queue at attempt 2, then cancel: `stop` moved the queued chunks to done but kept their attempt numbers. Nothing misbehaved at once. The next reopen did, because snapshot validation (rightly) refuses an attempt number on a retired chunk. A follower installing that snapshot, or a standalone node restarting, would have refused the whole state. `stop` now drops those attempts. A unit test in `task_array_state.rs` pins the case down, and proptest's minimised sequence is saved in `proptest-regressions/meat/task_array_store.txt`. Proptest replays every saved seed before it generates new cases, so the failing sequence runs on every CI run.
+
+The cron checks came later, and they show how a property test can look thorough and still not test something. At first the fire step only checked what *mustn't* happen: no second run in a minute already claimed, none past an unknown outcome. A fire that wrongly refused to start passed both. Two mutants proved it. One made an `Allow` schedule wait for its active run as if it said `Forbid`, and the other ignored `Forbid` altogether. Both passed 2,000 cases. The step now works out which of the store's reasons could hold an occurrence back, and when none applies, it requires a new run or a recorded skip. Both mutants now fail.
 
 ### The node: slots, not chunks
 
