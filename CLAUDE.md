@@ -86,6 +86,7 @@ Fixes and hardening update the existing chapter for that subsystem; they don't g
 | 14 | `14-changing-the-tyres.md` | "Changing the Tyres at Full Speed" |
 | 15 | `15-ready-for-production.md` | "Ready for Production" |
 | 0.2.0 | `17-a-million-jobs.md` | "A Million Jobs" |
+| 0.2.4 | `18-bending-without-forking.md` | "Bending Without Forking" |
 | — | `16-appendix-rust.md` | "Appendix: Rust for C, Python, and Go Programmers" |
 
 ## Quality Standards

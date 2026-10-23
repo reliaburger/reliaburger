@@ -360,7 +360,8 @@ migration and no feature gate
   defaults) on the one apply path that `relish apply` and GitOps share;
   sidecars, stop hooks and gated runtime knobs; an exec secret provider;
   templates that expand to ordinary apps, and a contract for running your own
-  controller. A new book chapter comes first. Exit test: four common policies,
+  controller. A new book chapter,
+  [Chapter 18](book/18-bending-without-forking.md), comes first. Exit test: four common policies,
   a template and a controller on a real cluster
   ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)).
 - [ ] **0.3.0: "Bare metal in an hour"**
