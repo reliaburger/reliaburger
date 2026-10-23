@@ -2526,10 +2526,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_first_held_chunk_is_reported_long_before_the_last_one_starts() {
+    async fn held_chunks_run_one_after_another_and_the_first_is_reported_first() {
         let root = tempfile::tempdir().unwrap();
-        let runner = FakeRunner::new(Duration::from_millis(5), |_| AttemptOutcome::Exited {
-            code: 0,
+        // The order tasks finish in, not a count taken when the receipt
+        // arrives: the receipt waits for the ledger's fsync, so a count
+        // would time the runner's disk (it failed CI's coverage run).
+        // A std mutex: the runner's outcome is a synchronous callback, and
+        // the push is the whole critical section.
+        let finished_tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&finished_tasks);
+        let runner = FakeRunner::new(Duration::from_millis(5), move |task| {
+            record.lock().unwrap().push(task.index);
+            AttemptOutcome::Exited { code: 0 }
         });
         let node = fake_node(root.path(), runner);
         let held: Vec<(u32, u64)> = (0..8).map(|chunk| (chunk, 1)).collect();
@@ -2537,16 +2545,27 @@ mod tests {
         capped.spec.per_node_concurrency = Some(2);
         let sync = request(vec![capped]);
         let progress = sync_until_finished(&node, &sync, 1).await;
-        // Its receipt goes to the leader at once, so the leader can top
-        // the node up while the other seven chunks still run.
+        // Its receipt goes to the leader first, so the leader can top the
+        // node up while the other seven chunks still run.
         assert_eq!(progress.finished[0].chunk, ChunkId(0), "{progress:?}");
-        assert!(
-            progress.counters.attempts_started <= 40,
-            "the first receipt came only after {} of 80 attempts started",
-            progress.counters.attempts_started
-        );
         let progress = sync_until_finished(&node, &sync, 8).await;
         assert_eq!(progress.counters.succeeded, 80);
+
+        // Chunk N's tasks take both slots before chunk N+1's start, so all
+        // of chunk 0 is done before anything past chunk 1 finishes. Run in
+        // lockstep, every chunk finishes near the end.
+        let chunks: Vec<u32> = finished_tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|index| index / 10)
+            .collect();
+        let last_of_first = chunks.iter().rposition(|&chunk| chunk == 0).unwrap();
+        let first_of_third = chunks.iter().position(|&chunk| chunk >= 2).unwrap();
+        assert!(
+            last_of_first < first_of_third,
+            "chunks finished interleaved: {chunks:?}"
+        );
     }
 
     #[tokio::test]

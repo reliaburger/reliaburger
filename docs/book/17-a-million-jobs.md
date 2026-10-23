@@ -3021,11 +3021,24 @@ receipt still goes out only once every record of the chunk is durable.
 Three tests pin it down. `chunks_sharing_slots_finish_in_the_order_they_arrived`
 runs four eight-task chunks through two slots and checks the first one
 finishes after at most twelve of the 32 attempts have started. Before the
-change, it finished after 24. `the_first_held_chunk_is_reported_long_before_the_last_one_starts`
-does the same through a node's `sync`: eight held chunks, a cap of two, and
-the first receipt has to arrive before 40 of 80 attempts start (it used to be
-68). `a_chunk_cancelled_while_queued_ends_at_once_and_keeps_the_order_behind_it`
+change, it finished after 24. `held_chunks_run_one_after_another_and_the_first_is_reported_first`
+does the same through a node's `sync`: eight held chunks and a cap of two.
+Chunk 0's receipt has to come first, and every task of chunk 0 has to finish
+before any task past chunk 1 does. Run in lockstep, the chunks finish
+interleaved, `0, 1, 2, …, 7, 0, 1, …`, to the end.
+`a_chunk_cancelled_while_queued_ends_at_once_and_keeps_the_order_behind_it`
 cancels a queued chunk and checks the one behind it still waits.
+
+The node test's first version counted the attempts started when the first
+receipt arrived, and required fewer than 40. It failed both of CI's Linux
+coverage runs, at 49 and 80. The order was right. The count was timing the
+disk. A receipt goes out only once its records are durable, which means the
+ledger's group commit and an fsync, and with 5 ms fake tasks the whole array
+takes about 200 ms. On a runner whose disk was busy with coverage profiles,
+the fsync outlasted the array. Slowing the fake tasks only moved the line:
+at 50 ms each, six local writers doing full fsyncs still failed it one run in
+thirty. So the test now records the order in which tasks finish, which no
+disk can change, and checks the receipt only for which chunk comes first.
 
 The profile predicts the node runs at its burst rate all the time, about
 10,000 host jobs a second on that rig. The five-round bench measurement is
