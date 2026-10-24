@@ -447,6 +447,7 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
     }
 
     validate_app_stop(name, app)?;
+    validate_app_sidecars(name, app)?;
 
     // Autoscale block: bounds, windows and threshold are validated up front
     // so a bad `[autoscale]` fails the deploy instead of silently clamping
@@ -498,6 +499,66 @@ fn validate_app_stop(name: &str, app: &super::app::AppSpec) -> Result<(), Config
             "an exec or script app's pre_stop runs on the host, where allowed_binaries \
              names programs by full path; start it with an absolute path",
         ));
+    }
+    Ok(())
+}
+
+/// Refuse sidecars that can't run as declared (#1120): a name that isn't a
+/// DNS label or appears twice, a host app (whose network is the node's, so
+/// there's no namespace to share), no image to run, an encrypted value in a
+/// sidecar's own `env`, and an app with an egress allowlist, which would
+/// hold the app to it but not its sidecars.
+fn validate_app_sidecars(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    if app.sidecar.is_empty() {
+        return Ok(());
+    }
+    let context = format!("app {name:?}");
+    let refuse = |reason: String| ConfigError::Validation {
+        field: "sidecar".to_string(),
+        context: context.clone(),
+        reason,
+    };
+    if app.exec.is_some() || app.script.is_some() {
+        return Err(refuse(
+            "a sidecar joins a container's network namespace, and an exec or script app \
+             runs in the node's own"
+                .to_string(),
+        ));
+    }
+    if app
+        .egress
+        .as_ref()
+        .is_some_and(|egress| !egress.allow.is_empty())
+    {
+        return Err(refuse(
+            "an egress allowlist binds the app's own cgroup, not its sidecars', so a sidecar \
+             could reach what the app can't; the two can't be combined yet"
+                .to_string(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for sidecar in &app.sidecar {
+        validate_label(&sidecar.name, &context, "sidecar.name")?;
+        if !seen.insert(sidecar.name.as_str()) {
+            return Err(refuse(format!("two sidecars are named {:?}", sidecar.name)));
+        }
+        if sidecar.image.is_none() && app.image.is_none() {
+            return Err(refuse(format!(
+                "sidecar {:?} names no image, and the app has none to lend it",
+                sidecar.name
+            )));
+        }
+        if let Some(variable) = sidecar
+            .env
+            .iter()
+            .find_map(|(variable, value)| value.is_encrypted().then_some(variable))
+        {
+            return Err(refuse(format!(
+                "sidecar {:?} env {variable:?} is encrypted; put it in the app's env, which \
+                 every sidecar inherits",
+                sidecar.name
+            )));
+        }
     }
     Ok(())
 }
@@ -1451,6 +1512,75 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// The field and reason a sidecar refusal gives, or `None` when the
+    /// app validates.
+    fn sidecar_refusal(app_toml: &str) -> Option<(String, String)> {
+        stop_refusal(app_toml)
+    }
+
+    #[test]
+    fn sidecars_on_a_container_app_validate() {
+        assert_eq!(
+            sidecar_refusal(
+                "image = \"web:v1\"\n[[sidecar]]\nname = \"proxy\"\nimage = \"envoy:1\"\n\
+                 env = { MODE = \"edge\", TOKEN = \"PROVIDER[vault:proxy/token]\" }\n\
+                 [[sidecar]]\nname = \"logs\"\ncommand = [\"ship\"]\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_host_app_cannot_have_a_sidecar() {
+        let (field, reason) = sidecar_refusal(
+            "exec = \"/bin/sleep\"\n[[sidecar]]\nname = \"proxy\"\nimage = \"envoy:1\"\n",
+        )
+        .unwrap();
+        assert_eq!(field, "sidecar");
+        assert!(reason.contains("network namespace"), "{reason}");
+    }
+
+    #[test]
+    fn a_sidecar_name_must_be_a_unique_dns_label() {
+        let (field, _) =
+            sidecar_refusal("image = \"web:v1\"\n[[sidecar]]\nname = \"Proxy_1\"\n").unwrap();
+        assert_eq!(field, "sidecar.name");
+        let (field, reason) = sidecar_refusal(
+            "image = \"web:v1\"\n[[sidecar]]\nname = \"p\"\n[[sidecar]]\nname = \"p\"\n",
+        )
+        .unwrap();
+        assert_eq!(field, "sidecar");
+        assert!(reason.contains("two sidecars"), "{reason}");
+    }
+
+    #[test]
+    fn a_sidecar_needs_an_image_of_its_own_or_the_apps() {
+        let (_, reason) = sidecar_refusal(
+            "command = [\"/app/run\"]\n[[sidecar]]\nname = \"p\"\ncommand = [\"x\"]\n",
+        )
+        .unwrap();
+        assert!(reason.contains("no image"), "{reason}");
+    }
+
+    #[test]
+    fn an_encrypted_sidecar_env_value_is_refused() {
+        let (_, reason) = sidecar_refusal(
+            "image = \"web:v1\"\n[[sidecar]]\nname = \"p\"\nenv = { K = \"ENC[AGE:abc]\" }\n",
+        )
+        .unwrap();
+        assert!(reason.contains("app's env"), "{reason}");
+    }
+
+    #[test]
+    fn sidecars_and_an_egress_allowlist_are_refused_together() {
+        let (_, reason) = sidecar_refusal(
+            "image = \"web:v1\"\n[egress]\nallow = [\"api.example.com:443\"]\n\
+             [[sidecar]]\nname = \"p\"\n",
+        )
+        .unwrap();
+        assert!(reason.contains("egress"), "{reason}");
     }
 
     #[test]

@@ -163,6 +163,9 @@ pub struct Compatibility {
 /// An app's `stop_signal`, `stop_grace`, `pre_stop` and `pre_stop_timeout`
 /// in Raft desired state and node syncs, and the `stop` policy in OCI
 /// specs, instance records, runtime intents and process owner records (#1121).
+/// An app's `sidecar` list in Raft desired state, node syncs and instance
+/// records, and `NodeCapabilities::shared_network` in the capability report
+/// (#1120).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 55,
     state: 72,

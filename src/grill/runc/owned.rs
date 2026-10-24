@@ -257,7 +257,9 @@ impl RuncGrill {
                 .await
                 .insert(id.clone(), context.clone());
             let result = async {
-                let index = if runtime.rootless {
+                // A sidecar joins its parent's namespace and address, so it
+                // reserves none of its own (#1120).
+                let index = if runtime.rootless || spec.joined_network().is_some() {
                     None
                 } else {
                     Some(

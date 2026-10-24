@@ -679,7 +679,89 @@ fn pod_spec_to_app(
     }
     app.env = import_env(resource, metadata_namespace, container, configmaps, report);
     import_pod_template(resource, pod_spec, container, &mut app, report);
+    app.sidecar = import_sidecars(resource, metadata_namespace, pod_spec, configmaps, report);
     app
+}
+
+/// A pod's sidecars (#1120): its native sidecars (`initContainers` with
+/// `restartPolicy: Always`, Kubernetes 1.29+) and every container after the
+/// first. Both share the app's network namespace and lifecycle, as they
+/// did in the pod. The difference worth knowing is reported: an extra
+/// container now starts before the app and stops after it, where
+/// Kubernetes started them together.
+fn import_sidecars(
+    resource: &str,
+    metadata_namespace: Option<&String>,
+    pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    configmaps: &mut ConfigMaps,
+    report: &mut MigrationReport,
+) -> Vec<crate::config::app::SidecarSpec> {
+    let Some(ps) = pod_spec else {
+        return Vec::new();
+    };
+    let native = ps
+        .init_containers
+        .iter()
+        .flatten()
+        .filter(|container| is_native_sidecar(container));
+    let extra = ps.containers.iter().skip(1);
+    if ps.containers.len() > 1 {
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message: format!(
+                "{} container(s) after the first imported as sidecar(s): they now start \
+                 before the app and stop after it",
+                ps.containers.len() - 1
+            ),
+        });
+    }
+    let mut sidecars = Vec::new();
+    for container in native.chain(extra) {
+        if !crate::config::valid_workload_label(&container.name) {
+            report.warnings.push(MigrationWarning {
+                resource: resource.to_string(),
+                message: format!(
+                    "sidecar container {:?} is not imported: its name must be a DNS label",
+                    container.name
+                ),
+            });
+            continue;
+        }
+        let env = import_env(
+            resource,
+            metadata_namespace,
+            Some(container),
+            configmaps,
+            report,
+        );
+        let resources = container.resources.as_ref();
+        sidecars.push(crate::config::app::SidecarSpec {
+            name: container.name.clone(),
+            image: container.image.clone(),
+            command: container.command.clone().unwrap_or_default(),
+            args: container.args.clone().unwrap_or_default(),
+            env,
+            memory: resources.and_then(|resources| {
+                resource_range_from(
+                    resource,
+                    "memory",
+                    resources,
+                    parse_k8s_memory_bytes,
+                    report,
+                )
+            }),
+            cpu: resources.and_then(|resources| {
+                resource_range_from(resource, "cpu", resources, parse_k8s_cpu_millicores, report)
+            }),
+        });
+    }
+    sidecars
+}
+
+/// Whether an init container is a Kubernetes native sidecar: one that
+/// keeps running beside the app (`restartPolicy: Always`).
+fn is_native_sidecar(container: &k8s_openapi::api::core::v1::Container) -> bool {
+    container.restart_policy.as_deref() == Some("Always")
 }
 
 /// Report what a pod spec carries that neither an app nor a job can, so a
@@ -712,13 +794,6 @@ fn warn_unimported_pod_fields(
         .is_some_and(|t| !t.is_empty())
     {
         warn("topologySpreadConstraints are not imported".to_string());
-    }
-    if ps.containers.len() > 1 {
-        warn(format!(
-            "only the first of {} containers is imported; {} sidecar(s) dropped",
-            ps.containers.len(),
-            ps.containers.len() - 1
-        ));
     }
     if ps.volumes.as_ref().is_some_and(|v| !v.is_empty()) {
         warn("pod volumes are not imported; declare Reliaburger volumes manually".to_string());
@@ -906,7 +981,8 @@ fn import_pod_template(
 
     // Init containers carry a single argv: command followed by args.
     if let Some(inits) = pod_spec.and_then(|ps| ps.init_containers.as_ref()) {
-        for ic in inits {
+        // A native sidecar keeps running: it imports as a sidecar instead.
+        for ic in inits.iter().filter(|ic| !is_native_sidecar(ic)) {
             let command = ic.command.clone().unwrap_or_default();
             let args = ic.args.clone().unwrap_or_default();
             if command.is_empty() && !args.is_empty() {
@@ -1396,6 +1472,7 @@ fn empty_app_spec() -> AppSpec {
         config_file: Vec::new(),
         volumes: Vec::new(),
         init: Vec::new(),
+        sidecar: Vec::new(),
         ingress: None,
         placement: None,
         deploy: None,
@@ -1789,6 +1866,16 @@ fn warn_unimported_job_pod_fields(
         .is_some_and(|inits| !inits.is_empty())
     {
         warn("initContainers are not imported; a job runs one container".to_string());
+    }
+    if let Some(count) = pod_spec
+        .map(|ps| ps.containers.len())
+        .filter(|count| *count > 1)
+    {
+        warn(format!(
+            "only the first of {count} containers is imported; {} sidecar(s) dropped, \
+             since a job runs one container",
+            count - 1
+        ));
     }
     let Some(container) = container else { return };
     if let Some(dir) = &container.working_dir {
@@ -4343,5 +4430,105 @@ spec:
         assert_eq!(back.stop_grace, original.stop_grace);
         assert_eq!(back.pre_stop, original.pre_stop);
         assert_eq!(back.pre_stop_timeout, original.pre_stop_timeout);
+    }
+
+    /// #1120: a native sidecar (an init container with `restartPolicy:
+    /// Always`) and every container after the first import as sidecars;
+    /// an ordinary init container stays one.
+    #[test]
+    fn native_sidecars_and_extra_containers_import_as_sidecars() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      initContainers:
+      - name: migrate
+        image: migrate:v1
+        command: ["migrate"]
+      - name: proxy
+        image: envoy:1.31
+        restartPolicy: Always
+        args: ["-c", "/etc/envoy.yaml"]
+        env:
+        - name: LOG_LEVEL
+          value: info
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {cpu: 200m, memory: 128Mi}
+      containers:
+      - name: web
+        image: web:v1
+      - name: logs
+        image: shipper:v2
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.init.len(), 1, "only the ordinary init stays one");
+        assert_eq!(app.init[0].image.as_deref(), Some("migrate:v1"));
+        let names: Vec<&str> = app.sidecar.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["proxy", "logs"]);
+        let proxy = &app.sidecar[0];
+        assert_eq!(proxy.image.as_deref(), Some("envoy:1.31"));
+        assert_eq!(proxy.args, ["-c", "/etc/envoy.yaml"]);
+        assert_eq!(
+            proxy.env.get("LOG_LEVEL"),
+            Some(&EnvValue::Plain("info".into()))
+        );
+        assert_eq!(proxy.cpu.unwrap().request, 50);
+        assert_eq!(proxy.memory.unwrap().limit, 128 * 1024 * 1024);
+        result.config.validate().unwrap();
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("imported as sidecar(s)") && w.contains("before the app")),
+            "{warnings:?}"
+        );
+    }
+
+    /// #1120: sidecars leave as native sidecars and come back as sidecars.
+    #[test]
+    fn sidecars_survive_an_export_and_import_round_trip() {
+        let config = crate::config::Config::parse(
+            r#"
+            [app.web]
+            image = "web:v1"
+            [[app.web.sidecar]]
+            name = "proxy"
+            image = "envoy:1.31"
+            args = ["-c", "/etc/envoy.yaml"]
+            cpu = "50m-200m"
+            env = { LOG_LEVEL = "info" }
+            [[app.web.sidecar]]
+            name = "worker"
+            command = ["/app/worker"]
+            "#,
+        )
+        .unwrap();
+        let exported = crate::relish::k8s_export::export_kubernetes(&config).unwrap();
+        assert!(
+            exported.yaml.contains("restartPolicy: Always"),
+            "{}",
+            exported.yaml
+        );
+        let imported = import_from_yaml(&exported.yaml).unwrap();
+        let (original, back) = (&config.app["web"], &imported.config.app["web"]);
+        assert_eq!(back.sidecar.len(), 2);
+        assert_eq!(back.sidecar[0].name, "proxy");
+        assert_eq!(back.sidecar[0].image, original.sidecar[0].image);
+        assert_eq!(back.sidecar[0].args, original.sidecar[0].args);
+        assert_eq!(back.sidecar[0].cpu, original.sidecar[0].cpu);
+        assert_eq!(back.sidecar[0].env, original.sidecar[0].env);
+        // Kubernetes has no "the app's image": it's written out.
+        assert_eq!(back.sidecar[1].image.as_deref(), Some("web:v1"));
+        assert_eq!(back.sidecar[1].command, original.sidecar[1].command);
     }
 }

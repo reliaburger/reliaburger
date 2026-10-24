@@ -18,6 +18,7 @@ mod published_status;
 mod restart_ownership;
 mod runtime_metadata;
 mod secret_providers;
+mod sidecars;
 mod stop_hooks;
 mod upgrade_answer;
 

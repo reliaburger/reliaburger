@@ -502,7 +502,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
     }
 
     /// Check every image `spec` runs against the trust policy: the app's and
-    /// each init container's own. Returns the spec with each verified image
+    /// each init container's and sidecar's own. Returns the spec with each verified image
     /// pinned to its digest, or `None` when nothing needed pinning.
     async fn pin_images(&self, spec: &AppSpec) -> Result<Option<AppSpec>, String> {
         let mut pinned: Option<AppSpec> = None;
@@ -525,6 +525,23 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 && let Some(slot) = pinned
                     .get_or_insert_with(|| spec.clone())
                     .init
+                    .get_mut(index)
+            {
+                slot.image = Some(image);
+            }
+        }
+        // A sidecar's own image answers to the same policy (#1120).
+        for (index, sidecar) in spec.sidecar.iter().enumerate() {
+            if sidecar.image.is_none() {
+                continue;
+            }
+            if let Some(image) = self
+                .ops
+                .enforce_image_signature(sidecar.image.as_deref())
+                .await?
+                && let Some(slot) = pinned
+                    .get_or_insert_with(|| spec.clone())
+                    .sidecar
                     .get_mut(index)
             {
                 slot.image = Some(image);
@@ -620,6 +637,75 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         Ok(())
     }
 
+    /// Start `spec`'s sidecars beside `instance_id` (#1120), after its init
+    /// containers and before the instance itself, from `app_oci`, the spec
+    /// the instance was created from with its secret references unresolved.
+    /// Each is registered first, so a failure part-way leaves nothing the
+    /// instance's retirement can't find. A sidecar that can't start fails
+    /// its instance, with the reason.
+    pub(super) async fn drive_sidecars(
+        &self,
+        instance_id: &InstanceId,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        app_oci: &crate::grill::oci::OciSpec,
+    ) -> Result<(), BunError> {
+        if spec.sidecar.is_empty() {
+            return Ok(());
+        }
+        let names = spec
+            .sidecar
+            .iter()
+            .map(|sidecar| sidecar.name.clone())
+            .collect();
+        let registered = self.ops.register_sidecars(instance_id, names).await?;
+        let launches = super::sidecars::sidecar_launches(spec, instance_id, app_oci);
+        let Err(failure) = super::sidecars::launch_sidecars(
+            &self.grill,
+            &self.secrets,
+            app_name,
+            namespace,
+            &launches,
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        // The ones that did start mustn't run beside an instance that never
+        // will. Retirement kills them again if this can't.
+        if let Err(error) =
+            super::sidecars::kill_sidecars(&self.grill, &registered, self.stop_confirmation_timeout)
+                .await
+        {
+            eprintln!("bun: {instance_id}: sidecars of a failed launch await retirement: {error}");
+        }
+        let reason = format!(
+            "sidecar {} failed to start: {}",
+            failure.sidecar, failure.error
+        );
+        match failure.error.launch_problem() {
+            Some(problem) => {
+                self.ops
+                    .record_launch_failure(
+                        instance_id,
+                        format!("sidecar {}: {problem}", failure.sidecar),
+                    )
+                    .await;
+            }
+            None => {
+                let _ = self
+                    .ops
+                    .transition_state(instance_id, ContainerState::Failed)
+                    .await;
+            }
+        }
+        Err(BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason,
+        })
+    }
+
     /// Resolve `spec`'s secret providers and create the instance in the
     /// runtime, returning the spec it was created from. A launch the runtime
     /// refuses (#881), or one whose secret a provider won't give (#1123),
@@ -705,6 +791,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             self.drive_initialisers(instance_id, app_name, spec, &launch, &prepared.cgroup_path)
                 .await?;
         }
+        // Sidecars after the inits and before the app (#1120).
+        self.drive_sidecars(instance_id, app_name, namespace, spec, &prepared.oci_spec)
+            .await?;
 
         self.ops
             .transition_state(instance_id, ContainerState::Starting)
@@ -1239,6 +1328,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let initialised = async {
             self.drive_initialisers(new_id, app_name, spec, &launch, &cgroup_path)
                 .await?;
+            self.drive_sidecars(new_id, app_name, namespace, spec, &oci_spec)
+                .await?;
             self.ops
                 .transition_state(new_id, ContainerState::Starting)
                 .await
@@ -1644,7 +1735,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
         // Without its own grace the old instance gets the drain timeout, as
         // it always has; with one, the drain and the grace are separate.
-        let stop = InstanceStop::for_policy(begun.stop.as_ref(), drain_timeout);
+        let stop = InstanceStop::for_policy(begun.stop.as_ref(), drain_timeout)
+            .with_sidecars(begun.sidecars);
         drain_and_stop_instance(
             &self.drains,
             &self.grill,

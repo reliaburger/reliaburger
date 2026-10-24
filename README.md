@@ -281,7 +281,8 @@ who may connect at all.
 **Ingress with TLS.** Host-based HTTP and HTTPS routing, with certificates signed
 by the cluster's own ingress CA or files you provide. WebSockets and streaming
 pass through, and connections drain before an instance stops. Each app can
-pick its stop signal, its grace and a pre-stop command.
+pick its stop signal, its grace and a pre-stop command, and run sidecars
+that share its network and start before it and stop after it.
 
 **Security on by default.** A generated cluster requires mTLS between nodes.
 Nodes join with single-use tokens and certificate signing requests.

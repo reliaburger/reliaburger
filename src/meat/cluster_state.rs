@@ -30,6 +30,11 @@ pub struct NodeCapabilities {
     /// provider is placed only where it's listed (#1123).
     #[serde(default)]
     pub secret_providers: BTreeSet<crate::sesame::secret_provider::ProviderName>,
+    /// The node's runtime can put one container into another's network
+    /// namespace, which an app's sidecars need: rootful runc can, Apple
+    /// Container, rootless runc and the process runtime can't (#1120).
+    #[serde(default)]
+    pub shared_network: bool,
 }
 
 #[cfg(test)]
