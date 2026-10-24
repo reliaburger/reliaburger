@@ -30,6 +30,11 @@ pub struct NodeCapabilities {
     /// provider is placed only where it's listed (#1123).
     #[serde(default)]
     pub secret_providers: BTreeSet<crate::sesame::secret_provider::ProviderName>,
+    /// The runtime knobs this node allows and can apply: its `[runtime]`
+    /// allowlist on rootful runc, empty on any other runtime. An app that
+    /// asks for a knob is placed only where it's listed (#1122).
+    #[serde(default)]
+    pub runtime_knobs: crate::grill::knobs::RuntimeAllowlist,
     /// The node's runtime can put one container into another's network
     /// namespace, which an app's sidecars need: rootful runc can, Apple
     /// Container, rootless runc and the process runtime can't (#1120).

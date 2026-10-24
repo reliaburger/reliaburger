@@ -637,6 +637,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         spec: &AppSpec,
         host_port: Option<u16>,
     ) -> Result<crate::grill::oci::OciSpec, BunError> {
+        // A replacement never went through `admit_app`, so the node gate for
+        // runtime knobs (#1122) holds here, before anything is prepared.
+        self.supervisor.admit_runtime_knobs(app_name, spec)?;
         let identities = self.decrypt_identities(namespace).await;
         if identities.is_empty() && spec.env.values().any(|v| v.is_encrypted()) {
             return Err(BunError::DeployFailed {

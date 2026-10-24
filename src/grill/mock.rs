@@ -43,6 +43,7 @@ pub struct MockGrill {
     network_references:
         Arc<tokio::sync::Mutex<HashMap<InstanceId, super::runc_intent::NetworkReference>>>,
     honours_cgroup_path: Arc<Mutex<bool>>,
+    applies_runtime_knobs: Arc<Mutex<bool>>,
     /// What `shares_network_namespaces` answers: true unless a test models
     /// a runtime that can't run sidecars (#1120).
     shares_network: Arc<AtomicBool>,
@@ -139,6 +140,7 @@ impl Default for MockGrill {
             network_references: Arc::default(),
             launch_inventory: Arc::default(),
             honours_cgroup_path: Arc::default(),
+            applies_runtime_knobs: Arc::default(),
             shares_network: Arc::new(AtomicBool::new(true)),
             runtime_kind: Arc::new(Mutex::new(crate::grill::records::RuntimeKind::Process)),
             pid: Arc::default(),
@@ -391,6 +393,13 @@ impl MockGrill {
     #[allow(dead_code)]
     pub fn set_honours_cgroup_path(&self, value: bool) {
         *self.honours_cgroup_path.lock().unwrap() = value;
+    }
+
+    /// Make `applies_runtime_knobs()` report `value`, simulating rootful
+    /// runc (#1122).
+    #[allow(dead_code)]
+    pub fn set_applies_runtime_knobs(&self, value: bool) {
+        *self.applies_runtime_knobs.lock().unwrap() = value;
     }
 
     /// Make every `create` of `instance` fail, as a pull of its image would.
@@ -937,6 +946,10 @@ impl super::Grill for MockGrill {
 
     fn honours_cgroup_path(&self) -> bool {
         *self.honours_cgroup_path.lock().unwrap()
+    }
+
+    fn applies_runtime_knobs(&self) -> bool {
+        *self.applies_runtime_knobs.lock().unwrap()
     }
 
     fn shares_network_namespaces(&self) -> bool {

@@ -123,6 +123,9 @@ pub struct WorkloadSupervisor<G: Grill> {
     /// Which host paths a volume or config-file `source` may mount
     /// (`[storage] allowed_host_paths`); refuses every one by default.
     host_paths: super::host_paths::HostPathPolicy,
+    /// Which runtime knobs an app may use here (`[runtime]` in `node.toml`,
+    /// #1122); allows none by default.
+    runtime_knobs: crate::grill::knobs::RuntimeAllowlist,
     /// What this node can actually enforce (GPU, rootless limits).
     capabilities: PlatformCapabilities,
     budget: std::sync::Arc<super::execution_budget::ExecutionBudget>,
@@ -159,6 +162,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
             app_instances: HashMap::new(),
             process_manager: crate::grill::process_workload::ProcessManager::new(process_config),
             host_paths: super::host_paths::HostPathPolicy::default(),
+            runtime_knobs: Default::default(),
             capabilities: PlatformCapabilities::default(),
             budget: super::execution_budget::ExecutionBudget::new(crate::meat::Resources::new(
                 u64::MAX,
@@ -290,8 +294,58 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.host_paths = policy;
     }
 
+    /// Replace the runtime knob allowlist. The binary feeds the one from
+    /// `node.toml`'s `[runtime]` section here; without it every knob is
+    /// refused.
+    pub fn set_runtime_allowlist(&mut self, allowlist: crate::grill::knobs::RuntimeAllowlist) {
+        self.runtime_knobs = allowlist;
+    }
+
+    /// The runtime knobs this node advertises to the scheduler: its
+    /// allowlist when its runtime applies knobs, nothing otherwise.
+    pub fn runtime_knob_capability(&self) -> crate::grill::knobs::RuntimeAllowlist {
+        if self.grill.applies_runtime_knobs() {
+            self.runtime_knobs.clone()
+        } else {
+            Default::default()
+        }
+    }
+
+    /// The node gate for runtime knobs (#1122): refuse an app whose
+    /// `[app.x.runtime]` asks for a knob this node's runtime can't apply,
+    /// or one its `[runtime]` allowlist doesn't list. The token gate
+    /// (`host-exec`) was checked at apply.
+    pub(crate) fn admit_runtime_knobs(
+        &self,
+        app_name: &str,
+        spec: &AppSpec,
+    ) -> Result<(), BunError> {
+        let refused = |refusal: crate::grill::knobs::KnobRefusal| BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason: refusal.to_string(),
+        };
+        let Some(knob) = spec.runtime_knob_uses().next() else {
+            return Ok(());
+        };
+        if !self.grill.applies_runtime_knobs() {
+            let runtime = match self.grill.runtime_kind_for_host(false) {
+                crate::grill::records::RuntimeKind::Process => "the process runtime",
+                crate::grill::records::RuntimeKind::Apple => "Apple Container",
+                crate::grill::records::RuntimeKind::Runc => "rootless runc",
+            };
+            return Err(refused(crate::grill::knobs::KnobRefusal::Unsupported {
+                knob,
+                runtime,
+            }));
+        }
+        match &spec.runtime {
+            Some(knobs) => self.runtime_knobs.check(knobs).map_err(refused),
+            None => Ok(()),
+        }
+    }
+
     /// Full admission check for an app: host-exec/script allowlist (for the
-    /// app and its host init containers), host-path allowlist, GPU
+    /// app and its host init containers), host-path allowlist, runtime knobs, GPU
     /// availability, rootless resource limits and egress enforcement.
     /// Returns the first refusal.
     fn admit_app(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
@@ -299,6 +353,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.admit_host_inits(app_name, spec)?;
         self.admit_sidecars(app_name, spec)?;
         self.admit_host_paths(app_name, spec)?;
+        self.admit_runtime_knobs(app_name, spec)?;
         self.admit_gpu(app_name, spec.gpu.unwrap_or(0))?;
         self.admit_rootless_limits(
             app_name,
@@ -1040,6 +1095,7 @@ mod tests {
             stop_grace: None,
             pre_stop: Vec::new(),
             pre_stop_timeout: None,
+            runtime: None,
             firewall: None,
             egress: None,
             autoscale: None,
@@ -1189,6 +1245,75 @@ mod tests {
         WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000))
             .admit_app("db", &managed)
             .unwrap();
+    }
+
+    fn knob_allowlist(runtime_section: &str) -> crate::grill::knobs::RuntimeAllowlist {
+        crate::config::NodeConfig::parse(&format!("[runtime]\n{runtime_section}"))
+            .unwrap()
+            .runtime
+            .knob_allowlist()
+    }
+
+    fn app_with_knobs(knobs: &str) -> AppSpec {
+        let mut app = basic_app_spec(None);
+        app.runtime = Some(toml::from_str(knobs).unwrap());
+        app
+    }
+
+    /// #1122: the node gate refuses on its own, naming the field, the value
+    /// and the gate; a runtime that can't apply knobs refuses them whatever
+    /// the node lists; and both keys together admit the app.
+    #[tokio::test]
+    async fn runtime_knobs_pass_only_the_node_gate_of_a_runtime_that_applies_them() {
+        let app = app_with_knobs("capabilities = [\"NET_ADMIN\"]\n");
+
+        let grill = MockGrill::new();
+        grill.set_applies_runtime_knobs(true);
+        let mut sup = WorkloadSupervisor::new(grill, PortAllocator::new(30000, 31000));
+        let error = sup.admit_app("lb", &app).unwrap_err().to_string();
+        assert!(
+            error.contains("runtime.capabilities CAP_NET_ADMIN"),
+            "{error}"
+        );
+        assert!(error.contains("node gate"), "{error}");
+        assert!(error.contains("allowed_capabilities"), "{error}");
+
+        sup.set_runtime_allowlist(knob_allowlist("allowed_capabilities = [\"NET_ADMIN\"]\n"));
+        sup.admit_app("lb", &app).unwrap();
+        assert_eq!(
+            sup.runtime_knob_capability().capabilities.len(),
+            1,
+            "the node advertises what it allows"
+        );
+        let error = sup
+            .admit_app(
+                "fs",
+                &app_with_knobs("devices = [{ path = \"/dev/fuse\" }]\n"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("runtime.devices /dev/fuse"), "{error}");
+
+        // An app with no knobs, or an empty table, needs neither key.
+        sup.admit_app("plain", &basic_app_spec(None)).unwrap();
+        sup.admit_app("empty", &app_with_knobs("")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_cannot_apply_knobs_refuses_them_and_advertises_none() {
+        let mut sup = WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000));
+        sup.set_runtime_allowlist(knob_allowlist("allowed_capabilities = [\"NET_ADMIN\"]\n"));
+        let error = sup
+            .admit_app("lb", &app_with_knobs("capabilities = [\"NET_ADMIN\"]\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("runtime.capabilities CAP_NET_ADMIN"),
+            "{error}"
+        );
+        assert!(error.contains("the process runtime"), "{error}");
+        assert!(error.contains("can't apply runtime knobs"), "{error}");
+        assert!(sup.runtime_knob_capability().is_empty());
     }
 
     fn app_spec_with_health(port: u16) -> AppSpec {

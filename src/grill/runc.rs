@@ -218,6 +218,15 @@ impl RuncGrill {
             });
         }
 
+        if self.rootless
+            && let Some(problem) = spec.runtime_knobs_refusal("rootless runc")
+        {
+            return Err(GrillError::LaunchRefused {
+                instance: instance.clone(),
+                problem,
+            });
+        }
+
         // A sidecar joins its parent's named namespace (#1120). Rootless
         // runc names none, and the parent's must still be there.
         if let Some(joined) = spec.joined_network() {
@@ -355,6 +364,23 @@ impl RuncGrill {
                 .unwrap_or(rootfs)
                 .to_string_lossy()
                 .to_string();
+        }
+
+        // Runtime knobs (#1122) go in after the user namespace has set the
+        // default capabilities, so the added ones join them. The node writes
+        // the network sysctls into the namespace it made; runc writes the
+        // IPC ones.
+        if let Some(knobs) = spec.runtime_knobs.clone() {
+            let failed = |reason: String| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason,
+            };
+            super::knobs::apply_to_spec(&mut spec, &knobs, super::knobs::host_device)
+                .map_err(|e| failed(e.to_string()))?;
+            let network_sysctls = super::knobs::take_network_sysctls(&mut spec);
+            netns::write_sysctls_with_commands(commands, instance, &network_sysctls)
+                .await
+                .map_err(|e| failed(e.to_string()))?;
         }
 
         // Point the container at the node's DNS responder with a per-instance
@@ -686,6 +712,12 @@ impl super::Grill for RuncGrill {
         !self.rootless
     }
 
+    /// Rootful runc applies runtime knobs (#1122). Rootless runc can't: it
+    /// owns no device cgroup and no capabilities beyond its own user's.
+    fn applies_runtime_knobs(&self) -> bool {
+        !self.rootless
+    }
+
     /// Rootful runc names every instance's network namespace, so a sidecar
     /// can join its parent's (#1120). Rootless networking is slirp4netns,
     /// set up per container after create.
@@ -907,7 +939,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         let error = grill.create(&id, &spec).await.unwrap_err();
@@ -972,7 +1007,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
         let result = grill.create(&id, &spec).await;
         if result.is_ok() {
@@ -1041,7 +1079,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         // runc create will fail (no real rootfs), but the bundle dir
@@ -1150,7 +1191,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         // Read the first instance's spec while it still owns its bundle: once
@@ -1307,7 +1351,10 @@ mod tests {
                     cgroups_path: None,
                     uid_mappings: None,
                     gid_mappings: None,
+                    sysctl: Default::default(),
+                    devices: Vec::new(),
                 },
+                runtime_knobs: None,
             };
         let specs = [spec_for("alpha", 0, 3), spec_for("beta", 1, 1)];
 
@@ -1469,7 +1516,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         let error = grill.create(&id, &spec).await.unwrap_err();
@@ -1536,7 +1586,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         let original = RuncGrill::new(
@@ -1730,7 +1783,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         grill

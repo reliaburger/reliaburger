@@ -118,6 +118,21 @@ pre_stop = ["/bin/sh", "-c", "sleep 2"]
 pre_stop_timeout = "10s"
 ```
 
+An app can ask for a few runtime knobs: added capabilities, namespaced
+sysctls and host devices (#1122). Each needs two keys, the node's `[runtime]`
+allowlist and the token's `host-exec`, and the scheduler places the app only
+on a node that allows all of them:
+
+```toml
+[app.vpn]
+image = "ghcr.io/example/vpn:2.0"
+
+[app.vpn.runtime]
+capabilities = ["NET_ADMIN"]
+sysctls = { "net.ipv4.ip_forward" = "1" }
+devices = [{ path = "/dev/net/tun", permissions = "rw" }]
+```
+
 ### Jobs and cron
 
 Jobs arrived in 0.2.0, and 0.2.1 changes the cluster's formats again, so a 0.2.0

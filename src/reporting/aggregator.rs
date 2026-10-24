@@ -519,6 +519,7 @@ mod tests {
                 process: Default::default(),
                 containers: true,
                 secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
                 shared_network: false,
             },
             egress_enforcement: Vec::new(),

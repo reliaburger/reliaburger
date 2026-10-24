@@ -121,6 +121,11 @@ pub struct AppSpec {
     /// How long `pre_stop` may run. 30 s when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_stop_timeout: Option<crate::grill::stop::StopDuration>,
+    /// `[app.x.runtime]`: added capabilities, namespaced sysctls and host
+    /// devices (#1122). Each use needs the node's `[runtime]` allowlist and
+    /// the token's `host-exec` permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<crate::grill::knobs::RuntimeKnobs>,
     /// Ingress firewall rules.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub firewall: Option<FirewallSpec>,
@@ -194,9 +199,17 @@ impl AppSpec {
 
     /// Whether deploying this app touches the host directly, so it needs the
     /// `host-exec` permission as well as `deploy`: a host binary, an inline
-    /// script, or a host-path `source`.
+    /// script, a host-path `source`, or a runtime knob.
     pub fn needs_host_access(&self) -> bool {
-        self.exec.is_some() || self.script.is_some() || self.host_path_sources().next().is_some()
+        self.exec.is_some()
+            || self.script.is_some()
+            || self.host_path_sources().next().is_some()
+            || self.runtime_knob_uses().next().is_some()
+    }
+
+    /// Every runtime knob this app asks for in `[app.x.runtime]` (#1122).
+    pub fn runtime_knob_uses(&self) -> impl Iterator<Item = crate::grill::knobs::KnobUse> + '_ {
+        self.runtime.iter().flat_map(|knobs| knobs.uses())
     }
 
     /// Where to scrape this app's Prometheus metrics inside each instance:

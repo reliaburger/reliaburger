@@ -17,6 +17,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     process: self.supervisor.process_capability(),
                     containers: self.supervisor.runs_containers(),
                     secret_providers: self.secret_providers.names(),
+                    runtime_knobs: self.supervisor.runtime_knob_capability(),
                     shared_network: self.supervisor.shares_network(),
                 })
                 .await;
@@ -41,6 +42,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     process: self.supervisor.process_capability(),
                     containers: self.supervisor.runs_containers(),
                     secret_providers: self.secret_providers.names(),
+                    runtime_knobs: self.supervisor.runtime_knob_capability(),
                     shared_network: self.supervisor.shares_network(),
                     ..Default::default()
                 },
@@ -60,6 +62,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             process: self.supervisor.process_capability(),
             containers: self.supervisor.runs_containers(),
             secret_providers: self.secret_providers.names(),
+            runtime_knobs: self.supervisor.runtime_knob_capability(),
             shared_network: self.supervisor.shares_network(),
         };
         let enforced_cgroups =
@@ -92,6 +95,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 process: self.supervisor.process_capability(),
                 containers: self.supervisor.runs_containers(),
                 secret_providers: self.secret_providers.names(),
+                runtime_knobs: self.supervisor.runtime_knob_capability(),
                 shared_network: self.supervisor.shares_network(),
                 ..Default::default()
             },
