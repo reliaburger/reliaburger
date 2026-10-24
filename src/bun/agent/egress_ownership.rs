@@ -455,7 +455,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|()| Landing::Landed)
     }
 
-    /// Whether an egress owners write is still going on off the loop.
+    /// Whether an egress owners write is still going on off the loop, for
+    /// the loop harness.
+    #[cfg(test)]
     pub(super) fn egress_write_in_flight(&self) -> bool {
         self.egress_write.is_some()
     }
