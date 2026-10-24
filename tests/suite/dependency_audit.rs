@@ -67,8 +67,8 @@ fn lock_file_has_no_bincode_and_audit_needs_no_exception_for_it() {
 }
 
 /// RUSTSEC-2024-0370: proc-macro-error is unmaintained. It came in at build
-/// time through age 0.10's i18n-embed-fl 0.7. The age 0.12 bump (#1026)
-/// moved to i18n-embed-fl 0.10, which uses proc-macro-error2, so the lock
+/// time through age 0.10's i18n-embed-fl 0.7. The age bump (#1026, now at
+/// 0.11.5) moved to i18n-embed-fl 0.9.4, which uses proc-macro-error2, so the lock
 /// file must not pull it back in and the audit needs no exception for it.
 #[test]
 fn lock_file_has_no_proc_macro_error_and_audit_needs_no_exception_for_it() {
@@ -124,4 +124,37 @@ fn lock_file_has_only_webpki_releases_that_distrust_emsign() {
             );
         }
     }
+}
+
+/// RUSTSEC-2026-0387: crypto-bigint before 0.7.6 has secret-dependent branches
+/// in operations meant to be constant-time. age 0.12 compiled it in through
+/// its P-256 hardware-token recipients, which we never use, so age went back
+/// to 0.11.5, which has none of that code. No vulnerable copy may come back,
+/// and the audit must not need an exception for it.
+#[test]
+fn lock_file_has_no_crypto_bigint_with_timing_leaks_and_audit_needs_no_exception_for_it() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    for package in lock.split("[[package]]") {
+        if !package.contains("\nname = \"crypto-bigint\"\n") {
+            continue;
+        }
+        let version: Vec<u64> = package
+            .split("\nversion = \"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap()
+            .split('.')
+            .map(|part| part.parse().unwrap())
+            .collect();
+        assert!(
+            version.as_slice() >= [0, 7, 6].as_slice(),
+            "Cargo.lock locks crypto-bigint {version:?}"
+        );
+    }
+    let audit = std::fs::read_to_string(root.join(".cargo/audit.toml")).unwrap();
+    assert!(
+        !audit.contains("\"RUSTSEC-2026-0387\""),
+        ".cargo/audit.toml ignores RUSTSEC-2026-0387"
+    );
 }

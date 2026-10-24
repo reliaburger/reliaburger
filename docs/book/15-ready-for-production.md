@@ -1081,6 +1081,22 @@ sealed by the old build and made the tests open them (chapter 4 has the details)
 paid a dividend: `age` 0.12 no longer pulls in the unmaintained `proc-macro-error`, so its
 `cargo audit` exception went too.
 
+Newest isn't always the right target, though. `age` 0.12 added recipients for P-256
+hardware tokens, and its P-256 code isn't optional. On 23 October 2026 RustSec published
+[RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387): some of
+`crypto-bigint` 0.5's constant-time operations could branch on secret values. The
+advisory failed 0.2.2's third candidate build. We never use P-256 (secrets and backups are
+X25519 and scrypt), but that code was still compiled into `bun` and `relish`, and no
+`age` release had moved to the patched `crypto-bigint` 0.7. `age` 0.11.5, released the
+same day as 0.12.1 and so still maintained, has every API we use and none of the P-256
+code. Moving back to it removed `crypto-bigint`, `p256` and `hpke` from the build. It also
+brought in `proc-macro-error2`, which is unmaintained but runs only inside the compiler.
+That's the same kind of finding as the existing `basic-toml` exception, so it got a dated
+exception
+([the 24 October review](../qualification/2026-10-24-dependency-exceptions.md)). One
+unmaintained build-time macro is a better trade than shipping arithmetic with a known
+timing flaw in it, even arithmetic we never call.
+
 Sometimes the next major version isn't there to take. bincode's list said 1→3, and bincode
 3.0.0 turned out to be a crate whose only code is a `compile_error!`, published when its
 maintainers stopped. No version clears its unmaintained advisory, so "bump it" became
