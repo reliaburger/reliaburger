@@ -5359,6 +5359,17 @@
           "sources": [
             "tests/test_storage.rs"
           ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-grill-runc-tests-runc_sidecar_reaches_its_app_on_localhost",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_sidecar_reaches_its_app_on_localhost",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs"
+          ]
         }
       ]
     },
@@ -5913,6 +5924,17 @@
           ],
           "sources": [
             "tests/placement.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-a_leader_killed_during_an_apply_under_policy_leaves_the_policy_enforced",
+          "binary": "reliaburger::cluster_failover",
+          "test": "a_leader_killed_during_an_apply_under_policy_leaves_the_policy_enforced",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
           ]
         }
       ]
