@@ -980,6 +980,18 @@ evaluates one.
   back) through `judge_job`. It changes nothing. `relish policy audit` prints
   it, and `relish wtf` reads it into a `policies` evidence row
   (`policy-would-deny`, `policy-audit`, `policy-broken`).
+- **Cost and coverage (#1126, #1311).** `benches/policy.rs` (in `make bench`)
+  measures `PolicySet::compile` and `judge_app` for 10, 100 and 1,000
+  policies: about 115 µs per policy to compile, about 2 µs per policy per app
+  to judge ([record](../qualification/2026-10-24-policy-evaluation-bench.md)).
+  `relish apply` compiles once per apply; caching the set per generation
+  would remove that if a cluster ever runs hundreds of policies.
+  `examples/policies/platform.toml` holds the four common policies, checked
+  offline by `tests/suite/platform_policies.rs` and on three nodes by
+  `make test-cluster` (apply, GitOps, a leader kill, break-glass). The V02
+  soak workload carries a deny, a warn and a default scoped to `soak-*`, and
+  `sustained_check.py` fails a snapshot where one is missing or changed or
+  the generation went backwards.
 
 ---
 
@@ -1054,6 +1066,14 @@ functions, one per kind of change:
 - **Scope.** A controller's token is a `deployer` scoped to its namespace; the
   existing scope checks keep it there. Only apps carry an owner: a scoped token
   can't write namespaces, permissions or policies anyway.
+- **The example.** `examples/controller/main.rs` keeps one of a cold-standby
+  pair running, from two `[app.*]` tables or from a template with two
+  `[use.*]` tables (`postgres-pair.toml`), in which case it applies the
+  active `use` with its own `owner` and `namespace` as parameters and the
+  apply endpoint expands it. The 0.2.4 exit test runs it on three nodes
+  (`tests/cluster_failover.rs`), failing over when the node under the active
+  member is killed, with Postgres replaced by a `sleep` stand-in because the
+  fixture runs host processes.
 
 ---
 

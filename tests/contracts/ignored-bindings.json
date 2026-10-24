@@ -270,6 +270,24 @@
     "test": "a_leader_killed_during_an_apply_under_policy_leaves_the_policy_enforced"
   },
   {
+    "source": "tests/cluster_failover.rs",
+    "function": "the_platform_policies_hold_through_apply_gitops_and_a_leader_kill",
+    "binary": "reliaburger::cluster_failover",
+    "test": "the_platform_policies_hold_through_apply_gitops_and_a_leader_kill"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "an_admin_removes_a_policy_that_denies_everything_through_any_node",
+    "binary": "reliaburger::cluster_failover",
+    "test": "an_admin_removes_a_policy_that_denies_everything_through_any_node"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "a_controller_fails_a_templated_database_pair_over_when_its_node_dies",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_controller_fails_a_templated_database_pair_over_when_its_node_dies"
+  },
+  {
     "source": "tests/cluster_gossip.rs",
     "function": "three_nodes_join_by_address_and_converge",
     "binary": "reliaburger::cluster_gossip",

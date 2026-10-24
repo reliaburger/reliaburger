@@ -20,8 +20,9 @@ needs more context than any of the issues can carry, and the context is mostly
 other people's mistakes. The research behind it is in the
 [extension points note](../plans/2026-10-19-research-extension-points.md), and
 the order of the work is in the [0.2.4 plan](../plans/2026-10-23-plan-0.2.4.md).
-The sections near the end that show the Rust and the tests are placeholders
-for now. Each issue on the 0.2.4 train fills in its part as it lands.
+The sections near the end that show the Rust and the tests were
+placeholders when we started. Each issue on the 0.2.4 train filled in its
+part as it landed, and the exit test, which uses all of them, came last.
 
 Here's the answer, up front, so you know where we're going:
 
@@ -856,7 +857,8 @@ primitives" model, with the guarantees Reliaburger already has: scoped tokens,
 audit, and the one apply path. No SDK, no framework, no new kinds. The 0.2.4
 exit test ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)) is
 a Postgres template plus a small controller that fails over a replica, written
-against the public API only.
+against the public API only. It's at the end of the chapter, with what it
+honestly proves.
 
 ## Escape hatches
 
@@ -2547,6 +2549,143 @@ let current = match existing[..] {
 match a slice with no elements, exactly one (binding it to `only`), or any
 other length. It reads like the rule it implements: none, one, or more.
 
+### Everything together
+
+([#1126](https://github.com/reliaburger/reliaburger/issues/1126),
+[#1311](https://github.com/reliaburger/reliaburger/issues/1311)) The exit
+test adds almost no production code, and that's the point of it. It takes
+what the rest of the train built and puts it together the way a platform
+team would: one file of policies, a template, a controller, a cluster. What
+it adds is that file, a few lines in the example controller, three cluster
+tests, a benchmark and a check in the soak.
+
+#### Four policies in one file
+
+`examples/policies/platform.toml` is the four rules platform teams ask for
+most, and the cluster test applies it unchanged. Two of them are worth
+reading closely, because the obvious version is wrong:
+
+```toml
+[policy.no-latest]
+applies_to = "both"
+match = "has(workload.image)"
+deny = "workload.image.matches(':latest(@|$)') || !workload.image.matches(':[^/:@]+(@|$)')"
+
+[policy.trusted-registries]
+applies_to = "both"
+match = "has(workload.image)"
+deny = "!['registry.example.com/', 'ghcr.io/example/'].exists(prefix, workload.image.startsWith(prefix))"
+```
+
+The chapter's first example, `app.image.endsWith(':latest')`, misses
+`web` with no tag at all, which pulls `:latest` too, and `web:latest@sha256:…`.
+`matches` is CEL's regular expression test (the crate's `regex` feature
+provides it). The second pattern asks for a tag: a colon followed by
+characters that aren't `/`, `:` or `@`, at the end or before a digest. That
+also stops `registry.example.com:5000/web` passing, since its only colon is
+a port. A digest on its own, `web@sha256:…`, passes: a digest is a pin. The
+`match` keeps both rules off host processes, which have no image.
+
+The registry rule uses `exists`, a CEL macro that's true when its expression
+holds for some element of the list, binding each one to `prefix` in turn.
+The trailing `/` on each registry is the important character. Without it,
+`registry.example.com.evil.net/web` passes. `src/policy/check.rs` gives
+the loop variable its own scope, so `prefix` can't leak out and be mistaken
+for a field.
+
+#### A controller that drives a template
+
+The example controller took two `[app.*]` tables. To drive a template it
+needed two small changes, and neither touches the crate. Given a manifest
+with `[use.*]` tables, `manifest` keeps the active `use` and fills in two of
+its parameters, `owner` and `namespace`, and the cluster expands it. And
+`app_names` reads each `use`'s `name` parameter, the app it makes:
+
+```rust
+let names = uses
+    .iter()
+    .map(|(key, value)| {
+        value
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+            .ok_or(format!("use.{key} has no `name` parameter naming its app"))
+    })
+    .collect::<Result<Vec<String>, String>>()?;
+```
+
+The closure gives back a `Result` for each `use`, so the iterator yields
+`Result<String, String>` items. `collect` can build many things, and the
+type in its turbofish (`::<...>`) picks which one. Asking for
+`Result<Vec<String>, String>`, rather than `Vec<Result<...>>`, turns the
+whole list inside out: `Ok` holding every name if each item was `Ok`, or the
+first `Err`, at which point it stops reading. The `?` after it returns that
+error. In Go this is the loop that appends and returns on the first error;
+here the error handling is in the type you collect into.
+
+`.and_then(toml::Value::as_str)` passes a method as a function. `as_str`
+takes `&Value` and returns `Option<&str>`, which is just the shape
+`and_then` wants, so there's no need to write `|value| value.as_str()`.
+
+#### Waiting on a cluster with an async closure
+
+Every cluster test polls: wait until a leader answers, until GitOps reports,
+until the standby runs. The fixture's `wait_until` takes a description, a
+deadline and a condition, and the condition is an *async closure*:
+
+```rust
+wait_until(
+    "the controller fails over to db-b, running on rack b",
+    Duration::from_secs(150),
+    async || {
+        check_once(&mut db_failover, &api).await;
+        let state = nodes[1].council.desired_state().await;
+        !state.apps.contains_key(&db_a)
+            && state.apps.contains_key(&db_b)
+            && running_on(&nodes, &[1, 2], "db-b").await.as_deref()
+                == Some(nodes[1].name.as_str())
+    },
+)
+.await;
+```
+
+`async || { ... }` arrived in Rust 1.85. Calling it gives a future, and
+`wait_until` awaits one per poll; its parameter is `impl AsyncFnMut() ->
+bool`. The older spelling, `|| async { ... }`, is a plain closure that
+returns a future, and it can't do what this one does. The future would need
+to borrow `db_failover` mutably, but a plain closure's result can't hold a
+borrow of the closure's own captures, because nothing stops you calling the
+closure again while the first future is still alive. An async closure's
+call ties the borrow to that one future, so each poll gets the controller
+mutably, in turn. The C equivalent is a callback with a context pointer and
+a promise in a comment that nobody calls it twice at once; here the
+signature makes the promise.
+
+#### The benchmark
+
+`benches/policy.rs` builds a set of 10, 100 or 1,000 policies: the four
+platform ones, which match every app, and copies of the same four shapes
+scoped to other teams' namespaces. Those don't match the app being judged,
+but each one's `match` still runs, and a quarter of them carry a default.
+That's the shape a cluster grows into with many teams, rather than a best
+case where nothing is evaluated. It measures two things per size:
+
+```rust
+group.bench_with_input(BenchmarkId::new("compile", count), &specs, |b, specs| {
+    b.iter(|| PolicySet::compile(specs).expect("the set compiles"));
+});
+// ...
+group.bench_with_input(BenchmarkId::new("judge_app", count), &set, |b, set| {
+    b.iter(|| judge_app(set, &app_id, &spec, &caller, Source::Apply));
+});
+```
+
+`bench_with_input` is Criterion's way of running one benchmark per
+parameter, naming each `policy/compile/100` and so on. Compiling happens
+once per apply; judging happens once per app. Before timing anything the
+bench asserts the app passes and exactly one field is filled, so a change
+that made every policy fail closed couldn't quietly report a fast number.
+
 ## Tests
 
 The research set out the plan, and each issue fills in what its tests check
@@ -2666,12 +2805,10 @@ Jobs and the audit action
   does the same on a real council through the public router: the app's
   stored spec is unchanged after the policy commits, and the audit names it.
 
-Still to come from the plan:
-
-- a cluster test of an admin removing a policy that denies everything (the
-  router test above covers it on one node);
-- the exit test on a real three-node cluster
-  ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)).
+The two cluster tests the plan still wanted, an admin removing a policy
+that denies everything on more than one node and the exit test itself,
+arrived together at the end of the train. They're described in
+[The exit test](#the-exit-test) below.
 
 ### Testing the exec secret provider
 
@@ -3006,10 +3143,138 @@ the owner table has a test at the level where it lives.
   applied and `db-a` deleted. A second test points the controller at another
   namespace and gets a 403.
 
+### The exit test
+
+([#1126](https://github.com/reliaburger/reliaburger/issues/1126),
+[#1311](https://github.com/reliaburger/reliaburger/issues/1311)) The exit
+test runs on the `make test-cluster` fixture in `tests/cluster_failover.rs`:
+three nodes in one process, each a full node with gossip, Raft, the HTTP API,
+the scheduler and a real agent, talking to each other over TCP on
+localhost. It isn't three machines, and it doesn't run containers, which
+matters for the third test.
+
+- **The four policies through both front doors and a leader kill**
+  (`the_platform_policies_hold_through_apply_gitops_and_a_leader_kill`).
+  An admin applies `examples/policies/platform.toml` as published. Through
+  `relish apply`, sent to a follower, which forwards it with the caller's
+  token, each rule refuses its case with a 422 naming it, and a passing
+  `prod` app is stored with `TEAM = "platform"` filled in and its declared
+  spec kept beside it. Through GitOps, running on all three nodes as Bun
+  runs it, one commit with three apps lands the one that passes and names
+  `trusted-registries` and `no-latest` for the two that don't. Then the
+  leader is killed twenty milliseconds into an apply of twenty apps. The new
+  leader holds the same four policies at the same generation, refuses
+  `:latest` through `relish apply`, refuses it again in the next GitOps
+  commit, which its own loop picks up, and accepts the interrupted apply
+  when it's sent again, every app with its team filled in.
+- **Break-glass on three nodes**
+  (`an_admin_removes_a_policy_that_denies_everything_through_any_node`,
+  #1311's third item). A policy with `deny = "true"` for apps and jobs
+  refuses a deployer's app, an admin's app and an admin's job. It doesn't
+  refuse a policy write, because policies never judge policies. With the
+  leader killed, a deployer's delete through a follower of the new leader
+  gets a 403; an admin's succeeds, forwarded to the leader, and both
+  survivors then hold the other policy and the app that now applies.
+- **A template and a controller failing over**
+  (`a_controller_fails_a_templated_database_pair_over_when_its_node_dies`).
+  The nodes carry `rack=a`, `rack=b` and `rack=c`. The example controller,
+  compiled into the test with `#[path]` and using nothing but HTTP and JSON,
+  drives `examples/controller/postgres-pair.toml` with a token scoped to
+  `pg`, with the platform policies in force. It starts `db-a`, pinned to rack
+  `a`. When the node on rack `a` is killed, `db-a` has nowhere to run; after
+  enough missed checks the controller applies `db-b`, which runs on rack `b`,
+  and deletes `db-a`. The stored `db-b` carries the controller as owner, the
+  template in its provenance and the team a policy filled in, because a
+  controller's writes go through the same apply path as everyone's.
+
+Two things here are stand-ins, and it's better to say so plainly. **Postgres
+is a stand-in.** The fixture's nodes run each container's command as a host
+process (`tests/support/host_containers.rs`) and pull nothing, and a host
+process can't enforce a memory limit. So the test takes the published
+template and changes two lines: its image becomes one from a trusted
+registry with `command = ["/bin/sleep", "600"]`, and its memory limit goes.
+Everything else (the parameters, the port, the rack placement, the owner)
+is the published file. **The failover has no data.** The controller fails
+over a cold standby, and the standby starts empty. A real database failover
+streams the data ahead of time, promotes the standby and fences the old
+primary, and that is the database's job and the controller author's, not the
+contract's. What the test proves is the contract: a controller written
+against the public API, scoped to one namespace, can see a member die and
+bring up its replacement on another rack, with the cluster's policies
+judging what it writes.
+
+All three pass. The first run of the third failed, and taught us something.
+The test checked every half second, with a threshold of three misses, and a
+fresh app takes several seconds to be placed and started. So `db-a` counted
+as failed before it ever ran, and the controller swapped the pair back and
+forth every few seconds without either one running. The fix was to check
+every two seconds with a threshold of seven, about the five-second checks
+the example makes. The manual now says to keep the threshold times the
+interval longer than an app takes to start.
+
+The soak (#1311's first item): the V02 workload,
+`scripts/release/sustained/soak-workloads.toml`, now carries
+`soak-pinned-images` (a deny), `soak-memory-limits` (a warn) and
+`soak-team` (a default). The harness applies the file at the start and at
+every generation, including the rolling deploy it kills a node under, so
+evaluation runs under faults. Each policy matches only workloads named
+`soak-*`. A first draft denied any unpinned image anywhere, which would have
+refused the catalogue pulse's `relish test` apps in their leased
+namespaces: policies are cluster-wide, so a soak's policies need a `match`.
+`tests/suite/platform_policies.rs` checks offline that the three admit every
+soak app and job, as the harness writes the file, and that the warn and the
+default fire on every soak app, so every apply exercises them. The checker,
+`sustained_check.py`, reads `relish policy list` after the first apply and in
+every snapshot, and fails on a policy that's gone or changed, or a policy
+generation that went backwards. The agent-loop turn budget check is
+untouched: it already judges every turn, whatever caused it, and
+`test_the_turn_budget_is_still_judged_with_the_policies_in_force` checks it
+still fails a slow turn in a snapshot where the policies are in force. No
+soak has run with the policies yet; the next V02 tier is the first.
+
+The bench (#1311's second item), run once on the release laptop
+([record](../qualification/2026-10-24-policy-evaluation-bench.md)):
+
+| Policies in force | Compile the set (per apply) | Judge one app |
+|------------------:|----------------------------:|--------------:|
+| 10 | 1.21 ms | 69 µs |
+| 100 | 11.5 ms | 248 µs |
+| 1,000 | 115 ms | 2.06 ms |
+
+Both grow linearly: about 115 µs per policy to compile, and about 2 µs
+per policy for each app judged. At the tens of policies we expect, policy
+adds well under a millisecond per app. At 1,000, one app's apply pays about
+117 ms, nearly all of it compiling, because compiling repeats every commit
+check. GitOps already keeps its compiled set while the generation holds;
+`relish apply` could do the same if anyone ever runs a thousand policies.
+The laptop was shared with other builds during the run, so these are upper
+bounds for it, not a quiet baseline.
+
 ## Lessons
 
-We'll add the lessons from building it when it's built. One we can state now,
-because Kubernetes paid for it so we don't have to: the cost of an extension
-point isn't in what it lets people do. It's in what it can stop the cluster
-from doing when it breaks. Keep extensions in-process, bounded and off the
-state machine, and most of that cost goes away.
+We wrote one lesson before the code, because Kubernetes paid for it so we
+don't have to: the cost of an extension point isn't in what it lets people
+do. It's in what it can stop the cluster from doing when it breaks. Keep
+extensions in-process, bounded and off the state machine, and most of that
+cost goes away. The exit test is where we checked it: a policy that denies
+everything was removed through a follower of a leader that had just taken
+over, and a leader killed mid-apply handed over the same policies at the
+same generation.
+
+A few more came from building it.
+
+- **The obvious rule is often the wrong rule.** `endsWith(':latest')` reads
+  like "no `:latest`" and lets an untagged image through. A registry prefix
+  without its trailing `/` lets a look-alike host through. Publishing a
+  tested file of policies is worth more than a page of advice, which is why
+  `examples/policies/platform.toml` has a table of cases behind it.
+- **Policies are cluster-wide, so scope them.** The first draft of the soak's
+  deny would have refused the apps the soak's own catalogue pulse deploys.
+  A `match` costs one line.
+- **A controller's patience must outlast placement.** Our first cluster run
+  failed a healthy pair back and forth because three quick checks were
+  shorter than an app takes to start. The contract can't know how long your
+  apps take; the controller has to.
+- **Measure before optimising.** We expected judging to dominate. It's
+  compiling, and only at sizes nobody has asked for yet, so it stays a note
+  rather than a cache.

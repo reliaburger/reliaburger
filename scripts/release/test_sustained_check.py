@@ -865,6 +865,88 @@ class AgentLoopTurns(Evidence):
         self.assertEqual(sorted(state["turns"]), ["rb-a-1", "rb-a-2"])
 
 
+SOAK_WORKLOADS = Path(__file__).resolve().parent / "sustained" / "soak-workloads.toml"
+
+
+def policy_listing(policies, generation=3):
+    """`relish --output json policy list` for `policies`, a {name: spec} map
+    in the TOML's shape (`match`, `deny`, `action`, `default`)."""
+    return {"policies": {name: dict({"action": "deny"}, **spec) for name, spec in policies.items()},
+            "generation": generation, "gitops_owned": []}
+
+
+class SoakPolicies(Evidence):
+    """The soak workload carries policies, and every check makes sure they're
+    still in force (#1311): a fault mustn't lose or change one."""
+
+    def setUp(self):
+        super().setUp()
+        (self.evidence / "workloads.toml").write_text(SOAK_WORKLOADS.read_text())
+        self.declared = checker.expected_policies(self.evidence)
+
+    def test_the_soak_workload_carries_a_deny_a_warn_and_a_default(self):
+        actions = {spec.get("action", "deny") for spec in self.declared.values() if "deny" in spec}
+        self.assertIn("deny", actions)
+        self.assertIn("warn", actions)
+        self.assertTrue(any("default" in spec for spec in self.declared.values()), self.declared)
+
+    def test_every_soak_policy_in_force_finds_nothing(self):
+        code, verdict = self.evaluate(self.snapshot(policies_json=policy_listing(self.declared)))
+        self.assertNotEqual(code, 1)
+        self.assertNotIn("policies", self.failures(verdict))
+        self.assertEqual(checker.load_state(self.evidence)["policy_checks"], 1)
+
+    def test_a_missing_soak_policy_fails_naming_it(self):
+        name = sorted(self.declared)[0]
+        listing = policy_listing({key: spec for key, spec in self.declared.items() if key != name})
+        code, verdict = self.evaluate(self.snapshot(policies_json=listing))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "policies")
+        self.assertIn(f"policy {name} is not in force", failure["detail"])
+
+    def test_a_changed_soak_policy_fails(self):
+        name = next(key for key, spec in self.declared.items() if "deny" in spec)
+        changed = dict(self.declared, **{name: dict(self.declared[name], deny="true")})
+        code, verdict = self.evaluate(self.snapshot(policies_json=policy_listing(changed)))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "policies")
+        self.assertIn(f"policy {name} differs from the soak workload's", failure["detail"])
+
+    def test_the_policy_generation_never_goes_backwards(self):
+        self.evaluate(self.snapshot(policies_json=policy_listing(self.declared, generation=9)))
+        code, verdict = self.evaluate(self.snapshot(ts=NOW + 600, policies_json=policy_listing(self.declared, generation=6)))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "policies")
+        self.assertIn("policy generation went from 9 back to 6", failure["detail"])
+
+    def test_a_snapshot_without_a_listing_is_not_judged(self):
+        # `relish policy list` can fail while there's no leader; the
+        # harness then removes the file, and the next check judges it.
+        code, verdict = self.evaluate(self.snapshot())
+        self.assertNotIn("policies", self.failures(verdict))
+        self.assertNotIn("policy_checks", checker.load_state(self.evidence))
+
+    def test_the_turn_budget_is_still_judged_with_the_policies_in_force(self):
+        # The apply path runs off the agent loop, so policies shouldn't
+        # move the turn budget; the soak checks that they don't.
+        code, verdict = self.evaluate(self.snapshot(**{
+            "policies_json": policy_listing(self.declared),
+            "turns__rb-a-1_json": turns(over=("2.5",))}))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.failures(verdict), ["agent-loop-turn"])
+
+    def test_the_configure_step_refuses_a_listing_without_the_soak_policies(self):
+        listing = self.evidence / "policies.json"
+        listing.write_text(json.dumps(policy_listing(self.declared)))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(checker.check_policies(self.evidence, listing), 0)
+        listing.write_text(json.dumps(policy_listing({})))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(checker.check_policies(self.evidence, listing), 1)
+        self.assertIn("is not in force", output.getvalue())
+
+
 class GuestClock(Evidence):
     """One clock source per guest: Lima's guest agent, not timesyncd as well (#608)."""
 
@@ -941,6 +1023,19 @@ class Record(Evidence):
         self.assertIn("not supplied: upgrade slots skipped", text)
         self.assertIn("short leaf lifetimes unavailable", text)
         self.assertIn("- Teardown: `relish local destroy --yes` and `relish uninstall --yes` succeeded", text)
+
+    def test_the_record_says_how_often_the_soak_policies_were_checked(self):
+        self.write_run()
+        record = self.evidence / "record.md"
+        checker.render(self.evidence, record)
+        self.assertIn("- Soak policies checked in force: not measured", record.read_text())
+        state = checker.load_state(self.evidence)
+        state.update(policy_checks=12, policy_generation=27)
+        checker.save_state(self.evidence, state)
+        again = self.evidence / "again.md"
+        checker.render(self.evidence, again)
+        self.assertIn("- Soak policies checked in force: 12 times, policy generation 27 at the last check",
+                      again.read_text())
 
     def test_an_open_failure_renders_fail_with_its_row(self):
         self.write_run(failures=["fault:power-off did not settle within 480 s"])

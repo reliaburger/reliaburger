@@ -774,6 +774,10 @@ apply_workloads() {
     write_workloads
     rel apply -f "$podinfo" > "$evidence/config/apply-podinfo.log" 2>&1 || fail "applying $podinfo failed"
     rel apply -f "$evidence/workloads.toml" > "$evidence/config/apply-workloads.log" 2>&1 || fail 'applying the soak workloads failed'
+    # The workload file carries a deny, a warn and a default policy (#1311);
+    # every later check makes sure they stay in force.
+    rel --output json policy list > "$evidence/config/policies.json" 2>&1 || fail 'listing the soak policies failed'
+    check policies "$evidence" "$evidence/config/policies.json" || fail 'the soak policies are not all in force'
     local deadline=$(( $(date +%s) + 600 )) file=$evidence/.status.json
     until rel --output json status > "$file" 2>/dev/null && python3 - "$file" <<'PY'
 import json, sys
@@ -1017,6 +1021,8 @@ collect() {
     echo "$exit_code" > "$directory/wtf.exit"
     rel --output json nodes > "$directory/nodes.json" 2>/dev/null || rm -f "$directory/nodes.json"
     rel --output json status > "$directory/status.json" 2>/dev/null || rm -f "$directory/status.json"
+    # The soak workload's policies must survive every fault (#1311).
+    rel --output json policy list > "$directory/policies.json" 2>/dev/null || rm -f "$directory/policies.json"
     for node in 1 2 3; do
         [ "${down[node]}" = 0 ] || continue
         # The agent loop's turn histogram, newest samples last: the checker

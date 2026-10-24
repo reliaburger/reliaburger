@@ -54,6 +54,15 @@ filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(own
 test-group = "host-network"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+# The 0.2.4 exit tests (#1126) each kill a leader or a node, then wait
+# for an election, a GitOps poll or a controller's failover on top of
+# cluster start-up. The first matching override wins, so this precedes the
+# cluster-heavy one below.
+[[profile.default.overrides]]
+filter = 'binary(cluster_failover) & test(/^(the_platform_policies_hold_through_apply_gitops_and_a_leader_kill|an_admin_removes_a_policy_that_denies_everything_through_any_node|a_controller_fails_a_templated_database_pair_over_when_its_node_dies)$/)'
+test-group = "cluster-heavy"
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 [[profile.default.overrides]]
 filter = 'binary(cluster_failover) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(cluster_gossip) | binary(reporting_tcp) | binary(cluster_task_arrays)'
 test-group = "cluster-heavy"
@@ -124,6 +133,15 @@ slow-timeout = { period = "120s", terminate-after = 4 }
 filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc_|_runc|runc::|netns|btrfs|buildah|image_pull)/)'
 test-group = "host-network"
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+# The 0.2.4 exit tests (#1126) each kill a leader or a node, then wait
+# for an election, a GitOps poll or a controller's failover on top of
+# cluster start-up. The first matching override wins, so this precedes the
+# cluster-heavy one below.
+[[profile.ci.overrides]]
+filter = 'binary(cluster_failover) & test(/^(the_platform_policies_hold_through_apply_gitops_and_a_leader_kill|an_admin_removes_a_policy_that_denies_everything_through_any_node|a_controller_fails_a_templated_database_pair_over_when_its_node_dies)$/)'
+test-group = "cluster-heavy"
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 [[profile.ci.overrides]]
 filter = 'binary(cluster_failover) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(cluster_gossip) | binary(reporting_tcp) | binary(cluster_task_arrays)'

@@ -5359,6 +5359,17 @@
           "sources": [
             "tests/test_storage.rs"
           ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-grill-runc-tests-runc_sidecar_reaches_its_app_on_localhost",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_sidecar_reaches_its_app_on_localhost",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs"
+          ]
         }
       ]
     },
@@ -5413,6 +5424,39 @@
           "id": "legacy-ci-reliaburger-cluster_failover-decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change",
           "binary": "reliaburger::cluster_failover",
           "test": "decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-the_platform_policies_hold_through_apply_gitops_and_a_leader_kill",
+          "binary": "reliaburger::cluster_failover",
+          "test": "the_platform_policies_hold_through_apply_gitops_and_a_leader_kill",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-an_admin_removes_a_policy_that_denies_everything_through_any_node",
+          "binary": "reliaburger::cluster_failover",
+          "test": "an_admin_removes_a_policy_that_denies_everything_through_any_node",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-a_controller_fails_a_templated_database_pair_over_when_its_node_dies",
+          "binary": "reliaburger::cluster_failover",
+          "test": "a_controller_fails_a_templated_database_pair_over_when_its_node_dies",
           "requires": [
             "cluster-tests"
           ],
@@ -5880,6 +5924,17 @@
           ],
           "sources": [
             "tests/placement.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-a_leader_killed_during_an_apply_under_policy_leaves_the_policy_enforced",
+          "binary": "reliaburger::cluster_failover",
+          "test": "a_leader_killed_during_an_apply_under_policy_leaves_the_policy_enforced",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
           ]
         }
       ]
