@@ -25,7 +25,7 @@ pub const MAX_MESSAGE_BYTES: usize = 512;
 pub const MAX_DEFAULT_BYTES: usize = 4096;
 
 /// App fields a `default` can never fill, and why.
-pub const UNFILLABLE_FIELDS: [(&str, &str); 4] = [
+pub const UNFILLABLE_FIELDS: [(&str, &str); 11] = [
     ("name", "is the app's table name, not a field"),
     (
         "namespace",
@@ -36,6 +36,20 @@ pub const UNFILLABLE_FIELDS: [(&str, &str); 4] = [
         "always has a value (1 when the app leaves it out), so a default could never fill it",
     ),
     ("ordinals", "comes from the leader's placements"),
+    // The apply path checks these against the caller's token (host-exec,
+    // the runtime-knob gate) on the spec as declared. A default filled in
+    // after that would hand every matching app what its caller may not
+    // have, so a default can't set them.
+    ("exec", GATED_BY_THE_CALLER),
+    ("script", GATED_BY_THE_CALLER),
+    ("volumes", GATED_BY_THE_CALLER),
+    ("config_file", GATED_BY_THE_CALLER),
+    ("init", GATED_BY_THE_CALLER),
+    ("runtime", GATED_BY_THE_CALLER),
+    (
+        "sidecar",
+        "would add a container to every matching app; declare sidecars on the app",
+    ),
 ];
 
 /// Every variable a policy expression can see. Nothing else: no other
@@ -81,7 +95,9 @@ pub const JOB_FIELDS: [&str; 19] = [
 ];
 
 /// The fields of `workload`: the ones apps and jobs share (#1119). A test
-/// checks this is exactly where [`APP_FIELDS`] and [`JOB_FIELDS`] meet.
+/// checks this is exactly where [`APP_FIELDS`] and [`JOB_FIELDS`] meet,
+/// less `runtime`, which means an app's kernel knobs but a job's execution
+/// state.
 pub const WORKLOAD_FIELDS: [&str; 11] = [
     "name",
     "image",
@@ -95,12 +111,14 @@ pub const WORKLOAD_FIELDS: [&str; 11] = [
     "egress",
     "namespace",
 ];
+/// Why a default can't fill a field the apply path gates on the caller.
+const GATED_BY_THE_CALLER: &str = "can need host access or a runtime knob, which the caller's token must allow, so a default can't grant it";
 
 /// The fields of `app`: every `[app.*]` key, plus the app's `name`.
 ///
 /// `namespace` is always present, resolved to `default` when the spec
 /// doesn't name one. A test checks this list against `AppSpec` itself.
-pub const APP_FIELDS: [&str; 32] = [
+pub const APP_FIELDS: [&str; 34] = [
     "name",
     "image",
     "command",
@@ -121,6 +139,7 @@ pub const APP_FIELDS: [&str; 32] = [
     "config_file",
     "volumes",
     "init",
+    "sidecar",
     "ingress",
     "placement",
     "deploy",
@@ -132,6 +151,7 @@ pub const APP_FIELDS: [&str; 32] = [
     "stop_grace",
     "pre_stop",
     "pre_stop_timeout",
+    "runtime",
     "namespace",
 ];
 

@@ -1412,6 +1412,17 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     agent.set_host_path_policy(
         reliaburger::bun::host_paths::HostPathPolicy::from_node_config(&config),
     );
+    // Runtime knobs are refused unless `[runtime]` lists each one (#1122).
+    // Naming an escape-hatch capability is allowed, but loudly.
+    let runtime_allowlist = config.runtime.knob_allowlist();
+    for capability in runtime_allowlist.escape_capabilities() {
+        eprintln!(
+            "bun: warning: [runtime] allowed_capabilities lists {capability}, which gives a \
+             container near-root power over its own namespaces; apps whose tokens carry \
+             host-exec may ask for it"
+        );
+    }
+    agent.set_runtime_allowlist(runtime_allowlist);
     // Bound fault durations by the `[smoker]` policy (default + maximum).
     agent.configure_perimeter(
         vec![

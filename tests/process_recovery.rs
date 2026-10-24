@@ -49,9 +49,12 @@ fn spec(script: &str) -> OciSpec {
             cgroups_path: None,
             uid_mappings: None,
             gid_mappings: None,
+            sysctl: Default::default(),
+            devices: Vec::new(),
         },
         port_mapping: None,
         stop: None,
+        runtime_knobs: None,
     }
 }
 

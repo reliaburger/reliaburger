@@ -175,6 +175,13 @@ pub struct Compatibility {
 /// Policies for jobs and the audit action: `PolicySpec::applies_to`,
 /// `PolicyAction::Audit`, a finding's `kind` and `workload` in API JSON,
 /// `Verdict::audits`, and `GET /v1/policies/audit` (#1119).
+/// An app's `[runtime]` knobs in Raft desired state and node syncs, the
+/// knobs and the OCI `linux.sysctl`, `linux.devices` and device rules in OCI
+/// specs and instance records, and the node's knob allowlist in its
+/// capability report (`NodeCapabilities::runtime_knobs`) (#1122).
+/// An app's `sidecar` list in Raft desired state, node syncs and instance
+/// records, and `NodeCapabilities::shared_network` in the capability report
+/// (#1120).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 55,
     state: 72,

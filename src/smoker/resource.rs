@@ -363,6 +363,7 @@ mod tests {
                 "memory.high".to_string(),
                 "33554432".to_string(),
             )]),
+            devices: Vec::new(),
         }
     }
 

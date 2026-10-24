@@ -218,9 +218,36 @@ impl RuncGrill {
             });
         }
 
+        if self.rootless
+            && let Some(problem) = spec.runtime_knobs_refusal("rootless runc")
+        {
+            return Err(GrillError::LaunchRefused {
+                instance: instance.clone(),
+                problem,
+            });
+        }
+
+        // A sidecar joins its parent's named namespace (#1120). Rootless
+        // runc names none, and the parent's must still be there.
+        if let Some(joined) = spec.joined_network() {
+            let reason = if self.rootless {
+                Some("rootless runc can't share a network namespace with a sidecar".to_string())
+            } else if !std::path::Path::new(joined).exists() {
+                Some(format!("the parent's network namespace {joined} is gone"))
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err(GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason,
+                });
+            }
+        }
+
         // Set up per-container networking (root mode only, non-rootless).
         // For rootless, slirp4netns is set up after runc create (needs PID).
-        if !self.rootless {
+        if !self.rootless && spec.joined_network().is_none() {
             let container_index = container_index.ok_or_else(|| GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: "missing durable network reservation".into(),
@@ -337,6 +364,23 @@ impl RuncGrill {
                 .unwrap_or(rootfs)
                 .to_string_lossy()
                 .to_string();
+        }
+
+        // Runtime knobs (#1122) go in after the user namespace has set the
+        // default capabilities, so the added ones join them. The node writes
+        // the network sysctls into the namespace it made; runc writes the
+        // IPC ones.
+        if let Some(knobs) = spec.runtime_knobs.clone() {
+            let failed = |reason: String| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason,
+            };
+            super::knobs::apply_to_spec(&mut spec, &knobs, super::knobs::host_device)
+                .map_err(|e| failed(e.to_string()))?;
+            let network_sysctls = super::knobs::take_network_sysctls(&mut spec);
+            netns::write_sysctls_with_commands(commands, instance, &network_sysctls)
+                .await
+                .map_err(|e| failed(e.to_string()))?;
         }
 
         // Point the container at the node's DNS responder with a per-instance
@@ -668,6 +712,19 @@ impl super::Grill for RuncGrill {
         !self.rootless
     }
 
+    /// Rootful runc applies runtime knobs (#1122). Rootless runc can't: it
+    /// owns no device cgroup and no capabilities beyond its own user's.
+    fn applies_runtime_knobs(&self) -> bool {
+        !self.rootless
+    }
+
+    /// Rootful runc names every instance's network namespace, so a sidecar
+    /// can join its parent's (#1120). Rootless networking is slirp4netns,
+    /// set up per container after create.
+    fn shares_network_namespaces(&self) -> bool {
+        !self.rootless
+    }
+
     async fn adopt(
         &self,
         instance: &InstanceId,
@@ -882,7 +939,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         let error = grill.create(&id, &spec).await.unwrap_err();
@@ -947,7 +1007,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
         let result = grill.create(&id, &spec).await;
         if result.is_ok() {
@@ -1016,7 +1079,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         // runc create will fail (no real rootfs), but the bundle dir
@@ -1125,7 +1191,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         // Read the first instance's spec while it still owns its bundle: once
@@ -1282,7 +1351,10 @@ mod tests {
                     cgroups_path: None,
                     uid_mappings: None,
                     gid_mappings: None,
+                    sysctl: Default::default(),
+                    devices: Vec::new(),
                 },
+                runtime_knobs: None,
             };
         let specs = [spec_for("alpha", 0, 3), spec_for("beta", 1, 1)];
 
@@ -1444,7 +1516,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         let error = grill.create(&id, &spec).await.unwrap_err();
@@ -1511,7 +1586,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         let original = RuncGrill::new(
@@ -1705,7 +1783,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         grill
@@ -2004,6 +2085,56 @@ mod tests {
             redis_host_uid,
             "the volume still belongs to the app's user"
         );
+    }
+
+    /// #1120: a sidecar joins its app's network namespace, so it reaches the
+    /// app on `localhost`, and it gets no address of its own.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_sidecar_reaches_its_app_on_localhost() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let app_id = InstanceId("default__sidecar-redis-0".to_string());
+        let sidecar_id = crate::grill::oci::sidecar_instance_id(&app_id, "probe");
+        for id in [&app_id, &sidecar_id] {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(vec![app_id.clone(), sidecar_id.clone()]);
+        let app_toml = format!(
+            "image = \"{REDIS_IMAGE}\"\n[[sidecar]]\nname = \"probe\"\ncommand = [\"sleep\", \"3600\"]\n"
+        );
+        let (grill, app) = image_app(tmp.path(), &app_id, &app_toml);
+        let config: crate::config::app::AppSpec = toml::from_str(&app_toml).unwrap();
+        let sidecar =
+            crate::grill::oci::generate_sidecar_oci_spec(&config.sidecar[0], &app, &app_id);
+
+        // Bun's order: the app's create makes the namespace, the sidecar
+        // starts in it, then the app starts.
+        grill.create(&app_id, &app).await.unwrap();
+        grill.create(&sidecar_id, &sidecar).await.unwrap();
+        grill.start(&sidecar_id).await.unwrap();
+        grill.start(&app_id).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let answer = loop {
+            let answer = redis_cli(&grill, &sidecar_id, &["-h", "127.0.0.1", "ping"]).await;
+            if answer == "PONG" || std::time::Instant::now() >= deadline {
+                break answer;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        let sidecar_ip = grill.container_ip(&sidecar_id).await;
+        let app_ip = grill.container_ip(&app_id).await;
+        grill.kill(&app_id).await.unwrap();
+        grill.kill(&sidecar_id).await.unwrap();
+
+        assert_eq!(
+            answer, "PONG",
+            "the sidecar couldn't reach its app on localhost"
+        );
+        assert!(app_ip.is_some(), "the app has its address");
+        assert_eq!(sidecar_ip, None, "a sidecar reserves no address of its own");
     }
 
     async fn redis_cli(grill: &RuncGrill, id: &InstanceId, command: &[&str]) -> String {

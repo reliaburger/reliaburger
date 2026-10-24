@@ -952,7 +952,11 @@ evaluates one.
   fill a remaining app differently, the apply stops and asks to be run again.
   Commit checks refuse an empty or oversized (4096-byte) default, a field
   that isn't an app field or can't be filled (`name`, `namespace`,
-  `replicas`, `ordinals`), and a value serde won't read back into `AppSpec`.
+  `replicas`, `ordinals`, `sidecar`, and the fields the apply path gates on
+  the caller's token: `exec`, `script`, `volumes`, `config_file`, `init`,
+  `runtime`), and a value serde won't read back into `AppSpec`. The token
+  gates run on the declared spec, before policy, so a default must not be
+  able to add what they'd have refused.
 - **Jobs and audit (#1119).** `PolicySpec::applies_to` is `apps` (the default,
   so every earlier policy keeps its meaning), `jobs` or `both`. An expression
   sees `app` or `job` by the workload's kind, plus `workload`, bound to the
@@ -975,6 +979,34 @@ evaluates one.
   back) through `judge_job`. It changes nothing. `relish policy audit` prints
   it, and `relish wtf` reads it into a `policies` evidence row
   (`policy-would-deny`, `policy-audit`, `policy-broken`).
+
+---
+
+### 5.10 Runtime Knobs
+
+An app can ask for added capabilities, namespaced sysctls and host devices (#1122):
+
+```toml
+[app.vpn]
+image = "ghcr.io/example/vpn:2.0"
+
+[app.vpn.runtime]
+capabilities = ["NET_ADMIN"]
+sysctls = { "net.ipv4.ip_forward" = "1" }
+devices = [{ path = "/dev/net/tun", permissions = "rw" }]
+```
+
+**Two gates.** Each use needs the node and the token, the double gate host paths use. The token gate runs at apply, in the same place as `host-exec` for host binaries and host-path sources: a token with a `[permission]` block needs `host-exec` for an app with any knob, and its refusal names the first knob and "the token gate". The node gate is the `[runtime]` allowlist in `node.toml` (`allowed_capabilities`, `allowed_sysctls`, `allowed_devices`), checked by `WorkloadSupervisor::admit_runtime_knobs` in `admit_app` and again before every rolling or blue-green replacement, with a refusal that names the knob, the allowlist key and "the node gate".
+
+**What can be asked for at all.** `grill::knobs` parses each field into a type that can't hold a value no node could allow. `Capability` holds a name from the 41 Linux capabilities, accepts `NET_ADMIN` or `CAP_NET_ADMIN`, and refuses `ALL` or any wildcard. `SysctlName` accepts only the per-namespace families (`net.*`, `kernel.shm*`, `kernel.msg*`, `kernel.sem`, `fs.mqueue.*`), and the node's `SysctlPattern` accepts those names or a `net.`/`fs.mqueue.` prefix ending in `.*`, so `kernel.panic` is refused in a node's list as well as an app's. `DevicePath` is an absolute path under `/dev` with no `.` or `..` part; `DevicePermissions` is a subset of `rwm`. `validate_app` refuses knobs on an `exec` or `script` app, which has no container to change.
+
+**Escape-hatch capabilities.** Ten capabilities give near-root power inside the container's namespaces (`ESCAPE_CAPABILITIES`: `CAP_SYS_ADMIN`, `CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, `CAP_SYS_PTRACE`, `CAP_SYS_BOOT`, `CAP_DAC_READ_SEARCH`, `CAP_MAC_ADMIN`, `CAP_MAC_OVERRIDE`, `CAP_BPF`, `CAP_PERFMON`). They aren't refused outright, because FUSE and some network tools genuinely need `CAP_SYS_ADMIN`. They're admitted only when a node names each one: there is no wildcard or pattern that could include them by accident, and Bun prints a startup warning for each one its `[runtime]` lists.
+
+**Placement.** A node reports its allowlist in its capability report (`NodeCapabilities::runtime_knobs`), and only when its runtime applies knobs (`Grill::applies_runtime_knobs`, true for rootful runc and the mixed runtime's runc side). `WorkloadRequirements::runtime_knobs` carries the app's knobs and `node_can_run` admits a node only when its allowlist admits every one, so an app needing a knob that some nodes allow lands only on those. Otherwise it's unplaced with `NoCapableNode`.
+
+**Applying them.** `generate_oci_spec` copies the knobs into the instance's `OciSpec` (`runtime_knobs`, not part of the OCI spec proper). Rootful runc's prepare step calls `grill::knobs::apply_to_spec` after the user namespace has set its default capabilities: added capabilities join the bounding, effective and permitted sets; sysctls go to `linux.sysctl`; each device is read from the host (`stat`) into `linux.devices` with an allow rule in `linux.resources.devices`. The network namespace belongs to the node's user namespace, not the container's, so container root can't write `net.*` sysctls; `take_network_sysctls` moves them out of the spec and Bun writes them with `ip netns exec`, as it writes the low-ports sysctls. runc writes the IPC ones in the container's own IPC namespace. ProcessGrill, Apple Container and rootless runc refuse a spec that carries knobs (`LaunchProblem::RuntimeKnobsUnsupported`) rather than run it without them. A sidecar's spec (`generate_sidecar_oci_spec`) carries no knobs: the gates admitted them for the app's container. It shares the app's network namespace, so the app's `net.*` sysctls reach it anyway.
+
+**Kubernetes.** `relish import` maps `securityContext.capabilities.add`, the pod's `securityContext.sysctls` and device `hostPath` volumes; unknown capabilities, host-wide sysctls, `capabilities.drop` and `privileged` are warnings. `relish export` writes them back, devices as `hostPath` mounts reported as unsupported.
 
 ## 6. Configuration
 

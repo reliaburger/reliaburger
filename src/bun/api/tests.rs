@@ -5155,6 +5155,66 @@ async fn managed_volume_needs_only_deploy() {
     );
 }
 
+const RUNTIME_KNOBS: &str = "[app.lb]\nimage = \"test:v1\"\n\
+    [app.lb.runtime]\ncapabilities = [\"NET_ADMIN\"]\n";
+
+/// #1122: the token gate on its own. A deployer whose permission block
+/// grants `deploy` but not `host-exec` can't apply an app with a runtime
+/// knob, and the refusal names the field, the value and the gate. Nothing
+/// reaches Raft.
+#[tokio::test]
+async fn a_runtime_knob_needs_host_exec_and_the_refusal_names_the_token_gate() {
+    let (app, council, _commands) = workload_admission_fixture("knob-deploy-only").await;
+    council
+        .write(crate::council::RaftRequest::PermissionSpec {
+            name: "ci".into(),
+            spec: Box::new(crate::config::PermissionSpec {
+                actions: vec!["deploy".into()],
+                apps: vec!["*".into()],
+                namespaces: None,
+            }),
+        })
+        .await
+        .unwrap();
+    let mut request = axum::http::Request::post("/v1/apply")
+        .body(Body::from(RUNTIME_KNOBS))
+        .unwrap();
+    request.extensions_mut().insert(deployer_context());
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let message = String::from_utf8_lossy(&body);
+    assert!(
+        message.contains("runtime.capabilities CAP_NET_ADMIN"),
+        "{message}"
+    );
+    assert!(message.contains("token gate"), "{message}");
+    assert!(message.contains("host-exec"), "{message}");
+    assert!(council.desired_state().await.apps.is_empty());
+    council.shutdown().await.unwrap();
+
+    assert_ne!(
+        apply_under_permission_block("knob-host-exec", &["deploy", "host-exec"], RUNTIME_KNOBS)
+            .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[test]
+fn apply_notes_each_runtime_knob_needs_a_node_allowlist_entry() {
+    let config = crate::config::Config::parse(RUNTIME_KNOBS).unwrap();
+    let notes = super::apply::runtime_knob_notes(&config);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("app.lb"), "{notes:?}");
+    assert!(
+        notes[0].contains("runtime.capabilities CAP_NET_ADMIN"),
+        "{notes:?}"
+    );
+    assert!(notes[0].contains("allowed_capabilities"), "{notes:?}");
+}
+
 #[test]
 fn apply_notes_each_host_path_source_needs_a_node_allowlist_entry() {
     let config = crate::config::Config::parse(HOST_PATH_VOLUME).unwrap();

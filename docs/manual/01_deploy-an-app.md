@@ -130,6 +130,79 @@ looking it up on its `PATH`.
 warning: app default/worker: init container command "echo" is a bare name, but it runs on the host, where allowed_binaries names binaries by full path; use the full path (`command -v echo` on the node prints it)
 ```
 
+## Sidecars
+
+A sidecar is a container that runs beside every instance of an app for the
+instance's whole life: a proxy in front of it, a log shipper reading its
+files, an adapter for a protocol it doesn't speak.
+
+```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+port = 8080
+cpu = "250m-1"
+memory = "256Mi-512Mi"
+
+[[app.api.sidecar]]
+name = "proxy"                         # a DNS label, unique in the app
+image = "envoyproxy/envoy:v1.31.0"     # default: the app's image
+args = ["-c", "/etc/envoy/envoy.yaml"]
+cpu = "50m-200m"
+memory = "64Mi-128Mi"
+env = { ENVOY_LOG_LEVEL = "warn" }
+
+[[app.api.sidecar]]
+name = "logs"
+image = "ghcr.io/example/shipper:3.0"
+```
+
+A sidecar joins its instance's network namespace, so the app reaches the
+proxy on `localhost:10000` and the proxy reaches the app on `localhost:8080`.
+It gets its own cgroup with its own `cpu` and `memory` limits. Like an init
+container, it runs its own `image` (pulled, trust-checked and pinned), or the
+app's, and it gets the app's environment and volume and config-file mounts.
+Its own `env` goes on top: plain values and `PROVIDER[...]` references,
+which are resolved when it starts. An encrypted value belongs in the app's
+`env`, which every sidecar inherits.
+
+The order is fixed:
+
+1. The app's instance is created, with its network namespace.
+2. Its init containers run, each to completion.
+3. Its sidecars start, in the order you list them.
+4. The app starts.
+
+A stop goes the other way. The app gets its `pre_stop`, signal and grace
+first. Only once it has exited does each sidecar get SIGTERM and the same
+grace, then SIGKILL if it's still running. A proxy keeps answering until
+the app is gone, and a log shipper sees the app's last lines. One catch: on
+runc the network interface belongs to the app's instance and goes when the
+app exits, so a sidecar spends its own grace with `localhost` but no route
+out. A shipper that must flush to a remote store should flush as it goes.
+
+When a sidecar exits, Bun starts it again on its own, while the app keeps
+running and keeps its address. The first restart is immediate, then they
+back off: 1 s, 2 s, 4 s, up to a minute. When the app exits, its sidecars
+restart with it: they stop after it and start again before it, because on
+runc the network namespace goes with the app's instance.
+
+The scheduler adds each sidecar's `cpu` and `memory` requests to the app's
+when it places a replica, and a namespace quota counts them too. Above, one
+replica of `api` requests 300m of CPU and 320 MiB of memory.
+
+Sidecars need a runtime that can share a network namespace, which today means
+rootful runc. The scheduler only places an app with sidecars on such nodes.
+A node on Apple Container (each container is its own VM), rootless runc or
+`--runtime process` refuses one at apply, saying why. `relish lint` and
+`apply` also refuse sidecars on an `exec` or `script` app, which runs in the
+node's own network, and on an app with an `egress` allowlist: the allowlist
+binds the app's cgroup, not its sidecars', so a sidecar could reach what the
+app can't.
+
+A Bun restart adopts running apps but not their sidecars, which have no
+adoption records. Bun starts them again on its next tick, a second or so
+later.
+
 ## Config files
 
 ```toml

@@ -122,7 +122,8 @@ pub async fn bind_image(
 /// One image an apply bound, as `relish apply` prints it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedBinding {
-    /// What names the image: `web`, `web (init)` or `job migrate`.
+    /// What names the image: `web`, `web (init)`, `web (sidecar proxy)` or
+    /// `job migrate`.
     pub workload: String,
     /// The image as written in the config.
     pub image: String,
@@ -145,6 +146,27 @@ impl std::fmt::Display for AppliedBinding {
             self.workload, self.image, self.digest
         )
     }
+}
+
+/// Every image slot of app `name`, labelled for errors: its own, then each
+/// init container's and each sidecar's (#1120). One left empty inherits
+/// the app's image and binds nothing.
+fn app_image_slots<'a>(
+    name: &'a str,
+    spec: &'a mut crate::config::app::AppSpec,
+) -> impl Iterator<Item = (String, &'a mut Option<String>)> {
+    std::iter::once((name.to_string(), &mut spec.image))
+        .chain(
+            spec.init
+                .iter_mut()
+                .map(move |init| (format!("{name} (init)"), &mut init.image)),
+        )
+        .chain(spec.sidecar.iter_mut().map(move |sidecar| {
+            (
+                format!("{name} (sidecar {})", sidecar.name),
+                &mut sidecar.image,
+            )
+        }))
 }
 
 /// Binds the images in an apply on the node that accepts it.
@@ -213,13 +235,7 @@ impl ImageBinder {
         let slots: Vec<(String, &mut Option<String>)> = config
             .app
             .iter_mut()
-            .flat_map(|(name, spec)| {
-                std::iter::once((name.clone(), &mut spec.image)).chain(
-                    spec.init
-                        .iter_mut()
-                        .map(move |init| (format!("{name} (init)"), &mut init.image)),
-                )
-            })
+            .flat_map(|(name, spec)| app_image_slots(name, spec))
             .chain(
                 config
                     .job
@@ -238,14 +254,7 @@ impl ImageBinder {
         spec: &mut crate::config::app::AppSpec,
         catalog: &ManifestCatalog,
     ) -> Result<Vec<AppliedBinding>, BindError> {
-        let slots: Vec<(String, &mut Option<String>)> =
-            std::iter::once((name.to_string(), &mut spec.image))
-                .chain(
-                    spec.init
-                        .iter_mut()
-                        .map(|init| (format!("{name} (init)"), &mut init.image)),
-                )
-                .collect();
+        let slots: Vec<(String, &mut Option<String>)> = app_image_slots(name, spec).collect();
         self.bind_slots(slots, catalog).await
     }
 
@@ -491,6 +500,35 @@ command = ["migrate"]
         );
         assert!(
             lines.iter().any(|line| line.starts_with("job migrate: ")),
+            "{lines:?}"
+        );
+    }
+
+    /// #1120: a sidecar's image binds like its app's, and one that names
+    /// none inherits the app's bound image.
+    #[tokio::test]
+    async fn binding_an_app_binds_its_sidecar_images() {
+        let binder = ImageBinder::with_upstream(counting(7));
+        let mut spec: crate::config::app::AppSpec = toml::from_str(
+            "image = \"nginx:1.27\"\n[[sidecar]]\nname = \"proxy\"\nimage = \"envoy:1.31\"\n\
+             [[sidecar]]\nname = \"logs\"\ncommand = [\"ship\"]\n",
+        )
+        .unwrap();
+        let bindings = binder
+            .bind_app("web", &mut spec, &ManifestCatalog::default())
+            .await
+            .unwrap();
+        let bound = |image: &str| format!("{image}@{}", digest(7).as_str());
+        assert_eq!(
+            spec.sidecar[0].image.as_deref(),
+            Some(bound("envoy:1.31").as_str())
+        );
+        assert_eq!(spec.sidecar[1].image, None);
+        let lines: Vec<String> = bindings.iter().map(ToString::to_string).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("web (sidecar proxy): envoy:1.31")),
             "{lines:?}"
         );
     }

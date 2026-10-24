@@ -16,8 +16,10 @@ mod loop_rule;
 mod namespace_secrets;
 mod published_status;
 mod restart_ownership;
+mod runtime_knobs;
 mod runtime_metadata;
 mod secret_providers;
+mod sidecars;
 mod stop_hooks;
 mod upgrade_answer;
 
@@ -9122,7 +9124,10 @@ fn adoption_record(
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         },
         rootless_network: None,
     }
@@ -9698,6 +9703,7 @@ pub(super) fn limited_adoption_record(
             "memory.high".to_string(),
             "33554432".to_string(),
         )]),
+        devices: Vec::new(),
     });
     record
 }

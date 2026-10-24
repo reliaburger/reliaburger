@@ -334,6 +334,9 @@ fn spec_problem(spec: &OciSpec) -> Option<super::LaunchProblem> {
     if !spec.host_process && spec.root.path != super::oci::HOST_ROOT {
         return Some(LaunchProblem::NeedsContainerRuntime(spec.root.path.clone()));
     }
+    if let Some(problem) = spec.runtime_knobs_refusal("process") {
+        return Some(problem);
+    }
     spec.process
         .args
         .is_empty()
@@ -1472,7 +1475,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         }
     }
 
@@ -3237,6 +3243,28 @@ mod tests {
             matches!(grill.start(&id).await, Err(GrillError::NotFound { .. })),
             "a refused image app must leave nothing to start"
         );
+    }
+
+    /// #1122: a spec carrying runtime knobs is refused, not run without
+    /// them. Validation keeps knobs off host apps, so this guards a spec
+    /// that reaches the wrong runtime some other way.
+    #[tokio::test]
+    async fn create_refuses_a_spec_with_runtime_knobs_instead_of_ignoring_them() {
+        let grill = ProcessGrill::new();
+        let id = InstanceId("default__lb-0".to_string());
+        let mut spec = echo_spec("hello");
+        spec.runtime_knobs = Some(toml::from_str("capabilities = [\"NET_ADMIN\"]\n").unwrap());
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem.to_string(),
+            "runtime.capabilities CAP_NET_ADMIN can't be applied: runtime knobs need rootful \
+             runc, and this node's runtime is process"
+        );
+        assert!(matches!(
+            grill.start(&id).await,
+            Err(GrillError::NotFound { .. })
+        ));
     }
 
     /// #914: an image app without a command used to run `sleep 86400` as a

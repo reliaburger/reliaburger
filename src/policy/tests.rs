@@ -815,6 +815,19 @@ fn every_kind_of_bad_default_is_refused_at_commit() {
             "[policy.rule.default]\nreplicas = 3\n",
             |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "replicas"),
         ),
+        // A default never grants what the caller's token gates.
+        (
+            "[policy.rule.default]\nexec = '/bin/sh'\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "exec"),
+        ),
+        (
+            "[policy.rule.default]\nruntime.sysctls = { 'net.core.somaxconn' = '4096' }\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "runtime"),
+        ),
+        (
+            "[policy.rule.default]\nsidecar = []\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "sidecar"),
+        ),
         (
             "[policy.rule.default]\ndeploy.max_unavaliable = 1\n",
             |e| matches!(e, PolicyError::InvalidDefault { error } if error.contains("max_unavaliable")),
@@ -1315,13 +1328,15 @@ fn job_fields_match_the_job_spec() {
     assert_eq!(keys, fields);
 }
 
-/// `WORKLOAD_FIELDS` is exactly where apps and jobs meet.
+/// `WORKLOAD_FIELDS` is exactly where apps and jobs meet, less `runtime`,
+/// which is a word both use for different things: an app's kernel knobs
+/// (#1122), a job's execution state.
 #[test]
 fn workload_fields_are_the_fields_apps_and_jobs_share() {
     let mut shared: Vec<&str> = APP_FIELDS
         .iter()
         .copied()
-        .filter(|field| JOB_FIELDS.contains(field))
+        .filter(|field| JOB_FIELDS.contains(field) && *field != "runtime")
         .collect();
     shared.sort();
     let mut fields: Vec<&str> = WORKLOAD_FIELDS.to_vec();

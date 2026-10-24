@@ -585,14 +585,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         } else {
             None
         };
-        if let Err(error) = self.supervisor.reserve_execution(
-            id.clone(),
-            crate::meat::Resources::new(
-                spec.cpu.map_or(0, |r| r.request),
-                spec.memory.map_or(0, |r| r.request),
-                spec.gpu.unwrap_or(0),
-            ),
-        ) {
+        if let Err(error) = self
+            .supervisor
+            .reserve_execution(id.clone(), crate::meat::admission::app_requests(spec))
+        {
             if let Some(port) = host_port {
                 // LOOP-INLINE: in-memory lock, no I/O
                 self.supervisor.port_allocator.release(port).await?;
@@ -641,6 +637,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         spec: &AppSpec,
         host_port: Option<u16>,
     ) -> Result<crate::grill::oci::OciSpec, BunError> {
+        // A replacement never went through `admit_app`, so the node gate for
+        // runtime knobs (#1122) holds here, before anything is prepared.
+        self.supervisor.admit_runtime_knobs(app_name, spec)?;
         let identities = self.decrypt_identities(namespace).await;
         if identities.is_empty() && spec.env.values().any(|v| v.is_encrypted()) {
             return Err(BunError::DeployFailed {
