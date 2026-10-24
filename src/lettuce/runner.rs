@@ -884,6 +884,11 @@ async fn write_judged_app(
         for filled in &judgement.filled {
             println!("gitops: {filled}");
         }
+        // An audit finding goes to the node's log; `relish policy audit`
+        // lists it while the app breaks the rule (#1119).
+        for audited in &judgement.verdict.audits {
+            eprintln!("gitops: audit: {audited}");
+        }
         let mut spec = judgement.spec;
         if let Some(binder) = app.binder {
             let catalog = council.manifest_catalog().await;

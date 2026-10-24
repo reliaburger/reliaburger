@@ -9,6 +9,10 @@
 /// fields it fills in wherever a matching app leaves them out. A default
 /// never overwrites a value the app sets.
 ///
+/// `applies_to` (#1119) says which workloads a policy judges: apps (the
+/// default), jobs, or both. `action = "audit"` records a finding without
+/// warning or refusing.
+///
 /// Policies are committed to Raft like permissions, and only an admin may
 /// write them. The leader evaluates them (`crate::policy`); the state
 /// machine only stores them. See chapter 18 of the book.
@@ -30,9 +34,14 @@ pub struct PolicySpec {
     /// message naming the policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// Whether a broken rule refuses the apply or only warns.
+    /// Whether a broken rule refuses the apply, only warns, or is only
+    /// recorded.
     #[serde(default)]
     pub action: PolicyAction,
+    /// The workloads this policy judges (#1119). Absent means apps, so a
+    /// policy written before jobs could be judged still means the same.
+    #[serde(default, skip_serializing_if = "PolicyTarget::is_apps")]
+    pub applies_to: PolicyTarget,
     /// App fields to fill in where a matching app leaves them out, as a
     /// TOML table shaped like an `[app.*]` table (#1118). Kept as JSON so
     /// it crosses Raft like the rest of desired state.
@@ -49,6 +58,9 @@ pub enum PolicyAction {
     Deny,
     /// Accept the apply, with a warning naming the policy.
     Warn,
+    /// Accept the apply silently and record the finding in the audit log
+    /// (#1119). `relish policy audit` lists it too.
+    Audit,
 }
 
 impl PolicyAction {
@@ -57,7 +69,37 @@ impl PolicyAction {
         match self {
             PolicyAction::Deny => "deny",
             PolicyAction::Warn => "warn",
+            PolicyAction::Audit => "audit",
         }
+    }
+}
+
+/// Which workloads a policy judges (#1119).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyTarget {
+    /// Apps only, seen as `app` (and `workload`). The default.
+    #[default]
+    Apps,
+    /// Jobs only, seen as `job` (and `workload`).
+    Jobs,
+    /// Apps and jobs, seen only as `workload`: the fields they share.
+    Both,
+}
+
+impl PolicyTarget {
+    /// The lowercase word used in TOML and in output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyTarget::Apps => "apps",
+            PolicyTarget::Jobs => "jobs",
+            PolicyTarget::Both => "both",
+        }
+    }
+
+    /// Whether this is the default, apps only.
+    pub fn is_apps(&self) -> bool {
+        *self == PolicyTarget::Apps
     }
 }
 
@@ -85,10 +127,27 @@ mod tests {
     }
 
     #[test]
-    fn warn_is_the_only_other_action() {
+    fn warn_and_audit_are_the_other_actions() {
         let spec: PolicySpec = toml::from_str("deny = 'true'\naction = 'warn'").unwrap();
         assert_eq!(spec.action, PolicyAction::Warn);
-        assert!(toml::from_str::<PolicySpec>("deny = 'true'\naction = 'audit'").is_err());
+        let spec: PolicySpec = toml::from_str("deny = 'true'\naction = 'audit'").unwrap();
+        assert_eq!(spec.action, PolicyAction::Audit);
+        assert!(toml::from_str::<PolicySpec>("deny = 'true'\naction = 'log'").is_err());
+    }
+
+    /// #1119: a policy without `applies_to` judges apps, as every policy
+    /// did before, and serialises without it.
+    #[test]
+    fn applies_to_defaults_to_apps() {
+        let spec: PolicySpec = toml::from_str("deny = 'true'").unwrap();
+        assert_eq!(spec.applies_to, PolicyTarget::Apps);
+        assert!(!toml::to_string(&spec).unwrap().contains("applies_to"));
+        for (word, target) in [("jobs", PolicyTarget::Jobs), ("both", PolicyTarget::Both)] {
+            let spec: PolicySpec =
+                toml::from_str(&format!("deny = 'true'\napplies_to = '{word}'")).unwrap();
+            assert_eq!(spec.applies_to, target);
+        }
+        assert!(toml::from_str::<PolicySpec>("deny = 'true'\napplies_to = 'builds'").is_err());
     }
 
     #[test]

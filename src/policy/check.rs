@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use cel::common::ast::{EntryExpr, Expr, IdedExpr};
 
-use crate::config::PolicySpec;
+use crate::config::{PolicySpec, PolicyTarget};
 
 /// The longest `match` or `deny` expression a policy may hold, in bytes.
 ///
@@ -59,12 +59,67 @@ pub const UNFILLABLE_FIELDS: [(&str, &str); 12] = [
     ),
 ];
 
+/// Every variable a policy expression can see. Nothing else: no other
+/// workloads, no policies, permissions or namespaces, no clock. Which of
+/// `app`, `job` and `workload` a policy sees depends on its `applies_to`
+/// ([`workload_variables`]).
+pub const POLICY_VARIABLES: [&str; 5] = ["app", "job", "workload", "caller", "source"];
+
+/// The workload variables a policy that applies to `target` sees: `app`
+/// for apps, `job` for jobs, and `workload`, the fields both share, for
+/// either (#1119).
+pub fn workload_variables(target: PolicyTarget) -> &'static [&'static str] {
+    match target {
+        PolicyTarget::Apps => &["app", "workload"],
+        PolicyTarget::Jobs => &["job", "workload"],
+        PolicyTarget::Both => &["workload"],
+    }
+}
+
+/// The fields of `job`: every `[job.*]` key, plus the job's `name`
+/// (#1119). `namespace` is always present, as for `app`. A test checks
+/// this list against `JobSpec` itself.
+pub const JOB_FIELDS: [&str; 19] = [
+    "name",
+    "runtime",
+    "image",
+    "command",
+    "schedule",
+    "run_before",
+    "memory",
+    "cpu",
+    "pids",
+    "env",
+    "namespace",
+    "exec",
+    "script",
+    "firewall",
+    "egress",
+    "max_attempts",
+    "task_timeout_secs",
+    "overlap",
+    "replay_unknown",
+];
+
+/// The fields of `workload`: the ones apps and jobs share (#1119). A test
+/// checks this is exactly where [`APP_FIELDS`] and [`JOB_FIELDS`] meet,
+/// less `runtime`, which means an app's kernel knobs but a job's execution
+/// state.
+pub const WORKLOAD_FIELDS: [&str; 11] = [
+    "name",
+    "image",
+    "command",
+    "exec",
+    "script",
+    "memory",
+    "cpu",
+    "env",
+    "firewall",
+    "egress",
+    "namespace",
+];
 /// Why a default can't fill a field the apply path gates on the caller.
 const GATED_BY_THE_CALLER: &str = "can need host access or a runtime knob, which the caller's token must allow, so a default can't grant it";
-
-/// The variables a policy expression can see. Nothing else: no other apps,
-/// no policies, permissions or namespaces, no clock.
-pub const POLICY_VARIABLES: [&str; 3] = ["app", "caller", "source"];
 
 /// The fields of `app`: every `[app.*]` key, plus the app's `name`.
 ///
@@ -190,15 +245,26 @@ pub enum PolicyError {
         error: String,
     },
     /// An expression names a variable a policy can't see, such as
-    /// `policy`, `permission` or `namespace`.
+    /// `policy`, `permission` or `namespace`, or the workload variable of
+    /// a kind the policy doesn't apply to (`job` in an apps policy).
     #[error(
-        "{field} uses {variable:?}, but policies see only app, caller and source; they never match policies, permissions or namespaces"
+        "{field} uses {variable:?}, but a policy that applies to {target} sees only {visible}, caller and source; policies never match policies, permissions or namespaces",
+        target = target.as_str(),
+        visible = workload_variables(*target).join(", ")
     )]
     UnknownVariable {
         /// The expression.
         field: PolicyField,
         /// The variable it names.
         variable: String,
+        /// What the policy applies to.
+        target: PolicyTarget,
+    },
+    /// A `default` on a policy that doesn't apply to apps only (#1119).
+    #[error("a default fills app fields, so its policy must apply to apps only, not {}", .target.as_str())]
+    DefaultOutsideApps {
+        /// What the policy applies to.
+        target: PolicyTarget,
     },
     /// The policy has neither a `deny` nor a `default`, so it does nothing.
     #[error("a policy needs a deny expression, a default table, or both")]
@@ -250,12 +316,17 @@ pub fn check_policy(name: &str, spec: &PolicySpec) -> Result<(), PolicyError> {
         });
     }
     if let Some(expression) = &spec.match_expression {
-        compile_checked(PolicyField::Match, expression)?;
+        compile_checked(PolicyField::Match, spec.applies_to, expression)?;
     }
     if let Some(deny) = &spec.deny {
-        compile_checked(PolicyField::Deny, deny)?;
+        compile_checked(PolicyField::Deny, spec.applies_to, deny)?;
     }
     match &spec.default {
+        Some(_) if !spec.applies_to.is_apps() => {
+            return Err(PolicyError::DefaultOutsideApps {
+                target: spec.applies_to,
+            });
+        }
         Some(default) => check_default(default)?,
         None if spec.deny.is_none() => return Err(PolicyError::NothingToDo),
         None => {}
@@ -314,6 +385,7 @@ fn check_default(default: &serde_json::Map<String, serde_json::Value>) -> Result
 /// uses. Returns the program, so evaluation compiles each expression once.
 pub(super) fn compile_checked(
     field: PolicyField,
+    target: PolicyTarget,
     expression: &str,
 ) -> Result<cel::Program, PolicyError> {
     if expression.trim().is_empty() {
@@ -333,54 +405,59 @@ pub(super) fn compile_checked(
                 field,
                 error: error.to_string(),
             })?;
-    check_names(field, program.expression(), &mut Vec::new())?;
+    check_names(field, target, program.expression(), &mut Vec::new())?;
     Ok(program)
 }
 
-/// Walk the expression, refusing a free variable a policy can't see and a
-/// field `app` or `caller` doesn't have. `bound` holds the variables the
+/// Walk the expression, refusing a free variable a policy that applies to
+/// `target` can't see and a field `app`, `job`, `workload` or `caller`
+/// doesn't have. `bound` holds the variables the
 /// enclosing comprehensions (`all`, `exists`, `map`, `filter`) introduce.
 fn check_names(
     field: PolicyField,
+    target: PolicyTarget,
     expression: &IdedExpr,
     bound: &mut Vec<String>,
 ) -> Result<(), PolicyError> {
     match &expression.expr {
         Expr::Unspecified | Expr::Literal(_) => Ok(()),
-        Expr::Ident(name) => check_variable(field, name, bound),
+        Expr::Ident(name) => check_variable(field, target, name, bound),
         Expr::Select(select) => {
+            // The variable first: `job.image` in an apps policy is the wrong
+            // variable, not a missing field.
+            check_names(field, target, &select.operand, bound)?;
             if let Expr::Ident(variable) = &select.operand.expr
                 && !bound.contains(variable)
             {
                 check_field(field, variable, &select.field)?;
             }
-            check_names(field, &select.operand, bound)
+            Ok(())
         }
         Expr::Call(call) => {
-            if let Some(target) = &call.target {
-                check_names(field, target, bound)?;
+            if let Some(call_target) = &call.target {
+                check_names(field, target, call_target, bound)?;
             }
             call.args
                 .iter()
-                .try_for_each(|argument| check_names(field, argument, bound))
+                .try_for_each(|argument| check_names(field, target, argument, bound))
         }
         Expr::List(list) => list
             .elements
             .iter()
-            .try_for_each(|element| check_names(field, element, bound)),
+            .try_for_each(|element| check_names(field, target, element, bound)),
         Expr::Map(map) => map
             .entries
             .iter()
-            .try_for_each(|entry| check_entry(field, &entry.expr, bound)),
+            .try_for_each(|entry| check_entry(field, target, &entry.expr, bound)),
         Expr::Struct(structure) => structure
             .entries
             .iter()
-            .try_for_each(|entry| check_entry(field, &entry.expr, bound)),
+            .try_for_each(|entry| check_entry(field, target, &entry.expr, bound)),
         Expr::Comprehension(comprehension) => {
             // The range and the accumulator's start are outside the loop;
             // everything else sees the loop's own variables.
-            check_names(field, &comprehension.iter_range, bound)?;
-            check_names(field, &comprehension.accu_init, bound)?;
+            check_names(field, target, &comprehension.iter_range, bound)?;
+            check_names(field, target, &comprehension.accu_init, bound)?;
             let depth = bound.len();
             bound.push(comprehension.iter_var.clone());
             bound.extend(comprehension.iter_var2.iter().cloned());
@@ -391,7 +468,7 @@ fn check_names(
                 &comprehension.result,
             ]
             .into_iter()
-            .try_for_each(|part| check_names(field, part, bound));
+            .try_for_each(|part| check_names(field, target, part, bound));
             bound.truncate(depth);
             inner
         }
@@ -400,21 +477,28 @@ fn check_names(
 
 fn check_entry(
     field: PolicyField,
+    target: PolicyTarget,
     entry: &EntryExpr,
     bound: &mut Vec<String>,
 ) -> Result<(), PolicyError> {
     match entry {
-        EntryExpr::StructField(structure) => check_names(field, &structure.value, bound),
+        EntryExpr::StructField(structure) => check_names(field, target, &structure.value, bound),
         EntryExpr::MapEntry(map) => {
-            check_names(field, &map.key, bound)?;
-            check_names(field, &map.value, bound)
+            check_names(field, target, &map.key, bound)?;
+            check_names(field, target, &map.value, bound)
         }
     }
 }
 
-fn check_variable(field: PolicyField, name: &str, bound: &[String]) -> Result<(), PolicyError> {
+fn check_variable(
+    field: PolicyField,
+    target: PolicyTarget,
+    name: &str,
+    bound: &[String],
+) -> Result<(), PolicyError> {
     if bound.iter().any(|variable| variable == name)
-        || POLICY_VARIABLES.contains(&name)
+        || CALLER_VARIABLES.contains(&name)
+        || workload_variables(target).contains(&name)
         || TYPE_NAMES.contains(&name)
     {
         return Ok(());
@@ -422,12 +506,18 @@ fn check_variable(field: PolicyField, name: &str, bound: &[String]) -> Result<()
     Err(PolicyError::UnknownVariable {
         field,
         variable: name.to_string(),
+        target,
     })
 }
+
+/// The variables every policy sees, whatever it applies to.
+const CALLER_VARIABLES: [&str; 2] = ["caller", "source"];
 
 fn check_field(field: PolicyField, variable: &str, name: &str) -> Result<(), PolicyError> {
     let known: &[&str] = match variable {
         "app" => &APP_FIELDS,
+        "job" => &JOB_FIELDS,
+        "workload" => &WORKLOAD_FIELDS,
         "caller" => &CALLER_FIELDS,
         _ => return Ok(()),
     };

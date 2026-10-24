@@ -265,19 +265,37 @@ action = "warn"
 expressions, the language Kubernetes uses for ValidatingAdmissionPolicy. When
 `match` is true (or absent) and `deny` is true, the apply is refused with
 `message`. With `action = "warn"` it goes ahead, and `relish apply` prints the
-warning. Without a `message`, the refusal says which policy it broke.
+warning. With `action = "audit"` it goes ahead without a word to the caller,
+and the finding is recorded in the audit log as `policy.audited`. Without a
+`message`, the refusal says which policy it broke.
 
 An expression sees three things and nothing else:
 
 | Name | What it holds |
 |------|---------------|
 | `app` | The app's spec as you wrote it, every `[app.*]` field, plus `app.name` and `app.namespace` (`default` when the app names none). A field you didn't set is absent: test it with `has(app.memory)` |
+| `job` | The same for a job, every `[job.*]` field plus `job.name` and `job.namespace`, in a policy that applies to jobs |
+| `workload` | The app or job, with only the fields both have: `name`, `namespace`, `image`, `command`, `exec`, `script`, `memory`, `cpu`, `env`, `firewall` and `egress` |
 | `caller` | `caller.name`, the token's name, and `caller.role`: `admin`, `deployer`, `read-only`, or `system` for a GitOps sync |
 | `source` | `apply` or `gitops` |
 
-Policies judge apps, not jobs, and never other policies, permissions or
-namespaces. They judge an app when it's applied: a new policy doesn't touch
-apps already running.
+A policy judges apps unless it says otherwise. `applies_to` chooses:
+
+```toml
+[policy.pinned-jobs]
+applies_to = "jobs"            # apps (the default), jobs or both
+deny = "job.image.endsWith(':latest')"
+
+[policy.no-latest-anywhere]
+applies_to = "both"
+deny = "workload.image.endsWith(':latest')"
+```
+
+An apps policy sees `app` and `workload`, a jobs policy `job` and `workload`,
+and a policy for both only `workload`. Policies never judge other policies,
+permissions or namespaces. They judge a workload when it's applied: a new
+policy doesn't touch apps or jobs already running. `relish policy audit`
+shows which of them it would refuse.
 
 The cluster checks a policy when you apply it, and refuses one that:
 
@@ -289,6 +307,10 @@ The cluster checks a policy when you apply it, and refuses one that:
   `permission` or `namespaces`;
 - reads a field `app` or `caller` doesn't have (`app.memroy`);
 - has neither a `deny` nor a `default`;
+- reads a workload variable its `applies_to` doesn't give it (`job` in an
+  apps policy, `app` in a policy for both), or a `workload` field apps and
+  jobs don't share;
+- has a `default` but doesn't apply to apps only;
 - has a `default` that's empty or over 4096 bytes, names a field an app
   doesn't have (`memroy`, `deploy.max_unavaliable`) or one a default can't
   fill (`namespace`, `replicas`, `sidecar`, `owner`, and the fields your
@@ -316,16 +338,50 @@ policies: an app a policy refuses is named in the sync's partial result, and
 the rest of the commit still applies.
 
 ```sh
-relish policy list                       # every policy, its action and who wrote it
+relish policy list                       # every policy, its action, what it applies to and who wrote it
+relish policy audit                      # committed apps and jobs the policies would now refuse
 relish policy delete no-latest           # admin only; always works
 relish policy test -f policies.toml -f apps.toml
 relish policy test -f policies.toml -f apps.toml --source gitops
 ```
 
-`relish policy test` judges the apps in the files by the policies in the
-files, offline, with the same code the cluster runs, and exits non-zero when
-an apply would be refused. Run it in CI. `--caller` and `--role` set what
+`relish policy test` judges the apps and jobs in the files by the policies in
+the files, offline, with the same code the cluster runs, and exits non-zero
+when an apply would be refused. Run it in CI. `--caller` and `--role` set what
 `caller` holds.
+
+### Auditing running work
+
+A policy judges apps and jobs as they're applied, so a new one never stops
+anything already running. `relish policy audit` answers what it leaves open:
+which committed apps and jobs would the policies in force refuse, warn about
+or record, if they were applied again now?
+
+```console
+$ relish policy audit
+Checked 2 app(s) and 1 job(s) against 3 policy(ies) at generation 7.
+
+  DENY   app default/web      no-latest     pin a version
+  DENY   job default/nightly  no-latest     pin a version
+  AUDIT  app default/web      limits        breaks policy limits
+
+2 denial(s), 0 warning(s), 1 audit finding(s). Nothing was changed: each runs as it is until it's next applied.
+```
+
+It changes nothing and exits zero whatever it finds. Each app is judged as
+its next apply would be: the spec you declared, with the defaults filled in.
+An app a controller owns is judged as the controller's token, with that
+token's role, from `apply`, since only that token writes it (see
+`writing-a-controller`). An app GitOps owns is judged as a GitOps sync, and
+everything else as the cluster's own caller `audit`, role `system`, from
+`apply`; so is a controller-owned app whose token is gone. Jobs are judged from
+the definitions the cluster keeps, which are scheduled jobs and deployment
+hooks; a one-off job's definition goes once its runs are pruned. `relish wtf` shows the same
+denials and audit findings as warnings.
+
+`action = "audit"` is the way to roll out a strict policy: commit it as
+`audit`, watch `relish policy audit` until nothing breaks it, then change it to
+`deny`.
 
 A policy never judges a policy, so `relish policy delete` works even when a
 broken policy refuses every app. A policy GitOps wrote comes back on the next

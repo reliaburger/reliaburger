@@ -957,6 +957,29 @@ evaluates one.
   `runtime`), and a value serde won't read back into `AppSpec`. The token
   gates run on the declared spec, before policy, so a default must not be
   able to add what they'd have refused.
+- **Jobs and audit (#1119).** `PolicySpec::applies_to` is `apps` (the default,
+  so every earlier policy keeps its meaning), `jobs` or `both`. An expression
+  sees `app` or `job` by the workload's kind, plus `workload`, bound to the
+  same value; a policy may only name the variables its target gives it, and
+  `workload` only has the fields in `WORKLOAD_FIELDS`, the intersection of
+  `APP_FIELDS` and `JOB_FIELDS` (a test keeps both lists honest against
+  serde). `judge_job` evaluates denies only: a `default` belongs to an apps
+  policy. `evaluate` judges a config's apps then its jobs, `admit` judges
+  both, and `job_apply` calls it whenever a manifest has apps or jobs; job
+  writes stay unfenced, like the apps of a job manifest. `Finding` carries a
+  `WorkloadKind` and names the workload (`policy p denies job ns/name: …`).
+  `PolicyAction::Audit` puts a finding in `Verdict::audits`: the apply goes
+  ahead, the caller isn't told, and `cluster_apply` and `job_apply` record one
+  `policy.audited` event; the GitOps runner logs it to stderr. `GET
+  /v1/policies/audit` (any token) runs `policy::audit::audit` on a copy of
+  desired state in `spawn_blocking`: every committed app (declared spec where
+  kept, else the stored one with its image read back as its tag) through
+  `judge_app`, as the owner's token (with its role) for apps a controller
+  owns (#1125), as `gitops` for apps GitOps owns and as the system caller
+  `audit` otherwise, including an owned app whose token is gone, and every job definition (schedule restored, image read
+  back) through `judge_job`. It changes nothing. `relish policy audit` prints
+  it, and `relish wtf` reads it into a `policies` evidence row
+  (`policy-would-deny`, `policy-audit`, `policy-broken`).
 
 ---
 

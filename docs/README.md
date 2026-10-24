@@ -1427,7 +1427,9 @@ authenticated client identity. It diagnoses node and council health,
 crashloops, stalled deploys, missing service backends, active faults and alerts,
 disk pressure, actual cgroup throttling, certificate lifecycle, Pickle
 redundancy and version skew (each node's bun version, commit and binary
-SHA-256; a warning names nodes on a different build). Use `--app <name>` for application scope or `--watch` for a
+SHA-256; a warning names nodes on a different build), and the committed apps
+and jobs the cluster's policies would now refuse (`relish policy audit` *(0.2.2, not in 0.2.1)* lists
+the same). Use `--app <name>` for application scope or `--watch` for a
 human refresh every 30 seconds (`--interval <secs>` changes the period). JSON and YAML use schema version 1. Exit status 0 means
 all selected evidence was observed and healthy, 1 means a critical finding,
 and 2 means warnings or unknown evidence. Bounded in-memory restart and deploy

@@ -2963,6 +2963,12 @@ impl BunClient {
         self.get_typed_json("/v1/policies").await
     }
 
+    /// What the policies in force would now say about every committed app
+    /// and job (`GET /v1/policies/audit`, #1119).
+    pub async fn policy_audit(&self) -> Result<crate::policy::audit::PolicyAudit, RelishError> {
+        self.get_typed_json("/v1/policies/audit").await
+    }
+
     /// Delete a policy (admin only).
     pub async fn delete_policy(&self, name: &str) -> Result<(), RelishError> {
         let name: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();

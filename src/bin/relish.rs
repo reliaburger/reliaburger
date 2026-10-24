@@ -876,7 +876,7 @@ enum Command {
         #[command(subcommand)]
         action: GitopsAction,
     },
-    /// List or delete the cluster's policies, or test policies offline.
+    /// List, audit or delete the cluster's policies, or test policies offline.
     Policy {
         #[command(subcommand)]
         action: PolicyAction,
@@ -1327,8 +1327,13 @@ enum PolicyAction {
         /// The policy's name.
         name: String,
     },
-    /// Judge the apps in some files by the policies in them, offline, the
-    /// way the cluster would. Exits non-zero when an apply would be refused.
+    /// List the committed apps and jobs the cluster's policies would now
+    /// refuse, warn about or record. Changes nothing: a new policy never
+    /// touches running work.
+    Audit,
+    /// Judge the apps and jobs in some files by the policies in them,
+    /// offline, the way the cluster would. Exits non-zero when an apply
+    /// would be refused.
     Test {
         /// A TOML file of policies, apps or both. Repeat for more files.
         #[arg(short = 'f', long = "file", required = true)]
@@ -2393,6 +2398,7 @@ async fn main() -> ExitCode {
         },
         Command::Policy { action } => match &action {
             PolicyAction::List => reliaburger::relish::policy_cmd::policy_list(cli.output).await,
+            PolicyAction::Audit => reliaburger::relish::policy_cmd::policy_audit(cli.output).await,
             PolicyAction::Delete { name } => {
                 reliaburger::relish::policy_cmd::policy_delete(name).await
             }

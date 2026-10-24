@@ -247,6 +247,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // Policies (#1117): anyone may read them; deleting one is an Admin
     // operation, like writing one through `relish apply`.
     route(Get, "/v1/policies", AnyToken),
+    route(Get, "/v1/policies/audit", AnyToken),
     gated(Post, "/v1/policies/{name}/delete", Admin, Cluster(ADMIN)),
     // Chaos.
     route(Post, "/v1/chaos/reserve", System),

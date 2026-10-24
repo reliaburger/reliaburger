@@ -214,7 +214,10 @@ async fn a_bad_policy_is_refused_at_apply() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains("policies see only app"), "{body}");
+    assert!(
+        body.contains("sees only app, workload, caller and source"),
+        "{body}"
+    );
     assert_eq!(cluster.council.desired_state().await.policy_generation, 0);
 }
 
@@ -246,6 +249,7 @@ async fn rejudging_refences_the_remaining_apps_or_names_the_new_denial() {
                 message: None,
                 action: crate::config::PolicyAction::Deny,
                 default: None,
+                applies_to: crate::config::PolicyTarget::Apps,
             }),
         })
         .await
@@ -321,4 +325,125 @@ async fn an_apply_fills_in_defaults_and_keeps_the_declared_spec() {
         "the app's own memory wins"
     );
     assert_eq!(desired.declared_apps[&web], declared.app["web"]);
+}
+
+impl Cluster {
+    async fn get(&self, uri: &str, bearer: &str) -> (StatusCode, String) {
+        let request = axum::http::Request::get(uri)
+            .header("authorization", format!("Bearer {bearer}"))
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.9:40000".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let response = self.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+/// #1119: a policy that applies to jobs refuses a job manifest, naming the
+/// job, before anything is written; the refusal is audited.
+#[tokio::test]
+async fn a_jobs_policy_refuses_a_job_manifest() {
+    let cluster = cluster("policy-jobs").await;
+    let (status, body) = cluster
+        .call(
+            "/v1/apply",
+            &cluster.admin,
+            "[policy.pinned]\napplies_to = 'jobs'\ndeny = \"job.image.endsWith(':latest')\"\nmessage = 'pin a version'\n",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = cluster
+        .call(
+            "/v1/apply",
+            &cluster.deployer,
+            "[job.nightly]\nimage = 'report:latest'\nschedule = '0 3 * * *'\n",
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let refusal: apply::PolicyRefusal = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        refusal.policy_denials,
+        vec!["policy pinned denies job default/nightly: pin a version".to_string()]
+    );
+    assert_eq!(cluster.records("policy.denied").await.len(), 1);
+    assert_eq!(
+        cluster
+            .council
+            .desired_state()
+            .await
+            .task_arrays
+            .jobs()
+            .definitions()
+            .count(),
+        0
+    );
+}
+
+/// #1119: an audit policy lets the apply through without a word to the
+/// caller, and records the finding in the audit log.
+#[tokio::test]
+async fn an_audit_policy_records_and_lets_the_apply_through() {
+    let cluster = cluster("policy-audit-action").await;
+    let (status, body) = cluster
+        .call(
+            "/v1/apply",
+            &cluster.admin,
+            "[policy.limits]\naction = 'audit'\ndeny = '!has(app.memory)'\nmessage = 'set a memory limit'\n",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = cluster
+        .call(
+            "/v1/apply",
+            &cluster.deployer,
+            "[app.web]\nimage = 'web:v1'\n",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("limits"), "the caller isn't told: {body}");
+    let audited = cluster.records("policy.audited").await;
+    assert_eq!(audited.len(), 1, "{audited:?}");
+    assert_eq!(audited[0].details["policies"], "limits");
+    assert!(
+        cluster
+            .council
+            .desired_state()
+            .await
+            .apps
+            .contains_key(&crate::meat::AppId::new("web", "default"))
+    );
+}
+
+/// #1119: a policy committed after an app never touches it. The audit
+/// route lists it as something the policy would now refuse, any token may
+/// read it, and nothing changes.
+#[tokio::test]
+async fn the_audit_lists_running_work_a_new_policy_would_refuse() {
+    let cluster = cluster("policy-audit-route").await;
+    let (status, body) = cluster
+        .call("/v1/apply", &cluster.deployer, LATEST_APP)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let web = crate::meat::AppId::new("web", "default");
+    let before = cluster.council.desired_state().await.apps[&web].clone();
+    cluster.apply_policy().await;
+
+    let (status, body) = cluster.get("/v1/policies/audit", &cluster.deployer).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let audit: crate::policy::audit::PolicyAudit = serde_json::from_str(&body).unwrap();
+    assert_eq!((audit.policies, audit.apps, audit.generation), (1, 1, 1));
+    assert_eq!(
+        audit
+            .verdict
+            .denials
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["policy no-latest denies app default/web: pin a version".to_string()]
+    );
+    assert_eq!(cluster.council.desired_state().await.apps[&web], before);
 }
