@@ -716,6 +716,11 @@ as their tags, for apps written before #1118). An adopted app is written
 with the effective spec, which keeps its declared one. A new or changed
 default reaches a GitOps app only when git changes that app.
 
+GitOps refuses jobs, so `applies_to = "jobs"` policies never meet a sync. An
+`action = "audit"` finding (#1119) doesn't refuse the app; the runner logs it
+as `gitops: audit: …`, and `relish policy audit` lists it for as long as the
+app breaks the rule, judging GitOps-owned apps as the caller `gitops`.
+
 ## 6. Configuration
 
 ### 6.1 Full Configuration Reference

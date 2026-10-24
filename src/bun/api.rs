@@ -116,7 +116,7 @@ use nodes::{
     MAX_RELAY_REQUEST_BYTES, cluster_elect_handler, council_handler, node_relay_handler,
     nodes_handler,
 };
-use policies::{policies_handler, policy_delete_handler};
+use policies::{policies_handler, policy_audit_handler, policy_delete_handler};
 use registry::{
     images_handler, registry_proposal_deadline, registry_proposal_handler, registry_query_handler,
 };
@@ -794,6 +794,7 @@ pub fn router_with_upgrade(
         .route("/v1/gitops", get(gitops_status_handler))
         .route("/v1/gitops/config", post(gitops_config_handler))
         .route("/v1/policies", get(policies_handler))
+        .route("/v1/policies/audit", get(policy_audit_handler))
         .route("/v1/policies/{name}/delete", post(policy_delete_handler))
         .route("/v1/nodes/decommission", post(node_decommission_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))

@@ -1053,6 +1053,7 @@ mod tests {
                     deny: Some("app.image.endsWith(':latest')".to_string()),
                     message: Some("pin a version".to_string()),
                     action: crate::config::PolicyAction::Warn,
+                    applies_to: crate::config::PolicyTarget::Both,
                     default: serde_json::json!({ "env": { "TEAM": "payments" } })
                         .as_object()
                         .cloned(),
