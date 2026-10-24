@@ -20,9 +20,12 @@ use reliaburger::council::log_store::MemLogStore;
 use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
 use reliaburger::council::node::CouncilNode;
 use reliaburger::council::state_machine::CouncilStateMachine;
-use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo, CouncilResponse, RaftRequest};
+use reliaburger::council::types::{
+    CouncilConfig, CouncilNodeInfo, CouncilResponse, RaftRequest, TypeConfig,
+};
 use reliaburger::lettuce::runner::spawn_gitops_sync;
 use reliaburger::lettuce::types::GitOpsConfig;
+use reliaburger::meat::task_array_store::TaskArrayWrite;
 use reliaburger::meat::types::AppId;
 use reliaburger::policy::{AdmitError, Caller, Source, admit};
 use reliaburger::sesame::types::ApiRole;
@@ -36,6 +39,13 @@ message = "pin a version"
 "#;
 
 pub(crate) async fn single_node_leader(id: u64) -> Arc<CouncilNode> {
+    single_node_leader_with_log(id).await.0
+}
+
+/// A one-voter council that leads, with a handle on its Raft log so a test
+/// can read the entries it holds.
+async fn single_node_leader_with_log(id: u64) -> (Arc<CouncilNode>, MemLogStore) {
+    let log_store = MemLogStore::new();
     let router = InMemoryRaftRouter::new();
     let network = InMemoryRaftNetworkFactory::new(id, router.clone());
     let node = CouncilNode::new(
@@ -48,7 +58,7 @@ pub(crate) async fn single_node_leader(id: u64) -> Arc<CouncilNode> {
             max_in_snapshot_log_to_keep: 50,
         },
         network,
-        MemLogStore::new(),
+        log_store.clone(),
         CouncilStateMachine::new(),
         None,
     )
@@ -70,7 +80,7 @@ pub(crate) async fn single_node_leader(id: u64) -> Arc<CouncilNode> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    node
+    (node, log_store)
 }
 
 pub(crate) async fn post_apply(
@@ -89,13 +99,28 @@ pub(crate) async fn post_apply(
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn last_log_index(council: &CouncilNode) -> Option<u64> {
-    council.metrics().borrow().last_log_index
+/// Every entry in the council's Raft log, oldest first.
+async fn log_entries(log_store: &MemLogStore) -> Vec<openraft::Entry<TypeConfig>> {
+    use openraft::storage::RaftLogReader;
+    log_store.clone().try_get_log_entries(..).await.unwrap()
+}
+
+/// Whether a log entry is the task-array leader loop's cron clock.
+///
+/// Building the API router spawns that loop, and it records the minute it
+/// has observed on its first tick and again each new minute, on its own
+/// timer. It's the one write in this council that no request makes.
+fn is_cron_observation(entry: &openraft::Entry<TypeConfig>) -> bool {
+    matches!(
+        &entry.payload,
+        openraft::EntryPayload::Normal(RaftRequest::TaskArray(write))
+            if matches!(**write, TaskArrayWrite::CronObserve { .. })
+    )
 }
 
 #[tokio::test]
 async fn a_denied_apply_leaves_no_raft_write_but_an_audit_entry() {
-    let council = single_node_leader(1).await;
+    let (council, log_store) = single_node_leader_with_log(1).await;
     let directory = tempfile::tempdir().unwrap();
     let log = AuditLog::open(
         directory.path().join("audit"),
@@ -126,7 +151,8 @@ async fn a_denied_apply_leaves_no_raft_write_but_an_audit_entry() {
     assert!(status.is_success(), "{status}: {body}");
     assert!(body.contains("policy no-latest: committed"), "{body}");
 
-    let before = last_log_index(&council);
+    // The policy's write has applied, so it's in the log already.
+    let before = log_entries(&log_store).await.len();
     let (status, body) = post_apply(&router, "[app.web]\nimage = 'web:latest'\n").await;
     assert_eq!(
         status,
@@ -138,7 +164,20 @@ async fn a_denied_apply_leaves_no_raft_write_but_an_audit_entry() {
         "{body}"
     );
 
-    assert_eq!(last_log_index(&council), before, "a denial writes nothing");
+    // Judged by what was written, not by how many entries: the router's
+    // task-array loop records the cron minute on its own timer, and that
+    // can land between any two reads of the log (#1329).
+    let written: Vec<_> = log_entries(&log_store)
+        .await
+        .into_iter()
+        .skip(before)
+        .filter(|entry| !is_cron_observation(entry))
+        .map(|entry| match entry.payload {
+            openraft::EntryPayload::Normal(request) => format!("{}: {request:?}", entry.log_id),
+            other => format!("{}: {other:?}", entry.log_id),
+        })
+        .collect();
+    assert!(written.is_empty(), "a denial writes nothing: {written:?}");
     assert!(council.desired_state().await.apps.is_empty());
     let denied = log
         .query(AuditFilter {
