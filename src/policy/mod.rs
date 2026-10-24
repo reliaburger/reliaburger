@@ -1,9 +1,15 @@
 //! Policies in the council: `[policy.*]` deny and warn rules (#1117).
 //!
 //! A policy is two CEL expressions: `match` picks the apps it applies to
-//! and `deny` says when to refuse one. This module holds the one pure
-//! function that evaluates them, [`evaluate`], and [`admit`], which wraps it
+//! and `deny` says when to refuse one. It can also carry a `default` table
+//! of fields to fill in where an app leaves them out (#1118). This module
+//! holds the one pure function that judges an app, [`judge_app`], with
+//! [`evaluate`] running it over a config, and [`admit`], which wraps it
 //! around the shared desired-state writes.
+//!
+//! Judging goes in a fixed order: every matching `default` in policy-name
+//! order, then the built-in app validation on the filled spec, then every
+//! `deny`. Nothing runs twice.
 //!
 //! The leader calls [`admit`] in `cluster_apply` and the Lettuce runner
 //! calls [`evaluate_app`], right before their writes, so `relish apply` and
@@ -18,6 +24,7 @@
 //! moved, so the apply evaluates again. Chapter 18 explains why.
 
 mod check;
+mod defaults;
 pub mod report;
 
 use std::collections::{BTreeMap, HashMap};
@@ -31,9 +38,10 @@ use crate::meat::types::AppId;
 use crate::sesame::types::ApiRole;
 
 pub use check::{
-    APP_FIELDS, CALLER_FIELDS, MAX_EXPRESSION_BYTES, MAX_MESSAGE_BYTES, POLICY_VARIABLES,
-    PolicyError, PolicyField, app_fields, check_policy,
+    APP_FIELDS, CALLER_FIELDS, MAX_DEFAULT_BYTES, MAX_EXPRESSION_BYTES, MAX_MESSAGE_BYTES,
+    POLICY_VARIABLES, PolicyError, PolicyField, UNFILLABLE_FIELDS, app_fields, check_policy,
 };
+pub use defaults::Filled;
 
 /// What `GET /v1/policies` answers: every policy, by name, and the
 /// generation the set is at.
@@ -202,6 +210,70 @@ pub struct Admitted {
     /// The policy generation the app writes are fenced on: the committed
     /// one, plus one for each policy this config writes before its apps.
     pub generation: u64,
+    /// Every field a policy default filled, in app order, then policy
+    /// name order.
+    pub filled: Vec<Filled>,
+    /// The apps a default changed, by identity: the spec as declared and
+    /// the spec to store.
+    pub defaulted: BTreeMap<AppId, DefaultedApp>,
+}
+
+/// An app a policy default changed (#1118).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DefaultedApp {
+    /// The spec as the config declared it. Stored beside the effective
+    /// one, so GitOps compares git with what git said, not with what the
+    /// policies added.
+    pub declared: AppSpec,
+    /// The spec with the defaults filled in: what runs.
+    pub effective: AppSpec,
+}
+
+/// What the policies made of one app: the spec to store, the fields the
+/// defaults filled in, and what the `deny` policies said.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Judgement {
+    /// The spec with every matching default filled in.
+    pub spec: AppSpec,
+    /// The fields filled, in policy name order.
+    pub filled: Vec<Filled>,
+    /// The denials and warnings, judged on `spec`.
+    pub verdict: Verdict,
+}
+
+/// What the policies made of a config's apps.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct Evaluation {
+    /// Each app with its defaults filled in, by its name in the config.
+    #[serde(skip)]
+    pub apps: BTreeMap<String, AppSpec>,
+    /// Every field filled, in app order, then policy name order.
+    pub filled: Vec<Filled>,
+    /// Every denial and warning.
+    #[serde(flatten)]
+    pub verdict: Verdict,
+}
+
+impl Evaluation {
+    /// The apps whose spec a default changed, by identity, with the spec
+    /// `config` declared beside the effective one.
+    pub fn defaulted(&self, config: &Config) -> BTreeMap<AppId, DefaultedApp> {
+        self.apps
+            .iter()
+            .filter_map(|(name, effective)| {
+                let declared = config.app.get(name)?;
+                (declared != effective).then(|| {
+                    (
+                        app_id_of(name, declared),
+                        DefaultedApp {
+                            declared: declared.clone(),
+                            effective: effective.clone(),
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
 }
 
 /// One compiled policy.
@@ -210,7 +282,8 @@ struct CompiledPolicy {
     action: PolicyAction,
     message: Option<String>,
     match_program: Option<Program>,
-    deny_program: Program,
+    deny_program: Option<Program>,
+    default: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A set of policies compiled once, ready to evaluate against many apps.
@@ -259,14 +332,19 @@ impl PolicySet {
                 .map(|expression| check::compile_checked(PolicyField::Match, expression))
                 .transpose()
                 .map_err(broken(name))?;
-            let deny_program =
-                check::compile_checked(PolicyField::Deny, &spec.deny).map_err(broken(name))?;
+            let deny_program = spec
+                .deny
+                .as_deref()
+                .map(|expression| check::compile_checked(PolicyField::Deny, expression))
+                .transpose()
+                .map_err(broken(name))?;
             policies.push(CompiledPolicy {
                 name: name.clone(),
                 action: spec.action,
                 message: spec.message.clone(),
                 match_program,
                 deny_program,
+                default: spec.default.clone(),
             });
         }
         Ok(PolicySet {
@@ -298,19 +376,12 @@ pub fn evaluate_app(
     if set.is_empty() {
         return verdict;
     }
-    let mut context = Context::with_env(Arc::clone(&set.environment));
-    context.add_variable_from_value("app", app_value(app_id, spec));
-    context.add_variable_from_value(
-        "caller",
-        HashMap::from([
-            ("name".to_string(), Value::from(caller.name.clone())),
-            ("role".to_string(), Value::from(caller.role_name())),
-        ]),
-    );
-    context.add_variable_from_value("source", source.as_str());
-
+    let context = policy_context(set, app_id, spec, caller, source);
     for policy in &set.policies {
-        let broken = match decide(policy, &context) {
+        let Some(deny_program) = &policy.deny_program else {
+            continue;
+        };
+        let broken = match decide(policy, deny_program, &context) {
             Ok(false) => continue,
             Ok(true) => None,
             Err(reason) => Some(reason),
@@ -336,15 +407,115 @@ pub fn evaluate_app(
     verdict
 }
 
+/// The variables an expression sees for one app: `app`, `caller` and
+/// `source`.
+fn policy_context(
+    set: &PolicySet,
+    app_id: &AppId,
+    spec: &AppSpec,
+    caller: &Caller,
+    source: Source,
+) -> Context<'static, 'static> {
+    let mut context = Context::with_env(Arc::clone(&set.environment));
+    context.add_variable_from_value("app", app_value(app_id, spec));
+    context.add_variable_from_value(
+        "caller",
+        HashMap::from([
+            ("name".to_string(), Value::from(caller.name.clone())),
+            ("role".to_string(), Value::from(caller.role_name())),
+        ]),
+    );
+    context.add_variable_from_value("source", source.as_str());
+    context
+}
+
 /// Whether `policy` applies to the app in `context` and its rule is
 /// broken, or why that couldn't be decided.
-fn decide(policy: &CompiledPolicy, context: &Context) -> Result<bool, String> {
-    if let Some(program) = &policy.match_program
-        && !run(PolicyField::Match, program, context)?
-    {
+fn decide(policy: &CompiledPolicy, deny: &Program, context: &Context) -> Result<bool, String> {
+    if !matches(policy, context)? {
         return Ok(false);
     }
-    run(PolicyField::Deny, &policy.deny_program, context)
+    run(PolicyField::Deny, deny, context)
+}
+
+/// Whether `policy` applies to the app in `context`: its `match` is
+/// absent or true.
+fn matches(policy: &CompiledPolicy, context: &Context) -> Result<bool, String> {
+    match &policy.match_program {
+        Some(program) => run(PolicyField::Match, program, context),
+        None => Ok(true),
+    }
+}
+
+/// Judge one app: fill in every matching policy's `default`, in policy
+/// name order, then run the built-in app validation on the filled spec,
+/// then every `deny` on it.
+///
+/// Each policy's `match` sees the spec as the policies before it left it.
+/// A default fills only fields the spec leaves out, so a value the app
+/// sets always survives. A default that can't be applied, or a `match`
+/// that can't be evaluated, refuses the app: it fails closed, as a broken
+/// `deny` does. So does a filled spec that fails validation, naming the
+/// policies that filled it.
+pub fn judge_app(
+    set: &PolicySet,
+    app_id: &AppId,
+    declared: &AppSpec,
+    caller: &Caller,
+    source: Source,
+) -> Judgement {
+    let mut spec = declared.clone();
+    let mut filled: Vec<Filled> = Vec::new();
+    let mut verdict = Verdict::default();
+    for policy in &set.policies {
+        let Some(default) = &policy.default else {
+            continue;
+        };
+        let context = policy_context(set, app_id, &spec, caller, source);
+        let outcome = match matches(policy, &context) {
+            Ok(true) => defaults::apply_default(&spec, default)
+                .map(Some)
+                .map_err(|reason| format!("its default couldn't be filled in: {reason}")),
+            Ok(false) => Ok(None),
+            Err(reason) => Err(format!("couldn't evaluate: {reason}")),
+        };
+        match outcome {
+            Ok(Some((next, fields))) => {
+                spec = next;
+                filled.extend(fields.into_iter().map(|(field, value)| Filled {
+                    policy: policy.name.clone(),
+                    app: app_id.clone(),
+                    field,
+                    value,
+                }));
+            }
+            Ok(None) => {}
+            Err(message) => verdict.denials.push(Finding {
+                policy: policy.name.clone(),
+                action: PolicyAction::Deny,
+                app: app_id.clone(),
+                message,
+            }),
+        }
+    }
+    if !filled.is_empty()
+        && let Err(error) = crate::config::validate_app_spec(&app_id.name, &spec)
+    {
+        let mut policies: Vec<&str> = filled.iter().map(|fill| fill.policy.as_str()).collect();
+        policies.dedup();
+        verdict.denials.push(Finding {
+            policy: policies.join(","),
+            action: PolicyAction::Deny,
+            app: app_id.clone(),
+            message: format!("the app isn't valid once its defaults are filled in: {error}"),
+        });
+    }
+    verdict.extend(evaluate_app(set, app_id, &spec, caller, source));
+    Judgement {
+        spec,
+        filled,
+        verdict,
+    }
 }
 
 fn run(field: PolicyField, program: &Program, context: &Context) -> Result<bool, String> {
@@ -403,19 +574,16 @@ fn app_id_of(name: &str, spec: &AppSpec) -> AppId {
     AppId::new(name, spec.namespace.as_deref().unwrap_or("default"))
 }
 
-/// Evaluate `set` against every app in `config`, in name order.
-pub fn evaluate(set: &PolicySet, config: &Config, caller: &Caller, source: Source) -> Verdict {
-    let mut verdict = Verdict::default();
+/// Judge every app in `config` by `set`, in name order.
+pub fn evaluate(set: &PolicySet, config: &Config, caller: &Caller, source: Source) -> Evaluation {
+    let mut evaluation = Evaluation::default();
     for (name, spec) in &config.app {
-        verdict.extend(evaluate_app(
-            set,
-            &app_id_of(name, spec),
-            spec,
-            caller,
-            source,
-        ));
+        let judgement = judge_app(set, &app_id_of(name, spec), spec, caller, source);
+        evaluation.apps.insert(name.clone(), judgement.spec);
+        evaluation.filled.extend(judgement.filled);
+        evaluation.verdict.extend(judgement.verdict);
     }
-    verdict
+    evaluation
 }
 
 /// The policies an apply of `config` runs under: the committed ones, with
@@ -440,11 +608,13 @@ pub fn effective_policies(
 /// `committed` and `generation` are the policies in force and their
 /// generation, read together from desired state; `writes` are the config's
 /// desired-state writes (`config_to_desired_writes`, or the leased ones).
-/// The config's apps are evaluated under [`effective_policies`]. A denial
-/// returns no writes at all. Otherwise every app write is wrapped in
+/// The config's apps are judged under [`effective_policies`]. A denial
+/// returns no writes at all. Otherwise each app write carries the app's
+/// spec with its defaults filled in, and is wrapped in
 /// `RaftRequest::PolicyFenced`, stamped with the generation desired state
 /// will have once this config's policy writes, which come first, have
-/// applied: each policy write moves it by one.
+/// applied: each policy write moves it by one. A defaulted app's fence
+/// also carries the spec as declared.
 pub fn admit(
     committed: &BTreeMap<String, PolicySpec>,
     generation: u64,
@@ -453,40 +623,90 @@ pub fn admit(
     source: Source,
     writes: Vec<RaftRequest>,
 ) -> Result<Admitted, AdmitError> {
-    let mut warnings = Vec::new();
+    let mut evaluation = Evaluation::default();
     if !config.app.is_empty() {
         let set = PolicySet::compile(&effective_policies(committed, config))?;
-        let verdict = evaluate(&set, config, caller, source);
-        if !verdict.is_allowed() {
+        evaluation = evaluate(&set, config, caller, source);
+        if !evaluation.verdict.is_allowed() {
             return Err(AdmitError::Denied(Denied {
-                denials: verdict.denials,
-                warnings: verdict.warnings,
+                denials: evaluation.verdict.denials,
+                warnings: evaluation.verdict.warnings,
             }));
         }
-        warnings = verdict.warnings;
     }
     let generation = generation.saturating_add(config.policy.len() as u64);
+    let defaulted = evaluation.defaulted(config);
     Ok(Admitted {
-        writes: fence(writes, generation),
-        warnings,
+        writes: fence(
+            with_defaults(writes, &defaulted),
+            generation,
+            &declared_apps(config),
+        ),
+        warnings: evaluation.verdict.warnings,
         generation,
+        filled: evaluation.filled,
+        defaulted,
     })
+}
+
+/// `writes` with each defaulted app's spec replaced by its effective one.
+fn with_defaults(
+    writes: Vec<RaftRequest>,
+    defaulted: &BTreeMap<AppId, DefaultedApp>,
+) -> Vec<RaftRequest> {
+    writes
+        .into_iter()
+        .map(|mut write| {
+            if let RaftRequest::AppSpec { app_id, spec }
+            | RaftRequest::TestLeaseAppSpec { app_id, spec, .. } = &mut write
+                && let Some(app) = defaulted.get(app_id)
+            {
+                **spec = app.effective.clone();
+            }
+            write
+        })
+        .collect()
 }
 
 /// Wrap every app write in `writes` in a policy fence at `generation`.
 /// Other writes pass through unchanged: only apps are judged by policy.
-pub fn fence(writes: Vec<RaftRequest>, generation: u64) -> Vec<RaftRequest> {
+///
+/// `declared` holds each app's spec as its config declared it. When the
+/// spec a write stores differs from that, because a policy default filled
+/// fields in or an image was bound to a digest, the fence carries the
+/// declared spec, so the cluster keeps it beside the stored one (#1118).
+pub fn fence(
+    writes: Vec<RaftRequest>,
+    generation: u64,
+    declared: &BTreeMap<AppId, AppSpec>,
+) -> Vec<RaftRequest> {
     writes
         .into_iter()
-        .map(|write| match write {
-            RaftRequest::AppSpec { .. } | RaftRequest::TestLeaseAppSpec { .. } => {
+        .map(|write| match &write {
+            RaftRequest::AppSpec { app_id, spec }
+            | RaftRequest::TestLeaseAppSpec { app_id, spec, .. } => {
+                let declared = declared
+                    .get(app_id)
+                    .filter(|declared| *declared != spec.as_ref())
+                    .map(|declared| Box::new(declared.clone()));
                 RaftRequest::PolicyFenced {
                     generation,
                     change: Box::new(write),
+                    declared,
                 }
             }
-            other => other,
+            _ => write,
         })
+        .collect()
+}
+
+/// Each app in `config` by identity, as declared: what [`fence`] compares
+/// a write's spec with.
+pub fn declared_apps(config: &Config) -> BTreeMap<AppId, AppSpec> {
+    config
+        .app
+        .iter()
+        .map(|(name, spec)| (app_id_of(name, spec), spec.clone()))
         .collect()
 }
 

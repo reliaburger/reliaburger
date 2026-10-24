@@ -82,7 +82,9 @@ sync writes it. Claiming or releasing changes who manages the app, not what
 runs, so neither restarts an instance or starts a rollout. A rollback keeps
 the app's current owner.
 
-Policies see the owner as `app.owner`, so a platform team can, for example,
+A policy's `default` can't fill in `owner`: claiming an app is for the
+controller's token or an admin, and a default would claim it for everyone who
+applies. Policies see the owner as `app.owner`, so a platform team can, for example,
 insist that only the database controller writes apps in `pg`:
 
 ```toml

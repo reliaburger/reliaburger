@@ -152,7 +152,7 @@ fn the_decision_table() {
         };
         let set = compile(&policy_toml);
         let config = apps(&format!("[app.web]\n{app}\n"));
-        let verdict = evaluate(&set, &config, &deployer(), Source::Apply);
+        let verdict = evaluate(&set, &config, &deployer(), Source::Apply).verdict;
         let got: Vec<Decision> = decisions(&verdict)
             .into_iter()
             .map(|(policy, action, _)| (policy, action))
@@ -168,7 +168,7 @@ fn the_decision_table() {
 fn a_denial_carries_the_policy_message_or_names_the_policy() {
     let set = compile(LIMITS_AND_LATEST);
     let config = apps("[app.web]\nimage = 'web:latest'\nnamespace = 'prod'\n");
-    let verdict = evaluate(&set, &config, &deployer(), Source::Apply);
+    let verdict = evaluate(&set, &config, &deployer(), Source::Apply).verdict;
     assert_eq!(verdict.denials.len(), 1);
     assert_eq!(
         verdict.denials[0].message,
@@ -190,7 +190,8 @@ fn a_failed_evaluation_says_why() {
         &apps("[app.web]\nimage = 'w:1'\n"),
         &deployer(),
         Source::Apply,
-    );
+    )
+    .verdict;
     assert!(
         verdict.denials[0]
             .message
@@ -205,8 +206,16 @@ fn a_gitops_sync_is_the_system_caller() {
         "[policy.rule]\ndeny = \"caller.role == 'system' && caller.name == 'gitops' && source == 'gitops'\"\n",
     );
     let config = apps("[app.web]\nimage = 'w:1'\n");
-    assert!(!evaluate(&set, &config, &Caller::gitops(), Source::GitOps).is_allowed());
-    assert!(evaluate(&set, &config, &deployer(), Source::Apply).is_allowed());
+    assert!(
+        !evaluate(&set, &config, &Caller::gitops(), Source::GitOps)
+            .verdict
+            .is_allowed()
+    );
+    assert!(
+        evaluate(&set, &config, &deployer(), Source::Apply)
+            .verdict
+            .is_allowed()
+    );
 }
 
 /// #1125: a policy sees an app's `owner`, so a platform team can say, for
@@ -220,8 +229,16 @@ fn a_policy_sees_the_owner() {
     let owned = apps("[app.db]\nimage = 'pg:17'\nnamespace = 'pg'\nowner = 'pg-failover'\n");
     let unowned = apps("[app.db]\nimage = 'pg:17'\nnamespace = 'pg'\n");
     let controller = Caller::token("pg-failover", ApiRole::Deployer);
-    assert!(evaluate(&set, &owned, &controller, Source::Apply).is_allowed());
-    assert!(!evaluate(&set, &unowned, &deployer(), Source::Apply).is_allowed());
+    assert!(
+        evaluate(&set, &owned, &controller, Source::Apply)
+            .verdict
+            .is_allowed()
+    );
+    assert!(
+        !evaluate(&set, &unowned, &deployer(), Source::Apply)
+            .verdict
+            .is_allowed()
+    );
 }
 
 /// Every category of bad policy is refused when it's committed.
@@ -345,9 +362,10 @@ fn every_kind_of_bad_policy_is_refused_at_commit() {
 fn spec(match_expression: Option<&str>, deny: &str) -> PolicySpec {
     PolicySpec {
         match_expression: match_expression.map(str::to_string),
-        deny: deny.to_string(),
+        deny: Some(deny.to_string()),
         message: None,
         action: PolicyAction::Deny,
+        default: None,
     }
 }
 
@@ -420,7 +438,9 @@ fn admit_fences_app_writes_on_the_generation_after_its_own_policies() {
     ));
     assert!(matches!(admitted.writes[1], RaftRequest::PolicySpec { .. }));
     match &admitted.writes[2] {
-        RaftRequest::PolicyFenced { generation, change } => {
+        RaftRequest::PolicyFenced {
+            generation, change, ..
+        } => {
             assert_eq!(*generation, 42);
             assert!(matches!(change.as_ref(), RaftRequest::AppSpec { .. }));
         }
@@ -496,7 +516,7 @@ fn fence_leaves_everything_but_apps_alone() {
             spec: Box::new(apps("[app.web]\nimage = 'w:1'\n").app["web"].clone()),
         },
     ];
-    let fenced = fence(writes, 9);
+    let fenced = fence(writes, 9, &BTreeMap::new());
     assert!(matches!(fenced[0], RaftRequest::NamespaceDelete { .. }));
     assert!(matches!(
         fenced[1],
@@ -518,16 +538,16 @@ fn the_test_report_lists_every_finding_and_the_outcome() {
         memory = "256Mi"
         "#,
     );
-    let verdict = evaluate(&set, &config, &deployer(), Source::Apply);
-    insta::assert_snapshot!(report::render_test(&verdict, 2, 2));
+    let evaluation = evaluate(&set, &config, &deployer(), Source::Apply);
+    insta::assert_snapshot!(report::render_test(&evaluation, 2, 2));
 }
 
 #[test]
 fn the_test_report_for_a_clean_config() {
     let set = compile(LIMITS_AND_LATEST);
     let config = apps("[app.web]\nimage = 'web:v1'\n");
-    let verdict = evaluate(&set, &config, &deployer(), Source::Apply);
-    insta::assert_snapshot!(report::render_test(&verdict, 1, 2));
+    let evaluation = evaluate(&set, &config, &deployer(), Source::Apply);
+    insta::assert_snapshot!(report::render_test(&evaluation, 1, 2));
 }
 
 /// An app for the property tests: a name, a namespace and an image tag,
@@ -630,15 +650,510 @@ proptest! {
             &config,
             &deployer(),
             Source::Apply,
-        );
+        ).verdict;
         for set in [&shuffled, &from_hash] {
             let verdict = evaluate(
                 &PolicySet::compile(set).unwrap(),
                 &config,
                 &deployer(),
                 Source::Apply,
-            );
+            ).verdict;
             prop_assert_eq!(&verdict, &expected);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fill-only defaults (#1118)
+// ---------------------------------------------------------------------------
+
+const TEAM_LABEL: &str = r#"
+[policy.team-label]
+match = "app.namespace == 'payments'"
+
+[policy.team-label.default]
+env.TEAM = "payments"
+deploy.max_unavailable = 1
+"#;
+
+/// A filled field as `(policy, field, value)`.
+type Fill = (String, String, String);
+
+/// The filled fields as `(policy, field, value)` triples.
+fn fills(filled: &[Filled]) -> Vec<Fill> {
+    filled
+        .iter()
+        .map(|fill| {
+            (
+                fill.policy.clone(),
+                fill.field.clone(),
+                fill.value.to_string(),
+            )
+        })
+        .collect()
+}
+
+fn judge(policies_toml: &str, app_toml: &str) -> Judgement {
+    let set = compile(policies_toml);
+    let config = apps(&format!("[app.web]\n{app_toml}\n"));
+    let spec = &config.app["web"];
+    judge_app(
+        &set,
+        &app_id_of("web", spec),
+        spec,
+        &deployer(),
+        Source::Apply,
+    )
+}
+
+/// The defaults table: one row per kind of fill.
+#[test]
+fn the_default_table() {
+    let fill = |policy: &str, field: &str, value: &str| {
+        (policy.to_string(), field.to_string(), value.to_string())
+    };
+    let rows: Vec<(&str, &str, Vec<Fill>)> = vec![
+        // A default fills a field the app leaves out, key by key.
+        (
+            TEAM_LABEL,
+            "image = 'w:1'\nnamespace = 'payments'",
+            vec![
+                fill("team-label", "deploy.max_unavailable", "1"),
+                fill("team-label", "env.TEAM", "\"payments\""),
+            ],
+        ),
+        // `match` decides, as it does for deny.
+        (TEAM_LABEL, "image = 'w:1'", vec![]),
+        // A value the app sets wins; its other keys are left alone.
+        (
+            TEAM_LABEL,
+            "image = 'w:1'\nnamespace = 'payments'\nenv = { TEAM = 'mine', OWNER = 'me' }\n[app.web.deploy]\nmax_unavailable = 3",
+            vec![],
+        ),
+        // An existing table gains only the keys it lacks.
+        (
+            TEAM_LABEL,
+            "image = 'w:1'\nnamespace = 'payments'\nenv = { OWNER = 'me' }\n[app.web.deploy]\nmax_surge = 2",
+            vec![
+                fill("team-label", "deploy.max_unavailable", "1"),
+                fill("team-label", "env.TEAM", "\"payments\""),
+            ],
+        ),
+        // Two defaults for one field: the first by name fills it.
+        (
+            "[policy.b-second.default]\nmemory = '1Gi'\n[policy.a-first.default]\nmemory = '256Mi'\n",
+            "image = 'w:1'",
+            vec![fill("a-first", "memory", "\"256Mi\"")],
+        ),
+        // A match sees what the policies before it filled.
+        (
+            "[policy.a-port.default]\nport = 8080\n[policy.b-health]\nmatch = 'has(app.port)'\n[policy.b-health.default]\nhealth = { path = '/healthz' }\n",
+            "image = 'w:1'",
+            vec![
+                fill("a-port", "port", "8080"),
+                fill("b-health", "health.path", "\"/healthz\""),
+            ],
+        ),
+    ];
+    for (policies_toml, app_toml, expected) in rows {
+        let judgement = judge(policies_toml, app_toml);
+        assert!(
+            judgement.verdict.is_allowed(),
+            "{app_toml}: {:?}",
+            judgement.verdict
+        );
+        assert_eq!(fills(&judgement.filled), expected, "{app_toml}");
+    }
+}
+
+#[test]
+fn a_filled_field_reads_as_the_policy_that_filled_it() {
+    let judgement = judge(TEAM_LABEL, "image = 'w:1'\nnamespace = 'payments'");
+    assert_eq!(
+        judgement.filled[1].to_string(),
+        "policy team-label fills env.TEAM = \"payments\" on app payments/web"
+    );
+    assert_eq!(
+        judgement.spec.env["TEAM"],
+        crate::config::EnvValue::Plain("payments".into())
+    );
+}
+
+/// Validation and every deny see the spec with its defaults filled in.
+#[test]
+fn deny_and_validation_see_the_filled_spec() {
+    let policies_toml = r#"
+        [policy.a-limits.default]
+        memory = "256Mi"
+        [policy.z-needs-limits]
+        deny = "!has(app.memory)"
+    "#;
+    assert!(judge(policies_toml, "image = 'w:1'").verdict.is_allowed());
+
+    // Port 0 has the right type, so it commits, but no app may use it.
+    let judgement = judge("[policy.zero.default]\nport = 0\n", "image = 'w:1'");
+    assert_eq!(judgement.verdict.denials.len(), 1);
+    let denial = &judgement.verdict.denials[0];
+    assert_eq!(denial.policy, "zero");
+    assert!(
+        denial
+            .message
+            .starts_with("the app isn't valid once its defaults are filled in"),
+        "{denial}"
+    );
+}
+
+#[test]
+fn a_policy_with_only_a_default_never_denies() {
+    let judgement = judge("[policy.fill.default]\nmemory = '256Mi'\n", "image = 'w:1'");
+    assert!(judgement.verdict.denials.is_empty());
+    assert!(judgement.verdict.warnings.is_empty());
+}
+
+/// Every category of bad `default` is refused when it's committed.
+#[test]
+fn every_kind_of_bad_default_is_refused_at_commit() {
+    let cases: Vec<(&str, ErrorCheck)> = vec![
+        ("[policy.rule]\nmatch = 'true'\n", |e| {
+            matches!(e, PolicyError::NothingToDo)
+        }),
+        ("[policy.rule]\ndefault = {}\n", |e| {
+            matches!(
+                e,
+                PolicyError::Empty {
+                    field: PolicyField::Default
+                }
+            )
+        }),
+        (
+            "[policy.rule.default]\nmemroy = '1Gi'\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "memroy"),
+        ),
+        (
+            "[policy.rule.default]\nnamespace = 'prod'\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "namespace"),
+        ),
+        (
+            "[policy.rule.default]\nreplicas = 3\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "replicas"),
+        ),
+        // A default never grants what the caller's token gates.
+        (
+            "[policy.rule.default]\nexec = '/bin/sh'\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "exec"),
+        ),
+        (
+            "[policy.rule.default]\nruntime.sysctls = { 'net.core.somaxconn' = '4096' }\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "runtime"),
+        ),
+        // Only the owner's token or an admin claims an app (#1125).
+        (
+            "[policy.rule.default]\nowner = 'db-failover'\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "owner"),
+        ),
+        (
+            "[policy.rule.default]\nsidecar = []\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "sidecar"),
+        ),
+        (
+            "[policy.rule.default]\ndeploy.max_unavaliable = 1\n",
+            |e| matches!(e, PolicyError::InvalidDefault { error } if error.contains("max_unavaliable")),
+        ),
+        ("[policy.rule.default]\nport = 'eighty'\n", |e| {
+            matches!(e, PolicyError::InvalidDefault { .. })
+        }),
+        ("[policy.rule.default]\nenv.TEAM = 7\n", |e| {
+            matches!(e, PolicyError::InvalidDefault { .. })
+        }),
+    ];
+    for (toml, expected) in cases {
+        let config: Config = toml::from_str(toml).unwrap();
+        let (name, policy) = config.policy.iter().next().unwrap();
+        let error = check_policy(name, policy).unwrap_err();
+        assert!(expected(&error), "{toml}: {error}");
+        assert!(config.validate().is_err(), "{toml}");
+    }
+    let huge = format!(
+        "[policy.rule.default]\nenv.BIG = '{}'\n",
+        "x".repeat(MAX_DEFAULT_BYTES)
+    );
+    let config: Config = toml::from_str(&huge).unwrap();
+    assert!(matches!(
+        check_policy("rule", &config.policy["rule"]),
+        Err(PolicyError::TooLong {
+            field: PolicyField::Default,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn admit_writes_the_filled_spec_and_fences_it_with_the_declared_one() {
+    let config = apps(&format!(
+        "{TEAM_LABEL}\n[app.web]\nimage = 'web:v1'\nnamespace = 'payments'\n[app.api]\nimage = 'api:v1'\n"
+    ));
+    let admitted = admit(
+        &BTreeMap::new(),
+        0,
+        &config,
+        &deployer(),
+        Source::Apply,
+        config_to_desired_writes(&config),
+    )
+    .unwrap();
+    let web = AppId::new("web", "payments");
+    assert_eq!(admitted.defaulted.len(), 1);
+    assert_eq!(admitted.defaulted[&web].declared, config.app["web"]);
+    assert_eq!(admitted.filled.len(), 2);
+    let mut fenced_apps = 0;
+    for write in &admitted.writes {
+        let RaftRequest::PolicyFenced {
+            change, declared, ..
+        } = write
+        else {
+            continue;
+        };
+        let RaftRequest::AppSpec { app_id, spec } = change.as_ref() else {
+            panic!("expected an app write, got {change:?}");
+        };
+        fenced_apps += 1;
+        if *app_id == web {
+            assert_eq!(
+                spec.env["TEAM"],
+                crate::config::EnvValue::Plain("payments".into())
+            );
+            assert_eq!(declared.as_deref(), Some(&config.app["web"]));
+        } else {
+            assert_eq!(declared, &None, "an app no default touched carries none");
+            assert!(spec.env.is_empty());
+        }
+    }
+    assert_eq!(fenced_apps, 2);
+}
+
+#[test]
+fn the_test_report_lists_filled_fields() {
+    let set = compile(&format!("{TEAM_LABEL}\n{LIMITS_AND_LATEST}"));
+    let config = apps(
+        r#"
+        [app.web]
+        image = "web:v1"
+        namespace = "payments"
+        "#,
+    );
+    let evaluation = evaluate(&set, &config, &deployer(), Source::Apply);
+    insta::assert_snapshot!(report::render_test(&evaluation, 1, 3));
+}
+
+/// An app for the default property tests: which of the fields the
+/// defaults name it sets itself.
+#[derive(Debug, Clone)]
+struct SometimesSet {
+    namespace: &'static str,
+    memory: Option<&'static str>,
+    team: Option<&'static str>,
+    owner: Option<&'static str>,
+    port: Option<u16>,
+    max_unavailable: Option<u32>,
+}
+
+fn sometimes_set() -> impl Strategy<Value = SometimesSet> {
+    (
+        prop_oneof![Just("default"), Just("payments")],
+        proptest::option::of(prop_oneof![Just("128Mi"), Just("2Gi")]),
+        proptest::option::of(prop_oneof![Just("mine"), Just("theirs")]),
+        proptest::option::of(Just("me")),
+        proptest::option::of(1u16..9000),
+        proptest::option::of(0u32..5),
+    )
+        .prop_map(
+            |(namespace, memory, team, owner, port, max_unavailable)| SometimesSet {
+                namespace,
+                memory,
+                team,
+                owner,
+                port,
+                max_unavailable,
+            },
+        )
+}
+
+fn app_from(app: &SometimesSet) -> AppSpec {
+    let mut toml = format!("image = 'w:1'\nnamespace = '{}'\n", app.namespace);
+    if let Some(memory) = app.memory {
+        toml.push_str(&format!("memory = '{memory}'\n"));
+    }
+    if let Some(port) = app.port {
+        toml.push_str(&format!("port = {port}\n"));
+    }
+    let env: Vec<String> = [("TEAM", app.team), ("OWNER", app.owner)]
+        .iter()
+        .filter_map(|(key, value)| value.map(|value| format!("{key} = '{value}'")))
+        .collect();
+    if !env.is_empty() {
+        toml.push_str(&format!("env = {{ {} }}\n", env.join(", ")));
+    }
+    if let Some(max_unavailable) = app.max_unavailable {
+        toml.push_str(&format!(
+            "deploy = {{ max_unavailable = {max_unavailable} }}\n"
+        ));
+    }
+    toml::from_str(&toml).unwrap()
+}
+
+/// Default policies that overlap on purpose: two fill `memory`, two fill
+/// `env.TEAM`, and some only match `payments`.
+const OVERLAPPING_DEFAULTS: [(&str, Option<&str>, &str); 4] = [
+    (
+        "a-team",
+        Some("app.namespace == 'payments'"),
+        "env.TEAM = 'payments'\ndeploy.max_unavailable = 1",
+    ),
+    ("b-limits", None, "memory = '256Mi'\nport = 8080"),
+    (
+        "c-other-team",
+        None,
+        "env.TEAM = 'platform'\nenv.OWNER = 'sre'",
+    ),
+    (
+        "d-big",
+        Some("app.namespace == 'payments'"),
+        "memory = '1Gi'",
+    ),
+];
+
+fn default_policy(match_expression: Option<&str>, default: &str) -> PolicySpec {
+    let table: toml::Table = toml::from_str(default).unwrap();
+    PolicySpec {
+        match_expression: match_expression.map(str::to_string),
+        deny: None,
+        message: None,
+        action: PolicyAction::Deny,
+        default: Some(
+            serde_json::to_value(table)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .clone(),
+        ),
+    }
+}
+
+/// Whether every value `declared` holds is in `effective`, unchanged.
+fn contained(declared: &serde_json::Value, effective: &serde_json::Value) -> bool {
+    match (declared, effective) {
+        (serde_json::Value::Object(declared), serde_json::Value::Object(effective)) => {
+            declared.iter().all(|(key, value)| {
+                value.is_null()
+                    || effective
+                        .get(key)
+                        .is_some_and(|kept| contained(value, kept))
+            })
+        }
+        _ => declared == effective,
+    }
+}
+
+proptest! {
+    /// Defaulting twice is defaulting once: the filled spec has nothing
+    /// left to fill.
+    #[test]
+    fn defaulting_is_idempotent(app in sometimes_set()) {
+        let specs: BTreeMap<String, PolicySpec> = OVERLAPPING_DEFAULTS
+            .iter()
+            .map(|(name, matching, default)| (name.to_string(), default_policy(*matching, default)))
+            .collect();
+        let set = PolicySet::compile(&specs).unwrap();
+        let declared = app_from(&app);
+        let app_id = app_id_of("web", &declared);
+        let once = judge_app(&set, &app_id, &declared, &deployer(), Source::Apply);
+        let twice = judge_app(&set, &app_id, &once.spec, &deployer(), Source::Apply);
+        prop_assert_eq!(&twice.spec, &once.spec);
+        prop_assert!(twice.filled.is_empty(), "{:?}", twice.filled);
+    }
+
+    /// A default never changes a field the user set: every value of the
+    /// declared spec is in the filled one, unchanged, and no field the
+    /// user set is reported as filled.
+    #[test]
+    fn a_default_never_changes_a_field_the_user_set(app in sometimes_set()) {
+        let specs: BTreeMap<String, PolicySpec> = OVERLAPPING_DEFAULTS
+            .iter()
+            .map(|(name, matching, default)| (name.to_string(), default_policy(*matching, default)))
+            .collect();
+        let set = PolicySet::compile(&specs).unwrap();
+        let declared = app_from(&app);
+        let judgement = judge_app(&set, &app_id_of("web", &declared), &declared, &deployer(), Source::Apply);
+        let declared_json = serde_json::to_value(&declared).unwrap();
+        let effective_json = serde_json::to_value(&judgement.spec).unwrap();
+        prop_assert!(contained(&declared_json, &effective_json), "{declared_json} vs {effective_json}");
+        for fill in &judgement.filled {
+            let path: Vec<&str> = fill.field.split('.').collect();
+            let user_value = path
+                .iter()
+                .try_fold(&declared_json, |value, key| value.get(*key));
+            prop_assert!(user_value.is_none_or(serde_json::Value::is_null), "{} was the user's", fill.field);
+        }
+    }
+
+    /// The filled spec doesn't depend on the order the policies were
+    /// declared or inserted in: they fill in name order.
+    #[test]
+    fn default_order_does_not_depend_on_map_order(
+        app in sometimes_set(),
+        order in Just(vec![0usize, 1, 2, 3]).prop_shuffle(),
+    ) {
+        let mut shuffled = BTreeMap::new();
+        let mut hashed = std::collections::HashMap::new();
+        for index in &order {
+            let (name, matching, default) = OVERLAPPING_DEFAULTS[*index];
+            shuffled.insert(name.to_string(), default_policy(matching, default));
+            hashed.insert(name.to_string(), default_policy(matching, default));
+        }
+        let in_order: BTreeMap<String, PolicySpec> = OVERLAPPING_DEFAULTS
+            .iter()
+            .map(|(name, matching, default)| (name.to_string(), default_policy(*matching, default)))
+            .collect();
+        let from_hash: BTreeMap<String, PolicySpec> = hashed.into_iter().collect();
+        let declared = app_from(&app);
+        let app_id = app_id_of("web", &declared);
+        let expected = judge_app(&PolicySet::compile(&in_order).unwrap(), &app_id, &declared, &deployer(), Source::Apply);
+        for specs in [&shuffled, &from_hash] {
+            let judgement = judge_app(&PolicySet::compile(specs).unwrap(), &app_id, &declared, &deployer(), Source::Apply);
+            prop_assert_eq!(&judgement, &expected);
+        }
+        // The first policy by name wins a field two of them fill.
+        if app.memory.is_none() {
+            prop_assert!(expected.filled.iter().any(|fill| fill.field == "memory" && fill.policy == "b-limits"));
+        }
+        if app.team.is_none() && app.namespace == "payments" {
+            prop_assert!(expected.filled.iter().any(|fill| fill.field == "env.TEAM" && fill.policy == "a-team"));
+        }
+    }
+}
+
+/// #1118: the fence carries the declared spec whenever the stored one
+/// differs from it, by a default or by an image bound to a digest, and
+/// not when they're the same.
+#[test]
+fn fence_carries_the_declared_spec_only_when_the_stored_one_differs() {
+    let config = apps("[app.web]\nimage = 'web:v1'\n[app.api]\nimage = 'api:v1'\n");
+    let mut bound = config.clone();
+    bound.app.get_mut("web").unwrap().image = Some(format!("web:v1@sha256:{}", "a".repeat(64)));
+    let fenced = fence(config_to_desired_writes(&bound), 3, &declared_apps(&config));
+    for write in &fenced {
+        let RaftRequest::PolicyFenced {
+            change, declared, ..
+        } = write
+        else {
+            panic!("expected a fence, got {write:?}");
+        };
+        let RaftRequest::AppSpec { app_id, .. } = change.as_ref() else {
+            panic!("expected an app write");
+        };
+        match app_id.name.as_str() {
+            "web" => assert_eq!(declared.as_deref(), Some(&config.app["web"])),
+            _ => assert_eq!(declared, &None),
         }
     }
 }

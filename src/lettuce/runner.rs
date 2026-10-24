@@ -156,6 +156,7 @@ pub fn spawn_gitops_sync(
                 continue;
             }
             let current_apps = desired.apps.clone();
+            let declared_apps = desired.declared_apps.clone();
             let current_namespaces = desired.namespaces.clone();
             let current_permissions = desired.permissions.clone();
             let current_policies = desired.policies.clone();
@@ -192,6 +193,7 @@ pub fn spawn_gitops_sync(
                 )?;
                 let current = CurrentState {
                     apps: &current_apps,
+                    declared_apps: &declared_apps,
                     namespaces: &current_namespaces,
                     permissions: &current_permissions,
                     policies: &current_policies,
@@ -709,45 +711,22 @@ pub async fn apply_changes(
             report.abandoned = Some(reason);
             return report;
         }
-        let Some(mut request) = change_to_request(change) else {
+        let Some(request) = change_to_request(change) else {
             continue; // jobs/builds: not reconciled desired state
         };
         let adopting = matches!(change, ResourceChange::Adopt { .. });
         // Policies judge what git declares, before an image is bound, the
         // way `relish policy test` sees it. An adopted app changes nothing,
         // and a new policy never touches what already runs.
-        let declared = match (&request, adopting) {
+        let outcome = match (request, adopting) {
             (RaftRequest::AppSpec { app_id, spec }, false) => {
-                Some((app_id.clone(), spec.as_ref().clone()))
-            }
-            _ => None,
-        };
-        if let (Some(binder), RaftRequest::AppSpec { app_id, spec }, false) =
-            (binder, &mut request, adopting)
-        {
-            let catalog = council.manifest_catalog().await;
-            match binder.bind_app(&app_id.name, spec, &catalog).await {
-                Ok(bindings) => {
-                    for binding in bindings {
-                        println!("gitops: {binding}");
-                    }
-                }
-                Err(error) => {
-                    report
-                        .refused
-                        .push(format!("{} ({error})", change_id(change)));
-                    continue;
-                }
-            }
-        }
-        let write = RaftRequest::GitOpsWrite {
-            term,
-            change: Box::new(request),
-        };
-        let outcome = match &declared {
-            None => council.write(write).await,
-            Some((app_id, spec)) => {
-                match write_judged_app(council, &mut policies, app_id, spec, write).await {
+                let app = JudgedApp {
+                    term,
+                    binder,
+                    app_id: &app_id,
+                    declared: &spec,
+                };
+                match write_judged_app(council, &mut policies, app).await {
                     Judged::Written { outcome, warnings } => {
                         report.warnings.extend(warnings);
                         outcome
@@ -758,7 +737,21 @@ pub async fn apply_changes(
                             .push(format!("{}: {reason}", change_id(change)));
                         continue;
                     }
+                    Judged::Unbound(error) => {
+                        report
+                            .refused
+                            .push(format!("{} ({error})", change_id(change)));
+                        continue;
+                    }
                 }
+            }
+            (request, _) => {
+                council
+                    .write(RaftRequest::GitOpsWrite {
+                        term,
+                        change: Box::new(request),
+                    })
+                    .await
             }
         };
         // A committed entry the state machine refused left desired state
@@ -833,16 +826,30 @@ enum Judged {
     },
     /// A policy refused the app, or the policy set kept moving.
     Refused(String),
+    /// The app's image couldn't be bound to a digest.
+    Unbound(String),
 }
 
-/// Judge one app by the policies in force and write it fenced on their
-/// generation, judging again when the set moves before the write commits.
+/// One app a sync adds or changes, as git declares it.
+struct JudgedApp<'a> {
+    /// The term the sync read desired state in.
+    term: u64,
+    /// Binds the app's images to digests, when the cluster has a registry.
+    binder: Option<&'a ImageBinder>,
+    /// The app's identity.
+    app_id: &'a crate::meat::types::AppId,
+    /// Its spec, as git declares it.
+    declared: &'a crate::config::AppSpec,
+}
+
+/// Judge one app by the policies in force, fill in their defaults, bind
+/// its images and write it fenced on their generation, judging again when
+/// the set moves before the write commits. A defaulted app's write
+/// carries its declared spec, so the next sync diffs git against that.
 async fn write_judged_app(
     council: &CouncilNode,
     policies: &mut PolicyCache,
-    app_id: &crate::meat::types::AppId,
-    spec: &crate::config::AppSpec,
-    write: RaftRequest,
+    app: JudgedApp<'_>,
 ) -> Judged {
     let caller = crate::policy::Caller::gitops();
     for _ in 0..POLICY_ATTEMPTS {
@@ -851,17 +858,57 @@ async fn write_judged_app(
             Ok(set) => set,
             Err(error) => return Judged::Refused(error.to_string()),
         };
-        let verdict =
-            crate::policy::evaluate_app(set, app_id, spec, &caller, crate::policy::Source::GitOps);
-        if !verdict.is_allowed() {
-            let denials: Vec<String> = verdict.denials.iter().map(ToString::to_string).collect();
+        let judgement = crate::policy::judge_app(
+            set,
+            app.app_id,
+            app.declared,
+            &caller,
+            crate::policy::Source::GitOps,
+        );
+        if !judgement.verdict.is_allowed() {
+            let denials: Vec<String> = judgement
+                .verdict
+                .denials
+                .iter()
+                .map(ToString::to_string)
+                .collect();
             eprintln!("gitops: {}", denials.join("; "));
-            return Judged::Refused(denial_reason(&verdict.denials));
+            return Judged::Refused(denial_reason(&judgement.verdict.denials));
         }
-        let warnings: Vec<String> = verdict.warnings.iter().map(ToString::to_string).collect();
+        let warnings: Vec<String> = judgement
+            .verdict
+            .warnings
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        for filled in &judgement.filled {
+            println!("gitops: {filled}");
+        }
+        let mut spec = judgement.spec;
+        if let Some(binder) = app.binder {
+            let catalog = council.manifest_catalog().await;
+            match binder.bind_app(&app.app_id.name, &mut spec, &catalog).await {
+                Ok(bindings) => {
+                    for binding in bindings {
+                        println!("gitops: {binding}");
+                    }
+                }
+                Err(error) => return Judged::Unbound(error.to_string()),
+            }
+        }
+        // What git declared rides along when the stored spec differs from
+        // it, by a default or a bound image (#1118).
+        let declared = (spec != *app.declared).then(|| Box::new(app.declared.clone()));
         let fenced = RaftRequest::PolicyFenced {
             generation,
-            change: Box::new(write.clone()),
+            change: Box::new(RaftRequest::GitOpsWrite {
+                term: app.term,
+                change: Box::new(RaftRequest::AppSpec {
+                    app_id: app.app_id.clone(),
+                    spec: Box::new(spec),
+                }),
+            }),
+            declared,
         };
         match council.write(fenced).await {
             Ok(CouncilResponse::PolicyGenerationMoved { .. }) => continue,

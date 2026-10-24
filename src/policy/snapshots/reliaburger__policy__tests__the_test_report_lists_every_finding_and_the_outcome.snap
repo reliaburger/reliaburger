@@ -1,6 +1,6 @@
 ---
 source: src/policy/tests.rs
-expression: "report::render_test(&verdict, 2, 2)"
+expression: "report::render_test(&evaluation, 2, 2)"
 ---
 Checked 2 app(s) against 2 policy(ies).
 

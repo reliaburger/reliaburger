@@ -34,11 +34,19 @@
 # for the webpki-roots 0.26.11 shim only: it has no patched 0.26 release and
 # re-exports webpki-roots 1.x, which Cargo.lock holds at the patched 1.0.10.
 # tests/suite/dependency_audit.rs fails if 1.x is unpatched (#1269).
+# RUSTSEC-2026-0387 (crypto-bigint 0.5.5, constant-time timing variability)
+# was added 24 October 2026 (see
+# docs/qualification/2026-10-24-dependency-exceptions.md): the fix is 0.7.6,
+# which elliptic-curve 0.13 can't take, and it's reached only through age's
+# HPKE/P-256 code, which our X25519 and scrypt recipients never call. Cosign
+# uses ring. tests/suite/dependency_audit.rs fails if Reliaburger depends on
+# that chain directly.
 # Next review: 18 November 2026.
 [advisories]
 ignore = [
     "RUSTSEC-2026-0374",
     "RUSTSEC-2026-0381",
+    "RUSTSEC-2026-0387",
 ]
 
 [output]

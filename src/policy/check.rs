@@ -21,6 +21,47 @@ pub const MAX_EXPRESSION_BYTES: usize = 1024;
 /// The longest `message` a policy may hold, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 512;
 
+/// The largest `default` table a policy may hold, in bytes of JSON.
+pub const MAX_DEFAULT_BYTES: usize = 4096;
+
+/// App fields a `default` can never fill, and why.
+pub const UNFILLABLE_FIELDS: [(&str, &str); 12] = [
+    ("name", "is the app's table name, not a field"),
+    (
+        "namespace",
+        "decides which app it is, so a default can't move it",
+    ),
+    (
+        "replicas",
+        "always has a value (1 when the app leaves it out), so a default could never fill it",
+    ),
+    ("ordinals", "comes from the leader's placements"),
+    // The apply path checks these against the caller's token (host-exec,
+    // the runtime-knob gate) on the spec as declared. A default filled in
+    // after that would hand every matching app what its caller may not
+    // have, so a default can't set them.
+    ("exec", GATED_BY_THE_CALLER),
+    ("script", GATED_BY_THE_CALLER),
+    ("volumes", GATED_BY_THE_CALLER),
+    ("config_file", GATED_BY_THE_CALLER),
+    ("init", GATED_BY_THE_CALLER),
+    ("runtime", GATED_BY_THE_CALLER),
+    // Only token X or an admin may declare `owner = X`, checked on the
+    // declared spec before defaults fill it (#1125). A default that filled
+    // it would hand an app to a controller its caller can't speak for.
+    (
+        "owner",
+        "names the controller that manages the app, which only that controller's token or an admin may declare, so a default can't claim an app",
+    ),
+    (
+        "sidecar",
+        "would add a container to every matching app; declare sidecars on the app",
+    ),
+];
+
+/// Why a default can't fill a field the apply path gates on the caller.
+const GATED_BY_THE_CALLER: &str = "can need host access or a runtime knob, which the caller's token must allow, so a default can't grant it";
+
 /// The variables a policy expression can see. Nothing else: no other apps,
 /// no policies, permissions or namespaces, no clock.
 pub const POLICY_VARIABLES: [&str; 3] = ["app", "caller", "source"];
@@ -91,6 +132,8 @@ pub enum PolicyField {
     Match,
     /// The `deny` expression.
     Deny,
+    /// The `default` table.
+    Default,
 }
 
 impl std::fmt::Display for PolicyField {
@@ -98,6 +141,7 @@ impl std::fmt::Display for PolicyField {
         f.write_str(match self {
             PolicyField::Match => "match",
             PolicyField::Deny => "deny",
+            PolicyField::Default => "default",
         })
     }
 }
@@ -156,6 +200,25 @@ pub enum PolicyError {
         /// The variable it names.
         variable: String,
     },
+    /// The policy has neither a `deny` nor a `default`, so it does nothing.
+    #[error("a policy needs a deny expression, a default table, or both")]
+    NothingToDo,
+    /// A `default` names an app field that doesn't exist, or one a
+    /// default can't fill (#1118).
+    #[error("default sets {name}, which {reason}")]
+    DefaultField {
+        /// The field it names.
+        name: String,
+        /// Why it can't be filled.
+        reason: String,
+    },
+    /// A `default` value doesn't fit its field: the wrong type, or a
+    /// nested key the field doesn't have (#1118).
+    #[error("default doesn't fit an app: {error}")]
+    InvalidDefault {
+        /// What serde said, naming the field.
+        error: String,
+    },
     /// An expression reads a field `app` or `caller` doesn't have.
     #[error("{field} reads {variable}.{name}, which doesn't exist")]
     UnknownField {
@@ -169,8 +232,9 @@ pub enum PolicyError {
 }
 
 /// Check that `spec` can be committed under `name`: a valid name, short
-/// expressions and message, valid CEL, and only the variables and fields a
-/// policy can see.
+/// expressions and message, valid CEL, only the variables and fields a
+/// policy can see, and a `default` whose every field exists and has the
+/// right type.
 pub fn check_policy(name: &str, spec: &PolicySpec) -> Result<(), PolicyError> {
     if !crate::config::valid_workload_label(name) {
         return Err(PolicyError::InvalidName {
@@ -188,7 +252,61 @@ pub fn check_policy(name: &str, spec: &PolicySpec) -> Result<(), PolicyError> {
     if let Some(expression) = &spec.match_expression {
         compile_checked(PolicyField::Match, expression)?;
     }
-    compile_checked(PolicyField::Deny, &spec.deny)?;
+    if let Some(deny) = &spec.deny {
+        compile_checked(PolicyField::Deny, deny)?;
+    }
+    match &spec.default {
+        Some(default) => check_default(default)?,
+        None if spec.deny.is_none() => return Err(PolicyError::NothingToDo),
+        None => {}
+    }
+    Ok(())
+}
+
+/// Check a `default` table: not empty or over the cap, only fields an app
+/// has and a default can fill, and values that fit them. The values are
+/// filled into an app that sets nothing and read back through `AppSpec`,
+/// so serde's own types decide what fits.
+fn check_default(default: &serde_json::Map<String, serde_json::Value>) -> Result<(), PolicyError> {
+    if default.is_empty() {
+        return Err(PolicyError::Empty {
+            field: PolicyField::Default,
+        });
+    }
+    let bytes = serde_json::to_string(default).map_or(usize::MAX, |json| json.len());
+    if bytes > MAX_DEFAULT_BYTES {
+        return Err(PolicyError::TooLong {
+            field: PolicyField::Default,
+            bytes,
+            limit: MAX_DEFAULT_BYTES,
+        });
+    }
+    for name in default.keys() {
+        if let Some((_, reason)) = UNFILLABLE_FIELDS.iter().find(|(field, _)| field == name) {
+            return Err(PolicyError::DefaultField {
+                name: name.clone(),
+                reason: (*reason).to_string(),
+            });
+        }
+        if !APP_FIELDS.contains(&name.as_str()) {
+            return Err(PolicyError::DefaultField {
+                name: name.clone(),
+                reason: "isn't an app field".to_string(),
+            });
+        }
+    }
+    let invalid = |error: String| PolicyError::InvalidDefault { error };
+    let bare: crate::config::AppSpec =
+        serde_json::from_value(serde_json::Value::Object(serde_json::Map::new()))
+            .map_err(|error| invalid(error.to_string()))?;
+    let (filled, _) = super::defaults::apply_default(&bare, default).map_err(invalid)?;
+    let kept = match serde_json::to_value(&filled) {
+        Ok(serde_json::Value::Object(kept)) => kept,
+        _ => return Err(invalid("the filled app didn't serialise".to_string())),
+    };
+    if let Some(path) = super::defaults::first_dropped(&kept, default, "") {
+        return Err(invalid(format!("{path} isn't a field an app keeps")));
+    }
     Ok(())
 }
 

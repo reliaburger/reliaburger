@@ -278,6 +278,13 @@ fn validate_build(
     Ok(())
 }
 
+/// The built-in checks one app must pass, on their own. Policies run them
+/// again on an app their defaults filled in (#1118), so validation sees
+/// the final spec.
+pub(crate) fn validate_app_spec(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    validate_app(name, app)
+}
+
 fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
     // An app needs at least one of: image, command, exec, or script
     if app.image.is_none() && app.command.is_empty() && app.exec.is_none() && app.script.is_none() {

@@ -338,7 +338,9 @@ memory and CPU as they go.
 limit", are kept in the council and checked on the leader before an app is
 written, for `relish apply` and GitOps alike. A rule refuses the apply or only
 warns, every denial names its policy, and `relish policy test` *(0.2.2, not in 0.2.1)* runs the same
-check offline in CI. See [security and access](docs/manual/10_security.md#policies).
+check offline in CI. A policy can also fill in fields an app leaves out, such
+as a team label, without ever overwriting one you wrote, and GitOps doesn't
+mistake a filled-in field for a change. See [security and access](docs/manual/10_security.md#policies).
 
 **Your own controllers, without an operator SDK.** A controller is an ordinary
 app holding a token scoped to its namespace. It reads the API and the event
@@ -413,7 +415,7 @@ binary was built from. Neither needs a network.
 | Prometheus, Alertmanager | Built-in scraping, alert rules and webhooks |
 | A log shipper and store | Built-in capture, streaming and Parquet export |
 | Argo CD or Flux | Built-in GitOps |
-| Kyverno or Gatekeeper (validation) | `[policy.*]` deny and warn rules |
+| Kyverno or Gatekeeper (validation, defaults) | `[policy.*]` deny and warn rules, fill-only defaults |
 | Argo Workflows, Kueue or a Celery-style queue | Built-in jobs, cron, hooks and task arrays |
 | Chaos Mesh or Litmus | `relish fault` |
 | Grafana (for the basics) | TUI and web dashboard |

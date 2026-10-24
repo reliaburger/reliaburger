@@ -31,8 +31,11 @@ pub(super) async fn current_apps_handler(
     }
     if let Some(council) = &state.council {
         let desired = council.desired_state().await;
-        for (app_id, spec) in &desired.apps {
+        for (app_id, effective) in &desired.apps {
             let resource = app_resource_key(&app_id.name, &app_id.namespace);
+            // A plan compares the file with what it declared, not with the
+            // fields policy defaults filled in beside it (#1118).
+            let spec = desired.declared_apps.get(app_id).unwrap_or(effective);
             resources.insert(
                 resource.clone(),
                 CurrentResourceStatus {

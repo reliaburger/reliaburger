@@ -310,3 +310,135 @@ async fn a_policy_changed_mid_apply_makes_the_write_retry() {
     );
     council.shutdown().await.ok();
 }
+
+fn head(dir: &std::path::Path) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// Wait for the sync of `sha` to be recorded, and return its diff summary.
+async fn synced(council: &CouncilNode, sha: &str) -> reliaburger::lettuce::types::DiffSummary {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let state = council.desired_state().await;
+        let entry = state.gitops_sync_state.as_ref().and_then(|sync| {
+            sync.history
+                .iter()
+                .rev()
+                .find(|entry| entry.commit.sha == sha)
+                .cloned()
+        });
+        if let Some(entry) = entry {
+            assert_eq!(
+                entry.result,
+                reliaburger::lettuce::types::SyncResult::Success,
+                "{entry:?}"
+            );
+            return entry.diff_summary.expect("a successful sync has a diff");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "commit {sha} was never synced"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// #1118, the diff trap: a policy fills `env.TEAM` into an app git
+/// declares without one. The cluster keeps the declared spec beside the
+/// effective one, and GitOps diffs git against the declared one, so later
+/// syncs see no change in that app and don't re-apply it.
+#[tokio::test]
+async fn repeated_syncs_of_a_defaulted_app_do_not_reapply_it() {
+    const TEAM_LABEL: &str = r#"
+[policy.team-label]
+match = "app.namespace == 'default'"
+
+[policy.team-label.default]
+env.TEAM = "payments"
+"#;
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q", "-b", "main"]);
+    let manifest = repository.path().join("cluster.toml");
+    std::fs::write(
+        &manifest,
+        format!("{TEAM_LABEL}\n[app.web]\nimage = 'web:v1'\n"),
+    )
+    .unwrap();
+    git(repository.path(), &["add", "."]);
+    git(
+        repository.path(),
+        &["commit", "-q", "-m", "a defaulted app"],
+    );
+    let first = head(repository.path());
+
+    let council = single_node_leader(4).await;
+    let shutdown = CancellationToken::new();
+    let (_webhook, webhook_rx) = mpsc::channel::<()>(4);
+    let data = tempfile::tempdir().unwrap();
+    spawn_gitops_sync(
+        Arc::clone(&council),
+        Some(GitOpsConfig {
+            repo: repository.path().to_string_lossy().to_string(),
+            branch: "main".to_string(),
+            path: "/".to_string(),
+            poll_interval_secs: 1,
+            require_signed_commits: false,
+            trusted_signing_keys: vec![],
+            webhook_secret: None,
+            webhook_rate_limit: 10,
+        }),
+        webhook_rx,
+        data.path().to_path_buf(),
+        shutdown.clone(),
+        None,
+    );
+
+    let summary = synced(&council, &first).await;
+    assert_eq!(summary.added, 2, "the policy and the app: {summary:?}");
+    let web = AppId::new("web", "default");
+    let state = council.desired_state().await;
+    assert!(
+        state.apps[&web].env.contains_key("TEAM"),
+        "the default is filled in"
+    );
+    assert!(
+        state.declared_apps[&web].env.is_empty(),
+        "git's spec is kept beside it"
+    );
+    let effective = state.apps[&web].clone();
+
+    // An unrelated change: only the new app is added. Without the declared
+    // spec, `web` would count as modified and be written again.
+    std::fs::write(
+        &manifest,
+        format!("{TEAM_LABEL}\n[app.web]\nimage = 'web:v1'\n\n[app.other]\nimage = 'other:v1'\n"),
+    )
+    .unwrap();
+    git(repository.path(), &["commit", "-q", "-am", "another app"]);
+    let summary = synced(&council, &head(repository.path())).await;
+    assert_eq!((summary.added, summary.modified), (1, 0), "{summary:?}");
+
+    // A commit that changes nothing the cluster sees: no change at all.
+    std::fs::write(
+        &manifest,
+        format!(
+            "# the team label comes from policy\n{TEAM_LABEL}\n[app.web]\nimage = 'web:v1'\n\n[app.other]\nimage = 'other:v1'\n"
+        ),
+    )
+    .unwrap();
+    git(repository.path(), &["commit", "-q", "-am", "a comment"]);
+    let summary = synced(&council, &head(repository.path())).await;
+    assert_eq!(
+        (summary.added, summary.modified, summary.removed),
+        (0, 0, 0),
+        "{summary:?}"
+    );
+    assert_eq!(council.desired_state().await.apps[&web], effective);
+    shutdown.cancel();
+    council.shutdown().await.ok();
+}

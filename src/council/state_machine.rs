@@ -1456,29 +1456,50 @@ impl StateMachineInner {
                 self.state.gitops_owned.policies.remove(name);
                 self.state.policy_generation = self.state.policy_generation.saturating_add(1);
             }
-            RaftRequest::PolicyFenced { generation, change } => {
+            RaftRequest::PolicyFenced {
+                generation,
+                change,
+                declared,
+            } => {
                 // Comparing two numbers is all the state machine does with
                 // policy: evaluating one here would let a log replayed under
                 // newer policies, or a newer `cel` crate, apply differently
                 // on different nodes (chapter 18).
                 let fenced_app = match change.as_ref() {
-                    RaftRequest::AppSpec { .. } | RaftRequest::TestLeaseAppSpec { .. } => true,
-                    RaftRequest::GitOpsWrite { change, .. } => {
-                        matches!(change.as_ref(), RaftRequest::AppSpec { .. })
-                    }
-                    _ => false,
+                    RaftRequest::AppSpec { app_id, .. }
+                    | RaftRequest::TestLeaseAppSpec { app_id, .. } => Some(app_id.clone()),
+                    RaftRequest::GitOpsWrite { change, .. } => match change.as_ref() {
+                        RaftRequest::AppSpec { app_id, .. } => Some(app_id.clone()),
+                        _ => None,
+                    },
+                    _ => None,
                 };
-                if !fenced_app {
+                let Some(app_id) = fenced_app else {
                     return Some(CouncilResponse::Refused {
                         reason: "a policy fence carries only an app write".into(),
                     });
-                }
+                };
                 if *generation != self.state.policy_generation {
                     return Some(CouncilResponse::PolicyGenerationMoved {
                         current: self.state.policy_generation,
                     });
                 }
-                return self.apply_request_at(change, position);
+                let response = self.apply_request_at(change, position);
+                // Only a write that landed records how its spec was
+                // declared (#1118); a refused one leaves state alone.
+                if !matches!(response, Some(CouncilResponse::Refused { .. })) {
+                    match declared {
+                        Some(declared) => {
+                            self.state
+                                .declared_apps
+                                .insert(app_id, declared.as_ref().clone());
+                        }
+                        None => {
+                            self.state.declared_apps.remove(&app_id);
+                        }
+                    }
+                }
+                return response;
             }
             RaftRequest::AppRelease { app_id } => {
                 let Some(spec) = self.state.apps.get_mut(app_id) else {
@@ -2632,6 +2653,7 @@ impl StateMachineInner {
             });
         }
         self.state.apps.remove(app_id);
+        self.state.declared_apps.remove(app_id);
         self.state.stopped_apps.remove(app_id);
         self.state.rollouts.remove(app_id);
         self.state.scheduling.remove(app_id);
@@ -2700,6 +2722,12 @@ impl StateMachineInner {
             self.state.gitops_owned.apps.remove(app_id);
         }
         self.state.apps.insert(app_id.clone(), spec.clone());
+        // A new spec without a declared one beside it (a rollback, say)
+        // is its own declaration. The same spec again, a GitOps adoption,
+        // keeps the declared spec it was filled from (#1118).
+        if !identical {
+            self.state.declared_apps.remove(app_id);
+        }
         if !identical && let Some(rollouts) = self.state.rollouts.get_mut(app_id) {
             rollouts.failed = None;
         }
@@ -10605,9 +10633,10 @@ mod tests {
     fn policy_spec(deny: &str) -> Box<crate::config::PolicySpec> {
         Box::new(crate::config::PolicySpec {
             match_expression: None,
-            deny: deny.to_string(),
+            deny: Some(deny.to_string()),
             message: None,
             action: crate::config::PolicyAction::Deny,
+            default: None,
         })
     }
 
@@ -10615,7 +10644,74 @@ mod tests {
         RaftRequest::PolicyFenced {
             generation,
             change: Box::new(change),
+            declared: None,
         }
+    }
+
+    /// #1118: a fenced write that carries a declared spec keeps it beside
+    /// the effective one; the same spec again (a GitOps adoption) keeps
+    /// it; a different spec without one (a rollback) clears it; and a
+    /// refused write or a delete leaves no stale entry.
+    #[test]
+    fn a_declared_spec_lives_beside_the_effective_one_until_the_spec_changes() {
+        let mut inner = StateMachineInner::default();
+        let web = AppId::new("web", "default");
+        let declared = default_spec();
+        let mut effective = default_spec();
+        effective.env.insert(
+            "TEAM".into(),
+            crate::config::EnvValue::Plain("payments".into()),
+        );
+        let write = |spec: &crate::config::app::AppSpec| RaftRequest::AppSpec {
+            app_id: web.clone(),
+            spec: Box::new(spec.clone()),
+        };
+        let filled = RaftRequest::PolicyFenced {
+            generation: 0,
+            change: Box::new(write(&effective)),
+            declared: Some(Box::new(declared.clone())),
+        };
+        assert_eq!(inner.apply_request(&filled), None);
+        assert_eq!(inner.state.apps[&web], effective);
+        assert_eq!(inner.state.declared_apps[&web], declared);
+
+        // The same effective spec again, unfenced: provenance unchanged.
+        assert_eq!(inner.apply_request(&write(&effective)), None);
+        assert_eq!(inner.state.declared_apps[&web], declared);
+
+        // A different spec with no declared one: it's its own declaration.
+        assert_eq!(inner.apply_request(&write(&declared)), None);
+        assert!(inner.state.declared_apps.is_empty());
+
+        // A fenced write without a declared spec clears one.
+        assert_eq!(inner.apply_request(&filled), None);
+        assert_eq!(inner.apply_request(&fenced(0, write(&effective))), None);
+        assert!(inner.state.declared_apps.is_empty());
+
+        // A refused write records nothing.
+        let refused = RaftRequest::PolicyFenced {
+            generation: 0,
+            change: Box::new(RaftRequest::AppSpec {
+                app_id: AppId::new("web", "rbtest-abc"),
+                spec: Box::new(effective.clone()),
+            }),
+            declared: Some(Box::new(declared.clone())),
+        };
+        assert!(matches!(
+            inner.apply_request(&refused),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.declared_apps.is_empty());
+
+        // Deleting the app drops its declared spec too.
+        assert_eq!(inner.apply_request(&filled), None);
+        assert_eq!(
+            inner.apply_request(&RaftRequest::AppDelete {
+                app_id: web.clone()
+            }),
+            None
+        );
+        assert!(inner.state.declared_apps.is_empty());
     }
 
     /// #1117: every policy write moves the generation by one, and so does
