@@ -1096,6 +1096,7 @@ mod tests {
             pre_stop: Vec::new(),
             pre_stop_timeout: None,
             runtime: None,
+            owner: None,
             firewall: None,
             egress: None,
             autoscale: None,

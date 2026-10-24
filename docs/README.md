@@ -1248,6 +1248,23 @@ image = "ghcr.io/example/shipper:3.0"
 memory = "32Mi-64Mi"
 ```
 
+### Apps a controller owns
+
+A controller is an ordinary app with an API token scoped to its namespace
+(#1125). It claims an app by applying it with its token's name as the
+`owner`. From then on `relish apply` skips the app with a note, GitOps leaves
+it out of its diff, and only the owner or an admin can stop, delete, roll it
+back or release it. See [Writing a controller](manual/15_writing-a-controller.md)
+for the rules and the JSON, and [`examples/controller`](../examples/controller)
+for a small one that fails an app over to a standby.
+
+```toml
+[app.db-a]
+image = "postgres:17"
+namespace = "pg"
+owner = "db-failover"
+```
+
 For the full configuration reference (resource limits, replicas, environment variables, volumes, secrets, namespaces), see the [App fields](manual/13_reference.md#app-fields) table and the book chapter [Hello, Container](book/01-hello-container.md).
 
 ## Runtime auto-detection

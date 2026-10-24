@@ -623,7 +623,7 @@ The diff engine compares two `DesiredState` trees: one from the parsed git TOML,
 
 **Complexity:** The diff is O(n * m) where n is the number of resources and m is the average number of fields per resource. For a typical cluster (hundreds of resources, tens of fields each), this completes in sub-millisecond time.
 
-**Ownership (implemented, 0.2.1, #693).** Step 3 above applies only to resources in `DesiredState.gitops_owned`: a resource in Raft but not in git is removed only when GitOps wrote it. A resource present in both that matches git but isn't owned produces a `ResourceChange::Adopt` carrying the spec the cluster already runs (bound image digest included), so the write changes nothing but records ownership. Everything in an `rbtest-*` test-lease namespace is left out of both sides. The output is ordered: adds, updates and adoptions as namespaces, permissions, apps, the order `config_to_desired_writes` uses, then removals as apps, permissions, namespaces.
+**Ownership (implemented, 0.2.1, #693).** Step 3 above applies only to resources in `DesiredState.gitops_owned`: a resource in Raft but not in git is removed only when GitOps wrote it. A resource present in both that matches git but isn't owned produces a `ResourceChange::Adopt` carrying the spec the cluster already runs (bound image digest included), so the write changes nothing but records ownership. Everything in an `rbtest-*` test-lease namespace is left out of both sides, and so is every app a controller owns (#1125, §5.10). The output is ordered: adds, updates and adoptions as namespaces, permissions, apps, the order `config_to_desired_writes` uses, then removals as apps, permissions, namespaces.
 
 ### 5.5 Selective Apply
 
@@ -720,6 +720,20 @@ GitOps refuses jobs, so `applies_to = "jobs"` policies never meet a sync. An
 `action = "audit"` finding (#1119) doesn't refuse the app; the runner logs it
 as `gitops: audit: …`, and `relish policy audit` lists it for as long as the
 app breaks the rule, judging GitOps-owned apps as the caller `gitops`.
+
+### 5.10 Controller-owned apps (#1125)
+
+GitOps owns what it wrote; a controller owns what it claimed. An app whose
+spec in Raft has an `owner` (the name of the controller's API token) is out of
+the diff entirely: `diff_apps` neither updates, adopts nor prunes it, whatever
+git says, the way it skips `rbtest-*` namespaces. A claim takes the app out of
+`gitops_owned.apps` in the same state-machine step, so a later commit that
+drops it can't prune it either.
+
+Git can't declare an owner. A controller claims apps with its own token, and a
+repository has none, so `apply_gitops_write` refuses an `AppSpec` that carries
+one: it's a refused change in the partial sync result, and the rest of the
+commit applies. The full rule table is in `deployments.md` §5.11.
 
 ## 6. Configuration
 

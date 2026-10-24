@@ -963,7 +963,11 @@ inherit it silently, for example after a revoke and re-create. `POST
 **Scope enforcement (shipped):** `--apps` and `--namespaces` restrict a token
 on every route that names an app and namespace (`authorize_scoped`), filter
 cluster-wide listings such as `/v1/status` and `/v1/images` to the scope, and
-refuse routes that need cluster-wide authority (`require_unscoped`). The Pickle
+refuse routes that need cluster-wide authority (`require_unscoped`).
+`/v1/events` filters too (#1125): a scoped token sees the events about apps
+its scope allows, or about a namespace it names when it isn't limited to some
+apps, and nothing that names no namespace. That's the stream a controller
+reads; the dashboard's `/v1/ws/events` still refuses a scoped token. The Pickle
 registry applies the same scope to repositories: a scoped token may push and
 (on a routable listener) pull only repositories named `<namespace>/<app>` whose
 namespace and app it covers, over Bearer and Basic alike; bare names such as

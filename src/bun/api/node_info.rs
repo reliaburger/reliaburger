@@ -399,6 +399,7 @@ pub(super) fn council_app_evidence(
                         .failed_for(&crate::meat::deploy_types::rollout_fingerprint(spec))
                         .cloned()
                 }),
+                owner: spec.owner.clone(),
             },
         )
         .collect::<Vec<_>>();

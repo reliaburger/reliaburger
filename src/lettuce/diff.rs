@@ -8,7 +8,8 @@
 //! GitOps owns only what it wrote (D9, #693). A resource in Raft but not
 //! in git is removed only when the ownership set says GitOps wrote it, so
 //! `relish apply` and GitOps coexist. A running test's `rbtest-*`
-//! namespace never enters the diff at all.
+//! namespace never enters the diff at all, and neither does an app a
+//! controller owns (#1125): GitOps doesn't update, adopt or prune it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -198,6 +199,9 @@ fn diff_apps(
     let mut diff = KindDiff::default();
     for (app_id, git_spec) in git_apps {
         let resource_id = app_resource_id(app_id);
+        if controller_owned(current, app_id) {
+            continue;
+        }
         let Some(effective_spec) = current.apps.get(app_id) else {
             diff.writes.push(ResourceChange::Add {
                 resource_id,
@@ -239,6 +243,7 @@ fn diff_apps(
             current.owned.apps.contains(*app_id)
                 && !git_apps.contains_key(*app_id)
                 && !valid_test_namespace(&app_id.namespace)
+                && !controller_owned(current, app_id)
         })
         .collect();
     removed.sort();
@@ -249,6 +254,15 @@ fn diff_apps(
         summary.removed += 1;
     }
     diff
+}
+
+/// Whether a controller owns the app in Raft (#1125). GitOps leaves such an
+/// app alone whatever git says, the way `relish apply` skips it.
+fn controller_owned(current: &CurrentState<'_>, app_id: &AppId) -> bool {
+    current
+        .apps
+        .get(app_id)
+        .is_some_and(|spec| spec.owner.is_some())
 }
 
 /// Diff a kind keyed by name (namespaces, permissions, policies): add what git has
@@ -672,6 +686,40 @@ mod tests {
             ),
             "{changes:?}"
         );
+        assert_eq!(
+            summary,
+            DiffSummary {
+                added: 0,
+                modified: 0,
+                removed: 0
+            }
+        );
+    }
+
+    /// #1125: an app a controller owns is out of the diff entirely. Git
+    /// declaring it doesn't update or adopt it, and git dropping it doesn't
+    /// prune it, even if GitOps wrote it before the controller claimed it.
+    #[test]
+    fn diff_leaves_controller_owned_apps_alone() {
+        let git = parse_config("[app.db]\nimage = \"db:v2\"\n");
+        let apps = make_current_apps(&[
+            ("db", "image = \"db:v1\"\nowner = \"pg-failover\""),
+            ("standby", "image = \"db:v1\"\nowner = \"pg-failover\""),
+        ]);
+        let owned = GitOpsOwnership {
+            apps: [AppId::new("standby", "default")].into(),
+            ..Default::default()
+        };
+        let current = CurrentState {
+            apps: &apps,
+            namespaces: EMPTY_NS.get_or_init(BTreeMap::new),
+            permissions: EMPTY_PERM.get_or_init(BTreeMap::new),
+            policies: EMPTY_POLICIES.get_or_init(BTreeMap::new),
+            owned: &owned,
+            declared_apps: EMPTY_DECLARED.get_or_init(HashMap::new),
+        };
+        let (changes, summary) = compute_diff(&git, &current, &[]);
+        assert!(changes.is_empty(), "{changes:?}");
         assert_eq!(
             summary,
             DiffSummary {

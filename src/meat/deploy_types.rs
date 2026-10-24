@@ -247,12 +247,14 @@ pub fn plan_rolling_step(
 /// under its own count and ordinals, so those two fields differ between the
 /// two views of the same version. Everything else (image, command, env,
 /// health check, `[deploy]` table) is the version. A scale change keeps the
-/// fingerprint, so it never waits for a rollout.
+/// fingerprint, so it never waits for a rollout. So does a change of
+/// `owner` (#1125): a controller claiming an app restarts nothing.
 pub fn rollout_fingerprint(spec: &crate::config::app::AppSpec) -> String {
     use sha2::Digest;
     let mut version = spec.clone();
     version.replicas = crate::config::Replicas::default();
     version.ordinals = None;
+    version.owner = None;
     // Serialising a spec can't fail: every field is plain data. An empty
     // string would still be a stable (if useless) fingerprint.
     let bytes = serde_json::to_vec(&version).unwrap_or_default();
@@ -1151,5 +1153,15 @@ mod tests {
                 "serving dropped to {min}, below the floor {floor}"
             );
         }
+    }
+
+    /// #1125: who manages an app isn't part of its version, so a
+    /// controller claiming or releasing it starts no rollout.
+    #[test]
+    fn the_owner_is_not_part_of_the_version() {
+        let spec: crate::config::app::AppSpec = toml::from_str("image = 'db:v1'").unwrap();
+        let mut claimed = spec.clone();
+        claimed.owner = Some("pg-failover".into());
+        assert_eq!(rollout_fingerprint(&spec), rollout_fingerprint(&claimed));
     }
 }

@@ -218,6 +218,29 @@ fn a_gitops_sync_is_the_system_caller() {
     );
 }
 
+/// #1125: a policy sees an app's `owner`, so a platform team can say, for
+/// example, that only the database controller writes apps in `pg`.
+#[test]
+fn a_policy_sees_the_owner() {
+    let set = compile(
+        "[policy.pg-is-the-controllers]\nmatch = \"app.namespace == 'pg'\"\n\
+         deny = \"!has(app.owner) || app.owner != 'pg-failover'\"\n",
+    );
+    let owned = apps("[app.db]\nimage = 'pg:17'\nnamespace = 'pg'\nowner = 'pg-failover'\n");
+    let unowned = apps("[app.db]\nimage = 'pg:17'\nnamespace = 'pg'\n");
+    let controller = Caller::token("pg-failover", ApiRole::Deployer);
+    assert!(
+        evaluate(&set, &owned, &controller, Source::Apply)
+            .verdict
+            .is_allowed()
+    );
+    assert!(
+        !evaluate(&set, &unowned, &deployer(), Source::Apply)
+            .verdict
+            .is_allowed()
+    );
+}
+
 /// Every category of bad policy is refused when it's committed.
 #[test]
 fn every_kind_of_bad_policy_is_refused_at_commit() {
@@ -824,6 +847,11 @@ fn every_kind_of_bad_default_is_refused_at_commit() {
             "[policy.rule.default]\nruntime.sysctls = { 'net.core.somaxconn' = '4096' }\n",
             |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "runtime"),
         ),
+        // Only the owner's token or an admin claims an app (#1125).
+        (
+            "[policy.rule.default]\nowner = 'db-failover'\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "owner"),
+        ),
         (
             "[policy.rule.default]\nsidecar = []\n",
             |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "sidecar"),
@@ -1349,7 +1377,69 @@ fn committed(name: &str, toml: &str, gitops_owned: bool) -> audit::CommittedApp 
         id: AppId::new(name, "default"),
         spec: toml::from_str(toml).unwrap(),
         gitops_owned,
+        controller: None,
     }
+}
+
+/// #1125: an app a controller owns is judged as the controller's token,
+/// since only that token writes it. A policy that lets only the controller
+/// write in a namespace passes the controller's app and flags another.
+#[test]
+fn the_audit_judges_a_controller_owned_app_as_its_controller() {
+    let policies = policies(
+        r#"
+        [policy.only-the-controller]
+        action = "audit"
+        deny = "caller.name != 'db-failover'"
+        "#,
+    );
+    let mut owned = committed("db", "image = 'pg:17'\nowner = 'db-failover'", false);
+    owned.controller = Some(Caller::token("db-failover", ApiRole::Deployer));
+    let unowned = committed("web", "image = 'web:v1'", false);
+    let audit = audit::audit_workloads(&policies, 1, &[owned, unowned], &[]);
+    assert_eq!(
+        workload_decisions(&audit.verdict),
+        vec![(
+            "only-the-controller".into(),
+            PolicyAction::Audit,
+            "app default/web".into()
+        )]
+    );
+}
+
+/// #1125: the audit finds the controller's caller from the token its
+/// `owner` names, role included; without that token it falls back to the
+/// cluster's own `audit` caller.
+#[test]
+fn the_audit_reads_the_controllers_role_from_its_token() {
+    let mut desired = crate::council::types::DesiredState {
+        policies: policies(
+            "[policy.deployers-only]\naction = \"audit\"\ndeny = \"caller.role != 'deployer'\"\n",
+        ),
+        ..Default::default()
+    };
+    for (name, owner) in [("db", "db-failover"), ("orphan", "revoked")] {
+        let mut spec: AppSpec = toml::from_str("image = 'pg:17'").unwrap();
+        spec.owner = Some(owner.to_string());
+        desired.apps.insert(AppId::new(name, "default"), spec);
+    }
+    let token = crate::sesame::token::create_token(
+        "db-failover",
+        ApiRole::Deployer,
+        crate::sesame::types::TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    desired.security_state.api_tokens.push(token.token);
+    let audit = audit::audit(&desired);
+    assert_eq!(
+        workload_decisions(&audit.verdict),
+        vec![(
+            "deployers-only".into(),
+            PolicyAction::Audit,
+            "app default/orphan".into()
+        )]
+    );
 }
 
 /// The audit judges committed apps and jobs as an apply would, by the

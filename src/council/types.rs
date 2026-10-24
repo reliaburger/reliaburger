@@ -530,6 +530,11 @@ pub enum RaftRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         declared: Option<Box<AppSpec>>,
     },
+    /// Clear an app's `owner`, handing it back to `relish apply` and GitOps
+    /// (#1125). The API checked that the caller is the owner or an admin;
+    /// the state machine refuses a release of an app that isn't there or
+    /// has no owner.
+    AppRelease { app_id: AppId },
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,6 +1082,9 @@ mod tests {
                 declared: Some(Box::new(
                     toml::from_str::<AppSpec>("image = 'web:v1'").unwrap(),
                 )),
+            },
+            RaftRequest::AppRelease {
+                app_id: AppId::new("db", "pg"),
             },
         ];
         for req in &requests {

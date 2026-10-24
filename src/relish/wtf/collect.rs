@@ -1262,6 +1262,7 @@ mod tests {
     fn service_evidence_uses_desire_even_when_resolver_has_no_entry() {
         let evidence = collect_services(
             Ok(vec![crate::bun::diagnostics::DesiredAppEvidence {
+                owner: None,
                 app: "api".to_string(),
                 namespace: "default".to_string(),
                 desired_replicas: 2,

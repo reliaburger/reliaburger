@@ -70,7 +70,9 @@ scope; a scoped token can't push or pull a bare name like `api` at all (see
 `images-and-volumes`). Some
 operations need cluster-wide authority, so only an *unscoped* admin can manage
 tokens and join tokens, rotate secrets, sign images, decommission nodes, clear
-every fault, or apply `[namespace]` and `[permission]` declarations.
+every fault, or apply `[namespace]` and `[permission]` declarations. A
+`deployer` scoped to one namespace is what a controller runs with
+(`writing-a-controller`).
 
 `create` prints the plaintext token once, on stdout, and the cluster keeps
 only a hash, so `TOKEN="$(relish token create ...)"` captures it. Its expiry
@@ -311,9 +313,9 @@ The cluster checks a policy when you apply it, and refuses one that:
 - has a `default` but doesn't apply to apps only;
 - has a `default` that's empty or over 4096 bytes, names a field an app
   doesn't have (`memroy`, `deploy.max_unavaliable`) or one a default can't
-  fill (`namespace`, `replicas`, `sidecar`, and the fields your token's
-  permissions gate: `exec`, `script`, `volumes`, `config_file`, `init` and
-  `runtime`), or gives a field a value of the wrong type
+  fill (`namespace`, `replicas`, `sidecar`, `owner`, and the fields your
+  token's permissions gate: `exec`, `script`, `volumes`, `config_file`,
+  `init` and `runtime`), or gives a field a value of the wrong type
   (`port = "eighty"`).
 
 An expression that fails while it runs, such as `app.memory == '1Gi'` on an
@@ -368,8 +370,11 @@ Checked 2 app(s) and 1 job(s) against 3 policy(ies) at generation 7.
 
 It changes nothing and exits zero whatever it finds. Each app is judged as
 its next apply would be: the spec you declared, with the defaults filled in.
-An app GitOps owns is judged as a GitOps sync, and everything else as the
-cluster's own caller `audit`, role `system`, from `apply`. Jobs are judged from
+An app a controller owns is judged as the controller's token, with that
+token's role, from `apply`, since only that token writes it (see
+`writing-a-controller`). An app GitOps owns is judged as a GitOps sync, and
+everything else as the cluster's own caller `audit`, role `system`, from
+`apply`; so is a controller-owned app whose token is gone. Jobs are judged from
 the definitions the cluster keeps, which are scheduled jobs and deployment
 hooks; a one-off job's definition goes once its runs are pruned. `relish wtf` shows the same
 denials and audit findings as warnings.

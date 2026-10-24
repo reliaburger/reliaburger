@@ -72,10 +72,16 @@ pub const GROUPS: &[CommandGroup] = &[
     },
     CommandGroup {
         title: "Deploy and manage apps",
-        guides: &[Guide {
-            label: "deploy an app",
-            path: "docs/manual/01_deploy-an-app.md",
-        }],
+        guides: &[
+            Guide {
+                label: "deploy an app",
+                path: "docs/manual/01_deploy-an-app.md",
+            },
+            Guide {
+                label: "writing a controller",
+                path: "docs/manual/15_writing-a-controller.md",
+            },
+        ],
         commands: &[
             "apply",
             "status",
@@ -87,6 +93,7 @@ pub const GROUPS: &[CommandGroup] = &[
             "rollback",
             "stop",
             "delete",
+            "release",
             "batch",
             "run",
             "batch-status",

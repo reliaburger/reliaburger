@@ -398,6 +398,18 @@ pub(super) async fn rollback_handler(
     {
         return resp;
     }
+    // Who may roll back comes before whether we can (#1125).
+    if let Some(council) = &state.council
+        && let Some(refusal) = super::apply::owner_command_refusal(
+            council,
+            auth.as_deref(),
+            &crate::meat::AppId::new(&app, &namespace),
+            "roll back",
+        )
+        .await
+    {
+        return refusal;
+    }
     if state.deploy_history.is_none() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -460,6 +472,9 @@ pub(super) async fn rollback_handler(
     // it. Those belong to the placement, not the spec, and an apply refuses
     // them; the leader numbers the replicas again (#398).
     spec.ordinals = None;
+    // Who manages the app isn't part of its version: the rollback keeps
+    // today's owner, whatever the old spec said (#1125).
+    spec.owner = current.as_ref().and_then(|current| current.owner.clone());
     // Re-apply the previous spec through the standard deploy path.
     let mut config = Config::default();
     config.app.insert(app.clone(), spec);
