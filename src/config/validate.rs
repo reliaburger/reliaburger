@@ -140,6 +140,15 @@ impl Config {
         &self,
         namespaces: Option<&[String]>,
     ) -> Result<(), ConfigError> {
+        // Templates expand in the compiler and on the apply endpoint before
+        // anything validates; a `use` left here would vanish silently.
+        if let Some(instance) = self.uses.keys().next() {
+            return Err(ConfigError::Validation {
+                field: format!("use.{instance}"),
+                context: "config".into(),
+                reason: "templates must be expanded before the config is validated".into(),
+            });
+        }
         self.validate_workload_names()?;
         for (name, app) in &self.app {
             validate_app(name, app)?;

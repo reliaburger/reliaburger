@@ -58,4 +58,8 @@ pub enum ConfigError {
         name: String,
         source: crate::policy::PolicyError,
     },
+
+    /// A `[template.*]` or `[use.*]` that can't expand (#1124).
+    #[error(transparent)]
+    Template(#[from] super::template::TemplateError),
 }

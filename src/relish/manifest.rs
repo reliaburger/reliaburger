@@ -99,10 +99,18 @@ pub fn load_file(path: &Path) -> Result<LoadedManifest, RelishError> {
 /// Parse manifest text, importing it first when it's Kubernetes YAML.
 pub fn parse(content: &str) -> Result<LoadedManifest, RelishError> {
     match detect_format(content) {
-        ManifestFormat::Reliaburger => Ok(LoadedManifest {
-            config: Config::parse(content)?,
-            migration_report: None,
-        }),
+        ManifestFormat::Reliaburger => {
+            // Templates expand here, so everything that reads a manifest
+            // (apply, lint, diff, compile, plan) sees only ordinary apps.
+            let mut config = Config::parse(content)?;
+            config
+                .expand_templates()
+                .map_err(crate::config::ConfigError::from)?;
+            Ok(LoadedManifest {
+                config,
+                migration_report: None,
+            })
+        }
         ManifestFormat::Kubernetes => import(content),
     }
 }

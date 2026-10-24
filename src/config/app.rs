@@ -141,6 +141,11 @@ pub struct AppSpec {
     /// Namespace this app belongs to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    /// The template and `[use.*]` that made this app, when one did
+    /// (#1124). The compiler writes it; it changes nothing about how the
+    /// app runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<super::template::Provenance>,
     /// The API token that manages this app, when a controller does (#1125).
     /// `relish apply` and GitOps leave an owned app alone; only that token
     /// or an admin changes it (`council::owner` has the rules).

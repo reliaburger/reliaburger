@@ -17,6 +17,7 @@ pub mod node;
 pub mod permission;
 pub mod policy;
 pub mod process_workloads;
+pub mod template;
 pub mod types;
 mod validate;
 pub(crate) use validate::{valid_workload_label, validate_app_spec};
@@ -33,12 +34,16 @@ pub use namespace::NamespaceSpec;
 pub use node::NodeConfig;
 pub use permission::{PermissionAction, PermissionSpec};
 pub use policy::{PolicyAction, PolicySpec, PolicyTarget};
+pub use template::{Provenance, TemplateError, TemplateSpec, UseSpec};
 pub use types::{ConfigFileSpec, EnvValue, Replicas, ResourceRange, VolumeSpec};
 
 /// Top-level workload configuration.
 ///
 /// Parsed from a TOML file containing `[app.*]`, `[job.*]`,
-/// `[namespace.*]`, `[permission.*]` and `[policy.*]` tables.
+/// `[namespace.*]`, `[permission.*]`, `[policy.*]`, `[template.*]` and
+/// `[use.*]` tables. Templates and uses only live until the config is
+/// expanded ([`Config::expand_templates`]); nothing past the compiler sees
+/// them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -60,6 +65,13 @@ pub struct Config {
     /// Build job definitions keyed by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build: BTreeMap<String, build::BuildSpec>,
+    /// Template definitions keyed by name (#1124).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub template: BTreeMap<String, TemplateSpec>,
+    /// Template instances keyed by name. `use` is a Rust keyword, so the
+    /// field has another name.
+    #[serde(rename = "use", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub uses: BTreeMap<String, UseSpec>,
 }
 
 impl Config {

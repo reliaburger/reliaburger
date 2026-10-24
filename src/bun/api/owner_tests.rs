@@ -302,3 +302,60 @@ async fn desired_apps_name_the_owner_within_the_tokens_scope() {
         .collect();
     assert_eq!(seen, vec![("pg", "db", Some("pg-failover"))]);
 }
+
+/// #1124: a template body that declares an `owner` is held to the same rule
+/// as a hand-written one, because the apply only ever sees the expanded
+/// app. And the expanded app keeps its provenance beside its owner, and in
+/// the declared spec a policy default leaves behind.
+#[tokio::test]
+async fn an_owner_a_template_declares_follows_the_owner_rules() {
+    const TEMPLATED_DB: &str = r#"
+[template.postgres]
+params = { name = "string", controller = "string" }
+body = """
+[app.${name}]
+image = "postgres:17"
+namespace = "pg"
+owner = "${controller}"
+"""
+
+[use.db]
+template = "postgres"
+name = "db"
+controller = "pg-failover"
+"#;
+    let cluster = cluster("owner-template").await;
+    let (status, body) = cluster
+        .call(
+            "/v1/apply",
+            &cluster.admin,
+            "[policy.team]\nmatch = 'has(app.provenance)'\n[policy.team.default]\nenv.TEAM = 'data'\n",
+        )
+        .await;
+    assert!(body.contains("committed"), "{status}: {body}");
+
+    let (status, body) = cluster
+        .call("/v1/apply", &cluster.human, TEMPLATED_DB)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("must be the name of the token"), "{body}");
+    assert!(cluster.db().await.is_none());
+
+    let (status, body) = cluster
+        .call("/v1/apply", &cluster.controller, TEMPLATED_DB)
+        .await;
+    assert!(body.contains("committed"), "{status}: {body}");
+    let provenance = Some(crate::config::Provenance {
+        template: "postgres".into(),
+        instance: "db".into(),
+    });
+    let db = cluster.db().await.unwrap();
+    assert_eq!(db.owner.as_deref(), Some("pg-failover"));
+    assert_eq!(db.provenance, provenance);
+    assert!(db.env.contains_key("TEAM"), "the default filled it in");
+    let state = cluster.council.desired_state().await;
+    let declared = &state.declared_apps[&AppId::new("db", "pg")];
+    assert_eq!(declared.provenance, provenance);
+    assert_eq!(declared.owner.as_deref(), Some("pg-failover"));
+    assert!(!declared.env.contains_key("TEAM"));
+}

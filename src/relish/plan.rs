@@ -178,6 +178,9 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
         if let Some(ref namespace) = app.namespace {
             summary.push(("namespace".to_string(), namespace.clone()));
         }
+        if let Some(ref provenance) = app.provenance {
+            summary.push(("from".to_string(), provenance.to_string()));
+        }
 
         let action = match current_map.get(resource_key.as_str()) {
             None => PlanAction::Create,
@@ -212,6 +215,9 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
         }
         if let Some(ref schedule) = job.schedule {
             summary.push(("schedule".to_string(), schedule.clone()));
+        }
+        if let Some(ref provenance) = job.provenance {
+            summary.push(("from".to_string(), provenance.to_string()));
         }
 
         let action = match current_map.get(resource_key.as_str()) {
@@ -575,6 +581,64 @@ namespace = "payments"
         insta::assert_snapshot!(plan.to_string());
         let json = serde_json::to_value(&plan).unwrap();
         assert_eq!(json["policy"]["filled"].as_array().unwrap().len(), 2);
+    }
+
+    /// #1124: the plan shows what the templates expanded to, ordinary apps
+    /// with the `use` that made each, and the policies judge those apps.
+    /// Planned again against the cluster, the expanded app is unchanged.
+    #[test]
+    fn the_plan_shows_the_expanded_apps_and_where_they_came_from() {
+        let manifest = r#"
+[template.postgres]
+params = { name = "string", size = "string", replicas = { type = "int", default = 1 } }
+body = """
+[app.${name}]
+image = "postgres:17"
+replicas = ${replicas}
+[[app.${name}.volumes]]
+path = "/var/lib/postgresql/data"
+size = "${size}"
+"""
+
+[use.orders-db]
+template = "postgres"
+name = "orders-db"
+size = "50Gi"
+
+[use.users-db]
+template = "postgres"
+name = "users-db"
+size = "5Gi"
+replicas = 2
+
+[app.web]
+image = "web:v1"
+"#;
+        let config = crate::relish::manifest::parse(manifest).unwrap().config;
+        let committed = parse_config(
+            r#"
+[policy.db-standby]
+match = "has(app.provenance) && app.provenance.template == 'postgres'"
+deny = "app.replicas < 2"
+message = "a database needs a standby"
+"#,
+        )
+        .policy;
+        let mut plan = generate_plan(&config, None);
+        plan.policy = crate::relish::commands::plan_policies(&committed, &config);
+        insta::assert_snapshot!(plan.to_string());
+
+        let current: Vec<CurrentResource> = config
+            .app
+            .iter()
+            .map(|(name, app)| CurrentResource {
+                resource: format!("app.{name}"),
+                image: app.image.clone(),
+                fingerprint: crate::config::fingerprint::app_fingerprint(app),
+            })
+            .collect();
+        let again = generate_plan(&config, Some(&current));
+        assert_eq!((again.unchanged, again.to_update), (3, 0), "{again:?}");
     }
 
     #[test]

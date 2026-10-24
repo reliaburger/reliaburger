@@ -145,6 +145,20 @@ is a field the node can't honour; nothing is silently dropped.
 | `firewall` | `allow_from`: apps (or `namespace/app`) allowed to connect |
 | `egress` | `allow`: outside destinations the app may reach. `allow_franchise` is refused |
 | `metrics` | `port` (default: the app's) and `path` (default `/metrics`) to scrape |
+| `provenance` | `template` and `use`: the template and `[use.*]` that made the app. Template expansion writes it, and `relish compile` keeps it in its output; changing it alone restarts nothing, and a policy `default` can't set it |
+
+## Template fields
+
+A `[template.NAME]` table takes `params` and `body`; a `[use.NAME]` table
+takes `template` and one key per parameter. Both names are lowercase DNS
+labels. See `deploy` for a worked example.
+
+| Field | Meaning |
+|-------|---------|
+| `params` | Parameter names to types: `"string"`, `"int"` or `"bool"`, or `{ type = "...", default = ... }`. A parameter without a default is required. Names start with a letter or `_`, and `template` is taken |
+| `body` | Ordinary `[app.*]` and `[job.*]` TOML with `${param}` placeholders, and nothing else: no other tables, templates or uses |
+| `template` (in `[use.*]`) | The template to expand |
+| any other key (in `[use.*]`) | A parameter's value, of the parameter's type |
 
 ## Job fields
 
@@ -168,6 +182,7 @@ A `[job.NAME]` table takes these fields. Unknown fields are refused.
 | `task_timeout_secs` | 0–86400 per attempt; 0 means no deadline. Default none, or 600 for a hook |
 | `overlap` | Cron only: `forbid` (default) skips an occurrence while a run is active; `allow` starts another |
 | `replay_unknown` | `true` replays automatically after an unknown outcome and counts a timeout as an ordinary failure; hooks refuse it. Default `false` |
+| `provenance` | `template` and `use`: the template and `[use.*]` that made the job, written by template expansion, as for an app |
 
 Ordinary TOML jobs, cron and hooks use the same executor as arrays. See [batch jobs](14_batch-jobs.md)
 for retry, overlap, retention, supported runtimes and API shapes.

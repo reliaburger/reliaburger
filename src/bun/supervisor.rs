@@ -1106,6 +1106,7 @@ mod tests {
             working_dir: None,
             run_as_user: None,
             run_as_group: None,
+            provenance: None,
         }
     }
 

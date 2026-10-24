@@ -751,7 +751,6 @@ different jobs, and splitting them is the whole trick.
 ordinary app, job and volume declarations, with `${param}` substitution and
 nothing else. No conditionals, no loops, no functions.
 
-<!-- snippet: planned #1124 -->
 ```toml
 [template.postgres]
 params = { name = "string", size = "string", replicas = { type = "int", default = 1 } }
@@ -772,8 +771,66 @@ size = "50Gi"
 
 The expansion happens at apply time, in the compiler `relish` and Lettuce
 share, and before policy runs. So what policy sees, and what lands in Raft, is
-ordinary apps, plus a note of which template they came from. `relish plan`
-shows the expanded result.
+ordinary apps, plus a note of which template they came from. `relish apply
+--dry-run`, our plan, shows the expanded result:
+
+```text
+  + app.orders-db
+      image     postgres:17
+      replicas  1
+      from      use.orders-db (template postgres)
+```
+
+A few decisions came out of building it
+([#1124](https://github.com/reliaburger/reliaburger/issues/1124)).
+
+**Substitution knows where it is.** The body is a string, and the obvious
+implementation is a find-and-replace followed by a TOML parse. Think about
+what that does with a value like `x"` followed by a newline and
+`[app.evil]`. The quote closes the string, and the value has just declared
+an app of its own. It's SQL injection with square brackets. So the
+substitution reads the body the way a TOML parser would, enough to know
+whether each placeholder sits outside quotes, in a basic `"..."` string, in
+a literal `'...'` string or in a comment. Inside a basic string the value is
+escaped, so it stays one string whatever it holds. Outside quotes, where
+`[app.${name}]` lives, a string must be a plain key of letters, digits, `-`
+and `_`. A literal string can't escape anything, so a value with a `'` in it
+is refused there. Integers and booleans can't break anything and go in as
+written. No value can change the shape of the body, the same promise a bound
+parameter makes for an SQL statement.
+
+**Expanded apps are ordinary apps of the file that uses them.** In a
+repository, a template in `templates.toml` can serve a `use` in
+`payments/db.toml`, and the app it makes lands in the `payments` namespace
+with `payments/_defaults.toml` filled in, exactly as if you'd written it
+there. Policies judge it like any other app, and they can tell where it came
+from: `app.provenance.template == 'postgres'` is a fine `match`.
+
+**Provenance is two strings.** The template's name and the `use`'s name, and
+nothing else. No template version, no parameter values, no copy of the
+body. The values are already in the spec they produced, and the body lives
+in git. Because provenance is part of the spec, the declared-spec diff from
+the last section needs no special case: what git declares after expansion
+is exactly what the cluster stores, so a re-sync writes nothing. Like a
+controller's `owner`, it isn't part of the app's version, so moving a
+hand-written app into a template restarts nothing when the expansion comes
+out the same. And because expansion runs before everything else, a body
+that declares `owner = "${controller}"` gets no special treatment: the
+owner rules see an ordinary app declaring an owner, and only that token or
+an admin may apply it.
+
+**No nesting, and no fighting.** A body holds apps and jobs and nothing
+else, so a template can't use another template. Nesting is how a template
+language grows into a programming language, and refusing it was the
+simplest guard rail we could find. An expanded name that collides with an
+app you declared, or with another `use`'s output, is refused. `relish
+compile` normally lets a later file override an app with a warning, but not
+when a template made either one. Two sources of truth fighting over one
+name is a bug, not a feature.
+
+**A placeholder no parameter fills is refused, even in a template nobody
+uses.** Otherwise a typo like `${imgae}` would sit there quietly until the
+day somebody tried the template.
 
 Why not a new kind? Because every new kind the council stores and reconciles is
 something the scheduler, the agent, the snapshot format and every future
@@ -2134,6 +2191,173 @@ Export goes back the same way, but a device can only leave as a `hostPath`
 mount, which Kubernetes won't let a pod open without a device plugin or a
 privileged container, so the export report says so.
 
+### Templates
+
+([#1124](https://github.com/reliaburger/reliaburger/issues/1124)) The code is
+in `src/config/template.rs`. `Config` gains two maps, and the second one
+can't use its TOML name:
+
+```rust
+/// Template definitions keyed by name (#1124).
+#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+pub template: BTreeMap<String, TemplateSpec>,
+/// Template instances keyed by name. `use` is a Rust keyword, so the
+/// field has another name.
+#[serde(rename = "use", default, skip_serializing_if = "BTreeMap::is_empty")]
+pub uses: BTreeMap<String, UseSpec>,
+```
+
+`use` is Rust's `import`, so like `match` in the policy struct it gets a
+Rust name and a serde rename.
+
+#### Two shapes for one parameter
+
+A parameter can be written two ways, `name = "string"` or `replicas = { type
+= "int", default = 1 }`. serde reads that with an *untagged* enum:
+
+```rust
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum RawParam {
+    Short(String),
+    Full(FullParam),
+}
+```
+
+A normal Rust enum in serde is *tagged*: the data says which variant it is,
+the way a JSON `{"Short": "string"}` would. Untagged means there's no tag, so
+serde tries each variant in order and keeps the first that fits. A string
+fits `Short`; a table fits `Full`. It's the closest thing Rust has to
+Python's "is it a str or a dict?", except the compiler makes us handle both
+answers.
+
+`RawParam` is private. What the rest of the code sees is `ParamSpec`, with
+the type parsed into an enum and the default checked against it. The
+`try_from` attribute we used for stop signals joins the two:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawParam", into = "RawParam")]
+pub struct ParamSpec {
+    pub kind: ParamType,
+    pub default: Option<ParamValue>,
+}
+```
+
+So `{ type = "int", default = "x" }` fails while the file parses, with
+TOML's line number on it, rather than later when somebody uses the template.
+A `[use.*]` table works the same way: it's a map of values, and `try_from`
+takes the `template` key out of it and keeps the rest as parameter values.
+
+#### Reading the body like a parser
+
+The scanner splits a body into pieces without copying it:
+
+```rust
+enum Piece<'a> {
+    Text(&'a str),
+    Placeholder { name: &'a str, slot: Slot },
+}
+
+fn scan(body: &str) -> Result<Vec<Piece<'_>>, String>
+```
+
+Each `&'a str` is a slice of `body`, a pointer and a length into memory
+somebody else owns. In C you'd hand out pointers into the buffer and hope
+nobody freed it. Here the lifetime `'a` ties every piece to `body`, and `'_`
+in the return type tells the compiler "the same lifetime as the one
+borrowed argument". If the caller dropped the body while it still held the
+pieces, the program wouldn't compile.
+
+The scanner itself is a small state machine. `Context` says where we are,
+and one function says what the next few bytes do to it:
+
+```rust
+fn advance(context: Context, rest: &str) -> (Context, usize) {
+    match context {
+        Context::Bare if rest.starts_with('#') => (Context::Comment, 0),
+        Context::Bare if rest.starts_with("\"\"\"") => (Context::MultiBasic, 3),
+        Context::Bare if rest.starts_with('"') => (Context::Basic, 0),
+        // ...
+        Context::Basic | Context::MultiBasic if rest.starts_with('\\') => {
+            let escaped = rest[1..].chars().next().map_or(0, char::len_utf8);
+            (context, 1 + escaped)
+        }
+        Context::Basic if rest.starts_with('"') => (Context::Bare, 0),
+        // ...
+        _ => (context, 0),
+    }
+}
+```
+
+The match guards are checked top to bottom, so `"""` is tried before `"`.
+The backslash arm is there so `"say \"hi\""` doesn't end at the escaped
+quote. The fiddly part is `char::len_utf8`. A Rust `&str` is always valid
+UTF-8, and slicing one in the middle of a multi-byte character panics. So the
+scanner steps over whole characters, never single bytes, and a template full
+of emoji still scans.
+
+A placeholder records its `Slot`, which is the context with the comment case
+taken away: placeholders in comments never become pieces at all. `render`
+then decides, per slot, what the value may be:
+
+```rust
+let text = match value {
+    ParamValue::Int(number) => return Ok(number.to_string()),
+    ParamValue::Bool(flag) => return Ok(flag.to_string()),
+    ParamValue::String(text) => text,
+};
+match slot {
+    Slot::Basic => Ok(escape_basic(text)),
+    Slot::Bare => { /* a plain key, or refused */ }
+    Slot::Literal | Slot::MultiLiteral => { /* no quote or control character */ }
+}
+```
+
+The first `match` returns early for the two types that are safe anywhere,
+and binds `text` for the one that isn't. After it, the compiler knows
+`text` is a string, so the second `match` only has to think about where it
+goes. Because `match` must be exhaustive, adding a fourth slot one day
+won't compile until somebody decides what a string may hold there.
+
+#### Expanding, and taking the maps
+
+`expand` moves the `use` tables out of the config before it expands them:
+
+```rust
+let uses = std::mem::take(&mut config.uses);
+```
+
+`std::mem::take` swaps a value out and leaves its type's default behind,
+here an empty map. We need it because we're about to insert apps into
+`config` while walking the uses. If we iterated `config.uses` directly, we'd
+hold a shared borrow of `config` while trying to change it, and the borrow
+checker refuses that. Taking the map out first gives us our own copy to
+walk, and leaves the config without uses, which is what we want at the end
+anyway. In Go you'd copy the map, or not notice the aliasing.
+
+Each expanded app gets its provenance, and a clash check runs first: was
+this name made by an earlier `use` (named in the error), or declared by the
+config itself? Uses expand in name order, because a `BTreeMap` iterates in
+key order, so the same files always give the same apps and the same first
+error.
+
+#### Three callers, one function
+
+`expand` has three callers, all before validation and policy. The compiler
+shared by `relish compile` and Lettuce collects every file's templates
+first, then expands each file's uses before that file's defaults and
+namespace apply. `relish::manifest::parse`, which `apply`, `lint`, `diff`
+and `policy test` read through, expands a single file's own templates. And
+the apply endpoint expands a manifest that arrives unexpanded, say from
+`curl`. Finally, `Config::validate` refuses a `use` that's still there, so a
+future fourth caller that forgets to expand fails loudly instead of quietly
+dropping apps.
+
+The only wire and state change is `provenance` on `AppSpec` and `JobSpec`,
+so it's a line under the 0.2.4 heading in `src/compatibility.rs`, not a
+bump.
+
 ### The controller contract
 
 ([#1125](https://github.com/reliaburger/reliaburger/issues/1125)) The contract
@@ -2322,11 +2546,6 @@ let current = match existing[..] {
 `existing[..]` is the vector viewed as a slice, and `[]`, `[only]` and `_`
 match a slice with no elements, exactly one (binding it to `only`), or any
 other length. It reads like the rule it implements: none, one, or more.
-
-Still to come in this walkthrough:
-
-- templates
-  ([#1124](https://github.com/reliaburger/reliaburger/issues/1124)).
 
 ## Tests
 
@@ -2662,6 +2881,82 @@ whose halves are never tested apart can quietly become a single gate.
 None of these run runc. The runc half is two calls and a `stat`, and it's
 Linux-only, so it's exercised by `make test-linux` rather than by the
 portable suite.
+
+### Testing templates
+
+([#1124](https://github.com/reliaburger/reliaburger/issues/1124)) Templates
+are pure functions from text to config, so nearly all of their tests are
+unit tests in `src/config/template/tests.rs`, with no node in sight:
+
+- **Parsing**: both shapes of parameter, a `use` with typed values, a TOML
+  and JSON round trip, and a table of malformed ones (an unknown type, a
+  default of the wrong type, a misspelt key, no `body`, a `use` without
+  `template`, a float value), each failing with its reason.
+- **Expansion**: a `use` makes an ordinary app with its provenance and the
+  default filled in; two uses make two apps; a body's jobs carry provenance
+  too; a config with no templates comes out unchanged.
+- **Injection**: `a_value_inside_quotes_is_escaped_so_it_cannot_add_tables`
+  passes a value that closes its string and declares `[app.evil]`, and
+  checks there's still one app, with the value intact in its environment.
+  Its siblings check the other slots: a string outside quotes must be a
+  plain key, a literal string refuses a quote, integers and booleans go
+  anywhere, `$${` survives as `${` for a shell, comments are left alone, and
+  a value that looks like a placeholder isn't expanded again.
+- **Every refusal has a test**: an unknown template, an unknown parameter, a
+  missing one, the wrong type, a clash with a declared app, two uses making
+  one name, a nested template or `use`, a body with a policy in it, a
+  placeholder no parameter resolves, bad names, and a body that isn't valid
+  TOML. The ones whose wording matters compare the whole message.
+- **A property test**, `expansion_is_deterministic_and_leaves_no_placeholders`,
+  generates names, counts, flags and strings full of quotes, backslashes,
+  newlines and Unicode, puts them in a basic string, a multi-line string, a
+  literal string, a command array and a bare position, and checks three
+  things: expanding twice gives the same config, the rendered result holds no
+  `${`, and every value comes back out of the parsed app exactly as it went
+  in. That last one is the injection promise, stated as a property.
+
+Around it:
+
+- **The compiler** (`relish::compile::tests`): a template in one file serves
+  a `use` in another, and the app takes the `use`'s directory namespace and
+  `_defaults.toml`, under both duplicate policies; a template declared twice
+  is refused, naming both files; an expanded app that collides with one in
+  another file is refused even when `relish compile` would only warn.
+- **Policies** (`policy::tests`): a `deny` matching `app.provenance.template`
+  refuses a one-replica Postgres and passes a two-replica one; a `default`
+  fills a field on an expanded app and keeps its provenance; and a default
+  that tries to set `provenance` is refused at commit. A job policy matching
+  `job.provenance.template` refuses a templated migration job pinned to
+  `:latest`. `app_fields_match_the_app_spec`
+  failed the moment `provenance` joined `AppSpec`, which is the job it was
+  written for.
+- **Owners** (`bun::api::owner_tests`): a template whose body declares
+  `owner = "${controller}"` is refused with a 403 for a human's token and
+  committed for the controller's, and the stored app keeps its owner, its
+  provenance and the field a policy default filled, with the declared spec
+  holding the owner and provenance but not the filled field.
+  `the_provenance_is_not_part_of_the_version` checks the rollout
+  fingerprint, beside the test that does the same for `owner`.
+- **Plan and diff**: an insta snapshot of `relish apply --dry-run` for two
+  uses and a hand-written app, with a policy denying one of them, plus a
+  check that the same apps planned against their own fingerprints are all
+  unchanged. A `relish diff` test changes one parameter and expects a change
+  to the app, not to a `use`.
+- **The portable suite** (`tests/suite/templates.rs`): the config `relish
+  apply` sends and the raw manifest both store one ordinary app, the same
+  one, with its provenance; a policy refuses an expanded app with a 422 and
+  writes nothing; a `use` that can't expand answers 400. And
+  `repeated_syncs_of_a_templated_app_do_not_reapply_it` is #1118's diff-trap
+  test for templates: a GitOps repository with the template in one file and
+  the `use` in another syncs one app, then an unrelated app is added without
+  touching it, then a comment-only commit changes nothing, and finally a
+  changed parameter is exactly one modification.
+- **Published manifests**: `documented_manifests` and `doc_snippets` now
+  expand templates before they validate, the way `relish apply` does, so the
+  manual's template and `examples/templates/container-postgres.toml` are
+  checked like any other manifest. Before that change, the example's
+  `use`-only shape would have been skipped as "not a workload" and never
+  checked at all.
 
 ### Testing the controller contract
 

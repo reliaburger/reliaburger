@@ -25,7 +25,7 @@ pub const MAX_MESSAGE_BYTES: usize = 512;
 pub const MAX_DEFAULT_BYTES: usize = 4096;
 
 /// App fields a `default` can never fill, and why.
-pub const UNFILLABLE_FIELDS: [(&str, &str); 12] = [
+pub const UNFILLABLE_FIELDS: [(&str, &str); 13] = [
     ("name", "is the app's table name, not a field"),
     (
         "namespace",
@@ -57,6 +57,10 @@ pub const UNFILLABLE_FIELDS: [(&str, &str); 12] = [
         "sidecar",
         "would add a container to every matching app; declare sidecars on the app",
     ),
+    (
+        "provenance",
+        "says which template made the app, and only template expansion writes it",
+    ),
 ];
 
 /// Every variable a policy expression can see. Nothing else: no other
@@ -79,7 +83,7 @@ pub fn workload_variables(target: PolicyTarget) -> &'static [&'static str] {
 /// The fields of `job`: every `[job.*]` key, plus the job's `name`
 /// (#1119). `namespace` is always present, as for `app`. A test checks
 /// this list against `JobSpec` itself.
-pub const JOB_FIELDS: [&str; 19] = [
+pub const JOB_FIELDS: [&str; 20] = [
     "name",
     "runtime",
     "image",
@@ -99,13 +103,14 @@ pub const JOB_FIELDS: [&str; 19] = [
     "task_timeout_secs",
     "overlap",
     "replay_unknown",
+    "provenance",
 ];
 
 /// The fields of `workload`: the ones apps and jobs share (#1119). A test
 /// checks this is exactly where [`APP_FIELDS`] and [`JOB_FIELDS`] meet,
 /// less `runtime`, which means an app's kernel knobs but a job's execution
 /// state.
-pub const WORKLOAD_FIELDS: [&str; 11] = [
+pub const WORKLOAD_FIELDS: [&str; 12] = [
     "name",
     "image",
     "command",
@@ -117,6 +122,7 @@ pub const WORKLOAD_FIELDS: [&str; 11] = [
     "firewall",
     "egress",
     "namespace",
+    "provenance",
 ];
 /// Why a default can't fill a field the apply path gates on the caller.
 const GATED_BY_THE_CALLER: &str = "can need host access or a runtime knob, which the caller's token must allow, so a default can't grant it";
@@ -125,7 +131,7 @@ const GATED_BY_THE_CALLER: &str = "can need host access or a runtime knob, which
 ///
 /// `namespace` is always present, resolved to `default` when the spec
 /// doesn't name one. A test checks this list against `AppSpec` itself.
-pub const APP_FIELDS: [&str; 35] = [
+pub const APP_FIELDS: [&str; 36] = [
     "name",
     "image",
     "command",
@@ -160,6 +166,7 @@ pub const APP_FIELDS: [&str; 35] = [
     "pre_stop_timeout",
     "runtime",
     "namespace",
+    "provenance",
     "owner",
 ];
 

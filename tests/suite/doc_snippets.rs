@@ -401,7 +401,16 @@ enum TomlKind {
     Manifest,
 }
 
-const WORKLOAD_TABLES: &[&str] = &["app", "job", "namespace", "permission", "policy", "build"];
+const WORKLOAD_TABLES: &[&str] = &[
+    "app",
+    "job",
+    "namespace",
+    "permission",
+    "policy",
+    "build",
+    "template",
+    "use",
+];
 
 /// Split a TOML document by the type that reads each top-level key. Anything
 /// that isn't a workload table, a scenario or a manifest is node config, so a
@@ -453,7 +462,11 @@ fn check_toml_part(kind: TomlKind, source: &str) -> Result<(), String> {
     use reliaburger::config::{Config, NodeConfig};
     match kind {
         TomlKind::Workload => {
-            let config = Config::parse(source).map_err(|error| error.to_string())?;
+            let mut config = Config::parse(source).map_err(|error| error.to_string())?;
+            // Templates expand before validation, as `relish apply` does.
+            config
+                .expand_templates()
+                .map_err(|error| error.to_string())?;
             config.validate().map_err(|error| error.to_string())
         }
         TomlKind::Node => {

@@ -2376,7 +2376,9 @@ fn spawn_placement_reconciler_with_io_timeout(
                 spec.ordinals = Some(assignment.ordinals.clone());
                 // Who manages an app is the council's business, not the
                 // node's: a controller claiming it mustn't redeploy it (#1125).
+                // Nor does the node need to know which template made it (#1124).
                 spec.owner = None;
+                spec.provenance = None;
                 let fingerprint = serde_json::to_string(&spec).unwrap_or_default();
                 if matches!(applied.get(&key), Some(AssignmentState::Applied { fingerprint: previous }) if previous == &fingerprint)
                 {

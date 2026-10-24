@@ -441,4 +441,24 @@ mod tests {
         let json = serde_json::to_string(&diff).unwrap();
         assert!(json.contains("app.web"));
     }
+
+    /// #1124: `relish diff` reads files the way `apply` does, templates
+    /// expanded, so a changed parameter shows as the change it makes to
+    /// the app, not as a change to a `use` table.
+    #[test]
+    fn a_changed_template_parameter_diffs_as_a_change_to_the_expanded_app() {
+        let manifest = |size: &str| {
+            crate::relish::manifest::parse(&format!(
+                "[template.db]\nparams = {{ size = 'string' }}\nbody = \"\"\"\n[app.orders-db]\nimage = 'postgres:17'\n[[app.orders-db.volumes]]\npath = '/data'\nsize = '${{size}}'\n\"\"\"\n[use.orders]\ntemplate = 'db'\nsize = '{size}'\n"
+            ))
+            .unwrap()
+            .config
+        };
+        let diff = diff_configs(&manifest("5Gi"), &manifest("50Gi"));
+        let output = diff.to_string();
+        assert_eq!(diff.modified.len(), 1, "got:\n{output}");
+        assert!(output.contains("~ app.orders-db"), "got:\n{output}");
+        assert!(output.contains("50Gi"), "got:\n{output}");
+        assert!(!output.contains("use."), "got:\n{output}");
+    }
 }

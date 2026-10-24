@@ -92,6 +92,7 @@ mod stop_hooks;
 mod task_array_million;
 mod task_array_recovery;
 mod task_arrays;
+mod templates;
 mod tls_connection_lifetime;
 mod uninstall;
 mod user_directories;
