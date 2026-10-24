@@ -119,6 +119,12 @@ pub(crate) const AUDITED_ROUTES: &[AuditedRoute] = &[
     audited(Post, "/v1/gitops/config", "gitops.configured", Operation),
     audited(
         Post,
+        "/v1/policies/{name}/delete",
+        "policy.deleted",
+        Operation,
+    ),
+    audited(
+        Post,
         "/v1/nodes/decommission",
         "node.decommissioned",
         Operation,
@@ -702,6 +708,13 @@ pub(super) fn manifest_audit_note(config: &Config) -> AuditNote {
         details.insert(
             "namespaces".to_string(),
             namespaces.iter().copied().collect::<Vec<_>>().join(","),
+        );
+    }
+    // Every policy write is audited (#1117): the apply's record names them.
+    if !config.policy.is_empty() {
+        details.insert(
+            "policies".to_string(),
+            config.policy.keys().cloned().collect::<Vec<_>>().join(","),
         );
     }
     let single = |items: &[(String, String)]| match items {

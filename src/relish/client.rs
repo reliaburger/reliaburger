@@ -922,6 +922,17 @@ impl BunClient {
             {
                 return Err(RelishError::SchedulingRejected(refusal.error));
             }
+            if status == 422
+                && let Ok(refusal) =
+                    serde_json::from_str::<crate::bun::api::apply::PolicyRefusal>(&body)
+            {
+                for warning in &refusal.policy_warnings {
+                    eprintln!("warning: {warning}");
+                }
+                return Err(RelishError::PolicyDenied {
+                    denials: refusal.policy_denials,
+                });
+            }
             return Err(RelishError::ApiError { status, body });
         }
 
@@ -2928,6 +2939,19 @@ impl BunClient {
 
     /// The cluster's GitOps configuration and sync status, as the node
     /// this client talks to sees it (#693).
+    /// The cluster's policies and their generation (`GET /v1/policies`).
+    pub async fn policies(&self) -> Result<crate::policy::PolicyListing, RelishError> {
+        self.get_typed_json("/v1/policies").await
+    }
+
+    /// Delete a policy (admin only).
+    pub async fn delete_policy(&self, name: &str) -> Result<(), RelishError> {
+        let name: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();
+        self.post_json(&format!("/v1/policies/{name}/delete"), String::new())
+            .await
+            .map(|_| ())
+    }
+
     pub async fn gitops_status(&self) -> Result<crate::lettuce::types::GitOpsStatus, RelishError> {
         self.get_typed_json("/v1/gitops").await
     }

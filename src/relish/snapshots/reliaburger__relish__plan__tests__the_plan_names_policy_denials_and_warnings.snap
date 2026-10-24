@@ -1,0 +1,20 @@
+---
+source: src/relish/plan.rs
+expression: plan.to_string()
+---
+Relish apply plan:
+
+  + app.prod/web
+      image     web:latest
+      replicas  1
+      namespace prod
+
+  + policy.no-latest
+      action    warn
+Plan: 2 to create, 0 to update, 0 unchanged.
+No live comparison was available; creates are an offline assumption.
+
+Policies:
+  DENY  policy prod-needs-limits denies app prod/web: apps in prod need a memory limit
+  WARN  policy no-latest warns about app prod/web: breaks policy no-latest
+The cluster's policies would refuse this apply.

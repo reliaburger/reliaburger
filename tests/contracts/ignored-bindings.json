@@ -258,6 +258,12 @@
     "test": "decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change"
   },
   {
+    "source": "tests/cluster_failover.rs",
+    "function": "a_leader_killed_during_an_apply_under_policy_leaves_the_policy_enforced",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_leader_killed_during_an_apply_under_policy_leaves_the_policy_enforced"
+  },
+  {
     "source": "tests/cluster_gossip.rs",
     "function": "three_nodes_join_by_address_and_converge",
     "binary": "reliaburger::cluster_gossip",

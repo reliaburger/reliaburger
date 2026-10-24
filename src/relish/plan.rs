@@ -66,6 +66,11 @@ pub struct PlanEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApplyPlan {
     pub entries: Vec<PlanEntry>,
+    /// What the policies said about this config's apps (#1117): the
+    /// cluster's policies when one answered, with the config's own
+    /// replacing any of the same name.
+    #[serde(skip_serializing_if = "PolicyPlan::is_empty")]
+    pub policy: PolicyPlan,
     pub to_create: usize,
     pub to_update: usize,
     /// Resources running on the cluster but absent from this config —
@@ -90,6 +95,30 @@ pub struct CurrentResource {
     pub image: Option<String>,
     /// Complete effective desired-spec fingerprint, when known.
     pub fingerprint: Option<String>,
+}
+
+/// The policy section of a plan: one line per denial and per warning.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PolicyPlan {
+    /// Policies that would refuse the apply, as `policy … denies app …`.
+    pub denials: Vec<String>,
+    /// Policies that would only warn.
+    pub warnings: Vec<String>,
+}
+
+impl PolicyPlan {
+    /// Whether the policies said nothing.
+    pub fn is_empty(&self) -> bool {
+        self.denials.is_empty() && self.warnings.is_empty()
+    }
+
+    /// The plan section for `verdict`.
+    pub fn from_verdict(verdict: &crate::policy::Verdict) -> Self {
+        PolicyPlan {
+            denials: verdict.denials.iter().map(ToString::to_string).collect(),
+            warnings: verdict.warnings.iter().map(ToString::to_string).collect(),
+        }
+    }
 }
 
 /// Generate an apply plan from a parsed config.
@@ -229,6 +258,30 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
         });
     }
 
+    // Policies
+    for name in config.policy.keys() {
+        let resource_key = format!("policy.{name}");
+        desired_resources.insert(resource_key.clone());
+
+        let action = match current_map.get(resource_key.as_str()) {
+            Some(existing) => compare_spec(
+                existing,
+                crate::config::fingerprint::spec_fingerprint(&config.policy[name]),
+                None,
+            ),
+            None => PlanAction::Create,
+        };
+
+        entries.push(PlanEntry {
+            resource: resource_key,
+            action,
+            summary: vec![(
+                "action".to_string(),
+                config.policy[name].action.as_str().to_string(),
+            )],
+        });
+    }
+
     // Resources in current state but absent from this config. Apply is
     // additive, so these are informational — not a promise of removal.
     if let Some(current_list) = current {
@@ -267,6 +320,7 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
     ApplyPlan {
         unknown,
         comparison_available: current.is_some(),
+        policy: PolicyPlan::default(),
         entries,
         to_create,
         to_update,
@@ -302,7 +356,7 @@ impl fmt::Display for ApplyPlan {
                     "\nNo live comparison was available; creates are an offline assumption."
                 )?;
             }
-            return Ok(());
+            return self.fmt_policy(f);
         }
 
         writeln!(f, "Relish apply plan:")?;
@@ -343,6 +397,27 @@ impl fmt::Display for ApplyPlan {
                 "\n{} running resource(s) not in this config (apply leaves them; `relish stop` removes).",
                 self.not_in_config
             )?;
+        }
+        self.fmt_policy(f)
+    }
+}
+
+impl ApplyPlan {
+    /// The policy section: every denial and warning, and whether the
+    /// policies would refuse the apply.
+    fn fmt_policy(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.policy.is_empty() {
+            return Ok(());
+        }
+        write!(f, "\n\nPolicies:")?;
+        for denial in &self.policy.denials {
+            write!(f, "\n  DENY  {denial}")?;
+        }
+        for warning in &self.policy.warnings {
+            write!(f, "\n  WARN  {warning}")?;
+        }
+        if !self.policy.denials.is_empty() {
+            write!(f, "\nThe cluster's policies would refuse this apply.")?;
         }
         Ok(())
     }
@@ -411,6 +486,45 @@ apps = ["web"]
         let plan = generate_plan(&changed, Some(&current));
         assert_eq!(plan.to_update, 4, "{plan:?}");
         assert_eq!(plan.unchanged, 0);
+    }
+
+    /// #1117: the plan names every denial and warning, judged by the
+    /// cluster's policies with the config's own replacing any of the same
+    /// name, and says the apply would be refused.
+    #[test]
+    fn the_plan_names_policy_denials_and_warnings() {
+        let committed = parse_config(
+            r#"
+[policy.prod-needs-limits]
+match = "app.namespace == 'prod'"
+deny = "!has(app.memory)"
+message = "apps in prod need a memory limit"
+"#,
+        )
+        .policy;
+        let config = parse_config(
+            r#"
+[policy.no-latest]
+deny = "app.image.endsWith(':latest')"
+action = "warn"
+
+[app.web]
+image = "web:latest"
+namespace = "prod"
+"#,
+        );
+        let mut plan = generate_plan(&config, None);
+        plan.policy = crate::relish::commands::plan_policies(&committed, &config);
+        insta::assert_snapshot!(plan.to_string());
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["policy"]["denials"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_plan_without_policy_findings_has_no_policy_section() {
+        let plan = generate_plan(&parse_config("[app.web]\nimage = 'web:v1'\n"), None);
+        assert!(!plan.to_string().contains("Policies:"));
+        assert!(serde_json::to_value(&plan).unwrap().get("policy").is_none());
     }
 
     #[test]

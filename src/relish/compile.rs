@@ -249,6 +249,11 @@ fn first_duplicate_resource(merged: &Config, incoming: &Config) -> Option<String
             return Some(format!("permission.{name}"));
         }
     }
+    for name in incoming.policy.keys() {
+        if merged.policy.contains_key(name) {
+            return Some(format!("policy.{name}"));
+        }
+    }
     for name in incoming.build.keys() {
         if merged.build.contains_key(name) {
             return Some(format!("build.{name}"));
@@ -329,6 +334,7 @@ fn merge_into(target: &mut Config, source: Config) -> Result<Vec<String>, Relish
     }
     target.namespace.extend(source.namespace);
     target.permission.extend(source.permission);
+    target.policy.extend(source.policy);
     Ok(collisions)
 }
 
@@ -403,6 +409,37 @@ mod tests {
             Some("base:v1"),
             "default image should be applied"
         );
+    }
+
+    /// #1117: policies from every file reach the compiled config, the one
+    /// GitOps applies; dropping them would let a repository's policies
+    /// silently vanish.
+    #[test]
+    fn policies_from_every_file_are_compiled() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "a.toml", "[policy.one]\ndeny = 'false'\n");
+        write_file(
+            dir.path(),
+            "b.toml",
+            "[policy.two]\ndeny = 'false'\n[app.web]\nimage = 'w:1'\n",
+        );
+        let result = compile(dir.path()).unwrap();
+        assert_eq!(
+            result.config.policy.keys().collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
+        let files = std::collections::BTreeMap::from([
+            (
+                PathBuf::from("a.toml"),
+                "[policy.one]\ndeny = 'false'\n".to_string(),
+            ),
+            (
+                PathBuf::from("b.toml"),
+                "[policy.one]\ndeny = 'true'\n".to_string(),
+            ),
+        ]);
+        let error = compile_sources(&files, DuplicatePolicy::Refuse).unwrap_err();
+        assert!(error.message.contains("policy.one"), "{error}");
     }
 
     /// O10: the maps are keyed by name, so `extend` silently replaced a

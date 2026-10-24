@@ -463,7 +463,7 @@ pub enum RaftRequest {
     },
     /// A desired-state write Lettuce makes for the repository (#693).
     ///
-    /// `change` is an app, namespace or permission spec or delete. It
+    /// `change` is an app, namespace, permission or policy spec or delete. It
     /// applies, and the GitOps ownership set records (or forgets) the
     /// resource, in this one entry. `term` is the Raft term the sync read
     /// its snapshot in; an entry proposed in any other term is refused, so
@@ -499,6 +499,28 @@ pub enum RaftRequest {
     /// record it as the newest rollback target. Refused unless `spec` is
     /// still the app's current spec.
     RolloutReleased { app_id: AppId, spec: Box<AppSpec> },
+    /// Register or replace a named policy (#1117). Every applied entry moves
+    /// `DesiredState::policy_generation` by one. The leader checked the
+    /// policy before proposing it; the state machine only stores it.
+    PolicySpec {
+        name: String,
+        spec: Box<crate::config::PolicySpec>,
+    },
+    /// Remove a named policy. Refused when there's no such policy, so every
+    /// applied entry moves `DesiredState::policy_generation` by one.
+    PolicyDelete { name: String },
+    /// An app write the leader evaluated against the policy set at
+    /// `generation` (#1117). The state machine applies `change` only while
+    /// its own `policy_generation` is still `generation`, and otherwise
+    /// answers `CouncilResponse::PolicyGenerationMoved`, so the leader
+    /// evaluates again. It compares two numbers and never runs a policy.
+    ///
+    /// `change` is an `AppSpec`, a `TestLeaseAppSpec`, or a `GitOpsWrite`
+    /// carrying an `AppSpec`.
+    PolicyFenced {
+        generation: u64,
+        change: Box<RaftRequest>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +577,10 @@ pub enum CouncilResponse {
     /// A leader tick's task-array writes applied; these were refused, by
     /// array id, with the reason.
     TaskArrayTicked { refused: Vec<(u64, String)> },
+    /// A `PolicyFenced` write was evaluated against an older policy set:
+    /// the policies are now at `current`. Nothing applied; the leader
+    /// evaluates the app again and retries (#1117).
+    PolicyGenerationMoved { current: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -670,6 +696,15 @@ pub struct DesiredState {
     pub namespaces: std::collections::BTreeMap<String, crate::config::NamespaceSpec>,
     /// Declared permission grants keyed by name (12b.2 T6).
     pub permissions: std::collections::BTreeMap<String, crate::config::PermissionSpec>,
+    /// Declared policies keyed by name (#1117). The leader evaluates them
+    /// before it proposes an app; the state machine only stores them. No
+    /// serde default: a snapshot that lost its policies must not load as a
+    /// cluster without any.
+    pub policies: std::collections::BTreeMap<String, crate::config::PolicySpec>,
+    /// How many policy writes have applied. Each app write a policy was
+    /// evaluated for carries the generation it saw, and is refused once
+    /// this has moved on (#1117).
+    pub policy_generation: u64,
     /// Cluster-wide service endpoint catalogue (12b.4): every namespace's
     /// services, their VIPs and healthy backends across all nodes. Built by
     /// the leader from health reports and replicated so any node resolves
@@ -990,11 +1025,39 @@ mod tests {
             RaftRequest::PermissionDelete {
                 name: "deployer".to_string(),
             },
+            RaftRequest::PolicySpec {
+                name: "no-latest".to_string(),
+                spec: Box::new(crate::config::PolicySpec {
+                    match_expression: Some("app.namespace == 'prod'".to_string()),
+                    deny: "app.image.endsWith(':latest')".to_string(),
+                    message: Some("pin a version".to_string()),
+                    action: crate::config::PolicyAction::Warn,
+                }),
+            },
+            RaftRequest::PolicyDelete {
+                name: "no-latest".to_string(),
+            },
+            RaftRequest::PolicyFenced {
+                generation: 7,
+                change: Box::new(RaftRequest::AppDelete {
+                    app_id: AppId::new("web", "default"),
+                }),
+            },
         ];
         for req in &requests {
             let json = serde_json::to_string(req).unwrap();
             let decoded: RaftRequest = serde_json::from_str(&json).unwrap();
             assert_eq!(*req, decoded);
+        }
+    }
+
+    #[test]
+    fn snapshot_must_not_forget_its_policies() {
+        for field in ["policies", "policy_generation"] {
+            let mut snapshot = serde_json::to_value(DesiredState::default()).unwrap();
+            snapshot.as_object_mut().unwrap().remove(field);
+            let error = serde_json::from_value::<DesiredState>(snapshot).unwrap_err();
+            assert!(error.to_string().contains(field), "{error}");
         }
     }
 

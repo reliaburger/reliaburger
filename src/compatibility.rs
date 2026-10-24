@@ -163,6 +163,11 @@ pub struct Compatibility {
 /// An app's `stop_signal`, `stop_grace`, `pre_stop` and `pre_stop_timeout`
 /// in Raft desired state and node syncs, and the `stop` policy in OCI
 /// specs, instance records, runtime intents and process owner records (#1121).
+/// Policies in the council: the `PolicySpec`, `PolicyDelete` and
+/// `PolicyFenced` Raft requests, the `PolicyGenerationMoved` response,
+/// `DesiredState::policies` and `policy_generation`, the GitOps ownership
+/// set's `policies`, `[policy.*]` in applied configs, `GET /v1/policies`
+/// and the 422 `PolicyRefusal` body of a refused apply (#1117).
 /// An app's `sidecar` list in Raft desired state, node syncs and instance
 /// records, and `NodeCapabilities::shared_network` in the capability report
 /// (#1120).

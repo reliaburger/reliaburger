@@ -51,4 +51,11 @@ pub enum ConfigError {
         context: String,
         reason: String,
     },
+
+    /// A `[policy.*]` table that can't be committed (#1117).
+    #[error("policy {name:?}: {source}")]
+    InvalidPolicy {
+        name: String,
+        source: crate::policy::PolicyError,
+    },
 }

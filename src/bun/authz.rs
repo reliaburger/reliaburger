@@ -243,6 +243,10 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // changing the cluster's configuration is an Admin operation (#693).
     route(Get, "/v1/gitops", AnyToken),
     gated(Post, "/v1/gitops/config", Admin, Cluster(ADMIN)),
+    // Policies (#1117): anyone may read them; deleting one is an Admin
+    // operation, like writing one through `relish apply`.
+    route(Get, "/v1/policies", AnyToken),
+    gated(Post, "/v1/policies/{name}/delete", Admin, Cluster(ADMIN)),
     // Chaos.
     route(Post, "/v1/chaos/reserve", System),
     route(Post, "/v1/chaos/fence", System),
@@ -651,6 +655,7 @@ mod tests {
         include_str!("api/metrics.rs"),
         include_str!("api/node_info.rs"),
         include_str!("api/nodes.rs"),
+        include_str!("api/policies.rs"),
         include_str!("api/registry.rs"),
         include_str!("api/secrets.rs"),
         include_str!("api/snapshots.rs"),
