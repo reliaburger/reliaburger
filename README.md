@@ -105,7 +105,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish decommission-node --workloads-stopped --reason <REASON> <NODE_ID>`: Permanently retire a stopped or fenced node; return requires fresh enrolment
 - `relish uninstall`: Remove the CLI, its PATH link, the managed Lima tools and the image cache
 
-**Deploy and manage apps** ([deploy an app](docs/manual/01_deploy-an-app.md))
+**Deploy and manage apps** ([deploy an app](docs/manual/01_deploy-an-app.md), [writing a controller](docs/manual/15_writing-a-controller.md))
 
 - `relish apply [PATH_OR_URL]`: Apply a Reliaburger TOML or Kubernetes YAML manifest
 - `relish status`: Show cluster and app status
@@ -117,6 +117,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish rollback <APP>`: Rollback an app to the previous version
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
 - `relish delete <APP>`: Remove an app from the cluster and stop all its instances
+- `relish release <APP>`: Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin) *(0.2.2, not in 0.2.1)*
 - `relish batch [PATH]`: Submit a batch of jobs, or manage a task array
   - `relish batch submit <PATH>`: Submit a compact TOML manifest containing mixed resource profiles
   - `relish batch replay --node <NODE> --grant-digest <GRANT_DIGEST> --acknowledge-side-effects <ID>`: Acknowledge repeating side effects for the exact unknown owner grants
@@ -338,6 +339,14 @@ limit", are kept in the council and checked on the leader before an app is
 written, for `relish apply` and GitOps alike. A rule refuses the apply or only
 warns, every denial names its policy, and `relish policy test` *(0.2.2, not in 0.2.1)* runs the same
 check offline in CI. See [security and access](docs/manual/10_security.md#policies).
+
+**Your own controllers, without an operator SDK.** A controller is an ordinary
+app holding a token scoped to its namespace. It reads the API and the event
+stream, and claims the apps it manages with an `owner`, after which
+`relish apply` and GitOps leave them alone. The JSON it reads and writes is
+documented and pinned by tests. See
+[writing a controller](docs/manual/15_writing-a-controller.md) and the example
+in [`examples/controller`](examples/controller).
 
 **A million jobs.** Every kind of job runs on one lifecycle: a one-off job, a
 cron schedule, a hook that runs before a deploy, and a task array that runs the

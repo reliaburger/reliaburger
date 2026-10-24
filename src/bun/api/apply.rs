@@ -599,7 +599,7 @@ pub(crate) fn runtime_knob_notes(config: &Config) -> Vec<String> {
 pub(super) async fn cluster_apply(
     state: ApiState,
     council: Arc<crate::council::CouncilNode>,
-    config: Config,
+    mut config: Config,
     raw_body: String,
     lease_id: Option<String>,
     caller_headers: HeaderMap,
@@ -692,6 +692,16 @@ pub(super) async fn cluster_apply(
             .into_response();
     }
 
+    // Resource owners (#1125): an app a controller owns is skipped unless
+    // this apply declares that owner, and only the owner's token or an admin
+    // may declare one. Decided before policy, so a skipped app is neither
+    // judged nor written.
+    let owner_notes =
+        match skip_owned_apps(&council, &mut config, &owner_caller(auth.as_ref())).await {
+            Ok(notes) => notes,
+            Err(error) => return owner_refusal(&error),
+        };
+
     if caller_headers.contains_key(CAPACITY_PROBE_HEADER) {
         use crate::cluster::capacity::{CapacityAdmissionError, SchedulingRefusal};
         let Some(admission) = capacity_admission else {
@@ -770,8 +780,9 @@ pub(super) async fn cluster_apply(
             .warnings
             .iter()
             .map(|finding| format!("warning: {finding}"));
-        for message in gitops_warnings
+        for message in owner_notes
             .into_iter()
+            .chain(gitops_warnings)
             .chain(policy_warnings)
             .chain(host_path_notes(&config))
             .chain(runtime_knob_notes(&config))
@@ -955,6 +966,103 @@ pub(crate) fn policy_caller(
             crate::policy::Caller::token("local-bootstrap", crate::sesame::types::ApiRole::Admin)
         }
     }
+}
+
+/// The caller resource owners see for an API request (#1125). The
+/// bootstrap window (no auth) and the service principal, which only ever
+/// carries a request another node already checked, count as admins.
+pub(crate) fn owner_caller(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+) -> crate::council::owner::OwnerCaller {
+    use crate::council::owner::OwnerCaller;
+    match auth {
+        None => OwnerCaller::token("local-bootstrap", true),
+        Some(auth) if auth.token_name == crate::sesame::auth::SYSTEM_PRINCIPAL => {
+            OwnerCaller::token(&auth.token_name, true)
+        }
+        Some(auth) => OwnerCaller::token(
+            &auth.token_name,
+            auth.role == crate::sesame::types::ApiRole::Admin,
+        ),
+    }
+}
+
+/// Take the apps a controller owns out of `config`, unless it declares
+/// their owner, and return a progress note for each one skipped (#1125).
+/// Refuses the whole apply when it declares an owner the caller can't
+/// speak for, or one that differs from the app's current owner.
+pub(crate) async fn skip_owned_apps(
+    council: &crate::council::CouncilNode,
+    config: &mut Config,
+    caller: &crate::council::owner::OwnerCaller,
+) -> Result<Vec<String>, crate::council::owner::OwnerError> {
+    use crate::council::owner::{ApplyVerdict, judge_apply, skip_note};
+    let declared: Vec<(String, crate::meat::AppId, Option<String>)> = config
+        .app
+        .iter()
+        .map(|(name, spec)| {
+            let app_id =
+                crate::meat::AppId::new(name, spec.namespace.as_deref().unwrap_or("default"));
+            (name.clone(), app_id, spec.owner.clone())
+        })
+        .collect();
+    let current: std::collections::HashMap<crate::meat::AppId, String> = council
+        .read_desired(|desired| {
+            declared
+                .iter()
+                .filter_map(|(_, app_id, _)| {
+                    let owner = desired.apps.get(app_id)?.owner.clone()?;
+                    Some((app_id.clone(), owner))
+                })
+                .collect()
+        })
+        .await;
+    let mut notes = Vec::new();
+    for (name, app_id, owner) in &declared {
+        let verdict = judge_apply(
+            app_id,
+            owner.as_deref(),
+            current.get(app_id).map(String::as_str),
+            caller,
+        )?;
+        if let ApplyVerdict::Skip { owner } = verdict {
+            config.app.remove(name);
+            notes.push(skip_note(app_id, &owner));
+        }
+    }
+    Ok(notes)
+}
+
+/// The answer to a change resource owners refused: 403 or 409, with the
+/// reason.
+pub(crate) fn owner_refusal(error: &crate::council::owner::OwnerError) -> Response {
+    let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::CONFLICT);
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
+}
+
+/// Check an imperative change (`verb`) against the app's owner, from
+/// desired state. Any node can answer it: a forwarded request then arrives
+/// at the leader as the service principal, which passes.
+pub(crate) async fn owner_command_refusal(
+    council: &crate::council::CouncilNode,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    app_id: &crate::meat::AppId,
+    verb: &'static str,
+) -> Option<Response> {
+    let current = council
+        .read_desired(|desired| desired.apps.get(app_id).and_then(|spec| spec.owner.clone()))
+        .await;
+    let caller = owner_caller(auth);
+    let judged = if verb == "release" {
+        crate::council::owner::judge_release(app_id, current.as_deref(), &caller)
+    } else {
+        crate::council::owner::judge_command(app_id, current.as_deref(), &caller, verb)
+    };
+    judged.err().map(|error| owner_refusal(&error))
 }
 
 /// The app an apply write commits, looking inside a policy fence.

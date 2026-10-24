@@ -2374,6 +2374,9 @@ fn spawn_placement_reconciler_with_io_timeout(
                 // ordinals the leader gave it.
                 spec.replicas = Replicas::Fixed(assignment.ordinals.len() as u32);
                 spec.ordinals = Some(assignment.ordinals.clone());
+                // Who manages an app is the council's business, not the
+                // node's: a controller claiming it mustn't redeploy it (#1125).
+                spec.owner = None;
                 let fingerprint = serde_json::to_string(&spec).unwrap_or_default();
                 if matches!(applied.get(&key), Some(AssignmentState::Applied { fingerprint: previous }) if previous == &fingerprint)
                 {

@@ -1635,6 +1635,25 @@ impl BunClient {
         Ok(())
     }
 
+    /// Clear an app's owner (`POST /v1/release/{app}/{namespace}`, #1125),
+    /// handing it back to `relish apply` and GitOps. Only the owner's token
+    /// or an admin may.
+    pub async fn release(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
+        let url = format!("{}/v1/release/{}/{}", self.base_url, app, namespace);
+        let response = self
+            .http()?
+            .post(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        Ok(())
+    }
+
     /// Snapshot an app's managed volumes; returns the created
     /// snapshots' metadata.
     pub async fn snapshot_create(

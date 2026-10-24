@@ -70,7 +70,9 @@ scope; a scoped token can't push or pull a bare name like `api` at all (see
 `images-and-volumes`). Some
 operations need cluster-wide authority, so only an *unscoped* admin can manage
 tokens and join tokens, rotate secrets, sign images, decommission nodes, clear
-every fault, or apply `[namespace]` and `[permission]` declarations.
+every fault, or apply `[namespace]` and `[permission]` declarations. A
+`deployer` scoped to one namespace is what a controller runs with
+(`writing-a-controller`).
 
 `create` prints the plaintext token once, on stdout, and the cluster keeps
 only a hash, so `TOKEN="$(relish token create ...)"` captures it. Its expiry

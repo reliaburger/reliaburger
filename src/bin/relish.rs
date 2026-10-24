@@ -658,6 +658,14 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin).
+    Release {
+        /// App name.
+        app: String,
+        /// Namespace the app lives in. Defaults to "default".
+        #[arg(long, default_value = "default")]
+        namespace: String,
+    },
     /// Initialise a new cluster (generates CAs, age keypair, node identity).
     Init(Box<InitOptions>),
     /// List cluster nodes and their gossip state.
@@ -1920,6 +1928,10 @@ async fn main() -> ExitCode {
             ref namespace,
             force,
         } => commands::delete(app, namespace, force).await,
+        Command::Release {
+            ref app,
+            ref namespace,
+        } => commands::release(app, namespace).await,
         Command::Init(options) => commands::init_with_security(
             &options.dir,
             &options.cluster_name,
@@ -2899,6 +2911,7 @@ fn honours_output(command: &Command) -> bool {
         | Command::Inspect { .. }
         | Command::Stop { .. }
         | Command::Delete { .. }
+        | Command::Release { .. }
         | Command::Init(_)
         | Command::Join(_)
         | Command::Routes

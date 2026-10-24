@@ -175,6 +175,10 @@ pub struct Compatibility {
 /// An app's `sidecar` list in Raft desired state, node syncs and instance
 /// records, and `NodeCapabilities::shared_network` in the capability report
 /// (#1120).
+/// An app's `owner` in Raft desired state, the `AppRelease` Raft request,
+/// the owner checks the state machine applies to app writes, `owner` in
+/// `GET /v1/diagnostics/apps`, and `GET /v1/events` answering scoped tokens
+/// with their own namespaces' events (#1125).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 55,
     state: 72,

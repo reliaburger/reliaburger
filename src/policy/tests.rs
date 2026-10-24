@@ -209,6 +209,21 @@ fn a_gitops_sync_is_the_system_caller() {
     assert!(evaluate(&set, &config, &deployer(), Source::Apply).is_allowed());
 }
 
+/// #1125: a policy sees an app's `owner`, so a platform team can say, for
+/// example, that only the database controller writes apps in `pg`.
+#[test]
+fn a_policy_sees_the_owner() {
+    let set = compile(
+        "[policy.pg-is-the-controllers]\nmatch = \"app.namespace == 'pg'\"\n\
+         deny = \"!has(app.owner) || app.owner != 'pg-failover'\"\n",
+    );
+    let owned = apps("[app.db]\nimage = 'pg:17'\nnamespace = 'pg'\nowner = 'pg-failover'\n");
+    let unowned = apps("[app.db]\nimage = 'pg:17'\nnamespace = 'pg'\n");
+    let controller = Caller::token("pg-failover", ApiRole::Deployer);
+    assert!(evaluate(&set, &owned, &controller, Source::Apply).is_allowed());
+    assert!(!evaluate(&set, &unowned, &deployer(), Source::Apply).is_allowed());
+}
+
 /// Every category of bad policy is refused when it's committed.
 #[test]
 fn every_kind_of_bad_policy_is_refused_at_commit() {

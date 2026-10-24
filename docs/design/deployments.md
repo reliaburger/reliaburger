@@ -961,6 +961,50 @@ devices = [{ path = "/dev/net/tun", permissions = "rw" }]
 
 **Kubernetes.** `relish import` maps `securityContext.capabilities.add`, the pod's `securityContext.sysctls` and device `hostPath` volumes; unknown capabilities, host-wide sysctls, `capabilities.drop` and `privileged` are warnings. `relish export` writes them back, devices as `hostPath` mounts reported as unsupported.
 
+### 5.11 Resource Owners (#1125)
+
+A controller is an ordinary app holding an API token. It claims an app by
+applying it with `owner = "<its token's name>"` (`AppSpec::owner`), and from
+then on `relish apply` and GitOps leave the app alone, the way GitOps leaves
+alone what it didn't write. The rules live in `council::owner` as pure
+functions, one per kind of change:
+
+| Who | Does what | Result | Where |
+|-----|-----------|--------|-------|
+| anyone | apply declaring `owner = X` | allowed only for token `X` or an admin, else 403 | `judge_apply` |
+| anyone | apply of an app owned by `X`, declaring `X` | written | `judge_apply` |
+| anyone | apply of an app owned by `X`, declaring no owner | skipped, with a progress note; the rest applies | `judge_apply` |
+| anyone | apply of an app owned by `X`, declaring `Y` | 409 until it's released | `judge_apply` |
+| token `X` or an admin | stop, delete, rollback, release | allowed | `judge_command`, `judge_release` |
+| anyone else | stop, delete, rollback, release | 409; `?force=true` doesn't help | `judge_command` |
+| GitOps | an owned app in the diff | left out: no update, adoption or prune | `lettuce::diff` |
+| GitOps | git declaring an `owner` | refused, in the partial result | state machine |
+
+- **Where.** `cluster_apply` calls `skip_owned_apps` on the leader before
+  policy admission, so a skipped app is neither judged nor written.
+  `cluster_app_change` (stop, delete, release) and `rollback_handler` check
+  before forwarding to the leader, because a forwarded request reaches the
+  leader as the service principal. The bootstrap window and the service
+  principal count as admins.
+- **Backstop.** Two writers can read the same owner and race. The state machine
+  refuses an `AppSpec` (or a leased one) whose `owner` differs from the stored
+  app's, with `stored_owner_conflict`, which compares two strings and needs no
+  caller. Only `RaftRequest::AppRelease` clears an owner; it's refused for an
+  app that isn't there or has none.
+- **Not a version.** `rollout_fingerprint` and the node's placement fingerprint
+  set `owner` aside, and a claim doesn't count as a changed spec for a failed
+  rollout. Claiming or releasing restarts nothing. A rollback keeps today's
+  owner, whatever the old spec said.
+- **Reads.** `GET /v1/diagnostics/apps` carries `owner`, and a policy sees it
+  as `app.owner`. The JSON a controller reads and writes is documented in the
+  manual's "Writing a controller" chapter and pinned by
+  `src/bun/api/contract_tests.rs`.
+- **Scope.** A controller's token is a `deployer` scoped to its namespace; the
+  existing scope checks keep it there. Only apps carry an owner: a scoped token
+  can't write namespaces, permissions or policies anyway.
+
+---
+
 ## 6. Configuration
 
 All deploy configuration lives under the `[app.<name>.deploy]` TOML section. Defaults are set per-directory in a `_defaults.toml` file, merged into each app by `relish compile`. There is no cluster-level `[defaults.app.deploy]` section — the block shown below is planned, not implemented.

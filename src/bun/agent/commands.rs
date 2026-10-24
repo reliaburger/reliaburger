@@ -583,6 +583,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             unschedulable: None,
                             rollout_failed: None,
                             volume_homes: Vec::new(),
+                            owner: spec.owner.clone(),
                         },
                     )
                     .collect::<Vec<_>>();

@@ -551,32 +551,51 @@ pub(super) fn peer_events_path(query: &EventsQuery, limit: usize) -> String {
     format!("/v1/events?{}", params.finish())
 }
 
-/// Return the newest events across the cluster, oldest first.
+/// Return the newest events across the cluster, oldest first, or with
+/// `follow=true` stream them live over SSE.
 ///
 /// Each node keeps its own bounded store, so the node asked merges its own
-/// with every live member's and names any member that didn't answer.
+/// with every live member's and names any member that didn't answer. A
+/// live stream does the same: this node's new events and every member's,
+/// unless `local=true` asks for this node's alone (the feed the merge
+/// itself reads from each member).
+///
+/// A token scoped to some apps or namespaces sees only the events about
+/// them (#1125): that's the stream a controller reads. An event that names
+/// no namespace, a token being created say, is for unscoped tokens only.
 pub(super) async fn events_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Query(query): Query<EventsQuery>,
 ) -> Response {
-    // Audit events span every app and namespace, so a scoped token is refused
-    // (C3) just as it is for the cluster-wide metrics and logs endpoints.
-    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
-        return resp;
-    }
+    let auth = auth.map(|extension| extension.0);
     if query.follow {
         let (events_tx, events_rx) = mpsc::channel(256);
-        let Some(relay) = spawn_local_event_relay(&state, events_tx).await else {
+        let Some(relay) = spawn_local_event_relay(&state, events_tx.clone()).await else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        let stream = ReceiverStream::new(events_rx).filter_map(|event| async move {
-            let json = serde_json::to_string(&event).ok()?;
-            Some(Ok::<_, std::convert::Infallible>(
-                Event::default().data(json),
-            ))
+        if !query.local {
+            tokio::spawn(relay_peer_events(state.clone(), events_tx));
+        }
+        let app = query.app.clone();
+        let severity = query.severity;
+        let stream = ReceiverStream::new(events_rx).filter_map(move |event| {
+            let shown = event_visible(auth.as_ref(), &event)
+                && app
+                    .as_deref()
+                    .is_none_or(|app| event.app.as_deref() == Some(app))
+                && severity.is_none_or(|level| event.severity >= level);
+            async move {
+                if !shown {
+                    return None;
+                }
+                let json = serde_json::to_string(&event).ok()?;
+                Some(Ok::<_, std::convert::Infallible>(
+                    Event::default().data(json),
+                ))
+            }
         });
-        // The relay ends when the client goes: its sender's receiver is
+        // The relays end when the client goes: their sender's receiver is
         // dropped with the response stream.
         drop(relay);
         return Sse::new(stream)
@@ -584,7 +603,52 @@ pub(super) async fn events_handler(
             .into_response();
     }
     let limit = query.limit.unwrap_or(100);
-    Json(cluster_recent_events(&state, &query, limit).await).into_response()
+    if !is_scoped(auth.as_ref()) {
+        return Json(cluster_recent_events(&state, &query, limit).await).into_response();
+    }
+    // A scoped caller's events are a slice of everyone's, so read as many
+    // as the stores keep and take the newest `limit` of that slice.
+    let mut view =
+        cluster_recent_events(&state, &query, crate::bun::events::EVENT_BUFFER_CAP).await;
+    view.events
+        .retain(|event| event_visible(auth.as_ref(), event));
+    let excess = view.events.len().saturating_sub(limit);
+    view.events.drain(..excess);
+    Json(view).into_response()
+}
+
+/// Whether `auth` is limited to some apps or namespaces. The bootstrap
+/// window and the service principal aren't.
+fn is_scoped(auth: Option<&crate::sesame::auth::AuthContext>) -> bool {
+    auth.is_some_and(|context| {
+        context.token_name != crate::sesame::auth::SYSTEM_PRINCIPAL
+            && (context.scoped_apps.is_some() || context.scoped_namespaces.is_some())
+    })
+}
+
+/// Whether `auth` may see `event` (#1125). A scoped token sees an event
+/// about an app its scope allows, or about a namespace its scope names
+/// when it isn't limited to some apps, and nothing else.
+pub(super) fn event_visible(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    event: &crate::bun::events::ClusterEvent,
+) -> bool {
+    if !is_scoped(auth) {
+        return true;
+    }
+    let Some(namespace) = event.namespace.as_deref() else {
+        return false;
+    };
+    match event.app.as_deref() {
+        Some(app) => crate::sesame::auth::authorize_scoped(auth, app, namespace).is_ok(),
+        None => auth.is_some_and(|context| {
+            context.scoped_apps.is_none()
+                && context
+                    .scoped_namespaces
+                    .as_ref()
+                    .is_some_and(|namespaces| namespaces.iter().any(|name| name == namespace))
+        }),
+    }
 }
 
 /// The newest `limit` events matching `query`, from this node and, unless

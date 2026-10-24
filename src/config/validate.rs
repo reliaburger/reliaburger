@@ -293,6 +293,16 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
     validate_app_ingress(name, app)?;
     validate_app_honoured_fields(name, app)?;
 
+    if let Some(owner) = &app.owner
+        && let Err(reason) = crate::council::owner::validate_owner(owner)
+    {
+        return Err(ConfigError::Validation {
+            field: "owner".to_string(),
+            context: format!("app {name:?}"),
+            reason,
+        });
+    }
+
     // Ordinals come from the leader's placements, never from a config file.
     if app.ordinals.is_some() {
         return Err(ConfigError::Validation {
@@ -1177,6 +1187,21 @@ mod tests {
             matches!(err, ConfigError::Validation { ref field, .. } if field == "ordinals"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn an_owner_must_look_like_a_token_name() {
+        let config = config_with_app("web", app_with_metrics("owner = 'pg-failover'"));
+        config.validate().unwrap();
+        for bad in ["owner = ''", "owner = 'two words'"] {
+            let err = config_with_app("web", app_with_metrics(bad))
+                .validate()
+                .unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Validation { ref field, .. } if field == "owner"),
+                "{bad}: {err:?}"
+            );
+        }
     }
 
     #[test]

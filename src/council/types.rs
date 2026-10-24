@@ -521,6 +521,11 @@ pub enum RaftRequest {
         generation: u64,
         change: Box<RaftRequest>,
     },
+    /// Clear an app's `owner`, handing it back to `relish apply` and GitOps
+    /// (#1125). The API checked that the caller is the owner or an admin;
+    /// the state machine refuses a release of an app that isn't there or
+    /// has no owner.
+    AppRelease { app_id: AppId },
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,6 +1047,9 @@ mod tests {
                 change: Box::new(RaftRequest::AppDelete {
                     app_id: AppId::new("web", "default"),
                 }),
+            },
+            RaftRequest::AppRelease {
+                app_id: AppId::new("db", "pg"),
             },
         ];
         for req in &requests {
