@@ -282,9 +282,40 @@ async fn status_answers_while_a_restart_reads_a_slow_launch_inventory() {
     // journals the publication. Judge the turns once both had time to meet
     // the slow inventory.
     tokio::time::sleep(STALL * 2 + std::time::Duration::from_millis(500)).await;
-    running
-        .assert_responsive("a restart read a slow launch inventory for its publication")
-        .await;
+    let latency = running.status_latency().await;
+    let worst = running.meter.worst_turn();
+    stop(running).await;
+
+    assert!(
+        latency.is_some(),
+        "status went unanswered while a restart read a slow launch inventory"
+    );
+    // Judge the inventory read, not the host disk. The publication's turn
+    // journals a real fsync'd write, which a loaded runner stretched past the
+    // 1 s budget on its own (1047 ms, the #508 class). An inventory read on
+    // the loop would cost the whole 2.5 s stall, so the worst turn, less its
+    // disk writes, stays under that stall and never reads the inventory.
+    if let Some(worst) = worst {
+        assert_eq!(
+            worst.part(TurnPart::RuntimeInventory),
+            None,
+            "a loop turn read the slow launch inventory: {worst}"
+        );
+        let disk: std::time::Duration = [
+            TurnPart::JournalWrite,
+            TurnPart::InFlightWrite,
+            TurnPart::EgressWrite,
+        ]
+        .into_iter()
+        .filter_map(|part| worst.part(part))
+        .sum();
+        assert!(
+            worst.took.saturating_sub(disk) < STALL,
+            "the worst loop turn waited {:?} beside its disk writes ({worst}); a \
+             launch inventory read on the loop would cost the {STALL:?} stall",
+            worst.took.saturating_sub(disk)
+        );
+    }
 }
 
 /// `Logs` reads every instance's whole capture into memory, on the loop. A
