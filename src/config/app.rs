@@ -146,6 +146,11 @@ pub struct AppSpec {
     /// app runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<super::template::Provenance>,
+    /// The API token that manages this app, when a controller does (#1125).
+    /// `relish apply` and GitOps leave an owned app alone; only that token
+    /// or an admin changes it (`council::owner` has the rules).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 impl AppSpec {

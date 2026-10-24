@@ -25,7 +25,7 @@ pub const MAX_MESSAGE_BYTES: usize = 512;
 pub const MAX_DEFAULT_BYTES: usize = 4096;
 
 /// App fields a `default` can never fill, and why.
-pub const UNFILLABLE_FIELDS: [(&str, &str); 12] = [
+pub const UNFILLABLE_FIELDS: [(&str, &str); 13] = [
     ("name", "is the app's table name, not a field"),
     (
         "namespace",
@@ -46,6 +46,13 @@ pub const UNFILLABLE_FIELDS: [(&str, &str); 12] = [
     ("config_file", GATED_BY_THE_CALLER),
     ("init", GATED_BY_THE_CALLER),
     ("runtime", GATED_BY_THE_CALLER),
+    // Only token X or an admin may declare `owner = X`, checked on the
+    // declared spec before defaults fill it (#1125). A default that filled
+    // it would hand an app to a controller its caller can't speak for.
+    (
+        "owner",
+        "names the controller that manages the app, which only that controller's token or an admin may declare, so a default can't claim an app",
+    ),
     (
         "sidecar",
         "would add a container to every matching app; declare sidecars on the app",
@@ -124,7 +131,7 @@ const GATED_BY_THE_CALLER: &str = "can need host access or a runtime knob, which
 ///
 /// `namespace` is always present, resolved to `default` when the spec
 /// doesn't name one. A test checks this list against `AppSpec` itself.
-pub const APP_FIELDS: [&str; 35] = [
+pub const APP_FIELDS: [&str; 36] = [
     "name",
     "image",
     "command",
@@ -160,6 +167,7 @@ pub const APP_FIELDS: [&str; 35] = [
     "runtime",
     "namespace",
     "provenance",
+    "owner",
 ];
 
 /// The fields of `caller`.

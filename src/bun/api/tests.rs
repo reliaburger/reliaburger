@@ -47,6 +47,7 @@ fn desired_app_diagnostics_filter_to_the_token_scope() {
         scoped_namespaces: Some(vec!["tenant-a".to_string()]),
     };
     let evidence = |app: &str, namespace: &str| crate::bun::diagnostics::DesiredAppEvidence {
+        owner: None,
         app: app.to_string(),
         namespace: namespace.to_string(),
         desired_replicas: 1,
@@ -4456,6 +4457,80 @@ async fn setup_scoped_with_role(
     (app, shutdown, created.plaintext)
 }
 
+/// #1125: a controller's token is scoped to its namespace, and the event
+/// list answers it with that namespace's events only: not another
+/// tenant's, and not cluster events that name no namespace.
+#[tokio::test]
+async fn a_scoped_token_reads_only_its_own_namespaces_events() {
+    use crate::bun::events::{EventKind, EventSeverity, EventStore};
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let scope = crate::sesame::types::TokenScope {
+        apps: None,
+        namespaces: Some(vec!["team-a".to_string()]),
+    };
+    let created = crate::sesame::token::create_token(
+        "controller",
+        crate::sesame::types::ApiRole::Deployer,
+        scope,
+        None,
+    )
+    .unwrap();
+    let store = crate::sesame::auth::new_token_store();
+    store.write().await.push(created.token);
+    let mut events = EventStore::new();
+    let mut record = |app: Option<&str>, namespace: Option<&str>, message: &str| {
+        events.record(
+            1,
+            EventKind::Health,
+            EventSeverity::Warning,
+            app.map(str::to_string),
+            namespace.map(str::to_string),
+            Some("node-1".into()),
+            message.to_string(),
+        );
+    };
+    record(Some("db"), Some("team-a"), "ours");
+    record(Some("db"), Some("team-b"), "theirs");
+    record(None, Some("team-a"), "our namespace");
+    record(None, None, "the cluster's");
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(store),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        Some(Arc::new(RwLock::new(events))),
+    );
+    let response = app
+        .oneshot(
+            axum::http::Request::get("/v1/events?limit=10")
+                .header("Authorization", format!("Bearer {}", created.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let view: crate::bun::cluster_view::ClusterEvents = serde_json::from_slice(&body).unwrap();
+    let messages: Vec<&str> = view
+        .events
+        .iter()
+        .map(|event| event.message.as_str())
+        .collect();
+    assert_eq!(messages, vec!["ours", "our namespace"]);
+}
+
 /// Every route that upgrades, rolls back or re-elects the cluster.
 const CLUSTER_ADMIN_ROUTES: [&str; 7] = [
     "/v1/upgrade/apply",
@@ -5528,21 +5603,16 @@ async fn scoped_token_is_refused_streaming_another_namespaces_logs() {
     let _ = server.await;
 }
 
-/// Audit events span every namespace, so `/v1/events` refuses a scoped
-/// token (C3). The live stream of the same events, `/v1/ws/events`, checked
-/// nothing: route authorisation lets any token through, and the handler
-/// upgraded straight away, so a token scoped to `team-a` streamed every
-/// tenant's events. It must refuse the upgrade the same way.
+/// The dashboard's live stream, `/v1/ws/events`, carries every tenant's
+/// events. It checked nothing: route authorisation lets any token through,
+/// and the handler upgraded straight away, so a token scoped to `team-a`
+/// streamed every tenant's events. It must refuse the upgrade. A scoped
+/// token reads its own events from `/v1/events` instead (#1125).
 #[tokio::test]
 async fn scoped_token_is_refused_the_live_event_stream() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
-    assert_eq!(
-        get_status(app.clone(), "/v1/events", Some(&tok)).await,
-        StatusCode::FORBIDDEN,
-        "the HTTP route already refuses"
-    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let serving = shutdown.clone();
@@ -5823,11 +5893,12 @@ async fn scoped_token_is_refused_faulting_another_namespace() {
     shutdown.cancel();
 }
 
-/// The cluster-wide metrics and events endpoints read across every app and
-/// namespace, so — like `/v1/logs/sql` — a scoped token is refused (C3)
-/// rather than served every tenant's data.
+/// The cluster-wide metrics endpoints read across every app and namespace,
+/// so — like `/v1/logs/sql` — a scoped token is refused (C3) rather than
+/// served every tenant's data. `/v1/events` used to be on this list; it now
+/// answers a scoped token with its own events only (#1125).
 #[tokio::test]
-async fn scoped_token_is_refused_cluster_wide_metrics_and_events() {
+async fn scoped_token_is_refused_cluster_wide_metrics() {
     for path in [
         "/v1/metrics?name=node_cpu_usage_percent",
         "/v1/metrics/summary",
@@ -5835,7 +5906,6 @@ async fn scoped_token_is_refused_cluster_wide_metrics_and_events() {
         "/v1/metrics/rollup",
         "/v1/metrics/rollup/owned",
         "/v1/metrics/cluster",
-        "/v1/events",
     ] {
         let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
         let status = get_status(app, path, Some(&tok)).await;
@@ -7046,6 +7116,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
     failed.state = "failed".into();
     let desired = vec![
         crate::bun::diagnostics::DesiredAppEvidence {
+            owner: None,
             app: "web".into(),
             namespace: "default".into(),
             desired_replicas: 3,
@@ -7059,6 +7130,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             volume_homes: Vec::new(),
         },
         crate::bun::diagnostics::DesiredAppEvidence {
+            owner: None,
             app: "pending".into(),
             namespace: "default".into(),
             desired_replicas: 2,

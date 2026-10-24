@@ -72,7 +72,7 @@ pub(crate) use apply::{
     mark_leader_forwarded,
 };
 use apply::{apply_handler, cluster_apply};
-use apps::{delete_handler, exec_handler, stop_handler};
+use apps::{delete_handler, exec_handler, release_handler, stop_handler};
 use audit::audit_handler;
 use ca::{ca_rotation_begin_handler, ca_rotation_finalize_handler, ca_rotation_prepare_handler};
 use deploys::{
@@ -673,6 +673,7 @@ pub fn router_with_upgrade(
         .route("/v1/top", get(top_handler))
         .route("/v1/stop/{app}/{namespace}", post(stop_handler))
         .route("/v1/delete/{app}/{namespace}", post(delete_handler))
+        .route("/v1/release/{app}/{namespace}", post(release_handler))
         .route("/v1/logs/{app}/{namespace}", get(logs_handler))
         .route(
             "/v1/logs/entries/{app}/{namespace}",
@@ -1360,6 +1361,10 @@ mod late_publication_tests;
 #[cfg(test)]
 mod permission_tests;
 
+#[cfg(test)]
+mod contract_tests;
+#[cfg(test)]
+mod owner_tests;
 #[cfg(test)]
 mod policy_tests;
 

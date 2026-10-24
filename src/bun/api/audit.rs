@@ -56,6 +56,12 @@ pub(crate) const AUDITED_ROUTES: &[AuditedRoute] = &[
         "app.deleted",
         Operation,
     ),
+    audited(
+        Post,
+        "/v1/release/{app}/{namespace}",
+        "app.released",
+        Operation,
+    ),
     audited(Post, "/v1/exec/{app}/{namespace}", "app.exec", Operation),
     audited(
         Post,

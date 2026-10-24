@@ -685,7 +685,11 @@ Nor can a default set `exec`, `script`, host volumes, `init`, `runtime` or
 `sidecar`. The apply path checks those against the caller's token, on the
 spec as declared, before any policy runs. A default filled in afterwards
 would hand every matching app host access its deployer was never granted,
-and the token check would never see it.
+and the token check would never see it. The same goes for `owner`
+([#1125](https://github.com/reliaburger/reliaburger/issues/1125)): only the
+controller's own token or an admin may claim an app, and that's checked on the
+declared spec too, so a default that filled it in would claim apps for a
+controller their deployer can't speak for.
 
 That rules some things out on purpose. A default can't rewrite an image
 registry; that belongs with the trust policy and the pull-through cache
@@ -807,7 +811,13 @@ nothing else. No template version, no parameter values, no copy of the
 body. The values are already in the spec they produced, and the body lives
 in git. Because provenance is part of the spec, the declared-spec diff from
 the last section needs no special case: what git declares after expansion
-is exactly what the cluster stores, so a re-sync writes nothing.
+is exactly what the cluster stores, so a re-sync writes nothing. Like a
+controller's `owner`, it isn't part of the app's version, so moving a
+hand-written app into a template restarts nothing when the expansion comes
+out the same. And because expansion runs before everything else, a body
+that declares `owner = "${controller}"` gets no special treatment: the
+owner rules see an ordinary app declaring an owner, and only that token or
+an admin may apply it.
 
 **No nesting, and no fighting.** A body holds apps and jobs and nothing
 else, so a template can't use another template. Nesting is how a template
@@ -836,9 +846,12 @@ first slice. Templates come from files or git.
 **Day-two logic is a controller you run yourself.** Failover, backups and
 version upgrades need code. Instead of an operator framework, we write down a
 contract. A controller is an ordinary app with a token scoped to its namespace.
-It reads the API and the event stream, and writes ordinary apps. Each resource
-carries an `owner`, like Lettuce's ownership set, so `relish apply`, GitOps and
-the controller don't fight over the same app. That's Fly's "expose the
+It reads the API and the event stream, and writes ordinary apps. Each app it
+manages carries an `owner`, the name of its token, like Lettuce's ownership
+set, so `relish apply`, GitOps and the controller don't fight over the same
+app: an apply that doesn't name the owner skips the app with a note, GitOps
+leaves it out of its diff, and only the owner or an admin can stop, delete,
+roll back or release it. That's Fly's "expose the
 primitives" model, with the guarantees Reliaburger already has: scoped tokens,
 audit, and the one apply path. No SDK, no framework, no new kinds. The 0.2.4
 exit test ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)) is
@@ -1346,6 +1359,12 @@ schedule put back. `audit_workloads` takes plain slices and runs
 and jobs without building a cluster. The route runs it on a copy of
 desired state inside `tokio::task::spawn_blocking`, because judging every
 workload is CPU work that would otherwise hold up an async thread.
+
+Who is the caller, when nobody is applying? The audit asks what the next
+write would get, so it judges each app as its next writer: GitOps for an app
+GitOps owns, the controller's token for an app a controller owns
+([#1125](https://github.com/reliaburger/reliaburger/issues/1125)), with the
+role read from that token, and the cluster's own `audit` caller for the rest.
 
 ### The exec secret provider
 
@@ -2339,8 +2358,194 @@ The only wire and state change is `provenance` on `AppSpec` and `JobSpec`,
 so it's a line under the 0.2.4 heading in `src/compatibility.rs`, not a
 bump.
 
-Still to come in this walkthrough: the controller contract
-([#1125](https://github.com/reliaburger/reliaburger/issues/1125)).
+### The controller contract
+
+([#1125](https://github.com/reliaburger/reliaburger/issues/1125)) The contract
+has three parts, and only one of them needed much new code.
+
+**The scoped token already existed.** `relish token create --namespaces pg`
+has been there since chapter 10, and `authorize_scoped` checks it on every
+route that names an app. A namespace-scoped `deployer` can't write
+namespaces, permissions or policies either; those need an unscoped admin. So a
+controller's token was already confined. What it couldn't do was read events.
+`/v1/events` refused every scoped token, because events span every tenant,
+and filtering looked like work nobody needed. A controller needs it, so now
+the handler filters instead of refusing:
+
+```rust
+pub(super) fn event_visible(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    event: &crate::bun::events::ClusterEvent,
+) -> bool {
+    if !is_scoped(auth) {
+        return true;
+    }
+    let Some(namespace) = event.namespace.as_deref() else {
+        return false;
+    };
+    match event.app.as_deref() {
+        Some(app) => crate::sesame::auth::authorize_scoped(auth, app, namespace).is_ok(),
+        None => auth.is_some_and(|context| {
+            context.scoped_apps.is_none()
+                && context
+                    .scoped_namespaces
+                    .as_ref()
+                    .is_some_and(|namespaces| namespaces.iter().any(|name| name == namespace))
+        }),
+    }
+}
+```
+
+An event that names no namespace, a token being minted say, is for unscoped
+tokens only. The same predicate filters the list and the live feed, and a
+test reads the handler's source to make sure both call it. While we were
+there, `?follow=true` learned to stream every node's events, as the
+dashboard's WebSocket already did; it used to stream only the node you asked.
+
+**The owner is one field.** `AppSpec` gains `owner: Option<String>`, with
+`#[serde(default, skip_serializing_if = "Option::is_none")]` so an app without
+one serialises exactly as before. Policies see the spec as JSON, so they got
+`app.owner` for free. The `APP_FIELDS` test from #1117 noticed the new key and
+failed until we added it to the list, which is the test doing its job.
+
+**The rules are pure functions.** `src/council/owner.rs` has one function per
+kind of change. Here's the one an apply calls for each app:
+
+```rust
+pub fn judge_apply(
+    app: &AppId,
+    declared: Option<&str>,
+    current: Option<&str>,
+    caller: &OwnerCaller,
+) -> Result<ApplyVerdict, OwnerError> {
+    if let Some(owner) = declared
+        && !caller.speaks_for(owner)
+    {
+        return Err(OwnerError::NotTheCaller { /* … */ });
+    }
+    match (current, declared) {
+        (None, _) => Ok(ApplyVerdict::Write),
+        (Some(current), Some(declared)) if current == declared => Ok(ApplyVerdict::Write),
+        (Some(current), Some(declared)) => Err(OwnerError::Claimed { /* … */ }),
+        (Some(current), None) => Ok(ApplyVerdict::Skip {
+            owner: current.to_string(),
+        }),
+    }
+}
+```
+
+`match (current, declared)` builds a tuple of the two `Option`s and matches
+both at once. Each arm is a pattern over the pair; `_` matches anything, and
+`if current == declared` is a *guard*, an extra condition the arm needs before
+it's chosen. Arms are tried top to bottom, so the guarded arm gets first go at
+two owners, and the next arm only sees two that differ. The compiler checks
+that the four arms cover every combination of `Some` and `None`. Delete the
+last one and the build fails, naming the missing case. In C or Go this would be
+a ladder of `if`s, and nothing would tell you if you'd forgotten a rung.
+
+Two choices in that table deserve their reasons.
+
+*Why skip, not refuse?* Because of how people use apply. A template expands to
+`db-a`; a controller later claims it. If re-applying the directory that holds
+the template refused the whole apply, every re-apply would fail, and GitOps
+would fail every sync and never advance its commit. Skipping with a note is
+what Lettuce already does with what it didn't write, and the note means it
+isn't silent.
+
+*Why tie the owner to a token's name?* The first sketch let any string be an
+owner, and treated it as a label. Then anyone allowed to deploy in `pg` could
+write `owner = "db-failover"` by copying a file, and silently take part in the
+controller's writes. Requiring the token named, or an admin, makes the owner
+mean something, and it's what makes `relish release` safe to offer: the
+release endpoint knows who's asking.
+
+**The state machine is the backstop.** The leader checks owners in
+`cluster_apply` before policy runs, so a skipped app is neither judged nor
+written. But the leader reads desired state and then proposes, and a
+controller and a human can both read "unowned" in the same moment. So the
+state machine refuses an app write that would change a stored owner:
+
+```rust
+if let Some(reason) = self.owner_conflict(app_id, spec) {
+    return Some(CouncilResponse::Refused { reason });
+}
+```
+
+It can't check *who* is writing: a Raft entry carries no caller, and the state
+machine must apply the same log the same way on every node. So it compares two
+strings, the stored owner and the incoming one, and that's all. It's the
+policy fence's principle again: the state machine compares, the leader judges.
+That leaves exactly one way to clear an owner, a dedicated entry:
+
+```rust
+RaftRequest::AppRelease { app_id } => {
+    let Some(spec) = self.state.apps.get_mut(app_id) else { /* refuse */ };
+    if spec.owner.take().is_none() {
+        return Some(CouncilResponse::Refused { /* "has no owner to release" */ });
+    }
+}
+```
+
+`Option::take` moves the value out of the `Option` and leaves `None` behind,
+returning what was there. One call clears the owner and tells us whether
+there was one to clear. `get_mut` hands out a mutable borrow of the stored
+spec, so the change happens in place, and the borrow ends with the block.
+
+**Claiming isn't a new version.** A rollout compares versions by
+`rollout_fingerprint`, a hash of the spec with the replica count set aside.
+The owner is set aside too, and so is it in each node's placement
+fingerprint. Without that, a controller claiming an app would roll every
+replica of it, which is the kind of surprise that makes people distrust a
+contract.
+
+**Check before you forward.** A follower can't write to Raft, so a `relish
+delete` that lands on one is forwarded to the leader, under the node's
+service token. By then the caller's identity is gone. So `stop`, `delete`,
+`release` and `rollback` check the owner on whichever node receives them,
+before forwarding, and the leader lets the service principal through.
+`relish apply` doesn't have this problem: its forward carries the caller's
+own token.
+
+**The JSON is pinned.** `src/bun/api/contract_tests.rs` builds one example of
+every shape a controller reads or writes, and checks its JSON against a
+snapshot with `insta`, the snapshot library the CLI's output tests use. A
+snapshot is a file committed next to the test. Change a field's name, and the
+test fails and shows the difference. The manual's "Writing a controller"
+chapter documents the same shapes field by field, and the test's comment says
+to update both.
+
+**The example runs as a test.** `examples/controller/main.rs` imports nothing
+from `reliaburger`: it's `reqwest`, `serde_json` and `toml`, the way anyone's
+controller would be. The portable suite compiles that same file into itself:
+
+```rust
+#[allow(dead_code)]
+#[path = "../../examples/controller/main.rs"]
+mod controller;
+```
+
+`#[path]` tells the compiler where a module's file is, instead of the usual
+`controller.rs` next to the parent. The example's `main` is never called from
+the test, hence `allow(dead_code)`. Its functions are `pub` for a reason that
+surprises people coming from Python: Rust's privacy works downwards. A module
+sees everything in its parents, but a parent sees only what a child marks
+`pub`. The test is the parent here.
+
+The controller decides with one pure function, `decide`, and part of it
+uses a *slice pattern*:
+
+```rust
+let existing: Vec<usize> = (0..2).filter(|&index| views[index].exists).collect();
+let current = match existing[..] {
+    [] => return Decision::Write { active: 0, /* … */ },
+    [only] => only,
+    _ => { /* both exist: keep the one that runs */ }
+};
+```
+
+`existing[..]` is the vector viewed as a slice, and `[]`, `[only]` and `_`
+match a slice with no elements, exactly one (binding it to `only`), or any
+other length. It reads like the rule it implements: none, one, or more.
 
 ## Tests
 
@@ -2720,9 +2925,18 @@ Around it:
 - **Policies** (`policy::tests`): a `deny` matching `app.provenance.template`
   refuses a one-replica Postgres and passes a two-replica one; a `default`
   fills a field on an expanded app and keeps its provenance; and a default
-  that tries to set `provenance` is refused at commit. `app_fields_match_the_app_spec`
+  that tries to set `provenance` is refused at commit. A job policy matching
+  `job.provenance.template` refuses a templated migration job pinned to
+  `:latest`. `app_fields_match_the_app_spec`
   failed the moment `provenance` joined `AppSpec`, which is the job it was
   written for.
+- **Owners** (`bun::api::owner_tests`): a template whose body declares
+  `owner = "${controller}"` is refused with a 403 for a human's token and
+  committed for the controller's, and the stored app keeps its owner, its
+  provenance and the field a policy default filled, with the declared spec
+  holding the owner and provenance but not the filled field.
+  `the_provenance_is_not_part_of_the_version` checks the rollout
+  fingerprint, beside the test that does the same for `owner`.
 - **Plan and diff**: an insta snapshot of `relish apply --dry-run` for two
   uses and a hand-written app, with a policy denying one of them, plus a
   check that the same apps planned against their own fingerprints are all
@@ -2743,6 +2957,54 @@ Around it:
   checked like any other manifest. Before that change, the example's
   `use`-only shape would have been skipped as "not a workload" and never
   checked at all.
+
+### Testing the controller contract
+
+([#1125](https://github.com/reliaburger/reliaburger/issues/1125)) Each rule in
+the owner table has a test at the level where it lives.
+
+- **The pure rules** (`council::owner::tests`) walk the table: an unowned app
+  is written, only the named token or an admin may declare an owner, an
+  apply without the owner skips an owned app whoever sends it (even the owner:
+  only a release clears it), a different owner is a 409 even for an admin,
+  and the imperative changes need the owner or an admin.
+- **The state machine** (`state_machine::tests`): an owned app refuses a write
+  that drops or changes its owner and keeps the owner's spec; a release clears
+  it and then an ordinary write applies; claiming doesn't clear a failed
+  rollout; git can't declare an owner, and a claim takes the app out of the
+  GitOps ownership set, so GitOps can't prune it afterwards.
+- **Through the router** (`bun::api::owner_tests`), with a real council, a
+  controller token scoped to `pg`, a human deployer and an admin: a re-apply
+  skips the owned app with the note and still writes the rest of the file;
+  the owner's writes go through; declaring someone else's name is a 403; a
+  rival controller gets a 409; stop, delete (with or without `force`) and
+  release are 409 for the human and allowed for the admin and the owner; a
+  release hands the app back; the controller's token can't touch another
+  namespace; and the desired-apps listing names the owner within the token's
+  scope.
+- **GitOps** (`lettuce::diff::tests::diff_leaves_controller_owned_apps_alone`):
+  git declaring a newer image doesn't update an owned app, and git dropping
+  one GitOps wrote before the claim doesn't prune it.
+- **Events** (`a_scoped_token_reads_only_its_own_namespaces_events`): a token
+  scoped to `team-a` gets its own app's event and its namespace's, not
+  `team-b`'s and not the cluster's.
+- **Not a version** (`the_owner_is_not_part_of_the_version`): claiming leaves
+  the rollout fingerprint alone.
+- **Policies** (`a_policy_sees_the_owner`): `app.owner` is there to match on,
+  and `every_kind_of_bad_default_is_refused_at_commit` refuses a default that
+  sets it.
+- **The audit** (`the_audit_judges_a_controller_owned_app_as_its_controller`,
+  `the_audit_reads_the_controllers_role_from_its_token`): `relish policy
+  audit` judges an owned app as the controller's token, with that token's
+  role, and falls back to the cluster's `audit` caller when the token is gone.
+- **The JSON** (`bun::api::contract_tests`): one snapshot per shape. A failure
+  here means the wire format changed; the diff `insta` prints is the change.
+- **The example** (`tests/suite/controller_example.rs`): the decision rules on
+  their own, then the controller against a real council over HTTP. It starts
+  and claims `db-a`, an admin's re-apply of `db-a` is skipped, and since
+  nothing runs in the test, the second missed check fails over: `db-b` is
+  applied and `db-a` deleted. A second test points the controller at another
+  namespace and gets a 403.
 
 ## Lessons
 

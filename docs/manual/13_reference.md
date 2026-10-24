@@ -128,6 +128,7 @@ is a field the node can't honour; nothing is silently dropped.
 | `gpu` | Refused above 0 until GPU support lands ([#359](https://github.com/reliaburger/reliaburger/issues/359)) |
 | `env` | Environment variables: plain, encrypted (`ENC[AGE:...]`) or from a secret provider (`PROVIDER[name:path]`, see `security`) |
 | `namespace` | Namespace; `default` when omitted |
+| `owner` | The name of the API token of the controller that manages the app. Only that token or an admin may set it; `relish apply` and GitOps then leave the app alone, and `relish release` hands it back (see `writing-a-controller`) |
 | `health` | `path`, `port` (default: the app's `port`), `protocol` (`http` or `https`), `interval` (10 s), `timeout` (5 s, at most `interval`), `threshold_unhealthy` (3), `threshold_healthy` (1), `initial_delay` (0 s). No zeros |
 | `[[init]]` | `image` (default: the app's) and `command`; runs before the app with its env and mounts |
 | `[[sidecar]]` | `name` (a DNS label), `image` (default: the app's), `command`, `args`, `env` (on top of the app's; no encrypted values), `cpu` and `memory`. Runs beside each instance in its network namespace, after the init containers and before the app, and stops after it. Restarts on its own with a backoff up to a minute. Its requests add to the app's. Needs rootful runc; refused on `exec` and `script` apps and alongside an `egress` allowlist |
@@ -144,7 +145,7 @@ is a field the node can't honour; nothing is silently dropped.
 | `firewall` | `allow_from`: apps (or `namespace/app`) allowed to connect |
 | `egress` | `allow`: outside destinations the app may reach. `allow_franchise` is refused |
 | `metrics` | `port` (default: the app's) and `path` (default `/metrics`) to scrape |
-| `provenance` | `template` and `use`: the template and `[use.*]` that made the app. Template expansion writes it, and `relish compile` keeps it in its output; it doesn't change how the app runs, and a policy `default` can't set it |
+| `provenance` | `template` and `use`: the template and `[use.*]` that made the app. Template expansion writes it, and `relish compile` keeps it in its output; changing it alone restarts nothing, and a policy `default` can't set it |
 
 ## Template fields
 

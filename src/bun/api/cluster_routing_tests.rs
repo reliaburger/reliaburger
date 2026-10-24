@@ -1094,6 +1094,7 @@ async fn the_relay_keeps_the_query_string() {
 /// `default/db`, a managed-volume app whose volumes live on `homes`.
 fn volume_app(homes: &[&str]) -> crate::bun::diagnostics::DesiredAppEvidence {
     crate::bun::diagnostics::DesiredAppEvidence {
+        owner: None,
         app: "db".to_string(),
         namespace: "default".to_string(),
         desired_replicas: u32::try_from(homes.len()).unwrap(),

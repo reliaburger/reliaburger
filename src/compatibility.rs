@@ -185,6 +185,10 @@ pub struct Compatibility {
 /// An app's and a job's `provenance` (the template and `use` that made it)
 /// in Raft desired state, node syncs, job definitions and the apply API,
 /// and `[template.*]` and `[use.*]` in applied configs (#1124).
+/// An app's `owner` in Raft desired state, the `AppRelease` Raft request,
+/// the owner checks the state machine applies to app writes, `owner` in
+/// `GET /v1/diagnostics/apps`, and `GET /v1/events` answering scoped tokens
+/// with their own namespaces' events (#1125).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 55,
     state: 72,

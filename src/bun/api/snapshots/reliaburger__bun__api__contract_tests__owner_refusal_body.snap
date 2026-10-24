@@ -1,0 +1,30 @@
+---
+source: src/bun/api/contract_tests.rs
+expression: bodies
+---
+[
+  {
+    "body": {
+      "error": "app pg/db: owner \"pg-failover\" must be the name of the token applying it, and this token is \"alice\""
+    },
+    "status": 403
+  },
+  {
+    "body": {
+      "error": "app pg/db is owned by \"pg-failover\", so \"other\" can't own it until it's released"
+    },
+    "status": 409
+  },
+  {
+    "body": {
+      "error": "app pg/db is owned by \"pg-failover\"; only that token or an admin may delete it"
+    },
+    "status": 409
+  },
+  {
+    "body": {
+      "error": "app pg/db has no owner to release"
+    },
+    "status": 409
+  }
+]

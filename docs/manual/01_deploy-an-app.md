@@ -498,7 +498,9 @@ It stores the apps, each with a `provenance` naming the template and the
 ```
 
 Policies judge the expanded apps like any others, and can match on where
-they came from with `app.provenance.template` or `app.provenance.use`. A
+they came from with `app.provenance.template` or `app.provenance.use`
+(`job.provenance` for a job). A body may declare an `owner`, and the same
+owner rules apply as to an app you wrote by hand. A
 directory's `_defaults.toml` and namespace apply to the apps a `use` in it
 makes, wherever the template lives. In a tree, a template in one file serves
 a `use` in any other.

@@ -530,6 +530,9 @@ impl StateMachineInner {
                         reason: error.to_string(),
                     });
                 }
+                if let Some(reason) = self.owner_conflict(app_id, spec) {
+                    return Some(CouncilResponse::Refused { reason });
+                }
                 self.apply_app_spec(app_id, spec);
             }
             RaftRequest::AppStop { app_id } => {
@@ -1498,6 +1501,18 @@ impl StateMachineInner {
                 }
                 return response;
             }
+            RaftRequest::AppRelease { app_id } => {
+                let Some(spec) = self.state.apps.get_mut(app_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("app {app_id} is not deployed"),
+                    });
+                };
+                if spec.owner.take().is_none() {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("app {app_id} has no owner to release"),
+                    });
+                }
+            }
             RaftRequest::RegisterEndpointConsumer { node_id } => {
                 if let Err(reason) = crate::cluster::retirement::validate_node_id(node_id) {
                     return Some(CouncilResponse::Refused {
@@ -1914,6 +1929,9 @@ impl StateMachineInner {
                     return Some(CouncilResponse::Refused {
                         reason: "app already exists outside this lease".to_string(),
                     });
+                }
+                if let Some(reason) = self.owner_conflict(app_id, spec) {
+                    return Some(CouncilResponse::Refused { reason });
                 }
                 if let Some(lease) = self.state.test_leases.get_mut(lease_id) {
                     lease.resources.insert(resource);
@@ -2529,6 +2547,18 @@ impl StateMachineInner {
                 ),
             });
         }
+        // A controller claims an app with its own token (#1125). Git has no
+        // token to claim with, so an `owner` in the repository is refused.
+        if let RaftRequest::AppSpec { app_id, spec } = change
+            && spec.owner.is_some()
+        {
+            return Some(CouncilResponse::Refused {
+                reason: format!(
+                    "app {app_id} declares an owner; a controller claims its apps with its own \
+                     token, so git can't declare one"
+                ),
+            });
+        }
         let owned = &self.state.gitops_owned;
         let unowned = match change {
             RaftRequest::AppSpec { .. }
@@ -2583,6 +2613,22 @@ impl StateMachineInner {
             _ => {}
         }
         response
+    }
+
+    /// Why an app write must not apply over the app's stored owner (#1125).
+    fn owner_conflict(
+        &self,
+        app_id: &crate::meat::types::AppId,
+        spec: &crate::config::app::AppSpec,
+    ) -> Option<String> {
+        crate::council::owner::stored_owner_conflict(
+            app_id,
+            self.state
+                .apps
+                .get(app_id)
+                .and_then(|stored| stored.owner.as_deref()),
+            spec.owner.as_deref(),
+        )
     }
 
     /// Whether a live test lease owns `namespace`.
@@ -2666,7 +2712,15 @@ impl StateMachineInner {
         // a scale change included (#929): the version's fingerprint sets
         // replicas aside, but an operator who changed the spec expects a
         // new rollout, not the old failure.
-        let identical = self.state.apps.get(app_id) == Some(spec);
+        // Claiming or releasing an app isn't a new version (#1125).
+        let identical = self.state.apps.get(app_id).is_some_and(|old| {
+            crate::council::owner::without_owner(old) == crate::council::owner::without_owner(spec)
+        });
+        // A claimed app is the controller's, not GitOps': GitOps stops
+        // pruning it even if git stops declaring it.
+        if spec.owner.is_some() {
+            self.state.gitops_owned.apps.remove(app_id);
+        }
         self.state.apps.insert(app_id.clone(), spec.clone());
         // A new spec without a declared one beside it (a rollback, say)
         // is its own declaration. The same spec again, a GitOps adoption,
@@ -10986,5 +11040,157 @@ mod tests {
             seed: false,
         });
         assert_eq!(repo(&inner), None);
+    }
+
+    fn owned_spec(owner: Option<&str>, image: &str) -> Box<AppSpec> {
+        let mut spec = *web_spec(image);
+        spec.owner = owner.map(str::to_string);
+        Box::new(spec)
+    }
+
+    /// #1125: once a controller owns an app, a write that drops or changes
+    /// the owner is refused, whoever proposed it. The owner's own writes
+    /// apply.
+    #[test]
+    fn an_owned_app_refuses_a_write_that_drops_or_changes_its_owner() {
+        let mut inner = StateMachineInner::default();
+        let app_id = AppId::new("db", "pg");
+        let write = |inner: &mut StateMachineInner, spec| {
+            inner.apply_request(&RaftRequest::AppSpec {
+                app_id: app_id.clone(),
+                spec,
+            })
+        };
+        assert_eq!(write(&mut inner, owned_spec(Some("ctl"), "db:v1")), None);
+        assert_eq!(write(&mut inner, owned_spec(Some("ctl"), "db:v2")), None);
+        for spec in [
+            owned_spec(None, "db:v3"),
+            owned_spec(Some("other"), "db:v3"),
+        ] {
+            assert!(matches!(
+                write(&mut inner, spec),
+                Some(CouncilResponse::Refused { ref reason }) if reason.contains("owned by \"ctl\"")
+            ));
+        }
+        assert_eq!(
+            inner.state.apps[&app_id].image.as_deref(),
+            Some("db:v2"),
+            "a refused write leaves the owner's spec in place"
+        );
+    }
+
+    /// #1125: a release clears the owner, after which an ordinary apply
+    /// writes the app again. A release of an app that isn't there, or has
+    /// no owner, is refused.
+    #[test]
+    fn a_release_hands_the_app_back() {
+        let mut inner = StateMachineInner::default();
+        let app_id = AppId::new("db", "pg");
+        let release = |inner: &mut StateMachineInner| {
+            inner.apply_request(&RaftRequest::AppRelease {
+                app_id: app_id.clone(),
+            })
+        };
+        assert!(matches!(
+            release(&mut inner),
+            Some(CouncilResponse::Refused { ref reason }) if reason.contains("not deployed")
+        ));
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: owned_spec(Some("ctl"), "db:v1"),
+        });
+        assert_eq!(release(&mut inner), None);
+        assert_eq!(inner.state.apps[&app_id].owner, None);
+        assert!(matches!(
+            release(&mut inner),
+            Some(CouncilResponse::Refused { ref reason }) if reason.contains("no owner")
+        ));
+        assert_eq!(
+            inner.apply_request(&RaftRequest::AppSpec {
+                app_id: app_id.clone(),
+                spec: owned_spec(None, "db:v2"),
+            }),
+            None
+        );
+    }
+
+    /// #1125: claiming an app isn't a new version, so it doesn't answer a
+    /// failed rollout the way a changed spec does.
+    #[test]
+    fn claiming_an_app_keeps_its_rollout_failed() {
+        let (mut inner, app_id) = failed_rollout("web:v2");
+        let mut claimed = *web_spec("web:v2");
+        claimed.owner = Some("ctl".into());
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: Box::new(claimed),
+        });
+        assert!(inner.state.rollouts[&app_id].failed.is_some());
+    }
+
+    /// #1125: git can't declare an owner, and a controller's claim takes
+    /// an app out of the GitOps ownership set, so a later commit that drops
+    /// it doesn't prune it.
+    #[tokio::test]
+    async fn gitops_never_writes_an_owner_and_loses_what_a_controller_claims() {
+        let mut sm = CouncilStateMachine::new();
+        let web = AppId::new("web", "default");
+        let responses = sm
+            .apply_fixture(vec![
+                normal_entry(
+                    3,
+                    1,
+                    gitops_write(
+                        3,
+                        RaftRequest::AppSpec {
+                            app_id: AppId::new("declared", "default"),
+                            spec: owned_spec(Some("ctl"), "x:v1"),
+                        },
+                    ),
+                ),
+                normal_entry(
+                    3,
+                    2,
+                    gitops_write(
+                        3,
+                        RaftRequest::AppSpec {
+                            app_id: web.clone(),
+                            spec: owned_spec(None, "web:v1"),
+                        },
+                    ),
+                ),
+                normal_entry(
+                    3,
+                    3,
+                    RaftRequest::AppSpec {
+                        app_id: web.clone(),
+                        spec: owned_spec(Some("ctl"), "web:v1"),
+                    },
+                ),
+                normal_entry(
+                    3,
+                    4,
+                    gitops_write(
+                        3,
+                        RaftRequest::AppDelete {
+                            app_id: web.clone(),
+                        },
+                    ),
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(
+            matches!(&responses[0], CouncilResponse::Refused { reason } if reason.contains("git can't declare one")),
+            "{responses:?}"
+        );
+        assert!(
+            matches!(&responses[3], CouncilResponse::Refused { reason } if reason.contains("GitOps didn't write")),
+            "{responses:?}"
+        );
+        let state = sm.desired_state().await;
+        assert!(!state.apps.contains_key(&AppId::new("declared", "default")));
+        assert_eq!(state.apps[&web].owner.as_deref(), Some("ctl"));
+        assert!(!state.gitops_owned.apps.contains(&web));
     }
 }

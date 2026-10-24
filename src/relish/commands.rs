@@ -621,6 +621,13 @@ async fn delete_with_client(
     Ok(())
 }
 
+/// Hand an app a controller owns back to `relish apply` and GitOps (#1125).
+pub async fn release(app: &str, namespace: &str) -> Result<(), RelishError> {
+    BunClient::default_local().release(app, namespace).await?;
+    println!("released {app} in {namespace}; relish apply and GitOps manage it again");
+    Ok(())
+}
+
 /// Show every instance of an app across the cluster, with its node.
 pub async fn inspect(name: &str) -> Result<(), RelishError> {
     inspect_with_client(name, &BunClient::default_local()).await
@@ -4546,6 +4553,7 @@ spec:
 
     fn evidence(app: &str, replicas: u32) -> crate::bun::diagnostics::DesiredAppEvidence {
         crate::bun::diagnostics::DesiredAppEvidence {
+            owner: None,
             app: app.to_string(),
             namespace: "prod".to_string(),
             desired_replicas: replicas,

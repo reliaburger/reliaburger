@@ -45,6 +45,11 @@ pub struct CommittedApp {
     pub spec: AppSpec,
     /// Whether GitOps owns it, so it's judged as a GitOps sync would.
     pub gitops_owned: bool,
+    /// The controller that owns it (#1125), as the caller its writes come
+    /// from: only that token (or an admin) writes the app, so it's judged
+    /// as that token would be. `None` for an app nobody owns, or whose
+    /// owner's token no longer exists.
+    pub controller: Option<Caller>,
 }
 
 /// Judge every committed app and job in `desired` by the policies in force.
@@ -69,6 +74,7 @@ pub fn audit(desired: &DesiredState) -> PolicyAudit {
                 id: id.clone(),
                 spec,
                 gitops_owned: desired.gitops_owned.apps.contains(id),
+                controller: controller_caller(desired, stored),
             }
         })
         .collect();
@@ -92,9 +98,24 @@ pub fn audit(desired: &DesiredState) -> PolicyAudit {
     audit_workloads(&desired.policies, desired.policy_generation, &apps, &jobs)
 }
 
-/// Judge `apps` and `jobs` by `policies`, at `generation`. An app GitOps
-/// owns is judged as a GitOps sync, by the caller `gitops`; any other
-/// workload as the cluster's own `audit` caller, with the source `apply`.
+/// The caller a controller-owned app's writes come from (#1125): the token
+/// its `owner` names, with that token's role. `None` when the app has no
+/// owner, or the token is gone and nobody but an admin can write it.
+fn controller_caller(desired: &DesiredState, stored: &AppSpec) -> Option<Caller> {
+    let owner = stored.owner.as_deref()?;
+    let token = desired
+        .security_state
+        .api_tokens
+        .iter()
+        .find(|token| token.name == owner)?;
+    Some(Caller::token(owner, token.role))
+}
+
+/// Judge `apps` and `jobs` by `policies`, at `generation`. An app a
+/// controller owns is judged as that controller's token, with the source
+/// `apply` (#1125); an app GitOps owns as a GitOps sync, by the caller
+/// `gitops`; any other workload as the cluster's own `audit` caller, with
+/// the source `apply`.
 pub fn audit_workloads(
     policies: &BTreeMap<String, PolicySpec>,
     generation: u64,
@@ -119,10 +140,10 @@ pub fn audit_workloads(
         }
     };
     for app in apps {
-        let (caller, source) = if app.gitops_owned {
-            (Caller::gitops(), Source::GitOps)
-        } else {
-            (Caller::audit(), Source::Apply)
+        let (caller, source) = match &app.controller {
+            Some(controller) => (controller.clone(), Source::Apply),
+            None if app.gitops_owned => (Caller::gitops(), Source::GitOps),
+            None => (Caller::audit(), Source::Apply),
         };
         let judgement = judge_app(&set, &app.id, &app.spec, &caller, source);
         audit.verdict.extend(judgement.verdict);

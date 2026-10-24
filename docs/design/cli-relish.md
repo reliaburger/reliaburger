@@ -633,6 +633,7 @@ relish deploy <path> --dry-run      # Print the plan without deploying
 relish rollback <app>               # Roll back an app one step, to its previous version
 relish rollback <app> --namespace <ns>  # Roll back within a namespace
 relish stop <app>                   # Stop all instances of an app
+relish release <app> [--namespace <ns>]  # Hand an app a controller owns back to apply and GitOps (#1125)
 relish inspect <app>                # Per-instance detail (bare app name, not app.X)
 
 # Configuration tooling
