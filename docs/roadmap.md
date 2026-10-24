@@ -363,7 +363,10 @@ migration and no feature gate
   controller. A new book chapter,
   [Chapter 18](book/18-bending-without-forking.md), comes first. Exit test: four common policies,
   a template and a controller on a real cluster
-  ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)).
+  ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)). Every
+  issue has landed on the train, and the exit test passes on the
+  `make test-cluster` fixture, with a stand-in for Postgres. Qualification
+  waits for 0.2.3.
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)

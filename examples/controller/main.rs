@@ -7,6 +7,10 @@
 //! deletes the app that failed. The only state it keeps is a counter;
 //! which app is active lives in the cluster, as the one that exists.
 //!
+//! The pair is two `[app.*]` tables (`pair.toml`), or a template with a
+//! `[use.*]` for each app (`postgres-pair.toml`), in which case the
+//! controller applies the active `use` and the cluster expands it.
+//!
 //! It touches nothing but HTTP and JSON:
 //!
 //! - `GET /v1/diagnostics/apps`: each app and its owner;
@@ -46,8 +50,9 @@ pub struct Settings {
     pub name: String,
     /// The namespace the token is scoped to.
     pub namespace: String,
-    /// The two apps, as an `[app.*]` TOML manifest with exactly two apps.
-    /// The controller sets their `namespace` and `owner`.
+    /// The two apps, as an `[app.*]` TOML manifest with exactly two apps,
+    /// or a template with exactly two `[use.*]` tables. The controller sets
+    /// their `namespace` and `owner`.
     pub manifest: String,
     /// How many checks in a row the active app may have no running
     /// instance before the controller fails over.
@@ -189,11 +194,32 @@ pub fn decide(views: [&AppView; 2], misses: u32, settings: &Settings) -> Decisio
 
 /// The manifest the controller applies: app `active` from `settings`, in
 /// its namespace, owned by its token.
+///
+/// A manifest with `[use.*]` tables is a templated pair: the controller
+/// keeps the active `use`, and passes its token's name and its namespace
+/// as the `owner` and `namespace` parameters. The cluster expands it.
 pub fn manifest(settings: &Settings, active: usize) -> Result<String, String> {
     let mut document: toml::Table = settings
         .manifest
         .parse()
         .map_err(|error| format!("the manifest isn't TOML: {error}"))?;
+    if let Some(uses) = document.get_mut("use").and_then(toml::Value::as_table_mut) {
+        if uses.len() != 2 {
+            return Err(format!("the manifest needs two uses, not {}", uses.len()));
+        }
+        let names: Vec<String> = uses.keys().cloned().collect();
+        uses.remove(&names[1 - active]);
+        let chosen = uses
+            .get_mut(&names[active])
+            .and_then(toml::Value::as_table_mut)
+            .ok_or("a use isn't a table")?;
+        chosen.insert("owner".into(), toml::Value::String(settings.name.clone()));
+        chosen.insert(
+            "namespace".into(),
+            toml::Value::String(settings.namespace.clone()),
+        );
+        return toml::to_string(&document).map_err(|error| error.to_string());
+    }
     let apps = document
         .get_mut("app")
         .and_then(toml::Value::as_table_mut)
@@ -217,12 +243,28 @@ pub fn manifest(settings: &Settings, active: usize) -> Result<String, String> {
     toml::to_string(&document).map_err(|error| error.to_string())
 }
 
-/// The two app names in the manifest, in its order.
+/// The two app names in the manifest, in its order. In a templated pair,
+/// each `use` names its app with its `name` parameter.
 pub fn app_names(settings: &Settings) -> Result<[String; 2], String> {
     let document: toml::Table = settings
         .manifest
         .parse()
         .map_err(|error| format!("the manifest isn't TOML: {error}"))?;
+    if let Some(uses) = document.get("use").and_then(toml::Value::as_table) {
+        let names = uses
+            .iter()
+            .map(|(key, value)| {
+                value
+                    .get("name")
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or(format!("use.{key} has no `name` parameter naming its app"))
+            })
+            .collect::<Result<Vec<String>, String>>()?;
+        return names.try_into().map_err(|names: Vec<String>| {
+            format!("the manifest needs two uses, not {}", names.len())
+        });
+    }
     let names: Vec<String> = document
         .get("app")
         .and_then(toml::Value::as_table)

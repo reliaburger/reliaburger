@@ -350,6 +350,16 @@ the files, offline, with the same code the cluster runs, and exits non-zero
 when an apply would be refused. Run it in CI. `--caller` and `--role` set what
 `caller` holds.
 
+For a starting set, `examples/policies/platform.toml` has the four rules
+platform teams ask for most: a memory limit for every app in `prod`, no
+`:latest` (or untagged) images, images only from listed registries, and a
+`TEAM` variable every app gets by default. Change the namespace, registries
+and team to your own, then try them against your apps:
+
+```sh
+relish policy test -f examples/policies/platform.toml -f my-apps.toml
+```
+
 ### Auditing running work
 
 A policy judges apps and jobs as they're applied, so a new one never stops

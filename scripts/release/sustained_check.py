@@ -15,6 +15,7 @@ Subcommands:
   power-cut EVIDENCE                    a node lost power: a log tail may end below an earlier one once
   baseline EVIDENCE SNAPSHOT            record each node's leak inventory as the baseline
   evaluate EVIDENCE SNAPSHOT            findings; exit 1 on a new failure, 3 when not yet settled
+  policies EVIDENCE LISTING             exit 1 unless the soak workload's policies are all in force
   seen EVIDENCE KEY                     exit 0 if a harness failure KEY was bundled in the last half hour
   ingress-expect EVIDENCE NODE SERIAL   the serial a node must serve after a successful reload
   count EVIDENCE NAME [N]               add to a named counter in the record
@@ -49,6 +50,7 @@ import ssl
 import statistics
 import sys
 import time
+import tomllib
 import job_soak
 import job_soak_inventory
 import soak_charts
@@ -952,6 +954,11 @@ def evaluate(evidence, snapshot):
     # Leaks only count once the cluster has settled; before that they are progress.
     findings += [dict(leak, severity="info") if fault_window else leak for leak in leaks]
 
+    expected = expected_policies(evidence)
+    listing = read_json(snapshot, "policies.json")
+    if expected and listing is not None:
+        findings += policy_findings(state, expected, listing)
+
     registry = read_json(snapshot, "registry.json")
     registry_cut = any(name == "registry" for _, name in cut)
     if registry is not None and registry_cut:
@@ -998,6 +1005,71 @@ def suppress_repeats(state, findings, now):
                 reported[key] = now
         result.append(item)
     return result
+
+
+# --- policies (#1311) --------------------------------------------------------
+
+def expected_policies(evidence):
+    """The `[policy.*]` tables of the workload file the harness applied
+    (EVIDENCE/workloads.toml), or None before it has written one."""
+    path = Path(evidence) / "workloads.toml"
+    if not path.exists():
+        return None
+    return tomllib.loads(path.read_text()).get("policy", {})
+
+
+# What a policy decides. The message is for people, so a reworded one isn't
+# a lost policy.
+POLICY_KEYS = ("match", "deny", "action", "applies_to", "default")
+POLICY_DEFAULTS = {"action": "deny", "applies_to": "apps"}
+
+
+def policy_differences(declared, listed):
+    """The keys whose value differs between a declared policy and the one in
+    force, comparing absent keys by their default."""
+    return [key for key in POLICY_KEYS
+            if declared.get(key, POLICY_DEFAULTS.get(key)) != listed.get(key, POLICY_DEFAULTS.get(key))]
+
+
+def policy_findings(state, expected, listing):
+    """Fail when a policy the soak applied is gone or changed, or the policy
+    generation went backwards: Raft keeps both through every fault."""
+    policies = listing.get("policies") if isinstance(listing, dict) else None
+    if not isinstance(policies, dict):
+        return [finding("policies", "warn", "`relish policy list` answered without a policy map")]
+    findings = []
+    for name, declared in sorted(expected.items()):
+        listed = policies.get(name)
+        if listed is None:
+            findings.append(finding("policies", "fail", f"policy {name} is not in force", name))
+            continue
+        changed = policy_differences(declared, listed)
+        if changed:
+            findings.append(finding("policies", "fail",
+                                    f"policy {name} differs from the soak workload's in {', '.join(changed)}", name))
+    generation = listing.get("generation")
+    previous = state.get("policy_generation")
+    if isinstance(generation, int):
+        if isinstance(previous, int) and generation < previous:
+            findings.append(finding("policies", "fail", f"policy generation went from {previous} back to {generation}"))
+        state["policy_generation"] = max(generation, previous or 0)
+    state["policy_checks"] = state.get("policy_checks", 0) + 1
+    return findings
+
+
+def check_policies(evidence, listing_path):
+    """The configure step's check: 0 when every policy in the applied
+    workload file is in force, 1 (printing why) when one isn't."""
+    expected = expected_policies(evidence) or {}
+    try:
+        listing = json.loads(Path(listing_path).read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"fail: policies: cannot read {listing_path}: {error}")
+        return 1
+    problems = policy_findings({}, expected, listing)
+    for item in problems:
+        print(f"{item['severity']}: policies: {item['detail']}")
+    return 1 if problems else 0
 
 
 def turn_scrapes(samples):
@@ -1884,6 +1956,11 @@ def render(evidence, record):
             f"{node} {over_budget.get(node, 0)}" for node in checked))
     else:
         lines.append("- Agent-loop turns over the 1 s budget: not measured")
+    if state.get("policy_checks"):
+        lines.append(f"- Soak policies checked in force: {state['policy_checks']} times, "
+                     f"policy generation {state.get('policy_generation', 'unknown')} at the last check")
+    else:
+        lines.append("- Soak policies checked in force: not measured")
     clock_steps = state.get("clock_steps", {})
     lines.append("- Guest clock steps by Lima's guest agent: " + (", ".join(
         f"{node} {count}" for node, count in sorted(clock_steps.items())) or "none"))
@@ -2035,6 +2112,9 @@ def main(argv=None):
         sub = commands.add_parser(name)
         sub.add_argument("evidence")
         sub.add_argument("snapshot")
+    policies = commands.add_parser("policies", help="exit 1 unless the soak workload's policies are all in force (#1311)")
+    policies.add_argument("evidence")
+    policies.add_argument("listing")
     seen = commands.add_parser("seen")
     seen.add_argument("evidence")
     seen.add_argument("key")
@@ -2132,6 +2212,8 @@ def main(argv=None):
         return 0
     if args.command == "evaluate":
         return evaluate(args.evidence, args.snapshot)
+    if args.command == "policies":
+        return check_policies(args.evidence, args.listing)
     if args.command == "seen":
         # A harness-detected failure already bundled in the last half hour is a repeat.
         state = load_state(args.evidence)

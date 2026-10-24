@@ -117,9 +117,10 @@ audit: ## Fail on new RustSec findings or an expired advisory exception
 outdated: ## Report crates that cargo update would move and those a major version behind (never fails)
 	-$(CARGO) update --dry-run --verbose
 
-bench: ## Run reproducible transport and 5-250 node gossip benchmarks, and the 1k and 10k node scheduling pass
+bench: ## Run reproducible transport and 5-250 node gossip benchmarks, the 1k and 10k node scheduling pass, and policy evaluation for 10-1,000 policies
 	$(CARGO) bench --bench gossip
 	$(CARGO) bench --bench scheduler
+	$(CARGO) bench --bench policy
 
 bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 	$(CARGO) bench --bench gossip_large
