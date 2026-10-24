@@ -229,8 +229,12 @@ async fn rejudging_refences_the_remaining_apps_or_names_the_new_denial() {
     )
     .unwrap();
     let caller = apply::policy_caller(None);
-    let mut pending: std::collections::VecDeque<_> =
-        crate::policy::fence(crate::council::config_to_desired_writes(&declared), 0).into();
+    let mut pending: std::collections::VecDeque<_> = crate::policy::fence(
+        crate::council::config_to_desired_writes(&declared),
+        0,
+        &std::collections::BTreeMap::new(),
+    )
+    .into();
 
     // A lenient change: both apps are fenced again on the new generation.
     council
@@ -238,16 +242,23 @@ async fn rejudging_refences_the_remaining_apps_or_names_the_new_denial() {
             name: "never".into(),
             spec: Box::new(crate::config::PolicySpec {
                 match_expression: None,
-                deny: "false".into(),
+                deny: Some("false".into()),
                 message: None,
                 action: crate::config::PolicyAction::Deny,
+                default: None,
             }),
         })
         .await
         .unwrap();
-    apply::rejudge(&council, &declared, &caller, &mut pending)
-        .await
-        .unwrap();
+    apply::rejudge(
+        &council,
+        &declared,
+        &Default::default(),
+        &caller,
+        &mut pending,
+    )
+    .await
+    .unwrap();
     assert!(pending.iter().all(|write| matches!(
         write,
         crate::council::RaftRequest::PolicyFenced { generation: 1, .. }
@@ -258,11 +269,56 @@ async fn rejudging_refences_the_remaining_apps_or_names_the_new_denial() {
     for write in crate::council::config_to_desired_writes(&config) {
         council.write(write).await.unwrap();
     }
-    let error = apply::rejudge(&council, &declared, &caller, &mut pending)
-        .await
-        .unwrap_err();
+    let error = apply::rejudge(
+        &council,
+        &declared,
+        &Default::default(),
+        &caller,
+        &mut pending,
+    )
+    .await
+    .unwrap_err();
     assert!(
         error.contains("policy no-latest denies app default/web"),
         "{error}"
     );
+}
+
+/// #1118: an apply fills in a policy's default, says so as it streams,
+/// stores the filled spec and keeps the declared one beside it. A field
+/// the app sets is never overwritten.
+#[tokio::test]
+async fn an_apply_fills_in_defaults_and_keeps_the_declared_spec() {
+    let cluster = cluster("policy-defaults").await;
+    let (status, body) = cluster
+        .call(
+            "/v1/apply",
+            &cluster.admin,
+            "[policy.team-label.default]\nenv.TEAM = 'payments'\nmemory = '256Mi'\n",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let manifest = "[app.web]\nimage = 'web:v1'\nmemory = '1Gi'\n";
+    let (status, body) = cluster.call("/v1/apply", &cluster.deployer, manifest).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("policy team-label fills env.TEAM = \\\"payments\\\" on app default/web"),
+        "{body}"
+    );
+    assert!(!body.contains("fills memory"), "{body}");
+
+    let web = crate::meat::AppId::new("web", "default");
+    let desired = cluster.council.desired_state().await;
+    let effective = &desired.apps[&web];
+    assert_eq!(
+        effective.env["TEAM"],
+        crate::config::EnvValue::Plain("payments".into())
+    );
+    let declared = crate::config::Config::parse(manifest).unwrap();
+    assert_eq!(
+        effective.memory, declared.app["web"].memory,
+        "the app's own memory wins"
+    );
+    assert_eq!(desired.declared_apps[&web], declared.app["web"]);
 }

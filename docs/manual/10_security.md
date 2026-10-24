@@ -285,7 +285,12 @@ The cluster checks a policy when you apply it, and refuses one that:
 - isn't valid CEL;
 - names anything other than `app`, `caller` and `source`, such as `policy`,
   `permission` or `namespaces`;
-- reads a field `app` or `caller` doesn't have (`app.memroy`).
+- reads a field `app` or `caller` doesn't have (`app.memroy`);
+- has neither a `deny` nor a `default`;
+- has a `default` that's empty or over 4096 bytes, names a field an app
+  doesn't have (`memroy`, `deploy.max_unavaliable`) or one a default can't
+  fill (`namespace`, `replicas`), or gives a field a value of the wrong type
+  (`port = "eighty"`).
 
 An expression that fails while it runs, such as `app.memory == '1Gi'` on an
 app with no memory set, or a `deny` that isn't true or false, counts as
@@ -321,6 +326,52 @@ an apply would be refused. Run it in CI. `--caller` and `--role` set what
 A policy never judges a policy, so `relish policy delete` works even when a
 broken policy refuses every app. A policy GitOps wrote comes back on the next
 sync unless you remove it from the repository too.
+
+### Defaults
+
+A policy can also fill in fields an app leaves out, with a `default` table
+shaped like an `[app.*]` table:
+
+```toml
+[policy.team-label]
+match = "app.namespace == 'payments'"
+
+[policy.team-label.default]
+env.TEAM = "payments"
+deploy.max_unavailable = 1
+```
+
+A default only fills gaps. It never overwrites a value you wrote: an app
+with its own `env.TEAM` keeps it, and an app with other `env` variables
+keeps them all and gains `TEAM`. To forbid a value, write a `deny`, not a
+default. A policy can have a `default`, a `deny`, or both.
+
+The cluster judges each app in a fixed order. It fills in every matching
+policy's default, in policy name order, so when two defaults fill the same
+field the one whose name sorts first wins. Each `match` sees the app as the
+policies before it left it. Then the app is validated as usual, and then
+every `deny` runs, on the filled-in app. A default that would leave the app
+invalid (`port = 0`, say) refuses the apply, naming the policy.
+
+A field counts as left out when the app doesn't set it at all. `replicas`
+always has a value, 1 when you leave it out, so a default can't fill it.
+
+`relish apply` and `relish apply --dry-run` show each field a default fills
+and the policy that fills it:
+
+```console
+$ relish apply --dry-run -f web.toml
+...
+Policies:
+  FILL  policy team-label fills deploy.max_unavailable = 1 on app payments/web
+  FILL  policy team-label fills env.TEAM = "payments" on app payments/web
+```
+
+`relish policy test` lists them too. The cluster stores the app as you
+declared it beside the filled-in spec it runs. GitOps compares the
+repository with the declared spec, so a filled-in field never looks like a
+change and a sync doesn't re-apply the app. A new or changed default
+reaches an app the next time the app itself is applied.
 
 ## Audit log
 

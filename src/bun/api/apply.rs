@@ -702,7 +702,16 @@ pub(super) async fn cluster_apply(
         Ok(admitted) => admitted,
         Err(error) => return policy_refusal(&state, auth.as_ref(), &error).await,
     };
+    // The apps as declared, for judging again, and the apps to write:
+    // each with its policy defaults filled in (#1118).
     let declared = config.clone();
+    let mut config = config;
+    for (name, spec) in config.app.iter_mut() {
+        let app_id = crate::meat::AppId::new(name, spec.namespace.as_deref().unwrap_or("default"));
+        if let Some(app) = admission.defaulted.get(&app_id) {
+            *spec = app.effective.clone();
+        }
+    }
 
     // A manual apply of a GitOps-managed resource goes ahead, with a warning
     // that the next sync puts back what git declares (#693).
@@ -718,12 +727,14 @@ pub(super) async fn cluster_apply(
     let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
     tokio::spawn(async move {
         let mut config = config;
+        let filled = admission.filled.iter().map(ToString::to_string);
         let policy_warnings = admission
             .warnings
             .iter()
             .map(|finding| format!("warning: {finding}"));
         for message in gitops_warnings
             .into_iter()
+            .chain(filled)
             .chain(policy_warnings)
             .chain(host_path_notes(&config))
         {
@@ -782,8 +793,12 @@ pub(super) async fn cluster_apply(
         // Every app write is fenced on the policy generation it was judged
         // under. When the policies move first, the state machine refuses
         // it, and the apps still to write are judged again (#1117).
-        let mut pending: std::collections::VecDeque<_> =
-            crate::policy::fence(writes, admission.generation).into();
+        let mut pending: std::collections::VecDeque<_> = crate::policy::fence(
+            writes,
+            admission.generation,
+            &crate::policy::declared_apps(&declared),
+        )
+        .into();
         let mut policy_attempts = 0usize;
         while let Some(request) = pending.pop_front() {
             let describe = describe_write(&request);
@@ -798,7 +813,14 @@ pub(super) async fn cluster_apply(
                              during this apply; apply again"
                         ))
                     } else {
-                        rejudge(&council, &declared, &caller, &mut pending).await
+                        rejudge(
+                            &council,
+                            &declared,
+                            &admission.defaulted,
+                            &caller,
+                            &mut pending,
+                        )
+                        .await
                     };
                     match rejudge_messages(rejudged) {
                         Ok(messages) => {
@@ -922,12 +944,18 @@ fn written_app(request: &crate::council::RaftRequest) -> Option<crate::meat::App
 
 /// Judge the apps still in `pending` again, under the policies now in
 /// force, and fence them on the new generation. Their declared specs come
-/// from `declared`, the config before its images were bound. The apply's
-/// own policies are committed by now, so the committed set is the whole
-/// story. Returns the warnings, or why the apply stops.
+/// from `declared`, the config before its defaults were filled in and its
+/// images bound. The apply's own policies are committed by now, so the
+/// committed set is the whole story. Returns the warnings, or why the
+/// apply stops.
+///
+/// The pending writes already carry the specs `defaulted` filled in. When
+/// the new policies would fill in a remaining app differently, the apply
+/// stops rather than write a spec no policy set produced (#1118).
 pub(super) async fn rejudge(
     council: &crate::council::CouncilNode,
     declared: &Config,
+    defaulted: &std::collections::BTreeMap<crate::meat::AppId, crate::policy::DefaultedApp>,
     caller: &crate::policy::Caller,
     pending: &mut std::collections::VecDeque<crate::council::RaftRequest>,
 ) -> Result<Vec<crate::policy::Finding>, String> {
@@ -949,6 +977,16 @@ pub(super) async fn rejudge(
         Vec::new(),
     )
     .map_err(|error| error.to_string())?;
+    for app_id in pending.iter().filter_map(written_app) {
+        let before = defaulted.get(&app_id).map(|app| &app.effective);
+        let now = admitted.defaulted.get(&app_id).map(|app| &app.effective);
+        if before != now {
+            return Err(format!(
+                "the policies now fill in app {}/{} differently; apply again",
+                app_id.namespace, app_id.name
+            ));
+        }
+    }
     for write in pending.iter_mut() {
         if let crate::council::RaftRequest::PolicyFenced { generation, .. } = write {
             *generation = admitted.generation;

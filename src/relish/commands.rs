@@ -96,7 +96,7 @@ pub(crate) fn plan_policies(
 ) -> super::plan::PolicyPlan {
     let effective = crate::policy::effective_policies(committed, config);
     match crate::policy::PolicySet::compile(&effective) {
-        Ok(set) => super::plan::PolicyPlan::from_verdict(&crate::policy::evaluate(
+        Ok(set) => super::plan::PolicyPlan::from_evaluation(&crate::policy::evaluate(
             &set,
             config,
             &crate::policy::Caller::token("relish", crate::sesame::types::ApiRole::Deployer),
@@ -104,7 +104,7 @@ pub(crate) fn plan_policies(
         )),
         Err(error) => super::plan::PolicyPlan {
             denials: vec![error.to_string()],
-            warnings: Vec::new(),
+            ..Default::default()
         },
     }
 }

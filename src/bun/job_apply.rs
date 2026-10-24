@@ -81,7 +81,7 @@ pub(crate) async fn apply(
             let (policies, generation) = council
                 .read_desired(|desired| (desired.policies.clone(), desired.policy_generation))
                 .await;
-            if let Err(error) = crate::policy::admit(
+            match crate::policy::admit(
                 &policies,
                 generation,
                 &config,
@@ -89,7 +89,23 @@ pub(crate) async fn apply(
                 crate::policy::Source::Apply,
                 Vec::new(),
             ) {
-                return super::api::apply::policy_refusal(&state, auth, &error).await;
+                // The apps commit with their policy defaults filled in
+                // (#1118). Job manifests never come from GitOps, so there's
+                // no declared spec to keep beside them.
+                Ok(admitted) => {
+                    for (name, spec) in config.app.iter_mut() {
+                        let app_id = crate::meat::AppId::new(
+                            name,
+                            spec.namespace.as_deref().unwrap_or("default"),
+                        );
+                        if let Some(app) = admitted.defaulted.get(&app_id) {
+                            *spec = app.effective.clone();
+                        }
+                    }
+                }
+                Err(error) => {
+                    return super::api::apply::policy_refusal(&state, auth, &error).await;
+                }
             }
         }
     }

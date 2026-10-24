@@ -97,9 +97,14 @@ pub struct CurrentResource {
     pub fingerprint: Option<String>,
 }
 
-/// The policy section of a plan: one line per denial and per warning.
+/// The policy section of a plan: one line per filled field, per denial
+/// and per warning.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PolicyPlan {
+    /// Fields a policy default would fill in, as `policy … fills … on
+    /// app …` (#1118).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub filled: Vec<String>,
     /// Policies that would refuse the apply, as `policy … denies app …`.
     pub denials: Vec<String>,
     /// Policies that would only warn.
@@ -109,12 +114,14 @@ pub struct PolicyPlan {
 impl PolicyPlan {
     /// Whether the policies said nothing.
     pub fn is_empty(&self) -> bool {
-        self.denials.is_empty() && self.warnings.is_empty()
+        self.filled.is_empty() && self.denials.is_empty() && self.warnings.is_empty()
     }
 
-    /// The plan section for `verdict`.
-    pub fn from_verdict(verdict: &crate::policy::Verdict) -> Self {
+    /// The plan section for `evaluation`.
+    pub fn from_evaluation(evaluation: &crate::policy::Evaluation) -> Self {
+        let verdict = &evaluation.verdict;
         PolicyPlan {
+            filled: evaluation.filled.iter().map(ToString::to_string).collect(),
             denials: verdict.denials.iter().map(ToString::to_string).collect(),
             warnings: verdict.warnings.iter().map(ToString::to_string).collect(),
         }
@@ -410,6 +417,9 @@ impl ApplyPlan {
             return Ok(());
         }
         write!(f, "\n\nPolicies:")?;
+        for filled in &self.policy.filled {
+            write!(f, "\n  FILL  {filled}")?;
+        }
         for denial in &self.policy.denials {
             write!(f, "\n  DENY  {denial}")?;
         }
@@ -518,6 +528,43 @@ namespace = "prod"
         insta::assert_snapshot!(plan.to_string());
         let json = serde_json::to_value(&plan).unwrap();
         assert_eq!(json["policy"]["denials"].as_array().unwrap().len(), 1);
+    }
+
+    /// #1118: the plan shows each field a default would fill in, and the
+    /// policy that fills it. The app itself is unchanged: the cluster
+    /// answers with the fingerprint of the spec as declared, so filled
+    /// fields aren't an update.
+    #[test]
+    fn the_plan_names_each_filled_field_and_its_policy() {
+        let committed = parse_config(
+            r#"
+[policy.team-label]
+match = "app.namespace == 'payments'"
+
+[policy.team-label.default]
+env.TEAM = "payments"
+deploy.max_unavailable = 1
+"#,
+        )
+        .policy;
+        let config = parse_config(
+            r#"
+[app.web]
+image = "web:v1"
+namespace = "payments"
+"#,
+        );
+        let current = [CurrentResource {
+            resource: "app.payments/web".into(),
+            image: Some("web:v1".into()),
+            fingerprint: crate::config::fingerprint::app_fingerprint(&config.app["web"]),
+        }];
+        let mut plan = generate_plan(&config, Some(&current));
+        plan.policy = crate::relish::commands::plan_policies(&committed, &config);
+        assert_eq!(plan.unchanged, 1, "{plan:?}");
+        insta::assert_snapshot!(plan.to_string());
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["policy"]["filled"].as_array().unwrap().len(), 2);
     }
 
     #[test]

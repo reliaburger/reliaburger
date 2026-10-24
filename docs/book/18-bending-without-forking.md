@@ -599,7 +599,6 @@ a limit, inject a sidecar. Platform teams want this badly. "Fill in our team
 label" is as common a request as "deny `:latest`". So a policy can carry a
 `default` fragment:
 
-<!-- snippet: planned #1118 -->
 ```toml
 [policy.team-label]
 match = "app.namespace == 'payments'"
@@ -630,6 +629,21 @@ validation runs, then every `deny`, so validation sees the final spec. And you
 always see your own values honoured. If a team must not use a value, the
 answer is a `deny`, not a silent rewrite.
 
+Two details came out of building it
+([#1118](https://github.com/reliaburger/reliaburger/issues/1118)). First, each
+policy's `match` sees the app as the policies before it left it, so a
+`b-health` policy can say `match = "has(app.port)"` and pick up a port that
+`a-port` filled in. That's what "in name order" has to mean if the order is to
+matter at all. It also bounds the idempotence promise: filling twice gives the
+same app unless an earlier policy's `match` tests a field a later one fills.
+We never fill twice in practice, though, because the cluster always fills the
+spec as you declared it, never the filled one, as the next section explains.
+Second, "a field you left out" needs a precise meaning. We serialise the app
+to JSON, and a field is absent when the JSON doesn't hold it or holds `null`.
+That covers every optional field and every empty list or map. It doesn't
+cover `replicas`, which always has a value (1 when you leave it out), so a
+policy that tries to default `replicas` is refused when it's committed.
+
 That rules some things out on purpose. A default can't rewrite an image
 registry; that belongs with the trust policy and the pull-through cache
 ([Chapter 10](10-locking-it-down.md#trust-the-image-or-dont-run-it)). It can't
@@ -653,8 +667,32 @@ what git owns is exactly what you wrote, and what the policy added sits beside
 it. There's a precedent: the autoscaler's replica override is already a runtime
 value that git doesn't own.
 
-`relish plan` and `apply --dry-run` show each filled field and the policy that
-filled it, so a default is never a surprise.
+We store the whole declared spec, not the list of filled fields. Taking
+fields back out of a spec would need a second, inverse operation that has to
+agree with filling for ever, and a stored spec needs nothing but an equality
+check. An app gets an entry, in a new `declared_apps` map in desired
+state, whenever the spec the cluster stores differs from the one you wrote.
+A default is one reason. The other was already there: the leader binds each
+image tag to a digest before it writes the app, so `web:v1` is stored as
+`web:v1@sha256:…`. Lettuce had a special case that read the digest back off
+before comparing. With the declared spec stored, that special case only
+matters for apps written before it, and `relish apply --dry-run` stops
+calling an app with a bound image "updated" when nothing changed.
+
+This has a consequence worth stating plainly: a new or changed default doesn't
+reach a GitOps app until git changes that app. That's the same promise a new
+`deny` makes, that a new policy never touches what already runs, and it's the
+only behaviour that doesn't turn one policy commit into a redeploy of
+everything it matches.
+
+`relish apply --dry-run` shows each filled field and the policy that filled
+it, so a default is never a surprise:
+
+```text
+Policies:
+  FILL  policy team-label fills deploy.max_unavailable = 1 on app payments/web
+  FILL  policy team-label fills env.TEAM = "payments" on app payments/web
+```
 
 ## Templates, not new kinds
 
@@ -983,6 +1021,128 @@ and each moves the generation by one, so `admit` fences the apps on
 `generation + config.policy.len()`. If anyone else writes a policy in
 between, the numbers don't match, the fence trips, and the apply judges again,
 now with the committed set, which includes its own policies.
+
+### Fill-only defaults
+
+([#1118](https://github.com/reliaburger/reliaburger/issues/1118)) A policy's
+`default` arrives as a TOML table, but we keep it as JSON:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub default: Option<serde_json::Map<String, serde_json::Value>>,
+```
+
+`serde_json::Value` is serde's "any JSON value" enum: `Null`, `Bool`,
+`Number`, `String`, `Array` or `Object`. Because serde separates the data
+model from the format, the TOML parser can fill a `serde_json::Map` directly:
+it walks the TOML table and hands serde maps, strings and numbers, and serde
+doesn't care which format they came from. Raft carries desired state as JSON
+anyway, so the table crosses the wire as itself. `deny` became an
+`Option<String>` at the same time, because a policy that only fills defaults
+has nothing to deny. `check_policy` refuses a policy with neither.
+
+Filling is one recursive function in `src/policy/defaults.rs`:
+
+```rust
+pub(super) fn fill(
+    target: &mut Map<String, Value>,
+    fragment: &Map<String, Value>,
+    prefix: &str,
+    filled: &mut Vec<(String, Value)>,
+) {
+    for (key, value) in fragment {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        let absent = matches!(target.get(key), None | Some(Value::Null));
+        match (target.get_mut(key), value) {
+            (Some(Value::Object(existing)), Value::Object(inner)) => {
+                fill(existing, inner, &path, filled);
+            }
+            (_, Value::Object(inner)) if absent && !inner.is_empty() => {
+                let mut table = Map::new();
+                fill(&mut table, inner, &path, filled);
+                target.insert(key.clone(), Value::Object(table));
+            }
+            _ if absent => {
+                target.insert(key.clone(), value.clone());
+                filled.push((path, value.clone()));
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+The parameters show who may change what. `target` is `&mut`, the app being
+filled; `fragment` is `&`, the policy's table, which nothing here can alter;
+and `filled` is `&mut` so each call can append the paths it filled. In C you'd
+pass pointers and promise in a comment; here the compiler holds every caller
+to it.
+
+The `match` is on a *tuple* of two things at once: what the app holds at this
+key, and what the default holds. Rust checks the arms top to bottom. Both are
+tables: recurse, which is how `env.TEAM` joins an app's own `env` without
+disturbing its other variables. The default is a table and the app has
+nothing: build the table leaf by leaf, so `relish apply` can report
+`deploy.max_unavailable` rather than all of `deploy`. The app has nothing and
+the default is a plain value: copy it. Anything else, `_ => {}`, means the app
+holds a value, and the app wins. There's no arm that writes over a value, so
+"never overwrites" isn't a rule the code follows. It's a rule the code can't
+break.
+
+The `if absent` after a pattern is a match guard, and `absent` comes from
+`matches!`, both of which we've met before. What's worth a closer look is
+why `absent` is worked out *before* the `match`. `target.get_mut(key)`
+borrows `target` mutably for the whole `match`, and while a mutable borrow is
+alive the compiler won't let anything else read `target`, not even a guard.
+This is the borrow checker's one-writer-or-many-readers rule at small scale.
+Asking the question first, while nothing holds a mutable borrow, is the usual
+way round it.
+
+`apply_default` serialises the app to JSON, fills it, and deserialises the
+result back into an `AppSpec`. The round trip is what keeps the types honest:
+if a default gave `port` a string, serde refuses to turn it back into a `u16`.
+The commit check uses the same trick. It fills the default into an app that
+sets nothing, reads it back, and refuses the policy if serde complains or if
+a key the default named has vanished on the way, which is what happens to a
+key no field keeps.
+
+`judge_app` runs the three stages in order. For each policy with a default,
+in name order, it evaluates `match` against the spec so far and fills;
+then, if anything was filled, it runs the same `validate_app_spec` that
+`relish apply` runs on a declared app; then every `deny`. `admit` returns the
+filled specs. `fence` compares each app write with the app as declared, and
+when they differ it hands the fence the declared one:
+
+```rust
+PolicyFenced {
+    generation: u64,
+    change: Box<RaftRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    declared: Option<Box<AppSpec>>,
+},
+```
+
+The state machine applies `change` first, and only if that wasn't refused
+does it record `declared` in `DesiredState::declared_apps`, or remove the
+entry when `declared` is `None`. Any other write that changes an app's spec,
+a rollback say, clears the entry, because the new spec is its own
+declaration. A write of the *same* spec keeps it. That's what a GitOps
+adoption sends: the spec the cluster already runs, filled fields and all,
+to record that GitOps owns it.
+
+On the GitOps side the fix is one line in `diff_apps`, with a comment that
+names the trap:
+
+```rust
+let current_spec = current.declared_apps.get(app_id).unwrap_or(effective_spec);
+```
+
+`get` returns an `Option<&AppSpec>`, and `unwrap_or` gives the effective spec
+when there's no declared one.
 
 ### The exec secret provider
 
@@ -1377,8 +1537,6 @@ keeps the old behaviour exactly: a deploy still gives an old instance its
 
 Still to come in this walkthrough:
 
-- fill-only defaults and the declared-versus-effective split
-  ([#1118](https://github.com/reliaburger/reliaburger/issues/1118));
 - jobs, the audit action, `relish policy audit` and the `wtf` row
   ([#1119](https://github.com/reliaburger/reliaburger/issues/1119));
 - sidecars and runtime knobs
@@ -1431,12 +1589,50 @@ and how to read them.
   at the same generation, refuses a breaking app, and accepts the interrupted
   apply when it's sent again.
 
+Defaults ([#1118](https://github.com/reliaburger/reliaburger/issues/1118))
+added their own:
+
+- **The default table** (`the_default_table`): a default fills an absent
+  field key by key; `match` decides; the app's own value wins; an existing
+  table gains only the keys it lacks; the first policy by name wins a field
+  two of them fill; and a `match` sees what earlier policies filled.
+- **Validation and deny see the filled spec**: a `deny` on `!has(app.memory)`
+  passes once a default fills `memory`, and a default of `port = 0`, which has
+  the right type and so commits, refuses the app on the built-in check,
+  naming the policy.
+- **Every kind of bad default** is refused at commit: no `deny` and no
+  `default`, an empty default, an unknown field, `namespace` or `replicas`, a
+  misspelt nested key, a value of the wrong type, and a table over the cap.
+- **Property tests.** `defaulting_is_idempotent` fills a generated app and
+  fills the result again, and expects nothing more to fill.
+  `a_default_never_changes_a_field_the_user_set` checks that every value of
+  the declared spec is in the filled one, unchanged, and that no field the
+  user set is reported as filled. `default_order_does_not_depend_on_map_order`
+  builds the policy set from shuffled and hashed maps and expects the same
+  judgement, with the first name winning each contested field. The four
+  generated policies overlap on purpose, two on `memory` and two on
+  `env.TEAM`, because a property test of non-overlapping defaults would prove
+  very little.
+- **Snapshots**: the `relish policy test` report and the `relish apply
+  --dry-run` plan, each listing the filled fields. The plan test also checks
+  that a defaulted app reads as unchanged.
+- **The state machine** (`a_declared_spec_lives_beside_the_effective_one_until_the_spec_changes`):
+  a fenced write keeps the declared spec, the same spec again keeps it, a
+  different spec clears it, and a refused write or a delete leaves no entry.
+- **The diff** (`a_field_a_policy_filled_in_is_not_drift_from_git`) checks
+  the trap both ways: with the declared spec there's no change, and without
+  it there's an update on every sync.
+- **The portable suite** (`repeated_syncs_of_a_defaulted_app_do_not_reapply_it`)
+  syncs a repository whose policy fills `env.TEAM`, then commits an unrelated
+  app and then a comment. The sync history must show one add and no
+  modification, then nothing at all. We checked it the honest way: with the
+  diff line reverted, it fails with `modified: 1`.
+- **Through the router**: an apply streams `policy team-label fills env.TEAM
+  = "payments"`, stores the filled spec and the declared one, and keeps the
+  app's own `memory`.
+
 Still to come from the plan:
 
-- property tests that defaulting is idempotent and never changes a field the
-  user set;
-- snapshot tests of `relish plan` showing filled fields;
-- a portable test that repeated syncs of a defaulted app don't re-apply;
 - a cluster test of an admin removing a policy that denies everything (the
   router test above covers it on one node);
 - the exit test on a real three-node cluster

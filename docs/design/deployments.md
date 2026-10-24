@@ -932,6 +932,27 @@ evaluates one.
   closed: a deny policy refuses, a warn policy warns. A committed policy that
   no longer compiles refuses every app apply until an admin replaces or
   deletes it. `POST /v1/policies/{name}/delete` is never judged.
+- **Defaults (#1118).** A policy may carry a `default` table (stored as a JSON
+  map in `PolicySpec::default`), and `deny` is optional once it does.
+  `policy::judge_app` judges one app in a fixed order: every matching default
+  in policy-name order, each `match` seeing the spec the policies before it
+  left; then `validate_app_spec` on the filled spec; then every `deny` on it.
+  A default fills a key only where the serialised spec holds nothing or
+  `null`, recursing into tables both hold, so a value the app sets always
+  wins. `admit` returns `Admitted::defaulted` (declared and effective spec per
+  changed app) and `filled`; the app writes carry the effective spec. `fence`
+  compares each app write with the declared app and, when they differ (a
+  default, or an image bound to a digest), carries the declared spec:
+  `PolicyFenced { generation, change, declared }`. The state machine stores it in `DesiredState::declared_apps`
+  when the inner write lands, clears it on a fenced write without one, on any
+  app write that changes the spec, and on delete. A write of the same spec (a
+  GitOps adoption) keeps it. `GET /v1/apps` fingerprints the declared spec, so
+  `relish apply --dry-run` shows a defaulted app as unchanged and lists each
+  filled field under `Policies:`. When the policies move mid-apply and would
+  fill a remaining app differently, the apply stops and asks to be run again.
+  Commit checks refuse an empty or oversized (4096-byte) default, a field
+  that isn't an app field or can't be filled (`name`, `namespace`,
+  `replicas`, `ordinals`), and a value serde won't read back into `AppSpec`.
 
 ## 6. Configuration
 

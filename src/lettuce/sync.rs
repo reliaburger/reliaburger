@@ -323,6 +323,7 @@ mod tests {
     /// Desired state with nothing in it.
     fn empty_state() -> CurrentState<'static> {
         static APPS: std::sync::OnceLock<HashMap<AppId, AppSpec>> = std::sync::OnceLock::new();
+        static DECLARED: std::sync::OnceLock<HashMap<AppId, AppSpec>> = std::sync::OnceLock::new();
         static NAMESPACES: std::sync::OnceLock<
             std::collections::BTreeMap<String, crate::config::NamespaceSpec>,
         > = std::sync::OnceLock::new();
@@ -335,6 +336,7 @@ mod tests {
         static OWNED: std::sync::OnceLock<GitOpsOwnership> = std::sync::OnceLock::new();
         CurrentState {
             apps: APPS.get_or_init(HashMap::new),
+            declared_apps: DECLARED.get_or_init(HashMap::new),
             namespaces: NAMESPACES.get_or_init(Default::default),
             permissions: PERMISSIONS.get_or_init(Default::default),
             policies: POLICIES.get_or_init(Default::default),
@@ -661,6 +663,7 @@ mod tests {
             &config,
             &CurrentState {
                 apps: &current,
+                declared_apps: &HashMap::new(),
                 namespaces: &namespaces,
                 permissions: &permissions,
                 policies: &policies,

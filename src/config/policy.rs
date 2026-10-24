@@ -5,6 +5,10 @@
 /// when to refuse one. When both are true the apply is refused with
 /// `message`, or, with `action = "warn"`, accepted with a warning.
 ///
+/// A policy can also carry a `[policy.<name>.default]` table (#1118): app
+/// fields it fills in wherever a matching app leaves them out. A default
+/// never overwrites a value the app sets.
+///
 /// Policies are committed to Raft like permissions, and only an admin may
 /// write them. The leader evaluates them (`crate::policy`); the state
 /// machine only stores them. See chapter 18 of the book.
@@ -19,7 +23,9 @@ pub struct PolicySpec {
     #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
     pub match_expression: Option<String>,
     /// CEL expression that is true when a matching app breaks the rule.
-    pub deny: String,
+    /// Absent for a policy that only fills defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<String>,
     /// What `relish apply` says when the rule is broken. Absent means a
     /// message naming the policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -27,6 +33,11 @@ pub struct PolicySpec {
     /// Whether a broken rule refuses the apply or only warns.
     #[serde(default)]
     pub action: PolicyAction,
+    /// App fields to fill in where a matching app leaves them out, as a
+    /// TOML table shaped like an `[app.*]` table (#1118). Kept as JSON so
+    /// it crosses Raft like the rest of desired state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// What happens when an app breaks a policy.
@@ -81,7 +92,25 @@ mod tests {
     }
 
     #[test]
-    fn a_policy_without_deny_does_not_parse() {
-        assert!(toml::from_str::<PolicySpec>("match = 'true'").is_err());
+    fn a_default_table_parses_with_dotted_keys() {
+        let config = crate::config::Config::parse(
+            r#"
+            [policy.team-label]
+            match = "app.namespace == 'payments'"
+
+            [policy.team-label.default]
+            env.TEAM = "payments"
+            deploy.max_unavailable = 1
+        "#,
+        )
+        .unwrap();
+        let spec = &config.policy["team-label"];
+        assert_eq!(spec.deny, None);
+        let default = spec.default.as_ref().unwrap();
+        assert_eq!(default["env"]["TEAM"], "payments");
+        assert_eq!(default["deploy"]["max_unavailable"], 1);
+        // It survives the JSON that carries it through Raft.
+        let back: PolicySpec = serde_json::from_str(&serde_json::to_string(spec).unwrap()).unwrap();
+        assert_eq!(&back, spec);
     }
 }
