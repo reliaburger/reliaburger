@@ -32,7 +32,7 @@ pub use job::JobSpec;
 pub use namespace::NamespaceSpec;
 pub use node::NodeConfig;
 pub use permission::{PermissionAction, PermissionSpec};
-pub use policy::{PolicyAction, PolicySpec};
+pub use policy::{PolicyAction, PolicySpec, PolicyTarget};
 pub use types::{ConfigFileSpec, EnvValue, Replicas, ResourceRange, VolumeSpec};
 
 /// Top-level workload configuration.

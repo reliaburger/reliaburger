@@ -83,3 +83,31 @@ pub(super) async fn policy_delete_handler(
             .into_response(),
     }
 }
+
+/// `GET /v1/policies/audit` — every committed app and job the policies in
+/// force would now refuse, warn about or record (#1119). It judges and
+/// changes nothing. Any token may read it, as it may read the policies.
+pub(super) async fn policy_audit_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::ReadOnly)
+    {
+        return resp;
+    }
+    let Some(council) = &state.council else {
+        return Json(crate::policy::audit::PolicyAudit::default()).into_response();
+    };
+    // Judging every workload is CPU work, so it runs off the async
+    // threads, on a copy of desired state rather than under its lock.
+    let desired = council.desired_state().await;
+    match tokio::task::spawn_blocking(move || crate::policy::audit::audit(&desired)).await {
+        Ok(audit) => Json(audit).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("the audit failed: {error}") })),
+        )
+            .into_response(),
+    }
+}

@@ -302,8 +302,10 @@ pub(super) async fn apply_handler(
         return lease_error_response(error);
     }
 
-    // Policies live in the council and judge apps, never jobs, so a
-    // manifest that declares one carries no jobs and needs a cluster.
+    // Policies live in the council, so a manifest that declares one needs
+    // a cluster. Job manifests take the job lifecycle, which judges jobs by
+    // the policies already committed (#1119) but doesn't write policies,
+    // so a policy and a job go in separate applies.
     if !config.policy.is_empty() && (!config.job.is_empty() || state.council.is_none()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -750,6 +752,7 @@ pub(super) async fn cluster_apply(
         Ok(admitted) => admitted,
         Err(error) => return policy_refusal(&state, auth.as_ref(), &error).await,
     };
+    record_policy_audits(&state, auth.as_ref(), &admission.audits).await;
     // The apps as declared, for judging again, and the apps to write:
     // each with its policy defaults filled in (#1118).
     let declared = config.clone();
@@ -1109,6 +1112,45 @@ pub(crate) async fn policy_refusal(
         }),
     )
         .into_response()
+}
+
+/// Record what `audit` policies found in an apply that goes ahead
+/// (#1119): one `policy.audited` event naming the policies, with every
+/// finding in its message. The caller isn't told; the audit log is where
+/// an audit policy's findings go.
+pub(crate) async fn record_policy_audits(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    audits: &[crate::policy::Finding],
+) {
+    if audits.is_empty() {
+        return;
+    }
+    let policies: std::collections::BTreeSet<&str> = audits
+        .iter()
+        .map(|finding| finding.policy.as_str())
+        .collect();
+    let mut details = std::collections::BTreeMap::new();
+    details.insert(
+        "policies".to_string(),
+        policies.into_iter().collect::<Vec<_>>().join(","),
+    );
+    let findings: Vec<String> = audits.iter().map(ToString::to_string).collect();
+    super::record_caller_action(
+        state,
+        auth,
+        super::CallerAction {
+            kind: crate::bun::events::EventKind::Operation,
+            severity: crate::bun::events::EventSeverity::Info,
+            action: "policy.audited",
+            app: None,
+            namespace: None,
+            node: None,
+            details,
+            message: format!("audit policies recorded: {}", findings.join("; ")),
+        },
+    )
+    .await;
 }
 
 /// The body of a 422 the policies caused (#1117).
