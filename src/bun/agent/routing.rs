@@ -645,8 +645,56 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .await)
     }
 
+    /// Journal `candidate` as `id`'s publication for a deploy op, then
+    /// publish it to the kernel. The journal write, and any write already in
+    /// flight, holds the turn only until its deadline (#1263):
+    /// `StillRunning` means nothing was published, and the deploy worker's
+    /// next ask publishes once the journal records `candidate`. The landing
+    /// turn is named `deploy_op (detail)`.
+    pub(super) async fn publish_backend_within_turn(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+        candidate: &crate::onion::service_map::ServiceMap,
+        detail: &'static str,
+    ) -> Result<(), BunError> {
+        let landing = self
+            .journal_publication_within_turn(id, candidate, LoopBranch::DeployOp, detail)
+            .await?;
+        discovery_ownership::still_running_unless_landed(landing, || {
+            format!("journalling {id}'s publication")
+        })?;
+        self.publish_journalled_backends(id, candidate).await
+    }
+
+    /// Register a local service, journal it and publish it to the kernel,
+    /// for a deploy op. A journal write still in flight at the turn's
+    /// deadline leaves `service_map` as it was and answers `StillRunning`
+    /// (#1263): registering again on the next ask gives the same entry,
+    /// which the journal then records.
+    pub(super) async fn register_and_publish_service(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+        port: u16,
+        firewall: Option<Vec<String>>,
+        detail: &'static str,
+    ) -> Result<(), BunError> {
+        let before = self.service_map.clone();
+        self.register_local_service(id, port, firewall)?;
+        let candidate = self.service_map.clone();
+        let published = self
+            .publish_backend_within_turn(id, &candidate, detail)
+            .await;
+        if let Err(BunError::StillRunning { .. }) = &published {
+            self.service_map = before;
+        }
+        published?;
+        self.sync_firewall_ebpf().await;
+        Ok(())
+    }
+
     /// Add one freshly-healthy replacement to the service map and rebuild the
     /// routing table, so traffic moves onto it before anything old retires (M7).
+    /// The journal write holds the turn only until its deadline (#1263).
     pub(super) async fn publish_new_backend(
         &mut self,
         app_name: &str,
@@ -674,7 +722,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 service: service_id.clone(),
                 reason: error.to_string(),
             })?;
-        self.publish_backend_snapshot(&service_id, &candidate)
+        self.publish_backend_within_turn(&service_id, &candidate, "publish_new_backend/landed")
             .await?;
         self.service_map = candidate;
         self.rebuild_routing_table().await;

@@ -181,7 +181,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    /// Publish original ownership, fencing later mutations after uncertain writes.
+    /// Publish the whole original ownership inventory, fencing later
+    /// mutations after uncertain writes. Only adoption uses it, before the
+    /// loop runs; the loop checkpoints one owner at a time with
+    /// [`Self::checkpoint_egress_owner`], which leaves a slow write in flight.
     pub(super) async fn persist_egress_owners(
         &mut self,
         owners: std::collections::HashMap<
@@ -223,11 +226,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    /// Forget positive policy-retirement evidence after adoption metadata is gone.
+    /// Forget positive policy-retirement evidence after adoption metadata is
+    /// gone. The checkpoint write holds the turn only until its deadline
+    /// (#1263): `StillRunning` means ask again, and the ask after the write
+    /// has landed finds nothing left to forget.
     pub(super) async fn forget_retired_egress_owner(
         &mut self,
         id: &crate::grill::InstanceId,
     ) -> Result<(), BunError> {
+        let still_running = || format!("checkpointing {id}'s forgotten egress owner");
+        // Read the bindings as the last checkpoint write left them.
+        let settled = self.settle_egress_write_outside_turn().await?;
+        super::discovery_ownership::still_running_unless_landed(settled, still_running)?;
         let Some(owner) = self.egress_bindings.get(id) else {
             return Ok(());
         };
@@ -236,11 +246,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "egress owner {id} has not confirmed kernel retirement"
             )));
         }
-        let mut remaining = self.egress_bindings.clone();
-        remaining.remove(id);
-        self.persist_egress_owners(remaining).await?;
-        self.egress_bindings.remove(id);
-        Ok(())
+        let deadline = self.turn_deadline();
+        let landing = self
+            .checkpoint_egress_owner(id, None, Some(deadline))
+            .await?;
+        super::discovery_ownership::still_running_unless_landed(landing, still_running)
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
@@ -350,4 +360,195 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         Ok(())
     }
+}
+
+/// An egress owners checkpoint write still running after its turn ended
+/// (#1263). The binding it records goes into `egress_bindings` only once it
+/// has landed, so no co-tenant's map rebuild sees an owner the checkpoint
+/// doesn't record yet.
+#[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+#[derive(Debug)]
+pub(super) struct EgressWrite {
+    /// The fsync'd persist of the whole checkpoint.
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    /// The instance whose binding the write changes.
+    instance: crate::grill::InstanceId,
+    /// What that binding becomes once the write is durable; `None` forgets it.
+    binding: Option<crate::bun::egress_owners::EgressBinding>,
+    /// When the write started, for the log line a slow one leaves.
+    started: std::time::Instant,
+}
+
+#[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// Checkpoint `id`'s binding as `binding` (`None` forgets it) and keep
+    /// it in `egress_bindings` once the write is durable.
+    ///
+    /// The write waits until `deadline` at most, as a discovery journal
+    /// write does (#1263): [`Landing::InFlight`] when it ran out first, and
+    /// the write goes on off the loop. A write already in flight, anyone's,
+    /// is `InFlight` too inside a turn, without waiting for it or writing.
+    /// Either way the caller answers `StillRunning`, and its next ask finds
+    /// the binding in `egress_bindings` once the write has landed. `None`
+    /// waits for the write however long it takes.
+    ///
+    /// [`Landing::InFlight`]: super::discovery_ownership::Landing::InFlight
+    pub(super) async fn checkpoint_egress_owner(
+        &mut self,
+        id: &crate::grill::InstanceId,
+        binding: Option<crate::bun::egress_owners::EgressBinding>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<super::discovery_ownership::Landing, BunError> {
+        use super::discovery_ownership::Landing;
+        // One write at a time, each from the state the last one left.
+        if self.settle_egress_write_outside_turn().await? == Landing::InFlight {
+            return Ok(Landing::InFlight);
+        }
+        if self.egress_store_uncertain {
+            return Err(BunError::AdoptionState(
+                "egress ownership persistence is uncertain; restart to recover the checkpoint"
+                    .into(),
+            ));
+        }
+        let Some(directory) = self.records_dir.clone() else {
+            self.install_egress_owner(id, binding);
+            return Ok(Landing::Landed);
+        };
+        let mut owners = self.egress_bindings.clone();
+        match &binding {
+            Some(binding) => owners.insert(id.clone(), binding.clone()),
+            None => owners.remove(id),
+        };
+        let started = std::time::Instant::now();
+        #[cfg(test)]
+        let stalls = std::sync::Arc::clone(&self.loop_stalls);
+        let mut task = tokio::spawn(async move {
+            #[cfg(test)]
+            stalls.hold(super::LoopStall::Persist).await;
+            tokio::task::spawn_blocking(move || {
+                crate::bun::egress_owners::persist(&directory, owners)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        });
+        let joined = match deadline {
+            // LOOP-INLINE: no deadline is only asked for outside the loop's turns
+            None => Some((&mut task).await),
+            Some(deadline) => tokio::time::timeout_at(deadline, &mut task).await.ok(),
+        };
+        // Timed apart from the discovery journal's write, so a slow turn's
+        // line says which store held it (#1266).
+        self.loop_meter.add_part(
+            crate::bun::loop_meter::TurnPart::EgressWrite,
+            started.elapsed(),
+        );
+        let Some(joined) = joined else {
+            self.egress_write = Some(EgressWrite {
+                task,
+                instance: id.clone(),
+                binding,
+                started,
+            });
+            return Ok(Landing::InFlight);
+        };
+        self.finish_egress_write(joined, id, binding)
+            .map(|()| Landing::Landed)
+    }
+
+    /// Whether an egress owners write is still going on off the loop.
+    pub(super) fn egress_write_in_flight(&self) -> bool {
+        self.egress_write.is_some()
+    }
+
+    /// Take back an egress owners write that has landed, or wait for one
+    /// in flight outside a turn, where nothing else waits. Inside a turn a
+    /// write still going is `InFlight`, unwaited. A write that failed
+    /// fences every later egress mutation, and its error is the answer.
+    pub(super) async fn settle_egress_write_outside_turn(
+        &mut self,
+    ) -> Result<super::discovery_ownership::Landing, BunError> {
+        use super::discovery_ownership::Landing;
+        let Some(write) = self.egress_write.as_mut() else {
+            return Ok(Landing::Landed);
+        };
+        if !write.task.is_finished() && self.turn_deadline.is_some() {
+            return Ok(Landing::InFlight);
+        }
+        let waited = std::time::Instant::now();
+        // LOOP-INLINE: a finished write, or one outside the loop's turns
+        let outcome = (&mut write.task).await;
+        self.loop_meter.add_part(
+            crate::bun::loop_meter::TurnPart::EgressWrite,
+            waited.elapsed(),
+        );
+        let Some(EgressWrite {
+            instance,
+            binding,
+            started,
+            ..
+        }) = self.egress_write.take()
+        else {
+            return Ok(Landing::Landed);
+        };
+        eprintln!(
+            "bun: an egress owners write took {} ms; the agent loop went on meanwhile",
+            started.elapsed().as_millis()
+        );
+        self.finish_egress_write(outcome, &instance, binding)
+            .map(|()| Landing::Landed)
+    }
+
+    /// Take back an egress owners write that has already landed, on the
+    /// tick, so its binding doesn't wait for its writer's next ask.
+    pub(super) async fn collect_landed_egress_write(&mut self) {
+        if !self
+            .egress_write
+            .as_ref()
+            .is_some_and(|write| write.task.is_finished())
+        {
+            return;
+        }
+        if let Err(error) = self.settle_egress_write_outside_turn().await {
+            eprintln!("bun: {error}");
+        }
+    }
+
+    /// Install a durable write's binding, or fence egress after a failed one.
+    fn finish_egress_write(
+        &mut self,
+        outcome: Result<std::io::Result<()>, tokio::task::JoinError>,
+        id: &crate::grill::InstanceId,
+        binding: Option<crate::bun::egress_owners::EgressBinding>,
+    ) -> Result<(), BunError> {
+        match outcome.unwrap_or_else(|error| Err(std::io::Error::other(error))) {
+            Ok(()) => {
+                self.install_egress_owner(id, binding);
+                Ok(())
+            }
+            Err(error) => {
+                // The write may or may not have reached disk. No later
+                // mutation may overwrite it blindly; restart recovers.
+                self.egress_store_uncertain = true;
+                Err(BunError::AdoptionState(error.to_string()))
+            }
+        }
+    }
+
+    /// Put a durable binding in `egress_bindings`, or forget it.
+    fn install_egress_owner(
+        &mut self,
+        id: &crate::grill::InstanceId,
+        binding: Option<crate::bun::egress_owners::EgressBinding>,
+    ) {
+        match binding {
+            Some(binding) => self.egress_bindings.insert(id.clone(), binding),
+            None => self.egress_bindings.remove(id),
+        };
+    }
+}
+
+/// Nothing to collect without the eBPF data path.
+#[cfg(not(any(test, all(feature = "ebpf", target_os = "linux"))))]
+impl<G: Grill + Clone + 'static> BunAgent<G> {
+    pub(super) async fn collect_landed_egress_write(&mut self) {}
 }
