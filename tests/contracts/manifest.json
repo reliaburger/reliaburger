@@ -5421,6 +5421,39 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-cluster_failover-the_platform_policies_hold_through_apply_gitops_and_a_leader_kill",
+          "binary": "reliaburger::cluster_failover",
+          "test": "the_platform_policies_hold_through_apply_gitops_and_a_leader_kill",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-an_admin_removes_a_policy_that_denies_everything_through_any_node",
+          "binary": "reliaburger::cluster_failover",
+          "test": "an_admin_removes_a_policy_that_denies_everything_through_any_node",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-a_controller_fails_a_templated_database_pair_over_when_its_node_dies",
+          "binary": "reliaburger::cluster_failover",
+          "test": "a_controller_fails_a_templated_database_pair_over_when_its_node_dies",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-cluster_gossip-three_nodes_join_by_address_and_converge",
           "binary": "reliaburger::cluster_gossip",
           "test": "three_nodes_join_by_address_and_converge",
