@@ -705,6 +705,17 @@ result, named `app.<namespace>/<name>: denied by policy <name>: <message>`,
 and the rest of the commit applies. The commit stays unadvanced, so the next
 sync tries the app again.
 
+Policy defaults (#1118) fill fields in before the app is bound and written,
+so desired state holds a spec git never wrote. Binding a tag to a digest does
+the same. To keep that from looking like
+drift on every sync, the fenced write carries the spec git declared and the
+state machine keeps it in `DesiredState::declared_apps`. `compute_diff` takes
+it as `CurrentState::declared_apps` and compares git with the declared spec
+where there is one, the effective spec otherwise (with bound images read back
+as their tags, for apps written before #1118). An adopted app is written
+with the effective spec, which keeps its declared one. A new or changed
+default reaches a GitOps app only when git changes that app.
+
 ## 6. Configuration
 
 ### 6.1 Full Configuration Reference

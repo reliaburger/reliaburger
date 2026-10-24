@@ -517,9 +517,18 @@ pub enum RaftRequest {
     ///
     /// `change` is an `AppSpec`, a `TestLeaseAppSpec`, or a `GitOpsWrite`
     /// carrying an `AppSpec`.
+    ///
+    /// `declared` is the app's spec as written, when the stored spec differs
+    /// from it (#1118): a policy default filled fields in, or an image was
+    /// bound to a digest. `change` carries the stored spec, and the
+    /// state machine keeps this one beside it in
+    /// `DesiredState::declared_apps`, so GitOps diffs git against what git
+    /// said. `None` clears any declared spec the app had.
     PolicyFenced {
         generation: u64,
         change: Box<RaftRequest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        declared: Option<Box<AppSpec>>,
     },
 }
 
@@ -705,6 +714,18 @@ pub struct DesiredState {
     /// evaluated for carries the generation it saw, and is refused once
     /// this has moved on (#1117).
     pub policy_generation: u64,
+    /// The spec each app was declared with, for the apps whose stored spec
+    /// differs from it: a policy default filled fields in, or an image was
+    /// bound to a digest (#1118). `apps` holds the filled, effective spec;
+    /// this holds what the config said, so GitOps diffs git against it and
+    /// doesn't re-apply a defaulted app on every sync. An app write that
+    /// changes the effective spec without carrying a declared one clears
+    /// the entry. No serde default, like `policies`.
+    #[serde(
+        serialize_with = "map_as_vec::serialize",
+        deserialize_with = "map_as_vec::deserialize"
+    )]
+    pub declared_apps: HashMap<AppId, AppSpec>,
     /// Cluster-wide service endpoint catalogue (12b.4): every namespace's
     /// services, their VIPs and healthy backends across all nodes. Built by
     /// the leader from health reports and replicated so any node resolves
@@ -1029,9 +1050,12 @@ mod tests {
                 name: "no-latest".to_string(),
                 spec: Box::new(crate::config::PolicySpec {
                     match_expression: Some("app.namespace == 'prod'".to_string()),
-                    deny: "app.image.endsWith(':latest')".to_string(),
+                    deny: Some("app.image.endsWith(':latest')".to_string()),
                     message: Some("pin a version".to_string()),
                     action: crate::config::PolicyAction::Warn,
+                    default: serde_json::json!({ "env": { "TEAM": "payments" } })
+                        .as_object()
+                        .cloned(),
                 }),
             },
             RaftRequest::PolicyDelete {
@@ -1042,6 +1066,16 @@ mod tests {
                 change: Box::new(RaftRequest::AppDelete {
                     app_id: AppId::new("web", "default"),
                 }),
+                declared: None,
+            },
+            RaftRequest::PolicyFenced {
+                generation: 8,
+                change: Box::new(RaftRequest::AppDelete {
+                    app_id: AppId::new("web", "default"),
+                }),
+                declared: Some(Box::new(
+                    toml::from_str::<AppSpec>("image = 'web:v1'").unwrap(),
+                )),
             },
         ];
         for req in &requests {
@@ -1053,7 +1087,7 @@ mod tests {
 
     #[test]
     fn snapshot_must_not_forget_its_policies() {
-        for field in ["policies", "policy_generation"] {
+        for field in ["policies", "policy_generation", "declared_apps"] {
             let mut snapshot = serde_json::to_value(DesiredState::default()).unwrap();
             snapshot.as_object_mut().unwrap().remove(field);
             let error = serde_json::from_value::<DesiredState>(snapshot).unwrap_err();

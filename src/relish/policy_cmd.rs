@@ -72,10 +72,7 @@ pub fn render_policy_list(listing: &PolicyListing) -> String {
         } else {
             "apply"
         };
-        let rule = match &spec.match_expression {
-            Some(matching) => format!("match {matching}; deny {}", spec.deny),
-            None => format!("deny {}", spec.deny),
-        };
+        let rule = policy_rule(spec);
         out.push_str(&format!(
             "{name:name_width$}  {:6}  {owner:6}  {rule}\n",
             spec.action.as_str()
@@ -83,6 +80,23 @@ pub fn render_policy_list(listing: &PolicyListing) -> String {
     }
     out.push_str(&format!("\nGeneration {}.\n", listing.generation));
     out
+}
+
+/// A policy's rule on one line: its `match`, `deny` and the fields its
+/// `default` fills.
+fn policy_rule(spec: &crate::config::PolicySpec) -> String {
+    let mut parts = Vec::new();
+    if let Some(matching) = &spec.match_expression {
+        parts.push(format!("match {matching}"));
+    }
+    if let Some(deny) = &spec.deny {
+        parts.push(format!("deny {deny}"));
+    }
+    if let Some(default) = &spec.default {
+        let fields: Vec<&str> = default.keys().map(String::as_str).collect();
+        parts.push(format!("default {}", fields.join(", ")));
+    }
+    parts.join("; ")
 }
 
 /// `relish policy delete NAME`: remove a policy. Policies never judge
@@ -113,21 +127,22 @@ pub fn policy_test(
             reason: error.to_string(),
         }
     })?;
-    let verdict = crate::policy::evaluate(&set, &merged, &identity.caller(), identity.source);
+    let evaluation = crate::policy::evaluate(&set, &merged, &identity.caller(), identity.source);
     match output {
         OutputFormat::Human => println!(
             "{}",
-            crate::policy::report::render_test(&verdict, merged.app.len(), merged.policy.len())
+            crate::policy::report::render_test(&evaluation, merged.app.len(), merged.policy.len())
         ),
         OutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&verdict).map_err(RelishError::SerialiseJson)?
+            serde_json::to_string_pretty(&evaluation).map_err(RelishError::SerialiseJson)?
         ),
         OutputFormat::Yaml => print!(
             "{}",
-            yaml_serde::to_string(&verdict).map_err(RelishError::SerialiseYaml)?
+            yaml_serde::to_string(&evaluation).map_err(RelishError::SerialiseYaml)?
         ),
     }
+    let verdict = evaluation.verdict;
     if verdict.is_allowed() {
         Ok(())
     } else {

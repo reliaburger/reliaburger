@@ -337,7 +337,9 @@ memory and CPU as they go.
 limit", are kept in the council and checked on the leader before an app is
 written, for `relish apply` and GitOps alike. A rule refuses the apply or only
 warns, every denial names its policy, and `relish policy test` *(0.2.2, not in 0.2.1)* runs the same
-check offline in CI. See [security and access](docs/manual/10_security.md#policies).
+check offline in CI. A policy can also fill in fields an app leaves out, such
+as a team label, without ever overwriting one you wrote, and GitOps doesn't
+mistake a filled-in field for a change. See [security and access](docs/manual/10_security.md#policies).
 
 **A million jobs.** Every kind of job runs on one lifecycle: a one-off job, a
 cron schedule, a hook that runs before a deploy, and a task array that runs the
@@ -404,7 +406,7 @@ binary was built from. Neither needs a network.
 | Prometheus, Alertmanager | Built-in scraping, alert rules and webhooks |
 | A log shipper and store | Built-in capture, streaming and Parquet export |
 | Argo CD or Flux | Built-in GitOps |
-| Kyverno or Gatekeeper (validation) | `[policy.*]` deny and warn rules |
+| Kyverno or Gatekeeper (validation, defaults) | `[policy.*]` deny and warn rules, fill-only defaults |
 | Argo Workflows, Kueue or a Celery-style queue | Built-in jobs, cron, hooks and task arrays |
 | Chaos Mesh or Litmus | `relish fault` |
 | Grafana (for the basics) | TUI and web dashboard |

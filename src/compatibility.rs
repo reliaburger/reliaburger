@@ -168,6 +168,10 @@ pub struct Compatibility {
 /// `DesiredState::policies` and `policy_generation`, the GitOps ownership
 /// set's `policies`, `[policy.*]` in applied configs, `GET /v1/policies`
 /// and the 422 `PolicyRefusal` body of a refused apply (#1117).
+/// Fill-only policy defaults: `PolicySpec::deny` is optional and a
+/// policy may carry a `default` table, `PolicyFenced` carries the
+/// declared spec, and `DesiredState::declared_apps` keeps it beside the
+/// effective one (#1118).
 /// An app's `[runtime]` knobs in Raft desired state and node syncs, the
 /// knobs and the OCI `linux.sysctl`, `linux.devices` and device rules in OCI
 /// specs and instance records, and the node's knob allowlist in its

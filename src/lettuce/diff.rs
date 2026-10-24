@@ -25,8 +25,13 @@ use super::types::{DiffSummary, GitOpsOwnership};
 /// parameter per resource kind.
 #[derive(Debug)]
 pub struct CurrentState<'a> {
-    /// Apps currently in Raft, keyed by identity.
+    /// Apps currently in Raft, keyed by identity: the effective specs,
+    /// with any policy defaults filled in.
     pub apps: &'a HashMap<AppId, AppSpec>,
+    /// The spec each defaulted app was declared with (#1118). Git is
+    /// diffed against this, not the effective spec, so the fields a
+    /// policy filled in aren't drift.
+    pub declared_apps: &'a HashMap<AppId, AppSpec>,
     /// Namespaces currently in Raft, keyed by name.
     pub namespaces: &'a BTreeMap<String, NamespaceSpec>,
     /// Permissions currently in Raft, keyed by name.
@@ -193,7 +198,7 @@ fn diff_apps(
     let mut diff = KindDiff::default();
     for (app_id, git_spec) in git_apps {
         let resource_id = app_resource_id(app_id);
-        let Some(current_spec) = current.apps.get(app_id) else {
+        let Some(effective_spec) = current.apps.get(app_id) else {
             diff.writes.push(ResourceChange::Add {
                 resource_id,
                 spec: ChangePayload::App(Box::new((*git_spec).clone())),
@@ -201,6 +206,10 @@ fn diff_apps(
             summary.added += 1;
             continue;
         };
+        // Git owns what it declared. A policy default fills fields in
+        // beside that, and comparing git with the filled spec would see
+        // them as drift and re-apply on every sync: the diff trap (#1118).
+        let current_spec = current.declared_apps.get(app_id).unwrap_or(effective_spec);
         let as_git = as_git_wrote_it(git_spec, current_spec);
         let replicas_changed = replicas_differ(git_spec, &as_git);
         if replicas_changed || non_replica_fields_differ(git_spec, &as_git) {
@@ -211,9 +220,11 @@ fn diff_apps(
             });
             summary.modified += 1;
         } else if !current.owned.apps.contains(app_id) {
+            // Adopt with the spec the cluster runs, defaults and bound
+            // image included: the write changes nothing.
             diff.writes.push(ResourceChange::Adopt {
                 resource_id,
-                spec: ChangePayload::App(Box::new(current_spec.clone())),
+                spec: ChangePayload::App(Box::new(effective_spec.clone())),
             });
         }
     }
@@ -402,6 +413,7 @@ mod tests {
         };
         CurrentState {
             apps,
+            declared_apps: EMPTY_DECLARED.get_or_init(HashMap::new),
             namespaces: EMPTY_NS.get_or_init(BTreeMap::new),
             permissions: EMPTY_PERM.get_or_init(BTreeMap::new),
             policies: EMPTY_POLICIES.get_or_init(BTreeMap::new),
@@ -410,6 +422,8 @@ mod tests {
     }
 
     static EMPTY_NS: std::sync::OnceLock<BTreeMap<String, NamespaceSpec>> =
+        std::sync::OnceLock::new();
+    static EMPTY_DECLARED: std::sync::OnceLock<HashMap<AppId, AppSpec>> =
         std::sync::OnceLock::new();
     static EMPTY_PERM: std::sync::OnceLock<BTreeMap<String, PermissionSpec>> =
         std::sync::OnceLock::new();
@@ -460,6 +474,7 @@ mod tests {
         };
         let current = CurrentState {
             apps: &apps,
+            declared_apps: EMPTY_DECLARED.get_or_init(HashMap::new),
             namespaces: &namespaces,
             permissions: &permissions,
             policies: EMPTY_POLICIES.get_or_init(BTreeMap::new),
@@ -506,6 +521,7 @@ mod tests {
         };
         let current = CurrentState {
             apps: &apps,
+            declared_apps: EMPTY_DECLARED.get_or_init(HashMap::new),
             namespaces: &namespaces,
             permissions: EMPTY_PERM.get_or_init(BTreeMap::new),
             policies: EMPTY_POLICIES.get_or_init(BTreeMap::new),
@@ -538,9 +554,10 @@ mod tests {
         );
         let rule = PolicySpec {
             match_expression: None,
-            deny: "true".into(),
+            deny: Some("true".into()),
             message: None,
             action: crate::config::PolicyAction::Deny,
+            default: None,
         };
         let policies = BTreeMap::from([
             ("old-rule".to_string(), rule.clone()),
@@ -553,6 +570,7 @@ mod tests {
         let apps = HashMap::new();
         let current = CurrentState {
             apps: &apps,
+            declared_apps: EMPTY_DECLARED.get_or_init(HashMap::new),
             namespaces: EMPTY_NS.get_or_init(BTreeMap::new),
             permissions: EMPTY_PERM.get_or_init(BTreeMap::new),
             policies: &policies,
@@ -606,6 +624,7 @@ mod tests {
         };
         let current = CurrentState {
             apps: &apps,
+            declared_apps: EMPTY_DECLARED.get_or_init(HashMap::new),
             namespaces: &namespaces,
             permissions: &permissions,
             policies: EMPTY_POLICIES.get_or_init(BTreeMap::new),
@@ -636,6 +655,7 @@ mod tests {
         let owned = GitOpsOwnership::default();
         let current = CurrentState {
             apps: &apps,
+            declared_apps: EMPTY_DECLARED.get_or_init(HashMap::new),
             namespaces: EMPTY_NS.get_or_init(BTreeMap::new),
             permissions: EMPTY_PERM.get_or_init(BTreeMap::new),
             policies: EMPTY_POLICIES.get_or_init(BTreeMap::new),
@@ -686,6 +706,42 @@ mod tests {
         assert_eq!(summary.removed, 1);
         assert!(
             matches!(&changes[0], ResourceChange::Remove { resource_id } if resource_id == "app.default/old")
+        );
+    }
+
+    /// #1118, the diff trap: a policy filled `env.TEAM` into an app git
+    /// didn't give one. Git is compared with the declared spec, so the
+    /// filled field isn't drift; a real change in git still is; and an
+    /// unowned defaulted app is adopted with the spec it runs.
+    #[test]
+    fn a_field_a_policy_filled_in_is_not_drift_from_git() {
+        let git = parse_config("[app.web]\nimage = \"web:v1\"\n");
+        let effective =
+            make_current_apps(&[("web", "image = \"web:v1\"\n[env]\nTEAM = \"payments\"\n")]);
+        let declared = make_current_apps(&[("web", "image = \"web:v1\"\n")]);
+        let mut current = apps_state(&effective);
+        current.declared_apps = &declared;
+        let (changes, summary) = compute_diff(&git, &current, &[]);
+        assert!(changes.is_empty(), "{changes:?}");
+        assert_eq!(summary.modified, 0);
+
+        // Without the declared spec, it's the trap: an update every sync.
+        let (changes, _) = compute_diff(&git, &apps_state(&effective), &[]);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+
+        let changed = parse_config("[app.web]\nimage = \"web:v2\"\n");
+        let (changes, _) = compute_diff(&changed, &current, &[]);
+        assert!(
+            matches!(&changes[0], ResourceChange::Update { spec: ChangePayload::App(spec), .. } if spec.env.is_empty()),
+            "git's spec goes to the runner, which fills the defaults in again: {changes:?}"
+        );
+
+        let unowned = GitOpsOwnership::default();
+        current.owned = &unowned;
+        let (changes, _) = compute_diff(&git, &current, &[]);
+        assert!(
+            matches!(&changes[0], ResourceChange::Adopt { spec: ChangePayload::App(spec), .. } if spec.env.contains_key("TEAM")),
+            "{changes:?}"
         );
     }
 
