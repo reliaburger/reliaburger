@@ -506,9 +506,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Post-start bookkeeping for a fresh instance (the loop side of the tail
-    /// of `drive_instance_startup`): record the container IP, transition to
-    /// HealthWait (→Running if no health checks), register its service-map
-    /// backend and finish kernel networking.
+    /// of `drive_instance_startup`): journal its service-map backend, record
+    /// the container IP, transition to HealthWait (→Running if no health
+    /// checks), and finish kernel networking.
+    ///
+    /// The backend's journal write comes first and waits only until the
+    /// turn's deadline (#1263). While it is in flight nothing about the
+    /// start is recorded: the instance stays `Starting`, the op answers
+    /// `StillRunning`, and the deploy worker's next ask finds the backend
+    /// journalled and does the rest without writing it again.
     pub(super) async fn finish_fresh_instance(
         &mut self,
         instance_id: &InstanceId,
@@ -517,49 +523,53 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         evidence: &launch_evidence::LaunchEvidence,
     ) -> Result<(), BunError> {
         self.record_launch_execution(instance_id, &evidence.execution)?;
-        self.spawn_log_forwarder(instance_id, app_name, namespace);
-        self.persist_instance_record(instance_id, evidence).await?;
-        let container_ip = evidence.container_ip;
-
-        if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
-            instance.container_ip = container_ip;
-        }
-
-        // Starting → HealthWait, then immediately to Running if no health checks
-        {
-            let instance = self
-                .supervisor
-                .get_instance_mut(instance_id)
-                .ok_or_else(|| BunError::InstanceNotFound {
-                    instance_id: instance_id.clone(),
-                })?;
-            instance.state = instance.state.transition_to(ContainerState::HealthWait)?;
-            if instance.health_config.is_none() {
-                instance.state = instance.state.transition_to(ContainerState::Running)?;
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        let instance = self.supervisor.get_instance(instance_id).ok_or_else(|| {
+            BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
             }
+        })?;
+        // Starting → HealthWait, then immediately to Running if no health checks
+        let mut state = instance.state.transition_to(ContainerState::HealthWait)?;
+        if instance.health_config.is_none() {
+            state = state.transition_to(ContainerState::Running)?;
         }
-
-        if let Some(instance) = self.supervisor.get_instance(instance_id)
-            && let Some(host_port) = instance.host_port
-        {
-            let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        let mut candidate = self.service_map.clone();
+        if let Some(host_port) = instance.host_port {
             let backend = self.local_backend(
                 instance_id,
                 &service_id,
-                instance.container_ip,
+                evidence.container_ip,
                 host_port,
-                instance.state == ContainerState::Running,
+                state == ContainerState::Running,
             );
-            self.service_map
+            candidate
                 .add_backend(&service_id, backend)
                 .map_err(|error| BunError::BackendPublication {
-                    service: service_id,
+                    service: service_id.clone(),
                     reason: error.to_string(),
                 })?;
         }
+        let landing = self
+            .journal_publication_within_turn(
+                &service_id,
+                &candidate,
+                LoopBranch::DeployOp,
+                "finish_fresh_instance/landed",
+            )
+            .await?;
+        discovery_ownership::still_running_unless_landed(landing, || {
+            format!("journalling {instance_id}'s backend")
+        })?;
 
-        self.finish_instance_networking(app_name, namespace).await?;
-        Ok(())
+        self.spawn_log_forwarder(instance_id, app_name, namespace);
+        self.persist_instance_record(instance_id, evidence).await?;
+        if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
+            instance.container_ip = evidence.container_ip;
+            instance.state = state;
+        }
+        self.service_map = candidate;
+        self.finish_journalled_networking(&service_id).await
     }
 
     pub(super) async fn reserve_rolling_instance(
