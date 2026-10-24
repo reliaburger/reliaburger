@@ -35,7 +35,7 @@ deny = "app.image.endsWith(':latest')"
 message = "pin a version"
 "#;
 
-async fn single_node_leader(id: u64) -> Arc<CouncilNode> {
+pub(crate) async fn single_node_leader(id: u64) -> Arc<CouncilNode> {
     let router = InMemoryRaftRouter::new();
     let network = InMemoryRaftNetworkFactory::new(id, router.clone());
     let node = CouncilNode::new(
@@ -73,7 +73,10 @@ async fn single_node_leader(id: u64) -> Arc<CouncilNode> {
     node
 }
 
-async fn post_apply(router: &axum::Router, manifest: &str) -> (axum::http::StatusCode, String) {
+pub(crate) async fn post_apply(
+    router: &axum::Router,
+    manifest: &str,
+) -> (axum::http::StatusCode, String) {
     use tower::ServiceExt;
     let request = axum::http::Request::post("/v1/apply")
         .body(axum::body::Body::from(manifest.to_string()))
@@ -149,7 +152,7 @@ async fn a_denied_apply_leaves_no_raft_write_but_an_audit_entry() {
     council.shutdown().await.ok();
 }
 
-fn git(dir: &std::path::Path, args: &[&str]) {
+pub(crate) fn git(dir: &std::path::Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -311,7 +314,7 @@ async fn a_policy_changed_mid_apply_makes_the_write_retry() {
     council.shutdown().await.ok();
 }
 
-fn head(dir: &std::path::Path) -> String {
+pub(crate) fn head(dir: &std::path::Path) -> String {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(dir)
@@ -321,7 +324,10 @@ fn head(dir: &std::path::Path) -> String {
 }
 
 /// Wait for the sync of `sha` to be recorded, and return its diff summary.
-async fn synced(council: &CouncilNode, sha: &str) -> reliaburger::lettuce::types::DiffSummary {
+pub(crate) async fn synced(
+    council: &CouncilNode,
+    sha: &str,
+) -> reliaburger::lettuce::types::DiffSummary {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let state = council.desired_state().await;

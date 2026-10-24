@@ -70,6 +70,16 @@ pub(super) async fn apply_handler(
                 .into_response();
         }
     };
+    // `relish apply` expands templates before it sends a manifest; one that
+    // arrives unexpanded expands here, before validation and policy, so
+    // both see only ordinary apps (#1124).
+    if let Err(error) = config.expand_templates() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
 
     let validation = if state.council.is_some() {
         config.validate_intrinsic()

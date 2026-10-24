@@ -341,6 +341,14 @@ check offline in CI. A policy can also fill in fields an app leaves out, such
 as a team label, without ever overwriting one you wrote, and GitOps doesn't
 mistake a filled-in field for a change. See [security and access](docs/manual/10_security.md#policies).
 
+**Templates, not CRDs.** A `[template.*]` has typed parameters and a body of
+ordinary apps and jobs; each `[use.*]` stamps it out with its own values.
+Expansion is substitution only, done when the config is read, so `relish
+apply --dry-run` and GitOps show the expanded apps, policies judge them, and
+the cluster stores plain apps with a note of the template that made them.
+See [deploy an app](docs/manual/01_deploy-an-app.md#templates) and
+[`examples/templates/container-postgres.toml`](examples/templates/container-postgres.toml).
+
 **A million jobs.** Every kind of job runs on one lifecycle: a one-off job, a
 cron schedule, a hook that runs before a deploy, and a task array that runs the
 same command thousands or millions of times (`relish run --batch`, or a
@@ -407,6 +415,7 @@ binary was built from. Neither needs a network.
 | A log shipper and store | Built-in capture, streaming and Parquet export |
 | Argo CD or Flux | Built-in GitOps |
 | Kyverno or Gatekeeper (validation, defaults) | `[policy.*]` deny and warn rules, fill-only defaults |
+| Helm charts or a CRD and its operator (the expansion half) | `[template.*]` and `[use.*]` |
 | Argo Workflows, Kueue or a Celery-style queue | Built-in jobs, cron, hooks and task arrays |
 | Chaos Mesh or Litmus | `relish fault` |
 | Grafana (for the basics) | TUI and web dashboard |

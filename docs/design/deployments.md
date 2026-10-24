@@ -986,6 +986,54 @@ devices = [{ path = "/dev/net/tun", permissions = "rw" }]
 
 **Kubernetes.** `relish import` maps `securityContext.capabilities.add`, the pod's `securityContext.sysctls` and device `hostPath` volumes; unknown capabilities, host-wide sysctls, `capabilities.drop` and `privileged` are warnings. `relish export` writes them back, devices as `hostPath` mounts reported as unsupported.
 
+### 5.11 Templates (#1124)
+
+`[template.NAME]` holds typed `params` (`string`, `int` or `bool`, optionally
+with a `default`; without one, required) and a `body` string of ordinary
+`[app.*]` and `[job.*]` TOML with `${param}` placeholders. `[use.NAME]` holds
+`template` and one value per parameter. `config::template` owns both.
+
+- **Where it expands.** `template::expand` runs in three places, always
+  before validation and policy: `relish::compile::compile_sources` (the
+  compiler `relish compile` and Lettuce share), `relish::manifest::parse`
+  (`apply`, `apply --dry-run`, `lint`, `diff`, single-file `compile`,
+  `policy test`), and the apply endpoint for a manifest that arrives
+  unexpanded. `relish apply` sends the expanded config, so the endpoint's
+  call is a no-op for it. `Config::validate` refuses a `use` that's still
+  there, so nothing can skip expansion silently.
+- **In a tree.** `compile_sources` collects every template from every file
+  first (a name declared twice is refused), then expands each file's uses
+  before that file's `_defaults.toml` and directory namespace apply, so an
+  expanded app is an ordinary app of the file holding its `use`. A later
+  file overriding an app is a warning for `relish compile`, but refused
+  when a template made either one, under both duplicate policies.
+- **Substitution.** `scan` walks the body tracking whether it's outside
+  strings, in a basic string (one line or many), a literal string (one line
+  or many) or a comment. In a basic string a value is escaped; outside
+  strings a string value must match `[A-Za-z0-9_-]+`; in a literal string
+  it can't hold `'` or control characters. Integers and booleans go in as
+  written everywhere. Comments are copied, placeholders and all. `$${` is a
+  literal `${`. A value is never scanned again. So no value can add a key
+  or table to the body, and expansion is deterministic.
+- **Refusals** (`TemplateError`): an unknown template, unknown parameter,
+  missing required parameter or wrong type; a placeholder no parameter
+  resolves, checked on every template whether or not it's used; a value that
+  can't go where its placeholder is; a body that isn't valid TOML, or holds
+  anything but apps and jobs; a body that declares or uses a template (no
+  nesting); an expanded name a declared resource or another use already has;
+  template and use names that aren't DNS labels, and a parameter named
+  `template`.
+- **What's stored.** Only ordinary apps and jobs. Each expanded one carries
+  `provenance: { template, use }` (`AppSpec::provenance`,
+  `JobSpec::provenance`), the one wire and state change. It's part of the
+  spec, so the GitOps declared-spec diff compares it like any field: git's
+  expansion and the stored spec agree, and a re-sync writes nothing. A
+  change to provenance alone is a spec change like any other. Policies see it
+  as `app.provenance`; a policy `default` can't set it. `relish apply
+  --dry-run` shows it as `from use.NAME (template NAME)`.
+- **Not done.** No registry: templates come from files or git. No logic in
+  templates, and no nesting.
+
 ## 6. Configuration
 
 All deploy configuration lives under the `[app.<name>.deploy]` TOML section. Defaults are set per-directory in a `_defaults.toml` file, merged into each app by `relish compile`. There is no cluster-level `[defaults.app.deploy]` section — the block shown below is planned, not implemented.

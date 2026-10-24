@@ -105,6 +105,9 @@ pub struct JobSpec {
     /// instead of waiting for `relish batch replay`. Hooks refuse it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replay_unknown: bool,
+    /// The template and `[use.*]` that made this job, when one did (#1124).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<super::template::Provenance>,
 }
 
 /// Whether a matching cron occurrence may overlap an earlier run.

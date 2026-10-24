@@ -179,6 +179,9 @@ pub struct Compatibility {
 /// An app's `sidecar` list in Raft desired state, node syncs and instance
 /// records, and `NodeCapabilities::shared_network` in the capability report
 /// (#1120).
+/// An app's and a job's `provenance` (the template and `use` that made it)
+/// in Raft desired state, node syncs, job definitions and the apply API,
+/// and `[template.*]` and `[use.*]` in applied configs (#1124).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 55,
     state: 72,

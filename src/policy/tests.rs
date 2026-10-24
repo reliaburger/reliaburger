@@ -1129,3 +1129,86 @@ fn fence_carries_the_declared_spec_only_when_the_stored_one_differs() {
         }
     }
 }
+
+/// #1124: policies judge what a template expanded to, an ordinary app, and
+/// can match on where it came from.
+const POSTGRES_USE: &str = r#"
+[template.postgres]
+params = { name = "string", replicas = { type = "int", default = 1 } }
+body = """
+[app.${name}]
+image = "postgres:17"
+replicas = ${replicas}
+"""
+
+[use.orders-db]
+template = "postgres"
+name = "orders-db"
+"#;
+
+fn expanded(toml: &str) -> Config {
+    let mut config = Config::parse(toml).unwrap();
+    config.expand_templates().unwrap();
+    config
+}
+
+#[test]
+fn a_policy_denies_an_app_a_template_expanded_to() {
+    let set = compile(
+        r#"
+[policy.db-replicas]
+match = "has(app.provenance) && app.provenance.template == 'postgres'"
+deny = "app.replicas < 2"
+message = "a database needs a standby"
+"#,
+    );
+    let config = expanded(POSTGRES_USE);
+    let evaluation = evaluate(&set, &config, &deployer(), Source::Apply);
+    assert_eq!(
+        decisions(&evaluation.verdict),
+        vec![(
+            "db-replicas".to_string(),
+            PolicyAction::Deny,
+            "default/orders-db".to_string()
+        )]
+    );
+    let enough = expanded(&format!("{POSTGRES_USE}replicas = 2\n"));
+    let evaluation = evaluate(&set, &enough, &deployer(), Source::Apply);
+    assert!(evaluation.verdict.denials.is_empty());
+}
+
+#[test]
+fn a_policy_default_fills_an_app_a_template_expanded_to() {
+    let set = compile(
+        r#"
+[policy.db-memory]
+match = "has(app.provenance) && app.provenance.use == 'orders-db'"
+
+[policy.db-memory.default]
+memory = "1Gi"
+"#,
+    );
+    let evaluation = evaluate(&set, &expanded(POSTGRES_USE), &deployer(), Source::Apply);
+    assert!(evaluation.apps["orders-db"].memory.is_some());
+    assert_eq!(
+        evaluation.filled[0].to_string(),
+        "policy db-memory fills memory = \"1Gi\" on app default/orders-db"
+    );
+    assert!(
+        evaluation.apps["orders-db"].provenance.is_some(),
+        "filling keeps the provenance"
+    );
+}
+
+#[test]
+fn a_default_cannot_claim_a_template_made_an_app() {
+    let error = check_policy(
+        "rule",
+        &policies("[policy.rule.default]\nprovenance = { template = 't', use = 'u' }\n")["rule"],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, PolicyError::DefaultField { name, .. } if name == "provenance"),
+        "{error}"
+    );
+}

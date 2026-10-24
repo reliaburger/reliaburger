@@ -8017,6 +8017,7 @@ mod tests {
                     task_timeout_secs: None,
                     overlap: None,
                     replay_unknown: false,
+                    provenance: None,
                 }),
                 spec: crate::meat::task_array::TaskArraySpec {
                     chunk_size: 4,

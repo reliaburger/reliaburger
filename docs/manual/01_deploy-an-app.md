@@ -455,6 +455,77 @@ duplicate resource definitions, while `relish compile` warns about overrides
 within one namespace. Parse, read and namespace-identity errors refuse the whole
 tree in both paths.
 
+## Templates
+
+Five teams each want a Postgres, and each copy of the app drifts a little
+from the others. A template is one shape with typed parameters, and a
+`[use.*]` table stamps it out:
+
+```toml
+[template.postgres]
+params = { name = "string", size = "string", replicas = { type = "int", default = 1 } }
+body = """
+[app.${name}]
+image = "postgres:17"
+replicas = ${replicas}
+[[app.${name}.volumes]]
+path = "/var/lib/postgresql/data"
+size = "${size}"
+"""
+
+[use.orders-db]
+template = "postgres"
+name = "orders-db"
+size = "50Gi"
+```
+
+The body is ordinary `[app.*]` and `[job.*]` TOML. `${name}` is replaced by
+the parameter's value, and that's all a template can do: there are no
+conditionals, loops or functions. A parameter is a `string`, an `int` or a
+`bool`; one with a `default` is optional, and one without is required.
+
+Templates expand when the config is read, before anything else sees it.
+`relish apply`, `apply --dry-run`, `lint`, `diff` and `compile` all work on
+the expanded apps, and so does GitOps. The cluster never stores a template.
+It stores the apps, each with a `provenance` naming the template and the
+`use` that made it, and `apply --dry-run` shows it:
+
+```text
+  + app.orders-db
+      image     postgres:17
+      replicas  1
+      from      use.orders-db (template postgres)
+```
+
+Policies judge the expanded apps like any others, and can match on where
+they came from with `app.provenance.template` or `app.provenance.use`. A
+directory's `_defaults.toml` and namespace apply to the apps a `use` in it
+makes, wherever the template lives. In a tree, a template in one file serves
+a `use` in any other.
+
+Where a placeholder sits matters. Inside a quoted string, the value is
+escaped, so it can hold quotes, backslashes or newlines and still be one
+string. Outside quotes, as in `[app.${name}]`, a string must be a plain key
+of letters, digits, `-` and `_`, and integers and booleans go in as they
+are. Inside a single-quoted string a value can't hold a `'` or a newline.
+Placeholders in comments are left alone. Write `$${` for a literal `${`,
+such as a shell variable in a command.
+
+These are refused, with the `use` and template named:
+
+- a `use` of a template nobody declared, a parameter the template doesn't
+  have, a required one left out, or a value of the wrong type;
+- a placeholder that names no parameter, even in a template nobody uses;
+- an expanded app or job whose name a declared one, or another `use`,
+  already has (also across files, where `compile` would otherwise let the
+  later file win);
+- a body with anything but apps and jobs in it, including another template
+  or `use`: templates don't nest;
+- a template declared in two files.
+
+Templates come from your files or your GitOps repository; there's no
+registry. `examples/templates/container-postgres.toml` is a complete one.
+
 ## Rolling deploys
 
 Apply a changed app and Bun replaces its instances one at a time, waiting for

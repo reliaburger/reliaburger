@@ -1042,6 +1042,7 @@ See [`examples/`](../examples/) for ready-to-apply configs:
 | [`container-full-featured.toml`](../examples/phase-1/container-full-featured.toml) | All Phase 1 features |
 | [`container-multi-app.toml`](../examples/phase-1/container-multi-app.toml) | Multiple apps in one config |
 | [`container-volumes.toml`](../examples/phase-1/container-volumes.toml) | Managed and HostPath volumes |
+| [`templates/container-postgres.toml`](../examples/templates/container-postgres.toml) | A `[template.*]` with typed parameters, stamped out twice by `[use.*]` |
 | [`container-egress.toml`](../examples/phase-1/container-egress.toml) | Job egress allowlist that resolves and reaches one host |
 | [`container-allow-from.toml`](../examples/phase-1/container-allow-from.toml) | One cross-namespace path opened with `allow_from` |
 | [`container-tls-ingress.toml`](../examples/phase-1/container-tls-ingress.toml) | HTTPS ingress with the cluster's own certificates |

@@ -25,7 +25,7 @@ pub const MAX_MESSAGE_BYTES: usize = 512;
 pub const MAX_DEFAULT_BYTES: usize = 4096;
 
 /// App fields a `default` can never fill, and why.
-pub const UNFILLABLE_FIELDS: [(&str, &str); 11] = [
+pub const UNFILLABLE_FIELDS: [(&str, &str); 12] = [
     ("name", "is the app's table name, not a field"),
     (
         "namespace",
@@ -50,6 +50,10 @@ pub const UNFILLABLE_FIELDS: [(&str, &str); 11] = [
         "sidecar",
         "would add a container to every matching app; declare sidecars on the app",
     ),
+    (
+        "provenance",
+        "says which template made the app, and only template expansion writes it",
+    ),
 ];
 
 /// Why a default can't fill a field the apply path gates on the caller.
@@ -63,7 +67,7 @@ pub const POLICY_VARIABLES: [&str; 3] = ["app", "caller", "source"];
 ///
 /// `namespace` is always present, resolved to `default` when the spec
 /// doesn't name one. A test checks this list against `AppSpec` itself.
-pub const APP_FIELDS: [&str; 34] = [
+pub const APP_FIELDS: [&str; 35] = [
     "name",
     "image",
     "command",
@@ -98,6 +102,7 @@ pub const APP_FIELDS: [&str; 34] = [
     "pre_stop_timeout",
     "runtime",
     "namespace",
+    "provenance",
 ];
 
 /// The fields of `caller`.

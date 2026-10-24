@@ -2835,6 +2835,7 @@ pub fn task_array_request(
             task_timeout_secs: None,
             overlap: None,
             replay_unknown: false,
+            provenance: None,
         },
         spec: run.spec,
     })

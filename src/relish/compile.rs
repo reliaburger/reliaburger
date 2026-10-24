@@ -1,12 +1,14 @@
 /// Config compilation for Reliaburger.
 ///
 /// Walks a directory of TOML files, discovers `_defaults.toml` files,
-/// merges defaults into each app/job spec, and returns a single resolved
-/// `Config`. Directory names become namespaces.
+/// expands `[use.*]` tables with the templates every file declares, merges
+/// defaults into each app/job spec, and returns a single resolved `Config`
+/// with no templates left in it. Directory names become namespaces.
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
 use crate::config::defaults::WorkloadDefaults;
+use crate::config::template::Provenance;
+use crate::config::{Config, TemplateSpec};
 
 use super::RelishError;
 
@@ -134,22 +136,81 @@ pub(crate) fn compile_sources(
             });
         }
     }
+    let templates = collect_templates(files)?;
     let mut result = CompileResult {
         config: Config::default(),
         merged_from: Vec::new(),
         warnings: Vec::new(),
     };
-    resolve_directory(Path::new(""), files, None, duplicates, &mut result)?;
+    let context = Resolve {
+        files,
+        templates: &templates,
+        duplicates,
+    };
+    resolve_directory(&context, Path::new(""), None, &mut result)?;
     Ok(result)
 }
 
-fn resolve_directory(
-    directory: &Path,
-    files: &std::collections::BTreeMap<PathBuf, String>,
-    parent: Option<&WorkloadDefaults>,
+/// What every directory of one compile shares.
+struct Resolve<'a> {
+    files: &'a std::collections::BTreeMap<PathBuf, String>,
+    /// Every template in the tree, whichever file declares it (#1124).
+    templates: &'a std::collections::BTreeMap<String, TemplateSpec>,
     duplicates: DuplicatePolicy,
+}
+
+/// Every `[template.*]` in the tree, so a `use` in one file can expand a
+/// template from another. A template name declared twice is refused, under
+/// either duplicate policy: there's no good reason to override one.
+fn collect_templates(
+    files: &std::collections::BTreeMap<PathBuf, String>,
+) -> Result<std::collections::BTreeMap<String, TemplateSpec>, TreeError> {
+    let mut templates = std::collections::BTreeMap::new();
+    let mut declared_in: std::collections::BTreeMap<String, &Path> =
+        std::collections::BTreeMap::new();
+    for (path, raw) in files {
+        if path
+            .file_name()
+            .is_some_and(|name| name == "_defaults.toml")
+        {
+            continue;
+        }
+        let config = Config::parse(raw).map_err(|error| TreeError {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+        for (name, template) in config.template {
+            if let Some(earlier) = declared_in.get(&name) {
+                return Err(TreeError {
+                    path: path.clone(),
+                    message: format!(
+                        "duplicate template.{name}, already declared in {}",
+                        earlier.display()
+                    ),
+                });
+            }
+            // Checked here, so a broken template names its own file.
+            crate::config::template::check_template(&name, &template).map_err(|error| {
+                TreeError {
+                    path: path.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            declared_in.insert(name.clone(), path);
+            templates.insert(name, template);
+        }
+    }
+    Ok(templates)
+}
+
+fn resolve_directory(
+    context: &Resolve<'_>,
+    directory: &Path,
+    parent: Option<&WorkloadDefaults>,
     result: &mut CompileResult,
 ) -> Result<(), TreeError> {
+    let files = context.files;
+    let duplicates = context.duplicates;
     let defaults_path = directory.join("_defaults.toml");
     let own = files
         .get(&defaults_path)
@@ -177,6 +238,15 @@ fn resolve_directory(
         let mut config = Config::parse(raw).map_err(|error| TreeError {
             path: path.clone(),
             message: error.to_string(),
+        })?;
+        // Expand first, so the apps a template makes are ordinary apps of
+        // this file: they take its directory's defaults and namespace.
+        config.template.clear();
+        crate::config::template::expand(&mut config, context.templates).map_err(|error| {
+            TreeError {
+                path: path.clone(),
+                message: error.to_string(),
+            }
         })?;
         if let Some(defaults) = &resolved {
             defaults.apply(&mut config);
@@ -223,7 +293,7 @@ fn resolve_directory(
         }
     }
     for child in children {
-        resolve_directory(&child, files, resolved.as_ref(), duplicates, result)?;
+        resolve_directory(context, &child, resolved.as_ref(), result)?;
     }
     Ok(())
 }
@@ -289,6 +359,12 @@ fn merge_into(target: &mut Config, source: Config) -> Result<Vec<String>, Relish
 
     for (name, spec) in source.app {
         if let Some(existing) = target.app.get(&name) {
+            check_template_collision(
+                "app",
+                &name,
+                existing.provenance.as_ref(),
+                spec.provenance.as_ref(),
+            )?;
             check_namespace_collision(
                 "app",
                 &name,
@@ -304,6 +380,12 @@ fn merge_into(target: &mut Config, source: Config) -> Result<Vec<String>, Relish
     }
     for (name, spec) in source.job {
         if let Some(existing) = target.job.get(&name) {
+            check_template_collision(
+                "job",
+                &name,
+                existing.provenance.as_ref(),
+                spec.provenance.as_ref(),
+            )?;
             check_namespace_collision(
                 "job",
                 &name,
@@ -336,6 +418,22 @@ fn merge_into(target: &mut Config, source: Config) -> Result<Vec<String>, Relish
     target.permission.extend(source.permission);
     target.policy.extend(source.policy);
     Ok(collisions)
+}
+
+/// A later file may override an app with a warning, but never one a
+/// template made, and a template's app never overrides another (#1124).
+fn check_template_collision(
+    kind: &str,
+    name: &str,
+    existing: Option<&Provenance>,
+    incoming: Option<&Provenance>,
+) -> Result<(), RelishError> {
+    match incoming.or(existing) {
+        Some(provenance) => Err(RelishError::FormatFailed(format!(
+            "{kind}.{name} is declared twice, and {provenance} made one of them; a template's output never overrides or is overridden, so rename one"
+        ))),
+        None => Ok(()),
+    }
 }
 
 fn check_namespace_collision(
@@ -785,5 +883,142 @@ auto_rollback = false
             crate::config::EnvValue::Plain("prod".into())
         );
         result.config.validate().unwrap();
+    }
+
+    const POSTGRES: &str = r#"
+[template.postgres]
+params = { name = "string", size = "string" }
+body = """
+[app.${name}]
+image = "postgres:17"
+[[app.${name}.volumes]]
+path = "/var/lib/postgresql/data"
+size = "${size}"
+"""
+"#;
+
+    fn sources(files: &[(&str, &str)]) -> std::collections::BTreeMap<PathBuf, String> {
+        files
+            .iter()
+            .map(|(path, content)| (PathBuf::from(path), content.to_string()))
+            .collect()
+    }
+
+    /// #1124: a template in one file serves a `use` in another, and the
+    /// expanded app is an ordinary app of the `use`'s directory: it takes
+    /// that namespace and that directory's defaults.
+    #[test]
+    fn a_use_expands_with_a_template_from_another_file_into_its_own_directory() {
+        let use_db = "[use.orders-db]\ntemplate = 'postgres'\nname = 'orders-db'\nsize = '50Gi'\n";
+        for duplicates in [DuplicatePolicy::Warn, DuplicatePolicy::Refuse] {
+            let result = compile_sources(
+                &sources(&[
+                    ("templates.toml", POSTGRES),
+                    ("payments/_defaults.toml", "memory = '256Mi'\n"),
+                    ("payments/db.toml", use_db),
+                ]),
+                duplicates,
+            )
+            .unwrap();
+            let config = &result.config;
+            assert!(config.template.is_empty() && config.uses.is_empty());
+            let app = &config.app["orders-db"];
+            assert_eq!(app.namespace.as_deref(), Some("payments"));
+            assert_eq!(
+                app.memory.as_ref().map(|range| range.request),
+                Some(256 * 1024 * 1024)
+            );
+            assert_eq!(
+                app.provenance.as_ref().map(ToString::to_string).as_deref(),
+                Some("use.orders-db (template postgres)")
+            );
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_template_declared_in_two_files_is_refused() {
+        let error = compile_sources(
+            &sources(&[("a.toml", POSTGRES), ("b.toml", POSTGRES)]),
+            DuplicatePolicy::Warn,
+        )
+        .unwrap_err();
+        assert_eq!(error.path, PathBuf::from("b.toml"));
+        assert!(
+            error.message.contains("template.postgres") && error.message.contains("a.toml"),
+            "{error}"
+        );
+    }
+
+    /// The interactive compiler lets a later file override an app in the
+    /// same namespace, with a warning. Not when a template made either one:
+    /// that's two sources fighting over a name.
+    #[test]
+    fn an_expanded_app_that_clashes_with_another_file_is_refused_even_when_warning() {
+        let use_db = "[use.db]\ntemplate = 'postgres'\nname = 'web'\nsize = '1Gi'\n";
+        for (first, second) in [
+            (use_db, "[app.web]\nimage = 'web:v1'\n"),
+            ("[app.web]\nimage = 'web:v1'\n", use_db),
+        ] {
+            let error = compile_sources(
+                &sources(&[("_t.toml", POSTGRES), ("a.toml", first), ("b.toml", second)]),
+                DuplicatePolicy::Warn,
+            )
+            .unwrap_err();
+            assert_eq!(error.path, PathBuf::from("b.toml"));
+            assert!(
+                error.message.contains("app.web") && error.message.contains("use.db"),
+                "{error}"
+            );
+        }
+    }
+
+    /// A broken template is reported against the file that declares it,
+    /// not whichever file happens to be expanded first.
+    #[test]
+    fn a_broken_template_is_refused_naming_its_own_file() {
+        let error = compile_sources(
+            &sources(&[
+                ("a.toml", "[app.web]\nimage = 'web:v1'\n"),
+                (
+                    "z-templates.toml",
+                    "[template.t]\nbody = \"[app.x]\\nimage = '${imgae}'\"\n",
+                ),
+            ]),
+            DuplicatePolicy::Warn,
+        )
+        .unwrap_err();
+        assert_eq!(error.path, PathBuf::from("z-templates.toml"), "{error}");
+        assert!(error.message.contains("${imgae}"), "{error}");
+    }
+
+    #[test]
+    fn a_refused_use_names_its_file() {
+        let error = compile_sources(
+            &sources(&[
+                ("templates.toml", POSTGRES),
+                ("db.toml", "[use.db]\ntemplate = 'postgres'\nname = 'db'\n"),
+            ]),
+            DuplicatePolicy::Refuse,
+        )
+        .unwrap_err();
+        assert_eq!(error.path, PathBuf::from("db.toml"));
+        assert!(
+            error.message.contains("needs a value for \"size\""),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_single_file_expands_its_own_templates() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            dir.path(),
+            "db.toml",
+            &format!("{POSTGRES}\n[use.db]\ntemplate = 'postgres'\nname = 'db'\nsize = '1Gi'\n"),
+        );
+        let result = compile(&dir.path().join("db.toml")).unwrap();
+        assert!(result.config.template.is_empty());
+        assert!(result.config.app["db"].provenance.is_some());
     }
 }

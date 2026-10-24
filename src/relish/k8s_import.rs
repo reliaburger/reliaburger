@@ -1601,6 +1601,7 @@ fn empty_app_spec() -> AppSpec {
         working_dir: None,
         run_as_user: None,
         run_as_group: None,
+        provenance: None,
     }
 }
 
@@ -1949,6 +1950,7 @@ fn pod_to_jobspec(
         task_timeout_secs: None,
         overlap: None,
         replay_unknown: false,
+        provenance: None,
     }
 }
 
