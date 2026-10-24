@@ -220,6 +220,22 @@ impl AppleContainerGrill {
             instance: instance.clone(),
             reason: reason.to_string(),
         };
+        if let Some(problem) = spec.runtime_knobs_refusal("Apple Container") {
+            return Err(GrillError::LaunchRefused {
+                instance: instance.clone(),
+                problem,
+            });
+        }
+        // Each Apple container is a VM with its own network stack, and the
+        // CLI has no way to put one into another's (#1120). Admission
+        // refuses sidecars here first; this keeps a stray one from starting
+        // with a network of its own, where `localhost` isn't its app.
+        if spec.joined_network().is_some() {
+            return Err(invalid(
+                "a sidecar shares its app's network namespace, and Apple Container gives \
+                 every container a VM of its own",
+            ));
+        }
         let mut args: Vec<String> = vec![
             "create".to_string(),
             "--name".to_string(),
@@ -730,6 +746,26 @@ mod tests {
         .expect("timed-out container CLI was left alive");
     }
 
+    /// #1120: a sidecar's spec joins its parent's network namespace, which
+    /// an Apple Container VM can't, so it's refused before the CLI runs.
+    #[test]
+    fn create_refuses_a_sidecar_that_would_join_another_network() {
+        let app: crate::config::app::AppSpec =
+            toml::from_str("image = \"web:1\"\n[[sidecar]]\nname = \"proxy\"\n").unwrap();
+        let parent = InstanceId("default__web-0".into());
+        let app_spec = crate::grill::oci::generate_oci_spec(
+            "web", "default", &app, &parent.0, None, "/cg", None, None,
+        );
+        let sidecar =
+            crate::grill::oci::generate_sidecar_oci_spec(&app.sidecar[0], &app_spec, &parent);
+        let error = AppleContainerGrill::create_command_args(
+            &crate::grill::oci::sidecar_instance_id(&parent, "proxy"),
+            &sidecar,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("VM of its own"), "{error}");
+    }
+
     #[test]
     fn create_preserves_mounts_identity_ports_and_process_settings() {
         let spec: OciSpec = serde_json::from_value(serde_json::json!({
@@ -781,6 +817,21 @@ mod tests {
             )
             .is_err()
         );
+        let mut knobbed = spec.clone();
+        knobbed.runtime_knobs =
+            Some(toml::from_str("devices = [{ path = \"/dev/fuse\" }]\n").unwrap());
+        let refusal = AppleContainerGrill::create_command_args(
+            &InstanceId("apple-settings".into()),
+            &knobbed,
+        )
+        .unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("runtime.devices /dev/fuse can't be applied"),
+            "{refusal}"
+        );
+        assert!(refusal.to_string().contains("Apple Container"), "{refusal}");
         unsupported = spec;
         unsupported.mounts[0].source = Some("/tmp/source,target=/escape".into());
         assert!(
@@ -1010,7 +1061,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         let result: Result<(), String> = async {
@@ -1087,7 +1141,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         // Best-effort cleanup of any leftover from an earlier aborted run, so

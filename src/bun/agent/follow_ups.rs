@@ -35,6 +35,8 @@ pub(super) enum FollowUp {
     CallersRead(super::fault_coverage::CallersRead),
     /// A node-pressure helper started or stopped.
     NodePressure(super::node_pressure_work::PressureDone),
+    /// A crashed sidecar was started again on its own, or wasn't (#1120).
+    SidecarRelaunched(super::sidecars::Relaunched),
     /// The egress allowlists were re-resolved.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     EgressResolved(Vec<super::egress_resolution::Resolution>),
@@ -133,6 +135,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Ok((_, FollowUp::CallersRead(read))) => self.finish_callers_read(read).await,
             Ok((_, FollowUp::NodePressure(done))) => {
                 self.finish_node_pressure(done).await;
+            }
+            Ok((_, FollowUp::SidecarRelaunched(relaunched))) => {
+                self.finish_sidecar_relaunch(relaunched).await;
             }
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             Ok((_, FollowUp::EgressResolved(resolutions))) => {

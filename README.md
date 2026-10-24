@@ -285,7 +285,8 @@ who may connect at all.
 **Ingress with TLS.** Host-based HTTP and HTTPS routing, with certificates signed
 by the cluster's own ingress CA or files you provide. WebSockets and streaming
 pass through, and connections drain before an instance stops. Each app can
-pick its stop signal, its grace and a pre-stop command.
+pick its stop signal, its grace and a pre-stop command, and run sidecars
+that share its network and start before it and stop after it.
 
 **Security on by default.** A generated cluster requires mTLS between nodes.
 Nodes join with single-use tokens and certificate signing requests.
@@ -294,6 +295,8 @@ cluster's public key. Workloads get SPIFFE certificates, API tokens carry
 roles and namespace scopes, and the registry can refuse unsigned images.
 Every apply binds image tags to digests, so a moved tag can't change what runs,
 and node config can limit which upstream registries images may come from.
+An app that needs an extra capability, a namespaced sysctl or a host device
+gets it only where the node allows it and the token carries `host-exec`.
 
 **Tenants kept apart.** Namespaces can't reach each other, at a virtual IP or
 at a real address, unless an app or job's `allow_from` lets a named caller

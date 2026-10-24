@@ -1959,7 +1959,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
         process.create(&id, &spec).await.unwrap();
         process.start(&id).await.unwrap();

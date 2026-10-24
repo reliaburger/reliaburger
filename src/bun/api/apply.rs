@@ -323,8 +323,37 @@ pub(super) async fn apply_handler(
     // a mixed manifest must not bypass admission after its apps have committed.
     // Host execution includes explicit binaries, inline scripts and, for
     // apps, host-path volume or config-file sources: a bind-mounted host
-    // path reaches past the namespace just as a host binary does.
+    // path reaches past the namespace just as a host binary does, and so
+    // does a runtime knob (#1122).
     let permissions = permission_map(&state).await;
+    // The token gate for runtime knobs (#1122), checked first so its refusal
+    // can name the knob. `needs_host_access` below counts knobs too, so the
+    // workload check holds the same line. The node gate comes later, on the
+    // node that runs the app.
+    for (app_name, spec) in &config.app {
+        let Some(knob) = spec.runtime_knob_uses().next() else {
+            continue;
+        };
+        let namespace = spec.namespace.as_deref().unwrap_or("default");
+        if crate::sesame::auth::authorize_permission(
+            auth.as_deref(),
+            crate::config::PermissionAction::HostExec,
+            app_name,
+            namespace,
+            &permissions,
+        )
+        .is_err()
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "app.{app_name}: {knob} refused by the token gate: a runtime knob needs \
+                     the host-exec permission, and this token's permission doesn't grant it"
+                ),
+            )
+                .into_response();
+        }
+    }
     let targets = config
         .app
         .iter()
@@ -353,7 +382,6 @@ pub(super) async fn apply_handler(
             return response;
         }
     }
-
     // Every job, leased or not, takes the common job lifecycle: the leader
     // admits it as an indexed run and grants it to a node with room.
     if !config.job.is_empty() {
@@ -462,6 +490,7 @@ pub(super) async fn apply_handler(
     // the agent's events.
     let notes: Vec<String> = host_path_notes(&config)
         .into_iter()
+        .chain(runtime_knob_notes(&config))
         .chain(bindings.iter().map(ToString::to_string))
         .collect();
     let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<ApplyEvent>(32 + notes.len());
@@ -535,6 +564,25 @@ pub(crate) fn host_path_notes(config: &Config) -> Vec<String> {
                     "app.{name}: host path {} is mounted only on a node whose \
                      [storage] allowed_host_paths lists a prefix covering it",
                     source.display()
+                )
+            })
+        })
+        .collect()
+}
+
+/// One progress line per runtime knob in `config` (#1122): like a host
+/// path, the API can't see any node's `[runtime]` allowlist, so it says
+/// which key the node needs. The scheduler places the app only where one
+/// lists it.
+pub(crate) fn runtime_knob_notes(config: &Config) -> Vec<String> {
+    config
+        .app
+        .iter()
+        .flat_map(|(name, spec)| {
+            spec.runtime_knob_uses().map(move |knob| {
+                format!(
+                    "app.{name}: {knob} runs only on a node whose [runtime] {} lists it",
+                    knob.kind.allowlist_key()
                 )
             })
         })
@@ -737,6 +785,7 @@ pub(super) async fn cluster_apply(
             .chain(filled)
             .chain(policy_warnings)
             .chain(host_path_notes(&config))
+            .chain(runtime_knob_notes(&config))
         {
             let _ = event_tx.send(ApplyEvent::Progress { message }).await;
         }

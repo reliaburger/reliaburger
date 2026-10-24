@@ -91,6 +91,11 @@ pub struct AppSpec {
     /// Init containers run before the main container starts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub init: Vec<InitContainerSpec>,
+    /// Sidecars: containers that run beside each instance for its whole
+    /// life, in its network namespace (#1120). They start after the init
+    /// containers and before the app, and stop after it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecar: Vec<SidecarSpec>,
     /// Ingress configuration for external traffic.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ingress: Option<IngressSpec>,
@@ -116,6 +121,11 @@ pub struct AppSpec {
     /// How long `pre_stop` may run. 30 s when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_stop_timeout: Option<crate::grill::stop::StopDuration>,
+    /// `[app.x.runtime]`: added capabilities, namespaced sysctls and host
+    /// devices (#1122). Each use needs the node's `[runtime]` allowlist and
+    /// the token's `host-exec` permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<crate::grill::knobs::RuntimeKnobs>,
     /// Ingress firewall rules.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub firewall: Option<FirewallSpec>,
@@ -160,12 +170,18 @@ impl AppSpec {
         }
     }
 
-    /// Every explicitly declared main or init image; omitted init images inherit the main image.
+    /// Every explicitly declared main, init or sidecar image; omitted init
+    /// and sidecar images inherit the main image.
     pub fn image_references(&self) -> impl Iterator<Item = &str> {
         self.image
             .iter()
             .map(String::as_str)
             .chain(self.init.iter().filter_map(|init| init.image.as_deref()))
+            .chain(
+                self.sidecar
+                    .iter()
+                    .filter_map(|sidecar| sidecar.image.as_deref()),
+            )
     }
 
     /// Every host path this app bind-mounts from the node: each volume and
@@ -183,9 +199,17 @@ impl AppSpec {
 
     /// Whether deploying this app touches the host directly, so it needs the
     /// `host-exec` permission as well as `deploy`: a host binary, an inline
-    /// script, or a host-path `source`.
+    /// script, a host-path `source`, or a runtime knob.
     pub fn needs_host_access(&self) -> bool {
-        self.exec.is_some() || self.script.is_some() || self.host_path_sources().next().is_some()
+        self.exec.is_some()
+            || self.script.is_some()
+            || self.host_path_sources().next().is_some()
+            || self.runtime_knob_uses().next().is_some()
+    }
+
+    /// Every runtime knob this app asks for in `[app.x.runtime]` (#1122).
+    pub fn runtime_knob_uses(&self) -> impl Iterator<Item = crate::grill::knobs::KnobUse> + '_ {
+        self.runtime.iter().flat_map(|knobs| knobs.uses())
     }
 
     /// Where to scrape this app's Prometheus metrics inside each instance:
@@ -305,6 +329,50 @@ pub struct InitContainerSpec {
     /// Command and arguments.
     #[serde(default)]
     pub command: Vec<String>,
+}
+
+/// A sidecar: a container that runs beside each instance of its app (#1120).
+///
+/// It joins the instance's network namespace, so the two reach each other
+/// on `localhost`. It mounts the app's volumes and config files and gets
+/// the app's environment, with its own `env` on top. It starts after the
+/// app's init containers and before the app, stops after the app, and is
+/// restarted on its own when it exits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SidecarSpec {
+    /// Names the sidecar within its app, such as `"proxy"`. A DNS label.
+    pub name: String,
+    /// Image to run. If omitted, runs the app's own image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Replaces the image's `Entrypoint`, as an app's `command` does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// Replaces the image's `Cmd`, as an app's `args` does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Variables set on top of the app's environment: plain values and
+    /// `PROVIDER[...]` references. An encrypted value belongs in the app's
+    /// `env`, which the sidecar inherits.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvValue>,
+    /// Memory request-limit range. The request adds to the app's when it's
+    /// placed.
+    #[serde(
+        default,
+        with = "super::types::memory_range",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub memory: Option<ResourceRange>,
+    /// CPU request-limit range. The request adds to the app's when it's
+    /// placed.
+    #[serde(
+        default,
+        with = "super::types::cpu_range",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cpu: Option<ResourceRange>,
 }
 
 /// Ingress configuration for external traffic routing.
@@ -713,6 +781,48 @@ mod tests {
         assert_eq!(app.init.len(), 2);
         assert_eq!(app.init[0].image.as_deref(), Some("migration:v1"));
         assert!(app.init[1].image.is_none());
+    }
+
+    #[test]
+    fn parse_app_with_sidecars() {
+        let app = parse_app(
+            r#"
+            image = "myapp:v1"
+
+            [[sidecar]]
+            name = "proxy"
+            image = "envoyproxy/envoy:v1.31"
+            args = ["-c", "/etc/envoy.yaml"]
+            memory = "64Mi-128Mi"
+            cpu = "50m-200m"
+            env = { LOG_LEVEL = "info" }
+
+            [[sidecar]]
+            name = "logs"
+            command = ["/bin/ship-logs"]
+        "#,
+        );
+        assert_eq!(app.sidecar.len(), 2);
+        assert_eq!(app.sidecar[0].name, "proxy");
+        assert_eq!(app.sidecar[0].memory.unwrap().request, 64 * 1024 * 1024);
+        assert_eq!(app.sidecar[0].cpu.unwrap().request, 50);
+        assert!(
+            app.sidecar[1].image.is_none(),
+            "an omitted image is the app's"
+        );
+        assert_eq!(
+            app.image_references().collect::<Vec<_>>(),
+            ["myapp:v1", "envoyproxy/envoy:v1.31"]
+        );
+    }
+
+    #[test]
+    fn a_sidecar_with_an_unknown_field_is_refused() {
+        let error = toml::from_str::<AppSpec>(
+            "image = \"a:1\"\n[[sidecar]]\nname = \"p\"\nrestart = \"always\"\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("restart"), "{error}");
     }
 
     #[test]

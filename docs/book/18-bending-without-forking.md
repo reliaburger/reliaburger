@@ -764,7 +764,23 @@ The evidence says sidecars are one of the commonest reasons teams leave a
 simple orchestrator, so we're bringing them forward. A sidecar shares the
 parent's network namespace and lifecycle, starts before it and stops after it.
 That ordering is precisely what Kubernetes needed KEP-753 to get right. A
-sidecar's resources count towards the app's requests when it's scheduled.
+sidecar's resources count towards the app's requests when it's scheduled:
+
+```toml
+[app.api]
+image = "registry.example.com/api:3.2"
+port = 8080
+
+[[app.api.sidecar]]
+name = "proxy"
+image = "envoyproxy/envoy:v1.31.0"
+args = ["-c", "/etc/envoy/envoy.yaml"]
+cpu = "50m-200m"
+memory = "64Mi-128Mi"
+```
+
+A sidecar that crashes restarts on its own. An app that crashes takes its
+sidecars down with it and brings them back up first.
 
 **Stop hooks** ([#1121](https://github.com/reliaburger/reliaburger/issues/1121)).
 A `stop_signal`, a grace period and a `pre_stop` command. They're cheap, and
@@ -786,7 +802,26 @@ devices. Each use needs two keys, like host paths already do: the node must
 allow it in `node.toml`, and the token must carry `host-exec`. Anything else is
 refused at apply, with a reason. That's the Swarm `--privileged` and
 `--device` lesson. Few teams need these flags, but those that do can't live
-without them.
+without them:
+
+```toml
+[app.vpn]
+image = "ghcr.io/example/vpn:2.0"
+
+[app.vpn.runtime]
+capabilities = ["NET_ADMIN"]
+sysctls = { "net.ipv4.ip_forward" = "1" }
+devices = [{ path = "/dev/net/tun", permissions = "rw" }]
+```
+
+The node's half lives in its own `node.toml`:
+
+```toml
+[runtime]
+allowed_capabilities = ["NET_ADMIN"]
+allowed_sysctls = ["net.ipv4.ip_forward"]
+allowed_devices = ["/dev/net/tun"]
+```
 
 ### The exec secret provider
 
@@ -1535,13 +1570,444 @@ one stop, with the caller's own grace wherever the app names none. That
 keeps the old behaviour exactly: a deploy still gives an old instance its
 `drain_timeout`, and any other stop still gives it 10 s.
 
+### Sidecars
+
+A sidecar is three promises: it shares its app's network, it's up before the
+app, and it's still up after the app. Kubernetes shipped the first in 2015
+and spent until 1.33 on the other two. We had a head start, because init
+containers already had most of the machinery: an auxiliary identity per
+instance, built from the app's finished spec, registered with the loop before
+the runtime hears of it so retirement can always find it. A sidecar is the
+long-running cousin.
+
+#### The config is a list, like `init`
+
+`[[app.api.sidecar]]` is an array of tables, the TOML spelling of a list of
+structs, exactly as `[[app.api.init]]` is:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SidecarSpec {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvValue>,
+    // memory and cpu, with the same range parsers as the app's
+}
+```
+
+`image` is an `Option` for two reasons. A sidecar can run the app's own
+image with a different command, which an init container already allowed.
+And Pickle's binder pins every image an apply names to a digest through a
+list of `&mut Option<String>` slots. With the same type, a sidecar's image
+is just one more slot.
+
+Validation refuses what can't work: a name that isn't a DNS label or appears
+twice, a sidecar on an `exec` or `script` app (whose network is the node's,
+so there's nothing to share), an encrypted value in a sidecar's own `env`,
+and an app that has both sidecars and an `egress` allowlist. That last one
+is a security call, and we come back to it under cgroups below.
+
+#### Joining a namespace, without a new field
+
+The portable half is `generate_sidecar_oci_spec`. It builds on the app's
+finished spec, as `generate_init_oci_spec` does, and changes one thing an
+init doesn't: the network namespace gets a path.
+
+```rust
+let mut namespaces = app.linux.namespaces.clone();
+let shared = network_namespace_path(parent);
+match namespaces.iter_mut().find(|ns| ns.ns_type == "network") {
+    Some(network) => network.path = Some(shared),
+    None => namespaces.push(OciNamespace {
+        ns_type: "network".to_string(),
+        path: Some(shared),
+    }),
+}
+```
+
+An OCI namespace entry with a `path` means "join this one" rather than
+"make a new one", so runc does the joining for us. The question was how the
+runtime learns it's looking at a sidecar. The obvious answer is a new
+`OciSpec` field. That spec has fifty struct literals across the runtimes,
+half of them in Linux-only files this laptop can't compile, and the runtime
+knobs branch (#1122) was editing the same struct at the same time. So the
+spec already says it:
+
+```rust
+pub fn joined_network(&self) -> Option<&str> {
+    self.linux
+        .namespaces
+        .iter()
+        .find(|ns| ns.ns_type == "network")
+        .and_then(|ns| ns.path.as_deref())
+}
+```
+
+Nothing else in Bun sets that path today, so it's unambiguous, and the
+runc side shrinks to two conditions. `owned_create` reserves no address
+for a spec that joins a network, and `prepare_with_commands` skips the veth
+setup and checks the parent's namespace is still there. Cleanup needed no
+change at all: with no reservation, there's no network to tear down. To
+keep both sides naming the same path, `netns::namespace_path` now calls the
+portable `network_namespace_path` instead of formatting its own.
+
+Apple Container and the process runtime can't do this. Each Apple container
+is a VM with its own network stack, and the `container` CLI has no way to
+put one inside another; a process workload runs in the node's own network.
+Rather than pretend, each runtime answers a new trait method:
+
+```rust
+fn shares_network_namespaces(&self) -> bool {
+    false
+}
+```
+
+A trait method with a body is a default, which an implementation may
+override and otherwise inherits. Rootful runc overrides it, and the mixed
+runtime asks its container backend. Admission refuses an app with sidecars
+on a node that says no, with the runtime's name in the reason, and the node
+reports the answer as `shared_network` in its capability report, which the
+scheduler reads. Apple's `create` refuses a joining spec too, in case one
+ever gets past both.
+
+#### Two containers, two cgroups
+
+An init container borrows its app's cgroup, because it has exited before the
+app starts. A sidecar can't: runc warns about a non-empty cgroup at best,
+and `runc delete --force` on the app would kill everything in it, sidecar
+included. So a sidecar gets a sibling, `/reliaburger/default/api/0-sidecar-proxy`,
+with its own `cpu` and `memory` limits.
+
+That has a consequence. Egress allowlists are keyed by cgroup in the eBPF
+programs, so a sidecar in its own cgroup isn't held to its app's allowlist.
+A proxy could reach what the app can't. Programming the sidecar's cgroup
+too means another set of egress bindings to own and retire, so for now
+validation refuses the combination with a reason that says why. Namespace
+isolation still applies, because the kernel falls back to the cgroup's
+`/reliaburger/<namespace>` ancestor.
+
+The requests, meanwhile, are simple arithmetic in `app_requests`, the one
+function placement, quotas and a node's own admission all call:
+
+```rust
+let cpu = spec
+    .sidecar
+    .iter()
+    .map(|sidecar| request(sidecar.cpu.as_ref()))
+    .fold(request(spec.cpu.as_ref()), u64::saturating_add);
+```
+
+`fold` starts from the app's request and combines each sidecar's into it.
+The combining function is `u64::saturating_add`, named rather than written
+as a closure: in Rust a method is also a plain function whose first
+argument is the receiver, so `u64::saturating_add(a, b)` is `a.saturating_add(b)`
+and the name can be passed wherever a two-argument function fits. Three
+places used to compute the request inline from the app alone; they all call
+this now.
+
+#### Up first, down last
+
+The order lives in portable agent code. A fresh launch runs create, the init
+containers, then `drive_sidecars`, then the app's start. `drive_sidecars`
+registers every sidecar identity with the loop before it creates the first,
+so a launch that dies half-way leaves nothing retirement can't find, and it
+fails the instance with the sidecar's reason if one won't start. The rolling
+replacement path makes the same call in the same place.
+
+Stopping went into `stop_runtime_instance`, which every graceful stop already
+used. `InstanceStop` grew the instance's sidecars, and once the instance's
+exit is confirmed, each sidecar gets its signal and grace in turn. The first
+draft called `stop_runtime_instance` for each sidecar, and rustc refused:
+
+```text
+error[E0733]: recursion in an async fn requires boxing
+```
+
+An `async fn` compiles to a state machine: a struct that holds every local
+the function keeps across an `.await`. If the function awaits itself, that
+struct contains itself, and has no finite size. Go and Python don't care,
+because their coroutines live on the heap. Rust wants you to say so, with
+`Box::pin`. Here the honest fix was smaller. A sidecar has no sidecars, so
+the four steps moved into `stop_instance_alone`, which both the instance and
+each sidecar use, and the recursion disappeared.
+
+The graceful sidecar stop is best effort. The guarantee comes from
+retirement, which kills every registered sidecar and confirms its exit
+before it forgets an instance, as it does for init containers. Even a stop
+that failed half-way can't leave a sidecar behind.
+
+#### Two crash policies
+
+Kubernetes restarts a crashed sidecar alone, and so do we. The health tick's
+state sweep already read each running instance's state off the loop; it now
+reads each sidecar too, under its instance's incarnation so a stale answer
+can't hit a successor. An exited sidecar becomes due, and the tick starts it
+again in a follow-up task: kill what's left of it, create, start. The first
+restart is immediate, then the backoff doubles:
+
+```rust
+pub(super) fn sidecar_backoff(restarts: u32) -> Duration {
+    if restarts == 0 {
+        return Duration::ZERO;
+    }
+    let seconds = 1u64.checked_shl(restarts - 1).unwrap_or(u64::MAX);
+    Duration::from_secs(seconds).min(SIDECAR_MAX_BACKOFF)
+}
+```
+
+`1 << n` in C is undefined once `n` reaches the width of the type. Rust's
+plain `<<` panics in a debug build and wraps in a release one, and
+`checked_shl` returns `None` instead, which turns into "a very long time"
+and then the one-minute cap.
+
+An app that crashes is different. On runc the network namespace belongs to
+the app's launch. The restart's Clear step tears it down with the app and
+the Create step makes a new one, so a sidecar left running would sit in a
+namespace nobody else is in. So an app's crash restarts the whole instance:
+Clear kills the app, then its sidecars, and Start creates and starts the
+sidecars before it starts the app. The same ordering as a fresh launch,
+just from the restart steps.
+
+Two races needed fencing. A sidecar restart in flight could create a sidecar
+after the app's Clear step killed them all, so an instance with one in
+flight waits a tick before its own restart begins, and every stop cancels
+it with a `CancellationToken` the task checks between steps. Retirement
+answers `StillRunning` until the task has ended, which is how every
+retirement step already says "ask me again".
+
+#### What a Bun restart does
+
+A restarted Bun adopts the instances it has records for and retires every
+other launch. Sidecars have no records, because the record format names
+replicas, so they're retired. Adoption then registers each adopted
+instance's sidecars as due, and the next tick starts them. That's a second
+or so without a sidecar on every Bun restart. Giving sidecars records of
+their own would close the gap, and it's the obvious next step.
+
+### Runtime knobs
+
+([#1122](https://github.com/reliaburger/reliaburger/issues/1122)) Runtime
+knobs are the escape hatch with the sharpest edges. A capability, a sysctl or
+a device reaches past the container in a way a stop signal never could, so
+the work here is mostly about saying no, clearly, in the right place.
+
+#### Two keys, in two places
+
+Host paths already had the shape we wanted. A volume `source` needs the
+token's `host-exec` permission at apply, and the node's own
+`[storage] allowed_host_paths` when the instance is admitted. Neither key
+opens the door alone: a cluster admin can't push a host path onto a node
+that never agreed to it, and a node that allows a path doesn't hand it to
+any deployer who asks. Runtime knobs reuse both halves.
+
+The token half is two lines of defence in `apply.rs`. A knob counts in
+`AppSpec::needs_host_access`, so the existing workload check demands
+`host-exec` for it, and a CI guard script insists every app goes through
+that check. But its refusal says only that the token lacks `host-exec`,
+which isn't enough to act on. So a few lines just before it ask the same
+question for each app with a knob, and refuse with a message that names the
+knob and the gate:
+
+```text
+app.vpn: runtime.capabilities CAP_NET_ADMIN refused by the token gate: a runtime knob needs the host-exec permission, and this token's permission doesn't grant it
+```
+
+The node half is `WorkloadSupervisor::admit_runtime_knobs`, which `admit_app`
+calls beside `admit_host_paths`, and which a rolling replacement calls before
+it prepares anything, because a replacement never goes through `admit_app`.
+It refuses in one of two ways: the runtime can't apply knobs at all, or the
+allowlist doesn't list one. The check itself is a walk over the three kinds:
+
+```rust
+pub fn check(&self, knobs: &RuntimeKnobs) -> Result<(), KnobRefusal> {
+    let refuse = |kind, value| {
+        Err(KnobRefusal::NotAllowed {
+            knob: KnobUse { kind, value },
+        })
+    };
+    if let Some(capability) = knobs
+        .capabilities
+        .iter()
+        .find(|capability| !self.capabilities.contains(capability))
+    {
+        return refuse(KnobKind::Capability, capability.to_string());
+    }
+    // ... the same for sysctls (by pattern) and devices (by path)
+    Ok(())
+}
+```
+
+`KnobKind` is a three-variant enum, not a `&str` like `"capabilities"`.
+The refusal's message needs both the app-side field name and the node-side
+key (`allowed_capabilities`), and two `match`es on the enum keep those in
+step. A typo in a string would compile.
+
+#### Placement asks the same question
+
+The exec secret provider showed the pattern: a node advertises what it can
+do, and `node_can_run` asks before placing. Here the node advertises its
+whole allowlist as `NodeCapabilities::runtime_knobs`, and placement calls the
+same `admits` the node will:
+
+```rust
+&& node
+    .capabilities
+    .runtime_knobs
+    .admits(&requirements.runtime_knobs)
+```
+
+So an app that needs `/dev/fuse` lands on the two nodes that list it, and
+stays unplaced with a reason if none do, instead of bouncing between nodes
+that refuse it. One detail matters: a node advertises its allowlist only if
+its runtime applies knobs (`Grill::applies_runtime_knobs`, true only for
+rootful runc). A Mac on Apple Container with a generous `[runtime]` section
+advertises nothing, so the scheduler never sends it an app it would have to
+refuse.
+
+#### Parsing is the validation, again
+
+Some values must never reach any node, whatever its `node.toml` says.
+`kernel.panic` is a sysctl, but it isn't namespaced: writing it from one
+container changes the whole machine. So, as with stop hooks, the fields parse
+into types that can't hold a bad value. `SysctlName` accepts only the
+families the kernel keeps per namespace, the same list Docker, runc and
+Kubernetes use:
+
+```rust
+fn namespaced_sysctl(name: &str) -> bool {
+    name.starts_with("net.")
+        || name.starts_with("fs.mqueue.")
+        || name.starts_with("kernel.shm")
+        || name.starts_with("kernel.msg")
+        || name == "kernel.sem"
+}
+```
+
+The node's list uses `SysctlPattern`, which goes through the same check, so
+an operator who writes `allowed_sysctls = ["kernel.*"]` gets a startup error
+saying why, not a node that quietly allows `kernel.panic`. A pattern may end
+in `.*` only after `net.` or `fs.mqueue.`, where everything underneath is
+namespaced.
+
+`Capability` was the more interesting type. There are exactly 41 Linux
+capabilities, so it holds a `&'static str` pointing into a table of them.
+`'static` is a lifetime: it says the borrowed string lives for the whole
+program, which a string literal does. That makes `Capability` `Copy`, as
+cheap to pass around as an integer, and unable to hold a name the kernel
+doesn't know. But serde's derive balked at it. A derived
+`Deserialize<'de>` may borrow from its input, whose lifetime is `'de`, and a
+`&'static str` field made it demand that the input live forever. No config
+file does. So we wrote the impl by hand, reading an owned `String` and
+looking it up:
+
+```rust
+impl<'de> Deserialize<'de> for Capability {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+```
+
+Six lines, and the borrow question goes away: the `String` is dropped once
+`parse` has found the table entry.
+
+#### What about CAP_SYS_ADMIN?
+
+We had to decide what to do with the capabilities that amount to root
+inside the container: `CAP_SYS_ADMIN`, `CAP_SYS_MODULE`, `CAP_SYS_PTRACE` and
+friends. Refusing them outright was tempting. But a FUSE filesystem needs
+`CAP_SYS_ADMIN`, and "use a different orchestrator" is exactly the Swarm
+answer this issue exists to avoid. So we allow them, on three conditions.
+There's no wildcard anywhere: `ALL` is a parse error on both sides, so no
+node allows `CAP_SYS_ADMIN` by accident. The node must name each one. And
+Bun prints a warning at startup for every escape-hatch capability its
+`[runtime]` lists, so it shows up in the node's log rather than hiding in a
+config file. It helps that a rootful container runs in its own user
+namespace (chapter 1): `CAP_SYS_ADMIN` there acts on the container's own
+mounts and namespaces, not the host's. It's still the capability behind most
+container escapes, which is why it needs naming.
+
+#### The OCI half, and a namespace that isn't ours
+
+The knobs travel to the runtime in the instance's `OciSpec`, like the stop
+policy, and only rootful runc acts on them. The process runtime and Apple
+Container refuse a spec that carries them with a `LaunchProblem`, rather than
+running the app without the capability it asked for. A missing capability
+fails in confusing ways much later; a refusal fails now.
+
+runc's part is deliberately thin. Everything that can be tested on a laptop
+lives in one portable function, `grill::knobs::apply_to_spec`:
+
+```rust
+pub fn apply_to_spec<F>(
+    spec: &mut OciSpec,
+    knobs: &RuntimeKnobs,
+    lookup: F,
+) -> Result<(), DeviceLookupError>
+where
+    F: Fn(&Path) -> Result<HostDevice, DeviceLookupError>,
+```
+
+The `where F: Fn(...)` clause says `lookup` can be any function or closure
+that takes a path and returns a device, the way a Go function might take a
+`func(string) (Device, error)`. runc passes `host_device`, which `stat`s the
+real node. The tests pass a closure over a table, so they can describe a
+block device with major 8 on a Mac that has no such thing. Because the
+compiler generates a copy of `apply_to_spec` for each `F` it's called with,
+there's no indirect call, as with the `Grill` generics in chapter 1.
+
+The function joins the added capabilities to the set the user namespace
+already granted (runc's code calls it after `userns::apply`), writes the
+sysctls into `linux.sysctl`, and gives each device both a node in
+`linux.devices` and an allow rule in `linux.resources.devices`. Without the
+rule, the device cgroup would deny the device the container can see.
+
+Then the surprise. runc writes `linux.sysctl` from inside the container, as
+container root. For `kernel.shmmax` that works: the IPC namespace is the
+container's own. For `net.core.somaxconn` it doesn't. Bun creates each
+container's network namespace before runc starts, so the namespace belongs
+to the node's user namespace, and container root has no say over it. (That's
+why chapter 1's networking code already writes two sysctls itself, to let
+container users bind low ports.) So `take_network_sysctls` lifts the `net.*`
+entries out of the spec, and runc's prepare step writes them with
+`ip netns exec`, like those two:
+
+```rust
+let network_sysctls = super::knobs::take_network_sysctls(&mut spec);
+netns::write_sysctls_with_commands(commands, instance, &network_sysctls)
+    .await
+    .map_err(|e| failed(e.to_string()))?;
+```
+
+The knobs are new fields in Raft desired state, OCI specs and the capability
+report, so they get a line under the 0.2.4 heading in `src/compatibility.rs`.
+The bump itself came with stop hooks.
+
+#### Kubernetes
+
+`relish import` maps the parts that have a home. A container's
+`securityContext.capabilities.add` becomes `capabilities`, the pod's
+`securityContext.sysctls` becomes `sysctls`, and a `hostPath` volume of a
+device becomes a device. Everything else is a warning: an unknown capability,
+a sysctl that isn't namespaced, `capabilities.drop` (we only add) and
+`privileged: true`, which is the very flag this design replaces with a list.
+Export goes back the same way, but a device can only leave as a `hostPath`
+mount, which Kubernetes won't let a pod open without a device plugin or a
+privileged container, so the export report says so.
+
 Still to come in this walkthrough:
 
 - jobs, the audit action, `relish policy audit` and the `wtf` row
   ([#1119](https://github.com/reliaburger/reliaburger/issues/1119));
-- sidecars and runtime knobs
-  ([#1120](https://github.com/reliaburger/reliaburger/issues/1120),
-  [#1122](https://github.com/reliaburger/reliaburger/issues/1122));
 - templates and the controller contract
   ([#1124](https://github.com/reliaburger/reliaburger/issues/1124),
   [#1125](https://github.com/reliaburger/reliaburger/issues/1125)).
@@ -1730,6 +2196,122 @@ signals it, even though the new spec has none. The parsing tests in
 `relish export` and back in. To check the tests check something, we put
 SIGTERM back in both runtimes and skipped the pre-stop: eight of them failed,
 each saying what it saw instead.
+
+### Testing sidecars
+
+The ordering is the feature, so the agent tests in
+`src/bun/agent/tests/sidecars.rs` read the mock runtime's call log and
+compare positions in it. Each deploys one app with an init container and
+two sidecars, `proxy` and `logs`:
+
+- `sidecars_start_after_the_init_containers_and_before_their_app`: the app
+  is created first (its namespace is what they join), then the init runs,
+  then `proxy` is created and started, then `logs`, then the app starts. The
+  spec the runtime got for `proxy` joins `/var/run/netns/rb-default__web-0`,
+  and `logs`, which names no image, runs the app's.
+- `an_app_stop_stops_its_sidecars_after_the_app_has_exited`: the app's stop
+  signal, then a state read that sees it exit, and only then each sidecar's
+  signal, in order. Retirement kills what's left and forgets them.
+- `a_rolling_deploy_starts_new_sidecars_first_and_stops_old_ones_last`: the
+  replacement's sidecars start before it does and join its namespace, not
+  the old one's; the old instance stops before its sidecars do.
+- `a_sidecar_that_crashes_restarts_alone_and_its_app_keeps_running`: the
+  sweep sees `proxy` exit, and the only runtime calls that follow are kill,
+  create and start on `proxy`. The app and `logs` are untouched, and the app
+  is still Running.
+- `a_sidecar_that_keeps_crashing_waits_out_its_backoff`: the first restart
+  is immediate and the second isn't.
+- `an_app_that_crashes_restarts_with_its_sidecars_stopped_after_and_started_before_it`:
+  the restart's Clear kills the app before `proxy` and `proxy` before
+  `logs`, and its Start starts both sidecars before the app.
+- `a_sidecar_that_cannot_start_fails_its_instance_which_never_starts`: when
+  `logs` can't be created, the deploy fails naming it, the app is never
+  started, and `proxy`, which did start, is killed.
+- `a_node_whose_runtime_cannot_share_a_network_refuses_sidecars_with_a_reason`
+  and `the_capability_report_says_whether_the_runtime_can_run_sidecars`
+  cover the Apple, rootless and process case: the deploy fails before the
+  runtime sees a create, and the node reports `shared_network: false`.
+- `an_adopted_instance_gets_its_sidecars_started_again`: an instance adopted
+  from its record gets both sidecars back on the next tick, joined to its
+  namespace, without the instance itself being touched.
+
+Around them, unit tests pin the pieces. `grill::oci` checks the generated
+spec: the joined namespace, the image and argv, the env with the sidecar's
+own on top, the app's mounts and a sibling cgroup with the sidecar's limits.
+`config::validate` covers each refusal. `meat::admission` and `meat::filter`
+check that a sidecar's requests add to its app's, that an app which fits
+alone doesn't fit with its sidecar on a node with room for only the app, and
+that only a node reporting `shared_network` is a candidate.
+`AppleContainerGrill::create_command_args` refuses a joining spec before the
+CLI runs, `pickle::binding` pins a sidecar's image, and the Kubernetes
+importer turns a native sidecar and a pod's second container into sidecars
+and survives a round trip through `relish export`. The registry's backoff
+and cancellation have their own tests in `bun::agent::sidecars`.
+
+To check that the agent tests check something, we started the sidecars
+after the app and stopped them before it. Four tests failed: the start
+order, the stop order, the rolling deploy and the failed launch, whose app
+now started before its sidecar could fail.
+
+The runc half can't be compiled on a Mac, so CI's Linux jobs compile it, and
+`make test-linux` runs `runc_sidecar_reaches_its_app_on_localhost`: Redis as
+the app, a sidecar in the same image running `sleep`, and `redis-cli -h
+127.0.0.1 ping` executed inside the sidecar. `PONG` means they share a
+namespace, and the sidecar must have no address of its own.
+
+### Testing runtime knobs
+
+Each gate is tested alone first, then both together, because a double gate
+whose halves are never tested apart can quietly become a single gate.
+
+- **The token gate alone**: `a_runtime_knob_needs_host_exec_and_the_refusal_names_the_token_gate`
+  applies an app with `CAP_NET_ADMIN` as a deployer whose permission block
+  grants only `deploy`. It must get a 403 whose body names
+  `runtime.capabilities CAP_NET_ADMIN` and "token gate", and the council
+  must hold no app. The same manifest under `deploy` and `host-exec` goes
+  through.
+- **The node gate alone**: `runtime_knobs_pass_only_the_node_gate_of_a_runtime_that_applies_them`
+  admits the app in a supervisor whose runtime applies knobs but whose
+  allowlist is empty, and reads the refusal for the knob, "node gate" and
+  `allowed_capabilities`. The agent test
+  `a_deploy_the_node_gate_refuses_never_reaches_the_runtime` runs a whole
+  deploy and checks the mock runtime was never asked to create anything.
+- **Both keys**: `a_deploy_both_gates_allow_hands_the_knobs_to_the_runtime`
+  checks the spec the runtime received carries exactly the app's knobs.
+- **The wrong runtime**: the process runtime and Apple Container each refuse
+  a spec with knobs, with a message naming the knob and the runtime, and a
+  node advertises its allowlist only when its runtime applies knobs.
+- **What no node may allow**: `a_host_wide_sysctl_is_refused_and_says_why`
+  tries `kernel.panic`, `vm.overcommit_memory`, `fs.file-max` and the
+  near miss `kernel.semx`. `a_node_cannot_allowlist_a_host_wide_sysctl` does
+  the same to `node.toml`, with `kernel.*` and a bare `*` as well. And
+  `a_host_wide_sysctl_fails_the_whole_config_at_parse` shows the error at
+  `relish lint`, before any gate is asked.
+- **Escape hatches**: `an_escape_hatch_capability_needs_the_node_to_name_it`
+  shows that a node allowing `CAP_NET_ADMIN` doesn't admit `CAP_SYS_ADMIN`,
+  and that naming it does, and appears in the startup warning's list.
+  `a_capability_wildcard_is_refused_with_its_reason` covers `ALL`, `all` and
+  `CAP_*`.
+- **Placement**: `an_app_with_runtime_knobs_lands_only_where_the_node_allows_them`
+  builds three nodes (one allowing FUSE, one allowing network tuning, one
+  allowing nothing) and checks each app lands only where every knob is
+  listed, and that one asking for a mix no node allows is unplaced with
+  `NoCapableNode`.
+- **OCI generation**: the tests in `src/grill/knobs/tests.rs` compare the
+  serialised spec against the JSON runc expects: added capabilities joined
+  to the user namespace defaults with no duplicates, `linux.sysctl`, and
+  each device as a node plus a matching cgroup rule, with the resource
+  limits already in the spec left alone. `network_sysctls_are_taken_out_for_the_node_to_write`
+  checks the split. `linux_device_numbers_split_like_glibc` round-trips
+  device numbers through a copy of glibc's `makedev`, including a major
+  above 4095 that needs the high bits.
+- **Kubernetes**: one import test carries every case at once, mapped and
+  unmapped, and a round trip sends an app's knobs through `relish export`
+  and back in.
+
+None of these run runc. The runc half is two calls and a `stat`, and it's
+Linux-only, so it's exercised by `make test-linux` rather than by the
+portable suite.
 
 ## Lessons
 

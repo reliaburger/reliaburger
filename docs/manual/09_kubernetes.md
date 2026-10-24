@@ -57,6 +57,27 @@ the grace, while Reliaburger gives `pre_stop` its own bound
 `pre_stop` gets a warning saying so. `relish export` maps the same three back;
 `pre_stop_timeout` has no Kubernetes field and is listed as unsupported.
 
+Native sidecars (init containers with `restartPolicy: Always`) become
+`[[app.NAME.sidecar]]` entries, with their image, `command`, `args`, plain
+`env` and resources. So does every container after the first, with a warning:
+Kubernetes starts a pod's containers together, while a Reliaburger sidecar
+starts before its app and stops after it. A container whose name isn't a DNS
+label is skipped, with a warning. `relish export` writes each sidecar back as
+a native sidecar, with the app's image when it names none and the app's `env`
+under its own, since Kubernetes gives a container neither by default.
+
+Runtime knobs come across where they map (see `security`). The container's
+`securityContext.capabilities.add` becomes `capabilities`, the pod's
+`securityContext.sysctls` becomes `sysctls`, and a `hostPath` volume of a
+device (a path under `/dev` with type `CharDevice`, `BlockDevice` or none)
+becomes a device with the default `rwm`. A capability Linux doesn't know, a
+sysctl that isn't namespaced, `capabilities.drop` and `privileged: true` are
+reported instead. Every imported knob gets a warning too, because it needs
+`host-exec` and a node that lists it. `relish export` writes them back the
+same way, a device as a `hostPath` mount, and lists devices as unsupported:
+Kubernetes only lets a pod use a device through a device plugin or a
+privileged container, and has nowhere to keep the permissions.
+
 Services attach the way Kubernetes routes them: a Service belongs to every
 workload in its namespace whose pod template labels include all of its
 `selector`, whatever the two are called. An app answers only to its own name,
@@ -70,9 +91,9 @@ nowhere.
 
 The report warns about everything it approximates or drops. The usual ones:
 
-- sidecars: only the first container is imported;
+- a job's extra containers: a job runs only the first;
 - pod volumes and `fsGroup`: declare Reliaburger volumes instead. A `hostPath`
-  volume gets a warning of its own, because its replacement, a hand-written
+  volume that isn't a device gets a warning of its own, because its replacement, a hand-written
   `source`, needs the `host-exec` permission and a `[storage]
   allowed_host_paths` entry on every node that runs it (see
   `images-and-volumes`);

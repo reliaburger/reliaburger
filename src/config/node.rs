@@ -136,17 +136,42 @@ impl SmokerSection {
 pub struct RuntimeSection {
     /// Seconds each stop or kill confirmation step may take. Default 10.
     pub stop_confirmation_timeout_secs: u64,
+    /// Capabilities an app's `[app.x.runtime] capabilities` may add on
+    /// this node (#1122). Empty by default: none. Each is named; there is
+    /// no wildcard.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub allowed_capabilities: std::collections::BTreeSet<crate::grill::knobs::Capability>,
+    /// Namespaced sysctls an app may set on this node: exact names, or a
+    /// `net.` or `fs.mqueue.` prefix ending in `.*`. Empty by default.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_sysctls: Vec<crate::grill::knobs::SysctlPattern>,
+    /// Host devices an app may pass in on this node, by path under `/dev`.
+    /// Empty by default.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub allowed_devices: std::collections::BTreeSet<crate::grill::knobs::DevicePath>,
 }
 
 impl Default for RuntimeSection {
     fn default() -> Self {
         Self {
             stop_confirmation_timeout_secs: 10,
+            allowed_capabilities: Default::default(),
+            allowed_sysctls: Vec::new(),
+            allowed_devices: Default::default(),
         }
     }
 }
 
 impl RuntimeSection {
+    /// The runtime knobs this node's `[runtime]` section allows (#1122).
+    pub fn knob_allowlist(&self) -> crate::grill::knobs::RuntimeAllowlist {
+        crate::grill::knobs::RuntimeAllowlist {
+            capabilities: self.allowed_capabilities.clone(),
+            sysctls: self.allowed_sysctls.clone(),
+            devices: self.allowed_devices.clone(),
+        }
+    }
+
     /// The per-step deadline for confirming a stop or force-kill.
     pub fn stop_confirmation_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.stop_confirmation_timeout_secs)

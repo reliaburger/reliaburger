@@ -393,13 +393,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let request = record
                 .app_spec
                 .as_ref()
-                .map(|spec| {
-                    crate::meat::Resources::new(
-                        spec.cpu.map_or(0, |r| r.request),
-                        spec.memory.map_or(0, |r| r.request),
-                        spec.gpu.unwrap_or(0),
-                    )
-                })
+                .map(crate::meat::admission::app_requests)
                 .unwrap_or_default();
             self.supervisor
                 .reserve_adopted_execution(instance_id.clone(), request);
@@ -441,6 +435,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .or_default()
                 .push(instance_id.clone());
             self.note_adopted_instance(&key, &instance_id, record.app_spec.as_ref(), &record.image);
+            // Its sidecars have no records of their own, so startup retired
+            // them with the other unrecorded launches. They start again on
+            // the next tick, beside the adopted instance (#1120).
+            if let Some(spec) = record
+                .app_spec
+                .as_ref()
+                .filter(|spec| !spec.sidecar.is_empty())
+            {
+                let ids = spec
+                    .sidecar
+                    .iter()
+                    .map(|sidecar| {
+                        crate::grill::oci::sidecar_instance_id(&instance_id, &sidecar.name)
+                    })
+                    .collect();
+                self.sidecars.register_down(&instance_id, ids, now)?;
+            }
             if let Some(spec) = record.app_spec {
                 self.deployed_specs.insert(key, spec);
             }
