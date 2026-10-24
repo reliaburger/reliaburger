@@ -643,6 +643,11 @@ to JSON, and a field is absent when the JSON doesn't hold it or holds `null`.
 That covers every optional field and every empty list or map. It doesn't
 cover `replicas`, which always has a value (1 when you leave it out), so a
 policy that tries to default `replicas` is refused when it's committed.
+Nor can a default set `exec`, `script`, host volumes, `init`, `runtime` or
+`sidecar`. The apply path checks those against the caller's token, on the
+spec as declared, before any policy runs. A default filled in afterwards
+would hand every matching app host access its deployer was never granted,
+and the token check would never see it.
 
 That rules some things out on purpose. A default can't rewrite an image
 registry; that belongs with the trust policy and the pull-through cache

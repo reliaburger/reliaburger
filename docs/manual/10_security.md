@@ -289,7 +289,9 @@ The cluster checks a policy when you apply it, and refuses one that:
 - has neither a `deny` nor a `default`;
 - has a `default` that's empty or over 4096 bytes, names a field an app
   doesn't have (`memroy`, `deploy.max_unavaliable`) or one a default can't
-  fill (`namespace`, `replicas`), or gives a field a value of the wrong type
+  fill (`namespace`, `replicas`, `sidecar`, and the fields your token's
+  permissions gate: `exec`, `script`, `volumes`, `config_file`, `init` and
+  `runtime`), or gives a field a value of the wrong type
   (`port = "eighty"`).
 
 An expression that fails while it runs, such as `app.memory == '1Gi'` on an

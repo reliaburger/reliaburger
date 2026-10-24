@@ -952,7 +952,11 @@ evaluates one.
   fill a remaining app differently, the apply stops and asks to be run again.
   Commit checks refuse an empty or oversized (4096-byte) default, a field
   that isn't an app field or can't be filled (`name`, `namespace`,
-  `replicas`, `ordinals`), and a value serde won't read back into `AppSpec`.
+  `replicas`, `ordinals`, `sidecar`, and the fields the apply path gates on
+  the caller's token: `exec`, `script`, `volumes`, `config_file`, `init`,
+  `runtime`), and a value serde won't read back into `AppSpec`. The token
+  gates run on the declared spec, before policy, so a default must not be
+  able to add what they'd have refused.
 
 ---
 

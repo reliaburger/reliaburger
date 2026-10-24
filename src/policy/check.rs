@@ -25,7 +25,7 @@ pub const MAX_MESSAGE_BYTES: usize = 512;
 pub const MAX_DEFAULT_BYTES: usize = 4096;
 
 /// App fields a `default` can never fill, and why.
-pub const UNFILLABLE_FIELDS: [(&str, &str); 4] = [
+pub const UNFILLABLE_FIELDS: [(&str, &str); 11] = [
     ("name", "is the app's table name, not a field"),
     (
         "namespace",
@@ -36,7 +36,24 @@ pub const UNFILLABLE_FIELDS: [(&str, &str); 4] = [
         "always has a value (1 when the app leaves it out), so a default could never fill it",
     ),
     ("ordinals", "comes from the leader's placements"),
+    // The apply path checks these against the caller's token (host-exec,
+    // the runtime-knob gate) on the spec as declared. A default filled in
+    // after that would hand every matching app what its caller may not
+    // have, so a default can't set them.
+    ("exec", GATED_BY_THE_CALLER),
+    ("script", GATED_BY_THE_CALLER),
+    ("volumes", GATED_BY_THE_CALLER),
+    ("config_file", GATED_BY_THE_CALLER),
+    ("init", GATED_BY_THE_CALLER),
+    ("runtime", GATED_BY_THE_CALLER),
+    (
+        "sidecar",
+        "would add a container to every matching app; declare sidecars on the app",
+    ),
 ];
+
+/// Why a default can't fill a field the apply path gates on the caller.
+const GATED_BY_THE_CALLER: &str = "can need host access or a runtime knob, which the caller's token must allow, so a default can't grant it";
 
 /// The variables a policy expression can see. Nothing else: no other apps,
 /// no policies, permissions or namespaces, no clock.

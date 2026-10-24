@@ -814,6 +814,19 @@ fn every_kind_of_bad_default_is_refused_at_commit() {
             "[policy.rule.default]\nreplicas = 3\n",
             |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "replicas"),
         ),
+        // A default never grants what the caller's token gates.
+        (
+            "[policy.rule.default]\nexec = '/bin/sh'\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "exec"),
+        ),
+        (
+            "[policy.rule.default]\nruntime.sysctls = { 'net.core.somaxconn' = '4096' }\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "runtime"),
+        ),
+        (
+            "[policy.rule.default]\nsidecar = []\n",
+            |e| matches!(e, PolicyError::DefaultField { name, .. } if name == "sidecar"),
+        ),
         (
             "[policy.rule.default]\ndeploy.max_unavaliable = 1\n",
             |e| matches!(e, PolicyError::InvalidDefault { error } if error.contains("max_unavaliable")),
