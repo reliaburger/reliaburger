@@ -897,9 +897,45 @@ Operator stops and retirements (`app_exit_wait`) read each instance's policy fro
 
 **Kubernetes.** `relish import` maps `terminationGracePeriodSeconds`, `lifecycle.stopSignal` and an exec `lifecycle.preStop` to the three fields and warns about the difference in how the bound works; `relish export` maps them back. `pre_stop_timeout` has no Kubernetes field.
 
+### 5.9 Policies on the Apply Path (#1117)
+
+`[policy.*]` is a declarative kind committed to Raft like a permission
+(`RaftRequest::PolicySpec`, `PolicyDelete`; `DesiredState::policies`). A
+policy holds a CEL `match` (optional) and `deny`, a `message` and an `action`
+(`deny` or `warn`). The leader evaluates every policy against every applied
+app with one pure function, `crate::policy::evaluate`; the state machine never
+evaluates one.
+
+- **Where.** `cluster_apply` calls `policy::admit` before anything is bound or
+  written, under the committed policies with the config's own replacing any
+  of the same name. A denial answers 422 with a `PolicyRefusal` body, writes
+  nothing and records a `policy.denied` audit event. A job manifest's apps are
+  judged the same way in `job_apply`, but without a fence (the state machine
+  commits them later). The Lettuce runner judges each added or changed app in
+  `apply_changes`; an adopted app is never judged.
+- **Fence.** `DesiredState::policy_generation` moves by one on every applied
+  policy write and delete. Each app write is wrapped in
+  `RaftRequest::PolicyFenced { generation, change }`. The state machine applies
+  `change` only while its generation still matches, and otherwise answers
+  `CouncilResponse::PolicyGenerationMoved`. Both callers then judge the apps
+  still to write again, up to three times. A config that writes policies and
+  apps fences its apps on the generation plus the number of policies it writes,
+  because its policy writes come first.
+- **Input.** `app` (the declared spec as JSON, before images are bound, plus
+  `name` and the resolved `namespace`), `caller` (`name`, `role`) and `source`
+  (`apply` or `gitops`). Nothing else.
+- **Commit checks.** `policy::check_policy`, run by `Config::validate`: a DNS
+  label name, expressions of at most 1024 bytes, a message of at most 512,
+  valid CEL, only the three variables, and only known `app` and `caller`
+  fields. The `cel` crate has no cost limit, so the size cap bounds evaluation.
+- **Failure.** An expression that errors or returns a non-boolean fails
+  closed: a deny policy refuses, a warn policy warns. A committed policy that
+  no longer compiles refuses every app apply until an admin replaces or
+  deletes it. `POST /v1/policies/{name}/delete` is never judged.
+
 ---
 
-### 5.9 Runtime Knobs
+### 5.10 Runtime Knobs
 
 An app can ask for added capabilities, namespaced sysctls and host devices (#1122):
 

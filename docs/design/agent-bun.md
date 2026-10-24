@@ -183,7 +183,7 @@ maps it into the node range and prepares every read-write volume:
   capabilities join the default set, devices are bind-mounted with a cgroup
   allow rule, IPC sysctls go in `linux.sysctl`, and Bun writes the `net.*`
   ones into the instance's network namespace itself, because that namespace
-  belongs to the node's user namespace. See deployments 5.9.
+  belongs to the node's user namespace. See deployments 5.10.
 - **Rootless runc** skips all of this: the volume was created by the user
   whose id is the container's only mapped id (container root).
 
@@ -1444,7 +1444,7 @@ join = ["10.0.1.5:9443"]
 | `[storage]` | `metrics` | `/var/lib/reliaburger/metrics` | absolute path | Time-series data (Mayo). Append-heavy, random reads. |
 | `[storage]` | `volumes` | `/var/lib/reliaburger/volumes` | absolute path | Persistent app data. Must be reliable. |
 | `[storage]` | `allowed_host_paths` | `[]` | list of absolute paths | Prefixes a volume or config-file `source` may mount from. Empty refuses every host path; the storage, identity, script and key directories are refused even under a listed prefix. |
-| `[runtime]` | `allowed_capabilities`, `allowed_sysctls`, `allowed_devices` | `[]` | capability names; namespaced sysctl names or `net.`/`fs.mqueue.` prefixes ending in `.*`; device paths under `/dev` | The runtime knobs an app's `[app.x.runtime]` may use on this node (#1122). Advertised to the scheduler only on rootful runc. See deployments 5.9. |
+| `[runtime]` | `allowed_capabilities`, `allowed_sysctls`, `allowed_devices` | `[]` | capability names; namespaced sysctl names or `net.`/`fs.mqueue.` prefixes ending in `.*`; device paths under `/dev` | The runtime knobs an app's `[app.x.runtime]` may use on this node (#1122). Advertised to the scheduler only on rootful runc. See deployments 5.10. |
 | `[resources]` | `reserved_cpu` | `"500m"` | resource string (millicores) | CPU reserved for system + Bun. Not allocatable. |
 | `[resources]` | `reserved_memory` | `"512Mi"` | resource string (bytes) | Memory reserved for system + Bun. Not allocatable. |
 | `[resources]` | `reserved_disk` | `"10Gi"` | resource string (bytes) | Disk reserved for system. |

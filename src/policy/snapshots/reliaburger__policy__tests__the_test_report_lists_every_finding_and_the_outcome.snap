@@ -1,0 +1,10 @@
+---
+source: src/policy/tests.rs
+expression: "report::render_test(&verdict, 2, 2)"
+---
+Checked 2 app(s) against 2 policy(ies).
+
+  DENY  prod/web  prod-needs-limits  apps in prod need a memory limit
+  WARN  prod/web  no-latest          breaks policy no-latest
+
+1 denial(s), 1 warning(s): an apply would be refused.

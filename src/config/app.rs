@@ -190,13 +190,10 @@ impl AppSpec {
     /// `host-exec` permission as well as `deploy`: a host binary, an inline
     /// script, a host-path `source`, or a runtime knob.
     pub fn needs_host_access(&self) -> bool {
-        self.needs_host_access_besides_runtime_knobs() || self.runtime_knob_uses().next().is_some()
-    }
-
-    /// [`needs_host_access`](Self::needs_host_access) without the runtime
-    /// knobs, which apply checks separately so its refusal can name one.
-    pub fn needs_host_access_besides_runtime_knobs(&self) -> bool {
-        self.exec.is_some() || self.script.is_some() || self.host_path_sources().next().is_some()
+        self.exec.is_some()
+            || self.script.is_some()
+            || self.host_path_sources().next().is_some()
+            || self.runtime_knob_uses().next().is_some()
     }
 
     /// Every runtime knob this app asks for in `[app.x.runtime]` (#1122).

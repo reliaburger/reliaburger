@@ -143,6 +143,7 @@ pub(super) async fn apply_handler(
             || !config.job.is_empty()
             || !config.namespace.is_empty()
             || !config.permission.is_empty()
+            || !config.policy.is_empty()
             || !config.build.is_empty()
             || config
                 .app
@@ -184,7 +185,11 @@ pub(super) async fn apply_handler(
                 config.job.is_empty() || !config.app.is_empty() || !config.namespace.is_empty()
             }
         };
-        if wrong_kind || !config.permission.is_empty() || !config.build.is_empty() {
+        if wrong_kind
+            || !config.permission.is_empty()
+            || !config.policy.is_empty()
+            || !config.build.is_empty()
+        {
             return lease_error_response(crate::testkit::lease::LeaseError::InvalidScope);
         }
         if auth.token_name != crate::sesame::auth::SYSTEM_PRINCIPAL
@@ -255,10 +260,14 @@ pub(super) async fn apply_handler(
         }
     }
 
-    // Ordinary namespace quotas and permission grants are operator policy.
-    // A test lease has already confined its namespace declaration to the
-    // caller-owned reservation above; its quota cannot affect other tenants.
-    if !config.permission.is_empty() || (lease_id.is_none() && !config.namespace.is_empty()) {
+    // Ordinary namespace quotas, permission grants and policies are
+    // operator policy. A test lease has already confined its namespace
+    // declaration to the caller-owned reservation above; its quota cannot
+    // affect other tenants.
+    if !config.permission.is_empty()
+        || !config.policy.is_empty()
+        || (lease_id.is_none() && !config.namespace.is_empty())
+    {
         if let Err(response) = crate::sesame::auth::authorize_user(
             auth.as_deref(),
             crate::sesame::types::ApiRole::Admin,
@@ -293,48 +302,34 @@ pub(super) async fn apply_handler(
         return lease_error_response(error);
     }
 
+    // Policies live in the council and judge apps, never jobs, so a
+    // manifest that declares one carries no jobs and needs a cluster.
+    if !config.policy.is_empty() && (!config.job.is_empty() || state.council.is_none()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "policies apply only to a cluster, in a manifest without jobs"
+            })),
+        )
+            .into_response();
+    }
+
     // The record of this apply names the manifest's workloads and, when
-    // there is just one, its namespace (#685).
+    // there is just one, its namespace (#685), and every policy it writes
+    // (#1117).
     crate::bun::audit::annotate(audit::manifest_audit_note(&config));
 
     // Check every workload before any Raft write or agent command. A job in
     // a mixed manifest must not bypass admission after its apps have committed.
     // Host execution includes explicit binaries, inline scripts and, for
     // apps, host-path volume or config-file sources: a bind-mounted host
-    // path reaches past the namespace just as a host binary does. Runtime
-    // knobs (#1122) are checked on their own below, so their refusal can
-    // name the knob.
+    // path reaches past the namespace just as a host binary does, and so
+    // does a runtime knob (#1122).
     let permissions = permission_map(&state).await;
-    let targets = config
-        .app
-        .iter()
-        .map(|(name, spec)| {
-            (
-                name.as_str(),
-                spec.namespace.as_deref().unwrap_or("default"),
-                spec.needs_host_access_besides_runtime_knobs(),
-            )
-        })
-        .chain(config.job.iter().map(|(name, spec)| {
-            (
-                name.as_str(),
-                spec.namespace.as_deref().unwrap_or("default"),
-                spec.script.is_some() || spec.exec.is_some(),
-            )
-        }));
-    for (app_name, namespace, host_execution) in targets {
-        if let Err(response) = crate::sesame::auth::authorize_workload(
-            auth.as_deref(),
-            app_name,
-            namespace,
-            host_execution,
-            &permissions,
-        ) {
-            return response;
-        }
-    }
-    // The token gate for runtime knobs (#1122). The node gate comes later,
-    // on the node that runs the app.
+    // The token gate for runtime knobs (#1122), checked first so its refusal
+    // can name the knob. `needs_host_access` below counts knobs too, so the
+    // workload check holds the same line. The node gate comes later, on the
+    // node that runs the app.
     for (app_name, spec) in &config.app {
         let Some(knob) = spec.runtime_knob_uses().next() else {
             continue;
@@ -359,7 +354,34 @@ pub(super) async fn apply_handler(
                 .into_response();
         }
     }
-
+    let targets = config
+        .app
+        .iter()
+        .map(|(name, spec)| {
+            (
+                name.as_str(),
+                spec.namespace.as_deref().unwrap_or("default"),
+                spec.needs_host_access(),
+            )
+        })
+        .chain(config.job.iter().map(|(name, spec)| {
+            (
+                name.as_str(),
+                spec.namespace.as_deref().unwrap_or("default"),
+                spec.script.is_some() || spec.exec.is_some(),
+            )
+        }));
+    for (app_name, namespace, host_execution) in targets {
+        if let Err(response) = crate::sesame::auth::authorize_workload(
+            auth.as_deref(),
+            app_name,
+            namespace,
+            host_execution,
+            &permissions,
+        ) {
+            return response;
+        }
+    }
     // Every job, leased or not, takes the common job lifecycle: the leader
     // admits it as an indexed run and grants it to a node with room.
     if !config.job.is_empty() {
@@ -403,6 +425,7 @@ pub(super) async fn apply_handler(
         && (!config.app.is_empty()
             || !config.namespace.is_empty()
             || !config.permission.is_empty()
+            || !config.policy.is_empty()
             || !config.build.is_empty())
     {
         return cluster_apply(
@@ -414,6 +437,7 @@ pub(super) async fn apply_handler(
             headers,
             capacity_admission.map(|extension| extension.0),
             binder.map(|extension| extension.0),
+            auth.map(|extension| extension.0),
         )
         .await;
     }
@@ -581,6 +605,7 @@ pub(super) async fn cluster_apply(
     caller_headers: HeaderMap,
     capacity_admission: Option<crate::cluster::capacity::CapacityAdmission>,
     binder: Option<ImageBinder>,
+    auth: Option<crate::sesame::auth::AuthContext>,
 ) -> Response {
     // Follower? Forward to the leader rather than half-failing. The leader
     // binds images: a follower's binder (or lack of one) plays no part.
@@ -705,6 +730,28 @@ pub(super) async fn cluster_apply(
         }
     }
 
+    // Policies (#1117): judge the declared apps before anything is written
+    // or bound, under the policies in force with this config's own
+    // replacing any of the same name. A denial writes nothing and is
+    // audited, naming every policy. The writes are worked out again after
+    // binding, below; only their fence generation is decided here.
+    let caller = policy_caller(auth.as_ref());
+    let (committed_policies, committed_generation) = council
+        .read_desired(|desired| (desired.policies.clone(), desired.policy_generation))
+        .await;
+    let admission = match crate::policy::admit(
+        &committed_policies,
+        committed_generation,
+        &config,
+        &caller,
+        crate::policy::Source::Apply,
+        Vec::new(),
+    ) {
+        Ok(admitted) => admitted,
+        Err(error) => return policy_refusal(&state, auth.as_ref(), &error).await,
+    };
+    let declared = config.clone();
+
     // A manual apply of a GitOps-managed resource goes ahead, with a warning
     // that the next sync puts back what git declares (#693).
     let gitops_warnings: Vec<String> = council
@@ -719,8 +766,13 @@ pub(super) async fn cluster_apply(
     let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
     tokio::spawn(async move {
         let mut config = config;
+        let policy_warnings = admission
+            .warnings
+            .iter()
+            .map(|finding| format!("warning: {finding}"));
         for message in gitops_warnings
             .into_iter()
+            .chain(policy_warnings)
             .chain(host_path_notes(&config))
             .chain(runtime_knob_notes(&config))
         {
@@ -776,16 +828,40 @@ pub(super) async fn cluster_apply(
             },
             None => crate::council::config_to_desired_writes(&config),
         };
-        for request in writes {
+        // Every app write is fenced on the policy generation it was judged
+        // under. When the policies move first, the state machine refuses
+        // it, and the apps still to write are judged again (#1117).
+        let mut pending: std::collections::VecDeque<_> =
+            crate::policy::fence(writes, admission.generation).into();
+        let mut policy_attempts = 0usize;
+        while let Some(request) = pending.pop_front() {
             let describe = describe_write(&request);
-            let app_id = match &request {
-                crate::council::RaftRequest::AppSpec { app_id, .. }
-                | crate::council::RaftRequest::TestLeaseAppSpec { app_id, .. } => {
-                    Some(app_id.clone())
+            let app_id = written_app(&request);
+            match council.write(request.clone()).await {
+                Ok(crate::council::CouncilResponse::PolicyGenerationMoved { .. }) => {
+                    policy_attempts += 1;
+                    pending.push_front(request);
+                    let rejudged = if policy_attempts > POLICY_ATTEMPTS {
+                        Err(format!(
+                            "{describe}: the cluster's policies changed {POLICY_ATTEMPTS} times \
+                             during this apply; apply again"
+                        ))
+                    } else {
+                        rejudge(&council, &declared, &caller, &mut pending).await
+                    };
+                    match rejudge_messages(rejudged) {
+                        Ok(messages) => {
+                            for message in messages {
+                                let _ = event_tx.send(ApplyEvent::Progress { message }).await;
+                            }
+                        }
+                        Err(message) => {
+                            let _ = event_tx.send(ApplyEvent::Error { message }).await;
+                            return;
+                        }
+                    }
+                    continue;
                 }
-                _ => None,
-            };
-            match council.write(request).await {
                 // A state-machine refusal (lease expired, in cleanup, resource
                 // owned elsewhere, quota) is NOT a commit — surfacing it as an
                 // error stops the apply instead of streaming "committed" and
@@ -864,6 +940,151 @@ fn rollout_failed_notice(
     ))
 }
 
+/// How many times one apply judges its apps again after the policies moved
+/// under it, before it gives up and asks the caller to apply again.
+const POLICY_ATTEMPTS: usize = 3;
+
+/// The caller a policy sees for an API request: the token, or the local
+/// bootstrap admin when the API has no auth.
+pub(crate) fn policy_caller(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+) -> crate::policy::Caller {
+    match auth {
+        Some(auth) => crate::policy::Caller::token(&auth.token_name, auth.role),
+        None => {
+            crate::policy::Caller::token("local-bootstrap", crate::sesame::types::ApiRole::Admin)
+        }
+    }
+}
+
+/// The app an apply write commits, looking inside a policy fence.
+fn written_app(request: &crate::council::RaftRequest) -> Option<crate::meat::AppId> {
+    use crate::council::RaftRequest;
+    match request {
+        RaftRequest::AppSpec { app_id, .. } | RaftRequest::TestLeaseAppSpec { app_id, .. } => {
+            Some(app_id.clone())
+        }
+        RaftRequest::PolicyFenced { change, .. } => written_app(change),
+        _ => None,
+    }
+}
+
+/// Judge the apps still in `pending` again, under the policies now in
+/// force, and fence them on the new generation. Their declared specs come
+/// from `declared`, the config before its images were bound. The apply's
+/// own policies are committed by now, so the committed set is the whole
+/// story. Returns the warnings, or why the apply stops.
+pub(super) async fn rejudge(
+    council: &crate::council::CouncilNode,
+    declared: &Config,
+    caller: &crate::policy::Caller,
+    pending: &mut std::collections::VecDeque<crate::council::RaftRequest>,
+) -> Result<Vec<crate::policy::Finding>, String> {
+    let mut remaining = Config::default();
+    for app_id in pending.iter().filter_map(written_app) {
+        if let Some(spec) = declared.app.get(&app_id.name) {
+            remaining.app.insert(app_id.name.clone(), spec.clone());
+        }
+    }
+    let (policies, generation) = council
+        .read_desired(|desired| (desired.policies.clone(), desired.policy_generation))
+        .await;
+    let admitted = crate::policy::admit(
+        &policies,
+        generation,
+        &remaining,
+        caller,
+        crate::policy::Source::Apply,
+        Vec::new(),
+    )
+    .map_err(|error| error.to_string())?;
+    for write in pending.iter_mut() {
+        if let crate::council::RaftRequest::PolicyFenced { generation, .. } = write {
+            *generation = admitted.generation;
+        }
+    }
+    Ok(admitted.warnings)
+}
+
+/// The progress lines a successful re-judgement streams, or the error.
+fn rejudge_messages(
+    rejudged: Result<Vec<crate::policy::Finding>, String>,
+) -> Result<Vec<String>, String> {
+    let warnings =
+        rejudged.map_err(|reason| format!("refused after the policies changed: {reason}"))?;
+    Ok(std::iter::once(
+        "the cluster's policies changed during this apply; judged the remaining apps again"
+            .to_string(),
+    )
+    .chain(warnings.iter().map(|finding| format!("warning: {finding}")))
+    .collect())
+}
+
+/// The answer to an apply the policies refused, after auditing it: 422
+/// with every denial and warning named.
+pub(crate) async fn policy_refusal(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    error: &crate::policy::AdmitError,
+) -> Response {
+    let (denials, warnings) = match error {
+        crate::policy::AdmitError::Denied(denied) => (
+            denied.denials.iter().map(ToString::to_string).collect(),
+            denied.warnings.iter().map(ToString::to_string).collect(),
+        ),
+        crate::policy::AdmitError::Broken { .. } => (vec![error.to_string()], Vec::new()),
+    };
+    let policies: std::collections::BTreeSet<&str> = match error {
+        crate::policy::AdmitError::Denied(denied) => denied
+            .denials
+            .iter()
+            .map(|finding| finding.policy.as_str())
+            .collect(),
+        crate::policy::AdmitError::Broken { name, .. } => [name.as_str()].into(),
+    };
+    let mut details = std::collections::BTreeMap::new();
+    details.insert(
+        "policies".to_string(),
+        policies.into_iter().collect::<Vec<_>>().join(","),
+    );
+    super::record_caller_action(
+        state,
+        auth,
+        super::CallerAction {
+            kind: crate::bun::events::EventKind::Operation,
+            severity: crate::bun::events::EventSeverity::Warning,
+            action: "policy.denied",
+            app: None,
+            namespace: None,
+            node: None,
+            details,
+            message: format!("apply refused by policy: {error}"),
+        },
+    )
+    .await;
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(PolicyRefusal {
+            error: error.to_string(),
+            policy_denials: denials,
+            policy_warnings: warnings,
+        }),
+    )
+        .into_response()
+}
+
+/// The body of a 422 the policies caused (#1117).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyRefusal {
+    /// Every denial, on one line.
+    pub error: String,
+    /// One line per denial.
+    pub policy_denials: Vec<String>,
+    /// One line per warning the same apply drew.
+    #[serde(default)]
+    pub policy_warnings: Vec<String>,
+}
+
 /// A short human-readable label for an apply progress message.
 pub(super) fn describe_write(request: &crate::council::types::RaftRequest) -> String {
     use crate::council::types::RaftRequest;
@@ -871,6 +1092,8 @@ pub(super) fn describe_write(request: &crate::council::types::RaftRequest) -> St
         RaftRequest::AppSpec { app_id, .. } => format!("app {}", app_id.name),
         RaftRequest::NamespaceSpec { name, .. } => format!("namespace {name}"),
         RaftRequest::PermissionSpec { name, .. } => format!("permission {name}"),
+        RaftRequest::PolicySpec { name, .. } => format!("policy {name}"),
+        RaftRequest::PolicyFenced { change, .. } => describe_write(change),
         RaftRequest::TestLeaseAppSpec { app_id, .. } => {
             format!("leased app {}", app_id.name)
         }

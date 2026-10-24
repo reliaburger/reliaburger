@@ -242,6 +242,86 @@ which is less than an anonymous caller can already do in that window. The
 moment the cluster has a master key or a first token, both need the service
 token again.
 
+## Policies
+
+A policy is a rule every app applied to the cluster must pass, such as "apps
+in `prod` need a memory limit". You write it in TOML, next to your apps, and
+apply it like anything else:
+
+```toml
+[policy.prod-needs-limits]
+match = "app.namespace == 'prod'"
+deny = "!has(app.memory)"
+message = "apps in prod need a memory limit"
+
+[policy.no-latest]
+deny = "app.image.endsWith(':latest')"
+action = "warn"
+```
+
+`match` and `deny` are [CEL](https://github.com/google/cel-spec)
+expressions, the language Kubernetes uses for ValidatingAdmissionPolicy. When
+`match` is true (or absent) and `deny` is true, the apply is refused with
+`message`. With `action = "warn"` it goes ahead, and `relish apply` prints the
+warning. Without a `message`, the refusal says which policy it broke.
+
+An expression sees three things and nothing else:
+
+| Name | What it holds |
+|------|---------------|
+| `app` | The app's spec as you wrote it, every `[app.*]` field, plus `app.name` and `app.namespace` (`default` when the app names none). A field you didn't set is absent: test it with `has(app.memory)` |
+| `caller` | `caller.name`, the token's name, and `caller.role`: `admin`, `deployer`, `read-only`, or `system` for a GitOps sync |
+| `source` | `apply` or `gitops` |
+
+Policies judge apps, not jobs, and never other policies, permissions or
+namespaces. They judge an app when it's applied: a new policy doesn't touch
+apps already running.
+
+The cluster checks a policy when you apply it, and refuses one that:
+
+- has a name that isn't a lowercase DNS label;
+- has an empty `deny` or `match`, or one over 1024 bytes, or a `message` over
+  512 bytes;
+- isn't valid CEL;
+- names anything other than `app`, `caller` and `source`, such as `policy`,
+  `permission` or `namespaces`;
+- reads a field `app` or `caller` doesn't have (`app.memroy`).
+
+An expression that fails while it runs, such as `app.memory == '1Gi'` on an
+app with no memory set, or a `deny` that isn't true or false, counts as
+broken: a deny policy refuses the app and says why, and a warn policy warns.
+
+Only an unscoped Admin token can apply or delete a policy, and every policy
+write is audited. A refused apply answers with every policy it broke, writes
+nothing, and is recorded as `policy.denied`:
+
+```console
+$ relish apply -f web.toml
+error: the cluster's policies refuse this apply:
+  policy no-latest denies app default/web: pin a version
+```
+
+`relish apply --dry-run` lists the denials and warnings the cluster's
+policies, together with any in the file, would give. GitOps applies the same
+policies: an app a policy refuses is named in the sync's partial result, and
+the rest of the commit still applies.
+
+```sh
+relish policy list                       # every policy, its action and who wrote it
+relish policy delete no-latest           # admin only; always works
+relish policy test -f policies.toml -f apps.toml
+relish policy test -f policies.toml -f apps.toml --source gitops
+```
+
+`relish policy test` judges the apps in the files by the policies in the
+files, offline, with the same code the cluster runs, and exits non-zero when
+an apply would be refused. Run it in CI. `--caller` and `--role` set what
+`caller` holds.
+
+A policy never judges a policy, so `relish policy delete` works even when a
+broken policy refuses every app. A policy GitOps wrote comes back on the next
+sync unless you remove it from the repository too.
+
 ## Runtime knobs
 
 Some apps need a little more from the kernel than a container gets by
@@ -349,6 +429,7 @@ What's recorded:
 | Workloads | `app.applied`, `app.stopped`, `app.deleted`, `app.exec`, `deploy.rolled_back`, `deploy.cancelled`, `snapshot.created`, `snapshot.restored`, `snapshot.deleted` |
 | Jobs and builds | `job.submitted`, `job.replayed`, `job.schedule_disabled`, `batch.submitted`, `array.submitted`, `batch.cancelled`, `build.submitted` |
 | The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
+| Policies | `policy.denied`, `policy.deleted`; an apply that writes a policy is `app.applied` with the policy names under `policies` |
 | Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
 | Chaos | `fault.injected`, `fault.cleared`, `fault.cleared-by-service`, `fault.cleared-all-workload`, `fault.expired` |
 

@@ -157,6 +157,14 @@ impl Config {
         for (name, build) in &self.build {
             validate_build(name, build, namespaces)?;
         }
+        for (name, policy) in &self.policy {
+            crate::policy::check_policy(name, policy).map_err(|source| {
+                ConfigError::InvalidPolicy {
+                    name: name.clone(),
+                    source,
+                }
+            })?;
+        }
         Ok(())
     }
 }

@@ -753,8 +753,8 @@ pub enum DeviceLookupError {
 /// Split a Linux `dev_t` into its major and minor numbers, the way glibc's
 /// `major()` and `minor()` macros do.
 pub fn split_linux_device_number(device: u64) -> (i64, i64) {
-    let major = ((device >> 8) & 0xfff) | ((device >> 32) & !0xfff);
-    let minor = (device & 0xff) | ((device >> 12) & !0xff);
+    let major = ((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000);
+    let minor = (device & 0xff) | ((device >> 12) & 0xffff_ff00);
     // Both fit in 32 bits by construction, so the casts can't wrap.
     (major as i64, minor as i64)
 }
