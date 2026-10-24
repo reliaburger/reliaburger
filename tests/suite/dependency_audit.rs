@@ -125,3 +125,24 @@ fn lock_file_has_only_webpki_releases_that_distrust_emsign() {
         }
     }
 }
+
+/// `.cargo/audit.toml` ignores RUSTSEC-2026-0387 (crypto-bigint 0.5 timing)
+/// because crypto-bigint reaches the build only through `age`'s HPKE and
+/// P-256 code, which Reliaburger's X25519 and scrypt recipients never call,
+/// and cosign verifies P-256 signatures with `ring`. A direct dependency on
+/// any crate in that chain would put the affected code on a path we call, so
+/// the exception would no longer hold.
+#[test]
+fn crypto_bigint_is_reached_only_through_age() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    for name in ["crypto-bigint", "elliptic-curve", "p256", "hpke", "ecdsa"] {
+        let declared = manifest
+            .lines()
+            .any(|line| line.trim_start().starts_with(&format!("{name} ")));
+        assert!(
+            !declared,
+            "Cargo.toml depends on {name} directly; review the RUSTSEC-2026-0387 exception"
+        );
+    }
+}
