@@ -181,3 +181,7 @@ harness = false
 [[bench]]
 name = "scheduler"
 harness = false
+
+[[bench]]
+name = "policy"
+harness = false

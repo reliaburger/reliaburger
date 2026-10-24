@@ -119,6 +119,54 @@ fn the_manifest_is_the_active_app_in_the_namespace_owned_by_the_token() {
     assert_eq!(b.image.as_deref(), Some("postgres:17"));
 }
 
+const TEMPLATED_PAIR: &str = include_str!("../../examples/controller/postgres-pair.toml");
+
+fn templated_settings(endpoint: &str, token: &str) -> Settings {
+    Settings {
+        manifest: TEMPLATED_PAIR.to_string(),
+        ..settings(endpoint, token)
+    }
+}
+
+#[test]
+fn a_templated_pair_names_its_apps_by_each_uses_name() {
+    assert_eq!(
+        controller::app_names(&templated_settings("", "")).unwrap(),
+        ["db-a".to_string(), "db-b".to_string()]
+    );
+}
+
+#[test]
+fn the_templated_manifest_is_the_active_use_with_the_controllers_owner_and_namespace() {
+    let mut settings = templated_settings("", "");
+    settings.name = "pg-ha".to_string();
+    settings.namespace = "orders".to_string();
+    let written = controller::manifest(&settings, 1).unwrap();
+    let mut config = reliaburger::config::Config::parse(&written).unwrap();
+    assert_eq!(config.uses.keys().collect::<Vec<_>>(), vec!["db-b"]);
+    config.expand_templates().unwrap();
+    config.validate_intrinsic().unwrap();
+    assert_eq!(config.app.keys().collect::<Vec<_>>(), vec!["db-b"]);
+    let b = &config.app["db-b"];
+    assert_eq!(b.owner.as_deref(), Some("pg-ha"));
+    assert_eq!(b.namespace.as_deref(), Some("orders"));
+    let provenance = b.provenance.as_ref().unwrap();
+    assert_eq!(provenance.template, "postgres-member");
+    assert_eq!(provenance.instance, "db-b");
+}
+
+#[test]
+fn a_templated_pair_needs_two_uses_that_name_their_apps() {
+    let one = "[template.t]\nparams = { name = 'string' }\nbody = '''\n[app.${name}]\nscript = 'true'\n'''\n[use.a]\ntemplate = 't'\nname = 'a'\n";
+    let mut settings = templated_settings("", "");
+    settings.manifest = one.to_string();
+    assert!(controller::app_names(&settings).is_err());
+    assert!(controller::manifest(&settings, 0).is_err());
+    settings.manifest = TEMPLATED_PAIR.replace("name = \"db-b\"\n", "");
+    let error = controller::app_names(&settings).unwrap_err();
+    assert!(error.contains("use.db-b"), "{error}");
+}
+
 async fn leader() -> Arc<CouncilNode> {
     let router = InMemoryRaftRouter::new();
     let node = CouncilNode::new(
@@ -294,6 +342,51 @@ async fn the_example_controller_claims_its_app_and_fails_over() {
     );
     assert_eq!(owner_of(&served.council, "db-a").await, None);
     assert_eq!(owner_of(&served.council, "db-b").await, owned);
+
+    served.shutdown.cancel();
+    served.council.shutdown().await.ok();
+}
+
+/// The same failover, driving a template (#1124): each write is one `use`,
+/// which the cluster expands into an ordinary app owned by the controller
+/// and marked with the template it came from.
+#[tokio::test]
+async fn the_example_controller_fails_a_templated_pair_over() {
+    let served = serve().await;
+    post(&served, &served.admin, "[namespace.pg]\n").await;
+    let api = Api::new(templated_settings(&served.endpoint, &served.controller)).unwrap();
+    let mut controller = Controller::default();
+
+    let first = controller.reconcile(&api).await.unwrap();
+    assert!(
+        matches!(first, Decision::Write { active: 0, .. }),
+        "{first:?}"
+    );
+    let state = served.council.desired_state().await;
+    let db_a = &state.apps[&AppId::new("db-a", "pg")];
+    assert_eq!(db_a.owner.as_deref(), Some("db-failover"));
+    assert_eq!(
+        db_a.provenance.as_ref().map(|p| p.template.as_str()),
+        Some("postgres-member")
+    );
+    assert!(!state.apps.contains_key(&AppId::new("db-b", "pg")));
+
+    // Nothing runs here, so after two missed checks it fails over.
+    controller.reconcile(&api).await.unwrap();
+    let third = controller.reconcile(&api).await.unwrap();
+    assert!(
+        matches!(third, Decision::Write { active: 1, .. }),
+        "{third:?}"
+    );
+    let state = served.council.desired_state().await;
+    assert!(!state.apps.contains_key(&AppId::new("db-a", "pg")));
+    let db_b = &state.apps[&AppId::new("db-b", "pg")];
+    assert_eq!(db_b.owner.as_deref(), Some("db-failover"));
+    assert_eq!(
+        db_b.placement.as_ref().unwrap().required,
+        vec!["rack=b".to_string()],
+        "the use's own parameters"
+    );
 
     served.shutdown.cancel();
     served.council.shutdown().await.ok();

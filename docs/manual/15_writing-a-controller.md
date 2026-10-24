@@ -250,6 +250,12 @@ controller applies the standby and deletes the app that failed. Which app is
 active lives in the cluster, so the controller can restart at any time; its
 only memory is the count of missed checks.
 
+It checks every five seconds, and `CONTROLLER_THRESHOLD` (3 by default) sets
+how many misses in a row make a failover. Keep the product longer than it
+takes your cluster to place and start the app. Otherwise a member that's
+still starting counts as failed, and the controller swaps the pair back and
+forth without either one ever running.
+
 ```sh
 relish token create --name db-failover --role deployer --namespaces pg
 ```
@@ -261,7 +267,26 @@ RELIABURGER_TOKEN=rbrg_... CONTROLLER_NAME=db-failover CONTROLLER_NAMESPACE=pg \
   CONTROLLER_MANIFEST=examples/controller/pair.toml cargo run --example controller
 ```
 
-It's deliberately simple. A real database failover also has to fence the old
-primary and promote a replica that has the data, which is what the 0.2.4 exit
-test ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)) builds
-on top of this contract.
+The pair can also come from a template. `examples/controller/postgres-pair.toml`
+declares a `[template.postgres-member]` and a `[use.*]` for each member. Given
+a manifest with `[use.*]` tables, the controller applies only the active
+member's `use` and lets the cluster expand it, passing its token's name as the
+`owner` parameter and its namespace as `namespace`. So a template it drives
+takes those two parameters, and each `use` names its app with `name`:
+
+```sh
+RELIABURGER_TOKEN=rbrg_... CONTROLLER_NAME=db-failover CONTROLLER_NAMESPACE=pg \
+  CONTROLLER_MANIFEST=examples/controller/postgres-pair.toml cargo run --example controller
+```
+
+The app it writes is an ordinary app with the template's name in its
+provenance, judged by the cluster's policies like any other.
+
+The 0.2.4 exit test ([#1126](https://github.com/reliaburger/reliaburger/issues/1126))
+runs this controller and this template on a three-node cluster with the
+platform policies in force, kills the node the active member runs on, and
+checks that the controller brings up the standby on another rack. It's
+deliberately simple, though. The standby starts with no data. A real database
+failover also streams the data to the standby, promotes it and fences the old
+primary, and that work belongs to the database and the controller you write,
+not to the contract.

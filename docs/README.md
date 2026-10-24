@@ -468,7 +468,7 @@ for the audit, exact suite contracts and CI mapping.
 Gossip protocol benchmarks use [criterion](https://docs.rs/criterion) for statistical analysis with regression detection.
 
 ```sh
-make bench         # reproducible transport and 5-250 node measurements, then one scheduling pass on 1k and 10k nodes
+make bench         # reproducible transport and 5-250 node measurements, one scheduling pass on 1k and 10k nodes, and policy evaluation for 10-1,000 policies
 make bench-large   # reproducible 500 and 1,000 node measurements
 make bench-task-arrays  # in-process task-array costs and the fork/exec floor
 ```
