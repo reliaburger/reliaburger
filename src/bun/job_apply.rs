@@ -72,12 +72,12 @@ pub(crate) async fn apply(
         if let Err(error) = config.validate_against(&namespaces) {
             return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
         }
-        // The apps in a job manifest are judged by the policies in force,
-        // as `relish apply` judges any app (#1117). The state machine
-        // commits them later, once their jobs have run, so their writes
-        // carry no policy fence: a policy committed in between doesn't
-        // stop them.
-        if !config.app.is_empty() {
+        // The apps and jobs in a job manifest are judged by the policies in
+        // force, as `relish apply` judges any app (#1117, #1119). The state
+        // machine commits them later, once their jobs have run, so their
+        // writes carry no policy fence: a policy committed in between
+        // doesn't stop them.
+        if !config.app.is_empty() || !config.job.is_empty() {
             let (policies, generation) = council
                 .read_desired(|desired| (desired.policies.clone(), desired.policy_generation))
                 .await;
@@ -93,6 +93,7 @@ pub(crate) async fn apply(
                 // (#1118). Job manifests never come from GitOps, so there's
                 // no declared spec to keep beside them.
                 Ok(admitted) => {
+                    super::api::apply::record_policy_audits(&state, auth, &admitted.audits).await;
                     for (name, spec) in config.app.iter_mut() {
                         let app_id = crate::meat::AppId::new(
                             name,

@@ -109,12 +109,18 @@ pub struct PolicyPlan {
     pub denials: Vec<String>,
     /// Policies that would only warn.
     pub warnings: Vec<String>,
+    /// `audit` policies that would record a finding (#1119).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audits: Vec<String>,
 }
 
 impl PolicyPlan {
     /// Whether the policies said nothing.
     pub fn is_empty(&self) -> bool {
-        self.filled.is_empty() && self.denials.is_empty() && self.warnings.is_empty()
+        self.filled.is_empty()
+            && self.denials.is_empty()
+            && self.warnings.is_empty()
+            && self.audits.is_empty()
     }
 
     /// The plan section for `evaluation`.
@@ -124,6 +130,7 @@ impl PolicyPlan {
             filled: evaluation.filled.iter().map(ToString::to_string).collect(),
             denials: verdict.denials.iter().map(ToString::to_string).collect(),
             warnings: verdict.warnings.iter().map(ToString::to_string).collect(),
+            audits: verdict.audits.iter().map(ToString::to_string).collect(),
         }
     }
 }
@@ -431,6 +438,9 @@ impl ApplyPlan {
         }
         for warning in &self.policy.warnings {
             write!(f, "\n  WARN  {warning}")?;
+        }
+        for audit in &self.policy.audits {
+            write!(f, "\n  AUDIT {audit}")?;
         }
         if !self.policy.denials.is_empty() {
             write!(f, "\nThe cluster's policies would refuse this apply.")?;

@@ -448,3 +448,53 @@ env.TEAM = "payments"
     shutdown.cancel();
     council.shutdown().await.ok();
 }
+
+/// #1119: a new policy never touches running work. An app committed before
+/// the policy keeps its spec, and `GET /v1/policies/audit` (what `relish
+/// policy audit` and `relish wtf` read) names it as something the policy
+/// would now refuse.
+#[tokio::test]
+async fn a_new_policy_leaves_running_work_alone_and_the_audit_names_it() {
+    use tower::ServiceExt;
+    let council = single_node_leader(5).await;
+    let (tx, _rx) = mpsc::channel(8);
+    let router = reliaburger::bun::api::router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&council)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let (status, body) = post_apply(&router, "[app.web]\nimage = 'web:latest'\n").await;
+    assert!(status.is_success(), "{status}: {body}");
+    let web = AppId::new("web", "default");
+    let before = council.desired_state().await.apps[&web].clone();
+    let (status, body) = post_apply(&router, NO_LATEST).await;
+    assert!(status.is_success(), "{status}: {body}");
+
+    let request = axum::http::Request::get("/v1/policies/audit")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let audit: reliaburger::policy::audit::PolicyAudit = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(audit.verdict.denials.len(), 1, "{audit:?}");
+    assert_eq!(
+        audit.verdict.denials[0].to_string(),
+        "policy no-latest denies app default/web: pin a version"
+    );
+    assert_eq!(council.desired_state().await.apps[&web], before);
+    council.shutdown().await.ok();
+}

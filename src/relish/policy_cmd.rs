@@ -1,5 +1,6 @@
-//! `relish policy`: list and delete the cluster's policies, and test
-//! policies against apps offline (#1117).
+//! `relish policy`: list and delete the cluster's policies, audit the
+//! committed apps and jobs against them (#1119), and test policies against
+//! apps and jobs offline (#1117).
 //!
 //! `relish policy test` runs the same pure function the leader runs, on
 //! files, with no cluster. That's what makes it a CI check: a pull request
@@ -65,7 +66,7 @@ pub fn render_policy_list(listing: &PolicyListing) -> String {
         .max()
         .unwrap_or(0)
         .max("NAME".len());
-    let mut out = format!("{:name_width$}  ACTION  OWNER   RULE\n", "NAME");
+    let mut out = format!("{:name_width$}  ACTION  FOR   OWNER   RULE\n", "NAME");
     for (name, spec) in &listing.policies {
         let owner = if listing.gitops_owned.contains(name) {
             "gitops"
@@ -74,8 +75,9 @@ pub fn render_policy_list(listing: &PolicyListing) -> String {
         };
         let rule = policy_rule(spec);
         out.push_str(&format!(
-            "{name:name_width$}  {:6}  {owner:6}  {rule}\n",
-            spec.action.as_str()
+            "{name:name_width$}  {:6}  {:4}  {owner:6}  {rule}\n",
+            spec.action.as_str(),
+            spec.applies_to.as_str()
         ));
     }
     out.push_str(&format!("\nGeneration {}.\n", listing.generation));
@@ -97,6 +99,25 @@ fn policy_rule(spec: &crate::config::PolicySpec) -> String {
         parts.push(format!("default {}", fields.join(", ")));
     }
     parts.join("; ")
+}
+
+/// `relish policy audit`: the committed apps and jobs the policies would
+/// now refuse, warn about or record. A report, not a gate: it exits zero
+/// whatever it finds.
+pub async fn policy_audit(output: OutputFormat) -> Result<(), RelishError> {
+    let audit = BunClient::default_local().policy_audit().await?;
+    match output {
+        OutputFormat::Human => print!("{}", crate::policy::report::render_audit(&audit)),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&audit).map_err(RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            yaml_serde::to_string(&audit).map_err(RelishError::SerialiseYaml)?
+        ),
+    }
+    Ok(())
 }
 
 /// `relish policy delete NAME`: remove a policy. Policies never judge
@@ -131,7 +152,12 @@ pub fn policy_test(
     match output {
         OutputFormat::Human => println!(
             "{}",
-            crate::policy::report::render_test(&evaluation, merged.app.len(), merged.policy.len())
+            crate::policy::report::render_test(
+                &evaluation,
+                merged.app.len(),
+                merged.job.len(),
+                merged.policy.len()
+            )
         ),
         OutputFormat::Json => println!(
             "{}",
@@ -152,7 +178,7 @@ pub fn policy_test(
     }
 }
 
-/// Add `config`'s apps and policies to `merged`. The same name in two files
+/// Add `config`'s apps, jobs and policies to `merged`. The same name in two files
 /// is a mistake, not an override.
 fn merge(merged: &mut Config, config: Config, file: &std::path::Path) -> Result<(), RelishError> {
     let duplicate = |kind: &str, name: &str| RelishError::InvalidFlag {
@@ -167,6 +193,12 @@ fn merge(merged: &mut Config, config: Config, file: &std::path::Path) -> Result<
             return Err(duplicate("app", &name));
         }
         merged.app.insert(name, spec);
+    }
+    for (name, spec) in config.job {
+        if merged.job.contains_key(&name) {
+            return Err(duplicate("job", &name));
+        }
+        merged.job.insert(name, spec);
     }
     for (name, spec) in config.policy {
         if merged.policy.contains_key(&name) {
@@ -252,7 +284,9 @@ message = "apps in prod need a memory limit"
         );
         let error = policy_test(&[policies], &deployer(), OutputFormat::Json).unwrap_err();
         assert!(
-            error.to_string().contains("policies see only app"),
+            error
+                .to_string()
+                .contains("sees only app, workload, caller and source"),
             "{error}"
         );
     }

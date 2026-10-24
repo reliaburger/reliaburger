@@ -10584,6 +10584,7 @@ mod tests {
             message: None,
             action: crate::config::PolicyAction::Deny,
             default: None,
+            applies_to: crate::config::PolicyTarget::Apps,
         })
     }
 

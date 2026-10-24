@@ -23,6 +23,7 @@
 //! that number with its own and refuses the write if the policy set has
 //! moved, so the apply evaluates again. Chapter 18 explains why.
 
+pub mod audit;
 mod check;
 mod defaults;
 pub mod report;
@@ -32,14 +33,15 @@ use std::sync::Arc;
 
 use cel::{Context, Env, Program, Value};
 
-use crate::config::{AppSpec, Config, PolicyAction, PolicySpec};
+use crate::config::{AppSpec, Config, JobSpec, PolicyAction, PolicySpec, PolicyTarget};
 use crate::council::types::RaftRequest;
 use crate::meat::types::AppId;
 use crate::sesame::types::ApiRole;
 
 pub use check::{
-    APP_FIELDS, CALLER_FIELDS, MAX_DEFAULT_BYTES, MAX_EXPRESSION_BYTES, MAX_MESSAGE_BYTES,
-    POLICY_VARIABLES, PolicyError, PolicyField, UNFILLABLE_FIELDS, app_fields, check_policy,
+    APP_FIELDS, CALLER_FIELDS, JOB_FIELDS, MAX_DEFAULT_BYTES, MAX_EXPRESSION_BYTES,
+    MAX_MESSAGE_BYTES, POLICY_VARIABLES, PolicyError, PolicyField, UNFILLABLE_FIELDS,
+    WORKLOAD_FIELDS, app_fields, check_policy, workload_variables,
 };
 pub use defaults::Filled;
 
@@ -103,21 +105,63 @@ impl Caller {
         }
     }
 
+    /// The caller `relish policy audit` judges committed workloads as:
+    /// the cluster itself, named `audit` (#1119).
+    pub fn audit() -> Self {
+        Caller {
+            name: "audit".to_string(),
+            role: None,
+        }
+    }
+
     fn role_name(&self) -> String {
         self.role
             .map_or_else(|| "system".to_string(), |role| role.to_string())
     }
 }
 
-/// One policy an app broke.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// The kinds of workload a policy judges (#1119).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkloadKind {
+    /// An `[app.*]`.
+    App,
+    /// A `[job.*]`.
+    Job,
+}
+
+impl WorkloadKind {
+    /// The word used in output and as the expression variable.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkloadKind::App => "app",
+            WorkloadKind::Job => "job",
+        }
+    }
+
+    fn judged_by(self, target: PolicyTarget) -> bool {
+        matches!(
+            (self, target),
+            (_, PolicyTarget::Both)
+                | (WorkloadKind::App, PolicyTarget::Apps)
+                | (WorkloadKind::Job, PolicyTarget::Jobs)
+        )
+    }
+}
+
+/// One policy a workload broke.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Finding {
     /// The policy's name.
     pub policy: String,
-    /// Whether it refuses or warns.
+    /// Whether it refuses, warns or is only recorded.
     pub action: PolicyAction,
-    /// The app that broke it.
-    pub app: AppId,
+    /// Whether an app or a job broke it.
+    pub kind: WorkloadKind,
+    /// The workload that broke it.
+    pub workload: AppId,
     /// The policy's message, or why it couldn't be evaluated.
     pub message: String,
 }
@@ -126,29 +170,35 @@ impl std::fmt::Display for Finding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "policy {} {} app {}/{}: {}",
+            "policy {} {} {} {}/{}: {}",
             self.policy,
             match self.action {
                 PolicyAction::Deny => "denies",
                 PolicyAction::Warn => "warns about",
+                PolicyAction::Audit => "audits",
             },
-            self.app.namespace,
-            self.app.name,
+            self.kind.as_str(),
+            self.workload.namespace,
+            self.workload.name,
             self.message
         )
     }
 }
 
-/// Everything the policies said about some apps: what they refuse and
-/// what they only warn about. Both lists are in app order, then policy
-/// name order.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+/// Everything the policies said about some workloads: what they refuse,
+/// what they only warn about, and what they only record. Each list is in
+/// workload order (apps, then jobs), then policy name order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Verdict {
     /// Findings from `deny` policies, and from any policy that couldn't be
     /// evaluated: a broken deny policy fails closed.
     pub denials: Vec<Finding>,
     /// Findings from `warn` policies.
     pub warnings: Vec<Finding>,
+    /// Findings from `audit` policies (#1119): recorded, never shown to
+    /// the caller as a warning, never refusing.
+    #[serde(default)]
+    pub audits: Vec<Finding>,
 }
 
 impl Verdict {
@@ -157,9 +207,23 @@ impl Verdict {
         self.denials.is_empty()
     }
 
+    /// Whether the policies said nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.denials.is_empty() && self.warnings.is_empty() && self.audits.is_empty()
+    }
+
     fn extend(&mut self, other: Verdict) {
         self.denials.extend(other.denials);
         self.warnings.extend(other.warnings);
+        self.audits.extend(other.audits);
+    }
+
+    fn push(&mut self, finding: Finding) {
+        match finding.action {
+            PolicyAction::Deny => self.denials.push(finding),
+            PolicyAction::Warn => self.warnings.push(finding),
+            PolicyAction::Audit => self.audits.push(finding),
+        }
     }
 }
 
@@ -207,6 +271,8 @@ pub struct Admitted {
     pub writes: Vec<RaftRequest>,
     /// What the `warn` policies said.
     pub warnings: Vec<Finding>,
+    /// What the `audit` policies recorded (#1119).
+    pub audits: Vec<Finding>,
     /// The policy generation the app writes are fenced on: the committed
     /// one, plus one for each policy this config writes before its apps.
     pub generation: u64,
@@ -280,6 +346,7 @@ impl Evaluation {
 struct CompiledPolicy {
     name: String,
     action: PolicyAction,
+    target: PolicyTarget,
     message: Option<String>,
     match_program: Option<Program>,
     deny_program: Option<Program>,
@@ -329,18 +396,23 @@ impl PolicySet {
             let match_program = spec
                 .match_expression
                 .as_deref()
-                .map(|expression| check::compile_checked(PolicyField::Match, expression))
+                .map(|expression| {
+                    check::compile_checked(PolicyField::Match, spec.applies_to, expression)
+                })
                 .transpose()
                 .map_err(broken(name))?;
             let deny_program = spec
                 .deny
                 .as_deref()
-                .map(|expression| check::compile_checked(PolicyField::Deny, expression))
+                .map(|expression| {
+                    check::compile_checked(PolicyField::Deny, spec.applies_to, expression)
+                })
                 .transpose()
                 .map_err(broken(name))?;
             policies.push(CompiledPolicy {
                 name: name.clone(),
                 action: spec.action,
+                target: spec.applies_to,
                 message: spec.message.clone(),
                 match_program,
                 deny_program,
@@ -372,12 +444,43 @@ pub fn evaluate_app(
     caller: &Caller,
     source: Source,
 ) -> Verdict {
+    let value = workload_value(app_id, spec);
+    evaluate_workload(set, WorkloadKind::App, app_id, value, caller, source)
+}
+
+/// Judge one job by every policy in `set` that applies to jobs (#1119).
+/// Defaults never touch a job: a policy with a `default` applies to apps
+/// only.
+pub fn judge_job(
+    set: &PolicySet,
+    job_id: &AppId,
+    spec: &JobSpec,
+    caller: &Caller,
+    source: Source,
+) -> Verdict {
+    let value = workload_value(job_id, spec);
+    evaluate_workload(set, WorkloadKind::Job, job_id, value, caller, source)
+}
+
+/// Evaluate every `deny` in `set` that applies to `kind` against one
+/// workload, seen as `value`.
+fn evaluate_workload(
+    set: &PolicySet,
+    kind: WorkloadKind,
+    id: &AppId,
+    value: Value,
+    caller: &Caller,
+    source: Source,
+) -> Verdict {
     let mut verdict = Verdict::default();
     if set.is_empty() {
         return verdict;
     }
-    let context = policy_context(set, app_id, spec, caller, source);
+    let context = policy_context(set, kind, value, caller, source);
     for policy in &set.policies {
+        if !kind.judged_by(policy.target) {
+            continue;
+        }
         let Some(deny_program) = &policy.deny_program else {
             continue;
         };
@@ -393,31 +496,29 @@ pub fn evaluate_app(
                 .clone()
                 .unwrap_or_else(|| format!("breaks policy {}", policy.name)),
         };
-        let finding = Finding {
+        verdict.push(Finding {
             policy: policy.name.clone(),
             action: policy.action,
-            app: app_id.clone(),
+            kind,
+            workload: id.clone(),
             message,
-        };
-        match policy.action {
-            PolicyAction::Deny => verdict.denials.push(finding),
-            PolicyAction::Warn => verdict.warnings.push(finding),
-        }
+        });
     }
     verdict
 }
 
-/// The variables an expression sees for one app: `app`, `caller` and
-/// `source`.
+/// The variables an expression sees for one workload: `app` or `job` by
+/// its kind, `workload` for either, `caller` and `source`.
 fn policy_context(
     set: &PolicySet,
-    app_id: &AppId,
-    spec: &AppSpec,
+    kind: WorkloadKind,
+    value: Value,
     caller: &Caller,
     source: Source,
 ) -> Context<'static, 'static> {
     let mut context = Context::with_env(Arc::clone(&set.environment));
-    context.add_variable_from_value("app", app_value(app_id, spec));
+    context.add_variable_from_value(kind.as_str(), value.clone());
+    context.add_variable_from_value("workload", value);
     context.add_variable_from_value(
         "caller",
         HashMap::from([
@@ -471,7 +572,8 @@ pub fn judge_app(
         let Some(default) = &policy.default else {
             continue;
         };
-        let context = policy_context(set, app_id, &spec, caller, source);
+        let value = workload_value(app_id, &spec);
+        let context = policy_context(set, WorkloadKind::App, value, caller, source);
         let outcome = match matches(policy, &context) {
             Ok(true) => defaults::apply_default(&spec, default)
                 .map(Some)
@@ -493,7 +595,8 @@ pub fn judge_app(
             Err(message) => verdict.denials.push(Finding {
                 policy: policy.name.clone(),
                 action: PolicyAction::Deny,
-                app: app_id.clone(),
+                kind: WorkloadKind::App,
+                workload: app_id.clone(),
                 message,
             }),
         }
@@ -506,7 +609,8 @@ pub fn judge_app(
         verdict.denials.push(Finding {
             policy: policies.join(","),
             action: PolicyAction::Deny,
-            app: app_id.clone(),
+            kind: WorkloadKind::App,
+            workload: app_id.clone(),
             message: format!("the app isn't valid once its defaults are filled in: {error}"),
         });
     }
@@ -535,13 +639,13 @@ fn run(field: PolicyField, program: &Program, context: &Context) -> Result<bool,
     }
 }
 
-/// The app as a policy sees it: its spec as JSON, with `name` and the
+/// A workload as a policy sees it: its spec as JSON, with `name` and the
 /// resolved `namespace` added.
-fn app_value(app_id: &AppId, spec: &AppSpec) -> Value {
+fn workload_value(id: &AppId, spec: &impl serde::Serialize) -> Value {
     let mut json = serde_json::to_value(spec).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(map) = &mut json {
-        map.insert("name".into(), app_id.name.clone().into());
-        map.insert("namespace".into(), app_id.namespace.clone().into());
+        map.insert("name".into(), id.name.clone().into());
+        map.insert("namespace".into(), id.namespace.clone().into());
     }
     json_to_cel(json)
 }
@@ -574,7 +678,12 @@ fn app_id_of(name: &str, spec: &AppSpec) -> AppId {
     AppId::new(name, spec.namespace.as_deref().unwrap_or("default"))
 }
 
-/// Judge every app in `config` by `set`, in name order.
+/// The identity a job in a config gets: its `namespace`, or `default`.
+fn job_id_of(name: &str, spec: &JobSpec) -> AppId {
+    AppId::new(name, spec.namespace.as_deref().unwrap_or("default"))
+}
+
+/// Judge every app, then every job, in `config` by `set`, in name order.
 pub fn evaluate(set: &PolicySet, config: &Config, caller: &Caller, source: Source) -> Evaluation {
     let mut evaluation = Evaluation::default();
     for (name, spec) in &config.app {
@@ -582,6 +691,11 @@ pub fn evaluate(set: &PolicySet, config: &Config, caller: &Caller, source: Sourc
         evaluation.apps.insert(name.clone(), judgement.spec);
         evaluation.filled.extend(judgement.filled);
         evaluation.verdict.extend(judgement.verdict);
+    }
+    for (name, spec) in &config.job {
+        evaluation
+            .verdict
+            .extend(judge_job(set, &job_id_of(name, spec), spec, caller, source));
     }
     evaluation
 }
@@ -624,7 +738,7 @@ pub fn admit(
     writes: Vec<RaftRequest>,
 ) -> Result<Admitted, AdmitError> {
     let mut evaluation = Evaluation::default();
-    if !config.app.is_empty() {
+    if !config.app.is_empty() || !config.job.is_empty() {
         let set = PolicySet::compile(&effective_policies(committed, config))?;
         evaluation = evaluate(&set, config, caller, source);
         if !evaluation.verdict.is_allowed() {
@@ -643,6 +757,7 @@ pub fn admit(
             &declared_apps(config),
         ),
         warnings: evaluation.verdict.warnings,
+        audits: evaluation.verdict.audits,
         generation,
         filled: evaluation.filled,
         defaulted,

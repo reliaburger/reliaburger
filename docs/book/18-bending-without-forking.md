@@ -592,6 +592,44 @@ absence can block writes, because everything runs inside Bun, from state that
 Raft already replicates. The worst a bad policy can do is refuse apps until an
 admin removes it.
 
+### Jobs, and rules you only watch
+
+Apps aren't the only thing a platform team wants rules for. A nightly report
+job pulling `:latest` is the same mistake as an app doing it
+([#1119](https://github.com/reliaburger/reliaburger/issues/1119)). So a policy
+can say what it judges:
+
+```toml
+[policy.no-latest-anywhere]
+applies_to = "both"                      # apps (the default), jobs or both
+deny = "workload.image.endsWith(':latest')"
+```
+
+The default is `apps`, so every policy written before jobs could be judged
+still means exactly what it meant. A jobs policy sees the job as `job`. A
+policy for both sees `workload`, which holds only the fields apps and jobs
+share, so `workload.port` is refused when the policy is committed rather
+than failing on every job at apply time. We could have bound one variable
+to whatever the workload was, but then an expression that reads `app.port`
+would be fine on apps and broken on jobs, and you'd find out from a refused
+cron job at three in the morning. Making the variable name carry the kind
+keeps the commit check honest.
+
+The second addition is a third action. `action = "audit"` lets the apply go
+ahead without telling the caller and records the finding in the audit log.
+It's how you roll out a strict rule: commit it as `audit`, watch what it
+would have refused, and change it to `deny` when nothing breaks it any more.
+Gatekeeper calls this dry run.
+
+And there's the question every new policy raises. It judges workloads as
+they're applied, so it never touches what's already running, which is the
+promise that keeps a policy commit from turning into a redeploy. But then
+what *is* running that the new rule would refuse? `relish policy audit`
+answers that, and a `relish wtf` row shows the same. It judges every
+committed app and job the way its next apply would be judged, and changes
+nothing. Gatekeeper runs a controller for this; we run the same pure
+function when someone asks.
+
 ## Defaults only fill gaps
 
 The second job admission does in Kubernetes is mutation: fill in a label, add
@@ -1234,6 +1272,80 @@ let current_spec = current.declared_apps.get(app_id).unwrap_or(effective_spec);
 
 `get` returns an `Option<&AppSpec>`, and `unwrap_or` gives the effective spec
 when there's no declared one.
+
+### Jobs, the audit action and `relish policy audit`
+
+([#1119](https://github.com/reliaburger/reliaburger/issues/1119)) Which
+workloads a policy judges is an enum with a default:
+
+```rust
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyTarget {
+    #[default]
+    Apps,
+    Jobs,
+    Both,
+}
+```
+
+and the field that holds it skips itself when it's the default:
+
+```rust
+#[serde(default, skip_serializing_if = "PolicyTarget::is_apps")]
+pub applies_to: PolicyTarget,
+```
+
+`#[default]` on a variant tells `#[derive(Default)]` which one
+`PolicyTarget::default()` returns, and `#[serde(default)]` calls that when
+the TOML leaves the key out. The two together are the whole compatibility
+story for old policies: they parse as `Apps`, and they serialise without
+the key, exactly as before.
+
+Which variables an expression may name now depends on the target, so the
+name check takes it as a parameter:
+
+```rust
+pub fn workload_variables(target: PolicyTarget) -> &'static [&'static str] {
+    match target {
+        PolicyTarget::Apps => &["app", "workload"],
+        PolicyTarget::Jobs => &["job", "workload"],
+        PolicyTarget::Both => &["workload"],
+    }
+}
+```
+
+The return type, `&'static [&'static str]`, is a slice that lives for the
+whole program: each arm returns a reference to an array the compiler bakes
+into the binary, so there's nothing to allocate and nothing to free. It's
+the Rust spelling of a `static const char *[]` in C. `WORKLOAD_FIELDS` is
+the intersection of `APP_FIELDS` and the new `JOB_FIELDS`, and a test checks
+it is exactly that, the same way `APP_FIELDS` is checked against serde.
+
+When the leader judges a workload, the context binds the same value twice,
+once as `app` or `job` and once as `workload`. The policy loop skips a
+policy whose target doesn't cover the workload's kind, using a `matches!`
+over a tuple, `(kind, target)`, with `(_, PolicyTarget::Both)` as the first
+pattern: `_` matches anything, so "both" covers either kind without a
+separate arm per combination.
+
+`PolicyAction` grew an `Audit` variant, and adding it broke the build in
+every `match` that turned an action into words or a list. That's the
+exhaustive `match` from Chapter 1 earning its keep: the compiler listed
+each place that needed a decision about audit findings, and `Verdict` got a
+third list, `audits`, beside `denials` and `warnings`. A `Finding` now also
+carries a `WorkloadKind`, so a refusal says `policy pinned denies job
+default/nightly` rather than calling a job an app.
+
+The audit itself, in `src/policy/audit.rs`, is two functions. `audit` reads
+desired state and gathers what to judge: each app's declared spec where
+the cluster kept one (#1118), otherwise the stored spec with its image read
+back as the tag it was bound from, and each job definition with its
+schedule put back. `audit_workloads` takes plain slices and runs
+`judge_app` and `judge_job` over them, so the unit tests can hand it apps
+and jobs without building a cluster. The route runs it on a copy of
+desired state inside `tokio::task::spawn_blocking`, because judging every
+workload is CPU work that would otherwise hold up an async thread.
 
 ### The exec secret provider
 
@@ -2227,12 +2339,8 @@ The only wire and state change is `provenance` on `AppSpec` and `JobSpec`,
 so it's a line under the 0.2.4 heading in `src/compatibility.rs`, not a
 bump.
 
-Still to come in this walkthrough:
-
-- jobs, the audit action, `relish policy audit` and the `wtf` row
-  ([#1119](https://github.com/reliaburger/reliaburger/issues/1119));
-- the controller contract
-  ([#1125](https://github.com/reliaburger/reliaburger/issues/1125)).
+Still to come in this walkthrough: the controller contract
+([#1125](https://github.com/reliaburger/reliaburger/issues/1125)).
 
 ## Tests
 
@@ -2318,6 +2426,40 @@ added their own:
 - **Through the router**: an apply streams `policy team-label fills env.TEAM
   = "payments"`, stores the filled spec and the declared one, and keeps the
   app's own `memory`.
+
+Jobs and the audit action
+([#1119](https://github.com/reliaburger/reliaburger/issues/1119)):
+
+- **What a policy applies to** (`what_a_policy_applies_to_decides_what_it_judges`)
+  judges one app and one scheduled job, both on `:latest`, by a policy of
+  each kind: no `applies_to`, `jobs`, `both`, an apps policy reading
+  `workload`, and an `audit` policy for both. The first row is the
+  compatibility promise: an old policy still judges the app and only the
+  app.
+- **Every kind of bad job policy** is refused at commit: `job` in an apps
+  policy, `app` in a jobs policy or one for both, `workload.port`, a field
+  jobs don't have, and a default on a jobs policy. One case checks the full
+  message, because it tells the reader which variables they do have.
+- `job_fields_match_the_job_spec` and
+  `workload_fields_are_the_fields_apps_and_jobs_share` keep the two new
+  hand-written lists honest.
+- **The audit** (`the_audit_lists_what_the_policies_would_now_say`) judges
+  two apps and a job and checks each finding, including that the
+  GitOps-owned app is judged as a GitOps sync. Its report is an `insta`
+  snapshot. Another test covers the three quiet answers: every workload
+  passes, there are no policies, and a policy no longer compiles.
+- **Through the router**: a jobs policy refuses a job manifest with 422 and a
+  `policy.denied` record, and writes no job definition; an audit policy lets
+  an apply through, says nothing to the caller, and leaves one
+  `policy.audited` record; and the audit route lists an app committed before
+  a policy that would now refuse it, without changing the app.
+- **`relish wtf`** (`warns_about_committed_workloads_the_policies_would_now_refuse`):
+  denials and audit findings become warnings named by workload, warnings are
+  left to the audit report, a clean audit is an OK, and no policies says
+  nothing.
+- **The portable suite** (`a_new_policy_leaves_running_work_alone_and_the_audit_names_it`)
+  does the same on a real council through the public router: the app's
+  stored spec is unchanged after the policy commits, and the audit names it.
 
 Still to come from the plan:
 

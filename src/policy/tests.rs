@@ -31,7 +31,7 @@ fn decisions(verdict: &Verdict) -> Vec<(String, PolicyAction, String)> {
             (
                 finding.policy.clone(),
                 finding.action,
-                format!("{}/{}", finding.app.namespace, finding.app.name),
+                format!("{}/{}", finding.workload.namespace, finding.workload.name),
             )
         })
         .collect()
@@ -343,6 +343,7 @@ fn spec(match_expression: Option<&str>, deny: &str) -> PolicySpec {
         message: None,
         action: PolicyAction::Deny,
         default: None,
+        applies_to: PolicyTarget::Apps,
     }
 }
 
@@ -516,7 +517,7 @@ fn the_test_report_lists_every_finding_and_the_outcome() {
         "#,
     );
     let evaluation = evaluate(&set, &config, &deployer(), Source::Apply);
-    insta::assert_snapshot!(report::render_test(&evaluation, 2, 2));
+    insta::assert_snapshot!(report::render_test(&evaluation, 2, 0, 2));
 }
 
 #[test]
@@ -524,7 +525,7 @@ fn the_test_report_for_a_clean_config() {
     let set = compile(LIMITS_AND_LATEST);
     let config = apps("[app.web]\nimage = 'web:v1'\n");
     let evaluation = evaluate(&set, &config, &deployer(), Source::Apply);
-    insta::assert_snapshot!(report::render_test(&evaluation, 1, 2));
+    insta::assert_snapshot!(report::render_test(&evaluation, 1, 0, 2));
 }
 
 /// An app for the property tests: a name, a namespace and an image tag,
@@ -914,7 +915,7 @@ fn the_test_report_lists_filled_fields() {
         "#,
     );
     let evaluation = evaluate(&set, &config, &deployer(), Source::Apply);
-    insta::assert_snapshot!(report::render_test(&evaluation, 1, 3));
+    insta::assert_snapshot!(report::render_test(&evaluation, 1, 0, 3));
 }
 
 /// An app for the default property tests: which of the fields the
@@ -1001,6 +1002,7 @@ fn default_policy(match_expression: Option<&str>, default: &str) -> PolicySpec {
         deny: None,
         message: None,
         action: PolicyAction::Deny,
+        applies_to: PolicyTarget::Apps,
         default: Some(
             serde_json::to_value(table)
                 .unwrap()
@@ -1210,5 +1212,322 @@ fn a_default_cannot_claim_a_template_made_an_app() {
     assert!(
         matches!(&error, PolicyError::DefaultField { name, .. } if name == "provenance"),
         "{error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Jobs, the audit action and `relish policy audit` (#1119)
+// ---------------------------------------------------------------------------
+
+/// A decision as `(policy, action, kind and workload)`.
+type WorkloadDecision = (String, PolicyAction, String);
+
+/// Every decision in `verdict`: denials, warnings, then audit findings.
+fn workload_decisions(verdict: &Verdict) -> Vec<WorkloadDecision> {
+    verdict
+        .denials
+        .iter()
+        .chain(&verdict.warnings)
+        .chain(&verdict.audits)
+        .map(|finding| {
+            (
+                finding.policy.clone(),
+                finding.action,
+                format!(
+                    "{} {}/{}",
+                    finding.kind.as_str(),
+                    finding.workload.namespace,
+                    finding.workload.name
+                ),
+            )
+        })
+        .collect()
+}
+
+const WORKLOADS: &str = r#"
+[app.web]
+image = "web:latest"
+
+[job.nightly]
+image = "report:latest"
+schedule = "0 3 * * *"
+"#;
+
+/// The jobs table: which policies judge which workloads, and how each
+/// sees it.
+#[test]
+fn what_a_policy_applies_to_decides_what_it_judges() {
+    let decision =
+        |policy: &str, action, workload: &str| (policy.to_string(), action, workload.to_string());
+    let rows: Vec<(&str, Vec<WorkloadDecision>)> = vec![
+        // A policy without `applies_to` judges apps, as before.
+        (
+            "deny = \"app.image.endsWith(':latest')\"",
+            vec![decision("rule", PolicyAction::Deny, "app default/web")],
+        ),
+        // A jobs policy sees the job as `job`, and only jobs.
+        (
+            "applies_to = 'jobs'\ndeny = \"job.image.endsWith(':latest') && has(job.schedule)\"",
+            vec![decision("rule", PolicyAction::Deny, "job default/nightly")],
+        ),
+        // A policy for both sees each as `workload`.
+        (
+            "applies_to = 'both'\ndeny = \"workload.image.endsWith(':latest')\"",
+            vec![
+                decision("rule", PolicyAction::Deny, "app default/web"),
+                decision("rule", PolicyAction::Deny, "job default/nightly"),
+            ],
+        ),
+        // An apps policy may read `workload` too.
+        (
+            "deny = \"workload.name == 'web'\"",
+            vec![decision("rule", PolicyAction::Deny, "app default/web")],
+        ),
+        // `audit` records, and refuses nothing.
+        (
+            "applies_to = 'both'\naction = 'audit'\ndeny = \"!has(workload.memory)\"",
+            vec![
+                decision("rule", PolicyAction::Audit, "app default/web"),
+                decision("rule", PolicyAction::Audit, "job default/nightly"),
+            ],
+        ),
+    ];
+    for (policy, expected) in rows {
+        let set = compile(&format!("[policy.rule]\n{policy}\n"));
+        let evaluation = evaluate(&set, &apps(WORKLOADS), &deployer(), Source::Apply);
+        assert_eq!(
+            workload_decisions(&evaluation.verdict),
+            expected,
+            "{policy}"
+        );
+    }
+}
+
+#[test]
+fn an_audit_finding_never_refuses_or_warns() {
+    let set = compile(
+        "[policy.limits]\naction = 'audit'\ndeny = '!has(app.memory)'\nmessage = 'set a memory limit'\n",
+    );
+    let verdict = evaluate(&set, &apps(WORKLOADS), &deployer(), Source::Apply).verdict;
+    assert!(verdict.is_allowed());
+    assert!(verdict.warnings.is_empty());
+    assert_eq!(
+        verdict.audits[0].to_string(),
+        "policy limits audits app default/web: set a memory limit"
+    );
+}
+
+#[test]
+fn a_denied_job_is_named_as_a_job() {
+    let config = apps(&format!(
+        "[policy.pinned]\napplies_to = 'jobs'\ndeny = \"job.image.endsWith(':latest')\"\nmessage = 'pin a version'\n{WORKLOADS}"
+    ));
+    let error = admit(
+        &BTreeMap::new(),
+        0,
+        &config,
+        &deployer(),
+        Source::Apply,
+        Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "policy pinned denies job default/nightly: pin a version"
+    );
+}
+
+/// What a policy may read depends on what it applies to, and a default
+/// belongs to an apps policy only.
+#[test]
+fn every_kind_of_bad_job_policy_is_refused_at_commit() {
+    let cases: Vec<(&str, ErrorCheck)> = vec![
+        (
+            "deny = \"job.image == 'x'\"",
+            |e| matches!(e, PolicyError::UnknownVariable { variable, .. } if variable == "job"),
+        ),
+        (
+            "applies_to = 'jobs'\ndeny = \"app.image == 'x'\"",
+            |e| matches!(e, PolicyError::UnknownVariable { variable, .. } if variable == "app"),
+        ),
+        (
+            "applies_to = 'both'\ndeny = \"app.image == 'x'\"",
+            |e| matches!(e, PolicyError::UnknownVariable { variable, .. } if variable == "app"),
+        ),
+        (
+            "applies_to = 'both'\ndeny = 'workload.port == 80'",
+            |e| matches!(e, PolicyError::UnknownField { variable, name, .. } if variable == "workload" && name == "port"),
+        ),
+        (
+            "applies_to = 'jobs'\ndeny = 'job.replicas == 2'",
+            |e| matches!(e, PolicyError::UnknownField { name, .. } if name == "replicas"),
+        ),
+        (
+            "applies_to = 'jobs'\n[policy.rule.default]\nmemory = '1Gi'",
+            |e| matches!(e, PolicyError::DefaultOutsideApps { .. }),
+        ),
+    ];
+    for (body, expected) in cases {
+        let config: Config = toml::from_str(&format!("[policy.rule]\n{body}\n")).unwrap();
+        let error = check_policy("rule", &config.policy["rule"]).unwrap_err();
+        assert!(expected(&error), "{body}: {error}");
+    }
+    let error = check_policy(
+        "rule",
+        &toml::from_str::<Config>("[policy.rule]\ndeny = \"job.image == 'x'\"\n")
+            .unwrap()
+            .policy["rule"],
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("a policy that applies to apps sees only app, workload, caller and source"),
+        "{error}"
+    );
+}
+
+/// `JOB_FIELDS` must name exactly the keys a `[job.*]` table takes, plus
+/// `name`, read from serde's own list as `APP_FIELDS` is.
+#[test]
+fn job_fields_match_the_job_spec() {
+    let error = toml::from_str::<crate::config::JobSpec>("zzz = 1")
+        .unwrap_err()
+        .to_string();
+    let expected = error
+        .split("expected one of ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{error}"));
+    let mut keys: Vec<&str> = expected
+        .split(',')
+        .map(|key| key.trim().trim_matches('`'))
+        .filter(|key| !key.is_empty())
+        .map(|key| key.split('`').next().unwrap_or(key))
+        .collect();
+    keys.push("name");
+    keys.sort();
+    let mut fields: Vec<&str> = JOB_FIELDS.to_vec();
+    fields.sort();
+    assert_eq!(keys, fields);
+}
+
+/// `WORKLOAD_FIELDS` is exactly where apps and jobs meet, less `runtime`,
+/// which is a word both use for different things: an app's kernel knobs
+/// (#1122), a job's execution state.
+#[test]
+fn workload_fields_are_the_fields_apps_and_jobs_share() {
+    let mut shared: Vec<&str> = APP_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| JOB_FIELDS.contains(field) && *field != "runtime")
+        .collect();
+    shared.sort();
+    let mut fields: Vec<&str> = WORKLOAD_FIELDS.to_vec();
+    fields.sort();
+    assert_eq!(shared, fields);
+}
+
+fn committed(name: &str, toml: &str, gitops_owned: bool) -> audit::CommittedApp {
+    audit::CommittedApp {
+        id: AppId::new(name, "default"),
+        spec: toml::from_str(toml).unwrap(),
+        gitops_owned,
+    }
+}
+
+/// The audit judges committed apps and jobs as an apply would, by the
+/// policies in force, and says nothing about what passes.
+#[test]
+fn the_audit_lists_what_the_policies_would_now_say() {
+    let policies = policies(
+        r#"
+        [policy.no-latest]
+        applies_to = "both"
+        deny = "workload.image.endsWith(':latest')"
+        message = "pin a version"
+
+        [policy.limits]
+        action = "audit"
+        deny = "!has(app.memory)"
+
+        [policy.not-from-git]
+        action = "warn"
+        deny = "source == 'gitops'"
+        "#,
+    );
+    let apps_list = vec![
+        committed("api", "image = 'api:v2'\nmemory = '256Mi'", false),
+        committed("web", "image = 'web:latest'", true),
+    ];
+    let jobs = vec![(
+        AppId::new("nightly", "default"),
+        toml::from_str::<crate::config::JobSpec>("image = 'report:latest'\nschedule = '0 3 * * *'")
+            .unwrap(),
+    )];
+    let audit = audit::audit_workloads(&policies, 7, &apps_list, &jobs);
+    assert_eq!(
+        (audit.generation, audit.policies, audit.apps, audit.jobs),
+        (7, 3, 2, 1)
+    );
+    assert_eq!(
+        workload_decisions(&audit.verdict),
+        vec![
+            (
+                "no-latest".into(),
+                PolicyAction::Deny,
+                "app default/web".into()
+            ),
+            (
+                "no-latest".into(),
+                PolicyAction::Deny,
+                "job default/nightly".into()
+            ),
+            // GitOps owns web, so it's judged as a GitOps sync.
+            (
+                "not-from-git".into(),
+                PolicyAction::Warn,
+                "app default/web".into()
+            ),
+            (
+                "limits".into(),
+                PolicyAction::Audit,
+                "app default/web".into()
+            ),
+        ]
+    );
+    insta::assert_snapshot!(report::render_audit(&audit));
+}
+
+#[test]
+fn an_audit_with_nothing_to_report_says_so() {
+    let clean = audit::audit_workloads(
+        &policies("[policy.no-latest]\ndeny = \"app.image.endsWith(':latest')\"\n"),
+        2,
+        &[committed("api", "image = 'api:v2'", false)],
+        &[],
+    );
+    assert!(clean.verdict.is_empty());
+    assert_eq!(
+        report::render_audit(&clean),
+        "Checked 1 app(s) against 1 policy(ies) at generation 2.\n\nEvery committed app and job passes.\n"
+    );
+    let none = audit::audit_workloads(&BTreeMap::new(), 0, &[], &[]);
+    assert_eq!(
+        report::render_audit(&none),
+        "No policies (generation 0): nothing to audit.\n"
+    );
+    let mut broken = BTreeMap::new();
+    broken.insert("old".to_string(), spec(None, "app.name ==="));
+    let audit = audit::audit_workloads(
+        &broken,
+        1,
+        &[committed("api", "image = 'api:v2'", false)],
+        &[],
+    );
+    assert!(
+        audit
+            .broken
+            .as_deref()
+            .is_some_and(|reason| reason.contains("relish policy delete old"))
     );
 }
