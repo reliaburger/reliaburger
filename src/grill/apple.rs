@@ -220,6 +220,12 @@ impl AppleContainerGrill {
             instance: instance.clone(),
             reason: reason.to_string(),
         };
+        if let Some(problem) = spec.runtime_knobs_refusal("Apple Container") {
+            return Err(GrillError::LaunchRefused {
+                instance: instance.clone(),
+                problem,
+            });
+        }
         let mut args: Vec<String> = vec![
             "create".to_string(),
             "--name".to_string(),
@@ -781,6 +787,21 @@ mod tests {
             )
             .is_err()
         );
+        let mut knobbed = spec.clone();
+        knobbed.runtime_knobs =
+            Some(toml::from_str("devices = [{ path = \"/dev/fuse\" }]\n").unwrap());
+        let refusal = AppleContainerGrill::create_command_args(
+            &InstanceId("apple-settings".into()),
+            &knobbed,
+        )
+        .unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("runtime.devices /dev/fuse can't be applied"),
+            "{refusal}"
+        );
+        assert!(refusal.to_string().contains("Apple Container"), "{refusal}");
         unsupported = spec;
         unsupported.mounts[0].source = Some("/tmp/source,target=/escape".into());
         assert!(
@@ -1010,7 +1031,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         let result: Result<(), String> = async {
@@ -1087,7 +1111,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         // Best-effort cleanup of any leftover from an earlier aborted run, so

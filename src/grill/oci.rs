@@ -67,9 +67,25 @@ pub struct OciSpec {
     /// the caller's grace and no pre-stop command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<super::stop::StopPolicy>,
+    /// The app's gated runtime knobs (#1122): added capabilities, sysctls
+    /// and devices. Not part of the OCI runtime spec: only rootful runc
+    /// applies them, writing them into `process.capabilities`,
+    /// `linux.sysctl` and `linux.devices` just before it creates the
+    /// container (see [`super::knobs::apply_to_spec`]). Every other runtime
+    /// refuses a spec that carries them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_knobs: Option<super::knobs::RuntimeKnobs>,
 }
 
 impl OciSpec {
+    /// The refusal a runtime that can't apply runtime knobs (#1122) gives
+    /// this spec, naming its first knob and the `runtime`. `None` when the
+    /// spec carries none.
+    pub fn runtime_knobs_refusal(&self, runtime: &'static str) -> Option<super::LaunchProblem> {
+        let knob = self.runtime_knobs.as_ref()?.uses().next()?;
+        Some(super::LaunchProblem::RuntimeKnobsUnsupported { knob, runtime })
+    }
+
     /// The signal a graceful stop sends this workload.
     pub fn stop_signal(&self) -> super::stop::StopSignal {
         super::stop::StopPolicy::signal_of(self.stop.as_ref())
@@ -221,6 +237,46 @@ pub struct OciLinux {
     pub uid_mappings: Option<Vec<OciIdMapping>>,
     #[serde(rename = "gidMappings", skip_serializing_if = "Option::is_none")]
     pub gid_mappings: Option<Vec<OciIdMapping>>,
+    /// Sysctls runc writes inside the container's namespaces (#1122).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sysctl: BTreeMap<String, String>,
+    /// Device nodes runc creates or binds in the container (#1122).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<OciDevice>,
+}
+
+/// A device node in the container (the OCI `linux.devices` entry).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciDevice {
+    pub path: PathBuf,
+    /// `c` for a character device, `b` for a block device.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub major: i64,
+    pub minor: i64,
+    #[serde(rename = "fileMode", default, skip_serializing_if = "Option::is_none")]
+    pub file_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
+}
+
+/// A cgroup device controller rule (the OCI `linux.resources.devices`
+/// entry). runc denies every device but its defaults, so a passed-in
+/// device needs an allow rule as well as its node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciDeviceRule {
+    pub allow: bool,
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub major: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minor: Option<i64>,
+    /// Some subset of `rwm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
 }
 
 impl OciLinux {
@@ -285,7 +341,7 @@ pub struct OciNamespace {
 /// The `cpu`/`memory` blocks carry the *hard* limits (quota and OOM
 /// ceiling). Resource *requests* have no dedicated field in the classic
 /// OCI schema, so they ride in `unified` — see that field's doc comment.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OciResources {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<OciCpuResources>,
@@ -312,6 +368,9 @@ pub struct OciResources {
     /// omitted so specs without requests are unchanged.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub unified: BTreeMap<String, String>,
+    /// Allow rules for devices passed in with runtime knobs (#1122).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<OciDeviceRule>,
 }
 
 /// CPU resource limits.
@@ -443,12 +502,15 @@ pub fn generate_oci_spec_with_decryptor(
             cgroups_path: Some(hierarchy_cgroup_path(cgroup_path)),
             uid_mappings: None,
             gid_mappings: None,
+            sysctl: Default::default(),
+            devices: Vec::new(),
         },
         port_mapping: host_port.zip(spec.port).map(|(hp, cp)| PortMapping {
             host_port: hp,
             container_port: cp,
         }),
         stop: super::stop::StopPolicy::from_app(spec),
+        runtime_knobs: spec.runtime.clone().filter(|knobs| !knobs.is_empty()),
     })
 }
 
@@ -777,6 +839,7 @@ fn build_resources_from_ranges(
             cpu: cpu_res,
             memory: memory_res,
             unified,
+            devices: Vec::new(),
         })
     } else {
         None
@@ -838,6 +901,7 @@ pub fn generate_job_oci_spec(
                 memory: None,
                 pids: None,
                 unified: BTreeMap::new(),
+                devices: Vec::new(),
             })
             .pids = Some(OciPidsResources {
             limit: i64::from(limit.get()),
@@ -883,10 +947,13 @@ pub fn generate_job_oci_spec(
             cgroups_path: Some(hierarchy_cgroup_path(cgroup_path)),
             uid_mappings: None,
             gid_mappings: None,
+            sysctl: Default::default(),
+            devices: Vec::new(),
         },
         // Jobs run to completion and don't publish ports.
         port_mapping: None,
         stop: None,
+        runtime_knobs: None,
     }
 }
 
@@ -940,10 +1007,13 @@ pub fn generate_init_oci_spec(
             cgroups_path: app.linux.cgroups_path.clone(),
             uid_mappings: None,
             gid_mappings: None,
+            sysctl: Default::default(),
+            devices: Vec::new(),
         },
         // Init containers run before the app and don't publish ports.
         port_mapping: None,
         stop: None,
+        runtime_knobs: None,
     }
 }
 

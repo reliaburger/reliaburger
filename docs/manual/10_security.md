@@ -183,7 +183,7 @@ do only what the block lists:
 | `deploy` | apply, delete and roll back the listed apps, cancel their deploys, create, restore and delete their volume snapshots, and `relish build` images that push to them |
 | `scale` | stop the listed apps |
 | `exec` | `relish exec` into the listed apps |
-| `host-exec` | jobs and process workloads that run host commands, and apps with a host-path `source` on a volume or `config_file` (each node also needs an allowlist entry, and mounts the resolved path it checked; see `images-and-volumes`) |
+| `host-exec` | jobs and process workloads that run host commands, apps with a host-path `source` on a volume or `config_file` (each node also needs an allowlist entry, and mounts the resolved path it checked; see `images-and-volumes`), and apps with `[runtime]` knobs (each node also lists each knob; see "Runtime knobs" below) |
 | `fault` | `relish fault` inject and clear on the listed apps; node faults and clearing every fault need it with `apps = ["*"]` and no `namespaces` |
 | `logs` | the listed apps' logs: `relish logs`, follow, WebSocket stream, entries |
 | `metrics` | the listed apps' metrics and charts, and their rows in `relish top` |
@@ -241,6 +241,87 @@ a node's poll for its placements and its report that a rollout failed (see
 which is less than an anonymous caller can already do in that window. The
 moment the cluster has a master key or a first token, both need the service
 token again.
+
+## Runtime knobs
+
+Some apps need a little more from the kernel than a container gets by
+default. A load balancer wants a bigger `net.core.somaxconn`, a VPN client
+wants `CAP_NET_ADMIN` and `/dev/net/tun`, a FUSE filesystem wants
+`/dev/fuse`. An app asks for these in its `[runtime]` table:
+
+```toml
+[app.vpn]
+image = "ghcr.io/example/vpn:2.0"
+
+[app.vpn.runtime]
+capabilities = ["NET_ADMIN"]
+sysctls = { "net.ipv4.ip_forward" = "1", "net.core.somaxconn" = "4096" }
+devices = [{ path = "/dev/net/tun", permissions = "rw" }]
+```
+
+Each use needs two keys, the same two a host-path `source` needs:
+
+- **The node** must list it under `[runtime]` in its `node.toml`. Every list
+  is empty by default, so a node allows nothing until you say so.
+- **The token** must carry `host-exec` when it has a `[permission]` block.
+
+```toml
+[runtime]
+allowed_capabilities = ["NET_ADMIN"]
+allowed_sysctls = ["net.ipv4.ip_forward", "net.core.*"]
+allowed_devices = ["/dev/net/tun"]
+```
+
+`apply` checks the token. A deploy-only token is refused before anything is
+written, with a reason that names the knob:
+
+```text
+app.vpn: runtime.capabilities CAP_NET_ADMIN refused by the token gate: a runtime knob needs the host-exec permission, and this token's permission doesn't grant it
+```
+
+The node checks its own list. Each node advertises what it allows, and the
+scheduler places the app only on a node that allows every knob it asks for.
+If none does, the app stays unplaced and `relish wtf` says no node can run
+it. A node that's asked anyway (on a standalone node, or after you've
+shortened its list) refuses the deploy and names the key it's missing:
+
+```text
+runtime.devices /dev/net/tun refused by the node gate: this node's [runtime] allowed_devices in node.toml doesn't list it
+```
+
+Only rootful runc applies knobs. A node on the process runtime, Apple
+Container or rootless runc advertises none, whatever its `[runtime]` says,
+and refuses an app that has them rather than running it without them. An
+`exec` or `script` app runs on the host, so it can't have knobs at all.
+
+What each kind accepts:
+
+- **`capabilities`**: Linux capability names, with or without `CAP_`
+  (`NET_ADMIN` and `CAP_NET_ADMIN` are the same). They're added to the
+  container's default set; nothing is dropped. There's no wildcard: `ALL`
+  is refused on both sides. The node names each capability, and the ones
+  that amount to root inside the container (`CAP_SYS_ADMIN`,
+  `CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, `CAP_SYS_PTRACE`, `CAP_SYS_BOOT`,
+  `CAP_DAC_READ_SEARCH`, `CAP_MAC_ADMIN`, `CAP_MAC_OVERRIDE`, `CAP_BPF` and
+  `CAP_PERFMON`) are allowed only when listed by name. Bun warns at startup
+  for each one it finds. A container's root is still an unprivileged user on
+  the host (see `images-and-volumes`), so these act on the container's own
+  namespaces. As in Docker and Kubernetes, a capability reaches a process
+  that runs as root in the container; a non-root user needs file
+  capabilities on its binary.
+- **`sysctls`**: only the ones the kernel keeps per container: `net.*`,
+  `kernel.shm*`, `kernel.msg*`, `kernel.sem` and `fs.mqueue.*`. Anything
+  else, `kernel.panic` or `vm.overcommit_memory` say, would change the whole
+  node, so it's refused at `lint` and `apply`, and a node can't list it
+  either. A node may list exact names or a `net.` or `fs.mqueue.` prefix
+  ending in `.*`.
+- **`devices`**: an absolute path under `/dev` and its `permissions`, some
+  of `r`, `w` and `m` (default `rwm`). The device appears at the same path
+  in the container, and the cgroup lets the container use it with those
+  permissions. The file's own mode still applies to the container's mapped
+  user, so a device that only root or a group can open needs a mode or a
+  udev rule that lets the container in. `/dev/fuse` and `/dev/net/tun` are
+  `0666` on most distributions.
 
 ## Audit log
 

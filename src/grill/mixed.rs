@@ -727,6 +727,9 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     fn honours_cgroup_path(&self) -> bool {
         self.container.honours_cgroup_path()
     }
+    fn applies_runtime_knobs(&self) -> bool {
+        self.container.applies_runtime_knobs()
+    }
     fn honours_cgroup_path_for(&self, spec: &OciSpec) -> bool {
         if spec.host_process {
             self.host.places_host_processes()
@@ -1112,6 +1115,7 @@ mod tests {
             cpu: None,
             memory: None,
             unified: Default::default(),
+            devices: Vec::new(),
         });
         assert!(runtime.create(&id, &limited).await.is_err());
         assert!(runtime.host.calls().is_empty());

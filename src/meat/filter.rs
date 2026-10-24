@@ -39,6 +39,9 @@ pub struct WorkloadRequirements {
     /// The secret providers the app's env names (`PROVIDER[name:...]`): the
     /// node must run every one (#1123).
     pub secret_providers: std::collections::BTreeSet<crate::sesame::secret_provider::ProviderName>,
+    /// The runtime knobs the app asks for in `[app.x.runtime]`: the node's
+    /// advertised allowlist must admit every one (#1122).
+    pub runtime_knobs: crate::grill::knobs::RuntimeKnobs,
 }
 
 impl WorkloadRequirements {
@@ -68,6 +71,7 @@ impl WorkloadRequirements {
                 .filter_map(|value| value.provider_reference())
                 .map(|reference| reference.provider().clone())
                 .collect(),
+            runtime_knobs: spec.runtime.clone().unwrap_or_default(),
         }
     }
 }
@@ -112,8 +116,9 @@ pub fn host_pre_stop_binary(spec: &AppSpec) -> Option<&Path> {
 
 /// Whether `node` can run a workload with these requirements, room and
 /// labels aside: it's ready, runs containers when the workload is one, and
-/// can enforce egress, resolve internal DNS, run the host binary and call
-/// the secret providers when the workload needs them.
+/// can enforce egress, resolve internal DNS, run the host binary, call the
+/// secret providers and apply the runtime knobs when the workload needs
+/// them.
 pub fn node_can_run(node: &SchedulerNodeState, requirements: &WorkloadRequirements) -> bool {
     node.ready
         && runs_its_kind(node, requirements)
@@ -126,6 +131,10 @@ pub fn node_can_run(node: &SchedulerNodeState, requirements: &WorkloadRequiremen
         && requirements
             .secret_providers
             .is_subset(&node.capabilities.secret_providers)
+        && node
+            .capabilities
+            .runtime_knobs
+            .admits(&requirements.runtime_knobs)
 }
 
 /// Whether `node` runs this kind of workload at all: a container needs a
@@ -264,6 +273,7 @@ mod tests {
                 host_binaries: Vec::new(),
                 requires_containers: false,
                 secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
             },
             &cluster,
         );
@@ -300,6 +310,7 @@ mod tests {
                 host_binaries: Vec::new(),
                 requires_containers: false,
                 secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
             },
             &cluster,
         );
@@ -323,6 +334,7 @@ mod tests {
                 host_binaries: Vec::new(),
                 requires_containers: false,
                 secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
             },
             &cluster,
         );
@@ -353,6 +365,7 @@ mod tests {
                 host_binaries: Vec::new(),
                 requires_containers: false,
                 secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
             },
             &cluster,
         );
@@ -391,6 +404,7 @@ mod tests {
                 host_binaries: Vec::new(),
                 requires_containers: false,
                 secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
             },
             &cluster,
         );
@@ -444,6 +458,7 @@ mod tests {
                 host_binaries: Vec::new(),
                 requires_containers: false,
                 secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
             },
             &cluster,
         );
@@ -497,6 +512,61 @@ mod tests {
         let plain: AppSpec = toml::from_str("image = \"api:1\"\n").unwrap();
         let anywhere = filter_nodes(&WorkloadRequirements::for_app(&plain, false), &cluster);
         assert_eq!(anywhere.len(), 3);
+    }
+
+    /// #1122: an app that asks for runtime knobs lands only on a node whose
+    /// advertised `[runtime]` allowlist admits every one of them. A node
+    /// whose runtime can't apply knobs advertises an empty allowlist.
+    #[test]
+    fn an_app_with_runtime_knobs_lands_only_where_the_node_allows_them() {
+        let allowing = |toml_source: &str| {
+            crate::config::NodeConfig::parse(toml_source)
+                .unwrap()
+                .runtime
+                .knob_allowlist()
+        };
+        let mut cluster = ClusterStateCache::new();
+        let mut fuse = node_state("fuse", 2000, 4096, BTreeMap::new(), true);
+        fuse.capabilities.runtime_knobs = allowing(
+            "[runtime]\nallowed_capabilities = [\"SYS_ADMIN\"]\nallowed_devices = [\"/dev/fuse\"]\n",
+        );
+        cluster.set_node(fuse);
+        let mut network = node_state("network", 2000, 4096, BTreeMap::new(), true);
+        network.capabilities.runtime_knobs = allowing(
+            "[runtime]\nallowed_capabilities = [\"NET_ADMIN\"]\nallowed_sysctls = [\"net.*\"]\n",
+        );
+        cluster.set_node(network);
+        cluster.set_node(node_state("plain", 2000, 4096, BTreeMap::new(), true));
+
+        let tuned: AppSpec = toml::from_str(
+            "image = \"lb:1\"\n[runtime]\ncapabilities = [\"NET_ADMIN\"]\n\
+             sysctls = { \"net.core.somaxconn\" = \"4096\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            filter_nodes(&WorkloadRequirements::for_app(&tuned, false), &cluster),
+            vec![NodeId::new("network")]
+        );
+
+        // Each knob must be allowed: SYS_ADMIN alone isn't enough for fuse
+        // plus a sysctl the fuse node doesn't list.
+        let mixed: AppSpec = toml::from_str(
+            "image = \"fs:1\"\n[runtime]\ncapabilities = [\"SYS_ADMIN\"]\n\
+             devices = [{ path = \"/dev/fuse\" }]\nsysctls = { \"net.core.somaxconn\" = \"1\" }\n",
+        )
+        .unwrap();
+        let requirements = WorkloadRequirements::for_app(&mixed, false);
+        assert!(filter_nodes(&requirements, &cluster).is_empty());
+        assert_eq!(
+            unplaced_reason(&requirements, &cluster),
+            UnplacedReason::NoCapableNode
+        );
+
+        let plain: AppSpec = toml::from_str("image = \"api:1\"\n[runtime]\n").unwrap();
+        assert_eq!(
+            filter_nodes(&WorkloadRequirements::for_app(&plain, false), &cluster).len(),
+            3
+        );
     }
 
     /// #702: nodes with different `[process_workloads]` policies. An exec

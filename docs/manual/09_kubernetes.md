@@ -57,6 +57,18 @@ the grace, while Reliaburger gives `pre_stop` its own bound
 `pre_stop` gets a warning saying so. `relish export` maps the same three back;
 `pre_stop_timeout` has no Kubernetes field and is listed as unsupported.
 
+Runtime knobs come across where they map (see `security`). The container's
+`securityContext.capabilities.add` becomes `capabilities`, the pod's
+`securityContext.sysctls` becomes `sysctls`, and a `hostPath` volume of a
+device (a path under `/dev` with type `CharDevice`, `BlockDevice` or none)
+becomes a device with the default `rwm`. A capability Linux doesn't know, a
+sysctl that isn't namespaced, `capabilities.drop` and `privileged: true` are
+reported instead. Every imported knob gets a warning too, because it needs
+`host-exec` and a node that lists it. `relish export` writes them back the
+same way, a device as a `hostPath` mount, and lists devices as unsupported:
+Kubernetes only lets a pod use a device through a device plugin or a
+privileged container, and has nowhere to keep the permissions.
+
 Services attach the way Kubernetes routes them: a Service belongs to every
 workload in its namespace whose pod template labels include all of its
 `selector`, whatever the two are called. An app answers only to its own name,
@@ -72,7 +84,7 @@ The report warns about everything it approximates or drops. The usual ones:
 
 - sidecars: only the first container is imported;
 - pod volumes and `fsGroup`: declare Reliaburger volumes instead. A `hostPath`
-  volume gets a warning of its own, because its replacement, a hand-written
+  volume that isn't a device gets a warning of its own, because its replacement, a hand-written
   `source`, needs the `host-exec` permission and a `[storage]
   allowed_host_paths` entry on every node that runs it (see
   `images-and-volumes`);

@@ -487,6 +487,32 @@ pub async fn setup_container_network_with_commands(
     })
 }
 
+/// Write an app's network sysctls (#1122) into the namespace
+/// [`setup_container_network_with_commands`] made for `instance_id`.
+///
+/// The namespace belongs to the node's user namespace, not the container's,
+/// so container root can't write them and runc writing them from inside
+/// would fail. The node can, as it does for the low-ports sysctls above.
+pub async fn write_sysctls_with_commands(
+    executor: &impl RuntimeCommandExecutor,
+    instance_id: &InstanceId,
+    sysctls: &std::collections::BTreeMap<String, String>,
+) -> Result<(), NetnsError> {
+    let ns_name = format!("rb-{}", instance_id.0);
+    for (name, value) in sysctls {
+        let setting = format!("{name}={value}");
+        run_cmd(
+            executor,
+            "ip",
+            &["netns", "exec", &ns_name, "sysctl", "-w", &setting],
+            instance_id,
+            "write the app's network sysctl",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Recover an existing rootful network only when the live container owns it.
 /// The address comes from the kernel, not a guessed allocation or stale record.
 pub async fn adopt_container_network(

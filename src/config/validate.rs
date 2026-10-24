@@ -448,6 +448,19 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
 
     validate_app_stop(name, app)?;
 
+    // Runtime knobs change a container's own kernel settings (#1122). A
+    // host app runs on the node itself, so there is no container for them
+    // to change.
+    if crate::meat::filter::host_binary(app).is_some() && app.runtime_knob_uses().next().is_some() {
+        return Err(ConfigError::Validation {
+            field: "runtime".to_string(),
+            context: format!("app {name:?}"),
+            reason: "runtime knobs apply to a container; an exec or script app runs on the \
+                     host, so give it an image or drop [runtime]"
+                .to_string(),
+        });
+    }
+
     // Autoscale block: bounds, windows and threshold are validated up front
     // so a bad `[autoscale]` fails the deploy instead of silently clamping
     // at runtime (DEP8). An unsupported metric, or one the app has no request
@@ -1477,6 +1490,42 @@ mod tests {
             stop_refusal("exec = \"/bin/sleep\"\npre_stop = [\"/bin/echo\", \"bye\"]\n"),
             None
         );
+    }
+
+    #[test]
+    fn runtime_knobs_on_a_container_app_validate() {
+        assert_eq!(
+            stop_refusal(
+                "image = \"web:v1\"\n[runtime]\ncapabilities = [\"NET_ADMIN\"]\n\
+                 sysctls = { \"net.core.somaxconn\" = \"1024\" }\n\
+                 devices = [{ path = \"/dev/fuse\" }]\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_knobs_on_a_host_app_are_refused() {
+        for host in ["exec = \"/bin/sleep\"", "script = \"sleep 1\""] {
+            let (field, reason) = stop_refusal(&format!(
+                "{host}\n[runtime]\ncapabilities = [\"NET_ADMIN\"]\n"
+            ))
+            .unwrap();
+            assert_eq!(field, "runtime");
+            assert!(reason.contains("container"), "{reason}");
+        }
+        // An empty table asks for nothing, so it's harmless anywhere.
+        assert_eq!(stop_refusal("exec = \"/bin/sleep\"\n[runtime]\n"), None);
+    }
+
+    #[test]
+    fn a_host_wide_sysctl_fails_the_whole_config_at_parse() {
+        let error = Config::parse(
+            "[app.web]\nimage = \"web:v1\"\n[app.web.runtime]\nsysctls = { \"kernel.panic\" = \"1\" }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("isn't namespaced"), "{error}");
     }
 
     #[test]

@@ -1321,6 +1321,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.supervisor.set_host_path_policy(policy);
     }
 
+    /// Thread the `[runtime]` knob allowlist from `node.toml` into the
+    /// supervisor (#1122). Without this every runtime knob is refused.
+    pub fn set_runtime_allowlist(&mut self, allowlist: crate::grill::knobs::RuntimeAllowlist) {
+        self.supervisor.set_runtime_allowlist(allowlist);
+    }
+
     /// Thread the parsed `[smoker]` duration limits in, so faults are bounded
     /// by config rather than only the hardcoded 24h backstop.
     pub fn set_smoker_config(&mut self, config: crate::smoker::config::SmokerConfig) {

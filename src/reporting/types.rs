@@ -357,6 +357,13 @@ mod tests {
                 )
                 .unwrap()]
                 .into(),
+                runtime_knobs: crate::config::NodeConfig::parse(
+                    "[runtime]\nallowed_capabilities = [\"NET_ADMIN\"]\n\
+                     allowed_sysctls = [\"net.*\"]\nallowed_devices = [\"/dev/fuse\"]\n",
+                )
+                .unwrap()
+                .runtime
+                .knob_allowlist(),
             },
             egress_enforcement: vec![EgressEnforcementEvidence {
                 app_name: "web".to_string(),
@@ -375,6 +382,9 @@ mod tests {
         assert!(decoded.capabilities.egress.can_enforce_allowlist());
         assert!(decoded.capabilities.dns.can_resolve_internal());
         assert_eq!(decoded.capabilities.secret_providers.len(), 1);
+        assert_eq!(decoded.capabilities.runtime_knobs.capabilities.len(), 1);
+        assert_eq!(decoded.capabilities.runtime_knobs.sysctls.len(), 1);
+        assert_eq!(decoded.capabilities.runtime_knobs.devices.len(), 1);
         assert_eq!(
             decoded.egress_enforcement[0].status,
             EgressEnforcementStatus::Enforced

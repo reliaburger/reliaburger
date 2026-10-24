@@ -290,6 +290,8 @@ cluster's public key. Workloads get SPIFFE certificates, API tokens carry
 roles and namespace scopes, and the registry can refuse unsigned images.
 Every apply binds image tags to digests, so a moved tag can't change what runs,
 and node config can limit which upstream registries images may come from.
+An app that needs an extra capability, a namespaced sysctl or a host device
+gets it only where the node allows it and the token carries `host-exec`.
 
 **Tenants kept apart.** Namespaces can't reach each other, at a virtual IP or
 at a real address, unless an app or job's `allow_from` lets a named caller
