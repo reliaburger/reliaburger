@@ -212,6 +212,10 @@ pub struct DesiredAppEvidence {
     /// spec is applied. `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_failed: Option<crate::meat::deploy_types::RolloutFailure>,
+    /// The token that manages the app, when a controller owns it (#1125).
+    /// A controller reads this to find the apps it claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 /// Current diagnostics wire schema.

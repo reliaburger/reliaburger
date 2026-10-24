@@ -156,8 +156,10 @@ pub fn spawn_gitops_sync(
                 continue;
             }
             let current_apps = desired.apps.clone();
+            let declared_apps = desired.declared_apps.clone();
             let current_namespaces = desired.namespaces.clone();
             let current_permissions = desired.permissions.clone();
+            let current_policies = desired.policies.clone();
             let owned = desired.gitops_owned.clone();
             let overrides = desired.autoscale_overrides.clone();
             let last_sha = desired
@@ -191,8 +193,10 @@ pub fn spawn_gitops_sync(
                 )?;
                 let current = CurrentState {
                     apps: &current_apps,
+                    declared_apps: &declared_apps,
                     namespaces: &current_namespaces,
                     permissions: &current_permissions,
+                    policies: &current_policies,
                     owned: &owned,
                 };
                 Ok::<_, LettuceError>(execute_sync(
@@ -662,12 +666,19 @@ fn now_millis() -> u64 {
 pub struct ApplyReport {
     /// Writes the cluster committed.
     pub applied: usize,
-    /// Every change that didn't apply, as `resource_id: reason`.
+    /// Every change that didn't apply, as `resource_id: reason`. A change
+    /// a policy refused names the policy.
     pub refused: Vec<String>,
+    /// What `warn` policies said about the apps that applied.
+    pub warnings: Vec<String>,
     /// Set when leadership changed part-way and the sync stopped: the
     /// remaining changes belong to the next leader's sync.
     pub abandoned: Option<String>,
 }
+
+/// How many times one app is evaluated again after the policy set moved
+/// under it, before the sync gives up on it until the next tick.
+const POLICY_ATTEMPTS: usize = 3;
 
 /// Apply a sync's changes to Raft, every one of them (#693, finding 4).
 ///
@@ -679,6 +690,12 @@ pub struct ApplyReport {
 /// advance `last_applied_commit` only when nothing was refused: that's the
 /// D12 guarantee that the next tick re-applies the (idempotent) set.
 ///
+/// Every added or changed app is first judged by the policies in force
+/// (#1117), the same ones `relish apply` uses, and its write is fenced on
+/// the policy generation it was judged under. A denied app is refused,
+/// naming the policy, and the rest still apply. When the policy set moves
+/// between judging and committing, the app is judged again.
+///
 /// When the term moves, or this node stops leading, the sync is abandoned
 /// at once rather than applying the rest of a stale diff.
 pub async fn apply_changes(
@@ -688,40 +705,58 @@ pub async fn apply_changes(
     binder: Option<&ImageBinder>,
 ) -> ApplyReport {
     let mut report = ApplyReport::default();
+    let mut policies = PolicyCache::default();
     for change in changes {
         if let Some(reason) = leadership_moved(council, term).await {
             report.abandoned = Some(reason);
             return report;
         }
-        let Some(mut request) = change_to_request(change) else {
+        let Some(request) = change_to_request(change) else {
             continue; // jobs/builds: not reconciled desired state
         };
         let adopting = matches!(change, ResourceChange::Adopt { .. });
-        if let (Some(binder), RaftRequest::AppSpec { app_id, spec }, false) =
-            (binder, &mut request, adopting)
-        {
-            let catalog = council.manifest_catalog().await;
-            match binder.bind_app(&app_id.name, spec, &catalog).await {
-                Ok(bindings) => {
-                    for binding in bindings {
-                        println!("gitops: {binding}");
+        // Policies judge what git declares, before an image is bound, the
+        // way `relish policy test` sees it. An adopted app changes nothing,
+        // and a new policy never touches what already runs.
+        let outcome = match (request, adopting) {
+            (RaftRequest::AppSpec { app_id, spec }, false) => {
+                let app = JudgedApp {
+                    term,
+                    binder,
+                    app_id: &app_id,
+                    declared: &spec,
+                };
+                match write_judged_app(council, &mut policies, app).await {
+                    Judged::Written { outcome, warnings } => {
+                        report.warnings.extend(warnings);
+                        outcome
+                    }
+                    Judged::Refused(reason) => {
+                        report
+                            .refused
+                            .push(format!("{}: {reason}", change_id(change)));
+                        continue;
+                    }
+                    Judged::Unbound(error) => {
+                        report
+                            .refused
+                            .push(format!("{} ({error})", change_id(change)));
+                        continue;
                     }
                 }
-                Err(error) => {
-                    report
-                        .refused
-                        .push(format!("{} ({error})", change_id(change)));
-                    continue;
-                }
             }
-        }
-        let write = RaftRequest::GitOpsWrite {
-            term,
-            change: Box::new(request),
+            (request, _) => {
+                council
+                    .write(RaftRequest::GitOpsWrite {
+                        term,
+                        change: Box::new(request),
+                    })
+                    .await
+            }
         };
         // A committed entry the state machine refused left desired state
         // unchanged, so it's as unapplied as a failed write (B15).
-        match council.write(write).await {
+        match outcome {
             Ok(CouncilResponse::Refused { reason }) => {
                 if let Some(moved) = leadership_moved(council, term).await {
                     report.abandoned = Some(moved);
@@ -746,6 +781,164 @@ pub async fn apply_changes(
     report
 }
 
+/// The policies last read from desired state, compiled, with the
+/// generation they were read at, so a sync compiles each set once.
+#[derive(Default)]
+struct PolicyCache {
+    compiled: Option<(
+        u64,
+        Result<crate::policy::PolicySet, crate::policy::AdmitError>,
+    )>,
+}
+
+impl PolicyCache {
+    /// The policies in force and their generation, read together.
+    async fn current(
+        &mut self,
+        council: &CouncilNode,
+    ) -> (
+        u64,
+        &Result<crate::policy::PolicySet, crate::policy::AdmitError>,
+    ) {
+        let generation = council
+            .read_desired(|desired| desired.policy_generation)
+            .await;
+        let fresh = match self.compiled.take() {
+            Some((at, set)) if at == generation => (at, set),
+            _ => {
+                let (at, specs) = council
+                    .read_desired(|desired| (desired.policy_generation, desired.policies.clone()))
+                    .await;
+                (at, crate::policy::PolicySet::compile(&specs))
+            }
+        };
+        let (at, set) = self.compiled.insert(fresh);
+        (*at, set)
+    }
+}
+
+/// What judging and writing one app did.
+enum Judged {
+    /// The write was proposed; `outcome` is what the council said.
+    Written {
+        outcome: Result<CouncilResponse, crate::council::CouncilError>,
+        warnings: Vec<String>,
+    },
+    /// A policy refused the app, or the policy set kept moving.
+    Refused(String),
+    /// The app's image couldn't be bound to a digest.
+    Unbound(String),
+}
+
+/// One app a sync adds or changes, as git declares it.
+struct JudgedApp<'a> {
+    /// The term the sync read desired state in.
+    term: u64,
+    /// Binds the app's images to digests, when the cluster has a registry.
+    binder: Option<&'a ImageBinder>,
+    /// The app's identity.
+    app_id: &'a crate::meat::types::AppId,
+    /// Its spec, as git declares it.
+    declared: &'a crate::config::AppSpec,
+}
+
+/// Judge one app by the policies in force, fill in their defaults, bind
+/// its images and write it fenced on their generation, judging again when
+/// the set moves before the write commits. A defaulted app's write
+/// carries its declared spec, so the next sync diffs git against that.
+async fn write_judged_app(
+    council: &CouncilNode,
+    policies: &mut PolicyCache,
+    app: JudgedApp<'_>,
+) -> Judged {
+    let caller = crate::policy::Caller::gitops();
+    for _ in 0..POLICY_ATTEMPTS {
+        let (generation, set) = policies.current(council).await;
+        let set = match set {
+            Ok(set) => set,
+            Err(error) => return Judged::Refused(error.to_string()),
+        };
+        let judgement = crate::policy::judge_app(
+            set,
+            app.app_id,
+            app.declared,
+            &caller,
+            crate::policy::Source::GitOps,
+        );
+        if !judgement.verdict.is_allowed() {
+            let denials: Vec<String> = judgement
+                .verdict
+                .denials
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            eprintln!("gitops: {}", denials.join("; "));
+            return Judged::Refused(denial_reason(&judgement.verdict.denials));
+        }
+        let warnings: Vec<String> = judgement
+            .verdict
+            .warnings
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        for filled in &judgement.filled {
+            println!("gitops: {filled}");
+        }
+        // An audit finding goes to the node's log; `relish policy audit`
+        // lists it while the app breaks the rule (#1119).
+        for audited in &judgement.verdict.audits {
+            eprintln!("gitops: audit: {audited}");
+        }
+        let mut spec = judgement.spec;
+        if let Some(binder) = app.binder {
+            let catalog = council.manifest_catalog().await;
+            match binder.bind_app(&app.app_id.name, &mut spec, &catalog).await {
+                Ok(bindings) => {
+                    for binding in bindings {
+                        println!("gitops: {binding}");
+                    }
+                }
+                Err(error) => return Judged::Unbound(error.to_string()),
+            }
+        }
+        // What git declared rides along when the stored spec differs from
+        // it, by a default or a bound image (#1118).
+        let declared = (spec != *app.declared).then(|| Box::new(app.declared.clone()));
+        let fenced = RaftRequest::PolicyFenced {
+            generation,
+            change: Box::new(RaftRequest::GitOpsWrite {
+                term: app.term,
+                change: Box::new(RaftRequest::AppSpec {
+                    app_id: app.app_id.clone(),
+                    spec: Box::new(spec),
+                }),
+            }),
+            declared,
+        };
+        match council.write(fenced).await {
+            Ok(CouncilResponse::PolicyGenerationMoved { .. }) => continue,
+            outcome => {
+                for warning in &warnings {
+                    println!("gitops: warning: {warning}");
+                }
+                return Judged::Written { outcome, warnings };
+            }
+        }
+    }
+    Judged::Refused(format!(
+        "the policies changed {POLICY_ATTEMPTS} times while it was being applied; the next sync tries again"
+    ))
+}
+
+/// How the partial sync result names the policies that refused an app.
+fn denial_reason(denials: &[crate::policy::Finding]) -> String {
+    let reasons: Vec<String> = denials
+        .iter()
+        .map(|finding| format!("denied by policy {}: {}", finding.policy, finding.message))
+        .collect();
+    reasons.join("; ")
+}
+
 /// Why this node may no longer apply a sync read in `term`, if it can't.
 async fn leadership_moved(council: &CouncilNode, term: u64) -> Option<String> {
     let current = council.current_term();
@@ -764,8 +957,8 @@ async fn leadership_moved(council: &CouncilNode, term: u64) -> Option<String> {
 ///
 /// Returns `None` for kinds that aren't reconciled desired state (jobs,
 /// builds) — those carry a `Generic` payload, so their add/update yields
-/// nothing to write. Every declarative kind (app, namespace, permission)
-/// maps to a real write for both add/update and remove.
+/// nothing to write. Every declarative kind (app, namespace, permission,
+/// policy) maps to a real write for both add/update and remove.
 fn change_to_request(change: &ResourceChange) -> Option<RaftRequest> {
     match change {
         ResourceChange::Add { resource_id, spec }
@@ -800,6 +993,10 @@ fn payload_to_request(resource_id: &str, payload: &ChangePayload) -> Option<Raft
             name: resource_id.strip_prefix("permission.")?.to_string(),
             spec: spec.clone(),
         }),
+        ChangePayload::Policy(spec) => Some(RaftRequest::PolicySpec {
+            name: resource_id.strip_prefix("policy.")?.to_string(),
+            spec: spec.clone(),
+        }),
         // Jobs (run to completion) and builds (imperative) aren't
         // reconciled desired state; nothing to write.
         ChangePayload::Generic => None,
@@ -818,6 +1015,11 @@ fn remove_to_request(resource_id: &str) -> Option<RaftRequest> {
     }
     if let Some(name) = resource_id.strip_prefix("permission.") {
         return Some(RaftRequest::PermissionDelete {
+            name: name.to_string(),
+        });
+    }
+    if let Some(name) = resource_id.strip_prefix("policy.") {
+        return Some(RaftRequest::PolicyDelete {
             name: name.to_string(),
         });
     }

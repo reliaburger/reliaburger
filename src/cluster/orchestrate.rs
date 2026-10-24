@@ -2374,6 +2374,11 @@ fn spawn_placement_reconciler_with_io_timeout(
                 // ordinals the leader gave it.
                 spec.replicas = Replicas::Fixed(assignment.ordinals.len() as u32);
                 spec.ordinals = Some(assignment.ordinals.clone());
+                // Who manages an app is the council's business, not the
+                // node's: a controller claiming it mustn't redeploy it (#1125).
+                // Nor does the node need to know which template made it (#1124).
+                spec.owner = None;
+                spec.provenance = None;
                 let fingerprint = serde_json::to_string(&spec).unwrap_or_default();
                 if matches!(applied.get(&key), Some(AssignmentState::Applied { fingerprint: previous }) if previous == &fingerprint)
                 {
@@ -2865,14 +2870,24 @@ const DEPLOY_TERMINAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long the reconciler waits for a deploy of `spec` (this node's share)
 /// to finish: [`DEPLOY_TERMINAL_TIMEOUT`] for image pulls and the like, plus
-/// a health wait and a drain for every replica, twice over, since an aborted
+/// a health wait, a drain and the stop hooks for every replica, twice over, since an aborted
 /// rollout restores the previous spec at the same pace (#692). A fixed five
 /// minutes gave up on a ten-replica share with a one-minute health timeout
 /// while it was still rolling.
 fn deploy_terminal_timeout(spec: &AppSpec) -> Duration {
     let config = crate::meat::deploy_types::DeployConfig::for_app(spec);
     let share = spec.replica_ordinals().len() as u32;
-    let per_replica = config.health_timeout.saturating_add(config.drain_timeout);
+    // An old replica's own stop hooks (#1121) come on top of its drain.
+    let stop = crate::grill::stop::StopPolicy::from_app(spec).map_or(Duration::ZERO, |stop| {
+        let pre_stop = stop
+            .pre_stop
+            .map_or(Duration::ZERO, |pre_stop| pre_stop.timeout);
+        stop.grace.unwrap_or_default().saturating_add(pre_stop)
+    });
+    let per_replica = config
+        .health_timeout
+        .saturating_add(config.drain_timeout)
+        .saturating_add(stop);
     DEPLOY_TERMINAL_TIMEOUT.saturating_add(per_replica.saturating_mul(share.saturating_mul(2)))
 }
 
@@ -4895,6 +4910,22 @@ image = "busybox:latest"
         );
     }
 
+    /// #1121: retiring an old replica also waits out its pre-stop bound and
+    /// its own stop grace, so the deadline grows by both.
+    #[test]
+    fn deploy_terminal_timeout_counts_the_stop_hooks() {
+        let spec: AppSpec = toml::from_str(
+            "image = \"web:v1\"\nstop_grace = \"45s\"\npre_stop = [\"drain\"]\n\
+             pre_stop_timeout = \"15s\"\n[deploy]\nhealth_timeout = \"60s\"\n\
+             drain_timeout = \"30s\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            deploy_terminal_timeout(&spec),
+            DEPLOY_TERMINAL_TIMEOUT + Duration::from_secs(2 * (60 + 30 + 45 + 15))
+        );
+    }
+
     /// A held assignment (#692) only starts a first placement, or follows a
     /// scale change of the version this node already runs.
     #[test]
@@ -5076,6 +5107,9 @@ image = "busybox:latest"
                 dns: Default::default(),
                 process: Default::default(),
                 containers: true,
+                secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
+                shared_network: false,
             },
             egress_enforcement: Vec::new(),
             egress_degraded: false,

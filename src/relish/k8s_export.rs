@@ -17,8 +17,9 @@ use k8s_openapi::api::autoscaling::v2::{
 };
 use k8s_openapi::api::batch::v1::{CronJob, CronJobSpec, Job, JobSpec, JobTemplateSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, Namespace, PodSpec, PodTemplateSpec, ResourceQuota,
-    ResourceQuotaSpec, ResourceRequirements, SecurityContext, Service, ServicePort, ServiceSpec,
+    Container, ContainerPort, EnvVar, ExecAction, Lifecycle, LifecycleHandler, Namespace, PodSpec,
+    PodTemplateSpec, ResourceQuota, ResourceQuotaSpec, ResourceRequirements, SecurityContext,
+    Service, ServicePort, ServiceSpec,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
@@ -172,9 +173,30 @@ fn export_app(
     // memory limit exported as an unlimited pod — the scheduler saw a
     // different workload from the one that was configured.
     container.resources = resource_requirements(app.memory.as_ref(), app.cpu.as_ref(), app.gpu);
+    container.lifecycle = stop_lifecycle(app);
+    // Kubernetes runs preStop inside terminationGracePeriodSeconds; it has
+    // no bound of its own to carry this one.
+    if let Some(timeout) = app.pre_stop_timeout {
+        report.unsupported.push(format!(
+            "[app.{name}] pre_stop_timeout = \"{}\" — Kubernetes bounds preStop by \
+             terminationGracePeriodSeconds instead",
+            String::from(timeout)
+        ));
+    }
 
+    let knobs = export_runtime_knobs(name, app, &mut container, report);
+
+    let sidecars: Vec<Container> = app
+        .sidecar
+        .iter()
+        .map(|sidecar| sidecar_container(name, app, sidecar, report))
+        .collect();
     let pod_spec = PodSpec {
         containers: vec![container],
+        init_containers: (!sidecars.is_empty()).then_some(sidecars),
+        termination_grace_period_seconds: termination_grace(app),
+        security_context: knobs.security_context,
+        volumes: knobs.volumes,
         ..PodSpec::default()
     };
 
@@ -663,6 +685,119 @@ fn export_namespace(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// An app's stop signal and pre-stop command as a container lifecycle
+/// (#1121). `None` when it sets neither, so the pod keeps Kubernetes'
+/// defaults, which are the same as Reliaburger's.
+fn stop_lifecycle(app: &AppSpec) -> Option<Lifecycle> {
+    if app.stop_signal.is_none() && app.pre_stop.is_empty() {
+        return None;
+    }
+    Some(Lifecycle {
+        stop_signal: app.stop_signal.map(String::from),
+        pre_stop: (!app.pre_stop.is_empty()).then(|| LifecycleHandler {
+            exec: Some(ExecAction {
+                command: Some(app.pre_stop.clone()),
+            }),
+            ..LifecycleHandler::default()
+        }),
+        ..Lifecycle::default()
+    })
+}
+
+/// `terminationGracePeriodSeconds` from an app's `stop_grace` (#1121).
+/// The pod-level half of an app's runtime knobs: its sysctls and the
+/// hostPath volumes behind its devices.
+struct PodKnobs {
+    security_context: Option<k8s_openapi::api::core::v1::PodSecurityContext>,
+    volumes: Option<Vec<k8s_openapi::api::core::v1::Volume>>,
+}
+
+/// Export `[app.x.runtime]` (#1122): capabilities to the container's
+/// `securityContext.capabilities.add` (without the `CAP_` prefix, as
+/// Kubernetes writes them), sysctls to the pod's `securityContext.sysctls`,
+/// and each device to a hostPath volume mounted at the same path. That last
+/// one is only half a mapping, so it's reported.
+fn export_runtime_knobs(
+    name: &str,
+    app: &AppSpec,
+    container: &mut Container,
+    report: &mut ExportReport,
+) -> PodKnobs {
+    use k8s_openapi::api::core::v1::{
+        Capabilities, HostPathVolumeSource, PodSecurityContext, Sysctl, Volume, VolumeMount,
+    };
+    let Some(knobs) = &app.runtime else {
+        return PodKnobs {
+            security_context: None,
+            volumes: None,
+        };
+    };
+    if !knobs.capabilities.is_empty() {
+        let added = knobs
+            .capabilities
+            .iter()
+            .map(|capability| capability.name().trim_start_matches("CAP_").to_string())
+            .collect();
+        container
+            .security_context
+            .get_or_insert_with(SecurityContext::default)
+            .capabilities = Some(Capabilities {
+            add: Some(added),
+            drop: None,
+        });
+    }
+    let security_context = (!knobs.sysctls.is_empty()).then(|| PodSecurityContext {
+        sysctls: Some(
+            knobs
+                .sysctls
+                .iter()
+                .map(|(sysctl, value)| Sysctl {
+                    name: sysctl.as_str().to_string(),
+                    value: value.as_str().to_string(),
+                })
+                .collect(),
+        ),
+        ..PodSecurityContext::default()
+    });
+    if knobs.devices.is_empty() {
+        return PodKnobs {
+            security_context,
+            volumes: None,
+        };
+    }
+    report.unsupported.push(format!(
+        "[app.{name}.runtime] devices — Kubernetes grants device access only through a device \
+         plugin or a privileged container; exported as hostPath mounts, without their \
+         permissions"
+    ));
+    let mut volumes = Vec::new();
+    let mut mounts = Vec::new();
+    for (index, device) in knobs.devices.iter().enumerate() {
+        let volume = format!("device-{index}");
+        let path = device.path.to_string();
+        mounts.push(VolumeMount {
+            name: volume.clone(),
+            mount_path: path.clone(),
+            ..VolumeMount::default()
+        });
+        volumes.push(Volume {
+            name: volume,
+            host_path: Some(HostPathVolumeSource { path, type_: None }),
+            ..Volume::default()
+        });
+    }
+    container.volume_mounts = Some(mounts);
+    PodKnobs {
+        security_context,
+        volumes: Some(volumes),
+    }
+}
+
+fn termination_grace(app: &AppSpec) -> Option<i64> {
+    app.stop_grace
+        .map(|grace| i64::try_from(grace.duration().as_secs()).unwrap_or(i64::MAX))
+}
+
 fn label_selector(
     labels: &BTreeMap<String, String>,
 ) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector {
@@ -683,6 +818,35 @@ fn to_yaml<T: serde::Serialize>(resource: &T) -> Result<String, RelishError> {
 /// it would be worse than a placeholder. A placeholder doesn't fail loudly,
 /// though: the pod starts with the wrong password. So each one is listed in
 /// the report, under `[table]`, as needing a Secret (#703).
+/// A sidecar as a Kubernetes native sidecar (#1120): an init container
+/// with `restartPolicy: Always`, which starts before the app's container,
+/// keeps running beside it and stops after it, as Reliaburger's does. It
+/// gets the app's image when it names none, and the app's env with its own
+/// on top, which Reliaburger gives it implicitly and Kubernetes doesn't.
+fn sidecar_container(
+    app_name: &str,
+    app: &crate::config::app::AppSpec,
+    sidecar: &crate::config::app::SidecarSpec,
+    report: &mut ExportReport,
+) -> Container {
+    let mut env = app.env.clone();
+    env.extend(sidecar.env.clone());
+    Container {
+        name: sidecar.name.clone(),
+        image: sidecar.image.clone().or_else(|| app.image.clone()),
+        command: (!sidecar.command.is_empty()).then(|| sidecar.command.clone()),
+        args: (!sidecar.args.is_empty()).then(|| sidecar.args.clone()),
+        env: env_vars(
+            &format!("app.{app_name}.sidecar.{}", sidecar.name),
+            &env,
+            report,
+        ),
+        resources: resource_requirements(sidecar.memory.as_ref(), sidecar.cpu.as_ref(), None),
+        restart_policy: Some("Always".to_string()),
+        ..Container::default()
+    }
+}
+
 fn env_vars(
     table: &str,
     env: &BTreeMap<String, crate::config::types::EnvValue>,
@@ -696,6 +860,14 @@ fn env_vars(
             .map(|(k, v)| {
                 let value = match v {
                     crate::config::types::EnvValue::Plain(s) => s.clone(),
+                    crate::config::types::EnvValue::Provider(reference) => {
+                        report.dropped.push(format!(
+                            "[{table}] env {k} — resolved by a secret provider at launch, \
+                             exported as the reference; create a Secret and reference it with \
+                             valueFrom.secretKeyRef"
+                        ));
+                        reference.as_str().to_string()
+                    }
                     crate::config::types::EnvValue::Encrypted(_) => {
                         report.dropped.push(format!(
                             "[{table}] env {k} — encrypted, exported as the placeholder \

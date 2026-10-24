@@ -922,6 +922,17 @@ impl BunClient {
             {
                 return Err(RelishError::SchedulingRejected(refusal.error));
             }
+            if status == 422
+                && let Ok(refusal) =
+                    serde_json::from_str::<crate::bun::api::apply::PolicyRefusal>(&body)
+            {
+                for warning in &refusal.policy_warnings {
+                    eprintln!("warning: {warning}");
+                }
+                return Err(RelishError::PolicyDenied {
+                    denials: refusal.policy_denials,
+                });
+            }
             return Err(RelishError::ApiError { status, body });
         }
 
@@ -1621,6 +1632,25 @@ impl BunClient {
             return Err(RelishError::ApiError { status, body });
         }
 
+        Ok(())
+    }
+
+    /// Clear an app's owner (`POST /v1/release/{app}/{namespace}`, #1125),
+    /// handing it back to `relish apply` and GitOps. Only the owner's token
+    /// or an admin may.
+    pub async fn release(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
+        let url = format!("{}/v1/release/{}/{}", self.base_url, app, namespace);
+        let response = self
+            .http()?
+            .post(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
         Ok(())
     }
 
@@ -2928,6 +2958,25 @@ impl BunClient {
 
     /// The cluster's GitOps configuration and sync status, as the node
     /// this client talks to sees it (#693).
+    /// The cluster's policies and their generation (`GET /v1/policies`).
+    pub async fn policies(&self) -> Result<crate::policy::PolicyListing, RelishError> {
+        self.get_typed_json("/v1/policies").await
+    }
+
+    /// What the policies in force would now say about every committed app
+    /// and job (`GET /v1/policies/audit`, #1119).
+    pub async fn policy_audit(&self) -> Result<crate::policy::audit::PolicyAudit, RelishError> {
+        self.get_typed_json("/v1/policies/audit").await
+    }
+
+    /// Delete a policy (admin only).
+    pub async fn delete_policy(&self, name: &str) -> Result<(), RelishError> {
+        let name: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();
+        self.post_json(&format!("/v1/policies/{name}/delete"), String::new())
+            .await
+            .map(|_| ())
+    }
+
     pub async fn gitops_status(&self) -> Result<crate::lettuce::types::GitOpsStatus, RelishError> {
         self.get_typed_json("/v1/gitops").await
     }

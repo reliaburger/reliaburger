@@ -1,0 +1,18 @@
+# The cold-standby pair the example controller keeps one of running
+# (examples/controller/main.rs). Only the active app exists; the
+# controller sets its `namespace` and `owner` itself. Pin the two to
+# different failure domains with `placement`.
+
+[app.db-a]
+image = "postgres:17"
+port = 5432
+
+[app.db-a.placement]
+required = ["rack=a"]
+
+[app.db-b]
+image = "postgres:17"
+port = 5432
+
+[app.db-b.placement]
+required = ["rack=b"]

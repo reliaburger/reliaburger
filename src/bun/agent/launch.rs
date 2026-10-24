@@ -118,6 +118,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             operation: Some(operation),
             stop_confirmation_timeout: self.stop_confirmation_timeout,
             egress: self.egress_resolver(),
+            secrets: self.secret_providers.clone(),
         };
         let worker_task = tokio::spawn(async move {
             worker.run_deploy(config, forward_tx).await;
@@ -584,14 +585,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         } else {
             None
         };
-        if let Err(error) = self.supervisor.reserve_execution(
-            id.clone(),
-            crate::meat::Resources::new(
-                spec.cpu.map_or(0, |r| r.request),
-                spec.memory.map_or(0, |r| r.request),
-                spec.gpu.unwrap_or(0),
-            ),
-        ) {
+        if let Err(error) = self
+            .supervisor
+            .reserve_execution(id.clone(), crate::meat::admission::app_requests(spec))
+        {
             if let Some(port) = host_port {
                 // LOOP-INLINE: in-memory lock, no I/O
                 self.supervisor.port_allocator.release(port).await?;
@@ -640,6 +637,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         spec: &AppSpec,
         host_port: Option<u16>,
     ) -> Result<crate::grill::oci::OciSpec, BunError> {
+        // A replacement never went through `admit_app`, so the node gate for
+        // runtime knobs (#1122) holds here, before anything is prepared.
+        self.supervisor.admit_runtime_knobs(app_name, spec)?;
         let identities = self.decrypt_identities(namespace).await;
         if identities.is_empty() && spec.env.values().any(|v| v.is_encrypted()) {
             return Err(BunError::DeployFailed {
@@ -897,4 +897,55 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         Ok(())
     }
+}
+
+/// Which instance of which app a launch is for: what a secret provider is
+/// told, and what a refusal names.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LaunchTarget<'a> {
+    pub(super) instance_id: &'a InstanceId,
+    pub(super) app_name: &'a str,
+    pub(super) namespace: &'a str,
+}
+
+/// Resolve `spec`'s `PROVIDER[...]` env values, then create the instance
+/// from the resolved spec (#1123). Returns the spec it was created from, so
+/// its init containers get the same environment.
+///
+/// This runs on a deploy or restart task, never on the agent loop: a
+/// provider may take up to its timeout. The resolved spec lives only here
+/// and in the runtime. What the supervisor keeps is `spec`, with the
+/// references, so every restart asks the provider again.
+///
+/// A provider that fails refuses the launch with
+/// [`LaunchProblem::SecretUnavailable`](crate::grill::LaunchProblem), the
+/// same way a missing binary does (#881), so the instance fails closed with
+/// the reason in `relish status` and `relish wtf`.
+pub(super) async fn create_with_secrets<'s, G: Grill>(
+    grill: &G,
+    providers: &crate::sesame::secret_provider::SecretProviders,
+    target: LaunchTarget<'_>,
+    spec: &'s crate::grill::oci::OciSpec,
+) -> Result<std::borrow::Cow<'s, crate::grill::oci::OciSpec>, crate::grill::GrillError> {
+    let launch = if crate::sesame::secret_provider::needs_resolution(&spec.process.env) {
+        let context = crate::sesame::secret_provider::LaunchContext {
+            namespace: target.namespace,
+            app: target.app_name,
+            instance: &target.instance_id.0,
+        };
+        let env = providers
+            .resolve_env(&spec.process.env, context)
+            .await
+            .map_err(|error| crate::grill::GrillError::LaunchRefused {
+                instance: target.instance_id.clone(),
+                problem: error.into(),
+            })?;
+        let mut resolved = spec.clone();
+        resolved.process.env = env;
+        std::borrow::Cow::Owned(resolved)
+    } else {
+        std::borrow::Cow::Borrowed(spec)
+    };
+    grill.create(target.instance_id, &launch).await?;
+    Ok(launch)
 }

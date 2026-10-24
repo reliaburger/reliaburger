@@ -383,6 +383,9 @@ pub struct ClusterEvidence {
     pub isolation: Evidence<IsolationObservation>,
     /// GitOps warnings and each node's view of the cluster's configuration.
     pub gitops: Evidence<GitOpsObservation>,
+    /// What the policies in force would now say about every committed app
+    /// and job (#1119), the report `relish policy audit` prints.
+    pub policies: Evidence<crate::policy::audit::PolicyAudit>,
 }
 
 /// What `relish wtf` checks about GitOps (#693).

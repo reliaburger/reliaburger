@@ -1,0 +1,17 @@
+---
+source: src/bun/api/contract_tests.rs
+expression: rows
+---
+[
+  {
+    "app": "db-a",
+    "namespace": "pg",
+    "desired_replicas": 1,
+    "scheduled_replicas": 1,
+    "placements": {
+      "node-2": 1
+    },
+    "service_port": 5432,
+    "owner": "db-failover"
+  }
+]

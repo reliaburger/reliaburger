@@ -7,7 +7,8 @@
 //! or through git" true *by construction*: there's no second code path
 //! that could drift.
 //!
-//! Only the declarative kinds live here: apps, namespaces, permissions.
+//! Only the declarative kinds live here: apps, namespaces, permissions and
+//! policies.
 //! Jobs run to completion (not reconciled desired state) and builds are
 //! dispatched imperatively; both are validated but not written by this
 //! function. See chapter 7 for why builds aren't a reconciling resource.
@@ -26,7 +27,8 @@ use super::types::RaftRequest;
 /// The ordered set of desired-state writes a `Config` implies.
 ///
 /// Namespaces come first so a namespace's quota is committed before any
-/// app that schedules against it, then permissions, then apps. Each app
+/// app that schedules against it, then permissions, then policies, so an
+/// app is judged by the policies committed beside it, then apps. Each app
 /// keys on `AppId::new(name, namespace)`, defaulting to the `default`
 /// namespace when the spec doesn't name one — the same rule
 /// `cluster_apply` used before this function existed.
@@ -45,6 +47,13 @@ pub fn config_to_desired_writes(config: &Config) -> Vec<RaftRequest> {
 
     for (name, spec) in &config.permission {
         writes.push(RaftRequest::PermissionSpec {
+            name: name.clone(),
+            spec: Box::new(spec.clone()),
+        });
+    }
+
+    for (name, spec) in &config.policy {
+        writes.push(RaftRequest::PolicySpec {
             name: name.clone(),
             spec: Box::new(spec.clone()),
         });
@@ -75,7 +84,8 @@ pub enum LeasedConfigError {
         "leased apply cannot declare {kind} {name:?}: only apps and namespaces are lease-owned"
     )]
     UnsupportedKind {
-        /// The offending declarative kind (`job`, `build`, `permission`).
+        /// The offending declarative kind (`job`, `build`, `permission`,
+        /// `policy`).
         kind: &'static str,
         /// The name of the first offending declaration, for a precise error.
         name: String,
@@ -100,6 +110,12 @@ pub fn config_to_leased_writes(
     if let Some(name) = config.permission.keys().next() {
         return Err(LeasedConfigError::UnsupportedKind {
             kind: "permission",
+            name: name.clone(),
+        });
+    }
+    if let Some(name) = config.policy.keys().next() {
+        return Err(LeasedConfigError::UnsupportedKind {
+            kind: "policy",
             name: name.clone(),
         });
     }
@@ -243,6 +259,13 @@ mod tests {
                 "#,
                 "permission",
             ),
+            (
+                r#"
+                [policy.no-latest]
+                deny = "app.image.endsWith(':latest')"
+                "#,
+                "policy",
+            ),
         ] {
             let config = parse(toml);
             let error = config_to_leased_writes(&config, "run1", 42).unwrap_err();
@@ -265,10 +288,18 @@ mod tests {
 
             [permission.deployer]
             actions = ["deploy"]
+
+            [policy.no-latest]
+            deny = "app.image.endsWith(':latest')"
         "#,
         );
         let writes = config_to_desired_writes(&config);
-        assert_eq!(writes.len(), 3);
+        assert_eq!(writes.len(), 4);
+        assert!(
+            writes
+                .iter()
+                .any(|w| matches!(w, RaftRequest::PolicySpec { .. }))
+        );
         assert!(
             writes
                 .iter()
@@ -284,6 +315,22 @@ mod tests {
                 .iter()
                 .any(|w| matches!(w, RaftRequest::AppSpec { .. }))
         );
+    }
+
+    #[test]
+    fn policies_are_written_before_apps() {
+        let config = parse(
+            r#"
+            [app.web]
+            image = "web:v1"
+
+            [policy.no-latest]
+            deny = "app.image.endsWith(':latest')"
+        "#,
+        );
+        let writes = config_to_desired_writes(&config);
+        assert!(matches!(writes[0], RaftRequest::PolicySpec { .. }));
+        assert!(matches!(writes[1], RaftRequest::AppSpec { .. }));
     }
 
     #[test]

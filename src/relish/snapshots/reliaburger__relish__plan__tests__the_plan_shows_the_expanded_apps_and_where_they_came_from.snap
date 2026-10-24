@@ -1,0 +1,25 @@
+---
+source: src/relish/plan.rs
+expression: plan.to_string()
+---
+Relish apply plan:
+
+  + app.orders-db
+      image     postgres:17
+      replicas  1
+      from      use.orders-db (template postgres)
+
+  + app.users-db
+      image     postgres:17
+      replicas  2
+      from      use.users-db (template postgres)
+
+  + app.web
+      image     web:v1
+      replicas  1
+Plan: 3 to create, 0 to update, 0 unchanged.
+No live comparison was available; creates are an offline assumption.
+
+Policies:
+  DENY  policy db-standby denies app default/orders-db: a database needs a standby
+The cluster's policies would refuse this apply.

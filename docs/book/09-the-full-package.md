@@ -735,7 +735,7 @@ A Kubernetes Deployment becomes an `AppSpec`. The mapping isn't one-to-one, but 
 - `env[].value` → `env` (plain values)
 - `readinessProbe.httpGet` → `health` (path, and the port when it isn't the app's)
 - `strategy.rollingUpdate.maxSurge` → `deploy.max_surge`
-- `terminationGracePeriodSeconds` → `deploy.drain_timeout`
+- `terminationGracePeriodSeconds` → `stop_grace`, and the container's `lifecycle.stopSignal` and exec `preStop` → `stop_signal` and `pre_stop` (chapter 18 tells that story; until 0.2.4 the grace became `deploy.drain_timeout`, which is the drain before the signal, not the wait after it)
 - `nodeSelector` → `placement.required`
 - `initContainers` → `init`
 

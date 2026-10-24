@@ -157,8 +157,12 @@ impl OwnedCommands {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
             port_mapping: None,
+            stop: None,
+            runtime_knobs: None,
         };
         self.control.prepare(&id.0, &spec).await?;
         Ok(id)

@@ -353,15 +353,20 @@ migration and no feature gate
   efficiency plan.
 - [ ] **0.2.4: extension points**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/19),
-  [research](plans/2026-10-19-research-extension-points.md)). One missing
+  [research](plans/2026-10-19-research-extension-points.md),
+  [plan](plans/2026-10-23-plan-0.2.4.md)). One missing
   feature shouldn't rule Reliaburger out, and the answer isn't CRDs or
   webhooks. Policies stored in the council (CEL deny and warn, fill-only
   defaults) on the one apply path that `relish apply` and GitOps share;
   sidecars, stop hooks and gated runtime knobs; an exec secret provider;
   templates that expand to ordinary apps, and a contract for running your own
-  controller. A new book chapter comes first. Exit test: four common policies,
+  controller. A new book chapter,
+  [Chapter 18](book/18-bending-without-forking.md), comes first. Exit test: four common policies,
   a template and a controller on a real cluster
-  ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)).
+  ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)). Every
+  issue has landed on the train, and the exit test passes on the
+  `make test-cluster` fixture, with a stand-in for Postgres. Qualification
+  waits for 0.2.3.
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)

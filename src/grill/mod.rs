@@ -15,6 +15,7 @@ pub mod image_config;
 mod inventory;
 #[cfg(target_os = "linux")]
 pub mod kernel;
+pub mod knobs;
 pub mod mixed;
 // Also exposed under the `ebpf` feature: the Lima-gated integration
 // tests drive the agent's pre-start egress programming through a mock
@@ -43,6 +44,7 @@ pub mod runc;
 pub mod runc_intent;
 pub mod snapshot;
 pub mod state;
+pub mod stop;
 pub mod userns;
 pub mod volume;
 
@@ -291,6 +293,20 @@ pub enum LaunchProblem {
     /// The spec names nothing to execute.
     #[error("no command to run")]
     NoCommand,
+    /// The spec carries runtime knobs (#1122), which only rootful runc
+    /// applies. Starting the workload without them would pretend it got
+    /// what it asked for, so the runtime refuses instead.
+    #[error(
+        "{knob} can't be applied: runtime knobs need rootful runc, and this node's runtime is {runtime}"
+    )]
+    RuntimeKnobsUnsupported {
+        knob: knobs::KnobUse,
+        runtime: &'static str,
+    },
+    /// A `PROVIDER[...]` env value couldn't be resolved (#1123). The launch
+    /// fails closed: the instance never runs without its secret.
+    #[error(transparent)]
+    SecretUnavailable(#[from] crate::sesame::secret_provider::SecretResolutionError),
 }
 
 impl GrillError {
@@ -582,6 +598,20 @@ pub trait Grill: Send + Sync {
     /// (#914). The process runtime runs host workloads only.
     fn runs_containers(&self) -> bool {
         self.runtime_kind_for_host(false) != records::RuntimeKind::Process
+    }
+    /// Whether this runtime applies an app's runtime knobs (#1122): added
+    /// capabilities, sysctls and devices. Only rootful runc does; every
+    /// other runtime refuses a spec that carries them.
+    fn applies_runtime_knobs(&self) -> bool {
+        false
+    }
+    /// Whether a container can join another's network namespace, as an
+    /// app's sidecars join its instance's (#1120): a spec whose network
+    /// namespace names a path ([`OciSpec::joined_network`]). Rootful runc
+    /// can. The default declines: the process runtime has no namespace to
+    /// share, and an Apple Container VM has its own network stack.
+    fn shares_network_namespaces(&self) -> bool {
+        false
     }
     /// Per-workload enforcement: whether this workload's process will run in
     /// the cgroup its spec names, so the agent can bind policy to it first.
@@ -1059,6 +1089,28 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.honours_cgroup_path(),
             #[cfg(target_os = "linux")]
             AnyGrill::Mixed(g) => g.honours_cgroup_path(),
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(_) => false,
+        }
+    }
+    fn applies_runtime_knobs(&self) -> bool {
+        match self {
+            AnyGrill::Process(_) => false,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.applies_runtime_knobs(),
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.applies_runtime_knobs(),
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(_) => false,
+        }
+    }
+    fn shares_network_namespaces(&self) -> bool {
+        match self {
+            AnyGrill::Process(_) => false,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.shares_network_namespaces(),
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.shares_network_namespaces(),
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(_) => false,
         }

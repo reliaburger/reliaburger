@@ -1,4 +1,4 @@
-//! App lifecycle routes: stop, delete and exec.
+//! App lifecycle routes: stop, delete, release and exec.
 
 use super::*;
 
@@ -66,7 +66,16 @@ pub(super) async fn stop_handler(
             .into_response();
     }
     if let Some(council) = state.council.clone() {
-        return cluster_app_change(state, council, app, namespace, AppChange::Stop, &headers).await;
+        return cluster_app_change(
+            state,
+            council,
+            app,
+            namespace,
+            AppChange::Stop,
+            auth.as_deref(),
+            &headers,
+        )
+        .await;
     }
 
     stop_local(&state, app, namespace).await
@@ -143,13 +152,71 @@ pub(super) async fn delete_handler(
     }
     if let Some(council) = state.council.clone() {
         let change = AppChange::Delete { force: query.force };
-        return cluster_app_change(state, council, app, namespace, change, &headers).await;
+        return cluster_app_change(
+            state,
+            council,
+            app,
+            namespace,
+            change,
+            auth.as_deref(),
+            &headers,
+        )
+        .await;
     }
 
     stop_local(&state, app, namespace).await
 }
 
-/// Whether `relish stop` or `relish delete` is changing an app.
+/// `POST /v1/release/{app}/{namespace}`: clear an app's `owner`, handing
+/// it back to `relish apply` and GitOps (#1125). Only the owner's token or
+/// an admin may release an app. Owners live in the council, so a standalone
+/// node has nothing to release.
+pub(super) async fn release_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Deploy,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
+    let Some(council) = state.council.clone() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "app owners live in a cluster's council" })),
+        )
+            .into_response();
+    };
+    cluster_app_change(
+        state,
+        council,
+        app,
+        namespace,
+        AppChange::Release,
+        auth.as_deref(),
+        &headers,
+    )
+    .await
+}
+
+/// Whether `relish stop`, `relish delete` or `relish release` is changing
+/// an app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AppChange {
     /// Scale to zero, keeping the specification, until the next apply.
@@ -157,6 +224,8 @@ pub(super) enum AppChange {
     /// Remove the app from desired state; `force` removes one GitOps
     /// manages.
     Delete { force: bool },
+    /// Clear the app's owner (#1125).
+    Release,
 }
 
 impl AppChange {
@@ -164,6 +233,7 @@ impl AppChange {
         match self {
             AppChange::Stop => "stop",
             AppChange::Delete { .. } => "delete",
+            AppChange::Release => "release",
         }
     }
 }
@@ -211,8 +281,18 @@ pub(super) async fn cluster_app_change(
     app: String,
     namespace: String,
     change: AppChange,
+    auth: Option<&crate::sesame::auth::AuthContext>,
     caller_headers: &HeaderMap,
 ) -> Response {
+    // Only the owner's token or an admin changes an owned app (#1125). The
+    // check runs here, before any forward: the leader sees a forwarded
+    // request as the service principal, not as the caller.
+    let app_id = crate::meat::AppId::new(&app, &namespace);
+    if let Some(refusal) =
+        super::apply::owner_command_refusal(&council, auth, &app_id, change.verb()).await
+    {
+        return refusal;
+    }
     // Followers can't write to Raft (openraft does not forward client
     // writes), so forward the whole request to the leader's API.
     if !council.is_leader().await {
@@ -253,21 +333,24 @@ pub(super) async fn cluster_app_change(
     {
         return refusal;
     }
-    let app_id = crate::meat::AppId::new(&app, &namespace);
     let request = match change {
         AppChange::Stop => crate::council::types::RaftRequest::AppStop { app_id },
         AppChange::Delete { .. } => crate::council::types::RaftRequest::AppDelete { app_id },
+        AppChange::Release => crate::council::types::RaftRequest::AppRelease { app_id },
     };
     match council.write(request).await {
-        Ok(crate::council::CouncilResponse::Refused { reason }) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": reason })),
-        )
-            .into_response(),
+        Ok(crate::council::CouncilResponse::Refused { reason }) => {
+            let status = match change {
+                AppChange::Release => StatusCode::CONFLICT,
+                AppChange::Stop | AppChange::Delete { .. } => StatusCode::NOT_FOUND,
+            };
+            (status, Json(serde_json::json!({ "error": reason }))).into_response()
+        }
         Ok(_) => {
             let status = match change {
                 AppChange::Stop => "stopping",
                 AppChange::Delete { .. } => "deleting",
+                AppChange::Release => "released",
             };
             (
                 StatusCode::ACCEPTED,

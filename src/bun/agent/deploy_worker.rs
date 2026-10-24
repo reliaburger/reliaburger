@@ -25,6 +25,8 @@ pub(super) struct DeployWorker<G: Grill> {
     /// Resolves an instance's egress allowlist before the loop programs
     /// it, so the loop never waits on DNS (#419).
     pub(super) egress: launch_evidence::EgressResolver,
+    /// The node's secret providers, for `PROVIDER[...]` env values (#1123).
+    pub(super) secrets: crate::sesame::secret_provider::SecretProviders,
 }
 
 /// The replacement instances a rollout, or the restoration of an aborted
@@ -500,7 +502,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
     }
 
     /// Check every image `spec` runs against the trust policy: the app's and
-    /// each init container's own. Returns the spec with each verified image
+    /// each init container's and sidecar's own. Returns the spec with each verified image
     /// pinned to its digest, or `None` when nothing needed pinning.
     async fn pin_images(&self, spec: &AppSpec) -> Result<Option<AppSpec>, String> {
         let mut pinned: Option<AppSpec> = None;
@@ -523,6 +525,23 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 && let Some(slot) = pinned
                     .get_or_insert_with(|| spec.clone())
                     .init
+                    .get_mut(index)
+            {
+                slot.image = Some(image);
+            }
+        }
+        // A sidecar's own image answers to the same policy (#1120).
+        for (index, sidecar) in spec.sidecar.iter().enumerate() {
+            if sidecar.image.is_none() {
+                continue;
+            }
+            if let Some(image) = self
+                .ops
+                .enforce_image_signature(sidecar.image.as_deref())
+                .await?
+                && let Some(slot) = pinned
+                    .get_or_insert_with(|| spec.clone())
+                    .sidecar
                     .get_mut(index)
             {
                 slot.image = Some(image);
@@ -618,19 +637,98 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         Ok(())
     }
 
-    /// Create `instance_id` in the runtime. A launch the runtime refuses
-    /// (#881) fails the instance with the reason before the error returns.
-    async fn create_or_fail(
+    /// Start `spec`'s sidecars beside `instance_id` (#1120), after its init
+    /// containers and before the instance itself, from `app_oci`, the spec
+    /// the instance was created from with its secret references unresolved.
+    /// Each is registered first, so a failure part-way leaves nothing the
+    /// instance's retirement can't find. A sidecar that can't start fails
+    /// its instance, with the reason.
+    pub(super) async fn drive_sidecars(
         &self,
         instance_id: &InstanceId,
-        spec: &crate::grill::oci::OciSpec,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        app_oci: &crate::grill::oci::OciSpec,
     ) -> Result<(), BunError> {
-        let Err(error) = self.grill.create(instance_id, spec).await else {
+        if spec.sidecar.is_empty() {
             return Ok(());
+        }
+        let names = spec
+            .sidecar
+            .iter()
+            .map(|sidecar| sidecar.name.clone())
+            .collect();
+        let registered = self.ops.register_sidecars(instance_id, names).await?;
+        let launches = super::sidecars::sidecar_launches(spec, instance_id, app_oci);
+        let Err(failure) = super::sidecars::launch_sidecars(
+            &self.grill,
+            &self.secrets,
+            app_name,
+            namespace,
+            &launches,
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        // The ones that did start mustn't run beside an instance that never
+        // will. Retirement kills them again if this can't.
+        if let Err(error) =
+            super::sidecars::kill_sidecars(&self.grill, &registered, self.stop_confirmation_timeout)
+                .await
+        {
+            eprintln!("bun: {instance_id}: sidecars of a failed launch await retirement: {error}");
+        }
+        let reason = format!(
+            "sidecar {} failed to start: {}",
+            failure.sidecar, failure.error
+        );
+        match failure.error.launch_problem() {
+            Some(problem) => {
+                self.ops
+                    .record_launch_failure(
+                        instance_id,
+                        format!("sidecar {}: {problem}", failure.sidecar),
+                    )
+                    .await;
+            }
+            None => {
+                let _ = self
+                    .ops
+                    .transition_state(instance_id, ContainerState::Failed)
+                    .await;
+            }
+        }
+        Err(BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason,
+        })
+    }
+
+    /// Resolve `spec`'s secret providers and create the instance in the
+    /// runtime, returning the spec it was created from. A launch the runtime
+    /// refuses (#881), or one whose secret a provider won't give (#1123),
+    /// fails the instance with the reason before the error returns.
+    async fn create_or_fail<'s>(
+        &self,
+        target: super::launch::LaunchTarget<'_>,
+        spec: &'s crate::grill::oci::OciSpec,
+    ) -> Result<std::borrow::Cow<'s, crate::grill::oci::OciSpec>, BunError> {
+        let error = match super::launch::create_with_secrets(
+            &self.grill,
+            &self.secrets,
+            target,
+            spec,
+        )
+        .await
+        {
+            Ok(launch) => return Ok(launch),
+            Err(error) => error,
         };
         if let Some(problem) = error.launch_problem() {
             self.ops
-                .record_launch_failure(instance_id, problem.to_string())
+                .record_launch_failure(target.instance_id, problem.to_string())
                 .await;
         }
         Err(error.into())
@@ -671,8 +769,15 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .prepare_fresh_instance(instance_id, app_name, namespace, spec)
             .await?;
 
-        // The image pull happens here, off the loop.
-        self.create_or_fail(instance_id, &prepared.oci_spec).await?;
+        // The image pull happens here, off the loop, and so does any secret
+        // provider call. The supervisor keeps the spec with its references,
+        // never the resolved secrets.
+        let target = super::launch::LaunchTarget {
+            instance_id,
+            app_name,
+            namespace,
+        };
+        let launch = self.create_or_fail(target, &prepared.oci_spec).await?;
         self.ops
             .store_oci_spec(instance_id, prepared.oci_spec.clone())
             .await;
@@ -683,15 +788,12 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await?;
 
         if prepared.has_init {
-            self.drive_initialisers(
-                instance_id,
-                app_name,
-                spec,
-                &prepared.oci_spec,
-                &prepared.cgroup_path,
-            )
-            .await?;
+            self.drive_initialisers(instance_id, app_name, spec, &launch, &prepared.cgroup_path)
+                .await?;
         }
+        // Sidecars after the inits and before the app (#1120).
+        self.drive_sidecars(instance_id, app_name, namespace, spec, &prepared.oci_spec)
+            .await?;
 
         self.ops
             .transition_state(instance_id, ContainerState::Starting)
@@ -1210,16 +1312,23 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         };
 
         started.runtime_attempted.insert(new_id.clone());
-        self.grill
-            .create(new_id, &oci_spec)
-            .await
-            .map_err(|error| format!("failed to create {}: {error}", new_id.0))?;
+        let target = super::launch::LaunchTarget {
+            instance_id: new_id,
+            app_name,
+            namespace,
+        };
+        let launch =
+            super::launch::create_with_secrets(&self.grill, &self.secrets, target, &oci_spec)
+                .await
+                .map_err(|error| format!("failed to create {}: {error}", new_id.0))?;
         // Same create → program → start ordering as the fresh path (#86).
         self.prepare_network(new_id, app_name, Some(spec), &cgroup_path)
             .await
             .map_err(|error| format!("failed to program egress for {}: {error}", new_id.0))?;
         let initialised = async {
-            self.drive_initialisers(new_id, app_name, spec, &oci_spec, &cgroup_path)
+            self.drive_initialisers(new_id, app_name, spec, &launch, &cgroup_path)
+                .await?;
+            self.drive_sidecars(new_id, app_name, namespace, spec, &oci_spec)
                 .await?;
             self.ops
                 .transition_state(new_id, ContainerState::Starting)
@@ -1603,7 +1712,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         id: &InstanceId,
         runtime_attempted: bool,
     ) -> Result<(), BunError> {
-        if let Some(restart) = self.ops.begin_retire(id).await? {
+        if let Some(restart) = self.ops.begin_retire(id).await?.restart {
             restart.settle(self.stop_confirmation_timeout).await?;
         }
         // A failed create may already own runtime resources. Only a
@@ -1620,14 +1729,20 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         id: &InstanceId,
         drain_timeout: std::time::Duration,
     ) -> Result<(), BunError> {
-        if let Some(restart) = self.ops.begin_retire(id).await? {
+        let begun = self.ops.begin_retire(id).await?;
+        if let Some(restart) = begun.restart {
             restart.settle(self.stop_confirmation_timeout).await?;
         }
+        // Without its own grace the old instance gets the drain timeout, as
+        // it always has; with one, the drain and the grace are separate.
+        let stop = InstanceStop::for_policy(begun.stop.as_ref(), drain_timeout)
+            .with_sidecars(begun.sidecars);
         drain_and_stop_instance(
             &self.drains,
             &self.grill,
             id,
             drain_timeout,
+            &stop,
             self.stop_confirmation_timeout,
         )
         .await
@@ -1788,7 +1903,15 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             };
 
             runtime_attempted.insert(new_id.clone());
-            if let Err(e) = self.grill.create(&new_id, &oci_spec).await {
+            let target = super::launch::LaunchTarget {
+                instance_id: &new_id,
+                app_name,
+                namespace,
+            };
+            if let Err(e) =
+                super::launch::create_with_secrets(&self.grill, &self.secrets, target, &oci_spec)
+                    .await
+            {
                 let _ = events
                     .send(ApplyEvent::Error {
                         message: format!("failed to create {}: {e}", new_id.0),

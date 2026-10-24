@@ -658,6 +658,14 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin).
+    Release {
+        /// App name.
+        app: String,
+        /// Namespace the app lives in. Defaults to "default".
+        #[arg(long, default_value = "default")]
+        namespace: String,
+    },
     /// Initialise a new cluster (generates CAs, age keypair, node identity).
     Init(Box<InitOptions>),
     /// List cluster nodes and their gossip state.
@@ -867,6 +875,11 @@ enum Command {
     Gitops {
         #[command(subcommand)]
         action: GitopsAction,
+    },
+    /// List, audit or delete the cluster's policies, or test policies offline.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
     },
     /// Back up the cluster's root CA, check the backup, and rotate intermediates.
     Ca {
@@ -1302,6 +1315,54 @@ enum GitopsAction {
     /// Turn GitOps off for the whole cluster (admin only; audited). What
     /// GitOps wrote stays in place.
     Disable,
+}
+
+#[derive(Subcommand)]
+enum PolicyAction {
+    /// List the cluster's policies, with their action and rule.
+    List,
+    /// Delete a policy (admin only; audited). Policies never judge
+    /// policies, so this works even when one refuses every app.
+    Delete {
+        /// The policy's name.
+        name: String,
+    },
+    /// List the committed apps and jobs the cluster's policies would now
+    /// refuse, warn about or record. Changes nothing: a new policy never
+    /// touches running work.
+    Audit,
+    /// Judge the apps and jobs in some files by the policies in them,
+    /// offline, the way the cluster would. Exits non-zero when an apply
+    /// would be refused.
+    Test {
+        /// A TOML file of policies, apps or both. Repeat for more files.
+        #[arg(short = 'f', long = "file", required = true)]
+        files: Vec<PathBuf>,
+        /// How the change arrives, as a policy sees it in `source`.
+        #[arg(long, value_enum, default_value_t = PolicySourceArg::Apply)]
+        source: PolicySourceArg,
+        /// The token name a policy sees in `caller.name`.
+        #[arg(long, default_value = "ci")]
+        caller: String,
+        /// The role a policy sees in `caller.role`.
+        #[arg(long, value_enum, default_value_t = PolicyRoleArg::Deployer)]
+        role: PolicyRoleArg,
+    },
+}
+
+/// `relish policy test --source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum PolicySourceArg {
+    Apply,
+    Gitops,
+}
+
+/// `relish policy test --role`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum PolicyRoleArg {
+    Admin,
+    Deployer,
+    ReadOnly,
 }
 
 #[derive(Subcommand)]
@@ -1872,6 +1933,10 @@ async fn main() -> ExitCode {
             ref namespace,
             force,
         } => commands::delete(app, namespace, force).await,
+        Command::Release {
+            ref app,
+            ref namespace,
+        } => commands::release(app, namespace).await,
         Command::Init(options) => commands::init_with_security(
             &options.dir,
             &options.cluster_name,
@@ -2330,6 +2395,34 @@ async fn main() -> ExitCode {
             GitopsAction::Status => commands::gitops_status(cli.output).await,
             GitopsAction::Set { path } => commands::gitops_set(path).await,
             GitopsAction::Disable => commands::gitops_disable().await,
+        },
+        Command::Policy { action } => match &action {
+            PolicyAction::List => reliaburger::relish::policy_cmd::policy_list(cli.output).await,
+            PolicyAction::Audit => reliaburger::relish::policy_cmd::policy_audit(cli.output).await,
+            PolicyAction::Delete { name } => {
+                reliaburger::relish::policy_cmd::policy_delete(name).await
+            }
+            PolicyAction::Test {
+                files,
+                source,
+                caller,
+                role,
+            } => reliaburger::relish::policy_cmd::policy_test(
+                files,
+                &reliaburger::relish::policy_cmd::TestIdentity {
+                    caller: caller.clone(),
+                    role: match role {
+                        PolicyRoleArg::Admin => reliaburger::sesame::types::ApiRole::Admin,
+                        PolicyRoleArg::Deployer => reliaburger::sesame::types::ApiRole::Deployer,
+                        PolicyRoleArg::ReadOnly => reliaburger::sesame::types::ApiRole::ReadOnly,
+                    },
+                    source: match source {
+                        PolicySourceArg::Apply => reliaburger::policy::Source::Apply,
+                        PolicySourceArg::Gitops => reliaburger::policy::Source::GitOps,
+                    },
+                },
+                cli.output,
+            ),
         },
         Command::Ca { action } => match &action {
             CaAction::Backup {
@@ -2796,6 +2889,7 @@ fn honours_output(command: &Command) -> bool {
             Some(BatchAction::Submit { .. }) | Some(BatchAction::Results { .. })
         ),
         Command::Gitops { action } => matches!(action, GitopsAction::Status),
+        Command::Policy { action } => !matches!(action, PolicyAction::Delete { .. }),
         Command::Token { action } => matches!(action, TokenAction::List),
         Command::Status
         | Command::Top
@@ -2823,6 +2917,7 @@ fn honours_output(command: &Command) -> bool {
         | Command::Inspect { .. }
         | Command::Stop { .. }
         | Command::Delete { .. }
+        | Command::Release { .. }
         | Command::Init(_)
         | Command::Join(_)
         | Command::Routes

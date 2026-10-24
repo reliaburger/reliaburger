@@ -58,6 +58,7 @@ mod logs;
 mod metrics;
 mod node_info;
 mod nodes;
+pub(crate) mod policies;
 mod registry;
 mod secrets;
 mod snapshots;
@@ -71,7 +72,7 @@ pub(crate) use apply::{
     mark_leader_forwarded,
 };
 use apply::{apply_handler, cluster_apply};
-use apps::{delete_handler, exec_handler, stop_handler};
+use apps::{delete_handler, exec_handler, release_handler, stop_handler};
 use audit::audit_handler;
 use ca::{ca_rotation_begin_handler, ca_rotation_finalize_handler, ca_rotation_prepare_handler};
 use deploys::{
@@ -115,6 +116,7 @@ use nodes::{
     MAX_RELAY_REQUEST_BYTES, cluster_elect_handler, council_handler, node_relay_handler,
     nodes_handler,
 };
+use policies::{policies_handler, policy_audit_handler, policy_delete_handler};
 use registry::{
     images_handler, registry_proposal_deadline, registry_proposal_handler, registry_query_handler,
 };
@@ -671,6 +673,7 @@ pub fn router_with_upgrade(
         .route("/v1/top", get(top_handler))
         .route("/v1/stop/{app}/{namespace}", post(stop_handler))
         .route("/v1/delete/{app}/{namespace}", post(delete_handler))
+        .route("/v1/release/{app}/{namespace}", post(release_handler))
         .route("/v1/logs/{app}/{namespace}", get(logs_handler))
         .route(
             "/v1/logs/entries/{app}/{namespace}",
@@ -791,6 +794,9 @@ pub fn router_with_upgrade(
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
         .route("/v1/gitops", get(gitops_status_handler))
         .route("/v1/gitops/config", post(gitops_config_handler))
+        .route("/v1/policies", get(policies_handler))
+        .route("/v1/policies/audit", get(policy_audit_handler))
+        .route("/v1/policies/{name}/delete", post(policy_delete_handler))
         .route("/v1/nodes/decommission", post(node_decommission_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))
         .route("/v1/discovery/retire", post(producer_retirement_handler))
@@ -1354,6 +1360,13 @@ mod late_publication_tests;
 
 #[cfg(test)]
 mod permission_tests;
+
+#[cfg(test)]
+mod contract_tests;
+#[cfg(test)]
+mod owner_tests;
+#[cfg(test)]
+mod policy_tests;
 
 #[cfg(test)]
 mod cluster_view_tests;

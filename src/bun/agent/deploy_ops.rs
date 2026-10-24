@@ -136,6 +136,13 @@ pub(super) enum DeployOp {
         initialiser: InstanceId,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
+    /// Reserve an instance's sidecar identities before the first is
+    /// created, so its retirement finds every one (#1120).
+    RegisterSidecars {
+        instance_id: InstanceId,
+        names: Vec<String>,
+        reply: oneshot::Sender<Result<Vec<InstanceId>, BunError>>,
+    },
     /// Program source and egress policy before create → program → start. On
     /// failure the caller stops the created container and fails the deploy.
     /// The caller retains the network reference first, off the loop.
@@ -251,7 +258,7 @@ pub(super) enum DeployOp {
     /// settle before it signals the runtime.
     BeginRetire {
         old_id: InstanceId,
-        reply: oneshot::Sender<Result<Option<restarts::TakenRestart>, BunError>>,
+        reply: oneshot::Sender<Result<super::retirement::BegunRetirement, BunError>>,
     },
     /// Hand a stopped old instance whose addresses still await remote
     /// withdrawal confirmations to the agent loop, so the rollout can finish.
@@ -295,6 +302,7 @@ impl DeployOp {
             DeployOp::RegisterInitialiser { .. } => "register_initialiser",
             DeployOp::RecordInitialiserGeneration { .. } => "record_initialiser_generation",
             DeployOp::ForgetInitialiser { .. } => "forget_initialiser",
+            DeployOp::RegisterSidecars { .. } => "register_sidecars",
             DeployOp::ApplyNetworkPreStart { .. } => "apply_network_pre_start",
             DeployOp::TransitionState { .. } => "transition_state",
             DeployOp::RecordLaunchFailure { .. } => "record_launch_failure",
@@ -746,6 +754,24 @@ impl DeployOps {
         .await
     }
 
+    pub(super) async fn register_sidecars(
+        &self,
+        instance_id: &InstanceId,
+        names: Vec<String>,
+    ) -> Result<Vec<InstanceId>, BunError> {
+        self.call(
+            |reply| DeployOp::RegisterSidecars {
+                instance_id: instance_id.clone(),
+                names,
+                reply,
+            },
+            Err(BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .await
+    }
+
     pub(super) async fn record_initialiser_generation(
         &self,
         instance_id: &InstanceId,
@@ -1023,7 +1049,7 @@ impl DeployOps {
     pub(super) async fn begin_retire(
         &self,
         old_id: &InstanceId,
-    ) -> Result<Option<restarts::TakenRestart>, BunError> {
+    ) -> Result<super::retirement::BegunRetirement, BunError> {
         self.call(
             |reply| DeployOp::BeginRetire {
                 old_id: old_id.clone(),
@@ -1417,6 +1443,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     })
                 };
                 let _ = reply.send(result);
+            }
+            DeployOp::RegisterSidecars {
+                instance_id,
+                names,
+                reply,
+            } => {
+                let _ = reply.send(self.register_sidecars(&instance_id, &names));
             }
             DeployOp::ApplyNetworkPreStart {
                 instance_id,

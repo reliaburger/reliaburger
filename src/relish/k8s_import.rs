@@ -669,7 +669,7 @@ fn pod_spec_to_app(
     app.image = container.and_then(|c| c.image.clone());
     app.namespace = metadata_namespace.cloned();
 
-    warn_unimported_pod_fields(resource, pod_spec, report);
+    warn_unimported_pod_fields(resource, pod_spec, true, report);
     if container.and_then(|c| c.liveness_probe.as_ref()).is_some() {
         report.warnings.push(MigrationWarning {
             resource: resource.to_string(),
@@ -679,15 +679,101 @@ fn pod_spec_to_app(
     }
     app.env = import_env(resource, metadata_namespace, container, configmaps, report);
     import_pod_template(resource, pod_spec, container, &mut app, report);
+    app.sidecar = import_sidecars(resource, metadata_namespace, pod_spec, configmaps, report);
     app
+}
+
+/// A pod's sidecars (#1120): its native sidecars (`initContainers` with
+/// `restartPolicy: Always`, Kubernetes 1.29+) and every container after the
+/// first. Both share the app's network namespace and lifecycle, as they
+/// did in the pod. The difference worth knowing is reported: an extra
+/// container now starts before the app and stops after it, where
+/// Kubernetes started them together.
+fn import_sidecars(
+    resource: &str,
+    metadata_namespace: Option<&String>,
+    pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    configmaps: &mut ConfigMaps,
+    report: &mut MigrationReport,
+) -> Vec<crate::config::app::SidecarSpec> {
+    let Some(ps) = pod_spec else {
+        return Vec::new();
+    };
+    let native = ps
+        .init_containers
+        .iter()
+        .flatten()
+        .filter(|container| is_native_sidecar(container));
+    let extra = ps.containers.iter().skip(1);
+    if ps.containers.len() > 1 {
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message: format!(
+                "{} container(s) after the first imported as sidecar(s): they now start \
+                 before the app and stop after it",
+                ps.containers.len() - 1
+            ),
+        });
+    }
+    let mut sidecars = Vec::new();
+    for container in native.chain(extra) {
+        if !crate::config::valid_workload_label(&container.name) {
+            report.warnings.push(MigrationWarning {
+                resource: resource.to_string(),
+                message: format!(
+                    "sidecar container {:?} is not imported: its name must be a DNS label",
+                    container.name
+                ),
+            });
+            continue;
+        }
+        let env = import_env(
+            resource,
+            metadata_namespace,
+            Some(container),
+            configmaps,
+            report,
+        );
+        let resources = container.resources.as_ref();
+        sidecars.push(crate::config::app::SidecarSpec {
+            name: container.name.clone(),
+            image: container.image.clone(),
+            command: container.command.clone().unwrap_or_default(),
+            args: container.args.clone().unwrap_or_default(),
+            env,
+            memory: resources.and_then(|resources| {
+                resource_range_from(
+                    resource,
+                    "memory",
+                    resources,
+                    parse_k8s_memory_bytes,
+                    report,
+                )
+            }),
+            cpu: resources.and_then(|resources| {
+                resource_range_from(resource, "cpu", resources, parse_k8s_cpu_millicores, report)
+            }),
+        });
+    }
+    sidecars
+}
+
+/// Whether an init container is a Kubernetes native sidecar: one that
+/// keeps running beside the app (`restartPolicy: Always`).
+fn is_native_sidecar(container: &k8s_openapi::api::core::v1::Container) -> bool {
+    container.restart_policy.as_deref() == Some("Always")
 }
 
 /// Report what a pod spec carries that neither an app nor a job can, so a
 /// silent drop becomes visible in the migration report rather than a
 /// surprise in production (M28).
+///
+/// An app imports device hostPaths as runtime knobs (`devices_imported`), so
+/// only its other hostPaths are reported; a job reports them all.
 fn warn_unimported_pod_fields(
     resource: &str,
     pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    devices_imported: bool,
     report: &mut MigrationReport,
 ) {
     let mut warn = |message: String| {
@@ -713,13 +799,6 @@ fn warn_unimported_pod_fields(
     {
         warn("topologySpreadConstraints are not imported".to_string());
     }
-    if ps.containers.len() > 1 {
-        warn(format!(
-            "only the first of {} containers is imported; {} sidecar(s) dropped",
-            ps.containers.len(),
-            ps.containers.len() - 1
-        ));
-    }
     if ps.volumes.as_ref().is_some_and(|v| !v.is_empty()) {
         warn("pod volumes are not imported; declare Reliaburger volumes manually".to_string());
     }
@@ -727,7 +806,9 @@ fn warn_unimported_pod_fields(
     // just declare: a `source` needs the host-exec permission and an
     // allowlist entry on every node that runs it.
     for volume in ps.volumes.iter().flatten() {
-        if let Some(host_path) = &volume.host_path {
+        if let Some(host_path) = &volume.host_path
+            && !(devices_imported && device_host_path(host_path).is_some())
+        {
             warn(format!(
                 "hostPath volume {:?} ({}) is not imported; a hand-written `source` \
                  needs the host-exec permission and a [storage] allowed_host_paths \
@@ -835,6 +916,8 @@ fn import_pod_template(
         app.working_dir = c.working_dir.clone().map(PathBuf::from);
     }
     import_security_context(resource, pod_spec, container, app, report);
+    import_stop_hooks(resource, pod_spec, container, app, report);
+    import_runtime_knobs(resource, pod_spec, container, app, report);
 
     let ports = container_ports(pod_spec);
     app.port = ports.first().map(|p| p.container_port as u16);
@@ -905,7 +988,8 @@ fn import_pod_template(
 
     // Init containers carry a single argv: command followed by args.
     if let Some(inits) = pod_spec.and_then(|ps| ps.init_containers.as_ref()) {
-        for ic in inits {
+        // A native sidecar keeps running: it imports as a sidecar instead.
+        for ic in inits.iter().filter(|ic| !is_native_sidecar(ic)) {
             let command = ic.command.clone().unwrap_or_default();
             let args = ic.args.clone().unwrap_or_default();
             if command.is_empty() && !args.is_empty() {
@@ -922,6 +1006,75 @@ fn import_pod_template(
                 image: ic.image.clone(),
                 command: command.into_iter().chain(args).collect(),
             });
+        }
+    }
+}
+
+/// `terminationGracePeriodSeconds`, `lifecycle.stopSignal` and an exec
+/// `lifecycle.preStop` as the app's stop hooks (#1121). What has no
+/// equivalent is reported, never dropped quietly.
+fn import_stop_hooks(
+    resource: &str,
+    pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    container: Option<&k8s_openapi::api::core::v1::Container>,
+    app: &mut AppSpec,
+    report: &mut MigrationReport,
+) {
+    use crate::grill::stop::{MAX_STOP_DURATION, StopDuration};
+    let mut warn = |message: String| {
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message,
+        })
+    };
+    if let Some(seconds) = pod_spec.and_then(|ps| ps.termination_grace_period_seconds) {
+        // Reliaburger's grace is 1 s to an hour. Kubernetes allows 0
+        // (kill at once) and any length; the nearest bound stands in.
+        let max = MAX_STOP_DURATION.as_secs() as i64;
+        let clamped = seconds.clamp(1, max);
+        if clamped != seconds {
+            warn(format!(
+                "terminationGracePeriodSeconds {seconds} imported as stop_grace = \"{clamped}s\"; \
+                 a stop grace is 1s to {max}s"
+            ));
+        }
+        app.stop_grace = StopDuration::new(std::time::Duration::from_secs(clamped as u64)).ok();
+    }
+    let Some(lifecycle) = container.and_then(|c| c.lifecycle.as_ref()) else {
+        return;
+    };
+    if let Some(signal) = &lifecycle.stop_signal {
+        match signal.parse() {
+            Ok(signal) => app.stop_signal = Some(signal),
+            Err(error) => warn(format!("lifecycle.stopSignal is not imported: {error}")),
+        }
+    }
+    if lifecycle.post_start.is_some() {
+        warn("lifecycle.postStart is not imported; Reliaburger has no post-start hook".into());
+    }
+    let Some(pre_stop) = &lifecycle.pre_stop else {
+        return;
+    };
+    match pre_stop
+        .exec
+        .as_ref()
+        .and_then(|exec| exec.command.as_ref())
+    {
+        Some(command) if !command.is_empty() => {
+            app.pre_stop = command.clone();
+            warn(
+                "lifecycle.preStop imported as pre_stop with its own 30s bound \
+                 (pre_stop_timeout); Kubernetes counts it inside the grace instead"
+                    .into(),
+            );
+        }
+        _ if pre_stop.sleep.is_some() => warn(
+            "lifecycle.preStop sleep is not imported; Reliaburger withdraws an instance \
+             from routing and drains it before it signals it"
+                .into(),
+        ),
+        _ => {
+            warn("lifecycle.preStop is not imported; only an exec command maps to pre_stop".into())
         }
     }
 }
@@ -991,6 +1144,110 @@ fn import_security_context(
             }),
         }
     }
+}
+
+/// `securityContext.capabilities.add`, the pod's `securityContext.sysctls`
+/// and hostPath volumes of devices, as `[runtime]` knobs (#1122).
+///
+/// What can't map is reported: a capability Linux doesn't know, a sysctl
+/// that isn't namespaced, `capabilities.drop` and `privileged`. Kubernetes
+/// has no device permissions, so a device gets the default `rwm`.
+fn import_runtime_knobs(
+    resource: &str,
+    pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    container: Option<&k8s_openapi::api::core::v1::Container>,
+    app: &mut AppSpec,
+    report: &mut MigrationReport,
+) {
+    use crate::grill::knobs::{Capability, DeviceRequest, RuntimeKnobs, SysctlName, SysctlValue};
+    let mut warn = |message: String| {
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message,
+        })
+    };
+    let mut knobs = RuntimeKnobs::default();
+    let security = container.and_then(|c| c.security_context.as_ref());
+    if let Some(capabilities) = security.and_then(|sc| sc.capabilities.as_ref()) {
+        for name in capabilities.add.iter().flatten() {
+            match name.parse::<Capability>() {
+                Ok(capability) => {
+                    knobs.capabilities.insert(capability);
+                }
+                Err(error) => warn(format!(
+                    "securityContext.capabilities.add {name} is not imported: {error}"
+                )),
+            }
+        }
+        if capabilities
+            .drop
+            .as_ref()
+            .is_some_and(|drop| !drop.is_empty())
+        {
+            warn(
+                "securityContext.capabilities.drop is not imported; a container keeps \
+                 Docker's default capabilities, inside its own user namespace"
+                    .to_string(),
+            );
+        }
+    }
+    if security.and_then(|sc| sc.privileged) == Some(true) {
+        warn(
+            "securityContext.privileged is not imported; list the capabilities, sysctls and \
+             devices it needs under [runtime] instead"
+                .to_string(),
+        );
+    }
+    let sysctls = pod_spec
+        .and_then(|ps| ps.security_context.as_ref())
+        .and_then(|sc| sc.sysctls.as_ref());
+    for sysctl in sysctls.into_iter().flatten() {
+        match (
+            sysctl.name.parse::<SysctlName>(),
+            sysctl.value.parse::<SysctlValue>(),
+        ) {
+            (Ok(name), Ok(value)) => {
+                knobs.sysctls.insert(name, value);
+            }
+            (Err(error), _) | (_, Err(error)) => warn(format!(
+                "securityContext.sysctls {} is not imported: {error}",
+                sysctl.name
+            )),
+        }
+    }
+    let host_paths = pod_spec
+        .and_then(|ps| ps.volumes.as_ref())
+        .into_iter()
+        .flatten()
+        .filter_map(|volume| volume.host_path.as_ref());
+    for path in host_paths.filter_map(device_host_path) {
+        knobs.devices.push(DeviceRequest {
+            path,
+            permissions: Default::default(),
+        });
+    }
+    if knobs.is_empty() {
+        return;
+    }
+    let names: Vec<String> = knobs.uses().map(|knob| knob.to_string()).collect();
+    warn(format!(
+        "{} imported as [runtime] knobs; each needs the host-exec permission at apply and a \
+         node whose [runtime] allowed_capabilities, allowed_sysctls or allowed_devices lists it",
+        names.join(", ")
+    ));
+    app.runtime = Some(knobs);
+}
+
+/// The host device a hostPath volume names, if it names one: a path under
+/// `/dev` whose type is `CharDevice`, `BlockDevice` or unset.
+fn device_host_path(
+    host_path: &k8s_openapi::api::core::v1::HostPathVolumeSource,
+) -> Option<crate::grill::knobs::DevicePath> {
+    let device_type = matches!(
+        host_path.type_.as_deref(),
+        None | Some("") | Some("CharDevice") | Some("BlockDevice")
+    );
+    device_type.then(|| host_path.path.parse().ok()).flatten()
 }
 
 /// Fill the app's `metrics` from the pod template's Prometheus annotations.
@@ -1130,9 +1387,9 @@ fn deployment_to_app(
                     }
                     _ => None,
                 }),
-                drain_timeout: pod_spec
-                    .and_then(|ps| ps.termination_grace_period_seconds)
-                    .map(|s| format!("{s}s")),
+                // terminationGracePeriodSeconds is the stop grace, not the
+                // drain (#1121); `import_stop_hooks` maps it.
+                drain_timeout: None,
                 health_timeout: None,
                 auto_rollback: None,
             });
@@ -1326,9 +1583,16 @@ fn empty_app_spec() -> AppSpec {
         config_file: Vec::new(),
         volumes: Vec::new(),
         init: Vec::new(),
+        sidecar: Vec::new(),
         ingress: None,
         placement: None,
         deploy: None,
+        stop_signal: None,
+        stop_grace: None,
+        pre_stop: Vec::new(),
+        pre_stop_timeout: None,
+        runtime: None,
+        owner: None,
         firewall: None,
         egress: None,
         autoscale: None,
@@ -1338,6 +1602,7 @@ fn empty_app_spec() -> AppSpec {
         working_dir: None,
         run_as_user: None,
         run_as_group: None,
+        provenance: None,
     }
 }
 
@@ -1650,7 +1915,7 @@ fn pod_to_jobspec(
     });
 
     let env = import_env(resource, metadata_namespace, container, configmaps, report);
-    warn_unimported_pod_fields(resource, pod_spec, report);
+    warn_unimported_pod_fields(resource, pod_spec, false, report);
     warn_unimported_job_pod_fields(resource, pod_spec, container, report);
 
     let (memory, cpu) = match container.and_then(|c| c.resources.as_ref()) {
@@ -1686,6 +1951,7 @@ fn pod_to_jobspec(
         task_timeout_secs: None,
         overlap: None,
         replay_unknown: false,
+        provenance: None,
     }
 }
 
@@ -1716,6 +1982,16 @@ fn warn_unimported_job_pod_fields(
     {
         warn("initContainers are not imported; a job runs one container".to_string());
     }
+    if let Some(count) = pod_spec
+        .map(|ps| ps.containers.len())
+        .filter(|count| *count > 1)
+    {
+        warn(format!(
+            "only the first of {count} containers is imported; {} sidecar(s) dropped, \
+             since a job runs one container",
+            count - 1
+        ));
+    }
     let Some(container) = container else { return };
     if let Some(dir) = &container.working_dir {
         warn(format!(
@@ -1736,6 +2012,15 @@ fn warn_unimported_job_pod_fields(
                 "securityContext.{field} {value} is not imported; a job runs as its image's user"
             ));
         }
+    }
+    let knobs = own_security.is_some_and(|sc| sc.capabilities.is_some() || sc.privileged.is_some())
+        || pod_security.is_some_and(|sc| sc.sysctls.as_ref().is_some_and(|s| !s.is_empty()));
+    if knobs {
+        warn(
+            "securityContext capabilities, privileged and sysctls are not imported; only an \
+             app has [runtime] knobs"
+                .to_string(),
+        );
     }
 }
 
@@ -4120,5 +4405,391 @@ spec:
                 "no warning for {field}: {warnings:?}"
             );
         }
+    }
+
+    fn stop_hooks_deployment(lifecycle: &str, grace: &str) -> String {
+        format!(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  template:
+    spec:
+      terminationGracePeriodSeconds: {grace}
+      containers:
+      - name: web
+        image: web:v1
+        lifecycle:
+{lifecycle}
+"#
+        )
+    }
+
+    #[test]
+    fn import_maps_grace_stop_signal_and_an_exec_pre_stop() {
+        let yaml = stop_hooks_deployment(
+            "          stopSignal: SIGQUIT\n          preStop:\n            exec:\n              command: [\"/usr/sbin/nginx\", \"-s\", \"quit\"]",
+            "45",
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.stop_signal, Some(crate::grill::stop::StopSignal::Quit));
+        assert_eq!(
+            app.stop_grace.map(|grace| grace.duration()),
+            Some(std::time::Duration::from_secs(45))
+        );
+        assert_eq!(app.pre_stop, ["/usr/sbin/nginx", "-s", "quit"]);
+        assert_eq!(app.pre_stop_timeout, None);
+        assert!(
+            result
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("inside the grace")),
+            "{:?}",
+            result.report.warnings
+        );
+        result.config.validate().unwrap();
+    }
+
+    #[test]
+    fn grace_is_the_stop_grace_not_the_drain_timeout() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 2
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+  template:
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: web
+        image: web:v1
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.deploy.as_ref().unwrap().drain_timeout, None);
+        assert_eq!(app.stop_grace.map(String::from).as_deref(), Some("60s"));
+    }
+
+    #[test]
+    fn a_zero_or_huge_grace_is_clamped_and_reported() {
+        for (grace, expected) in [("0", "1s"), ("86400", "3600s")] {
+            let yaml = stop_hooks_deployment("          stopSignal: SIGTERM", grace);
+            let result = import_from_yaml(&yaml).unwrap();
+            let app = &result.config.app["web"];
+            assert_eq!(app.stop_grace.map(String::from).as_deref(), Some(expected));
+            assert!(
+                result
+                    .report
+                    .warnings
+                    .iter()
+                    .any(|w| w.message.contains("terminationGracePeriodSeconds")),
+                "{grace}: {:?}",
+                result.report.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn unmappable_lifecycle_hooks_are_reported_not_dropped() {
+        let yaml = stop_hooks_deployment(
+            "          stopSignal: SIGKILL\n          postStart:\n            exec:\n              command: [\"/bin/true\"]\n          preStop:\n            sleep:\n              seconds: 5",
+            "30",
+        );
+        let result = import_from_yaml(&yaml).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.stop_signal, None);
+        assert!(app.pre_stop.is_empty());
+        let messages: Vec<&str> = result
+            .report
+            .warnings
+            .iter()
+            .map(|w| w.message.as_str())
+            .collect();
+        for expected in ["stopSignal", "postStart", "preStop sleep"] {
+            assert!(
+                messages.iter().any(|m| m.contains(expected)),
+                "no warning for {expected}: {messages:?}"
+            );
+        }
+    }
+
+    /// #1121: an app's stop hooks leave as a pod's lifecycle and grace and
+    /// come back as the same fields.
+    #[test]
+    fn stop_hooks_survive_an_export_and_import_round_trip() {
+        let config = crate::config::Config::parse(
+            r#"
+            [app.web]
+            image = "web:v1"
+            stop_signal = "SIGINT"
+            stop_grace = "2m"
+            pre_stop = ["/bin/sh", "-c", "curl -X POST localhost:8080/drain"]
+            "#,
+        )
+        .unwrap();
+        let exported = crate::relish::k8s_export::export_kubernetes(&config).unwrap();
+        assert!(
+            exported.yaml.contains("terminationGracePeriodSeconds: 120"),
+            "{}",
+            exported.yaml
+        );
+        assert!(
+            exported.yaml.contains("stopSignal: SIGINT"),
+            "{}",
+            exported.yaml
+        );
+        let imported = import_from_yaml(&exported.yaml).unwrap();
+        let (original, back) = (&config.app["web"], &imported.config.app["web"]);
+        assert_eq!(back.stop_signal, original.stop_signal);
+        assert_eq!(back.stop_grace, original.stop_grace);
+        assert_eq!(back.pre_stop, original.pre_stop);
+        assert_eq!(back.pre_stop_timeout, original.pre_stop_timeout);
+    }
+
+    /// #1120: a native sidecar (an init container with `restartPolicy:
+    /// Always`) and every container after the first import as sidecars;
+    /// an ordinary init container stays one.
+    #[test]
+    fn native_sidecars_and_extra_containers_import_as_sidecars() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      initContainers:
+      - name: migrate
+        image: migrate:v1
+        command: ["migrate"]
+      - name: proxy
+        image: envoy:1.31
+        restartPolicy: Always
+        args: ["-c", "/etc/envoy.yaml"]
+        env:
+        - name: LOG_LEVEL
+          value: info
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {cpu: 200m, memory: 128Mi}
+      containers:
+      - name: web
+        image: web:v1
+      - name: logs
+        image: shipper:v2
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(app.init.len(), 1, "only the ordinary init stays one");
+        assert_eq!(app.init[0].image.as_deref(), Some("migrate:v1"));
+        let names: Vec<&str> = app.sidecar.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["proxy", "logs"]);
+        let proxy = &app.sidecar[0];
+        assert_eq!(proxy.image.as_deref(), Some("envoy:1.31"));
+        assert_eq!(proxy.args, ["-c", "/etc/envoy.yaml"]);
+        assert_eq!(
+            proxy.env.get("LOG_LEVEL"),
+            Some(&EnvValue::Plain("info".into()))
+        );
+        assert_eq!(proxy.cpu.unwrap().request, 50);
+        assert_eq!(proxy.memory.unwrap().limit, 128 * 1024 * 1024);
+        result.config.validate().unwrap();
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("imported as sidecar(s)") && w.contains("before the app")),
+            "{warnings:?}"
+        );
+    }
+
+    /// #1120: sidecars leave as native sidecars and come back as sidecars.
+    #[test]
+    fn sidecars_survive_an_export_and_import_round_trip() {
+        let config = crate::config::Config::parse(
+            r#"
+            [app.web]
+            image = "web:v1"
+            [[app.web.sidecar]]
+            name = "proxy"
+            image = "envoy:1.31"
+            args = ["-c", "/etc/envoy.yaml"]
+            cpu = "50m-200m"
+            env = { LOG_LEVEL = "info" }
+            [[app.web.sidecar]]
+            name = "worker"
+            command = ["/app/worker"]
+            "#,
+        )
+        .unwrap();
+        let exported = crate::relish::k8s_export::export_kubernetes(&config).unwrap();
+        assert!(
+            exported.yaml.contains("restartPolicy: Always"),
+            "{}",
+            exported.yaml
+        );
+        let imported = import_from_yaml(&exported.yaml).unwrap();
+        let (original, back) = (&config.app["web"], &imported.config.app["web"]);
+        assert_eq!(back.sidecar.len(), 2);
+        assert_eq!(back.sidecar[0].name, "proxy");
+        assert_eq!(back.sidecar[0].image, original.sidecar[0].image);
+        assert_eq!(back.sidecar[0].args, original.sidecar[0].args);
+        assert_eq!(back.sidecar[0].cpu, original.sidecar[0].cpu);
+        assert_eq!(back.sidecar[0].env, original.sidecar[0].env);
+        // Kubernetes has no "the app's image": it's written out.
+        assert_eq!(back.sidecar[1].image.as_deref(), Some("web:v1"));
+        assert_eq!(back.sidecar[1].command, original.sidecar[1].command);
+    }
+
+    const KNOBBED_DEPLOYMENT: &str = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lb
+spec:
+  replicas: 1
+  template:
+    spec:
+      securityContext:
+        sysctls:
+        - name: net.core.somaxconn
+          value: "4096"
+        - name: kernel.panic
+          value: "10"
+      containers:
+      - name: lb
+        image: lb:v1
+        securityContext:
+          privileged: true
+          capabilities:
+            add: ["NET_ADMIN", "CAP_IPC_LOCK", "TELEPORT"]
+            drop: ["ALL"]
+        volumeMounts:
+        - name: fuse
+          mountPath: /dev/fuse
+        - name: disk
+          mountPath: /dev/sdb
+      volumes:
+      - name: fuse
+        hostPath:
+          path: /dev/fuse
+          type: CharDevice
+      - name: disk
+        hostPath:
+          path: /dev/sdb
+          type: BlockDevice
+      - name: logs
+        hostPath:
+          path: /var/log
+"#;
+
+    /// #1122: added capabilities, namespaced sysctls and device hostPaths
+    /// become `[runtime]` knobs; everything that can't map is reported.
+    #[test]
+    fn import_maps_capabilities_sysctls_and_device_host_paths_to_runtime_knobs() {
+        let result = import_from_yaml(KNOBBED_DEPLOYMENT).unwrap();
+        let app = &result.config.app["lb"];
+        let knobs = app.runtime.as_ref().unwrap();
+        let capabilities: Vec<&str> = knobs.capabilities.iter().map(|c| c.name()).collect();
+        assert_eq!(capabilities, ["CAP_IPC_LOCK", "CAP_NET_ADMIN"]);
+        let sysctls: Vec<(&str, &str)> = knobs
+            .sysctls
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(sysctls, [("net.core.somaxconn", "4096")]);
+        let devices: Vec<String> = knobs
+            .devices
+            .iter()
+            .map(|device| format!("{} {}", device.path, device.permissions))
+            .collect();
+        assert_eq!(devices, ["/dev/fuse rwm", "/dev/sdb rwm"]);
+        result.config.validate().unwrap();
+
+        let messages: Vec<&str> = result
+            .report
+            .warnings
+            .iter()
+            .map(|w| w.message.as_str())
+            .collect();
+        for expected in [
+            "kernel.panic",
+            "TELEPORT",
+            "capabilities.drop",
+            "privileged",
+            "allowed_capabilities",
+            "host-exec",
+            "/var/log",
+        ] {
+            assert!(
+                messages.iter().any(|m| m.contains(expected)),
+                "no warning for {expected}: {messages:?}"
+            );
+        }
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("hostPath volume \"fuse\"")),
+            "a device hostPath is imported, not dropped: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn a_pod_without_knobs_imports_no_runtime_table() {
+        let yaml = stop_hooks_deployment("          stopSignal: SIGTERM", "30");
+        let result = import_from_yaml(&yaml).unwrap();
+        assert_eq!(result.config.app["web"].runtime, None);
+    }
+
+    /// #1122: knobs leave as a securityContext and device hostPaths and
+    /// come back as the same `[runtime]` table. Kubernetes has no device
+    /// permissions, so only the default `rwm` survives the trip.
+    #[test]
+    fn runtime_knobs_survive_an_export_and_import_round_trip() {
+        let config = crate::config::Config::parse(
+            r#"
+            [app.lb]
+            image = "lb:v1"
+            [app.lb.runtime]
+            capabilities = ["NET_ADMIN"]
+            sysctls = { "net.core.somaxconn" = "4096", "kernel.shmmax" = "1048576" }
+            devices = [{ path = "/dev/fuse" }]
+            "#,
+        )
+        .unwrap();
+        let exported = crate::relish::k8s_export::export_kubernetes(&config).unwrap();
+        for expected in ["NET_ADMIN", "net.core.somaxconn", "/dev/fuse"] {
+            assert!(
+                exported.yaml.contains(expected),
+                "{expected}: {}",
+                exported.yaml
+            );
+        }
+        assert!(
+            exported
+                .report
+                .unsupported
+                .iter()
+                .any(|line| line.contains("device plugin")),
+            "{:?}",
+            exported.report.unsupported
+        );
+        let imported = import_from_yaml(&exported.yaml).unwrap();
+        assert_eq!(imported.config.app["lb"].runtime, config.app["lb"].runtime);
     }
 }

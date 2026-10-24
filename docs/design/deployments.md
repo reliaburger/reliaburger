@@ -780,7 +780,7 @@ When an instance is being replaced, Wrapper coordinates connection draining:
 3. **Wait for completion.** The system waits until either:
    - All in-flight connections complete (clean drain), OR
    - `drain_timeout` expires (forced drain).
-4. **On timeout:** Bun sends SIGTERM to the container. The application has a 10-second grace period to handle the signal and close connections. After the grace period, SIGKILL is sent.
+4. **Stop:** once the drain is clean or `drain_timeout` expires, Bun stops the instance with its stop hooks (5.8): its `pre_stop` command, then its `stop_signal` (SIGTERM by default), then its `stop_grace` (the `drain_timeout` again by default, 10 s for a stop outside a deploy), then SIGKILL.
 
 For WebSocket connections, the drain timeout applies equally. Long-lived WebSocket connections that exceed the drain timeout are forcefully closed. Applications that need longer drain times can configure `drain_timeout` accordingly.
 
@@ -864,6 +864,270 @@ The `replicas` field in git is the *base* replica count. Autoscaler adjustments 
 This prevents Lettuce from fighting the autoscaler during traffic spikes, even when unrelated configuration changes are deployed.
 
 ---
+
+### 5.8 Stop Hooks
+
+An app can say how its instances want to be stopped (#1121):
+
+```toml
+[app.worker]
+image = "registry.example.com/worker:2.1"
+stop_signal = "SIGQUIT"     # default SIGTERM
+stop_grace = "2m"           # 1s to 1h
+pre_stop = ["/app/bin/worker", "hand-back-jobs"]
+pre_stop_timeout = "20s"    # default 30s, 1s to 1h
+```
+
+**Where the policy lives.** `grill::oci::generate_oci_spec` copies the four fields into the instance's `OciSpec` as a `StopPolicy` (`stop`), so it's fixed per instance at launch, recorded with every instance record, runtime intent and process owner record, and survives adoption after a Bun restart. A rolling deploy retires each old instance with the policy that instance was launched with, not the new spec's, because the new spec's pre-stop command may not exist in the old image.
+
+**Who sends the signal.** Each runtime reads the signal from the spec it holds: `ProcessGrill` signals the process group itself or asks the process owner, which reads its launch spec; runc runs `runc kill <id> <SIGNAL>` from the runtime intent; Apple Container passes `container stop --signal`. Every graceful stop, including a Bun shutdown, therefore sends the app's signal, and `Grill::stop` keeps its one-argument shape.
+
+**Who runs the sequence.** `bun::agent::stop_runtime_instance` runs the four steps, each with its own bound:
+
+1. `pre_stop` through `Grill::exec`, within `pre_stop_timeout`. A non-zero exit, a refused exec or an overrun is logged and the stop carries on. Dropping the exec future ends the command (the owner closes it; the plain process runtime spawns it with `kill_on_drop`).
+2. `Grill::stop`, accepted within `[runtime] stop_confirmation_timeout_secs`.
+3. The grace: `stop_grace`, or the caller's default (`drain_timeout` in a deploy, 10 s otherwise).
+4. `Grill::kill` and a confirmed exit.
+
+Operator stops and retirements (`app_exit_wait`) read each instance's policy from the supervisor; the deploy worker gets it from the loop with `BeginRetire`, which already fences the instance from restarts.
+
+**Validation.** The signal and durations parse into `StopSignal` and `StopDuration`, so an unknown signal, a number, `SIGKILL`, a zero or an over-an-hour duration is a TOML parse error with the field's line. `validate_app` refuses a `pre_stop_timeout` without a `pre_stop`, an empty program, and, on an `exec` or `script` app, a program that isn't an absolute path. Such an app's pre-stop runs on the host, so it joins the app's host binaries for placement (`WorkloadRequirements::host_binaries`) and for the node's `allowed_binaries` check.
+
+**Deadlines.** The placement reconciler's deploy deadline adds `pre_stop_timeout` and `stop_grace` per replica. Its retirement deadline is still sized for the default grace; a longer stop overruns it, is retried on the next pass and joins the pending stop.
+
+**Kubernetes.** `relish import` maps `terminationGracePeriodSeconds`, `lifecycle.stopSignal` and an exec `lifecycle.preStop` to the three fields and warns about the difference in how the bound works; `relish export` maps them back. `pre_stop_timeout` has no Kubernetes field.
+
+### 5.9 Policies on the Apply Path (#1117)
+
+`[policy.*]` is a declarative kind committed to Raft like a permission
+(`RaftRequest::PolicySpec`, `PolicyDelete`; `DesiredState::policies`). A
+policy holds a CEL `match` (optional) and `deny`, a `message` and an `action`
+(`deny` or `warn`). The leader evaluates every policy against every applied
+app with one pure function, `crate::policy::evaluate`; the state machine never
+evaluates one.
+
+- **Where.** `cluster_apply` calls `policy::admit` before anything is bound or
+  written, under the committed policies with the config's own replacing any
+  of the same name. A denial answers 422 with a `PolicyRefusal` body, writes
+  nothing and records a `policy.denied` audit event. A job manifest's apps are
+  judged the same way in `job_apply`, but without a fence (the state machine
+  commits them later). The Lettuce runner judges each added or changed app in
+  `apply_changes`; an adopted app is never judged.
+- **Fence.** `DesiredState::policy_generation` moves by one on every applied
+  policy write and delete. Each app write is wrapped in
+  `RaftRequest::PolicyFenced { generation, change }`. The state machine applies
+  `change` only while its generation still matches, and otherwise answers
+  `CouncilResponse::PolicyGenerationMoved`. Both callers then judge the apps
+  still to write again, up to three times. A config that writes policies and
+  apps fences its apps on the generation plus the number of policies it writes,
+  because its policy writes come first.
+- **Input.** `app` (the declared spec as JSON, before images are bound, plus
+  `name` and the resolved `namespace`), `caller` (`name`, `role`) and `source`
+  (`apply` or `gitops`). Nothing else.
+- **Commit checks.** `policy::check_policy`, run by `Config::validate`: a DNS
+  label name, expressions of at most 1024 bytes, a message of at most 512,
+  valid CEL, only the three variables, and only known `app` and `caller`
+  fields. The `cel` crate has no cost limit, so the size cap bounds evaluation.
+- **Failure.** An expression that errors or returns a non-boolean fails
+  closed: a deny policy refuses, a warn policy warns. A committed policy that
+  no longer compiles refuses every app apply until an admin replaces or
+  deletes it. `POST /v1/policies/{name}/delete` is never judged.
+- **Defaults (#1118).** A policy may carry a `default` table (stored as a JSON
+  map in `PolicySpec::default`), and `deny` is optional once it does.
+  `policy::judge_app` judges one app in a fixed order: every matching default
+  in policy-name order, each `match` seeing the spec the policies before it
+  left; then `validate_app_spec` on the filled spec; then every `deny` on it.
+  A default fills a key only where the serialised spec holds nothing or
+  `null`, recursing into tables both hold, so a value the app sets always
+  wins. `admit` returns `Admitted::defaulted` (declared and effective spec per
+  changed app) and `filled`; the app writes carry the effective spec. `fence`
+  compares each app write with the declared app and, when they differ (a
+  default, or an image bound to a digest), carries the declared spec:
+  `PolicyFenced { generation, change, declared }`. The state machine stores it in `DesiredState::declared_apps`
+  when the inner write lands, clears it on a fenced write without one, on any
+  app write that changes the spec, and on delete. A write of the same spec (a
+  GitOps adoption) keeps it. `GET /v1/apps` fingerprints the declared spec, so
+  `relish apply --dry-run` shows a defaulted app as unchanged and lists each
+  filled field under `Policies:`. When the policies move mid-apply and would
+  fill a remaining app differently, the apply stops and asks to be run again.
+  Commit checks refuse an empty or oversized (4096-byte) default, a field
+  that isn't an app field or can't be filled (`name`, `namespace`,
+  `replicas`, `ordinals`, `sidecar`, and the fields the apply path gates on
+  the caller's token: `exec`, `script`, `volumes`, `config_file`, `init`,
+  `runtime`), and a value serde won't read back into `AppSpec`. The token
+  gates run on the declared spec, before policy, so a default must not be
+  able to add what they'd have refused.
+- **Jobs and audit (#1119).** `PolicySpec::applies_to` is `apps` (the default,
+  so every earlier policy keeps its meaning), `jobs` or `both`. An expression
+  sees `app` or `job` by the workload's kind, plus `workload`, bound to the
+  same value; a policy may only name the variables its target gives it, and
+  `workload` only has the fields in `WORKLOAD_FIELDS`, the intersection of
+  `APP_FIELDS` and `JOB_FIELDS` (a test keeps both lists honest against
+  serde). `judge_job` evaluates denies only: a `default` belongs to an apps
+  policy. `evaluate` judges a config's apps then its jobs, `admit` judges
+  both, and `job_apply` calls it whenever a manifest has apps or jobs; job
+  writes stay unfenced, like the apps of a job manifest. `Finding` carries a
+  `WorkloadKind` and names the workload (`policy p denies job ns/name: …`).
+  `PolicyAction::Audit` puts a finding in `Verdict::audits`: the apply goes
+  ahead, the caller isn't told, and `cluster_apply` and `job_apply` record one
+  `policy.audited` event; the GitOps runner logs it to stderr. `GET
+  /v1/policies/audit` (any token) runs `policy::audit::audit` on a copy of
+  desired state in `spawn_blocking`: every committed app (declared spec where
+  kept, else the stored one with its image read back as its tag) through
+  `judge_app`, as the owner's token (with its role) for apps a controller
+  owns (#1125), as `gitops` for apps GitOps owns and as the system caller
+  `audit` otherwise, including an owned app whose token is gone, and every job definition (schedule restored, image read
+  back) through `judge_job`. It changes nothing. `relish policy audit` prints
+  it, and `relish wtf` reads it into a `policies` evidence row
+  (`policy-would-deny`, `policy-audit`, `policy-broken`).
+- **Cost and coverage (#1126, #1311).** `benches/policy.rs` (in `make bench`)
+  measures `PolicySet::compile` and `judge_app` for 10, 100 and 1,000
+  policies: about 115 µs per policy to compile, about 2 µs per policy per app
+  to judge ([record](../qualification/2026-10-24-policy-evaluation-bench.md)).
+  `relish apply` compiles once per apply; caching the set per generation
+  would remove that if a cluster ever runs hundreds of policies.
+  `examples/policies/platform.toml` holds the four common policies, checked
+  offline by `tests/suite/platform_policies.rs` and on three nodes by
+  `make test-cluster` (apply, GitOps, a leader kill, break-glass). The V02
+  soak workload carries a deny, a warn and a default scoped to `soak-*`, and
+  `sustained_check.py` fails a snapshot where one is missing or changed or
+  the generation went backwards.
+
+---
+
+### 5.10 Runtime Knobs
+
+An app can ask for added capabilities, namespaced sysctls and host devices (#1122):
+
+```toml
+[app.vpn]
+image = "ghcr.io/example/vpn:2.0"
+
+[app.vpn.runtime]
+capabilities = ["NET_ADMIN"]
+sysctls = { "net.ipv4.ip_forward" = "1" }
+devices = [{ path = "/dev/net/tun", permissions = "rw" }]
+```
+
+**Two gates.** Each use needs the node and the token, the double gate host paths use. The token gate runs at apply, in the same place as `host-exec` for host binaries and host-path sources: a token with a `[permission]` block needs `host-exec` for an app with any knob, and its refusal names the first knob and "the token gate". The node gate is the `[runtime]` allowlist in `node.toml` (`allowed_capabilities`, `allowed_sysctls`, `allowed_devices`), checked by `WorkloadSupervisor::admit_runtime_knobs` in `admit_app` and again before every rolling or blue-green replacement, with a refusal that names the knob, the allowlist key and "the node gate".
+
+**What can be asked for at all.** `grill::knobs` parses each field into a type that can't hold a value no node could allow. `Capability` holds a name from the 41 Linux capabilities, accepts `NET_ADMIN` or `CAP_NET_ADMIN`, and refuses `ALL` or any wildcard. `SysctlName` accepts only the per-namespace families (`net.*`, `kernel.shm*`, `kernel.msg*`, `kernel.sem`, `fs.mqueue.*`), and the node's `SysctlPattern` accepts those names or a `net.`/`fs.mqueue.` prefix ending in `.*`, so `kernel.panic` is refused in a node's list as well as an app's. `DevicePath` is an absolute path under `/dev` with no `.` or `..` part; `DevicePermissions` is a subset of `rwm`. `validate_app` refuses knobs on an `exec` or `script` app, which has no container to change.
+
+**Escape-hatch capabilities.** Ten capabilities give near-root power inside the container's namespaces (`ESCAPE_CAPABILITIES`: `CAP_SYS_ADMIN`, `CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, `CAP_SYS_PTRACE`, `CAP_SYS_BOOT`, `CAP_DAC_READ_SEARCH`, `CAP_MAC_ADMIN`, `CAP_MAC_OVERRIDE`, `CAP_BPF`, `CAP_PERFMON`). They aren't refused outright, because FUSE and some network tools genuinely need `CAP_SYS_ADMIN`. They're admitted only when a node names each one: there is no wildcard or pattern that could include them by accident, and Bun prints a startup warning for each one its `[runtime]` lists.
+
+**Placement.** A node reports its allowlist in its capability report (`NodeCapabilities::runtime_knobs`), and only when its runtime applies knobs (`Grill::applies_runtime_knobs`, true for rootful runc and the mixed runtime's runc side). `WorkloadRequirements::runtime_knobs` carries the app's knobs and `node_can_run` admits a node only when its allowlist admits every one, so an app needing a knob that some nodes allow lands only on those. Otherwise it's unplaced with `NoCapableNode`.
+
+**Applying them.** `generate_oci_spec` copies the knobs into the instance's `OciSpec` (`runtime_knobs`, not part of the OCI spec proper). Rootful runc's prepare step calls `grill::knobs::apply_to_spec` after the user namespace has set its default capabilities: added capabilities join the bounding, effective and permitted sets; sysctls go to `linux.sysctl`; each device is read from the host (`stat`) into `linux.devices` with an allow rule in `linux.resources.devices`. The network namespace belongs to the node's user namespace, not the container's, so container root can't write `net.*` sysctls; `take_network_sysctls` moves them out of the spec and Bun writes them with `ip netns exec`, as it writes the low-ports sysctls. runc writes the IPC ones in the container's own IPC namespace. ProcessGrill, Apple Container and rootless runc refuse a spec that carries knobs (`LaunchProblem::RuntimeKnobsUnsupported`) rather than run it without them. A sidecar's spec (`generate_sidecar_oci_spec`) carries no knobs: the gates admitted them for the app's container. It shares the app's network namespace, so the app's `net.*` sysctls reach it anyway.
+
+**Kubernetes.** `relish import` maps `securityContext.capabilities.add`, the pod's `securityContext.sysctls` and device `hostPath` volumes; unknown capabilities, host-wide sysctls, `capabilities.drop` and `privileged` are warnings. `relish export` writes them back, devices as `hostPath` mounts reported as unsupported.
+
+### 5.11 Resource Owners (#1125)
+
+A controller is an ordinary app holding an API token. It claims an app by
+applying it with `owner = "<its token's name>"` (`AppSpec::owner`), and from
+then on `relish apply` and GitOps leave the app alone, the way GitOps leaves
+alone what it didn't write. The rules live in `council::owner` as pure
+functions, one per kind of change:
+
+| Who | Does what | Result | Where |
+|-----|-----------|--------|-------|
+| anyone | apply declaring `owner = X` | allowed only for token `X` or an admin, else 403 | `judge_apply` |
+| anyone | apply of an app owned by `X`, declaring `X` | written | `judge_apply` |
+| anyone | apply of an app owned by `X`, declaring no owner | skipped, with a progress note; the rest applies | `judge_apply` |
+| anyone | apply of an app owned by `X`, declaring `Y` | 409 until it's released | `judge_apply` |
+| token `X` or an admin | stop, delete, rollback, release | allowed | `judge_command`, `judge_release` |
+| anyone else | stop, delete, rollback, release | 409; `?force=true` doesn't help | `judge_command` |
+| GitOps | an owned app in the diff | left out: no update, adoption or prune | `lettuce::diff` |
+| GitOps | git declaring an `owner` | refused, in the partial result | state machine |
+
+- **Where.** `cluster_apply` calls `skip_owned_apps` on the leader before
+  policy admission, so a skipped app is neither judged nor written.
+  `cluster_app_change` (stop, delete, release) and `rollback_handler` check
+  before forwarding to the leader, because a forwarded request reaches the
+  leader as the service principal. The bootstrap window and the service
+  principal count as admins.
+- **Defaults.** The checks run on the declared spec, before policy defaults
+  (#1118) fill it, so `owner` is in `policy::check::UNFILLABLE_FIELDS`: a
+  policy whose `default` sets it is refused at commit, or a default could
+  claim apps for a controller their caller can't speak for.
+- **Backstop.** Two writers can read the same owner and race. The state machine
+  refuses an `AppSpec` (or a leased one) whose `owner` differs from the stored
+  app's, with `stored_owner_conflict`, which compares two strings and needs no
+  caller. Only `RaftRequest::AppRelease` clears an owner; it's refused for an
+  app that isn't there or has none.
+- **Not a version.** `rollout_fingerprint` and the node's placement fingerprint
+  set `owner` aside, and a claim doesn't count as a changed spec for a failed
+  rollout. Claiming or releasing restarts nothing. A rollback keeps today's
+  owner, whatever the old spec said.
+- **Reads.** `GET /v1/diagnostics/apps` carries `owner`, and a policy sees it
+  as `app.owner`. The JSON a controller reads and writes is documented in the
+  manual's "Writing a controller" chapter and pinned by
+  `src/bun/api/contract_tests.rs`.
+- **Scope.** A controller's token is a `deployer` scoped to its namespace; the
+  existing scope checks keep it there. Only apps carry an owner: a scoped token
+  can't write namespaces, permissions or policies anyway.
+- **The example.** `examples/controller/main.rs` keeps one of a cold-standby
+  pair running, from two `[app.*]` tables or from a template with two
+  `[use.*]` tables (`postgres-pair.toml`), in which case it applies the
+  active `use` with its own `owner` and `namespace` as parameters and the
+  apply endpoint expands it. The 0.2.4 exit test runs it on three nodes
+  (`tests/cluster_failover.rs`), failing over when the node under the active
+  member is killed, with Postgres replaced by a `sleep` stand-in because the
+  fixture runs host processes.
+
+---
+
+### 5.12 Templates (#1124)
+
+`[template.NAME]` holds typed `params` (`string`, `int` or `bool`, optionally
+with a `default`; without one, required) and a `body` string of ordinary
+`[app.*]` and `[job.*]` TOML with `${param}` placeholders. `[use.NAME]` holds
+`template` and one value per parameter. `config::template` owns both.
+
+- **Where it expands.** `template::expand` runs in three places, always
+  before validation and policy: `relish::compile::compile_sources` (the
+  compiler `relish compile` and Lettuce share), `relish::manifest::parse`
+  (`apply`, `apply --dry-run`, `lint`, `diff`, single-file `compile`,
+  `policy test`), and the apply endpoint for a manifest that arrives
+  unexpanded. `relish apply` sends the expanded config, so the endpoint's
+  call is a no-op for it. `Config::validate` refuses a `use` that's still
+  there, so nothing can skip expansion silently.
+- **In a tree.** `compile_sources` collects every template from every file
+  first (a name declared twice is refused), then expands each file's uses
+  before that file's `_defaults.toml` and directory namespace apply, so an
+  expanded app is an ordinary app of the file holding its `use`. A later
+  file overriding an app is a warning for `relish compile`, but refused
+  when a template made either one, under both duplicate policies.
+- **Substitution.** `scan` walks the body tracking whether it's outside
+  strings, in a basic string (one line or many), a literal string (one line
+  or many) or a comment. In a basic string a value is escaped; outside
+  strings a string value must match `[A-Za-z0-9_-]+`; in a literal string
+  it can't hold `'` or control characters. Integers and booleans go in as
+  written everywhere. Comments are copied, placeholders and all. `$${` is a
+  literal `${`. A value is never scanned again. So no value can add a key
+  or table to the body, and expansion is deterministic.
+- **Refusals** (`TemplateError`): an unknown template, unknown parameter,
+  missing required parameter or wrong type; a placeholder no parameter
+  resolves, checked on every template whether or not it's used; a value that
+  can't go where its placeholder is; a body that isn't valid TOML, or holds
+  anything but apps and jobs; a body that declares or uses a template (no
+  nesting); an expanded name a declared resource or another use already has;
+  template and use names that aren't DNS labels, and a parameter named
+  `template`.
+- **What's stored.** Only ordinary apps and jobs. Each expanded one carries
+  `provenance: { template, use }` (`AppSpec::provenance`,
+  `JobSpec::provenance`), the one wire and state change. It's part of the
+  spec, so the GitOps declared-spec diff compares it like any field: git's
+  expansion and the stored spec agree, and a re-sync writes nothing. Like
+  `owner` (5.11), it isn't part of the version: `rollout_fingerprint` and the
+  node's placement fingerprint set it aside, so moving an app into or out of
+  a template restarts nothing when the expansion is the same. Policies see
+  it as `app.provenance` or `job.provenance`; a policy `default` can't set
+  it. A body may declare an `owner`, and the owner rules judge the expanded
+  app exactly as they judge a hand-written one. `relish apply
+  --dry-run` shows it as `from use.NAME (template NAME)`.
+- **Not done.** No registry: templates come from files or git. No logic in
+  templates, and no nesting.
 
 ## 6. Configuration
 

@@ -16,7 +16,11 @@ mod loop_rule;
 mod namespace_secrets;
 mod published_status;
 mod restart_ownership;
+mod runtime_knobs;
 mod runtime_metadata;
+mod secret_providers;
+mod sidecars;
+mod stop_hooks;
 mod upgrade_answer;
 
 #[test]
@@ -2674,6 +2678,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             operation: None,
             stop_confirmation_timeout: self.stop_confirmation_timeout,
             egress: self.egress_resolver(),
+            secrets: self.secret_providers.clone(),
         };
         let events = events.clone();
         let mut task = tokio::spawn(async move { worker.run_deploy(config, events).await });
@@ -9097,6 +9102,7 @@ fn adoption_record(
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: "/tmp/test".to_string(),
                 readonly: false,
@@ -9118,7 +9124,10 @@ fn adoption_record(
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         },
         rootless_network: None,
     }
@@ -9694,6 +9703,7 @@ pub(super) fn limited_adoption_record(
             "memory.high".to_string(),
             "33554432".to_string(),
         )]),
+        devices: Vec::new(),
     });
     record
 }
@@ -10397,11 +10407,13 @@ async fn retire_waits_for_in_flight_request_before_kill() {
     drains.increment_connections(&id.0).await;
 
     // Kick off the retire on a task; it must block on the drain.
+    let stop = InstanceStop::for_policy(None, std::time::Duration::from_secs(30));
     let retire = drain_and_stop_instance(
         &drains,
         &grill,
         &id,
         std::time::Duration::from_secs(30),
+        &stop,
         std::time::Duration::from_secs(10),
     );
     tokio::pin!(retire);
@@ -10457,11 +10469,13 @@ async fn retire_waits_for_in_flight_websocket_before_kill() {
     drains.increment_connections(&id.0).await;
     drains.increment_websocket(&id.0).await;
 
+    let stop = InstanceStop::for_policy(None, std::time::Duration::from_secs(30));
     let retire = drain_and_stop_instance(
         &drains,
         &grill,
         &id,
         std::time::Duration::from_secs(30),
+        &stop,
         std::time::Duration::from_secs(10),
     );
     tokio::pin!(retire);

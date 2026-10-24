@@ -42,6 +42,7 @@ pub fn diagnose(inputs: &WtfInputs) -> WtfReport {
         check_tokens(inputs, &mut report);
         check_isolation(inputs, &mut report);
         check_gitops(inputs, &mut report);
+        check_policies(inputs, &mut report);
     }
     record_application_unknowns(&inputs.applications, inputs.app.as_deref(), &mut report);
     check_crashloops(inputs, &mut report);
@@ -87,6 +88,7 @@ fn record_cluster_unknowns(evidence: &ClusterEvidence, report: &mut WtfReport) {
     record_unknown("tokens", &evidence.tokens, "cluster", report);
     record_unknown("isolation", &evidence.isolation, "cluster", report);
     record_unknown("gitops", &evidence.gitops, "cluster", report);
+    record_unknown("policies", &evidence.policies, "cluster", report);
 }
 
 fn record_application_unknowns(
@@ -1473,6 +1475,87 @@ fn check_gitops(inputs: &WtfInputs, report: &mut WtfReport) {
     }
 }
 
+/// Policy findings (#1119): committed apps and jobs the policies in force
+/// would now refuse or record, the same list `relish policy audit` prints.
+/// A new policy never touches running work, so these keep running; the
+/// row says what the next apply of each would meet. A cluster with no
+/// policies says nothing.
+fn check_policies(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(audit) = inputs.cluster.policies.value() else {
+        return;
+    };
+    if audit.policies == 0 {
+        return;
+    }
+    if let Some(broken) = &audit.broken {
+        report.warnings.push(WtfFinding {
+            id: "policy-broken".to_string(),
+            title: "a policy in force can't be evaluated".to_string(),
+            details: vec![broken.clone()],
+            suggestion: "replace the policy with one that compiles, or remove it with \
+                         `relish policy delete`; every app apply is refused until then"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "policies".to_string(),
+        });
+        return;
+    }
+    let refused = audit.verdict.denials.iter().map(|finding| {
+        (
+            "policy-would-deny",
+            format!(
+                "{} {}/{} would now be refused by policy {}",
+                finding.kind.as_str(),
+                finding.workload.namespace,
+                finding.workload.name,
+                finding.policy
+            ),
+            "it keeps running as it is; fix it before its next apply, or change the policy",
+            finding,
+        )
+    });
+    let audited = audit.verdict.audits.iter().map(|finding| {
+        (
+            "policy-audit",
+            format!(
+                "{} {}/{} breaks audit policy {}",
+                finding.kind.as_str(),
+                finding.workload.namespace,
+                finding.workload.name,
+                finding.policy
+            ),
+            "an audit policy only records; make it `action = \"deny\"` once nothing breaks it",
+            finding,
+        )
+    });
+    let mut found = false;
+    for (id, title, suggestion, finding) in refused.chain(audited) {
+        found = true;
+        report.warnings.push(WtfFinding {
+            id: id.to_string(),
+            title,
+            details: vec![finding.message.clone()],
+            suggestion: suggestion.to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: format!(
+                "{}.{}/{}",
+                finding.kind.as_str(),
+                finding.workload.namespace,
+                finding.workload.name
+            ),
+        });
+    }
+    if !found {
+        report.ok.push(WtfOk {
+            id: "policies".to_string(),
+            description: format!(
+                "every committed app and job passes the cluster's {} policy(ies)",
+                audit.policies
+            ),
+        });
+    }
+}
+
 fn app_matches(scope: Option<&str>, app: &str) -> bool {
     scope.is_none_or(|scope| scope == app)
 }
@@ -1571,6 +1654,7 @@ mod tests {
                     }],
                 }),
                 gitops: available(GitOpsObservation::default()),
+                policies: available(crate::policy::audit::PolicyAudit::default()),
             },
             applications: ApplicationEvidence {
                 restarts: available(Vec::new()),
@@ -2162,6 +2246,77 @@ mod tests {
         let report = diagnose(&inputs);
 
         assert!(report.warnings.iter().any(|item| item.id == "deploy-stuck"));
+    }
+
+    /// #1119: the policies row lists what `relish policy audit` lists:
+    /// committed workloads a policy would now refuse, and audit findings.
+    /// Warnings are left to the audit report. No policies, no row.
+    #[test]
+    fn warns_about_committed_workloads_the_policies_would_now_refuse() {
+        use crate::config::PolicyAction;
+        use crate::policy::{Finding, Verdict, WorkloadKind, audit::PolicyAudit};
+        let finding = |policy: &str, action, kind, name: &str| Finding {
+            policy: policy.to_string(),
+            action,
+            kind,
+            workload: crate::meat::types::AppId::new(name, "default"),
+            message: "pin a version".to_string(),
+        };
+        let mut inputs = healthy_inputs();
+        inputs.cluster.policies = available(PolicyAudit {
+            generation: 3,
+            policies: 2,
+            apps: 1,
+            jobs: 1,
+            verdict: Verdict {
+                denials: vec![finding(
+                    "no-latest",
+                    PolicyAction::Deny,
+                    WorkloadKind::App,
+                    "web",
+                )],
+                warnings: vec![finding(
+                    "owner",
+                    PolicyAction::Warn,
+                    WorkloadKind::App,
+                    "web",
+                )],
+                audits: vec![finding(
+                    "limits",
+                    PolicyAction::Audit,
+                    WorkloadKind::Job,
+                    "nightly",
+                )],
+            },
+            broken: None,
+        });
+        let report = diagnose(&inputs);
+        let policies: Vec<_> = warning_ids(&report)
+            .into_iter()
+            .filter(|(id, _)| id.starts_with("policy"))
+            .collect();
+        assert_eq!(
+            policies,
+            vec![
+                ("policy-audit", "job.default/nightly"),
+                ("policy-would-deny", "app.default/web"),
+            ]
+        );
+        assert!(!report.ok.iter().any(|ok| ok.id == "policies"));
+
+        inputs.cluster.policies = available(PolicyAudit {
+            policies: 2,
+            ..PolicyAudit::default()
+        });
+        assert!(diagnose(&inputs).ok.iter().any(|ok| ok.id == "policies"));
+        inputs.cluster.policies = available(PolicyAudit::default());
+        let report = diagnose(&inputs);
+        assert!(!report.ok.iter().any(|ok| ok.id == "policies"));
+        assert!(
+            !warning_ids(&report)
+                .iter()
+                .any(|(id, _)| id.starts_with("policy"))
+        );
     }
 
     #[test]

@@ -105,6 +105,34 @@ Raise it on hosts where `runc kill` routinely answers slowly under load. A
 stop that outlasts it is reported as unconfirmed and retried, never as
 Stopped.
 
+An app can choose how it's stopped: its signal, its grace after the signal,
+and a command run inside it first, with its own bound (#1121). A failing
+`pre_stop` is logged and the stop carries on:
+
+```toml
+[app.web]
+image = "nginx:alpine"
+stop_signal = "SIGQUIT"
+stop_grace = "45s"
+pre_stop = ["/bin/sh", "-c", "sleep 2"]
+pre_stop_timeout = "10s"
+```
+
+An app can ask for a few runtime knobs: added capabilities, namespaced
+sysctls and host devices (#1122). Each needs two keys, the node's `[runtime]`
+allowlist and the token's `host-exec`, and the scheduler places the app only
+on a node that allows all of them:
+
+```toml
+[app.vpn]
+image = "ghcr.io/example/vpn:2.0"
+
+[app.vpn.runtime]
+capabilities = ["NET_ADMIN"]
+sysctls = { "net.ipv4.ip_forward" = "1" }
+devices = [{ path = "/dev/net/tun", permissions = "rw" }]
+```
+
 ### Jobs and cron
 
 Jobs arrived in 0.2.0, and 0.2.1 changes the cluster's formats again, so a 0.2.0
@@ -440,7 +468,7 @@ for the audit, exact suite contracts and CI mapping.
 Gossip protocol benchmarks use [criterion](https://docs.rs/criterion) for statistical analysis with regression detection.
 
 ```sh
-make bench         # reproducible transport and 5-250 node measurements, then one scheduling pass on 1k and 10k nodes
+make bench         # reproducible transport and 5-250 node measurements, one scheduling pass on 1k and 10k nodes, and policy evaluation for 10-1,000 policies
 make bench-large   # reproducible 500 and 1,000 node measurements
 make bench-task-arrays  # in-process task-array costs and the fork/exec floor
 ```
@@ -555,8 +583,8 @@ After bootstrap, cluster-wide token management, node join tokens, secret
 rotation, image signing, self-upgrades (start, apply, rollback, resume) and
 leader elections require an **unscoped Admin** credential. An Admin
 restricted by `--apps` or `--namespaces` cannot use those global operations.
-Ordinary `[namespace]` quota and `[permission]` declarations also require an
-unscoped Admin; a Deployer can apply workloads within its scope and configured
+Ordinary `[namespace]` quota, `[permission]` and `[policy]` declarations also
+require an unscoped Admin; a Deployer can apply workloads within its scope and configured
 permissions. Apps and jobs receive the same admission checks before any part
 of a manifest changes state. Lease-owned test namespace declarations retain
 their separate ownership checks. An administrator overriding another credential's
@@ -1014,6 +1042,7 @@ See [`examples/`](../examples/) for ready-to-apply configs:
 | [`container-full-featured.toml`](../examples/phase-1/container-full-featured.toml) | All Phase 1 features |
 | [`container-multi-app.toml`](../examples/phase-1/container-multi-app.toml) | Multiple apps in one config |
 | [`container-volumes.toml`](../examples/phase-1/container-volumes.toml) | Managed and HostPath volumes |
+| [`templates/container-postgres.toml`](../examples/templates/container-postgres.toml) | A `[template.*]` with typed parameters, stamped out twice by `[use.*]` |
 | [`container-egress.toml`](../examples/phase-1/container-egress.toml) | Job egress allowlist that resolves and reaches one host |
 | [`container-allow-from.toml`](../examples/phase-1/container-allow-from.toml) | One cross-namespace path opened with `allow_from` |
 | [`container-tls-ingress.toml`](../examples/phase-1/container-tls-ingress.toml) | HTTPS ingress with the cluster's own certificates |
@@ -1199,6 +1228,44 @@ image = "public.ecr.aws/docker/library/redis:8.8.0"
 command = ["echo", "initialising database"]
 ```
 
+### Sidecars
+
+A sidecar runs beside every instance of its app, in the instance's network
+namespace (#1120). It starts after the init containers and before the app,
+stops after the app, and restarts on its own if it crashes; when the app
+crashes, its sidecars restart with it. Its `cpu` and `memory` requests add to
+the app's when it's placed. Sidecars need rootful runc: the scheduler keeps
+such apps on nodes that report it, and Apple Container, rootless runc and the
+process runtime refuse them. See [Sidecars](manual/01_deploy-an-app.md#sidecars).
+
+```toml
+[app.web]
+image = "nginx:alpine"
+port = 8080
+
+[[app.web.sidecar]]
+name = "logs"
+image = "ghcr.io/example/shipper:3.0"
+memory = "32Mi-64Mi"
+```
+
+### Apps a controller owns
+
+A controller is an ordinary app with an API token scoped to its namespace
+(#1125). It claims an app by applying it with its token's name as the
+`owner`. From then on `relish apply` skips the app with a note, GitOps leaves
+it out of its diff, and only the owner or an admin can stop, delete, roll it
+back or release it. See [Writing a controller](manual/15_writing-a-controller.md)
+for the rules and the JSON, and [`examples/controller`](../examples/controller)
+for a small one that fails an app over to a standby.
+
+```toml
+[app.db-a]
+image = "postgres:17"
+namespace = "pg"
+owner = "db-failover"
+```
+
 For the full configuration reference (resource limits, replicas, environment variables, volumes, secrets, namespaces), see the [App fields](manual/13_reference.md#app-fields) table and the book chapter [Hello, Container](book/01-hello-container.md).
 
 ## Runtime auto-detection
@@ -1361,7 +1428,9 @@ authenticated client identity. It diagnoses node and council health,
 crashloops, stalled deploys, missing service backends, active faults and alerts,
 disk pressure, actual cgroup throttling, certificate lifecycle, Pickle
 redundancy and version skew (each node's bun version, commit and binary
-SHA-256; a warning names nodes on a different build). Use `--app <name>` for application scope or `--watch` for a
+SHA-256; a warning names nodes on a different build), and the committed apps
+and jobs the cluster's policies would now refuse (`relish policy audit` *(0.2.2, not in 0.2.1)* lists
+the same). Use `--app <name>` for application scope or `--watch` for a
 human refresh every 30 seconds (`--interval <secs>` changes the period). JSON and YAML use schema version 1. Exit status 0 means
 all selected evidence was observed and healthy, 1 means a critical finding,
 and 2 means warnings or unknown evidence. Bounded in-memory restart and deploy
@@ -1515,6 +1584,15 @@ a token scoped to other namespaces gets 403. Rotate it with
 `relish secret rotate [--finalize] --namespace X`, which takes an unscoped
 Admin. Until the master key is split, every node can still unwrap every
 namespace's key.
+
+### Secrets from an exec provider
+
+An app env value `PROVIDER[name:path]` is resolved when an instance launches,
+by a binary the node names in `[secret_providers.name]` in `node.toml`, over
+JSON on stdin and stdout with a timeout and an output cap. The scheduler places
+such an app only on nodes that run its provider, and a provider that fails
+keeps that instance from starting, with the reason in `relish status` and
+`relish wtf`. See [Secrets from a provider](manual/10_security.md#secrets-from-a-provider).
 
 ### OCI release qualification
 

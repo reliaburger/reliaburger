@@ -26,6 +26,7 @@ pub(crate) fn validate_rerun(config: &Config) -> Result<(), &'static str> {
         || !config.app.is_empty()
         || !config.namespace.is_empty()
         || !config.permission.is_empty()
+        || !config.policy.is_empty()
         || !config.build.is_empty()
         || config.job.values().any(|spec| spec.schedule.is_some())
     {
@@ -70,6 +71,43 @@ pub(crate) async fn apply(
             .collect();
         if let Err(error) = config.validate_against(&namespaces) {
             return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
+        // The apps and jobs in a job manifest are judged by the policies in
+        // force, as `relish apply` judges any app (#1117, #1119). The state
+        // machine commits them later, once their jobs have run, so their
+        // writes carry no policy fence: a policy committed in between
+        // doesn't stop them.
+        if !config.app.is_empty() || !config.job.is_empty() {
+            let (policies, generation) = council
+                .read_desired(|desired| (desired.policies.clone(), desired.policy_generation))
+                .await;
+            match crate::policy::admit(
+                &policies,
+                generation,
+                &config,
+                &super::api::apply::policy_caller(auth),
+                crate::policy::Source::Apply,
+                Vec::new(),
+            ) {
+                // The apps commit with their policy defaults filled in
+                // (#1118). Job manifests never come from GitOps, so there's
+                // no declared spec to keep beside them.
+                Ok(admitted) => {
+                    super::api::apply::record_policy_audits(&state, auth, &admitted.audits).await;
+                    for (name, spec) in config.app.iter_mut() {
+                        let app_id = crate::meat::AppId::new(
+                            name,
+                            spec.namespace.as_deref().unwrap_or("default"),
+                        );
+                        if let Some(app) = admitted.defaulted.get(&app_id) {
+                            *spec = app.effective.clone();
+                        }
+                    }
+                }
+                Err(error) => {
+                    return super::api::apply::policy_refusal(&state, auth, &error).await;
+                }
+            }
         }
     }
     if state.council.is_none() && !state.task_arrays.admission_configured() {

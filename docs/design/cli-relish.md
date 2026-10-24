@@ -633,6 +633,7 @@ relish deploy <path> --dry-run      # Print the plan without deploying
 relish rollback <app>               # Roll back an app one step, to its previous version
 relish rollback <app> --namespace <ns>  # Roll back within a namespace
 relish stop <app>                   # Stop all instances of an app
+relish release <app> [--namespace <ns>]  # Hand an app a controller owns back to apply and GitOps (#1125)
 relish inspect <app>                # Per-instance detail (bare app name, not app.X)
 
 # Configuration tooling
@@ -1551,7 +1552,9 @@ Each correlated group becomes one `[app.*]` block. Two apps or jobs with the sam
 | `volumes`, `fsGroup` | **Warning**; a `hostPath` volume gets its own |
 | `strategy.rollingUpdate.maxSurge` | `[app.*.deploy] max_surge` |
 | `strategy.rollingUpdate.maxUnavailable` | `[app.*.deploy] max_unavailable` |
-| `terminationGracePeriodSeconds` | `[app.*.deploy] drain_timeout` |
+| `terminationGracePeriodSeconds` | `[app.*] stop_grace`, clamped to 1 s to 1 h (**warned** when clamped) |
+| `lifecycle.stopSignal` | `[app.*] stop_signal` (**warned** when it isn't one Reliaburger accepts) |
+| `lifecycle.preStop.exec.command` | `[app.*] pre_stop` (**warned**: it gets its own bound, `pre_stop_timeout`, instead of sharing the grace); any other preStop handler and `postStart` are **warned** |
 
 **Migration report** (printed to stderr):
 

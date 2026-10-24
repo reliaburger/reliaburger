@@ -93,6 +93,8 @@ pulldown-cmark = "0.13.4"
 nucleo-matcher = "0.3.1"
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 libc = "0.2"
+# `[policy.*]` expressions (#1117). No chrono: policies see no clock.
+cel = { version = "0.15", default-features = false, features = ["regex"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.14", optional = true }
@@ -178,4 +180,8 @@ harness = false
 
 [[bench]]
 name = "scheduler"
+harness = false
+
+[[bench]]
+name = "policy"
 harness = false

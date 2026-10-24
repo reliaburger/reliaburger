@@ -87,6 +87,28 @@ fn apply_summary(created: usize, instances: &[String]) -> String {
     }
 }
 
+/// What the policies say about `config`'s apps, for `relish apply
+/// --dry-run`: the cluster's policies with the config's own replacing any
+/// of the same name, judged as a deployer applying by hand (#1117).
+pub(crate) fn plan_policies(
+    committed: &std::collections::BTreeMap<String, crate::config::PolicySpec>,
+    config: &Config,
+) -> super::plan::PolicyPlan {
+    let effective = crate::policy::effective_policies(committed, config);
+    match crate::policy::PolicySet::compile(&effective) {
+        Ok(set) => super::plan::PolicyPlan::from_evaluation(&crate::policy::evaluate(
+            &set,
+            config,
+            &crate::policy::Caller::token("relish", crate::sesame::types::ApiRole::Deployer),
+            crate::policy::Source::Apply,
+        )),
+        Err(error) => super::plan::PolicyPlan {
+            denials: vec![error.to_string()],
+            ..Default::default()
+        },
+    }
+}
+
 async fn apply_with_client(
     source: &super::manifest::ManifestSource,
     output: OutputFormat,
@@ -99,11 +121,20 @@ async fn apply_with_client(
         // Diff against the live agent's current state when one answers, so
         // updates and unchanged resources render as such instead of every
         // resource claiming to be a create. No agent → the all-create plan.
-        let current = match client.health().await {
-            Ok(()) => Some(client.current_resources().await?),
-            Err(_) => None,
+        let (current, committed_policies) = match client.health().await {
+            Ok(()) => (
+                Some(client.current_resources().await?),
+                // A standalone node has no council and so no policies.
+                client
+                    .policies()
+                    .await
+                    .map(|listing| listing.policies)
+                    .unwrap_or_default(),
+            ),
+            Err(_) => (None, Default::default()),
         };
-        let plan = generate_plan(&config, current.as_deref());
+        let mut plan = generate_plan(&config, current.as_deref());
+        plan.policy = plan_policies(&committed_policies, &config);
         let formatted = format_output(&plan, output)?;
         println!("{formatted}");
         // Human-only trailer: appending it to --output json|yaml would
@@ -587,6 +618,13 @@ async fn delete_with_client(
 ) -> Result<(), RelishError> {
     client.delete_with_force(app, namespace, force).await?;
     println!("delete requested for {app}; check `relish status` for remaining instances");
+    Ok(())
+}
+
+/// Hand an app a controller owns back to `relish apply` and GitOps (#1125).
+pub async fn release(app: &str, namespace: &str) -> Result<(), RelishError> {
+    BunClient::default_local().release(app, namespace).await?;
+    println!("released {app} in {namespace}; relish apply and GitOps manage it again");
     Ok(())
 }
 
@@ -2804,6 +2842,7 @@ pub fn task_array_request(
             task_timeout_secs: None,
             overlap: None,
             replay_unknown: false,
+            provenance: None,
         },
         spec: run.spec,
     })
@@ -4514,6 +4553,7 @@ spec:
 
     fn evidence(app: &str, replicas: u32) -> crate::bun::diagnostics::DesiredAppEvidence {
         crate::bun::diagnostics::DesiredAppEvidence {
+            owner: None,
             app: app.to_string(),
             namespace: "prod".to_string(),
             desired_replicas: replicas,
