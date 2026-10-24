@@ -19,6 +19,7 @@ mod restart_ownership;
 mod runtime_knobs;
 mod runtime_metadata;
 mod secret_providers;
+mod sidecars;
 mod stop_hooks;
 mod upgrade_answer;
 

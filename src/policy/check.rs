@@ -29,7 +29,7 @@ pub const POLICY_VARIABLES: [&str; 3] = ["app", "caller", "source"];
 ///
 /// `namespace` is always present, resolved to `default` when the spec
 /// doesn't name one. A test checks this list against `AppSpec` itself.
-pub const APP_FIELDS: [&str; 33] = [
+pub const APP_FIELDS: [&str; 34] = [
     "name",
     "image",
     "command",
@@ -50,6 +50,7 @@ pub const APP_FIELDS: [&str; 33] = [
     "config_file",
     "volumes",
     "init",
+    "sidecar",
     "ingress",
     "placement",
     "deploy",

@@ -176,12 +176,27 @@ struct CreateInput {
     secrets: crate::sesame::secret_provider::SecretProviders,
 }
 
+/// What a restart step does to the instance's sidecars (#1120): the Clear
+/// and Cleanup steps kill them after the instance, and the Start step
+/// starts them before it.
+#[derive(Default)]
+struct RestartSidecars {
+    /// The registered sidecars, killed after the instance.
+    ids: Vec<InstanceId>,
+    /// What the Start step creates and starts before the instance.
+    launches: Vec<super::sidecars::SidecarLaunch>,
+    secrets: crate::sesame::secret_provider::SecretProviders,
+    app_name: String,
+    namespace: String,
+}
+
 /// Run one step against the runtime, unless the restart was cancelled.
 async fn run_step<G: Grill>(
     grill: G,
     id: InstanceId,
     step: RestartStep,
     create: Option<CreateInput>,
+    sidecars: RestartSidecars,
     gate: RestartGate,
     confirmation_timeout: Duration,
 ) -> StepResult {
@@ -191,7 +206,34 @@ async fn run_step<G: Grill>(
     }
     let done = match step {
         RestartStep::Cleanup | RestartStep::Clear => {
-            kill_runtime_instance(&grill, &id, confirmation_timeout).await
+            match kill_runtime_instance(&grill, &id, confirmation_timeout).await {
+                Ok(()) => {
+                    super::sidecars::kill_sidecars(&grill, &sidecars.ids, confirmation_timeout)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        RestartStep::Start if !sidecars.launches.is_empty() => {
+            match super::sidecars::launch_sidecars(
+                &grill,
+                &sidecars.secrets,
+                &sidecars.app_name,
+                &sidecars.namespace,
+                &sidecars.launches,
+            )
+            .await
+            {
+                Ok(()) => match grill.start(&id).await {
+                    Ok(()) => {
+                        return StepResult::Started(Box::new(
+                            LaunchEvidence::read(&grill, &id).await,
+                        ));
+                    }
+                    Err(error) => Err(error.into()),
+                },
+                Err(failure) => Err((*failure.error).into()),
+            }
         }
         RestartStep::Create => match create {
             Some(create) => match super::launch::create_with_secrets(
@@ -266,6 +308,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }),
             _ => None,
         };
+        let sidecars = self.restart_sidecars(&id, step, launch.as_ref());
         let task = self
             .restart_steps
             .spawn(run_step(
@@ -273,6 +316,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 id.clone(),
                 step,
                 create,
+                sidecars,
                 gate.clone(),
                 self.stop_confirmation_timeout,
             ))
@@ -286,6 +330,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 task,
             },
         );
+    }
+
+    /// What `step` of `id`'s restart does to its sidecars (#1120).
+    fn restart_sidecars(
+        &self,
+        id: &InstanceId,
+        step: RestartStep,
+        launch: Option<&RestartLaunch>,
+    ) -> RestartSidecars {
+        let ids = self.sidecars.of(id);
+        if ids.is_empty() {
+            return RestartSidecars::default();
+        }
+        let launches = match (step, launch) {
+            (RestartStep::Start, Some(launch)) => self.sidecar_launches_of(id, &launch.oci_spec),
+            _ => Vec::new(),
+        };
+        RestartSidecars {
+            ids,
+            launches,
+            secrets: self.secret_providers.clone(),
+            app_name: launch.map(|l| l.app_name.clone()).unwrap_or_default(),
+            namespace: launch.map(|l| l.namespace.clone()).unwrap_or_default(),
+        }
     }
 
     /// Take the restart's Create result again after a short wait, off the
@@ -612,6 +680,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             return;
         }
+        // Its sidecars started again before it did (#1120).
+        self.sidecars.started_with(id);
         if let Err(error) = self.record_launch_execution(id, &evidence.execution) {
             self.record_failed_restart(id, &error.to_string()).await;
             return;
@@ -775,7 +845,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .list_instances()
             .iter()
             .filter(|i| {
-                i.state == ContainerState::Pending && i.restart_count > 0 && !self.restarting(&i.id)
+                i.state == ContainerState::Pending
+                    && i.restart_count > 0
+                    && !self.restarting(&i.id)
+                    // A sidecar restart still in flight could create a
+                    // sidecar after the Clear step killed them (#1120).
+                    && !self.sidecars.relaunching(&i.id)
             })
             .filter_map(|i| {
                 i.oci_spec.as_ref().map(|spec| {

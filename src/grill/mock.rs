@@ -44,6 +44,9 @@ pub struct MockGrill {
         Arc<tokio::sync::Mutex<HashMap<InstanceId, super::runc_intent::NetworkReference>>>,
     honours_cgroup_path: Arc<Mutex<bool>>,
     applies_runtime_knobs: Arc<Mutex<bool>>,
+    /// What `shares_network_namespaces` answers: true unless a test models
+    /// a runtime that can't run sidecars (#1120).
+    shares_network: Arc<AtomicBool>,
     runtime_kind: Arc<Mutex<crate::grill::records::RuntimeKind>>,
     pid: Arc<Mutex<Option<u32>>>,
     cgroup_paths: Arc<Mutex<HashMap<InstanceId, std::path::PathBuf>>>,
@@ -89,6 +92,9 @@ pub struct MockGrill {
     /// Make pid reads fail, as an owner that doesn't answer does.
     fail_pid: Arc<AtomicBool>,
     fail_create: Arc<AtomicBool>,
+    /// Instances whose `create` fails, for a test that fails one container
+    /// of several, such as one sidecar.
+    failing_creates: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
     /// When set, `create` refuses the launch as a missing binary would (#881).
     refused_launch: Arc<Mutex<Option<super::LaunchProblem>>>,
     /// When set, `start` refuses the launch as the owner gate's failed
@@ -135,6 +141,7 @@ impl Default for MockGrill {
             launch_inventory: Arc::default(),
             honours_cgroup_path: Arc::default(),
             applies_runtime_knobs: Arc::default(),
+            shares_network: Arc::new(AtomicBool::new(true)),
             runtime_kind: Arc::new(Mutex::new(crate::grill::records::RuntimeKind::Process)),
             pid: Arc::default(),
             cgroup_paths: Arc::default(),
@@ -167,6 +174,7 @@ impl Default for MockGrill {
             instance_pid_delays: Arc::default(),
             fail_pid: Arc::default(),
             fail_create: Arc::default(),
+            failing_creates: Arc::default(),
             refused_launch: Arc::default(),
             refused_start: Arc::default(),
             create_image_error: Arc::default(),
@@ -392,6 +400,20 @@ impl MockGrill {
     #[allow(dead_code)]
     pub fn set_applies_runtime_knobs(&self, value: bool) {
         *self.applies_runtime_knobs.lock().unwrap() = value;
+    }
+
+    /// Make every `create` of `instance` fail, as a pull of its image would.
+    pub fn fail_create_of(&self, instance: &InstanceId) {
+        self.failing_creates
+            .lock()
+            .unwrap()
+            .insert(instance.clone());
+    }
+
+    /// Make `shares_network_namespaces()` report `value`, as Apple Container
+    /// or rootless runc would with `false`.
+    pub fn set_shares_network(&self, value: bool) {
+        self.shares_network.store(value, Ordering::SeqCst);
     }
 
     /// Make `runtime_kind()` report `kind`, so tests can model a runc/Apple
@@ -737,7 +759,9 @@ impl super::Grill for MockGrill {
                 .expect("create gate closed");
             permit.forget();
         }
-        if self.fail_create.load(Ordering::SeqCst) {
+        if self.fail_create.load(Ordering::SeqCst)
+            || self.failing_creates.lock().unwrap().contains(instance)
+        {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: "injected create failure".into(),
@@ -926,6 +950,10 @@ impl super::Grill for MockGrill {
 
     fn applies_runtime_knobs(&self) -> bool {
         *self.applies_runtime_knobs.lock().unwrap()
+    }
+
+    fn shares_network_namespaces(&self) -> bool {
+        self.shares_network.load(Ordering::SeqCst)
     }
 
     async fn workload_cgroup(&self, instance: &InstanceId) -> Result<Option<u64>, GrillError> {

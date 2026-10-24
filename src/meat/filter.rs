@@ -42,6 +42,9 @@ pub struct WorkloadRequirements {
     /// The runtime knobs the app asks for in `[app.x.runtime]`: the node's
     /// advertised allowlist must admit every one (#1122).
     pub runtime_knobs: crate::grill::knobs::RuntimeKnobs,
+    /// The app has sidecars, which join its network namespace: only a
+    /// runtime that can share one may run it (#1120).
+    pub requires_shared_network: bool,
 }
 
 impl WorkloadRequirements {
@@ -65,13 +68,16 @@ impl WorkloadRequirements {
                 .collect(),
             requires_containers: (spec.exec.is_none() && spec.script.is_none())
                 || spec.init.iter().any(|init| init.image.is_some()),
+            // A sidecar's own env can name a provider too.
             secret_providers: spec
                 .env
                 .values()
+                .chain(spec.sidecar.iter().flat_map(|sidecar| sidecar.env.values()))
                 .filter_map(|value| value.provider_reference())
                 .map(|reference| reference.provider().clone())
                 .collect(),
             runtime_knobs: spec.runtime.clone().unwrap_or_default(),
+            requires_shared_network: !spec.sidecar.is_empty(),
         }
     }
 }
@@ -117,11 +123,13 @@ pub fn host_pre_stop_binary(spec: &AppSpec) -> Option<&Path> {
 /// Whether `node` can run a workload with these requirements, room and
 /// labels aside: it's ready, runs containers when the workload is one, and
 /// can enforce egress, resolve internal DNS, run the host binary, call the
-/// secret providers and apply the runtime knobs when the workload needs
+/// secret providers, share a network namespace and apply the runtime knobs
+/// when the workload needs
 /// them.
 pub fn node_can_run(node: &SchedulerNodeState, requirements: &WorkloadRequirements) -> bool {
     node.ready
         && runs_its_kind(node, requirements)
+        && (!requirements.requires_shared_network || node.capabilities.shared_network)
         && (!requirements.requires_egress || node.capabilities.egress.can_enforce_allowlist())
         && (!requirements.requires_dns || node.capabilities.dns.can_resolve_internal())
         && requirements
@@ -274,6 +282,7 @@ mod tests {
                 requires_containers: false,
                 secret_providers: Default::default(),
                 runtime_knobs: Default::default(),
+                requires_shared_network: false,
             },
             &cluster,
         );
@@ -311,6 +320,7 @@ mod tests {
                 requires_containers: false,
                 secret_providers: Default::default(),
                 runtime_knobs: Default::default(),
+                requires_shared_network: false,
             },
             &cluster,
         );
@@ -335,6 +345,7 @@ mod tests {
                 requires_containers: false,
                 secret_providers: Default::default(),
                 runtime_knobs: Default::default(),
+                requires_shared_network: false,
             },
             &cluster,
         );
@@ -366,6 +377,7 @@ mod tests {
                 requires_containers: false,
                 secret_providers: Default::default(),
                 runtime_knobs: Default::default(),
+                requires_shared_network: false,
             },
             &cluster,
         );
@@ -405,6 +417,7 @@ mod tests {
                 requires_containers: false,
                 secret_providers: Default::default(),
                 runtime_knobs: Default::default(),
+                requires_shared_network: false,
             },
             &cluster,
         );
@@ -459,6 +472,7 @@ mod tests {
                 requires_containers: false,
                 secret_providers: Default::default(),
                 runtime_knobs: Default::default(),
+                requires_shared_network: false,
             },
             &cluster,
         );
@@ -654,6 +668,59 @@ mod tests {
         needs.host_binaries.clear();
         assert_eq!(unplaced_reason(&needs, &cluster), UnplacedReason::NoRoom);
         assert!(filter_nodes(&needs, &cluster).is_empty());
+    }
+
+    /// #1120: an app with a sidecar lands only on a node whose runtime can
+    /// share a network namespace (rootful runc), and its sidecars' requests
+    /// count towards the room it needs.
+    #[test]
+    fn an_app_with_a_sidecar_needs_a_shared_network_and_room_for_both() {
+        let mut cluster = ClusterStateCache::new();
+        let mut runc = node_state("runc", 1000, 4096, BTreeMap::new(), true);
+        runc.capabilities.shared_network = true;
+        cluster.set_node(runc);
+        cluster.set_node(node_state("apple", 4000, 8192, BTreeMap::new(), true));
+
+        let spec: AppSpec = toml::from_str(
+            "image = \"api:1\"\ncpu = \"600m\"\n[[sidecar]]\nname = \"proxy\"\ncpu = \"300m\"\n",
+        )
+        .unwrap();
+        let requirements = WorkloadRequirements::for_app(&spec, false);
+        assert!(requirements.requires_shared_network);
+        assert_eq!(requirements.resources.cpu_millicores, 900);
+        assert_eq!(
+            filter_nodes(&requirements, &cluster),
+            vec![NodeId::new("runc")]
+        );
+
+        // Room for the app alone isn't room for the app and its sidecar.
+        let bigger: AppSpec = toml::from_str(
+            "image = \"api:1\"\ncpu = \"600m\"\n[[sidecar]]\nname = \"proxy\"\ncpu = \"500m\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            unplaced_reason(&WorkloadRequirements::for_app(&bigger, false), &cluster),
+            UnplacedReason::NoRoom
+        );
+
+        let mut without = ClusterStateCache::new();
+        without.set_node(node_state("apple", 4000, 8192, BTreeMap::new(), true));
+        assert_eq!(
+            unplaced_reason(&requirements, &without),
+            UnplacedReason::NoCapableNode
+        );
+    }
+
+    /// #1120: a provider named only in a sidecar's env is still one the
+    /// node must run.
+    #[test]
+    fn a_secret_provider_named_by_a_sidecar_is_required_too() {
+        let spec: AppSpec = toml::from_str(
+            "image = \"api:1\"\n[[sidecar]]\nname = \"p\"\nenv = { T = \"PROVIDER[vault:x]\" }\n",
+        )
+        .unwrap();
+        let requirements = WorkloadRequirements::for_app(&spec, false);
+        assert_eq!(requirements.secret_providers.len(), 1);
     }
 
     /// `node` on `--runtime process`: no container runtime.

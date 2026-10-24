@@ -252,6 +252,31 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.grill.runs_containers()
     }
 
+    /// Whether this node's runtime can run an app's sidecars in its
+    /// instance's network namespace (#1120). The leader places apps with
+    /// sidecars only where it can.
+    pub fn shares_network(&self) -> bool {
+        self.grill.shares_network_namespaces()
+    }
+
+    /// Refuse an app with sidecars on a runtime that can't share a network
+    /// namespace, before anything is allocated for it, with the reason the
+    /// operator needs: the leader's placement normally keeps such an app
+    /// away, so this is the standalone node's and a stale view's guard.
+    fn admit_sidecars(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
+        if spec.sidecar.is_empty() || self.shares_network() {
+            return Ok(());
+        }
+        let runtime = format!("{:?}", self.grill.runtime_kind()).to_lowercase();
+        Err(BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason: format!(
+                "sidecars join their app's network namespace, and this node's runtime \
+                 ({runtime}) can't share one; run it on rootful runc"
+            ),
+        })
+    }
+
     /// Replace the process-workloads policy (host-exec/script allowlist,
     /// mount isolation, script dir). The binary feeds the parsed
     /// `[process_workloads]` config here so the deny-by-default allowlist
@@ -326,6 +351,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
     fn admit_app(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
         self.admit_process_workload(app_name, spec.exec.as_deref(), spec.script.as_deref())?;
         self.admit_host_inits(app_name, spec)?;
+        self.admit_sidecars(app_name, spec)?;
         self.admit_host_paths(app_name, spec)?;
         self.admit_runtime_knobs(app_name, spec)?;
         self.admit_gpu(app_name, spec.gpu.unwrap_or(0))?;
@@ -703,11 +729,8 @@ impl<G: Grill> WorkloadSupervisor<G> {
         // already inserted into `self.instances` and their ports allocated —
         // but `app_instances` was only written after the loop, so `remove_app`
         // couldn't find them and their ports leaked until agent restart.
-        let request = crate::meat::Resources::new(
-            spec.cpu.map_or(0, |r| r.request),
-            spec.memory.map_or(0, |r| r.request),
-            spec.gpu.unwrap_or(0),
-        );
+        // The app's own requests and its sidecars' (#1120).
+        let request = crate::meat::admission::app_requests(spec);
         let mut leases = HashMap::new();
         for index in indices {
             let id = crate::grill::InstanceIdentity::new(namespace, app_name, *index).instance_id();
@@ -1064,6 +1087,7 @@ mod tests {
             config_file: Vec::new(),
             volumes: Vec::new(),
             init: Vec::new(),
+            sidecar: Vec::new(),
             ingress: None,
             placement: None,
             deploy: None,
@@ -2128,6 +2152,29 @@ mod tests {
         let mut image = basic_app_spec(None);
         image.memory = host.memory;
         sup.admit_app("image", &image).unwrap();
+    }
+
+    /// #1120: a node whose runtime can't share a network namespace (Apple
+    /// Container, rootless runc, the process runtime) refuses an app with
+    /// sidecars at admission, saying why, and still admits one without.
+    #[test]
+    fn an_app_with_sidecars_is_refused_where_the_runtime_cant_share_a_network() {
+        let grill = MockGrill::new();
+        grill.set_runtime_kind(crate::grill::records::RuntimeKind::Apple);
+        grill.set_shares_network(false);
+        let sup = WorkloadSupervisor::new(grill.clone(), PortAllocator::new(30000, 31000));
+        let app: AppSpec =
+            toml::from_str("image = \"web:1\"\n[[sidecar]]\nname = \"proxy\"\n").unwrap();
+
+        let error = sup.admit_app("web", &app).unwrap_err().to_string();
+        assert!(
+            error.contains("sidecars") && error.contains("apple"),
+            "{error}"
+        );
+        sup.admit_app("web", &basic_app_spec(None)).unwrap();
+
+        grill.set_shares_network(true);
+        sup.admit_app("web", &app).unwrap();
     }
 
     /// #935: a host app's init container that names no image runs its

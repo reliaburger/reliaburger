@@ -372,7 +372,9 @@ runtime.devices /dev/net/tun refused by the node gate: this node's [runtime] all
 Only rootful runc applies knobs. A node on the process runtime, Apple
 Container or rootless runc advertises none, whatever its `[runtime]` says,
 and refuses an app that has them rather than running it without them. An
-`exec` or `script` app runs on the host, so it can't have knobs at all.
+`exec` or `script` app runs on the host, so it can't have knobs at all. The
+knobs are the app container's alone: its sidecars get none, though they share
+its network namespace and so see its `net.*` sysctls.
 
 What each kind accepts:
 

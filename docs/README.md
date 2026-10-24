@@ -1227,6 +1227,27 @@ image = "public.ecr.aws/docker/library/redis:8.8.0"
 command = ["echo", "initialising database"]
 ```
 
+### Sidecars
+
+A sidecar runs beside every instance of its app, in the instance's network
+namespace (#1120). It starts after the init containers and before the app,
+stops after the app, and restarts on its own if it crashes; when the app
+crashes, its sidecars restart with it. Its `cpu` and `memory` requests add to
+the app's when it's placed. Sidecars need rootful runc: the scheduler keeps
+such apps on nodes that report it, and Apple Container, rootless runc and the
+process runtime refuse them. See [Sidecars](manual/01_deploy-an-app.md#sidecars).
+
+```toml
+[app.web]
+image = "nginx:alpine"
+port = 8080
+
+[[app.web.sidecar]]
+name = "logs"
+image = "ghcr.io/example/shipper:3.0"
+memory = "32Mi-64Mi"
+```
+
 For the full configuration reference (resource limits, replicas, environment variables, volumes, secrets, namespaces), see the [App fields](manual/13_reference.md#app-fields) table and the book chapter [Hello, Container](book/01-hello-container.md).
 
 ## Runtime auto-detection

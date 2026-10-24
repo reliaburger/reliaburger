@@ -585,14 +585,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         } else {
             None
         };
-        if let Err(error) = self.supervisor.reserve_execution(
-            id.clone(),
-            crate::meat::Resources::new(
-                spec.cpu.map_or(0, |r| r.request),
-                spec.memory.map_or(0, |r| r.request),
-                spec.gpu.unwrap_or(0),
-            ),
-        ) {
+        if let Err(error) = self
+            .supervisor
+            .reserve_execution(id.clone(), crate::meat::admission::app_requests(spec))
+        {
             if let Some(port) = host_port {
                 // LOOP-INLINE: in-memory lock, no I/O
                 self.supervisor.port_allocator.release(port).await?;

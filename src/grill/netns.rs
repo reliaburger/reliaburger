@@ -177,9 +177,10 @@ pub fn node_index_from_id(node_id: &str) -> u16 {
     ((hash % (MAX_NODE_INDEX as u32)) + 1) as u16
 }
 
-/// Generate the namespace path for an instance.
+/// Generate the namespace path for an instance. The portable spec builder
+/// names the same path when a sidecar joins it (#1120).
 pub fn namespace_path(instance_id: &InstanceId) -> PathBuf {
-    PathBuf::from(format!("/var/run/netns/rb-{}", instance_id.0))
+    PathBuf::from(super::oci::network_namespace_path(instance_id))
 }
 
 /// Generate the host-side veth name for an instance.

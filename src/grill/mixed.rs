@@ -730,6 +730,9 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     fn applies_runtime_knobs(&self) -> bool {
         self.container.applies_runtime_knobs()
     }
+    fn shares_network_namespaces(&self) -> bool {
+        self.container.shares_network_namespaces()
+    }
     fn honours_cgroup_path_for(&self, spec: &OciSpec) -> bool {
         if spec.host_process {
             self.host.places_host_processes()

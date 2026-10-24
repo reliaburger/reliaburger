@@ -18,6 +18,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     containers: self.supervisor.runs_containers(),
                     secret_providers: self.secret_providers.names(),
                     runtime_knobs: self.supervisor.runtime_knob_capability(),
+                    shared_network: self.supervisor.shares_network(),
                 })
                 .await;
         }
@@ -42,6 +43,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     containers: self.supervisor.runs_containers(),
                     secret_providers: self.secret_providers.names(),
                     runtime_knobs: self.supervisor.runtime_knob_capability(),
+                    shared_network: self.supervisor.shares_network(),
                     ..Default::default()
                 },
                 Default::default(),
@@ -61,6 +63,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             containers: self.supervisor.runs_containers(),
             secret_providers: self.secret_providers.names(),
             runtime_knobs: self.supervisor.runtime_knob_capability(),
+            shared_network: self.supervisor.shares_network(),
         };
         let enforced_cgroups =
             crate::sesame::egress::list_enforced_cgroups(&mut ebpf.bpf).unwrap_or_default();
@@ -93,6 +96,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 containers: self.supervisor.runs_containers(),
                 secret_providers: self.secret_providers.names(),
                 runtime_knobs: self.supervisor.runtime_knob_capability(),
+                shared_network: self.supervisor.shares_network(),
                 ..Default::default()
             },
             Default::default(),

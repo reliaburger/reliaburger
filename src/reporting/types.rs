@@ -364,6 +364,7 @@ mod tests {
                 .unwrap()
                 .runtime
                 .knob_allowlist(),
+                shared_network: true,
             },
             egress_enforcement: vec![EgressEnforcementEvidence {
                 app_name: "web".to_string(),
@@ -385,6 +386,7 @@ mod tests {
         assert_eq!(decoded.capabilities.runtime_knobs.capabilities.len(), 1);
         assert_eq!(decoded.capabilities.runtime_knobs.sysctls.len(), 1);
         assert_eq!(decoded.capabilities.runtime_knobs.devices.len(), 1);
+        assert!(decoded.capabilities.shared_network);
         assert_eq!(
             decoded.egress_enforcement[0].status,
             EgressEnforcementStatus::Enforced

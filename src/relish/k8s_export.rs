@@ -186,8 +186,14 @@ fn export_app(
 
     let knobs = export_runtime_knobs(name, app, &mut container, report);
 
+    let sidecars: Vec<Container> = app
+        .sidecar
+        .iter()
+        .map(|sidecar| sidecar_container(name, app, sidecar, report))
+        .collect();
     let pod_spec = PodSpec {
         containers: vec![container],
+        init_containers: (!sidecars.is_empty()).then_some(sidecars),
         termination_grace_period_seconds: termination_grace(app),
         security_context: knobs.security_context,
         volumes: knobs.volumes,
@@ -812,6 +818,35 @@ fn to_yaml<T: serde::Serialize>(resource: &T) -> Result<String, RelishError> {
 /// it would be worse than a placeholder. A placeholder doesn't fail loudly,
 /// though: the pod starts with the wrong password. So each one is listed in
 /// the report, under `[table]`, as needing a Secret (#703).
+/// A sidecar as a Kubernetes native sidecar (#1120): an init container
+/// with `restartPolicy: Always`, which starts before the app's container,
+/// keeps running beside it and stops after it, as Reliaburger's does. It
+/// gets the app's image when it names none, and the app's env with its own
+/// on top, which Reliaburger gives it implicitly and Kubernetes doesn't.
+fn sidecar_container(
+    app_name: &str,
+    app: &crate::config::app::AppSpec,
+    sidecar: &crate::config::app::SidecarSpec,
+    report: &mut ExportReport,
+) -> Container {
+    let mut env = app.env.clone();
+    env.extend(sidecar.env.clone());
+    Container {
+        name: sidecar.name.clone(),
+        image: sidecar.image.clone().or_else(|| app.image.clone()),
+        command: (!sidecar.command.is_empty()).then(|| sidecar.command.clone()),
+        args: (!sidecar.args.is_empty()).then(|| sidecar.args.clone()),
+        env: env_vars(
+            &format!("app.{app_name}.sidecar.{}", sidecar.name),
+            &env,
+            report,
+        ),
+        resources: resource_requirements(sidecar.memory.as_ref(), sidecar.cpu.as_ref(), None),
+        restart_policy: Some("Always".to_string()),
+        ..Container::default()
+    }
+}
+
 fn env_vars(
     table: &str,
     env: &BTreeMap<String, crate::config::types::EnvValue>,

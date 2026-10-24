@@ -729,28 +729,28 @@ pub struct DesiredState {
 
 impl DesiredState {
     /// Every image digest an app or job in desired state pins
-    /// (`web:v1@sha256:…`): app and init-container images, the rollback
-    /// targets in each app's rollout record (#692), job definitions and
-    /// task-array templates. Registry expiry never removes these.
+    /// (`web:v1@sha256:…`): app, init-container and sidecar images, the
+    /// rollback targets in each app's rollout record (#692), job definitions
+    /// and task-array templates. Registry expiry never removes these.
     pub fn pinned_image_digests(&self) -> std::collections::HashSet<String> {
         let rollback_targets = self
             .rollouts
             .values()
             .flat_map(|rollouts| rollouts.released.iter());
-        let apps = self.apps.values().chain(rollback_targets).flat_map(|spec| {
-            spec.image
-                .iter()
-                .chain(spec.init.iter().filter_map(|init| init.image.as_ref()))
-        });
+        let apps = self
+            .apps
+            .values()
+            .chain(rollback_targets)
+            .flat_map(|spec| spec.image_references());
         let jobs = self
             .task_arrays
             .jobs()
             .definitions()
-            .filter_map(|(_, record)| record.definition.template.image.as_ref());
+            .filter_map(|(_, record)| record.definition.template.image.as_deref());
         let arrays = self
             .task_arrays
             .iter()
-            .filter_map(|(_, record)| record.template.image.as_ref());
+            .filter_map(|(_, record)| record.template.image.as_deref());
         apps.chain(jobs)
             .chain(arrays)
             .filter_map(|image| crate::pickle::types::image_pin_digest(image))
@@ -1130,6 +1130,24 @@ mod tests {
         assert!(state.scheduling.is_empty());
         assert!(state.config.is_empty());
         assert!(state.last_applied_log.is_none());
+    }
+
+    /// #1120: a sidecar's pinned image is kept from registry expiry like
+    /// its app's and its init containers'.
+    #[test]
+    fn a_sidecars_pinned_image_is_never_expired() {
+        let mut state = DesiredState::default();
+        let spec: AppSpec = toml::from_str(
+            "image = \"web:v1@sha256:aaa\"\n\
+             [[init]]\nimage = \"migrate:v1@sha256:bbb\"\n\
+             [[sidecar]]\nname = \"proxy\"\nimage = \"envoy:1@sha256:ccc\"\n",
+        )
+        .unwrap();
+        state.apps.insert(AppId::new("web", "default"), spec);
+        let pinned = state.pinned_image_digests();
+        for digest in ["sha256:aaa", "sha256:bbb", "sha256:ccc"] {
+            assert!(pinned.contains(digest), "{digest} missing from {pinned:?}");
+        }
     }
 
     #[test]

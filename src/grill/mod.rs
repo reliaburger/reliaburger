@@ -605,6 +605,14 @@ pub trait Grill: Send + Sync {
     fn applies_runtime_knobs(&self) -> bool {
         false
     }
+    /// Whether a container can join another's network namespace, as an
+    /// app's sidecars join its instance's (#1120): a spec whose network
+    /// namespace names a path ([`OciSpec::joined_network`]). Rootful runc
+    /// can. The default declines: the process runtime has no namespace to
+    /// share, and an Apple Container VM has its own network stack.
+    fn shares_network_namespaces(&self) -> bool {
+        false
+    }
     /// Per-workload enforcement: whether this workload's process will run in
     /// the cgroup its spec names, so the agent can bind policy to it first.
     fn honours_cgroup_path_for(&self, spec: &OciSpec) -> bool {
@@ -1092,6 +1100,17 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.applies_runtime_knobs(),
             #[cfg(target_os = "linux")]
             AnyGrill::Mixed(g) => g.applies_runtime_knobs(),
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(_) => false,
+        }
+    }
+    fn shares_network_namespaces(&self) -> bool {
+        match self {
+            AnyGrill::Process(_) => false,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.shares_network_namespaces(),
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.shares_network_namespaces(),
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(_) => false,
         }
