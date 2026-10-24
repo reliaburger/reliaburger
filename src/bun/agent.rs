@@ -110,6 +110,7 @@ mod retirement;
 mod routing;
 mod runtime_inventory;
 mod scale_in_place;
+mod sidecars;
 mod signal_faults;
 mod startup_recovery;
 mod state_sweep;
@@ -234,11 +235,17 @@ pub struct InstanceStop {
     pub grace: std::time::Duration,
     /// Run inside the instance before the signal, within its own bound.
     pub pre_stop: Option<crate::grill::stop::PreStop>,
+    /// The instance's sidecars, stopped in turn once its own exit is
+    /// confirmed (#1120).
+    pub sidecars: Vec<InstanceId>,
+    /// Time each sidecar gets to exit after its stop signal.
+    pub sidecar_grace: std::time::Duration,
 }
 
 impl InstanceStop {
     /// The stop an instance declared in `policy`, with the caller's
-    /// `default_grace` where it declares none.
+    /// `default_grace` where it declares none. Its sidecars, if any, get
+    /// `default_grace` too.
     pub fn for_policy(
         policy: Option<&crate::grill::stop::StopPolicy>,
         default_grace: std::time::Duration,
@@ -248,7 +255,15 @@ impl InstanceStop {
                 .and_then(|policy| policy.grace)
                 .unwrap_or(default_grace),
             pre_stop: policy.and_then(|policy| policy.pre_stop.clone()),
+            sidecars: Vec::new(),
+            sidecar_grace: default_grace,
         }
+    }
+
+    /// The same stop, followed by stopping `sidecars` (#1120).
+    pub fn with_sidecars(mut self, sidecars: Vec<InstanceId>) -> Self {
+        self.sidecars = sidecars;
+        self
     }
 }
 
@@ -291,7 +306,34 @@ async fn drain_and_stop_instance<G: Grill>(
 /// `confirmation_timeout` (`[runtime] stop_confirmation_timeout_secs`) bounds
 /// the runtime's own work: accepting the stop request, accepting a kill, and
 /// reporting exit after it.
+///
+/// Once the instance's exit is confirmed, its sidecars (`stop.sidecars`)
+/// stop in turn, so a proxy or log shipper outlives the app it serves
+/// (#1120).
 pub async fn stop_runtime_instance<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    stop: &InstanceStop,
+    confirmation_timeout: std::time::Duration,
+) -> Result<(), BunError> {
+    stop_instance_alone(grill, id, stop, confirmation_timeout).await?;
+    if !stop.sidecars.is_empty() {
+        sidecars::stop_sidecars(
+            grill,
+            &stop.sidecars,
+            stop.sidecar_grace,
+            confirmation_timeout,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// [`stop_runtime_instance`]'s four steps for the instance itself, and for
+/// each of its sidecars in turn. A sidecar has no sidecars of its own, so
+/// calling this, not `stop_runtime_instance`, keeps the future from
+/// containing itself.
+async fn stop_instance_alone<G: Grill>(
     grill: &G,
     id: &InstanceId,
     stop: &InstanceStop,
@@ -713,6 +755,9 @@ pub struct BunAgent<G: Grill> {
     deploy_operations: crate::bun::deploy_operations::DeployOperationTracker,
     /// Initialisers whose runtime must retire before parent policy and records.
     initialisers: std::collections::HashMap<InstanceId, std::collections::HashSet<InstanceId>>,
+    /// Each instance's sidecars, which stop after it and retire with it,
+    /// and their restarts (#1120).
+    sidecars: sidecars::Sidecars,
     /// The runtime generation each parent's initialisers last launched, so
     /// the parent's retirement can forget exactly those journals and never
     /// a successor's under the same identity (#850).
@@ -982,6 +1027,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            sidecars: sidecars::Sidecars::default(),
             initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
@@ -1144,6 +1190,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            sidecars: sidecars::Sidecars::default(),
             initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
@@ -1792,6 +1839,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.refresh_egress_readiness().await;
         self.run_health_checks().await;
         self.begin_state_sweep();
+        self.relaunch_due_sidecars();
         self.drive_pending_restarts().await;
         self.expire_faults().await;
         self.reconcile_firewall();

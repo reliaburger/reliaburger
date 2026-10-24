@@ -727,6 +727,9 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     fn honours_cgroup_path(&self) -> bool {
         self.container.honours_cgroup_path()
     }
+    fn shares_network_namespaces(&self) -> bool {
+        self.container.shares_network_namespaces()
+    }
     fn honours_cgroup_path_for(&self, spec: &OciSpec) -> bool {
         if spec.host_process {
             self.host.places_host_processes()

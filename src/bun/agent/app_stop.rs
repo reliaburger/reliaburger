@@ -368,6 +368,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .iter()
             .filter_map(|id| self.take_back_from_restart(id))
             .collect();
+        // So does a sidecar restart; retirement waits for it to end (#1120).
+        for id in &instances {
+            self.sidecars.cancel_relaunches(id);
+        }
 
         Ok(AppStop {
             instances,
@@ -475,7 +479,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// How `id` is stopped: its launch spec's stop policy (#1121), with
-    /// `default_grace` where the policy names no grace.
+    /// `default_grace` where the policy names no grace, then its sidecars
+    /// (#1120).
     pub(super) fn instance_stop(
         &self,
         id: &InstanceId,
@@ -486,7 +491,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .get_instance(id)
             .and_then(|instance| instance.oci_spec.as_ref())
             .and_then(|spec| spec.stop.as_ref());
-        InstanceStop::for_policy(policy, default_grace)
+        InstanceStop::for_policy(policy, default_grace).with_sidecars(self.sidecars.of(id))
     }
 
     /// Record a stop whose exits are confirmed and release what it owned.

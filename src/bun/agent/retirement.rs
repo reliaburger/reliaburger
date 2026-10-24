@@ -10,6 +10,8 @@ pub(super) struct BegunRetirement {
     pub(super) restart: Option<restarts::TakenRestart>,
     /// How the instance's launch spec says it stops (#1121).
     pub(super) stop: Option<crate::grill::stop::StopPolicy>,
+    /// Its sidecars, which stop once it has exited (#1120).
+    pub(super) sidecars: Vec<InstanceId>,
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -230,6 +232,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         instance_id: &InstanceId,
     ) -> Result<(), BunError> {
         self.retire_initialisers(instance_id).await?;
+        self.retire_sidecars(instance_id).await?;
         if !self
             .poll_instance_withdrawal(instance_id, std::time::Duration::ZERO)
             .await?
@@ -394,9 +397,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
         self.supervisor.health_checker_mut().unregister(id);
+        self.sidecars.cancel_relaunches(id);
         Ok(BegunRetirement {
             restart: self.take_back_from_restart(id),
             stop,
+            sidecars: self.sidecars.of(id),
         })
     }
 
@@ -476,17 +481,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
-        // Ask everything to stop (SIGTERM), wait (up to a grace period, but no
-        // longer than needed) for it to exit, then force-kill (SIGKILL) whatever
-        // is still running so nothing is orphaned.
+        // Sidecars outlive their apps here too (#1120): they get their own
+        // round once every app has exited.
+        let sidecars = self.sidecars.all();
         for id in &ids {
+            self.sidecars.cancel_relaunches(id);
+        }
+        self.stop_or_kill_all(&ids).await;
+        self.stop_or_kill_all(&sidecars).await;
+    }
+
+    /// Ask everything in `ids` to stop (SIGTERM), wait (up to the shutdown
+    /// grace, but no longer than needed) for it to exit, then force-kill
+    /// (SIGKILL) whatever is still running so nothing is orphaned.
+    async fn stop_or_kill_all(&self, ids: &[InstanceId]) {
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
             // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
             let _ = self.supervisor.grill().stop(id).await;
         }
         let deadline = Instant::now() + self.shutdown_grace;
         loop {
             let mut all_stopped = true;
-            for id in &ids {
+            for id in ids {
                 if !matches!(
                     self.supervisor.grill().state(id).await,
                     Ok(ContainerState::Stopped)
@@ -501,7 +520,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        for id in &ids {
+        for id in ids {
             if !matches!(
                 self.supervisor.grill().state(id).await,
                 Ok(ContainerState::Stopped)

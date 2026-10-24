@@ -380,6 +380,7 @@ pub struct AppSpec {
     pub config_files: Vec<ConfigFileSpec>,
     pub volume: Option<VolumeSpec>,
     pub init_containers: Vec<InitContainerSpec>,
+    pub sidecar: Vec<SidecarSpec>,           // #1120
     pub allow_paths: Vec<MountPath>,
     pub capabilities: Vec<String>,
     pub capture: bool,
@@ -1054,6 +1055,7 @@ before their Phase 15 cases can use this contract.
 8. **Prepare workload identity:** Generate a keypair, send CSR to the nearest council member, receive the signed X.509 certificate. Write cert, key, CA chain, and JWT to a tmpfs mount.
 9. **Mount volumes and config files:** Bind-mount declared volumes from the host filesystem (a host-path `source` was checked against `[storage] allowed_host_paths` at admission and again when the OCI spec was built, which mounts the resolved path that check approved). Write `ConfigFileSpec` contents to temp files and bind-mount them read-only at the declared paths.
 10. **Run init containers (Initialising):** For each init container in declaration order, create a container from its own image (the app's when it names none, trust-checked and digest-pinned like the app's) with the app's environment, decrypted secrets, cgroup and volume and config-file mounts, built from the app's finished OCI spec (`generate_init_oci_spec`, #701). It gets its own network namespace and leaves the volumes owned by the app's user. An `exec` or `script` app's init that names no image runs its command on the host instead: its spec carries `host_process` like the app's, so the mixed runtime routes it to the host backend and a switch from `--runtime process` to `mixed` mid-run adopts it there, and admission refuses it unless `[process_workloads] allowed_binaries` names the first word of its command (#935). Wait for exit code 0. If any fails, or none finishes within 300 s, transition to `Failed` and emit event.
+10a. **Start sidecars (#1120):** Register the instance's sidecar identities (`<id>__sidecar-<name>`) with the loop, then create and start each in declaration order from `generate_sidecar_oci_spec`: its own image or the app's, the app's env with its own on top (secret references resolved by `create_with_secrets` like any launch), the app's mounts, its own cgroup beside the app's (`<cgroup>-sidecar-<name>`, with its own limits, since two runc containers can't share one), and the instance's network namespace by path (`/var/run/netns/rb-<id>`) instead of one of its own. Rootful runc sees that path (`OciSpec::joined_network`), reserves no address and sets up no network for it. Apple Container, rootless runc and the process runtime can't share a namespace (`Grill::shares_network_namespaces` is false), so admission refuses an app with sidecars there and the node reports `shared_network: false`, which keeps the scheduler away. A sidecar that fails to start fails the instance, and any already started are killed.
 11. **Create and start the main container (Starting):** Call `containerd::containers::create()` with the OCI spec (rootfs, namespaces, cgroups, mounts, env, seccomp). Call `containerd::tasks::start()`. Attach to stdout/stderr streams and pipe to Ketchup.
 12. **Health wait (HealthWait):** After `initial_delay`, begin sending HTTP GET to `health` path via the container's network namespace IP and declared port. Continue at `interval` until `threshold_healthy` consecutive successes.
 13. **Running:** Register the instance in the Onion service map (eBPF kernel map). The workload now receives traffic via DNS resolution and connect() rewriting. Emit a `WorkloadRunning` event to the reporting tree.
@@ -1068,7 +1070,10 @@ before their Phase 15 cases can use this contract.
 4. Send the app's `stop_signal` (SIGTERM by default) to the container's PID 1.
 5. Wait up to `stop_grace` for the container to exit (`drain_timeout` in a deploy without one, 10 s for any other stop).
 6. If still running, send SIGKILL.
+6a. Once its exit is confirmed, stop each sidecar the same way: SIGTERM, the same grace, SIGKILL (#1120). This is best effort; retirement kills every registered sidecar and confirms its exit before it forgets the instance, so none outlives it.
 7. Transition to `Stopped`. Release the host port back to PortAllocator. Remove the cgroup. Clean up the network namespace. Emit event.
+
+**Sidecar crashes (#1120):** The health tick's state sweep reads each sidecar of a started instance under the instance's incarnation. One that has exited restarts alone from a follow-up task (kill what's left, create, start), immediately the first time and then after 1 s, 2 s, 4 s and so on up to a minute; the app is not touched. When the app itself exits, its sidecars restart with it: the restart's Clear step kills them after the app, and its Start step creates and starts them before the app, because on runc the instance's network namespace goes with the app's launch. A sidecar restart in flight holds off the instance's own restart and retirement until it ends. Sidecars have no adoption records, so a Bun restart retires them with every other unrecorded launch and registers them as due on each adopted instance; the next tick starts them again.
 
 **Reconnect after Bun restart:**
 

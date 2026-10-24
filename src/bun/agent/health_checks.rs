@@ -405,6 +405,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// only if the app has one. Mark it Stopped and route it through the
     /// restart path.
     pub(super) async fn observe_app_exit(&mut self, id: &InstanceId) {
+        // Its sidecars restart with it, not on their own (#1120).
+        self.sidecars.cancel_relaunches(id);
         if let Some(instance) = self.supervisor.get_instance_mut(id) {
             instance.retry_pending = true;
             if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
