@@ -756,7 +756,9 @@ def job_findings(evidence, snapshot, now, fault_window, state=None):
     if metadata.get("job_soak") is not True: return []
     value=read_json(snapshot,"jobs.json")
     problems=job_soak.findings(value,now,fault_window)
-    if value and value.get("stopped") and now < metadata.get("job_stop_at",now):
+    # The harness sets job_stop_at only once the last cycle is over (#1338).
+    stop_at=metadata.get("job_stop_at")
+    if value and value.get("stopped") and (stop_at is None or now < stop_at):
         problems.append("job controller stopped before the final drain interval")
     errors=set(value.get("errors",[])) if isinstance(value,dict) else set()
     reported=state.setdefault("job_errors_reported",[]) if state is not None else []
@@ -1761,8 +1763,10 @@ def render(evidence, record):
     fault_kinds=job_soak.FAULT_KINDS+(job_soak.NODE_FAULT_KINDS if metadata.get("node_faults") is True else ())
     job_missing=job_soak.coverage_failures(job_report,state.get("nodes",[]),fault_kinds) if metadata.get("job_soak") is True else []
     if metadata.get("job_soak") is True:
-        if job_report and (type(job_report.get("stop_requested_at")) is not int or job_report["stop_requested_at"] < metadata.get("job_stop_at",0)):
-            job_missing.append("job campaign requested drain before the final two-minute interval")
+        if type(metadata.get("job_stop_at")) is not int:
+            job_missing.append("the harness never asked the job campaign to drain")
+        elif job_report and (type(job_report.get("stop_requested_at")) is not int or job_report["stop_requested_at"] < metadata["job_stop_at"]):
+            job_missing.append("job campaign requested drain before the harness asked for it")
         for node in state.get("nodes",[]):
             observed=state.get("job_resources",{}).get(node,{})
             if observed.get("complete") is not True or observed.get("ts",0)<(job_report or {}).get("heartbeat",0) or observed.get("live_owners")!=0:

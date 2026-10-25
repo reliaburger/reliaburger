@@ -857,6 +857,12 @@ start_jobs() {
     python3 "$job_controller" run --evidence "$evidence" --api-port "$api_port" --ca "$ca" --limactl "$limactl" "${load[@]}" > "$evidence/jobs/controller.log" 2>&1 &
     jobs_pid=$!
 }
+# The controller allows the drain 110 s once it sees job_stop_at; give it that
+# and its last requests before the heavy check and teardown.
+wait_for_job_drain() {
+    local until=$(( $(date +%s) + 150 ))
+    while [ ! -s "$evidence/jobs/exit-status" ] && [ "$(date +%s)" -lt "$until" ]; do sleep 2; done
+}
 job_mark_fault() {
     [ -n "${jobs_pid:-}" ] || return 0
     python3 "$job_controller" mark "$evidence/jobs" "${vm[$1]}" "$2" || event --phase harness-error --target jobs --detail 'could not record active fault overlap'
@@ -1848,7 +1854,6 @@ PY
     end=$(( started_at + duration ))
     next_rotation=$(( started_at + rotation ))
 fi
-meta job_stop_at "json:$(( end + quiet_tail - 120 ))"
 [ -n "$jobs_pid" ] || start_jobs
 
 next_light=$(date +%s)
@@ -1868,14 +1873,22 @@ current_slot=final
 wait_until "$end"
 if [ "$quiet_tail" -gt 0 ]; then
     # The tail starts when the last cycle has finished, however late, and
-    # always runs its full length; the jobs drain in its last two minutes.
+    # always runs its full length.
     quiet_started=$(date +%s)
-    meta job_stop_at "json:$(( quiet_started + quiet_tail - 120 ))"
     say "quiet tail: no faults for $quiet_tail s, so every leak checker arms"
     event --phase quiet --detail "no faults, walks or specials for $quiet_tail s"
     current_slot=quiet
     wait_until $(( quiet_started + quiet_tail ))
     event --phase quiet --verdict ok --duration $(( $(date +%s) - quiet_started ))
+fi
+# The drain starts once every fault and special is over, and after any quiet
+# tail, so the final heavy check sees a drained cluster. A drain timed from
+# $end ran inside the last cycle, which can finish after $end: an 8 h final's
+# hour-8 graceful stop held the cluster down for the drain's whole allowance
+# (#1338).
+if [ -n "${jobs_pid:-}" ]; then
+    meta job_stop_at "json:$(date +%s)"
+    wait_for_job_drain
 fi
 observe heavy || true
 say "soak finished after $index cycles"
