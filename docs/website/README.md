@@ -186,7 +186,7 @@ written from the published binary's own help by
 `tests/suite/website.rs` checks every `relish …` command on this page, in the
 README and in the tour chapter against it. The tour may only use released
 commands. Anything else has to say which release adds it, in the words
-"0.3.0, not in 0.2.1" (the build's version, then the installer's), in the
+"0.3.0, not in 0.2.2" (the build's version, then the installer's), in the
 same paragraph, `<details>` or section. The README's generated command list
 labels such commands itself. When the installer's default changes, regenerate
 the snapshot; the test refuses a snapshot for another version.
@@ -201,7 +201,7 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.2.1` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.2.2` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. Every line the site shows names a
 mode (`sh -s -- --laptop`): with no arguments both scripts only explain the
 choices and exit 2, and the bootstrap does it before downloading anything.
