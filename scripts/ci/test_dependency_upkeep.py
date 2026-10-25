@@ -52,6 +52,15 @@ class DependabotRefreshesWeekly(unittest.TestCase):
     def test_actions_refresh_leaves_the_compiler_pins_alone(self):
         self.assertIn("dependency-name: dtolnay/rust-toolchain", self.blocks["github-actions"])
 
+    def test_neither_ecosystem_proposes_a_major_version(self):
+        # Without this, Dependabot opened a PR per major on 21 October (#1288).
+        for name, block in self.blocks.items():
+            with self.subTest(ecosystem=name):
+                self.assertRegex(
+                    block,
+                    r'- dependency-name: "\*"\s*\n\s*update-types:\s*\n'
+                    r'\s*- "version-update:semver-major"')
+
 
 class LagReportNeverFails(unittest.TestCase):
     def test_outdated_runs_a_dry_run_and_ignores_its_status(self):

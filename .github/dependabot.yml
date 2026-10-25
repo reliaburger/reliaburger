@@ -9,7 +9,8 @@
 # deliberate, one-crate PR instead: it can change an API, a wire format or
 # durable state (a format change bumps `protocol` or `state` in `CURRENT`,
 # src/compatibility.rs). `make outdated`, and the weekly report in
-# security.yml, list those crates.
+# security.yml, list those crates. Both ecosystems ignore semver-major
+# updates, or Dependabot opens a PR of its own for every major (#1288).
 #
 # The optimised cron contract crate (tests/contracts/cron) is left out on
 # purpose: it pins `time` and `thiserror` to exactly the versions in the main
@@ -25,6 +26,10 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 10
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
     groups:
       cargo-minor-and-patch:
         update-types:
@@ -44,6 +49,9 @@ updates:
     # own requalification ("Compiler baseline" in docs/releasing.md).
     ignore:
       - dependency-name: dtolnay/rust-toolchain
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
     groups:
       actions-minor-and-patch:
         update-types:
