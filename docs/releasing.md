@@ -672,9 +672,8 @@ the real `curl … | sh` install against it on every host we advertise.
    upgrade walk the schedule owes (to the soak build, back and settled), every
    fault kind and node fault injected and settled, every special (quorum loss
    with quorum back), every catalogue pulse and offline export, the app
-   workloads settled at the baseline, the job campaign drained in its final
-   two minutes, the quiet tail with nothing injected, walked or stopped in
-   it, and the `candidate.json` bytes this run downloaded hashing to
+   workloads settled at the baseline, the quiet tail with nothing injected,
+   walked or stopped in it, the job campaign drained after it, and the `candidate.json` bytes this run downloaded hashing to
    `--qualified-digest`. The checker counts these from the run's events and
    kept bytes against the 8-hour full schedule, whatever the metadata says, so
    relabelling a shorter run can't promote it. A final tier refuses to start
@@ -718,8 +717,8 @@ the real `curl … | sh` install against it on every host we advertise.
    cron/hooks/publication fixtures. It opts the disposable nodes into mixed
    runtime and allowlists a host BusyBox copy from the pinned container image.
    The verifier binds each private VM address on TCP 8189 with a separate token.
-   Drain begins inside the final two minutes; tier and recovery budgets stay
-   unchanged. Missing support or incomplete coverage fails instead of skipping
+   Drain begins once the last cycle, its special and any quiet tail are over
+   (#1338); tier and recovery budgets stay unchanged. Missing support or incomplete coverage fails instead of skipping
    a mode. A local smoke check is not staged fast/final acceptance, and global
    storage bounds remain #668.
 
