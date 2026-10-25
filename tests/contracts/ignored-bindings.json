@@ -1501,12 +1501,6 @@
   },
   {
     "source": "tests/self_upgrade_cluster.rs",
-    "function": "upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader",
-    "binary": "reliaburger::self_upgrade_cluster",
-    "test": "upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader"
-  },
-  {
-    "source": "tests/self_upgrade_cluster.rs",
     "function": "start_refuses_same_version_other_bytes_and_unrequested_downgrades",
     "binary": "reliaburger::self_upgrade_cluster",
     "test": "start_refuses_same_version_other_bytes_and_unrequested_downgrades"
@@ -1852,6 +1846,12 @@
     "function": "rollout_demo_rolls_back_a_bad_version_and_marks_it_failed",
     "binary": "reliaburger::demos",
     "test": "rollout_demo_rolls_back_a_bad_version_and_marks_it_failed"
+  },
+  {
+    "source": "tests/demos.rs",
+    "function": "rollout_demo_on_a_plaintext_cluster_marks_a_bad_version_failed_and_stops_retrying",
+    "binary": "reliaburger::demos",
+    "test": "rollout_demo_on_a_plaintext_cluster_marks_a_bad_version_failed_and_stops_retrying"
   },
   {
     "source": "tests/demos.rs",

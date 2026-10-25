@@ -47,6 +47,15 @@ status_is_clear() {
     ! "${RELISH}" status | grep -q "RolloutFailed"
 }
 
+# How many deploys of web the node has logged as failed so far.
+failed_deploys() {
+    awk '/deploy of web\/default failed/ { n++ } END { print n + 0 }' "${DEMO_WORK}/bun.log"
+}
+
+failed_deploys_logged() {
+    (($(failed_deploys) > 0))
+}
+
 V1="$(version_of_example v1)"
 V2="$(version_of_example v2)"
 V3="$(version_of_example v3 broken)"
@@ -75,6 +84,23 @@ if ! demo_serves "${DEMO_APP_PORT}" v1; then
     demo_fail "expected v1 after the failed v3, got '$(demo_serving "${DEMO_APP_PORT}")'"
 fi
 echo "serving $(demo_serving "${DEMO_APP_PORT}") after the bad v3: auto_rollback restored it"
+if grep -q "refused the rollout failure" "${DEMO_WORK}/bun.log"; then
+    demo_fail "the leader refused the node's rollout failure report: $(grep "refused the rollout failure" "${DEMO_WORK}/bun.log" | head -1)"
+fi
+# Once v3 is marked, the leader holds the node on v1: no more attempts.
+# The node logs its failed attempt only after the leader answers the
+# report, and the leader answers after it has committed the mark and
+# written its audit record, so status can show RolloutFailed before that
+# first failure reaches the log. Count from that attempt, not from the
+# mark, or the first attempt's late line reads as a retry.
+demo_wait_for "the node to log its failed v3 deploy" 30 failed_deploys_logged
+ATTEMPTS_BEFORE="$(failed_deploys)"
+sleep 8
+ATTEMPTS_AFTER="$(failed_deploys)"
+if [[ "${ATTEMPTS_AFTER}" != "${ATTEMPTS_BEFORE}" ]]; then
+    demo_fail "the node kept retrying v3 after RolloutFailed (${ATTEMPTS_BEFORE} then ${ATTEMPTS_AFTER} failed deploys)"
+fi
+echo "v3 is not retried: ${ATTEMPTS_AFTER} failed deploy(s), none since the mark"
 
 demo_step "Apply v3 again: the same spec isn't retried, only reported"
 demo_run "${RELISH}" apply "${V3}"

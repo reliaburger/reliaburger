@@ -345,6 +345,12 @@ migration and no feature gate
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/15)). The
   CLI review pass ([#522](https://github.com/reliaburger/reliaburger/issues/522)),
   Kubernetes import and export fidelity, demos, examples and doc fixes.
+- [ ] **0.2.3: two billion a day**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/17),
+  [plan](plans/2026-10-20-plan-0.2.3.md)). 2B host-job tasks in one real
+  24-hour day on a three-node cluster, counted, not extrapolated, with 1B as
+  the floor. Plus the CI, soak and test follow-ups from the CI and test
+  efficiency plan.
 - [ ] **0.2.4: extension points**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/19),
   [research](plans/2026-10-19-research-extension-points.md)). One missing

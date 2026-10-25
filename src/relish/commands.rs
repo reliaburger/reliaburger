@@ -1763,7 +1763,7 @@ pub fn import_k8s(files: &[std::path::PathBuf], strict: bool) -> Result<(), Reli
 
 /// Export Reliaburger TOML to Kubernetes YAML manifests.
 #[cfg(feature = "kubernetes")]
-pub fn export_k8s(file: &Path) -> Result<(), RelishError> {
+pub fn export_k8s(file: &Path, strict: bool) -> Result<(), RelishError> {
     let config = Config::from_file(file)?;
     let result = super::k8s_export::export_kubernetes(&config)?;
 
@@ -1774,6 +1774,14 @@ pub fn export_k8s(file: &Path) -> Result<(), RelishError> {
         || !result.report.dropped.is_empty()
     {
         eprint!("{}", result.report);
+    }
+
+    // #1132: the same CI gate as `import --strict`, in the other direction.
+    let (unsupported, dropped) = (result.report.unsupported.len(), result.report.dropped.len());
+    if strict && (unsupported > 0 || dropped > 0) {
+        return Err(RelishError::FormatFailed(format!(
+            "export produced {unsupported} unsupported and {dropped} not-exported field(s) (--strict mode)"
+        )));
     }
 
     Ok(())

@@ -893,6 +893,23 @@ Encrypted env values were the nastier case. They export as the placeholder `ENCR
 
 And `--strict`, sold as the CI gate for migrations, checked only the warnings. A manifest of nothing but a NetworkPolicy and a PersistentVolumeClaim, both dropped whole, passed it. It now fails on any warning *or* any dropped resource, and the error counts both.
 
+Fixing all that turned up one more hole, in the job exporter. Jobs had grown `[firewall]`, `[egress]` and `overlap` since the exporter was written, and it ignored all three without a word. The app exporter already reported its firewall and egress as needing a NetworkPolicy, so the job exporter now says the same, and `replay_unknown` (Kubernetes has no switch for replaying a run whose node vanished) joins `pids` in the unsupported list. `overlap` is different: it has a home. A CronJob's `concurrencyPolicy` says whether a new run may start while the last one is still going, which is exactly what `overlap` means:
+
+```rust
+fn concurrency_policy(overlap: Option<OverlapPolicy>) -> &'static str {
+    match overlap.unwrap_or_default() {
+        OverlapPolicy::Allow => "Allow",
+        OverlapPolicy::Forbid => "Forbid",
+    }
+}
+```
+
+The return type `&'static str` is a borrowed string slice that lives for the whole program, which is what a string literal is: it's baked into the binary, so there's nothing to allocate or free.
+
+`unwrap_or_default()` on an `Option<T>` returns the value if there is one and `T::default()` if not. Here `OverlapPolicy` derives `Default` with `#[default]` on `Forbid`, so a job that never mentions `overlap` exports as `Forbid`. That's the whole point of writing it out: Kubernetes' default is `Allow`, so leaving the field unset would have quietly let a nightly backup start on top of the previous night's slow one. A translation that copies only the fields the user typed misses that the two systems disagree about defaults.
+
+The other half was making `--strict` symmetrical. `relish export --strict` now exits 1 when the report has anything unsupported or not exported yet, so a CI job can check that a config still exports whole, the same way it checks an import.
+
 ## Lessons learned
 
 **Test the order, not just the outcome.** Blue-green's whole promise is an order: every green instance healthy and published before any blue instance stops. A test that only checks the end state (green running, blue gone) passes for a rollout that stopped blue first and caused an outage on the way. `blue_green_publishes_green_before_stopping_blue` holds an in-flight request on a blue instance, so blue can't finish draining, and checks that green is already published while blue still serves.
@@ -1122,6 +1139,16 @@ that's where all our in-memory mutexes live. For the gaps, `clippy.toml` lists
 types: `file.try_lock()` anywhere except inside `FileLock` is a lint error, and
 CI treats warnings as errors. Two checks, one syntactic and one type-aware,
 for a bug we'd otherwise keep fixing one lock at a time.
+
+Parsing every file is honest but not cheap. `src/` grew to 524 files and
+15 MB, about five seconds of CPU for `syn` in a debug build, and on a Mac
+shared with other agents' builds the test once ran into nextest's one-minute
+limit (#1140). Every name and method the rule flags has to appear in the
+source text, so a file that contains none of them can't break the rule, and
+the test now skips it unread by the parser (`may_take_a_lock`). That leaves
+34 files to parse. A unit test feeds each forbidden name and method through
+both checks, so a new entry the text check missed would fail it. Twenty-four
+copies in parallel used to take 31 to 38 s each; now they take 4 to 8.
 
 ### Download before you trust, verify before you replace
 
@@ -2046,6 +2073,8 @@ The binary always lives in one place we own, `~/.reliaburger/bin`. Then there ar
 Why a link rather than a second copy? One real file means one checksum to verify, one atomic rename on upgrade, and an uninstaller that can tell our link from someone else's `relish`: it only removes a link that points into the store. For the same reason the installer never replaces anything already at `~/.local/bin/relish` unless it's our own link.
 
 Asking has a catch. With `curl … | sh`, the shell's standard input *is* the script, so `read` would swallow the next line of the installer instead of your answer. We ask on `/dev/tty`, the controlling terminal, and only if the subshell `(exec </dev/tty)` can open it; in CI or over a pipe with no terminal, we print the line and move on. The default answer is no, the line is added at most once, and `--no-modify-path` keeps everything inside `~/.reliaburger`. The tests give the installer a pseudo-terminal as its controlling terminal and type the answer, which is the only honest way to exercise that prompt.
+
+That test used to give the prompt ten seconds to appear, and on a Mac busy with other agents' builds it once didn't ([#1140](https://github.com/reliaburger/reliaburger/issues/1140)). The installer runs against a fake `uname` and `curl`, and each test wrote fresh copies into its own temporary directory. On macOS the first `exec` of a new file waits while `syspolicyd` assesses it, in a queue the whole host shares (Chapter 15 tells that story), so the ten seconds were really timing whatever else the host was launching. With three loops starting fresh copies of an 840 MB test binary beside it, the test failed 38 runs out of 40 with nothing at all on the terminal. Now the fake tools live in one directory per user, named after a hash of their contents, and a warm-up runs each once before any test waits. The wait itself counts work, not seconds: the test fails if the installer exits without asking, and a five-minute bound is there only for one that hangs. Under the same three loops it passed 40 of 40.
 
 The last step is the quickstart's own "next:" message. Straight after installation your current shell still has the old `PATH`, so `relish status` would fail. `relish::install::invocation()` looks up `relish` on `PATH` the way a shell would, canonicalises both paths (resolving the link), and prints `relish` only if the lookup lands on the running executable. Otherwise it prints the full path, quoted for the shell if it contains a space.
 

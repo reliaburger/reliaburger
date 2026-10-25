@@ -2,10 +2,12 @@
 # Decide which CI job groups a run needs and write them to $GITHUB_OUTPUT.
 #
 #   code         - anything the build or the tests read changed
-#   gossip       - the gossip protocol or its benchmarks changed
+#   gossip       - the gossip protocol or its benchmarks changed, or criterion's
+#                  version did
 #   heavy        - run the acceptance suites (cluster, upgrade, privileged Linux)
 #   task_arrays  - the task-array leader, node pool, executor or their
-#                  benchmarks changed, or the script that gates on them
+#                  benchmarks changed, the script that gates on them, or
+#                  criterion's version
 #   macos        - run the portable suite on macOS (three shards)
 #
 # Pushes, merge-queue groups, schedules and manual runs get everything. Pull
@@ -86,6 +88,25 @@ while IFS= read -r file; do
             scripts/ci/bench_baseline.py) task_arrays=true ;;
     esac
 done <<<"$changed"
+
+# Both benchmark jobs parse criterion's output and use its filter syntax, so a
+# change to criterion's version runs them (#1151), in the manifest or only in
+# the lockfile.
+range="${BASE_SHA}...${HEAD_SHA:-HEAD}"
+if git diff --no-renames "$range" -- Cargo.toml |
+    grep -Eq '^[-+][[:space:]]*criterion[[:space:]]*='; then
+    gossip=true
+    task_arrays=true
+fi
+if git diff --no-renames -U3 "$range" -- Cargo.lock | awk '
+    /^@@/ { package = 0; next }
+    /^[ +-]name = "criterion"$/ { package = 1; next }
+    /^[ +-]name = / { package = 0 }
+    package && /^[-+]version = / { found = 1 }
+    END { exit !found }'; then
+    gossip=true
+    task_arrays=true
+fi
 
 case "${HEAD_REF:-}" in
     release-*) from_a_train=true ;;

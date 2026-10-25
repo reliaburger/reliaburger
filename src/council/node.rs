@@ -82,6 +82,9 @@ pub struct CouncilNode {
     /// on a leader that has lost its quorum and not yet stepped down.
     #[cfg(test)]
     writes_hang: std::sync::atomic::AtomicBool,
+    /// Test hook: every write that hung, with the moment it arrived.
+    #[cfg(test)]
+    hung_writes: std::sync::Mutex<Vec<(tokio::time::Instant, RaftRequest)>>,
 }
 
 impl CouncilNode {
@@ -134,6 +137,8 @@ impl CouncilNode {
             fence: None,
             #[cfg(test)]
             writes_hang: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            hung_writes: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -192,6 +197,29 @@ impl CouncilNode {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Test hook: the writes that have hung since [`Self::hang_writes`], in
+    /// arrival order.
+    #[cfg(test)]
+    pub(crate) fn hung_writes(&self) -> Vec<(tokio::time::Instant, RaftRequest)> {
+        self.hung_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[cfg(test)]
+    async fn hang_write_if_asked(&self, request: &RaftRequest) {
+        if self.writes_hang.load(std::sync::atomic::Ordering::SeqCst) {
+            // A plain mutex in a test hook: the guard is a temporary,
+            // dropped before the await below.
+            self.hung_writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((tokio::time::Instant::now(), request.clone()));
+            std::future::pending::<()>().await;
+        }
+    }
+
     #[cfg(test)]
     async fn hang_if_asked(&self) {
         if self.writes_hang.load(std::sync::atomic::Ordering::SeqCst) {
@@ -219,7 +247,7 @@ impl CouncilNode {
     /// Returns `ForwardToLeader` if this node is not the leader.
     pub async fn write(&self, request: RaftRequest) -> Result<CouncilResponse, CouncilError> {
         #[cfg(test)]
-        self.hang_if_asked().await;
+        self.hang_write_if_asked(&request).await;
         if let Some(error) = self.fenced_error() {
             return Err(error);
         }

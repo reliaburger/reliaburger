@@ -35,8 +35,8 @@
 # for the webpki-roots 0.26.11 shim only: it has no patched 0.26 release and
 # re-exports webpki-roots 1.x, which Cargo.lock holds at the patched 1.0.10.
 # tests/suite/dependency_audit.rs fails if 1.x is unpatched (#1269).
-# RUSTSEC-2026-0173 (proc-macro-error2) was added 24 October 2026 (see
-# docs/qualification/2026-10-24-dependency-exceptions.md): unmaintained, no
+# RUSTSEC-2026-0173 (proc-macro-error2) was added 25 October 2026 (see
+# docs/qualification/2026-10-25-dependency-exceptions.md): unmaintained, no
 # patched release, compile time only, through age 0.11.5's i18n proc macros.
 # age 0.12 avoided it but compiled in P-256 code built on crypto-bigint 0.5
 # (RUSTSEC-2026-0387, timing variability), so age went back to 0.11.5.

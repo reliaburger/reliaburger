@@ -49,6 +49,9 @@ registry_port = 0
 }
 
 fn bun_command(config: &Path, listen: &str, clustered: bool) -> Command {
+    // Every caller times the child it builds, so pay `bun`'s first launch
+    // before the clock starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let mut command = Command::new(env!("CARGO_BIN_EXE_bun"));
     command
         .arg("--config")

@@ -71,6 +71,23 @@ Granting is a separate pure function, `plan_grants`, which tops each node up to 
 
 The test that matters most here is another property test: a random mix of plans, completions, node losses and cancels, after each of which every chunk must be in exactly one of queued, held or done, and every task counted exactly once. Then there's a plain unit test that runs a whole million-task array with 1% of indices failing for good on three nodes. The leader's state at the end is well under the 256 KiB budget, and the number of rounds depends on the number of chunks. At a fixed chunk size this still grows with task count; the gain is amortisation, not constant cost.
 
+That property test only sees one array's state. The store around it has more ways in: an `Idempotency-Key` sent twice, or reused with different content, a stale completion, an unknown outcome and the operator's replay acknowledgement, a cron fire, pruning, and a snapshot taken and reopened. A second property test in `task_array_store.rs` generates sequences of all of them. Every step is a real `TaskArrayWrite` through `TaskArrays::apply`, the same call a Raft replica makes, so there's no second model of the rules to drift away from the first. A small model sits beside the store, holding which key got which run and how many tasks each run has had accepted. After every step the test checks:
+
+- a refused write left the store exactly as it was and took no id;
+- a retried key gets its run back, and a changed one is refused;
+- no new run starts while an unknown outcome is unacknowledged, or over a
+  run its schedule forbids overlapping;
+- a cron minute that nothing holds back either starts a run or is recorded
+  as skipped for want of room;
+- a stale report is counted as refused and changes no count;
+- every task is still counted exactly once;
+- a terminal run stays terminal;
+- the store survives a JSON round trip unchanged.
+
+Its first run found a real bug in under twenty cases. Lose a node, so its chunks go back in the queue at attempt 2, then cancel: `stop` moved the queued chunks to done but kept their attempt numbers. Nothing misbehaved at once. The next reopen did, because snapshot validation (rightly) refuses an attempt number on a retired chunk. A follower installing that snapshot, or a standalone node restarting, would have refused the whole state. `stop` now drops those attempts. A unit test in `task_array_state.rs` pins the case down, and proptest's minimised sequence is saved in `proptest-regressions/meat/task_array_store.txt`. Proptest replays every saved seed before it generates new cases, so the failing sequence runs on every CI run.
+
+The cron checks came later, and they show how a property test can look thorough and still not test something. At first the fire step only checked what *mustn't* happen: no second run in a minute already claimed, none past an unknown outcome. A fire that wrongly refused to start passed both. Two mutants proved it. One made an `Allow` schedule wait for its active run as if it said `Forbid`, and the other ignored `Forbid` altogether. Both passed 2,000 cases. The step now works out which of the store's reasons could hold an occurrence back, and when none applies, it requires a new run or a recorded skip. Both mutants now fail.
+
 ### The node: slots, not chunks
 
 On the node, a `TaskPool` runs tasks through a `tokio::sync::Semaphore` whose permits are the node's slots. Every chunk the node holds draws from the same permits, so the tail of one chunk overlaps the head of the next instead of leaving slots idle. Each task is a tokio task in a `JoinSet` holding an *owned* permit, the same RAII trick Chapter 4 used for connections: dropping the permit frees the slot, so there's no release call to forget on an error path.
@@ -280,7 +297,23 @@ so a spawned task can hold it without borrowing a departed stack frame.
 Standalone writes clone the checkpoint, preflight identities and progress
 capacity, then publish private JSON with file and directory fsync. Only durable
 publication replaces the in-memory value. An I/O error fences later writes and
-dispatch. Compact initial ranges can expand into sparse progress; admission
+dispatch.
+
+A timeout fences them too, and that case is harder. The write runs on a
+blocking thread, so when its caller gives up after the write timeout the thread
+carries on, and the run can reach the disk after the client has been told
+"unavailable". The node can't tell whether it did, so it refuses every
+admission and stops leading until it restarts. A test holds the real writer
+after it has built its checkpoint and before it publishes (a `#[cfg(test)]`
+barrier in the store), lets the caller's deadline pass, and checks that
+admission returns 503 and nothing is dispatched. It then lets the write land,
+restarts the node and retries with the same `Idempotency-Key`. The retry gets
+the late write's run back, every task of it runs exactly once, and the next
+new submission gets a fresh id. The `Idempotency-Key` is what makes "unavailable"
+safe to retry: one durable run identity, whichever side of the timeout the
+write landed on.
+
+Compact initial ranges can expand into sparse progress; admission
 reserves that representation before accepting work. Reopen validates the chunk
 partition, counts and exact hook identities. Omitted metadata must never open
 an app gate. Expired results are pruned before capacity preflight; otherwise the
@@ -2899,6 +2932,123 @@ The price of lookahead is ownership. More granted work may need reconciliation
 or replay after a worker is lost. That window is bounded, and stale attempts
 keep their existing fences.
 
+### Sixteen chunks in lockstep
+
+Lookahead gave the node more to hold. It didn't make the node any busier,
+and the [0.2.3 host-job profile](../qualification/2026-10-20-host-job-profile/README.md)
+(#1029) showed why. Polling `relish batch-status` every 150 ms on a node
+running BusyBox tasks at the default cap of 27 gave a sawtooth:
+
+```
+   t(s)   held  accepted  started   active
+   2.37  16000     34000    44106       24
+   3.49  16000     50000    50000        0    <- all 16 chunks done together
+   5.39  16000     50000    60157       19    <- 1.9 s with nothing running
+```
+
+Inside a burst the node ran about 10,000 tasks a second. Averaged over the
+three-second cycle it ran 5,100, and a third of the VM's CPU sat idle. The
+node held sixteen chunks, finished all sixteen at the same moment, sent sixteen
+receipts in one sync, and then waited for the leader's next grant with nothing
+to run.
+
+Why would sixteen chunks finish together? Each held chunk had its own dispatch
+loop, and each loop asked the pool's semaphore for a permit, one task at a
+time. Tokio's semaphore is fair: waiters get permits in the order they asked.
+So the sixteen loops queued behind one another, took one permit each, went to
+the back of the queue, and took the next. That's round-robin. Every chunk
+advanced by one task per round, so none got ahead, and the first one finished
+only when nearly every task of every chunk had started. A fair semaphore did
+exactly what it promised, and that was the problem.
+
+The leader wasn't the bottleneck. `plan_sync` already applies a node's
+receipts and plans the replacement grants in the same entry, so a node that
+reports one finished chunk gets the next one a tick later. It just never had
+an early receipt to report.
+
+So for #1030 a chunk now waits its turn before it takes any slots. The pool
+hands out a `DispatchTurn` when the node accepts the grant, and a chunk starts
+asking for permits only once every chunk ahead of it has a permit for each of
+its tasks. The tail of one chunk still overlaps the head of the next, since a
+chunk lets the next one go as soon as its last task *starts*, not when it
+ends. But the first chunk now finishes first, its receipt goes out on the
+next sync, and the leader tops the node up while the other fifteen still run.
+
+The turn is a chain of one-shot channels:
+
+```rust
+pub fn take_turn(&self) -> DispatchTurn {
+    let (next, closed) = tokio::sync::oneshot::channel();
+    let previous = match self.last_turn.lock() {
+        Ok(mut last) => last.replace(closed),
+        Err(poisoned) => poisoned.into_inner().replace(closed),
+    };
+    DispatchTurn { previous, next }
+}
+```
+
+A `tokio::sync::oneshot` channel carries at most one value, and its receiver
+also wakes when the sender is *dropped*, with an error saying so. We never
+send anything. Each turn keeps the sender of its own channel and the receiver
+of the turn before it, and the pool keeps the newest receiver for whoever comes
+next. A chunk waits on `previous`, dispatches, and drops `next`, and that drop
+is the signal. Drop runs on every path out of the function, including an early
+return and a panic, so there's no "release" call to forget. It's the same RAII
+trick as the semaphore's owned permits.
+
+`last_turn` is a `std::sync::Mutex`, not tokio's. Our rule is tokio locks for
+shared state in async code, because a std lock held across an `.await` blocks a
+whole runtime thread. Here the lock covers one `Option::replace` in a plain
+function and is never held across an await, so the cheaper std lock is fine.
+`lock()` returns a `Result` because a std mutex is *poisoned* if a thread
+panics while holding it. Go's `sync.Mutex` has no such idea. The value here is
+just a receiver, so `into_inner()` takes it anyway rather than panic.
+
+The turn is taken in `reconcile`, when the grant arrives, not inside the
+spawned task. Tokio may poll freshly spawned tasks in any order on a
+multi-threaded runtime, so taking it there would make the order whatever the
+scheduler felt like. Taking it before `tokio::spawn` makes it the grant order,
+lowest chunk first within one sync.
+
+Cancellation needed one more step. A chunk the leader takes back while it's
+still queued should end at once, with every task counted as not run. But if it
+simply dropped `next`, the chunk behind it would stop waiting for the chunks
+ahead and run alongside them. So a cancelled turn hands its `previous` and
+`next` to a small spawned task that waits for the one and then drops the other.
+The order holds, and the cancelled chunk doesn't wait.
+
+Nothing else moved. Retries still ask the same semaphore for a permit, so a
+retried task competes with the next chunk's first tasks rather than jumping
+the queue. Each task still holds an owned permit, the node's admission
+semaphore and its resource lease. Records still stream to the ledger, and the
+receipt still goes out only once every record of the chunk is durable.
+
+Three tests pin it down. `chunks_sharing_slots_finish_in_the_order_they_arrived`
+runs four eight-task chunks through two slots and checks the first one
+finishes after at most twelve of the 32 attempts have started. Before the
+change, it finished after 24. `held_chunks_run_one_after_another_and_the_first_is_reported_first`
+does the same through a node's `sync`: eight held chunks and a cap of two.
+Chunk 0's receipt has to come first, and every task of chunk 0 has to finish
+before any task past chunk 1 does. Run in lockstep, the chunks finish
+interleaved, `0, 1, 2, …, 7, 0, 1, …`, to the end.
+`a_chunk_cancelled_while_queued_ends_at_once_and_keeps_the_order_behind_it`
+cancels a queued chunk and checks the one behind it still waits.
+
+The node test's first version counted the attempts started when the first
+receipt arrived, and required fewer than 40. It failed both of CI's Linux
+coverage runs, at 49 and 80. The order was right. The count was timing the
+disk. A receipt goes out only once its records are durable, which means the
+ledger's group commit and an fsync, and with 5 ms fake tasks the whole array
+takes about 200 ms. On a runner whose disk was busy with coverage profiles,
+the fsync outlasted the array. Slowing the fake tasks only moved the line:
+at 50 ms each, six local writers doing full fsyncs still failed it one run in
+thirty. So the test now records the order in which tasks finish, which no
+disk can change, and checks the receipt only for which chunk comes first.
+
+The profile predicts the node runs at its burst rate all the time, about
+10,000 host jobs a second on that rig. The five-round bench measurement is
+still to come.
+
 ### What the measurements do and don't show
 
 Measuring this turned out to be as instructive as building it, mostly because
@@ -3473,6 +3623,83 @@ jobs chart drops to zero at 10.5 hours, the moment the controller ran out of
 its run budget ([#989](https://github.com/reliaburger/reliaburger/issues/989)),
 while the memory chart beside it stays flat. The table said the same thing, but
 you had to know where to look.
+
+Charts show what happened. They don't show what *didn't*. Until 0.2.3 the
+final verdict checked four things: no open failures, the full schedule, eight
+hours on the clock and a candidate digest string in `metadata.json`. Forget
+`--soak-bun` and every upgrade slot logged "skipped" and moved on; the record
+still said the gate passed. Adopt an existing cluster with `--home` and the
+digest was whatever you typed, since nothing had downloaded the candidate. A
+quiet run and a thorough one looked the same
+([#1061](https://github.com/reliaburger/reliaburger/issues/1061)).
+
+So the record now carries an execution inventory: what the schedule owes
+against what the run completed, built from its events and the bytes it kept.
+A fault counts once it was injected (a chaos fault the rails refused doesn't)
+and the cluster settled after it. A walk counts once the nodes reached the soak
+build, rolled back and settled. Quorum loss needs quorum back. The candidate
+counts only if this run bootstrapped it and the `candidate.json` it kept
+hashes to the qualified digest. A final tier is held to the 8-hour full
+schedule whatever its metadata says, so relabelling a fast run as final, or a
+V02 final as the job final, lowers nothing. Anything short fails the record.
+The harness refuses to start a final without a soak build, a digest or with
+an adopted home, because such a run could only end incomplete.
+
+Writing the inventory turned up a gap nobody had noticed. The final ran two
+chaos kinds in each of its four chaos slots, eight in all, and there are nine
+kinds since `cpu` and `memory` arrived (#699). Every 8-hour final had quietly
+skipped the memory fault. A full-schedule slot now runs three. The checker
+keeps its own copy of the schedule, and a test holds it against the harness's
+`--plan` output, so the two can't drift apart again.
+
+The hosted workflow can't sign a soak build, so its runs can never complete a
+tier. It now says so: it passes `--tier custom`, and the record calls the run
+a diagnostic.
+
+Two smaller blind spots sat next to the inventory
+([#1062](https://github.com/reliaburger/reliaburger/issues/1062)). Fault
+choices came from bash's `$RANDOM`, unseeded, so nobody could replay the run
+that found a bug. Worse, `$RANDOM` inside `$(...)` runs in a subshell, and
+bash reseeds a subshell's generator, so even a seed at the top wouldn't have
+helped. Now every choice goes through `sustained_check.py choose`, which takes
+draw *n* of the run's seed from a fresh `random.Random(f"{seed}:{n}")` and
+counts draws in `choices.json`. Same seed, same choices, in the same order,
+and a resumed run picks up at the next draw.
+
+The other was the leak checkers. `leak-rss` starts judging a Bun process an
+hour after it appears, and every kill, power-off or upgrade exec makes a new
+one. The 0.2.0 final's own evidence shows the gap: the longest Bun on node 2
+lived 48 minutes, so `leak-rss` never once judged that node in eight hours.
+The record now reports each checker's armed minutes per node, and a final
+gates on them. The fix wasn't in the checker. Its hour-long warm-up is there
+for a reason: a young process's memory is still growing for honest reasons.
+The fault schedule was the problem, since it never let any Bun get old. So a
+final now ends with a quiet tail, two hours and a quarter after the last
+cycle with no faults, walks or specials. The apps and jobs keep running, so there's still
+something to leak. Every node gets an hour to arm `leak-rss` and an hour of
+comparison samples, and the final fails unless each checker was armed for an
+hour on every node, with one unbroken half-hour among them. The final grew
+from eight hours to about ten and a half. We chose that over cutting the faults to six,
+because the faults are what the eight hours were for.
+
+My first proposal for the tail was 90 minutes, an hour to arm and half an
+hour to compare, beside a 60-minute exposure threshold. Do the arithmetic and
+that fails every final. The last cycle ends with an upgrade walk and a
+graceful whole-cluster stop, so the tail is all the exposure a node gets, and
+90 minutes arms `leak-rss` for 30. Writing the fixture first caught it before
+an eight-hour run did.
+
+The fixed two hours had the same mistake one size smaller, and the fixture
+didn't catch it, because the fixture wrote the exposure straight into the
+checker's state instead of producing it from samples. The checker can only
+date a Bun from the first sample that shows it, and samples come every five
+minutes. The graceful stop runs after the last cycle's sample, so each new
+Bun is first seen up to five minutes into the tail. And the harness sets the
+next sample's time *after* each observe finishes, so a 30-second observe
+stretches every interval to 330 seconds. Feeding the checker that grid, from
+a restart at the tail's start to the observe after it, gave `leak-rss` 54
+minutes of the hour it needs. The tail is now two hours and a quarter, and the
+test that guards it drives the sampling, not the result.
 
 ### A task that failed before it ran
 

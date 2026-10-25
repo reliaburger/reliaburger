@@ -804,7 +804,7 @@ relish bench --capacity --yes                # Saturate with leased minimal apps
 relish import -f <file>                     # Convert K8s YAML to Reliaburger TOML (stdout)
 relish import -f <file> -f <file>           # Convert several files (repeatable)
 relish import -f <file> --strict            # Exit non-zero if any warnings
-relish export -f <file>                     # Convert Reliaburger TOML to Kubernetes YAML
+relish export -f <file> [--strict]          # Convert Reliaburger TOML to Kubernetes YAML
 
 # Dev cluster (Lima VMs)
 relish dev create [--nodes N] [--cpus N] [--memory <size>] [--runtime runc|process] [name]
@@ -1579,7 +1579,7 @@ Dropped (no Reliaburger equivalent):
 
 Exits 0 on success, 1 on error. With `--strict`, exits 1 if the report has any warning or any dropped resource, and the error counts both.
 
-**`relish export -f <path>`**
+**`relish export -f <path> [--strict]`**
 
 Converts Reliaburger TOML to Kubernetes YAML (also `kubernetes`-feature only). It takes `-f <file>`; there is no `--format` flag. Produces multi-document YAML (separated by `---`).
 
@@ -1593,10 +1593,12 @@ Converts Reliaburger TOML to Kubernetes YAML (also `kubernetes`-feature only). I
 | `[app.*.autoscale]` | + HorizontalPodAutoscaler (not for a DaemonSet) |
 | `[app.*.env]` with `ENC[AGE:...]` | the placeholder `ENCRYPTED_VALUE`; each one is listed as needing a Secret |
 | `[job.*]` | Job; `max_attempts` → `backoffLimit` (−1), `task_timeout_secs` → the pod's `activeDeadlineSeconds` |
-| `[job.*]` with `schedule` | CronJob |
+| `[job.*]` with `schedule` | CronJob; `overlap` → `concurrencyPolicy` (omitted → `Forbid`, Reliaburger's default) |
 | `[namespace.*]` | Namespace + ResourceQuota |
 
-The export report lists features with no Kubernetes equivalent (firewall and egress rules, process workloads, `run_before`, a job's `pids`, `max_apps`/`max_replicas`) separately from fields that have one but aren't exported yet (health checks, metrics, volumes, init containers, config files, placement, encrypted env values).
+The export report lists features with no Kubernetes equivalent (firewall and egress rules on apps and jobs, process workloads, `run_before`, a job's `pids` and `replay_unknown`, `max_apps`/`max_replicas`) separately from fields that have one but aren't exported yet (health checks, metrics, volumes, init containers, config files, placement, encrypted env values).
+
+Exits 0 on success, 1 on error. With `--strict`, exits 1 if the report lists anything unsupported or not exported yet, and the error counts both.
 
 ---
 

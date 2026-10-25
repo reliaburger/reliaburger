@@ -19,6 +19,10 @@ pub(super) struct JobStore {
     path: PathBuf,
     checkpoint: Checkpoint,
     fenced: bool,
+    /// Test hook: the next publication waits here, after its checkpoint is
+    /// built and before it reaches the disk, until the test also waits.
+    #[cfg(test)]
+    publication_pause: Option<std::sync::Arc<std::sync::Barrier>>,
 }
 
 impl JobStore {
@@ -70,7 +74,15 @@ impl JobStore {
             path,
             checkpoint,
             fenced: false,
+            #[cfg(test)]
+            publication_pause: None,
         })
+    }
+
+    /// Hold the next publication before it writes, until `pause` is released.
+    #[cfg(test)]
+    pub(super) fn pause_next_publication(&mut self, pause: std::sync::Arc<std::sync::Barrier>) {
+        self.publication_pause = Some(pause);
     }
 
     pub(super) fn ready(&self) -> bool {
@@ -113,6 +125,10 @@ impl JobStore {
         let bytes = serde_json::to_vec(&next).map_err(|e| e.to_string())?;
         if bytes.len() as u64 > MAX_STORE_BYTES {
             return Err("job store exceeds 64 MiB".into());
+        }
+        #[cfg(test)]
+        if let Some(pause) = self.publication_pause.take() {
+            pause.wait();
         }
         if let Err(error) =
             crate::sesame::identity::atomic_write_mode(&self.path, &bytes, Some(0o600))

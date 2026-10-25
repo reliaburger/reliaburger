@@ -706,9 +706,9 @@
           ]
         },
         {
-          "id": "issue-534-hung_failed_hook_settlement_preserves_the_exact_failure_and_app_gate",
+          "id": "issue-534-hung_cancel_after_a_failed_hook_preserves_the_exact_failure_and_app_gate",
           "binary": "reliaburger",
-          "test": "bun::api::tests::hung_failed_hook_settlement_preserves_the_exact_failure_and_app_gate",
+          "test": "bun::api::tests::hung_cancel_after_a_failed_hook_preserves_the_exact_failure_and_app_gate",
           "requires": [
             "portable-linux",
             "portable-darwin"
@@ -732,9 +732,9 @@
           ]
         },
         {
-          "id": "issue-534-hung_common_commit_preserves_the_exact_successful_hook_and_app_gate",
+          "id": "issue-534-hung_cancel_after_a_successful_hook_preserves_the_exact_intent_and_app_gate",
           "binary": "reliaburger",
-          "test": "bun::api::tests::hung_common_commit_preserves_the_exact_successful_hook_and_app_gate",
+          "test": "bun::api::tests::hung_cancel_after_a_successful_hook_preserves_the_exact_intent_and_app_gate",
           "requires": [
             "portable-linux",
             "portable-darwin"
@@ -742,6 +742,34 @@
           "sources": [
             "src/bun/api/tests.rs",
             "src/meat/job_deploy.rs"
+          ]
+        },
+        {
+          "id": "issue-1058-hung_common_commit_is_bounded_and_preserves_the_exact_successful_hook_and_app_gate",
+          "binary": "reliaburger",
+          "test": "bun::api::tests::hung_common_commit_is_bounded_and_preserves_the_exact_successful_hook_and_app_gate",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/api/tests.rs",
+            "src/bun/job_apply.rs",
+            "src/bun/task_array_leader.rs"
+          ]
+        },
+        {
+          "id": "issue-1058-hung_failed_hook_settlement_is_bounded_and_preserves_the_exact_failure_and_app_gate",
+          "binary": "reliaburger",
+          "test": "bun::api::tests::hung_failed_hook_settlement_is_bounded_and_preserves_the_exact_failure_and_app_gate",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/api/tests.rs",
+            "src/bun/job_apply.rs",
+            "src/bun/task_array_leader.rs"
           ]
         },
         {
@@ -6276,17 +6304,6 @@
           ]
         },
         {
-          "id": "legacy-ci-reliaburger-self_upgrade_cluster-upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader",
-          "binary": "reliaburger::self_upgrade_cluster",
-          "test": "upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader",
-          "requires": [
-            "upgrade-cluster"
-          ],
-          "sources": [
-            "tests/self_upgrade_cluster.rs"
-          ]
-        },
-        {
           "id": "legacy-ci-reliaburger-self_upgrade_cluster-start_refuses_same_version_other_bytes_and_unrequested_downgrades",
           "binary": "reliaburger::self_upgrade_cluster",
           "test": "start_refuses_same_version_other_bytes_and_unrequested_downgrades",
@@ -8375,6 +8392,34 @@
           "id": "demo-gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone",
           "binary": "reliaburger::demos",
           "test": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/demos.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-1067-plaintext-rollout-failure-report",
+      "issue": 1067,
+      "promise": "On a credential-free plaintext cluster a bad version reaches RolloutFailed and the node stops retrying it.",
+      "supported_paths": [
+        "scripts/demo/rollout.sh with DEMO_PLAINTEXT=1: require_mtls = false, no master key, no token, relish over plain HTTP."
+      ],
+      "refused_paths": [
+        "Without credentials the leader takes a rollout-failure report only for a node the app is placed on.",
+        "A cluster with a service token or a token keeps requiring the service token for the report."
+      ],
+      "boundaries": [
+        "One node on the process runtime; the portable suite covers the handler's refusals."
+      ],
+      "cases": [
+        {
+          "id": "issue-1067-rollout_demo_on_a_plaintext_cluster_marks_a_bad_version_failed_and_stops_retrying",
+          "binary": "reliaburger::demos",
+          "test": "rollout_demo_on_a_plaintext_cluster_marks_a_bad_version_failed_and_stops_retrying",
           "requires": [
             "cluster-tests"
           ],

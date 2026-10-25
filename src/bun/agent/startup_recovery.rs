@@ -113,6 +113,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn finish_startup_retirements(&mut self) {
         if self.startup_cleanup_pending && self.startup_retirements.is_empty() {
             let result = self.finish_discovery_recovery().await;
+            // A retirement's journal write is still in flight (#1263): the
+            // next tick goes on from it. Nothing is wrong.
+            if matches!(result, Err(BunError::StillRunning { .. })) {
+                return;
+            }
             if result.is_ok() {
                 self.startup_cleanup_pending = false;
             }

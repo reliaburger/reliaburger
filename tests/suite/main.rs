@@ -13,8 +13,9 @@
 mod bun_process;
 #[path = "../support/cluster.rs"]
 mod cluster_support;
-#[path = "../support/first_launch.rs"]
-mod first_launch;
+// `bun_process` includes `first_launch.rs` itself; one copy keeps one set of
+// launched paths.
+use bun_process::first_launch;
 #[cfg(target_os = "linux")]
 #[path = "../support/root_processes.rs"]
 mod root_processes;
