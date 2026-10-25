@@ -3090,7 +3090,7 @@ current boot, generation, pool slot and cgroup identity agree. A prefix is no
 proof. Complete disk inventories and actual cgroup limits accompany the owner
 proof; they do not substitute for the scheduler's commitment ledger. Missing
 job evidence, stale heartbeats, orphaned owners or incomplete drain fail the
-release verdict. Drain begins inside the last two minutes, with no new settle
+release verdict. Drain begins once the last cycle is over, with no new settle
 allowance.
 
 The first soak to get past setup with all of this switched on (0.2.0
@@ -3204,6 +3204,19 @@ seconds later. Now the harness leaves the job fixtures out of any apply once
 the drain is asked for, or within a minute of it, because an apply's schedules
 commit after its hooks. Apply doesn't delete job definitions a file leaves
 out, so they stay exactly as the drain left them (#963).
+
+That fix kept the clock-timed drain, and the same overlap came back for 0.2.2
+candidate 4. An 8 h final runs a graceful whole-cluster stop and start at
+hour 8, at the end of the last cycle, and that cycle finished after the
+soak's nominal end. The drain started at 14:17:27, 33 seconds into the stop,
+and the controller's 110-second allowance ran out at 14:19:17. The cluster
+wasn't back until 14:19:55. Three long batches each still had a few chunks
+held on node 1, waiting for the harness's replay acknowledgement. That
+acknowledgement is a call to the API, and a stopped cluster can't answer it.
+Now the harness doesn't set `job_stop_at` until the cycle loop has finished,
+so the drain starts only once every fault and special is over. The harness
+then waits for the controller's exit status before the final heavy check
+(#1338).
 
 The harness lost a verdict of its own too. It starts the job controller with
 `&` and, at teardown, used to `wait` on the controller's pid to learn how it
