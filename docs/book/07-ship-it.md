@@ -1775,6 +1775,8 @@ No authenticated caller, no service token, plain HTTP, and an empty token store.
 
 `scripts/demo/lib.sh` grew a `DEMO_PLAINTEXT=1` mode so the bug can't come back unnoticed: it runs `relish init --development-plaintext`, drops the master key and identity from the config, and drives the node over plain HTTP with no token. `tests/demos.rs` runs the rollout demo both ways under `make test-cluster`, and the demo now also checks that once v3 is marked the node logs no more failed deploys, which is what "stops retrying" looks like from the outside. Before the fix, the plaintext run logged the 403 and a fresh attempt every 5, 10, 20 and 40 seconds until the demo gave up waiting for the mark.
 
+That check once failed on CI when nothing was retrying. The node logs its failed attempt only after the leader answers the report, and the leader answers only after it has committed the mark and its audit record has reached disk. On a slow CI disk, `relish status` showed `RolloutFailed` while the line for that first attempt was still on its way, so the demo counted zero failures, then one, and called the late line a retry. The line said `attempt 1`, and a real retry would say `attempt 2`. The demo now waits for that first failure to reach the log before it starts counting. A check that watches a log has to start counting after the event it is judging has been logged, not when some other part of the system first reports it.
+
 `examples/phase-1/container-rollout.toml` is the container version, with `strategy = "blue-green"` on podinfo. The process version can't roll surge-first: two testapp instances can't both listen on one host port, so it sets `max_surge = 0` and `max_unavailable = 1` and the planner retires before it starts.
 
 ### What the demo costs
