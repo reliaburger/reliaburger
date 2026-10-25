@@ -10,7 +10,6 @@ the detail is in the GitHub milestones and issues.
 
 | Plan | What it is | Still open |
 |---|---|---|
-| [0.2.2: UX patch](2026-10-16-plan-0.2.2-ux-patch.md) | The 0.2.2 merge train: the CLI review, Kubernetes fidelity, chaos for jobs, demos, book and design-doc corrections, doc snippet tests and the 0.2.1 follow-ups, in three waves on `release-0-2-2`. | [Milestone 0.2.2](https://github.com/reliaburger/reliaburger/milestone/15) |
 | [CI and test efficiency](2026-10-11-ci-and-test-efficiency.md) | Faster CI and stronger test and soak evidence: one archive extraction per job (#1050), integration policy, test consolidation and compilation costs, with an 18 October status of what's done, tracked and proposed. | Merge queue on the current train; the proposed test, fixture and soak-evidence issues |
 | [Competitive review and comparison pages](2026-10-15-competitor-comparisons.md) | Source-linked comparisons and a wider review, matching the static homepage. | Review and merge into the 0.2.1 train |
 | [Research: LLM inference and training](2026-10-11-research-llm-workloads.md) | What would make Reliaburger the obvious choice for serving and training LLMs on a team's own GPUs: the projects to beat or host (vLLM, llm-d, Dynamo, GPUStack, dstack, SkyPilot, Slurm, Kubeflow, Ray), ten lessons, today's blockers, and the revised plan (0.6.0 GPUs, 0.7.0 Models, 0.8.0 Groups, 0.9.0 Pipelines, 0.10.0 Fair share, decided 11 October) with configuration sketches, implementation outlines and a landing-page demo per release. | Three open questions, then milestones and issues |
@@ -36,6 +35,7 @@ finished plans since. The
 [0.1.0 release closure record](../qualification/2026-09-27-v0.1.0-release-closure.md)
 is the summary of how 0.1.0 ended.
 
+- [0.2.2: UX patch](archive/2026-10-16-plan-0.2.2-ux-patch.md): the 0.2.2 merge train, the CLI review, Kubernetes fidelity, chaos for jobs, demos and doc fixes, shipped in 0.2.2
 - [Soak charts](archive/2026-10-17-soak-charts.md): SVG charts in every soak record, and the released version's on the homepage (#979)
 - [Equal-window job demonstrations and hourly saturation runs](archive/2026-10-09-plan-timed-job-scenarios.md)
 - [A million jobs, the September design](archive/2026-09-28-plan-million-jobs.md): superseded by the October plans; its M8 targets are recorded, not gated, by every job qualification run (D18-C)
