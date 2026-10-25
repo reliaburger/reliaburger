@@ -996,7 +996,11 @@ So we made moving routine
 minor release runs `cargo update`, which stays inside the ranges, and the release's soak
 then proves the new set. Dependabot opens the same lockfile-only refresh as one grouped PR
 each week between releases. Major versions stay deliberate, one crate per PR, because
-they're allowed to break an API or a wire format. `make outdated` lists them (it runs
+they're allowed to break an API or a wire format. Dependabot didn't know that at first:
+grouping only minor and patch updates doesn't stop it proposing majors, so the day the
+config landed it opened eight PRs, one per major, each running the whole CI. Both
+ecosystems now ignore `version-update:semver-major` outright
+([#1288](https://github.com/reliaburger/reliaburger/issues/1288)). `make outdated` lists them (it runs
 `cargo update --dry-run --verbose`, which changes nothing), and a weekly job prints the
 list, without ever failing the build. A lag report that broke builds would get muted
 within a week. One that nobody reads would rot just as fast, which is why the refresh is a
