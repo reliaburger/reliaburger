@@ -172,10 +172,13 @@ running.
 ```sh
 relish fault kill frontend --count 1 --acknowledge
 relish status
+relish events --app frontend
 ```
 
 Kill a frontend. Run `status` again a few seconds later and it's back, with a
-restart counted: the node agent restarts what should be running.
+restart counted: the node agent restarts what should be running. `events`
+asks every node what happened and merges the answers by time: the deploys, the
+fault, the failed health check and the restart, each with its node.
 
 ```sh
 relish local stop node-3

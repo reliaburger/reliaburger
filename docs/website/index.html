@@ -133,7 +133,7 @@
           <!-- The recording is always on show. assets/tour-player.js loads the vendored
                asciinema player (assets/asciinema/) and the recording from this site as the
                figure nears the viewport. -->
-          <figure id="tour-recording" class="recording" data-cast="./assets/tour.cast" data-poster="npt:4:30">
+          <figure id="tour-recording" class="recording" data-cast="./assets/tour.cast" data-poster="npt:4:18">
             <div class="recording-screen"></div>
             <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
               <a href="./assets/tour.cast">download the recording</a> and play it in a terminal with
@@ -141,7 +141,7 @@
             <figcaption>
               <span>The whole tour on a real laptop cluster, run by
                 <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>
-                against the published 0.2.1 install.
+                against the published 0.2.2 install.
                 Setup plays four times faster and idle time is cut to two seconds; every wait
                 says how long it really took.</span>
               <span class="recording-speed" role="group" aria-label="Playback speed" hidden>speed
@@ -242,9 +242,13 @@
               </li>
               <li>
                 <pre><code data-tour>relish fault kill frontend --count 1 --acknowledge</code>
-<code data-tour>relish status</code></pre>
+<code data-tour>relish status</code>
+<code data-tour>relish events --app frontend</code></pre>
                 <p>Kill a frontend. Run <code>status</code> again a few seconds later and it’s back,
-                  with a restart counted: the node agent restarts what should be running.</p>
+                  with a restart counted: the node agent restarts what should be running.
+                  <code>events</code> asks every node what happened and merges the answers by
+                  time: the deploys, the fault, the failed health check and the restart, each
+                  with its node.</p>
               </li>
               <li>
                 <pre><code data-tour>relish local stop node-3</code>

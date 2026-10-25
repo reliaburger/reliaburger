@@ -66,7 +66,7 @@ so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.2.1
+  --record docs/website/assets/tour.cast --install v0.2.2
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -96,12 +96,11 @@ published tarball holds exactly that directory. Until a promotion's site
 change deploys, the live tarball is the previous release's, so a re-record
 always shows the repository copy, and says so on screen. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.2.1 --api-port 29117 --ingress-port 28080 --registry-port 25050`,
-beside a laptop cluster on the default ports.
+`--install v0.2.2` on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
 `--record` writes the installed version into the cast's title (`Reliaburger
-0.2.1: the five-minute tour`), and the caption under the player names it too.
+0.2.2: the five-minute tour`), and the caption under the player names it too.
 `tests/suite/website.rs` checks that both match `install.sh`'s default, so a
 promotion that forgets the re-record fails CI.
 
