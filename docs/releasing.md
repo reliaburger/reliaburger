@@ -676,8 +676,8 @@ the real `curl … | sh` install against it on every host we advertise.
    cron/hooks/publication fixtures. It opts the disposable nodes into mixed
    runtime and allowlists a host BusyBox copy from the pinned container image.
    The verifier binds each private VM address on TCP 8189 with a separate token.
-   Drain begins inside the final two minutes; tier and recovery budgets stay
-   unchanged. Missing support or incomplete coverage fails instead of skipping
+   Drain begins once the last cycle and its special are over (#1338); tier
+   and recovery budgets stay unchanged. Missing support or incomplete coverage fails instead of skipping
    a mode. A local smoke check is not staged fast/final acceptance, and global
    storage bounds remain #668.
 
