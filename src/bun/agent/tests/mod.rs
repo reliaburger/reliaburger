@@ -11920,8 +11920,17 @@ async fn durable_consumer_waits_for_http_and_websocket_release_then_recovers_rec
     let retry = reply.await.unwrap().unwrap();
     assert!(!retry.published);
     assert_eq!(retry.receipts, vec![1]);
-    recovered.confirm_consumer_receipt(1).await.unwrap();
-    recovered.confirm_consumer_receipt(1).await.unwrap();
+    // Confirmed twice: the second finds it already forgotten.
+    for _ in 0..2 {
+        let (response, reply) = oneshot::channel();
+        recovered
+            .handle_command(AgentCommand::ConfirmConsumerReceipt {
+                generation: 1,
+                response,
+            })
+            .await;
+        reply.await.unwrap().unwrap();
+    }
     drop(recovered);
     let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
     let consumer = journal.inventory().consumer.as_ref().unwrap();
