@@ -31,6 +31,17 @@ requests, main and manual candidate builds:
 Pull requests build the guest images only when `build_guest_image.sh`,
 `guest-images.json` or the workflow changes.
 
+One more artefact is never shipped: `profiling-build-COMMIT-ATTEMPT` holds
+`bun-linux-aarch64` and `relish-linux-aarch64` built again from the same
+commit with frame pointers and line tables
+(`RUSTFLAGS="-C force-frame-pointers=yes"`,
+`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, not stripped). The release
+profile step uses it to name Bun's frames ([step 6](#staging-a-candidate)),
+so the profile never compiles on the bench host. Pushes and manual runs
+build it, and pull requests only when the workflow changes. Its name matches
+neither the candidate job's `binaries-*` nor `candidate-*`, so it never
+reaches `candidate.json`, staging or promotion.
+
 There's no Intel macOS build. 0.2.1 was the last release with
 `relish-macos-x86_64` (maintainer decision, 17 October 2026,
 [#1018](https://github.com/reliaburger/reliaburger/issues/1018)): nothing ever
@@ -892,63 +903,142 @@ the real `curl … | sh` install against it on every host we advertise.
    ([how](testing.md#benchmarks-in-ci)); its `criterion-task-arrays` artefact
    is the cost evidence for bounded-cost claims such as 0.2.0's (#668).
 
-6. **Record it.** Copy each host's record into
+6. **Profile it**, from 0.2.4 on (maintainer decision, 26 October 2026,
+   [#1358](https://github.com/reliaburger/reliaburger/issues/1358)). The
+   soaks check that things work and don't leak; nothing in them checks
+   whether a release got slower, or why. The [0.2.3 host-job
+   profile](qualification/2026-10-20-host-job-profile/README.md) found a
+   GitOps loop burning a core and grants running in lockstep that no test or
+   soak had noticed. This step runs that profile on every candidate and
+   compares it with the previous release:
+
+   ```sh
+   scripts/release/qualify-profile.sh \
+     --candidate https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.4-RUN_ID-ATTEMPT \
+     --qualified-digest QUALIFIED_DIGEST
+   ```
+
+   It creates a disposable Lima VM `rb-profile-<random>` with the profile
+   record's shape (VZ, 4 vCPUs, 8 GiB, 60 GiB, `template:ubuntu-24.04`),
+   and installs two versions in it: the candidate, and the previous release
+   (the patch number one lower; `--previous vX.Y.Z` names another). Every
+   binary is checked against its `candidate.json`. Rates come from those
+   release binaries, unchanged. Attribution comes from each version's
+   profiling build: `build.yml` builds `bun` and `relish` for Linux arm64
+   again with frame pointers and line tables, as the
+   `profiling-build-COMMIT-ATTEMPT` artefact. It's never shipped: the
+   candidate job, staging and promotion don't collect it. A version with no
+   profiling build (0.2.3 and older) is profiled from its stripped release
+   build, which names the kernel, helper and task frames but none of Bun's.
+
+   The scenarios are fixed in the script: raw VM processes (the rig's
+   calibration), host jobs at the default cap, shared containers, and an idle
+   cluster for 60 s. Fresh containers (`--scenarios …,fresh`) belong to
+   the nightly run and the control plane (`control`: `relish bench --quick`
+   and API round trips) comes later, so neither runs by default. Rounds
+   alternate, A/B then B/A, each on a fresh boot of the VM, three pairs of
+   60 s windows. Then one profiling session per version records `perf` on
+   host jobs and on the idle cluster. The rig changes between releases (the
+   0.2.0 record ran on an M2 Max, the profile on an M1 Max), so the
+   comparison never uses a number measured on another day: it measures the
+   previous release beside the candidate. The script prints its estimate up
+   front, about 70 minutes; if a session would take it past 2 hours it drops
+   rounds, never scenarios, and the record says so.
+
+   It needs a quiet host: never run it beside a soak or a build. It refuses
+   to start while `rustc` or `cargo` run, and records the host's load and
+   compilers every 10 s. It doesn't throw a round away for load, because on a
+   Mac every round would go; the alternation takes the noise instead.
+   `--plan` prints the sessions and the estimate without touching anything,
+   and `--smoke` runs one round of 30 s windows into a scratch directory, to
+   check the step itself works.
+
+   The record is `docs/qualification/DATE-vX.Y.Z-profile/`: a generated
+   README with each version's rates (the median and range of three rounds,
+   plus the steady rate between 15 and 58 s, because accepted counts move
+   in whole grant cycles), CPU busy, Bun's
+   CPU, start lag, the idle cluster's CPU, wake-ups and RSS, category tables
+   from [`profile_categories.py`](../scripts/release/profiling/profile_categories.py),
+   flamegraphs (on-CPU, off-CPU and a differential one), `perf sched
+   latency`, the grant-cycle probe and the host's load. Its "Compared with
+   vPREV" section, from
+   [`compare_profile.py`](../scripts/release/profiling/compare_profile.py),
+   shows the ratio of medians with a 95% bootstrap interval, each rate
+   relative to the same version's raw rate, and category shifts in points.
+   Its rules are evidence, not a gate yet: each reports what it *would
+   flag*:
+
+   | Would fail | Explain |
+   | --- | --- |
+   | A scenario more than 10% slower, the interval excluding no change | A category moving more than 5 points |
+   | Bun above 2% of one core in the idle cluster | A scenario more than 10% faster: why, and is it a measuring error? |
+   | A Bun category above 5% of Bun's CPU that was under 1% | |
+
+   More than 5% of Bun's samples uncategorised asks for new rules in the
+   category map instead. Before committing the record, write its answer
+   (where the time goes in this release, and what changed) and a sentence
+   for every flagged line. A later release turns the rules into a gate, once
+   a few records show how noisy the rig is.
+
+7. **Record it.** Copy each host's record into
    `docs/qualification/DATE-staged-install-HOST.md`, alongside the run ID,
    attempt, commit and digest, and link them from the release's milestone or
    gate issue (V04 is [#288](https://github.com/reliaburger/reliaburger/issues/288)).
+   The release closure record links the profile record from step 6.
 
-7. **Clean up the staging pre-releases.** Delete them before promotion so the
+8. **Clean up the staging pre-releases.** Delete them before promotion so the
    release page and the release notes' "previous tag" don't pick them up:
 
    ```sh
    gh release delete staging-v0.1.0-RUN_ID-ATTEMPT --cleanup-tag --yes
    ```
 
-8. **Promote** as described above, with the same run ID and digest. The
+9. **Promote** as described above, with the same run ID and digest. The
    staging tag can't be promoted: it doesn't match `v1.2.3`, `candidate.py`
    refuses it as a version, and `promote.yml` refuses any tag containing
    `staging`.
 
-9. **Update the docs** once the release is public: the release date in the
-   [roadmap](roadmap.md) (tick the release) and the homepage
-   (`docs/website/index.html`), and the bootstrap's default version if it
-   changed. Grep for the previous version to find the other "current
-   release" lines (the READMEs, the quickstart, the tour chapter, the
-   `VERSION=` lines in [linux-servers.md](linux-servers.md)), and leave
-   history alone. Update the five-minute tour to show off the release's new
-   features (the homepage's `data-tour` commands, the manual's
-   `08_five-minute-tour.md` and `scripts/demo/tour.sh` together), then
-   re-record `docs/website/assets/tour.cast` against the published install
-   with `scripts/demo/tour.sh --record … --install vX.Y.Z`
-   ([how](website/README.md#re-recording-the-tour)), and move the poster time
-   in `index.html` if its moment moved. The recording's title and the caption
-   under it name the installed version, and `tests/suite/website.rs` fails
-   until they match the bootstrap's default. Regenerate the released-CLI
-   snapshot with `scripts/release/released_cli.py vX.Y.Z >
-   scripts/release/released-cli.tsv` and run `make readme-commands`: commands
-   labelled "X.Y.Z, not in" the old release lose their labels, and the same test
-   flags any label the docs no longer need
-   ([how](website/README.md#commands-the-installed-release-doesnt-have)). The
-   website deploys from `main`, and publishes `/demo/*` from the tag the
-   bootstrap installs, so merge that change after promotion, not before.
+10. **Update the docs** once the release is public: the release date in the
+    [roadmap](roadmap.md) (tick the release) and the homepage
+    (`docs/website/index.html`), and the bootstrap's default version if it
+    changed. Grep for the previous version to find the other "current
+    release" lines (the READMEs, the quickstart, the tour chapter, the
+    `VERSION=` lines in [linux-servers.md](linux-servers.md)), and leave
+    history alone. Update the five-minute tour to show off the release's new
+    features (the homepage's `data-tour` commands, the manual's
+    `08_five-minute-tour.md` and `scripts/demo/tour.sh` together), then
+    re-record `docs/website/assets/tour.cast` against the published install
+    with `scripts/demo/tour.sh --record … --install vX.Y.Z`
+    ([how](website/README.md#re-recording-the-tour)), and move the poster time
+    in `index.html` if its moment moved. The recording's title and the caption
+    under it name the installed version, and `tests/suite/website.rs` fails
+    until they match the bootstrap's default. Regenerate the released-CLI
+    snapshot with `scripts/release/released_cli.py vX.Y.Z >
+    scripts/release/released-cli.tsv` and run `make readme-commands`: commands
+    labelled "X.Y.Z, not in" the old release lose their labels, and the same test
+    flags any label the docs no longer need
+    ([how](website/README.md#commands-the-installed-release-doesnt-have)). The
+    website deploys from `main`, and publishes `/demo/*` from the tag the
+    bootstrap installs, so merge that change after promotion, not before.
 
-   Refresh the homepage's
-   [How a release is tested](https://reliaburger.com/#release-testing)
-   section (`#release-testing` in `index.html`) to the new release: its
-   latest-release paragraph, its headline numbers with links to this
-   release's records, and the soak charts beside them. The charts are copies
-   of the app soak's (the V02 fast tier, now that the gate has no V02 final)
-   and the final job soak's `-charts/` directories in
-   `docs/website/assets/soak/`, which holds only this release's
-   ([how](website/README.md#soak-charts)). `tests/suite/website.rs`
-   fails while the section names a version older than the installer's
-   default, the release log's newest entry isn't this release, or a chart
-   isn't a byte-for-byte copy of this release's record.
+    Refresh the homepage's
+    [How a release is tested](https://reliaburger.com/#release-testing)
+    section (`#release-testing` in `index.html`) to the new release: its
+    latest-release paragraph, its headline numbers with links to this
+    release's records, and the soak charts beside them. The charts are copies
+    of the app soak's (the V02 fast tier, now that the gate has no V02 final)
+    and the final job soak's `-charts/` directories in
+    `docs/website/assets/soak/`, which holds only this release's
+    ([how](website/README.md#soak-charts)). `tests/suite/website.rs`
+    fails while the section names a version older than the installer's
+    default, the release log's newest entry isn't this release, or a chart
+    isn't a byte-for-byte copy of this release's record.
 
-   Add the release's paragraph to the top of the
-   [release log](release-log.md): the promotion date, how long qualifying it
-   took and how many candidates, what each soak found and what fixed it, and
-   any known issue it ships with, linking the records from step 6.
+    Add the release's paragraph to the top of the
+    [release log](release-log.md): the promotion date, how long qualifying it
+    took and how many candidates, what each soak found and what fixed it, and
+    any known issue it ships with, linking the records from step 7, and
+    one line from the profile's answer.
 
 ## Soaking a candidate in CI
 

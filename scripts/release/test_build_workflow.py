@@ -1,4 +1,5 @@
 """The candidate build tells qualification its digest without a 2 GB download."""
+import fnmatch
 import json
 from pathlib import Path
 import re
@@ -91,6 +92,52 @@ class BuildMatrixTests(unittest.TestCase):
                 built.add(f"{binary}-{entry['suffix']}")
         expected = {f"{binary}-{platform}" for binary, platforms in PLATFORMS.items() for platform in platforms}
         self.assertEqual(built, expected)
+
+
+def job(text, name):
+    """The lines of one top-level job, from its `  name:` line to the next job."""
+    match = re.search(rf"^  {re.escape(name)}:\n(.*?)(?=^  [a-z][a-z-]*:\n|\Z)", text, re.M | re.S)
+    if not match:
+        raise AssertionError(f"build.yml has no job {name!r}")
+    return match.group(1)
+
+
+class ProfilingBuildTests(unittest.TestCase):
+    """The release profile's attribution build (#1358) is built beside the candidate, never shipped."""
+
+    def setUp(self):
+        self.text = WORKFLOW.read_text()
+        self.job = job(self.text, "build-profiling")
+
+    def test_it_adds_frame_pointers_and_line_tables_to_the_release_profile(self):
+        self.assertIn("RUSTFLAGS: -C force-frame-pointers=yes", self.job)
+        self.assertIn("CARGO_PROFILE_RELEASE_DEBUG: line-tables-only", self.job)
+        self.assertIn('CARGO_PROFILE_RELEASE_STRIP: "false"', self.job)
+        self.assertIn("dtolnay/rust-toolchain@1.98.0", self.job)
+
+    def test_it_builds_what_the_shipped_linux_aarch64_build_builds(self):
+        shipped = next(entry for entry in build_matrix(self.text) if entry["suffix"] == "linux-aarch64")
+        self.assertIn(f"cargo build --locked --release --target {shipped['target']} {shipped['arguments']}",
+                      self.job)
+        self.assertIn(f"runs-on: {shipped['runner']}", self.job)
+
+    def test_its_artefact_is_one_staging_and_promotion_never_collect(self):
+        upload = step_named(self.job, "Upload the profiling build, never shipped")
+        name = re.search(r"^\s+name: (.+)$", upload, re.M).group(1)
+        self.assertEqual(name, "profiling-build-${{ github.sha }}-${{ github.run_attempt }}")
+        # The candidate job gathers `binaries-*` and candidate.py downloads
+        # `candidate-<commit>-<attempt>`; neither may match.
+        self.assertFalse(fnmatch.fnmatch(name, "binaries-*"))
+        self.assertFalse(name.startswith("candidate-"))
+
+    def test_the_candidate_does_not_wait_for_or_collect_it(self):
+        candidate = job(self.text, "candidate")
+        self.assertNotIn("build-profiling", candidate)
+        self.assertNotIn("profiling", candidate)
+
+    def test_the_profile_step_downloads_the_same_name(self):
+        script = (Path(__file__).resolve().parent / "qualify-profile.sh").read_text()
+        self.assertIn('--name "profiling-build-$commit-$attempt"', script)
 
 
 if __name__ == "__main__":

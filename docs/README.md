@@ -1427,6 +1427,14 @@ against an earlier report of the same scenario and fails on a drop beyond
 `--tolerance` (10% by default). The 100-million-a-day claim itself needs the
 job final: 8 hours of faults and a 2¼-hour quiet tail (`scripts/release/qualify-jobs-sustained.sh --tier final`).
 
+From 0.2.4 every release is also profiled (`scripts/release/qualify-profile.sh`,
+[release step 6](releasing.md#staging-a-candidate)): raw processes, host
+jobs, shared containers and an idle cluster, measured for the candidate and
+the previous release in alternating rounds in one disposable Lima VM, with
+`perf` on a never-shipped profiling build. Its record says where the time
+goes and what each comparison rule would flag; the rules don't gate a
+release yet.
+
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,
 crashloops, stalled deploys, missing service backends, active faults and alerts,
