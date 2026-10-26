@@ -2844,7 +2844,8 @@ gap. How much is enough? That depends on how long commands take, so the leader
 learns it from the final-attempt duration histogram the nodes already report.
 Bucket `i` counts commands that took up to `2^i` ms. Using the upper bound of
 each bucket gives a conservative estimate of throughput: slots × two seconds ÷
-average duration. Learned depth is capped at sixteen chunks.
+average duration. Learned depth was capped at sixteen chunks, and 0.2.3
+raised the cap to 32 for a reason we'll come to.
 
 That's the idea. The edges took four more fixes:
 
@@ -2871,8 +2872,8 @@ That's the idea. The edges took four more fixes:
   with a thousandth of the capacity gets two chunks.
 - **Lookahead needs automatic replay.** If a node dies, every chunk it held
   has an unknown outcome. Arrays that replay automatically don't mind. Arrays
-  that need an operator to acknowledge and replay would turn sixteen chunks
-  into manual work. Those keep the baseline window, and the leader passes the
+  that need an operator to acknowledge and replay would turn the whole
+  lookahead into manual work. Those keep the baseline window, and the leader passes the
   run's policy to `plan_grants` as a plain `bool`.
 - **The durations must be honest.** The executor used to time the whole
   `runner.run` call, which for a pool includes waiting for a slot and, on a
@@ -3406,6 +3407,29 @@ new version, so it needs care. Change 5, a single round trip per task between
 Bun and the helper, makes bursts cheaper, but bursts aren't the limit while
 the CPU waits. Past either doubling change, the next ceiling is CPU: about
 222 µs of VM time per task, or 18,000 a second on this rig.
+
+For 0.2.3 we took the first way, and it's one line:
+
+```rust
+pub const MAX_LEARNED_GRANT_DEPTH: u64 = 32;
+```
+
+That's 32 chunks × 1,000 tasks ÷ 2 s, or 16,000 a second, close enough to the
+CPU's 18,000 that the node should spend most of each cycle working. It isn't
+free. A lost node now strands up to twice as much work, which the leader hands
+to other nodes and runs again, and a cancel or drain has twice as many held
+chunks to write off. Arrays that need an operator to replay unknown outcomes
+never get the lookahead, so they don't pay that price. And the extra depth
+only matters for very short tasks: a node running 100 ms commands learns a
+depth far below sixteen, so it never reaches either cap.
+
+That's why it's a stopgap. The wait between ticks is still there; we've just
+made room for more work during it. Sending grants in the tick that commits
+them ([#1360](https://github.com/reliaburger/reliaburger/issues/1360)) removes
+the wait, helps every array rather than only the fastest, and lets the cap go
+back to sixteen. It changes the ordering of control versions that every node
+fences on, though, and that is code we'd rather not rush into a patch release.
+It's planned for 0.2.4.
 
 One more lesson came from the bench rig rather than the code. The first
 release-script run of the baseline fell apart in round 3: Bun stopped
