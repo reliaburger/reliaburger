@@ -113,7 +113,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         namespace: &str,
     ) -> Result<(), BunError> {
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        // Journals inline: rolling registration adds its replacements to
+        // `service_map` before it publishes (#1263).
         self.publish_backend_ebpf(&service_id).await?;
+        self.sync_firewall_ebpf().await;
+        self.reconcile_network_faults().await;
+        Ok(())
+    }
+
+    /// [`Self::finish_instance_networking`] for a `service_map` the
+    /// discovery journal already records.
+    pub(super) async fn finish_journalled_networking(
+        &mut self,
+        service_id: &crate::onion::service_id::ServiceId,
+    ) -> Result<(), BunError> {
+        let services = self.service_map.clone();
+        self.publish_journalled_backends(service_id, &services)
+            .await?;
         self.sync_firewall_ebpf().await;
         // A new caller must meet the network faults already active against
         // the services it calls.
@@ -309,15 +325,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // retirement with `StillRunning`, and the retry collects the same
         // task instead of asking again. A release is idempotent and names its
         // generation, so one that lands late is harmless.
+        //
+        // Everything below reads the journal itself, so a write in flight
+        // (its start's, which may be recording the hold right now (#1266),
+        // or this release's own from an earlier ask (#1263)) means ask
+        // again. Inside a turn it isn't waited for.
+        if self.settle_discovery_write_outside_turn().await
+            == discovery_ownership::Landing::InFlight
+        {
+            return Err(BunError::StillRunning {
+                work: format!("a discovery journal write in flight before {id}'s release"),
+            });
+        }
         let reference = match self.network_references.get(id).cloned() {
-            Some(reference) => reference,
-            // Its start's write may be recording the hold right now (#1266):
-            // the journal before it would read as not recording it.
-            None if self.reference_write_in_flight(id) => {
-                return Err(BunError::StillRunning {
-                    work: format!("journalling {id}'s network reference"),
-                });
+            // An earlier ask's write forgot the released permission after
+            // its turn ended (#1263): the journal no longer names the hold.
+            // The release is idempotent, so hand it back again and finish.
+            Some(reference)
+                if self.journal_reference(&reference) == JournalReference::Unrecorded =>
+            {
+                self.finish_network_release(id, reference).await?;
+                self.network_references.remove(id);
+                return Ok(());
             }
+            Some(reference) => reference,
             None => {
                 let read = off_loop_work::WorkKey::ReadNetworkReference(id.clone());
                 let Some(held) = self.read_network_reference(read, id).await? else {
@@ -455,20 +486,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 ),
             });
         }
-        self.clear_egress(instance_id).await?;
-        let resolved = egress.destinations;
-        let union: Vec<_> = self
-            .egress_bindings
-            .values()
-            .filter(|binding| binding.phase == PolicyPhase::Owned && binding.cgroup_id == cgroup_id)
-            .flat_map(|binding| binding.resolved.iter().copied())
-            .chain(resolved.iter().copied())
-            .collect();
-        crate::sesame::egress::merge_cidr_ports(&union).map_err(|error| {
-            BunError::DeployFailed {
-                app_name: app_name.into(),
-                reason: error.to_string(),
-            }
+        // Read the bindings as the last checkpoint write left them (#1263).
+        let settled = self.settle_egress_write_outside_turn().await?;
+        discovery_ownership::still_running_unless_landed(settled, || {
+            format!("checkpointing {instance_id}'s egress owner")
         })?;
         let original_spec = self
             .supervisor
@@ -492,9 +513,38 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .await
             .map_err(|error| BunError::AdoptionState(error.to_string()))?
             .map_err(|error| BunError::AdoptionState(error.to_string()))?;
-        self.egress_bindings.insert(
-            instance_id.clone(),
-            EgressBinding {
+        // An earlier ask's checkpoint write recorded exactly this owner and
+        // landed after that ask's turn (#1263): only the kernel is left.
+        let recorded = self
+            .egress_bindings
+            .get(instance_id)
+            .is_some_and(|binding| {
+                binding.phase == PolicyPhase::Owned
+                    && binding.cgroup_id == cgroup_id
+                    && binding.allow == allow
+                    && binding.original_spec == original_spec
+                    && binding.source_namespace == Some(source_namespace)
+                    && binding.boot_id == boot_id
+            });
+        if !recorded {
+            self.clear_egress(instance_id).await?;
+            let resolved = egress.destinations;
+            let union: Vec<_> = self
+                .egress_bindings
+                .values()
+                .filter(|binding| {
+                    binding.phase == PolicyPhase::Owned && binding.cgroup_id == cgroup_id
+                })
+                .flat_map(|binding| binding.resolved.iter().copied())
+                .chain(resolved.iter().copied())
+                .collect();
+            crate::sesame::egress::merge_cidr_ports(&union).map_err(|error| {
+                BunError::DeployFailed {
+                    app_name: app_name.into(),
+                    reason: error.to_string(),
+                }
+            })?;
+            let binding = EgressBinding {
                 phase: PolicyPhase::Owned,
                 cgroup_id,
                 source_namespace: Some(source_namespace),
@@ -503,10 +553,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 original_spec: original_spec.clone(),
                 runtime: self.supervisor.grill().runtime_kind_for(&original_spec),
                 boot_id,
-            },
-        );
-        self.persist_egress_owners(self.egress_bindings.clone())
-            .await?;
+            };
+            // The kernel enforces nothing for this owner until the
+            // checkpoint records it. A write still in flight at the turn's
+            // deadline keeps the start pending, and the next ask finds the
+            // owner recorded (#1263).
+            let deadline = self.turn_deadline();
+            let landing = self
+                .checkpoint_egress_owner(instance_id, Some(binding), Some(deadline))
+                .await?;
+            discovery_ownership::still_running_unless_landed(landing, || {
+                format!("checkpointing {instance_id}'s egress owner")
+            })?;
+        }
         let handle = self
             .onion_ebpf
             .clone()
@@ -569,8 +628,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Goes through `reprogram_cgroup_egress` because instances can share a
     /// cgroup path — deleting one instance's entries directly would wipe a
     /// co-tenant's policy.
+    ///
+    /// The retirement's checkpoint write holds the turn only until its
+    /// deadline (#1263): `StillRunning` means ask again, and the ask after
+    /// the write has landed finds the owner retired.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub(super) async fn clear_egress(&mut self, instance_id: &InstanceId) -> Result<(), BunError> {
+        let still_running = || format!("checkpointing {instance_id}'s egress retirement");
+        // Read the bindings as the last checkpoint write left them.
+        let settled = self.settle_egress_write_outside_turn().await?;
+        discovery_ownership::still_running_unless_landed(settled, still_running)?;
         if self.egress_store_uncertain {
             return Err(BunError::AdoptionState(
                 "egress ownership persistence is uncertain; restart to recover the checkpoint"
@@ -628,11 +695,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut confirmed = binding;
         confirmed.phase = PolicyPhase::Retired;
         confirmed.resolved.clear();
-        let mut owners = self.egress_bindings.clone();
-        owners.insert(instance_id.clone(), confirmed.clone());
-        self.persist_egress_owners(owners).await?;
+        let deadline = self.turn_deadline();
+        let landing = self
+            .checkpoint_egress_owner(instance_id, Some(confirmed.clone()), Some(deadline))
+            .await?;
+        // The kernel no longer enforces this owner, so memory says so at
+        // once, even while the write is in flight: a live check or sweep
+        // rebuilding the cgroup's maps meanwhile mustn't put it back. Only
+        // its writer reads the phase as durable, after the write has landed.
         self.egress_bindings.insert(instance_id.clone(), confirmed);
-        Ok(())
+        discovery_ownership::still_running_unless_landed(landing, still_running)
     }
 
     /// No-op without the eBPF data path.

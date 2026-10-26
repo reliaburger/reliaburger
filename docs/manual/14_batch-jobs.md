@@ -147,7 +147,7 @@ receipts to be pruned before reusing that identity for an app.
 A task array is a template and a count. The cluster assigns chunks to eligible
 nodes; each node starts tasks as CPU and memory become available. A chunk of
 1,000 tasks does not reserve 1,000 simultaneous executions. Fast verified
-completions can raise queued lookahead to sixteen chunks to bridge control-report
+completions can raise queued lookahead to 32 chunks to bridge control-report
 rounds. This changes queued ownership, not running concurrency or per-command
 resource admission. More granted work may require reconciliation or acknowledged
 replay after worker loss. Lookahead learns from roughly the last 4,096
@@ -883,6 +883,16 @@ relish bench --scenario jobs-host-processes --report before.json
 # ... change something ...
 relish bench --scenario jobs-host-processes --compare before.json --tolerance 15
 ```
+
+The report also breaks the window's successes down per node, from the
+counters each node reported to the leader, with the same cutoff as the total.
+Each node's fair share is its slots as a fraction of every node's. A node more
+than 20% over its fair share (above 40% on three equal nodes, 60% on two) makes
+the run fail, because a total that one node carries doesn't show the work
+spreading. A node whose counter went backwards restarted inside the window and
+is flagged. JSON reports carry the breakdown as `per_node`; reports from
+before 0.2.3 don't have it, still work as `--compare` baselines, and print
+`per node: not recorded`.
 
 A baseline from another scenario, or one that didn't complete and clean up,
 is refused before anything runs. A different window, concurrency, CPU

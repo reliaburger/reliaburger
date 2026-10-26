@@ -39,10 +39,35 @@ class Gate(unittest.TestCase):
         script=(Path(__file__).parent/"qualify-sustained.sh").read_text()
         self.assertIn("duration_text:=60m",script)
         self.assertIn("duration_text:=8h",script)
-        self.assertIn("end + quiet_tail - 120",script)
-        self.assertIn("quiet_started + quiet_tail - 120",script)
         self.assertNotIn("sleep 120",script)
         self.assertIn("mark \"$evidence/jobs\"",script)
+
+    def test_the_drain_starts_only_once_the_last_cycle_and_its_special_are_over(self):
+        # A drain timed from the soak's end ran inside the last cycle, which can
+        # finish after it: 0.2.2 candidate 4's hour-8 graceful stop held the
+        # cluster down for the drain's whole allowance (#1338).
+        script=(Path(__file__).parent/"qualify-sustained.sh").read_text()
+        loop_over=script.index('current_slot=final\nwait_until "$end"')
+        sets=[match.start() for match in re.finditer(r"meta job_stop_at ",script)]
+        self.assertTrue(sets)
+        self.assertTrue(all(position>loop_over for position in sets),"job_stop_at is set before the cycles are over")
+        self.assertIn("wait_for_job_drain",script[loop_over:])
+
+    def test_a_controller_that_stops_before_the_harness_asks_for_the_drain_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); snap=root/"snap"; snap.mkdir()
+            (root/"metadata.json").write_text(json.dumps(dict(job_soak=True)))
+            (snap/"jobs.json").write_text(json.dumps(dict(stopped=True,heartbeat=100,errors=[])))
+            self.assertTrue(any("before the final drain" in item["detail"] for item in checker.job_findings(root,snap,100,False)))
+
+    def test_a_final_whose_harness_never_asked_for_the_drain_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"jobs").mkdir()
+            (root/"metadata.json").write_text(json.dumps(dict(job_soak=True,result="PASS",started_at=100,finished_at=200)))
+            (root/"jobs/snapshot.json").write_text(json.dumps(dict(stopped=True,stop_requested_at=150,heartbeat=200,active=[],errors=[])))
+            checker.save_state(root,{"nodes":["n"]})
+            self.assertEqual(checker.render(root,root/"report.md"),1)
+            self.assertIn("the harness never asked the job campaign to drain",(root/"report.md").read_text())
 
     def test_live_snapshot_without_drain_timestamp_fails_without_crashing_render(self):
         with tempfile.TemporaryDirectory() as directory:

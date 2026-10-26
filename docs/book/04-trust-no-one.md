@@ -307,7 +307,7 @@ not the read worked.
 
 An operator files the backup away and may not open it for years, by which
 time we'll have bumped `age` a few more times. The 0.2.2 bump from `age` 0.10
-to 0.12 rewrote the API we just walked through, so we checked in backups that
+to 0.11 (by way of 0.12, as chapter 15 explains) rewrote the API we just walked through, so we checked in backups that
 an `age` 0.10 build sealed, one to a passphrase and one to a recipient, under
 `tests/fixtures/age/`. The tests `a_passphrase_backup_sealed_by_age_0_10_still_opens`
 and `a_recipient_backup_sealed_by_age_0_10_still_opens` open and verify them on
