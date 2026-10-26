@@ -52,6 +52,9 @@ const RETIREMENT_DEADLINE: Duration = Duration::from_secs(10);
 /// #759, and the command never reached that executor, so a second, fresh
 /// one runs it at most once. Both share the command's deadline.
 const STARTUP_ATTEMPTS: u32 = 2;
+/// How often a running command's namespace enforcement is checked again.
+#[cfg(feature = "ebpf")]
+const POLICY_TICK: Duration = Duration::from_millis(100);
 /// How one try at starting a cold executor ended.
 enum Startup {
     Started,
@@ -129,6 +132,11 @@ pub(crate) struct ReusablePool<G> {
     changed: Notify,
     #[cfg(feature = "ebpf")]
     policy: Option<Arc<crate::bun::task_namespace::TaskNamespacePolicy>>,
+    /// Advances every [`POLICY_TICK`] while the pool has a policy. Running
+    /// commands re-check their namespace on it, so no command creates a
+    /// timer of its own (#1030).
+    #[cfg(feature = "ebpf")]
+    policy_ticks: tokio::sync::watch::Receiver<u64>,
     /// Slot locks taken on a task's own path (checkout, admission, start
     /// and hand-back), counted so a test can hold that path to its budget.
     /// Eviction and the metrics readers lock without counting.
@@ -190,6 +198,10 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         >,
     ) -> Arc<Self> {
         let count = count.clamp(1, super::MAX_EXECUTOR_SLOTS);
+        #[cfg(feature = "ebpf")]
+        let (tick, policy_ticks) = tokio::sync::watch::channel(0u64);
+        #[cfg(feature = "ebpf")]
+        let supervised = policy.is_some();
         let pool = Arc::new(Self {
             runtime,
             group_kill,
@@ -214,6 +226,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             changed: Notify::new(),
             #[cfg(feature = "ebpf")]
             policy,
+            #[cfg(feature = "ebpf")]
+            policy_ticks,
             #[cfg(test)]
             task_locks: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -225,6 +239,22 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 pool.evict_idle().await;
             }
         });
+        // Its own task, not the eviction loop's: a retirement can hold that
+        // loop for seconds, and supervision must not wait for it. When the
+        // pool goes, the sender drops and any receiver left fails closed.
+        #[cfg(feature = "ebpf")]
+        if supervised {
+            let weak = Arc::downgrade(&pool);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(POLICY_TICK);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                interval.tick().await;
+                while weak.strong_count() > 0 {
+                    interval.tick().await;
+                    tick.send_modify(|count| *count = count.wrapping_add(1));
+                }
+            });
+        }
         pool
     }
     /// Lock the slots on a task's own path.
@@ -1347,23 +1377,22 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 }
             }
         };
+        // A command with no namespace policy has nothing to supervise, and
+        // one with a policy waits on the pool's tick, not a timer of its own.
         let policy_monitor = async {
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                #[cfg(feature = "ebpf")]
-                if let Some(policy) = &self.policy {
-                    policy
-                        .check(template.namespace.as_deref().unwrap_or("default"))
-                        .await?;
-                }
+            #[cfg(feature = "ebpf")]
+            if let Some(policy) = &self.policy {
+                let mut ticks = self.policy_ticks.clone();
+                ticks.mark_unchanged();
+                let namespace = template.namespace.as_deref().unwrap_or("default");
+                return supervise_policy(ticks, || policy.check(namespace)).await;
             }
-            #[allow(unreachable_code)]
-            Ok::<(), std::io::Error>(())
+            std::future::pending::<std::io::Error>().await
         };
         let outcome = tokio::select! { biased;
             () = cancel.cancelled() => AttemptOutcome::Cancelled,
             () = crate::bun::task_executor::wait_deadline(deadline) => AttemptOutcome::TimedOut,
-            result = policy_monitor => AttemptOutcome::Unknown { reason: result.err().map_or_else(|| "namespace supervision stopped".into(), |error| error.to_string()) },
+            error = policy_monitor => AttemptOutcome::Unknown { reason: error.to_string() },
             result = observe => match result { Ok(outcome) => outcome, Err(error) => AttemptOutcome::Unknown { reason: error.to_string() } },
         };
         bytes.fill(0);
@@ -1384,6 +1413,28 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             outcome,
             output,
             ran,
+        }
+    }
+}
+
+/// Run `check` at every tick of `ticks` until it fails, and return why. A
+/// tick that stops for good ends supervision too: the command is then no
+/// longer watched, so it must not keep running.
+#[cfg(any(feature = "ebpf", test))]
+async fn supervise_policy<C, F>(
+    mut ticks: tokio::sync::watch::Receiver<u64>,
+    mut check: C,
+) -> std::io::Error
+where
+    C: FnMut() -> F,
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    loop {
+        if ticks.changed().await.is_err() {
+            return std::io::Error::other("namespace supervision stopped");
+        }
+        if let Err(error) = check().await {
+            return error;
         }
     }
 }
@@ -2165,6 +2216,52 @@ mod tests {
             },
         )
         .await
+    }
+
+    /// #1030: a running command re-checks its namespace on the pool's tick
+    /// and never on a timer of its own, so starting one creates no timer.
+    #[tokio::test(start_paused = true)]
+    async fn policy_supervision_checks_on_each_pool_tick_and_never_on_its_own_clock() {
+        let (tick, ticks) = tokio::sync::watch::channel(0u64);
+        let checks = AtomicUsize::new(0);
+        let supervision = supervise_policy(ticks, || {
+            checks.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        });
+        tokio::pin!(supervision);
+        // An hour of a paused clock with no tick: nothing of its own fires.
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(futures_util::poll!(supervision.as_mut()).is_pending());
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+        for expected in 1..=3 {
+            tick.send_modify(|count| *count += 1);
+            assert!(futures_util::poll!(supervision.as_mut()).is_pending());
+            assert_eq!(checks.load(Ordering::SeqCst), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_supervision_ends_the_command_at_the_first_failed_check() {
+        let (tick, ticks) = tokio::sync::watch::channel(0u64);
+        let mut results = vec![Err(std::io::Error::other("enforcement was lost")), Ok(())];
+        let supervision = supervise_policy(ticks, || std::future::ready(results.pop().unwrap()));
+        tokio::pin!(supervision);
+        tick.send_modify(|count| *count += 1);
+        assert!(futures_util::poll!(supervision.as_mut()).is_pending());
+        tick.send_modify(|count| *count += 1);
+        let error = supervision.await;
+        assert_eq!(error.to_string(), "enforcement was lost");
+    }
+
+    #[tokio::test]
+    async fn policy_supervision_fails_closed_when_its_tick_stops() {
+        let (tick, ticks) = tokio::sync::watch::channel(0u64);
+        let supervision = supervise_policy(ticks, || std::future::ready(Ok(())));
+        drop(tick);
+        assert_eq!(
+            supervision.await.to_string(),
+            "namespace supervision stopped"
+        );
     }
 
     /// #1030: a warm command takes the slot lock to check its executor out
