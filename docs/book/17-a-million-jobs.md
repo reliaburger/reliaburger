@@ -3575,6 +3575,46 @@ elapsed time in its `Drop` implementation, Rust's destructor, which runs on
 every exit path, error returns included. Its lifetime spans exactly one phase,
 so waiting for a slot can't leak into execution time.
 
+### Counting per node
+
+0.2.3's headline is two billion host jobs a day on three nodes. A three-node
+total that's three times one node's sounds like proof that the scheduler
+spreads the work. It isn't. One node could be doing most of it while the
+others wait for grants, and the total would look the same until that node ran
+out of room. So #1031 needs the window's successes broken down per node, and
+a lopsided split counts as a failed measurement, not a result.
+
+The data was already there. Each batch summary carries the leader's view of
+every node: the slots it offered and the counters it reported at its last
+sync. `relish bench` now reads those counters on every poll, through a
+`NodeCounts` value keyed by array and node, and keeps the per-node deltas
+alongside the accepted total, with the same cutoff. A counter that goes
+backwards means the node restarted, so counting carries on from the new value
+and the report flags it. These are what each node *said* it finished. The
+headline total stays the leader's accepted count, and on a healthy run the two
+agree.
+
+Each node's fair share is its slots over everyone's. A node may go 20% over
+its fair share, so a third of the work on three equal nodes may grow to 40%,
+and anything more fails the command. The first version compared percentages
+as floats and called exactly 40% unbalanced: 33.33… × 1.2 comes out a hair
+under 40 in binary floating point. The check now cross-multiplies whole
+numbers in `u128`, Rust's 128-bit unsigned integer, wide enough that the
+product of three `u64`-sized counts can't overflow:
+
+```rust
+over_fair_share: u128::from(*successes) * u128::from(total_slots) * 100
+    > u128::from(slots) * u128::from(total) * tolerance,
+```
+
+`u128::from` is a lossless conversion; Rust won't silently widen a `u64` in
+arithmetic the way C promotes integers, so you say it each time.
+
+Older reports have no breakdown, and `--compare` still has to read them. The
+new field is an `Option<NodeBreakdown>` marked `#[serde(default)]`, which
+tells serde to fill in `None` when the key is missing instead of refusing the
+file. The human report then says `per node: not recorded`.
+
 ### Soak jobs while the apps keep running
 
 A fast command completing a million times tells us little about what happens

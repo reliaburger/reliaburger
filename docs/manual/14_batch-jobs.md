@@ -884,6 +884,16 @@ relish bench --scenario jobs-host-processes --report before.json
 relish bench --scenario jobs-host-processes --compare before.json --tolerance 15
 ```
 
+The report also breaks the window's successes down per node, from the
+counters each node reported to the leader, with the same cutoff as the total.
+Each node's fair share is its slots as a fraction of every node's. A node more
+than 20% over its fair share (above 40% on three equal nodes, 60% on two) makes
+the run fail, because a total that one node carries doesn't show the work
+spreading. A node whose counter went backwards restarted inside the window and
+is flagged. JSON reports carry the breakdown as `per_node`; reports from
+before 0.2.3 don't have it, still work as `--compare` baselines, and print
+`per node: not recorded`.
+
 A baseline from another scenario, or one that didn't complete and clean up,
 is refused before anything runs. A different window, concurrency, CPU
 request, image or executable makes the verdict informational: it's printed
