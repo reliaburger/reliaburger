@@ -1428,7 +1428,7 @@ against an earlier report of the same scenario and fails on a drop beyond
 job final: 8 hours of faults and a 2¼-hour quiet tail (`scripts/release/qualify-jobs-sustained.sh --tier final`).
 
 From 0.2.4 every release is also profiled (`scripts/release/qualify-profile.sh`,
-[release step 6](releasing.md#staging-a-candidate)): raw processes, host
+[release step 9](releasing.md#staging-a-candidate), after the tag): raw processes, host
 jobs, shared containers and an idle cluster, measured for the candidate and
 the previous release in alternating rounds in one disposable Lima VM, with
 `perf` on a never-shipped profiling build. Its record says where the time
@@ -1639,6 +1639,16 @@ machines.
   the first failure, writes the records and a rule-of-three summary
   (`DIR.md`), and deletes the VM and checkout (`--keep` keeps them). It
   refuses `reliaburger-test`, an existing VM and a dirty checkout.
+- `scripts/release/nightly-qualify.sh --train release-X-Y-Z [--gate patch|full]`
+  runs the long tiers on a train's tip every night: the power-cut and reboot
+  runs, then the V02 and jobs fast soaks against a staged build of the tip,
+  then the job final for the full gate. It writes a dated record naming the
+  commit under `~/reliaburger-nightly/`; `--plan` prints the tiers and touches
+  nothing. At code freeze `scripts/release/nightly.py freeze-check --commit SHA`
+  checks that the latest green night ran the candidate's code, and
+  `scripts/release/release_tier.py --previous vA --release vB` says whether a
+  release needs the patch gate or the full one
+  ([the release gate](releasing.md#the-release-gate)).
 - `scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_LIMA_VM` runs from the
   host. It starts real OCI executions, force-stops the VM and checks recovery
   after the new kernel boot, including address retention until explicit

@@ -56,8 +56,40 @@ jobs:
           { echo "pdf=$pdf"; echo "binaries=$binaries"; echo "matrix=$matrix"; echo "guest_images=$guest_images"; echo "profiling=$profiling"; } >>"$GITHUB_OUTPUT"
           echo "pdf=$pdf binaries=$binaries guest_images=$guest_images profiling=$profiling"
 
-  validate-release:
+  ci-evidence:
+    # A candidate's commit has normally passed ci.yml already, on the push to
+    # main (#1363). If a push, merge-queue or nightly run on exactly this
+    # commit passed every job, ignored-test evidence included, the build
+    # reuses it instead of running the suite again, saving about an hour,
+    # most of it spent waiting for hosted macOS runners. Any doubt, an API
+    # error included, says reuse=false and the suite runs below.
+    name: find passing CI
     if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse: ${{ steps.find.outputs.reuse }}
+      ci_run: ${{ steps.find.outputs.ci_run }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find a passing CI run on this commit
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          CANDIDATE_COMMIT: ${{ github.sha }}
+        run: >-
+          python3 scripts/release/ci_reuse.py
+          --repository "$RELEASE_REPOSITORY" --commit "$CANDIDATE_COMMIT"
+
+  validate-release:
+    # The whole suite, only when no passing run was found or the search
+    # itself failed (a failed search leaves reuse empty).
+    needs: ci-evidence
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && needs.ci-evidence.outputs.reuse != 'true' }}
     uses: ./.github/workflows/ci.yml
 
   build-pdf:
@@ -228,8 +260,17 @@ jobs:
           retention-days: 7
 
   candidate:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
-    needs: [validate-release, build-pdf, build-binaries, build-guest-images, test-packaging]
+    # Signs only a commit that passed the whole of ci.yml: in this run, or in
+    # the run ci-evidence found. A skipped validate-release counts only with
+    # that run, and every build job must have succeeded either way.
+    if: >-
+      ${{ !cancelled() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+      && needs.build-pdf.result == 'success' && needs.build-binaries.result == 'success'
+      && needs.build-guest-images.result == 'success' && needs.test-packaging.result == 'success'
+      && (needs.validate-release.result == 'success'
+      || (needs.validate-release.result == 'skipped' && needs.ci-evidence.result == 'success'
+      && needs.ci-evidence.outputs.reuse == 'true')) }}
+    needs: [ci-evidence, validate-release, build-pdf, build-binaries, build-guest-images, test-packaging]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -270,6 +311,7 @@ jobs:
           CANDIDATE_RUN: ${{ github.run_id }}
           CANDIDATE_ATTEMPT: ${{ github.run_attempt }}
           RELEASE_REPOSITORY: ${{ github.repository }}
+          CI_RUN: ${{ needs.ci-evidence.outputs.ci_run }}
         run: |
           digest=$(python3 scripts/release/candidate.py record --directory dist \
             --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" \
@@ -278,8 +320,10 @@ jobs:
           # The log line is what `gh run view --log` finds; the summary is
           # for people reading the run page.
           echo "Qualification manifest SHA-256: $digest"
-          printf 'Candidate commit: `%s`\n\nRun: `%s`, attempt: `%s`\n\nQualification manifest SHA-256: `%s`\n' \
-            "$CANDIDATE_COMMIT" "$CANDIDATE_RUN" "$CANDIDATE_ATTEMPT" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$CI_RUN" ]; then source_ci="reused ci.yml run $CI_RUN"; else source_ci="ran in this build"; fi
+          echo "Source CI: $source_ci"
+          printf 'Candidate commit: `%s`\n\nRun: `%s`, attempt: `%s`\n\nSource CI: %s\n\nQualification manifest SHA-256: `%s`\n' \
+            "$CANDIDATE_COMMIT" "$CANDIDATE_RUN" "$CANDIDATE_ATTEMPT" "$source_ci" "$digest" >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve the qualification manifest on its own
         # A few kilobytes that hash to the digest above, so qualification
         # can read it without the whole candidate. Staging and promotion

@@ -36,7 +36,7 @@ One more artefact is never shipped: `profiling-build-COMMIT-ATTEMPT` holds
 commit with frame pointers and line tables
 (`RUSTFLAGS="-C force-frame-pointers=yes"`,
 `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, not stripped). The release
-profile step uses it to name Bun's frames ([step 6](#staging-a-candidate)),
+profile step uses it to name Bun's frames ([step 9](#staging-a-candidate)),
 so the profile never compiles on the bench host. Pushes and manual runs
 build it, and pull requests only when the workflow changes. Its name matches
 neither the candidate job's `binaries-*` nor `candidate-*`, so it never
@@ -497,7 +497,24 @@ Run:
 gh workflow run build.yml --ref main
 ```
 
-This reruns source CI and builds the native matrix and PDFs at one main commit.
+This builds the native matrix and PDFs at one main commit, and makes sure
+that commit passed the whole of source CI. Usually it already has, on the push
+to `main`, so the build reuses that run instead of running the suite again
+([#1363](https://github.com/reliaburger/reliaburger/issues/1363)): its
+`find passing CI` job runs
+[`ci_reuse.py`](../scripts/release/ci_reuse.py), which asks the GitHub API
+for a `ci.yml` run on exactly this commit, from a push, the merge queue or the
+nightly schedule (a pull request's run tests a merge commit and may skip
+jobs). The run counts only if it succeeded and every job in it succeeded,
+`ignored-test evidence` included; the script's list of required jobs is kept
+equal to `ci.yml`'s own by a test, so a new CI job can't be skipped silently.
+Anything else (no such run, a failed, cancelled or skipped job, another
+commit, an API error) runs the full suite in `validate-release`, as every
+build did before 0.2.4. Reusing the run takes the candidate from about 2 hours
+to about 50 minutes, the macOS `relish` build's time; most of the hour saved
+was spent waiting for hosted macOS runners. The job summary's *Source CI*
+line names the run the candidate rests on.
+
 Only after those checks pass does it collect the two built guest images, sign
 all six binaries and both images' digests, and upload `candidate-<commit>-<attempt>` as an Actions artefact.
 It creates no Git tag or GitHub release. PR and ordinary main builds never use
@@ -572,6 +589,113 @@ Before tagging a release, complete the managed-cluster and clean-install
 gates. Record timing from an empty cache, the actual artefact digests, host and
 guest versions, memory use, and the successful sample workload. Don't publish a
 five-minute claim from a source build or a warmed VM.
+
+## The release gate
+
+0.2.3's gate took most of a week from code freeze to ready-to-tag, and only
+about two days of that was the gate itself. The rest had three causes: every
+benchmark, soak and day run needs a quiet host, so they queued one after
+another on one Mac; every failure meant a new candidate, about a day each
+time; and the performance records blocked the tag. From 0.2.4 the gate changes
+in three ways, besides the candidate build's reuse of a passing CI run
+([above](#metadata-and-publication)) (maintainer decision, 26 October 2026,
+[#1363](https://github.com/reliaburger/reliaburger/issues/1363)).
+
+### Nightly qualification on the train tip
+
+Every night the quiet host runs the long tiers on the current tip of the
+release's train, one after another: the power-cut and reboot runs, the V02
+and jobs fast soaks and, for a release that needs the full gate (below), the
+job final. A failure then turns up mid-week, on the train, instead of after
+the freeze on a candidate.
+
+```sh
+scripts/release/nightly-qualify.sh --train release-0-2-4 --gate patch \
+  --base-url https://github.com/reliaburger/reliaburger/releases/download/STAGED_BUILD_OF_THE_TIP \
+  --qualified-digest ITS_DIGEST [--soak-bun /path/to/bun-v0.2.4-soak.1]
+```
+
+It reads the tip with `git ls-remote`, fetches it, and runs every tier from a
+detached checkout of that commit, so the tip's own harness runs. Power-cut
+and reboot runs build the commit inside their disposable VM; the soaks
+install a staged build through `curl | sh`, and the script refuses one whose
+`candidate.json` doesn't hash to the digest or names other code. Without a
+staged build only the power-cut runs happen and the night isn't green. Every
+fast tier runs even after another one fails, so one night shows every
+problem; the job final is skipped after any failure. It refuses to start while
+`rustc` or `cargo` run, records the host's load around each tier, and writes
+`~/reliaburger-nightly/DATE-TRAIN-SHORTSHA/` (`--records` moves it): each
+tier's own record, `nightly.json` and a README naming the exact commit and
+the verdict. `--plan` (or `--dry-run`) resolves the tip and prints the tiers,
+touching nothing.
+
+Where the tip's staged build comes from is still open in #1363. `build.yml`
+signs only manual builds of `main` and `stage.yml` stages only those, because
+a release-signed build of unreleased code is as dangerous as the soak build
+[below](#soaking-a-candidate-in-ci). Until that's decided, a nightly whose
+soaks have no staged build is red, and the freeze falls back to running the
+soaks on the candidate (step 4).
+
+[`nightly-qualify.plist.example`](../scripts/release/nightly-qualify.plist.example)
+is a launchd job that starts it at 18:00; the patch gate's tiers take about
+3 hours and the full gate's about 14. Nothing installs it: the Mac Studio that
+becomes the quiet host arrives in the week of 2 November 2026.
+
+A failed night is triaged that day, like a failed CI run: a product bug gets
+an issue and a fix on the train, and anything that passes on a re-run goes in
+the [flakes register](flakes.md).
+
+### A gate scaled to the release
+
+Every release runs the **patch gate**: the staged installs (step 3), the V02
+and jobs fast tiers (step 4) and the power-cut and reboot runs (step 5). The
+**full gate** adds the job final, `qualify-jobs-sustained.sh --tier final`,
+8 hours of faults and the quiet tail. A release needs the full gate when it's
+
+- a minor or major release (`vX.Y.0`);
+- a release whose `CURRENT` in `src/compatibility.rs` differs from the
+  previous release's, so durable state or the wire changed; or
+- a release that touches the agent loop (`src/bun/agent.rs` or
+  `src/bun/agent/`), whose turn budget and ordering the final's eight hours
+  of faults exercise.
+
+[`release_tier.py`](../scripts/release/release_tier.py) applies the rule to
+a tag range and prints `patch` or `full` with its reasons:
+
+```sh
+scripts/release/release_tier.py --previous v0.2.3 --release v0.2.4 --commit origin/release-0-2-4
+```
+
+Run it when the train opens and again at freeze; a change that tips a patch
+release into the full gate moves its nightlies to `--gate full`.
+
+### Code freeze
+
+At freeze the candidate is built on `main` from the gate PR's merge. If the
+latest nightly that's green for the release's gate ran the candidate's code,
+the soaks and power-cut runs don't run again:
+
+```sh
+git fetch origin main
+scripts/release/nightly.py freeze-check --commit CANDIDATE_SHA --gate patch
+```
+
+Same code means the same commit, or a commit with the same tree: the gate
+PR's merge has a new commit, but with nothing else on `main` its tree is the
+train tip's. `freeze-check` fails if the latest green nightly ran other code,
+if no nightly is green for that gate, or if a later night on the same code was
+red: triage that night, and a newer green night on the code clears it. When
+it passes, the gate is the staged
+installs (step 3) on the candidate, and the matching nightly's directory is
+copied into `docs/qualification/` as the soak and power-cut records. When it
+fails, run steps 4 and 5 on the candidate as before.
+
+### Performance records after the tag
+
+Benchmarks, the profile (#1358) and the day run (#1032) don't decide whether a
+release works, and they need the quiet host for hours. They're published
+after the tag ([step 9](#staging-a-candidate)) instead of blocking it, and a
+regression they find goes into the next patch release.
 
 ## Staging a candidate
 
@@ -662,7 +786,11 @@ the real `curl … | sh` install against it on every host we advertise.
    script always starts empty) and again for repeatability.
 
 4. **Soak it (V02)** on Apple silicon, in two tiers
-   ([plan](plans/2026-09-25-v02-sustained.md), D3). Build and sign the soak
+   ([plan](plans/2026-09-25-v02-sustained.md), D3). When
+   [`freeze-check`](#code-freeze) passes, the matching nightly has already
+   run this step's tiers on the candidate's code: copy its records and go to
+   step 6. A patch release runs the fast tiers; the job final is for the
+   [full gate](#a-gate-scaled-to-the-release). Build and sign the soak
    bun first (D2). After each round of fixes, run the fast tier: every fault
    kind and every special on the compressed schedule, in about an hour.
 
@@ -817,8 +945,8 @@ the real `curl … | sh` install against it on every host we advertise.
    pass before the final run: until it does, a full disk stops a worker
    taking grants and fails the run.
 
-   Before release, re-record the published throughput table on the candidate
-   with `relish bench --scenario … --report FILE` on the same rig, and
+   After the tag ([step 9](#staging-a-candidate)), re-record the published
+   throughput table on the release with `relish bench --scenario … --report FILE` on the same rig, and
    compare it with the committed reports
    (`relish bench --scenario jobs-host-processes --compare docs/qualification/…/r1-jobs-host-processes.json`);
    `--compare` fails on a drop larger than `--tolerance` (10% by default).
@@ -862,7 +990,8 @@ the real `curl … | sh` install against it on every host we advertise.
 5. **Pull the plug.** Killing a process isn't a power cut: page-cache writes
    survive one and not the other. Run the power-cut and reboot qualifications
    ([what they prove](testing.md#pulling-the-plug)) on the candidate's commit,
-   from the host:
+   from the host. Every release runs them; a passing
+   [`freeze-check`](#code-freeze) means the matching nightly already has:
 
    ```sh
    scripts/release/qualify-power-cut-reboot.sh --commit CANDIDATE_SHA --iterations 10 \
@@ -897,24 +1026,43 @@ the real `curl … | sh` install against it on every host we advertise.
    regression, not a rare race; a release that changes storage, locking or
    ownership (as #613 did) runs 25.
 
-   Also link the candidate commit's `task-array benchmarks` run from the gate
-   issue. It runs nightly on `main` and fails only on a regression of more
-   than 2x against main's last baseline, allowing for the runner's own speed
-   ([how](testing.md#benchmarks-in-ci)); its `criterion-task-arrays` artefact
-   is the cost evidence for bounded-cost claims such as 0.2.0's (#668).
+6. **Record it.** Copy each host's record into
+   `docs/qualification/DATE-staged-install-HOST.md`, alongside the run ID,
+   attempt, commit and digest, and link them from the release's milestone or
+   gate issue (V04 is [#288](https://github.com/reliaburger/reliaburger/issues/288)).
+   When `freeze-check` passed, copy the matching nightly's directory too and
+   name its commit in the release closure record.
 
-6. **Profile it**, from 0.2.4 on (maintainer decision, 26 October 2026,
+7. **Clean up the staging pre-releases.** Delete them before promotion so the
+   release page and the release notes' "previous tag" don't pick them up:
+
+   ```sh
+   gh release delete staging-v0.1.0-RUN_ID-ATTEMPT --cleanup-tag --yes
+   ```
+
+8. **Promote** as described above, with the same run ID and digest. The
+   staging tag can't be promoted: it doesn't match `v1.2.3`, `candidate.py`
+   refuses it as a version, and `promote.yml` refuses any tag containing
+   `staging`.
+
+9. **Publish the performance records**, after the tag
+   ([why](#performance-records-after-the-tag)). They don't block the release;
+   a regression they find is a bug for the next patch release. Run them on the
+   quiet host, one at a time, never beside a nightly.
+
+   **The profile**, from 0.2.4 on (maintainer decision, 26 October 2026,
    [#1358](https://github.com/reliaburger/reliaburger/issues/1358)). The
    soaks check that things work and don't leak; nothing in them checks
    whether a release got slower, or why. The [0.2.3 host-job
    profile](qualification/2026-10-20-host-job-profile/README.md) found a
    GitOps loop burning a core and grants running in lockstep that no test or
-   soak had noticed. This step runs that profile on every candidate and
-   compares it with the previous release:
+   soak had noticed. This step runs that profile on every release and
+   compares it with the previous one. The staging pre-release is gone by now,
+   so point it at the published release:
 
    ```sh
    scripts/release/qualify-profile.sh \
-     --candidate https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.4-RUN_ID-ATTEMPT \
+     --candidate https://github.com/reliaburger/reliaburger/releases/download/v0.2.4 \
      --qualified-digest QUALIFIED_DIGEST
    ```
 
@@ -980,23 +1128,22 @@ the real `curl … | sh` install against it on every host we advertise.
    for every flagged line. A later release turns the rules into a gate, once
    a few records show how noisy the rig is.
 
-7. **Record it.** Copy each host's record into
-   `docs/qualification/DATE-staged-install-HOST.md`, alongside the run ID,
-   attempt, commit and digest, and link them from the release's milestone or
-   gate issue (V04 is [#288](https://github.com/reliaburger/reliaburger/issues/288)).
-   The release closure record links the profile record from step 6.
+   **The benchmarks.** Re-record the published throughput table on the
+   release (`relish bench --compare`, [step 4](#staging-a-candidate)), and
+   link the release commit's `task-array benchmarks` run from the gate
+   issue. That job runs nightly on `main` and fails only on a regression of
+   more than 2x against main's last baseline, allowing for the runner's own
+   speed ([how](testing.md#benchmarks-in-ci)); its `criterion-task-arrays`
+   artefact is the cost evidence for bounded-cost claims such as 0.2.0's
+   (#668).
 
-8. **Clean up the staging pre-releases.** Delete them before promotion so the
-   release page and the release notes' "previous tag" don't pick them up:
+   **The day run**, when the release makes a sustained-rate claim (0.2.3's
+   two billion a day, [#1032](https://github.com/reliaburger/reliaburger/issues/1032)):
+   24 hours of host jobs on the bench host to itself.
 
-   ```sh
-   gh release delete staging-v0.1.0-RUN_ID-ATTEMPT --cleanup-tag --yes
-   ```
-
-9. **Promote** as described above, with the same run ID and digest. The
-   staging tag can't be promoted: it doesn't match `v1.2.3`, `candidate.py`
-   refuses it as a version, and `promote.yml` refuses any tag containing
-   `staging`.
+   Commit the records, link them from the release closure record and the
+   release log, and open an issue for anything that regressed, on the next
+   patch release's milestone.
 
 10. **Update the docs** once the release is public: the release date in the
     [roadmap](roadmap.md) (tick the release) and the homepage
@@ -1027,7 +1174,8 @@ the real `curl … | sh` install against it on every host we advertise.
     latest-release paragraph, its headline numbers with links to this
     release's records, and the soak charts beside them. The charts are copies
     of the app soak's (the V02 fast tier, now that the gate has no V02 final)
-    and the final job soak's `-charts/` directories in
+    and the job soak's `-charts/` directories (the final's, or the fast
+    tier's for a patch release, which runs no final) in
     `docs/website/assets/soak/`, which holds only this release's
     ([how](website/README.md#soak-charts)). `tests/suite/website.rs`
     fails while the section names a version older than the installer's
@@ -1037,8 +1185,8 @@ the real `curl … | sh` install against it on every host we advertise.
     Add the release's paragraph to the top of the
     [release log](release-log.md): the promotion date, how long qualifying it
     took and how many candidates, what each soak found and what fixed it, and
-    any known issue it ships with, linking the records from step 7, and
-    one line from the profile's answer.
+    any known issue it ships with, linking the records from step 6. When the
+    profile from step 9 is in, add one line from its answer.
 
 ## Soaking a candidate in CI
 

@@ -900,6 +900,74 @@ means every heavy job except macOS: select jobs says `heavy=true, macos=false`, 
 aggregator calls that selection `train-full`, accepted, like the light set, only when the
 event is `pull_request`. The queue and the push to the train still demand all three shards.
 
+### A release gate that fits in a week
+
+Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took
+most of a week, and the gate itself only accounted for about two days of it. Where did the
+rest go? Into three queues. Every benchmark, soak and day run needs a quiet host, so they all
+ran one after another on one Mac. Every failure meant a new candidate, about a day each. And
+the performance records had to be in before the tag. None of that was a test failing. It was
+tests waiting.
+
+The candidate build had the same disease in miniature. 0.2.3's took 1 hour 53 minutes. The
+binaries were done in under an hour; `validate-release` took the rest, re-running the whole of
+`ci.yml` on a commit that had already passed it twice, on the gate PR and on the push to
+`main`. Its macOS shards waited over an hour for hosted runners before they ran at all.
+
+So the 0.2.4 gate changes in four ways
+([#1363](https://github.com/reliaburger/reliaburger/issues/1363)).
+
+**Trust a run that already passed, but only that exact run.** `build.yml` now starts with a
+job that asks the GitHub API whether `ci.yml` passed on exactly the commit being built
+(`scripts/release/ci_reuse.py`). The interesting part is what "passed" means. A run's
+overall conclusion isn't enough: a job whose `if:` is false finishes as *skipped*, and a
+skipped job doesn't fail its run. So the script looks at every job, and demands `success`
+from each one on a list it keeps of every job `ci.yml` has, `ignored-test evidence`
+included. A test parses `ci.yml` and fails when that list drifts, so a new CI job can't be
+quietly left out. Only a push, merge-queue or nightly run counts: a pull request's run tests a
+merge commit rather than its head, and may have skipped the heavy jobs on purpose.
+
+Then the workflow has to say "run the suite unless we found that". GitHub Actions has a trap
+here. By default a job whose dependency was skipped is skipped too, so a candidate job that
+`needs: validate-release` would never run on the fast path. The fix is to take control of the
+condition: `!cancelled()` stops the default skip, and then the condition lists every
+dependency's `result` explicitly, accepting a skipped `validate-release` only beside a reuse
+the search reported. The search fails safe. An API error, a missing run, a cancelled shard,
+another commit: all of them leave `reuse` false, or empty if the job itself died, and
+`validate-release` checks `!= 'true'` rather than `== 'false'` so that an empty answer runs
+the suite too. The signature still only ever covers a commit that passed everything; it just
+doesn't make it pass twice.
+
+**Qualify the train every night.** The long tiers (power-cut and reboot runs, the V02 and jobs
+soaks) now run on the train's tip each night, one after another on the quiet host
+(`scripts/release/nightly-qualify.sh`). At code freeze, `nightly.py freeze-check` only has to
+show that the latest green night ran the candidate's code. "The candidate's code" needed a
+definition: the candidate is built on `main` from the gate PR's merge, which is a new commit.
+So the check accepts the same commit or the same *tree*. Git hashes a commit's whole snapshot
+into one tree hash, so two commits with equal trees hold byte-for-byte the same files,
+whatever their history. It also refuses a green night that a later red night on the same code
+contradicts, because a gate that remembers only its good days isn't one.
+
+**Scale the gate to the release.** The 8-hour job final catches slow accumulation, and a
+patch release that touches neither the formats nor the agent loop rarely gives it anything
+new to find. So patch releases run the fast tiers and the power-cut and reboot runs, and the
+final is for minor releases and for anything that moves `CURRENT` in `src/compatibility.rs`
+or touches `src/bun/agent*`. That rule is mechanical, so `release_tier.py` applies it to a
+tag range rather than leaving it to someone's judgement at the end of a long week.
+
+**Publish performance after the tag.** Benchmarks, the profile and the day run don't decide
+whether a release works, so they no longer stand between it and its users. A regression they
+find is a bug for the next patch release.
+
+What we didn't do is move release builds onto the new quiet host. It's tempting, since it's
+fast and it's ours, but a release build is the one place where "who could have touched this
+machine?" must have a boring answer. Hosted runners give that. And one question is still
+open: the nightly's soaks install a staged build through `curl | sh`, and today only a
+manual build of `main` gets signed and staged. A release-signed build of unreleased code is
+something any cluster that trusts the release key would accept, the same reason CI doesn't
+sign the soak build ([the runbook](../releasing.md#soaking-a-candidate-in-ci) has the long
+version). So that's a decision for the maintainer, not a line of YAML.
+
 ## Dependencies are code too
 
 The lockfile is part of the programme. A perfectly tested call into a vulnerable archive
