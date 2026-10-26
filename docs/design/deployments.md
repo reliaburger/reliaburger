@@ -222,7 +222,15 @@ A rolling replacement stays `Starting` in the supervisor until `finalise_rolling
 
 Before this (#1353), a one-replica app rolled with `max_surge = 1`, `max_unavailable = 0` had no healthy backend in the catalogue from the first report after the old instance began retiring until the first report after finalisation, three to six seconds on a laptop cluster, and every other node's connect hook refused the service with `EPERM`. `one_replica_rollout_keeps_a_healthy_backend_on_every_node` in `tests/cluster_failover.rs` covers it.
 
-Still open: the old instance's drain waits only for ingress connections. A node that hasn't yet polled the catalogue that withdraws the old backend can still route a new connection to it after it has stopped, and gets `ECONNREFUSED`. The withdrawal receipts the producer-release protocol collects arrive only after the stop.
+A retiring old instance also has to keep running until no node routes to it (#1355). Its drain waits only for this node's ingress connections; service-to-service callers on other nodes connect to the backend directly and drop it only when their next view arrives. So `retire_old_instance` in `src/bun/agent/deploy_worker.rs` runs two waits together before the stop signal: the ingress drain, and `await_remote_withdrawal`, which asks the leader the producer-release question (`confirm_producer_release`) every 500 ms through the `AwaitRemoteWithdrawal` deploy op. The order is:
+
+1. Publish the replacement, then begin the old instance's retirement (local withdrawal, `Stopping`, restarts fenced).
+2. Ask the leader to retire the old execution. The leader fences it, drops it from the catalogue and records a withdrawal every consumer must acknowledge. It answers `202` until every receipt is in, then confirms.
+3. Wait until the leader confirms and the ingress drain finishes, or `PRODUCER_RELEASE_PATIENCE` (5 s) passes.
+4. Stop the instance (pre-stop, `SIGTERM`, grace, `SIGKILL`).
+5. Release its addresses once the leader confirms again, which is immediate when step 3 got a confirmation; otherwise the agent loop finishes the release later (deferred retirement).
+
+A node that never sends its receipt costs the rollout at most the 5 s patience, after which the instance stops anyway; the leader discharges that node when its view lease lapses, and step 5 still keeps the addresses until the leader confirms. An unreachable leader or uncertain discovery ownership gets the same bounded wait, logged. Without a cluster or durable discovery there is nothing to ask and no wait. No wire or state format changes: step 2 is the release request the producer always sent, only earlier, and re-fencing an execution is idempotent. `a_rolling_retirement_stops_the_old_instance_only_after_other_nodes_drop_it` in the agent tests checks that every release request before the confirmation arrives while the old instance is still running. The in-process cluster test fixture can't cover it: it runs plain HTTP without durable discovery, and the producer release refuses both.
 
 ---
 

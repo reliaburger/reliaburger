@@ -110,7 +110,10 @@ impl ProducerReleaseClient {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{delayed_fixture as test_delayed_fixture, fixture as test_fixture};
+pub(crate) use tests::{
+    delayed_fixture as test_delayed_fixture, fixture as test_fixture,
+    scripted_fixture as test_scripted_fixture,
+};
 
 #[cfg(test)]
 mod tests {
@@ -139,6 +142,29 @@ mod tests {
                 }
             }),
         );
+        serve_fixture(app).await
+    }
+
+    /// A leader whose every answer comes from `answer`, called once per
+    /// request, so a test can script a sequence or look at the producer's
+    /// state at the moment each request arrives.
+    pub(crate) async fn scripted_fixture<F>(
+        answer: F,
+    ) -> (ProducerReleaseClient, tokio::task::JoinHandle<()>)
+    where
+        F: Fn() -> (axum::http::StatusCode, String) + Clone + Send + Sync + 'static,
+    {
+        let app = Router::new().route(
+            "/v1/discovery/retire",
+            post(move || {
+                let answer = answer.clone();
+                async move { answer().into_response() }
+            }),
+        );
+        serve_fixture(app).await
+    }
+
+    async fn serve_fixture(app: Router) -> (ProducerReleaseClient, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
