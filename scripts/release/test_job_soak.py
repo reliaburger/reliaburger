@@ -571,3 +571,113 @@ class TargetLoad(unittest.TestCase):
         counts=[0]*16; counts[0]=99; counts[10]=1
         self.assertEqual(jobs.percentile(counts,0.99),1)
         self.assertEqual(jobs.percentile(counts,1.0),1024)
+
+
+class DayLoad(unittest.TestCase):
+    """#1032: 2 billion host-job tasks in one day on three nodes."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.path=Path(self.temp.name)/"jobs"; self.api=FakeAPI()
+    def campaign(self, rate=jobs.DAY_DEFAULT_RATE):
+        # A fresh directory each time: one directory is one campaign.
+        self.path=Path(self.temp.name)/("jobs-%d" % len(list(Path(self.temp.name).iterdir())))
+        return jobs.Campaign(self.path,self.api,[],"token",load="day",target_rate=rate)
+    def day_snapshot(self, host=jobs.DAY_DEFAULT_RATE*86400, nodes=None, hours=None):
+        c=self.campaign()
+        c.state["started"]=1_000_000
+        for mode in jobs.MODES: c.state["progress"][mode]["succeeded"]=0
+        c.state["progress"]["process"]["succeeded"]=host
+        third=host//3
+        c.state["per_node"]=nodes if nodes is not None else {
+            name:dict(succeeded=third,slots=27,restarted=False) for name in ("node-1","node-2","node-3")}
+        rate=host//86400
+        c.state["hour_marks"]=[[hour*3600,hour*3600*rate] for hour in range(25)] if hours is None else hours
+        c.state.update(stopped=True,stop_requested_at=1_086_400); c.publish(1_086_400)
+        return json.loads((self.path/"snapshot.json").read_text())
+
+    def test_two_billion_a_day_is_the_default_and_a_billion_the_floor(self):
+        self.assertEqual(jobs.DAY_DEFAULT_RATE,23149)
+        self.assertLess((jobs.DAY_DEFAULT_RATE-1)*86400,2_000_000_000)
+        self.assertGreaterEqual(jobs.DAY_DEFAULT_RATE*86400,2_000_000_000)
+        self.assertGreaterEqual(jobs.DAY_FLOOR*86400,1_000_000_000)
+        self.assertLess((jobs.DAY_FLOOR-1)*86400,1_000_000_000)
+        with self.assertRaises(jobs.InvalidEvidence): self.campaign(rate=jobs.DAY_FLOOR-1)
+        with self.assertRaises(jobs.InvalidEvidence): self.campaign(rate=None)
+        self.campaign(rate=jobs.DAY_FLOOR)
+
+    def test_day_load_runs_host_work_as_the_biggest_arrays_the_api_accepts(self):
+        c=self.campaign()
+        tasks=c.body(c.prepare("process","short","work",100))["definition"]["tasks"]
+        self.assertEqual((tasks["count"],tasks["chunk_size"],tasks["per_node_concurrency"]),(1<<24,1000,27))
+        # Only host jobs carry the day's load; the containers keep the soak mix.
+        self.assertEqual(c.body(c.prepare("shared-runc","short","work",100))["definition"]["tasks"]["count"],262144)
+        self.assertEqual(c.body(c.prepare("runc","short","work",100))["definition"]["tasks"]["count"],262144)
+        self.assertEqual(c.body(c.prepare("process","long","work",100))["definition"]["tasks"]["count"],512)
+
+    def test_each_nodes_host_successes_add_up_across_polls_runs_and_a_restart(self):
+        c=self.campaign()
+        first=dict(id=1,mode="process"); second=dict(id=2,mode="process")
+        view=lambda node,succeeded,slots=27: dict(node=node,slots=slots,counters=dict(succeeded=succeeded))
+        c.count_nodes(first,dict(nodes=[view("node-1",100),view("node-2",50)]))
+        c.count_nodes(first,dict(nodes=[view("node-1",300),view("node-2",50)]))
+        c.count_nodes(second,dict(nodes=[view("node-1",10)]))
+        # node-2 restarted and reopened the run: its counter starts again.
+        c.count_nodes(first,dict(nodes=[view("node-2",20,slots=30)]))
+        nodes=c.state["per_node"]
+        self.assertEqual(nodes["node-1"],dict(succeeded=310,slots=27,restarted=False))
+        self.assertEqual(nodes["node-2"],dict(succeeded=70,slots=30,restarted=True))
+
+    def test_a_clean_day_passes_and_reports_the_day_in_full(self):
+        snapshot=self.day_snapshot()
+        day=jobs.report(snapshot)["day"]
+        self.assertEqual(day["host_successes"],jobs.DAY_DEFAULT_RATE*86400)
+        self.assertEqual(day["host_successes_per_second"],jobs.DAY_DEFAULT_RATE)
+        self.assertTrue(day["target_met"]); self.assertTrue(day["floor_met"])
+        self.assertTrue(day["per_node"]["balanced"])
+        self.assertEqual(len(day["hourly"]),24)
+        self.assertTrue(day["slowdown_ok"])
+        self.assertTrue(jobs.report(snapshot)["target_met"])
+        coverage={m:{item:True for item in jobs.REQUIRED if item!="unknown"} for m in jobs.MODES}
+        snapshot["coverage"]=coverage
+        # No faults, so no lost node to replay and no fault overlap to owe.
+        self.assertEqual(jobs.coverage_failures(snapshot),[])
+
+    def test_a_day_below_the_target_fails_and_says_whether_it_made_the_floor(self):
+        snapshot=self.day_snapshot(host=15000*86400)
+        day=jobs.report(snapshot)["day"]
+        self.assertFalse(day["target_met"]); self.assertTrue(day["floor_met"])
+        self.assertIn("host-job rate 15,000.0/s is below the 23149/s target",";".join(jobs.coverage_failures(snapshot)))
+
+    def test_one_node_over_its_fair_share_fails_the_day(self):
+        nodes={"node-1":dict(succeeded=41,slots=27,restarted=False),"node-2":dict(succeeded=30,slots=27,restarted=False),
+               "node-3":dict(succeeded=29,slots=27,restarted=False)}
+        snapshot=self.day_snapshot(nodes=nodes)
+        self.assertFalse(jobs.report(snapshot)["day"]["per_node"]["balanced"])
+        self.assertIn("node-1 took 41.0% of the host-job successes",";".join(jobs.coverage_failures(snapshot)))
+        # Exactly 40% of three equal nodes' work is at the limit, not over it.
+        nodes["node-1"]["succeeded"]=40; nodes["node-2"]["succeeded"]=31
+        self.assertTrue(jobs.report(self.day_snapshot(nodes=nodes))["day"]["per_node"]["balanced"])
+        self.assertIn("no per-node host-job successes",";".join(jobs.coverage_failures(self.day_snapshot(nodes={}))))
+
+    def test_a_last_hour_much_slower_than_the_first_fails_the_day(self):
+        marks=[[0,0],[3600,3600*20000]]+[[hour*3600,3600*20000+(hour-1)*3600*19000] for hour in range(2,25)]
+        marks[-1][1]=marks[-2][1]+3600*17000
+        snapshot=self.day_snapshot(hours=marks)
+        day=jobs.report(snapshot)["day"]
+        self.assertEqual((day["first_hour"],day["last_hour"]),(20000,17000))
+        self.assertFalse(day["slowdown_ok"])
+        self.assertIn("last hour ran at 17,000.0/s",";".join(jobs.coverage_failures(snapshot)))
+        marks[-1][1]=marks[-2][1]+3600*18000
+        self.assertTrue(jobs.report(self.day_snapshot(hours=marks))["day"]["slowdown_ok"])
+        self.assertIn("fewer than two full hours",";".join(jobs.coverage_failures(self.day_snapshot(hours=marks[:2]))))
+
+    def test_hour_marks_fall_on_the_hour_from_the_start_and_stay_bounded(self):
+        c=self.campaign(); c.state["started"]=1000
+        for now in range(1000,1000+3*3600+1,600):
+            c.state["progress"]["process"]["succeeded"]=now-1000
+            c.mark_hours(now)
+        self.assertEqual(c.state["hour_marks"],[[1000,0],[4600,3600],[8200,7200],[11800,10800]])
+        c.state["hour_marks"]=[[i,i] for i in range(jobs.MAX_HOUR_MARKS)]
+        c.mark_hours(10**9)
+        self.assertEqual(len(c.state["hour_marks"]),jobs.MAX_HOUR_MARKS)
+

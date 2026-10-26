@@ -1505,6 +1505,8 @@ FINAL_TIER_SECONDS = 8 * 3600
 # heavy observe pushes the next one back by its own run time. The extra
 # 15 minutes cover that sampling.
 QUIET_TAIL_SECONDS = 2 * 3600 + 15 * 60
+# The day tier (#1032) is one real day.
+DAY_TIER_SECONDS = 24 * 3600
 EXPOSURE_ARMED_SECONDS = 3600
 EXPOSURE_WINDOW_SECONDS = 1800
 
@@ -1537,6 +1539,10 @@ def required_execution(metadata):
     slots overran still owes them. Each fault kind is owed once; walks,
     specials, pulses and exports are owed as often as the schedule runs them."""
     final = metadata.get("tier") == "final"
+    if metadata.get("tier") == "day":
+        # The day run (#1032) owes no faults, walks or specials: only the
+        # candidate it verified, a settled baseline and the final drain.
+        return {CANDIDATE_ITEM: 1, BASELINE_ITEM: 1, DRAIN_ITEM: 1}
     schedule = "full" if final else metadata.get("schedule", "full")
     if schedule not in SCHEDULES:
         schedule = "full"
@@ -1688,11 +1694,14 @@ def job_final_ran(metadata, job_report, missing):
             and not [item for item in missing if item.startswith("fault:node-")])
 
 
-def acceptance_line(metadata, result, elapsed, missing=(), job_final=False, exposure=()):
+def acceptance_line(metadata, result, elapsed, missing=(), job_final=False, exposure=(), day=None):
     """What the run says about the V02 gate (plan D3) and the release gate's
-    final soak (#991): only a clean, complete final tier passes either."""
+    final soak (#991): only a clean, complete final tier passes either. A day
+    tier (#1032) says whether the day held."""
     tier = metadata.get("tier") or "custom"
     clean = result == "PASS"
+    if tier == "day":
+        return day_acceptance_line(metadata, clean, elapsed, missing, exposure, day)
     if tier == "fast":
         if clean:
             return ("**Fast tier: clean.** The iteration loop only, not acceptance: the V02 gate needs a clean "
@@ -1727,6 +1736,53 @@ def acceptance_line(metadata, result, elapsed, missing=(), job_final=False, expo
     return (f"**Final tier (V02 alone): clean. The V02 soak gate passes** for the candidate whose `candidate.json` "
             f"has SHA-256 {digest}, if it is the final candidate. It is not the release gate's final soak, which is "
             "the job final (`qualify-jobs-sustained.sh --tier final`, #991).")
+
+
+def day_acceptance_line(metadata, clean, elapsed, missing, exposure, day):
+    """What a day tier (#1032) says: the day's accepted host-job tasks, and
+    whether every check held for all of it."""
+    gaps = (["missing from the execution inventory: " + ", ".join(missing)] if missing else []) + (
+        ["leak-checker exposure too short: " + ", ".join(f"{node} {check}" for node, check in exposure)]
+        if exposure else [])
+    if elapsed < DAY_TIER_SECONDS:
+        gaps.append(f"it ran for {duration_text(elapsed)}, not a whole day")
+    if not clean or not day:
+        return ("**Day tier: not clean.** The day run doesn't hold; the record says what failed."
+                + (" It is incomplete too: " + "; ".join(gaps) + "." if gaps else ""))
+    if gaps:
+        return "**Day tier: incomplete.** " + "; ".join(gaps) + "."
+    return (f"**Day tier: clean.** {day['host_successes']:,} host-job tasks accepted in {duration_text(elapsed)}, "
+            f"{day['host_successes_per_second']:,.1f}/s against the {day['target_rate']}/s target, for the candidate "
+            f"whose `candidate.json` has SHA-256 `{metadata.get('qualified_digest')}`.")
+
+
+def day_lines(day):
+    """The record's section for the day run (#1032): the total against the
+    target and the floor, each node's share and every full hour's rate."""
+    elapsed = max(1, day.get("elapsed_seconds") or 1)
+    lines = ["## Day run (#1032)", "",
+             f"{day['host_successes']:,} accepted host-job tasks in {duration_text(elapsed)}: "
+             f"{day['host_successes_per_second']:,.1f}/s against the {day['target_rate']}/s target "
+             f"({'PASS' if day['target_met'] else 'FAIL'}). The billion-a-day floor is {day['floor_rate']:,}/s "
+             f"({'met' if day['floor_met'] else 'not met'}). At this rate a day is {day['day_equivalent']:,} tasks.", "",
+             "| Node | Slots | Host-job successes | Rate | Share | Fair share | Verdict |", "|---|---|---|---|---|---|---|"]
+    for row in day["per_node"]["nodes"]:
+        verdict = "OVER" if row["over_fair_share"] else "ok"
+        if row["restarted"]:
+            verdict += " (restarted)"
+        lines.append(f"| {row['node']} | {row['slots']} | {row['successes']:,} | {row['successes'] / elapsed:,.1f}/s | "
+                     f"{row['share_percent']:.1f}% | {row['fair_share_percent']:.1f}% | {verdict} |")
+    lines += ["", f"A node may take up to {day['per_node']['tolerance_percent']}% more than its fair share by slots, "
+              "as `relish bench` allows (#1362).", "",
+              "| Hour | Host jobs a second | |", "|---|---|---|"]
+    peak = max(day["hourly"], default=0) or 1
+    for hour, rate in enumerate(day["hourly"], 1):
+        lines.append(f"| Hour {hour} | {rate:,.1f} | {'█' * round(20 * rate / peak)} |")
+    if day["first_hour"] is not None:
+        lines += ["", f"Last hour against the first: {day['last_hour']:,.1f}/s against {day['first_hour']:,.1f}/s, "
+                  f"{'ok' if day['slowdown_ok'] else 'FAIL'} (at most {day['slowdown_percent']}% slower; the first "
+                  "hour includes the campaign's start and its host-job probes)."]
+    return lines + [""]
 
 
 def render(evidence, record):
@@ -1774,7 +1830,9 @@ def render(evidence, record):
         gates.append(("mixed job campaign and positive drain",str(len(job_missing))+" missing/failing checks","0","FAIL" if job_missing else "PASS"))
     inventory = execution_inventory(evidence, metadata, events, job_report)
     missing = [item for item, need, done in inventory if done < need]
-    final_tier = metadata.get("tier") == "final"
+    # The final and day tiers gate on their inventory and leak-checker exposure.
+    final_tier = metadata.get("tier") in ("final", "day")
+    day = job_soak.report(job_report).get("day") if metadata.get("tier") == "day" and job_report else None
     exposure = exposure_shortfalls(state)
     gate_failed = any(row[3] == "FAIL" for row in gates) or (final_tier and bool(missing or exposure))
     open_failures = [row for row in failures if row.get("disposition", "open") == "open"]
@@ -1784,13 +1842,14 @@ def render(evidence, record):
 
     tier = metadata.get("tier") or "custom"
     lines = [f"# Sustained soak (V02): {result}", ""]
-    lines += [f"{time.strftime('%-d %B %Y', time.gmtime(started))}. {tier} tier, {metadata.get('schedule', 'full')} "
+    schedule_text = "no fault" if metadata.get("schedule") == "none" else metadata.get("schedule", "full")
+    lines += [f"{time.strftime('%-d %B %Y', time.gmtime(started))}. {tier} tier, {schedule_text} "
               f"schedule, {duration_text(elapsed)} of soak on a three-node quickstart cluster.", ""]
     # The acceptance line tells a failed check apart from a run that was clean but incomplete.
     clean_apart_from_inventory = "FAIL" if open_failures or metadata.get("result") == "FAIL" or any(
         row[3] == "FAIL" for row in gates) else "PASS"
     lines += [acceptance_line(metadata, clean_apart_from_inventory, elapsed, missing if final_tier else (),
-                              job_final_ran(metadata, job_report, missing), exposure if final_tier else ()), ""]
+                              job_final_ran(metadata, job_report, missing), exposure if final_tier else (), day), ""]
     lines += ["## Candidate and host", "", "| | |", "|---|---|"]
     for key, label in (("base_url", "Staged base URL"), ("candidate_digest", "`candidate.json` SHA-256"),
                        ("versions", "Running versions"), ("soak_bun", "Soak build"),
@@ -1868,6 +1927,8 @@ def render(evidence, record):
         lines += ["", "Complete disk inventories are recorded. Global retention bounds and the 12-hour job qualification remain #668; this gate cannot certify an unimplemented retention policy.", ""]
         qualification = job_qualification(job_report, state, metadata, elapsed)
         lines += job_qualification_lines(qualification)
+        if day:
+            lines += day_lines(day)
         evidence_json = record.with_name(record.stem + ".jobs.json")
         if evidence_json.exists():
             raise SystemExit(f"{evidence_json} already exists")
@@ -1934,7 +1995,8 @@ def job_qualification(job_report, state, metadata, elapsed):
         tier=metadata.get("tier"),
         schedule=metadata.get("schedule"),
         node_faults=metadata.get("node_faults") is True,
-        fault_kinds=list(job_soak.FAULT_KINDS + (job_soak.NODE_FAULT_KINDS if metadata.get("node_faults") is True else ())))
+        fault_kinds=[] if metadata.get("tier") == "day" else
+        list(job_soak.FAULT_KINDS + (job_soak.NODE_FAULT_KINDS if metadata.get("node_faults") is True else ())))
     return report
 
 

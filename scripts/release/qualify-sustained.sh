@@ -24,7 +24,12 @@
 #                           skipped, and a final tier refuses to start
 #   --tier T                fast (compressed schedule, 60m: the iteration loop
 #                           after each round of fixes), final (full schedule,
-#                           8h) or custom (the default: a diagnostic run that
+#                           8h), day (24h with no faults, walks or specials:
+#                           the #1032 day run, through
+#                           qualify-jobs-sustained.sh --tier day; it needs
+#                           --job-load day and --qualified-digest and refuses
+#                           --soak-bun and --node-faults) or custom (the
+#                           default: a diagnostic run that
 #                           says nothing about either gate); the release
 #                           gate's final soak is the job final,
 #                           qualify-jobs-sustained.sh --tier final. A final
@@ -51,9 +56,12 @@
 #                           the gap is recorded as a pause of the soak clock
 #   --keep                  leave the cluster and the installation afterwards
 #   --job-load L            calibration (the release soak's conservative job
-#                           mix, the default) or target (#668: shared and host
+#                           mix, the default), target (#668: shared and host
 #                           runs become million-task arrays, and the run fails
-#                           unless jobs average --target-rate)
+#                           unless jobs average --target-rate) or day (#1032:
+#                           host runs become the biggest arrays the API takes,
+#                           and the run fails unless host jobs average
+#                           --target-rate, default 23149)
 #   --target-rate R         accepted successes a second for --job-load target
 #                           (default 1390: the 1,158 of 100 million a day, plus
 #                           20% headroom)
@@ -144,15 +152,33 @@ case $job_load in
     target) : "${target_rate:=1390}"
             [[ $target_rate =~ ^[0-9]+$ ]] && [ "$target_rate" -ge 1158 ] \
                 || fail '--target-rate must be a whole number of at least 1158 (100 million accepted jobs a day)' ;;
-    *) fail '--job-load must be calibration or target' ;;
+    day) : "${target_rate:=23149}"
+         [[ $target_rate =~ ^[0-9]+$ ]] && [ "$target_rate" -ge 11575 ] \
+             || fail '--target-rate must be a whole number of at least 11575 (a billion host-job tasks a day)' ;;
+    *) fail '--job-load must be calibration, target or day' ;;
 esac
 # The two tiers (plan D3): fast for the fix-and-rerun loop, final for acceptance.
 case $tier in
     fast) : "${schedule:=compressed}" "${duration_text:=60m}" ;;
     final) : "${schedule:=full}" "${duration_text:=8h}" ;;
+    day) : "${schedule:=none}" "${duration_text:=24h}" ;;
     ''|custom) tier=custom; : "${schedule:=full}" "${duration_text:=24h}" ;;
-    *) fail '--tier must be fast, final or custom' ;;
+    *) fail '--tier must be fast, final, day or custom' ;;
 esac
+# The day run (#1032) is host jobs at the day rate and nothing else: no
+# faults, walks or specials, so the soak build has nothing to do.
+if [ "$tier" = day ]; then
+    [ "$job_load" = day ] || fail 'a day tier needs --job-load day'
+    [ "$node_faults" = false ] || fail 'a day tier injects no node faults'
+    [ -z "$soak_bun" ] || fail 'a day tier has no upgrade walks to run --soak-bun in'
+    [ "$schedule" = none ] || fail 'a day tier runs no fault schedule'
+    if [ "$plan" = false ] && [ "$resume" = false ]; then
+        [ -n "$qualified_digest" ] || fail 'a day tier needs --qualified-digest: the record names the candidate it checked'
+        [ -z "$home" ] || fail 'a day tier bootstraps its own cluster from the candidate; --home adopts one whose candidate this run cannot verify'
+    fi
+elif [ "$job_load" = day ] || [ "$schedule" = none ]; then
+    fail '--job-load day and --schedule none belong to the day tier'
+fi
 [ -z "$seed" ] || [[ $seed =~ ^[0-9]+$ ]] || fail '--seed must be a whole number'
 # A final tier owes every upgrade walk and a candidate it verified itself
 # (#1061), so one that could only finish incomplete never starts.
@@ -198,6 +224,10 @@ case $schedule in
     compressed) cycle=600; hold_min=20; hold_max=40; rotation=300; kill_offset=10
           quorum_hold=60; pulse_every=0; export_every=2; push_every=1; chaos_per_slot=2
           min_cycles=4 ;;
+    # The day tier's: no cycles. The cycle length only paces the heavy checks.
+    none) cycle=3600; hold_min=60; hold_max=180; rotation=900; kill_offset=20
+          quorum_hold=300; pulse_every=0; export_every=6; push_every=1; chaos_per_slot=3
+          min_cycles=0 ;;
     *) fail '--schedule must be full or compressed' ;;
 esac
 slot=$(( cycle / 6 ))
@@ -1767,6 +1797,10 @@ if [ "$plan" = true ]; then
         "$tier" "$schedule" "$duration" "$cycle" "$job_load" "${target_rate:-none}" "$node_faults" "$quiet_tail"
     plan_cycles=$(( (duration + cycle - 1) / cycle ))
     [ "$plan_cycles" -ge "$min_cycles" ] || plan_cycles=$min_cycles
+    if [ "$schedule" = none ]; then
+        plan_cycles=0
+        printf 'plan: day %s s with no faults, walks or specials, then the drain\n' "$duration"
+    fi
     printf 'plan: %s\n' "$job_runs"
     printf 'plan: seed %s for every fault and node choice\n' "${seed:-random}"
     for (( index = 0; index < plan_cycles; index++ )); do run_cycle "$index" 0; done
@@ -1859,7 +1893,8 @@ fi
 next_light=$(date +%s)
 next_heavy=$(( $(date +%s) + heavy_every ))
 index=$first_cycle
-while :; do
+# A day tier runs no cycles: its whole length is the wait below.
+while [ "$schedule" != none ]; do
     cycle_start=$(( started_at + index * cycle ))
     # A cycle that starts finishes; none starts once the soak time is up,
     # unless the run hasn't yet reached min_cycles.

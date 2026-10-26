@@ -3802,4 +3802,77 @@ mod tests {
             }
         }
     }
+
+    /// The #1032 day run: 2,000,000,000 host-job tasks in 24 hours on three
+    /// nodes, as the biggest arrays the API accepts, one every 12 minutes.
+    /// Each array's counters stay within its own count, the cluster-wide sum
+    /// is a `u64`, and retention keeps only the last hour of finished runs
+    /// however many the day finishes.
+    #[test]
+    fn a_two_billion_task_day_counts_every_task_and_keeps_only_the_last_hour() {
+        use crate::meat::task_array::{MAX_CHUNK_SIZE, MAX_TASK_COUNT};
+        const DAY: u64 = 2_000_000_000;
+        let chunks = MAX_TASK_COUNT / MAX_CHUNK_SIZE;
+        let runs = DAY.div_ceil(u64::from(MAX_TASK_COUNT));
+        let nodes = [node("a"), node("b"), node("c")];
+        let mut arrays = TaskArrays::default();
+        let mut succeeded = 0u64;
+        let mut peak_terminal = 0;
+        let mut peak_bytes = 0;
+        for run in 0..runs {
+            let at = run * 720;
+            let id = registered(
+                &mut arrays,
+                &register(MAX_TASK_COUNT, MAX_CHUNK_SIZE, at),
+                run + 1,
+            );
+            let mut held = [
+                IndexRangeSet::new(),
+                IndexRangeSet::new(),
+                IndexRangeSet::new(),
+            ];
+            for chunk in 0..chunks {
+                held[chunk as usize % 3].insert(chunk);
+            }
+            let granted = TaskArrayWrite::Sync {
+                now_epoch_secs: at,
+                batch_id: id,
+                results: Vec::new(),
+                grants: nodes.iter().cloned().zip(held).collect(),
+            };
+            arrays.apply(&granted, || 0).unwrap();
+            let results = (0..chunks)
+                .map(|chunk| {
+                    (
+                        nodes[chunk as usize % 3].clone(),
+                        finished(chunk, 1, MAX_CHUNK_SIZE),
+                    )
+                })
+                .collect();
+            let retired = TaskArrayWrite::Sync {
+                now_epoch_secs: at + 600,
+                batch_id: id,
+                results,
+                grants: Vec::new(),
+            };
+            arrays.apply(&retired, || 0).unwrap();
+            let summary = arrays.get(id).unwrap().state.summary();
+            assert_eq!(summary.status, TaskArrayStatus::Succeeded);
+            assert_eq!(summary.succeeded, u64::from(MAX_TASK_COUNT));
+            succeeded += summary.succeeded;
+            let terminal = arrays
+                .iter()
+                .filter(|(_, record)| record.state.status().is_terminal())
+                .count();
+            peak_terminal = peak_terminal.max(terminal);
+            peak_bytes = peak_bytes.max(serde_json::to_vec(&arrays).unwrap().len());
+        }
+        assert!(succeeded >= DAY, "{succeeded} succeeded");
+        assert_eq!(succeeded, runs * u64::from(MAX_TASK_COUNT));
+        // An hour's window at one run every 12 minutes holds five or six
+        // finished runs, far under the cap, and the state stays small.
+        assert!(peak_terminal <= 7, "{peak_terminal} finished runs kept");
+        assert!(peak_terminal <= MAX_TERMINAL_ARRAYS);
+        assert!(peak_bytes < 256 * 1024, "{peak_bytes} bytes of state");
+    }
 }
