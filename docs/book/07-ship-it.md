@@ -1895,6 +1895,30 @@ Nothing on the wire changed. The report has always carried a health status per i
 
 `one_replica_rollout_keeps_a_healthy_backend_on_every_node` in `tests/cluster_failover.rs` (`make test-cluster`) is the demo in miniature. Three real nodes run a one-replica `cheese`, the test writes v2, and every 50 ms it reads each node's installed view of the service until every node routes only to the replacement. Every sample must have a healthy backend. The first draft of the test passed on the unfixed code, which was the interesting part. In the test cluster, reports go out every second, and a `script` app that dies on `SIGTERM` let the whole rollout finish between two reports, so no report ever caught the bad moment. The demo's real containers took seconds to stop, and the default report interval is five. So the test's app ignores `SIGTERM` and the spec sets `drain_timeout = "3s"`, which holds the old instance in `Stopping` for longer than a report interval, as a server finishing its requests would. Then it failed: two to three seconds in which both remote nodes listed two backends, neither healthy. With the fix, those same samples list the replacement healthy and the old one unhealthy.
 
-### What's left
+### Stopping only once nobody routes to it
 
-The report fix closes the `EPERM` gap. It doesn't make a rollout seamless for other nodes. Once the old instance leaves the catalogue, the drain on its own node only waits for the ingress proxy's connections, and service-to-service callers on other nodes don't go through it. A server that exits the moment it gets `SIGTERM` can stop while a node that hasn't polled the new catalogue yet still routes to it, and that caller gets `ECONNREFUSED` instead of `EPERM`. Two replicas have the same window for each instance they replace. Closing it means holding the stop until the other nodes confirm the withdrawal, which the address-release protocol already collects, but only after the stop. Moving it in front is a change to how retirement and release fit together, and it's a separate piece of work.
+The report fix closes the `EPERM` gap. It didn't make a rollout seamless for other nodes, and the issue that came out of it (#1355) said why. Once the old instance's retirement began, the deploy worker drained it and stopped it. The drain waits for in-flight requests, but only the ones that came through this node's ingress proxy. A service-to-service caller on another node doesn't go through that proxy: its connect hook rewrites the virtual IP straight to the backend's address. So a server that exits the moment it gets `SIGTERM` could stop while another node, which hadn't polled the new catalogue yet, still routed to it. That caller got `ECONNREFUSED` instead of `EPERM`. Two replicas had the same window for each instance they replaced.
+
+The protocol that knows when every node has dropped a backend already existed. It's the producer release from Chapter 3: before a node reuses a retired instance's host port or runtime address, it asks the leader, the leader fences that runtime execution, takes it out of the catalogue, and answers "confirmed" only once every consumer has sent a withdrawal receipt for a view without it. Until then it answers `202 Accepted`. The release just ran at the wrong moment for this question, after the stop, because that's when addresses get freed.
+
+Nothing in the leader cares whether the process behind a fenced execution is still running. So the fix asks the same question twice. `retire_old_instance` in the deploy worker now waits for two things at once before the stop signal:
+
+```rust
+tokio::join!(
+    self.ops.await_remote_withdrawal(id),
+    drain_instance(&self.drains, id, drain_timeout),
+);
+stop_runtime_instance(&self.grill, id, &stop, self.stop_confirmation_timeout).await
+```
+
+`tokio::join!` polls both futures on the same task and finishes when both have. It's Go's `sync.WaitGroup` over two goroutines without the goroutines: nothing is spawned, so nothing can outlive the function, and the borrows of `self` and `id` stay legal. The rollout costs the longer of the two waits, not their sum.
+
+`await_remote_withdrawal` sends a new `DeployOp`, `AwaitRemoteWithdrawal`, to the agent loop every 500 ms, and the loop answers with `confirm_producer_release`, the same function the release after the stop calls. That function was already written for the loop's rules. It starts the leader request on its own task and waits for it only until the turn's deadline. A later ask collects the answer rather than sending another. So the waiting happens on the worker, between turns, never on the loop. The worker gives up after `PRODUCER_RELEASE_PATIENCE`, five seconds, the patience the release after the stop already had.
+
+What happens to a node that never answers? It costs at most those five seconds, and then the old instance stops anyway. That's a deliberate trade: a partitioned node can't hold every rollout in the cluster hostage. The leader discharges such a node once its view lease runs out (`onion::lease`), and the address release after the stop still holds the host port until the leader confirms, so nothing gets reused while somebody might route to it. An unreachable leader, or a node whose discovery ownership is uncertain, gets the same treatment, with a line in the log. A single node, or a cluster without durable discovery, has nothing to ask, so it doesn't wait at all.
+
+The early ask changes nothing on the wire. The request, the fence and the answer are the ones the release has always used, and asking twice is fine because fencing an execution that's already fenced is a no-op. The answer after the stop then comes straight back as "confirmed". `CURRENT` stays where it was.
+
+`a_rolling_retirement_stops_the_old_instance_only_after_other_nodes_drop_it` in the agent tests pins the order. It rolls a one-replica app against a fake leader that answers `202` once and then confirms, and at each request it records whether the mock runtime had already been told to stop the old instance. Before the fix, the first request arrived after the stop. Now both arrive while the old instance is still running.
+
+We'd have liked a cluster test here too, like the one above, but the in-process test cluster talks plain HTTP and runs without durable discovery, and the producer release refuses both on purpose, so the test cluster never runs a release at all. The release's own tests cover the leader's side. The agent test covers the order.

@@ -60,7 +60,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.producer_releases.clear();
     }
 
-    /// Call only after observed runtime exit and local request drainage.
+    /// Ask the leader whether every node has dropped `id`'s backend.
+    ///
+    /// A confirmation releases addresses only when the caller has observed
+    /// runtime exit and local request drainage. A rolling retirement also
+    /// asks once before the stop, while the instance still serves, only to
+    /// learn when other nodes have stopped routing to it (#1355); the
+    /// leader's fence and answer are the same either way.
     pub(super) async fn confirm_producer_release(
         &mut self,
         id: &InstanceId,
