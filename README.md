@@ -23,7 +23,7 @@ batch of jobs on it, breaks it and watches it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-0.2.1 was released on 21 October 2026, and the one-line installer fetches
+0.2.2 was released on 25 October 2026, and the one-line installer fetches
 its signed binaries. You'll need a Mac with Apple silicon, or Linux with QEMU
 and KVM, plus about 8 GiB of free memory and 15 GiB of disk.
 
@@ -151,7 +151,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish logs <NAME>`: Stream logs from an app or job
 - `relish logs-export --dest <DEST>`: Export Parquet log files to a destination directory
 - `relish logs-search <SOURCE> <SQL>`: Search exported Parquet log archives with SQL
-- `relish events`: Show the cluster's recent events: deploys, restarts, health, faults, tokens, secrets and audited operations, newest last *(0.2.2, not in 0.2.1)*
+- `relish events`: Show the cluster's recent events: deploys, restarts, health, faults, tokens, secrets and audited operations, newest last
 
 **Diagnose and test** ([diagnostics](docs/manual/07_diagnostics.md))
 
@@ -253,7 +253,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 ## What's in the binary
 
-This is what 0.2.1, the release the installer fetches, does.
+This is what 0.2.2, the release the installer fetches, does.
 
 **Runs Kubernetes YAML.** `relish apply -f` converts Deployments, StatefulSets,
 DaemonSets, Services, Ingresses, Jobs, CronJobs, HPAs and Namespaces on the
@@ -397,7 +397,7 @@ binary was built from. Neither needs a network.
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
-## Limits in 0.2.1
+## Limits in 0.2.2
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
   managed Linux VMs; native macOS `bun` runs plain processes only.

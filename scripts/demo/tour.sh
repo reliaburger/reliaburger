@@ -126,6 +126,7 @@ known_command() {
         | "relish metrics frontend --name http_request_duration_seconds" \
         | "relish dashboard" \
         | "relish fault kill frontend --count 1 --acknowledge" \
+        | "relish events --app frontend" \
         | "relish local stop node-3" \
         | "relish inspect frontend" \
         | "relish wtf" \

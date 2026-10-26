@@ -6,7 +6,7 @@ own next to it, run ten jobs beside them, walk its network path,
 measure it, break it and watch it heal. Open it any time with `relish manual tour`.
 
 It needs a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB
-of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.1 release.
+of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.2 release.
 
 ## Install and build the cluster
 
@@ -172,10 +172,13 @@ running.
 ```sh
 relish fault kill frontend --count 1 --acknowledge
 relish status
+relish events --app frontend
 ```
 
 Kill a frontend. Run `status` again a few seconds later and it's back, with a
-restart counted: the node agent restarts what should be running.
+restart counted: the node agent restarts what should be running. `events`
+asks every node what happened and merges the answers by time: the deploys, the
+fault, the failed health check and the restart, each with its node.
 
 ```sh
 relish local stop node-3
