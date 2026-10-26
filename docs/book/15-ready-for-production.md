@@ -1104,6 +1104,19 @@ exception
 unmaintained build-time macro is a better trade than shipping arithmetic with a known
 timing flaw in it, even arithmetic we never call.
 
+The day 0.2.3's candidate built, RustSec published 13 advisories against `zstd` 0.13, the
+compression crate under Parquet. The fixed `zstd` 0.14 was already in our lockfile, but
+`parquet`, `arrow-ipc` and DataFusion still asked for 0.13, and no DataFusion release yet
+uses the arrow version that moves. Cargo can hold two major versions of one crate side by
+side, which is why both were there: each dependency gets the version its own `Cargo.toml`
+asked for, and nothing we write in ours can overrule that. The only fix was a release we
+didn't have. We decompress only Parquet that Reliaburger wrote itself, so the exposure is
+low, and the alternative was holding the whole gate for an upstream release with no date.
+0.2.3 ships with a dated exception
+([the 26 October review](../qualification/2026-10-26-dependency-exceptions.md)), and
+[#1366](https://github.com/reliaburger/reliaburger/issues/1366) removes it once DataFusion
+moves.
+
 Sometimes the next major version isn't there to take. bincode's list said 1→3, and bincode
 3.0.0 turned out to be a crate whose only code is a `compile_error!`, published when its
 maintainers stopped. No version clears its unmaintained advisory, so "bump it" became
