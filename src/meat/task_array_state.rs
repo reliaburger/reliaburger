@@ -37,7 +37,10 @@ pub const MAX_ACCEPTED_RANGES: usize = 4096;
 pub const MIN_GRANT_DEPTH: u64 = 2;
 /// Cap extra prefetch learned from verified command durations. This queues work,
 /// not resource reservations; the original two-slot-round floor still applies.
-pub const MAX_LEARNED_GRANT_DEPTH: u64 = 16;
+/// A held chunk turns over once every two leader ticks, so this cap sets the
+/// fastest one node can run: 32 chunks of 1,000 tasks is 16,000 a second.
+// TODO(#1360): back to 16 once grants reach the node in the tick that commits them.
+pub const MAX_LEARNED_GRANT_DEPTH: u64 = 32;
 const LOOKAHEAD_MILLISECONDS: u128 = 2000;
 /// Lookahead learns from roughly this many recent final attempts: once the
 /// recent histogram holds more, every bucket halves. A slow start (cold image
@@ -1002,7 +1005,7 @@ mod tests {
             state.complete(&node("a"), &result).unwrap();
         }
         let plan = plan_grants(&state, &slots(&[("a", 27), ("blocked", 0)]), true);
-        assert_eq!(plan, vec![(node("a"), chunks(2..=17))]);
+        assert_eq!(plan, vec![(node("a"), chunks(2..=33))]);
         apply(&mut state, &plan);
         assert!(plan_grants(&state, &slots(&[("a", 27)]), true).is_empty());
     }
@@ -1049,7 +1052,7 @@ mod tests {
         }
         assert_eq!(
             plan_grants(&state, &slots(&[("a", 27)]), true),
-            vec![(node("a"), chunks(2..=17))]
+            vec![(node("a"), chunks(2..=33))]
         );
     }
 
@@ -1059,7 +1062,7 @@ mod tests {
         complete_in_bucket(&mut state, 0..=7, 0);
         assert_eq!(
             plan_grants(&state, &slots(&[("a", 27)]), true),
-            vec![(node("a"), chunks(8..=23))]
+            vec![(node("a"), chunks(8..=39))]
         );
         // Ten-second tasks from now on: the fast history decays away.
         complete_in_bucket(&mut state, 8..=19, 14);
@@ -1081,14 +1084,14 @@ mod tests {
         complete_in_bucket(&mut state, 4..=39, 0);
         assert_eq!(
             plan_grants(&state, &slots(&[("a", 27)]), true),
-            vec![(node("a"), chunks(40..=55))]
+            vec![(node("a"), chunks(40..=71))]
         );
     }
 
     #[test]
     fn near_the_tail_two_fast_nodes_split_the_remaining_chunks() {
-        // 100 chunks, 80 done fast: lookahead alone would hand node "a" 16 of
-        // the last 20 and leave "b" four.
+        // 100 chunks, 80 done fast: lookahead alone would hand node "a" all
+        // of the last 20 and leave "b" none.
         let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
         complete_in_bucket(&mut state, 0..=79, 0);
         assert_eq!(
@@ -1144,12 +1147,13 @@ mod tests {
     fn capacity_shares_stay_within_the_grant_depth_bounds() {
         // Almost the whole share goes to "big", but its lookahead still stops
         // at the learned maximum; "tiny" still gets the baseline window.
-        let state = fast_array_near_its_tail();
+        let mut state = TaskArrayState::new(spec(100_000, 1000), 1).unwrap();
+        complete_in_bucket(&mut state, 0..=19, 0);
         assert_eq!(
             plan_grants(&state, &slots(&[("big", 1000), ("tiny", 1)]), true),
             vec![
-                (node("big"), chunks(80..=95)),
-                (node("tiny"), chunks(96..=97))
+                (node("big"), chunks(20..=51)),
+                (node("tiny"), chunks(52..=53))
             ]
         );
     }

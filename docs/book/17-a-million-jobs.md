@@ -2689,7 +2689,9 @@ static int cleanup(int fd, uint64_t sequence) {
 
 (We've trimmed a test-fixture branch that uses plain `fork()` off Linux.)
 `launch` calls `clone3` through `syscall`, because older C libraries have no
-wrapper for it. `cleanup` first checks that Bun's request carries the sequence
+wrapper for it. (It doesn't any more: for #1030 the child borrows the helper's
+memory, which needs a few lines of assembly. See "Borrowing the helper's
+memory" below.) `cleanup` first checks that Bun's request carries the sequence
 of the command that just ran. In a container, `kill(-1, SIGKILL)` signals every
 process in the helper's PID namespace except PID 1 itself, which covers a
 background child that changed its process group or its uid. The `waitpid` loop
@@ -2842,7 +2844,8 @@ gap. How much is enough? That depends on how long commands take, so the leader
 learns it from the final-attempt duration histogram the nodes already report.
 Bucket `i` counts commands that took up to `2^i` ms. Using the upper bound of
 each bucket gives a conservative estimate of throughput: slots × two seconds ÷
-average duration. Learned depth is capped at sixteen chunks.
+average duration. Learned depth was capped at sixteen chunks, and 0.2.3
+raised the cap to 32 for a reason we'll come to.
 
 That's the idea. The edges took four more fixes:
 
@@ -2869,8 +2872,8 @@ That's the idea. The edges took four more fixes:
   with a thousandth of the capacity gets two chunks.
 - **Lookahead needs automatic replay.** If a node dies, every chunk it held
   has an unknown outcome. Arrays that replay automatically don't mind. Arrays
-  that need an operator to acknowledge and replay would turn sixteen chunks
-  into manual work. Those keep the baseline window, and the leader passes the
+  that need an operator to acknowledge and replay would turn the whole
+  lookahead into manual work. Those keep the baseline window, and the leader passes the
   run's policy to `plan_grants` as a plain `bool`.
 - **The durations must be honest.** The executor used to time the whole
   `runner.run` call, which for a pool includes waiting for a slot and, on a
@@ -3045,9 +3048,398 @@ at 50 ms each, six local writers doing full fsyncs still failed it one run in
 thirty. So the test now records the order in which tasks finish, which no
 disk can change, and checks the receipt only for which chunk comes first.
 
-The profile predicts the node runs at its burst rate all the time, about
-10,000 host jobs a second on that rig. The five-round bench measurement is
-still to come.
+The profile predicted the node would then run at its burst rate all the
+time, about 10,000 host jobs a second on that rig. It didn't, quite, and
+[What four changes bought](#what-four-changes-bought) below says why.
+
+### Borrowing the helper's memory
+
+The same profile split each task's own process into parts: 32 µs in `clone3`,
+47 µs in page faults, 49 µs in `execve` and 35 µs tearing the process down,
+out of about 313 µs per task in all. The page faults stood out. A raw
+`posix_spawn` loop paid 27 µs of faults for the same BusyBox `true`. Where did
+the other 20 µs come from? From how the helper made its child.
+
+If you've written C on Unix, you know `fork()`. The kernel copies the
+parent's page tables and marks every writable page read-only in both
+processes. The first write to a page, by either side, faults, and the kernel
+copies the page then. That's *copy-on-write*. It's cheap for a small parent
+and a child that will `exec` at once, but it isn't free. Our child wrote to
+its stack and a few globals before `exec`, and the helper, once running
+again, wrote to every page it touched: its stack, the frame buffer, the C
+library's data. Each of those writes was a fault. Our clone3 had
+`CLONE_INTO_CGROUP` and no other flag, which made it a `fork` with a
+destination cgroup.
+
+`vfork()` is the old answer. The child shares the parent's memory, nothing
+is copied or write-protected, and the parent is suspended until the child
+calls `exec` or `_exit`. In `clone` terms that's two flags:
+
+- `CLONE_VM`: share the address space. The child's writes land in the
+  parent's memory.
+- `CLONE_VFORK`: don't return in the parent until the child has exec'd or
+  exited.
+
+`posix_spawn` is the portable wrapper around the same idea. glibc builds it
+on `CLONE_VM | CLONE_VFORK`, which is why the raw loop was faster. We can't
+use it, though. Between `clone3` and `exec` the helper's child drops its
+supplementary groups, switches to the job's uid and gid and sets a
+parent-death signal; in a container it also gets private mounts, drops every
+capability and locks its securebits. `posix_spawn` can't do any of that, and
+glibc's spawn takes no cgroup on the Ubuntu 22.04 we build releases on.
+
+So the helper now asks `clone3` for `CLONE_VM | CLONE_VFORK | CLONE_INTO_CGROUP`.
+The price is discipline. Until it execs, the child is running inside the
+helper's memory while the helper is frozen mid-call, so it must behave like a
+signal handler: only *async-signal-safe* calls (the short list POSIX says you
+may call from a handler, mostly plain system calls), no `malloc`, no locks
+and no writes to the helper's variables. Our child broke that in four places.
+
+- **`perror`** goes through stdio, which locks the `stderr` stream and may
+  allocate its buffer. A new `report` function writes the same
+  `executor command: No such file or directory` line with one `writev`. Its
+  text comes from glibc's `strerrordesc_np`, which reads a constant table,
+  rather than `strerror`, which may consult the locale.
+- **`environ = env`** wrote a global. Now the helper points `environ` at the
+  task's environment just before `clone3` and puts it back as soon as
+  `clone3` returns, by which time the child has exec'd. Why not pass the
+  environment to `execvpe` instead? Because both `execvp` and `execvpe` look
+  the command up on the `PATH` in `environ`, not in the array you hand them,
+  and a task's own `PATH` has to decide.
+- **`setuid`, `setgid` and `setgroups`** in glibc aren't the plain system
+  calls. POSIX says credentials belong to the process, Linux keeps them per
+  thread, and glibc bridges the gap by taking a lock and signalling every
+  other thread to change too. The child makes the raw system calls instead,
+  as glibc's own `posix_spawn` does. It has one thread, so the effect is the
+  same.
+- **The stack.** With `CLONE_VM` the child can't share the parent's stack the
+  way `vfork()` does without the C library's help, so it gets its own:
+  256 KiB mapped once at start-up, with a guard page below it. That's far
+  more than the setup and `execvp`'s path buffer need.
+
+The stack is also why there's assembly in a C file. `syscall(SYS_clone3, …)`
+returns twice, and in the child it returns on the new, empty stack, where
+there's no return address to go back to. glibc's own `__clone3` solves that
+with a few instructions that call a function on the new stack, but it's
+private to glibc. So the helper has its own, `rb_clone3`, for x86-64 and
+aarch64, the only architectures we release. In the parent it returns the
+child's pid. In the child it calls `task_child` on the new stack and exits
+with its result, which never happens, since `task_child` ends in `exec` or
+`_exit`.
+
+Everything else the child does is a system call on its own kernel state.
+`clone3` without `CLONE_FILES`, `CLONE_SIGHAND` or `CLONE_THREAD` gave it its
+own descriptor table, signal handlers, credentials, limits and namespaces, so
+closing descriptors, dropping capabilities, `unshare` and `mount` don't touch
+the helper. One thing is shared that we can't avoid: `errno`, which lives in
+thread-local memory, and every failed call sets it. The helper never reads
+`errno` after a successful spawn, so that's harmless. The child also resets
+the helper's `SIGCHLD` handler first, so that handler can't run in the child
+and write to a pipe the child is about to close.
+
+How do you test that a fault went away without timing anything? Count it.
+The kernel counts minor page faults per process in the tenth field of
+`/proc/<pid>/stat`. The protocol test runs 64 `/bin/true` commands through a
+warm helper and reads the helper's count before and after. With the old
+clone the host helper took 576 faults, nine per spawn. With the new one it
+takes none, and the test allows fewer than 16. A gated test does the same with
+Bun's real host helper. Other protocol tests pin down what had to stay the
+same: a command gets exactly the environment Bun sent, a bare command name is
+found on the task's own `PATH`, and a command that can't run reports its
+`errno` on stderr with exit 127 while the next one still runs.
+
+The profile expected this to save most of the 47 µs of faults and some of
+the 32 µs clone, about 15% of a task once the node is CPU-bound. The bench run
+after all four changes measured 24 µs of faults and 13 µs of `clone3` per
+task, on a faster host than the profile's. The node isn't CPU-bound yet,
+though, so the saving doesn't show in the rate.
+
+### A core spent watching the log
+
+The same profile found the second cost somewhere nobody would look for a
+batch-job problem: the GitOps loop. It woke on every change to Raft's
+metrics, which means every commit and every heartbeat reply, and each time it
+cloned the whole `DesiredState` before checking whether GitOps was even
+configured. Each held chunk's receipt is a commit, and `DesiredState` holds
+every task array's record, so the busier the node, the bigger and more
+frequent the copy. That was 41% of Bun's CPU in a host-job window, and 64%
+with no tasks running at all.
+
+Experiment E2 simply dropped that wake. In a 62-second window of raw
+dispatch, Bun's CPU went from 61 s to 0.7 s, and the raw rate from
+18,026.5/s to 22,074.3/s. On top of the deeper grant from experiment E1, host
+jobs went from 6,766.7/s to 7,066.7/s, with a steady rate of 8,465/s. It may
+also explain why host windows that follow container scenarios run slower:
+those scenarios leave a bigger `DesiredState` behind to clone.
+
+Dropping the wake wasn't the fix, though, because a new leader must start
+syncing without waiting for its poll. So for #1030 the loop now wakes only
+when the term or the leader changes, and reads just the GitOps configuration
+until it knows a sync will run. Chapter 7 shows how. In the bench run below,
+Bun used 0.5 s of CPU in a 62-second raw window, down from 60.5 s.
+
+### Sixty-four microseconds of bookkeeping
+
+With the GitOps wake gone, the profile could see Bun's own share of a host
+task: about 64 µs of CPU, against roughly 270 µs for the helper and the
+BusyBox process it starts. The helper's socket protocol (15.1 µs) is a
+separate change. Here's most of the rest:
+
+| Where | µs per task |
+|---|---:|
+| The rest of `ReusablePool::run`: the slot lock, two or three times; a 100 ms policy timer per attempt; the Smoker listing; logs | 14.8 |
+| Chunk streaming and attempt bookkeeping, including a copy of the invocation | 11.9 |
+| `wait_empty_task`'s read of `cgroup.events` | 8.8 |
+| The namespace policy check before every command | 7.6 |
+| The OCI spec and host environment, rebuilt for every task | 4.9 |
+
+None of these is big. Together they're a seventh of a host task's CPU, and
+on a VM that is CPU-bound for host jobs, CPU is throughput. So for #1030 we
+took out the ones we could remove without weakening anything, one commit
+each.
+
+**One lock less per command.** A warm command locked the pool's slots to check
+an executor out, again to mark its command started (so metrics count it as
+active), and a third time to hand the slot back. The first and last are the
+point of a lock: two callers must never take the same executor. The middle
+one only flipped a flag. Now each slot has an `AtomicBool` beside the locked
+`Vec<Slot>`:
+
+```rust
+started: Box<[AtomicBool]>,
+```
+
+`Box<[T]>` is a fixed-size array on the heap. It's a `Vec` that can't grow,
+which says exactly what we mean: one flag per slot, for the pool's lifetime.
+Checkout clears the flag under the lock and records which run took the slot,
+and the command's own task sets it when the helper says it started, with no
+lock at all:
+
+```rust
+fn command_started(&self, index: usize) {
+    self.started[index].store(true, Ordering::Release);
+}
+```
+
+That `Ordering` argument is the part C and Go hide from you. Go's
+`sync/atomic` is always sequentially consistent, the strongest and dearest
+ordering, and C's `<stdatomic.h>` defaults to the same. Rust makes you pick.
+`Relaxed` only promises the flag itself is read and written whole. `Release` on
+the store and `Acquire` on the load add a promise about everything *else*: a
+reader that sees `true` also sees every write the storing task made before it.
+We need that here. The metrics reader must never count more active commands
+than callers (V02 candidate 5 caught it doing so once), and a caller counts
+itself before it checks a slot out. With `Release` and `Acquire`, a reader that
+sees a command as started sees its caller's count too. With `Relaxed`, it
+might not.
+
+`a_warm_command_takes_the_slot_lock_only_to_check_out_and_hand_back` counts
+the locks. A test-only counter sits behind `lock_slots`, the one way a task's
+path takes the lock, and the test runs three commands through a warm executor.
+Its helper is fake: a task on the other end of a `UnixStream::pair()` that
+speaks the protocol, answers every command with "started" and "exited 0", and
+confirms the cleanup. So the whole warm path runs without root, cgroups or a
+real process. Each command takes two locks. Put the old lock back and it fails
+with three.
+
+**No timer per command.** A running command re-checks its namespace's eBPF
+policy every 100 ms, so a command whose enforcement is lost mid-run gets
+stopped. Each attempt made its own `tokio::time::sleep` for that, even in
+builds without eBPF and pools without a policy, where the loop checked
+nothing. Most host tasks finish long before 100 ms, so almost every one of
+those timers was registered with the runtime and torn down without firing.
+
+Now a pool without a policy supervises nothing, and a pool with one runs a
+single ticker task that bumps a counter in a `tokio::sync::watch` channel every
+100 ms. A watch channel keeps only the latest value, and any number of
+receivers can wait for it to change. Each running command clones a receiver,
+calls `mark_unchanged()` so a tick from before it started doesn't count, and
+re-checks on every change:
+
+```rust
+loop {
+    if ticks.changed().await.is_err() {
+        return std::io::Error::other("namespace supervision stopped");
+    }
+    if let Err(error) = check().await {
+        return error;
+    }
+}
+```
+
+`changed()` fails only once the sender is gone, and the ticker owns the
+sender. If the ticker ever stops, every command it supervises ends rather
+than run on unwatched. The ticker is its own task, not the eviction loop that
+already wakes every 100 ms, because a stuck retirement can hold that loop for
+seconds. The tests drive the future by hand on a paused clock: an hour passes
+with no check, then each tick brings exactly one. A version that sleeps on
+its own fails them.
+
+**Build the process, not the container.** Each warm command called
+`generate_job_oci_spec`, built the mounts, namespaces and cgroup resources of a
+whole container, and kept only the process. A host command then read Bun's
+entire environment with `std::env::vars_os()` and filtered it down to the
+allowlist (`PATH`, `HOME`, `LANG` and so on). Now `oci::job_process` builds the
+process alone, and `generate_job_oci_spec` calls it too, so the fresh and the
+reused paths can't drift apart. A host executor reads Bun's allowlisted
+variables once, when it starts, and each command overlays its own:
+
+```rust
+let inherited = match &context.host_environment {
+    Some(inherited) => inherited.clone(),
+    None => crate::grill::process::inherited_host_environment(),
+};
+process.env = crate::grill::process::host_environment_over(inherited, &process.env)
+```
+
+`host_environment_over` takes the map *by value* and gives it back with the
+command's variables inserted. Taking ownership tells the caller "I'll change
+this, so hand me a copy you don't need", and the caller's `.clone()` is that
+copy. That's the whole build-once-and-patch idiom: the shared part stays
+untouched in the context, and every command patches a fresh copy of it. The
+risk with any cache like this is one command's variables leaking into the
+next. `each_warm_command_gets_exactly_its_own_arguments_and_environment` runs
+three different commands through one warm executor and checks each received
+exactly what a fresh command for that task alone would get. Save a command's
+environment back into the context and it fails on the second.
+
+**Share the template.** Every attempt built a `TaskInvocation` with its own
+copy of the job's template: an `Option<Box<JobSpec>>`, cloned deeply,
+environment map and all, for every attempt of every task. `Box<T>` is sole
+ownership of a heap value, like `unique_ptr` in C++, so cloning one clones
+what it points to. The template never changes within a chunk, so it's now an
+`Option<Arc<JobSpec>>`, in the chunk and in each invocation. `Arc<T>` is
+shared ownership with an atomic reference count. Cloning one bumps the count
+and copies a pointer, and the value is freed when the last owner drops it.
+Go gets this from its garbage collector and Python from its own reference
+counting. Rust makes you say which you want, and then won't let anyone mutate
+a value through an `Arc` others share. That's why the switch was safe:
+nothing could have been changing the template in place, or it wouldn't have
+compiled. `every_attempt_of_a_chunk_shares_one_template` checks with
+`Arc::ptr_eq` that all sixteen attempts of an eight-task chunk, retries
+included, point at the chunk's own template.
+
+**What we left alone.** The profile suggested moving the per-command policy
+check onto the 100 ms monitor, "gated on the same generation the monitor
+checks". The trouble is there's no generation. The check reads the live eBPF
+map and asks whether the hook is still attached, because enforcement can be
+lost by things outside Bun's code paths: a program detached, a map entry
+removed. A cached "checked a moment ago" would let a command start in the
+window after the loss and before the next tick, and nothing Bun does marks
+that window. Until enforcement changes publish a generation a command can
+compare against, the check stays where it is, before every command.
+`wait_empty_task`'s read of `cgroup.events` stays too. It's how a command
+proves its task group is empty before the executor is reused (#715), and
+there's no cheaper way to ask the kernel that question.
+
+The profile estimated 25 to 35 µs from trims like these, 5 to 10% of host-job
+throughput. After all four changes, Bun's per-task path measured 36 µs against
+the profile's 64, on a faster host, so we can't say how much of that is the
+trims alone.
+
+### What four changes bought
+
+#1030's target was 8,000 host jobs a second on one 4-vCPU node, as a
+five-round median. With all four changes in, the
+[26 October record](../qualification/2026-10-26-host-job-throughput/README.md)
+measured **7,500 a second**, up from 5,100 on the build the profile measured,
+with no terminal failures and cleanup verified every time. The release script's
+host windows doubled, from 3,767 to 7,500. Shared containers share the
+dispatch path, and the core the GitOps loop used to burn, and they went from
+2,583 to 6,483. Against the published 0.2.0 reports, through
+`relish bench --compare`, host jobs gained 58% and shared containers 133%.
+
+So, close, and not there. What's in the way now? Not the CPU. The VM sat 60%
+idle. Here's the probe again, polling `relish batch-status` every 150 ms:
+
+```
+   t(s)   held  accepted  started   active
+   1.76  16000     65000    65000        0    <- 15 chunks run and accepted
+   2.73  16000     66000    66002        0    <- 1 chunk
+   3.85  16000     81000    81000        0    <- 15 chunks
+```
+
+The node runs 15,000 tasks in about 0.8 s, close to 19,000 a second, and then
+has nothing to do. A `perf` timeline in 0.1-second buckets shows the same
+thing: 0.8 s at 98% busy, a short blip for the sixteenth chunk, then a second
+of idle.
+
+The profile expected in-order dispatch to keep the node busy, because the
+first chunk's receipt would go out while the other fifteen still ran. That
+only holds if sixteen chunks take longer than a tick. With the GitOps loop's
+core freed and a cheaper spawn, they take 0.8 s. Every chunk finishes before the
+next sync, so the receipts still travel together, and the node still waits
+out the round trip.
+
+How long is the round trip? That comes from the shape of the leader's loop.
+`spawn_leader_loop` ticks on a tokio interval:
+
+```rust
+let mut interval = tokio::time::interval(state.task_arrays.sync_interval);
+interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+```
+
+`interval` fires every `sync_interval`, one second. If a tick runs late,
+`Skip` drops the ticks it missed rather than firing them back to back, which
+is what you want from a heartbeat. Each tick reads the committed state, sends
+each node its grants, collects the answers and commits one entry with the
+results and the next grants. Those next grants go out with the *next* tick's
+request. So a grant committed at tick *k* runs after tick *k*+1, is reported at
+*k*+2, and its replacement runs after *k*+3. Each of the 16 chunks a node may
+hold turns over once every two seconds, however fast its tasks are:
+
+> 16 chunks × 1,000 tasks ÷ 2 s = 8,000 tasks a second
+
+The steady rate between 15 and 58 seconds was 7,921. That's the ceiling, not
+noise under it.
+
+We built that ceiling ourselves, and nobody could see it until the other
+fixes landed. That's the usual way with bottlenecks: you don't remove one,
+you promote the next.
+
+There are two ways through, and either doubles the ceiling. The profile's
+change 3 lets the node hold more: 32 chunks turn over twice as many tasks per
+two ticks, at the price of more unknown outcomes when a node is lost. Or the
+leader can send the grants it has just committed straight away, so a chunk
+turns over in one tick and the node holds no more than now. That one changes
+when syncs happen, and every node checks and writes its control fence on each
+new version, so it needs care. Change 5, a single round trip per task between
+Bun and the helper, makes bursts cheaper, but bursts aren't the limit while
+the CPU waits. Past either doubling change, the next ceiling is CPU: about
+222 µs of VM time per task, or 18,000 a second on this rig.
+
+For 0.2.3 we took the first way, and it's one line:
+
+```rust
+pub const MAX_LEARNED_GRANT_DEPTH: u64 = 32;
+```
+
+That's 32 chunks × 1,000 tasks ÷ 2 s, or 16,000 a second, close enough to the
+CPU's 18,000 that the node should spend most of each cycle working. It isn't
+free. A lost node now strands up to twice as much work, which the leader hands
+to other nodes and runs again, and a cancel or drain has twice as many held
+chunks to write off. Arrays that need an operator to replay unknown outcomes
+never get the lookahead, so they don't pay that price. And the extra depth
+only matters for very short tasks: a node running 100 ms commands learns a
+depth far below sixteen, so it never reaches either cap.
+
+That's why it's a stopgap. The wait between ticks is still there; we've just
+made room for more work during it. Sending grants in the tick that commits
+them ([#1360](https://github.com/reliaburger/reliaburger/issues/1360)) removes
+the wait, helps every array rather than only the fastest, and lets the cap go
+back to sixteen. It changes the ordering of control versions that every node
+fences on, though, and that is code we'd rather not rush into a patch release.
+It's planned for 0.2.4.
+
+One more lesson came from the bench rig rather than the code. The first
+release-script run of the baseline fell apart in round 3: Bun stopped
+answering mid-window, and the rounds after it ran at a third to a half of the
+rate. The VM's journal told the story. Ubuntu's `unattended-upgrades` had
+started in round 2, upgraded glibc and systemd, re-executed systemd and
+restarted `rb-bun`. It installed a new kernel too, which every later boot ran.
+A disposable VM is still a whole operating system with its own plans. The
+record discards that run, turns the timers off and repeats every session the
+upgrade could have touched.
 
 ### What the measurements do and don't show
 
@@ -3207,6 +3599,46 @@ elapsed time in its `Drop` implementation, Rust's destructor, which runs on
 every exit path, error returns included. Its lifetime spans exactly one phase,
 so waiting for a slot can't leak into execution time.
 
+### Counting per node
+
+0.2.3's headline is two billion host jobs a day on three nodes. A three-node
+total that's three times one node's sounds like proof that the scheduler
+spreads the work. It isn't. One node could be doing most of it while the
+others wait for grants, and the total would look the same until that node ran
+out of room. So #1031 needs the window's successes broken down per node, and
+a lopsided split counts as a failed measurement, not a result.
+
+The data was already there. Each batch summary carries the leader's view of
+every node: the slots it offered and the counters it reported at its last
+sync. `relish bench` now reads those counters on every poll, through a
+`NodeCounts` value keyed by array and node, and keeps the per-node deltas
+alongside the accepted total, with the same cutoff. A counter that goes
+backwards means the node restarted, so counting carries on from the new value
+and the report flags it. These are what each node *said* it finished. The
+headline total stays the leader's accepted count, and on a healthy run the two
+agree.
+
+Each node's fair share is its slots over everyone's. A node may go 20% over
+its fair share, so a third of the work on three equal nodes may grow to 40%,
+and anything more fails the command. The first version compared percentages
+as floats and called exactly 40% unbalanced: 33.33… × 1.2 comes out a hair
+under 40 in binary floating point. The check now cross-multiplies whole
+numbers in `u128`, Rust's 128-bit unsigned integer, wide enough that the
+product of three `u64`-sized counts can't overflow:
+
+```rust
+over_fair_share: u128::from(*successes) * u128::from(total_slots) * 100
+    > u128::from(slots) * u128::from(total) * tolerance,
+```
+
+`u128::from` is a lossless conversion; Rust won't silently widen a `u64` in
+arithmetic the way C promotes integers, so you say it each time.
+
+Older reports have no breakdown, and `--compare` still has to read them. The
+new field is an `Option<NodeBreakdown>` marked `#[serde(default)]`, which
+tells serde to fill in `None` when the key is missing instead of refusing the
+file. The human report then says `per node: not recorded`.
+
 ### Soak jobs while the apps keep running
 
 A fast command completing a million times tells us little about what happens
@@ -3240,7 +3672,7 @@ current boot, generation, pool slot and cgroup identity agree. A prefix is no
 proof. Complete disk inventories and actual cgroup limits accompany the owner
 proof; they do not substitute for the scheduler's commitment ledger. Missing
 job evidence, stale heartbeats, orphaned owners or incomplete drain fail the
-release verdict. Drain begins inside the last two minutes, with no new settle
+release verdict. Drain begins once the last cycle is over, with no new settle
 allowance.
 
 The first soak to get past setup with all of this switched on (0.2.0
@@ -3354,6 +3786,19 @@ seconds later. Now the harness leaves the job fixtures out of any apply once
 the drain is asked for, or within a minute of it, because an apply's schedules
 commit after its hooks. Apply doesn't delete job definitions a file leaves
 out, so they stay exactly as the drain left them (#963).
+
+That fix kept the clock-timed drain, and the same overlap came back for 0.2.2
+candidate 4. An 8 h final runs a graceful whole-cluster stop and start at
+hour 8, at the end of the last cycle, and that cycle finished after the
+soak's nominal end. The drain started at 14:17:27, 33 seconds into the stop,
+and the controller's 110-second allowance ran out at 14:19:17. The cluster
+wasn't back until 14:19:55. Three long batches each still had a few chunks
+held on node 1, waiting for the harness's replay acknowledgement. That
+acknowledgement is a call to the API, and a stopped cluster can't answer it.
+Now the harness doesn't set `job_stop_at` until the cycle loop has finished,
+so the drain starts only once every fault and special is over. The harness
+then waits for the controller's exit status before the final heavy check
+(#1338).
 
 The harness lost a verdict of its own too. It starts the job controller with
 `&` and, at teardown, used to `wait` on the controller's pid to learn how it

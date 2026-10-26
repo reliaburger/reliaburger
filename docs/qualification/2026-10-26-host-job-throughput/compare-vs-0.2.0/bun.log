@@ -1,0 +1,14 @@
+bun: reliaburger node agent v0.2.3 (259b606)
+bun: auto-detected runtime: runc+process
+bun: workloads use DNS nameserver 10.166.104.1
+bun: mTLS enabled on the Raft RPC, reporting and API transports
+bun: cluster mode — gossip on 127.0.0.1:9443, 0 seed(s)
+bun: GPU support enabled, 0 device(s) detected
+bun: eBPF data path loaded (attached=true)
+bun: dns responder ready on 10.166.104.1:53
+bun: observability enabled (metrics + logs + alerts)
+bun: API server listening on 127.0.0.1:9117
+bun: gitops sync loop started (it syncs only if the cluster has a [gitops] configuration)
+bun: Pickle registry listening on 127.0.0.1:5050 (TLS, authenticated writes)
+scheduler: cannot place every replica of default/web: placed 0 of 1 replicas: no node is ready
+scheduler: every replica of default/web is placed

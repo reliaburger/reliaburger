@@ -639,11 +639,14 @@ pub struct BunAgent<G: Grill> {
     /// id, the raw allow list, and the last-resolved destinations — so
     /// enforcement can be lifted on stop and the allowlist re-resolved as
     /// DNS changes (L16).
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    egress_bindings: std::collections::HashMap<InstanceId, EgressBinding>,
+    #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+    egress_bindings: std::collections::HashMap<InstanceId, super::egress_owners::EgressBinding>,
     /// Block policy mutations until restart resolves an uncertain checkpoint write.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
     egress_store_uncertain: bool,
+    /// An egress owners checkpoint write that outlasted its turn (#1263).
+    #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+    egress_write: Option<egress_ownership::EgressWrite>,
     /// Workloads fenced by the current live-enforcement incident. Kept after
     /// stop so the next capability report records what happened; cleared only
     /// after every required hook and pre-start guarantee recovers.
@@ -729,6 +732,9 @@ pub struct BunAgent<G: Grill> {
     /// The consumer synchronisation part of the way through its steps, and
     /// the leader answer waiting behind it (#505).
     consumer_syncs: consumer::ConsumerSyncs,
+    /// Leader-acknowledged receipts waiting for the journal to forget them
+    /// (#1340).
+    receipt_confirmations: consumer::ReceiptConfirmations,
     /// While the view lease has lapsed, the local-only view installed in
     /// place of the last publication: this node's own backends and nothing
     /// else. `None` while the published view is the whole cluster's.
@@ -742,6 +748,10 @@ pub struct BunAgent<G: Grill> {
     /// Journal to reopen after a discovery write whose outcome is unknown,
     /// and whether it had been recovered from an earlier process.
     discovery_reopen: Option<(std::path::PathBuf, bool)>,
+    /// Services whose retirement removed their allocation in a journal
+    /// write that outlasted its turn; the stop's next ask finds them
+    /// retired (#1263).
+    retired_discovery_services: std::collections::HashSet<crate::onion::service_id::ServiceId>,
     /// Perimeter firewall config. Disabled in rootless mode.
     perimeter_config: crate::firewall::rules::PerimeterConfig,
     /// Last applied cluster-node set for firewall reconciliation. `None`
@@ -971,10 +981,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             node_pressure: Default::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
-            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
             egress_bindings: std::collections::HashMap::new(),
-            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
             egress_store_uncertain: false,
+            #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+            egress_write: None,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_affected_workloads: std::collections::BTreeSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1014,10 +1026,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
             consumer_syncs: Default::default(),
+            receipt_confirmations: Default::default(),
             lapsed_view: None,
             deferred_retirements: Default::default(),
             view_lease: Default::default(),
             discovery_reopen: None,
+            retired_discovery_services: std::collections::HashSet::new(),
             // Single-node mode: no nftables needed (no cluster ports to protect)
             perimeter_config: crate::firewall::rules::PerimeterConfig {
                 enabled: false,
@@ -1123,10 +1137,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             node_pressure: Default::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
-            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
             egress_bindings: std::collections::HashMap::new(),
-            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
             egress_store_uncertain: false,
+            #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+            egress_write: None,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_affected_workloads: std::collections::BTreeSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1166,10 +1182,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
             consumer_syncs: Default::default(),
+            receipt_confirmations: Default::default(),
             lapsed_view: None,
             deferred_retirements: Default::default(),
             view_lease: Default::default(),
             discovery_reopen: None,
+            retired_discovery_services: std::collections::HashSet::new(),
             #[cfg(target_os = "linux")]
             perimeter_config: {
                 let mut cfg = if crate::grill::rootless::is_rootless() {
@@ -1736,15 +1754,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         self.continue_consumer_sync().await;
                         turn
                     }
-                    // A step's, a health probe's or a workload start's write
-                    // that outlasted its turn has landed (#890, #1255,
-                    // #1266): take the step's remainder, or install the
-                    // probe's publication, now. A start's next ask collects
-                    // its own.
+                    // A write that outlasted its turn has landed (#890,
+                    // #1255, #1266, #1263): take the step's remainder, or
+                    // install the probe's publication, now. Every other
+                    // writer's next ask collects its own.
                     outcome = Self::discovery_write_done(&mut self.discovery_ownership),
                         if self.discovery_write_in_flight() => {
                         let turn = self.begin_landing_turn();
                         self.land_write_in_flight(outcome).await;
+                        turn
+                    }
+                    // Receipt acknowledgements that arrived while a write
+                    // was in flight (#1340) take the journal once it is
+                    // free. They come only from commands, below, and one
+                    // turn takes all of them, so this branch can't flood.
+                    _ = std::future::ready(()), if self.receipt_confirmations.is_waiting()
+                        && !self.discovery_write_in_flight() => {
+                        let turn = self.begin_receipt_turn();
+                        self.confirm_waiting_receipts().await;
                         turn
                     }
                     Some(op) = self.deploy_ops_rx.recv() => {
@@ -1809,8 +1836,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Start the turn that takes a write in flight once it has landed,
     /// named after whoever waited for the write.
     fn begin_landing_turn(&mut self) -> super::loop_meter::Turn {
-        if let Some(landed) = self.deploy_op_write_in_flight() {
-            return self.begin_turn(LoopBranch::DeployOp, Some(landed));
+        if let Some((branch, landed)) = self.write_in_flight_landing_turn() {
+            return self.begin_turn(branch, Some(landed));
         }
         self.begin_consumer_sync_turn()
     }
@@ -1837,6 +1864,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// fault expiry, firewall reconciliation and identity rotation.
     async fn run_health_tick(&mut self) {
         self.reopen_uncertain_discovery().await;
+        self.collect_landed_egress_write().await;
         if let Err(error) = self.fence_lapsed_view().await {
             eprintln!("bun: withdrawing the lapsed cluster view awaits retry: {error}");
         }
