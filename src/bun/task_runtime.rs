@@ -1367,7 +1367,7 @@ mod tests {
     use super::*;
     fn invocation() -> TaskInvocation {
         TaskInvocation {
-            template: Some(Box::new(
+            template: Some(std::sync::Arc::new(
                 toml::from_str("runtime='process'\nexec='/unused'\nnamespace='tenant-a'").unwrap(),
             )),
             index: 0,
@@ -1383,7 +1383,7 @@ mod tests {
         let runtime = crate::grill::ProcessGrill::new();
         let runner = std::sync::Arc::new(OwnedRunner::new(runtime));
         let mut task = invocation();
-        task.template = Some(Box::new(
+        task.template = Some(std::sync::Arc::new(
             toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
         ));
         task.args = vec!["-c".into(), "printf live; exec sleep 30".into()];
@@ -1433,7 +1433,7 @@ mod tests {
             1,
         ));
         let mut task = invocation();
-        task.template = Some(Box::new(
+        task.template = Some(std::sync::Arc::new(
             toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
         ));
         task.args = vec!["-c".into(), "echo original; exec sleep 30".into()];
@@ -1499,7 +1499,7 @@ mod tests {
         );
         for id in [1, 2] {
             let mut task = invocation();
-            task.template = Some(Box::new(
+            task.template = Some(std::sync::Arc::new(
                 toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
             ));
             task.args = vec!["-c".into(), format!("echo output-{id}")];
@@ -1528,7 +1528,7 @@ mod tests {
         use crate::grill::Grill;
         let runner = std::sync::Arc::new(OwnedRunner::new(crate::grill::ProcessGrill::new()));
         let mut task = invocation();
-        task.template = Some(Box::new(
+        task.template = Some(std::sync::Arc::new(
             toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
         ));
         task.args = vec!["-c".into(), "printf 'live-output\n'; sleep 30".into()];
@@ -1579,7 +1579,7 @@ mod tests {
         let runtime = crate::grill::ProcessGrill::new();
         let runner = OwnedRunner::new(runtime).with_log_sink(Some(sink), Default::default());
         let mut task = invocation();
-        task.template = Some(Box::new(toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'\ncommand=['-c','echo output']").unwrap()));
+        task.template = Some(std::sync::Arc::new(toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'\ncommand=['-c','echo output']").unwrap()));
         task.args = vec!["-c".into(), "echo output".into()];
         task.env = vec![
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
