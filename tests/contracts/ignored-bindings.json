@@ -247,6 +247,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "one_replica_rollout_keeps_a_healthy_backend_on_every_node",
+    "binary": "reliaburger::cluster_failover",
+    "test": "one_replica_rollout_keeps_a_healthy_backend_on_every_node"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "lease_retirement_waits_for_paused_worker_across_leader_change",
     "binary": "reliaburger::cluster_failover",
     "test": "lease_retirement_waits_for_paused_worker_across_leader_change"
