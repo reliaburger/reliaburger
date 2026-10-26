@@ -214,6 +214,16 @@ Connection draining ensures that in-flight requests complete before an instance 
 
 For internal (service-to-service) traffic via Onion, the eBPF service map is updated atomically. Bun removes the draining instance's entry from the kernel BPF hash map on every node. Because the map update is atomic and takes microseconds, new `connect()` calls immediately stop targeting the draining instance. Existing TCP connections (already established) continue until they close naturally or the container is stopped.
 
+### 3.5 What Other Nodes See During a Rollout
+
+Other nodes route by the leader's endpoint catalogue, which the leader builds from node state reports (`build_endpoint_catalog` in `src/cluster/orchestrate.rs`). A backend is healthy there only when its node reports the instance `Healthy`, and a node reports `Healthy` only for a `Running` instance.
+
+A rolling replacement stays `Starting` in the supervisor until `finalise_rolling_deploy`, which runs after every old instance has drained and stopped. Supervision (health checks, crash restarts) takes it over only then, so an aborted rollout can tear replacements down without a restart racing it. But it serves traffic from the moment `start_replacement` publishes its backend, after its health wait. So the state report gives an instance that is still `Starting` or `HealthWait` and has a healthy backend in the node's service map the state `Running` (`reported_state` in `src/bun/agent/status.rs`). Since the worker publishes the replacement before it begins retiring an old instance, no report shows the old instance `Stopping` without a healthy replacement beside it, and the catalogue moves from "old healthy" to "new healthy, old unhealthy" with no step in between.
+
+Before this (#1353), a one-replica app rolled with `max_surge = 1`, `max_unavailable = 0` had no healthy backend in the catalogue from the first report after the old instance began retiring until the first report after finalisation, three to six seconds on a laptop cluster, and every other node's connect hook refused the service with `EPERM`. `one_replica_rollout_keeps_a_healthy_backend_on_every_node` in `tests/cluster_failover.rs` covers it.
+
+Still open: the old instance's drain waits only for ingress connections. A node that hasn't yet polled the catalogue that withdraws the old backend can still route a new connection to it after it has stopped, and gets `ECONNREFUSED`. The withdrawal receipts the producer-release protocol collects arrive only after the stop.
+
 ---
 
 ## 4. Data Structures

@@ -624,19 +624,23 @@ impl DeployOps {
         port: u16,
         firewall: Option<Vec<String>>,
     ) -> Result<(), BunError> {
-        self.call(
-            |reply| DeployOp::RegisterServiceApp {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                port,
-                firewall,
-                reply,
-            },
-            Err(BunError::BackendPublication {
-                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
-                reason: "agent loop closed before service registration".into(),
-            }),
-        )
+        // The loop answers `StillRunning` while the service's journal write
+        // is in flight (#1263); ask again until it has landed.
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::RegisterServiceApp {
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    port,
+                    firewall: firewall.clone(),
+                    reply,
+                },
+                Err(BunError::BackendPublication {
+                    service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                    reason: "agent loop closed before service registration".into(),
+                }),
+            )
+        })
         .await
     }
 
@@ -646,18 +650,20 @@ impl DeployOps {
         namespace: &str,
         spec: &AppSpec,
     ) -> Result<(), BunError> {
-        self.call(
-            |reply| DeployOp::RestoreStoppedRouting {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                spec: Box::new(spec.clone()),
-                reply,
-            },
-            Err(BunError::BackendPublication {
-                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
-                reason: "agent loop closed before service registration".into(),
-            }),
-        )
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::RestoreStoppedRouting {
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    spec: Box::new(spec.clone()),
+                    reply,
+                },
+                Err(BunError::BackendPublication {
+                    service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                    reason: "agent loop closed before service registration".into(),
+                }),
+            )
+        })
         .await
     }
 
@@ -870,16 +876,20 @@ impl DeployOps {
         namespace: &str,
         evidence: launch_evidence::LaunchEvidence,
     ) -> Result<(), BunError> {
-        self.call(
-            |reply| DeployOp::FinishFreshInstance {
-                instance_id: instance_id.clone(),
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                evidence: Box::new(evidence),
-                reply,
-            },
-            Ok(()),
-        )
+        // The loop answers `StillRunning` while the backend's journal write
+        // is in flight (#1263); ask again until it has landed.
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::FinishFreshInstance {
+                    instance_id: instance_id.clone(),
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    evidence: Box::new(evidence.clone()),
+                    reply,
+                },
+                Ok(()),
+            )
+        })
         .await
     }
 
@@ -1028,21 +1038,25 @@ impl DeployOps {
         container_ip: Option<std::net::Ipv4Addr>,
         has_port: bool,
     ) -> Result<(), BunError> {
-        self.call(
-            |reply| DeployOp::PublishNewBackend {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                new_id: new_id.clone(),
-                host_port,
-                container_ip,
-                has_port,
-                reply,
-            },
-            Err(BunError::BackendPublication {
-                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
-                reason: "agent loop closed before backend publication".into(),
-            }),
-        )
+        // The loop answers `StillRunning` while the backend's journal write
+        // is in flight (#1263); ask again until it has landed.
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::PublishNewBackend {
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    new_id: new_id.clone(),
+                    host_port,
+                    container_ip,
+                    has_port,
+                    reply,
+                },
+                Err(BunError::BackendPublication {
+                    service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                    reason: "agent loop closed before backend publication".into(),
+                }),
+            )
+        })
         .await
     }
 
@@ -1298,13 +1312,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reply,
             } => {
                 let service_id = crate::onion::service_id::ServiceId::new(&namespace, &app_name);
-                let result = async {
-                    self.register_local_service(&service_id, port, firewall)?;
-                    self.publish_backend_ebpf(&service_id).await?;
-                    self.sync_firewall_ebpf().await;
-                    Ok(())
-                }
-                .await;
+                let result = self
+                    .register_and_publish_service(
+                        &service_id,
+                        port,
+                        firewall,
+                        "register_service_app/landed",
+                    )
+                    .await;
                 let _ = reply.send(result);
             }
             DeployOp::RestoreStoppedRouting {

@@ -566,9 +566,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .as_ref()
                 .filter(|firewall| !firewall.allow_from.is_empty())
                 .map(|firewall| firewall.allow_from.clone());
-            self.register_local_service(&service_id, port, firewall)?;
-            self.publish_backend_ebpf(&service_id).await?;
-            self.sync_firewall_ebpf().await;
+            self.register_and_publish_service(
+                &service_id,
+                port,
+                firewall,
+                "restore_stopped_routing/landed",
+            )
+            .await?;
         }
         if let Some(ingress) = &spec.ingress {
             self.ingress_configs

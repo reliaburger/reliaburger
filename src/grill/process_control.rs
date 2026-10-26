@@ -810,6 +810,9 @@ fn remove_control_socket(record: &OwnerRecord) -> io::Result<()> {
 /// Requests made to a live owner before a dropped connection is an error.
 const OWNER_REQUEST_ATTEMPTS: u32 = 10;
 
+/// How long one request may wait for a live owner's answer.
+const OWNER_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Whether the owner closed or refused this connection before answering.
 ///
 /// A live single-threaded owner drops a client that is slower than its read
@@ -867,7 +870,42 @@ async fn deliver_exec_request_observed(
     }
 }
 
+/// Connect to an owner's control socket without ever blocking in `connect`.
+///
+/// A full listen backlog fails at once with `WouldBlock`, as Tokio's connect
+/// did, instead of waiting for room. Each read and write waits at most
+/// [`OWNER_REQUEST_TIMEOUT`]. The timeouts are set before connecting because
+/// macOS refuses them with `EINVAL` once the owner has hung up.
+fn connect_owner(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.set_read_timeout(Some(OWNER_REQUEST_TIMEOUT))?;
+    socket.set_write_timeout(Some(OWNER_REQUEST_TIMEOUT))?;
+    socket.set_nonblocking(true)?;
+    socket.connect(&socket2::SockAddr::unix(path)?)?;
+    socket.set_nonblocking(false)?;
+    Ok(socket.into())
+}
+
+/// What remains of a request's deadline, or a timeout once it has passed.
+fn time_left(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| owner_timeout(io::ErrorKind::TimedOut.into()))
+}
+
+/// A socket deadline reports `WouldBlock` on Linux and `TimedOut` on macOS.
+fn owner_timeout(error: io::Error) -> io::Error {
+    match error.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+            io::Error::new(io::ErrorKind::TimedOut, "process owner request timed out")
+        }
+        _ => error,
+    }
+}
+
 fn request(record: &OwnerRecord, action: &str) -> io::Result<serde_json::Value> {
+    use std::io::{Read, Write};
     let path = process_owner::socket_path(record);
     process_owner::validate_socket_directory(
         path.parent()
@@ -877,32 +915,37 @@ fn request(record: &OwnerRecord, action: &str) -> io::Result<serde_json::Value> 
         "{}\n",
         serde_json::json!({"nonce": record.nonce, "action": action})
     );
-    // This function runs on a blocking worker, but the socket uses the existing
-    // Tokio reactor so a full Unix listen backlog cannot block connect forever.
-    let bytes = tokio::runtime::Handle::current().block_on(async move {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-        tokio::time::timeout(Duration::from_secs(2), async move {
-            let mut socket = tokio::net::UnixStream::connect(path).await?;
-            socket.write_all(request.as_bytes()).await?;
-            let mut bytes = Vec::new();
-            tokio::io::BufReader::new(socket)
-                .take(4097)
-                .read_until(b'\n', &mut bytes)
-                .await?;
-            if bytes.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "process owner closed before responding",
-                ));
-            }
-            if bytes.len() > 4096 || bytes.last() != Some(&b'\n') {
-                return Err(io::Error::other("invalid process owner response size"));
-            }
-            Ok(bytes)
-        })
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "process owner request timed out"))?
-    })?;
+    // This function runs on a blocking worker, and Tokio lets those finish
+    // after it has stopped its timer during shutdown: a Tokio timeout here
+    // panicked a Bun that had just shut down cleanly. A plain socket with one
+    // deadline needs no runtime at all.
+    let deadline = Instant::now() + OWNER_REQUEST_TIMEOUT;
+    let mut socket = connect_owner(&path)?;
+    socket
+        .write_all(request.as_bytes())
+        .map_err(owner_timeout)?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 512];
+    while !bytes.contains(&b'\n') && bytes.len() <= 4096 {
+        time_left(deadline)?;
+        let read = socket.read(&mut chunk).map_err(owner_timeout)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    if let Some(end) = bytes.iter().position(|byte| *byte == b'\n') {
+        bytes.truncate(end + 1);
+    }
+    if bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "process owner closed before responding",
+        ));
+    }
+    if bytes.len() > 4096 || bytes.last() != Some(&b'\n') {
+        return Err(io::Error::other("invalid process owner response size"));
+    }
     let response: serde_json::Value = serde_json::from_slice(&bytes)?;
     if let Some(error) = response.get("error") {
         return Err(io::Error::other(format!("process owner refused: {error}")));
@@ -1286,5 +1329,50 @@ mod tests {
         let _owner = ImpatientOwner::start(&control, &id, usize::MAX).await;
         // Still no proof of absence: the caller gets an error, not Stopped.
         assert!(control.status(&id).await.is_err());
+    }
+
+    /// Owner requests run on blocking threads, which Tokio lets finish after
+    /// it has stopped its timer during shutdown. A request that leaned on the
+    /// runtime panicked a Bun that had already shut down cleanly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn owner_requests_need_no_tokio_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("default__runtime-free-0".into());
+        let _owner = ImpatientOwner::start(&control, &id, 0).await;
+        let record = control.load(&id).unwrap();
+        let response = std::thread::spawn(move || request(&record, "status"))
+            .join()
+            .expect("an owner request outside the runtime panicked")
+            .unwrap();
+        assert_eq!(response["phase"]["state"], "running");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_owner_request_times_out_when_the_owner_never_answers() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("default__mute-0".into());
+        control.prepare(&id, &spec()).await.unwrap();
+        let record = control.load(&id).unwrap();
+        let socket = process_owner::socket_path(&record);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(socket.parent().unwrap())
+            .unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        // Accept, then hold the connection open without a word.
+        let _mute = std::thread::spawn(move || {
+            let (connection, _) = listener.accept().unwrap();
+            std::thread::sleep(OWNER_REQUEST_TIMEOUT * 2);
+            drop(connection);
+        });
+        let started = Instant::now();
+        let error = std::thread::spawn(move || request(&record, "status"))
+            .join()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < OWNER_REQUEST_TIMEOUT * 2);
     }
 }

@@ -1,0 +1,29 @@
+# The tour's scaling step: burger.toml's patty with three replicas, and
+# nothing else changed. Applied after patty-v3.toml, it's also the spec change
+# that clears the RolloutFailed mark.
+#
+#   relish apply burger/triple-patty.toml
+#   curl http://burger.localhost:18080
+#
+# The counter asks each layer six times over fresh connections, and the
+# cluster balances connections round-robin, so it finds all three patties and
+# stacks one per instance: a triple patty.
+
+[app.patty]
+image = "burger:v1"
+port = 8080
+replicas = 3
+cpu = "10m-200m"
+memory = "8Mi-32Mi"
+env = { LAYER = "patty", VERSION = "v1" }
+metrics = {}
+
+[app.patty.health]
+path = "/healthz"
+interval = 2
+timeout = 1
+threshold_unhealthy = 2
+
+[app.patty.deploy]
+health_timeout = "20s"
+drain_timeout = "5s"

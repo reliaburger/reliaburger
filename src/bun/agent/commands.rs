@@ -1160,8 +1160,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 generation,
                 response,
             } => {
-                let result = self.confirm_consumer_receipt(generation).await;
-                let _ = response.send(result);
+                // Answered once forgetting the receipt is durable (#1340).
+                self.request_receipt_confirmation(generation, response)
+                    .await;
             }
             AgentCommand::Routes { response } => {
                 let table = self.routing_table.read().await;

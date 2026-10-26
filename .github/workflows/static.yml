@@ -34,11 +34,11 @@ jobs:
       - name: Setup Pages
         uses: actions/configure-pages@v5
       - name: Publish the tutorial's demo manifest and app
-        # The homepage tour applies https://reliaburger.com/demo/podinfo.yaml.
-        # Copying the tested example at deploy time means the site can never
-        # serve a different manifest from the one CI imports.
         # The tour's build step downloads https://reliaburger.com/demo/burger.tar.gz,
-        # packed here from the example directory for the same reason.
+        # packed here from the example directory, so the site can never serve
+        # a different app from the one CI tests. The manual's Kubernetes
+        # chapter applies https://reliaburger.com/demo/podinfo.yaml, copied
+        # from the tested example for the same reason.
         # Both come from the release install.sh installs, not from main: the
         # person running the tour has that release, and main's examples may
         # need features it doesn't have (tests/suite/website.rs checks this).

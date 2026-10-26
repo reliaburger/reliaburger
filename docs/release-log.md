@@ -8,6 +8,67 @@ release contains is in the [roadmap](roadmap.md#releases-after-010). A new
 paragraph goes at the top when a release is promoted
 ([release gate, step 9](releasing.md#staging-a-candidate)).
 
+## 0.2.2: UX polish
+
+Promoted on 25 October 2026 as tag `v0.2.2` at `43baee64`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/40244465831)).
+Qualification ran from 21 to 25 October 2026 (UTC) and took four candidates
+([closure record](qualification/2026-10-25-v0.2.2-release-closure.md)), on the
+same gate as 0.2.1. Candidate 1's V02 fast tier was refused a network delay in
+its first cycle: since chaos reached jobs
+([#704](https://github.com/reliaburger/reliaburger/issues/704)), every runc job
+attempt is a delay caller, and one that finished while `tc` programmed it
+failed the whole fault
+([#1291](https://github.com/reliaburger/reliaburger/issues/1291)). The same
+run showed `relish wtf`'s GitOps check was always UNKNOWN
+([#1286](https://github.com/reliaburger/reliaburger/issues/1286)). Candidate
+2's jobs fast tier found Bun panicking after `shutdown complete`: a
+process-owner request on a blocking thread registered a Tokio timer after the
+runtime had stopped, so Bun now talks to process owners over a plain `std`
+socket with its own deadline
+([#1299](https://github.com/reliaburger/reliaburger/issues/1299)). Candidate
+3 stopped at its build's dependency audit: RustSec published
+RUSTSEC-2026-0387 on 23 October, for crypto-bigint 0.5, reached only through
+`age` 0.12's P-256 code, which Reliaburger never calls. The maintainer
+accepted it under a reviewed exception
+([#1318](https://github.com/reliaburger/reliaburger/pull/1318),
+[record](qualification/2026-10-24-dependency-exceptions.md)). Candidate 4
+passed both staged installs, in 261 s and 143 s
+([first](qualification/2026-10-24-v0.2.2-staged-install-apple-silicon.md),
+[second](qualification/2026-10-24-v0.2.2-staged-install-apple-silicon-2.md)).
+Its V02 fast tier failed twice and its jobs fast tier once, each on one slow
+agent-loop turn, 1.4 to 5.6 s, waiting on a disk write while the soak host's
+three VMs stalled on disk together
+([V02 fast run 1](qualification/2026-10-24-v0.2.2-sustained-v02-fast.md),
+[run 2](qualification/2026-10-25-v0.2.2-release-closure/candidate-4-v02-fast-run2.md),
+[jobs fast](qualification/2026-10-24-v0.2.2-job-qualification-fast.md)). The
+maintainer accepted all three as host stalls for 0.2.2, and set a rule for the
+class: a slow turn whose slow part is a disk write, with a multi-second stall
+on another node at the same time and every other check passing. Its first
+8-hour jobs final passed everything but the job campaign's drain, which the
+harness asked for while the hour-8 graceful whole-cluster stop was still
+running ([#1338](https://github.com/reliaburger/reliaburger/issues/1338),
+[record](qualification/2026-10-25-v0.2.2-release-closure/candidate-4-jobs-final-run1.md)).
+With the harness fixed
+([#1339](https://github.com/reliaburger/reliaburger/pull/1339)), run 2 on the
+same candidate ran the full 8 hours at 3,877 accepted jobs a second, drained
+the campaign with nothing missing, lost nothing and kept Bun's memory within
+target ([record](qualification/2026-10-25-v0.2.2-job-qualification.md)). Its
+one failure was a 3,634 ms receipt-confirmation turn in a disk stall node 3
+saw in the same second, a host stall under the maintainer's rule. The
+power-cut and reboot lanes passed 25 of 25 in every lane
+([record](qualification/2026-10-25-power-cut-reboot.md)). 0.2.2 ships with
+two writes that still wait on the agent loop, so a slow disk can hold a node's
+loop for seconds: the egress-owners file
+([#1263](https://github.com/reliaburger/reliaburger/issues/1263)) and the
+consumer receipt confirmation
+([#1340](https://github.com/reliaburger/reliaburger/issues/1340)), both fixed
+in 0.2.3. It also ships with RUSTSEC-2026-0387 under the exception; 0.2.3
+moves to `age` 0.11.5, which drops crypto-bigint 0.5
+([#1333](https://github.com/reliaburger/reliaburger/pull/1333)). It's the
+first release without an Intel macOS build
+([#1018](https://github.com/reliaburger/reliaburger/issues/1018)).
+
 ## 0.2.1: cluster safety
 
 Promoted on 21 October 2026 as tag `v0.2.1` at `abec2c45`
