@@ -1737,15 +1737,16 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         // it always has; with one, the drain and the grace are separate.
         let stop = InstanceStop::for_policy(begun.stop.as_ref(), drain_timeout)
             .with_sidecars(begun.sidecars);
-        drain_and_stop_instance(
-            &self.drains,
-            &self.grill,
-            id,
-            drain_timeout,
-            &stop,
-            self.stop_confirmation_timeout,
-        )
-        .await
+        // Other nodes connect to the old backend directly, so this node's
+        // ingress drain says nothing about them. Keep the instance serving
+        // until they have all dropped it too, or the patience runs out
+        // (#1355). The two waits overlap, so the retirement costs the
+        // longer of them, not their sum.
+        tokio::join!(
+            self.ops.await_remote_withdrawal(id),
+            drain_instance(&self.drains, id, drain_timeout),
+        );
+        stop_runtime_instance(&self.grill, id, &stop, self.stop_confirmation_timeout).await
     }
 
     #[allow(clippy::too_many_arguments)]
