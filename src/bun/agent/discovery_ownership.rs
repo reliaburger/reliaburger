@@ -88,6 +88,9 @@ pub(super) enum WriteOwner {
         branch: crate::bun::loop_meter::LoopBranch,
         detail: &'static str,
     },
+    /// Forgetting receipts the leader acknowledged (#1340). The
+    /// acknowledgements are answered once it lands.
+    ConsumerReceipts,
 }
 
 /// What waited for a write in flight that has just landed.
@@ -100,6 +103,8 @@ pub(super) enum LandedWrite {
     /// A write whose writer's next ask collects it: a workload start's
     /// network reference, a publication, a release or a retirement.
     AskAgain,
+    /// Forgetting acknowledged receipts, whose callers have been answered.
+    ConsumerReceipts,
 }
 
 /// How a discovery write ended, as the loop's `select!` branch sees it.
@@ -839,6 +844,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 Some((LoopBranch::DeployOp, "apply_network_pre_start/landed"))
             }
             WriteOwner::AskAgain { branch, detail } => Some((branch, detail)),
+            WriteOwner::ConsumerReceipts => Some((LoopBranch::FollowUp, "consumer_receipt/landed")),
         }
     }
 
@@ -969,7 +975,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Some(LandedWrite::HealthProbe(Some(write))) => {
                 self.finish_health_publication(write).await;
             }
-            Some(LandedWrite::HealthProbe(None) | LandedWrite::AskAgain) => {}
+            Some(
+                LandedWrite::HealthProbe(None)
+                | LandedWrite::AskAgain
+                | LandedWrite::ConsumerReceipts,
+            ) => {}
         }
     }
 
@@ -1024,6 +1034,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     eprintln!("bun: {error}");
                 }
                 Some(LandedWrite::AskAgain)
+            }
+            WriteOwner::ConsumerReceipts => {
+                self.receipt_confirmations.write_landed(&landed);
+                Some(LandedWrite::ConsumerReceipts)
             }
         }
     }

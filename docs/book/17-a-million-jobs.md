@@ -3151,6 +3151,30 @@ The profile expected this to save most of the 47 µs of faults and some of
 the 32 µs clone, about 15% of a task once the node is CPU-bound. The bench
 measurement will say how much it really saves.
 
+### A core spent watching the log
+
+The same profile found the second cost somewhere nobody would look for a
+batch-job problem: the GitOps loop. It woke on every change to Raft's
+metrics, which means every commit and every heartbeat reply, and each time it
+cloned the whole `DesiredState` before checking whether GitOps was even
+configured. Each held chunk's receipt is a commit, and `DesiredState` holds
+every task array's record, so the busier the node, the bigger and more
+frequent the copy. That was 41% of Bun's CPU in a host-job window, and 64%
+with no tasks running at all.
+
+Experiment E2 simply dropped that wake. In a 62-second window of raw
+dispatch, Bun's CPU went from 61 s to 0.7 s, and the raw rate from
+18,026.5/s to 22,074.3/s. On top of the deeper grant from experiment E1, host
+jobs went from 6,766.7/s to 7,066.7/s, with a steady rate of 8,465/s. It may
+also explain why host windows that follow container scenarios run slower:
+those scenarios leave a bigger `DesiredState` behind to clone.
+
+Dropping the wake wasn't the fix, though, because a new leader must start
+syncing without waiting for its poll. So for #1030 the loop now wakes only
+when the term or the leader changes, and reads just the GitOps configuration
+until it knows a sync will run. Chapter 7 shows how. The bench measurement
+with this change and the in-order dispatch together is still to come.
+
 ### What the measurements do and don't show
 
 Measuring this turned out to be as instructive as building it, mostly because

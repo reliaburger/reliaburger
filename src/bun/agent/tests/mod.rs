@@ -1077,6 +1077,81 @@ async fn a_rollout_finishes_while_the_old_instance_waits_for_remote_release() {
     let _ = confirmed.await;
 }
 
+/// The states the node's next report would give every instance, by host port.
+async fn reported_states(
+    agent: &TestAgent,
+) -> std::collections::BTreeMap<Option<u16>, ContainerState> {
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    rx.await
+        .unwrap()
+        .instances
+        .into_iter()
+        .map(|instance| (instance.port, instance.container_state))
+        .collect()
+}
+
+/// #1353: the leader builds the service catalogue from node reports, and a
+/// report counts an instance healthy only when it's Running. A rolling
+/// replacement stayed Starting until the rollout finalised, after the old
+/// instance had drained and stopped, so for that whole stretch the report
+/// had no healthy instance and every other node's connect hook refused the
+/// service. Once its health wait passed and its backend is published, the
+/// replacement serves traffic, and the report has to say so before the old
+/// instance's withdrawal goes out.
+#[tokio::test]
+async fn a_published_rolling_replacement_reports_running_before_the_old_instance_retires() {
+    let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let old = InstanceId("default__web-0".into());
+    let old_port = agent.supervisor.get_instance(&old).unwrap().host_port;
+
+    // What the deploy worker asks the loop for, step by step, up to the
+    // moment it starts retiring the old instance.
+    let spec = Config::parse("[app.web]\nimage = 'myapp:v2'\nport = 8080\n")
+        .unwrap()
+        .app
+        .remove("web")
+        .unwrap();
+    let new = crate::grill::InstanceIdentity::canary("default", "web", 1, 0).instance_id();
+    let new_port = agent
+        .reserve_rolling_instance(&new, "web", "default", &spec)
+        .await
+        .unwrap();
+    agent
+        .prepare_rolling_instance(&new, "web", "default", &spec, new_port)
+        .await
+        .unwrap();
+    agent
+        .transition_deploy_state(&new, ContainerState::Starting)
+        .await
+        .unwrap();
+    assert_eq!(
+        reported_states(&agent).await,
+        std::collections::BTreeMap::from([
+            (old_port, ContainerState::Running),
+            (new_port, ContainerState::Starting),
+        ]),
+        "an unpublished replacement isn't serving yet"
+    );
+
+    agent
+        .publish_new_backend("web", "default", &new, new_port, None, true)
+        .await
+        .unwrap();
+    agent.begin_instance_retirement(&old).await.unwrap();
+    assert_eq!(
+        reported_states(&agent).await,
+        std::collections::BTreeMap::from([
+            (old_port, ContainerState::Stopping),
+            (new_port, ContainerState::Running),
+        ]),
+        "the report must name a healthy instance while the old one drains"
+    );
+}
+
 #[tokio::test]
 async fn slow_producer_release_does_not_stall_the_agent_loop() {
     let grill = MockGrill::new();
@@ -11920,8 +11995,17 @@ async fn durable_consumer_waits_for_http_and_websocket_release_then_recovers_rec
     let retry = reply.await.unwrap().unwrap();
     assert!(!retry.published);
     assert_eq!(retry.receipts, vec![1]);
-    recovered.confirm_consumer_receipt(1).await.unwrap();
-    recovered.confirm_consumer_receipt(1).await.unwrap();
+    // Confirmed twice: the second finds it already forgotten.
+    for _ in 0..2 {
+        let (response, reply) = oneshot::channel();
+        recovered
+            .handle_command(AgentCommand::ConfirmConsumerReceipt {
+                generation: 1,
+                response,
+            })
+            .await;
+        reply.await.unwrap().unwrap();
+    }
     drop(recovered);
     let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
     let consumer = journal.inventory().consumer.as_ref().unwrap();

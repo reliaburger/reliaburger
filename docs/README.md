@@ -5,13 +5,13 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.2.1 was released on 21 October 2026. Its signed binaries, guest images and
-installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.1),
+0.2.2 was released on 25 October 2026. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2),
 and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs it
 and builds a laptop cluster; without a flag the installer explains the choices.
 Until 1.0.0 Reliaburger is for developers and enthusiasts, not production. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
-The limits below are the ones 0.2.1 ships with; the [roadmap](roadmap.md) tracks
+The limits below are the ones 0.2.2 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.
 
 The [platform comparisons](website/compare/index.html) and
@@ -107,9 +107,9 @@ Stopped.
 
 ### Jobs and cron
 
-Jobs arrived in 0.2.0, and 0.2.1 changes the cluster's formats again, so a 0.2.0
+Jobs arrived in 0.2.0, and 0.2.2 changes the cluster's formats again, so a 0.2.1
 cluster can't roll to it: start a fresh cluster
-([upgrading from 0.2.0](releasing.md#upgrading-from-020)). The
+([upgrading from 0.2.1](releasing.md#upgrading-from-021)). The
 [job manual](manual/14_batch-jobs.md) covers jobs in full.
 
 Every job, cron occurrence, hook and task array runs on one lifecycle: a durable
@@ -284,7 +284,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-For 0.2.1, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.2.2, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -323,7 +323,7 @@ or operator firewall rules when diagnosing direct-host connectivity.
 
 ### macOS containers: managed Linux VMs
 
-For 0.2.1, run containers through the [managed laptop quickstart](quickstart.md):
+For 0.2.2, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
 relish setup --quickstart --nodes 3
@@ -334,7 +334,7 @@ foreground process workloads. Direct Apple Container selection is disabled,
 even when its CLI is installed: interrupted CLI requests can outlive Bun and
 mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
-work; they are outside the 0.2.1 runtime profile.
+work; they are outside the 0.2.2 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -354,7 +354,7 @@ sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
 limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
 environment and run without container isolation.
 
-**0.2.1 contract: foreground workloads only.** The main process stays under Bun's
+**0.2.2 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
 Use the application's foreground/no-daemon option. A shell wrapper should `exec`
@@ -924,16 +924,20 @@ relish apply -f examples/kubernetes/podinfo.yaml
 curl -H 'Host: podinfo.localhost' http://127.0.0.1:18080/
 ```
 
-`examples/demo/burger` is the five-minute tour's home-built app: a small Go
-service (standard library only), its test and a cross-compiling Dockerfile.
+`examples/demo/burger` is the five-minute tour's demo: one small Go program
+(standard library only), its tests and a cross-compiling Dockerfile. It plays
+every part of a burger: each layer is its own app (`LAYER=cheese VERSION=v2`),
+and the counter in front asks each layer by its service name and stacks what
+answers, so a missing layer is a gap you can see. `curl` gets an ANSI-coloured
+burger, a browser an SVG one that redraws every second, and a script JSON.
 `relish build` has a node with Buildah build it into Pickle (the quickstart's
-VMs have Buildah), and each `/order` names the podinfo backend it reached by
-service name, so apply podinfo first:
+VMs have Buildah). `cheese-v2.toml`, `patty-v3.toml` and `triple-patty.toml`
+next to it are the tour's rolling deploy, rollback and scale-up:
 
 ```bash
 relish build examples/demo/burger/burger.toml
 relish apply examples/demo/burger/burger.toml
-curl -H 'Host: burger.localhost' http://127.0.0.1:18080/order
+curl -H 'Host: burger.localhost' http://127.0.0.1:18080/
 ```
 
 ### Internal DNS on rootful runc
@@ -1479,7 +1483,7 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Direct Apple Container is disabled for 0.2.1 while interrupted daemon-command
+Direct Apple Container is disabled for 0.2.2 while interrupted daemon-command
 recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide

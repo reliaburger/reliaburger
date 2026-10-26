@@ -626,6 +626,9 @@ pub struct BunAgent<G: Grill> {
     /// The consumer synchronisation part of the way through its steps, and
     /// the leader answer waiting behind it (#505).
     consumer_syncs: consumer::ConsumerSyncs,
+    /// Leader-acknowledged receipts waiting for the journal to forget them
+    /// (#1340).
+    receipt_confirmations: consumer::ReceiptConfirmations,
     /// While the view lease has lapsed, the local-only view installed in
     /// place of the last publication: this node's own backends and nothing
     /// else. `None` while the published view is the whole cluster's.
@@ -910,6 +913,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
             consumer_syncs: Default::default(),
+            receipt_confirmations: Default::default(),
             lapsed_view: None,
             deferred_retirements: Default::default(),
             view_lease: Default::default(),
@@ -1063,6 +1067,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
             consumer_syncs: Default::default(),
+            receipt_confirmations: Default::default(),
             lapsed_view: None,
             deferred_retirements: Default::default(),
             view_lease: Default::default(),
@@ -1626,6 +1631,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         if self.discovery_write_in_flight() => {
                         let turn = self.begin_landing_turn();
                         self.land_write_in_flight(outcome).await;
+                        turn
+                    }
+                    // Receipt acknowledgements that arrived while a write
+                    // was in flight (#1340) take the journal once it is
+                    // free. They come only from commands, below, and one
+                    // turn takes all of them, so this branch can't flood.
+                    _ = std::future::ready(()), if self.receipt_confirmations.is_waiting()
+                        && !self.discovery_write_in_flight() => {
+                        let turn = self.begin_receipt_turn();
+                        self.confirm_waiting_receipts().await;
                         turn
                     }
                     Some(op) = self.deploy_ops_rx.recv() => {

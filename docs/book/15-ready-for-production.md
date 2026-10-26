@@ -6323,6 +6323,75 @@ backends the journal doesn't record yet. It needs the same reorder
 `the_inline_publication_path_still_waits_for_its_journal_write` holds the
 place until it does.
 
+#### And the receipt
+
+#1263's list had left one writer off on purpose. When the leader
+acknowledges a withdrawal receipt, the placement poll sends
+`ConfirmConsumerReceipt`, and the node forgets the receipt. That command
+settled any write in flight and then journalled inline, with no deadline at
+all. 0.2.2's gate met it four times, every one a host disk stall:
+
+```
+bun: agent loop turn took 2842 ms in command (confirm_consumer_receipt): journal write 2842 ms
+```
+
+We'd left it inline because the receipt depends on order. A receipt may
+only be forgotten after the leader's exact acknowledgement, only once it's
+proven locally (`Ready`), and only against the ownership as it is on disk.
+Forget it against the inventory from before a write in flight and you
+could undo whatever that write recorded. So "settle first" was there for a
+reason. The trick was to keep the settling and lose the waiting.
+
+The tests came first, five of them. Two stall the confirmation's own write
+for 1.6 s, one stalls another writer's write and sends the confirmation
+behind it, and one fails the write after its turn has moved on. Before the
+change all four failed, because every one of those turns waited out the
+stall:
+
+```
+status took Some(1.619841041s) while a receipt confirmation's journal write took 1.6s
+3.247000167s in command (confirm_consumer_receipt)
+```
+
+That second line is the bad one: the command waited for someone else's
+write, then for its own. The fifth test, that an unproven receipt is
+refused, passed before and after. It's there so the fix can't loosen the
+rule.
+
+A release could answer `StillRunning` and leave the asking to its
+caller. A confirmation has an answer to give, so it waits for one
+instead. The command now hands its `oneshot` sender to a queue:
+
+```rust
+pub(super) struct ReceiptConfirmations {
+    waiting: Vec<ReceiptConfirmation>,
+    forgetting: Vec<ReceiptConfirmation>,
+}
+```
+
+If the journal is free, the same turn forgets the receipt with a write that
+waits until the turn's deadline. If a write is in flight, the
+acknowledgement stays in `waiting` and the turn ends. A new branch in the
+loop's `select!`, guarded by `is_waiting()` and no write in flight, takes
+every waiting acknowledgement in one write once the journal is free. That's
+the order the inline version kept, just spread over more turns. A write
+that outlasts its turn moves its acknowledgements to `forgetting`, and the
+turn that lands it, `follow_up (consumer_receipt/landed)`, answers them.
+Taking the whole queue is one line, `std::mem::take(&mut
+self.receipt_confirmations.waiting)`: it moves the `Vec` out and leaves an
+empty one behind, so nothing stays borrowed while the write runs.
+
+The reply means what it always meant: `Ok` once the receipt is gone from
+disk, an error if it isn't proven or the write failed. What does a receipt
+do while its write is in flight? Nothing new. It's still on disk, so the
+node still reports it, and the leader acknowledges it again, exactly as it
+would after a crash. The poll waits a second for the reply and moves on.
+That's why this needed no protocol change and no bump to `CURRENT`.
+`a_receipt_confirmation_whose_write_fails_off_the_turn_keeps_the_receipt`
+pins down the crash case: a write that fails off the turn fences discovery,
+the caller hears the error, and the receipt is still on disk for the next
+acknowledgement.
+
 #### A 503 is an answer, not a verdict
 
 Candidate 7's jobs soak failed a pulse on one line: `deploy_from_cluster_registry`

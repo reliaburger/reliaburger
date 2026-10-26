@@ -75,7 +75,7 @@ The core of Lettuce is a continuous sync loop running on the coordinator:
 
 **Step-by-step flow:**
 
-1. **Trigger.** Either the poll timer fires (every `poll_interval`, default 30s) or a validated webhook arrives.
+1. **Trigger.** The poll timer fires (every `poll_interval`, default 30s), a validated webhook arrives, a committed trigger (`relish gitops sync`, or a webhook another node accepted) is pending, or this node has just become leader. The loop watches Raft's metrics only for a new term or leader, not for every commit, and reads only `gitops_config` and the trigger generations until it knows it leads a cluster with GitOps on; the whole `DesiredState` is cloned only for a sync that will run (#1030).
 2. **Git fetch.** Lettuce performs `git fetch origin <branch>` on the local bare clone. If the remote HEAD hasn't moved, the loop carries on with the current HEAD rather than stopping: every tick reconciles (B16), so a manual change to desired state is repaired without waiting for a commit. Each `git` call runs under a deadline and the shutdown token (see Section 5.3).
 3. **Commit signature verification.** If `require_signed_commits` is enabled globally, or if the commit adds, changes or removes any `script` value (auto-enforcement per Section 17, Section 5.8), the commit signature is verified against `trusted_signing_keys`. Unsigned or untrusted commits are rejected and the reason is recorded in `SyncState.last_error`. (A dedicated alert on rejection is **planned — not yet implemented**; today the rejection surfaces through sync state, not the alerting subsystem.)
 4. **TOML parse.** All `.toml` files under the configured `path` are parsed into the internal `DesiredState` representation. Parse errors are non-fatal per file -- a single malformed file doesn't block sync of other files, but the malformed file is flagged as an error in sync status.
@@ -89,7 +89,7 @@ The GitOps coordinator is the Raft leader. There's no separate election: the syn
 
 1. Every council member runs the Lettuce runner, but only the current leader's loop syncs.
 2. On each recorded sync, `coordinator_for_leader` (`src/lettuce/sync.rs`) stamps the leader's node ID into `SyncState.coordinator_node_id`, with reason `Initial`, or `Failover` when the previous coordinator was another node.
-3. When leadership moves, the new leader's loop takes over. It reads the last `SyncState` from Raft and resumes from the last applied commit, cloning the repository first if it has no usable local clone.
+3. When leadership moves, the new leader's loop takes over at once, without waiting for its poll tick. It reads the last `SyncState` from Raft and resumes from the last applied commit, cloning the repository first if it has no usable local clone.
 
 An earlier draft elected a separate coordinator, preferring a non-leader to spread load, with its own `CoordinatorElection` Raft entry and heartbeat-based failover. It was never built that way: a non-leader can't apply a sync, so the coordinator it named never synced.
 

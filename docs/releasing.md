@@ -184,9 +184,9 @@ gates. Any incompatible wire or durable-state change bumps `protocol` or
 so an upgrade across that bump means starting a fresh cluster. So
 `relish upgrade` works only between builds of the same format (maintainer
 decision D31 in [#674](https://github.com/reliaburger/reliaburger/issues/674),
-10 October 2026). Every release from 0.1.0 to 0.2.1 bumped a format, so no
+10 October 2026). Every release from 0.1.0 to 0.2.2 bumped a format, so no
 rolling upgrade between two published releases has run yet. A release that
-keeps 0.2.1's pair could roll in place, and qualifying a real
+keeps 0.2.2's pair could roll in place, and qualifying a real
 published-to-published rolling walk on such a patch release is a goal, not a
 release gate. The pre-1.0 rule for known harness artefacts in
 the V02 soak (step 4 of [staging a candidate](#staging-a-candidate))
@@ -433,6 +433,19 @@ created again, a new CA, job history exported first and volumes restored from
 snapshots. Tokens have to be reissued anyway, because 0.2.1 stores their
 hashes differently.
 
+### Upgrading from 0.2.1
+
+0.2.2 can't roll onto a 0.2.1 cluster either. Gossip, reporting frames and
+the Raft log's vote, log ids and encrypted-entry envelope are postcard now,
+not bincode. Exec answers carry the command's exit code, jobs carry a
+per-command process limit, and faults can name a job's task (the full list is
+in `src/compatibility.rs`). So the protocol moved from 52 to 53 and the state
+format from 69 to 70, and a 0.2.1 leader refuses `relish upgrade start v0.2.2`
+before it records a run.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
@@ -538,7 +551,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.2.1` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.2` today), so
 bump that default in the same change that announces a newer release. Both
 scripts need a mode, `--laptop` or `--install-only`; with none they explain the
 choices and exit 2. For a release from before 0.2.2 the bootstrap drops
@@ -623,7 +636,8 @@ the real `curl … | sh` install against it on every host we advertise.
    `candidate.json`, that setup used the mirror, and that the installed CLI,
    both Linux binaries and the guest image are candidate assets. Then it
    applies the podinfo tour, runs `status`, `path` and `metrics`, requires
-   `relish wtf` to check GitOps on every node, not leave it UNKNOWN (#1286), destroys the
+   `relish wtf` to check GitOps on every node, not leave it UNKNOWN (#1286), builds and
+   applies the burger demo and requires a whole burger through the ingress, destroys the
    cluster, uninstalls, and writes a Markdown record with the timings. It never
    uses `~/.reliaburger` and fails if that directory's top level or
    `~/.local/bin/relish` changed. Pass `setup --quickstart` options after

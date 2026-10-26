@@ -1567,6 +1567,339 @@ async fn a_journal_write_that_fails_off_the_turn_fences_discovery_and_installs_n
     assert_eq!(installed_remote_port(&agent), Some(30001));
 }
 
+// ---- receipt confirmations (#1340) --------------------------------------------
+
+/// The leader's withdrawal of the fixture's first view, sent with a later
+/// answer.
+fn withdrawal_of_the_first_view() -> crate::onion::withdrawal::EndpointWithdrawalInstruction {
+    let (catalog, _) = cluster_publication_fixture();
+    crate::onion::withdrawal::EndpointWithdrawalInstruction {
+        generation: 1,
+        services: catalog
+            .services
+            .iter()
+            .map(|(id, service)| {
+                (
+                    id.clone(),
+                    crate::onion::withdrawal::ServiceWithdrawal {
+                        service: service.clone(),
+                        retire_vip: true,
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+/// A consumer whose second answer withdrew its first view: receipt 1 is
+/// proven locally and waits for the leader's acknowledgement.
+async fn consumer_with_a_ready_receipt() -> (BunAgent<MockGrill>, tempfile::TempDir) {
+    let (mut agent, root, _ingress) = published_consumer().await;
+    let update = agent
+        .synchronise_consumer(
+            2,
+            Default::default(),
+            vec![],
+            vec![withdrawal_of_the_first_view()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.receipts, vec![1]);
+    (agent, root)
+}
+
+/// The receipts the discovery journal itself records: not the inventory
+/// before a write in flight.
+fn journalled_receipts(agent: &BunAgent<MockGrill>) -> Vec<u64> {
+    let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+        &agent.discovery_ownership
+    else {
+        panic!("discovery ownership is not settled");
+    };
+    receipts_of(journal)
+}
+
+/// The receipts a discovery journal records.
+fn receipts_of(journal: &crate::bun::discovery_owners::DiscoveryJournal) -> Vec<u64> {
+    journal
+        .inventory()
+        .consumer
+        .as_ref()
+        .unwrap()
+        .receipts
+        .keys()
+        .copied()
+        .collect()
+}
+
+/// The receipts on disk, once the agent that owned the journal is gone.
+fn receipts_on_disk(root: &tempfile::TempDir) -> Vec<u64> {
+    let journal =
+        crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+            .unwrap();
+    receipts_of(&journal)
+}
+
+/// Deliver the leader's acknowledgement of receipt `generation` in a
+/// command turn of its own, as the loop does. Returns the turn the meter
+/// saw and the reply still to come.
+async fn receipt_turn(
+    agent: &mut BunAgent<MockGrill>,
+    generation: u64,
+) -> (
+    crate::bun::loop_meter::TurnRecord,
+    oneshot::Receiver<Result<(), BunError>>,
+) {
+    let (response, reply) = oneshot::channel();
+    let turn = begin_scenario_turn(agent, LoopBranch::Command, Some("confirm_consumer_receipt"));
+    agent
+        .handle_command(AgentCommand::ConfirmConsumerReceipt {
+            generation,
+            response,
+        })
+        .await;
+    (end_scenario_turn(agent, turn), reply)
+}
+
+/// Take the loop's turn for confirmations that waited for the journal.
+async fn waiting_receipts_turn(
+    agent: &mut BunAgent<MockGrill>,
+) -> crate::bun::loop_meter::TurnRecord {
+    assert!(
+        agent.receipt_confirmations.is_waiting(),
+        "no confirmation waits for the journal"
+    );
+    let turn = agent.begin_receipt_turn();
+    agent.confirm_waiting_receipts().await;
+    end_scenario_turn(agent, turn)
+}
+
+/// 0.2.2's gate met this four times during host disk stalls (#1340): the
+/// leader acknowledged a receipt, and forgetting it journalled inline, a
+/// 1.4 to 3.6 s `command (confirm_consumer_receipt)` turn whose only part
+/// was its journal write. The write now waits only until the turn's
+/// deadline. A status queued meanwhile is answered, and the confirmation
+/// is answered once the write has landed.
+#[tokio::test]
+async fn status_answers_while_a_receipt_confirmation_journals_to_a_stalled_disk() {
+    let (agent, root) = consumer_with_a_ready_receipt().await;
+    let running = run_restarted(agent);
+    running
+        .stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    running.measure_from_here();
+    let reached = running.stalls.reached(LoopStall::Persist);
+    let (response, mut reply) = oneshot::channel();
+    running
+        .tx
+        .send(AgentCommand::ConfirmConsumerReceipt {
+            generation: 1,
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while running.stalls.reached(LoopStall::Persist) == reached {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the confirmation never journalled");
+    let mid_write = running.status_latency().await;
+    let early = reply.try_recv();
+    let answered_early = early.is_ok();
+    let confirmed = match early {
+        Ok(confirmed) => confirmed,
+        Err(_) => tokio::time::timeout(std::time::Duration::from_secs(10), reply)
+            .await
+            .expect("the confirmation was never answered")
+            .unwrap(),
+    };
+    running
+        .stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    let worst = running.meter.worst_turn();
+    stop(running).await;
+
+    assert!(
+        mid_write.is_some_and(|latency| latency < TURN_BUDGET),
+        "status took {mid_write:?} while a receipt confirmation's journal write took \
+         {STALLED_JOURNAL_WRITE:?}"
+    );
+    assert!(
+        !answered_early,
+        "the confirmation was answered before its write landed"
+    );
+    assert!(confirmed.is_ok(), "{confirmed:?}");
+    if let Some(worst) = worst {
+        assert!(worst.took < TURN_BUDGET, "the worst loop turn took {worst}");
+    }
+    assert!(receipts_on_disk(&root).is_empty());
+}
+
+/// The confirmation's own write waits only until the turn's deadline, and
+/// the confirmation is answered from the turn that lands it. Until then the
+/// receipt is still on disk, so the leader keeps being told about it; a
+/// second acknowledgement meanwhile writes nothing and waits for nothing.
+#[tokio::test]
+async fn a_receipt_confirmation_leaves_its_slow_journal_write_in_flight() {
+    let (mut agent, _root) = consumer_with_a_ready_receipt().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (turn, mut reply) = receipt_turn(&mut agent, 1).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "the confirmation didn't journal: {turn}"
+    );
+    assert!(turn.took < TURN_BUDGET, "{turn}");
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the confirmation's turn waited for its journal write: {turn}"
+    );
+    assert!(
+        reply.try_recv().is_err(),
+        "answered before the write landed"
+    );
+    assert_eq!(
+        agent.consumer_update(true).receipts,
+        vec![1],
+        "a receipt still on disk stopped being reported"
+    );
+
+    let (again_turn, mut again) = receipt_turn(&mut agent, 1).await;
+    assert!(again_turn.took < TURN_BUDGET, "{again_turn}");
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached + 1);
+    assert!(again.try_recv().is_err());
+
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(landed.detail, Some("consumer_receipt/landed"), "{landed}");
+    assert!(reply.await.unwrap().is_ok());
+    assert!(journalled_receipts(&agent).is_empty());
+    assert!(agent.consumer_update(true).receipts.is_empty());
+
+    // The second acknowledgement finds the receipt already forgotten.
+    waiting_receipts_turn(&mut agent).await;
+    assert!(again.await.unwrap().is_ok());
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached + 1);
+}
+
+/// A confirmation changes the ownership as it is on disk, so it waits for
+/// any write already in flight, but off the loop: the command's turn ends
+/// at once, and the loop takes the confirmation in a turn of its own once
+/// the journal is free.
+#[tokio::test]
+async fn a_receipt_confirmation_waits_off_the_loop_for_a_write_already_in_flight() {
+    let (mut agent, _root) = consumer_with_a_ready_receipt().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    // Another writer's write, left in flight at its turn's deadline.
+    let landing = agent
+        .write_discovery_inventory(
+            &crate::onion::service_id::ServiceId::new("system", "discovery"),
+            |_| {},
+            Some(tokio::time::Instant::now()),
+            super::discovery_ownership::WriteOwner::AskAgain {
+                branch: LoopBranch::FollowUp,
+                detail: "another_writer/landed",
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(landing, super::discovery_ownership::Landing::InFlight);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (turn, mut reply) = receipt_turn(&mut agent, 1).await;
+    assert!(turn.took < TURN_BUDGET, "{turn}");
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the confirmation's turn waited for another writer's write: {turn}"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert!(reply.try_recv().is_err());
+
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(landed.detail, Some("another_writer/landed"), "{landed}");
+    assert!(
+        reply.try_recv().is_err(),
+        "answered before forgetting the receipt was journalled"
+    );
+    let confirmed = waiting_receipts_turn(&mut agent).await;
+    assert_eq!(
+        confirmed.detail,
+        Some("consumer_receipt/confirm"),
+        "{confirmed}"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached + 1);
+    assert!(reply.await.unwrap().is_ok());
+    assert!(journalled_receipts(&agent).is_empty());
+}
+
+/// Only a locally proven receipt is forgotten. One whose withdrawal the
+/// published view still contradicts is refused at once, and nothing is
+/// journalled.
+#[tokio::test]
+async fn a_receipt_without_local_withdrawal_proof_is_refused() {
+    let (mut agent, _root, ingress) = published_consumer().await;
+    let (catalog, _) = cluster_publication_fixture();
+    let update = agent
+        .synchronise_consumer(2, catalog, ingress, vec![withdrawal_of_the_first_view()])
+        .await
+        .unwrap();
+    assert!(update.receipts.is_empty(), "{update:?}");
+    assert_eq!(journalled_receipts(&agent), vec![1]);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, mut reply) = receipt_turn(&mut agent, 1).await;
+    assert!(
+        matches!(reply.try_recv(), Ok(Err(_))),
+        "an unproven receipt was not refused"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert_eq!(journalled_receipts(&agent), vec![1]);
+}
+
+/// A confirmation whose write fails after its turn moved on fences
+/// discovery, answers the failure, and leaves the receipt on disk, as a
+/// crash before the write lands does: the leader is asked to acknowledge
+/// it again, and the next confirmation forgets it.
+#[tokio::test]
+async fn a_receipt_confirmation_whose_write_fails_off_the_turn_keeps_the_receipt() {
+    let (mut agent, root) = consumer_with_a_ready_receipt().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+        &mut agent.discovery_ownership
+    else {
+        panic!("discovery ownership is not ready");
+    };
+    journal.fail_next_write();
+    let (turn, reply) = receipt_turn(&mut agent, 1).await;
+    assert!(agent.discovery_write_in_flight(), "{turn}");
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    landing_turn(&mut agent).await;
+    assert!(
+        reply.await.unwrap().is_err(),
+        "a failed write was confirmed"
+    );
+    assert!(matches!(
+        agent.discovery_ownership,
+        DiscoveryOwnership::Uncertain
+    ));
+    drop(agent);
+    assert_eq!(receipts_on_disk(&root), vec![1]);
+}
+
 // ---- callers that can hold a turn ---------------------------------------------
 
 /// `relish logs -f --tail` sends the tail lines into the API's 64-slot
@@ -2137,7 +2470,7 @@ async fn probe_turn(
 }
 
 /// Wait for the write in flight to land, then take the loop's turn for it.
-async fn landing_turn(agent: &mut TestAgent) -> crate::bun::loop_meter::TurnRecord {
+async fn landing_turn(agent: &mut BunAgent<MockGrill>) -> crate::bun::loop_meter::TurnRecord {
     let outcome = BunAgent::<MockGrill>::discovery_write_done(&mut agent.discovery_ownership).await;
     let turn = agent.begin_landing_turn();
     agent.land_write_in_flight(outcome).await;
@@ -2557,7 +2890,7 @@ const STALLED_DISK: std::time::Duration = std::time::Duration::from_secs(5);
 /// Begin a turn of `branch` the way the loop does, for a scenario that hands
 /// the agent its work directly.
 fn begin_scenario_turn(
-    agent: &mut TestAgent,
+    agent: &mut BunAgent<MockGrill>,
     branch: LoopBranch,
     detail: Option<&'static str>,
 ) -> crate::bun::loop_meter::Turn {
@@ -2566,7 +2899,7 @@ fn begin_scenario_turn(
 
 /// End a turn begun with [`begin_scenario_turn`] and return what the meter saw.
 fn end_scenario_turn(
-    agent: &mut TestAgent,
+    agent: &mut BunAgent<MockGrill>,
     turn: crate::bun::loop_meter::Turn,
 ) -> crate::bun::loop_meter::TurnRecord {
     agent.turn_deadline = None;

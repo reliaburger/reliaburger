@@ -341,10 +341,26 @@ migration and no feature gate
   fixed in 0.2.2. 0.2.1 changes the cluster's formats, so a 0.2.0 cluster
   can't roll to it: recreate the cluster
   ([upgrading from 0.2.0](releasing.md#upgrading-from-020)).
-- [ ] **0.2.2: UX polish**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/15)). The
+- [x] **0.2.2: UX polish.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2)
+  on 25 October 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/15),
+  [plan](plans/archive/2026-10-16-plan-0.2.2-ux-patch.md)). The
   CLI review pass ([#522](https://github.com/reliaburger/reliaburger/issues/522)),
-  Kubernetes import and export fidelity, demos, examples and doc fixes.
+  with `relish events`, Kubernetes import and export fidelity, chaos for jobs
+  and task arrays, demos, examples and doc fixes, and no more Intel macOS build
+  ([#1018](https://github.com/reliaburger/reliaburger/issues/1018)). Candidate 4
+  passed the gate
+  ([record](qualification/2026-10-25-v0.2.2-job-qualification.md), [closure](qualification/2026-10-25-v0.2.2-release-closure.md),
+  [release log](release-log.md#022-ux-polish)), with four slow agent-loop turns
+  in host disk stalls accepted by the maintainer; the two writes behind them
+  move off the loop in 0.2.3
+  ([#1263](https://github.com/reliaburger/reliaburger/issues/1263),
+  [#1340](https://github.com/reliaburger/reliaburger/issues/1340)). It ships
+  with RUSTSEC-2026-0387 under a reviewed exception
+  ([#1318](https://github.com/reliaburger/reliaburger/pull/1318)), which 0.2.3
+  removes. 0.2.2 changes the cluster's formats, so a 0.2.1 cluster can't roll
+  to it: recreate the cluster
+  ([upgrading from 0.2.1](releasing.md#upgrading-from-021)).
 - [ ] **0.2.3: two billion a day**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/17),
   [plan](plans/2026-10-20-plan-0.2.3.md)). 2B host-job tasks in one real
@@ -530,7 +546,7 @@ what's shipped and what's scheduled.
   keyless cosign ([#619](https://github.com/reliaburger/reliaburger/issues/619)).
 - **Known bugs and flakes.** The bugs the 10 October audit
   ([#674](https://github.com/reliaburger/reliaburger/issues/674)) found outside
-  jobs are in [0.2.1](https://github.com/reliaburger/reliaburger/milestone/16)
+  jobs were fixed in [0.2.1](https://github.com/reliaburger/reliaburger/milestone/16)
   and [0.2.2](https://github.com/reliaburger/reliaburger/milestone/15); any open
   flake is in the [known flakes register](flakes.md)
   ([#318](https://github.com/reliaburger/reliaburger/issues/318)).
