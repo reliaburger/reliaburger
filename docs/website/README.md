@@ -118,11 +118,11 @@ command-line definition, and does the same for the manual's copy of the tour
 (`docs/manual/08_five-minute-tour.md`), so edit both together.
 `scripts/ci/select-jobs.sh` treats this page as code for that reason.
 
-The tour applies `https://reliaburger.com/demo/podinfo.yaml` and builds from
-`https://reliaburger.com/demo/burger.tar.gz`. Neither is committed here: the
-Pages workflow copies `examples/kubernetes/podinfo.yaml` into `demo/` and packs
-`examples/demo/burger` as `demo/burger.tar.gz` at deploy time, both taken from
-the tag `install.sh` installs. Someone running the tour has that release, and
+The tour builds from `https://reliaburger.com/demo/burger.tar.gz`, and the
+manual's Kubernetes chapter applies `https://reliaburger.com/demo/podinfo.yaml`.
+Neither is committed here: the Pages workflow packs `examples/demo/burger` as
+`demo/burger.tar.gz` and copies `examples/kubernetes/podinfo.yaml` into `demo/`
+at deploy time, both taken from the tag `install.sh` installs. Someone running the tour has that release, and
 `main`'s demo may need features it doesn't have yet. To preview them locally, make them the same way
 (`demo/` is ignored by version control).
 

@@ -26,6 +26,10 @@
 #   DEMO_RESOURCES_OUT    keep the samples there as resources.csv and steps.tsv,
 #                         with cpu.svg and memory.svg charts of them
 #   DEMO_SAMPLE_INTERVAL  seconds between samples (default 1)
+#   DEMO_PLAINTEXT=1      run the node as a credential-free plaintext cluster
+#                         instead: `[security] require_mtls = false` and no
+#                         master key, CA or token, so relish talks plain HTTP
+#                         with no credentials (#1067)
 #
 # The scripts need bash 3.2 (macOS's /bin/bash).
 
@@ -200,6 +204,11 @@ demo_start() {
     trap demo_stop EXIT
     DEMO_WORK="$(mktemp -d "${TMPDIR:-/tmp}/reliaburger-demo.XXXXXX")"
 
+    if [[ "${DEMO_PLAINTEXT:-}" == 1 ]]; then
+        demo_start_plaintext
+        return
+    fi
+
     demo_step "Starting a one-node cluster (${DEMO_RUNTIME} runtime) in ${DEMO_WORK}"
     "${RELISH}" init "${DEMO_WORK}/cluster" --cluster-name demo --node-id demo-node \
         >"${DEMO_WORK}/init.log" 2>&1 \
@@ -220,6 +229,30 @@ demo_start() {
         || demo_fail "couldn't create the admin token: $(cat "${DEMO_WORK}/token.log")"
     export RELIABURGER_TOKEN
     echo "    node demo-node is up; relish talks to ${RELIABURGER_ENDPOINT}"
+}
+
+# Start the demo's node as a credential-free plaintext cluster: the config
+# `relish init --development-plaintext` writes, less its master key and
+# identity, so the node has no service token and nobody holds a token.
+demo_start_plaintext() {
+    demo_step "Starting a credential-free plaintext one-node cluster (${DEMO_RUNTIME} runtime) in ${DEMO_WORK}"
+    "${RELISH}" init "${DEMO_WORK}/cluster" --cluster-name demo --node-id demo-node \
+        --development-plaintext >"${DEMO_WORK}/init.log" 2>&1 \
+        || demo_fail "relish init failed: $(cat "${DEMO_WORK}/init.log")"
+    demo_node_config "${DEMO_WORK}/cluster/reliaburger.toml" "${DEMO_WORK}/node.plain.toml"
+    grep -v -e "^master_key_path = " -e "^bootstrap_path = " -e "^identity_dir = " \
+        "${DEMO_WORK}/node.plain.toml" >"${DEMO_WORK}/node.toml"
+    grep -q "^require_mtls = false" "${DEMO_WORK}/node.toml" \
+        || demo_fail "the plaintext node config doesn't set require_mtls = false"
+    "${BUN}" --config "${DEMO_WORK}/node.toml" --listen "127.0.0.1:${DEMO_API_PORT}" \
+        --runtime "${DEMO_RUNTIME}" --cluster >"${DEMO_WORK}/bun.log" 2>&1 &
+    DEMO_BUN_PID=$!
+    demo_resources_start
+
+    export RELIABURGER_ENDPOINT="http://127.0.0.1:${DEMO_API_PORT}"
+    unset RELIABURGER_CA_CERT RELIABURGER_TOKEN
+    demo_wait_for "the council to elect its leader" 60 "${RELISH}" council status
+    echo "    node demo-node is up (plaintext, no credentials); relish talks to ${RELIABURGER_ENDPOINT}"
 }
 
 # Stop the node and its workloads, and remove what the demo wrote. Runs on

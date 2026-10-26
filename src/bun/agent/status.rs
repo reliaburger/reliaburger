@@ -288,6 +288,43 @@ pub async fn council_status(
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// The state this node's report gives `instance`.
+    ///
+    /// A rolling replacement stays `Starting` in the supervisor until its
+    /// rollout finalises, which is after every old instance has drained
+    /// and stopped. But it passed the rollout's health wait before its
+    /// backend was published, and from then on it serves traffic. The
+    /// leader builds the service catalogue from these reports and counts
+    /// only a `Running` instance as a healthy backend, so a published
+    /// replacement reports `Running`. Otherwise a one-replica rollout
+    /// reports no healthy instance from the moment the old one starts
+    /// retiring until the rollout finishes, and every other node's connect
+    /// hook refuses the service meanwhile (#1353).
+    fn reported_state(
+        &self,
+        instance: &crate::bun::supervisor::WorkloadInstance,
+    ) -> ContainerState {
+        if !matches!(
+            instance.state,
+            ContainerState::Starting | ContainerState::HealthWait
+        ) {
+            return instance.state;
+        }
+        let service =
+            crate::onion::service_id::ServiceId::new(&instance.namespace, &instance.app_name);
+        let published = self.service_map.resolve(&service).is_some_and(|entry| {
+            entry
+                .backends
+                .iter()
+                .any(|backend| backend.instance_id == instance.id.0 && backend.healthy)
+        });
+        if published {
+            ContainerState::Running
+        } else {
+            instance.state
+        }
+    }
+
     /// Handle a snapshot request from the reporting worker.
     pub(super) async fn handle_snapshot_request(&self, req: CollectSnapshotRequest) {
         use crate::reporting::worker::{AgentSnapshot, InstanceSnapshot};
@@ -386,7 +423,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         instance_id,
                         image: inst.image.clone(),
                         port: inst.host_port,
-                        container_state: inst.state,
+                        container_state: self.reported_state(inst),
                         consecutive_unhealthy: inst.health_counters.consecutive_unhealthy,
                         uptime: inst.created_at.elapsed(),
                         cpu_request_millicores,

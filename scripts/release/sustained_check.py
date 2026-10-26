@@ -29,6 +29,8 @@ Subcommands:
                                         keep Lima's host-agent logs before a stop truncates them
   curl-reason CODE                      name a curl exit code (refused, timeout, TLS...)
   test-failures REPORT [STDERR]         each failing case's reason from a `relish --output json test` report
+  seed EVIDENCE [--seed N]              start (or resume) the run's fault and node choices; prints the seed
+  choose EVIDENCE WHAT LOW HIGH         the run's next choice between LOW and HIGH, logged as an event
   render EVIDENCE RECORD                write the Markdown record (refuses to overwrite)
 """
 import argparse
@@ -39,7 +41,9 @@ import http.client
 import json
 import os
 from pathlib import Path
+import random
 import re
+import secrets
 import socket
 import ssl
 import statistics
@@ -79,6 +83,9 @@ FD_RISES = 3
 FD_STEP = 10
 FD_GROWTH = 1.25
 REPEAT_WINDOW = 1800
+# When each leak checker can first judge a process (#1062): leak-rss after
+# its warm-up, leak-fd once it has the warm-up and FD_RISES + 1 full windows.
+CHECKER_ARMED_AFTER = (("leak-rss", "rss_kb", RSS_WARMUP), ("leak-fd", "fd", FD_WARMUP + (FD_RISES + 1) * FD_BUCKET))
 # Snapshot kinds that collect the guest inventories (collect in qualify-sustained.sh).
 INVENTORY_KINDS = ("settle", "heavy")
 LEAK_KINDS = ("runc", "netns", "lease", "veth", "cgroup", "bpf", "listen")
@@ -119,6 +126,45 @@ def save_state(evidence, state):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(state, indent=1, sort_keys=True))
     os.replace(temporary, path)
+
+
+# --- seeded choices (#1062) -----------------------------------------------------
+
+def start_choices(evidence, seed):
+    """Start the run's choices from `seed` (a new random one when None), or
+    resume them. A resumed run keeps its seed and its place in the sequence;
+    asking it for a different seed is an error. Returns the seed."""
+    path = Path(evidence) / "choices.json"
+    if path.exists():
+        recorded = json.loads(path.read_text())
+        if seed is not None and seed != recorded["seed"]:
+            raise ValueError(f"this run's choices come from seed {recorded['seed']}, not {seed}")
+        return recorded["seed"]
+    if seed is None:
+        seed = secrets.randbelow(2 ** 32)
+    write_choices(path, {"seed": seed, "draws": 0})
+    return seed
+
+
+def write_choices(path, data):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, sort_keys=True))
+    os.replace(temporary, path)
+
+
+def choose(evidence, what, low, high):
+    """The run's next choice between `low` and `high`, inclusive.
+
+    Draw n of seed s is always the same number, so the same seed makes the
+    same choices in the same order. Each choice is logged as a `choice`
+    event naming what it chose."""
+    path = Path(evidence) / "choices.json"
+    data = json.loads(path.read_text())
+    draw = data["draws"]
+    value = random.Random(f"{data['seed']}:{draw}").randint(low, high)
+    write_choices(path, dict(data, draws=draw + 1))
+    append_event(evidence, phase="choice", target=what, detail=f"{value} of {low}-{high}, draw {draw}, seed {data['seed']}")
+    return value
 
 
 def append_event(evidence, **fields):
@@ -1094,9 +1140,11 @@ def resource_trend_findings(state, node, inventory, now):
     rss = inventory_number(inventory, "bun_rss_kb")
     # An upgrade walk execs bun in place: same pid, a new image whose RSS
     # starts from nothing. Either change is a new process to warm up.
-    if pid != node_state.get("pid") or image != node_state.get("image"):
+    changed = pid != node_state.get("pid") or image != node_state.get("image")
+    if changed:
         node_state.update(pid=pid, image=image, fd_samples=[], started=now)
         node_state.pop("rss_warm_kb", None)
+    record_exposure(state, node, changed, dict(rss_kb=rss, fd=fd), now - node_state["started"], now)
     if fd is not None:
         node_state["fd_samples"] = [sample for sample in node_state["fd_samples"] if sample[0] >= now - (FD_RISES + 3) * FD_BUCKET] + [[now, fd]]
     trend = state.setdefault("trends", {}).setdefault(node, {})
@@ -1115,6 +1163,53 @@ def resource_trend_findings(state, node, inventory, now):
     findings = [dict(item, target=node) for item in fd_findings(node_state["fd_samples"], node_state["started"], now)]
     findings += [dict(item, target=node) for item in rss_findings(node_state, rss, now, node_state["started"])]
     return findings
+
+
+def record_exposure(state, node, changed, values, age, now):
+    """How long each leak checker could judge this node (#1062).
+
+    A checker is armed once the Bun process it watches has lived past the
+    checker's warm-up; a new pid or image starts the warm-up again. The
+    time between two armed samples of one process counts as armed; the
+    record reports the total, the longest unbroken window, the samples
+    judged and how many processes ever armed it. Reported only."""
+    for check, key, armed_after in CHECKER_ARMED_AFTER:
+        entry = state.setdefault("exposure", {}).setdefault(node, {}).setdefault(check, dict(
+            armed_seconds=0, longest_seconds=0, samples=0, processes_armed=0, window_seconds=0, last=None))
+        if changed:
+            entry.update(last=None, window_seconds=0)
+        if values[key] is None or age < armed_after:
+            continue
+        if entry["last"] is None:
+            entry["processes_armed"] += 1
+        else:
+            entry["armed_seconds"] += now - entry["last"]
+            entry["window_seconds"] += now - entry["last"]
+            entry["longest_seconds"] = max(entry["longest_seconds"], entry["window_seconds"])
+        entry["samples"] += 1
+        entry["last"] = now
+
+
+def exposure_lines(state, gated):
+    """The record's table of armed time per node and leak checker; a final
+    tier gates on it, other tiers record it."""
+    short = set(exposure_shortfalls(state))
+    lines = [f"## Leak-checker exposure ({'gated' if gated else 'recorded, not gated'})", "",
+             "How long each leak checker could judge each node's Bun. `leak-rss` arms after "
+             f"{RSS_WARMUP // 60} minutes in one process and `leak-fd` after "
+             f"{(FD_WARMUP + (FD_RISES + 1) * FD_BUCKET) // 60}; a restart, kill or upgrade exec starts the warm-up "
+             f"again. A final needs each armed for {EXPOSURE_ARMED_SECONDS // 60} minutes on every node, with one "
+             f"unbroken window of {EXPOSURE_WINDOW_SECONDS // 60} (#1062); its quiet tail gives them that.", "",
+             "| Node | Checker | Armed | Longest armed window | Evaluated samples | Processes armed | Verdict |",
+             "|---|---|---|---|---|---|---|"]
+    for node in state.get("nodes", []):
+        for check, _, _ in CHECKER_ARMED_AFTER:
+            entry = state.get("exposure", {}).get(node, {}).get(check, {})
+            verdict = ("SHORT" if gated else "short") if (node, check) in short else "ok"
+            lines.append(f"| {node} | {check} | {entry.get('armed_seconds', 0) // 60} min | "
+                         f"{entry.get('longest_seconds', 0) // 60} min | {entry.get('samples', 0)} | "
+                         f"{entry.get('processes_armed', 0)} | {verdict} |")
+    return lines + [""]
 
 
 def job_metric_samples(state, node, inventory, now):
@@ -1398,10 +1493,204 @@ def expected_renewals(elapsed, period):
 
 
 FINAL_TIER_SECONDS = 8 * 3600
+# A final ends with a quiet tail after its 8 hours of faults: no faults, walks
+# or specials, so every node's Bun lives long enough to arm the leak checkers
+# and give them comparison samples (#1062, maintainer decision 20 October
+# 2026). Each checker must be armed this long on every node, with one
+# unbroken window at least EXPOSURE_WINDOW_SECONDS long; a fast or custom run
+# records its exposure without gating on it. qualify-sustained.sh has the
+# same tail length. Two hours would be the warm-up plus the armed hour, but
+# the last cycle's graceful stop comes after its heavy sample, so each new Bun
+# is first seen up to one heavy interval (300 s) into the tail, and every
+# heavy observe pushes the next one back by its own run time. The extra
+# 15 minutes cover that sampling.
+QUIET_TAIL_SECONDS = 2 * 3600 + 15 * 60
+EXPOSURE_ARMED_SECONDS = 3600
+EXPOSURE_WINDOW_SECONDS = 1800
+
+# The execution inventory (#1061). The schedule below mirrors run_cycle and
+# special_for_cycle in qualify-sustained.sh; test_sustained_check compares
+# it with the harness's --plan, so the two can't drift apart unnoticed.
+CHAOS_KINDS = ("kill", "delay", "partition", "scenario", "pause", "drop", "dns", "cpu", "memory")
+SCHEDULES = {"full": dict(cycle=3600, chaos_per_slot=3, pulse_every=1, export_every=6),
+             "compressed": dict(cycle=600, chaos_per_slot=2, pulse_every=0, export_every=2)}
+CANDIDATE_ITEM = "candidate.json bytes match the qualified digest"
+BASELINE_ITEM = "app workloads settled at the baseline"
+WALK_ITEM = "upgrade walk (to the soak build and back)"
+PULSE_ITEM = "catalogue pulse"
+EXPORT_ITEM = "offline export"
+DRAIN_ITEM = "job campaign drained in its final two minutes"
+QUIET_ITEM = "quiet tail with no faults, walks or specials"
+SLOT_FAULTS = ("fault:bun-kill-follower", "fault:bun-kill-leader", "fault:deploy-kill", "fault:power-off")
+SPECIALS = ("special:graceful-stop", "special:quorum-loss", "special:all-off")
 
 
-def acceptance_line(metadata, result, elapsed):
-    """What the run says about the V02 gate (plan D3): only a clean final tier passes it."""
+def required_execution(metadata):
+    """What a run must have completed, as {item: count}.
+
+    A final tier is held to the 8-hour full schedule with upgrade walks
+    whatever its metadata says about schedule, length or soak build, so
+    relabelling a shorter run can't lower the bar. Node faults are required
+    when the run says it injected them. Other tiers get the schedule they
+    say they ran; their inventory is recorded, not gated. The counts are the
+    cycles every run completes (min_cycles in the harness), so a run whose
+    slots overran still owes them. Each fault kind is owed once; walks,
+    specials, pulses and exports are owed as often as the schedule runs them."""
+    final = metadata.get("tier") == "final"
+    schedule = "full" if final else metadata.get("schedule", "full")
+    if schedule not in SCHEDULES:
+        schedule = "full"
+    plan = SCHEDULES[schedule]
+    duration = FINAL_TIER_SECONDS if final else int(metadata.get("duration_target") or 0)
+    walks = final or not str(metadata.get("soak_bun", "")).startswith("not supplied")
+    cycles = duration // plan["cycle"] if schedule == "full" else 4
+    hours = max(duration // 3600, 1)
+    half = max(hours // 2, 1)
+    required = {CANDIDATE_ITEM: 1, BASELINE_ITEM: 1, WALK_ITEM: 0}
+    slots = {phase: 0 for phase in SLOT_FAULTS}
+    specials = {phase: 0 for phase in SPECIALS}
+    node_kinds = {}
+    pulses = exports = chaos_rounds = 0
+    for index in range(cycles):
+        slots["fault:bun-kill-follower"] += 1
+        slots["fault:bun-kill-leader"] += 1
+        if index % 2 == 1 and walks:
+            required[WALK_ITEM] += 1
+            if schedule == "compressed":
+                chaos_rounds += plan["chaos_per_slot"]
+        else:
+            slots["fault:deploy-kill"] += 1
+            slots["fault:power-off"] += 1
+            chaos_rounds += plan["chaos_per_slot"]
+        if metadata.get("node_faults") is True:
+            kind = "fault:node-" + job_soak.NODE_FAULT_KINDS[index % 3]
+            node_kinds[kind] = 1
+        if (plan["pulse_every"] and index % plan["pulse_every"] == 0) or (schedule == "compressed" and index == 0):
+            pulses += 1
+        if index % plan["export_every"] == plan["export_every"] - 1:
+            exports += 1
+        if schedule == "compressed":
+            if 1 <= index <= 3:
+                specials[SPECIALS[index - 1]] += 1
+            continue
+        hour = index + 1
+        if hour % half == 0:
+            specials["special:graceful-stop"] += 1
+        if hour in ((hours * 40 + 50) // 100, (hours * 85 + 50) // 100):
+            specials["special:quorum-loss"] += 1
+        if hour == (hours * 70 + 50) // 100:
+            specials["special:all-off"] += 1
+    for phase, count in slots.items():
+        if count:
+            required[phase] = 1
+    for round_index in range(min(chaos_rounds, len(CHAOS_KINDS))):
+        required["fault:chaos-" + CHAOS_KINDS[round_index]] = 1
+    required.update(node_kinds)
+    required.update({phase: count for phase, count in specials.items() if count})
+    if pulses:
+        required[PULSE_ITEM] = pulses
+    if exports:
+        required[EXPORT_ITEM] = exports
+    if final:
+        required[QUIET_ITEM] = 1
+    required[DRAIN_ITEM] = 1
+    if not required[WALK_ITEM]:
+        del required[WALK_ITEM]
+    return required
+
+
+def candidate_verified(evidence, metadata):
+    """The candidate is known only when this run bootstrapped from it and the
+    bytes it kept hash to the digest it was asked to qualify. An adopted
+    --home installed whatever it installed before this run looked."""
+    digest = str(metadata.get("qualified_digest") or "")
+    path = Path(evidence) / "candidate.json"
+    if metadata.get("bootstrapped") not in (True, "true") or not re.fullmatch(r"[0-9a-f]{64}", digest) or not path.is_file():
+        return False
+    return hashlib.sha256(path.read_bytes()).hexdigest() == digest
+
+
+def completed_execution(evidence, metadata, events, job_report):
+    """What the run actually completed, as {item: count}, from its events,
+    the candidate bytes it kept and the job controller's final snapshot.
+
+    A fault counts once it was injected (no failed or refused injection) and
+    the cluster settled after it; a walk once it reached the soak build,
+    rolled back and settled; quorum loss once quorum came back too."""
+    def count(phase, **match):
+        return sum(1 for event in events if event.get("phase") == phase
+                   and all(event.get(key) == value for key, value in match.items()))
+
+    def injected(phase):
+        return sum(1 for event in events if event.get("phase") == phase and event.get("settle_seconds") is None
+                   and event.get("verdict") in (None, "ok") and event.get("exit") in (None, 0))
+
+    completed = {CANDIDATE_ITEM: 1 if candidate_verified(evidence, metadata) else 0,
+                 BASELINE_ITEM: min(count("baseline", verdict="ok"), 1),
+                 WALK_ITEM: min(count("upgrade:upgrade", verdict="ok"), count("upgrade:rollback", verdict="ok"),
+                                count("upgrade:settle", verdict="settled")),
+                 PULSE_ITEM: count("pulse", verdict="ok"),
+                 EXPORT_ITEM: count("storage:offline-export", verdict="ok")}
+    phases = {event.get("phase", "") for event in events}
+    for phase in phases | set(SLOT_FAULTS) | set(SPECIALS):
+        if phase.startswith(("fault:", "special:")) and phase != "special:quorum-back":
+            completed[phase] = min(injected(phase), count(phase, verdict="settled"))
+    completed["special:quorum-loss"] = min(completed["special:quorum-loss"], count("special:quorum-back", verdict="ok"))
+    report = job_report if isinstance(job_report, dict) else {}
+    stop = report.get("stop_requested_at")
+    drained = (metadata.get("job_soak") is True and report.get("stopped") is True and not report.get("active")
+               and type(stop) is int and stop >= metadata.get("job_stop_at", 0))
+    completed[DRAIN_ITEM] = 1 if drained else 0
+    completed[QUIET_ITEM] = quiet_tails(events)
+    return completed
+
+
+def quiet_tails(events):
+    """Quiet tails that lasted QUIET_TAIL_SECONDS (a minute's slack for the
+    clock) with no fault, walk or special inside them."""
+    complete, started, disturbed = 0, None, False
+    for event in events:
+        phase = event.get("phase", "")
+        if phase == "quiet" and event.get("verdict") is None:
+            started, disturbed = event.get("ts"), False
+        elif phase == "quiet" and started is not None:
+            if event.get("verdict") == "ok" and (event.get("duration") or 0) >= QUIET_TAIL_SECONDS - 60 and not disturbed:
+                complete += 1
+            started = None
+        elif started is not None and phase.startswith(("fault:", "upgrade", "special:")):
+            disturbed = True
+    return complete
+
+
+def exposure_shortfalls(state):
+    """(node, checker) pairs armed too briefly, or never for one unbroken window."""
+    short = []
+    for node in state.get("nodes", []):
+        for check, _, _ in CHECKER_ARMED_AFTER:
+            entry = state.get("exposure", {}).get(node, {}).get(check, {})
+            if (entry.get("armed_seconds", 0) < EXPOSURE_ARMED_SECONDS
+                    or entry.get("longest_seconds", 0) < EXPOSURE_WINDOW_SECONDS):
+                short.append((node, check))
+    return short
+
+
+def execution_inventory(evidence, metadata, events, job_report):
+    """Rows of (item, required, completed) in the order the record lists them."""
+    required = required_execution(metadata)
+    completed = completed_execution(evidence, metadata, events, job_report)
+    return [(item, need, completed.get(item, 0)) for item, need in required.items()]
+
+
+def job_final_ran(metadata, job_report, missing):
+    """A job final is the job controller at the target load with every node
+    fault completed; the labels alone don't make one."""
+    return (metadata.get("node_faults") is True and isinstance(job_report, dict) and job_report.get("load") == "target"
+            and not [item for item in missing if item.startswith("fault:node-")])
+
+
+def acceptance_line(metadata, result, elapsed, missing=(), job_final=False, exposure=()):
+    """What the run says about the V02 gate (plan D3) and the release gate's
+    final soak (#991): only a clean, complete final tier passes either."""
     tier = metadata.get("tier") or "custom"
     clean = result == "PASS"
     if tier == "fast":
@@ -1410,23 +1699,34 @@ def acceptance_line(metadata, result, elapsed):
                     "final-tier run (8 h, full schedule) on the final candidate.")
         return "**Fast tier: not clean.** Fix what failed and run the fast tier again before a final-tier run."
     if tier != "final":
-        return "**No tier (a custom run).** Neither tier's evidence, so it says nothing about the V02 gate."
-    if not clean:
-        return ("**Final tier: not clean. The V02 gate does not pass.** A product fix means a fresh fast-tier run, "
-                "then a fresh final-tier run.")
+        return ("**Custom run: diagnostic only.** It ran no tier, so it says nothing about the V02 gate or the "
+                "release gate's final soak.")
     shortfalls = []
     if metadata.get("schedule", "full") != "full":
         shortfalls.append(f"it ran the {metadata['schedule']} schedule")
     if min(elapsed, metadata.get("duration_target") or 0) < FINAL_TIER_SECONDS:
         shortfalls.append(f"it soaked for {duration_text(elapsed)}")
-    digest = metadata.get("candidate_digest") or "`not checked`"
-    if "not checked" in digest:
-        shortfalls.append("the candidate digest was not checked (--qualified-digest)")
+    gaps = (["missing from the execution inventory: " + ", ".join(missing)] if missing else []) + (
+        ["leak-checker exposure too short: " + ", ".join(f"{node} {check}" for node, check in exposure)]
+        if exposure else [])
+    if not clean:
+        return ("**Final tier: not clean. The V02 gate does not pass.** A product fix means a fresh fast-tier run, "
+                "then a fresh final-tier run." + (" It is incomplete too: " + "; ".join(gaps) + "." if gaps else ""))
+    if gaps:
+        return ("**Final tier: incomplete. It passes neither the V02 gate nor the release gate's final soak:** "
+                + "; ".join(shortfalls + gaps)
+                + ". A final tier owes every walk, fault kind and special of its 8-hour schedule, then a quiet tail "
+                "long enough to arm every leak checker on every node.")
     if shortfalls:
         return (f"**Final tier: clean, but not acceptance:** {'; '.join(shortfalls)}. The V02 gate needs 8 h on "
                 "the full schedule against a pinned candidate.")
-    return (f"**Final tier: clean. The V02 soak gate passes** for the candidate whose `candidate.json` has "
-            f"SHA-256 {digest}, if it is the final candidate.")
+    digest = f"`{metadata.get('qualified_digest')}`"
+    if job_final:
+        return (f"**Final job tier: clean. The release gate's final soak passes** for the candidate whose "
+                f"`candidate.json` has SHA-256 {digest}, if it is the final candidate.")
+    return (f"**Final tier (V02 alone): clean. The V02 soak gate passes** for the candidate whose `candidate.json` "
+            f"has SHA-256 {digest}, if it is the final candidate. It is not the release gate's final soak, which is "
+            "the job final (`qualify-jobs-sustained.sh --tier final`, #991).")
 
 
 def render(evidence, record):
@@ -1472,7 +1772,11 @@ def render(evidence, record):
             if observed.get("complete") is not True or observed.get("ts",0)<(job_report or {}).get("heartbeat",0) or observed.get("live_owners")!=0:
                 job_missing.append(node+" lacks a complete empty owner inventory after campaign drain")
         gates.append(("mixed job campaign and positive drain",str(len(job_missing))+" missing/failing checks","0","FAIL" if job_missing else "PASS"))
-    gate_failed = any(row[3] == "FAIL" for row in gates)
+    inventory = execution_inventory(evidence, metadata, events, job_report)
+    missing = [item for item, need, done in inventory if done < need]
+    final_tier = metadata.get("tier") == "final"
+    exposure = exposure_shortfalls(state)
+    gate_failed = any(row[3] == "FAIL" for row in gates) or (final_tier and bool(missing or exposure))
     open_failures = [row for row in failures if row.get("disposition", "open") == "open"]
     result = metadata.get("result") or ("FAIL" if open_failures or gate_failed else "PASS")
     if (open_failures or gate_failed) and result == "PASS":
@@ -1482,7 +1786,11 @@ def render(evidence, record):
     lines = [f"# Sustained soak (V02): {result}", ""]
     lines += [f"{time.strftime('%-d %B %Y', time.gmtime(started))}. {tier} tier, {metadata.get('schedule', 'full')} "
               f"schedule, {duration_text(elapsed)} of soak on a three-node quickstart cluster.", ""]
-    lines += [acceptance_line(metadata, result, elapsed), ""]
+    # The acceptance line tells a failed check apart from a run that was clean but incomplete.
+    clean_apart_from_inventory = "FAIL" if open_failures or metadata.get("result") == "FAIL" or any(
+        row[3] == "FAIL" for row in gates) else "PASS"
+    lines += [acceptance_line(metadata, clean_apart_from_inventory, elapsed, missing if final_tier else (),
+                              job_final_ran(metadata, job_report, missing), exposure if final_tier else ()), ""]
     lines += ["## Candidate and host", "", "| | |", "|---|---|"]
     for key, label in (("base_url", "Staged base URL"), ("candidate_digest", "`candidate.json` SHA-256"),
                        ("versions", "Running versions"), ("soak_bun", "Soak build"),
@@ -1499,6 +1807,11 @@ def render(evidence, record):
     if paused:
         lines.append(f"- Soak clock paused for {duration_text(paused)} (environment)")
     lines.append(f"- Cycles completed: {metadata.get('cycles', 0)}")
+    choices_path = evidence / "choices.json"
+    if choices_path.exists():
+        choices = json.loads(choices_path.read_text())
+        lines.append(f"- Fault and node choices: {choices['draws']}, from seed {choices['seed']} "
+                     f"(`--seed {choices['seed']}` repeats them)")
     if metadata.get("teardown"):
         lines.append(f"- Teardown: {metadata['teardown']}")
     lines.append("")
@@ -1524,6 +1837,19 @@ def render(evidence, record):
         timing = f"{seconds[len(seconds) // 2]} s / {seconds[-1]} s" if seconds else "n/a"
         lines.append(f"| {phase} | {entry['runs']} | {entry['settled']} | {entry['failed']} | {entry['skipped']} | {timing} |")
     lines.append("")
+    lines += [f"## Execution inventory ({'gated' if final_tier else 'recorded, not gated'})", "",
+              "What the run completed, from its events and kept bytes, against what its schedule owes. "
+              "A fault counts once it was injected and the cluster settled after it.", "",
+              "| Item | Required | Completed | Verdict |", "|---|---|---|---|"]
+    lines += [f"| {item} | {need} | {done} | {'ok' if done >= need else 'MISSING'} |" for item, need, done in inventory]
+    lines.append("")
+    effects = [event for event in events if event.get("phase", "").startswith("effect:")]
+    if effects:
+        lines += ["## Observed fault effects", "", "What each injected fault was seen to do, read back from the node.", "",
+                  "| Fault | Target | Observed |", "|---|---|---|"]
+        lines += [f"| {event['phase']} | {event.get('target', '')} | "
+                  f"{str(event.get('detail', '')).replace('|', '/').replace(chr(10), ' ')} |" for event in effects]
+        lines.append("")
     lines += ["## Renewals and rotations", "", "| Measure | Observed | Required | Verdict |", "|---|---|---|---|"]
     lines += [f"| {label} | {observed} | {need} | {verdict} |" for label, observed, need, verdict in gates]
     lines.append("")
@@ -1569,6 +1895,7 @@ def render(evidence, record):
     if progress:
         lines.append(f"- Last observed progress: {', '.join(f'{key} {value}' for key, value in sorted(progress.items()))}")
     lines.append("")
+    lines += exposure_lines(state, final_tier)
     lines += ["## Resource trends", "", "| Node | Measure | First | Last | Max |", "|---|---|---|---|---|"]
     for node, trend in sorted(state.get("trends", {}).items()):
         for measure, entry in sorted(trend.items()):
@@ -1757,6 +2084,14 @@ def main(argv=None):
     failures = commands.add_parser("test-failures", help="why a relish test JSON run failed (#1068)")
     failures.add_argument("report")
     failures.add_argument("stderr", nargs="?")
+    seed = commands.add_parser("seed", help="start or resume the run's seeded choices (#1062)")
+    seed.add_argument("evidence")
+    seed.add_argument("--seed", type=int)
+    choice = commands.add_parser("choose", help="the run's next seeded choice, logged")
+    choice.add_argument("evidence")
+    choice.add_argument("what")
+    choice.add_argument("low", type=int)
+    choice.add_argument("high", type=int)
     record = commands.add_parser("render")
     record.add_argument("evidence")
     record.add_argument("record")
@@ -1857,6 +2192,16 @@ def main(argv=None):
     if args.command == "test-failures":
         stderr_text = Path(args.stderr).read_text(errors="replace") if args.stderr and Path(args.stderr).exists() else ""
         print(test_failure_reasons(Path(args.report).read_text(errors="replace"), stderr_text))
+        return 0
+    if args.command == "seed":
+        try:
+            print(start_choices(args.evidence, args.seed))
+        except ValueError as error:
+            print(f"sustained_check: {error}", file=sys.stderr)
+            return 1
+        return 0
+    if args.command == "choose":
+        print(choose(args.evidence, args.what, args.low, args.high))
         return 0
     if args.command == "render-charts":
         directory = Path(args.directory)

@@ -636,7 +636,8 @@ the real `curl … | sh` install against it on every host we advertise.
    `candidate.json`, that setup used the mirror, and that the installed CLI,
    both Linux binaries and the guest image are candidate assets. Then it
    applies the podinfo tour, runs `status`, `path` and `metrics`, requires
-   `relish wtf` to check GitOps on every node, not leave it UNKNOWN (#1286), destroys the
+   `relish wtf` to check GitOps on every node, not leave it UNKNOWN (#1286), builds and
+   applies the burger demo and requires a whole burger through the ingress, destroys the
    cluster, uninstalls, and writes a Markdown record with the timings. It never
    uses `~/.reliaburger` and fails if that directory's top level or
    `~/.local/bin/relish` changed. Pass `setup --quickstart` options after
@@ -660,20 +661,61 @@ the real `curl … | sh` install against it on every host we advertise.
      --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.1.0-soak.1
    ```
 
-   The final tier is 8 hours on the full schedule, which catches slow
-   accumulation. The release gate runs it once, as the job final below
+   The final tier is 8 hours of faults on the full schedule, then a quiet
+   tail of 2 hours 15 minutes (about 10½ hours in all), which catches slow
+   accumulation. The
+   release gate runs it once, as the job final below
    (`qualify-jobs-sustained.sh --tier final`): that's the same soak with the
    job campaign and a node fault added to each cycle, so it checks
    everything the V02 final does, plus the jobs. All the final soaks fit in
-   one 8-hour slot that way (maintainer decision, 17 October 2026,
+   one slot of about 10 hours that way (maintainer decision, 17 October 2026,
    [#991](https://github.com/reliaburger/reliaburger/issues/991)).
    `qualify-sustained.sh --tier final` still runs the V02 final on its own,
    for example to separate a job problem from a cluster one, but it isn't a
    release step.
 
    The record's second paragraph states the verdict. A fast run can only say
-   "fast tier: clean"; only a clean final-tier run, 8 hours on the full
-   schedule with the digest checked, says the V02 gate passes. A product fix
+   "fast tier: clean", and a run without a tier is a diagnostic that says
+   nothing about either gate. Only a clean, complete final-tier run, 8 hours
+   of faults on the full schedule and its quiet tail, says a gate passes: "the V02 soak gate passes" for
+   `qualify-sustained.sh --tier final`, "the release gate's final soak
+   passes" only for the job final, whose job controller ran the target load
+   and whose node faults all completed. Complete means the record's execution
+   inventory has nothing missing
+   ([#1061](https://github.com/reliaburger/reliaburger/issues/1061)): every
+   upgrade walk the schedule owes (to the soak build, back and settled), every
+   fault kind and node fault injected and settled, every special (quorum loss
+   with quorum back), every catalogue pulse and offline export, the app
+   workloads settled at the baseline, the quiet tail with nothing injected,
+   walked or stopped in it, the job campaign drained after it, and the `candidate.json` bytes this run downloaded hashing to
+   `--qualified-digest`. The checker counts these from the run's events and
+   kept bytes against the 8-hour full schedule, whatever the metadata says, so
+   relabelling a shorter run can't promote it. A final tier refuses to start
+   without `--soak-bun` or `--qualified-digest`, or with `--home`, since it
+   could only end incomplete. Fast and custom runs show their inventory too,
+   recorded but not gated.
+
+   Every fault and node choice (which node, how long, after how many
+   seconds) comes from one seed, and each is logged as a `choice` event
+   ([#1062](https://github.com/reliaburger/reliaburger/issues/1062)). The
+   record names the seed; `--seed N` repeats a run's choices in the same
+   order, and `--resume` carries on with the run's own seed. The record also
+   lists what each fault was seen to do (Bun's pid before and after a kill,
+   Lima's status after a power-off, the netem qdisc, free bytes or I/O limits
+   a node fault left), and how long each leak checker (`leak-rss`,
+   `leak-fd`) could judge each node: a restart, kill or upgrade exec starts
+   its warm-up again, and the fault schedule restarts every node's Bun more
+   often than `leak-rss`'s hour-long warm-up. So a final ends with a quiet
+   tail: 2 hours 15 minutes after the last cycle with no faults, walks or
+   specials, while the apps and jobs keep running and the checks carry on.
+   That's an hour to arm `leak-rss`, an hour of comparison samples, and 15
+   minutes for the sampling: the last cycle's graceful stop comes after its
+   heavy sample, so a new Bun is first seen up to five minutes into the tail,
+   and each heavy observe delays the next by its own run time. A final fails
+   unless both checkers were armed for at least 60 minutes on every node,
+   with one unbroken window of at least 30 (maintainer decision, 20 October
+   2026, [#1062](https://github.com/reliaburger/reliaburger/issues/1062)).
+   Fast and custom runs record their exposure without gating on it. A product fix
    found during the final run means a new candidate, a fresh fast run and
    then a fresh final run. `--resume --evidence DIR` continues an interrupted
    run with its original tier. The [0.1.0 release closure
@@ -689,8 +731,8 @@ the real `curl … | sh` install against it on every host we advertise.
    cron/hooks/publication fixtures. It opts the disposable nodes into mixed
    runtime and allowlists a host BusyBox copy from the pinned container image.
    The verifier binds each private VM address on TCP 8189 with a separate token.
-   Drain begins once the last cycle and its special are over (#1338); tier
-   and recovery budgets stay unchanged. Missing support or incomplete coverage fails instead of skipping
+   Drain begins once the last cycle, its special and any quiet tail are over
+   (#1338); tier and recovery budgets stay unchanged. Missing support or incomplete coverage fails instead of skipping
    a mode. A local smoke check is not staged fast/final acceptance, and global
    storage bounds remain #668.
 
@@ -699,7 +741,8 @@ the real `curl … | sh` install against it on every host we advertise.
    three nodes, at 1,158 accepted successes a second or more (the rate of
    100 million a day) plus headroom, with concurrent apps, several resource
    profiles, worker and leader loss, delayed messages and disk faults. The
-   final tier runs 8 hours on the 3-node quickstart cluster, with every fault
+   final tier runs 8 hours of faults and a 2¼-hour quiet tail on the 3-node
+   quickstart cluster, with every fault
    and at the default 1,390 a second, and it is the release gate's only final
    soak ([#991](https://github.com/reliaburger/reliaburger/issues/991),
    above). `qualify-jobs-sustained.sh` runs it through the same soak,
@@ -726,7 +769,8 @@ the real `curl … | sh` install against it on every host we advertise.
    scripts/release/qualify-jobs-sustained.sh --tier fast \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
      --qualified-digest QUALIFIED_DIGEST
-   # 8 hours on the full schedule, on the final candidate: the one final soak.
+   # 8 hours of faults on the full schedule, then a 2¼-hour quiet tail, on the
+   # final candidate: the one final soak.
    scripts/release/qualify-jobs-sustained.sh --tier final \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
      --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.2.0-soak.1 \
@@ -942,12 +986,16 @@ What it covers, and what it doesn't:
   wouldn't fit next to about 45 minutes of setup, one cycle that starts just
   before the end and teardown: up to 285 minutes compressed, 235 minutes on
   the full schedule. That covers the compressed (fast) tier and full-schedule
-  runs of about four hours. The 8-hour final tier, and the 12-hour lane A run,
+  runs of about four hours. The final tier (about 10½ hours), and the 12-hour lane A run,
   still need a long-running host or a self-hosted runner.
-- **No upgrade walks.** They need a private soak build (`0.1.0-soak.1`) signed
-  with the release key (D2), and nothing in CI signs with it, so the harness
-  skips the upgrade slots and the record says so. Run those on a host that
-  holds the key.
+- **No upgrade walks, so it's a diagnostic.** They need a private soak build
+  (`0.1.0-soak.1`) signed with the release key (D2), and nothing in CI signs
+  with it, so the harness skips the upgrade slots and the record says so.
+  Without them no run can complete a tier's execution inventory, so the
+  workflow passes `--tier custom` and the record calls the run a diagnostic
+  that says nothing about either gate
+  ([#1061](https://github.com/reliaburger/reliaburger/issues/1061)). Run the
+  tiers on a host that holds the key.
 - **One platform.** Linux x86_64 with Lima's QEMU driver. The macOS VZ path is
   lane A's host.
 

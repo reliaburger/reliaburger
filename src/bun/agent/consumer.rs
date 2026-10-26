@@ -192,6 +192,49 @@ impl ConsumerSyncs {
     }
 }
 
+/// Leader acknowledgements of locally proven receipts, and the journal
+/// write that forgets them (#1340). A confirmation changes the ownership as
+/// it is on disk, so it waits for any write in flight, but never on the
+/// loop: it waits here, and the loop takes it in a turn of its own once the
+/// journal is free.
+#[derive(Default)]
+pub(super) struct ReceiptConfirmations {
+    /// Acknowledgements the journal hasn't been asked to forget yet.
+    waiting: Vec<ReceiptConfirmation>,
+    /// Acknowledgements whose write outlasted its turn, answered once it lands.
+    forgetting: Vec<ReceiptConfirmation>,
+}
+
+/// The leader's exact acknowledgement of one receipt, and whoever waits to
+/// hear that the receipt is forgotten.
+struct ReceiptConfirmation {
+    generation: u64,
+    response: oneshot::Sender<Result<(), BunError>>,
+}
+
+impl ReceiptConfirmations {
+    /// Some acknowledgement waits for the journal to be free.
+    pub(super) fn is_waiting(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
+    /// Answer the acknowledgements whose write has just landed.
+    pub(super) fn write_landed(&mut self, result: &Result<(), BunError>) {
+        answer_receipts(std::mem::take(&mut self.forgetting), result);
+    }
+}
+
+/// Tell each confirmation how its write ended.
+fn answer_receipts(confirmations: Vec<ReceiptConfirmation>, result: &Result<(), BunError>) {
+    for confirmation in confirmations {
+        let answer = match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(failure(error)),
+        };
+        let _ = confirmation.response.send(answer);
+    }
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// The consumer's durable ownership. While a step's write is in flight
     /// this is the ownership before it; the view that write records counts
@@ -223,6 +266,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         next: ConsumerOwnership,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<Landing, BunError> {
+        self.write_consumer_for(next, deadline, WriteOwner::ConsumerStep)
+            .await
+    }
+
+    /// [`Self::write_consumer`], for `owner` to take over if the write
+    /// outlasts `deadline`.
+    async fn write_consumer_for(
+        &mut self,
+        next: ConsumerOwnership,
+        deadline: Option<tokio::time::Instant>,
+        owner: WriteOwner,
+    ) -> Result<Landing, BunError> {
         // `next` was built from the journal as it is: no write in flight.
         if self.discovery_write_in_flight() {
             return Err(failure("a consumer journal write is still in flight"));
@@ -234,7 +289,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             &ServiceId::new("system", "discovery"),
             |inventory| inventory.consumer = Some(next),
             deadline,
-            WriteOwner::ConsumerStep,
+            owner,
         )
         .await
     }
@@ -1101,25 +1156,88 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Forget only a locally proven receipt after its exact leader acknowledgement.
-    pub(super) async fn confirm_consumer_receipt(
+    /// Take the leader's exact acknowledgement of receipt `generation`, and
+    /// forget the receipt now if the journal is free. `response` hears once
+    /// forgetting it is durable, or why it wasn't forgotten (#1340).
+    pub(super) async fn request_receipt_confirmation(
         &mut self,
         generation: u64,
-    ) -> Result<(), BunError> {
-        // Change the ownership as it is on disk, after any write in flight.
-        self.settle_discovery_write().await;
-        let mut owner = self
-            .consumer_owner()
-            .cloned()
-            .ok_or_else(|| failure("consumer ownership is unavailable"))?;
-        let Some(receipt) = owner.receipts.get(&generation) else {
-            return Ok(());
-        };
-        if receipt.phase != ReceiptPhase::Ready {
-            return Err(failure("consumer receipt has no local withdrawal proof"));
+        response: oneshot::Sender<Result<(), BunError>>,
+    ) {
+        self.receipt_confirmations
+            .waiting
+            .push(ReceiptConfirmation {
+                generation,
+                response,
+            });
+        self.confirm_waiting_receipts().await;
+    }
+
+    /// Start the loop's turn for acknowledgements that waited for the journal.
+    pub(super) fn begin_receipt_turn(&mut self) -> crate::bun::loop_meter::Turn {
+        self.begin_turn(
+            crate::bun::loop_meter::LoopBranch::FollowUp,
+            Some("consumer_receipt/confirm"),
+        )
+    }
+
+    /// Forget every waiting receipt the leader acknowledged, in one journal
+    /// write. Only a locally proven receipt is forgotten; one that isn't is
+    /// refused at once, and one already forgotten is confirmed at once.
+    ///
+    /// The receipts change as they are on disk, after any write in flight.
+    /// Inside a turn that write isn't waited for: the acknowledgements wait,
+    /// and the loop comes back once it has landed. The write itself waits
+    /// only until the turn's deadline (#1340); one still going carries on
+    /// off the loop, and the turn that lands it answers. Until then the
+    /// receipt is still on disk, so the leader keeps hearing about it, as
+    /// after a crash, and acknowledges it again.
+    pub(super) async fn confirm_waiting_receipts(&mut self) {
+        if !self.receipt_confirmations.is_waiting() {
+            return;
         }
-        owner.receipts.remove(&generation);
-        self.save_consumer(owner).await
+        if self.settle_discovery_write_outside_turn().await == Landing::InFlight {
+            return;
+        }
+        let waiting = std::mem::take(&mut self.receipt_confirmations.waiting);
+        let Some(durable) = self.consumer_owner() else {
+            answer_receipts(waiting, &Err(failure("consumer ownership is unavailable")));
+            return;
+        };
+        let mut owner = durable.clone();
+        let mut forgetting = Vec::new();
+        for confirmation in waiting {
+            let proven = durable
+                .receipts
+                .get(&confirmation.generation)
+                .map(|receipt| receipt.phase == ReceiptPhase::Ready);
+            match proven {
+                None => {
+                    let _ = confirmation.response.send(Ok(()));
+                }
+                Some(true) => {
+                    owner.receipts.remove(&confirmation.generation);
+                    forgetting.push(confirmation);
+                }
+                Some(false) => {
+                    let _ = confirmation.response.send(Err(failure(
+                        "consumer receipt has no local withdrawal proof",
+                    )));
+                }
+            }
+        }
+        if forgetting.is_empty() {
+            return;
+        }
+        let deadline = self.turn_deadline();
+        let written = self
+            .write_consumer_for(owner, Some(deadline), WriteOwner::ConsumerReceipts)
+            .await;
+        match written {
+            Ok(Landing::InFlight) => self.receipt_confirmations.forgetting.extend(forgetting),
+            Ok(Landing::Landed) => answer_receipts(forgetting, &Ok(())),
+            Err(error) => answer_receipts(forgetting, &Err(error)),
+        }
     }
 
     /// Mark the published view out of date after a local change. The agent

@@ -46,7 +46,13 @@ async fn wait_for(path: &Path) {
     .unwrap();
 }
 
+#[path = "support/first_launch.rs"]
+mod first_launch;
+
+/// The owner executable, its first launch paid: every command's owner is a
+/// `bun` that `start` gives 15 s to answer (#1149).
 fn bun() -> std::path::PathBuf {
+    first_launch::first_launch(&[(Path::new(env!("CARGO_BIN_EXE_bun")), &["--version"])]);
     env!("CARGO_BIN_EXE_bun").into()
 }
 
@@ -228,6 +234,9 @@ async fn timed_out_mutation_is_retired_before_cleanup_and_sealing_fences_new_wor
 #[tokio::test]
 async fn killed_caller_cannot_leave_a_late_mutation_after_recovered_cleanup() {
     let root = tempfile::tempdir().unwrap();
+    // The fixture child starts `bun` as its owner inside the wait below, so
+    // pay that first launch here (#1149).
+    let _ = bun();
     let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "runtime_command_fixture", "--nocapture"])
         .env("RELIABURGER_COMMAND_FIXTURE", root.path())
@@ -265,6 +274,9 @@ async fn killed_caller_cannot_leave_a_late_mutation_after_recovered_cleanup() {
 #[tokio::test]
 async fn the_next_process_waits_for_a_mutation_its_predecessor_left_running() {
     let root = tempfile::tempdir().unwrap();
+    // The fixture child starts `bun` as its owner inside the wait below, so
+    // pay that first launch here (#1149).
+    let _ = bun();
     let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "runtime_command_fixture", "--nocapture"])
         .env("RELIABURGER_COMMAND_FIXTURE", root.path())

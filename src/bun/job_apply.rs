@@ -324,7 +324,7 @@ pub(crate) async fn settle(state: &ApiState) {
         }
         if let Some(council) = &state.council {
             let result = tokio::time::timeout(
-                WRITE_TIMEOUT,
+                state.task_arrays.write_timeout(),
                 council.write(RaftRequest::JobApplyCommit {
                     operation_id: id.into(),
                     now_epoch_secs: now,

@@ -72,6 +72,8 @@ fn a_late_start_up_error_exits_without_waiting_for_the_binary_hash() {
     std::fs::create_dir_all(data.join("discovery")).unwrap();
 
     let config = write_config(root.path(), &binary_dir);
+    // Pay `bun`'s first launch before the deadline below starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let mut child = Command::new(env!("CARGO_BIN_EXE_bun"))
         .arg("--config")
         .arg(&config)

@@ -37,40 +37,42 @@ trying it out, not for production.
 # Install relish and build a three-node cluster in Linux VMs on this laptop
 curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
 
-# Run a real Kubernetes app: podinfo's frontend, backend and Redis
-relish apply -f https://reliaburger.com/demo/podinfo.yaml
-relish status                        # frontend-0, -1 and -2, one on each node
-relish council status                # every node's view of the council
-open http://podinfo.localhost:18080  # through the built-in ingress
-
-# Build a small Go app on the cluster (Buildah on a node, into the built-in
-# registry, signed), then run it next to podinfo
+# Build a burger on the cluster (Buildah on a node, into the built-in
+# registry, signed): one Go program that plays every layer
 curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz
 relish build burger/burger.toml
 relish images                        # burger:v1, built for amd64 and arm64
-relish apply burger/burger.toml
-curl http://burger.localhost:18080/order   # calls podinfo's backend by name
+relish apply burger/burger.toml      # six layers, a counter and a diner
+relish status                        # counter-0, -1 and -2, one on each node
+relish council status                # every node's view of the council
+curl http://burger.localhost:18080   # the burger, layer by layer; open it in a browser too
 
-# Ten jobs from the same image, packed around the running apps
+# Ten jobs from the same image cook patties beside the running apps
 relish batch submit burger/jobs.toml
 relish batch watch 1                 # the number submit printed
 relish jobs                          # the finished run and its rate
 
-# See every hop from frontend to Redis: DNS, VIP, eBPF map, firewall, TCP
-relish path frontend --to redis
+# Cut a layer off, roll one forward, roll a bad one back, scale one up, kill one
+relish fault partition lettuce --from counter --duration 30s --acknowledge  # a gap
+relish apply burger/cheese-v2.toml        # a rolling deploy to blue cheese
+relish apply burger/patty-v3.toml         # fails its health check, rolled back
+relish history patty
+relish apply burger/triple-patty.toml     # a triple patty
+relish fault kill patty --acknowledge     # a double, then a triple again
+relish events --app patty                 # what happened, from every node
 
-# podinfo's own Prometheus metrics, scraped from its pod annotations
-relish metrics frontend
+# See every hop from counter to patty: DNS, VIP, eBPF map, firewall, TCP
+relish path counter --to patty
+relish metrics counter               # its own Prometheus metrics, scraped for you
 
-# Make Redis slow, but only for the frontends, for two minutes
-relish fault delay redis 300ms --from frontend --duration 2m --acknowledge
-relish path frontend --to redis --count 3
+# Make the patties slow, but only for the counters, for two minutes
+relish fault delay patty 300ms --from counter --duration 2m --acknowledge
+relish path counter --to patty --count 3
 relish dashboard                     # live charts in the browser
 
-# Break things and watch the cluster recover
-relish fault kill frontend --count 1 --acknowledge
-relish local stop node-3             # lose a whole machine
-relish inspect frontend              # three frontends again, over the survivors
+# Lose a whole machine and watch the cluster recover
+relish local stop node-3
+relish inspect counter               # three counters again, over the survivors
 relish wtf                           # what's wrong and what to do about it
 
 # Clean up

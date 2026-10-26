@@ -996,7 +996,11 @@ So we made moving routine
 minor release runs `cargo update`, which stays inside the ranges, and the release's soak
 then proves the new set. Dependabot opens the same lockfile-only refresh as one grouped PR
 each week between releases. Major versions stay deliberate, one crate per PR, because
-they're allowed to break an API or a wire format. `make outdated` lists them (it runs
+they're allowed to break an API or a wire format. Dependabot didn't know that at first:
+grouping only minor and patch updates doesn't stop it proposing majors, so the day the
+config landed it opened eight PRs, one per major, each running the whole CI. Both
+ecosystems now ignore `version-update:semver-major` outright
+([#1288](https://github.com/reliaburger/reliaburger/issues/1288)). `make outdated` lists them (it runs
 `cargo update --dry-run --verbose`, which changes nothing), and a weekly job prints the
 list, without ever failing the build. A lag report that broke builds would get muted
 within a week. One that nobody reads would rot just as fast, which is why the refresh is a
@@ -1080,6 +1084,25 @@ whether 0.12 still opens a file 0.10 sealed years ago, so that PR first checked 
 sealed by the old build and made the tests open them (chapter 4 has the details). It also
 paid a dividend: `age` 0.12 no longer pulls in the unmaintained `proc-macro-error`, so its
 `cargo audit` exception went too.
+
+Newest isn't always the right target, though. `age` 0.12 added recipients for P-256
+hardware tokens, and its P-256 code isn't optional. On 23 October 2026 RustSec published
+[RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387): some of
+`crypto-bigint` 0.5's constant-time operations could branch on secret values. The
+advisory failed 0.2.2's third candidate build. We never use P-256 (secrets and backups are
+X25519 and scrypt), but that code was still compiled into `bun` and `relish`, and no
+`age` release had moved to the patched `crypto-bigint` 0.7. 0.2.2 was halfway through its
+gate, so it shipped with a dated exception and a test that keeps the P-256 chain out of
+reach ([the 24 October review](../qualification/2026-10-24-dependency-exceptions.md)).
+0.2.3 took the cleaner route. `age` 0.11.5, released the
+same day as 0.12.1 and so still maintained, has every API we use and none of the P-256
+code. Moving back to it removed `crypto-bigint`, `p256` and `hpke` from the build. It also
+brought in `proc-macro-error2`, which is unmaintained but runs only inside the compiler.
+That's the same kind of finding as the existing `basic-toml` exception, so it got a dated
+exception
+([the 25 October review](../qualification/2026-10-25-dependency-exceptions.md)). One
+unmaintained build-time macro is a better trade than shipping arithmetic with a known
+timing flaw in it, even arithmetic we never call.
 
 Sometimes the next major version isn't there to take. bincode's list said 1→3, and bincode
 3.0.0 turned out to be a crate whose only code is a `compile_error!`, published when its
@@ -5604,6 +5627,34 @@ and `a_large_consumer_view_change_takes_each_turn_well_within_the_budget`
 keeps it that way: every turn, less its journal write, must stay under half
 the budget.
 
+Or it did, until a Mac running several agents' builds failed it with turns
+of 500 to 700 ms (#1140). Wall clock is the wrong ruler for "what the view's
+size costs": a turn that spends 40 ms working and 600 ms waiting for a core
+looks just like one that works for 640 ms. So the test now asks the kernel
+how much CPU the process used across each turn, with `getrusage`:
+
+```rust
+fn process_cpu_time() -> std::time::Duration {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    assert_eq!(status, 0, "getrusage failed");
+    // user time plus system time, from two `timeval`s
+}
+```
+
+Both `unsafe` blocks carry a `// SAFETY:` comment in the source, cut here.
+`std::mem::zeroed` makes a value whose bytes are all zero. That's undefined
+behaviour for a reference or an enum, so the compiler can't vouch for it,
+but `rusage` is a C struct of integers, and zero is a fine integer.
+`getrusage` is a C function, and every foreign call is `unsafe` because Rust
+can't check what the other side does with the pointer. User plus system time
+counts the loop's own work and any blocking-pool work it waited for, and none
+of the waiting. Instrumented under the load that failed it, the old verdict
+would have failed 33 runs out of 120, while no turn used more than 116 ms of
+CPU. Now each turn must use less than half the budget in CPU time. A mutant
+that adds two seconds of arithmetic to every turn fails it at once, and 240
+loaded runs passed.
+
 That leaves the disk, the lock and the host. The same second, node 2 logged
 a 489 ms snapshot turn and node 3 an executor that "did not retire within
 1s", on three VMs sharing one Mac's disk while the leader ran a job campaign.
@@ -5864,7 +5915,8 @@ started its replacement, a deploy publishing a new backend, and a stop
 retiring a service still wait for a write in flight, because each decides
 what to do next from what it wrote. Health probes were different: they run
 on every interval for every checked instance, and what they publish can
-always wait for the next one.
+always wait for the next one. (Two releases later a soak made us defer the
+rest too. That's "And everyone else's", below.)
 
 #### And then its own write
 
@@ -6078,7 +6130,7 @@ bun: agent loop turn took 2493 ms in deploy_op (apply_network_pre_start): journa
 ```
 
 (That line comes from `a_slow_start_line_names_its_egress_owners_write`,
-not a soak. We haven't seen one yet.)
+not a soak. We hadn't seen one yet. Then we did, below.)
 
 `a_workload_start_leaves_its_slow_network_reference_write_in_flight` uses
 the probe test's trick. It stalls the reference write for 1.6 s and hands
@@ -6099,6 +6151,246 @@ run the whole loop with the stall on, and check that a deploy and a
 restart still finish, with the reference in the journal. The restart one
 failed before the restart learned to ask again: `restart of default__web-0
 refused: journalling default__web-0's network reference is still running`.
+
+#### And everyone else's
+
+The egress line we'd only ever made up turned up for real. 0.2.2
+candidate 4's V02 fast tier hit another host disk stall, about 5 s under
+all three VMs at once, and failed its settle check on one turn:
+
+```
+18:55 node-2: bun: a discovery journal write took 4998 ms; the agent loop went on meanwhile
+18:55 node-3: bun: a discovery journal write took 4548 ms; the agent loop went on meanwhile
+18:55 node-1: bun: agent loop turn took 5555 ms in restart_step: journal write 9 ms, egress owners write 5513 ms
+```
+
+Nodes 2 and 3 did the right thing: their writes went on without the loop.
+Node 1 was restarting a workload. The restart retires its predecessor's
+egress owner and checkpoints the replacement's, and `persist_egress_owners`
+waited for each fsync inline, under the same #351 allowance the probe and
+the start used to rely on. The settle check doesn't care which store held
+the turn. Every fault and upgrade walk settled, and nothing was lost, but a
+5.5 s turn is a 5.5 s turn.
+
+It wasn't the only writer left. Issue #1263 already listed the rest:
+deploys, retirements, releases and a restart's replacement publication all
+still waited inline, for their own write and for anyone else's. So this
+time we went through them all, tests first. Each scenario stalls one
+writer's persist for 1.6 s and uses the probe test's verdict: when the turn
+ends, the write must still be in flight. Before the change every one of
+them failed the same way:
+
+```
+the restart's turn waited for its own journal write: 1.652s in restart_step
+the start's turn waited for its own journal write: 1.613s in deploy_op (finish_fresh_instance)
+the release's turn waited for its permission's journal write: 1.630s in stop_wait
+the turn waited for its own egress owners write: 1.602s in restart_step
+```
+
+Three more run the whole loop with a 5 s stall, longer than the 4 s a
+status may take to come back. They queue a status once the stalled write
+has started and require an answer. A turn that waited for the write can't
+give one in time, however fast or slow the host's disk is, so the verdict
+counts work rather than timing it, as #939 taught us. All three failed
+before: `status went unanswered while a restart journalled to a stalled
+disk`, and the same for a deploy and a stop.
+
+The fix is the start's deal, extended. A writer's own write waits until
+the turn's deadline. A write already in flight isn't waited for at all
+inside a turn: the loop's `select!` lands it. Either way the writer answers
+`StillRunning` and asks again, and the next ask finds what the write
+recorded. What "finds" means differs per writer, and that's where the work
+was.
+
+A deploy op or a restart that publishes a backend now journals a
+*candidate* (the service map with the backend added) and installs nothing
+until the journal records it. The check is exact:
+
+```rust
+journal.inventory().services.iter().any(|owner| {
+    owner.phase == ServicePhase::Owned
+        && owner.entry == *entry
+        && entry.backends.iter().all(|backend| {
+            let instance = crate::grill::InstanceId(backend.instance_id.clone());
+            owner.executions.get(&backend.instance_id)
+                == self.launch_executions.get(&instance)
+        })
+})
+```
+
+`owner.entry == *entry` compares two whole `ServiceEntry` structs field by
+field, because the type derives `PartialEq`. In C you'd write the
+comparison yourself or reach for `memcmp` and hope there's no padding.
+The two `get` calls each return an `Option<&RuntimeGeneration>`, and
+`Option` compares equal only when both are `None` or both hold equal
+values, so a backend the journal names without its execution doesn't
+count as recorded.
+
+`finish_fresh_instance` needed a reorder for this. It used to record
+everything about a started replica (its log forwarder, its adoption
+record, its state) and only then journal the backend, so asking again
+would have done all of that twice. Now the journal write comes first, and
+the bookkeeping runs once, on the ask that finds the backend recorded.
+The replica stays `Starting` meanwhile, as a start waiting for its
+reference does. Registering a service took a different trick:
+`register_local_service` changes `service_map` in place, so
+`register_and_publish_service` keeps a copy from before and puts it back
+on `StillRunning`. Registering again on the next ask gives the same entry.
+A restart can't answer anybody, so it puts a `Publish` step on its task
+set that sleeps 100 ms and comes back, the way it already did for Create.
+
+Releases and retirements read the journal to decide what's left, so the
+next ask works it out from there. A release whose "forget the permission"
+write landed after its turn finds the journal no longer naming the hold.
+It hands the address back again (the runtime's release is idempotent and
+names its generation) and finishes. A service retirement skips its
+`Withdrawn` write once that's on disk. The removal after it is the one
+case the journal can't answer alone: an allocation that's gone looks like
+one that was never there, which retirement refuses as "original service
+allocation is missing". So a removal that outlasts its turn leaves the
+service in `retired_discovery_services`, and the next ask that finds the
+allocation gone and the marker set calls it done.
+
+The landing turns run nothing and carry the writer's name. The owner
+those writes use is a `const`:
+
+```rust
+const RETIREMENT_WRITE: WriteOwner = WriteOwner::AskAgain {
+    branch: crate::bun::loop_meter::LoopBranch::FollowUp,
+    detail: "service_retirement/landed",
+};
+```
+
+A `const` in Rust isn't a variable with an address. The compiler pastes
+the value in wherever the name is used, so each write gets its own fresh
+`WriteOwner`, even though `WriteOwner` doesn't implement `Copy` (another
+of its variants holds a `HealthWrite`). It's closer to a C `#define` than
+to a `static const`, except that it's type-checked.
+
+Then the egress owners checkpoint, the one that failed the soak. The
+store had a single fence, `egress_store_uncertain`, set before every write
+and cleared after, and no notion of a write in flight. It now gets one,
+`EgressWrite`, holding the write's task, the instance and what its binding
+becomes once the write is durable. `checkpoint_egress_owner` writes one
+owner at a time with a deadline, and other egress writers meanwhile get
+`StillRunning` rather than the uncertainty error, because nothing is
+uncertain yet. Only a write that fails sets the fence. Which way the
+in-memory binding goes depends on what the kernel has. An `Owned` binding
+before a start goes into `egress_bindings` only when its write lands, so
+no co-tenant's map rebuild programs it ahead of the checkpoint, and the
+kernel programming waits for the next ask. A `Retired` binding goes in at
+once, because `clear_egress` has already taken it out of the kernel, and a
+live check rebuilding the cgroup's maps mustn't put it back. Nobody treats
+`Retired` as durable until the write has landed: every egress writer
+settles the write in flight before it reads the bindings.
+
+There was a snag. All of that code builds only on Linux with eBPF, and we
+write most of this book on a Mac. The checkpoint itself doesn't touch the
+kernel, though, so its fields and methods now carry a wider `cfg`:
+
+```rust
+#[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+egress_write: Option<egress_ownership::EgressWrite>,
+```
+
+`cfg` takes a small boolean language: `all(...)` is AND, `any(...)` is
+OR, and `test` is set only when compiling tests. So the field exists in
+a Linux eBPF build and in every test build, and the egress scenarios drive
+`checkpoint_egress_owner` directly on any machine. A mutant that puts the
+inline wait back (`Some(_deadline) => Some((&mut task).await)`) fails both
+at once: `the turn waited for its own egress owners write`. The callers
+(`program_egress_pre_start`, `clear_egress` and
+`forget_retired_egress_owner`) still only build on Linux, so the Linux CI
+job is what compiles them.
+
+Does any of this bend the ordering #351 relies on? Go through the rules.
+The journal records a publication before the kernel or `service_map` has
+it: every deferred writer installs nothing until the next ask has found
+its write recorded. A workload never starts before its reference and its
+egress owner are on disk: both keep the start pending. The kernel never
+enforces an egress owner the checkpoint doesn't record: the binding, and
+the programming after it, wait for the landing. A retirement's `Retired`
+owner is on disk before its adoption record goes, and a release's
+permission before the runtime lets the address go, because each step
+answers `StillRunning` until its write has landed. Everything happens in
+the same order as before, just on more turns.
+
+One writer still waits. A rolling deploy's `register_rolling_instance`
+adds its replacements to the supervisor and `service_map` before it
+journals them, so a write left in flight would let readers route to
+backends the journal doesn't record yet. It needs the same reorder
+`finish_fresh_instance` got, and
+`the_inline_publication_path_still_waits_for_its_journal_write` holds the
+place until it does.
+
+#### And the receipt
+
+#1263's list had left one writer off on purpose. When the leader
+acknowledges a withdrawal receipt, the placement poll sends
+`ConfirmConsumerReceipt`, and the node forgets the receipt. That command
+settled any write in flight and then journalled inline, with no deadline at
+all. 0.2.2's gate met it four times, every one a host disk stall:
+
+```
+bun: agent loop turn took 2842 ms in command (confirm_consumer_receipt): journal write 2842 ms
+```
+
+We'd left it inline because the receipt depends on order. A receipt may
+only be forgotten after the leader's exact acknowledgement, only once it's
+proven locally (`Ready`), and only against the ownership as it is on disk.
+Forget it against the inventory from before a write in flight and you
+could undo whatever that write recorded. So "settle first" was there for a
+reason. The trick was to keep the settling and lose the waiting.
+
+The tests came first, five of them. Two stall the confirmation's own write
+for 1.6 s, one stalls another writer's write and sends the confirmation
+behind it, and one fails the write after its turn has moved on. Before the
+change all four failed, because every one of those turns waited out the
+stall:
+
+```
+status took Some(1.619841041s) while a receipt confirmation's journal write took 1.6s
+3.247000167s in command (confirm_consumer_receipt)
+```
+
+That second line is the bad one: the command waited for someone else's
+write, then for its own. The fifth test, that an unproven receipt is
+refused, passed before and after. It's there so the fix can't loosen the
+rule.
+
+A release could answer `StillRunning` and leave the asking to its
+caller. A confirmation has an answer to give, so it waits for one
+instead. The command now hands its `oneshot` sender to a queue:
+
+```rust
+pub(super) struct ReceiptConfirmations {
+    waiting: Vec<ReceiptConfirmation>,
+    forgetting: Vec<ReceiptConfirmation>,
+}
+```
+
+If the journal is free, the same turn forgets the receipt with a write that
+waits until the turn's deadline. If a write is in flight, the
+acknowledgement stays in `waiting` and the turn ends. A new branch in the
+loop's `select!`, guarded by `is_waiting()` and no write in flight, takes
+every waiting acknowledgement in one write once the journal is free. That's
+the order the inline version kept, just spread over more turns. A write
+that outlasts its turn moves its acknowledgements to `forgetting`, and the
+turn that lands it, `follow_up (consumer_receipt/landed)`, answers them.
+Taking the whole queue is one line, `std::mem::take(&mut
+self.receipt_confirmations.waiting)`: it moves the `Vec` out and leaves an
+empty one behind, so nothing stays borrowed while the write runs.
+
+The reply means what it always meant: `Ok` once the receipt is gone from
+disk, an error if it isn't proven or the write failed. What does a receipt
+do while its write is in flight? Nothing new. It's still on disk, so the
+node still reports it, and the leader acknowledges it again, exactly as it
+would after a crash. The poll waits a second for the reply and moves on.
+That's why this needed no protocol change and no bump to `CURRENT`.
+`a_receipt_confirmation_whose_write_fails_off_the_turn_keeps_the_receipt`
+pins down the crash case: a write that fails off the turn fences discovery,
+the caller hears the error, and the receipt is still on disk for the next
+acknowledgement.
 
 #### A 503 is an answer, not a verdict
 
@@ -7399,3 +7691,41 @@ cover it. The reaping wasn't involved at all: on macOS there is no subreaper,
 `launchd` adopts the orphans, and the test saw no zombies in any run. So
 `Owner::start` now calls `first_launch` on `bun --version` before it starts
 the owner, and the 15 seconds go back to timing the owner.
+
+One test fixed is one test. How many others start `bun` or `relish` under a
+deadline that includes the launch
+([#1149](https://github.com/reliaburger/reliaburger/issues/1149))? We went
+looking, and the answer was most of the black-box suite. Every Bun the shared
+fixture starts gets 30 seconds to listen. `relish` gets 30 seconds to reach
+it. Every command, role and process the owned runtimes start has a `bun`
+owner with 15 seconds to answer. To make it fail on demand, we replaced
+`bun`, `relish` and `testapp` with fresh copies of themselves before each
+round, which makes each one a new file to assess, and ran thirteen exposed
+tests under nextest. Three loops kept the assessment queue busy with fresh
+copies of an 840 MB test binary. In three rounds of four, both
+`owned_commands` tests we picked failed at exactly their 15-second bound.
+
+The fix lives where the deadlines do. `bun_process.rs` gained
+`first_launch_binaries()`, which pays all three first launches at once, and
+`BunProcess::spawn_runtime`, `wait_for_relish` and `wait_for_relish_output`
+call it before their clocks start. That covers every test that goes through
+the fixture, in the suite and in the separate `tests/*.rs` binaries. The
+module includes `first_launch.rs` itself:
+
+```rust
+#[path = "first_launch.rs"]
+mod first_launch;
+```
+
+`#[path]` on a module declared in a file (rather than inside an inline
+`mod { }` block) is relative to that file's directory, so this finds the
+sibling in `tests/support/` whichever binary includes `bun_process.rs`. The
+suite used to declare `first_launch` itself as well, and Clippy refuses a
+file loaded as two modules (`duplicate_mod`): each would be a separate module
+with its own `static` set of launched paths. So the suite now writes
+`use bun_process::first_launch;` instead, and `crate::first_launch` still
+names the one copy. Tests that spawn `bun` or
+`relish` themselves, or hand `bun` to the owned runtimes, call the helper
+before their own deadline. No deadline changed, and the same thirteen tests
+passed all eight rounds we ran under the same conditions. The PR lists every
+test the audit found and what happened to each.

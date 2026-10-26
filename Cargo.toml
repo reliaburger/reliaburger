@@ -1,6 +1,6 @@
 [package]
 name = "reliaburger"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -66,7 +66,7 @@ time = "0.3"
 ring = "0.17"
 x509-parser = { version = "0.18", features = ["verify"] }
 pem = "4"
-age = { version = "0.12", features = ["armor"] }
+age = { version = "0.11.5", features = ["armor"] }
 base64 = "0.23"
 datafusion = "55"
 # `relish logs --grep` patterns: validated with the same engine DataFusion's

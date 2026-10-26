@@ -145,26 +145,26 @@ issue until new evidence appears.
 |---|---|---|
 | Q1 timing report | Deferred | #1050's PR records the before/after timing for acceptance and cluster on the same runner class. A standing report isn't worth its own issue yet |
 | Q2 one extraction per consumer job | **Done**, [#1050](https://github.com/reliaburger/reliaburger/issues/1050) | See Q2 below |
-| Q3 cancel superseded work | Partly done; **proposed** for closed PRs | `ci.yml` cancels older runs on PR updates and train pushes, but its `pull_request` types have no `closed`, so a closed PR's run keeps going (the #768 case). The benchmark gate's separate treatment is done (#857, #859, #865) |
+| Q3 cancel superseded work | **Done**, [#1054](https://github.com/reliaburger/reliaburger/issues/1054) for closed PRs | `ci.yml` cancels older runs on PR updates and train pushes, and now on `closed`: a closed PR's run is a no-op in the same concurrency group, so its older run (the #768 case) is cancelled. The benchmark gate's separate treatment is done (#857, #859, #865) |
 | Q4 duplicate 65,536-chunk fixture | **Proposed** | `src/meat/task_array_state.rs` still calls `run_one_task_chunks_on_ten_nodes` from both tests |
-| Q5 consolidate upgrade walks | **Proposed**, pairs with [#1049](https://github.com/reliaburger/reliaburger/issues/1049) | The retention test still walks four transitions; the separate forwarding walk remains in `tests/self_upgrade_cluster.rs`. #1049 is that retention test flaking under load |
+| Q5 consolidate upgrade walks | **Done** ([#1055](https://github.com/reliaburger/reliaburger/issues/1055)) | Retention starts on v0.4 and makes one real upgrade; the rolling walk submits through a follower and the separate forwarding walk is retired |
 | B1 merge queue | Partly done; **proposed, urgent** | `ci.yml` handles `merge_group` and binds evidence to its head SHA. But the only queue ruleset targets `refs/heads/release-0-2-1` by name, so `release-0-2-2` has no rules at all: its PRs merge after the light checks alone, though [releasing.md](../releasing.md) and [testing.md](../testing.md) say every train has a queue |
 | B2 manual-clock cron capacity | **Done** | `tests/cluster_task_arrays.rs` uses `CronClock::manual`; the leadership test keeps the real UTC clock (#748, #868) |
 | B2 placement sleeps | **Proposed** | `tests/placement.rs` still has fixed 3 s and 6 s settle sleeps |
 | B2 upgrade rejection matrices and proxy/Council deadlines | **Proposed**, as one issue | Each rejection case still starts a real `ClusterHarness`; the proxy inactivity tests use production timeouts |
 | B3 legacy callback routes | **Done** | `legacy_batch_routes_are_gone` in `src/bun/api/tests.rs` |
-| B3 settlement helpers | **Proposed** | The hung commit and failed-hook settlement tests in `src/bun/api/tests.rs` still send a cancel request |
-| B3 stalled TLS reclamation | **Proposed** | `stalled_tls_handshakes_are_bounded_and_reclaimed` in `src/wrapper/proxy.rs` only checks a five-byte write after the stall, which passes without reclamation |
-| B3 real worker in the rolling walk | **Proposed**, with Q5 | The walk starts three voters and relabels one as the worker |
-| B4 late publication | **Proposed** | No test pauses the blocking writer past its caller's deadline |
-| B4 broader lifecycle property test | **Proposed** | The task-array proptest model has only plan, complete, lose and cancel |
+| B3 settlement helpers | **Done**, [#1058](https://github.com/reliaburger/reliaburger/issues/1058) | The cancel-request tests in `src/bun/api/tests.rs` are named as cancellation tests; new tests stall the leader's real `JobApplyCommit` and failed-hook `DeployCancel` writes and fail when either deadline is removed |
+| B3 stalled TLS reclamation | **Done**, [#1057](https://github.com/reliaburger/reliaburger/issues/1057) | `stalled_tls_handshakes_are_bounded_and_reclaimed` in `src/wrapper/proxy.rs` now proves a real `rustls` client is refused while the slots are full, that the server closes the stalled sockets, and that a real handshake and request then succeed; it fails with the bound or the deadline removed |
+| B3 real worker in the rolling walk | **Done** ([#1056](https://github.com/reliaburger/reliaburger/issues/1056)) | The walk starts four nodes, reads the three voters and the one worker from Raft membership, sends swapped labels the leader must correct, and asserts worker, council, then leader |
+| B4 late publication | **Done** ([#1059](https://github.com/reliaburger/reliaburger/issues/1059)) | `src/bun/api/late_publication_tests.rs` holds the standalone writer past its caller's deadline, checks admission and dispatch stay fenced, then reopens and retries the same `Idempotency-Key` |
+| B4 broader lifecycle property test | **Done** ([#1060](https://github.com/reliaburger/reliaburger/issues/1060)) | `generated_lifecycles_keep_identity_conservation_and_fences` in `src/meat/task_array_store.rs` drives repeated and changed requests, grants, stale completions, worker loss, unknown outcomes, replay acknowledgements, cancellation, cron fires, pruning and reopen through `TaskArrays::apply`. It found that a stop after a requeue kept attempts on retired chunks, so the snapshot refused to reopen |
 | B5 per-record fragments | Deferred | Only worth doing if conflicts in the shared manifest, bindings and flakes files are measured as frequent |
 | B6 repeated macOS compilation | **Done** (decided) | [#846](https://github.com/reliaburger/reliaburger/issues/846) and PR #903 removed the double compile; a shared macOS archive was measured and rejected, because the build stays on the critical path |
 | B6 small-crate pilot | Deferred | Speculative; the single crate is deliberate |
 | B6 explicit build targets | **Done** as far as it goes | [#904](https://github.com/reliaburger/reliaburger/issues/904) fixed the Make recipes' double compiles |
 | B6 light/full split against branch rules | Folded into B1 | A light-green PR on `release-0-2-2` merges without a queue today |
-| S1 executed coverage in RC verdicts | **Proposed** | `sustained_check.py`'s final verdict checks a clean result, schedule, duration and digest; without `--soak-bun` the upgrade slots are skipped without a shortfall; `soak.yml` passes no tier |
-| S2 accumulation exposure | Partly done; **proposed** | Per-runtime accepted successes are reported. The RSS baseline resets on a pid or image change and gives no finding while warming up, and fault choice uses an unseeded `$RANDOM` |
+| S1 executed coverage in RC verdicts | **Done** for the final verdict ([#1061](https://github.com/reliaburger/reliaburger/issues/1061)) | The record's execution inventory counts completed walks, faults, specials, pulses, exports, the baseline, the final drain and the verified candidate bytes against the 8-hour schedule; a final refuses to start without a soak build, a digest or its own bootstrap; `soak.yml` passes `--tier custom` as a diagnostic |
+| S2 accumulation exposure | **Done** for the final ([#1062](https://github.com/reliaburger/reliaburger/issues/1062)) | Per-runtime accepted successes are reported. Fault and node choices come from a logged, repeatable seed, and observed fault effects are recorded. A final ends with a 2¼-hour quiet tail after its 8 hours of faults and fails unless `leak-rss` and `leak-fd` were each armed for 60 minutes on every node, with one unbroken 30-minute window (maintainer decision, 20 October 2026); fast and custom runs record exposure only |
 | S3 one final campaign | **Done** (maintainer decision) | [#991](https://github.com/reliaburger/reliaburger/issues/991) and PR #996: one eight-hour job final replaces the separate V02 final. The loop-lane bounds are [#287](https://github.com/reliaburger/reliaburger/issues/287) |
 
 Earlier-attempt evidence is also supported now: a failed-job rerun may retain
@@ -361,9 +361,15 @@ compile or whole-run gain is promised.
 
 **Scope:** `tests/self_upgrade.rs` and `tests/self_upgrade_cluster.rs`.
 
-**Status:** open. The retention test still performs four transitions, and the
-successful forwarding walk remains separate. Rolling fixtures now use three
-voters rather than four; preserve that current quorum regression coverage.
+**Status:** done ([#1055](https://github.com/reliaburger/reliaburger/issues/1055)).
+The retention test starts on v0.4 with v0.1–v0.3 and their `.sig` envelopes
+installed, makes one real upgrade to v0.5 and checks GC the moment the node
+reports settled; it took about 40 s on a Mac (137.7 s for four transitions in
+#1049's sample), so its 720 s nextest override is gone. The rolling walk
+sends its start through a node that reports itself a Raft follower of the
+leader, and
+`upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader` is
+retired from the test file, the bindings, the manifest and the matrix.
 
 **Tasks:** start retention testing on v0.4 with v0.1–v0.3 already installed,
 then perform one real upgrade to v0.5. Do not seed while still running v0.1:
@@ -379,13 +385,13 @@ current saving forecast.
 
 **Acceptance criteria**
 
-- [ ] Retention still exercises real exec, verification, commit and deletion of
+- [x] Retention still exercises real exec, verification, commit and deletion of
   old binaries and signature sidecars; the settled marker cannot precede GC.
-- [ ] The main rolling test proves follower forwarding and retains ordering,
+- [x] The main rolling test proves follower forwarding and retains ordering,
   version convergence and surviving-leader assertions.
-- [ ] Pause/resume, rollback, interrupted download and role-correction coverage
+- [x] Pause/resume, rollback, interrupted download and role-correction coverage
   remain. Actual worker topology is handled explicitly in B3.
-- [ ] Smaller API forwarding/authentication tests and protected-version store
+- [x] Smaller API forwarding/authentication tests and protected-version store
   tests remain; the retired names are reconciled with their required owners.
 
 ## Larger changes

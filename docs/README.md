@@ -924,16 +924,20 @@ relish apply -f examples/kubernetes/podinfo.yaml
 curl -H 'Host: podinfo.localhost' http://127.0.0.1:18080/
 ```
 
-`examples/demo/burger` is the five-minute tour's home-built app: a small Go
-service (standard library only), its test and a cross-compiling Dockerfile.
+`examples/demo/burger` is the five-minute tour's demo: one small Go program
+(standard library only), its tests and a cross-compiling Dockerfile. It plays
+every part of a burger: each layer is its own app (`LAYER=cheese VERSION=v2`),
+and the counter in front asks each layer by its service name and stacks what
+answers, so a missing layer is a gap you can see. `curl` gets an ANSI-coloured
+burger, a browser an SVG one that redraws every second, and a script JSON.
 `relish build` has a node with Buildah build it into Pickle (the quickstart's
-VMs have Buildah), and each `/order` names the podinfo backend it reached by
-service name, so apply podinfo first:
+VMs have Buildah). `cheese-v2.toml`, `patty-v3.toml` and `triple-patty.toml`
+next to it are the tour's rolling deploy, rollback and scale-up:
 
 ```bash
 relish build examples/demo/burger/burger.toml
 relish apply examples/demo/burger/burger.toml
-curl -H 'Host: burger.localhost' http://127.0.0.1:18080/order
+curl -H 'Host: burger.localhost' http://127.0.0.1:18080/
 ```
 
 ### Internal DNS on rootful runc
@@ -1354,7 +1358,7 @@ it measures per-job overhead rather than real work; see the batch manual for
 prerequisites and resource profiles. `--compare OLD.json` checks a scenario
 against an earlier report of the same scenario and fails on a drop beyond
 `--tolerance` (10% by default). The 100-million-a-day claim itself needs the
-8-hour job final (`scripts/release/qualify-jobs-sustained.sh --tier final`).
+job final: 8 hours of faults and a 2¼-hour quiet tail (`scripts/release/qualify-jobs-sustained.sh --tier final`).
 
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,

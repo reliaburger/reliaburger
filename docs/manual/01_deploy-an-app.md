@@ -475,6 +475,16 @@ Any change to the spec clears the mark and starts a new rollout: a fixed image,
 releases the same version node by node again, so if it's still broken it fails
 again and is marked again.
 
+The node reports the failure to the leader with the cluster's service token.
+A plaintext development cluster with no master key has no service token, and
+until its first API token exists nobody holds a credential at all, so there
+the leader takes the report without one. It takes it only for a node the app
+is placed on, and once any credential exists (a master key or a first token)
+it requires the service token again. If `bun` logs
+`the leader refused the rollout failure of default/web` with a 401 or 403,
+the cluster has a token but its nodes have no master key to sign with: set
+`[security] master_key_path` on every node.
+
 `cancel-deploy` takes the operation id that `apply` prints and waits for the
 in-flight step to finish. It works on a single node only: a cluster `apply`
 returns once the council has recorded the spec, and prints no operation id,
@@ -490,6 +500,10 @@ applies a v3 that fails its health check and shows it rolled back and marked
 ```sh
 scripts/demo/rollout.sh
 ```
+
+With `DEMO_PLAINTEXT=1` in its environment the demo runs the same steps on a
+plaintext cluster with no master key and no token, and checks the node stops
+retrying v3 once it's marked.
 
 The demo measures what it costs as it goes. Before each step it prints Bun's
 latest memory and CPU, and its workloads', on one line, and it ends with each

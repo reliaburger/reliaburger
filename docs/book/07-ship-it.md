@@ -162,6 +162,8 @@ The gate is the app spec in Raft. Once that spec commits, any node can start the
 
 Migration cancellation also needs a boundary after the job settles. An accepted cancellation remains meaningful when the child subsequently exits zero: check it after settlement and immediately before proposing the desired-state transaction. A proposal already submitted to Raft can still commit; cancellation cannot roll that transaction back. Each replicated ownership write has a five-second caller deadline. A timeout does not tell us whether Raft committed, so we keep the uncertain fence and report an error. This is why the terminal job watcher ends without inventing a release when its settlement write stalls.
 
+Two of the tests for this were testing something else ([#1058](https://github.com/reliaburger/reliaburger/issues/1058)). Their names promised a hung *commit* and a hung *failed-hook settlement*, but after hanging the council they sent `POST /v1/deploys/operations/{id}/cancel`, so what they really proved was that a stalled cancellation returns a bounded `503`. That's worth keeping, so they now say so: `hung_cancel_after_a_successful_hook_…` and `hung_cancel_after_a_failed_hook_…`. The writes their names promised have no HTTP caller at all. The leader issues them from its own tick: `JobApplyCommit` once every hook has succeeded, `DeployCancel` once one has failed. The new tests seed a deployment with a finished hook, hang every council write, and let the real leader loop run. A test-only hook in `CouncilNode` records each write that hung and when it arrived, so the test can watch the leader try the settlement write, give up on it after its write timeout, and try it again on a later tick. A second attempt is the proof that the stall didn't wedge the leader; a gap of at least the write timeout between the two proves the first was really held, not refused. In production that timeout is `WRITE_TIMEOUT`, 10 seconds. The first version of these tests waited it out for real: each hung settlement write and the tick's hung `CronObserve` cost 10 seconds apiece, so every run spent over 20 seconds against a 40-second bound, close to failing on a loaded runner. The leader's council writes now take their timeout from the `TaskArrayService`, as a standalone publication already did, and the tests give it one second. Each now runs in about two. Meanwhile the durable intent must stay byte-for-byte what it was, no agent may be told to publish, and a failed hook must never even try `JobApplyCommit`. Drop the deadline around either write, or skip the failed-hook branch, and the matching test fails, while the old cancellation tests stay green.
+
 The first version held the gate differently. Raft recorded a bounded *claim* owning every app and job identity in the apply, with the leadership term that admitted it, until the jobs settled. A claim from an earlier term could never be released, each one reserved its jobs' resources on every candidate node, and a few leader changes during leased applies quietly leaked capacity. In 0.2.0 the claims went (#681), along with the agent's own job runner: Chapter 17's "Retiring the batch engine from Chapter 12" tells that story.
 
 ## What actually runs
@@ -1080,6 +1082,45 @@ The awkward bit is credentials. A private repository means a token in the URL, a
 
 A sync reads desired state, then spends seconds (or minutes, on a slow remote) in `git`. If leadership moves to B and back to A meanwhile, A's diff is stale: B may have changed things A's snapshot never saw. The fix costs one `u64`. The runner reads the Raft term *before* the snapshot and stamps it on every `GitOpsWrite`. The state machine compares it with the term of the log entry carrying the write, which openraft gives us for free in the entry's `LogId`, and refuses a mismatch. Because the check happens as the entry applies, every replica refuses the same writes. The runner also checks the term before each write and abandons the sync on the first sign it moved; the new leader's sync takes over.
 
+### Waking for leaders, not for commits
+
+The sync loop has four things to wait for: the poll timer, a webhook, a committed trigger, and a change of leader. The last one came from `council.metrics()`, a `tokio::sync::watch::Receiver<RaftMetrics>`. A watch channel holds one value, the latest, and `changed()` wakes whenever the sender publishes a new one. That's the catch. openraft publishes new metrics whenever *anything* in them moves: the log index on every commit, and `millis_since_quorum_ack` as heartbeat replies come back, even when there's nothing to commit. So the loop woke on every commit and every heartbeat, cloned the whole `DesiredState` under the state machine's read lock, and only then found out whether GitOps was even configured. Most of the time it wasn't.
+
+Nobody noticed until a node ran thousands of host jobs a second. Each job's receipts commit to Raft, every commit woke the loop, and every wake copied every task array's record. The host-job profile for #1030 found the loop eating 41% of Bun's CPU while jobs ran, and 64% when Bun ran nothing at all. Chapter 17 has the throughput side of that story.
+
+Watch channels have no filter, so the loop keeps its own: the three fields that say who leads.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Leadership {
+    term: u64,
+    leader: Option<u64>,
+    this_node: u64,
+}
+
+impl Leadership {
+    fn moved(self) -> impl FnMut(&RaftMetrics) -> bool {
+        move |metrics| Leadership::of(metrics) != self
+    }
+}
+```
+
+and waits with `wait_for`, which takes a predicate and returns only once the channel's value satisfies it:
+
+```rust
+change = metrics.wait_for(leadership.moved()) => {
+    let Ok(current) = change else { break };
+    leadership = Leadership::of(&current);
+    !leadership.names_this_node()
+}
+```
+
+`impl FnMut(&RaftMetrics) -> bool` in the return type means "some closure you can call repeatedly with a borrowed `RaftMetrics`". Every closure in Rust has its own anonymous type, so you can't write its name; `impl Trait` lets the compiler fill it in. The `move` keyword makes the closure take its own copy of `self` instead of borrowing it. That matters here: `leadership` is reassigned inside the `select!` arm, and a closure still borrowing it would stop that compiling. Because `Leadership` is `Copy` (three integers), the move is a cheap copy, and `moved(self)` can take `self` by value without consuming anything the loop still needs. `wait_for` still runs the predicate on every metrics update, but comparing three integers costs nothing next to cloning the cluster.
+
+The arm's value is the old `durable_wake` flag. A node that has just become leader syncs at once, the way a freshly started loop does on its first tick, instead of waiting up to thirty seconds for its poll. Any other move (a new term with someone else leading) only resumes a trigger that's still pending, as before. Then, before taking the full state, the loop reads just `gitops_config` with `read_desired`, which borrows the state under the lock and returns what the closure picks out, and checks it leads. A follower, or a leader of a cluster without GitOps, stops there.
+
+The tests in `src/lettuce/runner.rs` count whole-state clones through a test-only counter on `CouncilNode::desired_state`. `a_commit_that_only_moves_the_log_index_does_not_read_the_desired_state` commits twenty no-ops after a sync and expects no clone at all. Against the old loop it counted about 14,000 clones in that window, far more than twenty commits explain. `with_gitops_unconfigured_a_wake_never_clones_the_desired_state` sends a tick, commits and a webhook to a loop with nothing to sync, and expects zero. `the_loop_syncs_promptly_when_this_node_becomes_leader` starts a loop on a node that leads nothing, with an hour's poll, then makes it leader. The old loop waited the hour. Three more pin the other wake sources, a trigger, a webhook and a tick, so the filter can't quietly swallow one of them.
+
 ### Warning, not refusing, about plaintext secrets
 
 Last, a smaller decision (D8). A repository with `DB_PASSWORD = "hunter2"` in it works, and always has. Refusing it would turn a bad habit into an outage with no migration path. So the sync applies it and warns: any env key containing `PASSWORD`, `SECRET`, `TOKEN` or `CREDENTIAL`, or ending in `_KEY`, whose value isn't `ENC[AGE:...]`, produces a warning naming the app and the key, never the value. It lands in the log (once, when the set of warnings changes), in `SyncState.warnings` and in `relish wtf`.
@@ -1744,13 +1785,36 @@ The soak taught us one more thing. When a rollout did abort, the node told the l
 
 ### Tests
 
-The agent tests drive the real deploy worker against a `MockGrill` with a state override that makes one named replacement fail its health wait: `auto_rollback_after_a_retirement_restores_old_capacity` (three replicas, scenario A above), `auto_rollback_of_a_stop_first_volume_app_restarts_the_old_instance` (scenario B) and `abort_keeps_healthy_new_instances_when_old_capacity_cannot_return`. The share-move tests sit beside them: `a_moved_replica_starts_the_arriving_ordinal_and_retires_the_departing_one` checks that the replica that stays is never stopped, `a_shrunk_share_retires_only_the_departing_replica` and `a_swapped_share_starts_the_new_ordinals_without_a_new_generation` cover the other shapes, and `a_replica_moves_onto_a_full_node_where_a_redeploy_would_not_fit` gives the node a budget its two replicas fill, the soak's situation. All four failed before the change. The unit tests in `src/bun/agent/scale_in_place.rs` pin `share_change` itself for a pure increase, a pure decrease, a swap, one out and one in, an empty share, a reordered share, a version change and a daemon set, and `a_rollout_abort_reason_keeps_the_first_error` in `src/cluster/orchestrate.rs` checks the cause reaches the leader. The planner tests in `src/cluster/rollout.rs` cover one-node-at-a-time release, waiting on an unhealthy share, resuming from reports, ungated first placements and scale changes, and a failed spec that nobody new receives. The state machine tests cover the `RolloutFailed` mark surviving an identical re-apply, clearing on a new spec and on a scale change (`scale_change_clears_rollout_failed`), being set again when the same version fails again, refusing a stale report, refusing a failure of the spec that already rolled out (`a_failure_of_the_released_spec_is_refused`) while still marking a new version's failure after a release, and the ten-target cap. Two tests in the portable suite (`tests/suite/rollout_failed.rs`) apply through the real API against a one-node council: an identical re-apply keeps the mark and prints the warning, and a scale change clears it without one. The cluster tests in `tests/placement.rs` (`make test-cluster`) run three real nodes: a one-replica-per-node app keeps two replicas serving through a redeploy, a bad version becomes `RolloutFailed` and stops retrying, a scale change starts a new rollout that fails and is marked again, and `relish rollback` works after every node restarts.
+The agent tests drive the real deploy worker against a `MockGrill` with a state override that makes one named replacement fail its health wait: `auto_rollback_after_a_retirement_restores_old_capacity` (three replicas, scenario A above), `auto_rollback_of_a_stop_first_volume_app_restarts_the_old_instance` (scenario B) and `abort_keeps_healthy_new_instances_when_old_capacity_cannot_return`. The share-move tests sit beside them: `a_moved_replica_starts_the_arriving_ordinal_and_retires_the_departing_one` checks that the replica that stays is never stopped, `a_shrunk_share_retires_only_the_departing_replica` and `a_swapped_share_starts_the_new_ordinals_without_a_new_generation` cover the other shapes, and `a_replica_moves_onto_a_full_node_where_a_redeploy_would_not_fit` gives the node a budget its two replicas fill, the soak's situation. All four failed before the change. The unit tests in `src/bun/agent/scale_in_place.rs` pin `share_change` itself for a pure increase, a pure decrease, a swap, one out and one in, an empty share, a reordered share, a version change and a daemon set, and `a_rollout_abort_reason_keeps_the_first_error` in `src/cluster/orchestrate.rs` checks the cause reaches the leader. The planner tests in `src/cluster/rollout.rs` cover one-node-at-a-time release, waiting on an unhealthy share, resuming from reports, ungated first placements and scale changes, and a failed spec that nobody new receives. The state machine tests cover the `RolloutFailed` mark surviving an identical re-apply, clearing on a new spec and on a scale change (`scale_change_clears_rollout_failed`), being set again when the same version fails again, refusing a stale report, refusing a failure of the spec that already rolled out (`a_failure_of_the_released_spec_is_refused`) while still marking a new version's failure after a release, and the ten-target cap. Two tests in the portable suite (`tests/suite/rollout_failed.rs`) apply through the real API against a one-node council: an identical re-apply keeps the mark and prints the warning, and a scale change clears it without one. Three more there post an unauthenticated report the way a plaintext node sends one (#1067): a credential-free cluster marks the spec for a node the app is placed on, refuses a node without the app, and a cluster with a service token refuses it outright. The cluster tests in `tests/placement.rs` (`make test-cluster`) run three real nodes: a one-replica-per-node app keeps two replicas serving through a redeploy, a bad version becomes `RolloutFailed` and stops retrying, a scale change starts a new rollout that fails and is marked again, and `relish rollback` works after every node restarts.
 
 ### Watching it on a laptop
 
 Tests prove the rules; they don't let someone evaluating Reliaburger watch a bad version bounce off. `scripts/demo/rollout.sh` does. It applies `examples/phase-1/proc-rollout.toml` as v1, rolls it to v2, runs `relish rollback`, then applies a v3 whose testapp fails every health check, and checks each step against what the app really serves on its port (testapp's `/env/VERSION` route answers with the instance's `VERSION` variable). The last steps are the ones this section is about: v3 marked `RolloutFailed` with v1 still serving, a second identical apply that only warns, and a v2 that clears the mark.
 
 The demo needs a cluster, because `RolloutFailed` is the council's mark, and the first draft started one the quick way: `bun --cluster` with plaintext transports and no `relish init`. Every step passed except the one that mattered. The node rolled v3 back, then logged `the leader refused the rollout failure of default/web: 403 Forbidden` and went back to retrying. The report to `/v1/rollouts/failed` carries the node's service token, and a cluster that never ran `relish init` has none to give it. So `scripts/demo/lib.sh` sets the node up the way the manual does: `relish init` writes the CA and keys, a few `sed` lines point the generated config at a temporary directory and loopback ports, and the first `relish token create` mints the demo's admin token. A demo that takes a shortcut the product doesn't support ends up demonstrating the shortcut.
+
+The shortcut was supported, though. `[security] require_mtls = false` is the documented plaintext opt-in, so the demo had found a real bug, and #1067 fixed it. The issue offered two fixes. The leader could learn about the failure another way, from the state reports every node already sends, but that means a new field in `StateReport`, a wire change, a protocol bump, and the leader turning a report into a Raft write it otherwise makes only from an API call. Or the node could report the way it already talks to the leader about everything else. How does a plaintext node fetch its placements with no token, then? The placements handler, which every node polls every couple of seconds, lets it in without credentials on exactly this kind of cluster. So the rollout-failure handler now asks the same question, with the check pulled out of the placements handler so the two can't drift apart:
+
+```rust
+pub(super) async fn credential_free_development_cluster(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    state: &ApiState,
+) -> bool {
+    auth.is_none()
+        && state.service_token.is_none()
+        && state.cluster_http.scheme() == "http"
+        && match &state.token_store {
+            Some(tokens) => tokens.read().await.is_empty(),
+            None => true,
+        }
+}
+```
+
+No authenticated caller, no service token, plain HTTP, and an empty token store. That's the bootstrap window from Chapter 10 on a cluster that has no master key, and in that window the API already lets an anonymous caller apply, delete and roll back any app. Taking a failure report there gives nobody anything new. We still narrowed it: without credentials the leader takes a report only when the node it names has a placement of the app, so the report can say "my rollout failed" and nothing wider. A node with the wrong idea of who it is gets a 403 and backs off, as before. The moment the cluster has a master key or its first token, the handler is back to `require_system`. The fix touches no wire format or stored state, so `CURRENT` stays where it was.
+
+`scripts/demo/lib.sh` grew a `DEMO_PLAINTEXT=1` mode so the bug can't come back unnoticed: it runs `relish init --development-plaintext`, drops the master key and identity from the config, and drives the node over plain HTTP with no token. `tests/demos.rs` runs the rollout demo both ways under `make test-cluster`, and the demo now also checks that once v3 is marked the node logs no more failed deploys, which is what "stops retrying" looks like from the outside. Before the fix, the plaintext run logged the 403 and a fresh attempt every 5, 10, 20 and 40 seconds until the demo gave up waiting for the mark.
+
+That check once failed on CI when nothing was retrying. The node logs its failed attempt only after the leader answers the report, and the leader answers only after it has committed the mark and its audit record has reached disk. On a slow CI disk, `relish status` showed `RolloutFailed` while the line for that first attempt was still on its way, so the demo counted zero failures, then one, and called the late line a retry. The line said `attempt 1`, and a real retry would say `attempt 2`. The demo now waits for that first failure to reach the log before it starts counting. A check that watches a log has to start counting after the event it is judging has been logged, not when some other part of the system first reports it.
 
 `examples/phase-1/container-rollout.toml` is the container version, with `strategy = "blue-green"` on podinfo. The process version can't roll surge-first: two testapp instances can't both listen on one host port, so it sets `max_surge = 0` and `max_unavailable = 1` and the planner retires before it starts.
 
@@ -1785,3 +1849,52 @@ The sampler is a Python script, like the soak's tooling, not a `relish` subcomma
 
 The bug in the abort wasn't in a tricky line. Each step was locally reasonable: tear down what you started, keep what you didn't touch. The mistake was not writing down the invariant the whole function had to keep, "never end below the capacity you started with", and testing for it. Once it was written down, the fix was mostly reuse.
 
+
+## Serving isn't the same as reported
+
+The burger demo found this one (#1353). Its `cheese` app ran one replica, and the tour rolled it from v1 to v2 with the default `max_surge = 1` and `max_unavailable = 0`. That's the setting whose whole promise is "never fewer than you asked for". The rollout finished in ten seconds, and for three to six of them no node had a healthy `cheese` backend. The counters that call `cheese` by name got `EPERM` from `connect()`, which is the connect hook saying "this service has nothing healthy to give you" (Chapter 3's `onion_connect`), not a timeout. With two replicas it never happened, so the demo shipped with two and an issue.
+
+The local half of the rollout was right. `start_replacement` waits for the new instance's health check, publishes its backend into the node's service map, and only then lets the planner retire anything. On the node running both instances, traffic moved across without a gap. The other nodes don't read that service map, though. They read the leader's endpoint catalogue, and the leader builds it from node reports, in `build_endpoint_catalog`:
+
+```rust
+let healthy = matches!(app.health_status, ReportHealthStatus::Healthy);
+```
+
+and a node's report says `Healthy` only for an instance whose supervisor state is `Running`. A rolling replacement doesn't get there until `finalise_rolling_deploy`, which runs after every old instance has drained and stopped, and after the leader has answered the old one's address release. Meanwhile the old instance went to `Stopping` the moment its retirement began. So for every report in between, the node said "new one starting, old one stopping", the catalogue marked both backends unhealthy, and every other node's connect hook refused the service. Two replicas hid it because the second old instance kept serving while the first was swapped.
+
+Why was the replacement still `Starting`? Because the supervisor's lifecycle only takes it over at finalisation: health checks, crash restarts, the lot. That's deliberate. A rollout that aborts must be able to tear its replacements down without a restart driver racing it, so we didn't want to hand the replacement to supervision early just to change one word in a report. The report is what was wrong. It should describe what the node routes to, and the node routes to the replacement from the moment its backend is published. `handle_snapshot_request` now asks for each instance's *reported* state:
+
+```rust
+fn reported_state(&self, instance: &WorkloadInstance) -> ContainerState {
+    if !matches!(
+        instance.state,
+        ContainerState::Starting | ContainerState::HealthWait
+    ) {
+        return instance.state;
+    }
+    let service = ServiceId::new(&instance.namespace, &instance.app_name);
+    let published = self.service_map.resolve(&service).is_some_and(|entry| {
+        entry
+            .backends
+            .iter()
+            .any(|backend| backend.instance_id == instance.id.0 && backend.healthy)
+    });
+    if published { ContainerState::Running } else { instance.state }
+}
+```
+
+Only an instance that's still starting can be promoted, and only when the node's own service map routes to it as a healthy backend. Nothing else puts a starting instance there: a fresh instance's backend is unhealthy until its state reaches `Running`, so the test singles out exactly the rollout's published replacements. `resolve` returns an `Option<&ServiceEntry>`, and `is_some_and` runs the closure on the entry if there is one and answers `false` if there isn't, the way Python's `entry is not None and any(...)` would. Note that `reported_state` returns a `ContainerState` by value: it's a fieldless enum that derives `Copy`, so handing one back costs no more than returning an integer, and no borrow of the supervisor escapes.
+
+The worker publishes the replacement before it begins the old instance's retirement, so no report can show the old one stopping without the new one healthy beside it. The catalogue goes from "old healthy" (perhaps via "both healthy") to "new healthy, old unhealthy", and every node's view flips in one step.
+
+Nothing on the wire changed. The report has always carried a health status per instance, and the leader reads it the same way. Only what a node puts in it did, so `CURRENT` in `src/compatibility.rs` stays where it was.
+
+### Tests
+
+`a_published_rolling_replacement_reports_running_before_the_old_instance_retires` in the agent tests walks the loop through what the deploy worker asks of it, reserve, prepare, `Starting`, publish, begin retiring the old one, and reads the report snapshot at two points. Before publication the replacement reports `Starting`, because nothing routes to it yet. After publication and the start of the retirement it must report `Running` beside the old one's `Stopping`. Before the fix it reported `Starting` there.
+
+`one_replica_rollout_keeps_a_healthy_backend_on_every_node` in `tests/cluster_failover.rs` (`make test-cluster`) is the demo in miniature. Three real nodes run a one-replica `cheese`, the test writes v2, and every 50 ms it reads each node's installed view of the service until every node routes only to the replacement. Every sample must have a healthy backend. The first draft of the test passed on the unfixed code, which was the interesting part. In the test cluster, reports go out every second, and a `script` app that dies on `SIGTERM` let the whole rollout finish between two reports, so no report ever caught the bad moment. The demo's real containers took seconds to stop, and the default report interval is five. So the test's app ignores `SIGTERM` and the spec sets `drain_timeout = "3s"`, which holds the old instance in `Stopping` for longer than a report interval, as a server finishing its requests would. Then it failed: two to three seconds in which both remote nodes listed two backends, neither healthy. With the fix, those same samples list the replacement healthy and the old one unhealthy.
+
+### What's left
+
+The report fix closes the `EPERM` gap. It doesn't make a rollout seamless for other nodes. Once the old instance leaves the catalogue, the drain on its own node only waits for the ingress proxy's connections, and service-to-service callers on other nodes don't go through it. A server that exits the moment it gets `SIGTERM` can stop while a node that hasn't polled the new catalogue yet still routes to it, and that caller gets `ECONNREFUSED` instead of `EPERM`. Two replicas have the same window for each instance they replace. Closing it means holding the stop until the other nodes confirm the withdrawal, which the address-release protocol already collects, but only after the stop. Moving it in front is a change to how retirement and release fit together, and it's a separate piece of work.

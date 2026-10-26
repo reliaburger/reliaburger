@@ -362,7 +362,8 @@ migration and no feature gate
   to it: recreate the cluster
   ([upgrading from 0.2.1](releasing.md#upgrading-from-021)).
 - [ ] **0.2.3: two billion a day**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/17)). 2B host-job tasks in one real
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/17),
+  [plan](plans/2026-10-20-plan-0.2.3.md)). 2B host-job tasks in one real
   24-hour day on a three-node cluster, counted, not extrapolated, with 1B as
   the floor. Plus the CI, soak and test follow-ups from the CI and test
   efficiency plan.

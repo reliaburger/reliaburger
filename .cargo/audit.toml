@@ -24,7 +24,8 @@
 #     a compile_error! tombstone, so gossip, reporting frames and the Raft
 #     metadata moved to postcard (#1026). Removed.
 #   - RUSTSEC-2024-0370 (proc-macro-error): age 0.10 -> 0.12 (#1026) moves to
-#     i18n-embed-fl 0.10, which uses proc-macro-error2. Removed.
+#     i18n-embed-fl 0.10, which uses proc-macro-error2. Removed. age is now
+#     0.11.5 (below), whose i18n-embed-fl 0.9.4 also uses proc-macro-error2.
 #
 # RUSTSEC-2026-0374 (basic-toml) was added 20 October 2026 (see
 # docs/qualification/2026-10-20-dependency-exceptions.md): unmaintained, no
@@ -34,19 +35,17 @@
 # for the webpki-roots 0.26.11 shim only: it has no patched 0.26 release and
 # re-exports webpki-roots 1.x, which Cargo.lock holds at the patched 1.0.10.
 # tests/suite/dependency_audit.rs fails if 1.x is unpatched (#1269).
-# RUSTSEC-2026-0387 (crypto-bigint 0.5.5, constant-time timing variability)
-# was added 24 October 2026 (see
-# docs/qualification/2026-10-24-dependency-exceptions.md): the fix is 0.7.6,
-# which elliptic-curve 0.13 can't take, and it's reached only through age's
-# HPKE/P-256 code, which our X25519 and scrypt recipients never call. Cosign
-# uses ring. tests/suite/dependency_audit.rs fails if Reliaburger depends on
-# that chain directly.
+# RUSTSEC-2026-0173 (proc-macro-error2) was added 25 October 2026 (see
+# docs/qualification/2026-10-25-dependency-exceptions.md): unmaintained, no
+# patched release, compile time only, through age 0.11.5's i18n proc macros.
+# age 0.12 avoided it but compiled in P-256 code built on crypto-bigint 0.5
+# (RUSTSEC-2026-0387, timing variability), so age went back to 0.11.5.
 # Next review: 18 November 2026.
 [advisories]
 ignore = [
     "RUSTSEC-2026-0374",
     "RUSTSEC-2026-0381",
-    "RUSTSEC-2026-0387",
+    "RUSTSEC-2026-0173",
 ]
 
 [output]
