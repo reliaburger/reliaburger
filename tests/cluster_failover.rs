@@ -672,6 +672,159 @@ async fn invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
+/// A one-replica ported service at `version`: the version only changes
+/// the environment, so writing a new one rolls the app.
+///
+/// It ignores SIGTERM, so stopping the old instance takes the whole
+/// `drain_timeout` before the kill, the way a real server finishing its
+/// requests does. That holds the rollout between "old instance stopping"
+/// and "new instance finalised" for longer than a report interval.
+fn versioned_service_spec(port: u16, version: &str) -> reliaburger::config::app::AppSpec {
+    toml::from_str(&format!(
+        r#"
+        script = "trap '' TERM; while true; do sleep 0.2; done"
+        replicas = 1
+        port = {port}
+        [env]
+        VERSION = "{version}"
+        [deploy]
+        drain_timeout = "3s"
+        "#
+    ))
+    .unwrap()
+}
+
+/// #1353: rolling a one-replica service with the default `max_surge = 1`,
+/// `max_unavailable = 0` must keep a healthy backend in every node's view
+/// the whole way through. The burger demo's `cheese` showed 3 to 6 s in
+/// which no node had one, and callers got `EPERM` from the connect hook.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn one_replica_rollout_keeps_a_healthy_backend_on_every_node() {
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+
+    let mut fixture = Fixture::new();
+    const N: usize = 3;
+    let all: Vec<usize> = (0..N).collect();
+    let mut nodes = Vec::with_capacity(N);
+    nodes.push(fixture.start_node(300, vec![], true, None).await);
+    for index in 301..(300 + N) {
+        let seed = fixture.gossip(300);
+        nodes.push(fixture.start_node(index, vec![seed], true, None).await);
+    }
+    wait_until(
+        "three settled voters",
+        Duration::from_secs(60),
+        async || settled_voters(&pick(&nodes, &all)).is_some_and(|voters| voters.len() == N),
+    )
+    .await;
+    wait_until(
+        "all nodes reporting to the leader",
+        Duration::from_secs(60),
+        async || {
+            leader_state(&nodes, &all)
+                .await
+                .is_some_and(|state| state.reports.len() == N)
+        },
+    )
+    .await;
+
+    let app_id = AppId::new("cheese", "default");
+    write_through_leader(
+        &nodes,
+        &all,
+        RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: Box::new(versioned_service_spec(6391, "v1")),
+        },
+    )
+    .await;
+    wait_until(
+        "cheese v1 resolves with a healthy backend on every node",
+        Duration::from_secs(90),
+        async || {
+            for node in &nodes {
+                let healthy = node
+                    .resolve("cheese")
+                    .await
+                    .is_some_and(|info| info.healthy_backends >= 1);
+                if !healthy {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+    // Local and remote views name a backend differently (instance id here,
+    // `node:ip:port` elsewhere), but its host port is the same everywhere.
+    let original: BTreeSet<u16> = nodes[0]
+        .resolve("cheese")
+        .await
+        .expect("cheese resolves")
+        .backends
+        .into_iter()
+        .map(|backend| backend.host_port)
+        .collect();
+
+    write_through_leader(
+        &nodes,
+        &all,
+        RaftRequest::AppSpec {
+            app_id,
+            spec: Box::new(versioned_service_spec(6391, "v2")),
+        },
+    )
+    .await;
+
+    // Sample every node's installed view until each one names only the
+    // replacement, healthy. Every sample must have a healthy backend.
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(120);
+    let mut gaps: Vec<String> = Vec::new();
+    loop {
+        let mut rolled = 0;
+        for node in &nodes {
+            let view = node.resolve("cheese").await;
+            let at = started.elapsed();
+            if !view.as_ref().is_some_and(|info| info.healthy_backends >= 1) {
+                gaps.push(format!("{} at {at:?}: {view:?}", node.name));
+            }
+            let replaced = view.is_some_and(|info| {
+                !info.backends.is_empty()
+                    && info
+                        .backends
+                        .iter()
+                        .all(|backend| backend.healthy && !original.contains(&backend.host_port))
+            });
+            if replaced {
+                rolled += 1;
+            }
+        }
+        if rolled == N {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the rollout of cheese v2 never reached every node's view; gaps: {gaps:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        gaps.is_empty(),
+        "a one-replica rollout left nodes without a healthy cheese backend \
+         ({} samples):\n{}",
+        gaps.len(),
+        gaps.join("\n")
+    );
+
+    fixture.root.cancel();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover() {

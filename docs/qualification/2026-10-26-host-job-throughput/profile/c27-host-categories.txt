@@ -1,0 +1,23 @@
+samples 39913
+ 58.43%     312.1 us/task  idle (no runnable work)
+  0.03%       0.2 us/task  Bun: Raft core and log
+  0.05%       0.3 us/task  Bun: task ledger (group commit, fsync)
+  0.88%       4.7 us/task  Bun: per task, namespace policy check (kernel lock, BPF map read)
+  0.92%       4.9 us/task  Bun: per task, wait_empty_task (cgroup.events read)
+  1.79%       9.6 us/task  Bun: per task, helper protocol (socket read/write)
+  0.24%       1.3 us/task  Bun: per task, OCI spec and environment rebuild
+  1.50%       8.0 us/task  Bun: per task, rest of ReusablePool::run (slots lock, timers, logs)
+  0.07%       0.3 us/task  Bun: per task, OwnedRunner::run outside the pool (template, admission)
+  1.27%       6.8 us/task  Bun: per task, chunk streaming and attempt bookkeeping
+  0.01%       0.1 us/task  Bun: task-array leader tick and node sync
+  1.40%       7.5 us/task  Bun: other (runtime, timers, wakeups, other subsystems)
+  2.40%      12.8 us/task  helper/child: clone3 (process creation)
+  5.28%      28.2 us/task  helper/child: execve
+  4.76%      25.4 us/task  helper/child: exit and address-space teardown
+  4.43%      23.7 us/task  helper/child: page faults
+  7.32%      39.1 us/task  helper: wait, poll, pipes and socket syscalls
+  1.16%       6.2 us/task  helper: user space and other kernel
+  5.95%      31.8 us/task  busybox `true`: user space and other kernel
+  0.06%       0.3 us/task  relish (raw scenario spawner and bench client)
+  2.05%      11.0 us/task  other processes and kernel threads
+other by command: exe 0.93%, ksoftirqd/ 0.53%, migration/ 0.25%, lima-guestagent 0.06%, perf 0.06%, kworker/3:2-eve 0.05%, rcu_preempt 0.04%, kworker/2:2-eve 0.03%, kworker/0:3-eve 0.03%, kworker/1:2-eve 0.03%, kworker/u8:0-wr 0.02%, kworker/u8:1-ev 0.02%

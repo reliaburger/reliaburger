@@ -13,7 +13,7 @@ crash-loops on boot reverts to the previous version by itself.
 Until 1.0 it works only between builds of the same format. Every build speaks
 one cluster protocol and one state format (`bun --compatibility` prints them),
 and a node takes only a binary with its own pair. Every release from 0.1.0 to
-0.2.1 changed one or the other, so none of them can roll onto the release
+0.2.2 changed one or the other, so none of them can roll onto the release
 before it: moving between them means a fresh cluster, as described below.
 `relish upgrade` is for a later build with the same pair, such as a patch release that doesn't
 change a format, or your own rebuild. `relish upgrade check` tells you which
@@ -198,8 +198,11 @@ everything the council held
 And 0.2.1: protocol 52 and state format 69. A 0.2.0 cluster's leader refuses
 it the same way
 ([upgrading from 0.2.0](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-020)).
+And 0.2.2: protocol 53 and state format 70. A 0.2.1 cluster's leader refuses
+it the same way
+([upgrading from 0.2.1](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-021)).
 So no published release has yet rolled in place onto another; the first that
-can will be a release that keeps 0.2.1's pair.
+can will be a release that keeps 0.2.2's pair.
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it
