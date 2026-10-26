@@ -40,12 +40,31 @@
 # patched release, compile time only, through age 0.11.5's i18n proc macros.
 # age 0.12 avoided it but compiled in P-256 code built on crypto-bigint 0.5
 # (RUSTSEC-2026-0387, timing variability), so age went back to 0.11.5.
+# RUSTSEC-2026-0391 and 0395 to 0406 (zstd 0.13.3, zstd-safe
+# 7.3.0) were added 26 October 2026 (see
+# docs/qualification/2026-10-26-dependency-exceptions.md): parquet, arrow-ipc
+# and DataFusion 55.2.0 still require zstd 0.13, and only Parquet that
+# Reliaburger wrote itself is decompressed. Moving to zstd 0.14.3 is #1366.
 # Next review: 18 November 2026.
 [advisories]
 ignore = [
     "RUSTSEC-2026-0374",
     "RUSTSEC-2026-0381",
     "RUSTSEC-2026-0173",
+    # zstd 0.13.3 and zstd-safe 7.3.0, until #1366.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0395",
+    "RUSTSEC-2026-0396",
+    "RUSTSEC-2026-0397",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0399",
+    "RUSTSEC-2026-0400",
+    "RUSTSEC-2026-0401",
+    "RUSTSEC-2026-0402",
+    "RUSTSEC-2026-0403",
+    "RUSTSEC-2026-0404",
+    "RUSTSEC-2026-0405",
+    "RUSTSEC-2026-0406",
 ]
 
 [output]
