@@ -16,6 +16,11 @@
 //! next attempt so a late report from it is fenced off. The batch commits
 //! as a single `Tick` entry, however many arrays are running.
 //!
+//! Once that entry commits, every node it gave new chunks is called again
+//! at once with the committed state ([`follow_ups`]), so a grant reaches
+//! its node in the tick that made it rather than a tick later (#1360). The
+//! next tick collects that call's answer.
+//!
 //! Production persists the same state through a council or the private
 //! standalone job store. Tests may explicitly select volatile standalone state.
 
@@ -23,9 +28,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -1030,6 +1035,19 @@ impl SyncCalls {
         self.pending.push(call);
     }
 
+    /// Every answer already in, without waiting. A tick takes these before
+    /// it calls anyone, so a node whose last call has answered (the
+    /// previous tick's follow-up, say) is called again this tick, and one
+    /// whose call is still running isn't.
+    pub fn gather_ready(&mut self) -> Vec<SyncAnswer> {
+        let mut answers = Vec::new();
+        while let Some(Some(answer)) = self.pending.next().now_or_never() {
+            self.waiting_on.remove(&answer.node);
+            answers.push(answer);
+        }
+        answers
+    }
+
     /// Every answer that arrives by `deadline`, or sooner if no call is
     /// left. Calls still out stay for the next tick.
     pub async fn gather_until(&mut self, deadline: tokio::time::Instant) -> Vec<SyncAnswer> {
@@ -1045,6 +1063,60 @@ impl SyncCalls {
         }
         answers
     }
+}
+
+/// The chunks a sync request tells its node it holds: array, chunk and
+/// grant attempt.
+pub type HeldSet = BTreeSet<(u64, ChunkId, u64)>;
+
+/// What `request` tells its node it holds.
+pub fn held_chunks(request: &NodeSyncRequest) -> HeldSet {
+    request
+        .arrays
+        .iter()
+        .flat_map(|assignment| {
+            assignment
+                .held
+                .iter()
+                .map(move |held| (assignment.batch_id, held.chunk, held.attempt))
+        })
+        .collect()
+}
+
+/// The calls a tick makes once its entry has committed (#1360): one to
+/// each node the committed state gives a chunk, or a new attempt at one,
+/// that the tick's own request (`told`) didn't list. Without them a grant
+/// waits a whole tick for the next request. A node whose call is still out
+/// gets none: it would refuse a second call as busy, and the grant goes
+/// with its next regular request instead.
+pub fn follow_ups(
+    told: &HashMap<NodeId, HeldSet>,
+    requests: Vec<(NodeId, Option<String>, NodeSyncRequest)>,
+    calls: &SyncCalls,
+) -> Vec<(NodeId, Option<String>, NodeSyncRequest)> {
+    let nothing = HeldSet::new();
+    requests
+        .into_iter()
+        .filter(|(node, _, request)| {
+            let before = told.get(node).unwrap_or(&nothing);
+            !calls.is_waiting_on(node) && !held_chunks(request).is_subset(before)
+        })
+        .collect()
+}
+
+/// One answer per node, sorted by node: the last of its answers to
+/// arrive. A tick can collect two from one node, the previous tick's
+/// follow-up and its own call; a node reports every finished chunk on
+/// every sync until the leader retires it, so the later answer says
+/// everything the earlier one did.
+pub fn latest_per_node(
+    answers: Vec<(NodeId, NodeSyncResponse)>,
+) -> Vec<(NodeId, NodeSyncResponse)> {
+    let mut latest = BTreeMap::new();
+    for (node, response) in answers {
+        latest.insert(node, response);
+    }
+    latest.into_iter().collect()
 }
 
 /// What [`plan_tick`] needs besides the arrays.
@@ -1382,27 +1454,40 @@ struct SyncRound {
     counts: Vec<(u64, (u64, u64))>,
 }
 
-fn sync_round(view: ControlView<'_>, targets: Vec<(NodeId, Option<String>)>) -> SyncRound {
-    let arrays = view.arrays;
-    let version = super::task_array_node::ControlVersion {
+/// The control version of the state `view` shows. The term is filled in
+/// afterwards, from the council.
+fn control_version(view: &ControlView<'_>) -> super::task_array_node::ControlVersion {
+    super::task_array_node::ControlVersion {
         epoch: view.desired.map_or(0, |desired| desired.recovery_epoch),
         index: view.desired.map_or(view.revision, |desired| {
             desired.last_applied_log.map_or(0, |id| id.index)
         }),
         ..Default::default()
-    };
+    }
+}
+
+/// Each target's sync request against `arrays`, with its URL.
+fn requests_for(
+    arrays: &TaskArrays,
+    targets: Vec<(NodeId, Option<String>)>,
+) -> Vec<(NodeId, Option<String>, NodeSyncRequest)> {
+    targets
+        .into_iter()
+        .map(|(node, url)| {
+            let request = sync_request_for(arrays, &node);
+            (node, url, request)
+        })
+        .collect()
+}
+
+fn sync_round(view: ControlView<'_>, targets: Vec<(NodeId, Option<String>)>) -> SyncRound {
+    let arrays = view.arrays;
     let kept_arrays: BTreeSet<u64> = arrays.iter().map(|(id, _)| id).collect();
     SyncRound {
-        version,
+        version: control_version(&view),
         known: arrays.ids(),
         has_active: arrays.has_active(),
-        requests: targets
-            .into_iter()
-            .map(|(node, url)| {
-                let request = sync_request_for(arrays, &node);
-                (node, url, request)
-            })
-            .collect(),
+        requests: requests_for(arrays, targets),
         kept: kept_arrays
             .iter()
             .copied()
@@ -1455,6 +1540,7 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
     let since = *memory.since.get_or_insert(now);
     let targets = sync_targets(state).await;
     let target_nodes: Vec<NodeId> = targets.iter().map(|(node, _)| node.clone()).collect();
+    let follow_up_targets = targets.clone();
     let Some(mut round) = read_control(state, move |view| sync_round(view, targets)).await else {
         return;
     };
@@ -1468,7 +1554,12 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
     // Even an empty restored snapshot must reach workers: they can hold
     // pre-recovery attempts or directories unknown to this council history.
     // last_known below suppresses repeats only after a successful sync.
+    // Answers already in (mostly the last tick's follow-ups) are taken
+    // first, so those nodes are free to be called again now.
+    let mut arrived = memory.calls.gather_ready();
+    let mut told: HashMap<NodeId, HeldSet> = HashMap::new();
     for (node, url, mut request) in std::mem::take(&mut round.requests) {
+        told.insert(node.clone(), held_chunks(&request));
         if memory.calls.is_waiting_on(&node) {
             continue;
         }
@@ -1477,27 +1568,16 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
             continue;
         }
         let known = round.known.clone();
-        let caller = state.clone();
-        let call = tokio::spawn(async move { sync_node(&caller, url.as_deref(), &request).await });
-        let answering = node.clone();
-        memory.calls.start(
-            node,
-            Box::pin(async move {
-                SyncAnswer {
-                    node: answering,
-                    known,
-                    answer: call.await.unwrap_or_else(|error| Err(error.to_string())),
-                }
-            }),
-        );
+        start_sync(state, &mut memory.calls, node, url, request, known);
     }
     let deadline = tokio::time::Instant::now() + sync_deadline(state.task_arrays.sync_interval);
+    arrived.extend(memory.calls.gather_until(deadline).await);
     let mut answers: Vec<(NodeId, NodeSyncResponse)> = Vec::new();
     for SyncAnswer {
         node,
         known,
         answer,
-    } in memory.calls.gather_until(deadline).await
+    } in arrived
     {
         match answer {
             Ok(response) => {
@@ -1513,7 +1593,7 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
             }
         }
     }
-    answers.sort_by(|a, b| a.0.cmp(&b.0));
+    let answers = latest_per_node(answers);
     remember_views(state, &answers, &round).await;
     // The latest slots each node reported, this tick or earlier: a node
     // that missed one sync keeps its last word, rather than being charged
@@ -1566,13 +1646,82 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
     else {
         return;
     };
+    if writes.is_empty() {
+        return;
+    }
     match write_tick(state, writes).await {
         Ok(refused) => {
             for (batch_id, reason) in refused {
                 eprintln!("bun: task array {batch_id}: tick write refused: {reason}");
             }
+            send_new_grants(state, &mut memory.calls, follow_up_targets, &told).await;
         }
+        // The entry may still commit; the next tick's requests carry
+        // whatever it granted.
         Err(error) => eprintln!("bun: task arrays: tick write failed: {error}"),
+    }
+}
+
+/// Call a node with `request`, tracked in `calls` so this tick or a later
+/// one collects the answer.
+fn start_sync(
+    state: &ApiState,
+    calls: &mut SyncCalls,
+    node: NodeId,
+    url: Option<String>,
+    request: NodeSyncRequest,
+    known: Vec<u64>,
+) {
+    let caller = state.clone();
+    let call = tokio::spawn(async move { sync_node(&caller, url.as_deref(), &request).await });
+    let answering = node.clone();
+    calls.start(
+        node,
+        Box::pin(async move {
+            SyncAnswer {
+                node: answering,
+                known,
+                answer: call.await.unwrap_or_else(|error| Err(error.to_string())),
+            }
+        }),
+    );
+}
+
+/// Once a tick's entry has committed, send each node it gave new chunks
+/// its request at once (see [`follow_ups`]) rather than leaving the grants
+/// for the next tick. The requests are read from the committed state, so
+/// their control version is at least the one this tick's requests carried
+/// and each node's fence only moves forward. Nothing waits for the
+/// answers: the next tick collects them.
+async fn send_new_grants(
+    state: &ApiState,
+    calls: &mut SyncCalls,
+    targets: Vec<(NodeId, Option<String>)>,
+    told: &HashMap<NodeId, HeldSet>,
+) {
+    let Some((mut version, known, requests)) = read_control(state, move |view| {
+        (
+            control_version(&view),
+            view.arrays.ids(),
+            requests_for(view.arrays, targets),
+        )
+    })
+    .await
+    else {
+        return;
+    };
+    if let Some(council) = &state.council {
+        version.term = council.current_term();
+    }
+    // Leadership may have moved while the entry committed. A deposed
+    // leader's request carries its old term, so a node the new leader has
+    // reached refuses it, but it shouldn't go out at all.
+    if !is_leading(state).await {
+        return;
+    }
+    for (node, url, mut request) in follow_ups(told, requests, calls) {
+        request.version = version;
+        start_sync(state, calls, node, url, request, known.clone());
     }
 }
 
@@ -2569,6 +2718,303 @@ mod tests {
         assert_eq!(late[0].node, node("hung"));
         assert!(!calls.is_waiting_on(&node("hung")));
         assert!(ticks >= 5, "the hung call took {ticks} ticks to answer");
+    }
+
+    /// A request for array 1 that tells its node it holds `held`.
+    fn asking(held: &[(u32, u64)]) -> NodeSyncRequest {
+        let mut assignment = assignment_for(1, &record(100, 10), &node("any"));
+        assignment.held = held
+            .iter()
+            .map(|&(chunk, attempt)| HeldChunk {
+                chunk: ChunkId(chunk),
+                attempt,
+            })
+            .collect();
+        NodeSyncRequest {
+            version: Default::default(),
+            known: vec![1],
+            arrays: vec![assignment],
+        }
+    }
+
+    fn called(follow_ups: Vec<(NodeId, Option<String>, NodeSyncRequest)>) -> Vec<String> {
+        follow_ups
+            .into_iter()
+            .map(|(node, _, _)| node.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn only_nodes_given_chunks_they_were_not_told_of_are_called_again() {
+        let told: HashMap<NodeId, HeldSet> = [
+            ("granted", vec![]),
+            ("unchanged", vec![(1, 1)]),
+            ("retired", vec![(2, 1), (3, 1)]),
+            ("regranted", vec![(4, 1)]),
+            ("busy", vec![]),
+        ]
+        .into_iter()
+        .map(|(name, held)| (node(name), held_chunks(&asking(&held))))
+        .collect();
+        let committed = [
+            ("granted", vec![(0, 1)]),
+            ("unchanged", vec![(1, 1)]),
+            ("retired", vec![(3, 1)]),
+            ("regranted", vec![(4, 2)]),
+            // Joined after the tick read its targets.
+            ("new", vec![(5, 1)]),
+            ("busy", vec![(6, 1)]),
+        ]
+        .into_iter()
+        .map(|(name, held)| (node(name), None, asking(&held)))
+        .collect();
+        // The busy node's last call is still out: a second call now would
+        // be refused, so its grant goes with its next regular request.
+        let mut calls = SyncCalls::default();
+        calls.start(node("busy"), Box::pin(futures_util::future::pending()));
+        assert_eq!(
+            called(follow_ups(&told, committed, &calls)),
+            ["granted", "regranted", "new"]
+        );
+    }
+
+    #[test]
+    fn a_tick_that_grants_calls_the_granted_nodes_once_more_and_no_one_else() {
+        let mut arrays = running_arrays(1);
+        let nodes = [node("a"), node("b"), node("quiet")];
+        let targets: Vec<(NodeId, Option<String>)> =
+            nodes.iter().map(|node| (node.clone(), None)).collect();
+        let told_now = |arrays: &TaskArrays| -> HashMap<NodeId, HeldSet> {
+            nodes
+                .iter()
+                .map(|node| (node.clone(), held_chunks(&sync_request_for(arrays, node))))
+                .collect()
+        };
+        let told = told_now(&arrays);
+        // "quiet" doesn't answer, so it's granted nothing.
+        let answers: Vec<(NodeId, NodeSyncResponse)> = nodes[..2]
+            .iter()
+            .map(|node| (node.clone(), answer_for(&arrays, node, 2)))
+            .collect();
+        let heard = HashMap::new();
+        for entry in tick_entries(plan_tick(&arrays, None, &inputs(&answers, &heard))) {
+            arrays.apply(&entry, || 0).unwrap();
+        }
+        let calls = SyncCalls::default();
+        let after = requests_for(&arrays, targets.clone());
+        assert_eq!(called(follow_ups(&told, after, &calls)), ["a", "b"]);
+        // Once told, nothing new: no second follow-up.
+        let after = requests_for(&arrays, targets);
+        assert!(follow_ups(&told_now(&arrays), after, &calls).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_takes_answers_already_in_and_leaves_calls_still_out_for_later() {
+        // The last tick's follow-ups: one has answered, one is still
+        // running when this tick starts.
+        let arrays = running_arrays(1);
+        let mut calls = SyncCalls::default();
+        let call = |name: &str, delay: Duration| -> BoxFuture<'static, SyncAnswer> {
+            let node = node(name);
+            let response = answer_for(&arrays, &node, 10);
+            Box::pin(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                SyncAnswer {
+                    node,
+                    known: vec![1],
+                    answer: Ok(response),
+                }
+            })
+        };
+        calls.start(node("answered"), call("answered", Duration::ZERO));
+        calls.start(node("running"), call("running", Duration::from_millis(700)));
+
+        let started = tokio::time::Instant::now();
+        let ready = calls.gather_ready();
+        assert_eq!(started.elapsed(), Duration::ZERO, "gather_ready waited");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].node, node("answered"));
+        // So this tick calls "answered" again, but not "running": it would
+        // refuse a second call as busy.
+        assert!(!calls.is_waiting_on(&node("answered")));
+        assert!(calls.is_waiting_on(&node("running")));
+        // The running call's answer lands after this tick's deadline and
+        // is folded into the next one.
+        let late = calls
+            .gather_until(started + sync_deadline(SYNC_INTERVAL))
+            .await;
+        assert!(late.is_empty());
+        assert!(calls.gather_ready().is_empty());
+        let next = calls.gather_until(started + SYNC_INTERVAL).await;
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].node, node("running"));
+        assert!(!calls.is_waiting_on(&node("running")));
+    }
+
+    #[test]
+    fn a_node_answering_twice_in_one_tick_is_planned_from_its_later_answer() {
+        let arrays = running_arrays(1);
+        let earlier = answer_for(&arrays, &node("b"), 1);
+        let later = answer_for(&arrays, &node("b"), 4);
+        let other = answer_for(&arrays, &node("a"), 2);
+        let answers = latest_per_node(vec![
+            (node("b"), earlier),
+            (node("a"), other.clone()),
+            (node("b"), later.clone()),
+        ]);
+        assert_eq!(answers, vec![(node("a"), other), (node("b"), later)]);
+    }
+
+    /// A standalone leader with durable job storage under `data`, its node
+    /// running a fake executor that counts attempts in `executed`, and one
+    /// running array of `tasks` tasks. The leader loop ticks once when the
+    /// router starts and then not for an hour.
+    async fn one_tick_leader(
+        data: &std::path::Path,
+        executed: Arc<std::sync::atomic::AtomicU64>,
+        tasks: u32,
+    ) -> (Arc<TaskArrayService>, tokio_util::sync::CancellationToken) {
+        use crate::bun::task_array_node::{NodeRunner, TaskArrayNodeConfig};
+        use crate::bun::task_executor::{AttemptOutcome, FakeRunner};
+        let node = TaskArrayNode::new(
+            TaskArrayNodeConfig {
+                root: data.join("task-arrays"),
+                policy: crate::config::process_workloads::ProcessWorkloadsConfig {
+                    mount_isolation: false,
+                    allowed_binaries: vec!["/bin/sh".into()],
+                    ..Default::default()
+                },
+                default_concurrency: 4,
+                backoff: (Duration::ZERO, Duration::ZERO),
+                group_commit: Default::default(),
+                audit_dir: None,
+            },
+            NodeRunner::Fake(FakeRunner::new(Duration::ZERO, move |_| {
+                executed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                AttemptOutcome::Exited { code: 0 }
+            })),
+        );
+        let service = Arc::new(
+            TaskArrayService::with_timings(
+                Some(Arc::new(node)),
+                Duration::from_secs(3600),
+                SILENCE_TIMEOUT,
+            )
+            .with_storage(data)
+            .await
+            .unwrap(),
+        );
+        let mut template = record(tasks, 10).template;
+        template.exec = Some("/bin/sh".into());
+        template.command = Some(vec!["-c".into(), "exit 0".into()]);
+        write_standalone(
+            &service,
+            TaskArrayWrite::Register {
+                name: "render".into(),
+                namespace: "default".into(),
+                template: Box::new(template),
+                spec: TaskArraySpec {
+                    chunk_size: 10,
+                    ..TaskArraySpec::with_count(tasks)
+                },
+                submitted_at_epoch_secs: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
+        // No agent: holding the receiver keeps the leader loop alive.
+        let agent_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = agent_shutdown.cancelled() => return,
+                    command = cmd_rx.recv() => match command {
+                        Some(crate::bun::agent::AgentCommand::CurrentResources { response }) => {
+                            let _ = response.send(Vec::new());
+                        }
+                        Some(crate::bun::agent::AgentCommand::Status { response }) => {
+                            let _ = response.send(Vec::new());
+                        }
+                        Some(_) => {}
+                        None => return,
+                    },
+                }
+            }
+        });
+        let _app = crate::bun::api::router_with_upgrade(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            "default".into(),
+            Some("local".into()),
+            crate::bun::build_runner::BuildSettings::with_timeout(900),
+            crate::cluster::ClusterHttp::plaintext(),
+            5050,
+            "http",
+            256 * 1024 * 1024,
+            false,
+            crate::bun::capabilities::StaticCapabilities::default(),
+            crate::bun::readiness::ReadinessTracker::new(),
+            None,
+            None,
+            None,
+            Some(Arc::clone(&service)),
+        );
+        (service, shutdown)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_reaches_its_node_in_the_tick_that_commits_it() {
+        // #1360: before, the tick that granted a chunk sent it nowhere; the
+        // node learnt of it from the next tick's request, a whole interval
+        // later. With one tick and no second for an hour, the tasks run
+        // only if the grant goes out in the tick that commits it.
+        let data = tempfile::tempdir().unwrap();
+        let executed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (service, shutdown) = one_tick_leader(data.path(), Arc::clone(&executed), 40).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while executed.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first tick's grants never reached the node"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The follow-up carried the committed state's version, so the
+        // node's fence is the store's revision after the tick's entry.
+        let revision = {
+            let store = service.standalone.as_ref().unwrap();
+            store.lock().unwrap().revision()
+        };
+        let fence = super::super::control_fence::read(
+            &data
+                .path()
+                .join("task-arrays")
+                .join(super::super::control_fence::FILE_NAME),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fence.version.index, revision);
+        shutdown.cancel();
     }
 
     #[test]

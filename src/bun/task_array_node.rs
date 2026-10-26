@@ -2124,6 +2124,82 @@ mod tests {
         }
     }
 
+    /// A sync of array 1 holding `held`, at `term` and `index` of epoch 0.
+    fn sync_at(term: u64, index: u64, held: &[(u32, u64)]) -> NodeSyncRequest {
+        let mut sync = request(vec![assignment(1, 40, held)]);
+        sync.version = ControlVersion {
+            epoch: 0,
+            term,
+            index,
+        };
+        sync
+    }
+
+    fn refused_as_stale(answer: &NodeSyncResponse) -> bool {
+        answer.arrays[0]
+            .refused
+            .as_deref()
+            .is_some_and(|reason| reason.contains("stale control version"))
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_and_the_next_ticks_request_pass_the_fence_but_a_late_older_call_does_not()
+    {
+        // #1360: a tick calls the node at the index it read, commits new
+        // grants, then calls again at once at the committed index. The
+        // next tick reads no older state, so it passes the fence too; a
+        // call from before the follow-up that turns up afterwards doesn't.
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let tick = node.sync(&sync_at(1, 5, &[])).await.unwrap();
+        assert!(!refused_as_stale(&tick));
+        let follow_up = sync_at(1, 6, &[(0, 1)]);
+        let progress = sync_until_finished(&node, &follow_up, 1).await;
+        assert_eq!(progress.finished[0].chunk, ChunkId(0));
+        let flushes = node.control_syncs();
+        // Nothing committed between the follow-up and the next tick.
+        let next = node.sync(&sync_at(1, 6, &[(0, 1)])).await.unwrap();
+        assert!(!refused_as_stale(&next));
+        assert_eq!(next.arrays[0].finished.len(), 1);
+        assert_eq!(node.control_syncs(), flushes, "an unchanged fence flushed");
+        let late = node.sync(&sync_at(1, 5, &[])).await.unwrap();
+        assert!(refused_as_stale(&late));
+        assert!(!refused_as_stale(
+            &node.sync(&sync_at(1, 7, &[(0, 1)])).await.unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_deposed_leaders_follow_up_is_refused_once_the_new_leader_has_called() {
+        // The old leader committed its tick in term 1 and lost leadership
+        // before its follow-up reached the node. The new leader (term 2)
+        // has already called, so the follow-up is refused and its grant
+        // never runs here.
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        assert!(!refused_as_stale(
+            &node.sync(&sync_at(1, 5, &[])).await.unwrap()
+        ));
+        assert!(!refused_as_stale(
+            &node.sync(&sync_at(2, 7, &[])).await.unwrap()
+        ));
+        let deposed = node.sync(&sync_at(1, 7, &[(0, 1)])).await.unwrap();
+        assert!(refused_as_stale(&deposed));
+        assert!(deposed.arrays[0].finished.is_empty());
+
+        // The other order: the follow-up arrives first and is a committed
+        // grant like any other, and the new leader's call still passes.
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        assert!(!refused_as_stale(
+            &node.sync(&sync_at(1, 5, &[])).await.unwrap()
+        ));
+        sync_until_finished(&node, &sync_at(1, 6, &[(0, 1)]), 1).await;
+        let new_leader = node.sync(&sync_at(2, 6, &[(0, 1)])).await.unwrap();
+        assert!(!refused_as_stale(&new_leader));
+        assert_eq!(new_leader.arrays[0].finished.len(), 1);
+    }
+
     #[tokio::test]
     async fn a_moving_fence_is_rewritten_in_place_without_a_rename() {
         // Under load the leader's applied index moves every tick, so the
