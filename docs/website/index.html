@@ -127,9 +127,10 @@
           <h2 id="tour-title">Try it in five minutes <a class="permalink" href="#tour" aria-label="Link to the tour">#</a></h2>
         </div>
         <div class="tour">
-          <p class="tour-note">Install, then put the cluster through its paces: a real
-            Kubernetes app, an app of your own, a batch of jobs, a network fault, a killed
-            replica and a lost node. Same prerequisites as the install line.</p>
+          <p class="tour-note">Install, then put the cluster through its paces with a burger
+            built from six apps: watch a layer cut off, a rolling deploy, a rollback, a
+            scale-up, a killed patty, a batch of jobs, a network fault and a lost node. Same
+            prerequisites as the install line.</p>
           <!-- The recording is always on show. assets/tour-player.js loads the vendored
                asciinema player (assets/asciinema/) and the recording from this site as the
                figure nears the viewport. -->
@@ -162,77 +163,112 @@
                   that takes minutes.</p>
               </li>
               <li>
-                <pre><code data-tour>relish apply -f https://reliaburger.com/demo/podinfo.yaml</code></pre>
-                <p>A real Kubernetes app: podinfo’s frontend, backend and Redis cache, plus a small
-                  load generator so there’s always traffic. Relish converts the YAML as it applies it
-                  and tells you what it had to change.</p>
-              </li>
-              <li>
-                <pre><code data-tour>relish status</code>
-<code data-tour>relish council status</code></pre>
-                <p>Give it half a minute. Three frontend replicas, one on each node, named
-                  <code>frontend-0</code>, <code>-1</code> and <code>-2</code>. The scheduler
-                  spread them and numbered them across the cluster, not you. <code>status</code>
-                  opens with a line on the council, the Raft group that holds the cluster’s state;
-                  <code>council status</code> asks every node for its own view of it: its role,
-                  term and log position, with the leader and quorum on top.</p>
-              </li>
-              <li>
-                <pre><code>open http://podinfo.localhost:18080</code></pre>
-                <p>Or paste the address into a browser. It comes in through the built-in ingress;
-                  reload and the hostname changes as each replica answers.</p>
-              </li>
-              <li>
                 <pre><code data-tour>curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz</code>
 <code data-tour>relish build burger/burger.toml</code>
-<code data-tour>relish images</code>
-<code data-tour>relish apply burger/burger.toml</code>
-<code data-tour>curl http://burger.localhost:18080/order</code></pre>
-                <p>Now an app of your own: a small Go service and its Dockerfile. A node builds it
-                  with Buildah, straight into the cluster’s own registry, signed, for both
+<code data-tour>relish images</code></pre>
+                <p>An app of your own: one small Go program and its Dockerfile. A node builds it with
+                  Buildah, straight into the cluster’s own registry, signed, for both
                   <code>linux/amd64</code> and <code>linux/arm64</code>: <code>images</code> lists
-                  <code>burger:v1</code> once, with its platforms. Each order names the podinfo
-                  backend that cooked it, found by its service name.</p>
+                  <code>burger:v1</code> once, with its platforms. It’s the only image the tour
+                  needs.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish apply burger/burger.toml</code>
+<code data-tour>relish status</code>
+<code data-tour>relish council status</code></pre>
+                <p>Eight apps from that one image: a layer of the burger each (top bun, lettuce,
+                  tomato, cheese, patty, bottom bun), a counter in front and a diner who keeps
+                  ordering. Give it half a minute. Three counters, one on each node, named
+                  <code>counter-0</code>, <code>-1</code> and <code>-2</code>: the scheduler spread
+                  and numbered them, not you. <code>status</code> opens with a line on the council,
+                  the Raft group that holds the cluster’s state; <code>council status</code> asks
+                  every node for its own view of it.</p>
+              </li>
+              <li>
+                <pre><code data-tour>curl http://burger.localhost:18080</code></pre>
+                <p>The burger, through the built-in ingress. The counter asks each layer by its
+                  service name and stacks whatever answers: one coloured line per layer, with its
+                  version and the node and instance that served it. Open the same address in a
+                  browser and it’s drawn in SVG, redrawn every second, so keep it open for what
+                  follows.</p>
               </li>
               <li>
                 <pre><code data-tour>relish batch submit burger/jobs.toml</code>
 <code data-tour>relish batch watch 1</code>
 <code data-tour>relish jobs</code></pre>
-                <p>Then ten jobs beside it: 8 small and 2 larger hashing tasks from
+                <p>Now cook some patties beside it: 8 small and 2 larger hashing jobs from
                   the same image, in two resource profiles. Each profile is stored as a template
                   and a count, not a record per task, and its tasks are packed around the apps
                   already running. <code>watch</code> takes the number <code>submit</code>
                   printed and shows the rate and how long tasks take; <code>jobs</code> lists
-                  the finished run. The burger keeps taking orders throughout.</p>
+                  the finished run. Each task tells the counter its patty is done, and the
+                  burger’s footer counts them. It keeps serving throughout.</p>
               </li>
               <li>
-                <pre><code data-tour>relish path frontend --to redis</code></pre>
-                <p>Walk the path from a frontend to Redis, hop by hop: DNS, the virtual IP, the eBPF service map in
-                  the kernel, the firewall, any active faults, then a real TCP connect from inside the
-                  frontend. On Kubernetes you’d piece that together from five tools and a debug pod.</p>
+                <pre><code data-tour>relish fault partition lettuce --from counter --duration 30s --acknowledge</code>
+<code data-tour>curl http://burger.localhost:18080</code></pre>
+                <p>Cut the lettuce off from the counters, and there’s a gap where it was: the
+                  cluster refuses their connections. Nothing else notices, and after thirty
+                  seconds the fault lifts itself and the lettuce is back. No chaos tooling to
+                  install.</p>
               </li>
               <li>
-                <pre><code data-tour>relish metrics frontend</code></pre>
-                <p>podinfo’s own Prometheus metrics, from every replica. Each node read the manifest’s
-                  <code>prometheus.io</code> annotations and scrapes its own replicas. There’s no
+                <pre><code data-tour>relish apply burger/cheese-v2.toml</code>
+<code data-tour>curl http://burger.localhost:18080</code></pre>
+                <p>A rolling deploy: the same two cheese slices at <code>v2</code>. The node
+                  starts a blue cheese beside the cheddar, waits for its health check, then drains
+                  a cheddar, and goes again. The other slice keeps serving meanwhile, so the
+                  burger never loses its cheese; it turns blue a slice at a time.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish apply burger/patty-v3.toml</code>
+<code data-tour>relish status</code>
+<code data-tour>relish history patty</code></pre>
+                <p>A bad deploy: patty <code>v3</code> is raw in the middle and fails its health
+                  check. It never joins the service, so the burger keeps its beef patty. After
+                  twenty seconds the node rolls it back on its own, and <code>status</code> marks
+                  the patty <code>RolloutFailed</code> so nothing retries it. <code>history</code>
+                  shows what shipped when, on every node.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish apply burger/triple-patty.toml</code>
+<code data-tour>curl http://burger.localhost:18080</code></pre>
+                <p>Three patty replicas, and the counter finds all three: a triple patty, one
+                  line per instance. Any change to the spec clears the <code>RolloutFailed</code>
+                  mark, so this one goes out.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish fault kill patty --acknowledge</code>
+<code data-tour>curl http://burger.localhost:18080</code>
+<code data-tour>relish events --app patty</code></pre>
+                <p>Kill a patty. For a few seconds it’s a double; then the node agent has
+                  restarted it and it’s a triple again, the new patty under a new instance number.
+                  The cluster won’t kill an app’s last replica, which is why this is a patty and
+                  not the lettuce. <code>events</code> asks every node what happened and merges
+                  the answers by time: the deploys, the failed <code>v3</code> and its rollback,
+                  the kill and the restart, each with its node.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish path counter --to patty</code></pre>
+                <p>Walk the path from a counter to the patties, hop by hop: DNS, the virtual IP,
+                  the eBPF service map in the kernel, the firewall, any active faults, then a real
+                  TCP connect from inside the counter. On Kubernetes you’d piece that together
+                  from five tools and a debug pod.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish metrics counter</code></pre>
+                <p>The counters’ own Prometheus metrics, from every replica. Each node scrapes
+                  the replicas it runs, because the app says <code>metrics = {}</code>. There’s no
                   Prometheus to install.</p>
               </li>
               <li>
-                <pre><code data-tour>relish fault delay redis 300ms --from frontend --duration 2m --acknowledge</code></pre>
-                <p>Now make Redis slow, but only for the frontends. Every packet they send it waits
-                  300 ms; anything else calling Redis doesn’t notice. It lifts itself after two
-                  minutes. No chaos tooling to install either.</p>
-              </li>
-              <li>
-                <pre><code data-tour>relish path frontend --to redis --count 3</code></pre>
-                <p>The same path, now DEGRADED. It names the fault, shows the delay it found on
-                  the frontend’s network interface, and every connect takes 300 ms.</p>
-              </li>
-              <li>
-                <pre><code data-tour>relish metrics frontend --name http_request_duration_seconds</code></pre>
-                <p>Wait twenty seconds, then look at latency per replica. It was under a millisecond;
-                  now it’s in the hundreds, and a cache read through the ingress takes almost a
-                  second.</p>
+                <pre><code data-tour>relish fault delay patty 300ms --from counter --duration 2m --acknowledge</code>
+<code data-tour>relish path counter --to patty --count 3</code></pre>
+                <p>Now make the patties slow, but only for the counters. Every packet they send
+                  a patty waits 300 ms; the other layers don’t notice, and it lifts itself after
+                  two minutes. The path is now DEGRADED: it names the fault, shows the delay on
+                  the counter’s network interface, and every connect takes 300 ms. Your browser
+                  shows the same thing, each patty line in the hundreds of milliseconds.</p>
               </li>
               <li>
                 <pre><code data-tour>relish dashboard</code></pre>
@@ -241,22 +277,12 @@
                   cluster keeps running.</p>
               </li>
               <li>
-                <pre><code data-tour>relish fault kill frontend --count 1 --acknowledge</code>
-<code data-tour>relish status</code>
-<code data-tour>relish events --app frontend</code></pre>
-                <p>Kill a frontend. Run <code>status</code> again a few seconds later and it’s back,
-                  with a restart counted: the node agent restarts what should be running.
-                  <code>events</code> asks every node what happened and merges the answers by
-                  time: the deploys, the fault, the failed health check and the restart, each
-                  with its node.</p>
-              </li>
-              <li>
                 <pre><code data-tour>relish local stop node-3</code>
-<code data-tour>relish inspect frontend</code></pre>
-                <p>Now lose a whole machine. About a minute later there are three running frontends
+<code data-tour>relish inspect counter</code></pre>
+                <p>Now lose a whole machine. About a minute later there are three running counters
                   again, spread over the two nodes that are left: each keeps the one it had, and one
-                  of them starts a replacement under the lost one’s name. Nobody had to notice
-                  first. <code>inspect</code>
+                  of them starts a replacement under the lost one’s name. Any layer that lived on
+                  node-3 comes back the same way. Nobody had to notice first. <code>inspect</code>
                   asks every node, lists each instance, running or stopped, with the node it’s on,
                   and names the node that didn’t answer.</p>
               </li>
