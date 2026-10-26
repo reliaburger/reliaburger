@@ -589,6 +589,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// every step below, back to back. The loop spreads the same steps over
     /// several turns instead ([`Self::request_consumer_sync`]); this is for
     /// callers that must see the view settled before they carry on.
+    ///
+    /// Outside a turn each step's write is waited out. Inside one a write
+    /// still in flight isn't (#1336): the rest of the synchronisation goes
+    /// to the loop, which takes it once the write has landed, as it would a
+    /// local republication, and this answers `StillRunning`. Call it only
+    /// with no synchronisation under way.
     pub(super) async fn synchronise_consumer(
         &mut self,
         generation: u64,
@@ -602,7 +608,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         loop {
             match progress {
                 Progress::Done(update) => return Ok(update),
-                Progress::Next(step) => progress = self.consumer_step(step).await?,
+                Progress::Next(next) => {
+                    if self.settle_discovery_write_outside_turn().await == Landing::InFlight {
+                        // Nobody hears how it ends; a failure marks the view
+                        // stale again (`answer_consumer_sync`).
+                        self.consumer_syncs.current = Some(ConsumerSync { next, answer: None });
+                        return Err(BunError::StillRunning {
+                            work: "a consumer view's journal write".into(),
+                        });
+                    }
+                    progress = self.consumer_step(next).await?;
+                }
             }
         }
     }
@@ -717,9 +733,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// started. Each step journals at most one discovery write, and reads
     /// the ownership afresh, so a receipt confirmed between turns stays gone.
     async fn consumer_step(&mut self, step: ConsumerStep) -> Result<Progress, BunError> {
-        // The loop takes a step only once any write has landed; a caller
-        // finishing a synchronisation inline waits for it here.
-        self.settle_discovery_write().await;
+        // Every driver takes a step only once the journal is free (#1336):
+        // the loop's branches wait for the landing, and the inline drivers
+        // settle the write outside a turn, or stop at it inside one.
+        if self.discovery_write_in_flight() {
+            return Err(failure("a consumer journal write is still in flight"));
+        }
         match step {
             ConsumerStep::Journal {
                 publication,
@@ -877,11 +896,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Finish every synchronisation under way or waiting, inline, for a
-    /// caller that needs the view settled now.
-    pub(super) async fn finish_consumer_syncs(&mut self) {
+    /// caller that needs the view settled now. Inside a turn a step's write
+    /// in flight isn't waited for (#1336): this stops there with `InFlight`,
+    /// and the loop takes the rest once the write has landed.
+    pub(super) async fn finish_consumer_syncs(&mut self) -> Landing {
         while !self.consumer_syncs.is_idle() {
+            if self.settle_discovery_write_outside_turn().await == Landing::InFlight {
+                return Landing::InFlight;
+            }
             self.continue_consumer_sync().await;
         }
+        Landing::Landed
     }
 
     /// Tell whoever asked how a synchronisation ended.
@@ -1068,9 +1093,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// local change, such as a health transition or a replaced instance,
     /// inline: the caller sees the view settled when this returns. The loop
     /// uses [`Self::start_consumer_refresh`] instead.
+    ///
+    /// Inside a turn it waits for no journal write in flight (#1336). It
+    /// answers `StillRunning` instead, the synchronisation goes on in the
+    /// loop's own turns, and the caller asks again.
     pub(super) async fn refresh_consumer_view(&mut self) -> Result<(), BunError> {
         // Steps of another synchronisation may not interleave with these.
-        self.finish_consumer_syncs().await;
+        let finished = self.finish_consumer_syncs().await;
+        super::discovery_ownership::still_running_unless_landed(finished, || {
+            "a consumer view's journal write".into()
+        })?;
         if !self.consumer_view_stale {
             return Ok(());
         }
@@ -1092,9 +1124,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.consumer_view_stale = false;
             return Ok(());
         };
-        self.synchronise_consumer(last.generation, last.catalog, last.ingress, vec![])
-            .await?;
+        // Cleared first: a synchronisation left to the loop marks the view
+        // stale again only if it fails, and the caller's next ask then
+        // synchronises inline again and hears why.
         self.consumer_view_stale = false;
+        let synchronised = self
+            .synchronise_consumer(last.generation, last.catalog, last.ingress, vec![])
+            .await;
+        if let Err(error) = synchronised {
+            if !matches!(error, BunError::StillRunning { .. }) {
+                self.consumer_view_stale = true;
+            }
+            return Err(error);
+        }
         Ok(())
     }
 

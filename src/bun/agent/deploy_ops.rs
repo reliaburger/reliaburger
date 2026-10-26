@@ -1021,24 +1021,29 @@ impl DeployOps {
         new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
     ) -> Result<(), BunError> {
-        self.call(
-            |reply| DeployOp::FinaliseRollingDeploy {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                spec: Box::new(spec.clone()),
-                existing,
-                new_ids,
-                new_ports,
-                new_ips,
-                new_specs,
-                now,
-                reply,
-            },
-            Err(BunError::DeployFailed {
-                app_name: app_name.into(),
-                reason: "agent loop closed before finalisation".into(),
-            }),
-        )
+        // The loop answers `StillRunning`, having changed nothing, while the
+        // rolled-out service's journal write is in flight (#1336); ask again
+        // until it has landed.
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::FinaliseRollingDeploy {
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    spec: Box::new(spec.clone()),
+                    existing: existing.clone(),
+                    new_ids: new_ids.clone(),
+                    new_ports: new_ports.clone(),
+                    new_ips: new_ips.clone(),
+                    new_specs: new_specs.clone(),
+                    now,
+                    reply,
+                },
+                Err(BunError::DeployFailed {
+                    app_name: app_name.into(),
+                    reason: "agent loop closed before finalisation".into(),
+                }),
+            )
+        })
         .await
     }
 

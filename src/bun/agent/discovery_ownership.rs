@@ -242,7 +242,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
-    /// Preserve attempted publications before any kernel or userspace acknowledgement.
+    /// Journal a publication and wait for the write however long it takes,
+    /// for tests that set up a journal directly. Every loop writer journals
+    /// within its turn's deadline instead (#1263, #1336).
+    #[cfg(test)]
     pub(super) async fn persist_discovery_publication(
         &mut self,
         id: &crate::onion::service_id::ServiceId,
@@ -734,6 +737,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// A write with no deadline is waited for; this only settles what can't
     /// happen.
+    #[cfg(test)]
     async fn wait_for_landing(&mut self, landing: Landing) {
         if landing == Landing::InFlight {
             self.settle_discovery_write().await;

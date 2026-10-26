@@ -49,7 +49,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .send(crate::onion::dns::DnsFaultState::from_faults(faults));
     }
 
-    /// Require successful kernel publication before acknowledging deployment.
+    /// Journal and publish `service_map`'s entry for `id`, waiting for the
+    /// write inline. Every loop writer now journals within its turn's
+    /// deadline (#1263, #1336); tests use this to publish a fixture.
+    #[cfg(test)]
     pub(super) async fn publish_backend_ebpf(
         &mut self,
         id: &crate::onion::service_id::ServiceId,
@@ -58,7 +61,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.publish_backend_snapshot(id, &services).await
     }
 
-    /// Journal attempted routing before acknowledging its kernel publication.
+    /// Journal `services` and wait for the write inline, then publish `id`
+    /// to the kernel, for tests that set up a publication directly.
+    #[cfg(test)]
     pub(super) async fn publish_backend_snapshot(
         &mut self,
         id: &crate::onion::service_id::ServiceId,
