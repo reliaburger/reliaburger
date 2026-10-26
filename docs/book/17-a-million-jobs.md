@@ -3417,6 +3417,62 @@ A disposable VM is still a whole operating system with its own plans. The
 record discards that run, turns the timers off and repeats every session the
 upgrade could have touched.
 
+### A profile in every release
+
+Look at what found the GitOps loop's wasted core. Not a test, and not a soak:
+both of those check that things work and don't leak, and a core spent cloning
+state broke neither. A person with `perf` found it, by hand, once. So from 0.2.4
+on, the profile is a release step ([`releasing.md`](../releasing.md#staging-a-candidate),
+step 6), and `scripts/release/qualify-profile.sh` runs it in one command.
+
+The hard part isn't running `perf`. It's comparing the result with anything.
+The 0.2.0 throughput record ran on an M2 Max and the profile on an M1 Max, so
+a number stored with one release says nothing about the next. The script
+doesn't store numbers, then. It measures the previous release too, in the same
+fresh VM, in alternating rounds: previous then candidate, candidate then
+previous, and again. Whatever the host does to one build it does to the other.
+Each scenario's rate is also divided by the same version's raw-process rate,
+so a slower rig doesn't read as a slower release.
+
+Two builds of each version go into the VM. The rates come from the release
+binaries, byte for byte the ones we ship. The stacks come from a profiling
+build of the same commit, which `build.yml` now makes beside the candidate and
+never ships. It's the release build with two settings changed:
+
+```sh
+RUSTFLAGS="-C force-frame-pointers=yes" \
+CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=false \
+    cargo build --locked --release --features ebpf --bin bun --bin relish
+```
+
+`perf record -g` finds a sample's callers by walking frame pointers, a chain
+of saved stack addresses each function keeps in a register. An optimised
+build normally uses that register for something else, so the chain breaks
+after one frame. `-C force-frame-pointers=yes` tells `rustc` to keep it, for a
+cost of a percent or two. `line-tables-only` keeps just enough debug
+information to turn an address back into a function name, and not stripping
+the binary keeps the symbol table that holds those names. `CARGO_PROFILE_RELEASE_*`
+variables override `[profile.release]` in `Cargo.toml` for one build, so the
+shipped profile stays as it is.
+
+The comparison step, `compare_profile.py`, reports the ratio of medians with
+a bootstrap interval: resample the rounds with replacement a couple of
+thousand times, take the ratio each time, and keep the middle 95%. A scenario
+more than 10% slower whose interval excludes "no change", Bun above 2% of a
+core in an idle cluster, or a new category above 5% of Bun's CPU would fail. A
+category moving more than 5 points, or a scenario more than 10% *faster*, needs
+explaining. Faster needs a reason too: a speed-up nobody can explain is as
+likely to be a broken measurement as a win. For now none of it gates a
+release. The record says what each rule *would* flag, and whoever qualifies
+the release writes why, until a few releases show how noisy the rig is.
+
+The category map has a guard of its own. `profile_categories.py` names Bun's
+costs by frame: the GitOps loop, the Raft core, the ledger, the pool path and
+so on. Code moves, and a map that silently stops matching would make every
+release look the same. So when more than 5% of Bun's samples match no rule,
+the record says to extend the map. A hot path nobody has named is exactly
+what the step is there to find.
+
 ### What the measurements do and don't show
 
 Measuring this turned out to be as instructive as building it, mostly because

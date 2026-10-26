@@ -21,7 +21,9 @@ jobs:
     # Pushes and manual runs build everything. A pull request builds the PDF
     # only when the docs change, only the Linux x86-64 binaries when Rust
     # or packaging inputs change, and the guest images only when their build
-    # script or pins change; main builds the whole matrix.
+    # script or pins change; main builds the whole matrix. The profiling
+    # build runs on pushes and manual runs, and on a pull request only when
+    # this workflow changes.
     name: select builds
     runs-on: ubuntu-latest
     outputs:
@@ -29,6 +31,7 @@ jobs:
       binaries: ${{ steps.select.outputs.binaries }}
       matrix: ${{ steps.select.outputs.matrix }}
       guest_images: ${{ steps.select.outputs.guest_images }}
+      profiling: ${{ steps.select.outputs.profiling }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,17 +43,18 @@ jobs:
         run: |
           all='[{"target":"aarch64-unknown-linux-gnu","suffix":"linux-aarch64","runner":"ubuntu-22.04-arm","arguments":"--features ebpf --bin bun --bin relish"},{"target":"x86_64-unknown-linux-gnu","suffix":"linux-x86_64","runner":"ubuntu-22.04","arguments":"--features ebpf --bin bun --bin relish"},{"target":"aarch64-apple-darwin","suffix":"macos-aarch64","runner":"macos-15","arguments":"--bin relish"}]'
           if [ "$EVENT" != pull_request ]; then
-            pdf=true binaries=true guest_images=true matrix="$all"
+            pdf=true binaries=true guest_images=true profiling=true matrix="$all"
           else
             changed=$(git diff --name-only "$BASE_SHA...HEAD")
-            pdf=false binaries=false guest_images=false
+            pdf=false binaries=false guest_images=false profiling=false
             grep -qE '^docs/|^Makefile$|^\.github/workflows/build\.yml$' <<<"$changed" && pdf=true
             grep -qE '^(src|ebpf|brioche|assets|docs/manual|scripts/release)/|^(build\.rs|Cargo\.(toml|lock)|rust-toolchain.*|\.github/workflows/build\.yml)$' <<<"$changed" && binaries=true
             grep -qE '^scripts/release/(build_guest_image\.sh|guest-images\.json)$|^\.github/workflows/build\.yml$' <<<"$changed" && guest_images=true
+            grep -qE '^\.github/workflows/build\.yml$' <<<"$changed" && profiling=true
             matrix=$(jq -c '[.[] | select(.suffix == "linux-x86_64")]' <<<"$all")
           fi
-          { echo "pdf=$pdf"; echo "binaries=$binaries"; echo "matrix=$matrix"; echo "guest_images=$guest_images"; } >>"$GITHUB_OUTPUT"
-          echo "pdf=$pdf binaries=$binaries guest_images=$guest_images"
+          { echo "pdf=$pdf"; echo "binaries=$binaries"; echo "matrix=$matrix"; echo "guest_images=$guest_images"; echo "profiling=$profiling"; } >>"$GITHUB_OUTPUT"
+          echo "pdf=$pdf binaries=$binaries guest_images=$guest_images profiling=$profiling"
 
   validate-release:
     if: github.event_name == 'workflow_dispatch'
@@ -138,6 +142,53 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 7
+
+  build-profiling:
+    # Never shipped. The release profile step (qualify-profile.sh, #1358)
+    # takes its rates from the candidate's own binaries and its attribution
+    # from this build: the same commit, compiler and features as
+    # bun-linux-aarch64 and relish-linux-aarch64, plus frame pointers and line
+    # tables so `perf -g` can name Bun's frames. Its artefact name matches
+    # neither `binaries-*` nor `candidate-*`, so the candidate job, staging
+    # and promotion never see it, and the candidate job doesn't wait for it.
+    needs: changes
+    if: needs.changes.outputs.profiling == 'true'
+    runs-on: ubuntu-22.04-arm
+    env:
+      RELIABURGER_GIT_SHA: ${{ github.sha }}
+      CARGO_PROFILE_RELEASE_STRIP: "false"
+      CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+      RUSTFLAGS: -C force-frame-pointers=yes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: profiling-aarch64-unknown-linux-gnu
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install native Linux eBPF build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm libbpf-dev
+      - name: Build the profiling binaries
+        run: cargo build --locked --release --target aarch64-unknown-linux-gnu --features ebpf --bin bun --bin relish
+      - name: Smoke test and package the profiling binaries
+        run: |
+          mkdir -p profiling
+          target/aarch64-unknown-linux-gnu/release/bun --version
+          target/aarch64-unknown-linux-gnu/release/relish --version
+          cp target/aarch64-unknown-linux-gnu/release/bun profiling/bun-linux-aarch64
+          cp target/aarch64-unknown-linux-gnu/release/relish profiling/relish-linux-aarch64
+      - name: Upload the profiling build, never shipped
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiling-build-${{ github.sha }}-${{ github.run_attempt }}
+          path: profiling/*
+          if-no-files-found: error
+          # Long enough for the next release's profile to measure this one.
+          retention-days: 90
 
   build-guest-images:
     # The quickstart's VM image: pinned Ubuntu plus the node packages, so a

@@ -1237,7 +1237,7 @@ fn the_release_testing_section_shows_the_installed_release() {
         assert!(
             version >= current,
             "the release-testing section names {version:?}, older than {installed}; \
-             refresh it (docs/releasing.md, step 9)"
+             refresh it (docs/releasing.md, step 10)"
         );
     }
     let log = read("docs/release-log.md");
@@ -1308,7 +1308,7 @@ fn the_release_testing_section_shows_the_installed_release_s_soak_charts() {
         assert!(
             record.contains(&format!("-{installed}-")),
             "{source} comes from another release's record, not {installed}'s; \
-             refresh the charts (docs/releasing.md, step 9)"
+             refresh the charts (docs/releasing.md, step 10)"
         );
         let copy = std::fs::read(repository().join("docs/website").join(source))
             .unwrap_or_else(|error| panic!("{source} isn't in docs/website: {error}"));
