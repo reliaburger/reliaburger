@@ -5,8 +5,8 @@
 //! ```sh blocks) show the same tour. Every `relish …` line in them must parse
 //! with the real CLI definition: we run the compiled binary with
 //! `RELISH_PARSE_ONLY=1`, which parses the arguments and exits without doing
-//! anything. The two copies must list the same commands, and the demo
-//! manifest the tour applies must exist and be published by the Pages workflow.
+//! anything. The two copies must list the same commands, and the demo app
+//! the tour builds must exist and be published by the Pages workflow.
 //!
 //! `scripts/ci/select-jobs.sh` counts `docs/website/index.html` as code so an
 //! edit to the page alone still runs this test.
@@ -25,6 +25,8 @@ const DEMO_MANIFEST_PENDING: bool = false;
 /// The one-line install names its mode: without one the installer only
 /// explains the choices (#670).
 const INSTALL_LINE: &str = "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop";
+/// The Kubernetes demo the manual's Kubernetes chapter applies. The tour
+/// used it until 0.2.3 (#1343); the site still publishes it.
 const DEMO_URL: &str = "https://reliaburger.com/demo/podinfo.yaml";
 const DEMO_SOURCE: &str = "examples/kubernetes/podinfo.yaml";
 
@@ -237,8 +239,7 @@ fn manual_tour_opens_the_tour_chapter() {
 
 #[test]
 fn the_demo_manifest_is_published_from_the_tested_example() {
-    let page = read("docs/website/index.html");
-    assert!(page.contains(DEMO_URL));
+    assert!(read("docs/manual/09_kubernetes.md").contains(DEMO_URL));
     let workflow = read(".github/workflows/static.yml");
     assert!(
         workflow.contains(&format!("cp {DEMO_SOURCE} docs/website/demo/podinfo.yaml")),
@@ -266,11 +267,36 @@ const BURGER_FILES: &[&str] = &[
     "batch.go",
     "batch_test.go",
     "burger.toml",
+    "cheese-v2.toml",
+    "counter.go",
+    "counter_test.go",
     "go.mod",
     "jobs.toml",
+    "layer.go",
+    "layer_test.go",
     "main.go",
-    "main_test.go",
+    "metrics.go",
+    "metrics_test.go",
+    "patty-v3.toml",
+    "render.go",
+    "render_test.go",
+    "triple-patty.toml",
 ];
+
+/// The burger's layers, top to bottom: one app each, named as the counter
+/// asks for them (`layerOrder` in `layer.go`).
+const BURGER_LAYERS: &[&str] = &[
+    "top-bun",
+    "lettuce",
+    "tomato",
+    "cheese",
+    "patty",
+    "bottom-bun",
+];
+
+fn burger_config(file: &str) -> reliaburger::config::Config {
+    reliaburger::config::Config::from_file(&repository().join(BURGER_SOURCE).join(file)).unwrap()
+}
 
 fn burger_files_on_disk() -> Vec<String> {
     let mut files: Vec<String> = std::fs::read_dir(repository().join(BURGER_SOURCE))
@@ -297,16 +323,74 @@ fn the_demo_app_is_published_from_the_tested_example() {
     );
     assert_eq!(burger_files_on_disk(), BURGER_FILES);
 
-    let config = reliaburger::config::Config::from_file(
-        &repository().join(BURGER_SOURCE).join("burger.toml"),
-    )
-    .unwrap();
+    let config = burger_config("burger.toml");
     let build = &config.build["burger"];
     assert_eq!(build.context, Path::new("."));
     assert_eq!(build.destination, "pickle://burger:v1");
-    // The app runs what the build pushed, by the bare name nodes resolve
-    // through Pickle.
-    assert_eq!(config.app["burger"].image.as_deref(), Some("burger:v1"));
+    // One image plays every part: each app runs what the build pushed, by
+    // the bare name nodes resolve through Pickle.
+    let mut apps: Vec<&str> = config.app.keys().map(String::as_str).collect();
+    apps.sort();
+    let mut expected = BURGER_LAYERS.to_vec();
+    expected.extend(["counter", "diner"]);
+    expected.sort();
+    assert_eq!(apps, expected);
+    for (name, app) in &config.app {
+        assert_eq!(app.image.as_deref(), Some("burger:v1"), "{name}");
+    }
+    for layer in BURGER_LAYERS {
+        let env = &config.app[*layer].env;
+        assert_eq!(
+            env.get("LAYER"),
+            Some(&reliaburger::config::EnvValue::Plain(layer.to_string())),
+            "{layer} must serve its own layer"
+        );
+        assert_eq!(
+            env.get("VERSION"),
+            Some(&reliaburger::config::EnvValue::Plain("v1".into()))
+        );
+    }
+    let counter = &config.app["counter"];
+    assert_eq!(
+        counter
+            .ingress
+            .as_ref()
+            .map(|ingress| ingress.host.as_str()),
+        Some("burger.localhost")
+    );
+}
+
+/// The tour changes one layer at a time with a small file each. Each must be
+/// `burger.toml`'s app with exactly the change the tour describes, so a later
+/// edit to `burger.toml` can't leave a step silently changing more.
+#[test]
+fn each_tour_change_file_changes_one_thing() {
+    use reliaburger::config::{EnvValue, Replicas};
+    let base = burger_config("burger.toml");
+    let changes: [(&str, &str, &str, Option<u32>); 3] = [
+        ("cheese-v2.toml", "cheese", "v2", None),
+        ("patty-v3.toml", "patty", "v3", None),
+        ("triple-patty.toml", "patty", "v1", Some(3)),
+    ];
+    for (file, app, version, replicas) in changes {
+        let config = burger_config(file);
+        let names: Vec<&String> = config.app.keys().collect();
+        assert_eq!(names, [app], "{file} should change {app} alone");
+        assert!(config.build.is_empty() && config.job.is_empty(), "{file}");
+        let mut expected = base.app[app].clone();
+        expected
+            .env
+            .insert("VERSION".into(), EnvValue::Plain(version.into()));
+        if let Some(replicas) = replicas {
+            expected.replicas = Replicas::Fixed(replicas);
+        }
+        assert_eq!(config.app[app], expected, "{file}");
+        let page = read("docs/website/index.html");
+        assert!(
+            page.contains(&format!("relish apply burger/{file}")),
+            "the tour doesn't apply {file}"
+        );
+    }
 }
 
 /// Most tasks the tour's jobs step may submit. Fresh containers run at about
