@@ -1351,7 +1351,7 @@ idempotency costs. See the [execution and qualification plan](plans/archive/2026
 
 Fast delegated jobs use bounded grant lookahead derived from verified duration
 summaries, covering receipt acceptance and grant delivery without increasing
-control polling. Learned grant depth is capped at sixteen chunks; actual execution
+control polling. Learned grant depth is capped at 32 chunks; actual execution
 remains gated by per-node concurrency and resource admission. The trade-off is
 more granted work to reconcile after worker loss, with unchanged attempt fences.
 
