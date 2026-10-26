@@ -2844,8 +2844,8 @@ gap. How much is enough? That depends on how long commands take, so the leader
 learns it from the final-attempt duration histogram the nodes already report.
 Bucket `i` counts commands that took up to `2^i` ms. Using the upper bound of
 each bucket gives a conservative estimate of throughput: slots × two seconds ÷
-average duration. Learned depth was capped at sixteen chunks, and 0.2.3
-raised the cap to 32 for a reason we'll come to.
+average duration. Learned depth was capped at sixteen chunks; 0.2.3 raised
+the cap to 32 and 0.2.4 put it back, for reasons we'll come to.
 
 That's the idea. The edges took four more fixes:
 
@@ -3440,6 +3440,123 @@ restarted `rb-bun`. It installed a new kernel too, which every later boot ran.
 A disposable VM is still a whole operating system with its own plans. The
 record discards that run, turns the timers off and repeats every session the
 upgrade could have touched.
+
+### Grants in the tick that commits them
+
+For 0.2.4 we took the second way (#1360), and the stopgap went: the cap is
+one line again, back at sixteen, and the lookahead tests that pinned 32
+chunks pin sixteen again.
+
+The change itself is small. Once a tick's entry has committed, the leader reads
+the committed state again and calls every node that entry gave a chunk it
+didn't know about:
+
+```rust
+pub fn follow_ups(
+    told: &HashMap<NodeId, HeldSet>,
+    requests: Vec<(NodeId, Option<String>, NodeSyncRequest)>,
+    calls: &SyncCalls,
+) -> Vec<(NodeId, Option<String>, NodeSyncRequest)> {
+    let nothing = HeldSet::new();
+    requests
+        .into_iter()
+        .filter(|(node, _, request)| {
+            let before = told.get(node).unwrap_or(&nothing);
+            !calls.is_waiting_on(node) && !held_chunks(request).is_subset(before)
+        })
+        .collect()
+}
+```
+
+`HeldSet` is a `BTreeSet<(u64, ChunkId, u64)>`: array, chunk and grant attempt,
+built from the request the tick sent at its start (`told`). Rust lets you name
+a type like that with `type`, which is an alias, not a new type; the compiler
+treats `HeldSet` and the `BTreeSet` as the same thing. A node gets a follow-up
+only if the committed request lists something the tick's own request didn't,
+which `is_subset` answers. A chunk the node just finished and lost isn't news,
+so a node whose work only shrank isn't called. A chunk granted again at a
+higher attempt is news, because the attempt is part of the tuple.
+`unwrap_or(&nothing)` covers a node that joined after the tick read its
+targets: it was told nothing, so any chunk it holds counts.
+
+Nobody waits for the follow-up's answer. The call goes into `SyncCalls` like
+any other, and the next tick folds the answer in. The next tick starts by
+taking every answer that's already there:
+
+```rust
+pub fn gather_ready(&mut self) -> Vec<SyncAnswer> {
+    let mut answers = Vec::new();
+    while let Some(Some(answer)) = self.pending.next().now_or_never() {
+        self.waiting_on.remove(&answer.node);
+        answers.push(answer);
+    }
+    answers
+}
+```
+
+`now_or_never` polls a future once and gives back `Some(output)` if it was
+ready and `None` if it wasn't, without waiting. Go has no direct equivalent;
+the nearest is a `select` with a `default` case. Here the future is
+`FuturesUnordered::next()`, which itself yields `Option<SyncAnswer>`, `None`
+once the set is empty, hence the two layers of `Some`. Taking these first
+matters. If the tick sent its requests before collecting, a node whose
+follow-up had answered would still look busy, the tick would skip it, and
+its report of the chunks it just finished would wait another tick. That's the
+two-tick cycle again, by a different road.
+
+So a node with fresh grants is now called twice a tick: once by the tick, to
+hear what it finished, and once after the commit, to hand it the
+replacements. One tick can therefore hold two answers from one node.
+`latest_per_node` keeps the later one, which is safe because a node repeats
+every finished chunk on every sync until the leader stops listing it. The
+later answer says everything the earlier one did, and more.
+
+Where can that go wrong? The control fence. Each node keeps the newest
+control version (recovery epoch, Raft term, applied index) it has acted on,
+and refuses anything older. The follow-up reads its version *after* the
+commit, so its index is never below the one the tick's own request carried,
+and the next tick reads later still. Three paths needed a closer look, and
+each has a test:
+
+- **A call that's still running.** The node refuses a second call while its
+  first one is busy with the disk (`SyncBusy`, from the stuck-disk work
+  earlier). `follow_ups` never calls a node the leader is still waiting on,
+  and `only_nodes_given_chunks_they_were_not_told_of_are_called_again`
+  checks that alongside the other cases: new chunk, same chunks, fewer
+  chunks, a new attempt, a node that joined late.
+- **An answer that lands after the next tick has started.** The follow-up
+  stays in `SyncCalls`, the node isn't called again until it answers, and a
+  later tick collects it. `a_tick_takes_answers_already_in_and_leaves_calls_still_out_for_later`
+  drives that on tokio's paused clock. On the node,
+  `a_follow_up_and_the_next_ticks_request_pass_the_fence_but_a_late_older_call_does_not`
+  plays the versions in the order the leader sends them, then an old one
+  late: the first three pass, and the late one is refused.
+- **A leader change mid-tick.** The leader checks it still leads before it
+  sends any follow-up. A deposed leader can still lose that race, so
+  `a_deposed_leaders_follow_up_is_refused_once_the_new_leader_has_called`
+  plays both orders. If the new leader's call (term 2) reached the node
+  first, the old leader's follow-up (term 1) is refused and its grant never
+  runs. If the follow-up got there first, it's a committed grant like any
+  other, and the new leader's call still passes.
+
+The test that shows the actual gain is the simplest:
+`a_grant_reaches_its_node_in_the_tick_that_commits_it` starts a standalone
+node with a one-*hour* sync interval. The loop's first tick fires at once,
+and the next one isn't due for an hour. Before this change the first tick
+granted chunks and sent them nowhere, so the fake executor never ran a task.
+Now the tasks run within milliseconds, and the node's fence holds the store's
+revision *after* the tick's entry, which shows the follow-up carried the
+committed version. Waiting an hour for a test to fail isn't a plan, so the
+test waits twenty seconds and calls that never.
+
+What does it cost? Every new control version is a fence write and an fsync
+on the node, and on macOS an fsync flushes the whole device (#809). A busy
+node used to see one new version a tick; it now sees two. The leader sends at
+most one follow-up per node per tick, and only to nodes the tick gave work.
+An idle node costs what it did before. The gain should be the ceiling above,
+doubled: sixteen chunks turning over every tick, not every two, so 16,000
+host jobs a second on the same rig. "Should" because the bench numbers come
+from the profiling step (#1358), not from this test.
 
 ### What the measurements do and don't show
 
