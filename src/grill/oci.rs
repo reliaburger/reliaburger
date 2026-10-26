@@ -857,28 +857,6 @@ pub fn generate_job_oci_spec(
     cgroup_path: &str,
     netns_path: Option<&str>,
 ) -> OciSpec {
-    let env: Vec<String> = spec
-        .env
-        .iter()
-        .map(|(key, value)| match value {
-            EnvValue::Plain(v) => format!("{key}={v}"),
-            EnvValue::Encrypted(v) => format!("{key}={v}"),
-            // Validation refuses provider values in jobs (#1123).
-            EnvValue::Provider(reference) => format!("{key}={}", reference.as_str()),
-        })
-        .collect();
-
-    // Process workloads: exec binary or inline script via /bin/sh
-    let args = if let Some(ref exec_path) = spec.exec {
-        let mut a = vec![exec_path.to_string_lossy().to_string()];
-        a.extend(spec.command.clone().unwrap_or_default());
-        a
-    } else if let Some(ref script) = spec.script {
-        vec!["/bin/sh".to_string(), "-c".to_string(), script.clone()]
-    } else {
-        spec.command.clone().unwrap_or_default()
-    };
-
     let mut resources = build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref());
     if spec.image.is_some()
         && spec.exec.is_none()
@@ -922,24 +900,7 @@ pub fn generate_job_oci_spec(
             },
             readonly: false,
         },
-        process: OciProcess {
-            rlimits: Vec::new(),
-            args,
-            env,
-            cwd: "/".to_string(),
-            user: OciUser {
-                uid: 65534,
-                gid: 65534,
-            },
-            capabilities: None,
-            oom_score_adj: Some(WORKLOAD_OOM_SCORE_ADJ),
-            overrides: (spec.image.is_some() && spec.exec.is_none() && spec.script.is_none()).then(
-                || ProcessOverrides {
-                    command: spec.command.clone().unwrap_or_default(),
-                    ..ProcessOverrides::default()
-                },
-            ),
-        },
+        process: job_process(spec),
         mounts: standard_mounts(),
         linux: OciLinux {
             namespaces: standard_namespaces(netns_path),
@@ -954,6 +915,53 @@ pub fn generate_job_oci_spec(
         port_mapping: None,
         stop: None,
         runtime_knobs: None,
+    }
+}
+
+/// The process of a job's container: its command, environment and user,
+/// as [`generate_job_oci_spec`] sets them. A reused executor runs each
+/// command with just this, so it builds this alone rather than a whole
+/// container spec per command.
+pub fn job_process(spec: &JobSpec) -> OciProcess {
+    let env: Vec<String> = spec
+        .env
+        .iter()
+        .map(|(key, value)| match value {
+            EnvValue::Plain(v) => format!("{key}={v}"),
+            EnvValue::Encrypted(v) => format!("{key}={v}"),
+            // Validation refuses provider values in jobs (#1123).
+            EnvValue::Provider(reference) => format!("{key}={}", reference.as_str()),
+        })
+        .collect();
+
+    // Process workloads: exec binary or inline script via /bin/sh
+    let args = if let Some(ref exec_path) = spec.exec {
+        let mut a = vec![exec_path.to_string_lossy().to_string()];
+        a.extend(spec.command.clone().unwrap_or_default());
+        a
+    } else if let Some(ref script) = spec.script {
+        vec!["/bin/sh".to_string(), "-c".to_string(), script.clone()]
+    } else {
+        spec.command.clone().unwrap_or_default()
+    };
+
+    OciProcess {
+        rlimits: Vec::new(),
+        args,
+        env,
+        cwd: "/".to_string(),
+        user: OciUser {
+            uid: 65534,
+            gid: 65534,
+        },
+        capabilities: None,
+        oom_score_adj: Some(WORKLOAD_OOM_SCORE_ADJ),
+        overrides: (spec.image.is_some() && spec.exec.is_none() && spec.script.is_none()).then(
+            || ProcessOverrides {
+                command: spec.command.clone().unwrap_or_default(),
+                ..ProcessOverrides::default()
+            },
+        ),
     }
 }
 

@@ -55,22 +55,43 @@ pub fn host_environment(workload: &[String]) -> std::collections::BTreeMap<Strin
     host_environment_from(std::env::vars_os(), workload)
 }
 
-fn host_environment_from(
-    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+/// The variables of Bun's own environment a host command inherits, read
+/// now. A caller that starts many commands reads them once and overlays
+/// each command's entries with [`host_environment_over`].
+pub fn inherited_host_environment() -> std::collections::BTreeMap<String, String> {
+    inherited_from(std::env::vars_os())
+}
+
+/// `inherited` overlaid with the workload's `KEY=value` entries: the same
+/// environment [`host_environment`] builds, from variables read earlier.
+pub fn host_environment_over(
+    mut inherited: std::collections::BTreeMap<String, String>,
     workload: &[String],
 ) -> std::collections::BTreeMap<String, String> {
-    let mut environment: std::collections::BTreeMap<String, String> = inherited
-        .into_iter()
-        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-        .filter(|(key, _)| inherited_by_host_commands(key))
-        .collect();
-    environment.extend(
+    inherited.extend(
         workload
             .iter()
             .filter_map(|entry| entry.split_once('='))
             .map(|(key, value)| (key.to_owned(), value.to_owned())),
     );
-    environment
+    inherited
+}
+
+fn inherited_from(
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> std::collections::BTreeMap<String, String> {
+    inherited
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(key, _)| inherited_by_host_commands(key))
+        .collect()
+}
+
+fn host_environment_from(
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    workload: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    host_environment_over(inherited_from(inherited), workload)
 }
 
 #[cfg(test)]

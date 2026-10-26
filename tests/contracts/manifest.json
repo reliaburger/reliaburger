@@ -6967,6 +6967,17 @@
           "sources": [
             "tests/owned_task_arrays.rs"
           ]
+        },
+        {
+          "id": "host-executor-cgroup_host_executor_spawns_without_copy_on_write_faults",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_executor_spawns_without_copy_on_write_faults",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
         }
       ],
       "refused_paths": [
@@ -8071,6 +8082,33 @@
       ],
       "boundaries": [
         "The skipped route stays uninstalled until its app is reapplied with a valid ingress."
+      ]
+    },
+    {
+      "id": "issue-1353-one-replica-rollout-keeps-a-healthy-backend",
+      "issue": 1353,
+      "promise": "Rolling a one-replica service with max_surge = 1 and max_unavailable = 0 keeps a healthy backend for it in every node's service view throughout: a published replacement reports healthy before the old instance's retirement reaches the catalogue.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime, with the new spec written straight to the council"
+      ],
+      "cases": [
+        {
+          "id": "issue-1353-one_replica_rollout_keeps_a_healthy_backend_on_every_node",
+          "binary": "reliaburger::cluster_failover",
+          "test": "one_replica_rollout_keeps_a_healthy_backend_on_every_node",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "An instance that is still starting and not published as a healthy backend reports Starting, never Running."
+      ],
+      "boundaries": [
+        "A caller on another node may still reach the stopped old instance (ECONNREFUSED) until its view drops it; holding the stop until remote withdrawal receipts arrive is not claimed."
       ]
     },
     {

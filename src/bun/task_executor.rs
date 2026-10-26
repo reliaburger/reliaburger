@@ -41,7 +41,7 @@ pub const CANCEL_GRACE: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskInvocation {
     /// Container template, when execution uses an owned runtime.
-    pub template: Option<Box<crate::config::job::JobSpec>>,
+    pub template: Option<Arc<crate::config::job::JobSpec>>,
     /// The task's index.
     pub index: u32,
     /// Attempt number, starting at 1.
@@ -479,7 +479,7 @@ impl TaskRunner for FakeRunner {
 #[derive(Debug, Clone)]
 pub struct ChunkWork {
     /// Container template carried with the committed assignment.
-    pub template: Option<Box<crate::config::job::JobSpec>>,
+    pub template: Option<Arc<crate::config::job::JobSpec>>,
     /// The array's batch id (goes into each task's environment).
     pub batch_id: u64,
     /// Count and policy.
@@ -1371,6 +1371,47 @@ mod tests {
             String::from_utf8_lossy(&attempt.output.head),
             format!("{reason}\n")
         );
+    }
+
+    /// #1030: every attempt of a chunk shares the chunk's template. Each
+    /// used to carry its own deep copy of the job spec.
+    #[tokio::test]
+    async fn every_attempt_of_a_chunk_shares_one_template() {
+        #[derive(Default)]
+        struct Recording(std::sync::Mutex<Vec<Arc<crate::config::job::JobSpec>>>);
+        impl TaskRunner for Recording {
+            async fn run(
+                &self,
+                task: &TaskInvocation,
+                _: Duration,
+                _: &CancellationToken,
+            ) -> Attempt {
+                if let Some(template) = &task.template {
+                    self.0.lock().unwrap().push(Arc::clone(template));
+                }
+                Attempt {
+                    // One retry each, so later attempts are covered too.
+                    outcome: AttemptOutcome::Exited {
+                        code: i32::from(task.attempt == 1),
+                    },
+                    output: CapturedOutput::default(),
+                    ran: None,
+                }
+            }
+        }
+        let runner = Arc::new(Recording::default());
+        let pool = TaskPool::new(Arc::clone(&runner), fast(4));
+        let mut work = work(8, 8, 0);
+        work.spec.max_attempts = 2;
+        work.template = Some(Arc::new(
+            toml::from_str("runtime='process'\nexec='/bin/true'").unwrap(),
+        ));
+        let outcome = pool.run_chunk(&work, &CancellationToken::new()).await;
+        assert_eq!(outcome.result.succeeded, 8);
+        let seen = runner.0.lock().unwrap();
+        assert_eq!(seen.len(), 16);
+        let chunk = work.template.as_ref().unwrap();
+        assert!(seen.iter().all(|template| Arc::ptr_eq(template, chunk)));
     }
 
     #[tokio::test]

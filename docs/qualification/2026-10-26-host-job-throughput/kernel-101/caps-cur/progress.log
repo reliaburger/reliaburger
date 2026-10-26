@@ -1,0 +1,13 @@
+bun pid 1664
+2026-10-26T05:53:31Z c27-probe-host jobs-host-processes c=27 perf=probe exit 0
+2026-10-26T05:54:44Z c27-r1-host jobs-host-processes c=27 perf=none exit 0
+2026-10-26T05:55:55Z c27-r1-raw jobs-vm-baseline c=27 perf=none exit 0
+2026-10-26T05:57:06Z c27-r2-raw jobs-vm-baseline c=27 perf=none exit 0
+2026-10-26T05:58:18Z c27-r2-host jobs-host-processes c=27 perf=none exit 0
+2026-10-26T05:59:30Z c27-r3-host jobs-host-processes c=27 perf=none exit 0
+2026-10-26T06:00:41Z c27-r3-raw jobs-vm-baseline c=27 perf=none exit 0
+2026-10-26T06:01:52Z c27-r4-raw jobs-vm-baseline c=27 perf=none exit 0
+2026-10-26T06:03:04Z c27-r4-host jobs-host-processes c=27 perf=none exit 0
+2026-10-26T06:04:16Z c27-r5-host jobs-host-processes c=27 perf=none exit 0
+2026-10-26T06:05:27Z c27-r5-raw jobs-vm-baseline c=27 perf=none exit 0
+2026-10-26T06:05:37Z DONE

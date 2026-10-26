@@ -12,9 +12,13 @@
 //! ```text
 //!  tick            branch            branch             branch
 //!  Pending ─Clear─▶ (Pending) ─Create─▶ (Preparing) ─Start─▶ (Starting) ─▶ HealthWait
-//!                                         └─refused─Refuse─▶ Failed
+//!                                         └─refused─Refuse─▶ Failed    └─Publish─┘
 //!  Stopping ─Cleanup─▶ Stopped ─▶ Pending (backoff permitting)
 //! ```
+//!
+//! `Publish` touches no runtime. It only waits 100 ms, when the replacement
+//! backend's journal write outlasted its turn, so the loop looks again once
+//! the write may have landed (#1263).
 //!
 //! Each restart has at most one step in flight, recorded in `restarts`, so a
 //! tick never starts a second restart of the same instance. A stop or a
@@ -58,6 +62,9 @@ pub(super) enum RestartStep {
     Start,
     /// Stop a created replacement whose network preparation was refused.
     Refuse,
+    /// Look again at a started replacement whose backend's journal write
+    /// outlasted its turn (#1263). No runtime call: the step only waits.
+    Publish,
 }
 
 /// What a restart carries from one step to the next.
@@ -278,6 +285,8 @@ async fn run_step<G: Grill>(
             Err(error) => Err(error.into()),
         },
         RestartStep::Refuse => grill.stop(&id).await.map_err(BunError::from),
+        // Spawned by `recheck_restart_publication`, never here.
+        RestartStep::Publish => Ok(()),
     };
     match done {
         Ok(()) => StepResult::Done,
@@ -390,9 +399,44 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         );
     }
 
+    /// Look at a started replacement's publication again after a short
+    /// wait, off the loop, once its backend's journal write may have landed
+    /// (#1263). A stop or retirement that takes the instance back meanwhile
+    /// cancels it as it would any step.
+    fn recheck_restart_publication(
+        &mut self,
+        id: InstanceId,
+        launch: RestartLaunch,
+        gate: RestartGate,
+    ) {
+        let task = self
+            .restart_steps
+            .spawn(async {
+                tokio::time::sleep(deploy_ops::STILL_RUNNING_RECHECK).await;
+                StepResult::Done
+            })
+            .id();
+        self.restarts.insert(
+            id,
+            RestartInFlight {
+                step: RestartStep::Publish,
+                launch: Some(launch),
+                gate,
+                task,
+            },
+        );
+    }
+
     /// Whether `id` has a restart step in flight.
     pub(super) fn restarting(&self, id: &InstanceId) -> bool {
         self.restarts.contains_key(id)
+    }
+
+    /// Which step of `id`'s restart is in flight, for tests that hand the
+    /// loop one step's result at a time.
+    #[cfg(test)]
+    pub(super) fn restart_step_of(&self, id: &InstanceId) -> Option<RestartStep> {
+        self.restarts.get(id).map(|restart| restart.step)
     }
 
     /// Room for another restart step this tick.
@@ -481,7 +525,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .await;
             }
             (RestartStep::Start, StepResult::Started(evidence), Some(launch)) => {
-                self.restart_after_start(&id, &launch, &evidence).await;
+                self.restart_after_start(id, launch, gate, &evidence).await;
+            }
+            (RestartStep::Publish, StepResult::Done, Some(launch)) => {
+                self.publish_restarted_backend(id, launch, gate).await;
             }
             (RestartStep::Create | RestartStep::Start, StepResult::Failed(error), _) => {
                 // A binary that's gone fails every attempt the same way, so
@@ -499,6 +546,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 {
                     instance.state = state;
                 }
+            }
+            (RestartStep::Publish, StepResult::Failed(error), _) => {
+                eprintln!("bun: restart of {id} got an unexpected failure looking again: {error}");
             }
             (RestartStep::Refuse, StepResult::Failed(error), _) => {
                 // The replacement is created but not stopped. Keep the
@@ -666,53 +716,90 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// The loop's step after Start: stream the replacement's logs, record
-    /// it for adoption, and route to its address.
+    /// it for adoption, then publish its backend.
     async fn restart_after_start(
         &mut self,
-        id: &InstanceId,
-        launch: &RestartLaunch,
+        id: InstanceId,
+        launch: RestartLaunch,
+        gate: RestartGate,
         evidence: &LaunchEvidence,
     ) {
         if self
             .supervisor
-            .get_instance(id)
+            .get_instance(&id)
             .is_none_or(|instance| instance.state != ContainerState::Starting)
         {
             return;
         }
         // Its sidecars started again before it did (#1120).
-        self.sidecars.started_with(id);
-        if let Err(error) = self.record_launch_execution(id, &evidence.execution) {
-            self.record_failed_restart(id, &error.to_string()).await;
+        self.sidecars.started_with(&id);
+        if let Err(error) = self.record_launch_execution(&id, &evidence.execution) {
+            self.record_failed_restart(&id, &error.to_string()).await;
             return;
         }
-        self.spawn_log_forwarder(id, &launch.app_name, &launch.namespace);
-        if let Err(error) = self.persist_instance_record(id, evidence).await {
-            self.record_failed_restart(id, &error.to_string()).await;
+        self.spawn_log_forwarder(&id, &launch.app_name, &launch.namespace);
+        if let Err(error) = self.persist_instance_record(&id, evidence).await {
+            self.record_failed_restart(&id, &error.to_string()).await;
             return;
         }
-        let container_ip = evidence.container_ip;
-        if let Some(instance) = self.supervisor.get_instance_mut(id) {
-            instance.container_ip = container_ip;
+        if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+            instance.container_ip = evidence.container_ip;
         }
+        self.publish_restarted_backend(id, launch, gate).await;
+    }
+
+    /// Route to a started replacement's address. Its journal write waits
+    /// only until the turn's deadline, and a write already in flight isn't
+    /// waited for (#1263). Until the journal records the backend the
+    /// replacement stays `Starting` and out of `service_map`, and a
+    /// `Publish` step looks again after 100 ms.
+    async fn publish_restarted_backend(
+        &mut self,
+        id: InstanceId,
+        launch: RestartLaunch,
+        gate: RestartGate,
+    ) {
+        let Some(instance) = self
+            .supervisor
+            .get_instance(&id)
+            .filter(|instance| instance.state == ContainerState::Starting)
+        else {
+            return;
+        };
+        let (container_ip, healthy) = (instance.container_ip, instance.health_config.is_none());
         let service_id =
             crate::onion::service_id::ServiceId::new(&launch.namespace, &launch.app_name);
         let mut candidate = self.service_map.clone();
         if let Some(port) = launch.host_port {
-            let healthy = self
-                .supervisor
-                .get_instance(id)
-                .is_some_and(|instance| instance.health_config.is_none());
-            let backend = self.local_backend(id, &service_id, container_ip, port, healthy);
+            let backend = self.local_backend(&id, &service_id, container_ip, port, healthy);
             if let Err(error) = candidate.add_backend(&service_id, backend) {
-                self.record_failed_restart(id, &error.to_string()).await;
+                self.record_failed_restart(&id, &error.to_string()).await;
                 return;
             }
         }
         // Keep every reader on the confirmed view. A runtime restart can
         // change its address, but does not establish application health.
-        if let Err(error) = self.publish_backend_snapshot(&service_id, &candidate).await {
-            self.record_failed_restart(id, &error.to_string()).await;
+        let journalled = self
+            .journal_publication_within_turn(
+                &service_id,
+                &candidate,
+                LoopBranch::RestartStep,
+                "restart_step/landed",
+            )
+            .await;
+        let published = match journalled {
+            Ok(discovery_ownership::Landing::InFlight) => {
+                self.recheck_restart_publication(id, launch, gate);
+                return;
+            }
+            Ok(discovery_ownership::Landing::Landed) => {
+                self.publish_journalled_backends(&service_id, &candidate)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = published {
+            self.record_failed_restart(&id, &error.to_string()).await;
             return;
         }
         self.service_map = candidate;
@@ -720,7 +807,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.rebuild_routing_table().await;
 
         // Starting → HealthWait, then Running if no health checks
-        if let Some(instance) = self.supervisor.get_instance_mut(id) {
+        if let Some(instance) = self.supervisor.get_instance_mut(&id) {
             if let Ok(state) = instance.state.transition_to(ContainerState::HealthWait) {
                 instance.state = state;
             }
