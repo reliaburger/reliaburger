@@ -3164,6 +3164,81 @@ async fn cgroup_host_executor_drains_output_buffered_at_exit() {
     .await;
 }
 
+/// The helper spawns each command with `CLONE_VM | CLONE_VFORK` (#1030): the
+/// child borrows the helper's address space until it execs, so the helper
+/// takes no copy-on-write faults per command. A fork-style clone cost it
+/// several faults per spawn. A command that can't be executed still reports
+/// its errno on stderr with exit 127, and the helper carries on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_executor_spawns_without_copy_on_write_faults() {
+    use reliaburger::bun::task_executor::{AttemptOutcome, TaskRunner};
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-vfork-")
+        .tempdir()
+        .unwrap();
+    let (runner, budget, template, runtime) = one_slot_native_runner(root.path());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let run = |index: u32, script: &str| {
+        let task = shell_task(&template, index, script);
+        let runner = &runner;
+        let cancel = &cancel;
+        async move { runner.run(&task, Duration::from_secs(10), cancel).await }
+    };
+    for index in 0..8 {
+        let warm = run(index, "true").await;
+        assert!(warm.outcome.succeeded(), "{warm:?}");
+    }
+    let helper = running_helper(&runtime).await;
+    let faults = || {
+        let stat = std::fs::read_to_string(format!("/proc/{helper}/stat"))
+            .expect("the warm helper retired mid-measurement");
+        let (_, fields) = stat.rsplit_once(')').unwrap();
+        fields
+            .split_whitespace()
+            .nth(7)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let before = faults();
+    for index in 8..72 {
+        let outcome = run(index, "true").await;
+        assert!(outcome.outcome.succeeded(), "{outcome:?}");
+    }
+    let spawned = faults() - before;
+    assert!(
+        spawned < 16,
+        "the helper took {spawned} minor faults over 64 spawns"
+    );
+    let unexecutable = root.path().join("not-executable");
+    std::fs::write(&unexecutable, "#!/bin/sh\n").unwrap();
+    // The template's `exec` is the command the helper runs.
+    let mut denied_template = template.clone();
+    denied_template.exec = Some(unexecutable.clone());
+    let task = reliaburger::bun::task_executor::TaskInvocation {
+        program: unexecutable.clone(),
+        args: vec![],
+        ..shell_task(&denied_template, 72, "")
+    };
+    let denied = runner.run(&task, Duration::from_secs(10), &cancel).await;
+    assert!(
+        matches!(denied.outcome, AttemptOutcome::Exited { code: 127 }),
+        "{denied:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&denied.output.head),
+        "executor command: Permission denied\n"
+    );
+    let after = run(73, "printf after").await;
+    assert!(after.outcome.succeeded(), "{after:?}");
+    assert_eq!(after.output.head, b"after");
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}
+
 /// Another local user can create any name in `/tmp`. A helper's control
 /// socket must live where only root can, or that user can block the slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
