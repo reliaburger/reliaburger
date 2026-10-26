@@ -283,6 +283,21 @@ async fn drain_and_stop_instance<G: Grill>(
     stop: &InstanceStop,
     confirmation_timeout: std::time::Duration,
 ) -> Result<(), BunError> {
+    drain_instance(drains, id, drain_timeout).await;
+    stop_runtime_instance(grill, id, stop, confirmation_timeout).await
+}
+
+/// Route new ingress traffic away from `id` and wait until its in-flight
+/// requests finish, or `drain_timeout` passes.
+///
+/// This sees only connections that come through this node's Wrapper. Other
+/// nodes connect to the backend directly; a rolling retirement waits for
+/// them separately, before the stop (#1355).
+async fn drain_instance(
+    drains: &crate::wrapper::draining::SharedDrains,
+    id: &InstanceId,
+    drain_timeout: std::time::Duration,
+) {
     let cmd = crate::wrapper::draining::DrainCommand {
         app_name: String::new(),
         instance_id: id.0.clone(),
@@ -290,8 +305,6 @@ async fn drain_and_stop_instance<G: Grill>(
     };
     drains.start_drain(&cmd).await;
     drains.wait_drained(&id.0).await;
-
-    stop_runtime_instance(grill, id, stop, confirmation_timeout).await
 }
 
 /// Stop one instance, requiring observed exit even after force-kill.

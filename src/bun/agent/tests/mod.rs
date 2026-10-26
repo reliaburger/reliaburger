@@ -1156,6 +1156,98 @@ async fn a_published_rolling_replacement_reports_running_before_the_old_instance
     );
 }
 
+/// #1355: a retiring instance's drain waited only for this node's ingress
+/// connections. Other nodes connect to its backend directly, and they only
+/// drop it once their next view arrives, so a server that exits on SIGTERM
+/// could stop while they still routed to it, and their callers got
+/// `ECONNREFUSED`. The leader's producer release answers exactly "every
+/// node has dropped this backend", but it was asked only after the stop.
+/// Now the old instance keeps running until the leader confirms (or the
+/// patience runs out), and only then gets its stop signal.
+#[tokio::test]
+async fn a_rolling_retirement_stops_the_old_instance_only_after_other_nodes_drop_it() {
+    let grill = MockGrill::new();
+    grill.set_pid(std::process::id());
+    let allocator = PortAllocator::new(30000, 30010);
+    let (_, receiver) = mpsc::channel(8);
+    let mut agent = BunAgent::new(
+        grill.clone(),
+        allocator.clone(),
+        receiver,
+        CancellationToken::new(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    agent.set_volumes_dir(root.path().join("volumes"));
+    agent.set_records_dir(root.path().join("records"));
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let old = InstanceId("default__web-0".into());
+    let original = agent.supervisor.get_instance(&old).unwrap();
+    let execution = crate::grill::RuntimeExecution {
+        instance_id: old.clone(),
+        generation: crate::grill::RuntimeGeneration::process("original"),
+    };
+    grill
+        .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+            instance_id: old.clone(),
+            generation: execution.generation.clone(),
+            spec: original.oci_spec.clone().unwrap(),
+            network_reference: None,
+        }])
+        .await;
+    let (mut clustered, _, _) = test_cluster_fault_agent().await;
+    agent.cluster = clustered.cluster.take();
+
+    // The leader waits for one other node's receipt (202), then confirms.
+    // Each request notes whether the old instance had already been told to
+    // stop when it arrived.
+    let confirmation = serde_json::json!({"node_id": "test", "execution": execution}).to_string();
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+    let (client, leader) = crate::cluster::producer::test_scripted_fixture({
+        let requests = requests.clone();
+        let grill = grill.clone();
+        let old = old.clone();
+        move || {
+            let stopped = grill
+                .calls()
+                .iter()
+                .any(|(operation, id)| operation == "stop" && *id == old);
+            let mut requests = requests.lock().unwrap();
+            requests.push(stopped);
+            if requests.len() < 2 {
+                (axum::http::StatusCode::ACCEPTED, String::new())
+            } else {
+                (axum::http::StatusCode::OK, confirmation.clone())
+            }
+        }
+    })
+    .await;
+    agent.set_producer_release_client(client);
+
+    let replacement = Config::parse("[app.web]\nimage = 'web:v2'\nport = 8080\n").unwrap();
+    expect_complete(&drain_deploy(&mut agent, replacement).await);
+
+    let requests = requests.lock().unwrap().clone();
+    assert!(
+        requests.len() >= 2 && !requests[0] && !requests[1],
+        "the old instance must keep serving until the leader confirms every \
+         node has dropped it; stopped at each release request: {requests:?}"
+    );
+    assert!(
+        grill
+            .calls()
+            .iter()
+            .any(|(operation, id)| operation == "stop" && *id == old),
+        "the old instance was never stopped"
+    );
+    assert!(agent.supervisor.get_instance(&old).is_none());
+    leader.abort();
+    let _ = leader.await;
+}
+
 #[tokio::test]
 async fn slow_producer_release_does_not_stall_the_agent_loop() {
     let grill = MockGrill::new();

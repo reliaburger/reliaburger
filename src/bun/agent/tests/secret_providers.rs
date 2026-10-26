@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 
 use super::commands::{AgentCommand, ApplyEvent};
 use super::*;
-use crate::sesame::secret_provider::{ProviderName, SecretProviderConfig, SecretProviders};
+use crate::sesame::secret_provider::{
+    MAX_TIMEOUT_SECS, ProviderName, SecretProviderConfig, SecretProviders,
+};
 
 /// A value no status, event or error may ever carry.
 const SECRET: &str = "s3cret-from-the-provider";
@@ -29,6 +31,11 @@ fn answering(dir: &Path) -> PathBuf {
         &format!("head -n 1 > /dev/null\nprintf '{{\"version\":1,\"value\":\"{SECRET}\"}}'"),
     )
 }
+
+/// The timeout for a provider whose test isn't about time. A loaded host can
+/// take seconds just to start `/bin/sh`, so these get the longest a node
+/// accepts, and only the slow-provider test judges the timeout itself.
+const PATIENT: u64 = MAX_TIMEOUT_SECS;
 
 /// The node's `vault` provider, running `binary` with a `timeout_secs` timeout.
 fn vault(binary: &Path, timeout_secs: u64) -> SecretProviders {
@@ -67,7 +74,7 @@ async fn statuses(tx: &mpsc::Sender<AgentCommand>) -> Vec<super::super::status::
 async fn a_provider_value_reaches_the_runtime_but_never_the_supervisor() {
     let dir = tempfile::tempdir().unwrap();
     let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
-    agent.set_secret_providers(vault(&answering(dir.path()), 5));
+    agent.set_secret_providers(vault(&answering(dir.path()), PATIENT));
 
     expect_complete(&drain_deploy(&mut agent, provider_app("api")).await);
 
@@ -165,7 +172,7 @@ async fn a_refusing_provider_never_puts_a_secret_in_the_reason() {
             dir.path(),
             &format!("printf '{{\"version\":9,\"value\":\"{SECRET}\"}}'"),
         ),
-        5,
+        PATIENT,
     ));
     let handle = tokio::spawn(async move { agent.run().await });
 
@@ -192,7 +199,7 @@ async fn a_restart_asks_the_provider_again_and_fails_closed_when_it_stops_answer
     let dir = tempfile::tempdir().unwrap();
     let binary = answering(dir.path());
     let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
-    agent.set_secret_providers(vault(&binary, 5));
+    agent.set_secret_providers(vault(&binary, PATIENT));
     expect_complete(&drain_deploy(&mut agent, provider_app("api")).await);
     let id = agent.supervisor.list_instances()[0].id.clone();
 
@@ -215,7 +222,7 @@ async fn a_restart_asks_the_provider_again_and_fails_closed_when_it_stops_answer
 async fn a_node_advertises_the_providers_it_runs() {
     let dir = tempfile::tempdir().unwrap();
     let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
-    agent.set_secret_providers(vault(&answering(dir.path()), 5));
+    agent.set_secret_providers(vault(&answering(dir.path()), PATIENT));
     let (capabilities, _) = agent.live_egress_report_state().await;
     let names: Vec<&str> = capabilities
         .secret_providers
