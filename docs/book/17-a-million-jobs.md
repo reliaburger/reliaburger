@@ -2844,7 +2844,8 @@ gap. How much is enough? That depends on how long commands take, so the leader
 learns it from the final-attempt duration histogram the nodes already report.
 Bucket `i` counts commands that took up to `2^i` ms. Using the upper bound of
 each bucket gives a conservative estimate of throughput: slots × two seconds ÷
-average duration. Learned depth is capped at sixteen chunks.
+average duration. Learned depth was capped at sixteen chunks, and 0.2.3
+raised the cap to 32 for a reason we'll come to.
 
 That's the idea. The edges took four more fixes:
 
@@ -2871,8 +2872,8 @@ That's the idea. The edges took four more fixes:
   with a thousandth of the capacity gets two chunks.
 - **Lookahead needs automatic replay.** If a node dies, every chunk it held
   has an unknown outcome. Arrays that replay automatically don't mind. Arrays
-  that need an operator to acknowledge and replay would turn sixteen chunks
-  into manual work. Those keep the baseline window, and the leader passes the
+  that need an operator to acknowledge and replay would turn the whole
+  lookahead into manual work. Those keep the baseline window, and the leader passes the
   run's policy to `plan_grants` as a plain `bool`.
 - **The durations must be honest.** The executor used to time the whole
   `runner.run` call, which for a pool includes waiting for a slot and, on a
@@ -3407,6 +3408,29 @@ Bun and the helper, makes bursts cheaper, but bursts aren't the limit while
 the CPU waits. Past either doubling change, the next ceiling is CPU: about
 222 µs of VM time per task, or 18,000 a second on this rig.
 
+For 0.2.3 we took the first way, and it's one line:
+
+```rust
+pub const MAX_LEARNED_GRANT_DEPTH: u64 = 32;
+```
+
+That's 32 chunks × 1,000 tasks ÷ 2 s, or 16,000 a second, close enough to the
+CPU's 18,000 that the node should spend most of each cycle working. It isn't
+free. A lost node now strands up to twice as much work, which the leader hands
+to other nodes and runs again, and a cancel or drain has twice as many held
+chunks to write off. Arrays that need an operator to replay unknown outcomes
+never get the lookahead, so they don't pay that price. And the extra depth
+only matters for very short tasks: a node running 100 ms commands learns a
+depth far below sixteen, so it never reaches either cap.
+
+That's why it's a stopgap. The wait between ticks is still there; we've just
+made room for more work during it. Sending grants in the tick that commits
+them ([#1360](https://github.com/reliaburger/reliaburger/issues/1360)) removes
+the wait, helps every array rather than only the fastest, and lets the cap go
+back to sixteen. It changes the ordering of control versions that every node
+fences on, though, and that is code we'd rather not rush into a patch release.
+It's planned for 0.2.4.
+
 One more lesson came from the bench rig rather than the code. The first
 release-script run of the baseline fell apart in round 3: Bun stopped
 answering mid-window, and the rounds after it ran at a third to a half of the
@@ -3630,6 +3654,46 @@ concurrent slots record without taking a lock. A small guard records the
 elapsed time in its `Drop` implementation, Rust's destructor, which runs on
 every exit path, error returns included. Its lifetime spans exactly one phase,
 so waiting for a slot can't leak into execution time.
+
+### Counting per node
+
+0.2.3's headline is two billion host jobs a day on three nodes. A three-node
+total that's three times one node's sounds like proof that the scheduler
+spreads the work. It isn't. One node could be doing most of it while the
+others wait for grants, and the total would look the same until that node ran
+out of room. So #1031 needs the window's successes broken down per node, and
+a lopsided split counts as a failed measurement, not a result.
+
+The data was already there. Each batch summary carries the leader's view of
+every node: the slots it offered and the counters it reported at its last
+sync. `relish bench` now reads those counters on every poll, through a
+`NodeCounts` value keyed by array and node, and keeps the per-node deltas
+alongside the accepted total, with the same cutoff. A counter that goes
+backwards means the node restarted, so counting carries on from the new value
+and the report flags it. These are what each node *said* it finished. The
+headline total stays the leader's accepted count, and on a healthy run the two
+agree.
+
+Each node's fair share is its slots over everyone's. A node may go 20% over
+its fair share, so a third of the work on three equal nodes may grow to 40%,
+and anything more fails the command. The first version compared percentages
+as floats and called exactly 40% unbalanced: 33.33… × 1.2 comes out a hair
+under 40 in binary floating point. The check now cross-multiplies whole
+numbers in `u128`, Rust's 128-bit unsigned integer, wide enough that the
+product of three `u64`-sized counts can't overflow:
+
+```rust
+over_fair_share: u128::from(*successes) * u128::from(total_slots) * 100
+    > u128::from(slots) * u128::from(total) * tolerance,
+```
+
+`u128::from` is a lossless conversion; Rust won't silently widen a `u64` in
+arithmetic the way C promotes integers, so you say it each time.
+
+Older reports have no breakdown, and `--compare` still has to read them. The
+new field is an `Option<NodeBreakdown>` marked `#[serde(default)]`, which
+tells serde to fill in `None` when the key is missing instead of refusing the
+file. The human report then says `per node: not recorded`.
 
 ### Soak jobs while the apps keep running
 
