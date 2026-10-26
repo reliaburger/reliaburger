@@ -1082,6 +1082,45 @@ The awkward bit is credentials. A private repository means a token in the URL, a
 
 A sync reads desired state, then spends seconds (or minutes, on a slow remote) in `git`. If leadership moves to B and back to A meanwhile, A's diff is stale: B may have changed things A's snapshot never saw. The fix costs one `u64`. The runner reads the Raft term *before* the snapshot and stamps it on every `GitOpsWrite`. The state machine compares it with the term of the log entry carrying the write, which openraft gives us for free in the entry's `LogId`, and refuses a mismatch. Because the check happens as the entry applies, every replica refuses the same writes. The runner also checks the term before each write and abandons the sync on the first sign it moved; the new leader's sync takes over.
 
+### Waking for leaders, not for commits
+
+The sync loop has four things to wait for: the poll timer, a webhook, a committed trigger, and a change of leader. The last one came from `council.metrics()`, a `tokio::sync::watch::Receiver<RaftMetrics>`. A watch channel holds one value, the latest, and `changed()` wakes whenever the sender publishes a new one. That's the catch. openraft publishes new metrics whenever *anything* in them moves: the log index on every commit, and `millis_since_quorum_ack` as heartbeat replies come back, even when there's nothing to commit. So the loop woke on every commit and every heartbeat, cloned the whole `DesiredState` under the state machine's read lock, and only then found out whether GitOps was even configured. Most of the time it wasn't.
+
+Nobody noticed until a node ran thousands of host jobs a second. Each job's receipts commit to Raft, every commit woke the loop, and every wake copied every task array's record. The host-job profile for #1030 found the loop eating 41% of Bun's CPU while jobs ran, and 64% when Bun ran nothing at all. Chapter 17 has the throughput side of that story.
+
+Watch channels have no filter, so the loop keeps its own: the three fields that say who leads.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Leadership {
+    term: u64,
+    leader: Option<u64>,
+    this_node: u64,
+}
+
+impl Leadership {
+    fn moved(self) -> impl FnMut(&RaftMetrics) -> bool {
+        move |metrics| Leadership::of(metrics) != self
+    }
+}
+```
+
+and waits with `wait_for`, which takes a predicate and returns only once the channel's value satisfies it:
+
+```rust
+change = metrics.wait_for(leadership.moved()) => {
+    let Ok(current) = change else { break };
+    leadership = Leadership::of(&current);
+    !leadership.names_this_node()
+}
+```
+
+`impl FnMut(&RaftMetrics) -> bool` in the return type means "some closure you can call repeatedly with a borrowed `RaftMetrics`". Every closure in Rust has its own anonymous type, so you can't write its name; `impl Trait` lets the compiler fill it in. The `move` keyword makes the closure take its own copy of `self` instead of borrowing it. That matters here: `leadership` is reassigned inside the `select!` arm, and a closure still borrowing it would stop that compiling. Because `Leadership` is `Copy` (three integers), the move is a cheap copy, and `moved(self)` can take `self` by value without consuming anything the loop still needs. `wait_for` still runs the predicate on every metrics update, but comparing three integers costs nothing next to cloning the cluster.
+
+The arm's value is the old `durable_wake` flag. A node that has just become leader syncs at once, the way a freshly started loop does on its first tick, instead of waiting up to thirty seconds for its poll. Any other move (a new term with someone else leading) only resumes a trigger that's still pending, as before. Then, before taking the full state, the loop reads just `gitops_config` with `read_desired`, which borrows the state under the lock and returns what the closure picks out, and checks it leads. A follower, or a leader of a cluster without GitOps, stops there.
+
+The tests in `src/lettuce/runner.rs` count whole-state clones through a test-only counter on `CouncilNode::desired_state`. `a_commit_that_only_moves_the_log_index_does_not_read_the_desired_state` commits twenty no-ops after a sync and expects no clone at all. Against the old loop it counted about 14,000 clones in that window, far more than twenty commits explain. `with_gitops_unconfigured_a_wake_never_clones_the_desired_state` sends a tick, commits and a webhook to a loop with nothing to sync, and expects zero. `the_loop_syncs_promptly_when_this_node_becomes_leader` starts a loop on a node that leads nothing, with an hour's poll, then makes it leader. The old loop waited the hour. Three more pin the other wake sources, a trigger, a webhook and a tick, so the filter can't quietly swallow one of them.
+
 ### Warning, not refusing, about plaintext secrets
 
 Last, a smaller decision (D8). A repository with `DB_PASSWORD = "hunter2"` in it works, and always has. Refusing it would turn a bad habit into an outage with no migration path. So the sync applies it and warns: any env key containing `PASSWORD`, `SECRET`, `TOKEN` or `CREDENTIAL`, or ending in `_KEY`, whose value isn't `ENC[AGE:...]`, produces a warning naming the app and the key, never the value. It lands in the log (once, when the set of warnings changes), in `SyncState.warnings` and in `relish wtf`.
