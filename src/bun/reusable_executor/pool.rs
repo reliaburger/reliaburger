@@ -110,6 +110,9 @@ struct Context {
     /// Filesystem cleanup may continue after the caller times out. Keep its
     /// handle until completion before releasing or reusing the slot.
     cleanup: Option<tokio::task::JoinHandle<bool>>,
+    /// A host executor's share of Bun's environment, read once at start
+    /// rather than for every command (#1030).
+    host_environment: Option<std::collections::BTreeMap<String, String>>,
     #[cfg(feature = "ebpf")]
     namespace: Option<crate::bun::task_namespace::NamespaceLease>,
 }
@@ -629,6 +632,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         .await?;
         let helper = context.directory.join("helper");
         install_helper(helper.clone(), HOST_HELPER).await?;
+        context.host_environment = Some(crate::grill::process::inherited_host_environment());
         // Socket credentials and the durable owner's unreaped helper identity
         // authenticate this short address. Hash the executor directory too,
         // so two Buns on one host never share a name.
@@ -1141,6 +1145,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 idle_since: tokio::time::Instant::now(),
                 probe: None,
                 cleanup: None,
+                host_environment: None,
                 #[cfg(feature = "ebpf")]
                 namespace: None,
             });
@@ -1227,21 +1232,21 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 crate::config::types::EnvValue::Plain(value.clone()),
             );
         }
-        let mut process = crate::grill::oci::generate_job_oci_spec(
-            "task",
-            "default",
-            &template,
-            "/sys/fs/cgroup/unused",
-            None,
-        )
-        .process;
+        // A command needs only a process, not a whole container spec.
+        let mut process = crate::grill::oci::job_process(&template);
         if self.runtime.host() {
             // Preserve the existing owned host contract: commands run as Bun's
             // effective user, while the helper has a separate protected identity.
             process.user.uid = nix::unistd::geteuid().as_raw();
             process.user.gid = nix::unistd::getegid().as_raw();
-            // The helper execs with exactly this environment.
-            process.env = crate::grill::process::host_environment(&process.env)
+            // The helper execs with exactly this environment: Bun's own
+            // variables, read once when the executor started, overlaid with
+            // this command's.
+            let inherited = match &context.host_environment {
+                Some(inherited) => inherited.clone(),
+                None => crate::grill::process::inherited_host_environment(),
+            };
+            process.env = crate::grill::process::host_environment_over(inherited, &process.env)
                 .into_iter()
                 .map(|(key, value)| format!("{key}={value}"))
                 .collect();
@@ -2075,6 +2080,7 @@ mod tests {
             idle_since: tokio::time::Instant::now(),
             probe: None,
             cleanup: None,
+            host_environment: None,
             #[cfg(feature = "ebpf")]
             namespace: None,
         }
@@ -2171,6 +2177,7 @@ mod tests {
         let mut warm = context(&budget, InstanceId("rbtest-warm-host".into()), root);
         warm.key = ExecutorKey::new(template).unwrap();
         warm.connection = Some(ours);
+        warm.host_environment = Some(crate::grill::process::inherited_host_environment());
         // The task group the helper empties after every command.
         std::fs::create_dir_all(warm.base.join("task")).unwrap();
         std::fs::write(warm.base.join("task/cgroup.events"), "populated 0\n").unwrap();
@@ -2216,6 +2223,53 @@ mod tests {
             },
         )
         .await
+    }
+
+    /// #1030: the process is built once per command from the template and
+    /// that command alone, and the host environment read at the executor's
+    /// start never carries one command's arguments or variables into the
+    /// next.
+    #[tokio::test]
+    async fn each_warm_command_gets_exactly_its_own_arguments_and_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let template = host_template();
+        let (pool, mut received) = warm_pool(root.path(), &template).await;
+        let tasks = [
+            host_task(
+                0,
+                &["first", "--loud"],
+                &[("ONLY_FIRST", "1"), ("SHARED", "a")],
+            ),
+            host_task(1, &["second"], &[("SHARED", "b")]),
+            host_task(2, &[], &[]),
+        ];
+        for task in &tasks {
+            let attempt = run_warm(&pool, task, &template).await;
+            assert_eq!(attempt.outcome, AttemptOutcome::Exited { code: 0 });
+            let command = received.recv().await.unwrap();
+            // What a fresh host command would get for this task alone.
+            let mut fresh = template.clone();
+            fresh.command = Some(task.args.clone());
+            for (key, value) in &task.env {
+                fresh.env.insert(
+                    key.clone(),
+                    crate::config::types::EnvValue::Plain(value.clone()),
+                );
+            }
+            let spec = crate::grill::oci::generate_job_oci_spec(
+                "task",
+                "default",
+                &fresh,
+                "/sys/fs/cgroup/unused",
+                None,
+            );
+            let env: Vec<String> = crate::grill::process::host_environment(&spec.process.env)
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect();
+            assert_eq!(command.args, spec.process.args, "task {}", task.index);
+            assert_eq!(command.env, env, "task {}", task.index);
+        }
     }
 
     /// #1030: a running command re-checks its namespace on the pool's tick
