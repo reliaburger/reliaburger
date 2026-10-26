@@ -6912,6 +6912,17 @@
           "sources": [
             "tests/owned_task_arrays.rs"
           ]
+        },
+        {
+          "id": "host-executor-cgroup_host_executor_spawns_without_copy_on_write_faults",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_executor_spawns_without_copy_on_write_faults",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
         }
       ],
       "refused_paths": [

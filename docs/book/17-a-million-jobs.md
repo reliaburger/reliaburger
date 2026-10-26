@@ -2689,7 +2689,9 @@ static int cleanup(int fd, uint64_t sequence) {
 
 (We've trimmed a test-fixture branch that uses plain `fork()` off Linux.)
 `launch` calls `clone3` through `syscall`, because older C libraries have no
-wrapper for it. `cleanup` first checks that Bun's request carries the sequence
+wrapper for it. (It doesn't any more: for #1030 the child borrows the helper's
+memory, which needs a few lines of assembly. See "Borrowing the helper's
+memory" below.) `cleanup` first checks that Bun's request carries the sequence
 of the command that just ran. In a container, `kill(-1, SIGKILL)` signals every
 process in the helper's PID namespace except PID 1 itself, which covers a
 background child that changed its process group or its uid. The `waitpid` loop
@@ -3048,6 +3050,106 @@ disk can change, and checks the receipt only for which chunk comes first.
 The profile predicts the node runs at its burst rate all the time, about
 10,000 host jobs a second on that rig. The five-round bench measurement is
 still to come.
+
+### Borrowing the helper's memory
+
+The same profile split each task's own process into parts: 32 µs in `clone3`,
+47 µs in page faults, 49 µs in `execve` and 35 µs tearing the process down,
+out of about 313 µs per task in all. The page faults stood out. A raw
+`posix_spawn` loop paid 27 µs of faults for the same BusyBox `true`. Where did
+the other 20 µs come from? From how the helper made its child.
+
+If you've written C on Unix, you know `fork()`. The kernel copies the
+parent's page tables and marks every writable page read-only in both
+processes. The first write to a page, by either side, faults, and the kernel
+copies the page then. That's *copy-on-write*. It's cheap for a small parent
+and a child that will `exec` at once, but it isn't free. Our child wrote to
+its stack and a few globals before `exec`, and the helper, once running
+again, wrote to every page it touched: its stack, the frame buffer, the C
+library's data. Each of those writes was a fault. Our clone3 had
+`CLONE_INTO_CGROUP` and no other flag, which made it a `fork` with a
+destination cgroup.
+
+`vfork()` is the old answer. The child shares the parent's memory, nothing
+is copied or write-protected, and the parent is suspended until the child
+calls `exec` or `_exit`. In `clone` terms that's two flags:
+
+- `CLONE_VM`: share the address space. The child's writes land in the
+  parent's memory.
+- `CLONE_VFORK`: don't return in the parent until the child has exec'd or
+  exited.
+
+`posix_spawn` is the portable wrapper around the same idea. glibc builds it
+on `CLONE_VM | CLONE_VFORK`, which is why the raw loop was faster. We can't
+use it, though. Between `clone3` and `exec` the helper's child drops its
+supplementary groups, switches to the job's uid and gid and sets a
+parent-death signal; in a container it also gets private mounts, drops every
+capability and locks its securebits. `posix_spawn` can't do any of that, and
+glibc's spawn takes no cgroup on the Ubuntu 22.04 we build releases on.
+
+So the helper now asks `clone3` for `CLONE_VM | CLONE_VFORK | CLONE_INTO_CGROUP`.
+The price is discipline. Until it execs, the child is running inside the
+helper's memory while the helper is frozen mid-call, so it must behave like a
+signal handler: only *async-signal-safe* calls (the short list POSIX says you
+may call from a handler, mostly plain system calls), no `malloc`, no locks
+and no writes to the helper's variables. Our child broke that in four places.
+
+- **`perror`** goes through stdio, which locks the `stderr` stream and may
+  allocate its buffer. A new `report` function writes the same
+  `executor command: No such file or directory` line with one `writev`. Its
+  text comes from glibc's `strerrordesc_np`, which reads a constant table,
+  rather than `strerror`, which may consult the locale.
+- **`environ = env`** wrote a global. Now the helper points `environ` at the
+  task's environment just before `clone3` and puts it back as soon as
+  `clone3` returns, by which time the child has exec'd. Why not pass the
+  environment to `execvpe` instead? Because both `execvp` and `execvpe` look
+  the command up on the `PATH` in `environ`, not in the array you hand them,
+  and a task's own `PATH` has to decide.
+- **`setuid`, `setgid` and `setgroups`** in glibc aren't the plain system
+  calls. POSIX says credentials belong to the process, Linux keeps them per
+  thread, and glibc bridges the gap by taking a lock and signalling every
+  other thread to change too. The child makes the raw system calls instead,
+  as glibc's own `posix_spawn` does. It has one thread, so the effect is the
+  same.
+- **The stack.** With `CLONE_VM` the child can't share the parent's stack the
+  way `vfork()` does without the C library's help, so it gets its own:
+  256 KiB mapped once at start-up, with a guard page below it. That's far
+  more than the setup and `execvp`'s path buffer need.
+
+The stack is also why there's assembly in a C file. `syscall(SYS_clone3, …)`
+returns twice, and in the child it returns on the new, empty stack, where
+there's no return address to go back to. glibc's own `__clone3` solves that
+with a few instructions that call a function on the new stack, but it's
+private to glibc. So the helper has its own, `rb_clone3`, for x86-64 and
+aarch64, the only architectures we release. In the parent it returns the
+child's pid. In the child it calls `task_child` on the new stack and exits
+with its result, which never happens, since `task_child` ends in `exec` or
+`_exit`.
+
+Everything else the child does is a system call on its own kernel state.
+`clone3` without `CLONE_FILES`, `CLONE_SIGHAND` or `CLONE_THREAD` gave it its
+own descriptor table, signal handlers, credentials, limits and namespaces, so
+closing descriptors, dropping capabilities, `unshare` and `mount` don't touch
+the helper. One thing is shared that we can't avoid: `errno`, which lives in
+thread-local memory, and every failed call sets it. The helper never reads
+`errno` after a successful spawn, so that's harmless. The child also resets
+the helper's `SIGCHLD` handler first, so that handler can't run in the child
+and write to a pipe the child is about to close.
+
+How do you test that a fault went away without timing anything? Count it.
+The kernel counts minor page faults per process in the tenth field of
+`/proc/<pid>/stat`. The protocol test runs 64 `/bin/true` commands through a
+warm helper and reads the helper's count before and after. With the old
+clone the host helper took 576 faults, nine per spawn. With the new one it
+takes none, and the test allows fewer than 16. A gated test does the same with
+Bun's real host helper. Other protocol tests pin down what had to stay the
+same: a command gets exactly the environment Bun sent, a bare command name is
+found on the task's own `PATH`, and a command that can't run reports its
+`errno` on stderr with exit 127 while the next one still runs.
+
+The profile expected this to save most of the 47 µs of faults and some of
+the 32 µs clone, about 15% of a task once the node is CPU-bound. The bench
+measurement will say how much it really saves.
 
 ### What the measurements do and don't show
 
