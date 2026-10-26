@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "scenario": "jobs-host-processes",
+  "started_at": "2026-10-26T06:17:08Z",
+  "requested_seconds": 60,
+  "concurrency": 27,
+  "cpu_request_millicores": 25,
+  "cpu_limit_millicores": 1000,
+  "memory_bytes": 33554432,
+  "receipt_chunk_size": 1000,
+  "image": null,
+  "executable": "/opt/bench/busybox-image",
+  "executable_sha256": null,
+  "measurement_boundary": "configured cluster; concurrency is per node; unique accepted outcomes received before the monotonic cutoff; submission and cold executor/image startup are included; 10m/8Mi helper reservation for shared/host; remote host executable hash is unknown; compare on the same node and byte-identical BusyBox",
+  "unique_accepted_successes": 114000,
+  "verified_successes": 0,
+  "terminal_failures": 0,
+  "accepted_retries": 0,
+  "post_cutoff_drained": 0,
+  "batch_ids": [
+    15
+  ],
+  "active_submissions": [
+    15
+  ],
+  "drain_proofs": [],
+  "last_accepted_sample_seconds": 32.787552683,
+  "submission_names": [
+    "bench-jobs-676abe7a400fb02a012c0bc1a1075be1"
+  ],
+  "measurement_complete": false,
+  "interrupted": false,
+  "cleanup_verified": false,
+  "cleanup_failed_submissions": [
+    15
+  ],
+  "error": "bun agent not reachable at localhost:9117 (is it running?); cleanup of batch 15 failed: bun agent not reachable at localhost:9117 (is it running?)",
+  "elapsed_including_drain_seconds": 33.038475131,
+  "successes_per_second": 1900.0,
+  "extrapolated_runs_per_day": 164160000.0,
+  "daily_projection": "extrapolation from this window; not an observed daily total",
+  "qualified_100m_per_day": false
+}

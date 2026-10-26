@@ -3047,9 +3047,9 @@ at 50 ms each, six local writers doing full fsyncs still failed it one run in
 thirty. So the test now records the order in which tasks finish, which no
 disk can change, and checks the receipt only for which chunk comes first.
 
-The profile predicts the node runs at its burst rate all the time, about
-10,000 host jobs a second on that rig. The five-round bench measurement is
-still to come.
+The profile predicted the node would then run at its burst rate all the
+time, about 10,000 host jobs a second on that rig. It didn't, quite, and
+[What four changes bought](#what-four-changes-bought) below says why.
 
 ### Borrowing the helper's memory
 
@@ -3148,8 +3148,10 @@ found on the task's own `PATH`, and a command that can't run reports its
 `errno` on stderr with exit 127 while the next one still runs.
 
 The profile expected this to save most of the 47 µs of faults and some of
-the 32 µs clone, about 15% of a task once the node is CPU-bound. The bench
-measurement will say how much it really saves.
+the 32 µs clone, about 15% of a task once the node is CPU-bound. The bench run
+after all four changes measured 24 µs of faults and 13 µs of `clone3` per
+task, on a faster host than the profile's. The node isn't CPU-bound yet,
+though, so the saving doesn't show in the rate.
 
 ### A core spent watching the log
 
@@ -3172,8 +3174,8 @@ those scenarios leave a bigger `DesiredState` behind to clone.
 Dropping the wake wasn't the fix, though, because a new leader must start
 syncing without waiting for its poll. So for #1030 the loop now wakes only
 when the term or the leader changes, and reads just the GitOps configuration
-until it knows a sync will run. Chapter 7 shows how. The bench measurement
-with this change and the in-order dispatch together is still to come.
+until it knows a sync will run. Chapter 7 shows how. In the bench run below,
+Bun used 0.5 s of CPU in a 62-second raw window, down from 60.5 s.
 
 ### Sixty-four microseconds of bookkeeping
 
@@ -3330,8 +3332,90 @@ proves its task group is empty before the executor is reused (#715), and
 there's no cheaper way to ask the kernel that question.
 
 The profile estimated 25 to 35 µs from trims like these, 5 to 10% of host-job
-throughput. We haven't measured what these four removed yet. That's for the
-five-round bench comparison #1030 asks for.
+throughput. After all four changes, Bun's per-task path measured 36 µs against
+the profile's 64, on a faster host, so we can't say how much of that is the
+trims alone.
+
+### What four changes bought
+
+#1030's target was 8,000 host jobs a second on one 4-vCPU node, as a
+five-round median. With all four changes in, the
+[26 October record](../qualification/2026-10-26-host-job-throughput/README.md)
+measured **7,500 a second**, up from 5,100 on the build the profile measured,
+with no terminal failures and cleanup verified every time. The release script's
+host windows doubled, from 3,767 to 7,500. Shared containers share the
+dispatch path, and the core the GitOps loop used to burn, and they went from
+2,583 to 6,483. Against the published 0.2.0 reports, through
+`relish bench --compare`, host jobs gained 58% and shared containers 133%.
+
+So, close, and not there. What's in the way now? Not the CPU. The VM sat 60%
+idle. Here's the probe again, polling `relish batch-status` every 150 ms:
+
+```
+   t(s)   held  accepted  started   active
+   1.76  16000     65000    65000        0    <- 15 chunks run and accepted
+   2.73  16000     66000    66002        0    <- 1 chunk
+   3.85  16000     81000    81000        0    <- 15 chunks
+```
+
+The node runs 15,000 tasks in about 0.8 s, close to 19,000 a second, and then
+has nothing to do. A `perf` timeline in 0.1-second buckets shows the same
+thing: 0.8 s at 98% busy, a short blip for the sixteenth chunk, then a second
+of idle.
+
+The profile expected in-order dispatch to keep the node busy, because the
+first chunk's receipt would go out while the other fifteen still ran. That
+only holds if sixteen chunks take longer than a tick. With the GitOps loop's
+core freed and a cheaper spawn, they take 0.8 s. Every chunk finishes before the
+next sync, so the receipts still travel together, and the node still waits
+out the round trip.
+
+How long is the round trip? That comes from the shape of the leader's loop.
+`spawn_leader_loop` ticks on a tokio interval:
+
+```rust
+let mut interval = tokio::time::interval(state.task_arrays.sync_interval);
+interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+```
+
+`interval` fires every `sync_interval`, one second. If a tick runs late,
+`Skip` drops the ticks it missed rather than firing them back to back, which
+is what you want from a heartbeat. Each tick reads the committed state, sends
+each node its grants, collects the answers and commits one entry with the
+results and the next grants. Those next grants go out with the *next* tick's
+request. So a grant committed at tick *k* runs after tick *k*+1, is reported at
+*k*+2, and its replacement runs after *k*+3. Each of the 16 chunks a node may
+hold turns over once every two seconds, however fast its tasks are:
+
+> 16 chunks × 1,000 tasks ÷ 2 s = 8,000 tasks a second
+
+The steady rate between 15 and 58 seconds was 7,921. That's the ceiling, not
+noise under it.
+
+We built that ceiling ourselves, and nobody could see it until the other
+fixes landed. That's the usual way with bottlenecks: you don't remove one,
+you promote the next.
+
+There are two ways through, and either doubles the ceiling. The profile's
+change 3 lets the node hold more: 32 chunks turn over twice as many tasks per
+two ticks, at the price of more unknown outcomes when a node is lost. Or the
+leader can send the grants it has just committed straight away, so a chunk
+turns over in one tick and the node holds no more than now. That one changes
+when syncs happen, and every node checks and writes its control fence on each
+new version, so it needs care. Change 5, a single round trip per task between
+Bun and the helper, makes bursts cheaper, but bursts aren't the limit while
+the CPU waits. Past either doubling change, the next ceiling is CPU: about
+222 µs of VM time per task, or 18,000 a second on this rig.
+
+One more lesson came from the bench rig rather than the code. The first
+release-script run of the baseline fell apart in round 3: Bun stopped
+answering mid-window, and the rounds after it ran at a third to a half of the
+rate. The VM's journal told the story. Ubuntu's `unattended-upgrades` had
+started in round 2, upgraded glibc and systemd, re-executed systemd and
+restarted `rb-bun`. It installed a new kernel too, which every later boot ran.
+A disposable VM is still a whole operating system with its own plans. The
+record discards that run, turns the timers off and repeats every session the
+upgrade could have touched.
 
 ### What the measurements do and don't show
 
