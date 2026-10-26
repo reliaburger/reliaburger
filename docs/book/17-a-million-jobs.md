@@ -3073,6 +3073,164 @@ when the term or the leader changes, and reads just the GitOps configuration
 until it knows a sync will run. Chapter 7 shows how. The bench measurement
 with this change and the in-order dispatch together is still to come.
 
+### Sixty-four microseconds of bookkeeping
+
+With the GitOps wake gone, the profile could see Bun's own share of a host
+task: about 64 µs of CPU, against roughly 270 µs for the helper and the
+BusyBox process it starts. The helper's socket protocol (15.1 µs) is a
+separate change. Here's most of the rest:
+
+| Where | µs per task |
+|---|---:|
+| The rest of `ReusablePool::run`: the slot lock, two or three times; a 100 ms policy timer per attempt; the Smoker listing; logs | 14.8 |
+| Chunk streaming and attempt bookkeeping, including a copy of the invocation | 11.9 |
+| `wait_empty_task`'s read of `cgroup.events` | 8.8 |
+| The namespace policy check before every command | 7.6 |
+| The OCI spec and host environment, rebuilt for every task | 4.9 |
+
+None of these is big. Together they're a seventh of a host task's CPU, and
+on a VM that is CPU-bound for host jobs, CPU is throughput. So for #1030 we
+took out the ones we could remove without weakening anything, one commit
+each.
+
+**One lock less per command.** A warm command locked the pool's slots to check
+an executor out, again to mark its command started (so metrics count it as
+active), and a third time to hand the slot back. The first and last are the
+point of a lock: two callers must never take the same executor. The middle
+one only flipped a flag. Now each slot has an `AtomicBool` beside the locked
+`Vec<Slot>`:
+
+```rust
+started: Box<[AtomicBool]>,
+```
+
+`Box<[T]>` is a fixed-size array on the heap. It's a `Vec` that can't grow,
+which says exactly what we mean: one flag per slot, for the pool's lifetime.
+Checkout clears the flag under the lock and records which run took the slot,
+and the command's own task sets it when the helper says it started, with no
+lock at all:
+
+```rust
+fn command_started(&self, index: usize) {
+    self.started[index].store(true, Ordering::Release);
+}
+```
+
+That `Ordering` argument is the part C and Go hide from you. Go's
+`sync/atomic` is always sequentially consistent, the strongest and dearest
+ordering, and C's `<stdatomic.h>` defaults to the same. Rust makes you pick.
+`Relaxed` only promises the flag itself is read and written whole. `Release` on
+the store and `Acquire` on the load add a promise about everything *else*: a
+reader that sees `true` also sees every write the storing task made before it.
+We need that here. The metrics reader must never count more active commands
+than callers (V02 candidate 5 caught it doing so once), and a caller counts
+itself before it checks a slot out. With `Release` and `Acquire`, a reader that
+sees a command as started sees its caller's count too. With `Relaxed`, it
+might not.
+
+`a_warm_command_takes_the_slot_lock_only_to_check_out_and_hand_back` counts
+the locks. A test-only counter sits behind `lock_slots`, the one way a task's
+path takes the lock, and the test runs three commands through a warm executor.
+Its helper is fake: a task on the other end of a `UnixStream::pair()` that
+speaks the protocol, answers every command with "started" and "exited 0", and
+confirms the cleanup. So the whole warm path runs without root, cgroups or a
+real process. Each command takes two locks. Put the old lock back and it fails
+with three.
+
+**No timer per command.** A running command re-checks its namespace's eBPF
+policy every 100 ms, so a command whose enforcement is lost mid-run gets
+stopped. Each attempt made its own `tokio::time::sleep` for that, even in
+builds without eBPF and pools without a policy, where the loop checked
+nothing. Most host tasks finish long before 100 ms, so almost every one of
+those timers was registered with the runtime and torn down without firing.
+
+Now a pool without a policy supervises nothing, and a pool with one runs a
+single ticker task that bumps a counter in a `tokio::sync::watch` channel every
+100 ms. A watch channel keeps only the latest value, and any number of
+receivers can wait for it to change. Each running command clones a receiver,
+calls `mark_unchanged()` so a tick from before it started doesn't count, and
+re-checks on every change:
+
+```rust
+loop {
+    if ticks.changed().await.is_err() {
+        return std::io::Error::other("namespace supervision stopped");
+    }
+    if let Err(error) = check().await {
+        return error;
+    }
+}
+```
+
+`changed()` fails only once the sender is gone, and the ticker owns the
+sender. If the ticker ever stops, every command it supervises ends rather
+than run on unwatched. The ticker is its own task, not the eviction loop that
+already wakes every 100 ms, because a stuck retirement can hold that loop for
+seconds. The tests drive the future by hand on a paused clock: an hour passes
+with no check, then each tick brings exactly one. A version that sleeps on
+its own fails them.
+
+**Build the process, not the container.** Each warm command called
+`generate_job_oci_spec`, built the mounts, namespaces and cgroup resources of a
+whole container, and kept only the process. A host command then read Bun's
+entire environment with `std::env::vars_os()` and filtered it down to the
+allowlist (`PATH`, `HOME`, `LANG` and so on). Now `oci::job_process` builds the
+process alone, and `generate_job_oci_spec` calls it too, so the fresh and the
+reused paths can't drift apart. A host executor reads Bun's allowlisted
+variables once, when it starts, and each command overlays its own:
+
+```rust
+let inherited = match &context.host_environment {
+    Some(inherited) => inherited.clone(),
+    None => crate::grill::process::inherited_host_environment(),
+};
+process.env = crate::grill::process::host_environment_over(inherited, &process.env)
+```
+
+`host_environment_over` takes the map *by value* and gives it back with the
+command's variables inserted. Taking ownership tells the caller "I'll change
+this, so hand me a copy you don't need", and the caller's `.clone()` is that
+copy. That's the whole build-once-and-patch idiom: the shared part stays
+untouched in the context, and every command patches a fresh copy of it. The
+risk with any cache like this is one command's variables leaking into the
+next. `each_warm_command_gets_exactly_its_own_arguments_and_environment` runs
+three different commands through one warm executor and checks each received
+exactly what a fresh command for that task alone would get. Save a command's
+environment back into the context and it fails on the second.
+
+**Share the template.** Every attempt built a `TaskInvocation` with its own
+copy of the job's template: an `Option<Box<JobSpec>>`, cloned deeply,
+environment map and all, for every attempt of every task. `Box<T>` is sole
+ownership of a heap value, like `unique_ptr` in C++, so cloning one clones
+what it points to. The template never changes within a chunk, so it's now an
+`Option<Arc<JobSpec>>`, in the chunk and in each invocation. `Arc<T>` is
+shared ownership with an atomic reference count. Cloning one bumps the count
+and copies a pointer, and the value is freed when the last owner drops it.
+Go gets this from its garbage collector and Python from its own reference
+counting. Rust makes you say which you want, and then won't let anyone mutate
+a value through an `Arc` others share. That's why the switch was safe:
+nothing could have been changing the template in place, or it wouldn't have
+compiled. `every_attempt_of_a_chunk_shares_one_template` checks with
+`Arc::ptr_eq` that all sixteen attempts of an eight-task chunk, retries
+included, point at the chunk's own template.
+
+**What we left alone.** The profile suggested moving the per-command policy
+check onto the 100 ms monitor, "gated on the same generation the monitor
+checks". The trouble is there's no generation. The check reads the live eBPF
+map and asks whether the hook is still attached, because enforcement can be
+lost by things outside Bun's code paths: a program detached, a map entry
+removed. A cached "checked a moment ago" would let a command start in the
+window after the loss and before the next tick, and nothing Bun does marks
+that window. Until enforcement changes publish a generation a command can
+compare against, the check stays where it is, before every command.
+`wait_empty_task`'s read of `cgroup.events` stays too. It's how a command
+proves its task group is empty before the executor is reused (#715), and
+there's no cheaper way to ask the kernel that question.
+
+The profile estimated 25 to 35 µs from trims like these, 5 to 10% of host-job
+throughput. We haven't measured what these four removed yet. That's for the
+five-round bench comparison #1030 asks for.
+
 ### What the measurements do and don't show
 
 Measuring this turned out to be as instructive as building it, mostly because
