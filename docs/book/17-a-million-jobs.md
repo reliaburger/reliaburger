@@ -3639,6 +3639,26 @@ new field is an `Option<NodeBreakdown>` marked `#[serde(default)]`, which
 tells serde to fill in `None` when the key is missing instead of refusing the
 file. The human report then says `per node: not recorded`.
 
+### What the candidate measured
+
+We measured both claims on the staged release candidate itself, the signed
+binaries `stage.yml` published, rather than on builds made for the purpose
+([candidate record](../qualification/2026-10-27-v0.2.3-candidate-throughput/README.md)).
+One node ran 14,916.7 host jobs a second, against 7,500 before the cap change
+and 5,100 in 0.2.2. The node still waits two ticks for each chunk, but it now
+holds 32 of them, and the steady rate sits at 99% of the new 16,000 ceiling.
+
+Three nodes ran 29,350 a second, and two ran 27,400. Every window was
+balanced, and no node took more than 34.8% of the work. Two nodes scale almost
+perfectly; three don't, and the per-node breakdown is what let us say why
+without guessing. The work was spread evenly. The leader committed one Raft
+entry a second whatever the load, and when leadership happened to land on a
+node running no jobs, leading two busy nodes cost it 0.02 cores. What ran out
+was the Mac: three 4-vCPU VMs on twelve cores left nothing for the host, and
+each VM got less than its four. A benchmark that runs every node on one
+machine measures that machine too, so the record calls 29,350 a lower bound,
+not the cluster's limit.
+
 ### A day in one script
 
 The last step before publishing is the day itself: two billion host jobs in
