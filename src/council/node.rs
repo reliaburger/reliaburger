@@ -85,6 +85,10 @@ pub struct CouncilNode {
     /// Test hook: every write that hung, with the moment it arrived.
     #[cfg(test)]
     hung_writes: std::sync::Mutex<Vec<(tokio::time::Instant, RaftRequest)>>,
+    /// Test hook: how many times [`Self::desired_state`] cloned the whole
+    /// desired state, so a loop can be shown not to (#1030).
+    #[cfg(test)]
+    full_desired_reads: std::sync::atomic::AtomicU64,
 }
 
 impl CouncilNode {
@@ -139,6 +143,8 @@ impl CouncilNode {
             writes_hang: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             hung_writes: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            full_desired_reads: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -420,7 +426,18 @@ impl CouncilNode {
 
     /// Read the current desired state from the state machine.
     pub async fn desired_state(&self) -> DesiredState {
+        #[cfg(test)]
+        self.full_desired_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.state_machine.desired_state().await
+    }
+
+    /// Test hook: how many whole-state clones [`Self::desired_state`] has
+    /// made on this node.
+    #[cfg(test)]
+    pub(crate) fn full_desired_reads(&self) -> u64 {
+        self.full_desired_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Borrow the local desired state for `read`, without cloning all of
