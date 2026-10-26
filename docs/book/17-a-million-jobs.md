@@ -2844,8 +2844,8 @@ gap. How much is enough? That depends on how long commands take, so the leader
 learns it from the final-attempt duration histogram the nodes already report.
 Bucket `i` counts commands that took up to `2^i` ms. Using the upper bound of
 each bucket gives a conservative estimate of throughput: slots × two seconds ÷
-average duration. Learned depth was capped at sixteen chunks, and 0.2.3
-raised the cap to 32 for a reason we'll come to.
+average duration. Learned depth was capped at sixteen chunks; 0.2.3 raised
+the cap to 32 and 0.2.4 put it back, for reasons we'll come to.
 
 That's the idea. The edges took four more fixes:
 
@@ -3443,8 +3443,9 @@ upgrade could have touched.
 
 ### Grants in the tick that commits them
 
-0.2.3 took the first way through as a stopgap and let a node hold 32 chunks.
-For 0.2.4 we took the second (#1360), and the cap is back at sixteen.
+For 0.2.4 we took the second way (#1360), and the stopgap went: the cap is
+one line again, back at sixteen, and the lookahead tests that pinned 32
+chunks pin sixteen again.
 
 The change itself is small. Once a tick's entry has committed, the leader reads
 the committed state again and calls every node that entry gave a chunk it

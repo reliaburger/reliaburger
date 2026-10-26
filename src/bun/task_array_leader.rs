@@ -2022,7 +2022,7 @@ mod tests {
             };
         assert_eq!(
             grants(true),
-            vec![(node("a"), IndexRangeSet::from_range(2..=33))]
+            vec![(node("a"), IndexRangeSet::from_range(2..=17))]
         );
         assert_eq!(
             grants(false),
