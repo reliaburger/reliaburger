@@ -2884,7 +2884,7 @@ mod tests {
         )
         .unwrap();
         let task = TaskInvocation {
-            template: Some(Box::new(template.clone())),
+            template: Some(std::sync::Arc::new(template.clone())),
             index: 0,
             attempt: 1,
             program: "/bin/true".into(),
@@ -2940,7 +2940,7 @@ mod tests {
             toml::from_str("runtime='process'\nexec='/bin/true'\ncpu='1000m'\nmemory='32Mi'")
                 .unwrap();
         let task = TaskInvocation {
-            template: Some(Box::new(template.clone())),
+            template: Some(std::sync::Arc::new(template.clone())),
             index: 0,
             attempt: 1,
             program: "/bin/true".into(),

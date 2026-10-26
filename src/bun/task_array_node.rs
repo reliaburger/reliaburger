@@ -1162,7 +1162,8 @@ impl TaskArrayNode {
             let cancel = run.cancel.child_token();
             run.chunks.insert(chunk, (attempt, cancel.clone()));
             let work = ChunkWork {
-                template: assignment.template.clone(),
+                // Shared by every attempt of the chunk, not copied for each.
+                template: assignment.template.as_deref().cloned().map(Arc::new),
                 batch_id: assignment.batch_id,
                 spec: assignment.spec.clone(),
                 chunk: ChunkId(chunk),

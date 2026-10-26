@@ -65,7 +65,7 @@ async fn runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_p
         .unwrap()
     };
     let work = |id, template| {
-        ChunkWork{replay_unknown:true,batch_id:id,template:Some(Box::new(template)),spec:TaskArraySpec{chunk_size:6,max_attempts:1,..TaskArraySpec::with_count(6)},chunk:ChunkId(0),grant_attempt:1,program:"/unused".into(),args:vec!["/bin/sh".into(),"-c".into(),"test ! -e /tmp/previous; echo task > /tmp/previous; test -r /proc/self/cgroup; sleep 0.05".into()],env:vec![]}
+        ChunkWork{replay_unknown:true,batch_id:id,template:Some(std::sync::Arc::new(template)),spec:TaskArraySpec{chunk_size:6,max_attempts:1,..TaskArraySpec::with_count(6)},chunk:ChunkId(0),grant_attempt:1,program:"/unused".into(),args:vec!["/bin/sh".into(),"-c".into(),"test ! -e /tmp/previous; echo task > /tmp/previous; test -r /proc/self/cgroup; sleep 0.05".into()],env:vec![]}
     };
     let config = PoolConfig::with_concurrency(4);
     let small = TaskPool::with_node_slots(runner.clone(), config, slots.clone())
@@ -115,7 +115,7 @@ async fn runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_p
     }));
     let cancel = CancellationToken::new();
     let attempt = TaskInvocation {
-        template: Some(Box::new(template("500m", "64Mi"))),
+        template: Some(std::sync::Arc::new(template("500m", "64Mi"))),
         index: 0,
         attempt: 1,
         program: "/unused".into(),
@@ -278,7 +278,7 @@ async fn runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor()
     let cancel = CancellationToken::new();
     let task = |cpu: &str, script: &str| {
         TaskInvocation {
-        template: Some(Box::new(
+        template: Some(std::sync::Arc::new(
             toml::from_str(&format!(
                 "image='{image}'\nnamespace='rbtest-start'\nruntime='shared-runc'\ncpu='{cpu}'\nmemory='32Mi'"
             ))
@@ -443,7 +443,7 @@ async fn runc_warm_pinned_executor_cold_starts_make_no_registry_requests() {
     .unwrap();
     let tasks: Vec<TaskInvocation> = (0..BURST as u32)
         .map(|index| TaskInvocation {
-            template: Some(Box::new(template.clone())),
+            template: Some(std::sync::Arc::new(template.clone())),
             index,
             attempt: 1,
             program: "/unused".into(),
@@ -575,7 +575,7 @@ impl SlowColdPull {
         let work = ChunkWork {
             replay_unknown: true,
             batch_id: 740,
-            template: Some(Box::new(
+            template: Some(std::sync::Arc::new(
                 toml::from_str(&format!(
                     "image='{image}'\nnamespace='{namespace}'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"
                 ))
@@ -836,7 +836,7 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
             .to_string()
     };
     let invocation = |command| TaskInvocation {
-        template: Some(Box::new(
+        template: Some(std::sync::Arc::new(
             toml::from_str(&format!(
                 "image='{image}'\nnamespace='{namespace}'\nruntime='{isolation}'"
             ))
@@ -1082,7 +1082,7 @@ async fn runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs
     let namespace = format!("rbtest-fresh-{}", rand::random::<u32>());
     let job = "probe";
     let invocation = |command: String| TaskInvocation {
-        template: Some(Box::new(
+        template: Some(std::sync::Arc::new(
             toml::from_str(&format!(
                 "image='{image}'\nnamespace='{namespace}'\nruntime='runc'\n\
                  [egress]\nallow=['{host}:{}']",
@@ -1567,7 +1567,7 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
     let template: reliaburger::config::job::JobSpec = toml::from_str(&format!("image='{image}'\nnamespace='rbtest-reuse'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'")).unwrap();
     let command = "test ! -e /tmp/previous && test ! -e /dev/shm/previous && echo state >/tmp/previous && echo state >/dev/shm/previous && printf complete";
     let task = TaskInvocation {
-        template: Some(Box::new(template.clone())),
+        template: Some(std::sync::Arc::new(template.clone())),
         index: 0,
         attempt: 1,
         program: "/unused".into(),
@@ -1786,7 +1786,7 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
     let work = ChunkWork {
         replay_unknown: true,
         batch_id: 99,
-        template: Some(Box::new(template)),
+        template: Some(std::sync::Arc::new(template)),
         spec: TaskArraySpec::with_count(16),
         chunk: ChunkId(0),
         grant_attempt: 1,
@@ -2104,7 +2104,7 @@ async fn runc_array_attempt_can_be_paused_and_resumed() {
     .unwrap();
     // Two seconds of work, then a marker: a frozen task can't print it.
     let task = TaskInvocation {
-        template: Some(Box::new(template)),
+        template: Some(std::sync::Arc::new(template)),
         index: 2,
         attempt: 1,
         program: "/unused".into(),
@@ -2372,7 +2372,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
             .with_secrets(council.clone(), ikm),
     );
     let mut task = TaskInvocation {
-        template: Some(Box::new(template.clone())),
+        template: Some(std::sync::Arc::new(template.clone())),
         index: 0,
         attempt: 1,
         program: "/unused".into(),
@@ -2501,7 +2501,7 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
             eprintln!("native command {index}");
         }
         let task = TaskInvocation {
-            template: Some(Box::new(template.clone())),
+            template: Some(std::sync::Arc::new(template.clone())),
             index,
             attempt: 1,
             program: "/bin/sh".into(),
@@ -2563,7 +2563,7 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
         })
         .expect("the test environment has a variable outside the allowlist");
     let environment = TaskInvocation {
-        template: Some(Box::new(template.clone())),
+        template: Some(std::sync::Arc::new(template.clone())),
         index: 128,
         attempt: 1,
         program: "/bin/sh".into(),
@@ -2593,7 +2593,7 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
     assert_eq!(timings.command.samples, 129);
     assert_eq!(timings.cleanup.samples, 129);
     let memory_hog = TaskInvocation {
-        template: Some(Box::new(template.clone())),
+        template: Some(std::sync::Arc::new(template.clone())),
         index: 128,
         attempt: 1,
         program: "/bin/sh".into(),
@@ -2657,7 +2657,7 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
     }
     let cancel_command = CancellationToken::new();
     let task = TaskInvocation {
-        template: Some(Box::new(template)),
+        template: Some(std::sync::Arc::new(template)),
         index: 129,
         attempt: 1,
         program: "/bin/sh".into(),
@@ -2734,7 +2734,7 @@ async fn cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup(
         while read -r key value; do echo "event_$key=$value"; done < "$group/pids.events"
     "#;
     let task = TaskInvocation {
-        template: Some(Box::new(template)),
+        template: Some(std::sync::Arc::new(template)),
         index: 0,
         attempt: 1,
         program: "/bin/sh".into(),
@@ -2805,7 +2805,7 @@ async fn cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart()
     );
     let template = toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='rbtest-native-recovery'\ncpu='100m-1000m'\nmemory='32Mi'").unwrap();
     let task = TaskInvocation {
-        template: Some(Box::new(template)),
+        template: Some(std::sync::Arc::new(template)),
         index: 0,
         attempt: 1,
         program: "/bin/sh".into(),
@@ -2916,7 +2916,7 @@ fn shell_task(
     script: &str,
 ) -> reliaburger::bun::task_executor::TaskInvocation {
     reliaburger::bun::task_executor::TaskInvocation {
-        template: Some(Box::new(template.clone())),
+        template: Some(std::sync::Arc::new(template.clone())),
         index,
         attempt: 1,
         program: "/bin/sh".into(),
@@ -3493,7 +3493,7 @@ async fn runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_r
         ))
         .unwrap();
         let task = TaskInvocation {
-            template: Some(Box::new(template)),
+            template: Some(std::sync::Arc::new(template)),
             index: 0,
             attempt: 1,
             program: "/unused".into(),
