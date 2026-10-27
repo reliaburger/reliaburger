@@ -3564,7 +3564,7 @@ Look at what found the GitOps loop's wasted core. Not a test, and not a soak:
 both of those check that things work and don't leak, and a core spent cloning
 state broke neither. A person with `perf` found it, by hand, once. So from 0.2.4
 on, the profile is a release step ([`releasing.md`](../releasing.md#staging-a-candidate),
-step 6), and `scripts/release/qualify-profile.sh` runs it in one command.
+step 9, after the tag), and `scripts/release/qualify-profile.sh` runs it in one command.
 
 The hard part isn't running `perf`. It's comparing the result with anything.
 The 0.2.0 throughput record ran on an M2 Max and the profile on an M1 Max, so

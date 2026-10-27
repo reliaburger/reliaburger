@@ -140,5 +140,47 @@ class ProfilingBuildTests(unittest.TestCase):
         self.assertIn('--name "profiling-build-$commit-$attempt"', script)
 
 
+class SourceCiReuseTests(unittest.TestCase):
+    """A candidate reuses the CI run that passed on its commit, and runs the suite only without one (#1363)."""
+
+    def setUp(self):
+        self.text = WORKFLOW.read_text()
+
+    def test_the_search_runs_on_manual_builds_with_read_access_to_actions(self):
+        evidence = job(self.text, "ci-evidence")
+        self.assertIn("if: github.event_name == 'workflow_dispatch'", evidence)
+        self.assertIn("actions: read", evidence)
+        self.assertIn("python3 scripts/release/ci_reuse.py", evidence)
+        self.assertIn('--commit "$CANDIDATE_COMMIT"', evidence)
+        self.assertIn("CANDIDATE_COMMIT: ${{ github.sha }}", evidence)
+
+    def test_the_suite_runs_unless_a_passing_run_was_found(self):
+        validate = job(self.text, "validate-release")
+        self.assertIn("uses: ./.github/workflows/ci.yml", validate)
+        self.assertIn("needs: ci-evidence", validate)
+        # `!= 'true'`, not `== 'false'`: a failed search leaves the output
+        # empty, and that has to run the suite too.
+        self.assertIn("needs.ci-evidence.outputs.reuse != 'true'", validate)
+        self.assertIn("!cancelled()", validate)
+
+    def test_the_candidate_is_signed_only_after_a_full_pass(self):
+        candidate = job(self.text, "candidate")
+        condition = " ".join(re.search(r"if: >-\n(.*?)\n    needs:", candidate, re.S).group(1).split())
+        for build in ("build-pdf", "build-binaries", "build-guest-images", "test-packaging"):
+            self.assertIn(f"needs.{build}.result == 'success'", condition)
+        self.assertIn("needs.validate-release.result == 'success' || "
+                      "(needs.validate-release.result == 'skipped' && needs.ci-evidence.result == 'success' "
+                      "&& needs.ci-evidence.outputs.reuse == 'true')", condition)
+        self.assertIn("github.ref == 'refs/heads/main'", condition)
+        needs = re.search(r"^    needs: \[(.*)\]$", candidate, re.M).group(1).split(", ")
+        self.assertEqual(set(needs), {"ci-evidence", "validate-release", "build-pdf", "build-binaries",
+                                      "build-guest-images", "test-packaging"})
+
+    def test_the_summary_says_which_ci_run_the_candidate_rests_on(self):
+        record = step_named(self.text, "Record exact candidate identity and all asset digests")
+        self.assertIn("CI_RUN: ${{ needs.ci-evidence.outputs.ci_run }}", record)
+        self.assertIn('echo "Source CI: $source_ci"', record)
+
+
 if __name__ == "__main__":
     unittest.main()
