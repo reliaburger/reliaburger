@@ -378,6 +378,10 @@ class JobQualification(unittest.TestCase):
         # The scale-out record measured three 4 vCPU / 6 GiB nodes; quickstart
         # makes 2 vCPU / 2 GiB ones, so the day resizes them first.
         self.assertIn(["resize","4","vCPU","6","GiB","each","node,","one","at","a","time,","before","configuring"],lines)
+        # The scale-out record's two billion a day ran Ubuntu's static BusyBox,
+        # which costs half as much per process as the image's.
+        self.assertIn(["host-busybox","busybox-static","1:1.36.1-6ubuntu3.1",
+                       "52151e7f322f926b64049cdaa1410dc3ea6485525e0624b05813791c219ae933"],lines)
         budget=next(line for line in lines if line[0]=="job-runs")[1:]
         budget=dict(zip(budget[::2],budget[1::2]))
         self.assertLessEqual(int(budget["retained-peak"]),int(budget["limit"]))
@@ -402,6 +406,17 @@ class JobQualification(unittest.TestCase):
         script=(self.release/"qualify-sustained.sh").read_text()
         self.assertIn('while [ "$schedule" != none ]; do',script)
         self.assertIn('day) : "${schedule:=none}" "${duration_text:=24h}"',script)
+
+    def test_only_the_day_tier_swaps_the_image_busybox_for_a_checked_ubuntu_copy(self):
+        code,lines,_=self.plan("--tier","fast")
+        self.assertEqual(code,0)
+        self.assertFalse([line for line in lines if line[0]=="host-busybox"])
+        script=(self.release/"qualify-sustained.sh").read_text()
+        # Both the package and the binary in it are pinned by SHA-256, and a
+        # mismatch fails setup rather than falling back to the image's copy.
+        self.assertIn("day_busybox_deb_sha256=d96535e0402c011e0ee43449799df2f4504d44b842e4f2b3a6cbc845508eaafc",script)
+        self.assertIn('[ "$(sha256 "$deb")" = "$day_busybox_deb_sha256" ] || setup_fail',script)
+        self.assertIn('[ "$(sha256sum "$root/busybox" | cut -d" " -f1)" = "$busybox_sha256" ]',script)
 
     def test_job_tiers_refuse_a_rate_below_a_hundred_million_a_day_or_a_changed_schedule(self):
         code,_,error=self.plan("--tier","fast","--target-rate","1000")
