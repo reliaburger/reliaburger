@@ -781,7 +781,10 @@ the real `curl … | sh` install against it on every host we advertise.
    ([#1032](https://github.com/reliaburger/reliaburger/issues/1032)), outside
    the gate: 24 hours of host jobs with no faults, walks or specials, then the
    drain. It needs the bench host to itself for the whole day and about half
-   an hour more for setup, the baseline and the drain.
+   an hour more for setup, the baseline and the drain. Before configuring the
+   nodes it resizes each quickstart VM, one at a time, from 2 vCPU / 2 GiB to
+   4 vCPU / 6 GiB, the size the 0.2.3 scale-out record measured; the record
+   lists the resize as a deviation.
 
    ```sh
    scripts/release/qualify-jobs-sustained.sh --tier day \

@@ -767,6 +767,32 @@ wait_labels() {
 }
 
 # One leader, three live voters.
+# The day tier's claim rests on the scale-out record (2026-10-27), measured on
+# three 4 vCPU / 6 GiB nodes. Quickstart makes 2 vCPU / 2 GiB ones, so the day
+# resizes each VM, one at a time so the council keeps its quorum: a graceful
+# stop, the new size, `relish local start`, then the node and cluster checks
+# the power-off fault uses.
+day_cpus=4
+day_memory_gib=6
+resize_nodes() {
+    local node
+    for node in 1 2 3; do
+        avoid=$node
+        down[node]=1
+        with_timeout 300 "$limactl" stop "${vm[node]}" > "$evidence/snapshots/resize-$node.log" 2>&1 \
+            || setup_fail "could not stop ${vm[node]} to resize it"
+        with_timeout 60 "$limactl" edit --tty=false --cpus "$day_cpus" --memory "$day_memory_gib" "${vm[node]}" \
+            >> "$evidence/snapshots/resize-$node.log" 2>&1 || setup_fail "could not resize ${vm[node]}"
+        power_on "$node" || setup_fail "relish local start failed for ${vm[node]} after resizing it"
+        wait_node_ready "$node" 300 || setup_fail "${vm[node]} not ready after resizing"
+        wait_cluster 300 || setup_fail "cluster not healthy after resizing ${vm[node]}"
+        avoid=0
+        event --phase configure --target "${vm[node]}" --verdict ok \
+            --detail "resized to $("$limactl" list --format '{{.CPUs}} vCPU {{.Memory}} bytes' "${vm[node]}")"
+    done
+    meta deviations+ "Each quickstart VM resized from 2 vCPU / 2 GiB to $day_cpus vCPU / $day_memory_gib GiB before configuring, the size the scale-out record measured (maintainer decision, 27 October 2026)"
+}
+
 wait_cluster() {
     local deadline=$(( $(date +%s) + $1 )) file=$evidence/.nodes.json
     while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -1801,6 +1827,7 @@ if [ "$plan" = true ]; then
         plan_cycles=0
         printf 'plan: day %s s with no faults, walks or specials, then the drain\n' "$duration"
     fi
+    [ "$tier" != day ] || printf 'plan: resize %s vCPU %s GiB each node, one at a time, before configuring\n' "$day_cpus" "$day_memory_gib"
     printf 'plan: %s\n' "$job_runs"
     printf 'plan: seed %s for every fault and node choice\n' "${seed:-random}"
     for (( index = 0; index < plan_cycles; index++ )); do run_cycle "$index" 0; done
@@ -1860,6 +1887,7 @@ else
 import json, sys
 json.dump({"nodes": sys.argv[2:]}, open(sys.argv[1], "w"))
 PY
+    [ "$tier" != day ] || resize_nodes
     configure_nodes
     apply_workloads
     versions=$(node_versions)

@@ -375,6 +375,9 @@ class JobQualification(unittest.TestCase):
         self.assertEqual((header["job-load"],header["target-rate"],header["node-faults"]),("day",str(jobs.DAY_DEFAULT_RATE),"false"))
         self.assertFalse([line for line in lines if line[0]=="cycle"])
         self.assertIn(["day","86400","s","with","no","faults,","walks","or","specials,","then","the","drain"],lines)
+        # The scale-out record measured three 4 vCPU / 6 GiB nodes; quickstart
+        # makes 2 vCPU / 2 GiB ones, so the day resizes them first.
+        self.assertIn(["resize","4","vCPU","6","GiB","each","node,","one","at","a","time,","before","configuring"],lines)
         budget=next(line for line in lines if line[0]=="job-runs")[1:]
         budget=dict(zip(budget[::2],budget[1::2]))
         self.assertLessEqual(int(budget["retained-peak"]),int(budget["limit"]))
