@@ -1,0 +1,9 @@
+## reliaburger-scale-1
+bun 3754 4189 rss_kb 127940
+cpu  49532 182 208564 703709 1196 0 1780 0 0 0
+## reliaburger-scale-2
+bun 124 95 rss_kb 94968
+cpu  41663 181 170176 729683 1170 0 1317 0 0 0
+## reliaburger-scale-3
+bun 124 83 rss_kb 101144
+cpu  22113 176 88525 810574 873 0 1386 0 0 0

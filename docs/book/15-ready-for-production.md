@@ -983,12 +983,56 @@ find is a bug for the next patch release.
 
 What we didn't do is move release builds onto the new quiet host. It's tempting, since it's
 fast and it's ours, but a release build is the one place where "who could have touched this
-machine?" must have a boring answer. Hosted runners give that. And one question is still
-open: the nightly's soaks install a staged build through `curl | sh`, and today only a
-manual build of `main` gets signed and staged. A release-signed build of unreleased code is
-something any cluster that trusts the release key would accept, the same reason CI doesn't
-sign the soak build ([the runbook](../releasing.md#soaking-a-candidate-in-ci) has the long
-version). So that's a decision for the maintainer, not a line of YAML.
+machine?" must have a boring answer. Hosted runners give that.
+
+### A key nobody else trusts
+
+One question was left over. The nightly's soaks install a staged build through `curl | sh`,
+so somebody has to build and sign the train's tip every day. With the release key? A
+release-signed build of unreleased code is something every cluster that trusts the release
+key would accept, the same reason CI doesn't sign the soak build
+([the runbook](../releasing.md#soaking-a-candidate-in-ci) has the long version). That was a
+decision for the maintainer, not a line of YAML, and the answer was a second key.
+
+A second key on its own isn't enough, though. Signing is only half of it; the other half is
+who *trusts* the signature. Relish checks every bun and guest image it installs against the
+keys compiled into it, so a nightly signed with a new key would fail its own install unless
+the nightly binaries trust that key. And they must trust it without any released binary
+trusting it too. That's a job for a Cargo feature. `src/upgrade/keys.rs` now holds two
+lists, and picks one at compile time:
+
+```rust
+fn compiled_keys() -> &'static [&'static str] {
+    if cfg!(feature = "nightly-signing") {
+        NIGHTLY_SIGNING_KEYS
+    } else {
+        EMBEDDED_RELEASE_KEYS
+    }
+}
+```
+
+`cfg!(...)` is the expression form of the `#[cfg(...)]` attribute you've already met. It
+evaluates to a plain `true` or `false` when the crate compiles, so the optimiser drops the
+branch that can't run, but, unlike `#[cfg]`, both branches still have to type-check in every
+build. That's what we want here: `cargo clippy --all-features` sees both lists, and a typo
+in either breaks every build, not just the nightly one. Cargo features are additive flags
+declared in `Cargo.toml` (`nightly-signing = []`, a feature that turns on no dependencies)
+and switched on with `--features`. In Go you'd reach for a build tag; in C, `-D` and an
+`#ifdef`.
+
+`build.yml` passes `--features nightly-signing` only when it builds a `release-*` branch, and
+signs that build with the `RELIABURGER_NIGHTLY_KEY` secret in a step that only runs there. The
+release key's step only runs on `main`. So the trust graph has two islands and no bridge: a
+nightly relish refuses a release-signed bun, a released relish refuses a nightly one, and a
+released bun never upgrades to a nightly. `package.py` is belt and braces on top: it refuses to
+sign a nightly with any key on the release list, and refuses to run at all if the release key
+is anywhere in its environment.
+
+The staged nightly gets its own name too, `nightly-v0.2.4-RUN-ATTEMPT`, and the website
+installer refuses a mirror by that name unless `RELIABURGER_ACCEPT_NIGHTLY=1` says
+qualification is asking. That isn't the security boundary (the keys are), it's a guard rail,
+so nobody installs one by pasting the wrong URL. Old nightlies don't pile up either: each
+nightly staging deletes all but the newest seven.
 
 ## Dependencies are code too
 

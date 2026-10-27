@@ -2003,3 +2003,46 @@ We didn't add a size limit to the download. The registry already refuses uploads
 We didn't stream the hash. `fetch_once` could feed SHA-256 as the pieces arrive and refuse a wrong hash before the signature check reads the file again. But `verify_binary` checks the hash first anyway, from the page cache, and one check in one place is easier to trust than two.
 
 We didn't raise the adoption test's timeout either. A longer budget would have hidden the 837 MB, and it would have stretched again as the test binary grew.
+
+## A replacement that never answered
+
+On 21 October the version-form walk stopped dead in CI ([#1273](https://github.com/reliaburger/reliaburger/issues/1273)). n2 upgraded and committed. Then n1 exec'd into v0.2.0, printed its start-up lines down to `Pickle registry listening`, and went quiet. For three minutes it didn't answer `/v1/version` and didn't gossip, and the leader waited with "2 of 3 voters alive". Oddest of all, n1 never reached a verdict on its own upgrade. The verification from [section 14.9](#the-replacement-must-prove-rejoin-locally-too) always ends within one hash wait and one rejoin period, 20 s with the test's settings: the node either commits or writes `RevertPending` and exits. n1 did neither. A process whose timers don't fire isn't slow. It's stuck.
+
+The clue was a line the log didn't have. A restarted voter prints `council: no peer advertises a newer recovery epoch … serving raft` when its start-up probe ends (the recovery fence from [chapter 2](02-finding-friends.md#when-the-epoch-wasnt-enough)). n2 printed it and n1 never did. So we read the probe, `supervise_recovery_fence` in `src/cluster/recovery_fence.rs`. While the fence probed, it did this:
+
+```rust
+let directory = directory_rx.borrow_and_update();
+// ...
+let peers = peers(); // reads openraft's metrics channel
+```
+
+`borrow_and_update()` returns a `watch::Ref`, a guard that holds the channel's read lock until it's dropped. `peers()` borrows a second channel, openraft's metrics, while that guard is still alive. And the leader-target maintainer in `src/cluster/runtime.rs` takes the same two locks the other way round: metrics first, then the directory.
+
+Two readers taking two locks in opposite orders sounds harmless, because readers share. But a Tokio `watch` channel sits on `parking_lot`'s `RwLock`, and that lock is fair to writers: once a writer is waiting, a new reader waits behind it. On a restarting node both channels have busy writers. Openraft publishes metrics as it loads its log, and gossip publishes the directory as peers answer. So four tasks can line up like this:
+
+1. The fence supervisor holds the directory and waits to read the metrics, behind openraft's queued write.
+2. Openraft waits to write the metrics until the leader-target maintainer lets go of them.
+3. The maintainer holds the metrics and waits to read the directory, behind gossip's queued write.
+4. Gossip waits to write the directory until the supervisor lets go of it.
+
+Nobody lets go. These aren't `.await`s, where a task yields its thread; they're synchronous locks, so each one parks the worker thread it runs on. A GitHub runner has four cores, so Tokio gave Bun four workers, and there were four parked threads. Nothing was left to drive the timers or the sockets, so the verification never finished, the API never answered and gossip went silent. On a ten-core laptop the same knot parks four workers out of ten. Gossip and Raft die, but the verification timer still fires and the node reverts, so the walk pauses instead of hanging. That's part of why it took a CI runner, and a race at the right moment, to see it.
+
+Rust's borrow checker doesn't catch this one. A `watch::Ref` isn't `Send`, so the compiler refuses to hold one across an `.await` in a spawned task, which rules out the commonest way to deadlock on it. Two guards held side by side in one synchronous block are perfectly legal, though. Lock order is still the programmer's job.
+
+The fix keeps one order everywhere. Every other place that holds both borrows takes the metrics first, so the supervisor now copies the claims it needs out of the directory and drops the guard in the same statement:
+
+```rust
+let claims = directory_rx.borrow_and_update().recovery_claims.clone();
+```
+
+The `Ref` is a temporary there, and Rust drops a temporary at the end of the statement that made it. By the time `peers()` runs, the supervisor holds nothing. `probe_complete` takes the copied claims map instead of the whole directory, so the copy is one entry per node, not the directory.
+
+### Tests
+
+`the_probe_reads_the_membership_without_holding_the_gossip_directory` hands the supervisor a `peers` closure that, on its first call, starts a thread to write the directory and waits up to two seconds for it. Before the fix the write waited for the supervisor's guard and the test failed. Now it lands at once. The test pins the rule (no directory borrow during the membership read) rather than the four-way race. The race needs four threads lined up just so, and a test of it would pass nearly every time whether or not the bug was there.
+
+### What we decided not to do
+
+We didn't turn on `parking_lot`'s deadlock detector. It's a compile-time feature with a background thread, and it reports a deadlock after the fact. The node would still be wedged.
+
+We didn't clone every `watch` value out of its channel by habit. The directory carries an entry for every node, and the leader-target maintainer reads it on every change. Taking the borrows in one order costs nothing.

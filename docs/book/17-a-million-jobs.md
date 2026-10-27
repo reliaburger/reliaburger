@@ -3812,6 +3812,26 @@ new field is an `Option<NodeBreakdown>` marked `#[serde(default)]`, which
 tells serde to fill in `None` when the key is missing instead of refusing the
 file. The human report then says `per node: not recorded`.
 
+### What the candidate measured
+
+We measured both claims on the staged release candidate itself, the signed
+binaries `stage.yml` published, rather than on builds made for the purpose
+([candidate record](../qualification/2026-10-27-v0.2.3-candidate-throughput/README.md)).
+One node ran 14,916.7 host jobs a second, against 7,500 before the cap change
+and 5,100 in 0.2.2. The node still waits two ticks for each chunk, but it now
+holds 32 of them, and the steady rate sits at 99% of the new 16,000 ceiling.
+
+Three nodes ran 29,350 a second, and two ran 27,400. Every window was
+balanced, and no node took more than 34.8% of the work. Two nodes scale almost
+perfectly; three don't, and the per-node breakdown is what let us say why
+without guessing. The work was spread evenly. The leader committed one Raft
+entry a second whatever the load, and when leadership happened to land on a
+node running no jobs, leading two busy nodes cost it 0.02 cores. What ran out
+was the Mac: three 4-vCPU VMs on twelve cores left nothing for the host, and
+each VM got less than its four. A benchmark that runs every node on one
+machine measures that machine too, so the record calls 29,350 a lower bound,
+not the cluster's limit.
+
 ### A day in one script
 
 The last step before publishing is the day itself: two billion host jobs in
@@ -3833,6 +3853,19 @@ waiting for the council to be whole before moving to the next. Doing it one
 node at a time keeps two of three council members up, so Raft never loses its
 quorum during setup. The leak checkers like that: in a final
 they get a two-hour quiet tail to arm in, and here they get the whole day.
+
+The first day run on 0.2.3's candidate taught us a second thing to match. It
+ran at 15,100 jobs a second, a third short of the 23,149 that two billion a
+day needs, while the scale-out record had measured 29,350 on the same Mac. The
+VMs were busy, so the CPU was going somewhere. The record's host jobs ran
+Ubuntu's statically linked BusyBox, and the soak runs the copy from the
+container image it pulls. That copy costs twice as much CPU per process, and
+when each job is a process that does nothing, the process is all you measure.
+So the day tier now downloads the record's binary from Ubuntu's archive,
+checks the package and the binary against pinned SHA-256s, and fails setup on
+a mismatch rather than falling back. The lesson is an old one: a benchmark and
+the run that is meant to confirm it have to agree on what a job is, not just
+on how many machines run it.
 
 The job controller gains a `day` load. Host work runs as the biggest arrays
 the API accepts, 16,777,216 tasks each, about 120 a day, so the tail of each

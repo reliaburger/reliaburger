@@ -51,7 +51,8 @@ class CandidateManifestTests(unittest.TestCase):
     def test_the_manifest_is_uploaded_on_its_own_for_a_day(self):
         manifest = step_named(self.text, "Preserve the qualification manifest on its own")
         self.assertIn("actions/upload-artifact@", manifest)
-        self.assertIn("name: candidate-manifest-${{ github.sha }}-${{ github.run_attempt }}", manifest)
+        # ARTEFACT is `candidate` on main and `nightly` on a train.
+        self.assertIn("name: ${{ env.ARTEFACT }}-manifest-${{ github.sha }}-${{ github.run_attempt }}", manifest)
         self.assertIn("path: dist/candidate.json", manifest)
         self.assertIn("retention-days: 1", manifest)
         self.assertIn("if-no-files-found: error", manifest)
@@ -60,9 +61,16 @@ class CandidateManifestTests(unittest.TestCase):
         # Staging and promotion verify every byte of this artefact against
         # the digest; the manifest artefact is only a shortcut to the digest.
         candidate = step_named(self.text, "Preserve signed candidate without publishing a release")
-        self.assertIn("name: candidate-${{ github.sha }}-${{ github.run_attempt }}", candidate)
+        self.assertIn("name: ${{ env.ARTEFACT }}-${{ github.sha }}-${{ github.run_attempt }}", candidate)
         self.assertIn("path: dist/*", candidate)
-        self.assertIn("retention-days: 90", candidate)
+        self.assertIn("retention-days: ${{ env.CHANNEL == 'nightly' && 7 || 90 }}", candidate)
+
+    def test_the_artefact_names_are_the_ones_candidate_py_downloads(self):
+        from candidate import ARTEFACTS
+
+        choose = step_named(self.text, "Choose the release or nightly channel")
+        for channel, artefact in ARTEFACTS.items():
+            self.assertIn(f"CHANNEL={channel}\\nARTEFACT={artefact}\\n", choose)
 
 
 def build_matrix(text):
@@ -180,6 +188,85 @@ class SourceCiReuseTests(unittest.TestCase):
         record = step_named(self.text, "Record exact candidate identity and all asset digests")
         self.assertIn("CI_RUN: ${{ needs.ci-evidence.outputs.ci_run }}", record)
         self.assertIn('echo "Source CI: $source_ci"', record)
+
+
+def run_script(block):
+    """The shell script of a step's `run: |`, dedented."""
+    lines = block.splitlines()
+    start = next(index for index, line in enumerate(lines) if line.strip() == "run: |")
+    body = [line for line in lines[start + 1:]]
+    indent = min(len(line) - len(line.lstrip()) for line in body if line.strip())
+    return "\n".join(line[indent:] for line in body) + "\n"
+
+
+class NightlySigningTests(unittest.TestCase):
+    """A release train's nightly build is signed with the nightly key, and only main's with the release key (#1363)."""
+
+    def setUp(self):
+        self.text = WORKFLOW.read_text()
+
+    def run_step(self, name, ref):
+        import os
+        import subprocess
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w+") as environment:
+            result = subprocess.run(["bash", "-eo", "pipefail", "-c", run_script(step_named(self.text, name))],
+                                    capture_output=True, text=True,
+                                    env=dict(os.environ, CANDIDATE_REF=ref, GITHUB_ENV=environment.name))
+            environment.seek(0)
+            return result.returncode, environment.read()
+
+    def test_the_release_key_is_used_once_and_only_on_main(self):
+        self.assertEqual(self.text.count("secrets.RELIABURGER_RELEASE_KEY"), 1)
+        sign = step_named(self.text, "Sign complete matrix and generate release metadata")
+        self.assertIn("RELIABURGER_RELEASE_KEY: ${{ secrets.RELIABURGER_RELEASE_KEY }}", sign)
+        self.assertIn("if: github.ref == 'refs/heads/main'", sign)
+        self.assertNotIn("--channel nightly", sign)
+
+    def test_the_nightly_key_is_used_once_and_only_on_a_train(self):
+        self.assertEqual(self.text.count("secrets.RELIABURGER_NIGHTLY_KEY"), 1)
+        sign = step_named(self.text, "Sign a train's nightly build with the nightly key")
+        self.assertIn("RELIABURGER_NIGHTLY_KEY: ${{ secrets.RELIABURGER_NIGHTLY_KEY }}", sign)
+        self.assertIn("if: startsWith(github.ref, 'refs/heads/release-')", sign)
+        self.assertIn("--channel nightly", sign)
+        self.assertNotIn("RELIABURGER_RELEASE_KEY", sign)
+
+    def test_only_main_and_trains_are_ever_signed(self):
+        for ref, allowed in [("refs/heads/main", True), ("refs/heads/release-0-2-4", True),
+                             ("refs/heads/feature", False), ("refs/pull/1/merge", False),
+                             ("refs/tags/v0.2.4", False), ("refs/heads/mainline", False)]:
+            with self.subTest(ref=ref):
+                status, _ = self.run_step("Require main or a release train for a signed build", ref)
+                self.assertEqual(status == 0, allowed)
+
+    def test_the_channel_follows_the_branch(self):
+        for ref, channel, artefact in [("refs/heads/main", "release", "candidate"),
+                                       ("refs/heads/release-0-2-4", "nightly", "nightly")]:
+            with self.subTest(ref=ref):
+                status, environment = self.run_step("Choose the release or nightly channel", ref)
+                self.assertEqual(status, 0)
+                self.assertIn(f"CHANNEL={channel}\n", environment)
+                self.assertIn(f"ARTEFACT={artefact}\n", environment)
+        status, _ = self.run_step("Choose the release or nightly channel", "refs/heads/feature")
+        self.assertNotEqual(status, 0)
+
+    def test_a_train_build_compiles_in_the_nightly_trust_and_main_never_does(self):
+        binaries = job(self.text, "build-binaries")
+        self.assertIn("NIGHTLY_FEATURES: ${{ startsWith(github.ref, 'refs/heads/release-') "
+                      "&& '--features nightly-signing' || '' }}", binaries)
+        self.assertIn("${{ matrix.arguments }} $NIGHTLY_FEATURES", binaries)
+        self.assertEqual(self.text.count("--features nightly-signing"), 1)
+
+    def test_the_candidate_job_runs_on_main_and_trains_only(self):
+        candidate = job(self.text, "candidate")
+        condition = " ".join(re.search(r"if: >-\n(.*?)\n    needs:", candidate, re.S).group(1).split())
+        self.assertIn("(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release-'))",
+                      condition)
+
+    def test_the_record_names_its_channel(self):
+        record = step_named(self.text, "Record exact candidate identity and all asset digests")
+        self.assertIn('--channel "$CHANNEL"', record)
 
 
 if __name__ == "__main__":
