@@ -918,7 +918,9 @@ the real `curl … | sh` install against it on every host we advertise.
 
    0.2.3 adds a day tier for its headline record
    ([#1032](https://github.com/reliaburger/reliaburger/issues/1032)), outside
-   the gate: 24 hours of host jobs with no faults, walks or specials, then the
+   the gate. From 0.2.4 it runs after the tag, with the other performance
+   records (step 9, [#1363](https://github.com/reliaburger/reliaburger/issues/1363));
+   the command is here because it shares this step's flags: 24 hours of host jobs with no faults, walks or specials, then the
    drain. It needs the bench host to itself for the whole day and about half
    an hour more for setup, the baseline and the drain. Before configuring the
    nodes it resizes each quickstart VM, one at a time, from 2 vCPU / 2 GiB to
