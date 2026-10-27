@@ -1000,6 +1000,30 @@ the real `curl … | sh` install against it on every host we advertise.
      --record docs/qualification/DATE-job-qualification.md
    ```
 
+   0.2.3 adds a day tier for its headline record
+   ([#1032](https://github.com/reliaburger/reliaburger/issues/1032)), outside
+   the gate. From 0.2.4 it runs after the tag, with the other performance
+   records (step 9, [#1363](https://github.com/reliaburger/reliaburger/issues/1363));
+   the command is here because it shares this step's flags: 24 hours of host jobs with no faults, walks or specials, then the
+   drain. It needs the bench host to itself for the whole day and about half
+   an hour more for setup, the baseline and the drain. Before configuring the
+   nodes it resizes each quickstart VM, one at a time, from 2 vCPU / 2 GiB to
+   4 vCPU / 6 GiB, the size the 0.2.3 scale-out record measured; the record
+   lists the resize as a deviation.
+
+   ```sh
+   scripts/release/qualify-jobs-sustained.sh --tier day \
+     --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.3-RUN_ID-ATTEMPT \
+     --qualified-digest QUALIFIED_DIGEST \
+     --record docs/qualification/DATE-day-run.md
+   ```
+
+   Its `--target-rate` is host-job successes a second: 23,149 (2 billion a
+   day) by default, and no lower than 11,575 (a billion). The record fails if
+   host jobs average less, if a node takes more than 20% over its fair share,
+   if the last full hour runs more than 10% slower than the first, or on any
+   soak check; it lists every node's total and every hour's rate.
+
    `--target-rate` raises the rate above the default 1,390 a second (the
    floor plus 20%); `--plan` prints the schedule without touching anything,
    including the job controller's `job-runs` line: how many runs it expects,

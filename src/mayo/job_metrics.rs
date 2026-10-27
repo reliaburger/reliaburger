@@ -494,6 +494,43 @@ mod tests {
     }
 
     #[test]
+    fn a_two_billion_task_day_counts_exactly_and_forgets_finished_runs() {
+        // The #1032 day run on one node: all 2B tasks under one definition,
+        // as the biggest arrays the API accepts, each reported over many
+        // syncs. Every counter is a u64, and the exported f64 is exact up to
+        // 2^53, so the totals come out exact; finished runs are forgotten.
+        const TASKS: u64 = 1 << 24;
+        const RUNS: u64 = 120;
+        let telemetry = JobTelemetry::default();
+        let mut durations = [0; 16];
+        durations[0] = TASKS / 64;
+        for run in 1..=RUNS {
+            for sync in 1..=64 {
+                let done = sync * TASKS / 64;
+                telemetry.observe(run, &labels("day"), counts(done, done), 27, Vec::new());
+                telemetry.record_durations(&labels("day"), &durations);
+            }
+            telemetry.retain_runs(|id| id != run);
+            assert!(telemetry.lock().runs.is_empty());
+        }
+        let samples = telemetry.samples("a");
+        let day = RUNS * TASKS;
+        assert!(day > 2_000_000_000);
+        assert_eq!(
+            value(&samples, "job_tasks_succeeded_total", "day"),
+            day as f64
+        );
+        assert_eq!(
+            value(&samples, "job_attempts_started_total", "day"),
+            day as f64
+        );
+        assert_eq!(
+            value(&samples, "job_task_duration_ms_count", "day"),
+            day as f64
+        );
+    }
+
+    #[test]
     fn duration_buckets_are_cumulative() {
         let telemetry = JobTelemetry::default();
         let mut durations = [0; 16];

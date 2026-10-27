@@ -366,6 +366,43 @@ class JobQualification(unittest.TestCase):
         specials={line.split()[4] for line in result.stdout.splitlines() if " special " in line}
         self.assertEqual(specials,{"graceful-stop","quorum-loss","all-off"})
 
+    def test_the_day_tier_plans_a_day_of_host_jobs_with_no_faults(self):
+        # #1032: one real 24-hour day on three nodes, then the drain.
+        code,lines,_=self.plan("--tier","day")
+        self.assertEqual(code,0)
+        header=dict(zip(lines[0][::2],lines[0][1::2]))
+        self.assertEqual((header["tier"],header["schedule"],header["duration"],header["quiet-tail"]),("day","none","86400","0"))
+        self.assertEqual((header["job-load"],header["target-rate"],header["node-faults"]),("day",str(jobs.DAY_DEFAULT_RATE),"false"))
+        self.assertFalse([line for line in lines if line[0]=="cycle"])
+        self.assertIn(["day","86400","s","with","no","faults,","walks","or","specials,","then","the","drain"],lines)
+        # The scale-out record measured three 4 vCPU / 6 GiB nodes; quickstart
+        # makes 2 vCPU / 2 GiB ones, so the day resizes them first.
+        self.assertIn(["resize","4","vCPU","6","GiB","each","node,","one","at","a","time,","before","configuring"],lines)
+        budget=next(line for line in lines if line[0]=="job-runs")[1:]
+        budget=dict(zip(budget[::2],budget[1::2]))
+        self.assertLessEqual(int(budget["retained-peak"]),int(budget["limit"]))
+
+    def test_the_day_tier_takes_a_lower_rate_down_to_a_billion_a_day_and_no_faults(self):
+        code,lines,_=self.plan("--tier","day","--target-rate","15000")
+        self.assertEqual(code,0)
+        self.assertEqual(dict(zip(lines[0][::2],lines[0][1::2]))["target-rate"],"15000")
+        code,_,error=self.plan("--tier","day","--target-rate",str(jobs.DAY_FLOOR-1))
+        self.assertNotEqual(code,0); self.assertIn(str(jobs.DAY_FLOOR),error)
+        for option in (["--duration","2h"],["--schedule","full"],["--job-load","target"],["--node-faults"]):
+            code,_,error=self.plan("--tier","day",*option)
+            self.assertNotEqual(code,0); self.assertIn("fixed by the job qualification tier",error)
+        # A day has no walks to run a soak build in.
+        code,_,error=self.plan("--tier","day","--soak-bun","/nonexistent/bun-v0.2.3-soak.1")
+        self.assertNotEqual(code,0); self.assertIn("no upgrade walks",error)
+
+    def test_the_day_tier_runs_no_cycles_and_drains_after_the_day(self):
+        # The day spends its whole length in the wait that every tier ends
+        # with, which keeps the light and heavy checks and the TLS rotations
+        # going; the drain starts after it, as in every tier (#1338).
+        script=(self.release/"qualify-sustained.sh").read_text()
+        self.assertIn('while [ "$schedule" != none ]; do',script)
+        self.assertIn('day) : "${schedule:=none}" "${duration_text:=24h}"',script)
+
     def test_job_tiers_refuse_a_rate_below_a_hundred_million_a_day_or_a_changed_schedule(self):
         code,_,error=self.plan("--tier","fast","--target-rate","1000")
         self.assertNotEqual(code,0); self.assertIn("1158",error)
