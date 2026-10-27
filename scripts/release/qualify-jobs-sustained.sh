@@ -10,7 +10,7 @@
 # recorded, never gated.
 #
 # Usage:
-#   scripts/release/qualify-jobs-sustained.sh --tier fast|final [--target-rate R]
+#   scripts/release/qualify-jobs-sustained.sh --tier fast|final|day [--target-rate R]
 #       [qualify-sustained.sh options: --base-url, --qualified-digest, --record,
 #        --soak-bun, --evidence, --resume, --keep, --plan]
 #
@@ -21,8 +21,18 @@
 #                  gate's one final soak. It runs everything the V02 final
 #                  checks, plus the jobs, so it replaces it (maintainer
 #                  decision, 17 October 2026, #991)
+#   --tier day     the day run (#1032): 24 hours of host jobs at the day
+#                  rate on the three-node cluster, with no faults, walks or
+#                  specials, then cancellation and the drain. It gates the
+#                  host-job rate, each node's share (at most 20% over its
+#                  fair share, as relish bench), the last hour against the
+#                  first, and every soak check. A one-off record for 0.2.3;
+#                  whether it becomes a release gate tier is the
+#                  maintainer's later decision
 #   --target-rate  accepted successes a second (default 1390: 1,158, which is
-#                  100 million a day, plus 20% headroom)
+#                  100 million a day, plus 20% headroom); for the day tier,
+#                  host-job successes a second (default 23149, 2 billion a
+#                  day; at least 11575, a billion a day)
 #   --plan         print the fault schedule and exit
 set -euo pipefail
 
@@ -44,7 +54,9 @@ done
 case $tier in
     fast) tier_options=(--tier fast) ;;
     final) tier_options=(--tier final --duration 8h) ;;
-    *) usage >&2; fail '--tier must be fast or final' ;;
+    day) exec "$(dirname "$0")/qualify-sustained.sh" --tier day --job-load day \
+             ${passthrough[@]+"${passthrough[@]}"} ;;
+    *) usage >&2; fail '--tier must be fast, final or day' ;;
 esac
 
 exec "$(dirname "$0")/qualify-sustained.sh" "${tier_options[@]}" --job-load target --node-faults \
