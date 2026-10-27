@@ -4193,3 +4193,276 @@ async fn startup_discovery_recovery_leaves_its_slow_journal_write_in_flight() {
         Some(new_address)
     );
 }
+
+// ---- an upgrade's verification commit (#1381) --------------------------------
+
+/// A node that has just booted 0.2.0 from an upgrade off 0.1.0 and is
+/// verifying it: the store holds three older binaries for the commit's
+/// retention pass to prune, and the `Verifying` marker is on disk.
+struct VerifyingUpgrade {
+    _dir: tempfile::TempDir,
+    data: std::path::PathBuf,
+    binary_dir: std::path::PathBuf,
+    manager: crate::upgrade::manager::UpgradeManager,
+    marker: crate::upgrade::marker::UpgradeMarker,
+}
+
+fn verifying_upgrade() -> VerifyingUpgrade {
+    use crate::upgrade::marker::{MarkerPhase, UpgradeMarker};
+    let dir = tempfile::tempdir().unwrap();
+    let binary_dir = dir.path().join("bin");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&binary_dir).unwrap();
+    let store = crate::upgrade::store::BinaryStore::new(binary_dir.clone(), "bun".to_string());
+    let stub = crate::upgrade::signing::SignatureEnvelope {
+        schema: 1,
+        sha256: String::new(),
+        embedded: String::new(),
+        external: None,
+    };
+    for version in ["0.0.1", "0.0.2", "0.0.3", "0.1.0", "0.2.0"] {
+        store
+            .stage(&version.parse().unwrap(), version.as_bytes(), &stub)
+            .unwrap();
+    }
+    let running: crate::upgrade::BinaryVersion = "0.2.0".parse().unwrap();
+    store.activate(&running).unwrap();
+    let manager = crate::upgrade::manager::UpgradeManager::new(
+        &crate::config::node::UpgradeSection {
+            binary_dir: Some(binary_dir.clone()),
+            ..Default::default()
+        },
+        &data,
+        &binary_dir.join("bun"),
+        running.clone(),
+        vec!["bun".to_string()],
+    )
+    .unwrap();
+    let previous: crate::upgrade::BinaryVersion = "0.1.0".parse().unwrap();
+    let marker = UpgradeMarker {
+        schema: 1,
+        upgrade_id: "upgrade-1".into(),
+        previous_binary: previous.file_name("bun"),
+        previous_version: previous,
+        target_binary: running.file_name("bun"),
+        target_version: running,
+        phase: MarkerPhase::Verifying,
+        boot_attempts: 1,
+        pre_upgrade_instances: vec![],
+    };
+    marker.store(&UpgradeMarker::path_in(&data)).unwrap();
+    VerifyingUpgrade {
+        _dir: dir,
+        data,
+        binary_dir,
+        manager,
+        marker,
+    }
+}
+
+impl VerifyingUpgrade {
+    fn marker_on_disk(&self) -> bool {
+        use crate::upgrade::marker::UpgradeMarker;
+        UpgradeMarker::load(&UpgradeMarker::path_in(&self.data))
+            .unwrap()
+            .is_some()
+    }
+
+    fn committed_history(&self) -> usize {
+        self.manager
+            .status()
+            .history
+            .iter()
+            .filter(|entry| entry.outcome == crate::upgrade::types::UpgradeOutcome::Committed)
+            .count()
+    }
+
+    fn holds_binary(&self, version: &str) -> bool {
+        self.binary_dir.join(format!("bun-v{version}")).is_file()
+    }
+
+    fn verify(&self) -> (AgentCommand, oneshot::Receiver<Result<bool, BunError>>) {
+        let (response, answer) = oneshot::channel();
+        let command = AgentCommand::UpgradeVerify {
+            marker: self.marker.clone(),
+            rejoin: Ok(()),
+            response,
+        };
+        (command, answer)
+    }
+}
+
+/// Hand the agent an `UpgradeVerify` in a command turn of its own.
+async fn verify_turn(
+    agent: &mut BunAgent<MockGrill>,
+    command: AgentCommand,
+) -> crate::bun::loop_meter::TurnRecord {
+    let turn = begin_scenario_turn(agent, LoopBranch::Command, Some("upgrade_verify"));
+    agent.handle_command(command).await;
+    end_scenario_turn(agent, turn)
+}
+
+/// Wait for the next follow-up task, then take the loop's turn for it.
+async fn follow_up_turn(agent: &mut BunAgent<MockGrill>) -> crate::bun::loop_meter::TurnRecord {
+    let done = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent.follow_ups.join_next_with_id(),
+    )
+    .await
+    .expect("the follow-up never finished")
+    .expect("no follow-up was in flight");
+    let turn = begin_scenario_turn(agent, LoopBranch::FollowUp, None);
+    agent.apply_follow_up(done).await;
+    end_scenario_turn(agent, turn)
+}
+
+/// 0.2.3 candidate 1's V02 fast tier: just after an upgrade walk, one
+/// node's `upgrade_verify` turn took 2,260 ms (#1381). The commit appended
+/// the history entry, deleted old binaries and removed the marker inline.
+/// The commit now waits only until the turn's deadline and lands off the
+/// loop; a status queued meanwhile is answered, and the verification is
+/// answered once the commit has landed.
+#[tokio::test]
+async fn status_answers_while_an_upgrade_verification_commits_to_a_stalled_disk() {
+    let upgrade = verifying_upgrade();
+    let (mut agent, tx, shutdown) = test_agent();
+    agent.set_upgrade_manager(upgrade.manager.clone());
+    let running = RunningAgent::start(agent, tx, shutdown);
+    running.stalls.set(LoopStall::UpgradeCommit, STALL);
+    running.measure_from_here();
+    let (command, mut answer) = upgrade.verify();
+    running.tx.send(command).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while running.stalls.reached(LoopStall::UpgradeCommit) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the verification never committed");
+    let mid_commit = running.status_latency().await;
+    let early = answer.try_recv();
+    let answered_early = early.is_ok();
+    let marker_while_committing = upgrade.marker_on_disk();
+    let committed = match early {
+        Ok(committed) => committed,
+        Err(_) => tokio::time::timeout(std::time::Duration::from_secs(10), answer)
+            .await
+            .expect("the verification was never answered")
+            .unwrap(),
+    };
+    let worst = running.meter.worst_turn();
+    stop(running).await;
+
+    assert!(
+        mid_commit.is_some_and(|latency| latency < TURN_BUDGET),
+        "status took {mid_commit:?} while an upgrade commit took {STALL:?}"
+    );
+    assert!(
+        !answered_early,
+        "the verification was answered before its commit landed"
+    );
+    assert!(
+        marker_while_committing,
+        "the marker went before the commit landed"
+    );
+    assert!(matches!(committed, Ok(true)), "{committed:?}");
+    if let Some(worst) = worst {
+        assert!(worst.took < TURN_BUDGET, "the worst loop turn took {worst}");
+    }
+    assert!(!upgrade.marker_on_disk());
+    assert_eq!(upgrade.committed_history(), 1);
+}
+
+/// The verification's turn hands the commit's file work to a blocking
+/// thread and waits for it only until the turn's deadline. A commit still
+/// going lands in a follow-up turn of its own, which answers the caller.
+/// Until then the marker stays on disk, so the node still reports the
+/// upgrade in flight.
+#[tokio::test]
+async fn an_upgrade_verification_leaves_its_slow_commit_in_flight() {
+    let upgrade = verifying_upgrade();
+    let (mut agent, _tx, _shutdown) = test_agent();
+    agent.set_upgrade_manager(upgrade.manager.clone());
+    agent.loop_stalls.set(LoopStall::UpgradeCommit, STALL);
+    let (command, mut answer) = upgrade.verify();
+    let turn = verify_turn(&mut agent, command).await;
+    assert_eq!(agent.loop_stalls.reached(LoopStall::UpgradeCommit), 1);
+    assert!(
+        turn.took < TURN_BUDGET,
+        "the verification's turn waited for its commit: {turn}"
+    );
+    assert!(answer.try_recv().is_err(), "answered before the commit");
+    assert!(upgrade.marker_on_disk());
+    assert!(upgrade.manager.upgrade_in_flight());
+
+    let landed = follow_up_turn(&mut agent).await;
+    assert!(landed.took < TURN_BUDGET, "{landed}");
+    assert!(matches!(answer.await.unwrap(), Ok(true)));
+    assert!(!upgrade.marker_on_disk());
+    assert_eq!(upgrade.committed_history(), 1);
+    assert_eq!(agent.loop_stalls.reached(LoopStall::UpgradeCommit), 1);
+}
+
+/// With a healthy disk the commit lands inside the verification's own turn,
+/// as it always did: the caller is answered there, and nothing is left for
+/// a later turn.
+#[tokio::test]
+async fn an_upgrade_verification_commits_within_its_turn_on_a_healthy_disk() {
+    let upgrade = verifying_upgrade();
+    let (mut agent, _tx, _shutdown) = test_agent();
+    agent.set_upgrade_manager(upgrade.manager.clone());
+    let (command, mut answer) = upgrade.verify();
+    let turn = verify_turn(&mut agent, command).await;
+    assert!(turn.took < TURN_BUDGET, "{turn}");
+    assert!(matches!(answer.try_recv(), Ok(Ok(true))));
+    assert!(agent.follow_ups.is_empty());
+    assert!(!upgrade.marker_on_disk());
+    assert_eq!(upgrade.committed_history(), 1);
+}
+
+/// The commit prunes old binaries off the loop, after its history entry is
+/// recorded and before the marker goes. It keeps the binary now running and
+/// the one it upgraded from, and while the marker is on disk the next
+/// upgrade or rollback is refused, so it never stages a binary the pruning
+/// could remove.
+#[tokio::test]
+async fn an_upgrade_commit_prunes_old_binaries_off_the_loop_and_refuses_the_next_upgrade_meanwhile()
+{
+    let upgrade = verifying_upgrade();
+    let (mut agent, _tx, _shutdown) = test_agent();
+    agent.set_upgrade_manager(upgrade.manager.clone());
+    agent.loop_stalls.set(LoopStall::UpgradeCommit, STALL);
+    let (command, answer) = upgrade.verify();
+    verify_turn(&mut agent, command).await;
+    assert!(upgrade.holds_binary("0.0.1"), "pruned inside the turn");
+
+    let (response, rollback) = oneshot::channel();
+    let turn = begin_scenario_turn(&mut agent, LoopBranch::Command, Some("upgrade_rollback"));
+    agent
+        .handle_command(AgentCommand::UpgradeRollback {
+            version: Some("0.0.3".parse().unwrap()),
+            response,
+            answer_delivered: None,
+        })
+        .await;
+    end_scenario_turn(&mut agent, turn);
+    // The rollback's preparation reports first; the commit is still stalled.
+    follow_up_turn(&mut agent).await;
+    let refused = rollback.await.unwrap();
+    assert!(
+        matches!(
+            refused,
+            Err(BunError::Upgrade(
+                crate::upgrade::UpgradeError::AlreadyInFlight { .. }
+            ))
+        ),
+        "{refused:?}"
+    );
+
+    follow_up_turn(&mut agent).await;
+    assert!(matches!(answer.await.unwrap(), Ok(true)));
+    assert!(upgrade.holds_binary("0.2.0"), "pruned the running binary");
+    assert!(upgrade.holds_binary("0.1.0"), "pruned the rollback target");
+    assert!(!upgrade.holds_binary("0.0.1"));
+    assert!(!upgrade.marker_on_disk());
+}

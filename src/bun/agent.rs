@@ -494,6 +494,9 @@ enum LoopStall {
     /// one file per launch, which after a restart comes off a cold disk.
     /// Only counted; `MockGrill::set_inventory_delay` makes it slow.
     RuntimeInventory,
+    /// Committing a verified upgrade: appending its history entry, pruning
+    /// old binaries and removing the marker (#1381).
+    UpgradeCommit,
 }
 
 /// How long each [`LoopStall`] takes. Shared with the test through an `Arc`
