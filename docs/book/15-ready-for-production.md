@@ -6396,13 +6396,12 @@ permission before the runtime lets the address go, because each step
 answers `StillRunning` until its write has landed. Everything happens in
 the same order as before, just on more turns.
 
-One writer still waits. A rolling deploy's `register_rolling_instance`
-adds its replacements to the supervisor and `service_map` before it
-journals them, so a write left in flight would let readers route to
-backends the journal doesn't record yet. It needs the same reorder
-`finish_fresh_instance` got, and
-`the_inline_publication_path_still_waits_for_its_journal_write` holds the
-place until it does.
+One writer still waited. A rolling deploy's registration of its
+replacements added them to the supervisor and `service_map` before it
+journalled them, so a write left in flight would have let readers route to
+backends the journal didn't record yet. It needed the same reorder
+`finish_fresh_instance` got, and a test held its place until 0.2.4 ("And
+the stragglers", below).
 
 #### And the receipt
 
@@ -6472,6 +6471,98 @@ That's why this needed no protocol change and no bump to `CURRENT`.
 pins down the crash case: a write that fails off the turn fences discovery,
 the caller hears the error, and the receipt is still on disk for the next
 acknowledgement.
+
+#### And the stragglers
+
+Three waits were left after the receipt (#1336). The first was the one
+that test had been holding a place for. We'd called it
+`register_rolling_instance`, after the op that registers a replacement as
+it starts. Reading the code for the fix, that op turned out to write only
+the replacement's adoption record. The discovery write was in
+`finalise_rolling_deploy`, the op a rollout sends once every old instance
+has retired. It tore down the old instances' bookkeeping, put the
+replacements in the supervisor, unregistered the service, registered it
+again with only the new backends, and then journalled the lot, inline.
+The name was wrong; the problem was real.
+
+The tests came first, as always. Six of them, and five failed before the
+change:
+
+```
+the registration's turn waited for its own journal write: 1.632645333s in deploy_op (finalise_rolling_deploy)
+recovery's turn waited for its own journal write: 1.613360875s in health_tick
+the retirement's turn waited for its republication's journal writes: 4.847159833s in stop_wait
+```
+
+The sixth runs a whole rolling deploy through the loop with every journal
+write slower than a turn, and checks it completes and routes to exactly
+what the journal records. It passed before too. It's there so the fix
+can't break a rollout on the way to unblocking the loop.
+
+The fix is `finish_fresh_instance`'s reorder: journal first, change
+nothing until an ask finds the write recorded. The awkward part was
+building the candidate. Registration works on `service_map` in place,
+because `register_local_service` has to read the consumer's committed
+allocation and the map's other entries to build a valid one. So
+`rolled_out_services` borrows `service_map` for a moment and gives it
+back:
+
+```rust
+let current = self.service_map.clone();
+let _ = self.service_map.unregister(service_id);
+let registered = match spec.port {
+    Some(port) => self
+        .register_replacement_service(service_id, port, spec, new_ids, new_ports, new_ips),
+    None => Ok(()),
+};
+let rolled_out = std::mem::replace(&mut self.service_map, current);
+registered.map(|()| rolled_out)
+```
+
+`std::mem::replace` puts `current` into the field and hands back what was
+there, in one move. In C you'd swap two pointers; in Rust you can't move a
+value out of a field you only borrow (`&mut self`) and leave a hole, so
+the standard library gives you swap-shaped functions that never do. The
+last line turns `Result<(), BunError>` into `Result<ServiceMap, BunError>`:
+`map` runs its closure only on `Ok`, and `|()|` is a closure whose one
+argument is the unit value `()`, matched as a pattern.
+
+The ask that finds the candidate journalled then does the old
+bookkeeping and installs `rolled_out` itself. Could they differ? The
+bookkeeping changes only this service's entry, and the rolled-out map
+replaces that entry whole, so no. A registration the allocation refuses
+journals nothing and fails exactly where it used to, after the
+bookkeeping, keeping the reservation the retained replacements need. And
+#1355, which landed the same week and makes a retiring instance wait until
+every node has dropped it, isn't affected: that wait happens on the
+worker before the stop, long before this op.
+
+The second wait hid in the consumer. A service retirement on a cluster
+node republishes the view before it retires the allocation, and it needs
+the view settled, so it ran the synchronisation's steps back to back. Each
+step began by settling the write the previous step had left in flight.
+With three slow writes, that's one 4.8 s turn. Now a step waits for
+nothing at all. Outside a turn the driver settles the write first, as
+before; inside one it stops, and the rest of the synchronisation goes on
+the loop's queue as a local republication. The retirement answers
+`StillRunning` and asks again. If the republication fails in the loop, it
+marks the view stale, and the retirement's next ask synchronises inline
+again and gets the error. That's the receipt's trick once more: keep the
+settling, lose the waiting.
+
+The third was discovery recovery on a cluster node's first health tick
+after a restart, once its startup retirements have gone. It waited for any
+write in flight and for its own. It now answers `StillRunning` for the
+first and journals each service's adopted backends within the deadline
+for the second. It changes an adopted instance's address and state only
+once its backend is recorded, and a later pass leaves alone a backend
+already in `service_map`. That last rule closes a gap we hadn't been
+looking for: a second pass could set an adopted backend back to
+unhealthy, whatever its probes had said since.
+
+What still waits for a discovery journal write? Adoption itself, which
+runs before the loop starts and has nobody to hold up. That's the whole
+list.
 
 #### A 503 is an answer, not a verdict
 

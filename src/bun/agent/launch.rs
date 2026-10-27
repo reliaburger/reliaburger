@@ -710,6 +710,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         mut new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
     ) -> Result<(), BunError> {
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        // The service as the rollout leaves it is journalled before anything
+        // else changes (#1336), waiting only until the turn's deadline. While
+        // the write is in flight the op answers `StillRunning` with nothing
+        // changed, and the worker's next ask finds it recorded. A refused
+        // registration journals nothing, and fails below, after the old
+        // bookkeeping and keeping the reservation, as it always has.
+        let rolled_out = self.rolled_out_services(&service_id, spec, new_ids, new_ports, new_ips);
+        if let Ok(candidate) = &rolled_out {
+            let landing = self
+                .journal_publication_within_turn(
+                    &service_id,
+                    candidate,
+                    LoopBranch::DeployOp,
+                    "finalise_rolling_deploy/landed",
+                )
+                .await?;
+            discovery_ownership::still_running_unless_landed(landing, || {
+                format!("journalling {service_id}'s replacements")
+            })?;
+        }
         // DEP5: the worker routed traffic to the fresh instances (published
         // backends) before draining and stopping the old ones, so by the time
         // this op runs the cut-over has already happened. What's left is to
@@ -719,7 +740,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for old_id in existing {
             self.retain_stopped_instance(old_id);
         }
-        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
         // M7: publishing backends and retiring old instances now happen
         // incrementally as the rollout steps, so by the time we get here both
         // are usually already done. These loops are idempotent catch-ups for
@@ -780,13 +800,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             self.withdraw_service_ebpf(&service_id).await?;
         }
-        // Re-registration can be refused: a stop that withdrew the council's
-        // allocation mid-rollout leaves nothing to register against. The
-        // retained replacements then retire by proving withdrawal against
-        // this local reservation, so a refusal must put it back.
-        let reserved = self.service_map.clone();
-        let _ = self.service_map.unregister(&service_id);
-
         for new_id in new_ids {
             let host_port = new_ports.get(new_id).copied().flatten();
             let health_config = crate::bun::health::HealthCheckConfig::for_app(spec);
@@ -826,21 +839,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let key = (app_name.to_string(), namespace.to_string());
         self.supervisor.app_instances.insert(key, new_ids.to_vec());
 
-        if let Some(port) = spec.port
-            && let Err(error) = self.register_replacement_service(
-                &service_id,
-                port,
-                spec,
-                new_ids,
-                new_ports,
-                new_ips,
-            )
-        {
-            self.service_map = reserved;
-            return Err(error);
-        }
-
-        self.finish_instance_networking(app_name, namespace).await?;
+        // Re-registration can be refused: a stop that withdrew the council's
+        // allocation mid-rollout leaves nothing to register against. The
+        // retained replacements then retire by proving withdrawal against
+        // this local reservation, so a refusal leaves it in place.
+        //
+        // The old bookkeeping above changed only this service's entry, which
+        // the rolled-out map replaces whole, so this is exactly the map the
+        // journal now records.
+        self.service_map = rolled_out?;
+        self.finish_journalled_networking(&service_id).await?;
         // The rolled-out spec owns the route now (#307): a changed host
         // replaces the old one, and a spec without ingress drops it. The
         // stopped-app restore before the rollout only inserts when nothing
@@ -874,6 +882,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         super::deploy_ops::record_deploy_history(&mut *self.deploy_history.write().await, entry);
         Ok(())
+    }
+
+    /// The service map a rollout leaves: `service_id` registered afresh,
+    /// with only the replacements' backends, and every other service as it
+    /// is. `service_map` itself doesn't change. A refused registration
+    /// (an allocation a stop withdrew mid-rollout) is the error.
+    fn rolled_out_services(
+        &mut self,
+        service_id: &crate::onion::service_id::ServiceId,
+        spec: &AppSpec,
+        new_ids: &[InstanceId],
+        new_ports: &std::collections::HashMap<InstanceId, Option<u16>>,
+        new_ips: &std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
+    ) -> Result<crate::onion::service_map::ServiceMap, BunError> {
+        // Registration works on `service_map` in place, so build the result
+        // there and put the original back.
+        let current = self.service_map.clone();
+        let _ = self.service_map.unregister(service_id);
+        let registered = match spec.port {
+            Some(port) => self
+                .register_replacement_service(service_id, port, spec, new_ids, new_ports, new_ips),
+            None => Ok(()),
+        };
+        let rolled_out = std::mem::replace(&mut self.service_map, current);
+        registered.map(|()| rolled_out)
     }
 
     /// Refuse user/cleanup stops while a deploy can still mutate the target.

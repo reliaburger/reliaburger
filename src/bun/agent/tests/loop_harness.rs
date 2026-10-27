@@ -2941,7 +2941,7 @@ fn end_scenario_turn(
 /// The backends the discovery journal itself records for `service`: not the
 /// inventory before a write in flight.
 fn journalled_backends(
-    agent: &TestAgent,
+    agent: &BunAgent<MockGrill>,
     service: &crate::onion::service_id::ServiceId,
 ) -> Option<Vec<String>> {
     let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
@@ -3582,7 +3582,7 @@ async fn a_network_reference_release_leaves_its_slow_journal_writes_in_flight() 
 
 /// Retire `service`'s allocation in a turn of its own.
 async fn retire_service_turn(
-    agent: &mut TestAgent,
+    agent: &mut BunAgent<MockGrill>,
     service: &crate::onion::service_id::ServiceId,
 ) -> (crate::bun::loop_meter::TurnRecord, Result<(), BunError>) {
     let turn = begin_scenario_turn(agent, LoopBranch::StopWait, None);
@@ -3839,29 +3839,357 @@ async fn an_egress_owners_write_that_fails_off_the_turn_fences_egress() {
     assert!(!agent.egress_bindings.contains_key(&id));
 }
 
-/// Rolling registration of a replacement still journals its service map
-/// inline through `publish_backend_ebpf` (#1263). The op adds the
-/// replacements to the supervisor and `service_map` before it publishes, so
-/// a write left in flight would let readers route to backends the journal
-/// doesn't record yet. This scenario documents that the inline path still
-/// waits; the book and the design doc say why it stays.
+// ---- a rollout's registration and an inline republication (#1336) ----------
+
+/// `web` rolled out to one replacement, `web-g1-0`, on port 30999: what the
+/// deploy worker hands the loop once every old instance has retired.
+fn finalise_web(
+    reply: oneshot::Sender<Result<(), BunError>>,
+) -> crate::bun::agent::deploy_ops::DeployOp {
+    let replacement = InstanceId("default__web-g1-0".into());
+    crate::bun::agent::deploy_ops::DeployOp::FinaliseRollingDeploy {
+        app_name: "web".into(),
+        namespace: "default".into(),
+        spec: Box::new(basic_config().app.remove("web").unwrap()),
+        existing: vec![],
+        new_ids: vec![replacement.clone()],
+        new_ports: [(replacement.clone(), Some(30_999))].into_iter().collect(),
+        new_ips: [(replacement, None)].into_iter().collect(),
+        new_specs: Default::default(),
+        now: Instant::now(),
+        reply,
+    }
+}
+
+/// A rollout registers its replacements by registering the service afresh
+/// with only their backends, and it journalled that inline, after it had
+/// already put them in the supervisor and `service_map` (#1336). It now
+/// journals the rolled-out service first, waiting only until the turn's
+/// deadline, and installs nothing until an ask finds it recorded.
 #[tokio::test]
-async fn the_inline_publication_path_still_waits_for_its_journal_write() {
+async fn a_rolling_registration_leaves_its_slow_journal_write_in_flight() {
     let (mut agent, _tx, _shutdown, _grill, _root) = journalling_web().await;
     let service = crate::onion::service_id::ServiceId::new("default", "web");
+    let replacement = InstanceId("default__web-g1-0".into());
     agent
         .loop_stalls
         .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
     let reached = agent.loop_stalls.reached(LoopStall::Persist);
-    let turn = begin_scenario_turn(&mut agent, LoopBranch::DeployOp, None);
-    agent.publish_backend_ebpf(&service).await.unwrap();
-    let published = end_scenario_turn(&mut agent, turn);
+    let (turn, result) = deploy_op_turn(&mut agent, "finalise_rolling_deploy", finalise_web).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "{turn}, {result:?}"
+    );
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the registration's turn waited for its own journal write: {turn}"
+    );
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert_eq!(
+        routed_backends(&agent, &service),
+        Some(vec!["default__web-0".to_string()])
+    );
+    assert!(agent.supervisor.get_instance(&replacement).is_none());
+
+    // Before the landing, an ask writes nothing and installs nothing.
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, result) = deploy_op_turn(&mut agent, "finalise_rolling_deploy", finalise_web).await;
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert!(agent.supervisor.get_instance(&replacement).is_none());
+
     agent
         .loop_stalls
         .set(LoopStall::Persist, std::time::Duration::ZERO);
-    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached + 1);
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(
+        landed.detail,
+        Some("finalise_rolling_deploy/landed"),
+        "{landed}"
+    );
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, result) = deploy_op_turn(&mut agent, "finalise_rolling_deploy", finalise_web).await;
+    result.unwrap();
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert_eq!(
+        routed_backends(&agent, &service),
+        Some(vec![replacement.0.clone()])
+    );
+    assert_eq!(
+        journalled_backends(&agent, &service),
+        Some(vec![replacement.0.clone()])
+    );
+    assert!(agent.supervisor.get_instance(&replacement).is_some());
+}
+
+/// A rolling registration whose write fails after its turn moved on fences
+/// discovery and installs nothing; the next ask journals it again.
+#[tokio::test]
+async fn a_rolling_registration_whose_write_fails_off_the_turn_installs_nothing() {
+    let (mut agent, _tx, _shutdown, _grill, _root) = journalling_web().await;
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    let replacement = InstanceId("default__web-g1-0".into());
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+        &mut agent.discovery_ownership
+    else {
+        panic!("discovery ownership is not ready");
+    };
+    journal.fail_next_write();
+    let (turn, result) = deploy_op_turn(&mut agent, "finalise_rolling_deploy", finalise_web).await;
+    assert!(agent.discovery_write_in_flight(), "{turn}");
     assert!(
-        !agent.discovery_write_in_flight(),
-        "the inline path left its write in flight: {published}"
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    landing_turn(&mut agent).await;
+    assert!(matches!(
+        agent.discovery_ownership,
+        DiscoveryOwnership::Uncertain
+    ));
+    assert_eq!(
+        routed_backends(&agent, &service),
+        Some(vec!["default__web-0".to_string()])
+    );
+    assert!(agent.supervisor.get_instance(&replacement).is_none());
+
+    let (_, result) = deploy_op_turn(&mut agent, "finalise_rolling_deploy", finalise_web).await;
+    result.unwrap();
+    assert_eq!(
+        journalled_backends(&agent, &service),
+        Some(vec![replacement.0.clone()])
+    );
+    assert_eq!(routed_backends(&agent, &service), Some(vec![replacement.0]));
+}
+
+/// End to end: a rolling deploy whose every journal write outlasts its turn
+/// still completes, and routes to exactly what the journal records.
+#[tokio::test]
+async fn a_rolling_deploy_completes_when_its_journal_writes_outlast_the_turn() {
+    let (mut agent, tx, shutdown, _grill, _root) = journalling_web().await;
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let task = tokio::spawn(async move {
+        agent.run().await;
+        agent
+    });
+    let v2 = Config::parse("[app.web]\nimage = \"myapp:v2\"\nport = 8080\n").unwrap();
+    expect_complete(&send_deploy(&tx, v2).await);
+    shutdown.cancel();
+    let agent = task.await.unwrap();
+    let routed = routed_backends(&agent, &service).unwrap();
+    assert_eq!(routed.len(), 1, "{routed:?}");
+    assert_ne!(routed, vec!["default__web-0".to_string()]);
+    assert_eq!(journalled_backends(&agent, &service), Some(routed));
+}
+
+/// A clustered agent holding the committed local reservation of
+/// `default/remote`, journalled and withdrawn, ready to retire; and a local
+/// ingress route the published view doesn't carry yet, so the retirement's
+/// republication changes the view.
+async fn clustered_reservation_to_retire() -> (
+    BunAgent<MockGrill>,
+    tempfile::TempDir,
+    crate::onion::service_id::ServiceId,
+) {
+    let (mut agent, root, _catalog) = clustered_allocation_fixture().await;
+    let mut entry = agent.service_map_tx.borrow().resolve_all()[0].clone();
+    entry.backends.clear();
+    agent.service_map = crate::onion::service_map::ServiceMap::from_snapshot(&[entry]).unwrap();
+    let service = crate::onion::service_id::ServiceId::new("default", "remote");
+    agent
+        .persist_discovery_publication(&service, &agent.service_map.clone())
+        .await
+        .unwrap();
+    let route: crate::config::app::IngressSpec =
+        toml::from_str("host = \"local.test\"\ntls = \"disabled\"").unwrap();
+    agent
+        .ingress_configs
+        .insert(("default".into(), "local".into()), route);
+    (agent, root, service)
+}
+
+/// A retirement on a cluster node republishes the consumer view inline,
+/// before it retires the allocation. Each of that synchronisation's steps
+/// waited at its start for the previous step's write, inline in the
+/// retirement's turn (#1336): one turn took every write the view needed.
+/// Now the synchronisation stops at a write in flight, carries on in the
+/// loop's own turns, and the retirement asks again.
+#[tokio::test]
+async fn a_service_retirement_leaves_its_republication_write_in_flight() {
+    let (mut agent, _root, service) = clustered_reservation_to_retire().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (turn, result) = retire_service_turn(&mut agent, &service).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "the retirement's turn waited for its republication's journal writes: {turn}, {result:?}"
+    );
+    assert!(agent.discovery_write_in_flight(), "{turn}");
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert!(!agent.consumer_syncs.is_idle());
+
+    // Before the landing, an ask writes nothing.
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, result) = retire_service_turn(&mut agent, &service).await;
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+
+    // The loop lands the write and takes the rest of the synchronisation.
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    landing_turn(&mut agent).await;
+    while !agent.consumer_syncs.is_idle() {
+        one_consumer_sync_turn(&mut agent).await;
+    }
+    let (_, result) = retire_service_turn(&mut agent, &service).await;
+    result.unwrap();
+    assert_eq!(journalled_backends(&agent, &service), None);
+    assert!(agent.consumer_owner().is_some_and(|owner| {
+        owner.phase == crate::bun::consumer_owners::ConsumerPhase::Active
+            && owner.publications.last().is_some_and(|publication| {
+                publication
+                    .ingress
+                    .iter()
+                    .any(|route| route.name == "local")
+            })
+    }));
+}
+
+/// Take startup discovery recovery's work in a health tick's turn.
+async fn recovery_turn(
+    agent: &mut BunAgent<MockGrill>,
+) -> (crate::bun::loop_meter::TurnRecord, Result<(), BunError>) {
+    let turn = begin_scenario_turn(agent, LoopBranch::HealthTick, None);
+    let result = agent.finish_discovery_recovery().await;
+    (end_scenario_turn(agent, turn), result)
+}
+
+/// Startup discovery recovery publishes adopted backends once the last
+/// startup retirement has gone, on a health tick, and it waited inline for
+/// any write in flight (#1336). In a turn it now answers `StillRunning`,
+/// and the next tick tries again.
+#[tokio::test]
+async fn startup_discovery_recovery_waits_for_no_write_in_flight() {
+    let (mut agent, _root, _id, _service) = web_with_a_discovery_write_in_flight().await;
+    let (turn, result) = recovery_turn(&mut agent).await;
+    assert!(
+        agent.discovery_write_in_flight(),
+        "recovery's turn waited for a write in flight: {turn}"
+    );
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+}
+
+/// A recovered agent whose adopted `web` replica has since moved to a new
+/// address, with its backend not yet published, so recovery has a backend
+/// to journal.
+async fn recovered_web_to_publish() -> (
+    BunAgent<MockGrill>,
+    tempfile::TempDir,
+    InstanceId,
+    crate::onion::service_id::ServiceId,
+) {
+    let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+    grill.set_adopt_result(&reference.instance_id, true);
+    agent
+        .recover_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    grill.set_container_ip("10.0.2.6".parse().unwrap());
+    agent
+        .service_map
+        .remove_backend(&service, &reference.instance_id.0)
+        .unwrap();
+    (agent, root, reference.instance_id, service)
+}
+
+/// The address `service_map` routes `id` to, if it routes to `id` at all.
+fn routed_address(
+    agent: &BunAgent<MockGrill>,
+    service: &crate::onion::service_id::ServiceId,
+    id: &InstanceId,
+) -> Option<std::net::Ipv4Addr> {
+    agent
+        .service_map
+        .resolve(service)?
+        .backends
+        .iter()
+        .find(|backend| backend.instance_id == id.0)
+        .map(|backend| backend.node_ip)
+}
+
+/// Recovery's own journal write waited inline too. It now waits only until
+/// the turn's deadline; the instance and `service_map` stay as they were
+/// until a tick finds the backend recorded.
+#[tokio::test]
+async fn startup_discovery_recovery_leaves_its_slow_journal_write_in_flight() {
+    let (mut agent, _root, id, service) = recovered_web_to_publish().await;
+    let new_address: std::net::Ipv4Addr = "10.0.2.6".parse().unwrap();
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (turn, result) = recovery_turn(&mut agent).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "{turn}, {result:?}"
+    );
+    assert!(
+        agent.discovery_write_in_flight(),
+        "recovery's turn waited for its own journal write: {turn}"
+    );
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert_eq!(routed_address(&agent, &service, &id), None);
+    assert_ne!(
+        agent.supervisor.get_instance(&id).unwrap().container_ip,
+        Some(new_address)
+    );
+
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(landed.detail, Some("discovery_recovery/landed"), "{landed}");
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, result) = recovery_turn(&mut agent).await;
+    result.unwrap();
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert_eq!(routed_address(&agent, &service, &id), Some(new_address));
+    assert_eq!(
+        agent.supervisor.get_instance(&id).unwrap().container_ip,
+        Some(new_address)
     );
 }
