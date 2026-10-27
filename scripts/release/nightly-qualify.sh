@@ -12,12 +12,17 @@
 #   --gate patch|full       patch (default): power-cut and reboot runs, V02
 #                           and jobs fast tiers; full adds the job final.
 #                           scripts/release/release_tier.py says which
-#   --base-url URL          a staged build of the tip, for the soaks; without
-#                           one only the power-cut runs happen, and the night
-#                           isn't green
+#   --base-url URL          a staged build of the tip, for the soaks: the
+#                           nightly-v... pre-release stage.yml publishes for a
+#                           train's nightly build. Without one only the
+#                           power-cut runs happen, and the night isn't green.
+#                           It must be signed with its channel's key: a
+#                           nightly with the nightly key in src/upgrade/keys.rs
 #   --qualified-digest SHA  its candidate.json SHA-256
 #   --soak-bun PATH         the signed soak bun for the upgrade walks (the job
-#                           final needs it)
+#                           final needs it); for a nightly build, built with
+#                           the nightly-signing feature and signed with the
+#                           nightly key
 #   --iterations N          power-cut and reboot runs per lane (default 10)
 #   --records DIR           where the nightly records go
 #                           (default ~/reliaburger-nightly)

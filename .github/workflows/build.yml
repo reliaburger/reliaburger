@@ -125,11 +125,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test signing and metadata with ephemeral keys
         run: python3 -m unittest discover -s scripts/release -p 'test_*.py'
-      - name: Require main for a manually signed candidate
+      - name: Require main or a release train for a signed build
+        # Main's candidate gets the release key; a train's nightly build
+        # (#1363) gets the nightly key, which no release trusts. Nothing
+        # else is ever signed.
         if: github.event_name == 'workflow_dispatch'
         env:
           CANDIDATE_REF: ${{ github.ref }}
-        run: test "$CANDIDATE_REF" = refs/heads/main
+        run: |
+          case "$CANDIDATE_REF" in
+            refs/heads/main|refs/heads/release-*) ;;
+            *) echo "only main and release-* trains are signed, not $CANDIDATE_REF" >&2; exit 1 ;;
+          esac
 
   build-binaries:
     needs: changes
@@ -141,6 +148,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       RELIABURGER_GIT_SHA: ${{ github.sha }}
+      # A train's nightly build trusts the nightly key instead of the release
+      # keys (src/upgrade/keys.rs), so the bun it signs can never reach a
+      # released cluster. Main's build never has the feature.
+      NIGHTLY_FEATURES: ${{ startsWith(github.ref, 'refs/heads/release-') && '--features nightly-signing' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -156,7 +167,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang llvm libbpf-dev
       - name: Build locked release binaries
-        run: cargo build --locked --release --target ${{ matrix.target }} ${{ matrix.arguments }}
+        run: cargo build --locked --release --target ${{ matrix.target }} ${{ matrix.arguments }} $NIGHTLY_FEATURES
       - name: Smoke test and package native binaries
         shell: bash
         run: |
@@ -262,9 +273,12 @@ jobs:
   candidate:
     # Signs only a commit that passed the whole of ci.yml: in this run, or in
     # the run ci-evidence found. A skipped validate-release counts only with
-    # that run, and every build job must have succeeded either way.
+    # that run, and every build job must have succeeded either way. Main's
+    # candidate is signed with the release key; a release train's nightly
+    # build (#1363) with the nightly key, and it's uploaded as `nightly-*`.
     if: >-
-      ${{ !cancelled() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+      ${{ !cancelled() && github.event_name == 'workflow_dispatch'
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release-'))
       && needs.build-pdf.result == 'success' && needs.build-binaries.result == 'success'
       && needs.build-guest-images.result == 'success' && needs.test-packaging.result == 'success'
       && (needs.validate-release.result == 'success'
@@ -291,6 +305,15 @@ jobs:
           pattern: guest-image-*
           merge-multiple: true
           path: dist
+      - name: Choose the release or nightly channel
+        env:
+          CANDIDATE_REF: ${{ github.ref }}
+        run: |
+          case "$CANDIDATE_REF" in
+            refs/heads/main) printf 'CHANNEL=release\nARTEFACT=candidate\n' >> "$GITHUB_ENV" ;;
+            refs/heads/release-*) printf 'CHANNEL=nightly\nARTEFACT=nightly\n' >> "$GITHUB_ENV" ;;
+            *) echo "never signed: $CANDIDATE_REF" >&2; exit 1 ;;
+          esac
       - name: Read candidate version
         run: |
           python3 - <<'PYCODE' >> "$GITHUB_ENV"
@@ -299,11 +322,22 @@ jobs:
               print("RELEASE_TAG=v" + tomllib.load(source)["package"]["version"])
           PYCODE
       - name: Sign complete matrix and generate release metadata
+        if: github.ref == 'refs/heads/main'
         env:
           RELIABURGER_RELEASE_KEY: ${{ secrets.RELIABURGER_RELEASE_KEY }}
           RELEASE_REPOSITORY: ${{ github.repository }}
         run: >-
           python3 scripts/release/package.py --directory dist
+          --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY"
+      - name: Sign a train's nightly build with the nightly key
+        # Unreleased code never sees the release key. Only binaries built
+        # with the nightly-signing feature trust this one.
+        if: startsWith(github.ref, 'refs/heads/release-')
+        env:
+          RELIABURGER_NIGHTLY_KEY: ${{ secrets.RELIABURGER_NIGHTLY_KEY }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: >-
+          python3 scripts/release/package.py --channel nightly --directory dist
           --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY"
       - name: Record exact candidate identity and all asset digests
         env:
@@ -316,29 +350,30 @@ jobs:
           digest=$(python3 scripts/release/candidate.py record --directory dist \
             --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" \
             --commit "$CANDIDATE_COMMIT" --run-id "$CANDIDATE_RUN" \
-            --run-attempt "$CANDIDATE_ATTEMPT")
+            --run-attempt "$CANDIDATE_ATTEMPT" --channel "$CHANNEL")
           # The log line is what `gh run view --log` finds; the summary is
           # for people reading the run page.
           echo "Qualification manifest SHA-256: $digest"
           if [ -n "$CI_RUN" ]; then source_ci="reused ci.yml run $CI_RUN"; else source_ci="ran in this build"; fi
           echo "Source CI: $source_ci"
-          printf 'Candidate commit: `%s`\n\nRun: `%s`, attempt: `%s`\n\nSource CI: %s\n\nQualification manifest SHA-256: `%s`\n' \
-            "$CANDIDATE_COMMIT" "$CANDIDATE_RUN" "$CANDIDATE_ATTEMPT" "$source_ci" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Channel: %s\n\nCandidate commit: `%s`\n\nRun: `%s`, attempt: `%s`\n\nSource CI: %s\n\nQualification manifest SHA-256: `%s`\n' \
+            "$CHANNEL" "$CANDIDATE_COMMIT" "$CANDIDATE_RUN" "$CANDIDATE_ATTEMPT" "$source_ci" "$digest" >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve the qualification manifest on its own
         # A few kilobytes that hash to the digest above, so qualification
         # can read it without the whole candidate. Staging and promotion
         # still download the full artefact and verify every byte.
         uses: actions/upload-artifact@v4
         with:
-          name: candidate-manifest-${{ github.sha }}-${{ github.run_attempt }}
+          name: ${{ env.ARTEFACT }}-manifest-${{ github.sha }}-${{ github.run_attempt }}
           path: dist/candidate.json
           if-no-files-found: error
           retention-days: 1
       - name: Preserve signed candidate without publishing a release
         uses: actions/upload-artifact@v4
         with:
-          name: candidate-${{ github.sha }}-${{ github.run_attempt }}
+          name: ${{ env.ARTEFACT }}-${{ github.sha }}-${{ github.run_attempt }}
           path: dist/*
           if-no-files-found: error
           compression-level: 0
-          retention-days: 90
+          # A nightly is staged the same day and superseded the next.
+          retention-days: ${{ env.CHANNEL == 'nightly' && 7 || 90 }}

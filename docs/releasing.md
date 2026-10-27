@@ -488,6 +488,47 @@ signature verification. Public release signatures establish project provenance.
 Operators using the dual-signature upgrade policy still need to approve binaries
 with their configured external key.
 
+### Nightly signing key
+
+A release train's nightly build ([below](#nightly-qualification-on-the-train-tip))
+is unreleased code, so the release key never signs it. It has a key of its
+own (maintainer decision, 27 October 2026,
+[#1363](https://github.com/reliaburger/reliaburger/issues/1363)):
+
+- The private key is the Actions secret `RELIABURGER_NIGHTLY_KEY`, in the same
+  format as the release key's secret. `build.yml` uses it in one step, which
+  runs only on a `release-*` branch; the release key's step runs only on
+  `main`. A test in `test_build_workflow.py` holds both conditions.
+- The public key is `NIGHTLY_SIGNING_KEYS` in `src/upgrade/keys.rs`, next to
+  the release keys. Only a binary built with the `nightly-signing` Cargo
+  feature trusts it, and that binary trusts no release key. `build.yml`
+  turns the feature on for a train's build and never for `main`'s. So a
+  released relish refuses a nightly bun or guest image, a released bun never
+  upgrades to a nightly, and a nightly cluster never takes a release-signed
+  binary for its own.
+- `package.py --channel nightly` signs with it. It refuses a key that's in
+  the release list, refuses to run at all while `RELIABURGER_RELEASE_KEY` is
+  in its environment, and checks the key against the nightly list before
+  signing anything, exactly as the release channel does.
+
+The maintainer sets it up once, on a machine with `gh` signed in and a
+`relish` binary (any build), keeping the private key off the repository:
+
+```sh
+relish dev keygen --out ~/reliaburger-nightly-key
+base64 < ~/reliaburger-nightly-key/release.key | gh secret set RELIABURGER_NIGHTLY_KEY
+cat ~/reliaburger-nightly-key/release.pub
+```
+
+`relish dev keygen` names its files `release.key` and `release.pub` whatever
+they're for. The `ed25519:…` line it printed goes into
+`NIGHTLY_SIGNING_KEYS`. With an empty list, a train's build fails at signing
+with "signing key is not trusted by the binaries it signs". The maintainers
+created the key on 27 October 2026, and the 0.2.4 train carries its public
+half. Keep an offline backup of the private key
+with the release key's. Losing it costs nothing that matters: generate a
+new pair, replace the secret and the line, and the next night uses it.
+
 ## Metadata and publication
 
 Candidate building and release publication are separate manual operations.
@@ -518,7 +559,9 @@ line names the run the candidate rests on.
 Only after those checks pass does it collect the two built guest images, sign
 all six binaries and both images' digests, and upload `candidate-<commit>-<attempt>` as an Actions artefact.
 It creates no Git tag or GitHub release. PR and ordinary main builds never use
-the release signing secret.
+the release signing secret, and a manual build of a `release-*` train signs
+with the [nightly key](#nightly-signing-key) instead, as a `nightly-*`
+artefact.
 
 Download that artefact for qualification. Preserve its run ID, attempt, source
 commit and the `candidate.json` SHA-256 alongside the qualification results.
@@ -611,7 +654,7 @@ the freeze on a candidate.
 
 ```sh
 scripts/release/nightly-qualify.sh --train release-0-2-4 --gate patch \
-  --base-url https://github.com/reliaburger/reliaburger/releases/download/STAGED_BUILD_OF_THE_TIP \
+  --base-url https://github.com/reliaburger/reliaburger/releases/download/nightly-v0.2.4-RUN_ID-ATTEMPT \
   --qualified-digest ITS_DIGEST [--soak-bun /path/to/bun-v0.2.4-soak.1]
 ```
 
@@ -629,12 +672,53 @@ tier's own record, `nightly.json` and a README naming the exact commit and
 the verdict. `--plan` (or `--dry-run`) resolves the tip and prints the tiers,
 touching nothing.
 
-Where the tip's staged build comes from is still open in #1363. `build.yml`
-signs only manual builds of `main` and `stage.yml` stages only those, because
-a release-signed build of unreleased code is as dangerous as the soak build
-[below](#soaking-a-candidate-in-ci). Until that's decided, a nightly whose
-soaks have no staged build is red, and the freeze falls back to running the
-soaks on the candidate (step 4).
+The staged build is the train's **nightly build**: the tip built by
+`build.yml` and signed with the [nightly key](#nightly-signing-key), never the
+release key, because a release-signed build of unreleased code is as
+dangerous as the soak build [below](#soaking-a-candidate-in-ci) (maintainer
+decision, 27 October 2026). Each day, after the last merge to the train:
+
+```sh
+gh workflow run build.yml --ref release-0-2-4
+# when it finishes, from its summary or log (as in step 1 of staging):
+gh workflow run stage.yml --ref main \
+  -f channel=nightly -f candidate_run=RUN_ID -f qualified_digest=ITS_DIGEST
+```
+
+On a `release-*` branch the build compiles every binary with the
+`nightly-signing` feature, so they trust the nightly key and no release key,
+signs with `RELIABURGER_NIGHTLY_KEY`, writes `"channel": "nightly"` into
+`candidate.json` and uploads it as `nightly-<commit>-<attempt>` (kept for 7
+days) instead of `candidate-…`. It reuses the train's CI run exactly as a
+candidate build reuses main's. `stage.yml` with `channel=nightly` accepts only
+a successful manual build of a `release-X-Y-Z` branch whose record says
+nightly, and publishes it as the pre-release `nightly-v0.2.4-RUN_ID-ATTEMPT`,
+never marked latest. Nothing can mistake it for a release:
+
+- promotion refuses any tag containing `nightly`, and `candidate.py`
+  refuses a nightly record, run or artefact for a release;
+- `docs/website/install.sh` refuses a mirror whose last path segment starts
+  with `nightly-` unless `RELIABURGER_ACCEPT_NIGHTLY=1`, and
+  `nightly-qualify.sh` sets that for its soaks and nothing else does;
+- even with that set by hand, a released `relish` or `bun` refuses the
+  nightly's signatures, because it doesn't trust the nightly key.
+
+Before any tier, `nightly-qualify.sh` checks the staged build's
+`candidate.json` against the digest and the tip, and checks its guest images'
+signatures against the key its channel names, so a nightly signed with
+anything but the nightly key stops the night before a soak starts. Relish then
+checks every bun and guest image it installs against the nightly key compiled
+into it. For the full gate's job final, the soak bun is built from the tip
+with `--features ebpf,nightly-signing` and signed with the nightly key
+(`relish dev sign-binary --key ~/reliaburger-nightly-key/release.key bun-v0.2.4-soak.1`),
+because a nightly cluster upgrades only to binaries the nightly key signed.
+
+**Cleanup.** Every nightly staging run ends by deleting all but the newest
+seven `nightly-*` pre-releases, with their tags (`candidate.py
+prune-nightly --keep 7`). It never touches a release, a draft release of a
+version or a `staging-*` candidate. A night that has no staged build of its
+tip is red, and the freeze falls back to running the soaks on the
+candidate (step 4).
 
 [`nightly-qualify.plist.example`](../scripts/release/nightly-qualify.plist.example)
 is a launchd job that starts it at 18:00; the patch gate's tiers take about
@@ -1275,6 +1359,9 @@ as a downgrade target. Doing it safely needs its own environment with
 required reviewers, the key used in one step and never written to disk,
 signing inside the soak job so the build never leaves the runner or becomes
 an artefact, and ideally a separate soak key that only soak clusters trust. None of that is in place, so CI doesn't try.
+The [nightly signing key](#nightly-signing-key) is that separate key for a
+train's nightly build, though not for a release candidate's soak, whose
+binaries trust only the release key.
 
 ## Qualifying a candidate from another host
 

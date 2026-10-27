@@ -12,6 +12,12 @@ the staged installs.
     nightly.py run --train release-0-2-4 [--gate patch|full] [options]
     nightly.py freeze-check --records DIR --commit SHA [--gate patch|full]
 
+The soaks install a staged build of the tip: normally the train's nightly
+build, signed with the nightly key and staged under a `nightly-` tag
+(docs/releasing.md). Before any tier runs, `run` checks that its
+candidate.json hashes to the digest, names the tip's code, and that its guest
+images are signed with the key its channel names.
+
 `scripts/release/nightly-qualify.sh` wraps `run` and keeps the Mac awake.
 `run --plan` (or `--dry-run`) resolves the tip and prints the tiers it would
 run, touching nothing. Only the pure parts are tested here
@@ -32,8 +38,11 @@ import tempfile
 import time
 import urllib.request
 
+from package import GUEST_METADATA, guest_image_statement, trusted_keys, verify_signature
+
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
+ACCEPT_NIGHTLY = "RELIABURGER_ACCEPT_NIGHTLY"
 RECORD = "nightly.json"
 README = "README.md"
 SCHEMA = 1
@@ -188,6 +197,54 @@ def staged_problems(manifest, digest, commit, same_tree):
     return []
 
 
+def signature_problems(manifest, guest_metadata, keys_source):
+    """Why the staged build isn't signed with the key its channel names, or an empty list.
+
+    A train's nightly build (`"channel": "nightly"` in candidate.json) must be
+    signed with a key in `NIGHTLY_SIGNING_KEYS`, a staged release candidate
+    with one in `EMBEDDED_RELEASE_KEYS` (`keys_source` is the text of
+    src/upgrade/keys.rs). The guest images' signed statements are the check:
+    a few kilobytes, where the signed binaries are hundreds of megabytes.
+    Relish then checks every binary and image it installs against the keys
+    compiled into it, which in a nightly build are the nightly keys.
+    """
+    record = json.loads(manifest)
+    channel = record.get("channel", "release")
+    keys = trusted_keys(keys_source, channel)
+    if not keys:
+        return [f"src/upgrade/keys.rs has no {channel} public key yet (docs/releasing.md, "
+                "\"Nightly signing key\")"]
+    assets = record.get("assets", {})
+    if hashlib.sha256(guest_metadata).hexdigest() != assets.get(GUEST_METADATA, {}).get("sha256"):
+        return [f"{GUEST_METADATA} doesn't match candidate.json"]
+    images = json.loads(guest_metadata).get("images") or {}
+    if not images:
+        return [f"{GUEST_METADATA} signs no guest image"]
+    problems = []
+    for arch, image in sorted(images.items()):
+        if image.get("sha256") != assets.get(image.get("asset"), {}).get("sha256"):
+            problems.append(f"the {arch} guest image in {GUEST_METADATA} doesn't match candidate.json")
+            continue
+        statement = guest_image_statement(record.get("version", ""), arch, image["asset"], image["sha256"],
+                                          image.get("source", {}).get("sha256", ""))
+        if not any(verify_signature(key, statement, image.get("signature", "")) for key in keys):
+            problems.append(f"the {arch} guest image isn't signed by the {channel} key")
+    return problems
+
+
+def tier_environment(environment, channel):
+    """The environment a tier runs in: a nightly's soaks may install it through the website bootstrap.
+
+    docs/website/install.sh refuses a `nightly-` mirror unless
+    RELIABURGER_ACCEPT_NIGHTLY=1, so nobody installs one by accident. The
+    nightly is the one place that asks for it, and only for a nightly build.
+    """
+    environment = {name: value for name, value in environment.items() if name != ACCEPT_NIGHTLY}
+    if channel == "nightly":
+        environment[ACCEPT_NIGHTLY] = "1"
+    return environment
+
+
 def git(*arguments, repository=REPOSITORY):
     return subprocess.run(["git", *arguments], cwd=repository, check=True, capture_output=True,
                           text=True).stdout.strip()
@@ -213,6 +270,11 @@ def now():
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def fetch(base_url, name):
+    with urllib.request.urlopen(f"{base_url.rstrip('/')}/{name}", timeout=60) as response:
+        return response.read()
+
+
 def command_run(args):
     remote_tip = git("ls-remote", args.remote, f"refs/heads/{args.train}").split()
     if not remote_tip:
@@ -236,17 +298,23 @@ def command_run(args):
         print(f"nightly: {run_dir} exists; records are never overwritten", file=sys.stderr)
         return 2
     git("fetch", "--quiet", args.remote, f"refs/heads/{args.train}")
+    channel = "release"
     if staged:
-        with urllib.request.urlopen(f"{args.base_url.rstrip('/')}/candidate.json", timeout=60) as response:
-            problems = staged_problems(response.read(), args.qualified_digest, commit, same_tree)
+        manifest = fetch(args.base_url, "candidate.json")
+        problems = staged_problems(manifest, args.qualified_digest, commit, same_tree)
+        if not problems:
+            channel = json.loads(manifest).get("channel", "release")
+            keys_source = (REPOSITORY / "src" / "upgrade" / "keys.rs").read_text()
+            problems = signature_problems(manifest, fetch(args.base_url, GUEST_METADATA), keys_source)
         if problems:
             print("nightly: " + "; ".join(problems), file=sys.stderr)
             return 2
+    environment = tier_environment(os.environ, channel)
     run_dir.mkdir(parents=True)
     git("worktree", "add", "--quiet", "--detach", str(checkout), commit)
     started = now()
     try:
-        results = run_tiers(steps, lambda argv: subprocess.run(argv, cwd=checkout).returncode)
+        results = run_tiers(steps, lambda argv: subprocess.run(argv, cwd=checkout, env=environment).returncode)
     finally:
         git("worktree", "remove", "--force", str(checkout))
     record = dict(schema=SCHEMA, train=args.train, commit=commit, tree=tree_of(commit), date=date,

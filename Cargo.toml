@@ -104,6 +104,9 @@ aya-log = { version = "0.3", optional = true }
 default = ["kubernetes"]
 kubernetes = ["dep:k8s-openapi"]
 ebpf = ["aya", "aya-log"]
+# A release train's nightly build (build.yml on `release-*`, #1363) trusts the
+# nightly signing key instead of the release keys. Never in a release build.
+nightly-signing = []
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
