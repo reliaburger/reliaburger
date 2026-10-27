@@ -90,6 +90,11 @@ jobs:
     # itself failed (a failed search leaves reuse empty).
     needs: ci-evidence
     if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && needs.ci-evidence.outputs.reuse != 'true' }}
+    # ci.yml's cluster and acceptance jobs list this run's artefacts to
+    # fetch the test archive (#977); a called workflow gets no more than this.
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/ci.yml
 
   build-pdf:

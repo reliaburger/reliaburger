@@ -34,7 +34,18 @@ OWNERS = {
     'upgrade-cluster': ['make', 'test-upgrade-cluster'],
     'standard-clients': ['make', 'test-standard-clients'],
 }
-ARCHIVE_COMMAND = ['cargo', 'nextest', 'archive', '--locked', '--archive-file', 'tests.tar.zst']
+# The integration test binaries the archived owners run: every `binary(...)`
+# in their make targets' filters. Archiving all 47 binaries made a 3.0 GB
+# archive whose download often ran past its limit (#977). Cargo still builds
+# bun, relish and testapp for these tests' `CARGO_BIN_EXE_*`, and nextest
+# archives them with the test binaries.
+ARCHIVED_BINARIES = (
+    'cluster_failover', 'cluster_gossip', 'council_self_healing', 'council_disaster_recovery',
+    'placement', 'cluster_task_arrays', 'registry_durability', 'demos',
+    'integration', 'self_upgrade', 'self_upgrade_cluster', 'suite',
+)
+ARCHIVE_COMMAND = (['cargo', 'nextest', 'archive', '--locked', '--archive-file', 'tests.tar.zst']
+                   + [word for name in ARCHIVED_BINARIES for word in ('--test', name)])
 # The owners that run from the build-tests job's nextest archive.
 ARCHIVED_GATES = ('cluster-tests', 'slow-tests', 'upgrade-node', 'upgrade-cluster', 'standard-clients')
 # Each consumer job extracts the archive once into its checkout. Listing only

@@ -674,6 +674,28 @@ with no multi-gigabyte rehashing.
 The local recipes work the same way, by the way: `make test-upgrade-node` followed by
 `make test-upgrade-cluster` shares one `target` directory too.
 
+Building once also meant downloading once per job, and that turned out to be the fragile
+part (#977). The archive held all 47 binaries, 3.0 GB, and `actions/download-artifact` fetched
+it in anything from 33 seconds to almost five minutes. One download took 13 minutes and pushed
+`acceptance` past its limit, so we gave each attempt five minutes and one retry. That made
+things worse in a way we didn't see at first. On a slow runner both attempts ran out of time,
+and the retry started again from the first byte. In one run the cluster job failed this way
+three times in a row, while the acceptance job next to it fetched the same archive in 35
+seconds. The action logs nothing while it transfers, so a slow download and a hung one looked
+the same.
+
+So we fixed the two things that made a slow runner fatal. The archive now holds only the
+twelve test binaries those jobs run, plus the `bun`, `relish` and `testapp` they launch, which
+Cargo builds for any integration test. A test reads the make targets' `binary(...)` filters and
+fails if a suite names a binary the archive lacks. And a small script,
+`scripts/ci/fetch_artifact.py`, fetches the archive instead of the action. Each attempt asks
+for the bytes it doesn't have yet with an HTTP `Range` header, so a dropped connection resumes
+rather than restarts. An attempt is abandoned only after a minute without a single byte, not
+after a fixed wall-clock limit, so a slow but steady transfer finishes. It logs its progress,
+so the next slow runner tells us how slow. One detail bit us in the tests: Python's
+`response.read(1 MiB)` waits for the whole megabyte, so the bytes that arrived before a stall
+were thrown away with the timeout. `read1` returns whatever has arrived.
+
 The last piece is choosing what a run needs. A small script diffs a pull request against its
 base and sets three outputs, and every expensive job asks one of them:
 
