@@ -3652,7 +3652,13 @@ data-bearing apps and checks the same invariants every 30 seconds: agent-loop
 budgets, panics, restarts, leaks and the job controller's heartbeat. What it
 drops is the fault schedule. A day run with killed agents and powered-off VMs
 would measure how fast we recover, not how fast we run, so its whole length is
-the quiet wait every tier ends with. The leak checkers like that: in a final
+the quiet wait every tier ends with. It also adds one step. Quickstart makes
+2 vCPU / 2 GiB VMs, sized for a laptop, but the scale-out numbers the day rests
+on came from 4 vCPU / 6 GiB nodes. The tier stops each VM in turn, resizes it
+with `limactl edit` and starts it again, the same way the power-off fault does,
+waiting for the council to be whole before moving to the next. Doing it one
+node at a time keeps two of three council members up, so Raft never loses its
+quorum during setup. The leak checkers like that: in a final
 they get a two-hour quiet tail to arm in, and here they get the whole day.
 
 The job controller gains a `day` load. Host work runs as the biggest arrays
