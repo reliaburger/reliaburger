@@ -4066,13 +4066,20 @@ async fn a_service_retirement_leaves_its_republication_write_in_flight() {
     while !agent.consumer_syncs.is_idle() {
         one_consumer_sync_turn(&mut agent).await;
     }
-    // The retirement's own journal write waits only until the turn's
-    // deadline too. On a slow disk (the coverage runner, once) the ask that
-    // starts it answers `StillRunning` and a later one finds it landed, as
-    // the worker would; the stall makes that the path every time.
+    // The retirement's own two journal writes, `Withdrawn` and then the
+    // removal, wait only until the turn's deadline too. On a slow disk (the
+    // coverage runner, twice) the ask that starts either one answers
+    // `StillRunning` and a later one finds it landed, as the worker would;
+    // the stall makes that the path every time, for both writes.
     agent
         .loop_stalls
         .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let (_, result) = retire_service_turn(&mut agent, &service).await;
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    landing_turn(&mut agent).await;
     let (_, result) = retire_service_turn(&mut agent, &service).await;
     assert!(
         matches!(result, Err(BunError::StillRunning { .. })),
@@ -4082,8 +4089,12 @@ async fn a_service_retirement_leaves_its_republication_write_in_flight() {
         .loop_stalls
         .set(LoopStall::Persist, std::time::Duration::ZERO);
     landing_turn(&mut agent).await;
+
+    // Both writes are on disk: the last ask writes nothing.
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
     let (_, result) = retire_service_turn(&mut agent, &service).await;
     result.unwrap();
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
     assert!(!agent.discovery_write_in_flight());
     assert_eq!(journalled_backends(&agent, &service), None);
     assert!(agent.consumer_owner().is_some_and(|owner| {
