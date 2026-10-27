@@ -225,9 +225,7 @@ pub async fn batch_submit_handler(
     }
     // Preserve the caller on the second hop so the leader repeats admission
     // against its authoritative grants, without granting system authority.
-    if let Some(council) = &state.council
-        && !council.is_leader().await
-    {
+    if let Some(council) = super::task_array_api::council_to_forward_to(&state).await {
         return forward_to_leader(&state, council, "/v1/batch", body, &headers).await;
     }
     let _gate = if state.council.is_none() {
@@ -311,9 +309,7 @@ pub async fn batch_status_handler(
     headers: axum::http::HeaderMap,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
 ) -> Response {
-    if let Some(council) = &state.council
-        && !council.is_leader().await
-    {
+    if let Some(council) = super::task_array_api::council_to_forward_to(&state).await {
         return forward_get_to_leader(&state, council, &format!("/v1/batch/{batch_id}"), &headers)
             .await;
     }

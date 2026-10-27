@@ -237,9 +237,7 @@ pub async fn submit_handler(
         return response;
     }
     crate::bun::audit::annotate_workload(&request.name, &namespace);
-    if let Some(council) = &state.council
-        && !council.is_leader().await
-    {
+    if let Some(council) = super::task_array_api::council_to_forward_to(&state).await {
         return super::batch::forward_to_leader(&state, council, "/v1/jobs/runs", body, &headers)
             .await;
     }
@@ -334,9 +332,7 @@ pub async fn replay_handler(
     ) {
         return response;
     }
-    if let Some(council) = &state.council
-        && !council.is_leader().await
-    {
+    if let Some(council) = super::task_array_api::council_to_forward_to(&state).await {
         return super::batch::forward_to_leader(
             &state,
             council,
@@ -406,9 +402,7 @@ pub async fn disable_schedule_handler(
     ) {
         return response;
     }
-    if let Some(council) = &state.council
-        && !council.is_leader().await
-    {
+    if let Some(council) = super::task_array_api::council_to_forward_to(&state).await {
         return super::batch::forward_to_leader(
             &state,
             council,
@@ -452,9 +446,7 @@ pub(crate) async fn stop_definition(
 ) -> Option<Response> {
     let arrays = read_task_arrays(state).await;
     arrays.jobs().definition(namespace, name)?;
-    if let Some(council) = &state.council
-        && !council.is_leader().await
-    {
+    if let Some(council) = super::task_array_api::council_to_forward_to(state).await {
         return Some(
             super::batch::forward_to_leader(
                 state,
