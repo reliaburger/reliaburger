@@ -521,11 +521,11 @@ cat ~/reliaburger-nightly-key/release.pub
 ```
 
 `relish dev keygen` names its files `release.key` and `release.pub` whatever
-they're for. Paste the `ed25519:…` line it printed into
-`NIGHTLY_SIGNING_KEYS`, in place of the `NIGHTLY_PUBLIC_KEY` comment, as
-`"ed25519:…",`, and merge that into `main` and the open train. Until then the
-list is empty, and a train's build fails at signing with "signing key is not
-trusted by the binaries it signs". Keep an offline backup of the private key
+they're for. The `ed25519:…` line it printed goes into
+`NIGHTLY_SIGNING_KEYS`. With an empty list, a train's build fails at signing
+with "signing key is not trusted by the binaries it signs". The maintainers
+created the key on 27 October 2026, and the 0.2.4 train carries its public
+half. Keep an offline backup of the private key
 with the release key's. Losing it costs nothing that matters: generate a
 new pair, replace the secret and the line, and the next night uses it.
 

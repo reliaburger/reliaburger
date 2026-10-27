@@ -61,6 +61,10 @@ class KeyListTests(unittest.TestCase):
         self.assertEqual(trusted_keys(KEYS_RS.read_text(), "release"),
                          ["ed25519:zSUgsFfmv0WohbjRJE7FJf/xgLIgMuK7AbnDgOdduRM="])
 
+    def test_the_real_nightly_list_holds_the_key_created_on_27_october(self):
+        self.assertEqual(trusted_keys(KEYS_RS.read_text(), "nightly"),
+                         ["ed25519:MwQBdUzLbKUieHJ054IgcZ5LA/ICyGLLz12G4ifP+bs="])
+
     def test_a_missing_list_is_an_error(self):
         with self.assertRaises(ValueError):
             trusted_keys("pub const SOMETHING_ELSE: &[&str] = &[];", "nightly")

@@ -28,12 +28,10 @@ pub const EMBEDDED_RELEASE_KEYS: &[&str] =
 /// Only a build with the `nightly-signing` feature trusts them, and that
 /// build trusts no release key. `scripts/release/package.py` reads this list
 /// to check the nightly signing key, and refuses a key that's in both lists.
-/// The maintainer creates the key once (docs/releasing.md, "Nightly signing
-/// key"); until then the list is empty and no nightly build can be signed.
-pub const NIGHTLY_SIGNING_KEYS: &[&str] = &[
-    // NIGHTLY_PUBLIC_KEY: replace this comment with the quoted public key
-    // that `relish dev keygen` printed for the nightly key, then a comma.
-];
+/// The maintainers created the key on 27 October 2026 (docs/releasing.md,
+/// "Nightly signing key"); its private half is the `RELIABURGER_NIGHTLY_KEY`
+/// secret.
+pub const NIGHTLY_SIGNING_KEYS: &[&str] = &["ed25519:MwQBdUzLbKUieHJ054IgcZ5LA/ICyGLLz12G4ifP+bs="];
 
 /// The key set this build was compiled to trust.
 fn compiled_keys() -> &'static [&'static str] {
