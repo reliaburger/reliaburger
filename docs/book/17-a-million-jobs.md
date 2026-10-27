@@ -3812,6 +3812,61 @@ new field is an `Option<NodeBreakdown>` marked `#[serde(default)]`, which
 tells serde to fill in `None` when the key is missing instead of refusing the
 file. The human report then says `per node: not recorded`.
 
+### A day in one script
+
+The last step before publishing is the day itself: two billion host jobs in
+one real 24-hour day on three nodes (#1032). The issue had one rule about the
+harness: anyone should be able to repeat it, so nobody hand-drives it. It
+became a third tier of the job soak, `qualify-jobs-sustained.sh --tier day`.
+
+The day tier reuses almost everything the release soak already does. It
+builds the same three-node cluster from the staged candidate, runs the same
+data-bearing apps and checks the same invariants every 30 seconds: agent-loop
+budgets, panics, restarts, leaks and the job controller's heartbeat. What it
+drops is the fault schedule. A day run with killed agents and powered-off VMs
+would measure how fast we recover, not how fast we run, so its whole length is
+the quiet wait every tier ends with. It also adds one step. Quickstart makes
+2 vCPU / 2 GiB VMs, sized for a laptop, but the scale-out numbers the day rests
+on came from 4 vCPU / 6 GiB nodes. The tier stops each VM in turn, resizes it
+with `limactl edit` and starts it again, the same way the power-off fault does,
+waiting for the council to be whole before moving to the next. Doing it one
+node at a time keeps two of three council members up, so Raft never loses its
+quorum during setup. The leak checkers like that: in a final
+they get a two-hour quiet tail to arm in, and here they get the whole day.
+
+The job controller gains a `day` load. Host work runs as the biggest arrays
+the API accepts, 16,777,216 tasks each, about 120 a day, so the tail of each
+array, where only some nodes still have chunks, is a small part of the day.
+The controller adds up each node's successes the way `relish bench` does, and
+notes the host-job total on every hour from the start. The record then shows
+each node's share against its fair share, every hour's rate as a bar, and the
+last hour against the first. The run fails if host jobs average less than the
+target, if any node goes more than 20% over its fair share, or if the last
+hour runs more than 10% slower than the first.
+
+The default rate taught a small lesson. The issue says 23,148 a second, and
+that's what 2,000,000,000 ÷ 86,400 rounds to. But a day at 23,148 a second is
+1,999,987,200 tasks: 12,800 short. The default is 23,149, and a test checks
+that a day at it reaches two billion and a day one below doesn't. The floor,
+a billion a day, gets the same treatment: 11,575.
+
+Before booking 24 hours of the bench host, we wanted tests to say the counters
+and retention survive that scale, so the run confirms them rather than finding
+them. Two tests drive a day's worth of work through the code that counts it.
+One registers 120 maximum-size arrays in the task-array store, one every 12
+minutes, runs every chunk on three nodes and checks that the successes add up
+to exactly 120 × 2²⁴ while retention keeps only the last hour's finished runs
+and the replicated state stays under 256 KiB. The other feeds the same day
+into one node's job telemetry, 64 syncs per array, and checks the exported
+counters come out exact. They do. Every counter that spans arrays is a `u64`,
+and the exported value is an `f64`, which holds every whole number up to 2⁵³
+exactly, so a day's two billion is nowhere near the edge. Per-array counters
+are `u32`, but an array can't hold more than 2²⁴ tasks.
+
+The test works out how many arrays a day needs with `u64::div_ceil`, integer
+division that rounds up. In C you'd write `(a + b - 1) / b` and hope the
+addition doesn't overflow; the standard library method can't.
+
 ### Soak jobs while the apps keep running
 
 A fast command completing a million times tells us little about what happens
