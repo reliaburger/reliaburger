@@ -1217,6 +1217,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// pre-upgrade workloads must have been adopted and still be Running.
     /// Commit on success; flag revert and exit on failure (the supervisor
     /// restarts us, and startup recovery swaps the old binary back).
+    ///
+    /// The commit's file work runs off the loop and is waited for only
+    /// until the turn's deadline (#1381); the caller is answered once it
+    /// has landed, in this turn or a follow-up turn.
     pub(super) async fn handle_upgrade_verify(
         &mut self,
         marker: crate::upgrade::marker::UpgradeMarker,
@@ -1255,34 +1259,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if let Err(reason) = self.verify_upgrade_inventory(&marker).await {
                 eprintln!("bun: note: {reason} — not reverting (cluster reschedules placements)");
             }
-            match manager.commit(&marker) {
-                Ok(()) => {
-                    println!(
-                        "bun: upgrade to {} verified and committed",
-                        marker.target_version
-                    );
-                    let _ = response.send(Ok(true));
-                }
-                Err(e) => {
-                    let _ = response.send(Err(BunError::Upgrade(e)));
-                }
-            }
+            self.commit_verified_upgrade(manager, marker, response)
+                .await;
             return;
         }
 
         match self.verify_upgrade_inventory(&marker).await {
-            Ok(()) => match manager.commit(&marker) {
-                Ok(()) => {
-                    println!(
-                        "bun: upgrade to {} verified and committed",
-                        marker.target_version
-                    );
-                    let _ = response.send(Ok(true));
-                }
-                Err(e) => {
-                    let _ = response.send(Err(BunError::Upgrade(e)));
-                }
-            },
+            Ok(()) => {
+                self.commit_verified_upgrade(manager, marker, response)
+                    .await;
+            }
             Err(reason) => {
                 let _ = manager.mark_revert_pending(&marker, &reason);
                 let _ = response.send(Ok(false));

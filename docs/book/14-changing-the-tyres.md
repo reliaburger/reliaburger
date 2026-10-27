@@ -475,9 +475,48 @@ The sleep turned out to have been hiding a second bug. A leader rolling the clus
 
 While an upgrade is staged, the agent sets a **drain flag**: new deploys are refused with a clear message; running workloads are untouched. It's one `AtomicBool`: the cluster-level version of "don't schedule onto an upgrading node" comes later, in the orchestrator; this is the node defending itself.
 
-After the exec, the new binary's boot does what §14.4 and §14.5 built: startup recovery returns `Continue { verify: Some(marker) }`, workloads get adopted, and a task waits out `boot_grace_secs` (default 30; surviving the grace period is itself part of the proof, since crashing inside it burns a boot attempt). Then it commits: write history, delete the marker, GC old binaries (protecting the one we'd revert to: the §14.3 `protect` list in action). A genuinely broken new binary never reaches this point: it crash-loops inside the grace window and the boot-attempt budget (§14.4) reverts it first.
+After the exec, the new binary's boot does what §14.4 and §14.5 built: startup recovery returns `Continue { verify: Some(marker) }`, workloads get adopted, and a task waits out `boot_grace_secs` (default 30; surviving the grace period is itself part of the proof, since crashing inside it burns a boot attempt). Then it commits: write history, GC old binaries (protecting the one we'd revert to and the one now running: the §14.3 `protect` list in action), delete the marker. A genuinely broken new binary never reaches this point: it crash-loops inside the grace window and the boot-attempt budget (§14.4) reverts it first.
 
 There's a subtlety about *what* counts as a broken upgrade, and it bit us in the cluster tests. On a **single node**, the agent also checks the marker's inventory: every workload that was `Running` before the swap must be `Running` after. A vanished workload there really is a failed swap (nothing else could have moved it), so it triggers `mark_revert_pending` + `exit(1)`. But in a **cluster**, workload placement belongs to the scheduler, not the node: while the node bounces, the leader may legitimately reschedule an app elsewhere. A node that reverted its own (perfectly good) binary because the cluster moved a workload would be confusing correctness for coincidence. So in cluster mode the inventory mismatch is logged, not fatal: liveness through the grace window is the proof, and the "containers survive" guarantee rests on adoption (§14.5) plus the crash-loop budget, not on a placement census the node no longer owns. (The inventory skips jobs either way: a run-to-completion job finishing *during* the upgrade is success, not a casualty.)
+
+### Committing off the loop
+
+The commit is three bits of file work, and for a long time the agent did all three inside one turn of its loop: `handle_upgrade_verify` called `UpgradeManager::commit`, which is plain `std::fs`. On a healthy disk that's a millisecond or two. The GC step, though, deletes old Bun binaries of about 100 MB each, and a disk that's busy (or a VM whose host is busy) can make that take seconds. While it does, nothing else on the node gets a turn: no status, no deploy step, no health probe. The 0.2.3 candidate's soak caught one: `agent loop turn took 2260 ms in command (upgrade_verify)`, more than twice the 1 s turn budget (#1381).
+
+The fix is the deal every other slow writer on the loop already gets (chapter 15 tells that story at length): wait for the work only until the turn's deadline, then let it land off the loop. `commit_verified_upgrade` in `src/bun/agent/follow_ups.rs` hands the whole commit to a blocking thread and keeps the handle:
+
+```rust
+let committing = marker.clone();
+let mut commit = tokio::spawn(async move {
+    commit_outcome(tokio::task::spawn_blocking(move || manager.commit(&committing)).await)
+});
+match tokio::time::timeout_at(self.turn_deadline(), &mut commit).await {
+    Ok(joined) => finish_upgrade_commit(UpgradeCommit {
+        marker,
+        committed: commit_outcome(joined),
+        response,
+    }),
+    Err(_) => {
+        self.follow_ups.spawn(async move {
+            FollowUp::UpgradeCommitted(UpgradeCommit {
+                marker,
+                committed: commit_outcome(commit.await),
+                response,
+            })
+        });
+    }
+}
+```
+
+`spawn_blocking` runs a closure on Tokio's pool of threads set aside for blocking calls, so a slow `unlink` holds one of those, not the thread the loop runs on. The interesting Rust is `&mut commit`. A `JoinHandle` is itself a future, and `timeout_at` takes any future by value. Pass the handle by value and a timeout would drop it, and with it our only way to hear how the commit ended (dropping a `JoinHandle` doesn't stop the task; it just stops anyone listening). A `&mut F` is also a future whenever `F` is a future that's `Unpin`, which `JoinHandle` is. So we lend the handle to the timeout, and if the deadline wins we still own it, and can move it into a follow-up task that awaits the rest. On a healthy disk the commit finishes within the turn and the caller is answered there, exactly as before. On a slow one the turn ends at its 500 ms deadline, and a later `follow_up` turn answers once the commit lands.
+
+Who's waiting for that answer? Only the boot task in `bun` that sent `UpgradeVerify`, and it ignores what comes back. Nothing in `relish`, the orchestrator or the scripts calls verify, so it doesn't need the `StillRunning`-and-ask-again dance other commands use. The orchestrator learns the outcome the way it always did: it polls `/v1/version`, and `upgrade_in_flight` turns false once the marker has gone.
+
+What does have to hold is the order inside `commit`. The history entry is written first and now fsync'd (`sync_all` on the file, and on its directory the first time it's created), so the marker never disappears before the record that says the upgrade committed is on disk. Then GC, then the marker. Keeping GC *before* the marker matters twice over. It's the "do all the work first, flip the visible flag last" rule from §14.4. And it's what makes GC safe against the next upgrade: while the marker is on disk, `prepare` and `prepare_rollback` refuse anything but a re-delivery of the same upgrade, so no new binary can be staged while GC decides what to delete. GC protects the version we came from and the one now running; the marker protects everything else.
+
+The tests are in the agent's loop harness. `status_answers_while_an_upgrade_verification_commits_to_a_stalled_disk` runs the whole loop with the commit stalled for 2.5 s and checks that a status queued meanwhile is answered within the budget, that the verify isn't answered before the commit lands, and that the marker is still there until it does. `an_upgrade_verification_leaves_its_slow_commit_in_flight` drives the turns by hand and counts: one commit, the turn under budget, the answer only from the landing turn. `an_upgrade_commit_prunes_old_binaries_off_the_loop_and_refuses_the_next_upgrade_meanwhile` sends a rollback while the commit is stalled and checks it's refused, and that GC kept the right binaries. Against the inline commit, the counting one failed with `the verification's turn waited for its commit: 2.517645416s in command (upgrade_verify)`. A unit test in `upgrade::manager`, `commit_keeps_the_marker_and_the_binaries_when_history_cannot_be_written`, pins the order: a history file that can't be written leaves the marker and every binary where they were.
+
+`commit_outcome` turns a task that panicked into an `UpgradeError::Io`, so the caller hears about it rather than seeing a dropped channel, and the marker stays for the next boot to sort out. (The test build also has the spawned task wait on a `LoopStall::UpgradeCommit` hook first; that's how the harness makes the commit slow without a slow disk.)
 
 ### The first-ever upgrade
 
