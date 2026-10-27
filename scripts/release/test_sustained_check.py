@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 import time
@@ -1813,3 +1814,102 @@ class TestFailures(unittest.TestCase):
         chaos = script[script.index("chaos_one() {"):script.index("catalogue_pulse() {")]
         self.assertIn('--timeout 600s > "$output" 2> "$output.err"', chaos)
         self.assertIn('record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")"', chaos)
+
+
+DAY = 24 * 3600
+
+
+class DayRecord(unittest.TestCase):
+    """#1032: a day tier is gated on the day itself: the host-job rate, each
+    node's share, the last hour against the first, the drain, the candidate
+    and every leak checker armed. It owes no faults, walks or specials."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.runs = 0
+
+    def day_run(self, rate=23149, per_node=None, last_hour=None, drop=()):
+        import job_soak
+        self.runs += 1
+        self.evidence = Path(self.temp.name) / str(self.runs)
+        self.evidence.mkdir()
+        digest = hashlib.sha256(CANDIDATE).hexdigest()
+        (self.evidence / "metadata.json").write_text(json.dumps(dict(
+            tier="day", schedule="none", started_at=NOW, finished_at=NOW + DAY + 300, duration_target=DAY,
+            candidate_digest=f"`{digest}`", qualified_digest=digest, bootstrapped="true",
+            soak_bun="not supplied: upgrade slots skipped", job_soak=True, job_stop_at=NOW + DAY, job_load="day",
+            target_rate=str(rate if rate >= 23149 else 23149), node_faults=False, cycles=0,
+            ingress_rotation_secs=None, quiet_tail=0)))
+        (self.evidence / "candidate.json").write_bytes(CANDIDATE)
+        (self.evidence / "jobs").mkdir()
+        host = rate * DAY
+        marks = [[NOW + hour * 3600, hour * 3600 * rate] for hour in range(25)]
+        if last_hour is not None:
+            marks[-1][1] = marks[-2][1] + 3600 * last_hour
+        coverage = {mode: {item: True for item in job_soak.REQUIRED if item != "unknown"} for mode in job_soak.MODES}
+        third = host // 3
+        snapshot = dict(stopped=True, active=[], errors=[], coverage=coverage, load="day", target_rate=23149,
+                        started=NOW, heartbeat=NOW + DAY + 100, stop_requested_at=NOW + DAY,
+                        progress={mode: {"succeeded": host if mode == "process" else 1_000_000, "retried": 0}
+                                  for mode in job_soak.MODES},
+                        per_node=per_node if per_node is not None else {
+                            name: dict(succeeded=third, slots=27, restarted=False) for name in NODES},
+                        hour_marks=marks)
+        if "drain" in drop:
+            snapshot.update(stopped=False)
+        (self.evidence / "jobs" / "snapshot.json").write_text(json.dumps(snapshot))
+        armed = {check: dict(armed_seconds=DAY - 3600, longest_seconds=DAY - 3600, samples=2000, processes_armed=1)
+                 for check in ("leak-rss", "leak-fd")}
+        checker.save_state(self.evidence, {
+            "nodes": NODES, "renewals": {"workload-identity": {name: 50 for name in NODES}},
+            "exposure": {} if "exposure" in drop else {name: armed for name in NODES},
+            "job_resources": {name: {"complete": True, "ts": NOW + DAY + 200, "live_owners": 0} for name in NODES}})
+        checker.append_event(self.evidence, ts=NOW, phase="baseline", verdict="ok", detail="1")
+
+    def render(self):
+        record = self.evidence / "record.md"
+        code = checker.render(self.evidence, record)
+        return code, record.read_text()
+
+    def test_a_clean_day_passes_and_records_every_node_and_hour(self):
+        self.day_run()
+        code, text = self.render()
+        self.assertEqual(code, 0, text)
+        self.assertIn("**Day tier: clean.** 2,000,073,600 host-job tasks accepted in", text)
+        self.assertIn("## Execution inventory (gated)", text)
+        self.assertNotIn("MISSING", text)
+        self.assertNotIn("fault:", text.split("## Execution inventory")[1].split("##")[0])
+        self.assertIn("## Day run (#1032)", text)
+        self.assertIn("| rb-a-1 | 27 | 666,691,200 | 7,716.3/s | 33.3% | 33.3% | ok |", text)
+        hours = [line for line in text.splitlines() if re.match(r"\| Hour \d+ \|", line)]
+        self.assertEqual(len(hours), 24)
+        self.assertIn("Last hour against the first: 23,149.0/s against 23,149.0/s, ok", text)
+        self.assertIn("## Leak-checker exposure (gated)", text)
+
+    def test_a_slow_day_fails_and_says_whether_it_made_the_floor(self):
+        self.day_run(rate=15000)
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("host-job rate 15,000.0/s is below the 23149/s target (the billion-a-day floor holds", text)
+        self.assertIn("**Day tier: not clean.**", text)
+
+    def test_an_unbalanced_or_slowing_day_fails(self):
+        self.day_run(per_node={"rb-a-1": dict(succeeded=50, slots=27), "rb-a-2": dict(succeeded=25, slots=27),
+                               "rb-a-3": dict(succeeded=25, slots=27)})
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("rb-a-1 took 50.0% of the host-job successes", text)
+        self.day_run(last_hour=20000)
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("the last hour ran at 20,000.0/s, more than 10% below the first hour's 23,149.0/s", text)
+
+    def test_a_day_without_its_drain_or_armed_leak_checkers_fails(self):
+        for item in ("drain", "exposure"):
+            with self.subTest(item=item):
+                self.day_run(drop=(item,))
+                code, text = self.render()
+                self.assertEqual(code, 1)
+                self.assertNotIn("**Day tier: clean.**", text)
+

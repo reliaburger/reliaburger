@@ -24,7 +24,12 @@
 #                           skipped, and a final tier refuses to start
 #   --tier T                fast (compressed schedule, 60m: the iteration loop
 #                           after each round of fixes), final (full schedule,
-#                           8h) or custom (the default: a diagnostic run that
+#                           8h), day (24h with no faults, walks or specials:
+#                           the #1032 day run, through
+#                           qualify-jobs-sustained.sh --tier day; it needs
+#                           --job-load day and --qualified-digest and refuses
+#                           --soak-bun and --node-faults) or custom (the
+#                           default: a diagnostic run that
 #                           says nothing about either gate); the release
 #                           gate's final soak is the job final,
 #                           qualify-jobs-sustained.sh --tier final. A final
@@ -51,9 +56,12 @@
 #                           the gap is recorded as a pause of the soak clock
 #   --keep                  leave the cluster and the installation afterwards
 #   --job-load L            calibration (the release soak's conservative job
-#                           mix, the default) or target (#668: shared and host
+#                           mix, the default), target (#668: shared and host
 #                           runs become million-task arrays, and the run fails
-#                           unless jobs average --target-rate)
+#                           unless jobs average --target-rate) or day (#1032:
+#                           host runs become the biggest arrays the API takes,
+#                           and the run fails unless host jobs average
+#                           --target-rate, default 23149)
 #   --target-rate R         accepted successes a second for --job-load target
 #                           (default 1390: the 1,158 of 100 million a day, plus
 #                           20% headroom)
@@ -144,15 +152,33 @@ case $job_load in
     target) : "${target_rate:=1390}"
             [[ $target_rate =~ ^[0-9]+$ ]] && [ "$target_rate" -ge 1158 ] \
                 || fail '--target-rate must be a whole number of at least 1158 (100 million accepted jobs a day)' ;;
-    *) fail '--job-load must be calibration or target' ;;
+    day) : "${target_rate:=23149}"
+         [[ $target_rate =~ ^[0-9]+$ ]] && [ "$target_rate" -ge 11575 ] \
+             || fail '--target-rate must be a whole number of at least 11575 (a billion host-job tasks a day)' ;;
+    *) fail '--job-load must be calibration, target or day' ;;
 esac
 # The two tiers (plan D3): fast for the fix-and-rerun loop, final for acceptance.
 case $tier in
     fast) : "${schedule:=compressed}" "${duration_text:=60m}" ;;
     final) : "${schedule:=full}" "${duration_text:=8h}" ;;
+    day) : "${schedule:=none}" "${duration_text:=24h}" ;;
     ''|custom) tier=custom; : "${schedule:=full}" "${duration_text:=24h}" ;;
-    *) fail '--tier must be fast, final or custom' ;;
+    *) fail '--tier must be fast, final, day or custom' ;;
 esac
+# The day run (#1032) is host jobs at the day rate and nothing else: no
+# faults, walks or specials, so the soak build has nothing to do.
+if [ "$tier" = day ]; then
+    [ "$job_load" = day ] || fail 'a day tier needs --job-load day'
+    [ "$node_faults" = false ] || fail 'a day tier injects no node faults'
+    [ -z "$soak_bun" ] || fail 'a day tier has no upgrade walks to run --soak-bun in'
+    [ "$schedule" = none ] || fail 'a day tier runs no fault schedule'
+    if [ "$plan" = false ] && [ "$resume" = false ]; then
+        [ -n "$qualified_digest" ] || fail 'a day tier needs --qualified-digest: the record names the candidate it checked'
+        [ -z "$home" ] || fail 'a day tier bootstraps its own cluster from the candidate; --home adopts one whose candidate this run cannot verify'
+    fi
+elif [ "$job_load" = day ] || [ "$schedule" = none ]; then
+    fail '--job-load day and --schedule none belong to the day tier'
+fi
 [ -z "$seed" ] || [[ $seed =~ ^[0-9]+$ ]] || fail '--seed must be a whole number'
 # A final tier owes every upgrade walk and a candidate it verified itself
 # (#1061), so one that could only finish incomplete never starts.
@@ -198,6 +224,10 @@ case $schedule in
     compressed) cycle=600; hold_min=20; hold_max=40; rotation=300; kill_offset=10
           quorum_hold=60; pulse_every=0; export_every=2; push_every=1; chaos_per_slot=2
           min_cycles=4 ;;
+    # The day tier's: no cycles. The cycle length only paces the heavy checks.
+    none) cycle=3600; hold_min=60; hold_max=180; rotation=900; kill_offset=20
+          quorum_hold=300; pulse_every=0; export_every=6; push_every=1; chaos_per_slot=3
+          min_cycles=0 ;;
     *) fail '--schedule must be full or compressed' ;;
 esac
 slot=$(( cycle / 6 ))
@@ -737,6 +767,32 @@ wait_labels() {
 }
 
 # One leader, three live voters.
+# The day tier's claim rests on the scale-out record (2026-10-27), measured on
+# three 4 vCPU / 6 GiB nodes. Quickstart makes 2 vCPU / 2 GiB ones, so the day
+# resizes each VM, one at a time so the council keeps its quorum: a graceful
+# stop, the new size, `relish local start`, then the node and cluster checks
+# the power-off fault uses.
+day_cpus=4
+day_memory_gib=6
+resize_nodes() {
+    local node
+    for node in 1 2 3; do
+        avoid=$node
+        down[node]=1
+        with_timeout 300 "$limactl" stop "${vm[node]}" > "$evidence/snapshots/resize-$node.log" 2>&1 \
+            || setup_fail "could not stop ${vm[node]} to resize it"
+        with_timeout 60 "$limactl" edit --tty=false --cpus "$day_cpus" --memory "$day_memory_gib" "${vm[node]}" \
+            >> "$evidence/snapshots/resize-$node.log" 2>&1 || setup_fail "could not resize ${vm[node]}"
+        power_on "$node" || setup_fail "relish local start failed for ${vm[node]} after resizing it"
+        wait_node_ready "$node" 300 || setup_fail "${vm[node]} not ready after resizing"
+        wait_cluster 300 || setup_fail "cluster not healthy after resizing ${vm[node]}"
+        avoid=0
+        event --phase configure --target "${vm[node]}" --verdict ok \
+            --detail "resized to $("$limactl" list --format '{{.CPUs}} vCPU {{.Memory}} bytes' "${vm[node]}")"
+    done
+    meta deviations+ "Each quickstart VM resized from 2 vCPU / 2 GiB to $day_cpus vCPU / $day_memory_gib GiB before configuring, the size the scale-out record measured (maintainer decision, 27 October 2026)"
+}
+
 wait_cluster() {
     local deadline=$(( $(date +%s) + $1 )) file=$evidence/.nodes.json
     while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -1773,6 +1829,11 @@ if [ "$plan" = true ]; then
         "$tier" "$schedule" "$duration" "$cycle" "$job_load" "${target_rate:-none}" "$node_faults" "$quiet_tail"
     plan_cycles=$(( (duration + cycle - 1) / cycle ))
     [ "$plan_cycles" -ge "$min_cycles" ] || plan_cycles=$min_cycles
+    if [ "$schedule" = none ]; then
+        plan_cycles=0
+        printf 'plan: day %s s with no faults, walks or specials, then the drain\n' "$duration"
+    fi
+    [ "$tier" != day ] || printf 'plan: resize %s vCPU %s GiB each node, one at a time, before configuring\n' "$day_cpus" "$day_memory_gib"
     printf 'plan: %s\n' "$job_runs"
     printf 'plan: seed %s for every fault and node choice\n' "${seed:-random}"
     for (( index = 0; index < plan_cycles; index++ )); do run_cycle "$index" 0; done
@@ -1832,6 +1893,7 @@ else
 import json, sys
 json.dump({"nodes": sys.argv[2:]}, open(sys.argv[1], "w"))
 PY
+    [ "$tier" != day ] || resize_nodes
     configure_nodes
     apply_workloads
     versions=$(node_versions)
@@ -1865,7 +1927,8 @@ fi
 next_light=$(date +%s)
 next_heavy=$(( $(date +%s) + heavy_every ))
 index=$first_cycle
-while :; do
+# A day tier runs no cycles: its whole length is the wait below.
+while [ "$schedule" != none ]; do
     cycle_start=$(( started_at + index * cycle ))
     # A cycle that starts finishes; none starts once the soak time is up,
     # unless the run hasn't yet reached min_cycles.
