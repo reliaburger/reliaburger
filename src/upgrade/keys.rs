@@ -4,6 +4,11 @@
 //! (rather than a single key) allows rotation: ship a binary trusting both
 //! the old and new key, sign the next release with the new key only, then
 //! drop the old key a release later.
+//!
+//! A release train's nightly build is the one exception. It's compiled with
+//! the `nightly-signing` feature and trusts the nightly keys *instead of* the
+//! release keys, so the release key never signs unreleased code and no
+//! released binary ever accepts a nightly one (#1363).
 
 use crate::config::node::UpgradeSection;
 
@@ -16,6 +21,28 @@ use super::signing::{PublicKey, parse_public_key};
 /// process notes in docs/README.md). Verified by `embedded_keys_parse`.
 pub const EMBEDDED_RELEASE_KEYS: &[&str] =
     &["ed25519:zSUgsFfmv0WohbjRJE7FJf/xgLIgMuK7AbnDgOdduRM="];
+
+/// Ed25519 public keys trusted by a release train's nightly build, and by
+/// nothing else.
+///
+/// Only a build with the `nightly-signing` feature trusts them, and that
+/// build trusts no release key. `scripts/release/package.py` reads this list
+/// to check the nightly signing key, and refuses a key that's in both lists.
+/// The maintainer creates the key once (docs/releasing.md, "Nightly signing
+/// key"); until then the list is empty and no nightly build can be signed.
+pub const NIGHTLY_SIGNING_KEYS: &[&str] = &[
+    // NIGHTLY_PUBLIC_KEY: replace this comment with the quoted public key
+    // that `relish dev keygen` printed for the nightly key, then a comma.
+];
+
+/// The key set this build was compiled to trust.
+fn compiled_keys() -> &'static [&'static str] {
+    if cfg!(feature = "nightly-signing") {
+        NIGHTLY_SIGNING_KEYS
+    } else {
+        EMBEDDED_RELEASE_KEYS
+    }
+}
 
 /// The release keys this binary trusts.
 ///
@@ -30,7 +57,7 @@ pub fn release_keys(section: &UpgradeSection) -> Result<Vec<PublicKey>, UpgradeE
         }
         eprintln!("bun: warning: upgrades.release_keys_override is ignored in release builds");
     }
-    EMBEDDED_RELEASE_KEYS
+    compiled_keys()
         .iter()
         .map(|k| parse_public_key(k))
         .collect()
@@ -47,8 +74,57 @@ mod tests {
 
     #[test]
     fn embedded_keys_parse() {
-        let keys = release_keys(&UpgradeSection::default()).unwrap();
+        let keys: Vec<PublicKey> = EMBEDDED_RELEASE_KEYS
+            .iter()
+            .map(|key| parse_public_key(key).unwrap())
+            .collect();
         assert!(!keys.is_empty());
+    }
+
+    #[test]
+    fn nightly_keys_parse() {
+        for key in NIGHTLY_SIGNING_KEYS {
+            parse_public_key(key).unwrap();
+        }
+    }
+
+    #[test]
+    fn no_key_is_both_a_release_and_a_nightly_key() {
+        for key in NIGHTLY_SIGNING_KEYS {
+            assert!(
+                !EMBEDDED_RELEASE_KEYS.contains(key),
+                "{key} is a release key"
+            );
+        }
+    }
+
+    /// The keys a default build (no override) trusts, as `ed25519:` strings.
+    fn trusted_by_this_build() -> Vec<String> {
+        release_keys(&UpgradeSection::default())
+            .unwrap()
+            .iter()
+            .map(encode_public_key)
+            .collect()
+    }
+
+    #[cfg(not(feature = "nightly-signing"))]
+    #[test]
+    fn a_release_build_trusts_the_release_keys_and_never_a_nightly_key() {
+        let trusted = trusted_by_this_build();
+        assert_eq!(trusted, EMBEDDED_RELEASE_KEYS);
+        for key in NIGHTLY_SIGNING_KEYS {
+            assert!(!trusted.iter().any(|candidate| candidate == key));
+        }
+    }
+
+    #[cfg(feature = "nightly-signing")]
+    #[test]
+    fn a_nightly_build_trusts_the_nightly_keys_and_never_a_release_key() {
+        let trusted = trusted_by_this_build();
+        assert_eq!(trusted, NIGHTLY_SIGNING_KEYS);
+        for key in EMBEDDED_RELEASE_KEYS {
+            assert!(!trusted.iter().any(|candidate| candidate == key));
+        }
     }
 
     #[test]

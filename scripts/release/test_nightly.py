@@ -4,6 +4,7 @@ Only the pure parts are tested: which tiers a night runs and with what, what
 happens after a failure, the record, and the freeze rule. The tiers themselves
 need Lima and hours (docs/releasing.md, "Nightly qualification").
 """
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -14,7 +15,7 @@ import unittest
 
 from nightly import (FAIL, GATE_TIERS, JOBS_FAST, JOBS_FINAL, NOT_RUN, PASS, POWER_CUT, V02_FAST,
                      freeze_problems, green, load_records, plan_steps, render_readme, run_tiers,
-                     staged_problems)
+                     signature_problems, staged_problems, tier_environment)
 
 HERE = Path(__file__).resolve().parent
 COMMIT = "c" * 40
@@ -197,6 +198,72 @@ class StagedTests(unittest.TestCase):
     def test_a_manifest_that_does_not_hash_to_the_digest_is_refused(self):
         data, _ = self.manifest()
         self.assertIn("doesn't hash", staged_problems(data, "0" * 64, COMMIT, lambda a, b: True)[0])
+
+
+class StagedSignatureTests(unittest.TestCase):
+    """The nightly checks the staged build was signed with its channel's key before any soak installs it."""
+
+    def setUp(self):
+        from package import guest_image_statement, sign_bytes
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.keys = {}
+        for name in ("release", "nightly"):
+            path = root / f"{name}.der"
+            subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519", "-outform", "DER", "-out", str(path)],
+                           check=True, capture_output=True)
+            public = subprocess.run(["openssl", "pkey", "-inform", "DER", "-in", str(path), "-pubout",
+                                     "-outform", "DER"], check=True, capture_output=True).stdout
+            self.keys[name] = (path, "ed25519:" + base64.b64encode(public[-32:]).decode())
+        self.statement, self.sign = guest_image_statement, sign_bytes
+        self.source = ("pub const EMBEDDED_RELEASE_KEYS: &[&str] =\n"
+                       f'    &["{self.keys["release"][1]}"];\n'
+                       "pub const NIGHTLY_SIGNING_KEYS: &[&str] = &[\n"
+                       f'    "{self.keys["nightly"][1]}",\n];\n')
+
+    def build(self, signer, channel="nightly"):
+        """A staged build's candidate.json and guest-image-metadata.json, signed by `signer`."""
+        image_digest = "a" * 64
+        statement = self.statement("v0.2.4", "aarch64", "guest.qcow2", image_digest, "b" * 64)
+        metadata = json.dumps({"schema": 1, "version": "v0.2.4", "images": {"aarch64": {
+            "asset": "guest.qcow2", "sha256": image_digest, "size": 5,
+            "signature": self.sign(self.keys[signer][0], statement),
+            "source": {"url": "https://images.example/ubuntu.img", "sha256": "b" * 64}}}}).encode()
+        record = dict(schema=1, version="v0.2.4", commit=COMMIT, assets={
+            "guest.qcow2": {"sha256": image_digest, "size": 5},
+            "guest-image-metadata.json": {"sha256": hashlib.sha256(metadata).hexdigest(), "size": len(metadata)}})
+        if channel == "nightly":
+            record["channel"] = "nightly"
+        return json.dumps(record).encode(), metadata
+
+    def test_a_nightly_signed_with_the_nightly_key_is_accepted(self):
+        self.assertEqual(signature_problems(*self.build("nightly"), self.source), [])
+
+    def test_a_nightly_signed_with_the_release_key_is_refused(self):
+        problems = signature_problems(*self.build("release"), self.source)
+        self.assertIn("isn't signed by the nightly key", problems[0])
+
+    def test_a_staged_release_candidate_needs_the_release_key(self):
+        self.assertEqual(signature_problems(*self.build("release", channel="release"), self.source), [])
+        self.assertTrue(signature_problems(*self.build("nightly", channel="release"), self.source))
+
+    def test_metadata_other_than_the_recorded_bytes_is_refused(self):
+        record, metadata = self.build("nightly")
+        problems = signature_problems(record, metadata + b" ", self.source)
+        self.assertIn("doesn't match candidate.json", problems[0])
+
+    def test_without_a_nightly_public_key_nothing_is_accepted(self):
+        source = self.source.replace(f'    "{self.keys["nightly"][1]}",\n', "")
+        problems = signature_problems(*self.build("nightly"), source)
+        self.assertIn("no nightly public key", problems[0])
+
+    def test_the_soaks_may_install_a_nightly_only_through_the_opt_in(self):
+        self.assertEqual(tier_environment({"PATH": "/bin"}, "nightly"),
+                         {"PATH": "/bin", "RELIABURGER_ACCEPT_NIGHTLY": "1"})
+        self.assertEqual(tier_environment({"PATH": "/bin", "RELIABURGER_ACCEPT_NIGHTLY": "1"}, "release"),
+                         {"PATH": "/bin"})
 
 
 class WrapperTests(unittest.TestCase):

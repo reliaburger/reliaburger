@@ -1642,7 +1642,11 @@ machines.
 - `scripts/release/nightly-qualify.sh --train release-X-Y-Z [--gate patch|full]`
   runs the long tiers on a train's tip every night: the power-cut and reboot
   runs, then the V02 and jobs fast soaks against a staged build of the tip,
-  then the job final for the full gate. It writes a dated record naming the
+  then the job final for the full gate. The staged build is the train's
+  nightly build: `build.yml` on the train signs it with the nightly key, which
+  no release trusts, and `stage.yml -f channel=nightly` publishes it as a
+  `nightly-v…` pre-release that the website installer refuses
+  ([nightly signing key](releasing.md#nightly-signing-key)). It writes a dated record naming the
   commit under `~/reliaburger-nightly/`; `--plan` prints the tiers and touches
   nothing. At code freeze `scripts/release/nightly.py freeze-check --commit SHA`
   checks that the latest green night ran the candidate's code, and
