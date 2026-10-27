@@ -924,8 +924,11 @@ the real `curl … | sh` install against it on every host we advertise.
    drain. It needs the bench host to itself for the whole day and about half
    an hour more for setup, the baseline and the drain. Before configuring the
    nodes it resizes each quickstart VM, one at a time, from 2 vCPU / 2 GiB to
-   4 vCPU / 6 GiB, the size the 0.2.3 scale-out record measured; the record
-   lists the resize as a deviation.
+   4 vCPU / 6 GiB, the size the 0.2.3 scale-out record measured. Host jobs
+   run that record's binary too, Ubuntu's `busybox-static`, downloaded from
+   Ubuntu's archive and checked against pinned SHA-256s, instead of the
+   image's BusyBox, which costs twice as much per process. The record lists
+   both as deviations.
 
    ```sh
    scripts/release/qualify-jobs-sustained.sh --tier day \
