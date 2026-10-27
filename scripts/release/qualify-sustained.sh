@@ -774,6 +774,21 @@ wait_labels() {
 # the power-off fault uses.
 day_cpus=4
 day_memory_gib=6
+# The same record's host jobs ran Ubuntu's static BusyBox, which costs half as
+# much per process as the image's; with the image's, the first day run on
+# 27 October ran 15,100/s on this rig. So the day runs the record's binary,
+# from Ubuntu's archive, with the package and the binary in it both pinned.
+day_busybox_version=1:1.36.1-6ubuntu3.1
+day_busybox_url=https://ports.ubuntu.com/ubuntu-ports/pool/main/b/busybox/busybox-static_1.36.1-6ubuntu3.1_arm64.deb
+day_busybox_deb_sha256=d96535e0402c011e0ee43449799df2f4504d44b842e4f2b3a6cbc845508eaafc
+day_busybox_sha256=52151e7f322f926b64049cdaa1410dc3ea6485525e0624b05813791c219ae933
+fetch_day_busybox() {
+    local deb=$evidence/jobs/busybox-static.deb
+    [ -f "$deb" ] || curl -fsSL --max-time 120 -o "$deb" "$day_busybox_url" \
+        || setup_fail "could not download $day_busybox_url"
+    [ "$(sha256 "$deb")" = "$day_busybox_deb_sha256" ] || setup_fail "$deb does not match its pinned SHA-256"
+    meta deviations+ "Host jobs run Ubuntu's busybox-static $day_busybox_version (\`${day_busybox_sha256:0:8}…\`), the scale-out record's binary, instead of the image's"
+}
 resize_nodes() {
     local node
     for node in 1 2 3; do
@@ -857,9 +872,14 @@ prepare_jobs() {
 import json,sys
 json.dump([dict(name=n,address=a) for n,a in zip(sys.argv[2::2],sys.argv[3::2])],open(sys.argv[1],'w'))
 PYNODES
-    local node
+    local node busybox_sha256= busybox_deb=
+    if [ "$tier" = day ]; then
+        fetch_day_busybox
+        busybox_sha256=$day_busybox_sha256
+        busybox_deb=$evidence/jobs/busybox-static.deb
+    fi
     for node in 1 2 3; do
-        with_timeout 30 "$limactl" copy "$job_controller" "$job_inventory" "${vm[node]}:/var/tmp/" > /dev/null
+        with_timeout 30 "$limactl" copy "$job_controller" "$job_inventory" $busybox_deb "${vm[node]}:/var/tmp/" > /dev/null
         gsh_in "$node" "${address[node]}" < <(printf 'set -e
 umask 077
 root=/var/lib/reliaburger/soak-jobs
@@ -869,7 +889,14 @@ install -m 600 /var/tmp/job_soak.py /var/tmp/job_soak_inventory.py "$root/"
 cat > "$root/.token" <<"TOKEN"
 %s
 TOKEN
-' "$(cat "$evidence/jobs/.token")"; cat <<'GUEST'
+busybox_sha256=%s
+' "$(cat "$evidence/jobs/.token")" "$busybox_sha256"; cat <<'GUEST'
+if [ -n "$busybox_sha256" ]; then
+dpkg-deb --fsys-tarfile /var/tmp/busybox-static.deb | tar -xO ./usr/bin/busybox > "$root/busybox"
+rm -f /var/tmp/busybox-static.deb
+[ "$(sha256sum "$root/busybox" | cut -d" " -f1)" = "$busybox_sha256" ]
+chmod 755 "$root/busybox"
+else
 # Identity replicas have already pulled the pinned image on all three nodes.
 # Copy that exact image binary; never install an unrelated host BusyBox build.
 python3 - <<'PYBOX'
@@ -882,6 +909,7 @@ if not files or len({hashlib.sha256(file.read_bytes()).hexdigest() for file in f
 shutil.copyfile(files[0],'/var/lib/reliaburger/soak-jobs/busybox')
 Path('/var/lib/reliaburger/soak-jobs/busybox').chmod(0o755)
 PYBOX
+fi
 cat > /etc/systemd/system/reliaburger-soak-audit.service <<UNIT
 [Unit]
 Description=Independent release job effect verifier
@@ -1828,6 +1856,7 @@ if [ "$plan" = true ]; then
         printf 'plan: day %s s with no faults, walks or specials, then the drain\n' "$duration"
     fi
     [ "$tier" != day ] || printf 'plan: resize %s vCPU %s GiB each node, one at a time, before configuring\n' "$day_cpus" "$day_memory_gib"
+    [ "$tier" != day ] || printf 'plan: host-busybox busybox-static %s %s\n' "$day_busybox_version" "$day_busybox_sha256"
     printf 'plan: %s\n' "$job_runs"
     printf 'plan: seed %s for every fault and node choice\n' "${seed:-random}"
     for (( index = 0; index < plan_cycles; index++ )); do run_cycle "$index" 0; done

@@ -3681,6 +3681,19 @@ node at a time keeps two of three council members up, so Raft never loses its
 quorum during setup. The leak checkers like that: in a final
 they get a two-hour quiet tail to arm in, and here they get the whole day.
 
+The first day run on 0.2.3's candidate taught us a second thing to match. It
+ran at 15,100 jobs a second, a third short of the 23,149 that two billion a
+day needs, while the scale-out record had measured 29,350 on the same Mac. The
+VMs were busy, so the CPU was going somewhere. The record's host jobs ran
+Ubuntu's statically linked BusyBox, and the soak runs the copy from the
+container image it pulls. That copy costs twice as much CPU per process, and
+when each job is a process that does nothing, the process is all you measure.
+So the day tier now downloads the record's binary from Ubuntu's archive,
+checks the package and the binary against pinned SHA-256s, and fails setup on
+a mismatch rather than falling back. The lesson is an old one: a benchmark and
+the run that is meant to confirm it have to agree on what a job is, not just
+on how many machines run it.
+
 The job controller gains a `day` load. Host work runs as the biggest arrays
 the API accepts, 16,777,216 tasks each, about 120 a day, so the tail of each
 array, where only some nodes still have chunks, is a small part of the day.
