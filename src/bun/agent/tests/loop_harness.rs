@@ -4066,8 +4066,25 @@ async fn a_service_retirement_leaves_its_republication_write_in_flight() {
     while !agent.consumer_syncs.is_idle() {
         one_consumer_sync_turn(&mut agent).await;
     }
+    // The retirement's own journal write waits only until the turn's
+    // deadline too. On a slow disk (the coverage runner, once) the ask that
+    // starts it answers `StillRunning` and a later one finds it landed, as
+    // the worker would; the stall makes that the path every time.
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let (_, result) = retire_service_turn(&mut agent, &service).await;
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    landing_turn(&mut agent).await;
     let (_, result) = retire_service_turn(&mut agent, &service).await;
     result.unwrap();
+    assert!(!agent.discovery_write_in_flight());
     assert_eq!(journalled_backends(&agent, &service), None);
     assert!(agent.consumer_owner().is_some_and(|owner| {
         owner.phase == crate::bun::consumer_owners::ConsumerPhase::Active
