@@ -10,7 +10,6 @@ the detail is in the GitHub milestones and issues.
 
 | Plan | What it is | Still open |
 |---|---|---|
-| [0.2.3: Two billion a day](2026-10-20-plan-0.2.3.md) | The 0.2.3 merge train: 2B host-job tasks in one real day on three nodes (profile, speed up one node, prove scale-out, run the day, publish), plus the CI, soak and test follow-ups from the CI and test efficiency plan and the 0.2.2 agents, on `release-0-2-3`. | [Milestone 0.2.3](https://github.com/reliaburger/reliaburger/milestone/17) |
 | [Research: how Kubernetes tests its releases](2026-10-28-research-kubernetes-release-testing.md) | What the Kubernetes project runs before a release (blocking-job thresholds, e2e and conformance, scale tests and SLOs, etcd's history checks, OSS-Fuzz) against our gate, what we should copy and what we shouldn't. The source of the testing section on the Kubernetes comparison page. | [0.2.4](https://github.com/reliaburger/reliaburger/milestone/19): #1398–#1401 |
 | [CI and test efficiency](2026-10-11-ci-and-test-efficiency.md) | Faster CI and stronger test and soak evidence: one archive extraction per job (#1050), integration policy, test consolidation and compilation costs, with an 18 October status of what's done, tracked and proposed. | Merge queue on the current train; the proposed test, fixture and soak-evidence issues |
 | [Competitive review and comparison pages](2026-10-15-competitor-comparisons.md) | Source-linked comparisons and a wider review, matching the static homepage. | Review and merge into the 0.2.1 train |
@@ -37,6 +36,7 @@ finished plans since. The
 [0.1.0 release closure record](../qualification/2026-09-27-v0.1.0-release-closure.md)
 is the summary of how 0.1.0 ended.
 
+- [0.2.3: Two billion a day](archive/2026-10-20-plan-0.2.3.md): the 0.2.3 merge train, 1.81 billion host-job tasks in one real day on three nodes, plus the CI, soak and test follow-ups, shipped in 0.2.3
 - [0.2.2: UX patch](archive/2026-10-16-plan-0.2.2-ux-patch.md): the 0.2.2 merge train, the CLI review, Kubernetes fidelity, chaos for jobs, demos and doc fixes, shipped in 0.2.2
 - [Soak charts](archive/2026-10-17-soak-charts.md): SVG charts in every soak record, and the released version's on the homepage (#979)
 - [Equal-window job demonstrations and hourly saturation runs](archive/2026-10-09-plan-timed-job-scenarios.md)
