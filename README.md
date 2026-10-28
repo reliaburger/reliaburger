@@ -23,7 +23,7 @@ batch of jobs on it, breaks it and watches it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-0.2.2 was released on 25 October 2026, and the one-line installer fetches
+0.2.3 was released on 28 October 2026, and the one-line installer fetches
 its signed binaries. You'll need a Mac with Apple silicon, or Linux with QEMU
 and KVM, plus about 8 GiB of free memory and 15 GiB of disk.
 
@@ -255,7 +255,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 ## What's in the binary
 
-This is what 0.2.2, the release the installer fetches, does.
+This is what 0.2.3, the release the installer fetches, does.
 
 **Runs Kubernetes YAML.** `relish apply -f` converts Deployments, StatefulSets,
 DaemonSets, Services, Ingresses, Jobs, CronJobs, HPAs and Namespaces on the
@@ -347,6 +347,10 @@ jobs-shared-containers` and its siblings rerun them on your own cluster, and
 release, 0.2.0 ran 12 hours on a three-VM laptop cluster with apps, faults
 and upgrades at 4,600 accepted jobs a second, against 1,158 for 100 million a
 day ([record](docs/qualification/2026-10-17-v0.2.0-job-qualification.md), [#668](https://github.com/reliaburger/reliaburger/issues/668)).
+0.2.3 ran host jobs for one real 24-hour day on three 4-vCPU VMs and counted
+1,807,742,226, 20,920 a second, with no failed tasks: 1.81 billion against
+the 2 billion it aimed for
+([record](docs/qualification/2026-10-28-v0.2.3-day-run.md)).
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary
@@ -399,7 +403,7 @@ binary was built from. Neither needs a network.
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
-## Limits in 0.2.2
+## Limits in 0.2.3
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
   managed Linux VMs; native macOS `bun` runs plain processes only.

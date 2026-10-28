@@ -3727,6 +3727,42 @@ The test works out how many arrays a day needs with `u64::div_ceil`, integer
 division that rounds up. In C you'd write `(a + b - 1) / b` and hope the
 addition doesn't overflow; the standard library method can't.
 
+### What the day measured
+
+Day run 2 started at 17:30 on 27 October and counted 1,807,742,226 host jobs
+by 17:30 the next day: 20,920 a second, three nodes within a point of their
+fair shares, no errors and one retry
+([record](../qualification/2026-10-28-v0.2.3-day-run.md)). That's 1.81
+billion, not two. The benchmark had run 29,350 a second on the same candidate,
+so why the gap? A benchmark runs for minutes. A day runs long enough for a
+laptop to settle. The rate slid from 22,200 to 19,900 a second over the first
+14 hours, then held between 19,900 and 20,700 to the end, and the last hour
+was 6.9% slower than the first, inside the 10% the tier allows. The
+maintainer had already accepted the measured number on a 2023 MacBook whose
+twelve cores the three VMs fill. Two billion needs a host with more cores,
+not a code change. Counted, not extrapolated, was the promise, and 1.81 is
+what we counted.
+
+The harness's verdict was still FAIL, and the record publishes it as written.
+Bun's memory grew on every node for the whole day: about 200 MiB at the
+one-hour mark, 316 to 345 MiB at the end. The leak checker fails a process
+once it's 25% over its one-hour value, and it failed all three about seven
+hours in. The growth slowed, from about 15 MiB an hour early on to about 3
+late, and never reached the 384 MiB budget, but slowing isn't stopping. The
+8-hour jobs final passed the same checker on the same binaries at a third of
+the rate. So either something holds on to memory per task, and only a day at
+full speed shows it, or the working set really is bigger at 20,000 a second
+and the one-hour baseline is too early. Both fit the numbers. Telling them
+apart takes a heap profile, which is
+[#1417](https://github.com/reliaburger/reliaburger/issues/1417) for 0.2.4.
+Node 1's disk also filled up near the end, mostly with job instance storage
+the other two nodes didn't keep
+([#1418](https://github.com/reliaburger/reliaburger/issues/1418)).
+
+Neither of these was what the day run was built to find. That's the case for
+running it anyway: give the leak checkers 23 hours instead of two, and they
+see things a gate tier can't.
+
 ### Soak jobs while the apps keep running
 
 A fast command completing a million times tells us little about what happens
