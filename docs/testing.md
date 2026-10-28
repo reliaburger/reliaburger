@@ -623,6 +623,87 @@ evidence directory ([plan](plans/archive/2026-10-17-soak-charts.md)). The
 homepage shows the released version's final soak charts
 ([how](website/README.md#soak-charts)).
 
+## Checking the history, not just the invariants
+
+The soak's invariants each look at one thing: the writer's sequence has no
+gaps, the Redis counter never goes down, every job finishes once. A store can
+pass all of them and still be wrong. A read served by a node that hasn't
+caught up returns a value the cluster had already overwritten; a lease granted
+twice gives two clients the same lock for a moment; a write acknowledged just
+before a crash quietly disappears. etcd's
+[robustness tests](https://github.com/etcd-io/etcd/blob/main/tests/robustness/README.md)
+found exactly these by recording every operation and checking the whole
+history against a model, so from 0.2.4 the soak does the same for the council
+([#1399](https://github.com/reliaburger/reliaburger/issues/1399), from the
+[release testing research](plans/2026-10-28-research-kubernetes-release-testing.md)).
+
+**Linearizable** means every operation looks as if it took effect at one
+instant somewhere between the client sending it and getting the answer, and
+the answers are the ones those operations would give one at a time in that
+order. Two operations that overlap may land either way round. Two that don't
+overlap can't swap: once a renew has returned, every read that starts later
+must see it. That rule is what invariants miss. A stale read breaks no counter
+and loses no data; it is only wrong in the light of what came before it.
+
+What runs, in every tier except the day run:
+
+- **The client.** [`council_history.py`](../scripts/release/council_history.py)
+  runs on the host for the whole soak. Four threads take turns holding test
+  leases on two namespaces: grant, then renew and read a few times, then
+  release, each request to a node picked at random. After every successful
+  renew or read it reads the lease straight back through a different node,
+  since a lagging node shows itself in the milliseconds after a write. A
+  thread whose grant is refused reads the holder's lease instead. Every operation is a `call` and a `return` event in
+  `council-history.jsonl` in the evidence directory, with monotonic and wall
+  times. Test leases are what the council lets a client write and read back:
+  the lease record is the key-value pair (lease id to expiry and state) and
+  the namespace is the lock. There is no general key-value API to record.
+- **The model.** A namespace has at most one lease; a grant succeeds only when
+  it's free; a renew moves the expiry and a read returns the latest one; a
+  release frees the namespace, in two steps (cleanup starts, then the lease
+  goes), so a read in between may see it cleaning. The council's reaper may remove a lease once
+  its expiry has passed, which the model allows, with 30 seconds' margin for
+  the host's and the nodes' clocks.
+- **Unknown answers.** A timeout, a dropped connection or a 5xx may or may
+  not have taken effect, and may take effect later, after the client gave up.
+  The checker allows both: such a write never returns, and it may be put
+  anywhere after its call, or nowhere.
+- **The check.** [`linearizability.py`](../scripts/release/linearizability.py)
+  is a small port of [Porcupine](https://github.com/anishathalye/porcupine):
+  a depth-first search over the operations that could come next, with
+  memoisation, run on each namespace apart. Once the soak is over, a violation
+  records a failure and fails the record. The record says how many operations
+  were checked and shows the smallest failing slice: the shortest prefix of
+  the history that fails, cut down to the shortest tail that fails from any
+  starting state. The search is bounded per namespace; a namespace that runs
+  over is reported as *inconclusive*, which fails nothing but says so, rather
+  than hanging the soak.
+
+`make test-ci-scripts` runs the checker's unit tests
+([`test_linearizability.py`](../scripts/release/test_linearizability.py)):
+hand-made linearizable histories pass, and a stale read, a lost grant, renew
+or release, and a lease held by two clients at once each fail with a slice of
+two or three operations. [`test_council_history.py`](../scripts/release/test_council_history.py)
+runs the client against an in-memory council, honest and with the bug below,
+and checks the record. The gated
+`cluster_failover::a_lease_history_through_a_leader_kill_is_linearizable`
+(`make test-cluster`) runs the client against three in-process nodes while
+it kills the leader, and checks the history.
+
+**Showing it can fail.** The bug the issue names is a follower answering a
+read from its own copy without confirming leadership: in
+`test_lease_get_handler` (`src/bun/api/test_leases.rs`), add `&& false` to
+the `confirmed_lease_leader` condition so no node forwards a read. With that
+change the gated test above failed three runs out of three (28 October 2026,
+about 1,950 operations a run): a renew returned an expiry, and a read through
+another node 3 ms later returned the one before it. Without the change it
+passed seven runs out of seven. The soak's VMs, with a real network and
+fsync between them, lag more than in-process nodes, so the fast tier has a
+wider window to catch the same bug.
+
+The same check for job outcomes (exactly one completion per task-array chunk)
+is later work.
+
 ## When a test flakes
 
 CI runs with `retries = 0`. A test that passes on a re-run still failed once,

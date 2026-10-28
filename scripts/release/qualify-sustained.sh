@@ -93,7 +93,11 @@ checker=$repository/scripts/release/sustained_check.py
 job_controller=$repository/scripts/release/job_soak.py
 job_inventory=$repository/scripts/release/job_soak_inventory.py
 guest_memory=$repository/scripts/release/sustained/guest-memory.sh
+history_client=$repository/scripts/release/council_history.py
+linearizability=$repository/scripts/release/linearizability.py
+history_clients=4
 jobs_pid=
+history_pid=
 workloads_template=$repository/scripts/release/sustained/soak-workloads.toml
 podinfo=$repository/examples/kubernetes/podinfo.yaml
 base_url=
@@ -945,6 +949,41 @@ start_jobs() {
     python3 "$job_controller" run --evidence "$evidence" --api-port "$api_port" --ca "$ca" --limactl "$limactl" "${load[@]}" > "$evidence/jobs/controller.log" 2>&1 &
     jobs_pid=$!
 }
+# --- council history (#1399) ----------------------------------------------------
+# A client takes, renews, reads and releases test leases through every node for
+# the whole soak and records each operation; once the soak is over the history
+# is checked for linearizability. The day tier has no faults to check it under.
+start_council_history() {
+    [ "$tier" != day ] || return 0
+    python3 "$history_client" run --history "$evidence/council-history.jsonl" --ca "$ca" \
+        --token-file "$evidence/.token" --clients "$history_clients" \
+        --node "${vm[1]}=$api_port" --node "${vm[2]}=$(( api_port + 1 ))" --node "${vm[3]}=$(( api_port + 2 ))" \
+        >> "$evidence/council-history.log" 2>&1 &
+    history_pid=$!
+    meta council_history json:true
+}
+# SIGTERM: each client finishes its operation and releases its lease.
+stop_council_history() {
+    [ -n "$history_pid" ] || return 0
+    kill -TERM "$history_pid" 2>/dev/null || true
+    local until=$(( $(date +%s) + 90 ))
+    while kill -0 "$history_pid" 2>/dev/null && [ "$(date +%s)" -lt "$until" ]; do sleep 1; done
+    kill -KILL "$history_pid" 2>/dev/null || true
+    history_pid=
+}
+check_council_history() {
+    [ -f "$evidence/council-history.jsonl" ] || return 0
+    local result=0
+    python3 "$linearizability" check "$evidence/council-history.jsonl" --out "$evidence/council-history-check.json" \
+        > /dev/null || result=$?
+    case $result in
+        0) event --phase council-history --verdict ok ;;
+        3) event --phase council-history --verdict inconclusive --detail 'search over budget; see council-history-check.json' ;;
+        *) event --phase council-history --verdict fail
+           record_failure linearizability 'the council history is not linearizable; see council-history-check.json' ;;
+    esac
+}
+
 # The controller allows the drain 110 s once it sees job_stop_at; give it that
 # and its last requests before the heavy check and teardown.
 wait_for_job_drain() {
@@ -1767,6 +1806,7 @@ finish() {
         fi
     fi
     [ -z "${background_pid:-}" ] || kill "$background_pid" 2>/dev/null || true
+    [ -z "${history_pid:-}" ] || kill "$history_pid" 2>/dev/null || true
     [ -f "$evidence/metadata.json" ] || { printf 'sustained: stopped before the soak started\n' >&2; exit "$result"; }
     meta finished_at "json:$(date +%s)"
     [ -z "${vm[3]:-}" ] || keep_host_logs end 1 2 3
@@ -1865,6 +1905,7 @@ if [ "$plan" = true ]; then
     [ "$tier" != day ] || printf 'plan: host-busybox busybox-static %s %s\n' "$day_busybox_version" "$day_busybox_sha256"
     printf 'plan: %s\n' "$job_runs"
     printf 'plan: seed %s for every fault and node choice\n' "${seed:-random}"
+    [ "$tier" = day ] || printf 'plan: council-history %s clients, checked for linearizability after the soak\n' "$history_clients"
     for (( index = 0; index < plan_cycles; index++ )); do run_cycle "$index" 0; done
     [ "$quiet_tail" -eq 0 ] || printf 'plan: quiet-tail %s s with no faults, walks or specials after the last cycle\n' "$quiet_tail"
     rm -rf "$evidence"
@@ -1952,6 +1993,7 @@ PY
     next_rotation=$(( started_at + rotation ))
 fi
 [ -n "$jobs_pid" ] || start_jobs
+start_council_history
 
 next_light=$(date +%s)
 next_heavy=$(( $(date +%s) + heavy_every ))
@@ -1988,5 +2030,7 @@ if [ -n "${jobs_pid:-}" ]; then
     meta job_stop_at "json:$(date +%s)"
     wait_for_job_drain
 fi
+stop_council_history
+check_council_history
 observe heavy || true
 say "soak finished after $index cycles"
