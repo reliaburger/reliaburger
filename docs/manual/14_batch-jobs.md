@@ -1089,6 +1089,28 @@ Fresh receipt chunks contain one job; fast paths use 1,000 jobs. This reporting
 choice makes slow progress visible and amortises fast outcomes, so the rate gap
 also includes receipt granularity. Chunk size never decides how many jobs fit.
 
+## Measured on 0.2.3: host jobs for a day
+
+0.2.3's candidate was measured on the same M2 Max host, on 4-vCPU / 6 GiB
+Ubuntu 24.04 VMs, with host jobs running Ubuntu's statically linked BusyBox
+`true`, 27 slots per node and 1,000-task chunks:
+
+| Run | Nodes | Host jobs a second | Record |
+|---|---:|---:|---|
+| `relish bench --scenario jobs-host-processes` | 1 | 14,916.7 | [throughput record](../qualification/2026-10-27-v0.2.3-candidate-throughput/README.md) |
+| The same, scaled out | 3 | 29,350.0 | same record |
+| A real 24-hour day (`qualify-jobs-sustained.sh --tier day`) | 3 | 20,920.0: 1,807,742,226 in 24 h | [day-run record](../qualification/2026-10-28-v0.2.3-day-run.md) |
+
+The day run is a count, not an extrapolation: every task was accepted by the
+council within the 24 hours, the three nodes within a point of their fair
+shares, with no errors. It ran below the benchmark because three VMs filled
+the laptop's twelve cores for a whole day; plan from your own hardware's
+sustained rate, not a minute's peak. Bun's memory grew from about 200 MiB to
+up to 345 MiB over that day, still inside the 384 MiB (512 MiB on the node
+serving the API) job budget. Until
+[#1417](https://github.com/reliaburger/reliaburger/issues/1417) explains it,
+watch Bun's resident memory on nodes that run host jobs at full rate for days.
+
 The landing page's recording is an earlier development build's single run
 (`006aca5f`, [record](../qualification/2026-10-09-timed-job-scenarios/README.md)):
 3.55/s for fresh containers and 966.7/s for shared ones then.
