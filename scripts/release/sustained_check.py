@@ -1860,6 +1860,48 @@ def day_lines(day):
     return lines + [""]
 
 
+def council_history_section(evidence, metadata):
+    """The council history check (#1399): whether it failed the run, and the record's lines.
+
+    `linearizability.py check` writes council-history-check.json once the
+    soak is over. A run that started the history client (metadata
+    `council_history`) owes that check: without it, or with a violation, the
+    run fails. An inconclusive search is reported but fails nothing.
+    """
+    path = Path(evidence) / "council-history-check.json"
+    if not path.exists():
+        if metadata.get("council_history") is not True:
+            return False, []
+        return True, ["## Council history (linearizability)", "",
+                      "- Not checked: the soak recorded a council history but never checked it", ""]
+    result = json.loads(path.read_text())
+    verdict = result.get("verdict")
+    lines = ["## Council history (linearizability)", "",
+             "Every test-lease grant, renew, read and release the history client made, checked against a "
+             "model of the council's leases. A write with no answer may or may not have happened; the check "
+             "allows both.", "",
+             f"- Operations checked: {result.get('checked', 0)} of {result.get('operations', 0)}, "
+             f"in {result.get('partitions', 0)} namespaces; {result.get('unanswered_writes', 0)} writes had no answer"]
+    if verdict == "linearizable":
+        lines.append("- Verdict: linearizable")
+    elif verdict == "inconclusive":
+        lines.append("- Verdict: inconclusive: the search ran out of budget in "
+                     + ", ".join(result.get("inconclusive", [])))
+    else:
+        violation = result.get("violation", {})
+        lines += [f"- Verdict: **not linearizable** in {violation.get('namespace', 'unknown')}; "
+                  "the smallest failing slice of its history:", "",
+                  "| Id | Client | Operation | Lease | Call | Return | Outcome | Expiry | Cleaning |",
+                  "|---|---|---|---|---|---|---|---|---|"]
+        for op in violation.get("slice", []):
+            returned = "no answer" if op.get("return") is None else f"{op['return']:.3f}"
+            lines.append(f"| {op.get('id')} | {op.get('client')} | {op.get('op')} | {op.get('lease') or ''} | "
+                         f"{op.get('call', 0):.3f} | {returned} | {op.get('outcome')} | "
+                         f"{op.get('expires_at_unix_ms') or ''} | {op.get('cleaning') if op.get('cleaning') is not None else ''} |")
+    lines.append("")
+    return verdict not in ("linearizable", "inconclusive"), lines
+
+
 def render(evidence, record):
     evidence = Path(evidence)
     record = Path(record)
@@ -1914,7 +1956,10 @@ def render(evidence, record):
     slo_rows = soak_slo.rows(slo_data, job_soak.report(job_report) if job_report else None,
                              metadata.get("tier") or "custom", metadata.get("job_soak") is True)
     slo_failed = bool(soak_slo.failures(slo_rows))
-    gate_failed = any(row[3] == "FAIL" for row in gates) or (final_tier and bool(missing or exposure)) or slo_failed
+    # The council history (#1399): a violation, or a check owed and missing, fails the run.
+    history_failed, history_lines = council_history_section(evidence, metadata)
+    gate_failed = (any(row[3] == "FAIL" for row in gates) or (final_tier and bool(missing or exposure))
+                   or slo_failed or history_failed)
     open_failures = [row for row in failures if row.get("disposition", "open") == "open"]
     result = metadata.get("result") or ("FAIL" if open_failures or gate_failed else "PASS")
     if (open_failures or gate_failed) and result == "PASS":
@@ -1926,7 +1971,7 @@ def render(evidence, record):
     lines += [f"{time.strftime('%-d %B %Y', time.gmtime(started))}. {tier} tier, {schedule_text} "
               f"schedule, {duration_text(elapsed)} of soak on a three-node quickstart cluster.", ""]
     # The acceptance line tells a failed check apart from a run that was clean but incomplete.
-    clean_apart_from_inventory = "FAIL" if open_failures or metadata.get("result") == "FAIL" or slo_failed or any(
+    clean_apart_from_inventory = "FAIL" if open_failures or metadata.get("result") == "FAIL" or slo_failed or history_failed or any(
         row[3] == "FAIL" for row in gates) else "PASS"
     lines += [acceptance_line(metadata, clean_apart_from_inventory, elapsed, missing if final_tier else (),
                               job_final_ran(metadata, job_report, missing), exposure if final_tier else (), day), ""]
@@ -2042,6 +2087,7 @@ def render(evidence, record):
     if progress:
         lines.append(f"- Last observed progress: {', '.join(f'{key} {value}' for key, value in sorted(progress.items()))}")
     lines.append("")
+    lines += history_lines
     lines += exposure_lines(state, final_tier)
     lines += ["## Resource trends", "", "| Node | Measure | First | Last | Max |", "|---|---|---|---|---|"]
     for node, trend in sorted(state.get("trends", {}).items()):

@@ -5936,6 +5936,17 @@
           "sources": [
             "tests/cluster_failover.rs"
           ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-a_lease_history_through_a_leader_kill_is_linearizable",
+          "binary": "reliaburger::cluster_failover",
+          "test": "a_lease_history_through_a_leader_kill_is_linearizable",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
         }
       ]
     },
