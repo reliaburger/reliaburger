@@ -493,6 +493,14 @@ class TrainAndQueueTests(unittest.TestCase):
         for name in ["lint", "minimum-rust", "portable", "contract-boundaries", "demo-app"]:
             self.assertIn("if: needs.changes.outputs.code == 'true'", self.jobs[name])
 
+    def test_the_portable_suite_finishes_on_a_slow_runner_with_headroom(self):
+        # About 25 minutes normally and 35 to 41 on a slow runner (#1421).
+        # nextest's per-test timeouts catch a hung test, so the job limit
+        # only has to outlast a slow runner by half again.
+        limit = re.search(r"\n    timeout-minutes: (\d+)\n", self.jobs["portable"])
+        self.assertIsNotNone(limit)
+        self.assertGreaterEqual(int(limit.group(1)), 41 * 3 // 2)
+
 
 class BenchmarkTests(unittest.TestCase):
     def setUp(self):

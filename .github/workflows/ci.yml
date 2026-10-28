@@ -214,7 +214,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # About 25 minutes, but 35 to 41 on a slow runner (#1421). nextest's
+    # per-test timeouts catch a hung test, so this only catches a stuck runner.
+    timeout-minutes: 62
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
