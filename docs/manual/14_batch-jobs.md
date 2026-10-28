@@ -1103,7 +1103,7 @@ Ubuntu 24.04 VMs, with host jobs running Ubuntu's statically linked BusyBox
 
 The day run is a count, not an extrapolation: every task was accepted by the
 council within the 24 hours, the three nodes within a point of their fair
-shares, with no errors. It ran below the benchmark because three VMs filled
+shares, with no failed tasks. It ran below the benchmark because three VMs filled
 the laptop's twelve cores for a whole day; plan from your own hardware's
 sustained rate, not a minute's peak. Bun's memory grew from about 200 MiB to
 up to 345 MiB over that day, still inside the 384 MiB (512 MiB on the node
