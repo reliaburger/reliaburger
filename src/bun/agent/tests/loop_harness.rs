@@ -1190,6 +1190,46 @@ fn process_cpu_time() -> std::time::Duration {
     duration(usage.ru_utime) + duration(usage.ru_stime)
 }
 
+/// Take the loop's next turn for the consumer synchronisation under way,
+/// as `run_loop` does, and return it as the meter saw it, with the CPU time
+/// the process spent in it: the loop's own work and any blocking-pool work
+/// it waited on.
+///
+/// The loop takes no step while a step's write is in flight (#1336). Its
+/// `select!` waits for the write off the loop, then takes the landing turn,
+/// which takes the step's remainder. So does this: a harness that took the
+/// next step at once would be refused with "a consumer journal write is
+/// still in flight" whenever a slow disk let a write outlast the turn's
+/// deadline (#1396). The wait comes before the turn's clock starts, as it
+/// does in the loop.
+async fn consumer_sync_turn_and_work(
+    agent: &mut BunAgent<MockGrill>,
+) -> (crate::bun::loop_meter::TurnRecord, std::time::Duration) {
+    let landed = if agent.discovery_write_in_flight() {
+        Some(BunAgent::<MockGrill>::discovery_write_done(&mut agent.discovery_ownership).await)
+    } else {
+        None
+    };
+    let cpu = process_cpu_time();
+    let turn = match landed {
+        Some(outcome) => {
+            let turn = agent.begin_landing_turn();
+            agent.land_write_in_flight(outcome).await;
+            turn
+        }
+        None => {
+            let turn = agent.begin_consumer_sync_turn();
+            agent.continue_consumer_sync().await;
+            turn
+        }
+    };
+    agent.consumer_syncs.end_turn();
+    agent.turn_deadline = None;
+    agent.loop_meter.finish(turn);
+    let work = process_cpu_time().saturating_sub(cpu);
+    (agent.loop_meter.last_turn().unwrap(), work)
+}
+
 /// Take a leader answer through the loop's consumer-sync turns, one step a
 /// turn as `run_loop` does, and return each turn as the meter saw it.
 async fn consumer_sync_turns(
@@ -1226,14 +1266,7 @@ async fn consumer_sync_turns_and_work(
         .await;
     let mut turns = Vec::new();
     while !agent.consumer_syncs.is_idle() {
-        let cpu = process_cpu_time();
-        let turn = agent.begin_consumer_sync_turn();
-        agent.continue_consumer_sync().await;
-        agent.consumer_syncs.end_turn();
-        agent.turn_deadline = None;
-        agent.loop_meter.finish(turn);
-        let work = process_cpu_time().saturating_sub(cpu);
-        turns.push((agent.loop_meter.last_turn().unwrap(), work));
+        turns.push(consumer_sync_turn_and_work(agent).await);
     }
     let update = reply.await.unwrap().unwrap();
     assert!(
@@ -1352,6 +1385,48 @@ async fn a_large_consumer_view_change_takes_each_turn_well_within_the_budget() {
     }
 }
 
+/// A journal write a little longer than the turn's 500 ms runtime
+/// deadline, so it always goes on off the loop.
+const OUTLASTS_THE_TURN_DEADLINE: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// [`a_large_consumer_view_change_takes_each_turn_well_within_the_budget`]
+/// failed on the 0.2.4 train's `portable Linux` runner (#1396): a thousand
+/// services' journal write outlasted the turn's 500 ms deadline and went
+/// on off the loop, and the harness took the next step at once, which
+/// refused with "a consumer journal write is still in flight". The live
+/// loop takes no step while a write is in flight; its `select!` lands the
+/// write first. Holding every write past the deadline makes that the path
+/// every run takes, and the landing turns must stay inside the budget too.
+#[tokio::test]
+async fn a_consumer_view_change_whose_writes_outlast_the_turn_takes_each_turn_well_within_the_budget()
+ {
+    let (mut agent, _root, _catalog, _ingress) = recovered_consumer().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, OUTLASTS_THE_TURN_DEADLINE);
+    let mut landings = 0;
+    for (generation, catalog) in [
+        (1, large_catalogue(100, 30000)),
+        (2, large_catalogue(100, 31000)),
+    ] {
+        for (turn, work) in
+            consumer_sync_turns_and_work(&mut agent, generation, catalog, vec![]).await
+        {
+            assert!(
+                work < TURN_BUDGET / 2,
+                "generation {generation}: {turn} used {work:?} of CPU"
+            );
+            if matches!(
+                turn.detail,
+                Some("consumer_sync/install" | "consumer_sync/landed")
+            ) {
+                landings += 1;
+            }
+        }
+    }
+    assert!(landings > 0, "no write outlasted its turn");
+}
+
 /// Between a recovery's withdrawal and its publication the journal says
 /// Withdrawn, and other turns run in between. The view about to be
 /// published was built before, so the local addresses it names stay held.
@@ -1424,16 +1499,11 @@ async fn published_consumer() -> (
 }
 
 /// Take one consumer-sync turn as `run_loop` does, and return it as the
-/// meter saw it.
+/// meter saw it: [`consumer_sync_turn_and_work`] without the CPU time.
 async fn one_consumer_sync_turn(
     agent: &mut BunAgent<MockGrill>,
 ) -> crate::bun::loop_meter::TurnRecord {
-    let turn = agent.begin_consumer_sync_turn();
-    agent.continue_consumer_sync().await;
-    agent.consumer_syncs.end_turn();
-    agent.turn_deadline = None;
-    agent.loop_meter.finish(turn);
-    agent.loop_meter.last_turn().unwrap()
+    consumer_sync_turn_and_work(agent).await.0
 }
 
 /// The 0.2.0 soaks (#890): after a restart, one discovery-journal write
@@ -2545,6 +2615,40 @@ async fn landing_turn(agent: &mut BunAgent<MockGrill>) -> crate::bun::loop_meter
     agent.loop_meter.last_turn().unwrap()
 }
 
+/// The most landing turns [`ask_until_landed`] takes before it gives up and
+/// hands back the last `StillRunning`. Each landing finishes one write, and
+/// no ask here needs more than two.
+const MOST_LANDINGS: usize = 8;
+
+/// Ask in a turn of its own, as a deploy worker, a stop or a tick does,
+/// until the answer isn't `StillRunning` for a write in flight. Between
+/// asks, take the landing turn the loop's `select!` takes once that write
+/// has landed. Returns the last answer and how many landings it took.
+///
+/// A scenario that asks once in a turn and expects the write it starts to
+/// finish passes only while the disk keeps that write inside the turn's
+/// 500 ms deadline. On a loaded runner it doesn't (#1384, #1394, #1396):
+/// the ask answers `StillRunning`, as it should, and the scenario fails.
+async fn ask_until_landed<A, T>(
+    agent: &mut A,
+    mut ask: impl AsyncFnMut(&mut A) -> Result<T, BunError>,
+) -> (Result<T, BunError>, usize)
+where
+    A: std::ops::DerefMut<Target = BunAgent<MockGrill>>,
+{
+    let mut landings = 0;
+    loop {
+        let result = ask(agent).await;
+        let waits_for_a_landing = matches!(result, Err(BunError::StillRunning { .. }))
+            && agent.discovery_write_in_flight();
+        if !waits_for_a_landing || landings == MOST_LANDINGS {
+            return (result, landings);
+        }
+        landing_turn(agent).await;
+        landings += 1;
+    }
+}
+
 /// The 0.2.1 candidate 9 jobs final: all three VMs met the same host disk
 /// stall, and a health probe that turned an instance unhealthy journalled
 /// its withdrawal inline, under the #351 decision-2 allowance for fsync'd
@@ -2830,9 +2934,11 @@ async fn a_workload_start_whose_reference_write_fails_off_the_turn_records_it_ag
         matches!(result, Err(BunError::StillRunning { .. })),
         "{result:?}"
     );
+    // The next ask's write outlasts its turn too, so it lands as the loop
+    // lands it, not inside the ask (#1396).
     agent
         .loop_stalls
-        .set(LoopStall::Persist, std::time::Duration::ZERO);
+        .set(LoopStall::Persist, OUTLASTS_THE_TURN_DEADLINE);
 
     landing_turn(&mut agent).await;
     assert!(matches!(
@@ -2845,8 +2951,15 @@ async fn a_workload_start_whose_reference_write_fails_off_the_turn_records_it_ag
         "a hold whose write may have reached disk was handed back"
     );
 
-    let (_, result) = pre_start_turn(&mut agent, &grill, &root, &reference).await;
+    let (result, landings) = ask_until_landed(&mut agent, async |agent| {
+        pre_start_turn(agent, &grill, &root, &reference).await.1
+    })
+    .await;
     result.unwrap();
+    assert_eq!(
+        landings, 1,
+        "the reference was recorded again inside the ask"
+    );
     assert_eq!(
         agent.journal_reference(&reference),
         crate::bun::agent::discovery_ownership::JournalReference::Recorded
@@ -3245,14 +3358,20 @@ async fn starting_web() -> (
     })
     .await;
     let id = admitted.unwrap()[0].clone();
-    let (_, registered) = deploy_op_turn(&mut agent, "register_service_app", |reply| {
-        crate::bun::agent::deploy_ops::DeployOp::RegisterServiceApp {
-            app_name: "web".into(),
-            namespace: "default".into(),
-            port: 8080,
-            firewall: None,
-            reply,
-        }
+    // The registration journals the service, and on a loaded runner that
+    // write can outlast the turn: the worker then asks again once it lands.
+    let (registered, _) = ask_until_landed(&mut agent, async |agent| {
+        deploy_op_turn(agent, "register_service_app", |reply| {
+            crate::bun::agent::deploy_ops::DeployOp::RegisterServiceApp {
+                app_name: "web".into(),
+                namespace: "default".into(),
+                port: 8080,
+                firewall: None,
+                reply,
+            }
+        })
+        .await
+        .1
     })
     .await;
     registered.unwrap();
@@ -3985,9 +4104,11 @@ async fn a_rolling_registration_whose_write_fails_off_the_turn_installs_nothing(
         matches!(result, Err(BunError::StillRunning { .. })),
         "{result:?}"
     );
+    // The next ask's write outlasts its turn too, so it lands as the loop
+    // lands it, not inside the ask (#1396).
     agent
         .loop_stalls
-        .set(LoopStall::Persist, std::time::Duration::ZERO);
+        .set(LoopStall::Persist, OUTLASTS_THE_TURN_DEADLINE);
     landing_turn(&mut agent).await;
     assert!(matches!(
         agent.discovery_ownership,
@@ -3999,8 +4120,17 @@ async fn a_rolling_registration_whose_write_fails_off_the_turn_installs_nothing(
     );
     assert!(agent.supervisor.get_instance(&replacement).is_none());
 
-    let (_, result) = deploy_op_turn(&mut agent, "finalise_rolling_deploy", finalise_web).await;
+    let (result, landings) = ask_until_landed(&mut agent, async |agent| {
+        deploy_op_turn(agent, "finalise_rolling_deploy", finalise_web)
+            .await
+            .1
+    })
+    .await;
     result.unwrap();
+    assert_eq!(
+        landings, 1,
+        "the registration was journalled again inside the ask"
+    );
     assert_eq!(
         journalled_backends(&agent, &service),
         Some(vec![replacement.0.clone()])
