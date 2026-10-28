@@ -99,6 +99,10 @@ pub struct FleetReport {
     /// Hollow nodes that saw every member alive when the harness stopped
     /// waiting for gossip.
     pub nodes_seeing_everyone: usize,
+    /// Alive peers each hollow node saw then: the fewest and the median,
+    /// out of `hollow_nodes + council_members - 1`.
+    pub peers_seen_min: usize,
+    pub peers_seen_median: usize,
     pub council_voters: usize,
     pub hollow_voters: usize,
     pub replicas: usize,
@@ -752,6 +756,15 @@ impl Fleet {
             .all(|node| node.alive_peers() + 1 >= members)
     }
 
+    /// How many alive peers each running node sees.
+    fn peers_seen(&self) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .flatten()
+            .map(HollowNode::alive_peers)
+            .collect()
+    }
+
     /// How many running nodes see every member alive.
     fn seeing_everyone(&self, members: usize) -> usize {
         self.nodes
@@ -914,6 +927,10 @@ async fn measure(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     report.nodes_seeing_everyone = fleet.seeing_everyone(total_members);
+    let mut peers = fleet.peers_seen();
+    peers.sort_unstable();
+    report.peers_seen_min = peers.first().copied().unwrap_or(0);
+    report.peers_seen_median = peers.get(peers.len() / 2).copied().unwrap_or(0);
     if let Some(nodes) = council.nodes().await {
         report.council_voters = nodes.iter().filter(|node| node.is_council).count();
         report.hollow_voters = nodes
