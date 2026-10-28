@@ -143,27 +143,23 @@ fn validate_submission(request: &mut TaskArraySubmitRequest) -> Result<String, S
     Ok(namespace)
 }
 
-async fn follower_council(state: &ApiState) -> Option<&crate::council::CouncilNode> {
-    let council = state.council.as_deref()?;
-    if council.is_leader().await {
-        None
-    } else {
-        Some(council)
-    }
-}
-
-/// How long a leader gets to prove it leads before it answers a run it
-/// can't find (#1009, #1192).
+/// How long a leader gets to prove it leads before it serves a job or
+/// task-array request itself (#1009, #1192, #1253).
 const LEADER_CONFIRMATION: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// The council to forward a run's request to, or `None` when this node has
-/// proved it leads (or runs without a council) and its record is the truth.
+/// The council to forward a job or task-array request to, or `None` when
+/// this node has proved it leads (or runs without a council) and may serve
+/// the request itself.
 ///
 /// A follower's replica can lag, and a node back from a stop may hold a log
 /// older than the run, so only a confirmed leader may say "not found". The
 /// leader gets [`LEADER_CONFIRMATION`] to prove it, so one heartbeat round
-/// its followers answer late doesn't turn into a 503.
-async fn council_to_forward_to(state: &ApiState) -> Option<&crate::council::CouncilNode> {
+/// its followers answer late doesn't turn into a 503: a leader that fails a
+/// single round would forward to itself, which `leader_api_url` refuses. A
+/// follower answers at once, without waiting.
+pub(super) async fn council_to_forward_to(
+    state: &ApiState,
+) -> Option<&crate::council::CouncilNode> {
     let council = state.council.as_deref()?;
     if council.confirm_leadership(LEADER_CONFIRMATION).await {
         None
@@ -198,7 +194,7 @@ pub async fn submit_handler(
         return response;
     }
     crate::bun::audit::annotate_workload(&request.name, &namespace);
-    if let Some(council) = follower_council(&state).await {
+    if let Some(council) = council_to_forward_to(&state).await {
         return forward_to_leader(&state, council, "/v1/batch/array", body, &headers).await;
     }
     let count = request.spec.count;
@@ -322,7 +318,7 @@ pub async fn manifest_handler(
         }
         cohort.template = array.template;
     }
-    if let Some(council) = follower_council(&state).await {
+    if let Some(council) = council_to_forward_to(&state).await {
         return forward_to_leader(&state, council, "/v1/batch/manifest", body, &headers).await;
     }
     for cohort in &mut request.cohort {

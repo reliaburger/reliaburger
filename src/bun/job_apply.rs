@@ -51,9 +51,7 @@ pub(crate) async fn apply(
     rerun: bool,
     lease: Option<&crate::testkit::lease::TestLease>,
 ) -> Response {
-    if let Some(council) = &state.council
-        && !council.is_leader().await
-    {
+    if let Some(council) = super::task_array_api::council_to_forward_to(&state).await {
         return super::batch::forward_to_leader(&state, council, "/v1/apply", body, headers).await;
     }
     let _gate = if state.council.is_none() {

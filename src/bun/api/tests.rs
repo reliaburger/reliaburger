@@ -1782,6 +1782,17 @@ pub(super) fn serve_recording_leader(
 
 /// An in-memory council with `voters` voters, led by node 1.
 async fn council_of(voters: u64) -> Vec<Arc<crate::council::CouncilNode>> {
+    council_and_network(voters).await.0
+}
+
+/// An in-memory council with `voters` voters, led by node 1, and the
+/// network that joins them, so a test can cut and heal links.
+async fn council_and_network(
+    voters: u64,
+) -> (
+    Vec<Arc<crate::council::CouncilNode>>,
+    crate::council::network::InMemoryRaftRouter,
+) {
     use crate::council::CouncilNode;
     use crate::council::log_store::MemLogStore;
     use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
@@ -1822,7 +1833,7 @@ async fn council_of(voters: u64) -> Vec<Arc<crate::council::CouncilNode>> {
     })
     .await
     .unwrap();
-    nodes
+    (nodes, network)
 }
 
 /// The appliance lab's two-node cluster (#259): start and a cluster
@@ -2385,6 +2396,74 @@ async fn a_confirmed_leader_answers_404_for_a_run_it_does_not_hold() {
     for (method, path) in RUN_CALLS {
         let (status, reply) = send_bounded(app.clone(), method, path, &admin_key, "", &[]).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {reply}");
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// A request path, its body and the extra headers it carries.
+type Submission = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
+/// Job and task-array submissions a settled leader must serve after one
+/// heartbeat round its followers answer late. The runs submission carries
+/// the forwarded marker, as it does when a follower sent it on (#1253).
+const JOB_SUBMISSIONS: &[Submission] = &[
+    (
+        "/v1/batch/array",
+        r#"{"name":"bulk","namespace":"default","template":{"runtime":"process","exec":"/bin/true"},"spec":{"count":1}}"#,
+        &[],
+    ),
+    (
+        "/v1/batch/manifest",
+        r#"{"name":"mixed","namespace":"default","cohort":[{"name":"small","count":1,"template":{"runtime":"process","exec":"/bin/true"}}]}"#,
+        &[],
+    ),
+    (
+        "/v1/jobs/runs",
+        r#"{"name":"nightly","namespace":"ops","definition":{"template":{"runtime":"process","exec":"/bin/true"},"cron":{"expression":"0 0 1 1 *"}}}"#,
+        &[(super::LEADER_FORWARDED_HEADER, "1")],
+    ),
+];
+
+#[tokio::test]
+async fn a_settled_leader_accepts_job_submissions_after_its_quorum_misses_a_heartbeat_round() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Slow heartbeats, not a lost leader: the followers must not depose it
+    // while it can't reach them.
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let app = router_over(nodes[0].clone(), admin);
+
+    for (path, body, extra) in JOB_SUBMISSIONS {
+        network.partition(1, 2).await;
+        network.partition(1, 3).await;
+        // One confirmation round can't reach a quorum.
+        assert!(!nodes[0].is_leader().await);
+        let healer = {
+            let network = network.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                network.heal().await;
+            })
+        };
+        let (status, reply) =
+            send_bounded(app.clone(), "POST", path, &admin_key, body, extra).await;
+        healer.await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}: {reply}");
     }
     for node in nodes {
         node.shutdown().await.unwrap();
