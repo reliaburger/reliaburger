@@ -119,7 +119,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish rollback <APP>`: Rollback an app to the previous version
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
 - `relish delete <APP>`: Remove an app from the cluster and stop all its instances
-- `relish release <APP>`: Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin) *(0.2.3, not in 0.2.2)*
+- `relish release <APP>`: Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin) *(0.2.4, not in 0.2.2)*
 - `relish batch [PATH]`: Submit a batch of jobs, or manage a task array
   - `relish batch submit <PATH>`: Submit a compact TOML manifest containing mixed resource profiles
   - `relish batch replay --node <NODE> --grant-digest <GRANT_DIGEST> --acknowledge-side-effects <ID>`: Acknowledge repeating side effects for the exact unknown owner grants
@@ -202,11 +202,11 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
 - `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster
-- `relish policy`: List, audit or delete the cluster's policies, or test policies offline *(0.2.3, not in 0.2.2)*
-  - `relish policy list`: List the cluster's policies, with their action and rule *(0.2.3, not in 0.2.2)*
-  - `relish policy delete <NAME>`: Delete a policy (admin only; audited). Policies never judge policies, so this works even when one refuses every app *(0.2.3, not in 0.2.2)*
-  - `relish policy audit`: List the committed apps and jobs the cluster's policies would now refuse, warn about or record. Changes nothing: a new policy never touches running work *(0.2.3, not in 0.2.2)*
-  - `relish policy test --file <FILES>...`: Judge the apps and jobs in some files by the policies in them, offline, the way the cluster would. Exits non-zero when an apply would be refused *(0.2.3, not in 0.2.2)*
+- `relish policy`: List, audit or delete the cluster's policies, or test policies offline *(0.2.4, not in 0.2.2)*
+  - `relish policy list`: List the cluster's policies, with their action and rule *(0.2.4, not in 0.2.2)*
+  - `relish policy delete <NAME>`: Delete a policy (admin only; audited). Policies never judge policies, so this works even when one refuses every app *(0.2.4, not in 0.2.2)*
+  - `relish policy audit`: List the committed apps and jobs the cluster's policies would now refuse, warn about or record. Changes nothing: a new policy never touches running work *(0.2.4, not in 0.2.2)*
+  - `relish policy test --file <FILES>...`: Judge the apps and jobs in some files by the policies in them, offline, the way the cluster would. Exits non-zero when an apply would be refused *(0.2.4, not in 0.2.2)*
 
 **Images and volumes** ([images and volumes](docs/manual/11_images-and-volumes.md))
 
