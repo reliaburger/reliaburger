@@ -283,6 +283,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "a_lease_history_through_a_leader_kill_is_linearizable",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_lease_history_through_a_leader_kill_is_linearizable"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "an_admin_removes_a_policy_that_denies_everything_through_any_node",
     "binary": "reliaburger::cluster_failover",
     "test": "an_admin_removes_a_policy_that_denies_everything_through_any_node"

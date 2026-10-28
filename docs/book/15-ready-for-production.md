@@ -388,7 +388,52 @@ noisy. Once the measurements settle on comparable hardware, a threshold will mea
 something. Until then it would be another confident number with weak evidence. We've had
 enough of those.
 
-## A test that proves the door is locked
+## Numbers a user would feel
+
+So a unit test has no business asserting a duration. The soak is different. It runs for
+hours on one known rig, with the same three VMs, the same workloads and the same fault
+schedule every time. That's exactly where a latency means something, and for a long time we
+didn't look at one. The soak failed on an agent-loop turn over a second, on 30 seconds
+without a leader, on a job rate below target. All internal. Nobody using Reliaburger has
+ever felt a loop turn. They feel `relish status` taking three seconds, or an app that takes
+a minute to come back after a deploy.
+
+Kubernetes answers this with published service-level objectives (API call p99 at most a
+second, pod start-up p99 at most five) and measures every release against them with
+ClusterLoader2. We didn't want the tooling, but the idea fits the soak we already had
+([#1400](https://github.com/reliaburger/reliaburger/issues/1400)). Every soak tier now
+measures five latencies, outside fault windows only, and every record gets a table of their
+p99s.
+
+Which of them should fail a release? The honest answer was "only the ones we've measured".
+One had history: the job campaign has kept a histogram of task start lag since 0.2.0, and
+ten records said its p99 was 2 to 8 ms at the calibration load and 32 to 64 ms at the job
+qualification's target load. So that one is gated, at 256 ms: four times the worst we'd
+seen, and still a quarter of the September plan's one-second target. The other four (API
+reads, API writes, an app start and a rolling update) had never been timed. We could have
+picked Kubernetes's numbers and gated on them at once. But a threshold nobody has checked
+against a real run is a guess, and a guess that fails a release on its first night teaches
+everyone to ignore it. Those four start in record-only mode, with provisional thresholds,
+until the first 0.2.4 fast and final records show where they actually sit.
+
+Measuring them cost almost nothing, because the harness was already doing the work. Every
+light check talks to each node's API, so it now times two of the reads `relish` makes. For
+the writes, the app start and the rollout, the harness gives itself an app of its own,
+`soak-slo`: an idle BusyBox `httpd` with a health check on every node. Twice a cycle, when
+no fault is running, it bumps the app's generation and applies. The `relish apply` call is a
+write. Each node's deploy history then gets a new entry, with a start and a completion on
+that node's own clock, so the app start never mixes the host's clock with a guest's. And the
+time until every node has one is the rolling update. Why a new app rather than rolling one
+we had? `soak-identity` was the only multi-instance soak app, and rolling it every half hour
+would have changed its certificate serials, which is exactly what the identity-rotation gate
+counts. A rollout would have hidden a rotation that had stopped.
+
+The samples go into a bucketed histogram rather than a list, so a 24-hour run keeps a few
+kilobytes of state, and each p99 is a bucket's upper bound. We put every threshold on a
+bucket bound for the same reason we picked 256 ms: the record's number is then exactly the
+one the gate compared. `soak_slo.py trend` lists every record's values side by side, which
+is the closest we'll come to a dashboard for now.
+
 
 Here's a bug that a passing test hid for a while. Bun can run a workload as a plain host
 process, not just a container. You tell it a binary path and it runs it. Obviously you don't
@@ -7758,6 +7803,117 @@ fooled it. A child module declared as `agent/x/mod.rs` is perfectly good Rust,
 but the walker doesn't look in subdirectories, so its awaits would drop out of
 the check without a word. The walker now fails if `agent.rs` declares a module
 that isn't one of the files it read.
+
+## Did it happen in some order?
+
+Here's a history from three clients and one lease. Client 1 renews it through node A, and the
+answer says the lease now expires at 5,000,100. A moment later, after that answer, client 2
+reads it through node B and gets 5,000,000. Nothing was lost: the council still has the new
+expiry. No counter went backwards. Every invariant the soak checked was happy. And it was
+still wrong, because a read that starts after a write has finished must see that write.
+
+That rule has a name. A store is *linearizable* when every operation looks as if it happened
+at one instant between its call and its return, and the answers are the ones those
+operations would give run one at a time in that order. Operations that overlap may go either
+way. Operations that don't overlap can't swap. A stale read breaks the second rule and
+nothing else, so you only see it by looking at the whole history at once. That's what etcd's
+robustness tests do, and they found lost writes after a crash and revisions going backwards
+that their invariant checks had missed. The council is a Raft store with leases, the same
+shape as etcd, so from 0.2.4 our soak records a history and checks it the same way
+([#1399](https://github.com/reliaburger/reliaburger/issues/1399)).
+
+### Recording what the clients saw
+
+The council doesn't offer a general key-value API, but it does offer test leases: grant a
+namespace, renew the lease, read it, release it. That's a lock and a key-value record in one,
+and every node serves it, forwarding writes to the leader and confirming leadership before it
+answers a read. `scripts/release/council_history.py` runs four client threads for the whole
+soak. They take turns holding leases on two namespaces, and every request goes to a node
+picked at random. Each operation is two lines in a JSON Lines file: a `call` before the
+request goes out and a `return` when the answer comes back.
+
+The interesting answers are the ones that don't come back. A timeout tells you nothing: the
+leader may have committed the grant and crashed before replying, or never seen it. It may even
+commit it later, after the client gave up. So the recorder writes `unknown` for a timeout, a
+dropped connection or any 5xx, and the checker treats that operation as never returning. It
+may take effect anywhere after its call, or not at all. Getting this wrong in either direction
+is bad. Count a timeout as a failure and a grant that did commit looks like a phantom lock
+later; count it as a success and a grant that never happened makes the next client's grant
+look like two holders at once.
+
+### A search with a memory
+
+The checker, `scripts/release/linearizability.py`, is a small Python port of
+[Porcupine](https://github.com/anishathalye/porcupine), which is the Wing and Gong search with
+Lowe's memoisation. At each step it asks: which operations could come next? Any operation
+whose call came before every remaining operation's return. It tries each one against the
+model (a free or held namespace, a lease's expiry, whether cleanup has started), and moves on
+when the model's answer matches what the client saw. When nothing fits, it backs off. The
+memo is a set of (model state, operations done) pairs it has already explored, so two orders
+that reach the same place aren't searched twice.
+
+Two tricks keep it fast. Namespaces never affect each other, so each is checked on its own
+(Porcupine calls this P-compositionality). And an unanswered renew of lease L can only matter
+while L holds the namespace; once L is gone it never comes back, since lease ids are random.
+The search forgets such operations once they can't matter, so branches that differ only in
+them meet in the memo again. Before we added that, a history of 20,000 operations against a fake
+council that timed out one request in fifty didn't finish in two minutes. After it, the same
+history takes a twentieth of a second, and so does one where nearly half the requests time out
+or fail.
+
+It's still exponential in the worst case, and a soak can't hang on its own checker. Each
+namespace gets a budget of states, and a search that runs out reports *inconclusive*. The
+record says so, without failing the run. A violation fails it, and the record shows the
+smallest failing slice: the shortest prefix of the history that fails, then the latest
+quiet point (no answered operation in flight) from which the tail still fails, starting from
+any state at all. For the stale read above, that's two operations, the renew and the read,
+out of the thousands around them.
+
+### Breaking it on purpose
+
+A checker that never fails proves nothing, so we broke the council. The lease read handler
+starts like this:
+
+```rust
+if let Some(council) = &state.council
+    && !confirmed_lease_leader(council).await
+{
+    return forward_test_lease_request::<()>(/* ... to the leader */).await;
+}
+```
+
+Add `&& false` to that condition and a follower answers from its own copy of the state,
+which lags the leader. The gated cluster test
+`a_lease_history_through_a_leader_kill_is_linearizable` runs three in-process nodes, the
+history client against all three for 40 seconds, and kills the leader after 15. Our first
+broken run passed. So did the second. In-process nodes catch up within a millisecond or two,
+and the clients, pausing between operations, never read inside that window. So the client now
+reads every write straight back through a different node. With that, the broken build failed
+three runs out of three, each time on a renew that returned one expiry and a read 3 ms later,
+through another node, that returned the one before. The honest build passed every run.
+
+The checker's first finding wasn't that bug, though. It was in our model. On the honest
+build, a read during a release saw the lease *cleaning*, and the model said that couldn't
+happen: a release was one step, held one instant and free the next. But the council releases
+a lease in two writes, cleanup first and removal after, and a read can land between them.
+The history was right and the model was wrong. Now each release brings an extra optional
+operation, "cleanup started", that may happen anywhere in the release's interval. It's a
+useful reminder that a model is a claim about the system too, and the checker tests it as
+hard as it tests the code.
+
+The test drives Python from Rust, which needs two things we haven't used together before.
+`tokio::process::Command` is the async version of `std::process::Command`, so waiting for the
+client doesn't block a runtime thread while the cluster runs on the others.
+`.kill_on_drop(true)` ties the child to the Rust value: if the test panics before it waits, the
+`Child` is dropped while unwinding and tokio kills the process, so a failed run can't leave a
+client hammering ports another test is about to lease. In C or Go you'd write that cleanup by
+hand on every exit path; here it's the type's job. The nodes come from the fixture with
+`NodePlacement { test_operations: true, ..NodePlacement::default() }`, the struct update syntax
+from Chapter 1: every field we don't name comes from the default.
+
+What doesn't this cover? Only what the clients do. The soak's apps, jobs and upgrades write to
+the council too, and the history sees none of it. The next step is the same check for job
+outcomes, where "every task-array chunk completes exactly once" is an invariant today.
 
 ## Lessons learned: audit the evidence too
 

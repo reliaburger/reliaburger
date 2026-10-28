@@ -162,6 +162,7 @@ impl Fixture {
         let placement = NodePlacement {
             labels: BTreeMap::from([("rack".to_string(), rack.to_string())]),
             membership: Some(MembershipSource::Gossip),
+            test_operations: false,
         };
         self.start_node_with(index, seeds, true, Some(operator), placement)
             .await
@@ -198,7 +199,7 @@ impl Fixture {
             membership: placement.membership.unwrap_or(MembershipSource::Directory),
             service_identity: Some(RETIREMENT_SERVICE_TOKEN.into()),
             operator_token: operator,
-            fault_injection: false,
+            fault_injection: placement.test_operations,
             labels: placement.labels,
             keep_data_dir: false,
             task_arrays: None,
@@ -216,6 +217,9 @@ struct NodePlacement {
     labels: BTreeMap<String, String>,
     /// The gossip directory when `None`.
     membership: Option<MembershipSource>,
+    /// Serve the development test policy, which lets a client take test
+    /// leases.
+    test_operations: bool,
 }
 
 impl Drop for Fixture {
@@ -2077,4 +2081,85 @@ async fn a_controller_fails_a_templated_database_pair_over_when_its_node_dies() 
         Some(controller::Decision::Wait { .. })
     ));
     fixture.root.cancel();
+}
+
+/// #1399: four clients take, renew, read and release test leases through
+/// all three nodes while the leader is killed part-way, recording every
+/// operation; the history must check as linearizable. The same test with
+/// a deliberately broken read (a follower answering from its own copy
+/// without confirming leadership) fails the check: see "Checking the
+/// history, not just the invariants" in docs/testing.md.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1, a multi-core host and python3; run with make test-cluster"]
+async fn a_lease_history_through_a_leader_kill_is_linearizable() {
+    assert!(cluster_tests_enabled());
+    let operator = admin_token("history");
+    let mut fixture = Fixture::new();
+    let leases = || NodePlacement {
+        test_operations: true,
+        ..NodePlacement::default()
+    };
+    let mut nodes = vec![
+        fixture
+            .start_node_with(500, vec![], false, Some(operator.token.clone()), leases())
+            .await,
+    ];
+    for index in 501..503 {
+        let seed = fixture.gossip(500);
+        nodes.push(
+            fixture
+                .start_node_with(
+                    index,
+                    vec![seed],
+                    false,
+                    Some(operator.token.clone()),
+                    leases(),
+                )
+                .await,
+        );
+    }
+    let (leader, _) = settled_roles(&nodes).await;
+
+    let token_file = fixture.data.path().join("history-token");
+    std::fs::write(&token_file, &operator.plaintext).unwrap();
+    let history = fixture.data.path().join("council-history.jsonl");
+    let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/release");
+    let mut client = tokio::process::Command::new("python3");
+    client
+        .arg(scripts.join("council_history.py"))
+        .args(["run", "--clients", "4", "--pause", "0.05", "--timeout", "5"])
+        .args(["--duration", "40", "--history"])
+        .arg(&history)
+        .arg("--token-file")
+        .arg(&token_file)
+        .kill_on_drop(true);
+    for node in &nodes {
+        client
+            .arg("--node")
+            .arg(format!("{}={}", node.name, node.api_port));
+    }
+    let mut client = client.spawn().expect("python3 runs the history client");
+
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    kill(&nodes[leader]).await;
+    let finished = tokio::time::timeout(Duration::from_secs(120), client.wait())
+        .await
+        .expect("the history client stops after its duration")
+        .unwrap();
+    assert!(finished.success(), "history client exited with {finished}");
+
+    let checked = tokio::process::Command::new("python3")
+        .arg(scripts.join("linearizability.py"))
+        .arg("check")
+        .arg(&history)
+        .output()
+        .await
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&checked.stdout)
+        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&checked.stderr)));
+    assert_eq!(result["verdict"], "linearizable", "{result:#}");
+    assert!(
+        result["checked"].as_u64().unwrap_or(0) > 200,
+        "too few operations checked: {result:#}"
+    );
 }

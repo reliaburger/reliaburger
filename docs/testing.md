@@ -650,6 +650,156 @@ evidence directory ([plan](plans/archive/2026-10-17-soak-charts.md)). The
 homepage shows the released version's final soak charts
 ([how](website/README.md#soak-charts)).
 
+### Latency SLOs
+
+Everything above gates internal health. A user doesn't feel an agent-loop
+turn; they feel how long `relish status` takes, how long an app takes to come
+up, and how long a job waits before it starts. So every soak tier (V02 and job
+qualification, fast, final and day) also measures five latencies outside fault
+windows and puts a "Latency SLOs" table in its record
+([#1400](https://github.com/reliaburger/reliaburger/issues/1400)). Kubernetes
+does the same with its [published SLOs](https://github.com/kubernetes/community/blob/master/sig-scalability/slos/slos.md)
+(API call p99 ≤ 1 s, pod start-up p99 ≤ 5 s); the
+[research plan](plans/2026-10-28-research-kubernetes-release-testing.md) says
+why we copied the idea and not the tooling.
+
+| SLO (p99) | What's timed | Threshold | Mode |
+|---|---|---|---|
+| Job task start | A job task's start lag on a pooled executor, from the job campaign's buckets | ≤ 256 ms | Gated in the fast and final tiers |
+| API read | `GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` (what `relish status` and `relish nodes` ask) on every node, at every light check, from the host | ≤ 1,000 ms | Record only |
+| API write | `relish apply` of the soak workloads, from the call to the Raft commit | ≤ 2,000 ms | Record only |
+| App start | Each node's deploy of a new `soak-slo` instance, from its start until the instance passes its health check | ≤ 5,000 ms | Record only |
+| Rolling update | From `relish apply` returning until every node runs the new `soak-slo` | ≤ 30,000 ms | Record only |
+
+**Where the gated number comes from.** The job start lag is the one latency
+earlier records already kept. Across the ten 0.2.0 to 0.2.2 soak records its
+p99 was 2 to 8 ms at the V02 calibration load and 32 to 64 ms at the job
+qualification's target load (64 ms once, in the 0.2.1 fast tier; 32 ms in
+every final). There are no 0.2.3 soak records yet. The gate sits at 256 ms:
+four times the worst value seen, still a quarter of the September plan's
+1-second target, and a bucket bound, so the record's number is exact. A day
+tier records it without gating, since nothing has measured start lag at the
+day rate yet, and a run without a job campaign has nothing to judge.
+
+**Record only, from 28 October 2026.** No soak before 0.2.4 timed the API,
+an app start or a rolling update, so those four start in record-only mode:
+the record shows the value and whether it's over the provisional threshold,
+and never fails on it. The provisional thresholds are Kubernetes's for reads
+and app start, and a guess with room to spare for writes and rolling updates.
+Once the first 0.2.4 fast and final records exist, the maintainer sets each
+gate from them, with margin, the same way as the job start.
+
+**How it's measured.** At every light, settle and heavy check outside a fault
+window, the harness times the two API reads on each node that is up
+(`soak_slo.py api-latency`); the checker drops a node whose host forward is
+cut ([#987](https://github.com/reliaburger/reliaburger/issues/987)). Twice a
+cycle, outside fault windows, it bumps `soak-slo`'s generation (an idle
+BusyBox `httpd` with a health check, one instance per node) and applies the
+soak workloads without the job fixtures. The apply is a write; each node's
+new entry in `GET /v1/deploys/history/soak-slo` is an app start, timed on
+that node's own clock; and the time from the apply returning until every node
+has one is the rolling update. Samples go into a bucketed histogram in the
+evidence's `slo.json`, so each p99 is the upper bound of its bucket. A failed
+call counts with the time it took, and a rollout that didn't finish within
+180 s is counted and named in the record. `sustained_check.py render` fails
+the tier when a gated SLO is over its threshold or has no samples, and names
+the SLO in the record. `soak_slo.measure_api` is the same read probe as a
+function, for the hollow-node test
+([#1401](https://github.com/reliaburger/reliaburger/issues/1401)) to call.
+
+**The trend.** `python3 scripts/release/soak_slo.py trend docs/qualification`
+lists every record's SLO values, oldest first; for a record from before the
+table existed it reads the job start lag from the record's `.jobs.json`.
+
+The host reaches each node's API through a Lima port forward, so the API
+numbers include the forwarder. They're what `relish` on the same laptop sees,
+not what a client next to the node would.
+
+## Checking the history, not just the invariants
+
+The soak's invariants each look at one thing: the writer's sequence has no
+gaps, the Redis counter never goes down, every job finishes once. A store can
+pass all of them and still be wrong. A read served by a node that hasn't
+caught up returns a value the cluster had already overwritten; a lease granted
+twice gives two clients the same lock for a moment; a write acknowledged just
+before a crash quietly disappears. etcd's
+[robustness tests](https://github.com/etcd-io/etcd/blob/main/tests/robustness/README.md)
+found exactly these by recording every operation and checking the whole
+history against a model, so from 0.2.4 the soak does the same for the council
+([#1399](https://github.com/reliaburger/reliaburger/issues/1399), from the
+[release testing research](plans/2026-10-28-research-kubernetes-release-testing.md)).
+
+**Linearizable** means every operation looks as if it took effect at one
+instant somewhere between the client sending it and getting the answer, and
+the answers are the ones those operations would give one at a time in that
+order. Two operations that overlap may land either way round. Two that don't
+overlap can't swap: once a renew has returned, every read that starts later
+must see it. That rule is what invariants miss. A stale read breaks no counter
+and loses no data; it is only wrong in the light of what came before it.
+
+What runs, in every tier except the day run:
+
+- **The client.** [`council_history.py`](../scripts/release/council_history.py)
+  runs on the host for the whole soak. Four threads take turns holding test
+  leases on two namespaces: grant, then renew and read a few times, then
+  release, each request to a node picked at random. After every successful
+  renew or read it reads the lease straight back through a different node,
+  since a lagging node shows itself in the milliseconds after a write. A
+  thread whose grant is refused reads the holder's lease instead. That's
+  about six requests a second, about half of them council writes, which is
+  small beside the job campaign's writes, so it barely touches the
+  [latency SLOs](#latency-slos). The `soak-slo` rollouts take no test leases,
+  so they never appear in the history. Every operation is a `call` and a `return` event in
+  `council-history.jsonl` in the evidence directory, with monotonic and wall
+  times. Test leases are what the council lets a client write and read back:
+  the lease record is the key-value pair (lease id to expiry and state) and
+  the namespace is the lock. There is no general key-value API to record.
+- **The model.** A namespace has at most one lease; a grant succeeds only when
+  it's free; a renew moves the expiry and a read returns the latest one; a
+  release frees the namespace, in two steps (cleanup starts, then the lease
+  goes), so a read in between may see it cleaning. The council's reaper may remove a lease once
+  its expiry has passed, which the model allows, with 30 seconds' margin for
+  the host's and the nodes' clocks.
+- **Unknown answers.** A timeout, a dropped connection or a 5xx may or may
+  not have taken effect, and may take effect later, after the client gave up.
+  The checker allows both: such a write never returns, and it may be put
+  anywhere after its call, or nowhere.
+- **The check.** [`linearizability.py`](../scripts/release/linearizability.py)
+  is a small port of [Porcupine](https://github.com/anishathalye/porcupine):
+  a depth-first search over the operations that could come next, with
+  memoisation, run on each namespace apart. Once the soak is over, a violation
+  records a failure and fails the record. The record says how many operations
+  were checked and shows the smallest failing slice: the shortest prefix of
+  the history that fails, cut down to the shortest tail that fails from any
+  starting state. The search is bounded per namespace; a namespace that runs
+  over is reported as *inconclusive*, which fails nothing but says so, rather
+  than hanging the soak.
+
+`make test-ci-scripts` runs the checker's unit tests
+([`test_linearizability.py`](../scripts/release/test_linearizability.py)):
+hand-made linearizable histories pass, and a stale read, a lost grant, renew
+or release, and a lease held by two clients at once each fail with a slice of
+two or three operations. [`test_council_history.py`](../scripts/release/test_council_history.py)
+runs the client against an in-memory council, honest and with the bug below,
+and checks the record. The gated
+`cluster_failover::a_lease_history_through_a_leader_kill_is_linearizable`
+(`make test-cluster`) runs the client against three in-process nodes while
+it kills the leader, and checks the history.
+
+**Showing it can fail.** The bug the issue names is a follower answering a
+read from its own copy without confirming leadership: in
+`test_lease_get_handler` (`src/bun/api/test_leases.rs`), add `&& false` to
+the `confirmed_lease_leader` condition so no node forwards a read. With that
+change the gated test above failed three runs out of three (28 October 2026,
+about 1,950 operations a run): a renew returned an expiry, and a read through
+another node 3 ms later returned the one before it. Without the change it
+passed seven runs out of seven. The soak's VMs, with a real network and
+fsync between them, lag more than in-process nodes, so the fast tier has a
+wider window to catch the same bug.
+
+The same check for job outcomes (exactly one completion per task-array chunk)
+is later work.
+
 ## When a test flakes
 
 CI runs with `retries = 0`. A test that passes on a re-run still failed once,
