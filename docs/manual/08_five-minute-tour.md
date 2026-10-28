@@ -7,7 +7,7 @@ bad one back, scale one up, kill one, slow it down and lose a whole node. Open i
 `relish manual tour`.
 
 It needs a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB
-of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.2 release.
+of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.3 release.
 
 ## Install and build the cluster
 
