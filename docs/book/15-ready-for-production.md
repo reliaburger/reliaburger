@@ -388,7 +388,52 @@ noisy. Once the measurements settle on comparable hardware, a threshold will mea
 something. Until then it would be another confident number with weak evidence. We've had
 enough of those.
 
-## A test that proves the door is locked
+## Numbers a user would feel
+
+So a unit test has no business asserting a duration. The soak is different. It runs for
+hours on one known rig, with the same three VMs, the same workloads and the same fault
+schedule every time. That's exactly where a latency means something, and for a long time we
+didn't look at one. The soak failed on an agent-loop turn over a second, on 30 seconds
+without a leader, on a job rate below target. All internal. Nobody using Reliaburger has
+ever felt a loop turn. They feel `relish status` taking three seconds, or an app that takes
+a minute to come back after a deploy.
+
+Kubernetes answers this with published service-level objectives (API call p99 at most a
+second, pod start-up p99 at most five) and measures every release against them with
+ClusterLoader2. We didn't want the tooling, but the idea fits the soak we already had
+([#1400](https://github.com/reliaburger/reliaburger/issues/1400)). Every soak tier now
+measures five latencies, outside fault windows only, and every record gets a table of their
+p99s.
+
+Which of them should fail a release? The honest answer was "only the ones we've measured".
+One had history: the job campaign has kept a histogram of task start lag since 0.2.0, and
+ten records said its p99 was 2 to 8 ms at the calibration load and 32 to 64 ms at the job
+qualification's target load. So that one is gated, at 256 ms: four times the worst we'd
+seen, and still a quarter of the September plan's one-second target. The other four (API
+reads, API writes, an app start and a rolling update) had never been timed. We could have
+picked Kubernetes's numbers and gated on them at once. But a threshold nobody has checked
+against a real run is a guess, and a guess that fails a release on its first night teaches
+everyone to ignore it. Those four start in record-only mode, with provisional thresholds,
+until the first 0.2.4 fast and final records show where they actually sit.
+
+Measuring them cost almost nothing, because the harness was already doing the work. Every
+light check talks to each node's API, so it now times two of the reads `relish` makes. For
+the writes, the app start and the rollout, the harness gives itself an app of its own,
+`soak-slo`: an idle BusyBox `httpd` with a health check on every node. Twice a cycle, when
+no fault is running, it bumps the app's generation and applies. The `relish apply` call is a
+write. Each node's deploy history then gets a new entry, with a start and a completion on
+that node's own clock, so the app start never mixes the host's clock with a guest's. And the
+time until every node has one is the rolling update. Why a new app rather than rolling one
+we had? `soak-identity` was the only multi-instance soak app, and rolling it every half hour
+would have changed its certificate serials, which is exactly what the identity-rotation gate
+counts. A rollout would have hidden a rotation that had stopped.
+
+The samples go into a bucketed histogram rather than a list, so a 24-hour run keeps a few
+kilobytes of state, and each p99 is a bucket's upper bound. We put every threshold on a
+bucket bound for the same reason we picked 256 ms: the record's number is then exactly the
+one the gate compared. `soak_slo.py trend` lists every record's values side by side, which
+is the closest we'll come to a dashboard for now.
+
 
 Here's a bug that a passing test hid for a while. Bun can run a workload as a plain host
 process, not just a container. You tell it a binary path and it runs it. Obviously you don't
