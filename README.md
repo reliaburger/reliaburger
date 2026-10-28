@@ -340,11 +340,11 @@ memory and CPU as they go.
 **Policies.** `[policy.*]` rules in CEL, such as "apps in `prod` need a memory
 limit", are kept in the council and checked on the leader before an app is
 written, for `relish apply` and GitOps alike. A rule refuses the apply or only
-warns, every denial names its policy, and `relish policy test` *(0.2.3, not in 0.2.2)* runs the same
+warns, every denial names its policy, and `relish policy test` *(0.2.4, not in 0.2.2)* runs the same
 check offline in CI. A policy can also fill in fields an app leaves out, such
 as a team label, without ever overwriting one you wrote, and GitOps doesn't
 mistake a filled-in field for a change. Policies can judge jobs too, an
-`audit` policy only records what it finds, and `relish policy audit` *(0.2.3, not in 0.2.2)* and
+`audit` policy only records what it finds, and `relish policy audit` *(0.2.4, not in 0.2.2)* and
 `relish wtf` list the running apps and jobs a new policy would refuse. See [security and access](docs/manual/10_security.md#policies).
 
 **Your own controllers, without an operator SDK.** A controller is an ordinary
@@ -428,7 +428,7 @@ binary was built from. Neither needs a network.
 | Prometheus, Alertmanager | Built-in scraping, alert rules and webhooks |
 | A log shipper and store | Built-in capture, streaming and Parquet export |
 | Argo CD or Flux | Built-in GitOps |
-| Kyverno or Gatekeeper (validation, defaults, audit) | `[policy.*]` deny, warn and audit rules for apps and jobs, fill-only defaults, `relish policy audit` *(0.2.3, not in 0.2.2)* |
+| Kyverno or Gatekeeper (validation, defaults, audit) | `[policy.*]` deny, warn and audit rules for apps and jobs, fill-only defaults, `relish policy audit` *(0.2.4, not in 0.2.2)* |
 | Helm charts or a CRD and its operator (the expansion half) | `[template.*]` and `[use.*]` |
 | Argo Workflows, Kueue or a Celery-style queue | Built-in jobs, cron, hooks and task arrays |
 | Chaos Mesh or Litmus | `relish fault` |
