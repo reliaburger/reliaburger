@@ -54,6 +54,7 @@ import tomllib
 import job_soak
 import job_soak_inventory
 import soak_charts
+import soak_slo
 
 # Thresholds from section 4 of the plan (seconds unless stated).
 NODE_CERT_MARGIN = 300
@@ -801,6 +802,8 @@ def evaluate(evidence, snapshot):
         forward_findings, cut = host_forward_findings(state, forwards, now)
         findings += forward_findings
     ingress_cut = any(name == "ingress" for _, name in cut)
+    # The latency SLOs' API reads (#1400) count only outside fault windows.
+    soak_slo.fold_snapshot(evidence, snapshot, fault_window, cut)
 
     http = read(snapshot, "http.txt")
     http_ok = None
@@ -1948,9 +1951,15 @@ def render(evidence, record):
     final_tier = metadata.get("tier") in ("final", "day")
     day = job_soak.report(job_report).get("day") if metadata.get("tier") == "day" and job_report else None
     exposure = exposure_shortfalls(state)
-    gate_failed = any(row[3] == "FAIL" for row in gates) or (final_tier and bool(missing or exposure))
+    # The latency SLOs (#1400): a breached gated one fails the tier.
+    slo_data = soak_slo.load(evidence)
+    slo_rows = soak_slo.rows(slo_data, job_soak.report(job_report) if job_report else None,
+                             metadata.get("tier") or "custom", metadata.get("job_soak") is True)
+    slo_failed = bool(soak_slo.failures(slo_rows))
+    # The council history (#1399): a violation, or a check owed and missing, fails the run.
     history_failed, history_lines = council_history_section(evidence, metadata)
-    gate_failed = gate_failed or history_failed
+    gate_failed = (any(row[3] == "FAIL" for row in gates) or (final_tier and bool(missing or exposure))
+                   or slo_failed or history_failed)
     open_failures = [row for row in failures if row.get("disposition", "open") == "open"]
     result = metadata.get("result") or ("FAIL" if open_failures or gate_failed else "PASS")
     if (open_failures or gate_failed) and result == "PASS":
@@ -1962,7 +1971,7 @@ def render(evidence, record):
     lines += [f"{time.strftime('%-d %B %Y', time.gmtime(started))}. {tier} tier, {schedule_text} "
               f"schedule, {duration_text(elapsed)} of soak on a three-node quickstart cluster.", ""]
     # The acceptance line tells a failed check apart from a run that was clean but incomplete.
-    clean_apart_from_inventory = "FAIL" if open_failures or metadata.get("result") == "FAIL" or any(
+    clean_apart_from_inventory = "FAIL" if open_failures or metadata.get("result") == "FAIL" or slo_failed or history_failed or any(
         row[3] == "FAIL" for row in gates) else "PASS"
     lines += [acceptance_line(metadata, clean_apart_from_inventory, elapsed, missing if final_tier else (),
                               job_final_ran(metadata, job_report, missing), exposure if final_tier else (), day), ""]
@@ -2028,6 +2037,7 @@ def render(evidence, record):
     lines += ["## Renewals and rotations", "", "| Measure | Observed | Required | Verdict |", "|---|---|---|---|"]
     lines += [f"| {label} | {observed} | {need} | {verdict} |" for label, observed, need, verdict in gates]
     lines.append("")
+    lines += soak_slo.table_lines(slo_rows, slo_data)
     progress = state.get("progress", {})
     if metadata.get("job_soak") is True:
         lines += ["## Jobs", "", "| Runtime | Accepted successes | Retries | Last accepted progress |", "|---|---|---|---|"]
