@@ -44,6 +44,19 @@ class FuzzWorkflowTests(unittest.TestCase):
         self.assertIn("$(wildcard fuzz/fuzz_targets/*.rs)", makefile)
         self.assertIn("-max_total_time=$(FUZZ_SECONDS)", makefile)
 
+    def test_every_fuzz_build_and_run_names_the_toolchains_host_target(self):
+        # cargo-fuzz defaults --target to the triple it was itself built for.
+        # The prebuilt cargo-fuzz CI installs is a musl binary, so it asked for
+        # x86_64-unknown-linux-musl: a static CRT ASan refuses, and no std
+        # (run 40675683581). The nightly toolchain's own host is always right.
+        makefile = (REPO / "Makefile").read_text()
+        self.assertRegex(makefile, r"(?m)^FUZZ_TARGET \?= \$\(shell \$\(CARGO\) \+nightly -vV.*host")
+        calls = re.findall(r"\$\(FUZZ\) (build|run)\b([^\n]*)", makefile)
+        self.assertEqual(sorted({verb for verb, _ in calls}), ["build", "run"])
+        for verb, rest in calls:
+            with self.subTest(verb=verb):
+                self.assertIn("--target $(FUZZ_TARGET)", rest)
+
     def test_a_crash_fails_the_job_and_keeps_its_input(self):
         upload = self.text[self.text.index("uses: actions/upload-artifact@") - 200:]
         self.assertIn("if: failure()", upload)

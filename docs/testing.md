@@ -545,7 +545,7 @@ commands never build it. Three things run the targets:
 |---|---|---|
 | `make test` (in `make ci`) | stable | `fuzz::tests`: every fixture seed is accepted and round-trips, every file in `fuzz/corpus/` runs without a panic, 512 mutated seeds run without a panic, and every target has its binary |
 | `make fuzz-corpus-check` | stable | Only those tests |
-| `make fuzz-smoke` | nightly, cargo-fuzz | Builds every target with sanitizers and runs each for `FUZZ_SECONDS` (default 10). `make fuzz-tools` says how to install what's missing |
+| `make fuzz-smoke` | nightly, cargo-fuzz | Builds every target with sanitizers and runs each for `FUZZ_SECONDS` (default 10). `make fuzz-tools` says how to install what's missing. It builds for the nightly toolchain's host (`FUZZ_TARGET`), because cargo-fuzz otherwise picks the triple it was built for, and CI's prebuilt cargo-fuzz is a musl binary that AddressSanitizer can't use |
 
 [`fuzz.yml`](../.github/workflows/fuzz.yml) runs `make fuzz-smoke` nightly at
 300 seconds a target, and for 30 seconds on a pull request that touches a

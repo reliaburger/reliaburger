@@ -174,6 +174,10 @@ readme-commands: ## Regenerate the relish command list in README.md from the CLI
 # checked-in seeds; crashes go to fuzz/artifacts/<target>/.
 FUZZ = $(CARGO) +nightly fuzz
 FUZZ_SECONDS ?= 10
+# cargo-fuzz defaults --target to the triple it was built for; a prebuilt
+# musl cargo-fuzz then asks for a static CRT that AddressSanitizer refuses.
+# Name the nightly toolchain's own host instead.
+FUZZ_TARGET ?= $(shell $(CARGO) +nightly -vV 2>/dev/null | sed -n 's/^host: //p')
 FUZZ_TARGETS = $(sort $(basename $(notdir $(wildcard fuzz/fuzz_targets/*.rs))))
 
 fuzz-tools: ## Check that nightly Rust and cargo-fuzz are installed, and say how to get them
@@ -181,13 +185,13 @@ fuzz-tools: ## Check that nightly Rust and cargo-fuzz are installed, and say how
 	@$(FUZZ) --version >/dev/null 2>&1 || { 		echo "fuzzing needs cargo-fuzz: cargo install cargo-fuzz --locked" >&2; exit 1; }
 
 fuzz-build: fuzz-tools ## Build every fuzz target (nightly, cargo-fuzz)
-	$(FUZZ) build
+	$(FUZZ) build --target $(FUZZ_TARGET)
 
 fuzz-smoke: fuzz-build ## Run every fuzz target for FUZZ_SECONDS (default 10) each; fails if any crashes
 	@failed=""; for target in $(FUZZ_TARGETS); do \
 		mkdir -p fuzz/target/corpus/$$target fuzz/target/logs; \
 		echo "fuzz: $$target for $(FUZZ_SECONDS)s (log: fuzz/target/logs/$$target.log)"; \
-		$(FUZZ) run $$target fuzz/target/corpus/$$target fuzz/corpus/$$target -- \
+		$(FUZZ) run --target $(FUZZ_TARGET) $$target fuzz/target/corpus/$$target fuzz/corpus/$$target -- \
 			-max_total_time=$(FUZZ_SECONDS) -print_final_stats=1 \
 			>fuzz/target/logs/$$target.log 2>&1 || failed="$$failed $$target"; \
 		grep -E '^#[0-9]+.*(DONE|cov:)' fuzz/target/logs/$$target.log | tail -n 1; \
