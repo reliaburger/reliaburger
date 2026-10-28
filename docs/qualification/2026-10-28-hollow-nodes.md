@@ -79,7 +79,7 @@ Signals in the fleet's own log over each whole run:
    from an idle council to a thousand nodes. The council process's CPU levels
    off near 60% of one core between 500 and 1,000 nodes, and its memory grows
    by about a megabyte per node.
-2. **The leader refuses reports from 500 nodes up.** Every node reports
+2. **The leader refuses reports from 500 nodes up** ([#1411](https://github.com/reliaburger/reliaburger/issues/1411)). Every node reports
    straight to the leader, whose reporting listener serves 16 connections at
    a time and drops the rest (`MAX_REPORT_CONNECTIONS` in
    `src/reporting/transport.rs`). At 1,000 nodes the refusals ran at about
@@ -87,15 +87,15 @@ Signals in the fleet's own log over each whole run:
    again. Scheduling still converges because a report eventually lands, but
    placement, failure handling and the API all slow with it. This is the
    limit the whitepaper's §8.1 predicts, and it arrives well before 10,000.
-3. **API writes slow down about 75-fold between 500 and 1,000 nodes** while the
+3. **API writes slow down about 75-fold between 500 and 1,000 nodes** ([#1412](https://github.com/reliaburger/reliaburger/issues/1412)) while the
    Raft commit underneath doesn't move. A thousand placement reconcilers poll
    `/v1/placements` on the leader every 2 s (500 requests a second), beside
    the report traffic.
-4. **Failure handling at 1,000 nodes didn't finish.** In run 2 the replicas
+4. **Failure handling at 1,000 nodes didn't finish** ([#1413](https://github.com/reliaburger/reliaburger/issues/1413)). In run 2 the replicas
    of 100 crashed nodes weren't all running again after 6 minutes, and in
    neither 1,000-node run were the restarted nodes listed alive again within
    6 minutes. At 100 nodes the same steps take 10 s and under 1 s.
-5. **A mass join converges slowly.** 16 s for 100 nodes to see each other,
+5. **A mass join converges slowly** ([#1413](https://github.com/reliaburger/reliaburger/issues/1413)). 16 s for 100 nodes to see each other,
    139 s for 500, incomplete after 6 minutes for 1,000.
 
 ### How much of this is the laptop
@@ -117,14 +117,14 @@ leader transport for workload signing" because the harness runs plaintext
 
 ## What the measurements say about our claims
 
-None of these was changed; the coordinator decides.
+None of these was changed; the maintainer decides.
 
 - **Whitepaper §2, "Maximum nodes per cluster: 10,000. Target (unmeasured)"**
   and **§23's comparison matrix, "Target: 10,000 nodes (unmeasured)"**. Not
   contradicted as worded, but the first measured limits are far below it:
   report admissions refused from 500 nodes, applies at 2.6 s and failure
-  handling unfinished at 1,000. Either the target needs these as known
-  limits, or each needs an issue.
+  handling unfinished at 1,000. Each limit has an issue in the 0.3.0
+  milestone: [#1411](https://github.com/reliaburger/reliaburger/issues/1411), [#1412](https://github.com/reliaburger/reliaburger/issues/1412) and [#1413](https://github.com/reliaburger/reliaburger/issues/1413).
 - **Whitepaper §2 rationale and §8.1 Layer 1: "gossip scales to tens of
   thousands", "O(log N) convergence"**. A 500-node mass join took 139 s to
   converge and a 1,000-node one didn't within 6 minutes. CPU starvation
