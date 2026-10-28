@@ -172,17 +172,21 @@ readme-commands: ## Regenerate the relish command list in README.md from the CLI
 # The corpus checks run the same bodies on stable and are part of `make test`.
 # New inputs libFuzzer finds go to fuzz/target/corpus/, never into the
 # checked-in seeds; crashes go to fuzz/artifacts/<target>/.
-FUZZ = $(CARGO) +nightly fuzz
+# fuzz.yml pins a dated nightly here so its build cache stays valid.
+FUZZ_TOOLCHAIN ?= nightly
+FUZZ = $(CARGO) +$(FUZZ_TOOLCHAIN) fuzz
 FUZZ_SECONDS ?= 10
 # cargo-fuzz defaults --target to the triple it was built for; a prebuilt
 # musl cargo-fuzz then asks for a static CRT that AddressSanitizer refuses.
 # Name the nightly toolchain's own host instead.
-FUZZ_TARGET ?= $(shell $(CARGO) +nightly -vV 2>/dev/null | sed -n 's/^host: //p')
+FUZZ_TARGET ?= $(shell $(CARGO) +$(FUZZ_TOOLCHAIN) -vV 2>/dev/null | sed -n 's/^host: //p')
 FUZZ_TARGETS = $(sort $(basename $(notdir $(wildcard fuzz/fuzz_targets/*.rs))))
 
 fuzz-tools: ## Check that nightly Rust and cargo-fuzz are installed, and say how to get them
-	@$(CARGO) +nightly --version >/dev/null 2>&1 || { 		echo "fuzzing needs nightly Rust: rustup toolchain install nightly --profile minimal" >&2; exit 1; }
-	@$(FUZZ) --version >/dev/null 2>&1 || { 		echo "fuzzing needs cargo-fuzz: cargo install cargo-fuzz --locked" >&2; exit 1; }
+	@$(CARGO) +$(FUZZ_TOOLCHAIN) --version >/dev/null 2>&1 || { \
+		echo "fuzzing needs Rust $(FUZZ_TOOLCHAIN): rustup toolchain install $(FUZZ_TOOLCHAIN) --profile minimal" >&2; exit 1; }
+	@$(FUZZ) --version >/dev/null 2>&1 || { \
+		echo "fuzzing needs cargo-fuzz: cargo install cargo-fuzz --locked" >&2; exit 1; }
 
 fuzz-build: fuzz-tools ## Build every fuzz target (nightly, cargo-fuzz)
 	$(FUZZ) build --target $(FUZZ_TARGET)

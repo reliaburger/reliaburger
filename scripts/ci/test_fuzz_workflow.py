@@ -50,7 +50,7 @@ class FuzzWorkflowTests(unittest.TestCase):
         # x86_64-unknown-linux-musl: a static CRT ASan refuses, and no std
         # (run 40675683581). The nightly toolchain's own host is always right.
         makefile = (REPO / "Makefile").read_text()
-        self.assertRegex(makefile, r"(?m)^FUZZ_TARGET \?= \$\(shell \$\(CARGO\) \+nightly -vV.*host")
+        self.assertRegex(makefile, r"(?m)^FUZZ_TARGET \?= \$\(shell \$\(CARGO\) \+\$\(FUZZ_TOOLCHAIN\) -vV.*host")
         calls = re.findall(r"\$\(FUZZ\) (build|run)\b([^\n]*)", makefile)
         self.assertEqual(sorted({verb for verb, _ in calls}), ["build", "run"])
         for verb, rest in calls:
@@ -72,6 +72,21 @@ class FuzzWorkflowTests(unittest.TestCase):
         # The cache restores before the build it saves.
         self.assertLess(self.text.index("uses: Swatinem/rust-cache@"),
                         self.text.index("run: make fuzz-smoke"))
+
+    def test_the_cache_key_only_changes_with_the_pinned_nightly(self):
+        # rust-cache hashes every installed toolchain into its key. A floating
+        # nightly changes daily, and the runner image's own stable moved from
+        # 1.99.0 to 1.99.1 between two attempts of run 40684652389, so the
+        # re-run missed the cache it had just saved.
+        pin = re.search(r"(?m)^  FUZZ_TOOLCHAIN: (nightly-\d{4}-\d{2}-\d{2})$", self.text)
+        self.assertIsNotNone(pin, "fuzz.yml pins a dated nightly in FUZZ_TOOLCHAIN")
+        self.assertIn("toolchain: ${{ env.FUZZ_TOOLCHAIN }}", self.text)
+        keep = self.text.index("rustup toolchain uninstall")
+        self.assertLess(keep, self.text.index("uses: Swatinem/rust-cache@"))
+        makefile = (REPO / "Makefile").read_text()
+        self.assertIn("FUZZ_TOOLCHAIN ?= nightly", makefile)
+        fuzz_block = makefile[makefile.index("# --- Fuzzing"):makefile.index("fuzz-corpus-check:")]
+        self.assertNotIn("+nightly", fuzz_block, "every fuzz command uses $(FUZZ_TOOLCHAIN)")
 
     def test_a_crash_fails_the_job_and_keeps_its_input(self):
         upload = self.text[self.text.index("uses: actions/upload-artifact@") - 200:]

@@ -47,6 +47,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # A dated nightly, so the build cache below survives from one night to the
+  # next; a floating one changes its key every day. Move it forward by hand
+  # (and the cache with it) when a newer nightly is needed.
+  FUZZ_TOOLCHAIN: nightly-2026-10-28
 
 jobs:
   fuzz:
@@ -57,7 +61,21 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+      # rust-cache hashes every installed toolchain into its key, and the
+      # runner image's own stable changes as images roll out (1.99.0, then
+      # 1.99.1, between two attempts of one run). Keep only ours.
+      - name: Keep only the fuzzing toolchain
+        run: |
+          for toolchain in $(rustup toolchain list --quiet); do
+            case "$toolchain" in
+              "$FUZZ_TOOLCHAIN"-*) ;;
+              *) rustup toolchain uninstall "$toolchain" ;;
+            esac
+          done
+          rustup toolchain list
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz@0.13.2
