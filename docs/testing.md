@@ -554,6 +554,33 @@ and a rule-of-three summary, and deletes the VM. It never touches
 `reliaburger-test`. [`test_power_cut_reboot.py`](../scripts/release/test_power_cut_reboot.py)
 (in `make test-ci-scripts`) checks its decisions against a fake `limactl`.
 
+## Hollow nodes
+
+Our biggest real cluster is three VMs. To see what a council does with
+hundreds of nodes in front of it, [`tests/hollow_nodes.rs`](../tests/hollow_nodes.rs)
+borrows Kubernetes' Kubemark idea ([#1401](https://github.com/reliaburger/reliaburger/issues/1401)):
+a real three-member council in one process, and a fleet of hollow nodes in
+another. A hollow node ([`tests/support/hollow.rs`](../tests/support/hollow.rs))
+runs real gossip, the Raft endpoint, the reporting worker, a real agent and its
+placement reconciler. Only its runtime is fake: it "runs" every workload at
+once and reports the capacity the harness gives it. The council's size is held
+at three, so no hollow node becomes a voter.
+
+| Command | What it does |
+|---|---|
+| `make test-hollow` | Twenty hollow nodes: they converge, a replica runs on each, a quarter stop and come back. A check that the harness works, not a measurement |
+| `scripts/release/qualify-hollow-nodes.sh --sizes 100,500,1000` | One measured run per size, one at a time, each to `hollow-<N>.json`, then a table from [`hollow_summary.py`](../scripts/release/hollow_summary.py) |
+
+A run measures gossip convergence, the council's CPU and memory (it has its
+own process, so `ps` can tell them apart), Raft commit latency from a no-op
+write each second, how long one apply takes to put a replica on every node,
+the latency of twenty small applies, and, when a tenth of the fleet loses all
+its traffic at once, how long the council takes to notice and to run the lost
+replicas elsewhere. The script won't start a size while the host's load
+average is over 40, and the harness stops a run that crosses it. Nothing hollow
+is in the library or the release binary: it lives under `tests/`. Records are
+in [`qualification/`](qualification/) ([first run](qualification/2026-10-28-hollow-nodes.md)).
+
 ## Before a release
 
 Nothing ships that hasn't been built once, signed, staged and installed the way

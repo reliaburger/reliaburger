@@ -22,6 +22,9 @@ mod root_processes;
 // `cluster.rs` already includes the task harness; loading the file a second
 // time would compile two distinct `TestTasks` types.
 use cluster_support::task_harness;
+// Hollow nodes for the fleet harness; `tests/hollow_nodes.rs` runs fleets.
+#[path = "../support/hollow.rs"]
+mod hollow;
 // Seeds whole-pass admission entries the way a planner commits them.
 mod admission_fixture;
 
@@ -49,6 +52,7 @@ mod documented_manifests;
 mod endpoint_withdrawal;
 mod fixture_scripts;
 mod gitops;
+mod hollow_grill;
 mod ingress;
 mod ingress_certificates;
 mod ingress_connection_lifetime;

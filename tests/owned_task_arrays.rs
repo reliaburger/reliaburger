@@ -4050,6 +4050,7 @@ async fn leader_loss_mid_array(template: serde_json::Value) {
                 task_arrays: Some(service),
                 task_arrays_on_agent_budget: None,
                 process_only: false,
+                council_size_cap: None,
             })
             .await,
         );

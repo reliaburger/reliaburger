@@ -131,6 +131,14 @@ tower = { version = "0.5", features = ["util"] }
 strip = true
 codegen-units = 1
 
+# The hollow-node harness (#1401) measures optimised code, but nothing built
+# with this profile ships. Sixteen codegen units build it in a fraction of
+# the release profile's time, at a small cost in speed.
+[profile.hollow]
+inherits = "release"
+codegen-units = 16
+strip = false
+
 [profile.dev]
 debug = "line-tables-only"
 
