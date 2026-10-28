@@ -252,6 +252,7 @@ async fn start_node_with(
         task_arrays: None,
         task_arrays_on_agent_budget: None,
         process_only,
+        council_size_cap: None,
     })
     .await;
 

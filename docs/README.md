@@ -443,6 +443,7 @@ make test-slow             # genuine wall-clock acceptance tests
 sudo make test-linux       # runc, netns, eBPF, Btrfs, Buildah and root-only tests
 make test-rootless-runc    # rootless runc port and replacement test (never sudo)
 make test-cluster          # failover, healing, recovery, placement and chaos
+make test-hollow           # a three-member council and twenty hollow nodes (#1401)
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement
 make coverage              # portable suite under line coverage (HTML and LCOV)
@@ -1716,3 +1717,10 @@ record what each kind of job costs for 60 seconds on a small VM, with the rig
 and its limits. The 12-hour job qualification on three nodes, at 4,600
 accepted jobs a second, is [its own record](qualification/2026-10-17-v0.2.0-job-qualification.md) (#668), and resident
 model workers (#641) are a separate, later feature.
+
+How a council copes with a big fleet is measured with hollow nodes: real
+agents with a runtime that runs nothing, hundreds in one process, in front of
+a real three-member council in another (#1401).
+`scripts/release/qualify-hollow-nodes.sh --sizes 100,500,1000` runs them one
+size at a time; the [first record](qualification/2026-10-28-hollow-nodes.md)
+has 100, 500 and 1,000 nodes on one Mac, and the limits it found.
