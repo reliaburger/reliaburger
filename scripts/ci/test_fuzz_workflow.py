@@ -57,6 +57,22 @@ class FuzzWorkflowTests(unittest.TestCase):
             with self.subTest(verb=verb):
                 self.assertIn("--target $(FUZZ_TARGET)", rest)
 
+    def test_the_sanitizer_build_is_cached_and_the_job_has_headroom(self):
+        # The uncached nightly is about 31 minutes of build plus 45 of
+        # fuzzing: the limit leaves at least half again on top.
+        limit = re.search(r"(?m)^    timeout-minutes: (\d+)$", self.text)
+        self.assertIsNotNone(limit)
+        self.assertGreaterEqual(int(limit.group(1)), 120)
+        cache = self.text[self.text.index("uses: Swatinem/rust-cache@"):]
+        cache = cache[:cache.index("\n      - ")]
+        self.assertIn("workspaces: fuzz -> target", cache)
+        # One key for the nightly and the pull request runs.
+        self.assertIn("shared-key: fuzz", cache)
+        self.assertNotIn("${{", cache.split("shared-key:")[1].splitlines()[0])
+        # The cache restores before the build it saves.
+        self.assertLess(self.text.index("uses: Swatinem/rust-cache@"),
+                        self.text.index("run: make fuzz-smoke"))
+
     def test_a_crash_fails_the_job_and_keeps_its_input(self):
         upload = self.text[self.text.index("uses: actions/upload-artifact@") - 200:]
         self.assertIn("if: failure()", upload)
