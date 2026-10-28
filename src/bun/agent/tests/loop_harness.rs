@@ -1141,6 +1141,24 @@ async fn the_first_consumer_sync_after_a_restart_takes_one_slow_await_a_turn() {
     );
 }
 
+/// The CPU time this process has used so far, user and system, on every
+/// thread. Unlike the wall clock, it doesn't grow while a busy machine
+/// leaves the test waiting for a core, so it measures work.
+fn process_cpu_time() -> std::time::Duration {
+    // SAFETY: `rusage` is plain old data, for which all-zero bytes are a
+    // valid value, and `getrusage` only writes into the struct we pass.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `RUSAGE_SELF` is a valid target and `usage` a valid,
+    // exclusively borrowed out-pointer for the duration of the call.
+    let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    assert_eq!(status, 0, "getrusage failed");
+    let duration = |time: libc::timeval| {
+        std::time::Duration::from_secs(time.tv_sec as u64)
+            + std::time::Duration::from_micros(time.tv_usec as u64)
+    };
+    duration(usage.ru_utime) + duration(usage.ru_stime)
+}
+
 /// Take a leader answer through the loop's consumer-sync turns, one step a
 /// turn as `run_loop` does, and return each turn as the meter saw it.
 async fn consumer_sync_turns(
@@ -1149,6 +1167,21 @@ async fn consumer_sync_turns(
     catalog: crate::onion::catalog::EndpointCatalog,
     ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
 ) -> Vec<crate::bun::loop_meter::TurnRecord> {
+    consumer_sync_turns_and_work(agent, generation, catalog, ingress)
+        .await
+        .into_iter()
+        .map(|(turn, _)| turn)
+        .collect()
+}
+
+/// [`consumer_sync_turns`], with the CPU time the process spent in each
+/// turn: the loop's own work and any blocking-pool work it waited on.
+async fn consumer_sync_turns_and_work(
+    agent: &mut BunAgent<MockGrill>,
+    generation: u64,
+    catalog: crate::onion::catalog::EndpointCatalog,
+    ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
+) -> Vec<(crate::bun::loop_meter::TurnRecord, std::time::Duration)> {
     let (response, reply) = oneshot::channel();
     agent
         .handle_command(AgentCommand::SyncClusterConsumer {
@@ -1162,12 +1195,14 @@ async fn consumer_sync_turns(
         .await;
     let mut turns = Vec::new();
     while !agent.consumer_syncs.is_idle() {
+        let cpu = process_cpu_time();
         let turn = agent.begin_consumer_sync_turn();
         agent.continue_consumer_sync().await;
         agent.consumer_syncs.end_turn();
         agent.turn_deadline = None;
         agent.loop_meter.finish(turn);
-        turns.push(agent.loop_meter.last_turn().unwrap());
+        let work = process_cpu_time().saturating_sub(cpu);
+        turns.push((agent.loop_meter.last_turn().unwrap(), work));
     }
     let update = reply.await.unwrap().unwrap();
     assert!(
@@ -1259,9 +1294,15 @@ fn large_catalogue(services: usize, port_base: u16) -> crate::onion::catalog::En
 /// node consumes at once. Building, journalling and installing a view does
 /// scale with its size, so a thousand services (the soak runs a handful),
 /// first published after a recovery and then with every backend moved,
-/// must leave each turn well inside the budget once the disk's share is
-/// taken out. The disk's share is the slow-disk scenarios' business; this
-/// one measures what the view's size costs the loop.
+/// must leave each turn well inside the budget. The disk's share is the
+/// slow-disk scenarios' business; this one measures what the view's size
+/// costs the loop.
+///
+/// It counts work, not wall clock (#1140): the CPU time the process spent
+/// in each turn, which a machine too busy to give the test a core doesn't
+/// inflate. Timing the turn beside its journal write would have failed 33
+/// of 120 runs at load average 285 to 310, with turns of up to 673 ms,
+/// while no turn used more than 116 ms of CPU.
 #[tokio::test]
 async fn a_large_consumer_view_change_takes_each_turn_well_within_the_budget() {
     let (mut agent, _root, _catalog, _ingress) = recovered_consumer().await;
@@ -1269,12 +1310,12 @@ async fn a_large_consumer_view_change_takes_each_turn_well_within_the_budget() {
         (1, large_catalogue(1000, 30000)),
         (2, large_catalogue(1000, 31000)),
     ] {
-        for turn in consumer_sync_turns(&mut agent, generation, catalog, vec![]).await {
-            let disk = turn.part(TurnPart::JournalWrite).unwrap_or_default();
-            let view = turn.took.saturating_sub(disk);
+        for (turn, work) in
+            consumer_sync_turns_and_work(&mut agent, generation, catalog, vec![]).await
+        {
             assert!(
-                view < TURN_BUDGET / 2,
-                "generation {generation}: {turn} spent {view:?} beside its journal write"
+                work < TURN_BUDGET / 2,
+                "generation {generation}: {turn} used {work:?} of CPU"
             );
         }
     }
@@ -1524,6 +1565,339 @@ async fn a_journal_write_that_fails_off_the_turn_fences_discovery_and_installs_n
         "a failed write was published"
     );
     assert_eq!(installed_remote_port(&agent), Some(30001));
+}
+
+// ---- receipt confirmations (#1340) --------------------------------------------
+
+/// The leader's withdrawal of the fixture's first view, sent with a later
+/// answer.
+fn withdrawal_of_the_first_view() -> crate::onion::withdrawal::EndpointWithdrawalInstruction {
+    let (catalog, _) = cluster_publication_fixture();
+    crate::onion::withdrawal::EndpointWithdrawalInstruction {
+        generation: 1,
+        services: catalog
+            .services
+            .iter()
+            .map(|(id, service)| {
+                (
+                    id.clone(),
+                    crate::onion::withdrawal::ServiceWithdrawal {
+                        service: service.clone(),
+                        retire_vip: true,
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+/// A consumer whose second answer withdrew its first view: receipt 1 is
+/// proven locally and waits for the leader's acknowledgement.
+async fn consumer_with_a_ready_receipt() -> (BunAgent<MockGrill>, tempfile::TempDir) {
+    let (mut agent, root, _ingress) = published_consumer().await;
+    let update = agent
+        .synchronise_consumer(
+            2,
+            Default::default(),
+            vec![],
+            vec![withdrawal_of_the_first_view()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.receipts, vec![1]);
+    (agent, root)
+}
+
+/// The receipts the discovery journal itself records: not the inventory
+/// before a write in flight.
+fn journalled_receipts(agent: &BunAgent<MockGrill>) -> Vec<u64> {
+    let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+        &agent.discovery_ownership
+    else {
+        panic!("discovery ownership is not settled");
+    };
+    receipts_of(journal)
+}
+
+/// The receipts a discovery journal records.
+fn receipts_of(journal: &crate::bun::discovery_owners::DiscoveryJournal) -> Vec<u64> {
+    journal
+        .inventory()
+        .consumer
+        .as_ref()
+        .unwrap()
+        .receipts
+        .keys()
+        .copied()
+        .collect()
+}
+
+/// The receipts on disk, once the agent that owned the journal is gone.
+fn receipts_on_disk(root: &tempfile::TempDir) -> Vec<u64> {
+    let journal =
+        crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+            .unwrap();
+    receipts_of(&journal)
+}
+
+/// Deliver the leader's acknowledgement of receipt `generation` in a
+/// command turn of its own, as the loop does. Returns the turn the meter
+/// saw and the reply still to come.
+async fn receipt_turn(
+    agent: &mut BunAgent<MockGrill>,
+    generation: u64,
+) -> (
+    crate::bun::loop_meter::TurnRecord,
+    oneshot::Receiver<Result<(), BunError>>,
+) {
+    let (response, reply) = oneshot::channel();
+    let turn = begin_scenario_turn(agent, LoopBranch::Command, Some("confirm_consumer_receipt"));
+    agent
+        .handle_command(AgentCommand::ConfirmConsumerReceipt {
+            generation,
+            response,
+        })
+        .await;
+    (end_scenario_turn(agent, turn), reply)
+}
+
+/// Take the loop's turn for confirmations that waited for the journal.
+async fn waiting_receipts_turn(
+    agent: &mut BunAgent<MockGrill>,
+) -> crate::bun::loop_meter::TurnRecord {
+    assert!(
+        agent.receipt_confirmations.is_waiting(),
+        "no confirmation waits for the journal"
+    );
+    let turn = agent.begin_receipt_turn();
+    agent.confirm_waiting_receipts().await;
+    end_scenario_turn(agent, turn)
+}
+
+/// 0.2.2's gate met this four times during host disk stalls (#1340): the
+/// leader acknowledged a receipt, and forgetting it journalled inline, a
+/// 1.4 to 3.6 s `command (confirm_consumer_receipt)` turn whose only part
+/// was its journal write. The write now waits only until the turn's
+/// deadline. A status queued meanwhile is answered, and the confirmation
+/// is answered once the write has landed.
+#[tokio::test]
+async fn status_answers_while_a_receipt_confirmation_journals_to_a_stalled_disk() {
+    let (agent, root) = consumer_with_a_ready_receipt().await;
+    let running = run_restarted(agent);
+    running
+        .stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    running.measure_from_here();
+    let reached = running.stalls.reached(LoopStall::Persist);
+    let (response, mut reply) = oneshot::channel();
+    running
+        .tx
+        .send(AgentCommand::ConfirmConsumerReceipt {
+            generation: 1,
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while running.stalls.reached(LoopStall::Persist) == reached {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the confirmation never journalled");
+    let mid_write = running.status_latency().await;
+    let early = reply.try_recv();
+    let answered_early = early.is_ok();
+    let confirmed = match early {
+        Ok(confirmed) => confirmed,
+        Err(_) => tokio::time::timeout(std::time::Duration::from_secs(10), reply)
+            .await
+            .expect("the confirmation was never answered")
+            .unwrap(),
+    };
+    running
+        .stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    let worst = running.meter.worst_turn();
+    stop(running).await;
+
+    assert!(
+        mid_write.is_some_and(|latency| latency < TURN_BUDGET),
+        "status took {mid_write:?} while a receipt confirmation's journal write took \
+         {STALLED_JOURNAL_WRITE:?}"
+    );
+    assert!(
+        !answered_early,
+        "the confirmation was answered before its write landed"
+    );
+    assert!(confirmed.is_ok(), "{confirmed:?}");
+    if let Some(worst) = worst {
+        assert!(worst.took < TURN_BUDGET, "the worst loop turn took {worst}");
+    }
+    assert!(receipts_on_disk(&root).is_empty());
+}
+
+/// The confirmation's own write waits only until the turn's deadline, and
+/// the confirmation is answered from the turn that lands it. Until then the
+/// receipt is still on disk, so the leader keeps being told about it; a
+/// second acknowledgement meanwhile writes nothing and waits for nothing.
+#[tokio::test]
+async fn a_receipt_confirmation_leaves_its_slow_journal_write_in_flight() {
+    let (mut agent, _root) = consumer_with_a_ready_receipt().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (turn, mut reply) = receipt_turn(&mut agent, 1).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "the confirmation didn't journal: {turn}"
+    );
+    assert!(turn.took < TURN_BUDGET, "{turn}");
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the confirmation's turn waited for its journal write: {turn}"
+    );
+    assert!(
+        reply.try_recv().is_err(),
+        "answered before the write landed"
+    );
+    assert_eq!(
+        agent.consumer_update(true).receipts,
+        vec![1],
+        "a receipt still on disk stopped being reported"
+    );
+
+    let (again_turn, mut again) = receipt_turn(&mut agent, 1).await;
+    assert!(again_turn.took < TURN_BUDGET, "{again_turn}");
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached + 1);
+    assert!(again.try_recv().is_err());
+
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(landed.detail, Some("consumer_receipt/landed"), "{landed}");
+    assert!(reply.await.unwrap().is_ok());
+    assert!(journalled_receipts(&agent).is_empty());
+    assert!(agent.consumer_update(true).receipts.is_empty());
+
+    // The second acknowledgement finds the receipt already forgotten.
+    waiting_receipts_turn(&mut agent).await;
+    assert!(again.await.unwrap().is_ok());
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached + 1);
+}
+
+/// A confirmation changes the ownership as it is on disk, so it waits for
+/// any write already in flight, but off the loop: the command's turn ends
+/// at once, and the loop takes the confirmation in a turn of its own once
+/// the journal is free.
+#[tokio::test]
+async fn a_receipt_confirmation_waits_off_the_loop_for_a_write_already_in_flight() {
+    let (mut agent, _root) = consumer_with_a_ready_receipt().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    // Another writer's write, left in flight at its turn's deadline.
+    let landing = agent
+        .write_discovery_inventory(
+            &crate::onion::service_id::ServiceId::new("system", "discovery"),
+            |_| {},
+            Some(tokio::time::Instant::now()),
+            super::discovery_ownership::WriteOwner::AskAgain {
+                branch: LoopBranch::FollowUp,
+                detail: "another_writer/landed",
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(landing, super::discovery_ownership::Landing::InFlight);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (turn, mut reply) = receipt_turn(&mut agent, 1).await;
+    assert!(turn.took < TURN_BUDGET, "{turn}");
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the confirmation's turn waited for another writer's write: {turn}"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert!(reply.try_recv().is_err());
+
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(landed.detail, Some("another_writer/landed"), "{landed}");
+    assert!(
+        reply.try_recv().is_err(),
+        "answered before forgetting the receipt was journalled"
+    );
+    let confirmed = waiting_receipts_turn(&mut agent).await;
+    assert_eq!(
+        confirmed.detail,
+        Some("consumer_receipt/confirm"),
+        "{confirmed}"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached + 1);
+    assert!(reply.await.unwrap().is_ok());
+    assert!(journalled_receipts(&agent).is_empty());
+}
+
+/// Only a locally proven receipt is forgotten. One whose withdrawal the
+/// published view still contradicts is refused at once, and nothing is
+/// journalled.
+#[tokio::test]
+async fn a_receipt_without_local_withdrawal_proof_is_refused() {
+    let (mut agent, _root, ingress) = published_consumer().await;
+    let (catalog, _) = cluster_publication_fixture();
+    let update = agent
+        .synchronise_consumer(2, catalog, ingress, vec![withdrawal_of_the_first_view()])
+        .await
+        .unwrap();
+    assert!(update.receipts.is_empty(), "{update:?}");
+    assert_eq!(journalled_receipts(&agent), vec![1]);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, mut reply) = receipt_turn(&mut agent, 1).await;
+    assert!(
+        matches!(reply.try_recv(), Ok(Err(_))),
+        "an unproven receipt was not refused"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert_eq!(journalled_receipts(&agent), vec![1]);
+}
+
+/// A confirmation whose write fails after its turn moved on fences
+/// discovery, answers the failure, and leaves the receipt on disk, as a
+/// crash before the write lands does: the leader is asked to acknowledge
+/// it again, and the next confirmation forgets it.
+#[tokio::test]
+async fn a_receipt_confirmation_whose_write_fails_off_the_turn_keeps_the_receipt() {
+    let (mut agent, root) = consumer_with_a_ready_receipt().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+        &mut agent.discovery_ownership
+    else {
+        panic!("discovery ownership is not ready");
+    };
+    journal.fail_next_write();
+    let (turn, reply) = receipt_turn(&mut agent, 1).await;
+    assert!(agent.discovery_write_in_flight(), "{turn}");
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    landing_turn(&mut agent).await;
+    assert!(
+        reply.await.unwrap().is_err(),
+        "a failed write was confirmed"
+    );
+    assert!(matches!(
+        agent.discovery_ownership,
+        DiscoveryOwnership::Uncertain
+    ));
+    drop(agent);
+    assert_eq!(receipts_on_disk(&root), vec![1]);
 }
 
 // ---- callers that can hold a turn ---------------------------------------------
@@ -2096,7 +2470,7 @@ async fn probe_turn(
 }
 
 /// Wait for the write in flight to land, then take the loop's turn for it.
-async fn landing_turn(agent: &mut TestAgent) -> crate::bun::loop_meter::TurnRecord {
+async fn landing_turn(agent: &mut BunAgent<MockGrill>) -> crate::bun::loop_meter::TurnRecord {
     let outcome = BunAgent::<MockGrill>::discovery_write_done(&mut agent.discovery_ownership).await;
     let turn = agent.begin_landing_turn();
     agent.land_write_in_flight(outcome).await;
@@ -2324,12 +2698,17 @@ async fn a_workload_start_leaves_its_slow_network_reference_write_in_flight() {
         grill.network_reference(&id).await.unwrap().is_some(),
         "a hold the journal may be recording was handed back"
     );
-    // A retirement meanwhile can't read the journal as not recording the
-    // hold: the write in flight may be recording it.
-    assert!(matches!(
-        agent.release_network_reference(&id, None).await,
-        Err(BunError::StillRunning { .. })
-    ));
+    // A retirement's turn meanwhile can't read the journal as not recording
+    // the hold: the write in flight may be recording it. (Outside a turn,
+    // where nothing else waits, it would wait the write out, #1263.)
+    let turn = agent.begin_turn(LoopBranch::StopWait, None);
+    let released = agent.release_network_reference(&id, None).await;
+    agent.turn_deadline = None;
+    agent.loop_meter.finish(turn);
+    assert!(
+        matches!(released, Err(BunError::StillRunning { .. })),
+        "{released:?}"
+    );
 
     // The worker asks again before the write lands: still pending, with no
     // second write and no wait.
@@ -2485,10 +2864,973 @@ async fn a_restart_waits_for_its_slow_network_reference_write_instead_of_refusin
     wait_for_calls(&grill, "start", started, 1).await;
     stalls.set(LoopStall::Persist, std::time::Duration::ZERO);
     shutdown.cancel();
-    let agent = task.await.unwrap();
+    let mut agent = task.await.unwrap();
     assert_eq!(
         agent.network_references.get(&successor.instance_id),
         Some(&successor)
     );
+    // The replacement's publication may still be in flight (#1263).
+    agent.settle_discovery_write().await;
     assert!(agent.journal_holds(&successor));
+}
+
+// ---- every writer's own slow write (#1263) ---------------------------------
+//
+// Consumer steps, health probes and workload starts already left a slow
+// discovery-journal write in flight. These scenarios stall the persist under
+// each of the other writers in turn. Their verdict counts work rather than
+// timing the turn against the host's disk (#508, #939, #1140): a stalled
+// write that is still in flight when its turn has ended is one the turn
+// didn't wait for, and a write that was waited for has always landed.
+
+/// Longer than [`STATUS_PATIENCE`], so a turn that waited for a write this
+/// slow couldn't answer a status in time, whatever the host's disk does.
+const STALLED_DISK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Begin a turn of `branch` the way the loop does, for a scenario that hands
+/// the agent its work directly.
+fn begin_scenario_turn(
+    agent: &mut BunAgent<MockGrill>,
+    branch: LoopBranch,
+    detail: Option<&'static str>,
+) -> crate::bun::loop_meter::Turn {
+    agent.begin_turn(branch, detail)
+}
+
+/// End a turn begun with [`begin_scenario_turn`] and return what the meter saw.
+fn end_scenario_turn(
+    agent: &mut BunAgent<MockGrill>,
+    turn: crate::bun::loop_meter::Turn,
+) -> crate::bun::loop_meter::TurnRecord {
+    agent.turn_deadline = None;
+    agent.loop_meter.finish(turn);
+    agent.loop_meter.last_turn().unwrap()
+}
+
+/// The backends the discovery journal itself records for `service`: not the
+/// inventory before a write in flight.
+fn journalled_backends(
+    agent: &TestAgent,
+    service: &crate::onion::service_id::ServiceId,
+) -> Option<Vec<String>> {
+    let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+        &agent.discovery_ownership
+    else {
+        return None;
+    };
+    journal
+        .inventory()
+        .services
+        .iter()
+        .find(|owner| {
+            owner.entry.namespace == service.namespace && owner.entry.app_name == service.name
+        })
+        .map(|owner| {
+            owner
+                .entry
+                .backends
+                .iter()
+                .map(|backend| backend.instance_id.clone())
+                .collect()
+        })
+}
+
+/// The backends `service_map` routes `service` to.
+fn routed_backends(
+    agent: &TestAgent,
+    service: &crate::onion::service_id::ServiceId,
+) -> Option<Vec<String>> {
+    agent.service_map.resolve(service).map(|entry| {
+        entry
+            .backends
+            .iter()
+            .map(|backend| backend.instance_id.clone())
+            .collect()
+    })
+}
+
+/// An agent that journals discovery, with `basic_config`'s `web` deployed.
+async fn journalling_web() -> (
+    TestAgent,
+    mpsc::Sender<AgentCommand>,
+    CancellationToken,
+    MockGrill,
+    tempfile::TempDir,
+) {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    (agent, tx, shutdown, grill, root)
+}
+
+/// Queue a status once the running loop has reached a stalled persist, and
+/// say whether it was answered within [`STATUS_PATIENCE`].
+async fn status_answered_during_a_stalled_write(
+    tx: &mpsc::Sender<AgentCommand>,
+    stalls: &LoopStalls,
+    reached_before: usize,
+) -> bool {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while stalls.reached(LoopStall::Persist) == reached_before {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the work never reached a persist");
+    let (response, answer) = oneshot::channel();
+    tx.send(AgentCommand::Status { response }).await.unwrap();
+    tokio::time::timeout(STATUS_PATIENCE, answer)
+        .await
+        .is_ok_and(|answer| answer.is_ok())
+}
+
+/// Hand the loop a deploy op in a turn of its own and return the turn and
+/// the op's answer.
+async fn deploy_op_turn<T>(
+    agent: &mut TestAgent,
+    detail: &'static str,
+    op: impl FnOnce(oneshot::Sender<Result<T, BunError>>) -> crate::bun::agent::deploy_ops::DeployOp,
+) -> (crate::bun::loop_meter::TurnRecord, Result<T, BunError>) {
+    let (reply, result) = oneshot::channel();
+    let turn = begin_scenario_turn(agent, LoopBranch::DeployOp, Some(detail));
+    agent.handle_deploy_op(op(reply)).await;
+    let record = end_scenario_turn(agent, turn);
+    (record, result.await.unwrap())
+}
+
+/// Crash `web`'s only replica and hand the loop its restart's steps, one a
+/// turn, until the Start step is in flight.
+async fn restart_until_its_start(agent: &mut TestAgent, grill: &MockGrill, id: &InstanceId) {
+    crash(grill);
+    agent.check_apps().await;
+    agent.begin_restart_launches().await;
+    while agent.restart_step_of(id) != Some(super::restarts::RestartStep::Start) {
+        let outcome = agent
+            .restart_steps
+            .join_next_with_id()
+            .await
+            .expect("the restart stopped before its start");
+        agent.finish_restart_step(outcome).await;
+    }
+}
+
+/// Take the next restart step's result in a turn of its own.
+async fn restart_step_turn(agent: &mut TestAgent) -> crate::bun::loop_meter::TurnRecord {
+    let outcome = agent
+        .restart_steps
+        .join_next_with_id()
+        .await
+        .expect("no restart step is in flight");
+    let turn = begin_scenario_turn(agent, LoopBranch::RestartStep, None);
+    agent.finish_restart_step(outcome).await;
+    end_scenario_turn(agent, turn)
+}
+
+/// The 0.2.2 candidate 4 V02 fast tier: a 5 s host disk stall made one
+/// `restart_step` turn take 5,555 ms (#1263). A restart publishes its
+/// replacement's backend in the turn after Start, and that journal write
+/// had no deadline. It now waits only until the turn's deadline. The
+/// replacement stays `Starting` and out of `service_map` meanwhile, and a
+/// step that comes back after 100 ms looks again: it publishes once the
+/// journal records the backend, without writing it a second time.
+#[tokio::test]
+async fn a_restart_publication_leaves_its_slow_journal_write_in_flight() {
+    let (mut agent, _tx, _shutdown, grill, _root) = journalling_web().await;
+    let id = InstanceId("default__web-0".into());
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    // A new address, so the journal doesn't already record the backend the
+    // restart publishes.
+    grill.set_container_ip("10.0.2.9".parse().unwrap());
+    restart_until_its_start(&mut agent, &grill, &id).await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let start = restart_step_turn(&mut agent).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "the restart didn't journal its replacement: {start}"
+    );
+    // The write sleeps 1.6 s and the turn's deadline is 500 ms, so a turn
+    // that waited for it would find it landed.
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the restart's turn waited for its own journal write: {start}"
+    );
+    assert_eq!(
+        agent.supervisor.get_instance(&id).unwrap().state,
+        ContainerState::Starting
+    );
+    assert_eq!(
+        routed_backends(&agent, &service),
+        Some(Vec::new()),
+        "routed to the replacement before its journal write landed"
+    );
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+
+    // Its next look, before the write lands, writes nothing and waits for
+    // nothing.
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let again = restart_step_turn(&mut agent).await;
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert!(agent.discovery_write_in_flight(), "{again}");
+
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(landed.branch, LoopBranch::RestartStep, "{landed}");
+    assert_eq!(landed.detail, Some("restart_step/landed"));
+    assert_eq!(
+        journalled_backends(&agent, &service),
+        Some(vec![id.0.clone()])
+    );
+
+    // The look after it finds the backend recorded and publishes it.
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    restart_step_turn(&mut agent).await;
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert_eq!(
+        agent.supervisor.get_instance(&id).unwrap().state,
+        ContainerState::Running
+    );
+    assert_eq!(routed_backends(&agent, &service), Some(vec![id.0.clone()]));
+}
+
+/// End to end: a restart whose publication meets a stalled disk keeps the
+/// loop answering, and finishes once the write lands.
+#[tokio::test]
+async fn status_answers_while_a_restart_journals_to_a_stalled_disk() {
+    let (agent, tx, shutdown, grill, _root) = journalling_web().await;
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    let stalls = Arc::clone(&agent.loop_stalls);
+    let mut agent = agent;
+    let task = tokio::spawn(async move {
+        agent.run().await;
+        agent
+    });
+    stalls.set(LoopStall::Persist, STALLED_DISK);
+    let reached = stalls.reached(LoopStall::Persist);
+    grill.set_container_ip("10.0.2.9".parse().unwrap());
+    crash(&grill);
+    let answered = status_answered_during_a_stalled_write(&tx, &stalls, reached).await;
+    stalls.set(LoopStall::Persist, std::time::Duration::ZERO);
+    assert!(
+        answered,
+        "status went unanswered while a restart journalled to a stalled disk"
+    );
+    // The replacement has started, and stays `Starting` until its write
+    // lands, so no state sweep reads it before the runtime says it runs.
+    let id = InstanceId("default__web-0".into());
+    grill.set_state(&id, ContainerState::Running);
+    grill.set_exit_code(&id, None);
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let (response, answer) = oneshot::channel();
+            tx.send(AgentCommand::Status { response }).await.unwrap();
+            if answer.await.unwrap().iter().any(|instance| {
+                instance.restart_count > 0 && instance.state.eq_ignore_ascii_case("running")
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the restart never finished");
+    shutdown.cancel();
+    let agent = task.await.unwrap();
+    assert_eq!(
+        journalled_backends(&agent, &service),
+        Some(vec!["default__web-0".to_string()])
+    );
+    assert_eq!(
+        routed_backends(&agent, &service),
+        Some(vec!["default__web-0".to_string()])
+    );
+}
+
+/// A discovery-journalling agent with `web` admitted and its service
+/// registered, its only replica `Starting`, and what the runtime says about
+/// the replica's launch.
+async fn starting_web() -> (
+    TestAgent,
+    tempfile::TempDir,
+    InstanceId,
+    super::launch_evidence::LaunchEvidence,
+) {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    let spec = basic_config().app.remove("web").unwrap();
+    let (_, admitted) = deploy_op_turn(&mut agent, "supervisor_deploy_app", |reply| {
+        crate::bun::agent::deploy_ops::DeployOp::SupervisorDeployApp {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            spec: Box::new(spec),
+            reply,
+        }
+    })
+    .await;
+    let id = admitted.unwrap()[0].clone();
+    let (_, registered) = deploy_op_turn(&mut agent, "register_service_app", |reply| {
+        crate::bun::agent::deploy_ops::DeployOp::RegisterServiceApp {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            port: 8080,
+            firewall: None,
+            reply,
+        }
+    })
+    .await;
+    registered.unwrap();
+    agent.supervisor.get_instance_mut(&id).unwrap().state = ContainerState::Starting;
+    let evidence = super::launch_evidence::LaunchEvidence::read(&grill, &id).await;
+    (agent, root, id, evidence)
+}
+
+/// Hand the loop a fresh replica's `FinishFreshInstance` in a turn.
+async fn finish_fresh_turn(
+    agent: &mut TestAgent,
+    id: &InstanceId,
+    evidence: &super::launch_evidence::LaunchEvidence,
+) -> (crate::bun::loop_meter::TurnRecord, Result<(), BunError>) {
+    deploy_op_turn(agent, "finish_fresh_instance", |reply| {
+        crate::bun::agent::deploy_ops::DeployOp::FinishFreshInstance {
+            instance_id: id.clone(),
+            app_name: "web".into(),
+            namespace: "default".into(),
+            evidence: Box::new(evidence.clone()),
+            reply,
+        }
+    })
+    .await
+}
+
+/// A deploy publishes each fresh replica's backend in the turn after its
+/// start, and that journal write had no deadline (#1263). It now waits only
+/// until the turn's deadline, as a workload start's reference write does
+/// (#1266). Nothing about the start is recorded meanwhile: the replica
+/// stays `Starting` and out of `service_map`, and the op answers
+/// `StillRunning`. The deploy worker's next ask after the landing finds the
+/// backend recorded and finishes the start without writing it again.
+#[tokio::test]
+async fn a_fresh_start_publication_leaves_its_slow_journal_write_in_flight() {
+    let (mut agent, _root, id, evidence) = starting_web().await;
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (start, result) = finish_fresh_turn(&mut agent, &id, &evidence).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "the start didn't journal its backend: {start}, {result:?}"
+    );
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the start's turn waited for its own journal write: {start}"
+    );
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "a start whose backend isn't on disk yet must be asked again: {result:?}"
+    );
+    assert_eq!(
+        agent.supervisor.get_instance(&id).unwrap().state,
+        ContainerState::Starting
+    );
+    assert_eq!(routed_backends(&agent, &service), Some(Vec::new()));
+
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (again, result) = finish_fresh_turn(&mut agent, &id, &evidence).await;
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert!(agent.discovery_write_in_flight(), "{again}");
+
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(landed.branch, LoopBranch::DeployOp, "{landed}");
+    assert_eq!(landed.detail, Some("finish_fresh_instance/landed"));
+
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, result) = finish_fresh_turn(&mut agent, &id, &evidence).await;
+    result.unwrap();
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert_eq!(
+        agent.supervisor.get_instance(&id).unwrap().state,
+        ContainerState::Running
+    );
+    assert_eq!(routed_backends(&agent, &service), Some(vec![id.0.clone()]));
+    assert_eq!(
+        journalled_backends(&agent, &service),
+        Some(vec![id.0.clone()])
+    );
+}
+
+/// A deploy registers its app's service, and publishes it, before any
+/// replica starts (#1263). A slow write leaves the service unregistered in
+/// `service_map` until the worker's next ask finds it journalled.
+#[tokio::test]
+async fn a_service_registration_leaves_its_slow_journal_write_in_flight() {
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    let register = |reply| crate::bun::agent::deploy_ops::DeployOp::RegisterServiceApp {
+        app_name: "web".into(),
+        namespace: "default".into(),
+        port: 8080,
+        firewall: None,
+        reply,
+    };
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (turn, result) = deploy_op_turn(&mut agent, "register_service_app", register).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "{turn}, {result:?}"
+    );
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the registration's turn waited for its own journal write: {turn}"
+    );
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert_eq!(routed_backends(&agent, &service), None);
+
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(
+        landed.detail,
+        Some("register_service_app/landed"),
+        "{landed}"
+    );
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, result) = deploy_op_turn(&mut agent, "register_service_app", register).await;
+    result.unwrap();
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert_eq!(routed_backends(&agent, &service), Some(Vec::new()));
+    assert_eq!(journalled_backends(&agent, &service), Some(Vec::new()));
+}
+
+/// A rolling deploy publishes each healthy replacement's backend before
+/// anything old retires (#1263). A slow write leaves it unpublished until
+/// the worker's next ask finds it journalled.
+#[tokio::test]
+async fn a_rolling_replacement_publication_leaves_its_slow_journal_write_in_flight() {
+    let (mut agent, _tx, _shutdown, _grill, _root) = journalling_web().await;
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    let replacement = InstanceId("default__web-1".into());
+    let publish = |reply| crate::bun::agent::deploy_ops::DeployOp::PublishNewBackend {
+        app_name: "web".into(),
+        namespace: "default".into(),
+        new_id: InstanceId("default__web-1".into()),
+        host_port: Some(30_999),
+        container_ip: None,
+        has_port: true,
+        reply,
+    };
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (turn, result) = deploy_op_turn(&mut agent, "publish_new_backend", publish).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "{turn}, {result:?}"
+    );
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the publication's turn waited for its own journal write: {turn}"
+    );
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert_eq!(
+        routed_backends(&agent, &service),
+        Some(vec!["default__web-0".to_string()])
+    );
+
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, result) = deploy_op_turn(&mut agent, "publish_new_backend", publish).await;
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(
+        landed.detail,
+        Some("publish_new_backend/landed"),
+        "{landed}"
+    );
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, result) = deploy_op_turn(&mut agent, "publish_new_backend", publish).await;
+    result.unwrap();
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert_eq!(
+        routed_backends(&agent, &service),
+        Some(vec!["default__web-0".to_string(), replacement.0.clone()])
+    );
+}
+
+/// End to end: a deploy whose publications meet a stalled disk keeps the
+/// loop answering, and completes once the writes land.
+#[tokio::test]
+async fn status_answers_while_a_deploy_journals_to_a_stalled_disk() {
+    let (mut agent, tx, shutdown, _grill) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    let stalls = Arc::clone(&agent.loop_stalls);
+    let task = tokio::spawn(async move {
+        agent.run().await;
+        agent
+    });
+    stalls.set(LoopStall::Persist, STALLED_DISK);
+    let reached = stalls.reached(LoopStall::Persist);
+    let deploying = {
+        let tx = tx.clone();
+        tokio::spawn(async move { send_deploy(&tx, basic_config()).await })
+    };
+    let answered = status_answered_during_a_stalled_write(&tx, &stalls, reached).await;
+    stalls.set(LoopStall::Persist, std::time::Duration::ZERO);
+    assert!(
+        answered,
+        "status went unanswered while a deploy journalled to a stalled disk"
+    );
+    expect_complete(&deploying.await.unwrap());
+    shutdown.cancel();
+    let agent = task.await.unwrap();
+    assert_eq!(
+        journalled_backends(&agent, &service),
+        Some(vec!["default__web-0".to_string()])
+    );
+}
+
+/// `web` deployed with a network reference the journal records, its backend
+/// withdrawn, ready for retirement to release the reference.
+async fn withdrawn_web_holding_its_reference() -> (
+    TestAgent,
+    MockGrill,
+    tempfile::TempDir,
+    crate::grill::runc_intent::NetworkReference,
+) {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    let reference = original_test_network_reference();
+    grill.set_network_reference(reference.clone()).await;
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    assert!(agent.journal_holds(&reference));
+    agent
+        .withdraw_instance_backend(&reference.instance_id)
+        .await
+        .unwrap();
+    (agent, grill, root, reference)
+}
+
+/// Release `id`'s network reference in a turn of its own.
+async fn release_turn(
+    agent: &mut TestAgent,
+    id: &InstanceId,
+) -> (crate::bun::loop_meter::TurnRecord, Result<(), BunError>) {
+    let turn = begin_scenario_turn(agent, LoopBranch::StopWait, None);
+    let result = agent.release_network_reference(id, None).await;
+    (end_scenario_turn(agent, turn), result)
+}
+
+/// Retiring an instance releases its network reference with two journal
+/// writes, the release permission and then forgetting it, and both had no
+/// deadline (#1263). Each now waits only until the turn's deadline, and the
+/// retirement answers `StillRunning` until the journal says what it wrote.
+#[tokio::test]
+async fn a_network_reference_release_leaves_its_slow_journal_writes_in_flight() {
+    let (mut agent, grill, _root, reference) = withdrawn_web_holding_its_reference().await;
+    let id = reference.instance_id.clone();
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (turn, result) = release_turn(&mut agent, &id).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "the release didn't journal its permission: {turn}, {result:?}"
+    );
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the release's turn waited for its permission's journal write: {turn}"
+    );
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert_eq!(calls_of(&grill, "release_network_reference"), 0);
+
+    // Asked again before the write lands: nothing written, nothing waited for.
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, result) = release_turn(&mut agent, &id).await;
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(landed.detail, Some("discovery_release/landed"), "{landed}");
+
+    // With the permission on disk the runtime releases the address, and
+    // forgetting the permission meets the stalled disk too.
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (turn, result) = release_turn(&mut agent, &id).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "{turn}, {result:?}"
+    );
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the release's turn waited for forgetting the permission: {turn}"
+    );
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert!(grill.network_reference(&id).await.unwrap().is_none());
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    landing_turn(&mut agent).await;
+
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, result) = release_turn(&mut agent, &id).await;
+    result.unwrap();
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert!(!agent.network_references.contains_key(&id));
+    assert_eq!(
+        agent.journal_reference(&reference),
+        crate::bun::agent::discovery_ownership::JournalReference::Unrecorded
+    );
+}
+
+/// Retire `service`'s allocation in a turn of its own.
+async fn retire_service_turn(
+    agent: &mut TestAgent,
+    service: &crate::onion::service_id::ServiceId,
+) -> (crate::bun::loop_meter::TurnRecord, Result<(), BunError>) {
+    let turn = begin_scenario_turn(agent, LoopBranch::StopWait, None);
+    let result = agent.retire_discovery_service(service).await;
+    (end_scenario_turn(agent, turn), result)
+}
+
+/// A completed stop retires its service's allocation with two journal
+/// writes, `Withdrawn` and then removing it, and both had no deadline
+/// (#1263). Each now waits only until the turn's deadline, and the stop
+/// asks again until the journal no longer holds the allocation.
+#[tokio::test]
+async fn a_service_retirement_leaves_its_slow_journal_writes_in_flight() {
+    let (mut agent, _tx, _shutdown, _grill, _root) = journalling_web().await;
+    let id = InstanceId("default__web-0".into());
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    agent.withdraw_instance_backend(&id).await.unwrap();
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (turn, result) = retire_service_turn(&mut agent, &service).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "{turn}, {result:?}"
+    );
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the retirement's turn waited for its own journal write: {turn}"
+    );
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, result) = retire_service_turn(&mut agent, &service).await;
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(landed.detail, Some("service_retirement/landed"), "{landed}");
+
+    // `Withdrawn` is on disk: the next ask writes only the removal.
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (turn, result) = retire_service_turn(&mut agent, &service).await;
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "{turn}, {result:?}"
+    );
+    assert!(agent.discovery_write_in_flight(), "{turn}");
+    assert!(
+        matches!(result, Err(BunError::StillRunning { .. })),
+        "{result:?}"
+    );
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    landing_turn(&mut agent).await;
+
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let (_, result) = retire_service_turn(&mut agent, &service).await;
+    result.unwrap();
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert_eq!(journalled_backends(&agent, &service), None);
+}
+
+/// End to end: a stop whose retirement journals to a stalled disk keeps the
+/// loop answering, and is answered once its writes land.
+#[tokio::test]
+async fn status_answers_while_a_stop_journals_to_a_stalled_disk() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    let reference = original_test_network_reference();
+    grill.set_network_reference(reference.clone()).await;
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    let stalls = Arc::clone(&agent.loop_stalls);
+    let task = tokio::spawn(async move {
+        agent.run().await;
+        agent
+    });
+    stalls.set(LoopStall::Persist, STALLED_DISK);
+    let reached = stalls.reached(LoopStall::Persist);
+    let (response, stopped) = oneshot::channel();
+    tx.send(AgentCommand::Stop {
+        app_name: "web".into(),
+        namespace: "default".into(),
+        response,
+    })
+    .await
+    .unwrap();
+    let answered = status_answered_during_a_stalled_write(&tx, &stalls, reached).await;
+    stalls.set(LoopStall::Persist, std::time::Duration::ZERO);
+    assert!(
+        answered,
+        "status went unanswered while a stop journalled to a stalled disk"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(20), stopped)
+        .await
+        .expect("the stop was never answered")
+        .expect("the stop's waiter was dropped")
+        .unwrap();
+    shutdown.cancel();
+    let agent = task.await.unwrap();
+    assert_eq!(journalled_backends(&agent, &service), None);
+    assert_eq!(
+        agent.journal_reference(&reference),
+        crate::bun::agent::discovery_ownership::JournalReference::Unrecorded
+    );
+}
+
+/// The 0.2.2 candidate 4 soak line again: of that 5,555 ms `restart_step`
+/// turn, 5,513 ms was the egress owners checkpoint (#1263). A restart, a
+/// deploy's start and a retirement each write it on a Linux node with eBPF,
+/// and each waited for it inline. It now waits only until the turn's
+/// deadline, like a discovery journal write. The binding it records goes
+/// into `egress_bindings` only once it has landed, so no co-tenant's map
+/// rebuild sees it first; another writer meanwhile neither writes nor
+/// waits; and outside a turn, where nothing else waits, the write is waited
+/// out. The Linux callers turn `InFlight` into `StillRunning`.
+#[tokio::test]
+async fn an_egress_owners_checkpoint_leaves_its_slow_write_in_flight() {
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    let records = root.path().join("records");
+    agent.set_records_dir(records.clone());
+    let id = InstanceId("default__web-0".into());
+    let other = InstanceId("default__api-0".into());
+    let binding = crate::bun::egress_owners::owned_test_binding(7, vec!["example.com:443".into()]);
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let turn = begin_scenario_turn(&mut agent, LoopBranch::RestartStep, None);
+    let deadline = agent.turn_deadline();
+    let landing = agent
+        .checkpoint_egress_owner(&id, Some(binding.clone()), Some(deadline))
+        .await;
+    let restart = end_scenario_turn(&mut agent, turn);
+    assert_eq!(
+        agent.loop_stalls.reached(LoopStall::Persist),
+        reached + 1,
+        "the turn didn't write the checkpoint: {restart}, {landing:?}"
+    );
+    // The write sleeps 1.6 s and the turn's deadline is 500 ms, so a turn
+    // that waited for it would find it landed.
+    assert!(
+        agent.egress_write_in_flight(),
+        "the turn waited for its own egress owners write: {restart}"
+    );
+    assert!(
+        matches!(
+            landing,
+            Ok(crate::bun::agent::discovery_ownership::Landing::InFlight)
+        ),
+        "{landing:?}"
+    );
+    assert!(
+        restart.part(TurnPart::EgressWrite).is_some(),
+        "the turn's line doesn't name the egress owners write: {restart}"
+    );
+    assert!(
+        !agent.egress_bindings.contains_key(&id),
+        "the binding was in memory before it was durable"
+    );
+
+    // Another writer meanwhile neither writes nor waits.
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let turn = begin_scenario_turn(&mut agent, LoopBranch::DeployOp, None);
+    let deadline = agent.turn_deadline();
+    let landing = agent
+        .checkpoint_egress_owner(&other, Some(binding.clone()), Some(deadline))
+        .await;
+    let again = end_scenario_turn(&mut agent, turn);
+    assert!(
+        matches!(
+            landing,
+            Ok(crate::bun::agent::discovery_ownership::Landing::InFlight)
+        ),
+        "{landing:?}"
+    );
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached);
+    assert!(agent.egress_write_in_flight(), "{again}");
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+
+    // Outside a turn the next writer waits the write out, then writes.
+    let landing = agent
+        .checkpoint_egress_owner(&other, Some(binding.clone()), None)
+        .await;
+    assert!(
+        matches!(
+            landing,
+            Ok(crate::bun::agent::discovery_ownership::Landing::Landed)
+        ),
+        "{landing:?}"
+    );
+    assert!(!agent.egress_write_in_flight());
+    assert_eq!(agent.egress_bindings.get(&id), Some(&binding));
+    assert_eq!(agent.egress_bindings.get(&other), Some(&binding));
+    let durable = crate::bun::egress_owners::load(&records).unwrap();
+    assert_eq!(durable.get(&id), Some(&binding));
+    assert_eq!(durable.get(&other), Some(&binding));
+}
+
+/// An egress owners write that fails after its turn moved on fences every
+/// later egress mutation, as an inline failure does, and its binding never
+/// reaches memory.
+#[tokio::test]
+async fn an_egress_owners_write_that_fails_off_the_turn_fences_egress() {
+    let (mut agent, _, _, _) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    // A records directory under a regular file can't be created.
+    let blocker = root.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    agent.set_records_dir(blocker.join("records"));
+    let id = InstanceId("default__web-0".into());
+    let binding = crate::bun::egress_owners::owned_test_binding(7, vec!["example.com:443".into()]);
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let turn = begin_scenario_turn(&mut agent, LoopBranch::RestartStep, None);
+    let deadline = agent.turn_deadline();
+    let landing = agent
+        .checkpoint_egress_owner(&id, Some(binding.clone()), Some(deadline))
+        .await;
+    let restart = end_scenario_turn(&mut agent, turn);
+    assert!(
+        matches!(
+            landing,
+            Ok(crate::bun::agent::discovery_ownership::Landing::InFlight)
+        ),
+        "{landing:?}, {restart}"
+    );
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+
+    let next = agent
+        .checkpoint_egress_owner(&id, Some(binding.clone()), None)
+        .await;
+    assert!(next.is_err(), "a write after a failed one went ahead");
+    assert!(agent.egress_store_uncertain);
+    assert!(!agent.egress_bindings.contains_key(&id));
+}
+
+/// Rolling registration of a replacement still journals its service map
+/// inline through `publish_backend_ebpf` (#1263). The op adds the
+/// replacements to the supervisor and `service_map` before it publishes, so
+/// a write left in flight would let readers route to backends the journal
+/// doesn't record yet. This scenario documents that the inline path still
+/// waits; the book and the design doc say why it stays.
+#[tokio::test]
+async fn the_inline_publication_path_still_waits_for_its_journal_write() {
+    let (mut agent, _tx, _shutdown, _grill, _root) = journalling_web().await;
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let turn = begin_scenario_turn(&mut agent, LoopBranch::DeployOp, None);
+    agent.publish_backend_ebpf(&service).await.unwrap();
+    let published = end_scenario_turn(&mut agent, turn);
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached + 1);
+    assert!(
+        !agent.discovery_write_in_flight(),
+        "the inline path left its write in flight: {published}"
+    );
 }

@@ -261,11 +261,22 @@ files on `PATH`. Prefer this
 shape for a new fixture whose caller can take an interpreter; use `install_script` when the
 caller needs a single executable path.
 
-The `[[bin]]` targets (`bun`, `relish`, `testapp`) are not the fixtures' job: `make test`
+The `[[bin]]` targets (`bun`, `relish`, `testapp`) get the same treatment twice. `make test`
 depends on `make warm-executables`, which builds them with `cargo test --no-run`, as the
 suite will, and runs each of them once before the suite
 ([#722](https://github.com/reliaburger/reliaburger/issues/722),
-[#846](https://github.com/reliaburger/reliaburger/issues/846)).
+[#846](https://github.com/reliaburger/reliaburger/issues/846)). That doesn't cover a filtered
+`cargo nextest run` straight after a build, or an assessment the host has to repeat, so a
+test that starts one of them under a deadline also pays its first launch before the clock
+starts ([#1134](https://github.com/reliaburger/reliaburger/issues/1134),
+[#1149](https://github.com/reliaburger/reliaburger/issues/1149)). The shared fixtures do it
+for their callers: `bun_process::first_launch_binaries()` launches all three together, and
+`BunProcess::spawn_runtime`, `wait_for_relish` and `wait_for_relish_output` call it first.
+A test that spawns `bun` or `relish` itself, or hands `bun` to `ProcessControl` as an owner
+(15 s to answer), calls it, or `first_launch` directly, before its own deadline. A
+candidate binary under the upgrade compatibility query is always a fresh private copy, so no
+warm-up applies there; `QUERY_DEADLINE` (60 s) stays a hang guard
+([#1078](https://github.com/reliaburger/reliaburger/issues/1078)).
 
 ## Benchmarks and coverage
 

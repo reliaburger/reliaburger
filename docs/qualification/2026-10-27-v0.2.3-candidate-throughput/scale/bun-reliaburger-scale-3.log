@@ -1,0 +1,93 @@
+bun: reliaburger node agent v0.2.3 (d387d56)
+bun: using runc runtime (root)
+bun: mTLS enabled on the Raft RPC, reporting and API transports
+bun: cluster mode — gossip on 192.168.104.10:9443, 1 seed(s)
+bun: GPU support enabled, 0 device(s) detected
+bun: waiting for replicated API credentials before opening 0.0.0.0:9117
+report worker: snapshot collection failed or timed out, and no recent observation to re-send
+council: joined a council at recovery epoch 0
+report worker: snapshot collection failed or timed out, and no recent observation to re-send
+bun: observability enabled (metrics + logs + alerts)
+bun: API server listening on 0.0.0.0:9117
+bun: gitops sync loop started (it syncs only if the cluster has a [gitops] configuration)
+bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+report worker: admission at 192.168.104.8:9445 failed; next tick collects fresh state: send failed: TCP connect to 192.168.104.8:9445: Connection refused (os error 111)
+report worker: admission at 192.168.104.8:9445 failed; next tick collects fresh state: send failed: TCP connect to 192.168.104.8:9445: Connection refused (os error 111)
+report worker: admission at 192.168.104.8:9445 failed; next tick collects fresh state: send failed: TCP connect to 192.168.104.8:9445: Connection refused (os error 111)
+pickle: registry cleanup pending: replication failed: error sending request for url (https://192.168.104.8:9117/v1/registry/query)
+pickle: registry cleanup resumed
+
+bun: received shutdown signal
+bun: shutdown complete
+bun: reliaburger node agent v0.2.3 (d387d56)
+bun: auto-detected runtime: runc+process
+bun: mTLS enabled on the Raft RPC, reporting and API transports
+bun: cluster mode — gossip on 192.168.104.10:9443, 1 seed(s)
+bun: GPU support enabled, 0 device(s) detected
+bun: eBPF data path loaded (attached=true)
+bun: observability enabled (metrics + logs + alerts)
+bun: API server listening on 0.0.0.0:9117
+bun: gitops sync loop started (it syncs only if the cluster has a [gitops] configuration)
+bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+council: no peer advertises a newer recovery epoch than 0; serving raft
+pickle: registry cleanup pending: replication failed: error sending request for url (https://192.168.104.8:9117/v1/registry/query)
+report worker: admission at 192.168.104.8:9445 failed; next tick collects fresh state: send failed: TCP connect to 192.168.104.8:9445: Connection refused (os error 111)
+report worker: admission at 192.168.104.8:9445 failed; next tick collects fresh state: send failed: TCP connect to 192.168.104.8:9445: Connection refused (os error 111)
+report worker: admission at 192.168.104.8:9445 failed; next tick collects fresh state: send failed: TCP connect to 192.168.104.8:9445: Connection refused (os error 111)
+pickle: registry cleanup resumed
+pickle: registry cleanup pending: replication failed: error sending request for url (https://192.168.104.9:9117/v1/registry/query)
+pickle: registry cleanup resumed
+
+bun: received shutdown signal
+bun: shutdown complete
+bun: reliaburger node agent v0.2.3 (d387d56)
+bun: auto-detected runtime: runc+process
+bun: mTLS enabled on the Raft RPC, reporting and API transports
+bun: cluster mode — gossip on 192.168.104.10:9443, 1 seed(s)
+bun: GPU support enabled, 0 device(s) detected
+bun: eBPF data path loaded (attached=true)
+bun: observability enabled (metrics + logs + alerts)
+bun: API server listening on 0.0.0.0:9117
+bun: gitops sync loop started (it syncs only if the cluster has a [gitops] configuration)
+bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+council: no peer advertises a newer recovery epoch than 0; serving raft
+scheduler: placement pass refused: admission revision changed
+
+bun: received shutdown signal
+bun: shutdown complete
+bun: reliaburger node agent v0.2.3 (d387d56)
+bun: auto-detected runtime: runc+process
+bun: mTLS enabled on the Raft RPC, reporting and API transports
+bun: cluster mode — gossip on 192.168.104.10:9443, 1 seed(s)
+bun: GPU support enabled, 0 device(s) detected
+bun: eBPF data path loaded (attached=true)
+bun: observability enabled (metrics + logs + alerts)
+bun: API server listening on 0.0.0.0:9117
+bun: gitops sync loop started (it syncs only if the cluster has a [gitops] configuration)
+bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+council: no peer advertises a newer recovery epoch than 0; serving raft
+pickle: registry cleanup pending: replication failed: error sending request for url (https://192.168.104.8:9117/v1/registry/query)
+report worker: admission at 192.168.104.8:9445 failed; next tick collects fresh state: send failed: TCP connect to 192.168.104.8:9445: Connection refused (os error 111)
+report worker: admission at 192.168.104.8:9445 failed; next tick collects fresh state: send failed: TCP connect to 192.168.104.8:9445: Connection refused (os error 111)
+report worker: admission at 192.168.104.8:9445 failed; next tick collects fresh state: send failed: TCP connect to 192.168.104.8:9445: Connection refused (os error 111)
+pickle: registry cleanup resumed
+scheduler: placement pass refused: admission revision changed
+
+bun: received shutdown signal
+bun: shutdown complete
+bun: reliaburger node agent v0.2.3 (d387d56)
+bun: auto-detected runtime: runc+process
+bun: mTLS enabled on the Raft RPC, reporting and API transports
+bun: cluster mode — gossip on 192.168.104.10:9443, 1 seed(s)
+bun: GPU support enabled, 0 device(s) detected
+bun: eBPF data path loaded (attached=true)
+bun: observability enabled (metrics + logs + alerts)
+bun: API server listening on 0.0.0.0:9117
+bun: gitops sync loop started (it syncs only if the cluster has a [gitops] configuration)
+bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+council: no peer advertises a newer recovery epoch than 0; serving raft

@@ -1,7 +1,7 @@
-# What relish v0.2.1 accepts, read from its -h pages by
+# What relish v0.2.3 accepts, read from its -h pages by
 # scripts/release/released_cli.py. Regenerate it when docs/website/install.sh's
 # default version changes; tests/suite/website.rs checks the two match.
-version	v0.2.1
+version	v0.2.3
 argument	relish apply	[PATH_OR_URL]
 argument	relish batch	[PATH]
 argument	relish batch cancel	<ID>
@@ -132,6 +132,7 @@ command	relish dev status
 command	relish dev stop
 command	relish dev test
 command	relish diff
+command	relish events
 command	relish exec
 command	relish export
 command	relish fault
@@ -217,8 +218,8 @@ command	relish upgrade status
 command	relish wtf
 option	relish	--ca-cert	<CA_CERT>	
 option	relish	--endpoint	<ENDPOINT>	
-option	relish	--output	<OUTPUT>	human,json,yaml
 option	relish	--token	<TOKEN>	
+option	relish	-o,--output	<OUTPUT>	human,json,yaml
 option	relish apply	--dry-run		
 option	relish apply	--rerun-jobs		
 option	relish apply	-f,--file	<PATH_OR_URL>	
@@ -262,12 +263,12 @@ option	relish build	--timeout	<TIMEOUT>
 option	relish ca backup	--cluster-name	<CLUSTER_NAME>	
 option	relish ca backup	--dir	<DIR>	
 option	relish ca backup	--out	<OUT>	
-option	relish ca backup	--output	<OUTPUT>	
 option	relish ca backup	--passphrase-file	<PASSPHRASE_FILE>	
 option	relish ca backup	--recipient	<RECIPIENT>	
+option	relish ca backup	-o,--output	<OUTPUT>	
 option	relish ca backup	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
 option	relish ca backup	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
-option	relish ca backup	Output format: human,json,or yaml [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish ca backup	Output format: human,json,or yaml. A command that has no machine output refuses json and yaml rather than ignoring them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish ca backup	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish ca backup	Print help (see more with	'--help')	
 option	relish ca backup	Read the passphrase from the first line of this file instead of	asking	
@@ -277,13 +278,13 @@ option	relish ca backup	The directory `relish init` wrote to [default:	/etc/reli
 option	relish ca backup	Where to write the sealed backup (created	owner-only)	
 option	relish ca rotate	--finalize		
 option	relish ca rotate	--identity	<IDENTITY>	
-option	relish ca rotate	--output	<OUTPUT>	
 option	relish ca rotate	--passphrase-file	<PASSPHRASE_FILE>	
 option	relish ca rotate	--role	<ROLE>	
 option	relish ca rotate	--root-backup	<ROOT_BACKUP>	
+option	relish ca rotate	-o,--output	<OUTPUT>	
 option	relish ca rotate	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
 option	relish ca rotate	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
-option	relish ca rotate	Output format: human,json,or yaml [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish ca rotate	Output format: human,json,or yaml. A command that has no machine output refuses json and yaml rather than ignoring them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish ca rotate	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish ca rotate	Print help (see more with	'--help')	
 option	relish ca rotate	Read the backup's passphrase from the first line of this file instead of	asking	
@@ -293,11 +294,11 @@ option	relish ca rotate	The sealed root backup `relish ca backup`	wrote
 option	relish ca rotate	Your age identity file,for a backup sealed with	`--recipient`	
 option	relish ca verify	--fingerprint	<FINGERPRINT>	
 option	relish ca verify	--identity	<IDENTITY>	
-option	relish ca verify	--output	<OUTPUT>	
 option	relish ca verify	--passphrase-file	<PASSPHRASE_FILE>	
+option	relish ca verify	-o,--output	<OUTPUT>	
 option	relish ca verify	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
 option	relish ca verify	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
-option	relish ca verify	Output format: human,json,or yaml [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish ca verify	Output format: human,json,or yaml. A command that has no machine output refuses json and yaml rather than ignoring them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish ca verify	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish ca verify	Print help (see more with	'--help')	
 option	relish ca verify	Read the passphrase from the first line of this file instead of	asking	
@@ -333,7 +334,11 @@ option	relish dev sign-binary	--external-key	<EXTERNAL_KEY>
 option	relish dev sign-binary	--key	<KEY>	
 option	relish dev sign-binary	--out	<OUT>	
 option	relish dev test	--recreate		
+option	relish events	--app	<APP>	
+option	relish events	--limit	<LIMIT>	
+option	relish events	--severity	<SEVERITY>	
 option	relish exec	--namespace	<NAMESPACE>	
+option	relish export	--strict		
 option	relish export	-f,--file	<FILE>	
 option	relish fault bandwidth	--acknowledge		
 option	relish fault bandwidth	--duration	<DURATION>	
@@ -451,12 +456,12 @@ option	relish jobs	--definitions
 option	relish join	--ca-fingerprint	<CA_FINGERPRINT>	
 option	relish join	--identity-dir	<IDENTITY_DIR>	
 option	relish join	--node-id	<NODE_ID>	
-option	relish join	--output	<OUTPUT>	
 option	relish join	--token-file	<TOKEN_FILE>	
+option	relish join	-o,--output	<OUTPUT>	
 option	relish join	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish join	Directory to write the received identity into. Defaults to `identity` in the current directory (matching `relish	init`)	
 option	relish join	Join token issued by `relish init` or `relish join-token	create`	
-option	relish join	Output format: human,json,or yaml [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish join	Output format: human,json,or yaml. A command that has no machine output refuses json and yaml rather than ignoring them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish join	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish join	Pin the cluster's root CA fingerprint (`sha256:...`). When set,a member offering a different root CA is	refused	
 option	relish join	Print	help	
@@ -489,6 +494,7 @@ option	relish path	--namespace	<NAMESPACE>
 option	relish path	--port	<PORT>	
 option	relish path	--to	<TO>	
 option	relish path	--to-namespace	<TO_NAMESPACE>	
+option	relish resolve	--namespace	<NAMESPACE>	
 option	relish rollback	--force		
 option	relish rollback	--namespace	<NAMESPACE>	
 option	relish run	--batch	<NAME>	
@@ -518,13 +524,13 @@ option	relish setup	--dir	<DIR>
 option	relish setup	--ingress-port	<INGRESS_PORT>	
 option	relish setup	--name	<NAME>	
 option	relish setup	--nodes	<NODES>	
-option	relish setup	--output	<OUTPUT>	
 option	relish setup	--quickstart		
 option	relish setup	--registry-port	<REGISTRY_PORT>	
 option	relish setup	--release-mirror	<RELEASE_MIRROR>	
 option	relish setup	--release-url	<RELEASE_URL>	
 option	relish setup	--timings		
 option	relish setup	--yes		
+option	relish setup	-o,--output	<OUTPUT>	
 option	relish setup	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
 option	relish setup	Accept the default answer to every question	(non-interactive)	
 option	relish setup	Also print every setup step's timing (always saved as	timings.json)	
@@ -534,7 +540,7 @@ option	relish setup	Directory to install the bun binary into (default:	~/.reliab
 option	relish setup	Directory to write reliaburger.toml into [default:	.]	
 option	relish setup	HTTPS directory containing unchanged signed release candidate	assets	
 option	relish setup	Host port forwarded to the managed Pickle registry (default:	15050)	
-option	relish setup	Output format: human,json,or yaml [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish setup	Output format: human,json,or yaml. A command that has no machine output refuses json and yaml rather than ignoring them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish setup	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish setup	Print	help	
 option	relish setup	Release metadata URL [default:	https://github.com/reliaburger/reliaburger/releases/latest/download/metadata.json]	

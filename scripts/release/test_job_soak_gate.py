@@ -39,9 +39,35 @@ class Gate(unittest.TestCase):
         script=(Path(__file__).parent/"qualify-sustained.sh").read_text()
         self.assertIn("duration_text:=60m",script)
         self.assertIn("duration_text:=8h",script)
-        self.assertIn("end - 120",script)
         self.assertNotIn("sleep 120",script)
         self.assertIn("mark \"$evidence/jobs\"",script)
+
+    def test_the_drain_starts_only_once_the_last_cycle_and_its_special_are_over(self):
+        # A drain timed from the soak's end ran inside the last cycle, which can
+        # finish after it: 0.2.2 candidate 4's hour-8 graceful stop held the
+        # cluster down for the drain's whole allowance (#1338).
+        script=(Path(__file__).parent/"qualify-sustained.sh").read_text()
+        loop_over=script.index('current_slot=final\nwait_until "$end"')
+        sets=[match.start() for match in re.finditer(r"meta job_stop_at ",script)]
+        self.assertTrue(sets)
+        self.assertTrue(all(position>loop_over for position in sets),"job_stop_at is set before the cycles are over")
+        self.assertIn("wait_for_job_drain",script[loop_over:])
+
+    def test_a_controller_that_stops_before_the_harness_asks_for_the_drain_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); snap=root/"snap"; snap.mkdir()
+            (root/"metadata.json").write_text(json.dumps(dict(job_soak=True)))
+            (snap/"jobs.json").write_text(json.dumps(dict(stopped=True,heartbeat=100,errors=[])))
+            self.assertTrue(any("before the final drain" in item["detail"] for item in checker.job_findings(root,snap,100,False)))
+
+    def test_a_final_whose_harness_never_asked_for_the_drain_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"jobs").mkdir()
+            (root/"metadata.json").write_text(json.dumps(dict(job_soak=True,result="PASS",started_at=100,finished_at=200)))
+            (root/"jobs/snapshot.json").write_text(json.dumps(dict(stopped=True,stop_requested_at=150,heartbeat=200,active=[],errors=[])))
+            checker.save_state(root,{"nodes":["n"]})
+            self.assertEqual(checker.render(root,root/"report.md"),1)
+            self.assertIn("the harness never asked the job campaign to drain",(root/"report.md").read_text())
 
     def test_live_snapshot_without_drain_timestamp_fails_without_crashing_render(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -323,9 +349,10 @@ class JobQualification(unittest.TestCase):
         budget=next(line for line in lines if line[0]=="job-runs")[1:]
         budget=dict(zip(budget[::2],budget[1::2]))
         cycles=len({line[1] for line in lines if line[0]=="cycle"})
-        # The campaign is sized for the whole schedule the plan prints...
+        # The campaign is sized for the whole schedule the plan prints, the
+        # quiet tail after the faults included (#1062)...
         self.assertEqual(cycles*int(header["cycle"]),int(header["duration"]))
-        plan=jobs.run_budget(cycles*int(header["cycle"]))
+        plan=jobs.run_budget(cycles*int(header["cycle"])+int(header["quiet-tail"]))
         self.assertEqual((int(budget["expected"]),int(budget["retained-peak"])),(plan["expected_runs"],plan["peak_retained"]))
         # ...and what it holds at once fits its limit.
         self.assertLessEqual(int(budget["retained-peak"]),int(budget["limit"]))
@@ -338,6 +365,58 @@ class JobQualification(unittest.TestCase):
         self.assertIn("plan: tier fast schedule compressed duration 3600 ",result.stdout)
         specials={line.split()[4] for line in result.stdout.splitlines() if " special " in line}
         self.assertEqual(specials,{"graceful-stop","quorum-loss","all-off"})
+
+    def test_the_day_tier_plans_a_day_of_host_jobs_with_no_faults(self):
+        # #1032: one real 24-hour day on three nodes, then the drain.
+        code,lines,_=self.plan("--tier","day")
+        self.assertEqual(code,0)
+        header=dict(zip(lines[0][::2],lines[0][1::2]))
+        self.assertEqual((header["tier"],header["schedule"],header["duration"],header["quiet-tail"]),("day","none","86400","0"))
+        self.assertEqual((header["job-load"],header["target-rate"],header["node-faults"]),("day",str(jobs.DAY_DEFAULT_RATE),"false"))
+        self.assertFalse([line for line in lines if line[0]=="cycle"])
+        self.assertIn(["day","86400","s","with","no","faults,","walks","or","specials,","then","the","drain"],lines)
+        # The scale-out record measured three 4 vCPU / 6 GiB nodes; quickstart
+        # makes 2 vCPU / 2 GiB ones, so the day resizes them first.
+        self.assertIn(["resize","4","vCPU","6","GiB","each","node,","one","at","a","time,","before","configuring"],lines)
+        # The scale-out record's two billion a day ran Ubuntu's static BusyBox,
+        # which costs half as much per process as the image's.
+        self.assertIn(["host-busybox","busybox-static","1:1.36.1-6ubuntu3.1",
+                       "52151e7f322f926b64049cdaa1410dc3ea6485525e0624b05813791c219ae933"],lines)
+        budget=next(line for line in lines if line[0]=="job-runs")[1:]
+        budget=dict(zip(budget[::2],budget[1::2]))
+        self.assertLessEqual(int(budget["retained-peak"]),int(budget["limit"]))
+
+    def test_the_day_tier_takes_a_lower_rate_down_to_a_billion_a_day_and_no_faults(self):
+        code,lines,_=self.plan("--tier","day","--target-rate","15000")
+        self.assertEqual(code,0)
+        self.assertEqual(dict(zip(lines[0][::2],lines[0][1::2]))["target-rate"],"15000")
+        code,_,error=self.plan("--tier","day","--target-rate",str(jobs.DAY_FLOOR-1))
+        self.assertNotEqual(code,0); self.assertIn(str(jobs.DAY_FLOOR),error)
+        for option in (["--duration","2h"],["--schedule","full"],["--job-load","target"],["--node-faults"]):
+            code,_,error=self.plan("--tier","day",*option)
+            self.assertNotEqual(code,0); self.assertIn("fixed by the job qualification tier",error)
+        # A day has no walks to run a soak build in.
+        code,_,error=self.plan("--tier","day","--soak-bun","/nonexistent/bun-v0.2.3-soak.1")
+        self.assertNotEqual(code,0); self.assertIn("no upgrade walks",error)
+
+    def test_the_day_tier_runs_no_cycles_and_drains_after_the_day(self):
+        # The day spends its whole length in the wait that every tier ends
+        # with, which keeps the light and heavy checks and the TLS rotations
+        # going; the drain starts after it, as in every tier (#1338).
+        script=(self.release/"qualify-sustained.sh").read_text()
+        self.assertIn('while [ "$schedule" != none ]; do',script)
+        self.assertIn('day) : "${schedule:=none}" "${duration_text:=24h}"',script)
+
+    def test_only_the_day_tier_swaps_the_image_busybox_for_a_checked_ubuntu_copy(self):
+        code,lines,_=self.plan("--tier","fast")
+        self.assertEqual(code,0)
+        self.assertFalse([line for line in lines if line[0]=="host-busybox"])
+        script=(self.release/"qualify-sustained.sh").read_text()
+        # Both the package and the binary in it are pinned by SHA-256, and a
+        # mismatch fails setup rather than falling back to the image's copy.
+        self.assertIn("day_busybox_deb_sha256=d96535e0402c011e0ee43449799df2f4504d44b842e4f2b3a6cbc845508eaafc",script)
+        self.assertIn('[ "$(sha256 "$deb")" = "$day_busybox_deb_sha256" ] || setup_fail',script)
+        self.assertIn('[ "$(sha256sum "$root/busybox" | cut -d" " -f1)" = "$busybox_sha256" ]',script)
 
     def test_job_tiers_refuse_a_rate_below_a_hundred_million_a_day_or_a_changed_schedule(self):
         code,_,error=self.plan("--tier","fast","--target-rate","1000")
@@ -627,7 +706,9 @@ class RunBudget(unittest.TestCase):
                               stderr=subprocess.PIPE,text=True,timeout=60,env=dict(os.environ,RELIABURGER_SOAK_CAFFEINATED="1"))
         self.assertEqual(result.returncode,0,result.stderr)
         header=next(line for line in result.stdout.splitlines() if line.startswith("plan: tier ")).split()[1:]
-        duration=int(dict(zip(header[::2],header[1::2]))["duration"])
+        header=dict(zip(header[::2],header[1::2]))
+        # The campaign also runs through the final's quiet tail (#1062).
+        duration=int(header["duration"])+int(header["quiet-tail"])
         line=next(line for line in result.stdout.splitlines() if line.startswith("plan: job-runs "))
         fields=line.split()[2:]
         fields=dict(zip(fields[::2],fields[1::2]))
@@ -1026,3 +1107,18 @@ class ControllerExitStatus(unittest.TestCase):
             with mock.patch.object(sys,"argv",argv), mock.patch.object(jobs,"run",return_value=0):
                 self.assertEqual(jobs.main(),0)
             self.assertEqual((evidence/"jobs/exit-status").read_text().strip(),"0")
+
+
+class NodeFaultOverlap(unittest.TestCase):
+    """A mark records the job modes running on the faulted node in the last
+    15 s. One mark at injection left runc, whose attempts are sparse, a coin
+    toss: the 0.2.2 jobs fast tier missed its only slow-fsync overlap."""
+
+    def test_node_faults_mark_job_overlap_throughout_the_hold(self):
+        source=(Path(__file__).parent/"qualify-sustained.sh").read_text()
+        slot=source[source.index("\nslot_node_fault() {"):]; slot=slot[:slot.index("\n}\n")]
+        injected=slot.index('node_fault_script "$kind" start')
+        removed=slot.index('node_fault_script "$kind" stop')
+        hold=slot[injected:removed]
+        self.assertIn("job_mark_fault",hold)
+        self.assertRegex(hold,r"while \[")

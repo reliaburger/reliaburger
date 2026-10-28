@@ -10,7 +10,15 @@ use reliaburger::grill::{Grill, InstanceId};
 #[path = "support/first_launch.rs"]
 mod first_launch;
 
+/// Pay `bun`'s first launch in this test process. Every owned start runs a
+/// `bun` owner that gets 15 s to answer, so its first launch mustn't land
+/// inside that (#1149).
+fn first_launch_bun() {
+    first_launch::first_launch(&[(Path::new(env!("CARGO_BIN_EXE_bun")), &["--version"])]);
+}
+
 fn runtime(directory: &Path) -> ProcessGrill {
+    first_launch_bun();
     ProcessGrill::with_owner(directory.to_path_buf(), env!("CARGO_BIN_EXE_bun").into())
 }
 
@@ -471,6 +479,8 @@ async fn cancellation_of_start_preserves_the_owned_launch_transaction() {
             env!("CARGO_BIN_EXE_bun")
         ),
     );
+    // The wrapper ends by exec'ing `bun`, inside the 15-second wait too.
+    first_launch_bun();
     let grill = ProcessGrill::with_owner(directory.path().to_path_buf(), wrapper);
     let id = InstanceId("default__cancelled-caller-0".into());
     grill.create(&id, &spec("sleep 30")).await.unwrap();
@@ -618,6 +628,8 @@ async fn owner_reaping_survives_parent_exec() {
     const DIRECTORY: &str = "RELIABURGER_OWNER_REEXEC_DIRECTORY";
     let Some(phase) = std::env::var_os(PHASE) else {
         let directory = tempfile::tempdir().unwrap();
+        // The child starts a `bun` owner inside the 45 s below.
+        first_launch_bun();
         let output = tokio::time::timeout(
             Duration::from_secs(45),
             tokio::process::Command::new(std::env::current_exe().unwrap())

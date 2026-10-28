@@ -729,6 +729,17 @@ failed. `delay_injection_outcome` refuses the injection only for a `Failed`
 caller of this rule. A `match` on the enum, rather than a search through the
 message text, is what keeps the two from being confused.
 
+Once jobs could be faulted (#704), every runc job attempt became a caller
+too, and a soak runs thousands of them an hour. The 0.2.2 soak caught one
+finishing while `tc` ran: `Cannot find device "eth0"`, a `Failed`, and the
+whole delay refused for a caller that no longer existed (#1291). Now the
+reconcile asks again after programming what each failed caller is, as a
+`CallerNow` enum: `Gone`, `Attempt` or `Instance`. `delay_program_failure`
+drops a `Gone` caller, treats an `Attempt` without its namespace or `eth0` as
+`Pending`, and leaves an app instance's failures as they were. Here the text
+match on `tc`'s stderr is the only signal we have, but it's contained in one
+function, and only an attempt's failure can be softened by it.
+
 On the podinfo demo, `relish fault delay redis 300ms --from frontend` took a
 cache read from 43 ms to 945 ms: about three redis round trips (podinfo's
 read runs `EXISTS` and then `GET`, and its pool talks to redis too), each

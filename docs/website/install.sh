@@ -114,7 +114,7 @@ main() {
     exit 2
   fi
   command -v curl >/dev/null 2>&1 || fail 'curl is required'
-  version=${RELIABURGER_VERSION:-v0.2.1}
+  version=${RELIABURGER_VERSION:-v0.2.3}
   # The character gate rejects newlines, so the grep below sees exactly one line.
   case $version in
     ''|*[!A-Za-z0-9.-]*) fail 'invalid RELIABURGER_VERSION' ;;

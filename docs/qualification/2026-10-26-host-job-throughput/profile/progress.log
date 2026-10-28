@@ -1,0 +1,6 @@
+bun pid 1630
+2026-10-26T07:49:46Z c27-perfcpu-host jobs-host-processes c=27 perf=cpu exit 0
+2026-10-26T07:50:57Z c27-perfcpu-raw jobs-vm-baseline c=27 perf=cpu exit 0
+2026-10-26T07:52:09Z c27-perfoff-host jobs-host-processes c=27 perf=off exit 0
+2026-10-26T07:53:21Z c27-probe-host jobs-host-processes c=27 perf=probe exit 0
+2026-10-26T07:53:31Z DONE

@@ -1,7 +1,10 @@
 """The V02 soak checker judges evidence the way section 4 of the plan says."""
 import contextlib
+import hashlib
 import io
 import json
+import os
+import re
 from pathlib import Path
 import tempfile
 import time
@@ -986,12 +989,14 @@ class Record(Evidence):
         self.assertIn("not acceptance", text)
         self.assertNotIn("gate passes", text)
 
-    def test_a_clean_final_tier_passes_the_gate(self):
+    def test_a_clean_final_tier_without_its_execution_inventory_fails(self):
+        # #1061: elapsed time, the schedule label and a digest string were
+        # enough before; a final tier without walks, faults or specials passed.
         code, text = self.render_tier("final")
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1)
         self.assertIn("final tier, full schedule, 8 h 02 min", text)
-        self.assertIn("**Final tier: clean. The V02 soak gate passes** for the candidate whose `candidate.json` "
-                      "has SHA-256 `abc`", text)
+        self.assertIn("**Final tier: incomplete. It passes neither the V02 gate nor the release gate's final soak:**", text)
+        self.assertNotIn("gate passes", text)
 
     def test_a_final_tier_with_an_open_failure_does_not_pass_the_gate(self):
         code, text = self.render_tier("final", failures=["bun RSS 31% above its warm sample"])
@@ -1002,16 +1007,18 @@ class Record(Evidence):
     def test_a_short_or_unpinned_final_tier_is_not_acceptance(self):
         code, text = self.render_tier("final", finished_at=NOW + 4 * 3600, duration_target=4 * 3600,
                                       candidate_digest="`not checked`")
-        self.assertEqual(code, 0)
-        self.assertIn("**Final tier: clean, but not acceptance:** it soaked for 4 h 00 min; "
-                      "the candidate digest was not checked", text)
+        self.assertEqual(code, 1)
+        self.assertIn("it soaked for 4 h 00 min", text)
+        self.assertIn("| candidate.json bytes match the qualified digest | 1 | 0 | MISSING |", text)
         self.assertNotIn("gate passes", text)
 
-    def test_a_run_without_a_tier_says_nothing_about_the_gate(self):
+    def test_a_run_without_a_tier_is_a_diagnostic(self):
         self.write_run()
         record = self.evidence / "record.md"
         self.assertEqual(checker.render(self.evidence, record), 0)
-        self.assertIn("**No tier (a custom run).**", record.read_text())
+        text = record.read_text()
+        self.assertIn("**Custom run: diagnostic only.**", text)
+        self.assertNotIn("gate passes", text)
 
     def test_render_refuses_to_overwrite(self):
         self.write_run()
@@ -1023,6 +1030,595 @@ class Record(Evidence):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+CHAOS_KINDS = ("kill", "delay", "partition", "scenario", "pause", "drop", "dns", "cpu", "memory")
+NODE_FAULT_KINDS = ("delay", "disk-full", "slow-fsync")
+CANDIDATE = b'{"assets": {}, "version": "0.2.3"}\n'
+FINAL = 8 * 3600
+QUIET = checker.QUIET_TAIL_SECONDS
+
+
+def passing_job_report(load, node_faults):
+    """A job controller snapshot that drained in its last two minutes and
+    covered every mode, node and fault kind."""
+    import job_soak
+    kinds = job_soak.FAULT_KINDS + (job_soak.NODE_FAULT_KINDS if node_faults else ())
+    coverage = {mode: dict({item: True for item in job_soak.REQUIRED},
+                           **{"fault:" + node: True for node in NODES},
+                           **{"fault-kind:" + kind: True for kind in kinds}) for mode in job_soak.MODES}
+    return dict(stopped=True, active=[], errors=[], coverage=coverage, load=load,
+                target_rate=1390 if load == "target" else None, started=NOW, heartbeat=NOW + FINAL,
+                stop_requested_at=NOW + FINAL - 100,
+                progress={mode: {"succeeded": 20_000_000, "retried": 0} for mode in job_soak.MODES})
+
+
+class ExecutionInventory(unittest.TestCase):
+    """#1061: a final tier passes only on a completed-execution inventory:
+    every upgrade walk, fault kind, special, workload check, the candidate's
+    bytes and the job campaign's final drain, from what the run did, not
+    from its labels."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.runs = 0
+
+    def event(self, phase, **fields):
+        checker.append_event(self.evidence, ts=NOW + len(checker.read_events(self.evidence)), phase=phase, **fields)
+
+    def settled(self, phase, injection=None):
+        self.event(phase, **(injection or {}))
+        self.event(phase, verdict="settled", settle_seconds=40)
+
+    def final_run(self, drop=(), job_final=True, candidate=CANDIDATE, **metadata):
+        """Write the evidence of a complete 8-hour final, less the classes in `drop`."""
+        self.runs += 1
+        self.evidence = Path(self.temp.name) / str(self.runs)
+        self.evidence.mkdir()
+        digest = hashlib.sha256(CANDIDATE).hexdigest()
+        run = dict(tier="final", schedule="full", started_at=NOW, finished_at=NOW + FINAL + QUIET + 120,
+                   duration_target=FINAL, candidate_digest=f"`{digest}`", qualified_digest=digest,
+                   bootstrapped="true", soak_bun="`bun-v0.2.3-soak.1`, SHA-256 `ff`", release_version="0.2.3",
+                   job_soak=True, job_stop_at=NOW + FINAL - 120, job_load="target" if job_final else "calibration",
+                   node_faults=job_final, cycles=8, ingress_rotation_secs=None, quiet_tail=QUIET)
+        run.update(metadata)
+        (self.evidence / "metadata.json").write_text(json.dumps(run))
+        if candidate is not None and "candidate" not in drop:
+            (self.evidence / "candidate.json").write_bytes(candidate)
+        (self.evidence / "jobs").mkdir()
+        report = passing_job_report(run["job_load"] if job_final else "calibration", job_final)
+        if "drain" in drop:
+            report.update(stopped=False, stop_requested_at=None)
+        (self.evidence / "jobs" / "snapshot.json").write_text(json.dumps(report))
+        armed = {check: dict(armed_seconds=checker.EXPOSURE_ARMED_SECONDS, longest_seconds=checker.EXPOSURE_WINDOW_SECONDS,
+                             samples=30, processes_armed=1) for check in ("leak-rss", "leak-fd")}
+        checker.save_state(self.evidence, {
+            "nodes": NODES, "renewals": {"workload-identity": {name: 24 for name in NODES}},
+            "exposure": {} if "exposure" in drop else {name: armed for name in NODES},
+            "job_resources": {name: {"complete": True, "ts": NOW + FINAL + QUIET + 60, "live_owners": 0} for name in NODES}})
+        if "baseline" not in drop:
+            self.event("baseline", verdict="ok", detail="1")
+        for phase in ("fault:bun-kill-follower", "fault:bun-kill-leader", "fault:deploy-kill", "fault:power-off"):
+            if phase not in drop:
+                self.settled(phase, dict(target="rb-a-2"))
+        for kind in CHAOS_KINDS:
+            if "fault:chaos-" + kind not in drop:
+                self.settled("fault:chaos-" + kind, dict(exit=0, command=kind, verdict="ok"))
+        if job_final:
+            for kind in NODE_FAULT_KINDS:
+                if "fault:node-" + kind not in drop:
+                    self.settled("fault:node-" + kind, dict(exit=0, command=kind, target="rb-a-1"))
+        for _ in range(4 - (1 if "walk" in drop else 0)):
+            self.event("upgrade:upgrade", verdict="ok", duration=200)
+            self.event("upgrade:rollback", verdict="ok", duration=200)
+            self.event("upgrade:settle", verdict="settled", settle_seconds=60)
+        for phase, count in (("special:graceful-stop", 2), ("special:quorum-loss", 2), ("special:all-off", 1)):
+            for _ in range(count - (1 if phase in drop else 0)):
+                self.event(phase)
+                if phase == "special:quorum-loss":
+                    self.event("special:quorum-back", verdict="ok", duration=30)
+                self.event(phase, verdict="settled", settle_seconds=90)
+        for _ in range(8 - (1 if "pulse" in drop else 0)):
+            self.event("pulse", exit=0, verdict="ok")
+        if "export" not in drop:
+            self.event("storage:offline-export", target="rb-a-2", verdict="ok")
+        if "quiet" not in drop:
+            self.quiet_tail()
+
+    def quiet_tail(self, interruption=None):
+        """The quiet tail after the faults: nothing injected, walked or stopped."""
+        self.event("quiet", detail=f"no faults for {QUIET} s")
+        if interruption:
+            self.event(interruption, target="rb-a-2")
+        self.event("quiet", verdict="ok", duration=QUIET)
+
+    def render(self):
+        record = self.evidence / "record.md"
+        code = checker.render(self.evidence, record)
+        return code, record.read_text()
+
+    def test_a_complete_job_final_passes_the_release_gates_final_soak(self):
+        self.final_run()
+        code, text = self.render()
+        self.assertEqual(code, 0, text)
+        self.assertIn("**Final job tier: clean. The release gate's final soak passes** for the candidate whose "
+                      f"`candidate.json` has SHA-256 `{hashlib.sha256(CANDIDATE).hexdigest()}`", text)
+        self.assertIn("## Execution inventory (gated)", text)
+        self.assertIn("| upgrade walk (to the soak build and back) | 4 | 4 | ok |", text)
+        self.assertIn("| fault:chaos-memory | 1 | 1 | ok |", text)
+        self.assertNotIn("MISSING", text)
+
+    def test_a_complete_v02_final_alone_passes_the_v02_gate_but_not_the_release_gates_final(self):
+        self.final_run(job_final=False)
+        code, text = self.render()
+        self.assertEqual(code, 0, text)
+        self.assertIn("**Final tier (V02 alone): clean. The V02 soak gate passes**", text)
+        self.assertIn("not the release gate's final soak", text)
+        self.assertNotIn("release gate's final soak passes", text)
+
+    def test_each_missing_item_fails_a_final_that_otherwise_looks_clean(self):
+        missing = {
+            "walk": "| upgrade walk (to the soak build and back) | 4 | 3 | MISSING |",
+            "baseline": "| app workloads settled at the baseline | 1 | 0 | MISSING |",
+            "candidate": "| candidate.json bytes match the qualified digest | 1 | 0 | MISSING |",
+            "drain": "| job campaign drained in its final two minutes | 1 | 0 | MISSING |",
+            "pulse": "| catalogue pulse | 8 | 7 | MISSING |",
+            "export": "| offline export | 1 | 0 | MISSING |",
+            "quiet": "| quiet tail with no faults, walks or specials | 1 | 0 | MISSING |",
+            "special:graceful-stop": "| special:graceful-stop | 2 | 1 | MISSING |",
+            "special:quorum-loss": "| special:quorum-loss | 2 | 1 | MISSING |",
+            "special:all-off": "| special:all-off | 1 | 0 | MISSING |",
+        }
+        for phase in ("fault:bun-kill-follower", "fault:bun-kill-leader", "fault:deploy-kill", "fault:power-off"):
+            missing[phase] = f"| {phase} | 1 | 0 | MISSING |"
+        for kind in CHAOS_KINDS:
+            missing["fault:chaos-" + kind] = f"| fault:chaos-{kind} | 1 | 0 | MISSING |"
+        for kind in NODE_FAULT_KINDS:
+            missing["fault:node-" + kind] = f"| fault:node-{kind} | 1 | 0 | MISSING |"
+        for item, row in missing.items():
+            with self.subTest(item=item):
+                self.final_run(drop=(item,))
+                code, text = self.render()
+                self.assertEqual(code, 1)
+                self.assertTrue(text.startswith("# Sustained soak (V02): FAIL"))
+                self.assertIn(row, text)
+                # A missing drain fails the job gate too, so that record also says "not clean".
+                self.assertIn("incomplete", text.split("\n")[4])
+                self.assertNotIn("gate passes", text)
+                self.assertNotIn("final soak passes", text)
+
+    def test_skipped_upgrade_slots_are_not_walks(self):
+        self.final_run(drop=("walk",))
+        self.event("upgrade", verdict="skipped", detail="no --soak-bun")
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| upgrade walk (to the soak build and back) | 4 | 3 | MISSING |", text)
+
+    def test_a_walk_whose_rollback_failed_is_not_a_completed_walk(self):
+        self.final_run(drop=("walk",))
+        self.event("upgrade:upgrade", verdict="ok", duration=200)
+        self.event("upgrade:rollback", verdict="fail", duration=600)
+        self.event("upgrade:settle", verdict="settled", settle_seconds=60)
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| upgrade walk (to the soak build and back) | 4 | 3 | MISSING |", text)
+
+    def test_a_fault_injected_but_never_settled_is_not_completed(self):
+        self.final_run(drop=("fault:power-off",))
+        self.event("fault:power-off", target="rb-a-2")
+        self.event("fault:power-off", verdict="fail", settle_seconds=480)
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| fault:power-off | 1 | 0 | MISSING |", text)
+
+    def test_a_chaos_fault_the_rails_refused_is_not_completed(self):
+        self.final_run(drop=("fault:chaos-pause",))
+        self.settled("fault:chaos-pause", dict(exit=1, command="pause", verdict="fail"))
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| fault:chaos-pause | 1 | 0 | MISSING |", text)
+
+    def test_quorum_loss_needs_quorum_back(self):
+        self.final_run(drop=("special:quorum-loss",))
+        self.event("special:quorum-loss")
+        self.event("special:quorum-loss", verdict="settled", settle_seconds=90)
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| special:quorum-loss | 2 | 1 | MISSING |", text)
+
+    def test_candidate_bytes_must_hash_to_the_qualified_digest(self):
+        self.final_run(candidate=b"something else\n")
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| candidate.json bytes match the qualified digest | 1 | 0 | MISSING |", text)
+
+    def test_an_adopted_home_never_verified_the_candidate(self):
+        self.final_run(bootstrapped="false")
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| candidate.json bytes match the qualified digest | 1 | 0 | MISSING |", text)
+
+    def test_a_final_without_a_job_campaign_has_no_final_drain(self):
+        self.final_run(job_final=False, job_soak=None)
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| job campaign drained in its final two minutes | 1 | 0 | MISSING |", text)
+
+    def test_a_fault_inside_the_quiet_tail_breaks_it(self):
+        self.final_run(drop=("quiet",))
+        self.quiet_tail(interruption="fault:bun-kill-follower")
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| quiet tail with no faults, walks or specials | 1 | 0 | MISSING |", text)
+
+    def test_a_final_whose_leak_checkers_lack_exposure_fails(self):
+        # #1062: a final that never armed leak-rss on a node can't claim it
+        # found no leak there.
+        self.final_run()
+        state = checker.load_state(self.evidence)
+        state["exposure"]["rb-a-2"]["leak-rss"] = dict(armed_seconds=30 * 60, longest_seconds=30 * 60, samples=7,
+                                                      processes_armed=1)
+        checker.save_state(self.evidence, state)
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertTrue(text.startswith("# Sustained soak (V02): FAIL"))
+        self.assertIn("## Leak-checker exposure (gated)", text)
+        self.assertIn("| rb-a-2 | leak-rss | 30 min | 30 min | 7 | 1 | SHORT |", text)
+        self.assertIn("leak-checker exposure too short: rb-a-2 leak-rss", text)
+        self.assertNotIn("passes**", text)
+
+    def test_a_final_needs_one_unbroken_armed_window(self):
+        self.final_run()
+        state = checker.load_state(self.evidence)
+        state["exposure"]["rb-a-3"]["leak-fd"] = dict(armed_seconds=90 * 60, longest_seconds=20 * 60, samples=30,
+                                                     processes_armed=4)
+        checker.save_state(self.evidence, state)
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| rb-a-3 | leak-fd | 90 min | 20 min | 30 | 4 | SHORT |", text)
+
+    def test_a_final_with_no_exposure_recorded_fails(self):
+        self.final_run(drop=("exposure",))
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| rb-a-1 | leak-rss | 0 min | 0 min | 0 | 0 | SHORT |", text)
+
+    def test_fast_and_custom_runs_record_exposure_without_gating_on_it(self):
+        for tier in ("fast", "custom"):
+            with self.subTest(tier=tier):
+                self.final_run(drop=("walk", "exposure", "quiet"), tier=tier, schedule="compressed",
+                               finished_at=NOW + 3600, duration_target=3600, cycles=6)
+                code, text = self.render()
+                self.assertEqual(code, 0, text)
+                self.assertIn("## Leak-checker exposure (recorded, not gated)", text)
+                self.assertIn("| rb-a-1 | leak-rss | 0 min | 0 min | 0 | 0 | short |", text)
+
+    def test_relabelling_a_fast_run_as_final_does_not_promote_it(self):
+        # A fast run's evidence: two walks, one of each special, one pulse,
+        # four cycles. Its labels now say final, full, 8 h.
+        self.final_run(drop=("walk", "special:graceful-stop", "special:quorum-loss", "pulse"))
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("**Final tier: incomplete.", text)
+
+    def test_relabelling_a_v02_final_as_a_job_final_does_not_promote_it(self):
+        # The labels claim the job final; the controller ran the calibration
+        # load and no node fault ever ran.
+        self.final_run(job_final=False, job_load="target", node_faults=True)
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("| fault:node-slow-fsync | 1 | 0 | MISSING |", text)
+        self.assertNotIn("final soak passes", text)
+
+    def test_a_fast_tier_records_its_inventory_without_gating_on_it(self):
+        self.final_run(drop=("walk",), tier="fast", schedule="compressed", finished_at=NOW + 3600,
+                       duration_target=3600, cycles=6)
+        code, text = self.render()
+        self.assertEqual(code, 0, text)
+        self.assertIn("## Execution inventory (recorded, not gated)", text)
+        self.assertIn("**Fast tier: clean.**", text)
+
+    def test_the_checker_requires_what_the_final_plan_schedules(self):
+        # The checker's own copy of the schedule must match the harness's.
+        import subprocess
+        result = subprocess.run([str(Path(__file__).parent / "qualify-jobs-sustained.sh"), "--tier", "final", "--plan"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60,
+                                env=dict(os.environ, RELIABURGER_SOAK_CAFFEINATED="1"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line.split()[1:] for line in result.stdout.splitlines() if line.startswith("plan: cycle ")]
+        planned = {"quiet-tail": sum(1 for line in result.stdout.splitlines()
+                                     if line.startswith(f"plan: quiet-tail {QUIET} s "))}
+        for line in lines:
+            slot = line[2]
+            if slot == "chaos":
+                names = ["fault:chaos-" + kind for kind in line[3:]]
+            elif slot == "node-fault":
+                names = ["fault:node-" + line[3]]
+            elif slot == "special":
+                names = ["special:" + line[3]]
+            else:
+                names = [slot]
+            for name in names:
+                planned[name] = planned.get(name, 0) + 1
+        required = checker.required_execution(dict(tier="final", node_faults=True))
+        self.assertEqual(planned.get("upgrade"), required["upgrade walk (to the soak build and back)"])
+        self.assertEqual(planned.get("catalogue-pulse"), required["catalogue pulse"])
+        self.assertEqual(planned.get("offline-export"), required["offline export"])
+        self.assertEqual(planned.get("quiet-tail"), required["quiet tail with no faults, walks or specials"])
+        for name in ("special:graceful-stop", "special:quorum-loss", "special:all-off"):
+            self.assertEqual(planned.get(name), required[name], name)
+        for kind in CHAOS_KINDS:
+            self.assertGreaterEqual(planned.get("fault:chaos-" + kind, 0), required["fault:chaos-" + kind], kind)
+        for kind in NODE_FAULT_KINDS:
+            self.assertGreaterEqual(planned.get("fault:node-" + kind, 0), required["fault:node-" + kind], kind)
+        for slot in ("follower-kill", "leader-kill", "deploy-kill", "power-off"):
+            self.assertGreaterEqual(planned.get(slot, 0), 1, slot)
+
+
+class FinalTierDriver(unittest.TestCase):
+    """#1061: the harness refuses to start a final tier that could only
+    finish incomplete, before it touches a cluster."""
+
+    release = Path(__file__).parent
+
+    def run_script(self, *arguments):
+        import subprocess
+        return subprocess.run([str(self.release / "qualify-sustained.sh"), *arguments],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60,
+                              env=dict(os.environ, RELIABURGER_SOAK_CAFFEINATED="1"))
+
+    def soak_build(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        build = Path(directory.name) / "bun-v0.2.3-soak.1"
+        build.write_bytes(b"bun")
+        build.with_name(build.name + ".sig").write_text("{}")
+        return str(build)
+
+    def test_a_final_tier_refuses_to_start_without_a_soak_build(self):
+        result = self.run_script("--tier", "final", "--base-url", "https://example.invalid/staged",
+                                 "--qualified-digest", "a" * 64)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("a final tier needs --soak-bun", result.stderr)
+
+    def test_a_final_tier_refuses_to_start_without_a_qualified_digest(self):
+        result = self.run_script("--tier", "final", "--base-url", "https://example.invalid/staged",
+                                 "--soak-bun", self.soak_build())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("a final tier needs --qualified-digest", result.stderr)
+
+    def test_a_final_tier_refuses_an_adopted_home(self):
+        result = self.run_script("--tier", "final", "--home", tempfile.gettempdir(), "--qualified-digest", "a" * 64,
+                                 "--soak-bun", self.soak_build())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("a final tier bootstraps its own cluster", result.stderr)
+
+    def test_the_final_plan_walks_four_times_and_its_chaos_reaches_every_kind(self):
+        result = self.run_script("--tier", "final", "--plan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line.split()[1:] for line in result.stdout.splitlines() if line.startswith("plan: cycle ")]
+        self.assertEqual(sum(1 for line in lines if line[2] == "upgrade"), 4)
+        kinds = {kind for line in lines if line[2] == "chaos" for kind in line[3:]}
+        self.assertEqual(kinds, set(CHAOS_KINDS))
+
+    def test_a_final_adds_its_quiet_tail_after_eight_hours_of_faults(self):
+        result = self.run_script("--tier", "final", "--plan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        header = result.stdout.splitlines()[0].split()[1:]
+        header = dict(zip(header[::2], header[1::2]))
+        self.assertEqual((header["duration"], header["quiet-tail"]), ("28800", str(QUIET)))
+        self.assertIn(f"plan: quiet-tail {QUIET} s with no faults, walks or specials after the last cycle", result.stdout)
+
+    def test_fast_and_custom_tiers_have_no_quiet_tail(self):
+        for arguments in (("--tier", "fast"), ("--duration", "2h")):
+            result = self.run_script(*arguments, "--plan")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(" quiet-tail 0", result.stdout.splitlines()[0])
+            self.assertNotIn("plan: quiet-tail", result.stdout)
+
+    def test_the_hosted_soak_is_an_explicit_diagnostic(self):
+        workflow = (self.release.parent.parent / ".github" / "workflows" / "soak.yml").read_text()
+        self.assertIn("--tier custom", workflow)
+        self.assertIn("diagnostic", workflow)
+
+
+class Choices(unittest.TestCase):
+    """#1062: every fault and node choice comes from a recorded seed, so a
+    run's choices can be repeated, and each one is logged."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+
+    def evidence(self, name):
+        directory = Path(self.temp.name) / name
+        directory.mkdir()
+        return directory
+
+    def draws(self, evidence, seed):
+        checker.start_choices(evidence, seed)
+        return [checker.choose(evidence, what, low, high) for what, low, high in
+                (("deploy-kill-node", 1, 3), ("deploy-kill-offset", 0, 20), ("power-off-hold", 60, 180),
+                 ("follower", 0, 1), ("export-node", 2, 3))]
+
+    def test_the_same_seed_repeats_every_choice(self):
+        self.assertEqual(self.draws(self.evidence("a"), 1234), self.draws(self.evidence("b"), 1234))
+
+    def test_another_seed_gives_other_choices(self):
+        first = [self.draws(self.evidence(f"a{seed}"), seed) for seed in (1, 2, 3)]
+        self.assertGreater(len({tuple(draw) for draw in first}), 1)
+
+    def test_choices_stay_in_their_range(self):
+        evidence = self.evidence("range")
+        checker.start_choices(evidence, 99)
+        values = [checker.choose(evidence, "hold", 60, 180) for _ in range(200)]
+        self.assertTrue(all(60 <= value <= 180 for value in values))
+        self.assertEqual(len(set(values)) > 50, True)
+
+    def test_each_choice_is_logged_with_what_it_chose(self):
+        evidence = self.evidence("log")
+        checker.start_choices(evidence, 7)
+        value = checker.choose(evidence, "deploy-kill-node", 1, 3)
+        events = [event for event in checker.read_events(evidence) if event["phase"] == "choice"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["target"], "deploy-kill-node")
+        self.assertEqual(events[0]["detail"], f"{value} of 1-3, draw 0, seed 7")
+
+    def test_without_a_seed_one_is_made_and_recorded(self):
+        evidence = self.evidence("fresh")
+        seed = checker.start_choices(evidence, None)
+        self.assertIsInstance(seed, int)
+        self.assertEqual(json.loads((evidence / "choices.json").read_text())["seed"], seed)
+
+    def test_a_resumed_run_continues_its_sequence(self):
+        whole = self.evidence("whole")
+        expected = self.draws(whole, 42)
+        resumed = self.evidence("resumed")
+        checker.start_choices(resumed, 42)
+        got = [checker.choose(resumed, "deploy-kill-node", 1, 3), checker.choose(resumed, "deploy-kill-offset", 0, 20)]
+        self.assertEqual(checker.start_choices(resumed, None), 42)
+        got += [checker.choose(resumed, "power-off-hold", 60, 180), checker.choose(resumed, "follower", 0, 1),
+                checker.choose(resumed, "export-node", 2, 3)]
+        self.assertEqual(got, expected)
+
+    def test_a_resumed_run_refuses_a_different_seed(self):
+        evidence = self.evidence("conflict")
+        checker.start_choices(evidence, 1)
+        with self.assertRaises(ValueError):
+            checker.start_choices(evidence, 2)
+
+    def test_the_command_line_prints_the_choice(self):
+        evidence = self.evidence("cli")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(checker.main(["seed", str(evidence), "--seed", "5"]), 0)
+            self.assertEqual(checker.main(["choose", str(evidence), "power-off-node", "2", "3"]), 0)
+        seed, value = out.getvalue().split()
+        self.assertEqual(seed, "5")
+        self.assertIn(int(value), (2, 3))
+
+
+class CheckerExposure(Evidence):
+    """#1062: the record says how long each leak checker was armed on each
+    node. Reported only; nothing is gated on it yet."""
+
+    def sample(self, ts, pid, rss_kb=300000, fd=300):
+        inventory = INVENTORY.replace("bun_pid 100", f"bun_pid {pid}").replace(
+            "bun_rss_kb 300000", f"bun_rss_kb {rss_kb}").replace("bun_fd 300", f"bun_fd {fd}")
+        checker.resource_trend_findings(self.state, "rb-a-1", checker.parse_inventory(inventory), ts)
+
+    def setUp(self):
+        super().setUp()
+        self.state = {"nodes": NODES}
+
+    def exposure(self, check):
+        return self.state["exposure"]["rb-a-1"][check]
+
+    def test_one_long_process_arms_each_checker_after_its_warm_up(self):
+        for minute in range(0, 91, 5):
+            self.sample(NOW + minute * 60, 100)
+        self.assertEqual(self.exposure("leak-rss")["armed_seconds"], 30 * 60)
+        self.assertEqual(self.exposure("leak-rss")["samples"], 7)
+        self.assertEqual(self.exposure("leak-fd")["armed_seconds"], 40 * 60)
+        self.assertEqual(self.exposure("leak-fd")["longest_seconds"], 40 * 60)
+
+    def test_a_restart_ends_the_window_and_starts_the_warm_up_again(self):
+        for minute in range(0, 71, 5):
+            self.sample(NOW + minute * 60, 100)
+        for minute in range(75, 146, 5):
+            self.sample(NOW + minute * 60, 200)
+        rss = self.exposure("leak-rss")
+        self.assertEqual(rss["armed_seconds"], 20 * 60)
+        self.assertEqual(rss["longest_seconds"], 10 * 60)
+        self.assertEqual(rss["processes_armed"], 2)
+
+    def test_short_lived_processes_never_arm_the_checkers(self):
+        for start in range(0, 300, 45):
+            for minute in range(start, start + 45, 5):
+                self.sample(NOW + minute * 60, 1000 + start)
+        self.assertEqual(self.exposure("leak-rss")["armed_seconds"], 0)
+        self.assertEqual(self.exposure("leak-fd")["armed_seconds"], 0)
+
+    def test_a_finals_quiet_tail_arms_both_checkers_long_enough_after_the_last_special(self):
+        # The last cycle ends with a graceful stop after its heavy sample, so
+        # each Bun is first seen up to one heavy interval into the tail, and
+        # every heavy observe pushes the next one back by however long it
+        # took (wait_until in qualify-sustained.sh). The tail's last sample
+        # is the observe after it.
+        heavy_every, observe_takes = 300, 30
+        tail_end = NOW + checker.QUIET_TAIL_SECONDS
+        ts = NOW + heavy_every
+        while ts < tail_end:
+            self.sample(ts, 200)
+            ts += heavy_every + observe_takes
+        self.sample(tail_end, 200)
+        short = [check for node, check in checker.exposure_shortfalls(self.state) if node == "rb-a-1"]
+        self.assertEqual(short, [], self.state["exposure"]["rb-a-1"])
+
+    def test_the_record_reports_armed_minutes_per_node_and_checker(self):
+        (self.evidence / "metadata.json").write_text(json.dumps({"started_at": NOW, "finished_at": NOW + 7200}))
+        for minute in range(0, 91, 5):
+            self.sample(NOW + minute * 60, 100)
+        checker.save_state(self.evidence, self.state)
+        record = self.evidence / "record.md"
+        checker.render(self.evidence, record)
+        text = record.read_text()
+        self.assertIn("## Leak-checker exposure (recorded, not gated)", text)
+        self.assertIn("| rb-a-1 | leak-rss | 30 min | 30 min | 7 | 1 | short |", text)
+        self.assertIn("| rb-a-1 | leak-fd | 40 min | 40 min | 9 | 1 | short |", text)
+        self.assertIn("| rb-a-2 | leak-rss | 0 min | 0 min | 0 | 0 | short |", text)
+
+
+class SeedInTheRecord(Evidence):
+    def test_the_record_names_the_seed_and_the_observed_effects(self):
+        (self.evidence / "metadata.json").write_text(json.dumps({"started_at": NOW, "finished_at": NOW + 600}))
+        checker.start_choices(self.evidence, 31337)
+        checker.choose(self.evidence, "power-off-node", 2, 3)
+        checker.append_event(self.evidence, ts=NOW + 5, phase="effect:node-disk-full", target="rb-a-2",
+                             detail="available 67108864 bytes")
+        record = self.evidence / "record.md"
+        checker.render(self.evidence, record)
+        text = record.read_text()
+        self.assertIn("- Fault and node choices: 1, from seed 31337 (`--seed 31337` repeats them)", text)
+        self.assertIn("| effect:node-disk-full | rb-a-2 | available 67108864 bytes |", text)
+
+
+class SeededHarness(unittest.TestCase):
+    """#1062: the harness draws nothing from bash's unseeded $RANDOM."""
+
+    release = Path(__file__).parent
+
+    def run_script(self, *arguments):
+        import subprocess
+        return subprocess.run([str(self.release / "qualify-sustained.sh"), *arguments],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60,
+                              env=dict(os.environ, RELIABURGER_SOAK_CAFFEINATED="1"))
+
+    def test_the_harness_never_uses_bash_random(self):
+        script = (self.release / "qualify-sustained.sh").read_text()
+        code = [line for line in script.splitlines() if not line.lstrip().startswith("#")]
+        self.assertFalse([line for line in code if "RANDOM" in line])
+
+    def test_the_plan_prints_the_seed_it_was_given(self):
+        result = self.run_script("--tier", "fast", "--plan", "--seed", "77")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("plan: seed 77", result.stdout)
+
+    def test_a_seed_must_be_a_whole_number(self):
+        result = self.run_script("--tier", "fast", "--plan", "--seed", "lucky")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--seed must be a whole number", result.stderr)
+
+    def test_every_node_fault_has_a_parseable_effect_probe(self):
+        import subprocess
+        script = (self.release / "qualify-sustained.sh").read_text()
+        function = script[script.index("node_fault_script() {"):]
+        function = function[:function.index("\n}\n") + 3]
+        for kind in ("delay", "disk-full", "slow-fsync"):
+            probe = subprocess.run(["bash", "-c", function + f'node_fault_script {kind} effect'],
+                                   stdout=subprocess.PIPE, text=True, check=True).stdout
+            self.assertTrue(probe.strip(), kind)
+            subprocess.run(["bash", "-n"], input=probe, text=True, check=True)
 
 
 class GuestMemory(unittest.TestCase):
@@ -1123,3 +1719,102 @@ class TestFailures(unittest.TestCase):
         chaos = script[script.index("chaos_one() {"):script.index("catalogue_pulse() {")]
         self.assertIn('--timeout 600s > "$output" 2> "$output.err"', chaos)
         self.assertIn('record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")"', chaos)
+
+
+DAY = 24 * 3600
+
+
+class DayRecord(unittest.TestCase):
+    """#1032: a day tier is gated on the day itself: the host-job rate, each
+    node's share, the last hour against the first, the drain, the candidate
+    and every leak checker armed. It owes no faults, walks or specials."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.runs = 0
+
+    def day_run(self, rate=23149, per_node=None, last_hour=None, drop=()):
+        import job_soak
+        self.runs += 1
+        self.evidence = Path(self.temp.name) / str(self.runs)
+        self.evidence.mkdir()
+        digest = hashlib.sha256(CANDIDATE).hexdigest()
+        (self.evidence / "metadata.json").write_text(json.dumps(dict(
+            tier="day", schedule="none", started_at=NOW, finished_at=NOW + DAY + 300, duration_target=DAY,
+            candidate_digest=f"`{digest}`", qualified_digest=digest, bootstrapped="true",
+            soak_bun="not supplied: upgrade slots skipped", job_soak=True, job_stop_at=NOW + DAY, job_load="day",
+            target_rate=str(rate if rate >= 23149 else 23149), node_faults=False, cycles=0,
+            ingress_rotation_secs=None, quiet_tail=0)))
+        (self.evidence / "candidate.json").write_bytes(CANDIDATE)
+        (self.evidence / "jobs").mkdir()
+        host = rate * DAY
+        marks = [[NOW + hour * 3600, hour * 3600 * rate] for hour in range(25)]
+        if last_hour is not None:
+            marks[-1][1] = marks[-2][1] + 3600 * last_hour
+        coverage = {mode: {item: True for item in job_soak.REQUIRED if item != "unknown"} for mode in job_soak.MODES}
+        third = host // 3
+        snapshot = dict(stopped=True, active=[], errors=[], coverage=coverage, load="day", target_rate=23149,
+                        started=NOW, heartbeat=NOW + DAY + 100, stop_requested_at=NOW + DAY,
+                        progress={mode: {"succeeded": host if mode == "process" else 1_000_000, "retried": 0}
+                                  for mode in job_soak.MODES},
+                        per_node=per_node if per_node is not None else {
+                            name: dict(succeeded=third, slots=27, restarted=False) for name in NODES},
+                        hour_marks=marks)
+        if "drain" in drop:
+            snapshot.update(stopped=False)
+        (self.evidence / "jobs" / "snapshot.json").write_text(json.dumps(snapshot))
+        armed = {check: dict(armed_seconds=DAY - 3600, longest_seconds=DAY - 3600, samples=2000, processes_armed=1)
+                 for check in ("leak-rss", "leak-fd")}
+        checker.save_state(self.evidence, {
+            "nodes": NODES, "renewals": {"workload-identity": {name: 50 for name in NODES}},
+            "exposure": {} if "exposure" in drop else {name: armed for name in NODES},
+            "job_resources": {name: {"complete": True, "ts": NOW + DAY + 200, "live_owners": 0} for name in NODES}})
+        checker.append_event(self.evidence, ts=NOW, phase="baseline", verdict="ok", detail="1")
+
+    def render(self):
+        record = self.evidence / "record.md"
+        code = checker.render(self.evidence, record)
+        return code, record.read_text()
+
+    def test_a_clean_day_passes_and_records_every_node_and_hour(self):
+        self.day_run()
+        code, text = self.render()
+        self.assertEqual(code, 0, text)
+        self.assertIn("**Day tier: clean.** 2,000,073,600 host-job tasks accepted in", text)
+        self.assertIn("## Execution inventory (gated)", text)
+        self.assertNotIn("MISSING", text)
+        self.assertNotIn("fault:", text.split("## Execution inventory")[1].split("##")[0])
+        self.assertIn("## Day run (#1032)", text)
+        self.assertIn("| rb-a-1 | 27 | 666,691,200 | 7,716.3/s | 33.3% | 33.3% | ok |", text)
+        hours = [line for line in text.splitlines() if re.match(r"\| Hour \d+ \|", line)]
+        self.assertEqual(len(hours), 24)
+        self.assertIn("Last hour against the first: 23,149.0/s against 23,149.0/s, ok", text)
+        self.assertIn("## Leak-checker exposure (gated)", text)
+
+    def test_a_slow_day_fails_and_says_whether_it_made_the_floor(self):
+        self.day_run(rate=15000)
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("host-job rate 15,000.0/s is below the 23149/s target (the billion-a-day floor holds", text)
+        self.assertIn("**Day tier: not clean.**", text)
+
+    def test_an_unbalanced_or_slowing_day_fails(self):
+        self.day_run(per_node={"rb-a-1": dict(succeeded=50, slots=27), "rb-a-2": dict(succeeded=25, slots=27),
+                               "rb-a-3": dict(succeeded=25, slots=27)})
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("rb-a-1 took 50.0% of the host-job successes", text)
+        self.day_run(last_hour=20000)
+        code, text = self.render()
+        self.assertEqual(code, 1)
+        self.assertIn("the last hour ran at 20,000.0/s, more than 10% below the first hour's 23,149.0/s", text)
+
+    def test_a_day_without_its_drain_or_armed_leak_checkers_fails(self):
+        for item in ("drain", "exposure"):
+            with self.subTest(item=item):
+                self.day_run(drop=(item,))
+                code, text = self.render()
+                self.assertEqual(code, 1)
+                self.assertNotIn("**Day tier: clean.**", text)
+

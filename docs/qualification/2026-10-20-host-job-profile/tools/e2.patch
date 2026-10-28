@@ -1,0 +1,30 @@
+--- a/src/meat/task_array_state.rs	2026-10-20 14:12:34
++++ b/src/meat/task_array_state.rs	2026-10-20 14:12:34
+@@ -37,7 +37,7 @@
+ pub const MIN_GRANT_DEPTH: u64 = 2;
+ /// Cap extra prefetch learned from verified command durations. This queues work,
+ /// not resource reservations; the original two-slot-round floor still applies.
+-pub const MAX_LEARNED_GRANT_DEPTH: u64 = 16;
++pub const MAX_LEARNED_GRANT_DEPTH: u64 = 64;
+ const LOOKAHEAD_MILLISECONDS: u128 = 2000;
+ /// Lookahead learns from roughly this many recent final attempts: once the
+ /// recent histogram holds more, every bucket halves. A slow start (cold image
+--- a/src/lettuce/runner.rs	2026-10-20 14:12:34
++++ b/src/lettuce/runner.rs	2026-10-20 14:12:34
+@@ -81,7 +81,7 @@
+         let mut poll = local_config.as_ref().map_or(DEFAULT_POLL, poll_interval);
+         let mut ticker = tokio::time::interval(poll);
+         let mut triggers = council.gitops_trigger_updates();
+-        let mut leadership = council.metrics();
++        let _leadership = council.metrics();
+ 
+         // Tracked locally so a run of failures backs off (GIT4): the delay
+         // is `poll * 2^failures`, capped, and is also mirrored into the
+@@ -93,7 +93,6 @@
+                 _ = shutdown.cancelled() => break,
+                 _ = ticker.tick() => false,
+                 change = triggers.changed() => { if change.is_err() { break } true },
+-                change = leadership.changed() => { if change.is_err() { break } true },
+                 signal = webhook_rx.recv() => {
+                     if signal.is_none() {
+                         break; // sender dropped

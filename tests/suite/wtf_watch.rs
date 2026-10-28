@@ -36,6 +36,8 @@ async fn watch_recovers_from_collection_failure_and_retains_warning_exit() {
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
+    // Pay `relish`'s first launch before the first 40 s wait starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
         .args([
             "--endpoint",
