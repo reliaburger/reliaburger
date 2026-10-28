@@ -8,6 +8,62 @@ release contains is in the [roadmap](roadmap.md#releases-after-010). A new
 paragraph goes at the top when a release is promoted
 ([release gate, step 9](releasing.md#staging-a-candidate)).
 
+## 0.2.3: two billion a day
+
+Promoted on 28 October 2026 as tag `v0.2.3` at `d387d569`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/40779591166)).
+Qualification ran from 26 to 28 October 2026 (UTC) and took one candidate
+([closure record](qualification/2026-10-28-v0.2.3-release-closure.md)), on the same gate
+as 0.2.2. Its build first stopped at the dependency audit: RustSec published
+13 advisories against `zstd` 0.13 on 26 October, reached only through the
+Parquet files Reliaburger writes itself, and the maintainer accepted them
+under a dated exception
+([#1367](https://github.com/reliaburger/reliaburger/pull/1367),
+[record](qualification/2026-10-26-dependency-exceptions.md)). The staged candidate was
+benchmarked before any soak: 14,916.7 host jobs a second on one node and
+29,350.0 on three, every node within its share
+([record](qualification/2026-10-27-v0.2.3-candidate-throughput/README.md)). It passed
+both staged installs, in 153 s and 149 s
+([first](qualification/2026-10-26-v0.2.3-staged-install-apple-silicon.md),
+[second](qualification/2026-10-26-v0.2.3-staged-install-apple-silicon-2.md)). Its first
+V02 fast tier failed on one 2,260 ms `upgrade_verify` turn, the upgrade's
+commit writing to disk on the agent loop while another node's disk stalled
+for 4.9 s ([record](qualification/2026-10-28-v0.2.3-release-closure/candidate-1-v02-fast-run1.md)).
+The maintainer accepted it under 0.2.2's host-stall rule, with the write
+moving off the loop in 0.2.4
+([#1381](https://github.com/reliaburger/reliaburger/issues/1381)), and the
+rerun on the same candidate passed
+([record](qualification/2026-10-27-v0.2.3-sustained-v02-fast.md)). The jobs fast tier
+passed at 6,701.5 accepted jobs a second
+([record](qualification/2026-10-27-v0.2.3-job-qualification-fast.md)), and the 8-hour
+jobs final passed clean at 7,300.5 a second, with every job drained, nothing
+lost and every leak checker armed through its quiet tail
+([record](qualification/2026-10-27-v0.2.3-job-qualification.md)). The power-cut and
+reboot lanes passed 25 of 25 in every lane
+([record](qualification/2026-10-27-power-cut-reboot.md)). Then the day run, outside the
+gate. The first ran the image's BusyBox, which costs twice the CPU per
+process of the `busybox-static` the benchmark used, so it was stopped after
+two hours and the day tier pinned the benchmark's
+([#1386](https://github.com/reliaburger/reliaburger/pull/1386)). The second
+counted 1,807,742,226 host-job tasks in 24 hours on three 4-vCPU VMs, 20,920
+a second: below the 2 billion target, above the 1 billion floor
+([record](qualification/2026-10-28-v0.2.3-day-run.md)). The harness's verdict is FAIL,
+published unchanged: Bun's memory grew all day on every node, still inside
+its budget ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)),
+node 1's disk filled near the end
+([#1418](https://github.com/reliaburger/reliaburger/issues/1418)), and one
+turn on node 3 ran 1 to 2.5 s
+([#1419](https://github.com/reliaburger/reliaburger/issues/1419)). The
+maintainer accepted the measured number and shipped with all three fixed in
+0.2.4. On the day of the promotion RustSec published RUSTSEC-2026-0414 against
+`pulldown-cmark` 0.13.4, which needs an option Reliaburger never sets; the
+maintainer kept the candidate
+([record](qualification/2026-10-28-dependency-exceptions.md)), and `main` has the fix
+([#1409](https://github.com/reliaburger/reliaburger/pull/1409)). 0.2.3 is the
+first release to keep its predecessor's formats, so a 0.2.2 cluster can roll
+onto it; that walk isn't qualified yet
+([#1444](https://github.com/reliaburger/reliaburger/issues/1444)).
+
 ## 0.2.2: UX polish
 
 Promoted on 25 October 2026 as tag `v0.2.2` at `43baee64`

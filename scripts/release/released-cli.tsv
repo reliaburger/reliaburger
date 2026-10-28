@@ -1,7 +1,7 @@
-# What relish v0.2.2 accepts, read from its -h pages by
+# What relish v0.2.3 accepts, read from its -h pages by
 # scripts/release/released_cli.py. Regenerate it when docs/website/install.sh's
 # default version changes; tests/suite/website.rs checks the two match.
-version	v0.2.2
+version	v0.2.3
 argument	relish apply	[PATH_OR_URL]
 argument	relish batch	[PATH]
 argument	relish batch cancel	<ID>
@@ -338,6 +338,7 @@ option	relish events	--app	<APP>
 option	relish events	--limit	<LIMIT>	
 option	relish events	--severity	<SEVERITY>	
 option	relish exec	--namespace	<NAMESPACE>	
+option	relish export	--strict		
 option	relish export	-f,--file	<FILE>	
 option	relish fault bandwidth	--acknowledge		
 option	relish fault bandwidth	--duration	<DURATION>	
