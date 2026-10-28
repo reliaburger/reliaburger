@@ -123,3 +123,23 @@ image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d77
 command = ["/bin/sh", "-c", "trap 'exit 0' TERM; while true; do sleep 1; done"]
 replicas = "*"
 env = { SOAK_GENERATION = "0" }
+
+# The latency SLOs' rolling update (#1400). Outside fault windows, about
+# twice a cycle, the harness bumps SOAK_SLO_GENERATION and times the apply
+# (an API write), each node's new instance until its health check passes
+# (app start) and the whole rollout (deploy-to-ready). It is its own app so
+# the rollouts never touch soak-identity's certificate rotations or the data
+# apps. `sh` stays PID 1 so SIGTERM stops it at once. It serves a file it
+# writes itself (the container's root is a private writable layer), so the
+# health check never depends on what the image ships.
+[app.soak-slo]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/sh", "-c", "trap 'exit 0' TERM; mkdir -p /srv/soak-slo; echo ok > /srv/soak-slo/health; /bin/busybox httpd -f -p 8080 -h /srv/soak-slo & wait"]
+port = 8080
+replicas = "*"
+env = { SOAK_SLO_GENERATION = "0" }
+
+[app.soak-slo.health]
+path = "/health"
+interval = 1
+timeout = 1

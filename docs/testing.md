@@ -623,6 +623,71 @@ evidence directory ([plan](plans/archive/2026-10-17-soak-charts.md)). The
 homepage shows the released version's final soak charts
 ([how](website/README.md#soak-charts)).
 
+### Latency SLOs
+
+Everything above gates internal health. A user doesn't feel an agent-loop
+turn; they feel how long `relish status` takes, how long an app takes to come
+up, and how long a job waits before it starts. So every soak tier (V02 and job
+qualification, fast, final and day) also measures five latencies outside fault
+windows and puts a "Latency SLOs" table in its record
+([#1400](https://github.com/reliaburger/reliaburger/issues/1400)). Kubernetes
+does the same with its [published SLOs](https://github.com/kubernetes/community/blob/master/sig-scalability/slos/slos.md)
+(API call p99 ≤ 1 s, pod start-up p99 ≤ 5 s); the
+[research plan](plans/2026-10-28-research-kubernetes-release-testing.md) says
+why we copied the idea and not the tooling.
+
+| SLO (p99) | What's timed | Threshold | Mode |
+|---|---|---|---|
+| Job task start | A job task's start lag on a pooled executor, from the job campaign's buckets | ≤ 256 ms | Gated in the fast and final tiers |
+| API read | `GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` (what `relish status` and `relish nodes` ask) on every node, at every light check, from the host | ≤ 1,000 ms | Record only |
+| API write | `relish apply` of the soak workloads, from the call to the Raft commit | ≤ 2,000 ms | Record only |
+| App start | Each node's deploy of a new `soak-slo` instance, from its start until the instance passes its health check | ≤ 5,000 ms | Record only |
+| Rolling update | From `relish apply` returning until every node runs the new `soak-slo` | ≤ 30,000 ms | Record only |
+
+**Where the gated number comes from.** The job start lag is the one latency
+earlier records already kept. Across the ten 0.2.0 to 0.2.2 soak records its
+p99 was 2 to 8 ms at the V02 calibration load and 32 to 64 ms at the job
+qualification's target load (64 ms once, in the 0.2.1 fast tier; 32 ms in
+every final). There are no 0.2.3 soak records yet. The gate sits at 256 ms:
+four times the worst value seen, still a quarter of the September plan's
+1-second target, and a bucket bound, so the record's number is exact. A day
+tier records it without gating, since nothing has measured start lag at the
+day rate yet, and a run without a job campaign has nothing to judge.
+
+**Record only, from 28 October 2026.** No soak before 0.2.4 timed the API,
+an app start or a rolling update, so those four start in record-only mode:
+the record shows the value and whether it's over the provisional threshold,
+and never fails on it. The provisional thresholds are Kubernetes's for reads
+and app start, and a guess with room to spare for writes and rolling updates.
+Once the first 0.2.4 fast and final records exist, the maintainer sets each
+gate from them, with margin, the same way as the job start.
+
+**How it's measured.** At every light, settle and heavy check outside a fault
+window, the harness times the two API reads on each node that is up
+(`soak_slo.py api-latency`); the checker drops a node whose host forward is
+cut ([#987](https://github.com/reliaburger/reliaburger/issues/987)). Twice a
+cycle, outside fault windows, it bumps `soak-slo`'s generation (an idle
+BusyBox `httpd` with a health check, one instance per node) and applies the
+soak workloads without the job fixtures. The apply is a write; each node's
+new entry in `GET /v1/deploys/history/soak-slo` is an app start, timed on
+that node's own clock; and the time from the apply returning until every node
+has one is the rolling update. Samples go into a bucketed histogram in the
+evidence's `slo.json`, so each p99 is the upper bound of its bucket. A failed
+call counts with the time it took, and a rollout that didn't finish within
+180 s is counted and named in the record. `sustained_check.py render` fails
+the tier when a gated SLO is over its threshold or has no samples, and names
+the SLO in the record. `soak_slo.measure_api` is the same read probe as a
+function, for the hollow-node test
+([#1401](https://github.com/reliaburger/reliaburger/issues/1401)) to call.
+
+**The trend.** `python3 scripts/release/soak_slo.py trend docs/qualification`
+lists every record's SLO values, oldest first; for a record from before the
+table existed it reads the job start lag from the record's `.jobs.json`.
+
+The host reaches each node's API through a Lima port forward, so the API
+numbers include the forwarder. They're what `relish` on the same laptop sees,
+not what a client next to the node would.
+
 ## When a test flakes
 
 CI runs with `retries = 0`. A test that passes on a re-run still failed once,
