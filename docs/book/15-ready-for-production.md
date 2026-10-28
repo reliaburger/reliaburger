@@ -5576,6 +5576,22 @@ the retirement finishes or 20 seconds pass. It still counts per tick, which
 is the promise. A second test makes the leader answer after 750 ms, past the
 turn, so the slow case runs every time instead of only on a busy machine.
 
+The gap modelled one part of the loop and not another, and that showed up
+once 0.2.4 changed what a tick does with a slow write (#1394). Since #1336,
+discovery recovery on a health tick waits for a journal write only until
+the turn's deadline. If the write is still running, it goes on off the loop
+and the tick answers `StillRunning`. In the live loop, a separate branch of
+the `select!` takes the write back when it lands. The hand-driven ticks had
+no such branch. A loaded CI runner let the service retirement's second
+write, the removal, outlast tick two. Every tick after that found the write
+still in flight, so the 20 seconds ran out at `[2, 2, 0, 0, ...]`. Before
+0.2.4 the next tick waited the write out itself, which is why the harness
+had never needed a landing turn. Now it takes one between ticks whenever a
+write is in flight, as the loop would. A third test holds every journal
+write for 300 ms, three fifths of the turn budget, so each tick's second
+write always goes off the loop. It still counts four writes, at most two a
+tick.
+
 #### One write a turn
 
 Two writes a tick held for a week. Then the 0.1.4 candidate's compressed

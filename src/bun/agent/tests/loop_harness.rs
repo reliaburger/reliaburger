@@ -2186,7 +2186,23 @@ async fn the_tick_waits_out_a_startup_retirement_whose_inventory_is_slow() {
 /// Counting the writes per tick makes that independent of the disk.
 #[tokio::test]
 async fn a_startup_retirement_journals_at_most_two_writes_a_tick() {
-    let writes_per_tick = startup_retirement_writes_per_tick(std::time::Duration::ZERO).await;
+    let writes_per_tick = startup_retirement_writes_per_tick(std::time::Duration::ZERO, None).await;
+    assert_at_most_two_writes_a_tick(&writes_per_tick);
+}
+
+/// The same promise when each journal write outlasts the rest of its turn,
+/// as a loaded runner's fsync can (#1394). The second write of a tick goes
+/// on off the loop and the tick answers `StillRunning`; the loop's landing
+/// turn takes the write back, and a later tick goes on from what the
+/// journal records. Every write lands once: the retirement still journals
+/// four, at most two a tick.
+#[tokio::test]
+async fn a_startup_retirement_whose_writes_outlast_the_turn_journals_at_most_two_writes_a_tick() {
+    let writes_per_tick = startup_retirement_writes_per_tick(
+        std::time::Duration::ZERO,
+        Some(TURN_RUNTIME_BUDGET * 3 / 5),
+    )
+    .await;
     assert_at_most_two_writes_a_tick(&writes_per_tick);
 }
 
@@ -2199,7 +2215,8 @@ async fn a_startup_retirement_journals_at_most_two_writes_a_tick() {
 async fn a_startup_retirement_whose_leader_answers_after_the_turn_journals_at_most_two_writes_a_tick()
  {
     let writes_per_tick =
-        startup_retirement_writes_per_tick(TURN_RUNTIME_BUDGET + TURN_RUNTIME_BUDGET / 2).await;
+        startup_retirement_writes_per_tick(TURN_RUNTIME_BUDGET + TURN_RUNTIME_BUDGET / 2, None)
+            .await;
     assert_at_most_two_writes_a_tick(&writes_per_tick);
 }
 
@@ -2216,13 +2233,25 @@ const BETWEEN_TICKS: std::time::Duration = std::time::Duration::from_millis(100)
 const TICKS_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Drive a startup retirement tick by tick, with the leader answering its
-/// producer release after `leader_delay`, and count each tick's journal
-/// writes. Ticks are spaced like the loop's, and counted by tick rather than
-/// by time, so a loaded machine changes how many ticks it takes but not
-/// what each tick journals.
-async fn startup_retirement_writes_per_tick(leader_delay: std::time::Duration) -> Vec<usize> {
+/// producer release after `leader_delay` and each journal write held for
+/// `persist_stall`, and count each tick's journal writes. Ticks are spaced
+/// like the loop's, and counted by tick rather than by time, so a loaded
+/// machine changes how many ticks it takes but not what each tick journals.
+///
+/// A write that outlasts its tick's deadline goes on off the loop, and the
+/// ticks after it answer `StillRunning` until it lands. Nothing but the
+/// loop's landing turn takes it back (#1263), so between ticks the scenario
+/// takes that turn as the loop's `select!` would. Without it a write left
+/// in flight stays in flight, and every later tick returns at once (#1394).
+async fn startup_retirement_writes_per_tick(
+    leader_delay: std::time::Duration,
+    persist_stall: Option<std::time::Duration>,
+) -> Vec<usize> {
     let (mut agent, _grill, _root, _host_port, confirmation) =
         restarted_with_a_startup_retirement().await;
+    if let Some(stall) = persist_stall {
+        agent.loop_stalls.set(LoopStall::Persist, stall);
+    }
     let (client, server) = crate::cluster::producer::test_delayed_fixture(
         axum::http::StatusCode::OK,
         confirmation,
@@ -2235,6 +2264,11 @@ async fn startup_retirement_writes_per_tick(leader_delay: std::time::Duration) -
     while agent.startup_cleanup_pending && tokio::time::Instant::now() < patience {
         if !writes_per_tick.is_empty() {
             tokio::time::sleep(BETWEEN_TICKS).await;
+        }
+        if agent.discovery_write_in_flight() {
+            // Landing takes back a write already counted; it starts none.
+            let _ = tokio::time::timeout_at(patience, landing_turn(&mut agent)).await;
+            continue;
         }
         let before = agent.loop_stalls.reached(LoopStall::Persist);
         agent.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
