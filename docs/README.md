@@ -463,6 +463,18 @@ The deferred Apple Container adapter has manual development tests on Apple silic
 these aren't a release acceptance gate. See the [test harness design](design/test-harness.md)
 for the audit, exact suite contracts and CI mapping.
 
+### Fuzzing
+
+Every decoder that reads bytes from another machine (gossip, Raft frames, DNS,
+backups, OCI manifests, join CSRs, app and node TOML) has a
+[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) target in
+`fuzz/`. See [testing.md](testing.md#fuzzing).
+
+```sh
+make fuzz-corpus-check  # every target body over its checked-in corpus, on stable
+make fuzz-smoke         # every target for FUZZ_SECONDS (default 10); needs nightly and cargo-fuzz
+```
+
 ### Benchmarks
 
 Gossip protocol benchmarks use [criterion](https://docs.rs/criterion) for statistical analysis with regression detection.

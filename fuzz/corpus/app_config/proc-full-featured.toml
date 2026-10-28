@@ -1,0 +1,48 @@
+# Full-featured app using most Phase 1 capabilities (process-runtime version).
+#
+# Demonstrates: replicas, port, health checks, environment variables,
+# init containers, and a one-shot job. Volumes and resource limits need a
+# container runtime, so only container-full-featured.toml shows them.
+#
+# This is the process-runtime version: the app runs testapp as a host
+# `exec` workload, so everything works without a container runtime. See
+# container-full-featured.toml for the real-runtime version with OCI images.
+#
+# Build first:
+#   cargo build
+#
+# Start Bun with the process runtime and the node config that allows
+# testapp, from the repository root:
+#   target/debug/bun --runtime process --config examples/node/process-runtime.toml
+#
+# Deploy with:
+#   cargo run --bin relish -- apply examples/phase-1/proc-full-featured.toml
+
+[app.myapp]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8080"]
+port = 8080
+replicas = 3
+
+[app.myapp.health]
+path = "/healthz"
+interval = 10
+timeout = 3
+threshold_unhealthy = 3
+threshold_healthy = 1
+
+[app.myapp.env]
+DATABASE_URL = "postgres://db:5432/myapp"
+LOG_LEVEL = "info"
+
+# Run database migrations before the app starts.
+# With no image of its own it runs on the host, like its app, so the node's
+# allowed_binaries must name its binary by path.
+[[app.myapp.init]]
+command = ["/bin/echo", "running migrations..."]
+
+# A one-shot migration job that runs independently.
+[job.db-seed]
+runtime = "process"
+exec = "/bin/echo"
+command = ["seeding database..."]

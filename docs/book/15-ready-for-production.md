@@ -7611,6 +7611,160 @@ but the walker doesn't look in subdirectories, so its awaits would drop out of
 the check without a word. The walker now fails if `agent.rs` declares a module
 that isn't one of the files it read.
 
+## Feeding the decoders garbage
+
+A gossip datagram arrives on an unauthenticated UDP port. We can't check its
+HMAC until we've decoded it, because the HMAC is inside it. So for one
+function call, `decode_datagram` holds bytes from anyone on the network and
+nothing else stands between them and our memory. Every unit test we'd
+written for it fed it bytes we'd made ourselves, with an encoder we'd also
+written. How much does that tell us about bytes an attacker made?
+
+Not much. Hand-written tests check the inputs we thought of. A *fuzzer*
+checks the ones we didn't. It calls a function with generated inputs, millions
+of them, watches which branches each one reaches, and keeps mutating the
+inputs that reached somewhere new. libFuzzer, the one LLVM ships, is very good
+at this: a comparison against a magic number or a version byte is something
+it learns to pass in seconds, because the compiler instruments the comparison
+and tells it what the other side was. If any input makes the function panic,
+overflow or read out of bounds, it stops and writes the input to a file.
+
+Kubernetes has run in Google's OSS-Fuzz for years. We had nothing
+([#1398](https://github.com/reliaburger/reliaburger/issues/1398)). Nine
+decoders read bytes that cross a trust boundary: gossip datagrams, Raft
+frames, DNS queries from workloads, backup files, OCI manifests from clients
+and from upstream registries, join CSRs, and app and node TOML. Each one now
+has a target.
+
+### cargo-fuzz
+
+In Rust the tool is [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html),
+a cargo subcommand that wraps libFuzzer. A target is a small binary:
+
+```rust
+#![no_main]
+
+use libfuzzer_sys::fuzz_target;
+
+fuzz_target!(|data: &[u8]| {
+    let _ = reliaburger::fuzz::gossip_datagram(data);
+});
+```
+
+`#![no_main]` (an *inner* attribute, with `!`, so it applies to the whole
+file rather than the next item) tells the compiler not to expect a `main`
+function: libFuzzer brings its own `main`, which loops, generating inputs.
+`fuzz_target!` is a macro from the `libfuzzer-sys` crate that wraps the
+closure in the C function libFuzzer calls once per input. The closure takes
+`&[u8]`, a borrowed slice of bytes: a pointer and a length, like C's
+`const uint8_t *data, size_t size`, except the length travels with the
+pointer and every index is bounds-checked.
+
+cargo-fuzz needs nightly Rust, the toolchain that gets new compiler features
+before they're stable, because it builds with sanitizer flags (`-Zsanitizer=address`
+and coverage instrumentation) that stable doesn't accept. That's a problem for
+a project whose CI runs on stable. We dealt with it in three ways.
+
+First, the `fuzz/` crate is its own workspace. Its `Cargo.toml` has an empty
+`[workspace]` table, so cargo treats it as a separate project, and `cargo test`,
+`cargo clippy` and `make ci` in the root never try to build it.
+
+Second, the target binaries contain no logic. Each body is an ordinary
+function in [`src/fuzz/mod.rs`](../../src/fuzz/mod.rs), compiled only for
+tests or when the `fuzzing` feature is on:
+
+```rust
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzz;
+```
+
+`cfg(any(...))` is conditional compilation, true if any condition is: the
+crate's own tests, or a build that asked for the feature. Only the `fuzz/`
+crate turns `fuzzing` on, so no binary we ship carries this code. That's
+also why a few decoders became `pub(crate)` (visible anywhere in our crate,
+invisible outside it): the fuzz module is a sibling of `onion::dns`, not a
+child, and Rust's privacy is per module.
+
+Third, since the bodies are plain functions, stable unit tests run them over
+every file in the checked-in corpus, and over a crude mutation loop built with
+proptest. `make ci` exercises every assertion a nightly fuzzer would, on
+every input we've ever kept. It doesn't search, but it runs on every change.
+
+### More than "didn't crash"
+
+A fuzzer that only waits for a panic finds memory bugs and `unwrap`s. The
+bigger prize is a decoder that accepts something it shouldn't, or a decoder
+and encoder that disagree. So where there's an encoder, each body does a round
+trip:
+
+```rust
+pub fn gossip_datagram(data: &[u8]) -> Outcome {
+    let Ok(message) = decode_datagram(data) else {
+        return Outcome::Refused;
+    };
+    let encoded = encode_datagram(&message).expect("a decoded datagram re-encodes");
+    let again = decode_datagram(&encoded).expect("a re-encoded datagram decodes");
+    let reencoded = encode_datagram(&again).expect("a decoded datagram re-encodes");
+    assert_eq!(encoded, reencoded, "a datagram changed on its round trip");
+    Outcome::Accepted
+}
+```
+
+(The real one also checks that re-encoding never makes a datagram longer.)
+`let Ok(message) = ... else { ... };` is a *let-else*: bind the pattern, or
+run the `else` block, which must leave the function. It's the early return
+you'd write in Go as `if err != nil { return }`, without a nested scope for
+the happy path. And yes, there's `expect` and `assert_eq!` in library code,
+which the rest of the book tells you not to write. Here a panic is the
+point: it's how libFuzzer knows the input found a bug.
+
+We compare the first and second encodings rather than the original bytes,
+because a decoder may legitimately accept more than one spelling of the same
+message. The Raft and manifest targets compare `serde_json::Value`s instead
+of bytes, since two JSON objects with their keys in a different order mean
+the same thing. Other targets check something specific to their decoder. The
+CSR target checks that a signed certificate names the node the CA chose and
+no other, whatever the CSR asked for. The push target checks that Pickle will
+serve a manifest back as the media type the client declared.
+
+### Seeds, and where the runs happen
+
+A fuzzer starts faster from real inputs than from nothing. The seed corpus in
+`fuzz/corpus/` comes from the unit-test fixtures: a ping, an ack and a sync
+datagram, a vote and an append-entries frame, the DNS queries the resolver
+tests build, every app config in `examples/`. A unit test checks each seed is
+*accepted*, not just survived, so the round trips always run on real data.
+When the protocol version moves, the checked-in gossip and Raft seeds stop
+decoding, and `make fuzz-corpus-seed` writes fresh ones.
+
+`make fuzz-smoke` runs every target for ten seconds. The `fuzz.yml` workflow
+runs each one for five minutes every night, and for thirty seconds on a pull
+request that touches a decoder. A crash fails the job and uploads the input.
+We treat it like a flake: an issue the same day, then a unit test that fails
+on that input, then the fix.
+
+What did the first runs find? One bug, in the first ten seconds of the first
+`make fuzz-smoke`. The push target pushed a Docker schema 2 manifest with an
+extra field whose string held two `0xff` bytes, which isn't UTF-8 and so isn't
+JSON. Pickle accepted it. Serving it back is where it went wrong: to choose the
+`Content-Type`, Pickle parses the stored bytes as a generic JSON value, that
+parse failed, and the fallback labelled the manifest as OCI. docker refuses a
+Docker manifest labelled as OCI, so the image would have pushed fine and then
+refused to pull.
+
+Why did the push accept it? serde skips a field it doesn't know without
+checking what's inside, so the typed parse never looked at the bad bytes. A
+lone UTF-16 surrogate escape (`"\udc00"`) does the same. Two parsers read the
+same bytes and disagreed, which is exactly what a round-trip assertion is for.
+The fix parses the whole document before the typed parse, so a push and a
+pull read the same JSON. Two unit tests (one per spelling) failed first, and
+the input that found it now lives in the corpus. After the fix, three minutes
+per target (about two million inputs across the nine) found nothing else.
+
+The next step is OSS-Fuzz, which runs the same cargo-fuzz targets on
+Google's machines around the clock. That wants targets that have run clean
+nightly for a while first, so it's a follow-up.
+
 ## Lessons learned: audit the evidence too
 
 Export a log file, replace it with new contents under the same name, then export

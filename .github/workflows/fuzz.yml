@@ -1,0 +1,90 @@
+name: Fuzz
+
+# Every decoder that reads bytes from another machine has a cargo-fuzz target
+# (fuzz/, bodies in src/fuzz/, #1398). Nightly, each one runs for five
+# minutes. A pull request that touches a decoder runs each for 30 seconds.
+# Any crash fails the job and its input is kept as an artefact. A nightly
+# crash gets an issue the same day, like a flake (docs/flakes.md), and
+# becomes a unit test before it's fixed (docs/testing.md, "Fuzzing").
+#
+# It is its own workflow, like flakes.yml: cargo-fuzz needs nightly Rust,
+# which nothing in ci.yml uses, and the evidence gate there waits on every
+# job it holds. The stable half (every target over its checked-in corpus)
+# already runs in ci.yml's portable suite.
+
+on:
+  schedule:
+    - cron: "29 2 * * *"
+  pull_request:
+    branches: [main, "codex/**", "fix/**", "release-*"]
+    # The decoders the targets drive, and the fuzzing set-up itself.
+    paths:
+      - src/fuzz/**
+      - fuzz/**
+      - src/mustard/message.rs
+      - src/council/network.rs
+      - src/council/backup.rs
+      - src/onion/dns.rs
+      - src/pickle/api.rs
+      - src/grill/oci_pull.rs
+      - src/sesame/ca.rs
+      - src/config/**
+      - Cargo.lock
+      - Makefile
+      - .github/workflows/fuzz.yml
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "300"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz every decoder
+    runs-on: ubuntu-latest
+    # Nine targets at five minutes each, plus the sanitizer build.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Run each target
+        env:
+          FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '30' || inputs.seconds || '300' }}
+        run: make fuzz-smoke
+      - name: Report executions and coverage per target
+        if: always()
+        run: |
+          {
+            echo '## Fuzzing'
+            echo
+            echo '| Target | Last status line |'
+            echo '| --- | --- |'
+            for log in fuzz/target/logs/*.log; do
+              [ -e "$log" ] || continue
+              line=$(grep -E '^#[0-9]+' "$log" | tail -n 1)
+              echo "| $(basename "$log" .log) | \`${line}\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep any crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            fuzz/artifacts/
+            fuzz/target/logs/
+          if-no-files-found: ignore
+          retention-days: 30

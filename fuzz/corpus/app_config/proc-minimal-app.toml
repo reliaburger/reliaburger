@@ -1,0 +1,32 @@
+# Minimal app configuration for Phase 1.
+#
+# Build first:
+#   cargo build
+#
+# Deploy with:
+#   cargo run --bin bun -- --runtime process --config examples/node/process-runtime.toml
+#   cargo run --bin relish -- apply examples/phase-1/proc-minimal-app.toml
+#
+# Add --dry-run to preview the plan without an agent; a plain apply with
+# no agent prints the plan and fails, because nothing was deployed.
+
+[app.web]
+# An `exec` app runs a host binary, which the node must allow in
+# `[process_workloads] allowed_binaries`. The process runtime
+# (`--runtime process`, or what `--runtime auto` picks when runc isn't
+# available) runs no images: an app with an `image` needs a container runtime.
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8080"]
+port = 8080
+
+[app.web.health]
+path = "/healthz"
+interval = 5
+timeout = 2
+threshold_unhealthy = 3
+threshold_healthy = 1
+
+[app.worker]
+# A worker with no health check — transitions straight to Running.
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "9090"]
