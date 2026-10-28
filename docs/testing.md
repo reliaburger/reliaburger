@@ -357,16 +357,29 @@ every other job skips it
 new base, so the new base's set applies without another push. The fixtures in
 [`test_select_jobs.py`](../scripts/ci/test_select_jobs.py) cover each case.
 
-Every job that downloads an artefact (the cluster and acceptance jobs fetch
-the nextest archive, the evidence gate fetches every envelope, and the V02
-loops do both) gives each download 5 minutes and retries a failed one once.
-A download normally takes a minute or two, but one stalled for 13 minutes and
-pushed `acceptance` past its 40-minute limit
+Every job that downloads an artefact with `actions/download-artifact` (the
+evidence gate fetches every envelope, and the V02 loops fetch their archives)
+gives each download 5 minutes and retries a failed one once. A download
+normally takes a minute or two, but one stalled for 13 minutes and pushed
+`acceptance` past its 40-minute limit
 ([#977](https://github.com/reliaburger/reliaburger/issues/977)). Now a stall
-costs at most 10 minutes, and the second attempt usually recovers it. The
-jobs keep their own limits.
+costs at most 10 minutes. The jobs keep their own limits.
 [`test_ci_workflow.py`](../scripts/ci/test_ci_workflow.py) fails any download
 step without its own limit or its retry.
+
+That wasn't enough for the cluster and acceptance jobs' nextest archive. At
+3.0 GB its download took 33 s to almost 5 minutes in passing runs, so the
+limit was a cliff, and a retry started again from the first byte. So the
+`build tests` job archives only the test binaries those jobs run
+(`ARCHIVED_BINARIES` in
+[`workflow_assembly.py`](../scripts/ci/workflow_assembly.py); a test fails
+when an archived owner's make filter names a binary the list lacks), and
+[`fetch_artifact.py`](../scripts/ci/fetch_artifact.py) fetches it. It lists
+the run's artefacts through the API (the jobs, and every workflow that calls
+`ci.yml`, grant `actions: read`), resumes a dropped or stalled transfer with
+an HTTP `Range` request, abandons an attempt after 60 s without a byte, logs
+its progress, checks the zip's digest and stops at 13 minutes, inside the
+step's 14.
 
 ### Portable macOS in three shards
 

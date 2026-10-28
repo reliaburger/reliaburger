@@ -379,8 +379,10 @@ jobs:
       archive_sha256: ${{ steps.archive.outputs.archive_sha256 }}
       archive_origin_sha256: ${{ steps.archive.outputs.archive_origin_sha256 }}
       archive_runtime_sha256: ${{ steps.archive.outputs.archive_runtime_sha256 }}
-    # Compile the portable test binaries once. The acceptance jobs download
-    # this nextest archive instead of each rebuilding every test binary.
+    # Compile the test binaries the cluster and acceptance jobs run, once.
+    # They fetch this nextest archive instead of each rebuilding them.
+    # ARCHIVED_BINARIES in scripts/ci/workflow_assembly.py names them: all
+    # 47 binaries made a 3.0 GB archive that was slow to download (#977).
     # Runners check out to the same path, so the archive's compiled-in binary
     # paths still resolve after extraction.
     name: build tests
@@ -423,31 +425,33 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # actions: read lets the archive fetch list this run's artefacts.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.145
-      - name: Download the test archive
-        id: test_archive
-        # One attempt normally takes a minute or two. One stalled for 13
-        # minutes and pushed acceptance past its limit (#977), so each
-        # attempt gets 5 minutes and a failed one is retried once.
-        uses: actions/download-artifact@v4
-        timeout-minutes: 5
-        continue-on-error: true
-        with:
-          name: nextest-archive
-      - name: Retry downloading the test archive
-        if: ${{ !cancelled() && steps.test_archive.outcome == 'failure' }}
-        uses: actions/download-artifact@v4
-        timeout-minutes: 5
-        with:
-          name: nextest-archive
+      - name: Fetch the test archive
+        # actions/download-artifact took 33 s to almost 5 minutes for the
+        # 3 GB archive, logged nothing while it ran, and a retry after its
+        # 5-minute limit started again from the first byte, so a slow runner
+        # failed both attempts (#977). This resumes a dropped or stalled
+        # transfer where it stopped, gives up on an attempt only after 60 s
+        # without a byte, logs its progress and stops at 13 minutes.
+        timeout-minutes: 14
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ci/fetch_artifact.py --repository "$GITHUB_REPOSITORY"
+          --run-id "$GITHUB_RUN_ID" --name nextest-archive --destination .
+          --deadline 780 --stall 60
       - name: Extract the test archive once for every suite
         id: extract_archive
-        # Each suite used to extract the 2.9 GB archive twice, to list its
+        # Each suite used to extract the archive twice, to list its
         # tests and to run them (#1050). This checks the archive against the
         # build job's digest and extracts it once; every suite then reuses
         # the extracted build through nextest's build-reuse flags, naming
@@ -484,28 +488,33 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    # actions: read lets the archive fetch list this run's artefacts.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.145
-      - name: Download the test archive
-        id: test_archive
-        uses: actions/download-artifact@v4
-        timeout-minutes: 5
-        continue-on-error: true
-        with:
-          name: nextest-archive
-      - name: Retry downloading the test archive
-        if: ${{ !cancelled() && steps.test_archive.outcome == 'failure' }}
-        uses: actions/download-artifact@v4
-        timeout-minutes: 5
-        with:
-          name: nextest-archive
+      - name: Fetch the test archive
+        # actions/download-artifact took 33 s to almost 5 minutes for the
+        # 3 GB archive, logged nothing while it ran, and a retry after its
+        # 5-minute limit started again from the first byte, so a slow runner
+        # failed both attempts (#977). This resumes a dropped or stalled
+        # transfer where it stopped, gives up on an attempt only after 60 s
+        # without a byte, logs its progress and stops at 13 minutes.
+        timeout-minutes: 14
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ci/fetch_artifact.py --repository "$GITHUB_REPOSITORY"
+          --run-id "$GITHUB_RUN_ID" --name nextest-archive --destination .
+          --deadline 780 --stall 60
       - name: Extract the test archive once for every suite
         id: extract_archive
-        # Each suite used to extract the 2.9 GB archive twice, to list its
+        # Each suite used to extract the archive twice, to list its
         # tests and to run them (#1050). This checks the archive against the
         # build job's digest and extracts it once; every suite then reuses
         # the extracted build through nextest's build-reuse flags, naming
