@@ -56,9 +56,12 @@ jobs:
   fuzz:
     name: fuzz every decoder
     runs-on: ubuntu-latest
-    # Nine targets at five minutes each (45) plus an uncached sanitizer
-    # build (31 on run 40679496293), with half that again to spare.
-    timeout-minutes: 120
+    # Uncached: a 33-minute sanitizer build (run 40697356210), nine targets
+    # at five minutes each and about 3 minutes of set-up, 81 in all, with
+    # half that again to spare. Cached, only reliaburger itself rebuilds
+    # (14 minutes): a path dependency's fingerprint is its files' mtimes,
+    # which every checkout resets.
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
