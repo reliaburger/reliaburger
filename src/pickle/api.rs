@@ -1396,7 +1396,7 @@ async fn blob_upload_complete(
 
 /// OCI manifest JSON as received from the client.
 #[derive(Debug, Deserialize)]
-struct OciManifestJson {
+pub(crate) struct OciManifestJson {
     #[serde(rename = "schemaVersion", default)]
     _schema_version: Option<u32>,
     #[serde(rename = "mediaType", default)]
@@ -1426,6 +1426,53 @@ struct OciPlatform {
     architecture: String,
     #[serde(default)]
     variant: Option<String>,
+}
+
+/// Parse a pushed manifest or index body: the first thing
+/// `PUT /v2/{name}/manifests/{reference}` does with a client's bytes, and
+/// what the `oci_manifest_push` fuzz target drives (#1398).
+///
+/// serde skips a field it doesn't know without checking it, so the typed
+/// parse alone takes bytes that aren't JSON: invalid UTF-8, or a lone UTF-16
+/// surrogate escape, inside an unknown field. Serving reads the whole
+/// document ([`detect_manifest_content_type`]) and would fail on them, then
+/// label a Docker manifest as OCI. Parsing the whole document first makes the
+/// push and the pull read the same JSON.
+pub(crate) fn parse_pushed_manifest(body: &[u8]) -> Result<OciManifestJson, serde_json::Error> {
+    serde_json::from_slice::<serde_json::Value>(body)?;
+    serde_json::from_slice(body)
+}
+
+// What the `oci_manifest_push` fuzz target checks on a parsed body.
+#[cfg(any(test, feature = "fuzzing"))]
+impl OciManifestJson {
+    /// The `mediaType` the body declares, if it declares one.
+    pub(crate) fn declared_media_type(&self) -> Option<&str> {
+        self.media_type.as_deref()
+    }
+
+    /// Every descriptor's digest string, before it is validated.
+    pub(crate) fn descriptor_digests(&self) -> impl Iterator<Item = &str> {
+        self.config
+            .iter()
+            .chain(&self.layers)
+            .chain(&self.manifests)
+            .map(|descriptor| descriptor.digest.as_str())
+    }
+
+    /// The platform names an index's entries carry.
+    pub(crate) fn platform_names(&self) -> Vec<String> {
+        self.manifests
+            .iter()
+            .filter_map(|descriptor| descriptor.platform.as_ref().map(OciPlatform::name))
+            .collect()
+    }
+}
+
+/// Whether Pickle stores manifests of `media_type`.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn is_supported_media_type(media_type: &str) -> bool {
+    MANIFEST_MEDIA_TYPES.contains(&media_type) || INDEX_MEDIA_TYPES.contains(&media_type)
 }
 
 impl OciPlatform {
@@ -1663,7 +1710,7 @@ async fn manifest_put(
         );
     }
 
-    let manifest_json: OciManifestJson = match serde_json::from_slice(&body) {
+    let manifest_json = match parse_pushed_manifest(&body) {
         Ok(m) => m,
         Err(e) => {
             return oci_error(
@@ -1875,7 +1922,7 @@ async fn manifest_head(state: &PickleState, name: &str, reference: &str) -> Resp
 /// A manifest that names its own `mediaType` is served as that type: docker
 /// refuses a Docker schema 2 manifest labelled as OCI. One that doesn't is
 /// an OCI index if it lists manifests, else an OCI image manifest.
-fn detect_manifest_content_type(data: &[u8]) -> &'static str {
+pub(crate) fn detect_manifest_content_type(data: &[u8]) -> &'static str {
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(data) else {
         return "application/vnd.oci.image.manifest.v1+json";
     };
@@ -5137,6 +5184,54 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+    /// A Docker schema 2 manifest with `bytes` as the value of a field
+    /// Pickle doesn't know, so only that field is unusual.
+    async fn docker_manifest_with_unknown_field(app: &Router, bytes: &[u8]) -> Vec<u8> {
+        let config_digest = push_blob(app, "myapp", b"docker config").await;
+        let mut body = br#"{"unknown": ""#.to_vec();
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(
+            format!(
+                r#"", "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "config": {{"digest": "{}", "size": 13}}, "layers": []}}"#,
+                config_digest.as_str()
+            )
+            .as_bytes(),
+        );
+        body
+    }
+
+    /// Found by the `oci_manifest_push` fuzz target (#1398). serde skips a
+    /// field it doesn't know without checking its UTF-8, so the push parse
+    /// accepted this body, and the serving side, which reads the whole
+    /// document, couldn't parse it and served a Docker manifest as OCI.
+    /// JSON is UTF-8 (RFC 8259), so the push is refused instead.
+    #[tokio::test]
+    async fn push_manifest_that_is_not_utf8_returns_400() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+        // Control: the same body with ordinary text is accepted.
+        let fine = docker_manifest_with_unknown_field(&app, b"fine").await;
+        let resp = put_manifest(&app, "/v2/myapp/manifests/fine", fine).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body = docker_manifest_with_unknown_field(&app, b"\xff\xff").await;
+        let resp = put_manifest(&app, "/v2/myapp/manifests/latest", body).await;
+        assert_oci_error(resp, "MANIFEST_INVALID").await;
+    }
+
+    /// The same disagreement through an escape: a lone UTF-16 surrogate is
+    /// valid UTF-8 text but not a valid JSON string.
+    #[tokio::test]
+    async fn push_manifest_with_a_lone_surrogate_returns_400() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+        let body = docker_manifest_with_unknown_field(&app, br"\udc00").await;
+        let resp = put_manifest(&app, "/v2/myapp/manifests/latest", body).await;
+        assert_oci_error(resp, "MANIFEST_INVALID").await;
     }
 
     #[tokio::test]

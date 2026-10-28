@@ -509,6 +509,73 @@ and immutable publication identity remain part of acknowledgement. These
 controlled local/object-store cases don't establish power-loss survival or a
 real cloud's durability guarantees; those have separate owners.
 
+## Fuzzing
+
+Every decoder that reads bytes from another machine has a
+[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) target
+(libFuzzer) ([#1398](https://github.com/reliaburger/reliaburger/issues/1398);
+plan: [`plans/2026-10-28-research-kubernetes-release-testing.md`](plans/2026-10-28-research-kubernetes-release-testing.md)):
+
+| Target | Decoder | Bytes from |
+|---|---|---|
+| `gossip_datagram` | `mustard::message::decode_datagram` | anyone who can reach the gossip UDP port |
+| `raft_rpc_frame` | `council::network::decode_and_admit` | a council peer's TCP frame |
+| `dns_query` | `onion::dns::decode_query` (and the answers built from it) | any workload |
+| `council_backup` | `council::backup::decode_backup` | a backup file an operator hands us |
+| `oci_manifest_push` | `pickle::api::parse_pushed_manifest` | a client pushing to Pickle |
+| `oci_manifest_upstream` | `grill::oci_pull::parse_manifest` | an upstream registry |
+| `join_csr` | `sesame::ca::sign_node_csr` | a joining node |
+| `app_config` | `config::Config::parse` | `relish apply` or a GitOps repository |
+| `node_config` | `config::node::NodeConfig::parse` | a node's config file |
+
+A target's body lives in [`src/fuzz/mod.rs`](../src/fuzz/mod.rs), behind the
+`fuzzing` feature, and [`fuzz/fuzz_targets/`](../fuzz/fuzz_targets) only wraps
+it. A body does more than wait for a panic: where the decoder has an encoder,
+an accepted input is decoded, re-encoded, decoded again and compared. The
+Raft frame and upstream manifest compare JSON values, because key order isn't
+meaning; gossip compares postcard bytes. Other checks are specific to the
+decoder: the push target checks that Pickle serves a manifest as the media type
+the client declared, and the CSR target checks that the certificate names the
+node the CA chose, never one the CSR asked for.
+
+The `fuzz/` crate has its own `[workspace]`, so the root crate's `cargo`
+commands never build it. Three things run the targets:
+
+| Command | Toolchain | What it does |
+|---|---|---|
+| `make test` (in `make ci`) | stable | `fuzz::tests`: every fixture seed is accepted and round-trips, every file in `fuzz/corpus/` runs without a panic, 512 mutated seeds run without a panic, and every target has its binary |
+| `make fuzz-corpus-check` | stable | Only those tests |
+| `make fuzz-smoke` | nightly, cargo-fuzz | Builds every target with sanitizers and runs each for `FUZZ_SECONDS` (default 10). `make fuzz-tools` says how to install what's missing. It builds for the nightly toolchain's host (`FUZZ_TARGET`), because cargo-fuzz otherwise picks the triple it was built for, and CI's prebuilt cargo-fuzz is a musl binary that AddressSanitizer can't use |
+
+[`fuzz.yml`](../.github/workflows/fuzz.yml) runs `make fuzz-smoke` nightly at
+300 seconds a target, and for 30 seconds on a pull request that touches a
+decoder (or by hand, with any budget). The job summary has each target's last
+libFuzzer status line (executions, coverage, corpus size). A crash fails the
+job and its input is kept as the `fuzz-crashes` artefact. The workflow pins a
+dated nightly (`FUZZ_TOOLCHAIN`) and caches the sanitizer build under one
+rust-cache key for nightly and pull request runs; a floating nightly would
+change that key every day. Move the pin forward by hand when a newer nightly
+is needed. Locally, `FUZZ_TOOLCHAIN` defaults to `nightly`.
+
+A crash is handled like a flake: an issue the same day. Then add the input as
+a unit test next to the decoder, watch it fail, and fix it (tests first).
+Locally, `cargo +nightly fuzz run <target> fuzz/artifacts/<target>/crash-...`
+replays it.
+
+The seed corpus in [`fuzz/corpus/`](../fuzz/corpus) comes from the decoders'
+unit-test fixtures and the `examples/` configs
+([`src/fuzz/seeds.rs`](../src/fuzz/seeds.rs)). `make fuzz-corpus-seed`
+rewrites it; run it after a protocol or state bump, since old gossip and Raft
+seeds then stop decoding. libFuzzer writes what it finds to
+`fuzz/target/corpus/`, never into the checked-in seeds.
+
+OSS-Fuzz is the follow-up: Google's continuous fuzzing runs Rust projects
+through the same cargo-fuzz targets
+([guide](https://google.github.io/oss-fuzz/getting-started/new-project-guide/rust-lang/)).
+Applying needs a `projects/reliaburger/` directory in the OSS-Fuzz repository
+(a `project.yaml`, a Dockerfile and a `build.sh` that runs `cargo fuzz build -O`),
+once the targets have run clean nightly for a while.
+
 ## Inside a live cluster
 
 Relish carries its own test runner, so you can check a real cluster (yours)

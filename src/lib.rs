@@ -19,6 +19,9 @@ pub mod council;
 pub(crate) mod durable;
 pub mod file_lock;
 pub mod firewall;
+// Fuzz target bodies (#1398): the crate's own tests and the `fuzz/` crate only.
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzz;
 pub mod grill;
 pub mod http_client;
 pub mod ketchup;

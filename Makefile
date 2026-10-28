@@ -1,4 +1,4 @@
-.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands bench-task-arrays
+.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -167,6 +167,49 @@ ci-bench: ci bench ## Run the portable CI checks, then the 5-250 node gossip ben
 
 readme-commands: ## Regenerate the relish command list in README.md from the CLI definition
 	RELIABURGER_UPDATE_README=1 $(CARGO) test --bin relish readme_command_list_matches_the_cli
+
+# --- Fuzzing (#1398) ---
+#
+# One cargo-fuzz target per decoder that reads bytes from another machine;
+# the bodies are in src/fuzz/. Fuzzing needs nightly Rust and cargo-fuzz.
+# The corpus checks run the same bodies on stable and are part of `make test`.
+# New inputs libFuzzer finds go to fuzz/target/corpus/, never into the
+# checked-in seeds; crashes go to fuzz/artifacts/<target>/.
+# fuzz.yml pins a dated nightly here so its build cache stays valid.
+FUZZ_TOOLCHAIN ?= nightly
+FUZZ = $(CARGO) +$(FUZZ_TOOLCHAIN) fuzz
+FUZZ_SECONDS ?= 10
+# cargo-fuzz defaults --target to the triple it was built for; a prebuilt
+# musl cargo-fuzz then asks for a static CRT that AddressSanitizer refuses.
+# Name the nightly toolchain's own host instead.
+FUZZ_TARGET ?= $(shell $(CARGO) +$(FUZZ_TOOLCHAIN) -vV 2>/dev/null | sed -n 's/^host: //p')
+FUZZ_TARGETS = $(sort $(basename $(notdir $(wildcard fuzz/fuzz_targets/*.rs))))
+
+fuzz-tools: ## Check that nightly Rust and cargo-fuzz are installed, and say how to get them
+	@$(CARGO) +$(FUZZ_TOOLCHAIN) --version >/dev/null 2>&1 || { \
+		echo "fuzzing needs Rust $(FUZZ_TOOLCHAIN): rustup toolchain install $(FUZZ_TOOLCHAIN) --profile minimal" >&2; exit 1; }
+	@$(FUZZ) --version >/dev/null 2>&1 || { \
+		echo "fuzzing needs cargo-fuzz: cargo install cargo-fuzz --locked" >&2; exit 1; }
+
+fuzz-build: fuzz-tools ## Build every fuzz target (nightly, cargo-fuzz)
+	$(FUZZ) build --target $(FUZZ_TARGET)
+
+fuzz-smoke: fuzz-build ## Run every fuzz target for FUZZ_SECONDS (default 10) each; fails if any crashes
+	@failed=""; for target in $(FUZZ_TARGETS); do \
+		mkdir -p fuzz/target/corpus/$$target fuzz/target/logs; \
+		echo "fuzz: $$target for $(FUZZ_SECONDS)s (log: fuzz/target/logs/$$target.log)"; \
+		$(FUZZ) run --target $(FUZZ_TARGET) $$target fuzz/target/corpus/$$target fuzz/corpus/$$target -- \
+			-max_total_time=$(FUZZ_SECONDS) -print_final_stats=1 \
+			>fuzz/target/logs/$$target.log 2>&1 || failed="$$failed $$target"; \
+		grep -E '^#[0-9]+.*(DONE|cov:)' fuzz/target/logs/$$target.log | tail -n 1; \
+	done; \
+	if [ -n "$$failed" ]; then echo "fuzz: crashed:$$failed (inputs in fuzz/artifacts/)" >&2; exit 1; fi
+
+fuzz-corpus-check: ## Run every fuzz target body over its seeds and checked-in corpus on stable
+	$(NEXTEST) --lib -E 'test(/^fuzz::/)'
+
+fuzz-corpus-seed: ## Write the fixture seeds into fuzz/corpus/ (after a format change)
+	RELIABURGER_UPDATE_FUZZ_CORPUS=1 $(NEXTEST) --lib -E 'test(=fuzz::tests::fixture_seeds_are_in_the_checked_in_corpus)'
 
 # --- Documentation targets ---
 

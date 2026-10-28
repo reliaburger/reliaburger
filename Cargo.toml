@@ -107,6 +107,9 @@ ebpf = ["aya", "aya-log"]
 # A release train's nightly build (build.yml on `release-*`, #1363) trusts the
 # nightly signing key instead of the release keys. Never in a release build.
 nightly-signing = []
+# The fuzz target bodies in `src/fuzz/`, for the `fuzz/` crate (#1398).
+# Nothing else turns it on, so no binary carries them.
+fuzzing = []
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
