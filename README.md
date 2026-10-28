@@ -119,7 +119,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish rollback <APP>`: Rollback an app to the previous version
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
 - `relish delete <APP>`: Remove an app from the cluster and stop all its instances
-- `relish release <APP>`: Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin) *(0.2.3, not in 0.2.2)*
+- `relish release <APP>`: Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin) *(0.2.4, not in 0.2.2)*
 - `relish batch [PATH]`: Submit a batch of jobs, or manage a task array
   - `relish batch submit <PATH>`: Submit a compact TOML manifest containing mixed resource profiles
   - `relish batch replay --node <NODE> --grant-digest <GRANT_DIGEST> --acknowledge-side-effects <ID>`: Acknowledge repeating side effects for the exact unknown owner grants
@@ -202,11 +202,11 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
 - `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster
-- `relish policy`: List, audit or delete the cluster's policies, or test policies offline *(0.2.3, not in 0.2.2)*
-  - `relish policy list`: List the cluster's policies, with their action and rule *(0.2.3, not in 0.2.2)*
-  - `relish policy delete <NAME>`: Delete a policy (admin only; audited). Policies never judge policies, so this works even when one refuses every app *(0.2.3, not in 0.2.2)*
-  - `relish policy audit`: List the committed apps and jobs the cluster's policies would now refuse, warn about or record. Changes nothing: a new policy never touches running work *(0.2.3, not in 0.2.2)*
-  - `relish policy test --file <FILES>...`: Judge the apps and jobs in some files by the policies in them, offline, the way the cluster would. Exits non-zero when an apply would be refused *(0.2.3, not in 0.2.2)*
+- `relish policy`: List, audit or delete the cluster's policies, or test policies offline *(0.2.4, not in 0.2.2)*
+  - `relish policy list`: List the cluster's policies, with their action and rule *(0.2.4, not in 0.2.2)*
+  - `relish policy delete <NAME>`: Delete a policy (admin only; audited). Policies never judge policies, so this works even when one refuses every app *(0.2.4, not in 0.2.2)*
+  - `relish policy audit`: List the committed apps and jobs the cluster's policies would now refuse, warn about or record. Changes nothing: a new policy never touches running work *(0.2.4, not in 0.2.2)*
+  - `relish policy test --file <FILES>...`: Judge the apps and jobs in some files by the policies in them, offline, the way the cluster would. Exits non-zero when an apply would be refused *(0.2.4, not in 0.2.2)*
 
 **Images and volumes** ([images and volumes](docs/manual/11_images-and-volumes.md))
 
@@ -340,11 +340,11 @@ memory and CPU as they go.
 **Policies.** `[policy.*]` rules in CEL, such as "apps in `prod` need a memory
 limit", are kept in the council and checked on the leader before an app is
 written, for `relish apply` and GitOps alike. A rule refuses the apply or only
-warns, every denial names its policy, and `relish policy test` *(0.2.3, not in 0.2.2)* runs the same
+warns, every denial names its policy, and `relish policy test` *(0.2.4, not in 0.2.2)* runs the same
 check offline in CI. A policy can also fill in fields an app leaves out, such
 as a team label, without ever overwriting one you wrote, and GitOps doesn't
 mistake a filled-in field for a change. Policies can judge jobs too, an
-`audit` policy only records what it finds, and `relish policy audit` *(0.2.3, not in 0.2.2)* and
+`audit` policy only records what it finds, and `relish policy audit` *(0.2.4, not in 0.2.2)* and
 `relish wtf` list the running apps and jobs a new policy would refuse. See [security and access](docs/manual/10_security.md#policies).
 
 **Your own controllers, without an operator SDK.** A controller is an ordinary
@@ -428,7 +428,7 @@ binary was built from. Neither needs a network.
 | Prometheus, Alertmanager | Built-in scraping, alert rules and webhooks |
 | A log shipper and store | Built-in capture, streaming and Parquet export |
 | Argo CD or Flux | Built-in GitOps |
-| Kyverno or Gatekeeper (validation, defaults, audit) | `[policy.*]` deny, warn and audit rules for apps and jobs, fill-only defaults, `relish policy audit` *(0.2.3, not in 0.2.2)* |
+| Kyverno or Gatekeeper (validation, defaults, audit) | `[policy.*]` deny, warn and audit rules for apps and jobs, fill-only defaults, `relish policy audit` *(0.2.4, not in 0.2.2)* |
 | Helm charts or a CRD and its operator (the expansion half) | `[template.*]` and `[use.*]` |
 | Argo Workflows, Kueue or a Celery-style queue | Built-in jobs, cron, hooks and task arrays |
 | Chaos Mesh or Litmus | `relish fault` |

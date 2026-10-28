@@ -1296,6 +1296,16 @@ low, and the alternative was holding the whole gate for an upstream release with
 [#1366](https://github.com/reliaburger/reliaburger/issues/1366) removes it once DataFusion
 moves.
 
+Two days later, with the candidate most of the way through its 24-hour run, RustSec flagged
+`pulldown-cmark` 0.13.4, the Markdown parser behind `relish manual`. The advisory's own
+text answered the question that matters: is it reachable? The bug needs a parser option,
+wikilinks, that we never turn on, and the only Markdown we parse is the manual compiled into
+the binary. The fix was a one-line lockfile change, but taking it meant a new candidate and
+the whole gate again, for a bug no 0.2.3 user could reach. 0.2.3 shipped with another dated
+record ([the 28 October review](../qualification/2026-10-28-dependency-exceptions.md)), and
+`main` took 0.13.5 in [#1409](https://github.com/reliaburger/reliaburger/pull/1409). An
+advisory is where the review starts, not the verdict.
+
 Sometimes the next major version isn't there to take. bincode's list said 1→3, and bincode
 3.0.0 turned out to be a crate whose only code is a `compile_error!`, published when its
 maintainers stopped. No version clears its unmaintained advisory, so "bump it" became
