@@ -361,12 +361,30 @@ migration and no feature gate
   removes. 0.2.2 changes the cluster's formats, so a 0.2.1 cluster can't roll
   to it: recreate the cluster
   ([upgrading from 0.2.1](releasing.md#upgrading-from-021)).
-- [ ] **0.2.3: two billion a day**
+- [x] **0.2.3: two billion a day.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.3)
+  on 28 October 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/17),
-  [plan](plans/2026-10-20-plan-0.2.3.md)). 2B host-job tasks in one real
-  24-hour day on a three-node cluster, counted, not extrapolated, with 1B as
-  the floor. Plus the CI, soak and test follow-ups from the CI and test
-  efficiency plan.
+  [plan](plans/archive/2026-10-20-plan-0.2.3.md)). One node runs 14,917
+  host-job tasks a second and three run 29,350
+  ([record](qualification/2026-10-27-v0.2.3-candidate-throughput/README.md)),
+  and one real 24-hour day on three nodes counted 1,807,742,226: 1.81 billion
+  against the 2 billion target, above the 1 billion floor, accepted by the
+  maintainer ([day run](qualification/2026-10-28-v0.2.3-day-run.md)). Plus the
+  CI, soak and test follow-ups from the CI and test efficiency plan. Candidate
+  1 passed the gate
+  ([closure](qualification/2026-10-28-v0.2.3-release-closure.md),
+  [release log](release-log.md#023-two-billion-a-day)), with one slow
+  `upgrade_verify` turn in a host disk stall accepted by the maintainer
+  ([#1381](https://github.com/reliaburger/reliaburger/issues/1381)). The day
+  run's memory growth, full disk and slow turn are fixed in 0.2.4
+  ([#1417](https://github.com/reliaburger/reliaburger/issues/1417),
+  [#1418](https://github.com/reliaburger/reliaburger/issues/1418),
+  [#1419](https://github.com/reliaburger/reliaburger/issues/1419)). It ships
+  with the `zstd` 0.13 advisories under a reviewed exception
+  ([#1367](https://github.com/reliaburger/reliaburger/pull/1367)). 0.2.3 keeps
+  0.2.2's formats, the first release to do so, so a 0.2.2 cluster can roll to
+  it; that walk isn't qualified yet
+  ([#1444](https://github.com/reliaburger/reliaburger/issues/1444)).
 - [ ] **0.2.4: extension points**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/19),
   [research](plans/2026-10-19-research-extension-points.md),
