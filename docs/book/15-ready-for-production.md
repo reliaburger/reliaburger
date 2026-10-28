@@ -5592,6 +5592,25 @@ write for 300 ms, three fifths of the turn budget, so each tick's second
 write always goes off the loop. It still counts four writes, at most two a
 tick.
 
+A day later the same trap caught a third test, in a different place
+(#1396). The scenario that publishes a thousand-service view drove its
+consumer-sync turns by hand, one step a turn, and measured each turn's CPU
+time. On the runner, one step's journal write took a little over 500 ms,
+so it went on off the loop, and the harness took the next step at once.
+That step refused with "a consumer journal write is still in flight", which
+is right: the live loop takes no step while a write is in flight, and its
+landing branch takes the step's remainder once the write has landed.
+Rather than patch the third test as we had the first two, we looked for
+every hand-driven turn that expects a write to finish inside it, and gave
+the harness two helpers that do what the loop does. One takes the next
+consumer-sync turn, or the landing turn if a write is in flight. The other
+asks again, as a deploy worker or a stop does, landing the write in between
+whenever the answer is `StillRunning`. Five more scenarios had the same
+latent bug. A new test holds every journal write for 600 ms, past the
+deadline, so the landing path runs on every run instead of only on a slow
+disk, and the two scenarios whose writes fail off the turn now hold their
+retry's write past the deadline too.
+
 #### One write a turn
 
 Two writes a tick held for a week. Then the 0.1.4 candidate's compressed
