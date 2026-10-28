@@ -361,6 +361,13 @@ class Harness(unittest.TestCase):
         self.assertIn('replicas = "*"', app)
         self.assertIn('env = { SOAK_SLO_GENERATION = "0" }', app)
         self.assertIn("[app.soak-slo.health]", app)
+        # The health check serves a file the command writes itself, so it
+        # never depends on what the image ships (/etc/hostname is a Docker
+        # runtime mount, not part of the image).
+        self.assertIn('path = "/health"', app)
+        self.assertIn("echo ok > /srv/soak-slo/health", app)
+        self.assertIn("httpd -f -p 8080 -h /srv/soak-slo", app)
+        self.assertNotIn("/etc", app.split("[app.soak-slo.health]")[0].split("command =")[1])
         generations = self.script[self.script.index("soak_workloads() {"):self.script.index("write_workloads() {")]
         self.assertIn("SOAK_SLO_GENERATION", generations)
         self.assertIn('"soak-slo": 3', self.script)
