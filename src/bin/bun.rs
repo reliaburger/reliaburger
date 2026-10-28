@@ -251,6 +251,7 @@ fn cluster_params_from_config(
             .cluster
             .recovery_probe_window_secs
             .map(std::time::Duration::from_secs),
+        council_size_cap: None,
     })
 }
 

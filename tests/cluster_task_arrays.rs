@@ -119,6 +119,7 @@ async fn start_node(
         task_arrays: Some(service(data)),
         task_arrays_on_agent_budget: None,
         process_only: false,
+        council_size_cap: None,
     })
     .await
 }
@@ -633,6 +634,7 @@ async fn start_common_node(
         )),
         task_arrays_on_agent_budget: None,
         process_only: false,
+        council_size_cap: None,
     })
     .await
 }
@@ -1199,6 +1201,7 @@ async fn start_hung_node(
         ))),
         task_arrays_on_agent_budget: None,
         process_only: false,
+        council_size_cap: None,
     })
     .await
 }
@@ -1512,6 +1515,7 @@ async fn shared_budget_node(
         ))),
         task_arrays_on_agent_budget: build,
         process_only: false,
+        council_size_cap: None,
     })
     .await
 }
@@ -1700,6 +1704,7 @@ async fn chaos_node(
         task_arrays: None,
         task_arrays_on_agent_budget: Some(build),
         process_only: false,
+        council_size_cap: None,
     })
     .await
 }

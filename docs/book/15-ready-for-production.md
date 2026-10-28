@@ -7500,6 +7500,154 @@ that. The snapshot uploader still needs its own fixture: it needs Btrfs
 volumes. Its export receipts are written atomically and durably now, and an
 upload is only receipted once the destination has confirmed the archive.
 
+## A thousand nodes that aren't there
+
+How big a cluster have we actually run? Three VMs. The whitepaper's 10,000-node
+target came from benchmarks of single pieces: a gossip simulation, a scheduling
+pass over a made-up cluster. Nothing had ever put a real council in front of
+hundreds of real agents, and 0.3.0 ("Bare metal in an hour") is where we start
+talking about real fleets. So before that, we measured.
+
+Nobody on this project can afford a thousand machines. Kubernetes can't either,
+for its own scale tests, which is why it has Kubemark: a real control plane in
+front of "hollow" nodes, kubelets with the container runtime cut out. A hollow
+kubelet does everything a kubelet does except start containers. We borrowed
+the idea ([#1401](https://github.com/reliaburger/reliaburger/issues/1401)).
+
+### What a hollow Bun keeps
+
+A hollow node runs what a worker's `bun --cluster` runs for the council to
+see: Mustard gossip, the Raft endpoint every node keeps, the reporting worker,
+a real `BunAgent` and its placement reconciler, which pulls placements from the
+leader every two seconds. Only the runtime is fake. Remember `Grill` from
+Chapter 1, the trait every runtime implements? `HollowGrill` implements it by
+doing nothing at all:
+
+```rust
+impl Grill for HollowGrill {
+    fn runs_containers(&self) -> bool {
+        true
+    }
+
+    async fn start(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        let previous = self
+            .instances
+            .lock()
+            .await
+            .insert(instance.clone(), ContainerState::Running);
+        self.counters.starts.fetch_add(1, Ordering::Relaxed);
+        if previous != Some(ContainerState::Running) {
+            self.counters.running.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    // create, stop, kill and state are as short
+}
+```
+
+Chapter 1 declared `start` as `fn start(&self, ...) -> impl Future<Output =
+Result<(), GrillError>> + Send`, and here we implement it with a plain `async
+fn`. That's allowed: an `async fn` *is* a function returning some type that
+implements `Future`, so it satisfies the declaration, and the compiler still
+checks the `+ Send` bound against the future the body produces. (Holding a
+`std::sync::MutexGuard` across that `.await` would fail the check, which is
+one reason the map sits behind a tokio mutex.) `runs_containers` returning
+`true` is the other half of the trick: the scheduler places image apps on the
+node, and no image is ever pulled.
+
+Hundreds of these share one process. The council doesn't: three fully wired
+nodes, the same `start_wired_node` the cluster suites use, run in a second
+process, which is the test binary started again with `--exact
+hollow_council_member` (the re-exec trick from "Pulling the plug"). The
+separate process is the point. `ps -o rss=,time=` on its PID gives the
+council's memory and CPU on their own, with the fleet's noise in another row.
+
+One thing had to change in the library. The council reconciler seats up to
+seven voters from whatever gossip shows it, and hollow nodes have real Raft
+endpoints, so four of them would have become voters and the "council" would
+have been partly hollow. `ClusterParams` gained `council_size_cap`, which Bun
+leaves unset; the harness sets it to three.
+
+### Measuring without blocking
+
+The harness polls a lot: until every node sees every member, until every
+replica runs, until the council stops listing a dead node. One helper does all
+of it, and its signature is worth a look:
+
+```rust
+async fn time_until<F, Fut>(timeout: Duration, every: Duration, mut check: F) -> Option<Duration>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+```
+
+`check` is a closure that returns a future, so a check can await an HTTP call.
+Calling it looks like this:
+
+```rust
+let view = &*fleet;
+report.all_replicas_ms = time_until(wait, Duration::from_millis(100), move || async move {
+    view.running().await >= wanted
+})
+```
+
+Why `move` twice? Each call of the closure builds a new future, and that
+future may outlive the call that built it, so it can't borrow from the
+closure's own captures. The outer `move` copies `view` (a shared reference,
+which is `Copy`, like a pointer in C) and `wanted` into the closure; the inner
+`async move` copies them again into each future. Nothing is moved out of
+`fleet` itself. Write `|| async { fleet.running().await }` instead and the
+compiler refuses with "captured variable cannot escape `FnMut` closure body",
+which is the borrow checker noticing exactly that dangling-reference risk.
+
+The resource sampler goes the other way: `ps` blocks, so it runs on a
+`std::thread` of its own rather than on the runtime, and hands its readings
+back when it's joined. Every second it also reads the host's load average, and
+the run stops if it goes over 40. This Mac is shared, and a run on a host busy
+with someone else's build measures that build.
+
+### What we found
+
+Twenty nodes is a check (`make test-hollow`). The measured runs went through
+`scripts/release/qualify-hollow-nodes.sh` on an M1 Max with 64 GB, one size at
+a time ([record](../qualification/2026-10-28-hollow-nodes.md)):
+
+| | 100 nodes | 500 nodes | 1,000 nodes |
+|---|---|---|---|
+| Every node sees every member, after the last joins | 16 s | 139 s | not within 6 min |
+| One apply → a replica running on every node | 5.9 s | 12 s | 124 s |
+| Small apply, median | 32 ms | 34 ms | 2.6 s |
+| Raft commit, median | 25 ms | 24 ms | 25 ms |
+| Council CPU (one core = 100%) / memory | 5% / 136 MB | 52% / 517 MB | 58% / 1 GB |
+| 10% crash: lost replicas running again | 10 s | 30 s | not within 6 min |
+
+The council held up better than its neighbours. At a thousand nodes it used
+about 60% of one core and a gigabyte of memory, and a Raft commit took 25 ms at
+the median, the same as with nobody attached. Raft isn't the bottleneck. What
+grew was everything that meets the fleet one node at a time:
+
+- **Reports.** Every node reports straight to the leader, and the leader's
+  reporting listener takes 16 connections at a time and refuses the rest. At
+  a thousand nodes the fleet logged 879,084 refused reports in 25 minutes,
+  about 600 a second, against the 200 a second a thousand nodes send on a
+  five-second interval (a refused worker tries again). The planned reporting tree ([#364](https://github.com/reliaburger/reliaburger/issues/364))
+  is meant for exactly this; now we know it's needed well before 10,000.
+- **The API.** Twenty small applies took 32 ms each at the median at 100
+  nodes and 2.6 s at 1,000, while the Raft commits underneath stayed at 25 ms.
+  A thousand placement reconcilers polling the leader every two seconds is
+  500 requests a second on the same API.
+- **Gossip joins.** Every node saw every member 16 s after the last of 100
+  joined, and 139 s after the last of 500. At 1,000, no node had a complete
+  view within the six minutes the harness waits.
+
+Not all of that is Reliaburger's fault. A thousand agents on ten cores is
+nothing like a thousand machines: the fleet process used seven cores, and a
+starved node misses probe deadlines that a real one wouldn't. That's why the
+record treats the gossip and failure times as upper bounds for real hardware,
+not predictions. But a fixed limit of 16 report connections doesn't come from
+a slow laptop, and it would have stayed hidden
+behind "10,000 (target)" until somebody built that fleet.
+
 ## Files nobody could read
 
 By 0.1.2, `src/bun/api.rs` had grown to 18,351 lines. About 10,500 of them were

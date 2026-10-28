@@ -212,6 +212,7 @@ async fn start_node_with(
             job_capabilities_rx: None,
             readiness: None,
             recovery_probe_window: None,
+            council_size_cap: None,
         },
         shutdown.clone(),
     )
@@ -296,6 +297,7 @@ async fn start_mtls_node(
             job_capabilities_rx: None,
             readiness: None,
             recovery_probe_window: None,
+            council_size_cap: None,
         },
         shutdown.clone(),
     )
