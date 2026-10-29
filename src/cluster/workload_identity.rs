@@ -174,8 +174,8 @@ impl WorkloadCsrClient {
             ));
         }
         let address = super::directory::resolve_leader(
-            &self.metrics.borrow(),
-            &self.directory.borrow(),
+            &self.metrics,
+            &self.directory,
             self.raft_to_api_offset,
             0,
         )

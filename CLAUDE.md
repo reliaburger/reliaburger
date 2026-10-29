@@ -242,6 +242,8 @@ let config = NodeConfig::from_file(&path)
 - `tokio::sync::oneshot` — single request-response.
 - `tokio::sync::broadcast` — rarely needed. Prefer `watch` unless every subscriber must see every event.
 
+**Never hold two `watch` borrows at once.** A `watch::Ref` holds its channel's read lock, and a reader waits behind a queued writer, so two tasks taking two borrows in opposite orders deadlock their worker threads (#1273, #1433). Copy what you need out of one borrow, in one statement, before taking the next. `cluster::directory::resolve_leader` and `leader_api_address` do this for the Raft metrics and the gossip directory; use them.
+
 **Never block the runtime.** No `std::thread::sleep`, no blocking I/O, no heavy CPU work on async tasks. Use `tokio::task::spawn_blocking` when you must:
 
 ```rust

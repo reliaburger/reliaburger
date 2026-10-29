@@ -169,9 +169,7 @@ pub(super) async fn leader_base_url(
 ) -> Result<String, NoLeaderRoute> {
     leader_to_forward_to(council, inbound).await?;
     let advertised = directory.and_then(|LeaderDirectory(directory)| {
-        let metrics = council.metrics();
-        let metrics = metrics.borrow();
-        crate::cluster::directory::leader_api_address(&metrics, &directory.borrow())
+        crate::cluster::directory::leader_api_address(Some(&council.metrics()), directory)
     });
     match advertised {
         Some(address) => Ok(state.cluster_http.url(&address.to_string(), "")),

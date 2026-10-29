@@ -369,6 +369,15 @@ impl RegistryForwarder {
         .map_err(|_| unavailable("registry ownership query timed out"))?
     }
 
+    /// The leader's advertised API endpoint. `metrics` is `None` on a node
+    /// without a council handle, which has only the gossip hint.
+    fn leader_address(
+        &self,
+        metrics: Option<&crate::cluster::directory::MetricsReceiver>,
+    ) -> Option<std::net::SocketAddr> {
+        crate::cluster::directory::leader_api_address(metrics, &self.directory)
+    }
+
     async fn send_request<T: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         council: Option<&Arc<CouncilNode>>,
@@ -378,17 +387,9 @@ impl RegistryForwarder {
         if self.requires_mtls() {
             return Err(PickleError::RegistryNeedsMtls);
         }
-        let address = {
-            let directory = self.directory.borrow();
-            if let Some(council) = council {
-                let metrics = council.metrics();
-                let metrics = metrics.borrow();
-                crate::cluster::directory::leader_api_address(&metrics, &directory)
-            } else {
-                directory.leader.as_ref().map(|leader| leader.api_address)
-            }
-        }
-        .ok_or_else(|| unavailable("no advertised registry leader endpoint"))?;
+        let address = self
+            .leader_address(council.map(|council| council.metrics()).as_ref())
+            .ok_or_else(|| unavailable("no advertised registry leader endpoint"))?;
         let bearer = self
             .http
             .bearer()
@@ -822,5 +823,24 @@ mod tests {
         assert!(message.starts_with("the registry needs mTLS"), "{message}");
         assert!(message.contains("relish init"), "{message}");
         assert!(message.contains("relish join"), "{message}");
+    }
+
+    // #1433: a follower forwarding a registry write held the gossip
+    // directory while it read openraft's metrics, the reverse of the
+    // leader-target maintainer's order. With both channels' writers queued
+    // that is #1273's deadlock, reached through Pickle.
+    #[test]
+    fn forwarding_reads_the_metrics_without_holding_the_gossip_directory() {
+        let waited = crate::cluster::directory::directory_write_waits_for_metrics_read(
+            |metrics, directory| {
+                let forwarder =
+                    RegistryForwarder::new(crate::cluster::ClusterHttp::plaintext(), directory);
+                forwarder.leader_address(Some(&metrics));
+            },
+        );
+        assert!(
+            !waited,
+            "a gossip directory write waited for the metrics read"
+        );
     }
 }
