@@ -601,10 +601,12 @@ impl ProcessGrill {
                 .await
                 .map_err(|error| owner_error(instance, error))?;
             let path = log_file(&stem, if stdout { "stdout" } else { "stderr" });
-            return tokio::task::spawn_blocking(move || match std::fs::read(path) {
-                Ok(bytes) => Ok(bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-                Err(error) => Err(error),
+            return tokio::task::spawn_blocking(move || {
+                match super::capture::read_retained(&path) {
+                    Ok(bytes) => Ok(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                    Err(error) => Err(error),
+                }
             })
             .await
             .map_err(|error| owner_error(instance, error))?
@@ -620,7 +622,7 @@ impl ProcessGrill {
             observe_child_exit(entry).map_err(|error| owner_error(instance, error))?;
             if let Some(stem) = &entry.log_stem {
                 let path = log_file(stem, if stdout { "stdout" } else { "stderr" });
-                return Ok(std::fs::read(path).unwrap_or_default());
+                return Ok(super::capture::read_retained(&path).unwrap_or_default());
             }
             let buffer = if stdout {
                 entry.stdout_buf.clone()
@@ -2264,6 +2266,76 @@ mod tests {
         for line in after_truncation {
             assert!(store.ingest(&client_record(&id, line)));
         }
+        grill.kill(&id).await.unwrap();
+    }
+
+    /// #1418: in the 0.2.3 day run the soak's log spammer, about 200 lines a
+    /// second, grew its capture file by 40 MiB an hour for 24 hours, and
+    /// filled most of node 1's disk. Once the store holds the lines durably,
+    /// the capture keeps only its last mebibyte allocated, while the process
+    /// writes on and `stdout` still reads whole lines.
+    #[tokio::test]
+    async fn a_chatty_instance_s_capture_stays_bounded_once_its_lines_are_stored() {
+        use std::os::unix::fs::MetadataExt;
+        const LINE: &str = "spam the quick brown fox jumps over the lazy dog";
+        const BYTES: u64 = 8 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let id = InstanceId("spammer-0".to_string());
+        grill
+            .create(
+                &id,
+                &spec_with_args(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("yes '{LINE}' | head -c {BYTES}; sleep 60"),
+                ]),
+            )
+            .await
+            .unwrap();
+        grill.start(&id).await.unwrap();
+        let capture = dir.path().join("spammer-0.stdout");
+        let expected = BYTES / (LINE.len() as u64 + 1);
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1024);
+        let follower = grill.clone();
+        let follow_id = id.clone();
+        let task = tokio::spawn(async move {
+            follower
+                .follow_logs(&follow_id, sender, &Default::default())
+                .await
+        });
+        let store_dir = tempfile::tempdir().unwrap();
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        let mut read = 0;
+        while read < expected {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(30), receiver.recv())
+                .await
+                .expect("the follower went quiet")
+                .unwrap();
+            assert!(store.ingest(&client_record(&id, line)));
+            read += 1;
+        }
+        task.abort();
+        let allocated = || std::fs::metadata(&capture).unwrap().blocks() * 512;
+        assert!(
+            allocated() >= BYTES,
+            "the whole output is on disk before a flush"
+        );
+
+        store.flush().await.unwrap();
+
+        assert_eq!(std::fs::metadata(&capture).unwrap().len(), BYTES);
+        assert!(
+            allocated() <= super::super::capture::RETAINED_CAPTURE_BYTES + 256 * 1024,
+            "{} bytes of the capture are still allocated",
+            allocated()
+        );
+        let stdout = grill.stdout(&id).await.unwrap();
+        assert!(!stdout.contains(&0), "reclaimed bytes read back as zeros");
+        let text = String::from_utf8(stdout).unwrap();
+        let mut lines = text.split('\n');
+        assert_eq!(lines.next(), Some(LINE), "the first line read is whole");
         grill.kill(&id).await.unwrap();
     }
 

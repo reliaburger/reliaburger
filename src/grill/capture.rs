@@ -42,6 +42,142 @@ pub async fn read_capture_chunk(path: &Path, offset: u64) -> io::Result<Vec<u8>>
     Ok(chunk)
 }
 
+/// How much of a capture file's end stays on disk after its ingested prefix
+/// is reclaimed: the window a tail snapshot reads (#1418).
+pub const RETAINED_CAPTURE_BYTES: u64 = 1024 * 1024;
+
+/// Free the disk blocks holding the start of a capture file the log store
+/// has already ingested, keeping the file's length and identity (#1418).
+///
+/// A capture file is append-only and the workload holds it open for as long
+/// as it runs, so it can't be rotated without losing lines or moving every
+/// offset the store has checkpointed. Punching a hole instead hands the
+/// blocks back to the filesystem while the file keeps its length: offsets
+/// still name the same lines, and the writer's `O_APPEND` writes carry on at
+/// the end. The last [`RETAINED_CAPTURE_BYTES`] stay for tail snapshots, and
+/// nothing past `ingested_through` is ever touched.
+///
+/// Returns where the reclaimed prefix ends; everything before it reads as
+/// zeros. Nothing is freed when `path` has gone or is no longer the file
+/// `identity` names. A filesystem that can't punch holes reports
+/// [`io::ErrorKind::Unsupported`].
+pub fn reclaim_ingested(
+    path: &Path,
+    identity: CaptureFileIdentity,
+    ingested_through: u64,
+) -> io::Result<u64> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = match std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if CaptureFileIdentity::of(&metadata) != identity {
+        return Ok(0);
+    }
+    let block = metadata.blksize().max(1);
+    let end = ingested_through.min(metadata.len().saturating_sub(RETAINED_CAPTURE_BYTES));
+    let end = end - end % block;
+    let start = data_start(&file, 0)?;
+    let start = start - start % block;
+    if start < end {
+        punch_hole(&file, start, end - start)?;
+    }
+    Ok(end.max(start))
+}
+
+/// Where the first byte of data at or after `offset` lives: past any hole
+/// [`reclaim_ingested`] punched. A file with no data there (or a filesystem
+/// that can't say) answers `offset`.
+fn data_start(file: &impl std::os::fd::AsFd, offset: u64) -> io::Result<u64> {
+    use nix::unistd::{Whence, lseek};
+    let Ok(signed) = i64::try_from(offset) else {
+        return Ok(offset);
+    };
+    match lseek(file, signed, Whence::SeekData) {
+        Ok(found) => Ok(u64::try_from(found).unwrap_or(offset)),
+        // ENXIO: no data at or after `offset`, which is past the end.
+        Err(nix::errno::Errno::ENXIO | nix::errno::Errno::EINVAL) => Ok(offset),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn punch_hole(file: &std::fs::File, offset: u64, length: u64) -> io::Result<()> {
+    use nix::fcntl::{FallocateFlags, fallocate};
+    let (Ok(offset), Ok(length)) = (i64::try_from(offset), i64::try_from(length)) else {
+        return Ok(());
+    };
+    fallocate(
+        file,
+        FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+        offset,
+        length,
+    )
+    .map_err(|errno| match errno {
+        nix::errno::Errno::EOPNOTSUPP => io::Error::from(io::ErrorKind::Unsupported),
+        errno => errno.into(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn punch_hole(file: &std::fs::File, offset: u64, length: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (Ok(offset), Ok(length)) = (i64::try_from(offset), i64::try_from(length)) else {
+        return Ok(());
+    };
+    let hole = nix::libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: offset,
+        fp_length: length,
+    };
+    // SAFETY: `file` is an open descriptor for the call's duration, and
+    // F_PUNCHHOLE reads one `fpunchhole_t`, which `hole` is and outlives the
+    // call. The kernel does not keep the pointer.
+    let result = unsafe { nix::libc::fcntl(file.as_raw_fd(), nix::libc::F_PUNCHHOLE, &hole) };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(nix::libc::ENOTSUP) {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn punch_hole(_file: &std::fs::File, _offset: u64, _length: u64) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// Read a whole capture file, minus any prefix [`reclaim_ingested`] freed.
+///
+/// The line the reclaimed prefix ends in may have lost its start, so the
+/// answer begins after its newline. The store already holds every line
+/// in that range.
+pub fn read_retained(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::{Read, Seek};
+    let mut file = std::fs::File::open(path)?;
+    let start = data_start(&file, 0)?;
+    file.seek(io::SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if start > 0 {
+        let cut = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |newline| newline + 1);
+        bytes.drain(..cut);
+    }
+    Ok(bytes)
+}
+
 /// A bounded tail and the exact complete-line positions from the same snapshot.
 /// Resume after these positions so a live follower never duplicates the tail.
 #[derive(Default)]
@@ -88,7 +224,7 @@ impl TailSnapshot {
             let Ok(meta) = file.metadata().await else {
                 continue;
             };
-            let start = meta.len().saturating_sub(1024 * 1024);
+            let start = meta.len().saturating_sub(RETAINED_CAPTURE_BYTES);
             if file.seek(io::SeekFrom::Start(start)).await.is_err() {
                 continue;
             }
@@ -116,6 +252,9 @@ pub struct CaptureReader {
     consumed: u64,
     /// Bytes read past the last newline, waiting for the rest of their line.
     partial: Vec<u8>,
+    /// Dropping bytes up to the next newline: the read skipped a reclaimed
+    /// prefix, so the line in progress lost its start.
+    discarding: bool,
     identity: Option<CaptureFileIdentity>,
     #[cfg(test)]
     read_test_gate: Option<std::sync::Arc<CaptureReadGate>>,
@@ -130,6 +269,7 @@ impl CaptureReader {
             file,
             consumed: 0,
             partial: Vec::new(),
+            discarding: false,
             identity: None,
             #[cfg(test)]
             read_test_gate: None,
@@ -168,6 +308,7 @@ impl CaptureReader {
             file: Some(file),
             consumed,
             partial: Vec::new(),
+            discarding: false,
             identity,
             #[cfg(test)]
             read_test_gate: None,
@@ -198,7 +339,11 @@ impl CaptureReader {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
-        file.seek(io::SeekFrom::Start(offset)).await?;
+        // A reader that starts inside a reclaimed prefix (a store that lost
+        // its checkpoint reads from byte 0) jumps to the retained bytes
+        // instead of handing on zeros (#1418).
+        let start = data_start(&file, offset)?;
+        file.seek(io::SeekFrom::Start(start)).await?;
         let mut chunk = Vec::with_capacity(CAPTURE_CHUNK_BYTES);
         file.take(CAPTURE_CHUNK_BYTES as u64)
             .read_to_end(&mut chunk)
@@ -206,6 +351,12 @@ impl CaptureReader {
         if reset {
             self.consumed = 0;
             self.partial.clear();
+            self.discarding = false;
+        }
+        if start > offset {
+            self.consumed = start;
+            self.partial.clear();
+            self.discarding = true;
         }
         self.identity = Some(identity);
         Ok(chunk)
@@ -230,6 +381,17 @@ impl CaptureReader {
     /// newline, so only the new ones are searched, and the finished lines
     /// leave the buffer in one step at the end.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<CapturedLine> {
+        let bytes = if self.discarding {
+            let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+                self.consumed += bytes.len() as u64;
+                return Vec::new();
+            };
+            self.consumed += newline as u64 + 1;
+            self.discarding = false;
+            &bytes[newline + 1..]
+        } else {
+            bytes
+        };
         let mut search_from = self.partial.len();
         self.partial.extend_from_slice(bytes);
         let mut lines = Vec::new();
@@ -548,5 +710,177 @@ mod tests {
             Some(CaptureFileIdentity::of(&std::fs::metadata(&file).unwrap()))
         );
         drop(held_old_inode);
+    }
+
+    /// A capture of `lines` numbered lines, each 32 bytes with its newline.
+    fn numbered_capture(path: &Path, lines: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(lines * 32);
+        for index in 0..lines {
+            bytes.extend_from_slice(format!("spam {index:09} quick brown fox.\n").as_bytes());
+        }
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    fn allocated_bytes(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().blocks() * 512
+    }
+
+    fn identity_of(path: &Path) -> CaptureFileIdentity {
+        CaptureFileIdentity::of(&std::fs::metadata(path).unwrap())
+    }
+
+    /// #1418: a chatty app's capture file grew by its whole output for as
+    /// long as it ran. Once the store holds the lines, their blocks go back
+    /// to the filesystem, while the length (and so every offset) stays.
+    #[test]
+    fn reclaiming_frees_ingested_bytes_but_keeps_the_length_and_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spammer.stdout");
+        let contents = numbered_capture(&path, 256 * 1024);
+        let identity = identity_of(&path);
+        assert!(allocated_bytes(&path) >= contents.len() as u64);
+
+        let reclaimed = reclaim_ingested(&path, identity, contents.len() as u64).unwrap();
+
+        assert!(reclaimed > 0, "nothing was reclaimed");
+        assert!(reclaimed <= contents.len() as u64 - RETAINED_CAPTURE_BYTES);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            contents.len() as u64
+        );
+        assert_eq!(identity_of(&path), identity);
+        assert!(
+            allocated_bytes(&path) <= RETAINED_CAPTURE_BYTES + 256 * 1024,
+            "{} bytes still allocated",
+            allocated_bytes(&path)
+        );
+        // Reclaiming again is a no-op that reports the same boundary.
+        assert_eq!(
+            reclaim_ingested(&path, identity, contents.len() as u64).unwrap(),
+            reclaimed
+        );
+    }
+
+    #[test]
+    fn reclaiming_never_frees_bytes_the_store_has_not_ingested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spammer.stdout");
+        let contents = numbered_capture(&path, 256 * 1024);
+        let identity = identity_of(&path);
+        let ingested = 2 * 1024 * 1024;
+
+        let reclaimed = reclaim_ingested(&path, identity, ingested).unwrap();
+
+        assert!(reclaimed <= ingested);
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut rest = Vec::new();
+        use std::io::{Read, Seek};
+        file.seek(io::SeekFrom::Start(ingested)).unwrap();
+        file.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, contents[ingested as usize..]);
+    }
+
+    #[test]
+    fn reclaiming_a_replaced_file_frees_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spammer.stdout");
+        numbered_capture(&path, 256 * 1024);
+        let old = identity_of(&path);
+        let replacement = tmp.path().join("replacement");
+        let contents = numbered_capture(&replacement, 256 * 1024);
+        std::fs::rename(&replacement, &path).unwrap();
+
+        assert_eq!(
+            reclaim_ingested(&path, old, contents.len() as u64).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+        // A file that has gone is not an error either.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(reclaim_ingested(&path, old, 1 << 30).unwrap(), 0);
+    }
+
+    /// A tail snapshot reads the last mebibyte, which reclaiming keeps.
+    #[tokio::test]
+    async fn a_tail_after_reclaiming_is_whole_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stem = tmp.path().join("spammer");
+        let path = stem.with_extension("stdout");
+        let contents = numbered_capture(&path, 256 * 1024);
+        reclaim_ingested(&path, identity_of(&path), contents.len() as u64).unwrap();
+
+        let snapshot = TailSnapshot::files(&stem).await;
+
+        assert!(!snapshot.text.contains('\0'));
+        let last = snapshot.text.lines().last().unwrap();
+        assert_eq!(last, "spam 000262143 quick brown fox.");
+        assert_eq!(snapshot.offsets.0[&path], contents.len() as u64);
+    }
+
+    /// A store that lost its checkpoint reads the file from byte 0 again. The
+    /// reclaimed prefix is skipped, not handed on as one line of zeros, and
+    /// the line it cut in half is dropped rather than stored as a fragment.
+    #[tokio::test]
+    async fn a_reader_from_byte_zero_skips_a_reclaimed_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spammer.stdout");
+        let contents = numbered_capture(&path, 256 * 1024);
+        let reclaimed = reclaim_ingested(&path, identity_of(&path), contents.len() as u64).unwrap();
+        assert!(reclaimed > 0);
+
+        let mut reader = CaptureReader::new(LogStream::Stdout, Some(path.clone()));
+        let mut lines = Vec::new();
+        loop {
+            let chunk = reader.read_chunk().await.unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            lines.extend(reader.push(&chunk));
+        }
+
+        let first = &lines[0];
+        let end = first.position.as_ref().unwrap().end_offset;
+        // The line the prefix ends in may have lost its start, so it is
+        // dropped too: the first line read is the one after it.
+        assert!(
+            end > reclaimed && end - reclaimed <= 64,
+            "first line ends at {end}"
+        );
+        assert_eq!(end % 32, 0, "the first line is a whole line");
+        assert_eq!(
+            first.line,
+            format!("spam {:09} quick brown fox.", end / 32 - 1)
+        );
+        assert!(lines.iter().all(|line| !line.line.contains('\0')));
+        assert_eq!(lines.len() as u64, (contents.len() as u64 - end) / 32 + 1);
+        assert_eq!(reader.read_offset(), contents.len() as u64);
+    }
+
+    #[test]
+    fn read_retained_skips_the_reclaimed_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spammer.stdout");
+        let contents = numbered_capture(&path, 256 * 1024);
+        let reclaimed = reclaim_ingested(&path, identity_of(&path), contents.len() as u64).unwrap();
+
+        let retained = read_retained(&path).unwrap();
+
+        assert!(!retained.contains(&0));
+        // Everything after the first newline past the reclaimed prefix: the
+        // line the prefix ends in may have lost its start.
+        let cut = reclaimed as usize;
+        let start = cut
+            + contents[cut..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap()
+            + 1;
+        assert_eq!(retained, contents[start..]);
+        // A capture nothing was reclaimed from reads whole.
+        let small = tmp.path().join("small.stdout");
+        std::fs::write(&small, b"one\ntwo\n").unwrap();
+        assert_eq!(read_retained(&small).unwrap(), b"one\ntwo\n");
     }
 }
