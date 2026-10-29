@@ -732,7 +732,7 @@ why we copied the idea and not the tooling.
 
 | SLO (p99) | What's timed | Threshold | Mode |
 |---|---|---|---|
-| Job task start | A job task's start lag on a pooled executor, from the job campaign's buckets | ≤ 256 ms | Gated in the fast and final tiers |
+| Job task start | A job task's start lag on a pooled executor, from the job campaign's buckets, in runs no fault window overlapped | ≤ 256 ms | Gated in the fast and final tiers |
 | API read | `GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` (what `relish status` and `relish nodes` ask) on every node, at every light check, from the host | ≤ 1,000 ms | Record only |
 | API write | `relish apply` of the soak workloads, from the call to the Raft commit | ≤ 2,000 ms | Record only |
 | App start | Each node's deploy of a new `soak-slo` instance, from its start until the instance passes its health check | ≤ 5,000 ms | Record only |
@@ -746,7 +746,15 @@ every final). There are no 0.2.3 soak records yet. The gate sits at 256 ms:
 four times the worst value seen, still a quarter of the September plan's
 1-second target, and a bucket bound, so the record's number is exact. A day
 tier records it without gating, since nothing has measured start lag at the
-day rate yet, and a run without a job campaign has nothing to judge.
+day rate yet, and a run without a job campaign has nothing to judge. The
+campaign keeps two sets of buckets: every drained run's start lag, for the
+M8 number in the job report, and only the runs that no fault window
+overlapped, for the SLO. A run that was active at any step inside a fault
+window counts for M8 alone, so start lag during a leader kill's recovery
+can't fail the quiet-cluster SLO
+([#1438](https://github.com/reliaburger/reliaburger/issues/1438)). The
+earlier records' 32 to 64 ms counted every run, faults included, so they
+bound the quiet number from above.
 
 **Record only, from 28 October 2026.** No soak before 0.2.4 timed the API,
 an app start or a rolling update, so those four start in record-only mode:
