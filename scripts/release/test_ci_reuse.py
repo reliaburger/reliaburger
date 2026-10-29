@@ -17,9 +17,9 @@ OTHER = "b" * 40
 REPOSITORY = "reliaburger/reliaburger"
 
 
-def run(run_id=1, commit=COMMIT, event="push", conclusion="success", repository=REPOSITORY):
+def run(run_id=1, commit=COMMIT, event="push", conclusion="success", repository=REPOSITORY, attempt=1):
     return dict(id=run_id, head_sha=commit, event=event, status="completed", conclusion=conclusion,
-                path=".github/workflows/ci.yml", run_attempt=1,
+                path=".github/workflows/ci.yml", run_attempt=attempt,
                 repository=dict(full_name=repository), head_repository=dict(full_name=repository))
 
 
@@ -126,6 +126,17 @@ class DecideTests(unittest.TestCase):
     def test_a_run_from_a_fork_runs_the_suite(self):
         self.assertIsNone(self.decide([run(repository="someone/fork")])[0])
 
+    def test_a_run_that_went_green_only_on_a_re_run_runs_the_suite(self):
+        # Retries are 0: a failure re-run until it passes is not evidence (#1436).
+        run_id, reasons = self.decide([run(attempt=2)])
+        self.assertIsNone(run_id)
+        self.assertIn("attempt 2", reasons[0])
+
+    def test_a_run_without_an_attempt_number_runs_the_suite(self):
+        record = run()
+        del record["run_attempt"]
+        self.assertIsNone(self.decide([record])[0])
+
     def test_one_green_run_among_failed_ones_is_enough(self):
         runs = [run(1, conclusion="failure"), run(2)]
         self.assertEqual(self.decide(runs)[0], 2)
@@ -140,22 +151,23 @@ class MainTests(unittest.TestCase):
             return status, output.read()
 
     def test_a_green_run_is_written_out(self):
-        self.assertEqual(self.main(lambda repository, commit: [run(7)]), (0, "reuse=true\nci_run=7\n"))
+        self.assertEqual(self.main(lambda repository, commit: [run(7)]),
+                         (0, "reuse=true\nci_run=7\nci_run_attempt=1\n"))
 
     def test_an_api_error_runs_the_suite(self):
         def broken(repository, commit):
             raise subprocess.CalledProcessError(1, ["gh", "api"])
-        self.assertEqual(self.main(broken), (0, "reuse=false\nci_run=\n"))
+        self.assertEqual(self.main(broken), (0, "reuse=false\nci_run=\nci_run_attempt=\n"))
 
     def test_an_error_reading_jobs_runs_the_suite(self):
         def broken(repository, run_id):
             raise ValueError("run 7 has 120 jobs; only 100 were read")
         self.assertEqual(self.main(lambda repository, commit: [run(7)], broken),
-                         (0, "reuse=false\nci_run=\n"))
+                         (0, "reuse=false\nci_run=\nci_run_attempt=\n"))
 
     def test_a_short_commit_runs_the_suite(self):
         self.assertEqual(self.main(lambda repository, commit: [run(7, commit="aaaa")], commit="aaaa"),
-                         (0, "reuse=false\nci_run=\n"))
+                         (0, "reuse=false\nci_run=\nci_run_attempt=\n"))
 
 
 if __name__ == "__main__":

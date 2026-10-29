@@ -994,6 +994,16 @@ included. A test parses `ci.yml` and fails when that list drifts, so a new CI jo
 quietly left out. Only a push, merge-queue or nightly run counts: a pull request's run tests a
 merge commit rather than its head, and may have skipped the heavy jobs on purpose.
 
+The first version had a hole the review found
+([#1436](https://github.com/reliaburger/reliaburger/issues/1436)). The API reports a run's
+*latest* attempt: its conclusion is the last attempt's, and `filter=latest` lists that
+attempt's jobs. So a flaky failure on `main`, re-run until it passed, looked exactly like a
+clean pass and became the candidate's whole source-CI evidence. That quietly undid retries
+= 0, the rule that a test passing on a second try is a flake to register, not a pass. The
+run's `run_attempt` field says which attempt the result came from, and the script now
+accepts only attempt 1. A re-run's green can still merge a pull request; it just can't
+stand in for the candidate's own suite, and the job summary names the run and the attempt.
+
 Then the workflow has to say "run the suite unless we found that". GitHub Actions has a trap
 here. By default a job whose dependency was skipped is skipped too, so a candidate job that
 `needs: validate-release` would never run on the fast path. The fix is to take control of the
