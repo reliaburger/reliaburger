@@ -466,7 +466,8 @@ migration and no feature gate
   only if the network-ownership spike (S11) passes; otherwise it comes off this
   page. VMs are its first target if the VM migration spike passes first
   ([#1185](https://github.com/reliaburger/reliaburger/issues/1185)).
-- [ ] **0.6.0: "GPUs"** (no milestone yet;
+- [ ] **0.6.0: "GPUs"**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/23),
   [research](plans/2026-10-11-research-llm-workloads.md#060-gpus)). GPUs as
   devices with identities: per-device placement for apps and jobs, CDI
   injection, topology inside a node, shared memory and memlock, a driver and
@@ -475,8 +476,9 @@ migration and no feature gate
   F01 ([#359](https://github.com/reliaburger/reliaburger/issues/359)) from "Later". Exit test: a tensor-parallel
   vLLM and a fine-tune share an eight-GPU node with their own devices, and an
   injected GPU fault cordons the node within two minutes.
-- [ ] **0.7.0: "Models"** (no milestone yet;
-  [research](plans/2026-10-11-research-llm-workloads.md#070-models)). From a
+- [ ] **0.7.0: "LLMs"**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/24),
+  [research](plans/2026-10-11-research-llm-workloads.md#070-llms)). From a
   model name to an OpenAI-compatible endpoint: `[model.*]` and
   `relish model run`, weights as OCI artifacts in Pickle with resumable peer
   pulls and placement next to them, startup and generate-based readiness,
@@ -484,9 +486,13 @@ migration and no feature gate
   to zero, API keys and token limits. Exit test: peer-loaded replicas start at
   least five times faster than the first, prefix routing doubles shared-prefix
   throughput, and a model scales to zero and back.
-- [ ] **0.7.1: GPU dev environments** (no milestone yet). `relish dev`: a GPU
-  container over SSH or VS Code with a persistent home and an idle timeout.
-- [ ] **0.8.0: "Groups"** (no milestone yet;
+- [ ] **0.7.1: GPU dev environments**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/25),
+  [research](plans/2026-10-11-research-llm-workloads.md#071-gpu-dev-environments)).
+  `relish dev`: a GPU container over SSH or VS Code with a persistent home and
+  an idle timeout.
+- [ ] **0.8.0: "Groups"**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/26),
   [research](plans/2026-10-11-research-llm-workloads.md#080-groups)).
   Multi-node work as one unit: all-or-nothing placement with ranks, roles,
   topology domains, RDMA, checkpoint-aware restarts, hot spares and health
@@ -498,13 +504,15 @@ migration and no feature gate
   partial success, a Python client and OpenAPI spec, an Airflow provider and
   a Nextflow executor in this repository, and an OpenAI-compatible batch API
   over resident model workers ([#641](https://github.com/reliaburger/reliaburger/issues/641)). Exit test: Nextflow and
-  Airflow each run a three-stage pipeline through a node failure.
+  Airflow each run a three-stage pipeline through a node failure. No issues
+  yet: the maintainer revisits it after 0.8.0 ships.
 - [ ] **0.10.0: "Fair share"** (no milestone yet;
   [research](plans/2026-10-11-research-llm-workloads.md#0100-fair-share)).
   Queues with weighted, decaying fair share, backfill, priority classes and
   preemption with grace periods, node selectors for arrays, retries by
   failure kind, and usage by queue. Exit test: an under-share team gets its
   half of a flooded cluster within a minute, and no service loses a replica.
+  No issues yet: the maintainer revisits it after 0.8.0 ships.
 - [ ] **Later**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/9)). The
   fleet control plane ([#265](https://github.com/reliaburger/reliaburger/pull/265)); rootless
@@ -517,8 +525,11 @@ migration and no feature gate
   hosts without KVM ([#1186](https://github.com/reliaburger/reliaburger/issues/1186));
   Windows Server guests
   ([#1187](https://github.com/reliaburger/reliaburger/issues/1187)); and, for
-  models, an external endpoint picker, disaggregated prefill and decode,
-  LoRA adapters from Pickle, AMD GPUs and GB200 compute domains.
+  LLMs, an external endpoint picker ([#1232](https://github.com/reliaburger/reliaburger/issues/1232)),
+  disaggregated prefill and decode ([#1233](https://github.com/reliaburger/reliaburger/issues/1233)), LoRA adapters
+  from Pickle ([#1234](https://github.com/reliaburger/reliaburger/issues/1234)), AMD GPUs
+  ([#1235](https://github.com/reliaburger/reliaburger/issues/1235)) and GB200 compute domains
+  ([#1236](https://github.com/reliaburger/reliaburger/issues/1236)).
 
 ## Known gaps
 
@@ -545,7 +556,9 @@ what's shipped and what's scheduled.
   [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08),
   [0.4.3](https://github.com/reliaburger/reliaburger/milestone/20) (F10) and
   [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F02,
-  F06, F09, F11, and the rest of F03–F05). F01 moves to 0.6.0.
+  F06, F09, F11, and the rest of F03–F05). F01
+  ([#359](https://github.com/reliaburger/reliaburger/issues/359)) moves to
+  [0.6.0](https://github.com/reliaburger/reliaburger/milestone/23).
 - **Whitepaper design ahead of the binary.** The [whitepaper](whitepaper.md)
   marks each of these as planned where it describes them: the reporting tree,
   resource-aware council selection, per-app rollups and remote-read
