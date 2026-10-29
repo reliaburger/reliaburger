@@ -42,6 +42,14 @@ def parse_version(text):
     return tuple(int(part) for part in match.groups())
 
 
+def cargo_version(source):
+    """The package version in a Cargo.toml's source, such as `0.2.4`."""
+    match = re.search(r'^\[package\][^\[]*?^version\s*=\s*"([^"]+)"', source, re.MULTILINE | re.DOTALL)
+    if match is None:
+        raise ValueError("Cargo.toml declares no package version")
+    return match.group(1)
+
+
 def parse_current(source):
     """The (protocol, state) pair `CURRENT` declares in compatibility.rs's source."""
     match = re.search(r"pub const CURRENT: Compatibility = Compatibility \{\s*protocol:\s*(\d+),\s*state:\s*(\d+),?\s*\}",

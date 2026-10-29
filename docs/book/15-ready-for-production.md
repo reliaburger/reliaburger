@@ -1022,6 +1022,17 @@ final is for minor releases and for anything that moves `CURRENT` in `src/compat
 or touches `src/bun/agent*`. That rule is mechanical, so `release_tier.py` applies it to a
 tag range rather than leaving it to someone's judgement at the end of a long week.
 
+At first, though, only a person ran it. `nightly.py` took the gate as `--gate` and defaulted
+to `patch`, and the runbook's examples passed `--gate patch` for 0.2.4, a release that moves
+`CURRENT` and the agent loop
+([#1428](https://github.com/reliaburger/reliaburger/issues/1428)). Follow the doc, or leave
+the flag out, and `freeze-check` would pass a nightly green only for the patch gate, and the
+8-hour final would never run. A rule that's mechanical should be applied by the machine at
+the point it matters, so `run` and `freeze-check` now work out the gate themselves: the
+release is the version in the commit's `Cargo.toml`, the previous release the nearest `v*`
+tag behind it, and the rest is `release_tier.decide`. `--gate` survives only to raise the
+gate; asking for less than the rule says is refused, with the rule's reasons.
+
 **Publish performance after the tag.** Benchmarks, the profile and the day run don't decide
 whether a release works, so they no longer stand between it and its users. A regression they
 find is a bug for the next patch release.

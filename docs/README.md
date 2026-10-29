@@ -1653,11 +1653,13 @@ machines.
   the first failure, writes the records and a rule-of-three summary
   (`DIR.md`), and deletes the VM and checkout (`--keep` keeps them). It
   refuses `reliaburger-test`, an existing VM and a dirty checkout.
-- `scripts/release/nightly-qualify.sh --train release-X-Y-Z [--gate patch|full]`
+- `scripts/release/nightly-qualify.sh --train release-X-Y-Z`
   runs the long tiers on a train's tip every night: the power-cut and reboot
   runs, then the V02 and jobs fast soaks against a staged build of the tip,
-  then the job final for the full gate. The staged build is the train's
-  nightly build: `build.yml` on the train signs it with the nightly key, which
+  then the job final when the release needs the full gate, which it works
+  out with `release_tier.py` (`--gate full` can raise it, never lower it).
+  The staged build is the train's nightly build: `build.yml` on the train
+  signs it with the nightly key, which
   no release trusts, and `stage.yml -f channel=nightly` publishes it as a
   `nightly-v…` pre-release that the website installer refuses
   ([nightly signing key](releasing.md#nightly-signing-key)). It writes a dated record naming the
