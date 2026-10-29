@@ -1922,3 +1922,44 @@ The early ask changes nothing on the wire. The request, the fence and the answer
 `a_rolling_retirement_stops_the_old_instance_only_after_other_nodes_drop_it` in the agent tests pins the order. It rolls a one-replica app against a fake leader that answers `202` once and then confirms, and at each request it records whether the mock runtime had already been told to stop the old instance. Before the fix, the first request arrived after the stop. Now both arrive while the old instance is still running.
 
 We'd have liked a cluster test here too, like the one above, but the in-process test cluster talks plain HTTP and runs without durable discovery, and the producer release refuses both on purpose, so the test cluster never runs a release at all. The release's own tests cover the leader's side. The agent test covers the order.
+
+The review of 0.2.4 found what that patience costs at scale (#1440). Picture a node that's slow to confirm, or down and not yet discharged. Every retirement then waits the full five seconds, and the deploy worker retired one instance at a time. Scaling 100 replicas to none spent eight minutes waiting on one node. And every 500 ms ask went to the leader as a `RetireEndpointExecution` write: up to ten Raft entries per retiring instance, each one fsynced on a quorum, to say "nothing has changed".
+
+The writes were the easy half. Fencing an execution that's already fenced changes nothing, and a test already proved it: the second write leaves the state byte for byte the same. So the leader now answers a repeat from what it has committed. `DesiredState::committed_producer_release` returns `Some(released)` when the execution's fence is already there, and `None` when only the write can answer. That's the first ask, or a node whose identity has been retired, which the write refuses:
+
+```rust
+pub fn committed_producer_release(
+    &self,
+    node_id: &str,
+    execution: &crate::grill::RuntimeExecution,
+) -> Option<bool> {
+    if self.security_state.crl.retired_nodes.contains_key(node_id)
+        || !self.producer_retirements.fences(node_id, execution)
+    {
+        return None;
+    }
+    // ...and None if the catalogue still names a fenced backend
+    Some(self.producer_retirements.release_confirmed(
+        node_id,
+        execution,
+        &self.endpoint_withdrawals,
+    ))
+}
+```
+
+`Option<bool>` reads oddly at first if you come from Go, where you'd return `(released bool, ok bool)`. It's the same thing, but the compiler won't let the handler use `released` without first saying what happens when there isn't one. The handler already does a linearizable read of the security state before it trusts the caller's certificate, and that read proves this node leads and has applied everything committed. So the state it reads next is current, and the answer is the one the write would have given. `a_fenced_retirement_reads_the_answer_its_write_would_give` checks that answer against the write's at every step. `a_repeated_producer_release_commits_no_new_log_entry`, in the integration suite, asks four times and reads openraft's `last_log_index` after each: the first ask commits the fence, the other three add nothing. On the old handler they added three entries. Nothing changed on the wire, so `CURRENT` stays put.
+
+The waits needed a different fix. The leader can't tell a slow node from a dead one any sooner than its view lease does, so we can't skip the wait. What we can do is stop queueing them. A scale-down, the surplus a rollout leaves behind and the whole of blue in a blue-green swap are batches: every instance in them is leaving anyway. `retire_old_instances` retires a batch together, 16 at a time:
+
+```rust
+for chunk in ids.chunks(RETIREMENT_CONCURRENCY) {
+    let retiring = chunk
+        .iter()
+        .map(|id| self.retire_old_instance(id, drain_timeout));
+    outcomes.extend(futures_util::future::join_all(retiring).await);
+}
+```
+
+`join_all` polls every future in the chunk on the deploy task, the way `tokio::join!` polls two, so a chunk costs its slowest retirement, not the sum. Our first version used a stream's `buffered(16)`, which keeps all 16 slots busy instead of waiting for a whole chunk. It didn't compile, with "implementation of `FnOnce` is not general enough", pointing at the `tokio::spawn` that starts the deploy task. `tokio::spawn` needs a future that's `Send`, and the compiler has to prove that for every lifetime of the borrowed `id`. With the closure stored inside a stream adapter it can't, a known limit of today's trait solver. Chunks lose a little overlap and keep the borrow checker happy. Now 100 replicas cost seven waits, not a hundred. Why 16 and not all of them? Each waiting retirement asks through the agent loop every 500 ms, and each stop drives the runtime.
+
+A rolling step still retires one old instance at a time, on purpose: `max_unavailable` is what decides how many may be down at once, and the rollout already waits on it. Scale-down changed in one more way. One failure used to stop the loop, and the rest weren't touched. Now they've all been stopped by the time we see the failure, so the worker finishes the bookkeeping for every one that stopped, then reports the first failure (`a_failed_retirement_in_a_batch_leaves_the_others_retired`). `a_batch_of_retirements_waits_out_the_patience_once` retires six instances while the loop's side answers "pending" for ever. On the serial code it took 27 seconds of paused tokio time. Now it's one patience.
