@@ -8026,8 +8026,15 @@ history takes a twentieth of a second, and so does one where nearly half the req
 or fail.
 
 It's still exponential in the worst case, and a soak can't hang on its own checker. Each
-namespace gets a budget of states, and a search that runs out reports *inconclusive*. The
-record says so, without failing the run. A violation fails it, and the record shows the
+namespace gets a budget of states, and a search that runs out reports *inconclusive*. At
+first the record said so without failing the run, and the deadline, 600 seconds, was shared
+by every namespace. Review found what that adds up to
+([#1437](https://github.com/reliaburger/reliaburger/issues/1437)): if the first namespace
+used the whole 600 seconds, every later one gave up after its first 1,024 states, and the
+soak went green with next to no linearizability coverage. A check that can quietly not
+happen isn't a gate. So each namespace now gets its own deadline, and an inconclusive check
+fails a fast or final tier; only a custom run, which gates nothing, reports it and moves on.
+A violation fails every run, and the record shows the
 smallest failing slice: the shortest prefix of the history that fails, then the latest
 quiet point (no answered operation in flight) from which the tail still fails, starting from
 any state at all. For the stale read above, that's two operations, the renew and the read,

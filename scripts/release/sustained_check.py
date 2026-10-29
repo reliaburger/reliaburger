@@ -1866,8 +1866,11 @@ def council_history_section(evidence, metadata):
     `linearizability.py check` writes council-history-check.json once the
     soak is over. A run that started the history client (metadata
     `council_history`) owes that check: without it, or with a violation, the
-    run fails. An inconclusive search is reported but fails nothing.
+    run fails. An inconclusive search fails a fast or final tier, which would
+    otherwise go green with no linearizability coverage (#1437); other runs
+    only report it.
     """
+    gated = metadata.get("tier") in soak_slo.GATED_TIERS
     path = Path(evidence) / "council-history-check.json"
     if not path.exists():
         if metadata.get("council_history") is not True:
@@ -1884,6 +1887,10 @@ def council_history_section(evidence, metadata):
              f"in {result.get('partitions', 0)} namespaces; {result.get('unanswered_writes', 0)} writes had no answer"]
     if verdict == "linearizable":
         lines.append("- Verdict: linearizable")
+    elif verdict == "inconclusive" and gated:
+        lines.append("- Verdict: **inconclusive**: the search ran out of budget in "
+                     + ", ".join(result.get("inconclusive", []))
+                     + "; a fast or final tier needs a conclusive check")
     elif verdict == "inconclusive":
         lines.append("- Verdict: inconclusive: the search ran out of budget in "
                      + ", ".join(result.get("inconclusive", [])))
@@ -1899,7 +1906,8 @@ def council_history_section(evidence, metadata):
                          f"{op.get('call', 0):.3f} | {returned} | {op.get('outcome')} | "
                          f"{op.get('expires_at_unix_ms') or ''} | {op.get('cleaning') if op.get('cleaning') is not None else ''} |")
     lines.append("")
-    return verdict not in ("linearizable", "inconclusive"), lines
+    passed = verdict == "linearizable" or (verdict == "inconclusive" and not gated)
+    return not passed, lines
 
 
 def render(evidence, record):

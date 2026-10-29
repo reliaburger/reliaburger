@@ -838,9 +838,12 @@ What runs, in every tier except the day run:
   records a failure and fails the record. The record says how many operations
   were checked and shows the smallest failing slice: the shortest prefix of
   the history that fails, cut down to the shortest tail that fails from any
-  starting state. The search is bounded per namespace; a namespace that runs
-  over is reported as *inconclusive*, which fails nothing but says so, rather
-  than hanging the soak.
+  starting state. The search is bounded per namespace, by a budget of states
+  and a deadline of its own (600 s); a namespace that runs over is reported as
+  *inconclusive* rather than hanging the soak. An inconclusive check fails a
+  fast or final tier, since that soak would otherwise pass with no
+  linearizability coverage; a custom run only reports it
+  ([#1437](https://github.com/reliaburger/reliaburger/issues/1437)).
 
 `make test-ci-scripts` runs the checker's unit tests
 ([`test_linearizability.py`](../scripts/release/test_linearizability.py)):
