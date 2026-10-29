@@ -110,6 +110,21 @@ class FuzzWorkflowTests(unittest.TestCase):
                 self.assertTrue(any(fnmatch(path, pattern.replace("**", "*")) for pattern in paths),
                                 f"{path} is missing from fuzz.yml's pull_request paths")
 
+    def test_only_the_decoders_and_the_fuzzing_set_up_start_a_pull_request_run(self):
+        # The job takes 14 to 33 minutes; a lockfile, Makefile or any config
+        # change shouldn't buy one. The nightly covers those (#1442).
+        paths = pull_request_paths(self.text)
+        for broad in ("Cargo.lock", "Makefile", "src/config/**"):
+            self.assertNotIn(broad, paths)
+        self.assertIn("src/config/mod.rs", paths)
+        self.assertIn("src/config/node.rs", paths)
+
+    def test_pull_request_runs_never_save_the_cache(self):
+        # ci.yml keeps the 10 GB cache quota for main (#1442).
+        cache = self.text[self.text.index("uses: Swatinem/rust-cache@"):]
+        cache = cache[:cache.index("\n      - ")]
+        self.assertIn("save-if: ${{ github.event_name != 'pull_request' }}", cache)
+
     def test_the_fuzz_crate_is_outside_the_root_workspace(self):
         manifest = (REPO / "fuzz" / "Cargo.toml").read_text()
         self.assertRegex(manifest, r"(?m)^\[workspace\]$")

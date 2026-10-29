@@ -508,6 +508,17 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertIsNotNone(limit)
         self.assertGreaterEqual(int(limit.group(1)), 41 * 3 // 2)
 
+    def test_the_nightly_signing_build_s_own_key_test_runs(self):
+        # The nightly build trusts the nightly key instead of every release
+        # key, and only a build with the feature compiles the test that says
+        # so (#1442).
+        portable = self.jobs["portable"]
+        block = next(step for step in steps(portable) if "--features nightly-signing" in step)
+        self.assertIn("cargo test --locked --lib --features nightly-signing upgrade::keys::", block)
+        self.assertNotIn("if:", block)
+        keys = (REPO / "src" / "upgrade" / "keys.rs").read_text()
+        self.assertIn('#[cfg(feature = "nightly-signing")]\n    #[test]', keys)
+
 
 class BenchmarkTests(unittest.TestCase):
     def setUp(self):

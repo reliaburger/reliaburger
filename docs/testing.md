@@ -569,12 +569,15 @@ commands never build it. Three things run the targets:
 
 [`fuzz.yml`](../.github/workflows/fuzz.yml) runs `make fuzz-smoke` nightly at
 300 seconds a target, and for 30 seconds on a pull request that touches a
-decoder (or by hand, with any budget). The job summary has each target's last
+decoder's file or the fuzzing set-up (or by hand, with any budget). A
+dependency bump, a Makefile change or the rest of `src/config/` waits for the
+nightly: the job takes 14 to 33 minutes. The job summary has each target's last
 libFuzzer status line (executions, coverage, corpus size). A crash fails the
 job and its input is kept as the `fuzz-crashes` artefact. The workflow pins a
 dated nightly (`FUZZ_TOOLCHAIN`) and caches the sanitizer build under one
-rust-cache key for nightly and pull request runs; a floating nightly would
-change that key every day. Move the pin forward by hand when a newer nightly
+rust-cache key for nightly and pull request runs, which only the nightly and
+runs by hand save, so pull requests don't eat into the cache quota `ci.yml`
+keeps for `main`; a floating nightly would change that key every day. Move the pin forward by hand when a newer nightly
 is needed. Locally, `FUZZ_TOOLCHAIN` defaults to `nightly`.
 
 A crash is handled like a flake: an issue the same day. Then add the input as

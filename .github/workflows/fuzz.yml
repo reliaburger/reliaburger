@@ -17,7 +17,10 @@ on:
     - cron: "29 2 * * *"
   pull_request:
     branches: [main, "codex/**", "fix/**", "release-*"]
-    # The decoders the targets drive, and the fuzzing set-up itself.
+    # The decoders the targets drive, and the fuzzing set-up itself. Only
+    # the files that hold a decoder: a dependency bump, a Makefile change or
+    # the rest of src/config waits for the nightly, since the job takes 14
+    # to 33 minutes (#1442).
     paths:
       - src/fuzz/**
       - fuzz/**
@@ -28,9 +31,8 @@ on:
       - src/pickle/api.rs
       - src/grill/oci_pull.rs
       - src/sesame/ca.rs
-      - src/config/**
-      - Cargo.lock
-      - Makefile
+      - src/config/mod.rs
+      - src/config/node.rs
       - .github/workflows/fuzz.yml
   workflow_dispatch:
     inputs:
@@ -83,13 +85,14 @@ jobs:
         with:
           tool: cargo-fuzz@0.13.2
       # The sanitizer build of the whole crate is most of the job. One key
-      # serves the nightly run and pull requests. Unlike ci.yml, pull
-      # requests save too: GitHub scopes a PR's cache to that PR, and the
-      # nightly on main otherwise leaves a decoder PR's later pushes cold.
+      # serves the nightly run and pull requests, and only the nightly (or a
+      # run by hand) saves it: a PR's saved cache counts against the 10 GB
+      # quota ci.yml keeps for main (#1442).
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz -> target
           shared-key: fuzz
+          save-if: ${{ github.event_name != 'pull_request' }}
           cache-on-failure: true
           # reliaburger is a path dependency here, which rust-cache would
           # otherwise prune as a local crate; on a nightly with no new

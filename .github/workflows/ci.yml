@@ -257,6 +257,12 @@ jobs:
           retention-days: 14
       - name: Doctests
         run: make test-doc
+      # A train's nightly build trusts the nightly key instead of every
+      # release key (#1363). The test that says so only compiles with the
+      # feature, so no other run has it (#1442). The doctests have just
+      # built the dependencies for this profile; only the crate rebuilds.
+      - name: Nightly-signing key trust
+        run: 'cargo test --locked --lib --features nightly-signing upgrade::keys::'
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v4
