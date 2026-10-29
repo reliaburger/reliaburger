@@ -427,6 +427,15 @@ whether a fault window is open, and marks every run active at that moment. When 
 drains, its start lag goes into the M8 buckets either way, and into a second, quiet set only
 if it was never marked. The SLO reads the quiet set.
 
+That fix went too far in the fast tiers, and the 0.2.4 candidate found it
+([#1485](https://github.com/reliaburger/reliaburger/issues/1485)). A fast tier's faults come
+back to back, so out of 15.7 million job tasks only 20 ran in runs that missed every fault
+window. The p99 of 20 samples is simply the largest, and 4 of those 20 took between one and
+two seconds, so both fast tiers failed on a number that was really one slow task. Now the
+gate wants at least 1,000 quiet samples before it judges the p99. A fast tier with fewer
+records the value and says it had too few to judge. A final has a quiet tail of more than two
+hours with the job campaign at full load, so it can't run short, and if it does, it fails.
+
 Measuring them cost almost nothing, because the harness was already doing the work. Every
 light check talks to each node's API, so it now times two of the reads `relish` makes. For
 the writes, the app start and the rollout, the harness gives itself an app of its own,
