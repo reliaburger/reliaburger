@@ -1141,7 +1141,10 @@ with a `default`; without one, required) and a `body` string of ordinary
   node's placement fingerprint set it aside, so moving an app into or out of
   a template restarts nothing when the expansion is the same. Policies see
   it as `app.provenance` or `job.provenance`; a policy `default` can't set
-  it. A body may declare an `owner`, and the owner rules judge the expanded
+  it. It is not a trust signal (#1430): any manifest may declare a template
+  of any name, and a hand-written spec may set the field, which the apply
+  endpoint can't tell from `relish`'s local expansion. A policy may aim a
+  rule at it, never exempt on it. A body may declare an `owner`, and the owner rules judge the expanded
   app exactly as they judge a hand-written one. `relish apply
   --dry-run` shows it as `from use.NAME (template NAME)`.
 - **Not done.** No registry: templates come from files or git. No logic in
