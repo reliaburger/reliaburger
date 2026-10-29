@@ -677,6 +677,21 @@ impl CouncilNode {
             .await
     }
 
+    /// What a repeated producer retirement of `execution` would answer,
+    /// read from this node's applied state instead of committing a no-op
+    /// entry (#1440). See [`DesiredState::committed_producer_release`].
+    /// Current only after a linearizable read, such as
+    /// [`Self::security_state_linearizable`], on the leader.
+    pub async fn committed_producer_release(
+        &self,
+        node_id: &str,
+        execution: &crate::grill::RuntimeExecution,
+    ) -> Option<bool> {
+        self.state_machine
+            .read_desired(|state| state.committed_producer_release(node_id, execution))
+            .await
+    }
+
     /// Read the security state only if this node can prove the read is current.
     ///
     /// `ensure_linearizable` confirms with a quorum that this node is still

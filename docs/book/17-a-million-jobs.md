@@ -3565,6 +3565,15 @@ revision *after* the tick's entry, which shows the follow-up carried the
 committed version. Waiting an hour for a test to fail isn't a plan, so the
 test waits twenty seconds and calls that never.
 
+The review of 0.2.4 spotted a loose end in it (#1442): the test cancelled
+its shutdown token and returned, without checking that the leader loop had
+stopped. The loop doesn't watch that token. It stops when the agent's
+command channel closes, and the test's stand-in agent drops its receiver on
+cancel. So the test now waits for the loop to go, and it can tell because the
+loop owns a clone of the `ApiState`, which holds an `Arc` of the task-array
+service. `Arc::strong_count` counts the owners. When the count gets back to
+one, the test's own, nothing else is running with the service.
+
 What does it cost? Every new control version is a fence write and an fsync
 on the node, and on macOS an fsync flushes the whole device (#809). A busy
 node used to see one new version a tick; it now sees two. The leader sends at

@@ -2130,14 +2130,10 @@ async fn poll_consumer(
     io_timeout: Duration,
 ) -> Option<ConsumerPoll> {
     let client = cluster_http.client();
-    let leader_url = {
-        let metrics = metrics_rx.borrow();
-        let directory = directory_rx.borrow();
-        crate::cluster::directory::resolve_leader(&metrics, &directory, raft_to_api_offset, 0)
+    let leader_url =
+        crate::cluster::directory::resolve_leader(metrics_rx, directory_rx, raft_to_api_offset, 0)
             .and_then(|view| view.api_address)
-            .map(|address| cluster_http.url(&address.to_string(), ""))
-    };
-    let leader_url = leader_url?;
+            .map(|address| cluster_http.url(&address.to_string(), ""))?;
 
     let url = format!("{leader_url}/v1/placements/{node_name}");
     let mut request = client.get(&url);

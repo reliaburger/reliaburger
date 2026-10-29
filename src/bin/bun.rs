@@ -1695,10 +1695,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             let mut expiry = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 use reliaburger::mustard::state::NodeState;
+                // Copy the roster out before borrowing the directory: two
+                // `watch` borrows held at once can deadlock (#1433).
+                let members = refresher_rx.borrow().clone();
                 let roster: Vec<api::RosterMember> = {
                     let directory = refresher_directory_rx.borrow();
-                    refresher_rx
-                        .borrow()
+                    members
                         .iter()
                         .map(|m| api::RosterMember {
                             info: api::NodeMembershipInfo::from_gossip(

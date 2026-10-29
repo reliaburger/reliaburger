@@ -514,6 +514,8 @@ Who's waiting for that answer? Only the boot task in `bun` that sent `UpgradeVer
 
 What does have to hold is the order inside `commit`. The history entry is written first and now fsync'd (`sync_all` on the file, and on its directory the first time it's created), so the marker never disappears before the record that says the upgrade committed is on disk. Then GC, then the marker. Keeping GC *before* the marker matters twice over. It's the "do all the work first, flip the visible flag last" rule from §14.4. And it's what makes GC safe against the next upgrade: while the marker is on disk, `prepare` and `prepare_rollback` refuse anything but a re-delivery of the same upgrade, so no new binary can be staged while GC decides what to delete. GC protects the version we came from and the one now running; the marker protects everything else.
 
+The exec has the same kind of file work. `execute` writes and fsyncs the `Executed` marker and swaps the symlink before the exec. If the exec fails, it puts the old symlink back and appends an `Abandoned` entry to the history, fsync'd too (#1381). All of that ran on a Tokio worker thread, where the project's rule says no blocking call belongs. Since 0.2.4 the loop runs the whole of `execute` under `spawn_blocking` (#1442). Can a blocking-pool thread exec? Yes. `execv` replaces the whole process from whichever thread calls it, and the call never came from the main thread anyway: the agent loop is a spawned task. The loop's turn still waits for the answer, because there's nothing else for a node to do mid-exec. What changed is that the worker thread underneath it is free. The history entry's serialisation lost its `.expect` on the way. It can't fail, but `serde_json::to_string` returns a `Result`, and a library function that can return an error shouldn't panic instead.
+
 The tests are in the agent's loop harness. `status_answers_while_an_upgrade_verification_commits_to_a_stalled_disk` runs the whole loop with the commit stalled for 2.5 s and checks that a status queued meanwhile is answered within the budget, that the verify isn't answered before the commit lands, and that the marker is still there until it does. `an_upgrade_verification_leaves_its_slow_commit_in_flight` drives the turns by hand and counts: one commit, the turn under budget, the answer only from the landing turn. `an_upgrade_commit_prunes_old_binaries_off_the_loop_and_refuses_the_next_upgrade_meanwhile` sends a rollback while the commit is stalled and checks it's refused, and that GC kept the right binaries. Against the inline commit, the counting one failed with `the verification's turn waited for its commit: 2.517645416s in command (upgrade_verify)`. A unit test in `upgrade::manager`, `commit_keeps_the_marker_and_the_binaries_when_history_cannot_be_written`, pins the order: a history file that can't be written leaves the marker and every binary where they were.
 
 `commit_outcome` turns a task that panicked into an `UpgradeError::Io`, so the caller hears about it rather than seeing a dropped channel, and the marker stays for the next boot to sort out. (The test build also has the spawned task wait on a `LoopStall::UpgradeCommit` hook first; that's how the harness makes the commit slow without a slow disk.)
@@ -2045,4 +2047,32 @@ The `Ref` is a temporary there, and Rust drops a temporary at the end of the sta
 
 We didn't turn on `parking_lot`'s deadlock detector. It's a compile-time feature with a background thread, and it reports a deadlock after the fact. The node would still be wedged.
 
-We didn't clone every `watch` value out of its channel by habit. The directory carries an entry for every node, and the leader-target maintainer reads it on every change. Taking the borrows in one order costs nothing.
+We didn't clone every `watch` value out of its channel by habit. The directory carries an entry for every node, and the leader-target maintainer reads it on every change. We meant to take the borrows in one order instead, and that turned out to be harder to keep than it sounds.
+
+### One order wasn't enough
+
+"Every other place takes the metrics first" was wrong. A week later a review of the 0.2.4 train found Pickle doing it the other way round ([#1433](https://github.com/reliaburger/reliaburger/issues/1433)). When a follower forwards a registry write or an ownership query to the leader, `RegistryForwarder::send_request` in `src/pickle/authority.rs` looked up the leader's address like this:
+
+```rust
+let directory = self.directory.borrow();
+if let Some(council) = council {
+    let metrics = council.metrics();
+    let metrics = metrics.borrow();
+    leader_api_address(&metrics, &directory)
+}
+```
+
+That's the directory first, then the metrics: the fence supervisor's knot again, reached through the image registry. Nothing in the type system says which order is the right one, and the code that broke the rule was written long before the rule existed. Seven places in the tree took both borrows, each by hand. A rule that every caller has to remember will be broken again by the eighth.
+
+So now nobody takes both. The two functions that combine the channels, `resolve_leader` and `leader_api_address` in `src/cluster/directory.rs`, take the receivers instead of borrowed values, and they borrow each channel in turn:
+
+```rust
+let raft = metrics.map(|metrics| raft_leader(&metrics.borrow()));
+let directory = directory.borrow();
+```
+
+`raft_leader` copies out the three things resolution needs from the metrics: the leader's name, its Raft address and the term. The `Ref` from `metrics.borrow()` is a temporary, so Rust drops it when that statement ends, before the directory borrow starts. Copying a name, an address and a number costs nothing next to cloning the metrics, which carry the whole membership. Every caller (the leader-target maintainer, the placement poll, the producer release, workload signing, the upgrade and GitOps forwarding, and Pickle) now goes through those two functions, so the order lives in one place. `metrics` is an `Option` because a worker outside the council has no Raft metrics and resolves the leader from the gossip hint alone.
+
+The project's async rules gained a line too: never hold two `watch` borrows at once. Two more places broke it with other pairs of gossip channels: the council reconciler's membership filter in `src/cluster/recovery_fence.rs` held the membership and the directory, and Bun's roster refresher held the directory and the roster. Neither had a partner taking the pair the other way round yet, but neither should wait for one. Each now borrows one channel per statement.
+
+`directory_write_waits_for_metrics_read` in the same file is the test fixture. It holds a metrics borrow, as the maintainer does, and queues an openraft write behind it. Then it runs the code under test on its own thread, which blocks on the metrics behind that queued writer, and checks whether a gossip write can still land. Three tests use it: one each for `resolve_leader` and `leader_api_address`, and `forwarding_reads_the_metrics_without_holding_the_gossip_directory` for Pickle's forwarder. With the directory borrowed first, all three fail with "a gossip directory write waited for the metrics read". Every wait in the fixture has a timeout, so a regression fails the test instead of hanging it.
