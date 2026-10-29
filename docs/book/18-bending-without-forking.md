@@ -1401,6 +1401,22 @@ GitOps owns, the controller's token for an app a controller owns
 ([#1125](https://github.com/reliaburger/reliaburger/issues/1125)), with the
 role read from that token, and the cluster's own `audit` caller for the rest.
 
+And who may read it? Any token can read the policies themselves, so the
+first cut let any token read the audit too. That was a leak
+([#1432](https://github.com/reliaburger/reliaburger/issues/1432)): a policy
+is a rule, but a finding names a workload, its namespace and why it's
+broken, and a controller's token scoped to `team-a` could list every other
+team's apps that way. Everywhere else a scoped token reads only its own
+namespaces, events included (#1125). So `audit` became a thin wrapper round
+`audit_visible`, which takes a predicate, `impl Fn(&AppId) -> bool`, and
+judges only the workloads it keeps. `impl Trait` in argument position is
+Rust's way of saying "any type that implements this", much like a Go
+parameter of interface type, except that the compiler generates a copy of
+the function for each closure it's called with, so there's no indirect call.
+The handler builds the predicate from the caller's scope and moves it into
+`spawn_blocking`. The counts come from the filtered lists, so a scoped
+caller can't even tell how many other workloads there are.
+
 ### The exec secret provider
 
 ([#1123](https://github.com/reliaburger/reliaburger/issues/1123)) The code
@@ -2910,6 +2926,11 @@ Jobs and the audit action
   an apply through, says nothing to the caller, and leaves one
   `policy.audited` record; and the audit route lists an app committed before
   a policy that would now refuse it, without changing the app.
+- **A scoped audit** (`the_audit_shows_a_scoped_token_only_its_own_namespaces`,
+  #1432): with an app in `team-a`, and an app and a cron job in `team-b`, all
+  on `:latest`, a token scoped to `team-a` reads one app, no jobs and one
+  denial, and the body never mentions `team-b`; the admin still reads all
+  three.
 - **`relish wtf`** (`warns_about_committed_workloads_the_policies_would_now_refuse`):
   denials and audit findings become warnings named by workload, warnings are
   left to the audit report, a clean audit is an OK, and no policies says

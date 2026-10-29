@@ -395,6 +395,11 @@ the definitions the cluster keeps, which are scheduled jobs and deployment
 hooks; a one-off job's definition goes once its runs are pruned. `relish wtf` shows the same
 denials and audit findings as warnings.
 
+Any token can run it, but a token limited to some apps or namespaces sees
+only those: the counts and findings leave out everything else, so a
+controller's token can't list another team's workloads or why they'd be
+refused.
+
 `action = "audit"` is the way to roll out a strict policy: commit it as
 `audit`, watch `relish policy audit` until nothing breaks it, then change it to
 `deny`.
