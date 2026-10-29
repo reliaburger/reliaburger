@@ -4304,15 +4304,14 @@ a histogram labelled by branch:
 
 ```rust
 struct BranchHistogram {
-    buckets: [AtomicU64; BUCKET_BOUNDS.len()],
+    buckets: [AtomicU64; BUCKET_BOUNDS.len() + 1],
     sum_nanos: AtomicU64,
-    count: AtomicU64,
 }
 
 impl BranchHistogram {
     const fn new() -> Self {
         Self {
-            buckets: [const { AtomicU64::new(0) }; BUCKET_BOUNDS.len()],
+            buckets: [const { AtomicU64::new(0) }; BUCKET_BOUNDS.len() + 1],
             // ...
         }
     }
@@ -4323,9 +4322,12 @@ impl BranchHistogram {
 `Copy`, and an atomic isn't (two copies of one counter would defeat the
 point). `const { ... }` is an *inline const*: a block the compiler evaluates at
 build time, and an array can repeat a constant expression whether or not its
-type is `Copy`. The loop increments with `Ordering::Relaxed`, as Wrapper's
-round-robin counter does, because nobody needs the buckets to agree with each
-other to the nanosecond, only to add up. The metrics collector holds the same
+type is `Copy`. The extra bucket at the end counts turns past the last bound,
+10 s. The loop increments with `Ordering::Relaxed`, as Wrapper's round-robin
+counter does, because nobody needs the buckets to agree with each other to
+the nanosecond, only to add up. (That turned out to be true only if every
+number a scrape exports comes from the same reading; more on that below.)
+The metrics collector holds the same
 meter through an `Arc` and writes it into Mayo every interval as
 `bun_agent_loop_turn_seconds_bucket{branch, le}`, plus `_sum` and `_count`,
 the way Prometheus histograms look. Reading it is the usual game: the ratio
@@ -5421,6 +5423,48 @@ The finding says which bucket the
 worst turn landed in, `1 deploy_op turn(s) over the 1 s budget, the worst
 between 2.5 and 5 s`, and Bun's own log line from the meter says which op it
 was.
+
+Then 0.2.3's day run failed on `1 follow_up turn(s) over the 1 s budget, the
+worst between 1 and 2.5 s` on node 3, and Bun's log had no line for it (#1419).
+The fifteen minutes of journal kept with the failure held fourteen lines, the
+slowest turn among them 273 ms. Nothing was rate-limiting the slow-turn line:
+it's a plain `eprintln!` on every turn over 250 ms. So either a turn finished
+without being logged, or no turn was slow.
+
+The scrapes settled it. Across the run's 182,000 samples of the histogram, on
+every node and branch, `+Inf` minus `le="1"` was never above zero. Once, at
+05:10:08 on node 3, it was *below* zero: `le="1"` said 105,877 and `+Inf` said
+105,876. A cumulative histogram can't do that. The old `samples` read the turn
+count first and the buckets after, from another thread while the loop kept
+finishing turns. One short turn landed between the two reads, so it was in
+the bucket and not in the count. The checker then saw "over the budget" go
+from 0 to -1, which looks like a count going down, so it decided Bun had
+restarted and remembered -1. Ten seconds later an honest scrape said 0, an
+increase of one. That's the phantom turn, and replaying failure 30's own
+samples through the checker reproduces its finding word for word.
+
+The fix makes a scrape one reading. There's no separate count any more: a
+turn past 10 s goes in the extra bucket, `counts()` loads every bucket once
+into a plain array, and `+Inf` and `_count` are that array's sum. Each bucket
+can still be a moment older or newer than its neighbour, but cumulative sums
+of one array can't decrease and can't exceed their own total, so `+Inf` minus
+`le="1"` only ever counts turns that really landed above a second.
+
+```rust
+fn counts(&self) -> [u64; BUCKET_BOUNDS.len() + 1] {
+    std::array::from_fn(|bucket| self.buckets[bucket].load(Ordering::Relaxed))
+}
+```
+
+`std::array::from_fn` builds a fixed-size array by calling the closure once
+per index, which is how you fill an array from a computation without first
+making a dummy array to overwrite. The checker got the matching guard: a
+scrape with `le="1"` above `+Inf` is no evidence either way, so it's skipped,
+which keeps older binaries' torn scrapes from failing a tier.
+`a_scrape_racing_finished_turns_is_one_consistent_histogram` finishes turns on
+one thread while another scrapes 20,000 times and requires every scrape to be
+consistent; the old code tore 19,800 of them.
+`test_a_torn_scrape_is_not_a_slow_turn` replays node 3's three scrapes.
 
 Looking back over the whole arc, the lesson isn't about `select!` at all. We
 spent a dozen PRs arranging the order in which slow things waited, and three

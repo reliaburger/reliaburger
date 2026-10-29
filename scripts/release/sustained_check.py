@@ -1120,6 +1120,12 @@ def turn_findings(state, node, samples):
             total, within = counts.get("+Inf"), counts.get(TURN_BUDGET_LE)
             if total is None or within is None or stamp <= last.get("at", float("-inf")):
                 continue
+            # A Bun before #1419 read its turn count and its buckets apart, so
+            # a turn finishing in between could put le="1" above +Inf. That
+            # scrape is no evidence; counting from it made the next, honest,
+            # one look like a slow turn.
+            if within > total:
+                continue
             over = int(total - within)
             restarted = total < last.get("total", 0) or over < last.get("over", 0)
             previous = 0 if restarted else last.get("over", 0)
