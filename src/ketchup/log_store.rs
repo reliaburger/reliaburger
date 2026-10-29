@@ -291,6 +291,18 @@ impl IngestCheckpoint {
         checkpoint
     }
 
+    /// The capture files this checkpoint has ingested far enough into to
+    /// reclaim some of: past the window a tail keeps (#1418). Small captures,
+    /// such as most jobs', never qualify, so a flush touches only the few
+    /// files of long-running, chatty instances.
+    fn reclaimable(&self) -> Vec<(PathBuf, FileIdentity, u64)> {
+        self.offsets
+            .iter()
+            .filter(|(_, offset)| **offset > crate::grill::capture::RETAINED_CAPTURE_BYTES)
+            .filter_map(|(file, offset)| Some((file.clone(), *self.files.get(file)?, *offset)))
+            .collect()
+    }
+
     /// Durably replace the checkpoint: a unique temp file, fsync, rename over
     /// the old one, then fsync the directory. A reader sees the old
     /// checkpoint or the new one, never half of either.
@@ -302,6 +314,23 @@ impl IngestCheckpoint {
             .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))?;
         crate::sesame::identity::atomic_write(&data_dir.join(CHECKPOINT_FILE), &bytes)?;
         Ok(())
+    }
+}
+
+/// Give back the disk blocks of capture-file prefixes a durable checkpoint
+/// covers (#1418). Without this a chatty instance's capture file held its
+/// whole output for as long as it ran, next to the store's own copy. A
+/// failure costs only disk space, so it is reported and the flush stands.
+fn reclaim_captures(reclaimable: &[(PathBuf, FileIdentity, u64)]) {
+    for (file, identity, ingested) in reclaimable {
+        match crate::grill::capture::reclaim_ingested(file, *identity, *ingested) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+            Err(error) => eprintln!(
+                "ketchup: cannot reclaim ingested capture {}: {error}",
+                file.display()
+            ),
+        }
     }
 }
 
@@ -517,8 +546,10 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
                 released = gate.release.wait(released).unwrap();
             }
         }
+        let reclaimable = checkpoint.reclaimable();
         checkpoint.save(&data_dir)?;
         completed.store(true, Ordering::Release);
+        reclaim_captures(&reclaimable);
         Ok(())
     })
     .await
@@ -2715,5 +2746,59 @@ mod tests {
         fault.failing.store(false, Ordering::Release);
         assert_parent_retry_has_one_durable_capture_copy(&mut fresh, &logs, &capture).await;
         assert_eq!(&*fault.visits.lock().unwrap(), &[logs.clone(), logs]);
+    }
+
+    /// #1418: the soak's log spammer grew its capture file by about 40 MiB an
+    /// hour on top of the store's own copy. Once a flush makes the lines
+    /// durable, the capture's ingested prefix is reclaimed, never before.
+    #[tokio::test]
+    async fn a_durable_flush_reclaims_the_ingested_capture_prefix() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = captures.path().join("spammer.stdout");
+        let line = "spam the quick brown fox jumps over the lazy dog\n";
+        let contents = line.repeat(4 * 1024 * 1024 / line.len());
+        std::fs::write(&file, &contents).unwrap();
+        let allocated = || std::fs::metadata(&file).unwrap().blocks() * 512;
+        let mut store = LogStore::new(directory.path().to_path_buf());
+        let mut reader =
+            crate::grill::capture::CaptureReader::new(LogStream::Stdout, Some(file.clone()));
+        loop {
+            let bytes = reader.read_chunk().await.unwrap();
+            if bytes.is_empty() {
+                break;
+            }
+            for line in reader.push(&bytes) {
+                store.ingest_at(
+                    100,
+                    &crate::ketchup::types::LogRecord {
+                        app: "spammer".into(),
+                        namespace: "default".into(),
+                        instance: "spammer-0".into(),
+                        stream: line.stream,
+                        line: line.line,
+                        position: line.position,
+                    },
+                );
+            }
+        }
+        assert!(
+            allocated() >= contents.len() as u64,
+            "nothing is reclaimed before the lines are durable"
+        );
+
+        store.flush().await.unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().len(),
+            contents.len() as u64
+        );
+        assert!(
+            allocated() <= crate::grill::capture::RETAINED_CAPTURE_BYTES + 256 * 1024,
+            "{} bytes of the capture are still allocated",
+            allocated()
+        );
+        assert_eq!(store.capture_offsets().0[&file], contents.len() as u64);
     }
 }

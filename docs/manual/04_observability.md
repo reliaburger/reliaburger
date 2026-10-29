@@ -75,6 +75,17 @@ its data directory, because such a cap would never prune before the disk
 filled. Singleton jobs stream their output into the log store, so a busy job
 node reaches the log cap well within the seven days.
 
+The store's caps cover the store. Each running instance also has its raw
+capture files under the data directory's `instances/`, which the app writes
+into directly. Once the store has saved a stretch of output to disk, Bun hands
+those bytes of the capture back to the filesystem. It keeps the last mebibyte
+of each stream, for `relish logs -f` to start from, and anything not saved
+yet (the store saves once a minute). So a chatty app costs its node the
+store's copy plus a mebibyte or so, not everything it ever printed. The capture file's size, as `ls` shows it, still counts everything;
+`du` shows what it really takes. This needs a filesystem that can punch holes
+in a file (ext4, XFS, Btrfs and APFS can); on one that can't, the capture
+grows until the instance stops.
+
 Exported Parquet archives answer SQL:
 
 ```sh
