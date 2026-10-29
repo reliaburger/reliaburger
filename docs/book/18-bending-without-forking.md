@@ -1967,9 +1967,43 @@ That has a consequence. Egress allowlists are keyed by cgroup in the eBPF
 programs, so a sidecar in its own cgroup isn't held to its app's allowlist.
 A proxy could reach what the app can't. Programming the sidecar's cgroup
 too means another set of egress bindings to own and retire, so for now
-validation refuses the combination with a reason that says why. Namespace
-isolation still applies, because the kernel falls back to the cgroup's
-`/reliaburger/<namespace>` ancestor.
+validation refuses the combination with a reason that says why.
+
+Namespace isolation has the same shape, and the first version got it wrong.
+The connect hook looks up the caller's cgroup in `cgroup_namespace_map`,
+and when that misses, its `/reliaburger/<namespace>` ancestor. We wrote
+here that the fallback held sidecars to their namespace. It doesn't: that
+ancestor is bound only while a delegated job of the namespace runs on the
+node. The rest of the time a sidecar's cgroup had no namespace at all, and
+a caller with no namespace is a host daemon as far as the hook can tell, so
+it went anywhere. The review of the 0.2.4 train caught it (#1426), and a
+`make test-linux` case showed a sidecar in `tenant-a` connecting to a
+`tenant-b` address nothing had granted.
+
+The fix is the one the egress note above put off, and it's cheap here,
+because namespace bindings have no owner to retire: the reconcile rebuilds
+both maps from scratch every time. So `reconcile_namespace_firewall` asks
+the runtime for each sidecar's cgroup as it does for each instance's, and
+files it under the app's `(namespace, app)` key:
+
+```rust
+for instance in self.supervisor.list_instances() {
+    let key = (instance.namespace.clone(), instance.app_name.clone());
+    if sidecars::runs_beside(instance.state) {
+        for sidecar in self.sidecars.running_beside(&instance.id) {
+            sidecar_ids.push((key.clone(), sidecar));
+        }
+    }
+    pairs.push((key, instance.id.clone(), instance.is_being_created()));
+}
+```
+
+Everything downstream works off that key, so the sidecar gets its app's
+namespace and its app's `allow_from` grants in the same pass, no more and no
+less. A sidecar whose cgroup isn't there yet, because it's still being
+created or has just been restarted, keeps the sync stale, so the next tick
+tries again; and a finished sidecar restart marks it stale too, because its
+new cgroup has a new id.
 
 The requests, meanwhile, are simple arithmetic in `app_requests`, the one
 function placement, quotas and a node's own admission all call:
@@ -3163,6 +3197,14 @@ The runc half can't be compiled on a Mac, so CI's Linux jobs compile it, and
 the app, a sidecar in the same image running `sleep`, and `redis-cli -h
 127.0.0.1 ping` executed inside the sidecar. `PONG` means they share a
 namespace, and the sidecar must have no address of its own.
+
+`a_sidecar_is_held_to_its_apps_namespace`, in `tests/ebpf.rs`, runs the
+agent with the real eBPF programs loaded. It deploys `web` in `tenant-a`
+with a `proxy` sidecar, and `db` in `tenant-b` with `allow_from =
+["tenant-a/web"]`. The mock runtime runs nothing, so the test makes the
+sidecar's cgroup where runc would and connects from a process inside it: to
+an address of `db`'s, which must work, and to one of a third namespace's,
+which must get `EPERM`. Before the fix, the second connect went through.
 
 ### Testing runtime knobs
 
