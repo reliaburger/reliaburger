@@ -323,6 +323,19 @@ pub(super) async fn producer_retirement_handler(
             .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
         let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
             .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+        // A producer asks again every 500 ms while it waits for the other
+        // nodes (#1355). Once the fence has committed, the read above has
+        // proved this state current, and a repeat write would change
+        // nothing, so answer from it rather than commit a no-op (#1440).
+        if let Some(released) = council
+            .committed_producer_release(&node_id, &receipt.execution)
+            .await
+        {
+            return Ok((
+                node_id,
+                crate::council::CouncilResponse::EndpointExecutionRetired { released },
+            ));
+        }
         council
             .write(crate::council::RaftRequest::RetireEndpointExecution {
                 node_id: node_id.clone(),
