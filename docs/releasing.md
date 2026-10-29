@@ -558,15 +558,18 @@ to `main`, so the build reuses that run instead of running the suite again
 [`ci_reuse.py`](../scripts/release/ci_reuse.py), which asks the GitHub API
 for a `ci.yml` run on exactly this commit, from a push, the merge queue or the
 nightly schedule (a pull request's run tests a merge commit and may skip
-jobs). The run counts only if it succeeded and every job in it succeeded,
-`ignored-test evidence` included; the script's list of required jobs is kept
+jobs). The run counts only if it succeeded on its first attempt and every
+job in it succeeded, `ignored-test evidence` included. A run that went green
+only when someone re-ran it doesn't count: a failure that passes on a re-run
+is a flake, retries are 0, and the candidate runs its own suite instead
+([#1436](https://github.com/reliaburger/reliaburger/issues/1436)); the script's list of required jobs is kept
 equal to `ci.yml`'s own by a test, so a new CI job can't be skipped silently.
-Anything else (no such run, a failed, cancelled or skipped job, another
-commit, an API error) runs the full suite in `validate-release`, as every
+Anything else (no such run, a re-run, a failed, cancelled or skipped job,
+another commit, an API error) runs the full suite in `validate-release`, as every
 build did before 0.2.4. Reusing the run takes the candidate from about 2 hours
 to about 50 minutes, the macOS `relish` build's time; most of the hour saved
 was spent waiting for hosted macOS runners. The job summary's *Source CI*
-line names the run the candidate rests on.
+line names the run and attempt the candidate rests on.
 
 Only after those checks pass does it collect the two built guest images, sign
 all six binaries and both images' digests, and upload `candidate-<commit>-<attempt>` as an Actions artefact.
