@@ -824,7 +824,21 @@ repository, a template in `templates.toml` can serve a `use` in
 `payments/db.toml`, and the app it makes lands in the `payments` namespace
 with `payments/_defaults.toml` filled in, exactly as if you'd written it
 there. Policies judge it like any other app, and they can tell where it came
-from: `app.provenance.template == 'postgres'` is a fine `match`.
+from: `app.provenance.template == 'postgres'` is a fine `match` for a rule
+that only makes sense for databases.
+
+It's a fine `match` for adding a rule, and a terrible one for lifting one
+([#1430](https://github.com/reliaburger/reliaburger/issues/1430)).
+Templates aren't an admin thing: any manifest can declare `[template.approved]`
+and use it, and `provenance` is an ordinary field, so a hand-written app can
+set it too. We looked at refusing a hand-written `provenance`, but it wouldn't
+close the hole, because the self-declared template still would, and the
+cluster can't tell one apart from `relish`'s own expansion anyway: `relish
+apply` expands on your laptop and sends the apps with their provenance. So
+the manual says what it is, a label. A policy that wants "only blessed
+templates" needs the blessing to live somewhere a deployer can't write, and
+today that's the policy itself: match the fields the template sets, not the
+name it claims.
 
 **Provenance is two strings.** The template's name and the `use`'s name, and
 nothing else. No template version, no parameter values, no copy of the
@@ -3194,7 +3208,9 @@ Around it:
   fills a field on an expanded app and keeps its provenance; and a default
   that tries to set `provenance` is refused at commit. A job policy matching
   `job.provenance.template` refuses a templated migration job pinned to
-  `:latest`. `app_fields_match_the_app_spec`
+  `:latest`. `provenance_is_a_label_anyone_can_write` (#1430) pins down the
+  limit: a policy that exempts template `approved` exempts a hand-written
+  app claiming it and an app from a template the manifest declared itself. `app_fields_match_the_app_spec`
   failed the moment `provenance` joined `AppSpec`, which is the job it was
   written for.
 - **Owners** (`bun::api::owner_tests`): a template whose body declares

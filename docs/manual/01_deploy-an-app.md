@@ -504,7 +504,11 @@ It stores the apps, each with a `provenance` naming the template and the
 
 Policies judge the expanded apps like any others, and can match on where
 they came from with `app.provenance.template` or `app.provenance.use`
-(`job.provenance` for a job). A body may declare an `owner`, and the same
+(`job.provenance` for a job). Treat it as a label, not a credential: anyone
+who can apply can declare a template of any name, or write `provenance` on
+an app by hand, so a policy should never exempt an app because of it. Use it
+to aim a rule at template-made apps (`a database needs a standby`), not to
+let them off one. A body may declare an `owner`, and the same
 owner rules apply as to an app you wrote by hand. A
 directory's `_defaults.toml` and namespace apply to the apps a `use` in it
 makes, wherever the template lives. In a tree, a template in one file serves

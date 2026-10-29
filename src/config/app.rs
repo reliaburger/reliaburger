@@ -122,8 +122,12 @@ pub struct AppSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_stop_timeout: Option<crate::grill::stop::StopDuration>,
     /// `[app.x.runtime]`: added capabilities, namespaced sysctls and host
-    /// devices (#1122). Each use needs the node's `[runtime]` allowlist and
-    /// the token's `host-exec` permission.
+    /// devices (#1122). Each use needs the node's `[runtime]` allowlist,
+    /// which is empty by default, and, from a token with a `[permission]`
+    /// block, a `host-exec` grant. Permissions are opt-in, so a token with
+    /// no block passes the token gate on its role and scope alone, as it
+    /// does for `exec`, `script` and host-path sources
+    /// (`sesame::auth::authorize_permission`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<crate::grill::knobs::RuntimeKnobs>,
     /// Ingress firewall rules.
@@ -143,7 +147,8 @@ pub struct AppSpec {
     pub namespace: Option<String>,
     /// The template and `[use.*]` that made this app, when one did
     /// (#1124). The compiler writes it; it changes nothing about how the
-    /// app runs.
+    /// app runs. It isn't a trust signal (#1430): a manifest can declare a
+    /// template of any name, or set this field by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<super::template::Provenance>,
     /// The API token that manages this app, when a controller does (#1125).

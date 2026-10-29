@@ -1207,6 +1207,39 @@ message = "a database needs a standby"
     assert!(evaluation.verdict.denials.is_empty());
 }
 
+/// #1430: `provenance` is a label, not a trust signal. A policy that
+/// exempts template-made apps exempts a hand-written app that sets
+/// `provenance` itself, and one made by a template the manifest declares
+/// itself, because templates aren't something only an admin can write.
+/// The manual and chapter 18 say so; this test keeps them honest.
+#[test]
+fn provenance_is_a_label_anyone_can_write() {
+    let set = compile(
+        r#"
+[policy.pinned]
+match = "!has(app.provenance) || app.provenance.template != 'approved'"
+deny = "app.image.endsWith(':latest')"
+"#,
+    );
+    let by_hand = expanded(
+        "[app.web]\nimage = 'web:latest'\nprovenance = { template = 'approved', use = 'x' }\n",
+    );
+    let own_template = expanded(
+        "[template.approved]\nparams = { name = 'string' }\nbody = \"[app.${name}]\\nimage = 'web:latest'\\n\"\n[use.x]\ntemplate = 'approved'\nname = 'web'\n",
+    );
+    for config in [by_hand, own_template] {
+        assert_eq!(
+            config.app["web"]
+                .provenance
+                .as_ref()
+                .map(|p| p.template.as_str()),
+            Some("approved")
+        );
+        let evaluation = evaluate(&set, &config, &deployer(), Source::Apply);
+        assert!(evaluation.verdict.denials.is_empty());
+    }
+}
+
 #[test]
 fn a_policy_default_fills_an_app_a_template_expanded_to() {
     let set = compile(
