@@ -1229,7 +1229,9 @@ def resource_trend_findings(state, node, inventory, now):
     if fd is not None:
         node_state["fd_samples"] = [sample for sample in node_state["fd_samples"] if sample[0] >= now - (FD_RISES + 3) * FD_BUCKET] + [[now, fd]]
     trend = state.setdefault("trends", {}).setdefault(node, {})
-    for key, value in (("fd", fd), ("rss_kb", rss)):
+    # Anonymous against file-backed RSS tells heap growth from mapped files (#1417).
+    anon, mapped = inventory_number(inventory, "bun_rss_anon_kb"), inventory_number(inventory, "bun_rss_file_kb")
+    for key, value in (("fd", fd), ("rss_kb", rss), ("rss_anon_kb", anon), ("rss_file_kb", mapped)):
         if value is None:
             continue
         entry = trend.setdefault(key, {"first": value, "max": value})

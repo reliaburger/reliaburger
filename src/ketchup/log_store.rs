@@ -291,6 +291,40 @@ impl IngestCheckpoint {
         checkpoint
     }
 
+    /// Drop, and return, the captures whose files are gone or replaced: a
+    /// retired job instance deletes its capture files, and a restarted
+    /// forwarder can't resume a file that isn't there. [`load`](Self::load)
+    /// does the same at startup; doing it on each flush keeps a node that
+    /// runs many printing jobs from holding every capture it ever read
+    /// (#1417). Runs on the blocking pool: one `stat` per capture.
+    fn forget_gone(&mut self) -> Vec<(PathBuf, FileIdentity)> {
+        let gone: Vec<(PathBuf, FileIdentity)> = self
+            .files
+            .iter()
+            .filter(|(file, identity)| {
+                std::fs::metadata(file)
+                    .map_or(true, |metadata| FileIdentity::of(&metadata) != **identity)
+            })
+            .map(|(file, identity)| (file.clone(), *identity))
+            .collect();
+        for (file, _) in &gone {
+            self.files.remove(file);
+            self.offsets.remove(file);
+        }
+        gone
+    }
+
+    /// Forget captures [`forget_gone`](Self::forget_gone) found gone, unless
+    /// the path has since been ingested again as a different file.
+    fn forget(&mut self, gone: Vec<(PathBuf, FileIdentity)>) {
+        for (file, identity) in gone {
+            if self.files.get(&file) == Some(&identity) {
+                self.files.remove(&file);
+                self.offsets.remove(&file);
+            }
+        }
+    }
+
     /// The capture files this checkpoint has ingested far enough into to
     /// reclaim some of: past the window a tail keeps (#1418). Small captures,
     /// such as most jobs', never qualify, so a flush touches only the few
@@ -396,6 +430,11 @@ pub struct LogPendingFlush {
     // inside the blocking task, including when its async caller is canceled.
     writing: Arc<tokio::sync::Mutex<()>>,
     completed: Arc<AtomicBool>,
+    /// Captures the flush found gone, for the store to forget once the
+    /// flush is complete. A std mutex: the blocking writer fills it and
+    /// `clear_completed_flush`, which is synchronous, empties it; neither
+    /// holds it across an `.await`.
+    gone: Arc<std::sync::Mutex<Vec<(PathBuf, FileIdentity)>>>,
     #[cfg(test)]
     test_gate: Arc<std::sync::Mutex<Option<Arc<LogFlushGate>>>>,
     #[cfg(test)]
@@ -486,8 +525,9 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
         data_dir,
         path,
         batch,
-        checkpoint,
+        mut checkpoint,
         completed,
+        gone,
         ..
     } = pending;
     tokio::task::spawn_blocking(move || -> Result<(), KetchupError> {
@@ -508,6 +548,7 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
             #[cfg(test)]
             test_parent_confirmation_fault.as_deref(),
         )?;
+        let forgotten = checkpoint.forget_gone();
         let tmp = path.with_extension("parquet.tmp");
         let file = std::fs::File::create(&tmp)?;
         let checkpoint_json = serde_json::to_string(&checkpoint)
@@ -548,6 +589,9 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
         }
         let reclaimable = checkpoint.reclaimable();
         checkpoint.save(&data_dir)?;
+        *gone
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = forgotten;
         completed.store(true, Ordering::Release);
         reclaim_captures(&reclaimable);
         Ok(())
@@ -769,12 +813,17 @@ impl LogStore {
     }
 
     fn clear_completed_flush(&mut self) {
-        if self
+        if let Some(pending) = self
             .pending
-            .as_ref()
-            .is_some_and(|pending| pending.completed.load(Ordering::Acquire))
+            .take_if(|pending| pending.completed.load(Ordering::Acquire))
         {
-            self.pending = None;
+            let gone = std::mem::take(
+                &mut *pending
+                    .gone
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            self.ingested.forget(gone);
         }
     }
 
@@ -833,6 +882,7 @@ impl LogStore {
             checkpoint: self.ingested.clone(),
             writing: Arc::new(tokio::sync::Mutex::new(())),
             completed: Arc::new(AtomicBool::new(false)),
+            gone: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             test_gate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -1403,6 +1453,40 @@ mod tests {
             .collect();
         let expected: Vec<String> = (0..200).map(|i| format!("ACK {i}")).collect();
         assert_eq!(lines, expected);
+    }
+
+    #[tokio::test]
+    async fn the_checkpoint_forgets_captures_whose_files_are_gone() {
+        // #1417: every singleton job that printed added its capture file to
+        // the checkpoint, and only a restart dropped the files its retired
+        // instance had deleted. A node running thousands of such jobs held
+        // them all, and cloned and serialised them on every flush.
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let mut store = LogStore::new(logs.clone());
+        let kept = capture_file(&dir, "kept.stdout");
+        assert!(store.ingest(&writer_line(&kept, 1)));
+        let mut retired = Vec::new();
+        for job in 0..200 {
+            let capture = capture_file(&dir, &format!("job-{job}.stdout"));
+            assert!(store.ingest(&writer_line(&capture, 1)));
+            retired.push(capture);
+        }
+        for capture in &retired {
+            std::fs::remove_file(capture).unwrap();
+        }
+        store.flush().await.unwrap();
+        // The capture that is still there keeps moving on.
+        assert!(store.ingest(&writer_line(&kept, 2)));
+        store.flush().await.unwrap();
+
+        let offsets = store.capture_offsets();
+        assert_eq!(offsets.0.keys().collect::<Vec<_>>(), vec![&kept]);
+        assert_eq!(offsets.1.keys().collect::<Vec<_>>(), vec![&kept]);
+        let saved: IngestCheckpoint =
+            serde_json::from_slice(&std::fs::read(logs.join(CHECKPOINT_FILE)).unwrap()).unwrap();
+        assert_eq!(saved.offsets.keys().collect::<Vec<_>>(), vec![&kept]);
+        assert_eq!(saved.offsets.get(&kept), Some(&(2 * LINE_BYTES)));
     }
 
     /// A line the writer app printed, as the forwarder hands it over: `ACK n`

@@ -991,7 +991,17 @@ the real `curl … | sh` install against it on every host we advertise.
    unless both checkers were armed for at least 60 minutes on every node,
    with one unbroken window of at least 30 (maintainer decision, 20 October
    2026, [#1062](https://github.com/reliaburger/reliaburger/issues/1062)).
-   Fast and custom runs record their exposure without gating on it. A product fix
+   Fast and custom runs record their exposure without gating on it. Each
+   heavy check also reports Bun's anonymous and file-backed RSS
+   (`rss_anon_kb`, `rss_file_kb` in the record's resource trends), so heap
+   growth isn't mistaken for mapped files
+   ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)). The
+   nodes export logs and metrics to `soak-export` on their own disks; once a
+   metrics export's source has been gone for 30 minutes, and the checker has
+   seen it at the destination, the harness deletes it
+   (`soak_export_retention.py`). Without that the export grew by about
+   600 MiB a node in a day run
+   ([#1418](https://github.com/reliaburger/reliaburger/issues/1418)). A product fix
    found during the final run means a new candidate, a fresh fast run and
    then a fresh final run. `--resume --evidence DIR` continues an interrupted
    run with its original tier. The [0.1.0 release closure

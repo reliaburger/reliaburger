@@ -93,6 +93,7 @@ checker=$repository/scripts/release/sustained_check.py
 slo_tool=$repository/scripts/release/soak_slo.py
 job_controller=$repository/scripts/release/job_soak.py
 job_inventory=$repository/scripts/release/job_soak_inventory.py
+export_retention=$repository/scripts/release/soak_export_retention.py
 guest_memory=$repository/scripts/release/sustained/guest-memory.sh
 history_client=$repository/scripts/release/council_history.py
 linearizability=$repository/scripts/release/linearizability.py
@@ -668,7 +669,7 @@ configure_nodes() {
     done
     probe_leaf_lifetime
     meta deviations+ 'node.toml `[testing] allowed_operations` adds `provision_isolated_workloads` (quickstart allows only inject_workload_faults and alter_node_state), so the catalogue pulse can lease test namespaces'
-    meta deviations+ 'node.toml `[logs]`/`[metrics]` export to file:///var/lib/reliaburger/soak-export every 60 s with max_storage_mb = 8, `[storage.snapshots]` every 900 s (compressed: 120 s), retain 4, uploaded to the same directory'
+    meta deviations+ 'node.toml `[logs]`/`[metrics]` export to file:///var/lib/reliaburger/soak-export every 60 s with max_storage_mb = 8 (the harness deletes a metrics export 30 minutes after its source has gone), `[storage.snapshots]` every 900 s (compressed: 120 s), retain 4, uploaded to the same directory'
     meta deviations+ 'node.toml `[ingress] tls_cert/tls_key` point at an operator pair from a soak CA, 45-minute leaves rotated by the harness'
     meta deviations+ 'Bun runs with auto/mixed; host jobs opt in to a single pinned BusyBox copy under /var/lib/reliaburger/soak-jobs, mount_isolation=false. The independent verifier listens on each private VM address, TCP 8189, with a separate run token'
     meta deviations+ 'node.toml `[node.labels] soak-volume` = "writer" on node 2 and "redis" on node 3, to pin the volume apps'
@@ -1030,6 +1031,9 @@ echo "bun_pid $pid"
 if [ "${pid:-0}" -gt 0 ]; then
     echo "bun_fd $(ls /proc/"$pid"/fd | wc -l)"
     echo "bun_rss_kb $(awk '/^VmRSS/ {print $2}' /proc/"$pid"/status)"
+    # Heap and other private memory against mapped files (#1417).
+    echo "bun_rss_anon_kb $(awk '/^RssAnon/ {print $2}' /proc/"$pid"/status)"
+    echo "bun_rss_file_kb $(awk '/^RssFile/ {print $2}' /proc/"$pid"/status)"
     # utime + stime: fields 14 and 15, counted after comm's closing parenthesis.
     echo "bun_cpu_ticks $(sed 's/.*) //' /proc/"$pid"/stat | awk '{print $12 + $13}')"
     echo "clk_tck $(getconf CLK_TCK)"
@@ -1087,6 +1091,13 @@ for kind in logs metrics; do
         fi
     done
 done
+GUEST
+    # Once listed, metrics exports whose source left 30 minutes ago go
+    # (#1418): the destination used to keep about 600 MiB a node a day.
+    printf "python3 - /var/lib/reliaburger/metrics /var/lib/reliaburger/soak-export/metrics <<'RETENTION' || true\n"
+    cat "$export_retention"
+    printf 'RETENTION\n'
+    cat <<'GUEST'
 find /var/lib/reliaburger/soak-export/snapshots -name '*.tar.gz' -type f 2>/dev/null | while read -r file; do
     if gzip -t "$file" 2>/dev/null; then state=ok; else state=bad; fi
     echo "snap ${file#/var/lib/reliaburger/soak-export/snapshots/} $state"
