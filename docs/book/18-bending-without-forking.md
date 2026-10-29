@@ -2275,8 +2275,8 @@ Six lines, and the borrow question goes away: the `String` is dropped once
 #### What about CAP_SYS_ADMIN?
 
 We had to decide what to do with the capabilities that amount to root
-inside the container: `CAP_SYS_ADMIN`, `CAP_SYS_MODULE`, `CAP_SYS_PTRACE` and
-friends. Refusing them outright was tempting. But a FUSE filesystem needs
+inside the container: `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE` and
+`CAP_SYS_BOOT`. Refusing them outright was tempting. But a FUSE filesystem needs
 `CAP_SYS_ADMIN`, and "use a different orchestrator" is exactly the Swarm
 answer this issue exists to avoid. So we allow them, on three conditions.
 There's no wildcard anywhere: `ALL` is a parse error on both sides, so no
@@ -2399,6 +2399,128 @@ process holding `CAP_MKNOD` in the *initial* user namespace make a device
 node at all. No container has that, so `m` granted nothing, and it was the
 default. Permissions are now `r`, `w` or `rw` (the default), `m` is a parse
 error, and the same runc test checks `mknod` fails inside the container.
+
+#### Every other capability gets the same question
+
+Fixing the network capabilities left an awkward thought. If the kernel
+checks `CAP_NET_ADMIN` against whoever owns the network namespace, what does
+it check `CAP_SYS_TIME` against? The clock isn't in any namespace the
+container owns. Neither is the module loader, the kernel log or the
+realtime scheduler. The manual now said "anything checked against the host
+itself fails", and the parser still accepted every one of them, so an app
+could pass both gates and fail at run time: #1427 all over again. That was
+#1474.
+
+The kernel has two ways to check a capability. `ns_capable(ns, cap)` asks
+whether the caller holds `cap` in user namespace `ns`, or in one of its
+ancestors. Most checks pass the namespace that owns the object: the
+process's for `kill` and `ptrace`, the mount namespace's for `mount`, the
+IPC namespace's for shared memory. Those work in a container, because the
+container's user namespace owns all of them. The other way is plain
+`capable(cap)`, which is `ns_capable(&init_user_ns, cap)`: the host's own
+namespace, which no container is in. Reading kernel source told us which
+capability went where, mostly. It didn't tell us which ones have *both*
+kinds of check, or whether a distribution patched one. So we asked the
+kernel instead.
+
+The trick is the one #1427's test used. A process that joins a user
+namespace from outside, as `nsenter --user` does, gets every capability in
+it, which is the most any knob could ever grant. So
+`tests/fixtures/capability_probe.py` (Python with `ctypes`, because it has
+to make a dozen raw system calls and the Linux test hosts all have Python)
+runs the operation each capability guards and prints one line: `allowed:`
+or `denied:`. `runc_capability_knobs_work_only_where_the_container_owns_the_check`
+starts an Alpine container and runs every probe twice:
+
+- For the capabilities we expected to be refused, once as root on the host,
+  where the operation has to work (otherwise the probe is wrong, not the
+  container), and once through `nsenter` in the container's user, pid, IPC,
+  UTS and network namespaces, where it has to fail.
+- For the ones we expected to work, once through `nsenter` and once through
+  `nsenter` with the capability cleared from the effective set first
+  (`--drop`, which calls `capset`), to show the probe really needs it.
+
+Here's part of what it printed in the Lima VM (Ubuntu, Linux 6.8):
+
+```text
+CAP_SYS_TIME: host root allowed: set the clock; container, every capability denied: EPERM
+CAP_SYS_NICE: host root allowed: lowered its nice value below zero; container, every capability denied: EACCES
+CAP_IPC_LOCK: host root allowed: locked 1 MiB beyond a 64 KiB RLIMIT_MEMLOCK; container, every capability denied: ENOMEM: locked memory is limited to RLIMIT_MEMLOCK
+CAP_SYS_MODULE: host root allowed: passed init_module's capability check (ENOEXEC); container, every capability denied: EPERM
+CAP_AUDIT_WRITE: host root allowed: audit answered AUDIT_GET; container, every capability denied: ECONNREFUSED
+CAP_BLOCK_SUSPEND: host root allowed: EPOLLWAKEUP kept; container, every capability denied: the kernel dropped EPOLLWAKEUP
+CAP_SYS_ADMIN: container allowed: set the hostname; container without it denied: EPERM
+CAP_SYS_PTRACE: container allowed: attached to another user's process; container without it denied: EPERM
+```
+
+All 21 probed host capabilities came out the way the issue guessed, and a
+few it didn't name joined them. Some probes stop short on purpose. Loading a
+real module or rebooting the test host would prove the point rather too
+well, so `init_module` gets an empty buffer: `ENOEXEC` means the capability
+check passed and the ELF parser said no, while `EPERM` means it never got
+that far. `CAP_BLOCK_SUSPEND` doesn't fail at all: the kernel quietly drops
+the `EPOLLWAKEUP` flag, so the probe reads it back from
+`/proc/self/fdinfo`. And the audit system refuses every user namespace but
+the host's with `ECONNREFUSED` before it looks at a capability.
+
+Two results needed thought. `CAP_SYS_NICE` isn't entirely dead in a
+container: it lets container root lower the priority of processes that
+belong to the container's other users, and change their CPU affinity. But nobody adds `SYS_NICE`
+for that. They add it for a negative nice value or realtime scheduling, and
+both are checked against the host. `CAP_DAC_READ_SEARCH` is the other
+way round: reading past file permissions works in the container, but every
+container already has `CAP_DAC_OVERRIDE`, which covers it, and the one call
+that's only `CAP_DAC_READ_SEARCH`'s, `open_by_handle_at`, is checked against
+the host. Adding either changes nothing an app would notice, so both are
+refused. `CAP_MAC_OVERRIDE` has no probe: only Smack checks it (against the
+host), and the test hosts run AppArmor. We refuse it on the source alone and
+say so in the test.
+
+The result is a second table beside `NETWORK_CAPABILITIES`, this time of
+pairs:
+
+```rust
+pub const HOST_CAPABILITIES: [(&str, &str); 22] = [
+    ("CAP_AUDIT_CONTROL", "controlling the audit system"),
+    // ...
+    ("CAP_SYS_TIME", "setting the clock"),
+    ("CAP_SYS_TTY_CONFIG", "configuring terminals"),
+    ("CAP_WAKE_ALARM", "alarms that wake the system"),
+];
+```
+
+`[(&str, &str); 22]` is a fixed-size array of 22 tuples, each a name and
+what the kernel checks it for. `from_str` looks the canonical name up with
+`.find(|(host, _)| *host == canonical)`. The closure's parameter is a
+pattern, like a `match` arm: it takes the pair apart, binds the name to
+`host` and throws the description away with `_`. The error is a struct-like
+enum variant, `KnobError::HostCapability { capability, guards }`, whose
+message reads:
+
+```text
+CAP_SYS_TIME can't be granted: the kernel checks it against the node's own user namespace, not the container's, for setting the clock, so the container would still get "operation not permitted"
+```
+
+That leaves 15 capabilities a container can be given: Docker's defaults
+plus `CAP_CHECKPOINT_RESTORE`, `CAP_IPC_OWNER`, `CAP_SYS_ADMIN`,
+`CAP_SYS_BOOT` and `CAP_SYS_PTRACE`. The same test starts its container
+with the last five as a knob, reads `CapEff` from `/proc/self/status` inside
+it to check each one arrived, and runs `hostname` there, which needs
+`CAP_SYS_ADMIN` in the container's UTS namespace. Seven of the ten escape
+hatches turned out to be host capabilities, so `ESCAPE_CAPABILITIES` is
+down to `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE` and `CAP_SYS_BOOT`. (`CAP_SYS_BOOT`
+in a container can only end the container: `reboot` in a child pid
+namespace kills its init. It still needs naming.)
+
+`CAP_MKNOD` and `CAP_AUDIT_WRITE` are refused as knobs but stay in the
+default set every container gets, as do `CAP_NET_RAW` and
+`CAP_NET_BIND_SERVICE`. They do nothing there either, but the default set
+is Docker's, and changing what every container starts with is its own
+decision.
+
+The test fixtures had used `SYS_NICE` and `IPC_LOCK` as the ordinary,
+harmless capability. They now use `IPC_OWNER` and `CHECKPOINT_RESTORE`,
+which work.
 
 The knobs are new fields in Raft desired state, OCI specs and the capability
 report, so they get a line under the 0.2.4 heading in `src/compatibility.rs`.
@@ -3276,9 +3398,9 @@ Each gate is tested alone first, then both together, because a double gate
 whose halves are never tested apart can quietly become a single gate.
 
 - **The token gate alone**: `a_runtime_knob_needs_host_exec_and_the_refusal_names_the_token_gate`
-  applies an app with `CAP_SYS_NICE` as a deployer whose permission block
+  applies an app with `CAP_IPC_OWNER` as a deployer whose permission block
   grants only `deploy`. It must get a 403 whose body names
-  `runtime.capabilities CAP_SYS_NICE` and "token gate", and the council
+  `runtime.capabilities CAP_IPC_OWNER` and "token gate", and the council
   must hold no app. The same manifest under `deploy` and `host-exec` goes
   through.
 - **The node gate alone**: `runtime_knobs_pass_only_the_node_gate_of_a_runtime_that_applies_them`
@@ -3299,7 +3421,7 @@ whose halves are never tested apart can quietly become a single gate.
   `a_host_wide_sysctl_fails_the_whole_config_at_parse` shows the error at
   `relish lint`, before any gate is asked.
 - **Escape hatches**: `an_escape_hatch_capability_needs_the_node_to_name_it`
-  shows that a node allowing `CAP_SYS_NICE` doesn't admit `CAP_SYS_ADMIN`,
+  shows that a node allowing `CAP_IPC_OWNER` doesn't admit `CAP_SYS_ADMIN`,
   and that naming it does, and appears in the startup warning's list.
   `a_capability_wildcard_is_refused_with_its_reason` covers `ALL`, `all` and
   `CAP_*`.
@@ -3323,13 +3445,16 @@ whose halves are never tested apart can quietly become a single gate.
 - **What no container can use**: `a_network_capability_is_refused_in_an_app_and_in_a_node`
   tries all four network capabilities, spelt three ways, in an app and in
   `node.toml`, and `the_mknod_device_permission_is_refused` tries `m`,
-  `rwm` and `mr`.
+  `rwm` and `mr`. `a_capability_checked_against_the_node_is_refused_in_an_app_and_in_a_node`
+  does the same for all 22 host capabilities, and pins the 15 that are
+  left, so a capability can't drift from one list to the other unnoticed.
 
 None of those run runc. The first version said the runc half was
 "exercised by `make test-linux`", and it wasn't: no Linux test ran a knob.
 `runc_a_container_cannot_use_a_network_capability_or_make_device_nodes`
 is the first, and it's the one that proved #1427 before we touched the
-code.
+code. `runc_capability_knobs_work_only_where_the_container_owns_the_check`
+is the second, and it ends by checking the parser agrees with the kernel.
 
 ### Testing templates
 

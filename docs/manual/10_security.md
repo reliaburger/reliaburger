@@ -521,29 +521,49 @@ What each kind accepts:
   container's default set; nothing is dropped. There's no wildcard: `ALL`
   is refused on both sides. The node names each capability, and the ones
   that amount to root inside the container (`CAP_SYS_ADMIN`,
-  `CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, `CAP_SYS_PTRACE`, `CAP_SYS_BOOT`,
-  `CAP_DAC_READ_SEARCH`, `CAP_MAC_ADMIN`, `CAP_MAC_OVERRIDE`, `CAP_BPF` and
-  `CAP_PERFMON`) are allowed only when listed by name. Bun warns at startup
-  for each one it finds. A container's root is still an unprivileged user on
-  the host (see `images-and-volumes`), so these act on the container's own
-  namespaces. As in Docker and Kubernetes, a capability reaches a process
-  that runs as root in the container; a non-root user needs file
-  capabilities on its binary.
+  `CAP_SYS_PTRACE` and `CAP_SYS_BOOT`) are allowed only when listed by name.
+  Bun warns at startup for each one it finds. A container's root is still
+  an unprivileged user on the host (see `images-and-volumes`), so these act
+  on the container's own namespaces. As in Docker and Kubernetes, a
+  capability reaches a process that runs as root in the container; a
+  non-root user needs file capabilities on its binary.
 
-  That's also the limit of what a capability can do here. The kernel
-  checks a capability against the user namespace that owns the thing being
-  changed, and a container runs in a user namespace of its own. Its
-  processes, files, mounts and IPC belong to that namespace, so a
-  capability works on them. Its network namespace doesn't: Bun creates it,
-  before the container exists, so the node's user namespace owns it. So
-  the network capabilities, `CAP_NET_ADMIN`, `CAP_NET_RAW`,
-  `CAP_NET_BIND_SERVICE` and `CAP_NET_BROADCAST`, are refused on both sides:
-  with one, `ip link`, a TUN device or a raw socket would still fail with
-  "operation not permitted". Ask for `net.*` sysctls instead, which the node
-  writes into the namespace for the app, and note that every port, low ones
-  included, is already bindable. Anything the kernel checks against the host
-  itself, such as setting the clock or loading a module, fails whatever the
-  container holds.
+  That's also the limit of what a capability can do here. A container runs
+  in a user namespace of its own, and the kernel checks each capability
+  against a user namespace: for most, the one that owns the thing being
+  changed; for the rest, the host's own. The container's processes, files,
+  mounts and IPC belong to its namespace, so `CAP_SYS_ADMIN` (mounts,
+  hostname), `CAP_SYS_PTRACE`, `CAP_SYS_BOOT` (which can only end the
+  container), `CAP_CHECKPOINT_RESTORE` and `CAP_IPC_OWNER` work on them,
+  as do the defaults (`CAP_CHOWN`, `CAP_SETUID` and the rest of Docker's
+  set). Nothing else does, so everything else is refused on both sides:
+
+  - The network capabilities, `CAP_NET_ADMIN`, `CAP_NET_RAW`,
+    `CAP_NET_BIND_SERVICE` and `CAP_NET_BROADCAST`. Bun creates the
+    container's network namespace before the container exists, so the
+    node's user namespace owns it, and `ip link`, a TUN device or a raw
+    socket would still fail with "operation not permitted". Ask for `net.*`
+    sysctls instead, which the node writes into the namespace for the app,
+    and note that every port, low ones included, is already bindable.
+  - The ones the kernel checks against the host whatever namespace asks:
+    `CAP_SYS_TIME` (the clock), `CAP_SYS_NICE` (negative nice values and
+    realtime scheduling), `CAP_IPC_LOCK` (locking memory beyond
+    `RLIMIT_MEMLOCK`), `CAP_SYS_RESOURCE` (raising hard limits),
+    `CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, `CAP_SYS_PACCT`, `CAP_SYS_TTY_CONFIG`,
+    `CAP_SYSLOG`, `CAP_LINUX_IMMUTABLE`, `CAP_LEASE`, `CAP_WAKE_ALARM`,
+    `CAP_BLOCK_SUSPEND`, `CAP_BPF`, `CAP_PERFMON`, `CAP_MAC_ADMIN`,
+    `CAP_MAC_OVERRIDE`, the three `CAP_AUDIT_*` and `CAP_MKNOD`.
+    `CAP_DAC_READ_SEARCH` is refused too: its one call of its own,
+    opening a file by handle, is checked against the host, and reading
+    past file permissions is `CAP_DAC_OVERRIDE`, which every container
+    already has.
+
+  The error names the capability and what the kernel checks it for:
+
+  ```text
+  CAP_SYS_TIME can't be granted: the kernel checks it against the node's own user namespace, not the container's, for setting the clock, so the container would still get "operation not permitted"
+  ```
+
 - **`sysctls`**: only the ones the kernel keeps per container: `net.*`,
   `kernel.shm*`, `kernel.msg*`, `kernel.sem` and `fs.mqueue.*`. Anything
   else, `kernel.panic` or `vm.overcommit_memory` say, would change the whole

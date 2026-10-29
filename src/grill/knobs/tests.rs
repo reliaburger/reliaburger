@@ -22,12 +22,12 @@ fn allowlist(toml_source: &str) -> RuntimeAllowlist {
 #[test]
 fn a_full_runtime_table_parses_into_canonical_values() {
     let parsed = knobs(
-        "capabilities = [\"IPC_LOCK\", \"cap_sys_nice\"]\n\
+        "capabilities = [\"CHECKPOINT_RESTORE\", \"cap_ipc_owner\"]\n\
          sysctls = { \"net.core.somaxconn\" = \"1024\", \"kernel.shmmax\" = \"68719476736\" }\n\
          devices = [{ path = \"/dev/fuse\" }, { path = \"/dev/net/tun\", permissions = \"rw\" }]\n",
     );
     let names: Vec<&str> = parsed.capabilities.iter().map(|c| c.name()).collect();
-    assert_eq!(names, ["CAP_IPC_LOCK", "CAP_SYS_NICE"]);
+    assert_eq!(names, ["CAP_CHECKPOINT_RESTORE", "CAP_IPC_OWNER"]);
     assert_eq!(parsed.sysctls.len(), 2);
     assert_eq!(parsed.devices[0].permissions.to_string(), "rw");
     assert_eq!(parsed.devices[1].permissions.to_string(), "rw");
@@ -37,11 +37,11 @@ fn a_full_runtime_table_parses_into_canonical_values() {
 #[test]
 fn knobs_round_trip_through_json_and_postcard() {
     let parsed = knobs(
-        "capabilities = [\"CAP_SYS_NICE\"]\nsysctls = { \"fs.mqueue.msg_max\" = \"64\" }\n\
+        "capabilities = [\"CAP_IPC_OWNER\"]\nsysctls = { \"fs.mqueue.msg_max\" = \"64\" }\n\
          devices = [{ path = \"/dev/fuse\", permissions = \"r\" }]\n",
     );
     let json = serde_json::to_string(&parsed).unwrap();
-    assert!(json.contains("\"CAP_SYS_NICE\""), "{json}");
+    assert!(json.contains("\"CAP_IPC_OWNER\""), "{json}");
     assert_eq!(serde_json::from_str::<RuntimeKnobs>(&json).unwrap(), parsed);
     let bytes = postcard::to_allocvec(&parsed).unwrap();
     assert_eq!(
@@ -74,6 +74,83 @@ fn a_network_capability_is_refused_in_an_app_and_in_a_node() {
         .to_string();
         assert!(node.contains("can't be granted"), "{name}: {node}");
     }
+}
+
+/// #1474: these capabilities are checked against the node's own user
+/// namespace, whatever namespace the caller is in, so a container can hold
+/// one and still be refused. `make test-linux` runs the operation each one
+/// guards inside a container's user namespace with every capability there
+/// (`runc_capability_knobs_work_only_where_the_container_owns_the_check`).
+#[test]
+fn a_capability_checked_against_the_node_is_refused_in_an_app_and_in_a_node() {
+    let refused = [
+        "AUDIT_CONTROL",
+        "AUDIT_READ",
+        "AUDIT_WRITE",
+        "BLOCK_SUSPEND",
+        "BPF",
+        "DAC_READ_SEARCH",
+        "IPC_LOCK",
+        "LEASE",
+        "LINUX_IMMUTABLE",
+        "MAC_ADMIN",
+        "MAC_OVERRIDE",
+        "MKNOD",
+        "PERFMON",
+        "SYSLOG",
+        "SYS_MODULE",
+        "SYS_NICE",
+        "SYS_PACCT",
+        "SYS_RAWIO",
+        "SYS_RESOURCE",
+        "SYS_TIME",
+        "SYS_TTY_CONFIG",
+        "WAKE_ALARM",
+    ];
+    for name in refused {
+        for spelling in [name.to_string(), format!("cap_{}", name.to_lowercase())] {
+            let error = parse_error(&format!("capabilities = [\"{spelling}\"]\n"));
+            assert!(
+                error.contains(&format!("CAP_{name} can't be granted")),
+                "{spelling}: {error}"
+            );
+            assert!(error.contains("node's own user namespace"), "{error}");
+        }
+        let node = crate::config::NodeConfig::parse(&format!(
+            "[runtime]\nallowed_capabilities = [\"{name}\"]\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(node.contains("can't be granted"), "{name}: {node}");
+    }
+    let time = parse_error("capabilities = [\"SYS_TIME\"]\n");
+    assert!(time.contains("setting the clock"), "{time}");
+
+    // What's left works on what the container's own namespaces own.
+    let accepted: Vec<&str> = KNOWN_CAPABILITIES
+        .into_iter()
+        .filter(|name| name.parse::<Capability>().is_ok())
+        .collect();
+    assert_eq!(
+        accepted,
+        [
+            "CAP_CHECKPOINT_RESTORE",
+            "CAP_CHOWN",
+            "CAP_DAC_OVERRIDE",
+            "CAP_FOWNER",
+            "CAP_FSETID",
+            "CAP_IPC_OWNER",
+            "CAP_KILL",
+            "CAP_SETFCAP",
+            "CAP_SETGID",
+            "CAP_SETPCAP",
+            "CAP_SETUID",
+            "CAP_SYS_ADMIN",
+            "CAP_SYS_BOOT",
+            "CAP_SYS_CHROOT",
+            "CAP_SYS_PTRACE",
+        ]
+    );
 }
 
 #[test]
@@ -198,7 +275,7 @@ fn an_unknown_runtime_field_is_refused() {
 #[test]
 fn the_node_allowlist_parses_from_its_runtime_section() {
     let allowed = allowlist(
-        "[runtime]\nallowed_capabilities = [\"SYS_NICE\"]\n\
+        "[runtime]\nallowed_capabilities = [\"IPC_OWNER\"]\n\
          allowed_sysctls = [\"net.ipv4.*\", \"kernel.shmmax\"]\n\
          allowed_devices = [\"/dev/fuse\"]\n",
     );
@@ -235,13 +312,15 @@ fn a_node_cannot_allow_every_capability_at_once() {
 
 #[test]
 fn the_node_gate_names_the_field_the_value_and_the_gate() {
-    let allowed = allowlist("[runtime]\nallowed_capabilities = [\"CAP_IPC_LOCK\"]\n");
+    let allowed = allowlist("[runtime]\nallowed_capabilities = [\"CAP_CHECKPOINT_RESTORE\"]\n");
     let refusal = allowed
-        .check(&knobs("capabilities = [\"IPC_LOCK\", \"SYS_NICE\"]\n"))
+        .check(&knobs(
+            "capabilities = [\"CHECKPOINT_RESTORE\", \"IPC_OWNER\"]\n",
+        ))
         .unwrap_err()
         .to_string();
     assert!(
-        refusal.contains("runtime.capabilities CAP_SYS_NICE"),
+        refusal.contains("runtime.capabilities CAP_IPC_OWNER"),
         "{refusal}"
     );
     assert!(refusal.contains("node gate"), "{refusal}");
@@ -268,12 +347,12 @@ fn the_node_gate_names_the_field_the_value_and_the_gate() {
 #[test]
 fn the_node_gate_admits_exactly_what_it_lists() {
     let allowed = allowlist(
-        "[runtime]\nallowed_capabilities = [\"CAP_SYS_NICE\"]\n\
+        "[runtime]\nallowed_capabilities = [\"CAP_IPC_OWNER\"]\n\
          allowed_sysctls = [\"net.ipv4.*\", \"kernel.shmmax\"]\n\
          allowed_devices = [\"/dev/fuse\"]\n",
     );
     assert!(allowed.admits(&knobs(
-        "capabilities = [\"SYS_NICE\"]\n\
+        "capabilities = [\"IPC_OWNER\"]\n\
          sysctls = { \"net.ipv4.tcp_syncookies\" = \"1\", \"kernel.shmmax\" = \"1\" }\n\
          devices = [{ path = \"/dev/fuse\", permissions = \"rw\" }]\n"
     )));
@@ -288,7 +367,7 @@ fn the_node_gate_admits_exactly_what_it_lists() {
 
 #[test]
 fn an_escape_hatch_capability_needs_the_node_to_name_it() {
-    let ordinary = allowlist("[runtime]\nallowed_capabilities = [\"CAP_SYS_NICE\"]\n");
+    let ordinary = allowlist("[runtime]\nallowed_capabilities = [\"CAP_IPC_OWNER\"]\n");
     let wants_admin = knobs("capabilities = [\"SYS_ADMIN\"]\n");
     assert!(!ordinary.admits(&wants_admin));
     assert!(ordinary.escape_capabilities().is_empty());
@@ -310,7 +389,7 @@ fn every_escape_hatch_is_a_known_capability() {
         assert!(name.parse::<Capability>().unwrap().is_escape_hatch());
     }
     assert!(
-        !"CAP_SYS_NICE"
+        !"CAP_IPC_OWNER"
             .parse::<Capability>()
             .unwrap()
             .is_escape_hatch()
@@ -359,9 +438,10 @@ fn fuse(path: &Path) -> Result<HostDevice, DeviceLookupError> {
 
 #[test]
 fn the_app_spec_carries_its_knobs_into_the_oci_spec() {
-    let app: crate::config::app::AppSpec =
-        toml::from_str("image = \"redis:8\"\n[runtime]\ncapabilities = [\"CAP_IPC_LOCK\"]\n")
-            .unwrap();
+    let app: crate::config::app::AppSpec = toml::from_str(
+        "image = \"redis:8\"\n[runtime]\ncapabilities = [\"CAP_CHECKPOINT_RESTORE\"]\n",
+    )
+    .unwrap();
     let spec = crate::grill::oci::generate_oci_spec(
         "redis",
         "default",
@@ -390,7 +470,7 @@ fn added_capabilities_join_the_user_namespace_defaults() {
     crate::grill::userns::apply(&mut spec).unwrap();
     apply_to_spec(
         &mut spec,
-        &knobs("capabilities = [\"SYS_NICE\", \"CHOWN\"]\n"),
+        &knobs("capabilities = [\"IPC_OWNER\", \"CHOWN\"]\n"),
         fuse,
     )
     .unwrap();
@@ -400,7 +480,7 @@ fn added_capabilities_join_the_user_namespace_defaults() {
         &capabilities.effective,
         &capabilities.permitted,
     ] {
-        assert!(set.iter().any(|c| c == "CAP_SYS_NICE"), "{set:?}");
+        assert!(set.iter().any(|c| c == "CAP_IPC_OWNER"), "{set:?}");
         assert!(set.iter().any(|c| c == "CAP_SETUID"), "{set:?}");
         assert_eq!(
             set.iter().filter(|c| *c == "CAP_CHOWN").count(),
@@ -413,10 +493,10 @@ fn added_capabilities_join_the_user_namespace_defaults() {
 #[test]
 fn capabilities_on_a_spec_with_none_become_the_whole_set() {
     let mut spec = base_spec();
-    apply_to_spec(&mut spec, &knobs("capabilities = [\"SYS_NICE\"]\n"), fuse).unwrap();
+    apply_to_spec(&mut spec, &knobs("capabilities = [\"IPC_OWNER\"]\n"), fuse).unwrap();
     assert_eq!(
         spec.process.capabilities.unwrap().effective,
-        ["CAP_SYS_NICE"]
+        ["CAP_IPC_OWNER"]
     );
 }
 
