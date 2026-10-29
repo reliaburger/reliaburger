@@ -409,6 +409,9 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertIn("HEAD_REF: ${{ github.event.pull_request.head.ref }}", changes)
         self.assertIn("FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}", changes)
         self.assertIn("macos: ${{ steps.select.outputs.macos }}", changes)
+        self.assertIn("RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}",
+                      changes)
+        self.assertIn("MACOS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}", changes)
 
     def test_evidence_binds_to_the_merge_groups_own_commit(self):
         self.assertIn("  EXPECTED_CHECKOUT_COMMIT: ${{ github.event.merge_group.head_sha || github.sha }}\n",
@@ -474,6 +477,10 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertNotIn("if:", blocks[first])
         self.assertIn('--event "$GITHUB_EVENT_NAME"', blocks[first])
         self.assertIn('--event "$GITHUB_EVENT_NAME"', blocks[aggregate])
+        # The release gate PR qualifies only with every owner, macOS included (#1443).
+        self.assertIn("RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}",
+                      blocks[aggregate])
+        self.assertIn('--release-gate "$RELEASE_GATE"', blocks[aggregate])
         # The owner check still reports when another job failed, so one red
         # job doesn't hide whether the evidence was complete.
         self.assertIn("if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}", blocks[aggregate])

@@ -315,11 +315,32 @@ jobs. What else runs depends on where the change is going:
 
 | Run | Jobs | Typical wall time |
 |---|---|---|
-| Pull request into a merge train (`release-*`, e.g. `release-0-2-1`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, portable Linux (with coverage and doctests) and the optimised contract boundaries | about 25 minutes, set by portable Linux; up to 41 on a slow runner (#1421) |
-| The same, labelled `full-ci` | Everything the change touches except the three macOS shards: the light set plus privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks | about 45 minutes |
-| Any pull request whose head is a train (the gate PR into `main`); any pull request into `main` | Everything the change touches: the light set plus three macOS shards, privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks | about 45 minutes, plus any wait for macOS runners |
-| Merge-queue group on a train (`merge_group`), push to a train or to `main`, nightly, manual | Everything | about 45 minutes, plus any wait for macOS runners |
-| Pull request stacked on any other branch | The light set plus macOS; the heavy suites only with `full-ci` | 40 minutes |
+| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, portable Linux (with coverage, doctests and the nightly-signing key test) and the optimised contract boundaries | about 25 minutes, set by portable Linux; up to 41 on a slow runner (#1421) |
+| The same, labelled `full-ci` | The light set plus privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks the change touches | about 45 minutes |
+| The gate PR (a train into `main`) | The light set on each push; with `full-ci`, the heavy suites too | as above |
+| The gate PR labelled `release-gate` | Everything, the three macOS shards included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
+| Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
+| Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 25 minutes |
+| Push to a train or to `main`, merge-queue group, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
+
+**macOS only where it adds something**
+([#1443](https://github.com/reliaburger/reliaburger/issues/1443), maintainer
+decision of 28 October 2026). The organisation's plan runs at most five macOS
+jobs at once and a full run takes three, so between 25 and 28 October macOS
+shards queued a median of 0 minutes but 24 at p90 and 47 at worst. A pull
+request gets the three macOS shards only when
+
+- it touches macOS-specific code: `src/grill/apple*`, any Rust file with a
+  `target_os = "macos"` cfg before or after the change, the installers
+  (`docs/website/install.sh`, `scripts/release/install.sh.in`) or
+  `scripts/demo/`; a gate PR's diff holds the whole train, so this rule
+  doesn't apply to it;
+- it carries the `macos` label (any code PR, Dependabot's included); or
+- it's the gate PR labelled `release-gate`.
+
+Dependabot's PRs never get macOS otherwise; the nightly covers them. Every
+push to a train or to `main`, the nightly and the candidate build still run
+all three shards, so no commit reaches a train or `main` without them.
 
 The light set exists because macOS was the critical path of almost every run:
 twelve runs before the change took 45–55 minutes of wall time, of which
@@ -327,17 +348,16 @@ runner queueing was mostly under ten, portable macOS 35–49 and acceptance
 about 34; every other job finished in about 15. A pull request into a train
 only needs to show it compiles, lints and passes the portable suite on Linux,
 with the coverage floor (`COVERAGE_MIN_LINES`, which only the Linux job
-measures). Nothing is lost, only moved: the merge queue on each `release-*`
-branch runs every job on the batch merged onto the train before any of it
-lands, and the push to the train runs everything again on the result. So
-every commit on a train, and the gate PR into `main`, has full coverage. Label
-a pull request `full-ci` when you want the heavy suites on the PR itself, for
-example for a change to privileged Linux, cluster or acceptance code. On a
-pull request into a train the label leaves out the three macOS shards, which
-each run took from a pool that queued for over an hour; the merge queue still
-runs them before the change lands. The evidence gate calls this selection
-`train-full` and accepts it only on a `pull_request` event. For macOS-only
-code, check it on a Mac with `make test` before the queue does.
+measures). Nothing is lost, only moved: the push to the train runs every job
+on the result, so every commit on a train has full coverage. The gate PR
+doesn't run it all again on each push, since that push just did; it runs
+everything once it's labelled `release-gate` at code freeze. Label a pull
+request `full-ci` when you want the heavy suites on the PR itself, for
+example for a change to privileged Linux, cluster or acceptance code. The
+evidence gate calls a heavy selection without macOS `train-full` and accepts
+it, like the light set, only on a `pull_request` event, and never on a
+`release-gate` PR. For macOS-only code the PR runs the shards itself; for
+anything else, check it on a Mac with `make test`, or add the `macos` label.
 
 The merge queue requires one check, `ignored-test evidence`. It waits for
 every other job, fails if any of them failed or was cancelled, and then runs
