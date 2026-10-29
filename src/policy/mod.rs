@@ -62,7 +62,8 @@ pub struct PolicyListing {
 /// Where a change came from, as a policy sees it in `source`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// `relish apply`, or anything else that posts to `/v1/apply`.
+    /// `relish apply`, or anything else that posts to `/v1/apply`, and every
+    /// other route that submits a job (#1424).
     Apply,
     /// A GitOps sync.
     GitOps,

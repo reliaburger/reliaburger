@@ -616,6 +616,25 @@ would be fine on apps and broken on jobs, and you'd find out from a refused
 cron job at three in the morning. Making the variable name carry the kind
 keeps the commit check honest.
 
+A job also has more than one way in. `relish apply` posts a manifest to
+`/v1/apply`, but `relish run --batch` posts to `/v1/batch/array`, `relish
+batch FILE` to `/v1/batch`, `relish batch submit` to `/v1/batch/manifest`, and a cron
+job can be registered straight through `/v1/jobs/runs`. The first cut judged
+jobs only on `/v1/apply`, so the same `:latest` job a policy refused there
+went through untouched on the other four
+([#1424](https://github.com/reliaburger/reliaburger/issues/1424)). The fix
+puts the check where every route already meets: `admit_definition` in
+`src/bun/job_api.rs`, which each of them calls to authorise and bind a job
+before it's written. It takes a `PolicyCheck`, `Judge` or `Judged`, because
+`/v1/apply` has already judged the job together with the rest of its
+manifest and shouldn't record its audit findings twice. An enum with two
+named variants reads better at the call site than a bare `true`, and the
+compiler won't let a new caller forget to choose. A job definition keeps
+its schedule and retry policy outside its template, so
+`JobDefinition::to_spec` puts them back before judging: `job.schedule` reads
+the same whichever route the job came in by. Warnings come back in the
+answer as `policy_warnings`, and `relish` prints each as a `warning:` line.
+
 The second addition is a third action. `action = "audit"` lets the apply go
 ahead without telling the caller and records the finding in the audit log.
 It's how you roll out a strict rule: commit it as `audit`, watch what it
@@ -2798,6 +2817,12 @@ Jobs and the audit action
   GitOps-owned app is judged as a GitOps sync. Its report is an `insta`
   snapshot. Another test covers the three quiet answers: every workload
   passes, there are no policies, and a policy no longer compiles.
+- **Every job route** (`a_jobs_policy_refuses_a_job_on_every_submission_route`,
+  `a_jobs_warn_policy_warns_on_every_submission_route`, #1424) posts the same
+  `:latest` job to `/v1/jobs/runs` (with a cron), `/v1/batch`,
+  `/v1/batch/array` and `/v1/batch/manifest`. A deny policy refuses it with
+  422 and a `policy.denied` record on each, and writes no definition; a warn
+  policy lets it through with the finding in `policy_warnings`.
 - **Through the router**: a jobs policy refuses a job manifest with 422 and a
   `policy.denied` record, and writes no job definition; an audit policy lets
   an apply through, says nothing to the caller, and leaves one
