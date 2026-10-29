@@ -3015,6 +3015,17 @@ mod tests {
         .unwrap();
         assert_eq!(fence.version.index, revision);
         shutdown.cancel();
+        // The leader loop holds the service through its `ApiState`, and
+        // stops when the agent's command channel closes. Wait for that, so
+        // the loop doesn't outlive the test (#1442).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&service) > 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the leader loop still runs after shutdown"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     #[test]
