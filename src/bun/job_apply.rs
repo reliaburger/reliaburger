@@ -59,6 +59,7 @@ pub(crate) async fn apply(
     } else {
         None
     };
+    let mut owner_notes = Vec::new();
     if let Some(council) = &state.council {
         let namespaces: Vec<_> = council
             .desired_state()
@@ -70,6 +71,21 @@ pub(crate) async fn apply(
         if let Err(error) = config.validate_against(&namespaces) {
             return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
         }
+        // The resource owner rules hold here as on any apply (#1125, #1429):
+        // an app a controller owns is skipped unless the manifest declares
+        // its owner, and only that owner's token (or an admin) may.
+        // Decided before policy, so a skipped app is neither judged nor
+        // written.
+        owner_notes = match super::api::apply::skip_owned_apps(
+            council,
+            &mut config,
+            &super::api::apply::owner_caller(auth),
+        )
+        .await
+        {
+            Ok(notes) => notes,
+            Err(error) => return super::api::apply::owner_refusal(&error),
+        };
         // The apps and jobs in a job manifest are judged by the policies in
         // force, as `relish apply` judges any app (#1117, #1119). The state
         // machine commits them later, once their jobs have run, so their
@@ -79,14 +95,15 @@ pub(crate) async fn apply(
             let (policies, generation) = council
                 .read_desired(|desired| (desired.policies.clone(), desired.policy_generation))
                 .await;
-            match crate::policy::admit(
-                &policies,
+            match crate::policy::admit_blocking(
+                policies,
                 generation,
-                &config,
-                &super::api::apply::policy_caller(auth),
+                config.clone(),
+                super::api::apply::policy_caller(auth),
                 crate::policy::Source::Apply,
-                Vec::new(),
-            ) {
+            )
+            .await
+            {
                 // The apps commit with their policy defaults filled in
                 // (#1118). Job manifests never come from GitOps, so there's
                 // no declared spec to keep beside them.
@@ -188,6 +205,9 @@ pub(crate) async fn apply(
         operation_id: operation_id.clone(),
     });
     tokio::spawn(async move {
+        for message in owner_notes {
+            let _ = tx.send(ApplyEvent::Progress { message }).await;
+        }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(900);
         loop {
             let arrays = read_task_arrays(&state).await;

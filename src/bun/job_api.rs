@@ -172,17 +172,31 @@ async fn judge_definition(
     let refuse = |error: crate::policy::AdmitError| async move {
         super::api::apply::policy_refusal(state, auth, &error).await
     };
-    let set = match crate::policy::PolicySet::compile(&policies) {
-        Ok(set) => set,
+    // Judging is CPU work the caller's input partly sizes, so it runs off
+    // the async threads (#1431).
+    let job_id = crate::meat::AppId::new(name, namespace);
+    let spec = definition.to_spec();
+    let caller = super::api::apply::policy_caller(auth);
+    let judged = tokio::task::spawn_blocking(move || {
+        let set = crate::policy::PolicySet::compile(&policies)?;
+        Ok(crate::policy::judge_job(
+            &set,
+            &job_id,
+            &spec,
+            &caller,
+            crate::policy::Source::Apply,
+        ))
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(crate::policy::AdmitError::Interrupted {
+            reason: error.to_string(),
+        })
+    });
+    let verdict = match judged {
+        Ok(verdict) => verdict,
         Err(error) => return Err(refuse(error).await),
     };
-    let verdict = crate::policy::judge_job(
-        &set,
-        &crate::meat::AppId::new(name, namespace),
-        &definition.to_spec(),
-        &super::api::apply::policy_caller(auth),
-        crate::policy::Source::Apply,
-    );
     if !verdict.is_allowed() {
         let denied = crate::policy::Denied {
             denials: verdict.denials,

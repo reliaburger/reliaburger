@@ -839,25 +839,20 @@ pub async fn apply_changes(
     report
 }
 
+/// A compiled policy set, or why it doesn't compile, shared with the
+/// blocking thread that judges an app.
+type CompiledPolicies = std::sync::Arc<Result<crate::policy::PolicySet, crate::policy::AdmitError>>;
+
 /// The policies last read from desired state, compiled, with the
 /// generation they were read at, so a sync compiles each set once.
 #[derive(Default)]
 struct PolicyCache {
-    compiled: Option<(
-        u64,
-        Result<crate::policy::PolicySet, crate::policy::AdmitError>,
-    )>,
+    compiled: Option<(u64, CompiledPolicies)>,
 }
 
 impl PolicyCache {
     /// The policies in force and their generation, read together.
-    async fn current(
-        &mut self,
-        council: &CouncilNode,
-    ) -> (
-        u64,
-        &Result<crate::policy::PolicySet, crate::policy::AdmitError>,
-    ) {
+    async fn current(&mut self, council: &CouncilNode) -> (u64, CompiledPolicies) {
         let generation = council
             .read_desired(|desired| desired.policy_generation)
             .await;
@@ -867,11 +862,19 @@ impl PolicyCache {
                 let (at, specs) = council
                     .read_desired(|desired| (desired.policy_generation, desired.policies.clone()))
                     .await;
-                (at, crate::policy::PolicySet::compile(&specs))
+                let compiled =
+                    tokio::task::spawn_blocking(move || crate::policy::PolicySet::compile(&specs))
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(crate::policy::AdmitError::Interrupted {
+                                reason: error.to_string(),
+                            })
+                        });
+                (at, std::sync::Arc::new(compiled))
             }
         };
         let (at, set) = self.compiled.insert(fresh);
-        (*at, set)
+        (*at, std::sync::Arc::clone(set))
     }
 }
 
@@ -912,17 +915,32 @@ async fn write_judged_app(
     let caller = crate::policy::Caller::gitops();
     for _ in 0..POLICY_ATTEMPTS {
         let (generation, set) = policies.current(council).await;
-        let set = match set {
-            Ok(set) => set,
-            Err(error) => return Judged::Refused(error.to_string()),
+        if let Err(error) = set.as_ref() {
+            return Judged::Refused(error.to_string());
+        }
+        // Judging is CPU work git's content partly sizes, so it runs off
+        // the async threads (#1431).
+        let (app_id, declared, judging_caller) =
+            (app.app_id.clone(), app.declared.clone(), caller.clone());
+        let judged = tokio::task::spawn_blocking(move || {
+            set.as_ref().as_ref().ok().map(|set| {
+                crate::policy::judge_app(
+                    set,
+                    &app_id,
+                    &declared,
+                    &judging_caller,
+                    crate::policy::Source::GitOps,
+                )
+            })
+        })
+        .await;
+        let judgement = match judged {
+            Ok(Some(judgement)) => judgement,
+            Ok(None) => return Judged::Refused("the policies didn't compile".to_string()),
+            Err(error) => {
+                return Judged::Refused(format!("the policies couldn't be evaluated: {error}"));
+            }
         };
-        let judgement = crate::policy::judge_app(
-            set,
-            app.app_id,
-            app.declared,
-            &caller,
-            crate::policy::Source::GitOps,
-        );
         if !judgement.verdict.is_allowed() {
             let denials: Vec<String> = judgement
                 .verdict

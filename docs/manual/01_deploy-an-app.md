@@ -163,7 +163,8 @@ container, it runs its own `image` (pulled, trust-checked and pinned), or the
 app's, and it gets the app's environment and volume and config-file mounts.
 Its own `env` goes on top: plain values and `PROVIDER[...]` references,
 which are resolved when it starts. An encrypted value belongs in the app's
-`env`, which every sidecar inherits.
+`env`, which every sidecar inherits. That includes its secrets: see
+[Secrets](10_security.md#secrets).
 
 The order is fixed:
 
@@ -201,6 +202,10 @@ A node on Apple Container (each container is its own VM), rootless runc or
 node's own network, and on an app with an `egress` allowlist: the allowlist
 binds the app's cgroup, not its sidecars', so a sidecar could reach what the
 app can't.
+
+Namespace isolation does cover sidecars: a sidecar belongs to its app's
+namespace, and its app's `allow_from` grants are its grants too. A sidecar
+reaches what its app may reach in other namespaces, and nothing else.
 
 A Bun restart adopts running apps but not their sidecars, which have no
 adoption records. Bun starts them again on its next tick, a second or so
@@ -504,7 +509,11 @@ It stores the apps, each with a `provenance` naming the template and the
 
 Policies judge the expanded apps like any others, and can match on where
 they came from with `app.provenance.template` or `app.provenance.use`
-(`job.provenance` for a job). A body may declare an `owner`, and the same
+(`job.provenance` for a job). Treat it as a label, not a credential: anyone
+who can apply can declare a template of any name, or write `provenance` on
+an app by hand, so a policy should never exempt an app because of it. Use it
+to aim a rule at template-made apps (`a database needs a standby`), not to
+let them off one. A body may declare an `owner`, and the same
 owner rules apply as to an app you wrote by hand. A
 directory's `_defaults.toml` and namespace apply to the apps a `use` in it
 makes, wherever the template lives. In a tree, a template in one file serves

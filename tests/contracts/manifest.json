@@ -4492,6 +4492,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-ebpf-a_sidecar_is_held_to_its_apps_namespace",
+          "binary": "reliaburger::ebpf",
+          "test": "a_sidecar_is_held_to_its_apps_namespace",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-ebpf-egress_allowlist_still_resolves_dns",
           "binary": "reliaburger::ebpf",
           "test": "egress_allowlist_still_resolves_dns",

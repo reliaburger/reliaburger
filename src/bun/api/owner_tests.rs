@@ -359,3 +359,82 @@ controller = "pg-failover"
     assert_eq!(declared.owner.as_deref(), Some("pg-failover"));
     assert!(!declared.env.contains_key("TEAM"));
 }
+
+impl Cluster {
+    /// Post `body` and answer with the status alone, without waiting for a
+    /// streamed answer to finish: a job manifest's stream lasts until its
+    /// jobs have run, and nothing runs them here.
+    async fn start(&self, uri: &str, bearer: &str, body: &str) -> StatusCode {
+        let request = axum::http::Request::post(uri)
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        self.app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    /// The config of every job deployment the cluster accepted.
+    async fn deployed_configs(&self) -> Vec<crate::config::Config> {
+        self.council
+            .desired_state()
+            .await
+            .task_arrays
+            .deployments()
+            .map(|(_, record)| (*record.config).clone())
+            .collect()
+    }
+}
+
+const JOB: &str = "[job.migrate]\nimage = 'migrate:v1'\nnamespace = 'pg'\ncommand = ['true']\n";
+
+/// #1429: a job manifest follows the owner rules too. Declaring an owner
+/// the caller can't speak for is forbidden, and a rival's claim conflicts,
+/// before anything is written.
+#[tokio::test]
+async fn a_job_manifest_cant_take_an_owned_app() {
+    let cluster = Cluster::claimed("owner-job-manifest").await;
+    let (status, body) = cluster
+        .call(
+            "/v1/apply",
+            &cluster.human,
+            &format!("{JOB}{}", CLAIMED_DB.replace("postgres:17", "evil:1")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = cluster
+        .call(
+            "/v1/apply",
+            &cluster.rival,
+            &format!(
+                "{JOB}{}",
+                CLAIMED_DB
+                    .replace("pg-failover", "other-controller")
+                    .replace("postgres:17", "evil:1")
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(cluster.deployed_configs().await.is_empty());
+    assert_eq!(
+        cluster.db().await.unwrap().image.as_deref(),
+        Some("postgres:17")
+    );
+}
+
+/// #1429: a job manifest that doesn't declare the owner leaves the owned
+/// app out of what it deploys, as `relish apply` does, and keeps its jobs.
+#[tokio::test]
+async fn a_job_manifest_skips_an_owned_app() {
+    let cluster = Cluster::claimed("owner-job-skip").await;
+    let status = cluster
+        .start(
+            "/v1/apply",
+            &cluster.human,
+            &format!("{JOB}{}", DB.replace("postgres:17", "postgres:18")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let configs = cluster.deployed_configs().await;
+    assert_eq!(configs.len(), 1);
+    assert!(configs[0].app.is_empty(), "{:?}", configs[0].app);
+    assert!(configs[0].job.contains_key("migrate"));
+}

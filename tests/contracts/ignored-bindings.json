@@ -565,6 +565,12 @@
   },
   {
     "source": "tests/ebpf.rs",
+    "function": "a_sidecar_is_held_to_its_apps_namespace",
+    "binary": "reliaburger::ebpf",
+    "test": "a_sidecar_is_held_to_its_apps_namespace"
+  },
+  {
+    "source": "tests/ebpf.rs",
     "function": "egress_allowlist_still_resolves_dns",
     "binary": "reliaburger::ebpf",
     "test": "egress_allowlist_still_resolves_dns"

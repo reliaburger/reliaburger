@@ -527,3 +527,93 @@ async fn a_jobs_warn_policy_warns_on_every_submission_route() {
         );
     }
 }
+
+/// #1432: a token scoped to some namespaces reads the audit of its own
+/// workloads only. It never learns another namespace's apps, or why the
+/// policies would refuse them; an unscoped token still sees everything.
+#[tokio::test]
+async fn the_audit_shows_a_scoped_token_only_its_own_namespaces() {
+    let council = seeded_council("policy-audit-scope").await;
+    let (admin_token, admin) = named_user_token("operator", ApiRole::Admin);
+    let scoped = crate::sesame::token::create_token(
+        "controller",
+        ApiRole::Deployer,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team-a".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (app, _shutdown) = setup_with_auth_leases_events_and_council(
+        vec![admin_token, scoped.token],
+        None,
+        crate::bun::readiness::ReadinessTracker::new(),
+        crate::bun::capabilities::StaticCapabilities::default(),
+        None,
+        None,
+        Some(Arc::clone(&council)),
+    )
+    .await;
+    let cluster = Cluster {
+        app,
+        council,
+        log: AuditLog::open(
+            tempfile::tempdir().unwrap().path().join("audit"),
+            AuditLimits::from_total(1 << 20),
+        )
+        .unwrap(),
+        admin: admin.clone(),
+        deployer: scoped.plaintext.clone(),
+        _events: Arc::new(RwLock::new(EventStore::new())),
+        _directory: tempfile::tempdir().unwrap(),
+        _shutdown,
+    };
+    let (status, body) = cluster
+        .call(
+            "/v1/apply",
+            &admin,
+            "[namespace.team-a]\n[namespace.team-b]\n\
+             [app.api]\nimage = 'api:latest'\nnamespace = 'team-a'\n\
+             [app.db]\nimage = 'db:latest'\nnamespace = 'team-b'\n",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = cluster
+        .call(
+            "/v1/jobs/runs",
+            &admin,
+            r#"{"name":"report","namespace":"team-b","definition":{"template":{"image":"report:latest","command":["true"]},"cron":{"expression":"0 3 * * *"}}}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let (status, body) = cluster
+        .call(
+            "/v1/apply",
+            &admin,
+            "[policy.no-latest]\napplies_to = 'both'\ndeny = \"workload.image.endsWith(':latest')\"\nmessage = 'pin a version'\n",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = cluster.get("/v1/policies/audit", &cluster.deployer).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let audit: crate::policy::audit::PolicyAudit = serde_json::from_str(&body).unwrap();
+    assert_eq!((audit.apps, audit.jobs), (1, 0), "{body}");
+    assert_eq!(
+        audit
+            .verdict
+            .denials
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["policy no-latest denies app team-a/api: pin a version".to_string()]
+    );
+    assert!(!body.contains("team-b"), "{body}");
+
+    let (status, body) = cluster.get("/v1/policies/audit", &admin).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let audit: crate::policy::audit::PolicyAudit = serde_json::from_str(&body).unwrap();
+    assert_eq!((audit.apps, audit.jobs), (2, 1), "{body}");
+    assert_eq!(audit.verdict.denials.len(), 3, "{body}");
+}

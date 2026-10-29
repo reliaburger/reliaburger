@@ -208,11 +208,10 @@ And 0.2.2: protocol 53 and state format 70. A 0.2.1 cluster's leader refuses
 it the same way
 ([upgrading from 0.2.1](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-021)).
 0.2.3 keeps 0.2.2's pair, protocol 53 and state format 70, so it's the first
-published release a cluster can roll onto in place. That walk hasn't been
-qualified yet
-([#1444](https://github.com/reliaburger/reliaburger/issues/1444)); until it
-is, a fresh cluster is the tested way to move
-([upgrading from 0.2.2](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-022)).
+published release a cluster can roll onto in place. The walk works, but
+each node's app replicas restart, and may move, as that node upgrades
+([#1449](https://github.com/reliaburger/reliaburger/issues/1449), fixed in
+0.2.4; [upgrading from 0.2.2](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-022)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it

@@ -234,18 +234,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // is what stops same-named apps in different namespaces from sharing a
         // firewall rule or a namespace mapping (H9). Collect the pairs first so
         // the `list_instances` borrow is released before the async workload-identity lookups.
-        let pairs: Vec<((String, String), InstanceId, bool)> = self
-            .supervisor
-            .list_instances()
-            .into_iter()
-            .map(|i| {
-                (
-                    (i.namespace.clone(), i.app_name.clone()),
-                    i.id.clone(),
-                    i.is_being_created(),
-                )
-            })
-            .collect();
+        // A sidecar's cgroup is its own, beside its app's, so it is bound
+        // under its app's identity: the same namespace and the same
+        // `allow_from` grants (#1426). Only sidecars that should be running
+        // beside a started instance are asked about.
+        let mut pairs: Vec<((String, String), InstanceId, bool)> = Vec::new();
+        let mut sidecar_ids: Vec<((String, String), InstanceId)> = Vec::new();
+        for instance in self.supervisor.list_instances() {
+            let key = (instance.namespace.clone(), instance.app_name.clone());
+            if sidecars::runs_beside(instance.state) {
+                for sidecar in self.sidecars.running_beside(&instance.id) {
+                    sidecar_ids.push((key.clone(), sidecar));
+                }
+            }
+            pairs.push((key, instance.id.clone(), instance.is_being_created()));
+        }
         let mut cgroup_ids: std::collections::HashMap<(String, String), Vec<u64>> =
             std::collections::HashMap::new();
         // Until a sync completes, the tick tries again (#351, stage 3).
@@ -279,6 +282,32 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 Err(_) => {
                     eprintln!(
                         "sesame: source identity for {id} did not arrive within the turn; the next tick retries"
+                    );
+                    return;
+                }
+            }
+        }
+
+        // A sidecar whose cgroup isn't there yet (still being created, or
+        // just restarted) is bound on a later tick: until then it keeps the
+        // sync stale, so the tick tries again.
+        let mut sidecar_unbound = false;
+        for (key, id) in sidecar_ids {
+            let cgroup =
+                tokio::time::timeout_at(deadline, self.supervisor.grill().workload_cgroup(&id))
+                    .await;
+            match cgroup {
+                Ok(Ok(Some(cgroup))) => cgroup_ids.entry(key).or_default().push(cgroup),
+                Ok(Ok(None)) | Ok(Err(crate::grill::GrillError::NotFound { .. })) => {
+                    sidecar_unbound = true;
+                }
+                Ok(Err(error)) => {
+                    eprintln!("sesame: source identity for sidecar {id} is unavailable: {error}");
+                    return;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "sesame: source identity for sidecar {id} did not arrive within the turn; the next tick retries"
                     );
                     return;
                 }
@@ -364,7 +393,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Err(error) = reconciled {
             eprintln!("sesame: firewall reconciliation failed: {error}");
         } else {
-            self.namespace_firewall_stale = false;
+            self.namespace_firewall_stale = sidecar_unbound;
         }
         self.apply_isolation_rules(isolation);
     }

@@ -284,17 +284,11 @@ pub(super) async fn cluster_app_change(
     auth: Option<&crate::sesame::auth::AuthContext>,
     caller_headers: &HeaderMap,
 ) -> Response {
-    // Only the owner's token or an admin changes an owned app (#1125). The
-    // check runs here, before any forward: the leader sees a forwarded
-    // request as the service principal, not as the caller.
     let app_id = crate::meat::AppId::new(&app, &namespace);
-    if let Some(refusal) =
-        super::apply::owner_command_refusal(&council, auth, &app_id, change.verb()).await
-    {
-        return refusal;
-    }
     // Followers can't write to Raft (openraft does not forward client
-    // writes), so forward the whole request to the leader's API.
+    // writes), so forward the whole request to the leader's API, as the
+    // caller: the leader checks the owner below against its own desired
+    // state, which a follower's replica can lag (#1442).
     if !council.is_leader().await {
         let leader_url = match leader_api_url(&state, &council, caller_headers).await {
             Ok(url) => url,
@@ -306,10 +300,10 @@ pub(super) async fn cluster_app_change(
             ""
         };
         let url = format!("{leader_url}/v1/{}/{app}/{namespace}{force}", change.verb());
-        let mut request = mark_leader_forwarded(state.cluster_http.client().post(url));
-        if let Some(token) = &state.service_token {
-            request = request.bearer_auth(token);
-        }
+        let request = copy_forwarded_auth(
+            mark_leader_forwarded(state.cluster_http.client().post(url)),
+            caller_headers,
+        );
         return match request.send().await {
             Ok(response) => {
                 let status = StatusCode::from_u16(response.status().as_u16())
@@ -327,6 +321,13 @@ pub(super) async fn cluster_app_change(
         };
     }
 
+    // Only the owner's token or an admin changes an owned app (#1125),
+    // checked here on the leader, which proposes the write.
+    if let Some(refusal) =
+        super::apply::owner_command_refusal(&council, auth, &app_id, change.verb()).await
+    {
+        return refusal;
+    }
     if let AppChange::Delete { force } = change
         && let Some(refusal) =
             gitops_managed_refusal(&council, &app, &namespace, "delete", force).await

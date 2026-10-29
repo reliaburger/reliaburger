@@ -945,7 +945,14 @@ evaluates one.
 - **Commit checks.** `policy::check_policy`, run by `Config::validate`: a DNS
   label name, expressions of at most 1024 bytes, a message of at most 512,
   valid CEL, only the three variables, and only known `app` and `caller`
-  fields. The `cel` crate has no cost limit, so the size cap bounds evaluation.
+  fields, and no more than two nested macros (`all`, `exists`, `exists_one`,
+  `map`, `filter`; `MAX_COMPREHENSION_NESTING`). The `cel` crate has no cost
+  limit, so evaluation is bounded by expression size times input size squared,
+  and the input is capped too: a workload with any list or map over
+  `MAX_COLLECTION_ENTRIES` (1,024) entries fails every policy that applies to
+  it closed, naming the field (#1431). `admit` (as `admit_blocking`),
+  `judge_job` on the job routes and `judge_app` in the GitOps runner run in
+  `spawn_blocking`, never on an async worker.
 - **Failure.** An expression that errors or returns a non-boolean fails
   closed: a deny policy refuses, a warn policy warns. A committed policy that
   no longer compiles refuses every app apply until an admin replaces or
@@ -995,8 +1002,9 @@ evaluates one.
   `PolicyAction::Audit` puts a finding in `Verdict::audits`: the apply goes
   ahead, the caller isn't told, and `cluster_apply` and `job_apply` record one
   `policy.audited` event; the GitOps runner logs it to stderr. `GET
-  /v1/policies/audit` (any token) runs `policy::audit::audit` on a copy of
-  desired state in `spawn_blocking`: every committed app (declared spec where
+  /v1/policies/audit` (any token) runs `policy::audit::audit_visible` on a copy of
+  desired state in `spawn_blocking`, keeping only the workloads the token's
+  scope allows (counts included, #1432): every committed app (declared spec where
   kept, else the stored one with its image read back as its tag) through
   `judge_app`, as the owner's token (with its role) for apps a controller
   owns (#1125), as `gitops` for apps GitOps owns and as the system caller
@@ -1066,9 +1074,16 @@ functions, one per kind of change:
 
 - **Where.** `cluster_apply` calls `skip_owned_apps` on the leader before
   policy admission, so a skipped app is neither judged nor written.
-  `cluster_app_change` (stop, delete, release) and `rollback_handler` check
-  before forwarding to the leader, because a forwarded request reaches the
-  leader as the service principal. The bootstrap window and the service
+  `job_apply` does the same for the apps of a job manifest (#1429): the
+  state machine's backstop only checks that a write keeps the stored owner,
+  not that the caller speaks for it, so the API is the only place that can.
+  `cluster_app_change` (stop, delete, release) checks on the leader, against
+  the leader's desired state: a follower forwards the request with the
+  caller's credentials, not its service token, because its replica can lag a
+  claim (#1442). `rollback_handler` checks on the node that's asked, then
+  re-applies through `cluster_apply`, forwarding the caller's credentials too,
+  so the leader's `skip_owned_apps` judges the re-apply (it declares today's
+  owner) as the caller. The bootstrap window and the service
   principal count as admins.
 - **Defaults.** The checks run on the declared spec, before policy defaults
   (#1118) fill it, so `owner` is in `policy::check::UNFILLABLE_FIELDS`: a
@@ -1150,7 +1165,10 @@ with a `default`; without one, required) and a `body` string of ordinary
   node's placement fingerprint set it aside, so moving an app into or out of
   a template restarts nothing when the expansion is the same. Policies see
   it as `app.provenance` or `job.provenance`; a policy `default` can't set
-  it. A body may declare an `owner`, and the owner rules judge the expanded
+  it. It is not a trust signal (#1430): any manifest may declare a template
+  of any name, and a hand-written spec may set the field, which the apply
+  endpoint can't tell from `relish`'s local expansion. A policy may aim a
+  rule at it, never exempt on it. A body may declare an `owner`, and the owner rules judge the expanded
   app exactly as they judge a hand-written one. `relish apply
   --dry-run` shows it as `from use.NAME (template NAME)`.
 - **Not done.** No registry: templates come from files or git. No logic in

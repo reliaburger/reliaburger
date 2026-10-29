@@ -100,6 +100,10 @@ jobs:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          # The gate PR runs everything only once labelled release-gate, and
+          # a macos label asks for the macOS shards on any PR (#1443).
+          RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}
+          MACOS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}
         run: scripts/ci/select-jobs.sh
 
   ci-policy:
@@ -673,12 +677,16 @@ jobs:
           merge-multiple: false
       - name: Every selected owner and exact required case completed this run
         if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+        env:
+          # The release gate PR qualifies only with every owner (#1443).
+          RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}
         run: |
           python3 scripts/ci/workflow_adapter.py aggregate --root . \
             --manifest tests/contracts/manifest.json --directory incoming \
             --ignored-bindings tests/contracts/ignored-bindings.json \
             --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" \
-            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --event "$GITHUB_EVENT_NAME"
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --event "$GITHUB_EVENT_NAME" \
+            --release-gate "$RELEASE_GATE"
 
   macos:
     outputs:

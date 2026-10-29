@@ -499,9 +499,11 @@ existing expressions mostly carry over. The other candidates were weaker fits:
   ([CUE spec](https://cuelang.org/docs/reference/spec/)), and only has a Go
   implementation.
 
-CEL's guarantee bounds evaluation by the size of the input times the size of
-the expression. The input is one spec, and we cap the expression's size when a
-policy is committed. Kubernetes goes further, with a cost model that refuses
+CEL's "linear time" is linear in the size of the program and the data it's
+handed, but its macros iterate, and a macro inside another multiplies. So the
+real bound is the expression's size times the input's size raised to how
+deeply the macros nest. We cap all three when a policy is committed or a
+workload is judged; the next section has the numbers. Kubernetes goes further, with a cost model that refuses
 expensive expressions at write time and halts them at run time
 ([CEL in Kubernetes](https://kubernetes.io/docs/reference/using-api/cel/)).
 
@@ -565,10 +567,27 @@ Here's what the check found, in `cel` 0.15:
   map, `startsWith` and `endsWith`, the `exists` and `all` macros, `size()`,
   `type()`, and int comparisons. Every row passed on the first run.
 - **Cost.** There's no cost model and no step limit. The parser caps nesting
-  at 96 levels, and that's all. So our own cap does the bounding: an
-  expression of at most 1,024 bytes, over one app's spec. CEL has no loops of
-  its own, and a macro like `exists` iterates over a list that came from the
-  spec, so the work is bounded by expression size times input size.
+  at 96 levels, and that's all. So our own caps do the bounding. The first
+  draft of this section said an expression of at most 1,024 bytes was enough,
+  because "the work is bounded by expression size times input size". The
+  review of the train proved it wrong
+  ([#1431](https://github.com/reliaburger/reliaburger/issues/1431)): a macro
+  like `all` runs its body once per element, so
+  `app.env.all(a, app.env.all(b, …))` costs the number of env entries
+  squared, and 1,024 bytes fit 96 levels of that. Worse, the deployer
+  chooses the input. An admin's perfectly plausible quadratic rule, "no
+  argument given twice", became a CPU amplifier for anyone with a deploy token
+  and a long list. Now three caps hold. The expression is still at most
+  1,024 bytes. `check_names`, which already walked every expression to
+  check its variables, counts comprehensions on the way down and refuses
+  nesting deeper than two (`MAX_COMPREHENSION_NESTING`), which still allows
+  comparing a list with itself. And the input: `workload_value` refuses a
+  workload with any list or map of more than 1,024 entries
+  (`MAX_COLLECTION_ENTRIES`), and every policy that applies to it fails
+  closed, naming the field, the same as an expression that can't be
+  evaluated. We could have truncated the list instead, but then padding
+  `env` with a thousand dummies would push the entry a deny looks for past
+  the end. Refusing is the only answer an attacker can't use.
 - **The calls.** `Env::stdlib()` plus the strings extension, `env.compile` to
   get a `Program`, `Context::with_env` and `add_variable_from_value` to bind
   `app`, `caller` and `source`, then `program.execute`. A spec becomes a CEL
@@ -824,7 +843,21 @@ repository, a template in `templates.toml` can serve a `use` in
 `payments/db.toml`, and the app it makes lands in the `payments` namespace
 with `payments/_defaults.toml` filled in, exactly as if you'd written it
 there. Policies judge it like any other app, and they can tell where it came
-from: `app.provenance.template == 'postgres'` is a fine `match`.
+from: `app.provenance.template == 'postgres'` is a fine `match` for a rule
+that only makes sense for databases.
+
+It's a fine `match` for adding a rule, and a terrible one for lifting one
+([#1430](https://github.com/reliaburger/reliaburger/issues/1430)).
+Templates aren't an admin thing: any manifest can declare `[template.approved]`
+and use it, and `provenance` is an ordinary field, so a hand-written app can
+set it too. We looked at refusing a hand-written `provenance`, but it wouldn't
+close the hole, because the self-declared template still would, and the
+cluster can't tell one apart from `relish`'s own expansion anyway: `relish
+apply` expands on your laptop and sends the apps with their provenance. So
+the manual says what it is, a label. A policy that wants "only blessed
+templates" needs the blessing to live somewhere a deployer can't write, and
+today that's the policy itself: match the fields the template sets, not the
+name it claims.
 
 **Provenance is two strings.** The template's name and the `use`'s name, and
 nothing else. No template version, no parameter values, no copy of the
@@ -1385,11 +1418,42 @@ and jobs without building a cluster. The route runs it on a copy of
 desired state inside `tokio::task::spawn_blocking`, because judging every
 workload is CPU work that would otherwise hold up an async thread.
 
+At first only the audit did that. The apply path judged inline, on whichever
+tokio worker took the request, and so did the GitOps runner and the job
+routes ([#1431](https://github.com/reliaburger/reliaburger/issues/1431)).
+One judgement is microseconds, which is why nobody noticed, but its cost is
+partly the caller's to choose, and a worker busy judging is a worker not
+serving heartbeats and API calls. Now they all go through `spawn_blocking`.
+`policy::admit_blocking` wraps `admit`, taking every argument by value:
+`spawn_blocking` wants a `'static` closure, because the thread may outlive
+the function that started it, so nothing it holds can borrow from the
+caller's stack. In Go you'd capture what you like in a goroutine and the
+garbage collector keeps it alive; Rust makes you hand ownership over, and a
+clone of the config is the price. The GitOps runner's cached `PolicySet`
+moved into an `Arc` for the same reason: the blocking thread gets a second
+handle to the compiled set rather than a borrow of the cache.
+
 Who is the caller, when nobody is applying? The audit asks what the next
 write would get, so it judges each app as its next writer: GitOps for an app
 GitOps owns, the controller's token for an app a controller owns
 ([#1125](https://github.com/reliaburger/reliaburger/issues/1125)), with the
 role read from that token, and the cluster's own `audit` caller for the rest.
+
+And who may read it? Any token can read the policies themselves, so the
+first cut let any token read the audit too. That was a leak
+([#1432](https://github.com/reliaburger/reliaburger/issues/1432)): a policy
+is a rule, but a finding names a workload, its namespace and why it's
+broken, and a controller's token scoped to `team-a` could list every other
+team's apps that way. Everywhere else a scoped token reads only its own
+namespaces, events included (#1125). So `audit` became a thin wrapper round
+`audit_visible`, which takes a predicate, `impl Fn(&AppId) -> bool`, and
+judges only the workloads it keeps. `impl Trait` in argument position is
+Rust's way of saying "any type that implements this", much like a Go
+parameter of interface type, except that the compiler generates a copy of
+the function for each closure it's called with, so there's no indirect call.
+The handler builds the predicate from the caller's scope and moves it into
+`spawn_blocking`. The counts come from the filtered lists, so a scoped
+caller can't even tell how many other workloads there are.
 
 ### The exec secret provider
 
@@ -1907,9 +1971,43 @@ That has a consequence. Egress allowlists are keyed by cgroup in the eBPF
 programs, so a sidecar in its own cgroup isn't held to its app's allowlist.
 A proxy could reach what the app can't. Programming the sidecar's cgroup
 too means another set of egress bindings to own and retire, so for now
-validation refuses the combination with a reason that says why. Namespace
-isolation still applies, because the kernel falls back to the cgroup's
-`/reliaburger/<namespace>` ancestor.
+validation refuses the combination with a reason that says why.
+
+Namespace isolation has the same shape, and the first version got it wrong.
+The connect hook looks up the caller's cgroup in `cgroup_namespace_map`,
+and when that misses, its `/reliaburger/<namespace>` ancestor. We wrote
+here that the fallback held sidecars to their namespace. It doesn't: that
+ancestor is bound only while a delegated job of the namespace runs on the
+node. The rest of the time a sidecar's cgroup had no namespace at all, and
+a caller with no namespace is a host daemon as far as the hook can tell, so
+it went anywhere. The review of the 0.2.4 train caught it (#1426), and a
+`make test-linux` case showed a sidecar in `tenant-a` connecting to a
+`tenant-b` address nothing had granted.
+
+The fix is the one the egress note above put off, and it's cheap here,
+because namespace bindings have no owner to retire: the reconcile rebuilds
+both maps from scratch every time. So `reconcile_namespace_firewall` asks
+the runtime for each sidecar's cgroup as it does for each instance's, and
+files it under the app's `(namespace, app)` key:
+
+```rust
+for instance in self.supervisor.list_instances() {
+    let key = (instance.namespace.clone(), instance.app_name.clone());
+    if sidecars::runs_beside(instance.state) {
+        for sidecar in self.sidecars.running_beside(&instance.id) {
+            sidecar_ids.push((key.clone(), sidecar));
+        }
+    }
+    pairs.push((key, instance.id.clone(), instance.is_being_created()));
+}
+```
+
+Everything downstream works off that key, so the sidecar gets its app's
+namespace and its app's `allow_from` grants in the same pass, no more and no
+less. A sidecar whose cgroup isn't there yet, because it's still being
+created or has just been restarted, keeps the sync stale, so the next tick
+tries again; and a finished sidecar restart marks it stale too, because its
+new cgroup has a new id.
 
 The requests, meanwhile, are simple arithmetic in `app_requests`, the one
 function placement, quotas and a node's own admission all call:
@@ -2657,13 +2755,20 @@ fingerprint. Without that, a controller claiming an app would roll every
 replica of it, which is the kind of surprise that makes people distrust a
 contract.
 
-**Check before you forward.** A follower can't write to Raft, so a `relish
-delete` that lands on one is forwarded to the leader, under the node's
-service token. By then the caller's identity is gone. So `stop`, `delete`,
-`release` and `rollback` check the owner on whichever node receives them,
-before forwarding, and the leader lets the service principal through.
-`relish apply` doesn't have this problem: its forward carries the caller's
-own token.
+**Check where you write.** A follower can't write to Raft, so a `relish
+delete` that lands on one is forwarded to the leader. The first cut
+forwarded it under the node's service token, which loses the caller, so
+`stop`, `delete` and `release` checked the owner on the follower before
+forwarding, and the leader let the service principal through. The review
+found the hole in that ([#1442](https://github.com/reliaburger/reliaburger/issues/1442)):
+a follower's replica can lag. A controller claims the app, the claim commits
+on the leader, and a follower that hasn't applied it yet sees an unowned app
+and waves a human's `delete` through, with the leader none the wiser. Now
+the forward carries the caller's own credentials, as `relish apply`'s
+always did, and the owner check runs on the leader, against the state the
+write will land on. `rollback` checks where it's asked and re-applies
+through the apply path, whose forward now carries the caller too, so the
+leader's owner rules judge it again.
 
 **The JSON is pinned.** `src/bun/api/contract_tests.rs` builds one example of
 every shape a controller reads or writes, and checks its JSON against a
@@ -2960,6 +3065,11 @@ Jobs and the audit action
   an apply through, says nothing to the caller, and leaves one
   `policy.audited` record; and the audit route lists an app committed before
   a policy that would now refuse it, without changing the app.
+- **A scoped audit** (`the_audit_shows_a_scoped_token_only_its_own_namespaces`,
+  #1432): with an app in `team-a`, and an app and a cron job in `team-b`, all
+  on `:latest`, a token scoped to `team-a` reads one app, no jobs and one
+  denial, and the body never mentions `team-b`; the admin still reads all
+  three.
 - **`relish wtf`** (`warns_about_committed_workloads_the_policies_would_now_refuse`):
   denials and audit findings become warnings named by workload, warnings are
   left to the audit report, a clean audit is an OK, and no policies says
@@ -3152,6 +3262,14 @@ the app, a sidecar in the same image running `sleep`, and `redis-cli -h
 127.0.0.1 ping` executed inside the sidecar. `PONG` means they share a
 namespace, and the sidecar must have no address of its own.
 
+`a_sidecar_is_held_to_its_apps_namespace`, in `tests/ebpf.rs`, runs the
+agent with the real eBPF programs loaded. It deploys `web` in `tenant-a`
+with a `proxy` sidecar, and `db` in `tenant-b` with `allow_from =
+["tenant-a/web"]`. The mock runtime runs nothing, so the test makes the
+sidecar's cgroup where runc would and connects from a process inside it: to
+an address of `db`'s, which must work, and to one of a third namespace's,
+which must get `EPERM`. Before the fix, the second connect went through.
+
 ### Testing runtime knobs
 
 Each gate is tested alone first, then both together, because a double gate
@@ -3265,7 +3383,9 @@ Around it:
   fills a field on an expanded app and keeps its provenance; and a default
   that tries to set `provenance` is refused at commit. A job policy matching
   `job.provenance.template` refuses a templated migration job pinned to
-  `:latest`. `app_fields_match_the_app_spec`
+  `:latest`. `provenance_is_a_label_anyone_can_write` (#1430) pins down the
+  limit: a policy that exempts template `approved` exempts a hand-written
+  app claiming it and an app from a template the manifest declared itself. `app_fields_match_the_app_spec`
   failed the moment `provenance` joined `AppSpec`, which is the job it was
   written for.
 - **Owners** (`bun::api::owner_tests`): a template whose body declares
@@ -3320,6 +3440,15 @@ the owner table has a test at the level where it lives.
   release hands the app back; the controller's token can't touch another
   namespace; and the desired-apps listing names the owner within the token's
   scope.
+- **Job manifests** (`a_job_manifest_cant_take_an_owned_app`,
+  `a_job_manifest_skips_an_owned_app`, #1429). A manifest with a `[job.*]`
+  goes down a different path, `job_apply`, and the first cut forgot the
+  owner check there: a deployer who added any job to a file could replace
+  a controller's app, because the state machine's backstop only checks that
+  a write keeps the stored owner, not who's asking. Now the same
+  `skip_owned_apps` runs first. Declaring someone else's owner is a 403, a
+  rival's is a 409, and a manifest that doesn't declare the owner deploys
+  its jobs without the owned app.
 - **GitOps** (`lettuce::diff::tests::diff_leaves_controller_owned_apps_alone`):
   git declaring a newer image doesn't update an owned app, and git dropping
   one GitOps wrote before the claim doesn't prune it.

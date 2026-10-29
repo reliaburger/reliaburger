@@ -309,6 +309,9 @@ The cluster checks a policy when you apply it, and refuses one that:
 - has an empty `deny` or `match`, or one over 1024 bytes, or a `message` over
   512 bytes;
 - isn't valid CEL;
+- nests `all`, `exists`, `exists_one`, `map` or `filter` more than two deep
+  (`app.args.all(a, app.args.exists_one(b, a == b))` is as deep as it goes),
+  because each level multiplies what the policy costs to run;
 - names anything other than `app`, `caller` and `source`, such as `policy`,
   `permission` or `namespaces`;
 - reads a field `app` or `caller` doesn't have (`app.memroy`);
@@ -327,6 +330,9 @@ The cluster checks a policy when you apply it, and refuses one that:
 An expression that fails while it runs, such as `app.memory == '1Gi'` on an
 app with no memory set, or a `deny` that isn't true or false, counts as
 broken: a deny policy refuses the app and says why, and a warn policy warns.
+So does a workload with a list or map of more than 1,024 entries (`env`,
+`command`, …): it's too big for a policy to judge cheaply, so every policy
+that applies to it fails closed, naming the field.
 
 Only an unscoped Admin token can apply or delete a policy, and every policy
 write is audited. A refused apply answers with every policy it broke, writes
@@ -394,6 +400,11 @@ everything else as the cluster's own caller `audit`, role `system`, from
 the definitions the cluster keeps, which are scheduled jobs and deployment
 hooks; a one-off job's definition goes once its runs are pruned. `relish wtf` shows the same
 denials and audit findings as warnings.
+
+Any token can run it, but a token limited to some apps or namespaces sees
+only those: the counts and findings leave out everything else, so a
+controller's token can't list another team's workloads or why they'd be
+refused.
 
 `action = "audit"` is the way to roll out a strict policy: commit it as
 `audit`, watch `relish policy audit` until nothing breaks it, then change it to
@@ -668,6 +679,13 @@ rootless runc, the user running Bun) alone can read, and the container spec
 that carries it is deleted when the instance stops. The runtime's record of a
 stopped instance keeps the names of its environment variables, never their
 values.
+
+A sidecar inherits its app's whole `env`, so every sidecar sees the app's
+decrypted secrets, and each `PROVIDER[...]` reference in it is fetched again
+for each sidecar as it starts. A third-party proxy image you run as a
+sidecar can read the app's database password. Sidecars get the app's
+mounts too, so a file is no hiding place either. If a sidecar shouldn't
+hold a secret, run it as an app of its own.
 
 To rotate the key: `relish secret rotate` makes a new keypair and prints its
 public key, while the old one keeps decrypting. Re-encrypt your values with the
