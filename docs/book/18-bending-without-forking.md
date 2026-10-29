@@ -616,6 +616,25 @@ would be fine on apps and broken on jobs, and you'd find out from a refused
 cron job at three in the morning. Making the variable name carry the kind
 keeps the commit check honest.
 
+A job also has more than one way in. `relish apply` posts a manifest to
+`/v1/apply`, but `relish run --batch` posts to `/v1/batch/array`, `relish
+batch FILE` to `/v1/batch`, `relish batch submit` to `/v1/batch/manifest`, and a cron
+job can be registered straight through `/v1/jobs/runs`. The first cut judged
+jobs only on `/v1/apply`, so the same `:latest` job a policy refused there
+went through untouched on the other four
+([#1424](https://github.com/reliaburger/reliaburger/issues/1424)). The fix
+puts the check where every route already meets: `admit_definition` in
+`src/bun/job_api.rs`, which each of them calls to authorise and bind a job
+before it's written. It takes a `PolicyCheck`, `Judge` or `Judged`, because
+`/v1/apply` has already judged the job together with the rest of its
+manifest and shouldn't record its audit findings twice. An enum with two
+named variants reads better at the call site than a bare `true`, and the
+compiler won't let a new caller forget to choose. A job definition keeps
+its schedule and retry policy outside its template, so
+`JobDefinition::to_spec` puts them back before judging: `job.schedule` reads
+the same whichever route the job came in by. Warnings come back in the
+answer as `policy_warnings`, and `relish` prints each as a `warning:` line.
+
 The second addition is a third action. `action = "audit"` lets the apply go
 ahead without telling the caller and records the finding in the audit log.
 It's how you roll out a strict rule: commit it as `audit`, watch what it
@@ -1703,7 +1722,13 @@ pub struct StopPolicy {
 Every runtime already keeps that spec. The process runtime signals the
 workload's process group with `entry.spec.stop_signal()`, the process owner
 reads the spec it was launched with, runc passes the name to `runc kill`, and
-Apple Container gets `container stop --signal`. Because the spec is in the
+Apple Container gets `container kill --signal`. Why not `container stop
+--signal`, which looks made for this? Because it waits for the exit itself
+and kills the workload after its own `--time`, 5 s unless told otherwise, so
+`stop_grace = "2m"` bought two minutes on Linux and five seconds on a Mac
+(#1435). `Grill::stop` only signals, on every runtime, and Bun owns the
+grace. `container kill` refuses a workload that's already gone, so Apple's
+`stop` checks the state before it calls that a failure. Because the spec is in the
 instance record too, a Bun that restarts and adopts its instances still
 knows how to stop them. And a deploy retires an old instance with *its own*
 policy, not the new spec's. That matters when the new image has dropped the
@@ -1989,6 +2014,42 @@ pub(super) fn sidecar_backoff(restarts: u32) -> Duration {
 plain `<<` panics in a debug build and wraps in a release one, and
 `checked_shl` returns `None` instead, which turns into "a very long time"
 and then the one-minute cap.
+
+The first version never counted back down. A sidecar that crashed seven
+times over a few days waited a full minute after every crash from then on,
+as if it were in a crash loop. A kubelet forgets a container's back-off
+once it has run for ten minutes, and the registry now does the same: each
+restart alone records when it succeeded, and a crash at least
+`SIDECAR_STABLE_RUN` later starts the count from zero, so it's restarted at
+once again.
+
+Restarting it from *what* turned out to matter too (#1434). The first
+version rebuilt a crashed sidecar from the app's current spec, the one
+`deployed_specs` holds. That's right until a rollout begins: the deploy
+worker stores the new spec as it starts, while the old instances still run.
+An old instance's proxy that crashed then came back with the new proxy
+image, next to the old app. A sidecar the new spec added was created but
+never registered, so nothing would ever retire it. And one the new spec
+dropped was never relaunched and stayed due on every tick. The fix is to
+remember what each instance was launched with. `RegisterSidecars` now
+carries the `SidecarSpec`s, not just their names, and every registered
+sidecar keeps its own:
+
+```rust
+struct SidecarRun {
+    id: InstanceId,
+    spec: SidecarSpec,
+    restarts: u32,
+    restarted_at: Option<Instant>,
+    due: Option<Instant>,
+    relaunching: Option<CancellationToken>,
+}
+```
+
+A restart alone, and a whole-instance restart's Start step, build their
+launches from those and the instance's own stored OCI spec, never from the
+app's current one. An adopted instance registers the sidecars of the app
+spec in its own record, for the same reason.
 
 An app that crashes is different. On runc the network namespace belongs to
 the app's launch. The restart's Clear step tears it down with the app and
@@ -2377,6 +2438,38 @@ this name made by an earlier `use` (named in the error), or declared by the
 config itself? Uses expand in name order, because a `BTreeMap` iterates in
 key order, so the same files always give the same apps and the same first
 error.
+
+#### Substitution multiplies
+
+The injection argument above was about what a value can *say*. The review
+of the train found a problem with how much it can *weigh*
+([#1425](https://github.com/reliaburger/reliaburger/issues/1425)). A body
+of 250,000 `${v}` placeholders fits in a 2 MB request, and so does a
+megabyte-long value for `v`. Substitution writes the value once per
+placeholder: 250 gigabytes, asked for by one apply, before any namespace or
+permission check, on the leader. That's a denial of service anyone with a
+deploy token, or a commit to a GitOps repository, could send.
+
+So `substitute` now takes a `limit` and checks the running length before it
+appends each piece, text or value, rather than after the loop, by which time
+the memory is gone. A use may expand to at most 4 MiB
+(`MAX_EXPANDED_BYTES`), and all the uses in one expansion (one manifest, or
+one file of a GitOps tree) to 16 MiB together (`MAX_TOTAL_EXPANDED_BYTES`),
+because ten thousand uses that each stay under the first cap would add up to
+the same problem. `expand` keeps the remaining budget and hands each use the
+smaller of the two; a use that would pass it is refused with
+`TemplateError::TooLarge`, naming the use and the template.
+
+`substitute` used to return `Err((parameter, reason))`, a tuple, because
+the only failure was a value in the wrong place. A second failure that has
+no parameter at all made that tuple a lie, so the error is now a small
+private enum, `Unfillable`, with `Placement { parameter, reason }` and
+`TooLarge`, and `expand_one` maps each to its `TemplateError`. A tuple is
+fine for one kind of failure; as soon as there are two, an enum makes the
+compiler check every caller handles both. Each rendered value is a
+`Cow<str>`, "clone on write": a borrowed slice for a piece of the body, an
+owned `String` for a rendered value, so the length check reads the same
+for both without copying the body.
 
 #### Three callers, one function
 
@@ -2826,6 +2919,12 @@ Jobs and the audit action
   GitOps-owned app is judged as a GitOps sync. Its report is an `insta`
   snapshot. Another test covers the three quiet answers: every workload
   passes, there are no policies, and a policy no longer compiles.
+- **Every job route** (`a_jobs_policy_refuses_a_job_on_every_submission_route`,
+  `a_jobs_warn_policy_warns_on_every_submission_route`, #1424) posts the same
+  `:latest` job to `/v1/jobs/runs` (with a cron), `/v1/batch`,
+  `/v1/batch/array` and `/v1/batch/manifest`. A deny policy refuses it with
+  422 and a `policy.denied` record on each, and writes no definition; a warn
+  policy lets it through with the finding in `policy_warnings`.
 - **Through the router**: a jobs policy refuses a job manifest with 422 and a
   `policy.denied` record, and writes no job definition; an audit policy lets
   an apply through, says nothing to the caller, and leaves one
@@ -2937,6 +3036,20 @@ signals it, even though the new spec has none. The parsing tests in
 SIGTERM back in both runtimes and skipped the pre-stop: eight of them failed,
 each saying what it saw instead.
 
+Two more came out of the review of the 0.2.4 train. On Apple silicon,
+`make test-apple` runs
+`a_stop_only_signals_so_a_slow_workload_finishes_within_bun_s_grace`: a
+workload traps SIGTERM, sleeps 10 s and prints `finished-cleanly`. The stop
+must return within 3 s, the workload must print its line, and a second stop
+of the exited workload must succeed. Against `container stop` it failed
+before it got that far: the CLI held the call for its own 5 s, then gave up
+with an XPC timeout. And `the_wait_for_remote_withdrawal_gives_up_at_its_patience`
+covers the wait before a rollout stops an old instance, the one that holds
+it serving until every node has dropped its backend (#1355). A node that
+never confirms mustn't hold the stop for ever, so the test answers
+"pending" to every ask, on tokio's paused clock, and checks the wait gives
+up at its 5 s patience, not before and not after.
+
 ### Testing sidecars
 
 The ordering is the feature, so the agent tests in
@@ -2961,6 +3074,13 @@ two sidecars, `proxy` and `logs`:
   is still Running.
 - `a_sidecar_that_keeps_crashing_waits_out_its_backoff`: the first restart
   is immediate and the second isn't.
+- `a_sidecar_that_crashes_mid_rollout_comes_back_from_its_own_instances_spec`
+  swaps the stored spec for one with a newer proxy image, a new `metrics`
+  sidecar and no `logs`, the way a rollout's start does, then crashes both
+  of the old instance's sidecars. `proxy` must come back on its old image,
+  `logs` must come back at all, nothing called `metrics` may appear, and
+  nothing may stay due. Before the fix it failed on the first: the proxy
+  came back on the new image.
 - `an_app_that_crashes_restarts_with_its_sidecars_stopped_after_and_started_before_it`:
   the restart's Clear kills the app before `proxy` and `proxy` before
   `logs`, and its Start starts both sidecars before the app.
@@ -2986,7 +3106,10 @@ that only a node reporting `shared_network` is a candidate.
 CLI runs, `pickle::binding` pins a sidecar's image, and the Kubernetes
 importer turns a native sidecar and a pod's second container into sidecars
 and survives a round trip through `relish export`. The registry's backoff
-and cancellation have their own tests in `bun::agent::sidecars`.
+and cancellation have their own tests in `bun::agent::sidecars`, and
+`a_sidecar_that_ran_stably_restarts_at_once_again` crashes a sidecar seven
+times, checks a crash a minute later still waits the longest backoff, and
+one ten quiet minutes later doesn't wait at all.
 
 To check that the agent tests check something, we started the sidecars
 after the app and stopped them before it. Four tests failed: the start
@@ -3086,6 +3209,13 @@ unit tests in `src/config/template/tests.rs`, with no node in sight:
   one name, a nested template or `use`, a body with a policy in it, a
   placeholder no parameter resolves, bad names, and a body that isn't valid
   TOML. The ones whose wording matters compare the whole message.
+- **Size** (#1425): `a_use_that_expands_past_the_limit_is_refused` turns
+  about 20 KiB of input (2,048 placeholders and a 4 KiB value) into a
+  refusal instead of 8 MiB; `uses_that_together_expand_past_the_total_are_refused`
+  has five uses of about 3.5 MiB each, every one under the per-use cap, and
+  checks the fifth is refused with the budget the first four left; and
+  `a_use_under_the_limit_expands` checks the cap doesn't bite ordinary
+  templates.
 - **A property test**, `expansion_is_deterministic_and_leaves_no_placeholders`,
   generates names, counts, flags and strings full of quotes, backslashes,
   newlines and Unicode, puts them in a basic string, a multi-line string, a

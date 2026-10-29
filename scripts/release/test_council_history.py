@@ -221,13 +221,35 @@ class SoakRecord(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("- Not checked: the soak recorded a council history but never checked it", text)
 
-    def test_an_inconclusive_check_is_reported_but_does_not_fail(self):
+    def inconclusive(self, tier):
+        metadata = json.loads((self.evidence / "metadata.json").read_text())
+        (self.evidence / "metadata.json").write_text(json.dumps(dict(metadata, tier=tier)))
         (self.evidence / "council-history-check.json").write_text(json.dumps({
             "verdict": "inconclusive", "operations": 900, "checked": 600, "partitions": 2,
             "inconclusive": ["rbtest-lin-x-1"], "unanswered_writes": 4}))
-        code, text = self.render()
+        (self.evidence / "record.md").unlink(missing_ok=True)
+        return self.render()
+
+    def test_an_inconclusive_check_in_a_custom_run_is_reported_but_does_not_fail(self):
+        code, text = self.inconclusive("custom")
         self.assertEqual(code, 0, text)
         self.assertIn("- Verdict: inconclusive: the search ran out of budget in rbtest-lin-x-1", text)
+
+    def test_an_inconclusive_check_fails_a_gated_tier(self):
+        # A soak with no linearizability coverage isn't a green soak (#1437).
+        for tier in ("fast", "final"):
+            with self.subTest(tier=tier):
+                code, text = self.inconclusive(tier)
+                self.assertEqual(code, 1, text)
+                self.assertIn("- Verdict: **inconclusive**: the search ran out of budget in rbtest-lin-x-1; "
+                              "a fast or final tier needs a conclusive check", text)
+
+    def test_the_harness_records_an_inconclusive_check_as_a_failure_in_a_gated_tier(self):
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        case = script[script.index("check_council_history() {"):]
+        case = case[:case.index("\n}\n")]
+        self.assertIn("3) if [ \"$tier\" = fast ] || [ \"$tier\" = final ]; then", case)
+        self.assertIn("record_failure linearizability 'the council history check was inconclusive", case)
 
     def test_a_run_without_a_history_says_nothing_about_one(self):
         (self.evidence / "metadata.json").write_text(json.dumps({"tier": "day", "schedule": "none",

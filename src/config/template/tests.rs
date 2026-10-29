@@ -498,6 +498,73 @@ fn a_body_that_is_not_valid_toml_names_the_use_and_template() {
     );
 }
 
+/// A template whose body repeats `${v}` `uses` times inside one quoted
+/// value, and `instances` uses of it, each giving `v` a value `value_bytes`
+/// long.
+fn amplifier(uses: usize, instances: usize, value_bytes: usize) -> String {
+    let mut toml = format!(
+        "[template.t]\nparams = {{ name = 'string', v = 'string' }}\nbody = '''\n[app.${{name}}]\nimage = \"x:1\"\nenv = {{ A = \"{}\" }}\n'''\n",
+        "${v}".repeat(uses)
+    );
+    let value = "a".repeat(value_bytes);
+    for instance in 0..instances {
+        toml.push_str(&format!(
+            "[use.u{instance}]\ntemplate = 't'\nname = 'web{instance}'\nv = '{value}'\n"
+        ));
+    }
+    toml
+}
+
+/// The bytes one use of [`amplifier`]'s template expands to.
+fn expanded_size(uses: usize, value_bytes: usize) -> usize {
+    "[app.web0]\nimage = \"x:1\"\nenv = { A = \"\" }\n".len() + uses * value_bytes
+}
+
+/// #1425: one `use` can't expand past [`MAX_EXPANDED_BYTES`]. Without the
+/// cap a body of `${v}`s and a long value multiply into gigabytes; with it
+/// the expansion stops as soon as the text passes the limit.
+#[test]
+fn a_use_that_expands_past_the_limit_is_refused() {
+    // 2,048 uses of a 4 KiB value: 8 MiB, from about 20 KiB of input.
+    let error = refused(&amplifier(2048, 1, 4096));
+    assert_eq!(
+        error,
+        TemplateError::TooLarge {
+            instance: "u0".into(),
+            template: "t".into(),
+            limit: MAX_EXPANDED_BYTES,
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "use.u0: template \"t\" expands to more than 4096 KiB; template expansion is limited to 4096 KiB per use and 16384 KiB per file"
+    );
+}
+
+/// #1425: the uses in one config share [`MAX_TOTAL_EXPANDED_BYTES`], so
+/// many uses each under the per-use limit can't add up to the same
+/// problem. The use that crosses it is named.
+#[test]
+fn uses_that_together_expand_past_the_total_are_refused() {
+    // Five uses of about 3.5 MiB each: every one fits, all five don't.
+    let error = refused(&amplifier(896, 5, 4096));
+    assert_eq!(
+        error,
+        TemplateError::TooLarge {
+            instance: "u4".into(),
+            template: "t".into(),
+            limit: MAX_TOTAL_EXPANDED_BYTES - 4 * expanded_size(896, 4096),
+        }
+    );
+}
+
+/// A use under the limit still expands.
+#[test]
+fn a_use_under_the_limit_expands() {
+    let config = expanded(&amplifier(16, 1, 4096)).unwrap();
+    assert!(config.app.contains_key("web0"));
+}
+
 #[test]
 fn validation_refuses_a_config_whose_uses_were_never_expanded() {
     let config = Config::parse(&instance("name = 'db'\nsize = '1Gi'")).unwrap();

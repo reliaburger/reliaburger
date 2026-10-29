@@ -343,15 +343,20 @@ impl AppleContainerGrill {
         args
     }
 
-    /// Build `container stop` arguments. The default SIGTERM is left to the
-    /// CLI; any other stop signal (#1121) is named with `--signal`.
+    /// Build the arguments that ask a workload to stop: `container kill`
+    /// with its stop signal (#1121), which signals and returns.
+    ///
+    /// Not `container stop`: that waits for the exit itself and kills the
+    /// workload after its own `--time`, 5 s by default, so an app's
+    /// `stop_grace` would end after 5 s on macOS (#1435). Bun owns the
+    /// grace, as it does on every runtime, and sends the kill when it ends.
     fn stop_command_args(instance: &InstanceId, signal: super::stop::StopSignal) -> Vec<String> {
-        let mut args = vec!["stop".to_string()];
-        if signal != super::stop::StopSignal::Term {
-            args.extend(["--signal".to_string(), signal.name().to_string()]);
-        }
-        args.push(instance.0.clone());
-        args
+        vec![
+            "kill".to_string(),
+            "--signal".to_string(),
+            signal.name().to_string(),
+            instance.0.clone(),
+        ]
     }
 }
 
@@ -482,11 +487,15 @@ impl super::Grill for AppleContainerGrill {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let output = self.container_command(&args, instance).await?;
 
-        if !output.status.success() {
+        // `container kill` refuses a workload that has already exited, which
+        // a stop has nothing left to do for.
+        if !output.status.success()
+            && self.state(instance).await.ok() != Some(ContainerState::Stopped)
+        {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
-                reason: format!("container stop failed: {stderr}"),
+                reason: format!("container stop signal failed: {stderr}"),
             });
         }
 
@@ -994,15 +1003,15 @@ mod tests {
     }
 
     #[test]
-    fn stop_names_only_a_non_default_signal() {
+    fn a_stop_only_sends_the_stop_signal() {
         let id = InstanceId("apple-0".to_string());
         assert_eq!(
             AppleContainerGrill::stop_command_args(&id, super::super::stop::StopSignal::Term),
-            ["stop", "apple-0"]
+            ["kill", "--signal", "SIGTERM", "apple-0"]
         );
         assert_eq!(
             AppleContainerGrill::stop_command_args(&id, super::super::stop::StopSignal::Int),
-            ["stop", "--signal", "SIGINT", "apple-0"]
+            ["kill", "--signal", "SIGINT", "apple-0"]
         );
     }
 
@@ -1102,6 +1111,110 @@ mod tests {
         let _ = AppleContainerGrill::new()
             .container_command(&["rm", "-f", &id.0], &id)
             .await;
+        result.unwrap_or_else(|reason| panic!("{reason}"));
+    }
+
+    /// #1435: `container stop` gives a workload 5 s before it kills it,
+    /// whatever the app's `stop_grace`. Bun owns the grace, so a stop only
+    /// signals: a workload that takes 10 s to finish its work after SIGTERM
+    /// gets to finish it.
+    #[tokio::test]
+    #[ignore = "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1; run with make test-apple"]
+    async fn a_stop_only_signals_so_a_slow_workload_finishes_within_bun_s_grace() {
+        assert!(
+            apple_tests_enabled(),
+            "set RELIABURGER_APPLE_CONTAINER_TESTS=1 after installing and starting Apple Container"
+        );
+
+        let grill = AppleContainerGrill::new();
+        let id = InstanceId("apple-slow-stop-0".to_string());
+        let _ = grill.container_command(&["rm", "-f", &id.0], &id).await;
+        let spec = crate::grill::oci::OciSpec {
+            reusable_executor: false,
+            host_process: false,
+            initialiser: false,
+            port_mapping: None,
+            stop: None,
+            root: crate::grill::oci::OciRoot {
+                path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
+                readonly: false,
+            },
+            process: crate::grill::oci::OciProcess {
+                rlimits: Vec::new(),
+                args: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "trap 'sleep 10; echo finished-cleanly; exit 0' TERM; echo trapping; \
+                     while true; do sleep 1; done"
+                        .to_string(),
+                ],
+                env: vec![],
+                cwd: "/".to_string(),
+                user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                oom_score_adj: None,
+                overrides: None,
+            },
+            mounts: vec![],
+            linux: crate::grill::oci::OciLinux {
+                namespaces: vec![],
+                resources: None,
+                cgroups_path: None,
+                uid_mappings: None,
+                gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
+            },
+            runtime_knobs: None,
+        };
+
+        let result: Result<(), String> = async {
+            grill.create(&id, &spec).await.map_err(|e| e.to_string())?;
+            grill.start(&id).await.map_err(|e| e.to_string())?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !grill
+                .logs(&id)
+                .await
+                .unwrap_or_default()
+                .contains("trapping")
+            {
+                if std::time::Instant::now() > deadline {
+                    return Err("the workload never set its trap".into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+
+            let begun = std::time::Instant::now();
+            grill.stop(&id).await.map_err(|e| e.to_string())?;
+            let signalled = begun.elapsed();
+            if signalled > std::time::Duration::from_secs(3) {
+                return Err(format!("stop waited {signalled:?}: it must only signal"));
+            }
+            // Bun's side of a 30 s grace: wait for the exit, then look.
+            let deadline = begun + std::time::Duration::from_secs(30);
+            while grill.state(&id).await.ok() != Some(ContainerState::Stopped) {
+                if std::time::Instant::now() > deadline {
+                    return Err("the workload never exited".into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            let logs = grill.logs(&id).await.unwrap_or_default();
+            if !logs.contains("finished-cleanly") {
+                return Err(format!(
+                    "killed after {:?}, before its work was done: {logs:?}",
+                    begun.elapsed()
+                ));
+            }
+            // Stopping a workload that has already gone is no error.
+            grill
+                .stop(&id)
+                .await
+                .map_err(|e| format!("second stop: {e}"))
+        }
+        .await;
+
+        let _ = grill.kill(&id).await;
+        let _ = grill.container_command(&["rm", "-f", &id.0], &id).await;
         result.unwrap_or_else(|reason| panic!("{reason}"));
     }
 

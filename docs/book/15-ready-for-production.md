@@ -416,6 +416,17 @@ against a real run is a guess, and a guess that fails a release on its first nig
 everyone to ignore it. Those four start in record-only mode, with provisional thresholds,
 until the first 0.2.4 fast and final records show where they actually sit.
 
+"Outside fault windows only" was true of four of the five at first, and review caught the
+fifth ([#1438](https://github.com/reliaburger/reliaburger/issues/1438)). The API reads skip
+any check that runs inside a fault window, but the job start lag came from the campaign's
+histogram, summed over every run that drained, including runs that lived through a leader
+kill. A p99 is exactly the statistic a few slow recoveries move, so the one gated SLO could
+fail a tier for something the faults were meant to cause, while the record claimed it
+measured a quiet cluster. The fix keeps both numbers. Each step of the job campaign knows
+whether a fault window is open, and marks every run active at that moment. When a run
+drains, its start lag goes into the M8 buckets either way, and into a second, quiet set only
+if it was never marked. The SLO reads the quiet set.
+
 Measuring them cost almost nothing, because the harness was already doing the work. Every
 light check talks to each node's API, so it now times two of the reads `relish` makes. For
 the writes, the app start and the rollout, the harness gives itself an app of its own,
@@ -994,6 +1005,16 @@ included. A test parses `ci.yml` and fails when that list drifts, so a new CI jo
 quietly left out. Only a push, merge-queue or nightly run counts: a pull request's run tests a
 merge commit rather than its head, and may have skipped the heavy jobs on purpose.
 
+The first version had a hole the review found
+([#1436](https://github.com/reliaburger/reliaburger/issues/1436)). The API reports a run's
+*latest* attempt: its conclusion is the last attempt's, and `filter=latest` lists that
+attempt's jobs. So a flaky failure on `main`, re-run until it passed, looked exactly like a
+clean pass and became the candidate's whole source-CI evidence. That quietly undid retries
+= 0, the rule that a test passing on a second try is a flake to register, not a pass. The
+run's `run_attempt` field says which attempt the result came from, and the script now
+accepts only attempt 1. A re-run's green can still merge a pull request; it just can't
+stand in for the candidate's own suite, and the job summary names the run and the attempt.
+
 Then the workflow has to say "run the suite unless we found that". GitHub Actions has a trap
 here. By default a job whose dependency was skipped is skipped too, so a candidate job that
 `needs: validate-release` would never run on the fast path. The fix is to take control of the
@@ -1021,6 +1042,17 @@ new to find. So patch releases run the fast tiers and the power-cut and reboot r
 final is for minor releases and for anything that moves `CURRENT` in `src/compatibility.rs`
 or touches `src/bun/agent*`. That rule is mechanical, so `release_tier.py` applies it to a
 tag range rather than leaving it to someone's judgement at the end of a long week.
+
+At first, though, only a person ran it. `nightly.py` took the gate as `--gate` and defaulted
+to `patch`, and the runbook's examples passed `--gate patch` for 0.2.4, a release that moves
+`CURRENT` and the agent loop
+([#1428](https://github.com/reliaburger/reliaburger/issues/1428)). Follow the doc, or leave
+the flag out, and `freeze-check` would pass a nightly green only for the patch gate, and the
+8-hour final would never run. A rule that's mechanical should be applied by the machine at
+the point it matters, so `run` and `freeze-check` now work out the gate themselves: the
+release is the version in the commit's `Cargo.toml`, the previous release the nearest `v*`
+tag behind it, and the rest is `release_tier.decide`. `--gate` survives only to raise the
+gate; asking for less than the rule says is refused, with the rule's reasons.
 
 **Publish performance after the tag.** Benchmarks, the profile and the day run don't decide
 whether a release works, so they no longer stand between it and its users. A regression they
@@ -1075,8 +1107,11 @@ is anywhere in its environment.
 
 The staged nightly gets its own name too, `nightly-v0.2.4-RUN-ATTEMPT`, and the website
 installer refuses a mirror by that name unless `RELIABURGER_ACCEPT_NIGHTLY=1` says
-qualification is asking. That isn't the security boundary (the keys are), it's a guard rail,
-so nobody installs one by pasting the wrong URL. Old nightlies don't pile up either: each
+qualification is asking. That's a guard rail, so nobody installs one by pasting the wrong URL,
+and on a fresh install it's the only one: with the variable set, the bootstrap runs the
+nightly's own `install.sh`, which installs the nightly's own `relish`, which trusts the
+nightly key. The keys guard the direction that matters, a released binary already on a
+machine taking a nightly one. Old nightlies don't pile up either: each
 nightly staging deletes all but the newest seven.
 
 ## Dependencies are code too
@@ -8026,8 +8061,15 @@ history takes a twentieth of a second, and so does one where nearly half the req
 or fail.
 
 It's still exponential in the worst case, and a soak can't hang on its own checker. Each
-namespace gets a budget of states, and a search that runs out reports *inconclusive*. The
-record says so, without failing the run. A violation fails it, and the record shows the
+namespace gets a budget of states, and a search that runs out reports *inconclusive*. At
+first the record said so without failing the run, and the deadline, 600 seconds, was shared
+by every namespace. Review found what that adds up to
+([#1437](https://github.com/reliaburger/reliaburger/issues/1437)): if the first namespace
+used the whole 600 seconds, every later one gave up after its first 1,024 states, and the
+soak went green with next to no linearizability coverage. A check that can quietly not
+happen isn't a gate. So each namespace now gets its own deadline, and an inconclusive check
+fails a fast or final tier; only a custom run, which gates nothing, reports it and moves on.
+A violation fails every run, and the record shows the
 smallest failing slice: the shortest prefix of the history that fails, then the latest
 quiet point (no answered operation in flight) from which the tail still fails, starting from
 any state at all. For the stale read above, that's two operations, the renew and the read,

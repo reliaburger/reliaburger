@@ -87,6 +87,23 @@ impl JobDefinition {
         }
     }
 
+    /// The job as its manifest would have declared it: the template with
+    /// the schedule and run policy [`Self::from_spec`] moved out put back.
+    /// A policy judges this (#1424), so `job.schedule` reads the same
+    /// whichever route submitted the job. A hook's `run_before` list isn't
+    /// kept, so it can't be put back.
+    pub fn to_spec(&self) -> JobSpec {
+        let mut spec = self.template.clone();
+        if let Some(cron) = &self.cron {
+            spec.schedule = Some(cron.expression.clone());
+            spec.overlap = Some(cron.overlap);
+        }
+        spec.max_attempts = Some(self.tasks.max_attempts);
+        spec.task_timeout_secs = Some(self.tasks.task_timeout_secs);
+        spec.replay_unknown = self.replay_unknown;
+        spec
+    }
+
     /// Whether the definition outlives its runs. Anything else is a one-off
     /// and expires when its last run is pruned.
     pub fn is_lasting(&self) -> bool {
@@ -703,6 +720,22 @@ impl JobCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1424: the spec a policy judges carries the schedule and run policy
+    /// that `from_spec` moved out of the template.
+    #[test]
+    fn to_spec_puts_back_what_from_spec_moved_out() {
+        let spec: JobSpec = toml::from_str(
+            "image = 'report:v1'\nschedule = '0 3 * * *'\nmax_attempts = 2\ntask_timeout_secs = 60\nreplay_unknown = true\n",
+        )
+        .unwrap();
+        let back = JobDefinition::from_spec(spec.clone()).to_spec();
+        assert_eq!(back.schedule.as_deref(), Some("0 3 * * *"));
+        assert_eq!(back.max_attempts, Some(2));
+        assert_eq!(back.task_timeout_secs, Some(60));
+        assert!(back.replay_unknown);
+        assert_eq!(back.image, spec.image);
+    }
     use crate::config::job::JobSpec;
     use crate::meat::task_array_store::{TaskArrayApplied, TaskArrayWrite, TaskArrays};
 

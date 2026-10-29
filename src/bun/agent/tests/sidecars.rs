@@ -198,6 +198,68 @@ async fn a_sidecar_that_crashes_restarts_alone_and_its_app_keeps_running() {
     assert_eq!(agent.sidecars.restarts(&proxy), 1);
 }
 
+/// #1434: a rollout stores the new spec before its old instances go. A
+/// sidecar of an old instance that crashes meanwhile comes back as its
+/// instance launched it: its old image, not a sidecar the new spec added,
+/// and still there when the new spec dropped it.
+#[tokio::test]
+async fn a_sidecar_that_crashes_mid_rollout_comes_back_from_its_own_instances_spec() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    with_finished_init(&grill, WEB);
+    expect_complete(&drain_deploy(&mut agent, web_with_sidecars("myapp:v1")).await);
+    let (proxy, logs) = (id(PROXY), id(LOGS));
+    let next = Config::parse(
+        r#"
+        [app.web]
+        image = "myapp:v2"
+        port = 8080
+
+        [[app.web.sidecar]]
+        name = "proxy"
+        image = "envoy:1.32"
+
+        [[app.web.sidecar]]
+        name = "metrics"
+        image = "exporter:1"
+        "#,
+    )
+    .unwrap();
+    // What the deploy worker's store_deployed_spec does as the rollout begins.
+    agent.deployed_specs.insert(
+        ("web".to_string(), "default".to_string()),
+        next.app["web"].clone(),
+    );
+    let from = grill.calls().len();
+
+    grill.set_state(&proxy, ContainerState::Stopped);
+    grill.set_state(&logs, ContainerState::Stopped);
+    agent.check_apps().await;
+    agent.relaunch_due_sidecars_to_completion().await;
+
+    let calls = grill.calls()[from..].to_vec();
+    assert_eq!(
+        grill.created_spec(&proxy).unwrap().root.path,
+        "envoy:1.31",
+        "the old instance's proxy came back from the new spec"
+    );
+    assert!(
+        operations(&calls, &logs).contains(&"create".to_string()),
+        "a sidecar the new spec dropped never came back: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|(_, instance)| instance.0.ends_with("__sidecar-metrics")),
+        "a sidecar only the new spec has was started beside an old instance: {calls:?}"
+    );
+    assert!(
+        agent
+            .sidecars
+            .due(std::time::Instant::now() + std::time::Duration::from_secs(120))
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn a_sidecar_that_keeps_crashing_waits_out_its_backoff() {
     let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();

@@ -549,12 +549,15 @@ commands never build it. Three things run the targets:
 
 [`fuzz.yml`](../.github/workflows/fuzz.yml) runs `make fuzz-smoke` nightly at
 300 seconds a target, and for 30 seconds on a pull request that touches a
-decoder (or by hand, with any budget). The job summary has each target's last
+decoder's file or the fuzzing set-up (or by hand, with any budget). A
+dependency bump, a Makefile change or the rest of `src/config/` waits for the
+nightly: the job takes 14 to 33 minutes. The job summary has each target's last
 libFuzzer status line (executions, coverage, corpus size). A crash fails the
 job and its input is kept as the `fuzz-crashes` artefact. The workflow pins a
 dated nightly (`FUZZ_TOOLCHAIN`) and caches the sanitizer build under one
-rust-cache key for nightly and pull request runs; a floating nightly would
-change that key every day. Move the pin forward by hand when a newer nightly
+rust-cache key for nightly and pull request runs, which only the nightly and
+runs by hand save, so pull requests don't eat into the cache quota `ci.yml`
+keeps for `main`; a floating nightly would change that key every day. Move the pin forward by hand when a newer nightly
 is needed. Locally, `FUZZ_TOOLCHAIN` defaults to `nightly`.
 
 A crash is handled like a flake: an issue the same day. Then add the input as
@@ -732,7 +735,7 @@ why we copied the idea and not the tooling.
 
 | SLO (p99) | What's timed | Threshold | Mode |
 |---|---|---|---|
-| Job task start | A job task's start lag on a pooled executor, from the job campaign's buckets | ≤ 256 ms | Gated in the fast and final tiers |
+| Job task start | A job task's start lag on a pooled executor, from the job campaign's buckets, in runs no fault window overlapped | ≤ 256 ms | Gated in the fast and final tiers |
 | API read | `GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` (what `relish status` and `relish nodes` ask) on every node, at every light check, from the host | ≤ 1,000 ms | Record only |
 | API write | `relish apply` of the soak workloads, from the call to the Raft commit | ≤ 2,000 ms | Record only |
 | App start | Each node's deploy of a new `soak-slo` instance, from its start until the instance passes its health check | ≤ 5,000 ms | Record only |
@@ -746,7 +749,15 @@ every final). There are no 0.2.3 soak records yet. The gate sits at 256 ms:
 four times the worst value seen, still a quarter of the September plan's
 1-second target, and a bucket bound, so the record's number is exact. A day
 tier records it without gating, since nothing has measured start lag at the
-day rate yet, and a run without a job campaign has nothing to judge.
+day rate yet, and a run without a job campaign has nothing to judge. The
+campaign keeps two sets of buckets: every drained run's start lag, for the
+M8 number in the job report, and only the runs that no fault window
+overlapped, for the SLO. A run that was active at any step inside a fault
+window counts for M8 alone, so start lag during a leader kill's recovery
+can't fail the quiet-cluster SLO
+([#1438](https://github.com/reliaburger/reliaburger/issues/1438)). The
+earlier records' 32 to 64 ms counted every run, faults included, so they
+bound the quiet number from above.
 
 **Record only, from 28 October 2026.** No soak before 0.2.4 timed the API,
 an app start or a rolling update, so those four start in record-only mode:
@@ -838,9 +849,12 @@ What runs, in every tier except the day run:
   records a failure and fails the record. The record says how many operations
   were checked and shows the smallest failing slice: the shortest prefix of
   the history that fails, cut down to the shortest tail that fails from any
-  starting state. The search is bounded per namespace; a namespace that runs
-  over is reported as *inconclusive*, which fails nothing but says so, rather
-  than hanging the soak.
+  starting state. The search is bounded per namespace, by a budget of states
+  and a deadline of its own (600 s); a namespace that runs over is reported as
+  *inconclusive* rather than hanging the soak. An inconclusive check fails a
+  fast or final tier, since that soak would otherwise pass with no
+  linearizability coverage; a custom run only reports it
+  ([#1437](https://github.com/reliaburger/reliaburger/issues/1437)).
 
 `make test-ci-scripts` runs the checker's unit tests
 ([`test_linearizability.py`](../scripts/release/test_linearizability.py)):

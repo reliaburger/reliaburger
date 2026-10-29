@@ -31,10 +31,15 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+use crate::config::app::SidecarSpec;
 use crate::grill::oci::OciSpec;
 
 /// The longest a crashed sidecar waits to be started again.
 pub(super) const SIDECAR_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// How long a restarted sidecar must run before its next crash counts as
+/// the first again: ten minutes, as a kubelet resets a container's back-off.
+pub(super) const SIDECAR_STABLE_RUN: Duration = Duration::from_secs(600);
 
 /// How long a sidecar waits before restart number `restarts + 1`: nothing
 /// for the first, then 1 s, doubling to [`SIDECAR_MAX_BACKOFF`].
@@ -64,14 +69,14 @@ pub(super) struct SidecarLaunch {
     pub(super) spec: OciSpec,
 }
 
-/// The launches of `app`'s sidecars beside instance `parent`, built from the
+/// The launches of `sidecars` beside instance `parent`, built from the
 /// parent's stored spec, in the order the app declares them.
 pub(super) fn sidecar_launches(
-    app: &AppSpec,
+    sidecars: &[SidecarSpec],
     parent: &InstanceId,
     parent_spec: &OciSpec,
 ) -> Vec<SidecarLaunch> {
-    app.sidecar
+    sidecars
         .iter()
         .map(|sidecar| SidecarLaunch {
             id: crate::grill::oci::sidecar_instance_id(parent, &sidecar.name),
@@ -212,8 +217,15 @@ pub(super) struct Relaunched {
 #[derive(Debug, Clone)]
 struct SidecarRun {
     id: InstanceId,
-    /// Restarts since it last started with its instance.
+    /// The definition its instance launched it from. A restart uses this,
+    /// not the app's current spec, which a rollout replaces while old
+    /// instances still run (#1434).
+    spec: SidecarSpec,
+    /// Restarts since it last started with its instance, or since it last
+    /// ran for [`SIDECAR_STABLE_RUN`].
     restarts: u32,
+    /// When its last restart alone succeeded.
+    restarted_at: Option<Instant>,
     /// Set while it's down: when it may be started again.
     due: Option<Instant>,
     /// Set while a restart is in flight.
@@ -227,56 +239,68 @@ pub(super) struct Sidecars {
 }
 
 impl Sidecars {
-    /// Record `ids` as `parent`'s sidecars, running from now on. Refused
-    /// while a restart of one it had before is still in flight: that
-    /// restart could still create it.
+    /// Record `specs` as `parent`'s sidecars, running from now on, and
+    /// return their identities. Refused while a restart of one it had
+    /// before is still in flight: that restart could still create it.
     pub(super) fn register(
         &mut self,
         parent: &InstanceId,
-        ids: Vec<InstanceId>,
-    ) -> Result<(), BunError> {
-        self.register_with(parent, ids, None)
+        specs: &[SidecarSpec],
+    ) -> Result<Vec<InstanceId>, BunError> {
+        self.register_with(parent, specs, None)
     }
 
-    /// Record `ids` as `parent`'s sidecars, all down and due at `now`: an
+    /// Record `specs` as `parent`'s sidecars, all down and due at `now`: an
     /// instance adopted after a Bun restart, whose old sidecars startup
     /// adoption retired because no record names them.
     pub(super) fn register_down(
         &mut self,
         parent: &InstanceId,
-        ids: Vec<InstanceId>,
+        specs: &[SidecarSpec],
         now: Instant,
-    ) -> Result<(), BunError> {
-        self.register_with(parent, ids, Some(now))
+    ) -> Result<Vec<InstanceId>, BunError> {
+        self.register_with(parent, specs, Some(now))
     }
 
     fn register_with(
         &mut self,
         parent: &InstanceId,
-        ids: Vec<InstanceId>,
+        specs: &[SidecarSpec],
         due: Option<Instant>,
-    ) -> Result<(), BunError> {
+    ) -> Result<Vec<InstanceId>, BunError> {
         if self.relaunching(parent) {
             return Err(BunError::RetirementState {
                 instance_id: parent.clone(),
                 reason: "a sidecar's restart still owns its previous runtime".into(),
             });
         }
-        if ids.is_empty() {
+        if specs.is_empty() {
             self.by_parent.remove(parent);
-            return Ok(());
+            return Ok(Vec::new());
         }
-        let runs = ids
-            .into_iter()
-            .map(|id| SidecarRun {
-                id,
+        let runs: Vec<SidecarRun> = specs
+            .iter()
+            .map(|spec| SidecarRun {
+                id: crate::grill::oci::sidecar_instance_id(parent, &spec.name),
+                spec: spec.clone(),
                 restarts: 0,
+                restarted_at: None,
                 due,
                 relaunching: None,
             })
             .collect();
+        let ids = runs.iter().map(|run| run.id.clone()).collect();
         self.by_parent.insert(parent.clone(), runs);
-        Ok(())
+        Ok(ids)
+    }
+
+    /// The definitions `parent`'s sidecars were launched from, in the
+    /// order the app declares them.
+    pub(super) fn specs_of(&self, parent: &InstanceId) -> Vec<SidecarSpec> {
+        self.by_parent
+            .get(parent)
+            .map(|runs| runs.iter().map(|run| run.spec.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// `parent`'s sidecars, in the order the app declares them.
@@ -353,6 +377,13 @@ impl Sidecars {
         if run.due.is_some() || run.relaunching.is_some() {
             return false;
         }
+        // Crashes far apart aren't a crash loop: the backoff starts over.
+        if run
+            .restarted_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= SIDECAR_STABLE_RUN)
+        {
+            run.restarts = 0;
+        }
         run.due = Some(now + sidecar_backoff(run.restarts));
         true
     }
@@ -392,6 +423,7 @@ impl Sidecars {
             .take()
             .is_some_and(|token| token.is_cancelled());
         run.restarts = run.restarts.saturating_add(1);
+        run.restarted_at = succeeded.then_some(now);
         run.due = (!succeeded && !cancelled).then(|| now + sidecar_backoff(run.restarts));
     }
 
@@ -422,42 +454,31 @@ impl Sidecars {
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
-    /// Register `parent`'s sidecars before the first is created. Answers
-    /// the deploy worker's `RegisterSidecars`.
+    /// Register `parent`'s sidecars, with the definitions it launches them
+    /// from, before the first is created. Answers the deploy worker's
+    /// `RegisterSidecars`.
     pub(super) fn register_sidecars(
         &mut self,
         parent: &InstanceId,
-        names: &[String],
+        specs: &[SidecarSpec],
     ) -> Result<Vec<InstanceId>, BunError> {
         if self.supervisor.get_instance(parent).is_none() {
             return Err(BunError::InstanceNotFound {
                 instance_id: parent.clone(),
             });
         }
-        let ids: Vec<InstanceId> = names
-            .iter()
-            .map(|name| crate::grill::oci::sidecar_instance_id(parent, name))
-            .collect();
-        self.sidecars.register(parent, ids.clone())?;
-        Ok(ids)
+        self.sidecars.register(parent, specs)
     }
 
-    /// The launches of `parent`'s sidecars from its deployed spec and its
-    /// stored launch spec, or none when it has no sidecars or either is
-    /// missing.
+    /// The launches of `parent`'s sidecars from the definitions it
+    /// registered and its stored launch spec. Never from the app's current
+    /// spec: mid-rollout that's the new one, while `parent` is old (#1434).
     pub(super) fn sidecar_launches_of(
         &self,
         parent: &InstanceId,
         parent_spec: &OciSpec,
     ) -> Vec<SidecarLaunch> {
-        let Some(instance) = self.supervisor.get_instance(parent) else {
-            return Vec::new();
-        };
-        let key = (instance.app_name.clone(), instance.namespace.clone());
-        self.deployed_specs
-            .get(&key)
-            .map(|spec| sidecar_launches(spec, parent, parent_spec))
-            .unwrap_or_default()
+        sidecar_launches(&self.sidecars.specs_of(parent), parent, parent_spec)
     }
 
     /// Start every crashed sidecar whose backoff is over and whose instance
@@ -611,6 +632,14 @@ mod tests {
         InstanceId(value.to_string())
     }
 
+    /// The proxy sidecar's definition; its identity beside `web-0` is
+    /// `web-0__sidecar-proxy`.
+    fn proxy_spec() -> Vec<SidecarSpec> {
+        let app: AppSpec =
+            toml::from_str("image = \"a:1\"\n[[sidecar]]\nname = \"proxy\"\n").unwrap();
+        app.sidecar
+    }
+
     #[test]
     fn the_first_restart_is_at_once_and_later_ones_back_off_to_a_minute() {
         assert_eq!(sidecar_backoff(0), Duration::ZERO);
@@ -625,7 +654,7 @@ mod tests {
     fn a_crashing_sidecar_is_due_again_after_a_growing_backoff() {
         let mut sidecars = Sidecars::default();
         let (parent, proxy) = (id("web-0"), id("web-0__sidecar-proxy"));
-        sidecars.register(&parent, vec![proxy.clone()]).unwrap();
+        sidecars.register(&parent, &proxy_spec()).unwrap();
         let now = Instant::now();
 
         assert!(sidecars.mark_exited(&proxy, now));
@@ -652,11 +681,40 @@ mod tests {
         assert_eq!(sidecars.due(now + Duration::from_secs(2)).len(), 1);
     }
 
+    /// #1442: the backoff counts crashes close together. A sidecar that has
+    /// then run for ten minutes since its last restart starts at once again,
+    /// as a kubelet resets its back-off.
+    #[test]
+    fn a_sidecar_that_ran_stably_restarts_at_once_again() {
+        let mut sidecars = Sidecars::default();
+        let (parent, proxy) = (id("web-0"), id("web-0__sidecar-proxy"));
+        sidecars.register(&parent, &proxy_spec()).unwrap();
+        let mut now = Instant::now();
+        for _ in 0..7 {
+            assert!(sidecars.mark_exited(&proxy, now));
+            now += SIDECAR_MAX_BACKOFF;
+            sidecars.begin_relaunch(&proxy, CancellationToken::new());
+            sidecars.finish_relaunch(&proxy, true, now);
+        }
+
+        // A crash soon after still waits the longest backoff...
+        let soon = now + Duration::from_secs(60);
+        assert!(sidecars.mark_exited(&proxy, soon));
+        assert!(sidecars.due(soon).is_empty());
+        sidecars.begin_relaunch(&proxy, CancellationToken::new());
+        sidecars.finish_relaunch(&proxy, true, soon);
+
+        // ...but one after ten quiet minutes doesn't.
+        let later = soon + Duration::from_secs(600);
+        assert!(sidecars.mark_exited(&proxy, later));
+        assert_eq!(sidecars.due(later), vec![(parent.clone(), proxy.clone())]);
+    }
+
     #[test]
     fn a_cancelled_restart_is_not_due_again() {
         let mut sidecars = Sidecars::default();
         let (parent, proxy) = (id("web-0"), id("web-0__sidecar-proxy"));
-        sidecars.register(&parent, vec![proxy.clone()]).unwrap();
+        sidecars.register(&parent, &proxy_spec()).unwrap();
         let now = Instant::now();
         sidecars.mark_exited(&proxy, now);
         let token = CancellationToken::new();
@@ -665,12 +723,12 @@ mod tests {
         sidecars.cancel_relaunches(&parent);
         assert!(token.is_cancelled());
         assert!(
-            sidecars.register(&parent, vec![proxy.clone()]).is_err(),
+            sidecars.register(&parent, &proxy_spec()).is_err(),
             "a restart in flight could still create the old sidecar"
         );
         sidecars.finish_relaunch(&proxy, false, now);
         assert!(sidecars.due(now + SIDECAR_MAX_BACKOFF).is_empty());
-        sidecars.register(&parent, vec![proxy.clone()]).unwrap();
+        sidecars.register(&parent, &proxy_spec()).unwrap();
     }
 
     #[test]
@@ -678,9 +736,7 @@ mod tests {
         let mut sidecars = Sidecars::default();
         let (parent, proxy) = (id("web-0"), id("web-0__sidecar-proxy"));
         let now = Instant::now();
-        sidecars
-            .register_down(&parent, vec![proxy.clone()], now)
-            .unwrap();
+        sidecars.register_down(&parent, &proxy_spec(), now).unwrap();
         assert_eq!(sidecars.due(now), vec![(parent.clone(), proxy.clone())]);
         assert_eq!(sidecars.parent_of(&proxy), Some(&parent));
         assert_eq!(sidecars.forget(&parent), vec![proxy.clone()]);
