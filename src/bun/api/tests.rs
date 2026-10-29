@@ -1943,6 +1943,38 @@ async fn follower_of_a_recording_leader(
     (follower, seen, nodes)
 }
 
+/// #1442: a follower forwards stop, delete and release as the caller, not
+/// as its own service identity, so the leader checks the app's owner
+/// against its own desired state and the caller's token. A follower's
+/// replica can lag a claim, and the leader used to wave the forwarded
+/// request through as the system principal.
+#[tokio::test]
+async fn a_follower_forwards_app_changes_to_the_leader_with_the_callers_token() {
+    let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+    let (follower, seen, nodes) = follower_of_a_recording_leader(deployer).await;
+    let calls = [
+        "/v1/stop/db/pg",
+        "/v1/delete/db/pg",
+        "/v1/delete/db/pg?force=true",
+        "/v1/release/db/pg",
+    ];
+    for path in calls {
+        let (status, reply) =
+            send_bounded(follower.clone(), "POST", path, &deployer_key, "", &[]).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}: {reply}");
+    }
+    let seen = seen.lock().await.clone();
+    assert_eq!(seen.len(), calls.len(), "{seen:?}");
+    assert!(
+        seen.iter().all(|(_, bearer, marked, _)| *marked
+            && bearer.as_deref() == Some(format!("Bearer {deployer_key}").as_str())),
+        "each forward carries the caller's token and the forwarded mark: {seen:?}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn a_follower_forwards_upgrade_control_calls_to_the_leader_with_the_callers_token() {
     let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);

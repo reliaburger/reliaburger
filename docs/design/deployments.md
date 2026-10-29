@@ -1077,9 +1077,13 @@ functions, one per kind of change:
   `job_apply` does the same for the apps of a job manifest (#1429): the
   state machine's backstop only checks that a write keeps the stored owner,
   not that the caller speaks for it, so the API is the only place that can.
-  `cluster_app_change` (stop, delete, release) and `rollback_handler` check
-  before forwarding to the leader, because a forwarded request reaches the
-  leader as the service principal. The bootstrap window and the service
+  `cluster_app_change` (stop, delete, release) checks on the leader, against
+  the leader's desired state: a follower forwards the request with the
+  caller's credentials, not its service token, because its replica can lag a
+  claim (#1442). `rollback_handler` checks on the node that's asked, then
+  re-applies through `cluster_apply`, forwarding the caller's credentials too,
+  so the leader's `skip_owned_apps` judges the re-apply (it declares today's
+  owner) as the caller. The bootstrap window and the service
   principal count as admins.
 - **Defaults.** The checks run on the declared spec, before policy defaults
   (#1118) fill it, so `owner` is in `policy::check::UNFILLABLE_FIELDS`: a
