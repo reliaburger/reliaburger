@@ -1079,9 +1079,10 @@ pub(crate) fn owner_refusal(error: &crate::council::owner::OwnerError) -> Respon
         .into_response()
 }
 
-/// Check an imperative change (`verb`) against the app's owner, from
-/// desired state. Any node can answer it: a forwarded request then arrives
-/// at the leader as the service principal, which passes.
+/// Check an imperative change (`verb`) against the app's owner, from this
+/// node's desired state. Stop, delete and release call it on the leader,
+/// which proposes the write; a follower forwards them as the caller
+/// (#1442).
 pub(crate) async fn owner_command_refusal(
     council: &crate::council::CouncilNode,
     auth: Option<&crate::sesame::auth::AuthContext>,

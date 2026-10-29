@@ -2500,13 +2500,20 @@ fingerprint. Without that, a controller claiming an app would roll every
 replica of it, which is the kind of surprise that makes people distrust a
 contract.
 
-**Check before you forward.** A follower can't write to Raft, so a `relish
-delete` that lands on one is forwarded to the leader, under the node's
-service token. By then the caller's identity is gone. So `stop`, `delete`,
-`release` and `rollback` check the owner on whichever node receives them,
-before forwarding, and the leader lets the service principal through.
-`relish apply` doesn't have this problem: its forward carries the caller's
-own token.
+**Check where you write.** A follower can't write to Raft, so a `relish
+delete` that lands on one is forwarded to the leader. The first cut
+forwarded it under the node's service token, which loses the caller, so
+`stop`, `delete` and `release` checked the owner on the follower before
+forwarding, and the leader let the service principal through. The review
+found the hole in that ([#1442](https://github.com/reliaburger/reliaburger/issues/1442)):
+a follower's replica can lag. A controller claims the app, the claim commits
+on the leader, and a follower that hasn't applied it yet sees an unowned app
+and waves a human's `delete` through, with the leader none the wiser. Now
+the forward carries the caller's own credentials, as `relish apply`'s
+always did, and the owner check runs on the leader, against the state the
+write will land on. `rollback` checks where it's asked and re-applies
+through the apply path, whose forward now carries the caller too, so the
+leader's owner rules judge it again.
 
 **The JSON is pinned.** `src/bun/api/contract_tests.rs` builds one example of
 every shape a controller reads or writes, and checks its JSON against a
