@@ -628,12 +628,16 @@ pub fn plan_council_action(
         }
     }
 
-    // 4. Bring replacements and growth in as learners (add-before-remove):
-    //    enough to fill the seats below the target that dead or resigning
-    //    voters don't hold, less the live learners already catching up.
+    // 4. Bring replacements, growth and spares in as learners (add-before-
+    //    remove): up to the cap, not just the odd target, less the seats
+    //    live voters hold and the live learners already catching up. A
+    //    spare that can't vote yet (the second of two nodes, the fourth of
+    //    four) still needs the replicated state: an mTLS node's API opens
+    //    only once the tokens reach it (#1477). Promotion above still keeps
+    //    the voters odd.
     let seated = voters.len() - dead_voters.len() - pressured_voters.len();
     let live_learners = observation.learners.iter().filter(|id| alive(**id)).count();
-    let wanted = target.saturating_sub(seated);
+    let wanted = config.max_council_size.saturating_sub(seated);
     if wanted > live_learners {
         for id in observation.candidates {
             if !observation.learners.contains(id) && !voters.contains(id) && stable_alive(*id) {
@@ -1619,7 +1623,9 @@ mod tests {
 
     /// D12: with two machines Raft can't do better than one voter. The
     /// second node never becomes a voter (two voters would need both for
-    /// quorum), so losing it is survivable.
+    /// quorum), so losing it is survivable. It does join as a learner:
+    /// a node outside Raft never gets the replicated API tokens, so an
+    /// mTLS node's API would never open (#1477).
     #[test]
     fn two_live_nodes_keep_one_voter() {
         let now = Instant::now();
@@ -1634,9 +1640,12 @@ mod tests {
             change_in_flight: false,
             disk_pressured: BTreeSet::new(),
         };
-        assert_eq!(fixture.plan(&roomy_config(), now), CouncilAction::Nothing);
+        assert_eq!(
+            fixture.plan(&roomy_config(), now),
+            CouncilAction::AddLearner(2)
+        );
 
-        // Even if node 2 is already a caught-up learner, it stays one.
+        // Once node 2 is a caught-up learner, it stays one.
         fixture.learners.insert(2);
         fixture.replication.insert(2, Some(10));
         assert_eq!(fixture.plan(&roomy_config(), now), CouncilAction::Nothing);
@@ -1674,6 +1683,33 @@ mod tests {
             fixture.plan(&roomy_config(), now),
             CouncilAction::PromotePair(2, 3)
         );
+    }
+
+    /// The fourth node of four joins as a learner, and stays one (#1477).
+    #[test]
+    fn a_fourth_live_node_joins_as_a_learner() {
+        let now = Instant::now();
+        let mut fixture = healthy_three(now);
+        fixture.candidates = vec![4];
+        fixture.health.remove(&5);
+        assert_eq!(
+            fixture.plan(&roomy_config(), now),
+            CouncilAction::AddLearner(4)
+        );
+    }
+
+    /// Spares past the cap stay outside Raft: a cluster of five voters
+    /// (its `council_size`) adds no learners.
+    #[test]
+    fn no_learners_join_past_the_council_cap() {
+        let now = Instant::now();
+        let mut fixture = healthy_three(now);
+        fixture.candidates = vec![4, 5];
+        let config = CouncilSelectionConfig {
+            max_council_size: 3,
+            ..roomy_config()
+        };
+        assert_eq!(fixture.plan(&config, now), CouncilAction::Nothing);
     }
 
     #[test]
