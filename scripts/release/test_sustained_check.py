@@ -823,6 +823,19 @@ class AgentLoopTurns(Evidence):
         failure = next(item for item in verdict["findings"] if item["check"] == "agent-loop-turn")
         self.assertIn("1 command turn(s) over the 1 s budget", failure["detail"])
 
+    def test_a_torn_scrape_is_not_a_slow_turn(self):
+        # #1419: the 0.2.3 day run's node 3 scraped le="1" one above +Inf
+        # once, from a Bun that read its turn count before its buckets. No
+        # turn was slow, and the scrape after it was honest again.
+        torn = [dict(sample, value=sample["value"] + (1 if json.loads(sample["labels"])["le"] != "+Inf" else 0))
+                for sample in turns(branch="follow_up", within=105875, ts=NOW + 10)]
+        code, verdict = self.evaluate(self.snapshot(ts=NOW + 30, **{
+            "inventory__rb-a-3_txt": INVENTORY,
+            "turns__rb-a-3_json": turns(branch="follow_up", within=105850, ts=NOW)
+            + torn + turns(branch="follow_up", within=105904, ts=NOW + 20)}))
+        self.assertNotIn("agent-loop-turn", self.failures(verdict))
+        self.assertNotIn("rb-a-3", checker.load_state(self.evidence).get("turns_over_budget", {}))
+
     def slow_fsync_window(self, node):
         with contextlib.redirect_stdout(io.StringIO()):
             checker.main(["window", str(self.evidence), "open", "node-slow-fsync", "--node", node])
