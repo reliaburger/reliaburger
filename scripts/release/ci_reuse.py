@@ -11,14 +11,18 @@ passed:
 - the run is on this commit, in this repository, from `ci.yml`, and from an
   event that selects every job (`push`, `merge_group` or `schedule`; a pull
   request's run tests a merge commit, not its head, and may skip jobs);
-- the run completed with `success`;
+- the run completed with `success` on its first attempt: a run re-run until
+  it passed has a flaky failure behind it, and retries are 0 (#1436). The
+  API reports a run's latest attempt, and its jobs with `filter=latest`, so
+  a re-run's green says nothing about the attempts before it;
 - every job in `REQUIRED_JOBS` is there and succeeded, `ignored-test
   evidence` included, and every other job in the run succeeded too, apart
   from the closed-PR no-op, which a real run always skips.
 
 Anything else, an API error included, means "run the suite here": the build
 fails safe, never open. The decision goes to `$GITHUB_OUTPUT` as
-`reuse=true|false` and `ci_run=<id>`, with the reason on stderr.
+`reuse=true|false`, `ci_run=<id>` and `ci_run_attempt=1`, with the reason on
+stderr.
 `test_ci_reuse.py` keeps `REQUIRED_JOBS` equal to ci.yml's own job list.
 """
 from __future__ import annotations
@@ -38,6 +42,9 @@ FULL_EVENTS = ("push", "merge_group", "schedule")
 
 # The job ci.yml starts only for a closed pull request; any real run skips it.
 SKIPPED_JOB = "closed pull request"
+
+# The only attempt whose green counts: anything later is a re-run.
+FIRST_ATTEMPT = 1
 
 # Every check name a full ci.yml run reports, as the API names them: the
 # job's `name:`, with the macOS matrix expanded. test_ci_reuse.py fails when
@@ -78,6 +85,8 @@ def run_problems(run, jobs, commit, repository):
         found.append(f"a {run.get('event')} run doesn't run every job on this commit")
     if run.get("status") != "completed" or run.get("conclusion") != "success":
         found.append(f"run finished as {run.get('status')}/{run.get('conclusion')}")
+    if run.get("run_attempt") != FIRST_ATTEMPT:
+        found.append(f"run's result is from attempt {run.get('run_attempt')}: a re-run, not a first-time pass")
     conclusions = {}
     for job in jobs:
         conclusions.setdefault(job.get("name"), []).append(job.get("conclusion"))
@@ -155,8 +164,11 @@ def main(argv=None, runs_for=fetch_runs, jobs_for=fetch_jobs):
         for reason in reasons:
             print("CI reuse: " + reason, file=sys.stderr)
     else:
-        print(f"CI reuse: ci.yml run {run_id} passed every job on {args.commit}", file=sys.stderr)
-    lines = f"reuse={'true' if run_id is not None else 'false'}\nci_run={run_id or ''}\n"
+        print(f"CI reuse: ci.yml run {run_id} passed every job on {args.commit} at attempt {FIRST_ATTEMPT}",
+              file=sys.stderr)
+    reused = run_id is not None
+    lines = (f"reuse={'true' if reused else 'false'}\nci_run={run_id or ''}\n"
+             f"ci_run_attempt={FIRST_ATTEMPT if reused else ''}\n")
     if args.github_output:
         with open(args.github_output, "a", encoding="utf-8") as output:
             output.write(lines)

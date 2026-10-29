@@ -448,6 +448,86 @@ async fn the_audit_lists_running_work_a_new_policy_would_refuse() {
     assert_eq!(cluster.council.desired_state().await.apps[&web], before);
 }
 
+/// A jobs policy that refuses `:latest` images, as a deny or a warn rule.
+fn pinned_jobs_policy(action: &str) -> String {
+    format!(
+        "[policy.pinned-jobs]\napplies_to = 'jobs'\naction = '{action}'\ndeny = \"job.image.endsWith(':latest')\"\nmessage = 'pin a version'\n"
+    )
+}
+
+/// Every route that admits a job besides `/v1/apply`, with a body that
+/// submits one `report:latest` job named `nightly` in `default` (#1424).
+const JOB_ROUTES: &[(&str, &str)] = &[
+    (
+        "/v1/jobs/runs",
+        r#"{"name":"nightly","namespace":"default","definition":{"template":{"image":"report:latest","command":["true"]},"cron":{"expression":"0 3 * * *"}}}"#,
+    ),
+    (
+        "/v1/batch",
+        r#"{"jobs":[{"name":"nightly","namespace":"default","spec":{"image":"report:latest","command":["true"]}}]}"#,
+    ),
+    (
+        "/v1/batch/array",
+        r#"{"name":"nightly","namespace":"default","template":{"image":"report:latest","command":["true"]},"spec":{"count":1}}"#,
+    ),
+    (
+        "/v1/batch/manifest",
+        r#"{"name":"nightly","namespace":"default","cohort":[{"name":"small","count":1,"template":{"image":"report:latest","command":["true"]}}]}"#,
+    ),
+];
+
+/// #1424: a jobs policy refuses a job on every route that admits one, not
+/// only on `/v1/apply`. The refusal names the job, writes nothing and is
+/// audited.
+#[tokio::test]
+async fn a_jobs_policy_refuses_a_job_on_every_submission_route() {
+    let cluster = cluster("policy-job-routes-deny").await;
+    let (status, body) = cluster
+        .call("/v1/apply", &cluster.admin, &pinned_jobs_policy("deny"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for (index, (route, request)) in JOB_ROUTES.iter().enumerate() {
+        let (status, body) = cluster.call(route, &cluster.deployer, request).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{route}: {body}");
+        let refusal: apply::PolicyRefusal = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            refusal.policy_denials,
+            vec!["policy pinned-jobs denies job default/nightly: pin a version".to_string()],
+            "{route}"
+        );
+        assert_eq!(
+            cluster.records("policy.denied").await.len(),
+            index + 1,
+            "{route}"
+        );
+    }
+    let desired = cluster.council.desired_state().await;
+    assert_eq!(desired.task_arrays.jobs().definitions().count(), 0);
+}
+
+/// #1424: a warn policy lets the job through on every route, and the
+/// answer carries the warning.
+#[tokio::test]
+async fn a_jobs_warn_policy_warns_on_every_submission_route() {
+    let cluster = cluster("policy-job-routes-warn").await;
+    let (status, body) = cluster
+        .call("/v1/apply", &cluster.admin, &pinned_jobs_policy("warn"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for (route, request) in JOB_ROUTES {
+        let request = request.replace("nightly", &format!("nightly-{}", route.len()));
+        let (status, body) = cluster.call(route, &cluster.deployer, &request).await;
+        assert!(status.is_success(), "{route}: {status} {body}");
+        let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let warnings = answer["policy_warnings"].as_array().cloned();
+        assert_eq!(warnings.unwrap_or_default().len(), 1, "{route}: {body}");
+        assert!(
+            body.contains("policy pinned-jobs warns about job"),
+            "{route}: {body}"
+        );
+    }
+}
+
 /// #1432: a token scoped to some namespaces reads the audit of its own
 /// workloads only. It never learns another namespace's apps, or why the
 /// policies would refuse them; an unscoped token still sees everything.

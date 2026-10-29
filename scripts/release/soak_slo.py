@@ -12,7 +12,9 @@ docs/plans/2026-10-28-research-kubernetes-release-testing.md.
 Every sample is taken outside fault windows. Samples go into a bucketed
 histogram in EVIDENCE/slo.json, so a day-long run stays a few kilobytes,
 and each p99 is the upper bound of the bucket holding it. A job's start
-lag comes from the job campaign's own buckets (job_soak.BUCKETS).
+lag comes from the job campaign's own buckets (job_soak.BUCKETS), summed
+over only the runs no fault window overlapped (#1438); the campaign's M8
+start lag counts every run.
 
 `measure_api` is the reusable part: give it endpoints, a token and a CA
 and it times the API reads `relish status` and `relish nodes` make. The
@@ -79,7 +81,8 @@ SLOS = (
     Slo("deploy-ready", "Rolling update p99", "rolling update", 30000, False, "rollout",
         "from `relish apply` returning to every node's `soak-identity` running the new spec"),
     Slo("job-start", "Job task start p99", "job task start", 256, True, "job",
-        "a job task's start lag on a pooled executor, from the job campaign's buckets"),
+        "a job task's start lag on a pooled executor, from the job campaign's buckets, in runs no fault "
+        "window overlapped"),
 )
 
 
@@ -282,8 +285,8 @@ def rows(data, job_report, tier, job_campaign=True):
         over_every_bucket = False
         if slo.source == "job":
             m8 = (job_report or {}).get("m8") or {}
-            samples = m8.get("start_lag_samples") or 0
-            value = m8.get("p99_start_lag_ms") if samples else None
+            samples = m8.get("quiet_start_lag_samples") or 0
+            value = m8.get("quiet_p99_start_lag_ms") if samples else None
             over_every_bucket = bool(samples) and value is None
             failed = 0
         else:

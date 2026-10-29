@@ -9,6 +9,7 @@ import linearizability as lin
 
 NS = "rbtest-lin-0"
 TTL = 900_000
+INFINITE_DEADLINE = float("inf")
 
 
 class History:
@@ -232,6 +233,30 @@ class BoundedSearch(unittest.TestCase):
         self.assertEqual(result["verdict"], "inconclusive")
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(result["inconclusive"], [NS])
+
+
+    def test_each_namespace_gets_its_own_deadline(self):
+        # One slow namespace must not leave the next with nothing (#1437).
+        history = lifecycle(History(), client=1, lease="L1")
+        for event in history.events:
+            event["namespace"] = "rbtest-lin-1"
+        lifecycle(history, client=2, lease="L2")
+        clock = [1000.0]
+        deadlines = []
+        real_search, real_monotonic = lin.search, lin.time.monotonic
+
+        def slow_search(operations, initial, budget, deadline):
+            deadlines.append(deadline - clock[0])
+            clock[0] += 600  # this namespace used its whole deadline
+            return real_search(operations, initial, budget, INFINITE_DEADLINE)
+
+        lin.search, lin.time.monotonic = slow_search, lambda: clock[0]
+        try:
+            result = history.check(deadline_seconds=600)
+        finally:
+            lin.search, lin.time.monotonic = real_search, real_monotonic
+        self.assertEqual(deadlines, [600, 600])
+        self.assertEqual(result["verdict"], "linearizable")
 
 
 class Events(unittest.TestCase):

@@ -1147,7 +1147,8 @@ def passing_job_report(load, node_faults):
                 stop_requested_at=NOW + FINAL - 100,
                 progress={mode: {"succeeded": 20_000_000, "retried": 0} for mode in job_soak.MODES},
                 # p99 job start lag 32 ms, inside its SLO (#1400).
-                metrics=dict(start_lag_ms_counts=[980, 0, 0, 0, 0, 20] + [0] * 10))
+                metrics=dict(start_lag_ms_counts=[980, 0, 0, 0, 0, 20] + [0] * 10,
+                             quiet_start_lag_ms_counts=[980, 0, 0, 0, 0, 20] + [0] * 10))
 
 
 class ExecutionInventory(unittest.TestCase):

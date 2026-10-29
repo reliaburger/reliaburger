@@ -558,15 +558,18 @@ to `main`, so the build reuses that run instead of running the suite again
 [`ci_reuse.py`](../scripts/release/ci_reuse.py), which asks the GitHub API
 for a `ci.yml` run on exactly this commit, from a push, the merge queue or the
 nightly schedule (a pull request's run tests a merge commit and may skip
-jobs). The run counts only if it succeeded and every job in it succeeded,
-`ignored-test evidence` included; the script's list of required jobs is kept
+jobs). The run counts only if it succeeded on its first attempt and every
+job in it succeeded, `ignored-test evidence` included. A run that went green
+only when someone re-ran it doesn't count: a failure that passes on a re-run
+is a flake, retries are 0, and the candidate runs its own suite instead
+([#1436](https://github.com/reliaburger/reliaburger/issues/1436)); the script's list of required jobs is kept
 equal to `ci.yml`'s own by a test, so a new CI job can't be skipped silently.
-Anything else (no such run, a failed, cancelled or skipped job, another
-commit, an API error) runs the full suite in `validate-release`, as every
+Anything else (no such run, a re-run, a failed, cancelled or skipped job,
+another commit, an API error) runs the full suite in `validate-release`, as every
 build did before 0.2.4. Reusing the run takes the candidate from about 2 hours
 to about 50 minutes, the macOS `relish` build's time; most of the hour saved
 was spent waiting for hosted macOS runners. The job summary's *Source CI*
-line names the run the candidate rests on.
+line names the run and attempt the candidate rests on.
 
 Only after those checks pass does it collect the two built guest images, sign
 all six binaries and both images' digests, and upload `candidate-<commit>-<attempt>` as an Actions artefact.
@@ -665,12 +668,14 @@ job final. A failure then turns up mid-week, on the train, instead of after
 the freeze on a candidate.
 
 ```sh
-scripts/release/nightly-qualify.sh --train release-0-2-4 --gate patch \
+scripts/release/nightly-qualify.sh --train release-0-2-4 \
   --base-url https://github.com/reliaburger/reliaburger/releases/download/nightly-v0.2.4-RUN_ID-ATTEMPT \
   --qualified-digest ITS_DIGEST [--soak-bun /path/to/bun-v0.2.4-soak.1]
 ```
 
-It reads the tip with `git ls-remote`, fetches it, and runs every tier from a
+It reads the tip with `git ls-remote`, fetches it, works out the gate the
+release needs ([below](#a-gate-scaled-to-the-release)), and runs every tier
+from a
 detached checkout of that commit, so the tip's own harness runs. Power-cut
 and reboot runs build the commit inside their disposable VM; the soaks
 install a staged build through `curl | sh`, and the script refuses one whose
@@ -712,8 +717,21 @@ never marked latest. Nothing can mistake it for a release:
 - `docs/website/install.sh` refuses a mirror whose last path segment starts
   with `nightly-` unless `RELIABURGER_ACCEPT_NIGHTLY=1`, and
   `nightly-qualify.sh` sets that for its soaks and nothing else does;
-- even with that set by hand, a released `relish` or `bun` refuses the
-  nightly's signatures, because it doesn't trust the nightly key.
+- on a fresh install that variable is the only guard. Set by hand, it lets
+  the bootstrap run the nightly's own `install.sh`, which installs the
+  nightly's own `relish`, and that one trusts the nightly key. What the keys
+  guarantee is the other direction: a released `relish` or `bun` already on a
+  machine refuses the nightly's signatures, so nothing released installs or
+  upgrades to a nightly.
+
+The nightly's binaries aren't the candidate's bytes, either. They're built
+from the same commit, but with the `nightly-signing` feature, which changes
+the keys `src/upgrade/keys.rs` trusts and nothing else. A green night says
+the candidate's *code* passed the long tiers; the staged installs at freeze
+still run on the candidate's own signed build. The portable Linux CI job runs
+the nightly build's key test (`cargo test --features nightly-signing
+upgrade::keys::`), so the one difference is tested on every run
+([#1442](https://github.com/reliaburger/reliaburger/issues/1442)).
 
 Before any tier, `nightly-qualify.sh` checks the staged build's
 `candidate.json` against the digest and the tip, and checks its guest images'
@@ -762,8 +780,15 @@ a tag range and prints `patch` or `full` with its reasons:
 scripts/release/release_tier.py --previous v0.2.3 --release v0.2.4 --commit origin/release-0-2-4
 ```
 
-Run it when the train opens and again at freeze; a change that tips a patch
-release into the full gate moves its nightlies to `--gate full`.
+`nightly-qualify.sh` and `nightly.py freeze-check` apply the same rule
+themselves, so neither takes the gate on trust: the release is the version in
+the commit's `Cargo.toml`, the previous release the nearest `v*` tag behind
+it (`--previous` names another), and the run prints the reasons. `--gate`
+can only raise the gate: asking for the patch gate on a release that needs
+the full one is refused, so a change that tips a patch release into the full
+gate moves its nightlies and its freeze check with it
+([#1428](https://github.com/reliaburger/reliaburger/issues/1428)). 0.2.4
+needs the full gate: it moves `CURRENT` and the agent loop.
 
 ### Code freeze
 
@@ -773,7 +798,7 @@ the soaks and power-cut runs don't run again:
 
 ```sh
 git fetch origin main
-scripts/release/nightly.py freeze-check --commit CANDIDATE_SHA --gate patch
+scripts/release/nightly.py freeze-check --commit CANDIDATE_SHA
 ```
 
 Same code means the same commit, or a commit with the same tree: the gate
