@@ -329,15 +329,20 @@ pub fn spawn_reconciler_membership_filter(
     fence: RecoveryFence,
     shutdown: CancellationToken,
 ) -> watch::Receiver<Vec<MembershipSnapshot>> {
-    let filter = move |membership: &[MembershipSnapshot], directory: &NodeDirectory| {
-        let stale = stale_epoch_members(directory, fence.snapshot().claimed_epoch());
-        membership
+    // Each channel is borrowed in its own statement: two `watch` borrows
+    // held at once can deadlock (#1273, #1433).
+    let filter = move |membership_rx: &watch::Receiver<Vec<MembershipSnapshot>>,
+                       directory_rx: &watch::Receiver<NodeDirectory>| {
+        let own_epoch = fence.snapshot().claimed_epoch();
+        let stale = stale_epoch_members(&directory_rx.borrow(), own_epoch);
+        membership_rx
+            .borrow()
             .iter()
             .filter(|member| !stale.contains(&member.node_id))
             .cloned()
             .collect::<Vec<_>>()
     };
-    let (tx, rx) = watch::channel(filter(&membership_rx.borrow(), &directory_rx.borrow()));
+    let (tx, rx) = watch::channel(filter(&membership_rx, &directory_rx));
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -345,7 +350,7 @@ pub fn spawn_reconciler_membership_filter(
                 changed = membership_rx.changed() => if changed.is_err() { break },
                 changed = directory_rx.changed() => if changed.is_err() { break },
             }
-            let filtered = filter(&membership_rx.borrow(), &directory_rx.borrow());
+            let filtered = filter(&membership_rx, &directory_rx);
             if tx.send(filtered).is_err() {
                 break;
             }
