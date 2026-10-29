@@ -2178,7 +2178,7 @@ mod tests {
             .flatten()
             .find(|entry| {
                 std::fs::read(entry.path().join("cmdline")).ok().as_deref()
-                    == Some(b"sleep\03607\0".as_slice())
+                    == Some(b"sleep\x003607\x00".as_slice())
                     && std::fs::read_link(entry.path().join("ns/user"))
                         .is_ok_and(|namespace| namespace != own_namespace)
             })
