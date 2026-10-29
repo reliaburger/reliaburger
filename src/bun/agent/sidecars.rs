@@ -516,6 +516,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         } = relaunched;
         self.sidecars
             .finish_relaunch(&sidecar, result.is_ok(), Instant::now());
+        // Its new cgroup is bound to its app's namespace on the next tick
+        // (#1426).
+        if result.is_ok() {
+            self.namespace_firewall_stale = true;
+        }
         let Some(instance) = self.supervisor.get_instance(&parent) else {
             return;
         };

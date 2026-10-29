@@ -645,6 +645,13 @@ that carries it is deleted when the instance stops. The runtime's record of a
 stopped instance keeps the names of its environment variables, never their
 values.
 
+A sidecar inherits its app's whole `env`, so every sidecar sees the app's
+decrypted secrets, and each `PROVIDER[...]` reference in it is fetched again
+for each sidecar as it starts. A third-party proxy image you run as a
+sidecar can read the app's database password. Sidecars get the app's
+mounts too, so a file is no hiding place either. If a sidecar shouldn't
+hold a secret, run it as an app of its own.
+
 To rotate the key: `relish secret rotate` makes a new keypair and prints its
 public key, while the old one keeps decrypting. Re-encrypt your values with the
 new key, re-apply, then run `relish secret rotate --finalize`. It refuses, and

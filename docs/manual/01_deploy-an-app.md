@@ -163,7 +163,8 @@ container, it runs its own `image` (pulled, trust-checked and pinned), or the
 app's, and it gets the app's environment and volume and config-file mounts.
 Its own `env` goes on top: plain values and `PROVIDER[...]` references,
 which are resolved when it starts. An encrypted value belongs in the app's
-`env`, which every sidecar inherits.
+`env`, which every sidecar inherits. That includes its secrets: see
+[Secrets](10_security.md#secrets).
 
 The order is fixed:
 
@@ -198,6 +199,10 @@ A node on Apple Container (each container is its own VM), rootless runc or
 node's own network, and on an app with an `egress` allowlist: the allowlist
 binds the app's cgroup, not its sidecars', so a sidecar could reach what the
 app can't.
+
+Namespace isolation does cover sidecars: a sidecar belongs to its app's
+namespace, and its app's `allow_from` grants are its grants too. A sidecar
+reaches what its app may reach in other namespaces, and nothing else.
 
 A Bun restart adopts running apps but not their sidecars, which have no
 adoption records. Bun starts them again on its next tick, a second or so
