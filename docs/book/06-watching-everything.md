@@ -932,6 +932,20 @@ the one line that's left. `a_rotated_capture_file_is_read_again_from_the_start`
 renames the capture file away and writes a longer one in its place, which is
 the case a length check alone gets wrong.
 
+`load` was also the only place that forgot a capture. Every singleton job
+that printed added its capture file's path to the checkpoint, the job's
+instance deleted the file when it retired, and the entry stayed until Bun
+restarted. Each flush cloned the whole map, wrote it into the Parquet footer
+and wrote it again as JSON, so a node running a printing cron job every
+minute carried one more entry a minute, three times over (#1417). Now each
+flush runs the same check on the blocking pool before it writes: a path that
+is gone, or is a different file now, leaves the copy being written, and once
+the flush is durable the store forgets it too, unless the path has meanwhile
+been ingested again as a new file. The test
+`the_checkpoint_forgets_captures_whose_files_are_gone` ingests from two
+hundred job captures, deletes them and checks that one flush leaves only the
+capture still on disk, in memory and in the saved checkpoint.
+
 ### Ask everyone, not just the current home
 
 All of that shipped, and the next soak still caught a stale tail. Right
