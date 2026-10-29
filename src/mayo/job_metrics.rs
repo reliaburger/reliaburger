@@ -6,7 +6,8 @@
 //! `profile` (a manifest's resource profile, `default` otherwise) and `node`.
 //! A task index or run id never becomes a label: a million-task run is the
 //! same handful of series as a one-task run, and the number of label sets a
-//! node keeps is capped at [`MAX_JOB_SERIES`].
+//! node keeps is capped at [`MAX_JOB_SERIES`]. A set idle for
+//! [`IDLE_SERIES_AFTER`] is no longer exported, though its totals stay.
 //!
 //! The node's executor calls [`JobTelemetry::observe`] each time the leader
 //! syncs it, with each run's live counters. The collection loop turns the
@@ -25,6 +26,13 @@ use super::types::MetricKey;
 /// Most label sets one node keeps. Past it, the longest-idle set with no
 /// running attempts is dropped (its counters start again if it comes back).
 pub const MAX_JOB_SERIES: usize = 1024;
+
+/// How long a label set with nothing running and nothing new to count keeps
+/// being exported. Past it the set drops out of Mayo's samples, as a scrape
+/// target that stops answering does in Prometheus, but its totals stay: if it
+/// comes back, its counters carry on and never go backwards. Without this a
+/// node exported every array it had ever run, every tick, all day (#1417).
+pub const IDLE_SERIES_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// Upper bounds of the task duration buckets, in milliseconds. The last
 /// bucket, `+Inf`, catches the rest. Matches the run state's buckets.
@@ -108,6 +116,8 @@ struct Totals {
     counts: AttemptCounts,
     durations: [u64; 16],
     touched: u64,
+    /// When something last ran or was counted under these labels.
+    active: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +195,9 @@ impl JobTelemetry {
             .map_or_else(AttemptCounts::default, |run| run.last);
         let delta = counts.since(last);
         let totals = inner.totals(labels);
+        if running > 0 || delta != AttemptCounts::default() {
+            totals.active = Some(Instant::now());
+        }
         totals.counts.started += delta.started;
         totals.counts.succeeded += delta.succeeded;
         totals.counts.failed += delta.failed;
@@ -204,6 +217,9 @@ impl JobTelemetry {
     pub fn record_durations(&self, labels: &JobLabels, durations: &[u64; 16]) {
         let mut inner = self.lock();
         let totals = inner.totals(labels);
+        if durations.iter().any(|count| *count > 0) {
+            totals.active = Some(Instant::now());
+        }
         for (total, count) in totals.durations.iter_mut().zip(durations) {
             *total += count;
         }
@@ -239,9 +255,15 @@ impl JobTelemetry {
         self.lock().usage.clone()
     }
 
-    /// Mayo samples for every label set this node keeps: counters, the
-    /// cumulative duration histogram, and the running gauge.
+    /// Mayo samples for every label set this node is running, or ran within
+    /// [`IDLE_SERIES_AFTER`]: counters, the cumulative duration histogram,
+    /// and the running gauge.
     pub fn samples(&self, node: &str) -> Vec<CollectedMetric> {
+        self.samples_at(node, Instant::now())
+    }
+
+    /// As [`samples`](Self::samples), judging idleness at `now`.
+    fn samples_at(&self, node: &str, now: Instant) -> Vec<CollectedMetric> {
         let inner = self.lock();
         let mut running: BTreeMap<&JobLabels, u64> = BTreeMap::new();
         for run in inner.runs.values() {
@@ -249,6 +271,12 @@ impl JobTelemetry {
         }
         let mut samples = Vec::new();
         for (labels, totals) in &inner.totals {
+            let recent = totals
+                .active
+                .is_some_and(|active| now.saturating_duration_since(active) < IDLE_SERIES_AFTER);
+            if !recent && running.get(labels).copied().unwrap_or(0) == 0 {
+                continue;
+            }
             let base = labels.metric_labels(node);
             let metric = |name: &str, value: u64| CollectedMetric {
                 key: MetricKey::with_labels(name, base.clone()),
@@ -457,6 +485,41 @@ mod tests {
             label_sets.contains(&Some("render".to_string())),
             "a running label set was evicted"
         );
+    }
+
+    #[test]
+    fn idle_label_sets_stop_being_exported_after_a_quiet_period() {
+        // The #1417 day run named every array afresh. Each finished array's
+        // label set went on being exported every collection tick for the
+        // rest of the day, so Mayo's samples per minute grew all day.
+        let telemetry = JobTelemetry::default();
+        for run in 1..=300u64 {
+            let name = format!("soak-{run}");
+            telemetry.observe(run, &labels(&name), counts(10, 10), 0, Vec::new());
+            telemetry.record_durations(&labels(&name), &[1; 16]);
+        }
+        telemetry.retain_runs(|_| false);
+        telemetry.observe(301, &labels("live"), counts(1, 0), 1, Vec::new());
+        let definitions = |samples: Vec<CollectedMetric>| {
+            samples
+                .into_iter()
+                .filter_map(|sample| sample.key.labels.get("definition").cloned())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        // Within the quiet period every set is still exported.
+        assert_eq!(definitions(telemetry.samples("a")).len(), 301);
+
+        let later = Instant::now() + IDLE_SERIES_AFTER + std::time::Duration::from_secs(1);
+        assert_eq!(
+            definitions(telemetry.samples_at("a", later)),
+            std::collections::BTreeSet::from(["live".to_string()])
+        );
+
+        // A label set that comes back carries on from its old totals, so
+        // its counters never go backwards.
+        telemetry.observe(302, &labels("soak-1"), counts(5, 5), 1, Vec::new());
+        let samples = telemetry.samples_at("a", later);
+        assert_eq!(value(&samples, "job_tasks_succeeded_total", "soak-1"), 15.0);
     }
 
     #[test]

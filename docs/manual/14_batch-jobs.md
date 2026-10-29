@@ -306,6 +306,9 @@ Every node exports Mayo series for the attempts it ran itself, so they survive
 a leader change. Each carries only `namespace`, `definition` (the job or array
 name), `profile` (a manifest's resource profile, `default` otherwise) and
 `node`, never a task index or run ID. A node keeps at most 1,024 label sets.
+A label set drops out of the samples 15 minutes after its last attempt ended,
+and comes back with its old totals if the definition runs again, so a
+finished array doesn't keep adding rows to the metrics store.
 
 | Series | Meaning |
 |--------|---------|

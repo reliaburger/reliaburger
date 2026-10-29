@@ -1128,6 +1128,18 @@ and a daily `render-$DATE` would grow the store for ever. A test checks that
 no other label ever appears, and that a node never keeps more than 1,024
 label sets however many definitions come and go.
 
+The cap bounded the map but not the samples. The collection loop exported
+every label set it kept, every 10 seconds, whether anything had run under it
+for hours or not. The 0.2.3 day run gave each of its arrays a new name, so
+each node exported one more idle set every few minutes: its metrics export
+grew from 6 MiB an hour at the start to 42 MiB an hour at the end, and Bun
+built, buffered and queried all those rows (#1417). Now a set records when it
+last saw activity, and `samples` leaves it out once it has been idle for
+`IDLE_SERIES_AFTER`, 15 minutes. Its totals stay in the map, so a definition
+that runs again carries on counting from where it was. A Prometheus target
+that stops answering looks the same: its series go stale, and `rate()` over
+a counter that comes back still works.
+
 The telemetry is shared by async tasks and synchronous code, so it sits behind
 a `std::sync::Mutex`, not a tokio one. That's allowed here because no critical
 section contains an `.await`: each is a few map operations. Holding a std mutex
