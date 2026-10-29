@@ -1267,20 +1267,20 @@ mod tests {
     /// the node lists; and both keys together admit the app.
     #[tokio::test]
     async fn runtime_knobs_pass_only_the_node_gate_of_a_runtime_that_applies_them() {
-        let app = app_with_knobs("capabilities = [\"NET_ADMIN\"]\n");
+        let app = app_with_knobs("capabilities = [\"SYS_NICE\"]\n");
 
         let grill = MockGrill::new();
         grill.set_applies_runtime_knobs(true);
         let mut sup = WorkloadSupervisor::new(grill, PortAllocator::new(30000, 31000));
         let error = sup.admit_app("lb", &app).unwrap_err().to_string();
         assert!(
-            error.contains("runtime.capabilities CAP_NET_ADMIN"),
+            error.contains("runtime.capabilities CAP_SYS_NICE"),
             "{error}"
         );
         assert!(error.contains("node gate"), "{error}");
         assert!(error.contains("allowed_capabilities"), "{error}");
 
-        sup.set_runtime_allowlist(knob_allowlist("allowed_capabilities = [\"NET_ADMIN\"]\n"));
+        sup.set_runtime_allowlist(knob_allowlist("allowed_capabilities = [\"SYS_NICE\"]\n"));
         sup.admit_app("lb", &app).unwrap();
         assert_eq!(
             sup.runtime_knob_capability().capabilities.len(),
@@ -1304,13 +1304,13 @@ mod tests {
     #[tokio::test]
     async fn a_runtime_that_cannot_apply_knobs_refuses_them_and_advertises_none() {
         let mut sup = WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000));
-        sup.set_runtime_allowlist(knob_allowlist("allowed_capabilities = [\"NET_ADMIN\"]\n"));
+        sup.set_runtime_allowlist(knob_allowlist("allowed_capabilities = [\"SYS_NICE\"]\n"));
         let error = sup
-            .admit_app("lb", &app_with_knobs("capabilities = [\"NET_ADMIN\"]\n"))
+            .admit_app("lb", &app_with_knobs("capabilities = [\"SYS_NICE\"]\n"))
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("runtime.capabilities CAP_NET_ADMIN"),
+            error.contains("runtime.capabilities CAP_SYS_NICE"),
             "{error}"
         );
         assert!(error.contains("the process runtime"), "{error}");

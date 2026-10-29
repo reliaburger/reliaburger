@@ -463,18 +463,18 @@ reaches an app the next time the app itself is applied.
 ## Runtime knobs
 
 Some apps need a little more from the kernel than a container gets by
-default. A load balancer wants a bigger `net.core.somaxconn`, a VPN client
-wants `CAP_NET_ADMIN` and `/dev/net/tun`, a FUSE filesystem wants
-`/dev/fuse`. An app asks for these in its `[runtime]` table:
+default. A load balancer wants a bigger `net.core.somaxconn`, a FUSE
+filesystem wants `CAP_SYS_ADMIN` and `/dev/fuse`. An app asks for these in
+its `[runtime]` table:
 
 ```toml
-[app.vpn]
-image = "ghcr.io/example/vpn:2.0"
+[app.files]
+image = "ghcr.io/example/files:2.0"
 
-[app.vpn.runtime]
-capabilities = ["NET_ADMIN"]
-sysctls = { "net.ipv4.ip_forward" = "1", "net.core.somaxconn" = "4096" }
-devices = [{ path = "/dev/net/tun", permissions = "rw" }]
+[app.files.runtime]
+capabilities = ["SYS_ADMIN"]
+sysctls = { "net.core.somaxconn" = "4096" }
+devices = [{ path = "/dev/fuse", permissions = "rw" }]
 ```
 
 Each use needs two keys, the same two a host-path `source` needs:
@@ -485,16 +485,16 @@ Each use needs two keys, the same two a host-path `source` needs:
 
 ```toml
 [runtime]
-allowed_capabilities = ["NET_ADMIN"]
-allowed_sysctls = ["net.ipv4.ip_forward", "net.core.*"]
-allowed_devices = ["/dev/net/tun"]
+allowed_capabilities = ["SYS_ADMIN"]
+allowed_sysctls = ["net.core.*"]
+allowed_devices = ["/dev/fuse"]
 ```
 
 `apply` checks the token. A deploy-only token is refused before anything is
 written, with a reason that names the knob:
 
 ```text
-app.vpn: runtime.capabilities CAP_NET_ADMIN refused by the token gate: a runtime knob needs the host-exec permission, and this token's permission doesn't grant it
+app.files: runtime.capabilities CAP_SYS_ADMIN refused by the token gate: a runtime knob needs the host-exec permission, and this token's permission doesn't grant it
 ```
 
 The node checks its own list. Each node advertises what it allows, and the
@@ -504,7 +504,7 @@ it. A node that's asked anyway (on a standalone node, or after you've
 shortened its list) refuses the deploy and names the key it's missing:
 
 ```text
-runtime.devices /dev/net/tun refused by the node gate: this node's [runtime] allowed_devices in node.toml doesn't list it
+runtime.devices /dev/fuse refused by the node gate: this node's [runtime] allowed_devices in node.toml doesn't list it
 ```
 
 Only rootful runc applies knobs. A node on the process runtime, Apple
@@ -517,7 +517,7 @@ its network namespace and so see its `net.*` sysctls.
 What each kind accepts:
 
 - **`capabilities`**: Linux capability names, with or without `CAP_`
-  (`NET_ADMIN` and `CAP_NET_ADMIN` are the same). They're added to the
+  (`SYS_ADMIN` and `CAP_SYS_ADMIN` are the same). They're added to the
   container's default set; nothing is dropped. There's no wildcard: `ALL`
   is refused on both sides. The node names each capability, and the ones
   that amount to root inside the container (`CAP_SYS_ADMIN`,
@@ -529,19 +529,37 @@ What each kind accepts:
   namespaces. As in Docker and Kubernetes, a capability reaches a process
   that runs as root in the container; a non-root user needs file
   capabilities on its binary.
+
+  That's also the limit of what a capability can do here. The kernel
+  checks a capability against the user namespace that owns the thing being
+  changed, and a container runs in a user namespace of its own. Its
+  processes, files, mounts and IPC belong to that namespace, so a
+  capability works on them. Its network namespace doesn't: Bun creates it,
+  before the container exists, so the node's user namespace owns it. So
+  the network capabilities, `CAP_NET_ADMIN`, `CAP_NET_RAW`,
+  `CAP_NET_BIND_SERVICE` and `CAP_NET_BROADCAST`, are refused on both sides:
+  with one, `ip link`, a TUN device or a raw socket would still fail with
+  "operation not permitted". Ask for `net.*` sysctls instead, which the node
+  writes into the namespace for the app, and note that every port, low ones
+  included, is already bindable. Anything the kernel checks against the host
+  itself, such as setting the clock or loading a module, fails whatever the
+  container holds.
 - **`sysctls`**: only the ones the kernel keeps per container: `net.*`,
   `kernel.shm*`, `kernel.msg*`, `kernel.sem` and `fs.mqueue.*`. Anything
   else, `kernel.panic` or `vm.overcommit_memory` say, would change the whole
   node, so it's refused at `lint` and `apply`, and a node can't list it
   either. A node may list exact names or a `net.` or `fs.mqueue.` prefix
   ending in `.*`.
-- **`devices`**: an absolute path under `/dev` and its `permissions`, some
-  of `r`, `w` and `m` (default `rwm`). The device appears at the same path
-  in the container, and the cgroup lets the container use it with those
-  permissions. The file's own mode still applies to the container's mapped
+- **`devices`**: an absolute path under `/dev` and its `permissions`, `r`,
+  `w` or `rw` (the default). The device appears at the same path in the
+  container, and the cgroup lets the container use it with those
+  permissions. A node that lists a device lets an app read and write it.
+  There's no `m` (mknod): the kernel lets only the host's own user namespace
+  make device nodes, so the permission would grant nothing, and it's
+  refused. The file's own mode still applies to the container's mapped
   user, so a device that only root or a group can open needs a mode or a
-  udev rule that lets the container in. `/dev/fuse` and `/dev/net/tun` are
-  `0666` on most distributions.
+  udev rule that lets the container in. `/dev/fuse` is `0666` on most
+  distributions.
 
 ## Audit log
 

@@ -5342,7 +5342,7 @@ async fn managed_volume_needs_only_deploy() {
 }
 
 const RUNTIME_KNOBS: &str = "[app.lb]\nimage = \"test:v1\"\n\
-    [app.lb.runtime]\ncapabilities = [\"NET_ADMIN\"]\n";
+    [app.lb.runtime]\ncapabilities = [\"SYS_NICE\"]\n";
 
 /// #1122: the token gate on its own. A deployer whose permission block
 /// grants `deploy` but not `host-exec` can't apply an app with a runtime
@@ -5373,7 +5373,7 @@ async fn a_runtime_knob_needs_host_exec_and_the_refusal_names_the_token_gate() {
         .unwrap();
     let message = String::from_utf8_lossy(&body);
     assert!(
-        message.contains("runtime.capabilities CAP_NET_ADMIN"),
+        message.contains("runtime.capabilities CAP_SYS_NICE"),
         "{message}"
     );
     assert!(message.contains("token gate"), "{message}");
@@ -5395,7 +5395,7 @@ fn apply_notes_each_runtime_knob_needs_a_node_allowlist_entry() {
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(notes[0].contains("app.lb"), "{notes:?}");
     assert!(
-        notes[0].contains("runtime.capabilities CAP_NET_ADMIN"),
+        notes[0].contains("runtime.capabilities CAP_SYS_NICE"),
         "{notes:?}"
     );
     assert!(notes[0].contains("allowed_capabilities"), "{notes:?}");

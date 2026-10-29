@@ -375,8 +375,17 @@ impl RuncGrill {
                 instance: instance.clone(),
                 reason,
             };
-            super::knobs::apply_to_spec(&mut spec, &knobs, super::knobs::host_device)
+            let devices = super::knobs::host_devices(&knobs)
+                .await
                 .map_err(|e| failed(e.to_string()))?;
+            super::knobs::apply_to_spec(&mut spec, &knobs, |path| {
+                devices.get(path).copied().ok_or_else(|| {
+                    super::knobs::DeviceLookupError::NotADevice {
+                        path: path.display().to_string(),
+                    }
+                })
+            })
+            .map_err(|e| failed(e.to_string()))?;
             let network_sysctls = super::knobs::take_network_sysctls(&mut spec);
             netns::write_sysctls_with_commands(commands, instance, &network_sysctls)
                 .await
@@ -2135,6 +2144,72 @@ mod tests {
         );
         assert!(app_ip.is_some(), "the app has its address");
         assert_eq!(sidecar_ip, None, "a sidecar reserves no address of its own");
+    }
+
+    /// #1427: why the network capabilities and the `m` device permission
+    /// are refused at parse time. The container's network namespace belongs
+    /// to the node's user namespace. A process that joins the container's
+    /// user namespace from the host holds every capability there,
+    /// `CAP_NET_ADMIN` included, and still can't change that network. And
+    /// only the initial user namespace may make device nodes, so `mknod`
+    /// fails inside the container, though its default set has `CAP_MKNOD`
+    /// and runc's device cgroup allows it. If either starts working, the
+    /// refusal can go.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_a_container_cannot_use_a_network_capability_or_make_device_nodes() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__net-admin-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let (grill, spec) = image_app(
+            tmp.path(),
+            &id,
+            // An odd duration, to find this container's process on the host.
+            &format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3607\"]\n"),
+        );
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let own_namespace = std::fs::read_link("/proc/self/ns/user").unwrap();
+        let target = std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                std::fs::read(entry.path().join("cmdline")).ok().as_deref()
+                    == Some(b"sleep\x003607\x00".as_slice())
+                    && std::fs::read_link(entry.path().join("ns/user"))
+                        .is_ok_and(|namespace| namespace != own_namespace)
+            })
+            .expect("the container's process")
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        // Every capability in the container's user namespace: setns into a
+        // user namespace grants the full set there.
+        let network = tokio::process::Command::new("nsenter")
+            .args(["--target", &target, "--user", "--net", "--"])
+            .args(["ip", "link", "set", "dev", "lo", "mtu", "1400"])
+            .output()
+            .await
+            .unwrap();
+        let run = |command: &[&str]| {
+            let argv: Vec<String> = command.iter().map(|part| part.to_string()).collect();
+            let grill = &grill;
+            let id = &id;
+            async move { grill.exec(id, &argv).await.unwrap() }
+        };
+        let mknod = run(&["mknod", "/tmp/rb-null", "c", "1", "3"]).await;
+        // The same container can change what its own namespaces own.
+        let own = run(&["chown", "65534", "/tmp"]).await;
+        grill.kill(&id).await.unwrap();
+
+        let said = String::from_utf8_lossy(&network.stderr);
+        assert!(!network.status.success(), "CAP_NET_ADMIN worked: {said}");
+        assert!(said.contains("not permitted"), "{said}");
+        assert_ne!(mknod.exit_code, 0, "mknod worked: {}", mknod.output);
+        assert_eq!(own.exit_code, 0, "{}", own.output);
     }
 
     async fn redis_cli(grill: &RuncGrill, id: &InstanceId, command: &[&str]) -> String {

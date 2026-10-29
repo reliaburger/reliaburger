@@ -67,6 +67,22 @@ pub const KNOWN_CAPABILITIES: [&str; 41] = [
     "CAP_WAKE_ALARM",
 ];
 
+/// The network capabilities, which no container can use (#1427).
+///
+/// Bun makes each container's network namespace before runc starts it, so
+/// the namespace belongs to the node's user namespace, while the container
+/// runs in one of its own. The kernel checks these capabilities against the
+/// user namespace that owns the network namespace, where the container has
+/// none, so granting one changes nothing: `ip link`, a TUN device and raw
+/// sockets still fail with `EPERM`. Refusing them at parse time says so,
+/// instead of letting a deploy succeed and the workload fail.
+pub const NETWORK_CAPABILITIES: [&str; 4] = [
+    "CAP_NET_ADMIN",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_NET_BROADCAST",
+    "CAP_NET_RAW",
+];
+
 /// The capabilities that amount to "nearly root": with one of these a
 /// process can mount filesystems, load kernel code, read any file or trace
 /// any process. No wildcard or pattern ever admits them; a node must name
@@ -98,8 +114,15 @@ const MAX_DEVICE_PATH_LENGTH: usize = 255;
 /// A runtime knob that can't be used anywhere.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KnobError {
-    #[error("unknown capability {0:?}: use a Linux capability name such as \"CAP_NET_ADMIN\"")]
+    #[error("unknown capability {0:?}: use a Linux capability name such as \"CAP_SYS_NICE\"")]
     UnknownCapability(String),
+    #[error(
+        "{0} can't be granted: a container's network namespace belongs to the node, and the \
+         kernel checks network capabilities against the namespace's owner, so the container \
+         would still get \"operation not permitted\". Set network sysctls with `sysctls`, which \
+         the node writes into the namespace for it"
+    )]
+    NetworkCapability(&'static str),
     #[error(
         "{0:?} is not a capability: name each capability, because a wildcard would grant \
          CAP_SYS_ADMIN and the other escape hatches with it"
@@ -121,8 +144,14 @@ pub enum KnobError {
     MalformedSysctlValue(String),
     #[error("device {0:?} must be an absolute path under /dev with no '.' or '..' parts")]
     MalformedDevice(String),
-    #[error("device permissions {0:?} must be one or more of r, w and m, each once")]
+    #[error("device permissions {0:?} must be r, w or rw")]
     MalformedPermissions(String),
+    #[error(
+        "device permission \"m\" (mknod) can't be granted: a container runs in its own user \
+         namespace, where the kernel refuses to make device nodes whatever the device cgroup \
+         allows. Pass the device itself with `path` instead"
+    )]
+    DeviceMknod,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +179,7 @@ impl<'de> Deserialize<'de> for Capability {
 }
 
 impl Capability {
-    /// The canonical name, such as `"CAP_NET_ADMIN"`.
+    /// The canonical name, such as `"CAP_SYS_NICE"`.
     pub fn name(self) -> &'static str {
         self.0
     }
@@ -170,9 +199,9 @@ impl fmt::Display for Capability {
 impl FromStr for Capability {
     type Err = KnobError;
 
-    /// Accept `CAP_NET_ADMIN`, `NET_ADMIN` or `net_admin`, the forms Docker
-    /// and Kubernetes take. Refuse `ALL` and anything the kernel doesn't
-    /// know.
+    /// Accept `CAP_SYS_NICE`, `SYS_NICE` or `sys_nice`, the forms Docker
+    /// and Kubernetes take. Refuse `ALL`, anything the kernel doesn't know,
+    /// and the [`NETWORK_CAPABILITIES`], which a container can't use.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let upper = value.trim().to_ascii_uppercase();
         if upper == "ALL" || upper == "CAP_ALL" || upper.contains('*') {
@@ -183,6 +212,12 @@ impl FromStr for Capability {
         } else {
             format!("CAP_{upper}")
         };
+        if let Some(network) = NETWORK_CAPABILITIES
+            .iter()
+            .find(|network| **network == canonical)
+        {
+            return Err(KnobError::NetworkCapability(network));
+        }
         KNOWN_CAPABILITIES
             .iter()
             .find(|known| **known == canonical)
@@ -440,30 +475,33 @@ impl From<DevicePath> for String {
     }
 }
 
-/// What a container may do with a device: read, write and create the node
-/// (`m`, for mknod), in the cgroup device controller's `rwm` notation.
+/// What a container may do with a device: read it, write it, or both, in
+/// the cgroup device controller's `rwm` notation.
+///
+/// There's no `m` (mknod): a container runs in its own user namespace, and
+/// the kernel lets only the initial user namespace make device nodes, so a
+/// device cgroup rule allowing it would grant nothing (#1442).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct DevicePermissions {
     pub read: bool,
     pub write: bool,
-    pub mknod: bool,
 }
 
 impl Default for DevicePermissions {
-    /// `rwm`, what Docker's `--device` grants when it isn't told otherwise.
+    /// `rw`: Docker's `--device` default without the mknod no container
+    /// here can use.
     fn default() -> Self {
         Self {
             read: true,
             write: true,
-            mknod: true,
         }
     }
 }
 
 impl fmt::Display for DevicePermissions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (granted, letter) in [(self.read, "r"), (self.write, "w"), (self.mknod, "m")] {
+        for (granted, letter) in [(self.read, "r"), (self.write, "w")] {
             if granted {
                 f.write_str(letter)?;
             }
@@ -480,13 +518,12 @@ impl FromStr for DevicePermissions {
         let mut permissions = DevicePermissions {
             read: false,
             write: false,
-            mknod: false,
         };
         for letter in value.chars() {
             let slot = match letter {
                 'r' => &mut permissions.read,
                 'w' => &mut permissions.write,
-                'm' => &mut permissions.mknod,
+                'm' => return Err(KnobError::DeviceMknod),
                 _ => return Err(malformed()),
             };
             if *slot {
@@ -521,7 +558,7 @@ impl From<DevicePermissions> for String {
 pub struct DeviceRequest {
     /// The host device, which appears at the same path in the container.
     pub path: DevicePath,
-    /// What the container may do with it. `rwm` when unset.
+    /// What the container may do with it. `rw` when unset.
     #[serde(default)]
     pub permissions: DevicePermissions,
 }
@@ -760,16 +797,20 @@ pub fn split_linux_device_number(device: u64) -> (i64, i64) {
 }
 
 /// Read a host device node. Runs on the node at launch, where the device
-/// lives.
+/// lives, and reads it with `tokio::fs`, so a slow `stat` never holds an
+/// async worker thread.
 #[cfg(unix)]
-pub fn host_device(path: &Path) -> Result<HostDevice, DeviceLookupError> {
+pub async fn host_device(path: &Path) -> Result<HostDevice, DeviceLookupError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     let display = path.display().to_string();
-    let metadata = std::fs::metadata(path).map_err(|source| DeviceLookupError::Unreadable {
-        path: display.clone(),
-        source,
-    })?;
+    let metadata =
+        tokio::fs::metadata(path)
+            .await
+            .map_err(|source| DeviceLookupError::Unreadable {
+                path: display.clone(),
+                source,
+            })?;
     let file_type = metadata.file_type();
     let kind = if file_type.is_char_device() {
         DeviceKind::Char
@@ -789,14 +830,28 @@ pub fn host_device(path: &Path) -> Result<HostDevice, DeviceLookupError> {
     })
 }
 
+/// Read every host device `knobs` asks for, by path, for
+/// [`apply_to_spec`]'s lookup.
+#[cfg(unix)]
+pub async fn host_devices(
+    knobs: &RuntimeKnobs,
+) -> Result<BTreeMap<PathBuf, HostDevice>, DeviceLookupError> {
+    let mut devices = BTreeMap::new();
+    for request in &knobs.devices {
+        let path = request.path.as_path();
+        devices.insert(path.to_path_buf(), host_device(path).await?);
+    }
+    Ok(devices)
+}
+
 /// Write an app's runtime knobs into the OCI spec a runtime is about to
 /// hand to runc: the added capabilities joined to whatever set the spec
 /// already grants, the sysctls into `linux.sysctl`, and each device into
 /// `linux.devices` with a matching allow rule in the cgroup device
 /// controller (`linux.resources.devices`).
 ///
-/// `lookup` reads a host device; runc's caller passes [`host_device`], and
-/// tests pass a table. Call it after the user namespace has set the default
+/// `lookup` finds a host device; runc's caller reads them first with
+/// [`host_devices`] and looks them up there, and tests pass a table. Call it after the user namespace has set the default
 /// capabilities, so they're joined rather than replaced.
 pub fn apply_to_spec<F>(
     spec: &mut OciSpec,

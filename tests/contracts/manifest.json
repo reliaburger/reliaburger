@@ -5381,6 +5381,17 @@
           "sources": [
             "src/grill/runc.rs"
           ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-grill-runc-tests-runc_a_container_cannot_use_a_network_capability_or_make_device_nodes",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_a_container_cannot_use_a_network_capability_or_make_device_nodes",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs"
+          ]
         }
       ]
     },

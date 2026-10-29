@@ -3274,12 +3274,12 @@ mod tests {
         let grill = ProcessGrill::new();
         let id = InstanceId("default__lb-0".to_string());
         let mut spec = echo_spec("hello");
-        spec.runtime_knobs = Some(toml::from_str("capabilities = [\"NET_ADMIN\"]\n").unwrap());
+        spec.runtime_knobs = Some(toml::from_str("capabilities = [\"SYS_NICE\"]\n").unwrap());
 
         let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
         assert_eq!(
             problem.to_string(),
-            "runtime.capabilities CAP_NET_ADMIN can't be applied: runtime knobs need rootful \
+            "runtime.capabilities CAP_SYS_NICE can't be applied: runtime knobs need rootful \
              runc, and this node's runtime is process"
         );
         assert!(matches!(
