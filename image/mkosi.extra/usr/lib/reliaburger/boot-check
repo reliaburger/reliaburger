@@ -61,6 +61,10 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 2
 done
 echo "reliaburger: bun not healthy after $limit s on OS ${IMAGE_VERSION:-unknown}"
+# Why: bun's stderr is in the journal, and a CI boot test keeps only the
+# console.
+journalctl -b -o cat --no-pager -u reliaburger.service 2>/dev/null \
+    | tail -n 60 | sed 's/^/reliaburger: bun: /'
 if counted; then
     echo "reliaburger: counted boot failed, rebooting (systemd-boot falls back after the last try)"
     systemctl reboot
