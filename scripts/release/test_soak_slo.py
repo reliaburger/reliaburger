@@ -80,8 +80,8 @@ class Rows(unittest.TestCase):
 
     def test_a_job_start_past_the_last_bucket_fails(self):
         counts = [0] * 16
-        counts[-1] = 100
-        report = {"m8": {"quiet_p99_start_lag_ms": soak_slo.job_p99(counts), "quiet_start_lag_samples": 100}}
+        counts[-1] = 1000
+        report = {"m8": {"quiet_p99_start_lag_ms": soak_slo.job_p99(counts), "quiet_start_lag_samples": 1000}}
         rows = soak_slo.rows(self.measured(), report, "fast")
         self.assertEqual(self.verdicts(rows)["job-start"], "FAIL")
         self.assertIn("over every start-lag bucket", soak_slo.failures(rows)[0])
@@ -94,6 +94,24 @@ class Rows(unittest.TestCase):
         rows = soak_slo.rows(self.measured(), report, "final")
         self.assertEqual(self.verdicts(rows)["job-start"], "PASS")
         self.assertEqual(next(row for row in rows if row["name"] == "job-start")["p99"], 32)
+
+    def test_a_fast_tier_with_too_few_quiet_job_starts_records_them_without_judging(self):
+        # A fast tier's faults leave few runs outside every window (#1485).
+        counts = [0] * 16
+        counts[0], counts[soak_slo.job_bucket_index(2048)] = 16, 4
+        report = {"m8": {"quiet_p99_start_lag_ms": soak_slo.job_p99(counts), "quiet_start_lag_samples": 20}}
+        rows = soak_slo.rows(self.measured(), report, "fast")
+        row = next(row for row in rows if row["name"] == "job-start")
+        self.assertEqual(soak_slo.failures(rows), [])
+        self.assertEqual((row["verdict"], row["mode"], row["p99"]), ("too few samples", "record only", 2048))
+        self.assertIn("- Job task start p99 not judged: only 20 job task start samples, fewer than the 1,000 a p99 "
+                      "needs", soak_slo.table_lines(rows))
+
+    def test_a_final_with_too_few_quiet_job_starts_fails(self):
+        # The final's quiet tail runs the campaign at full load, so it can't be short of samples.
+        rows = soak_slo.rows(self.measured(), self.job_report(p99_ms=32, samples=20), "final")
+        self.assertEqual(soak_slo.failures(rows),
+                         ["job-start: only 20 job task start samples, fewer than the 1,000 a p99 needs"])
 
     def test_a_gated_slo_with_no_samples_fails(self):
         for report in (None, self.job_report(samples=0)):

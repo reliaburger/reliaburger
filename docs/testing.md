@@ -779,6 +779,13 @@ can't fail the quiet-cluster SLO
 earlier records' 32 to 64 ms counted every run, faults included, so they
 bound the quiet number from above.
 
+A p99 needs at least 1,000 quiet samples before the gate judges it
+([#1485](https://github.com/reliaburger/reliaburger/issues/1485)). A fast
+tier's faults come back to back, so only about 20 runs a tier miss every
+window, and the p99 of 20 samples is their largest. A fast tier short of
+1,000 records the value as too few samples to judge. A final's 2¼-hour quiet
+tail gives it millions, so a final short of 1,000 fails.
+
 **Record only, from 28 October 2026.** No soak before 0.2.4 timed the API,
 an app start or a rolling update, so those four start in record-only mode:
 the record shows the value and whether it's over the provisional threshold,
