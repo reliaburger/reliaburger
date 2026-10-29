@@ -95,6 +95,32 @@ pub struct CouncilNode {
     /// Test hook: how many leadership proofs this node has run (#1441).
     #[cfg(test)]
     leadership_proofs: std::sync::atomic::AtomicU64,
+    /// Test hook: leadership proofs running now, and the most ever at once.
+    #[cfg(test)]
+    proofs_in_flight: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64),
+}
+
+/// Test hook: counts a leadership proof while it runs, including one a
+/// caller's timeout cancels (#1441).
+#[cfg(test)]
+struct ProofInFlight<'a>(&'a std::sync::atomic::AtomicU64);
+
+#[cfg(test)]
+impl<'a> ProofInFlight<'a> {
+    fn start(node: &'a CouncilNode) -> Self {
+        use std::sync::atomic::Ordering;
+        node.leadership_proofs.fetch_add(1, Ordering::SeqCst);
+        let (now, most) = &node.proofs_in_flight;
+        most.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+        Self(now)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProofInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl CouncilNode {
@@ -154,6 +180,8 @@ impl CouncilNode {
             full_desired_reads: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             leadership_proofs: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            proofs_in_flight: Default::default(),
         })
     }
 
@@ -309,8 +337,7 @@ impl CouncilNode {
         self.leadership_proof
             .run(|| async {
                 #[cfg(test)]
-                self.leadership_proofs
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _in_flight = ProofInFlight::start(self);
                 self.raft.ensure_linearizable().await.is_ok()
             })
             .await
@@ -1332,12 +1359,17 @@ mod tests {
         let answers = futures_util::future::join_all(confirmations).await;
         let together = leader.leadership_proofs.load(Ordering::SeqCst) - before;
         assert!(answers.iter().all(|confirmed| !confirmed));
-        // Proofs never overlap now, but a failed one ends at once and each
-        // request sleeps its own retry pause, so requests that wake just
-        // after a round start the next. Unshared, fifty ran fifty times as
-        // many as one alone.
+        assert_eq!(
+            leader.proofs_in_flight.1.load(Ordering::SeqCst),
+            1,
+            "two leadership proofs ran at once"
+        );
+        // A failed proof ends at once and each request sleeps its own retry
+        // pause, so requests that wake just after a round start the next:
+        // fifty run a few times as many as one. Unshared, they ran fifty
+        // times as many.
         assert!(
-            together <= 4 * alone,
+            together <= 10 * alone,
             "fifty requests ran {together} proofs; one alone ran {alone}"
         );
     }
