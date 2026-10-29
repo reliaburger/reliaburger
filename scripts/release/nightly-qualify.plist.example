@@ -8,7 +8,8 @@
       > ~/Library/LaunchAgents/com.reliaburger.nightly-qualify.plist
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.reliaburger.nightly-qualify.plist
 
-  Edit the train (and the gate, staged build and soak bun) first. It starts at
+  Edit the train (and the staged build and soak bun) first; the gate comes
+  from the release (release_tier.py). It starts at
   18:00: the patch gate's tiers take about 3 hours, the full gate's about
   14, so a full night ends around 08:00. A login shell (-l) gives it the PATH
   that finds limactl, gh and python3. Remove it with
@@ -23,7 +24,7 @@
   <array>
     <string>/bin/bash</string>
     <string>-lc</string>
-    <string>scripts/release/nightly-qualify.sh --train release-0-2-4 --gate patch</string>
+    <string>scripts/release/nightly-qualify.sh --train release-0-2-4</string>
   </array>
   <key>WorkingDirectory</key>
   <string>CHECKOUT</string>

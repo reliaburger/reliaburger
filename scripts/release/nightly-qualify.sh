@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Nightly qualification of a merge train's tip (#1363): the power-cut and
-# reboot runs, the V02 and jobs fast soaks and, with --gate full, the 8-hour
+# reboot runs, the V02 and jobs fast soaks and, for the full gate, the 8-hour
 # job final, one after another on the quiet host, against the commit at the
 # tip of the train when the night starts. Writes a dated record directory
 # (nightly.json and a README naming the commit) under --records.
@@ -9,9 +9,12 @@
 #   scripts/release/nightly-qualify.sh --train release-0-2-4 [options]
 #
 #   --train NAME            the merge train whose tip to qualify
-#   --gate patch|full       patch (default): power-cut and reboot runs, V02
-#                           and jobs fast tiers; full adds the job final.
-#                           scripts/release/release_tier.py says which
+#   --previous TAG          the previous release (default: the nearest v* tag
+#                           behind the tip); the gate is release_tier.py's
+#                           verdict on it and the tip's Cargo.toml version
+#   --gate full             run the full gate when the rule says patch. The
+#                           patch gate is refused for a release that needs
+#                           the full one (#1428)
 #   --base-url URL          a staged build of the tip, for the soaks: the
 #                           nightly-v... pre-release stage.yml publishes for a
 #                           train's nightly build. Without one only the
@@ -29,8 +32,8 @@
 #   --remote NAME           the remote holding the train (default origin)
 #   --plan, --dry-run       resolve the tip, print the tiers and exit
 #
-# At code freeze, `scripts/release/nightly.py freeze-check --commit SHA
-# --gate patch|full` says whether the latest green nightly ran the candidate's
+# At code freeze, `scripts/release/nightly.py freeze-check --commit SHA`
+# works out the same gate and says whether the latest green nightly ran the candidate's
 # code. scripts/release/nightly-qualify.plist.example runs this from launchd.
 set -euo pipefail
 

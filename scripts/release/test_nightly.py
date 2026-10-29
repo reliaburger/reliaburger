@@ -14,10 +14,11 @@ import tempfile
 import unittest
 
 from nightly import (FAIL, GATE_TIERS, JOBS_FAST, JOBS_FINAL, NOT_RUN, PASS, POWER_CUT, V02_FAST,
-                     freeze_problems, green, load_records, plan_steps, render_readme, run_tiers,
-                     signature_problems, staged_problems, tier_environment)
+                     choose_gate, freeze_problems, green, load_records, main, plan_steps, render_readme,
+                     required_gate, run_tiers, signature_problems, staged_problems, tier_environment)
 
 HERE = Path(__file__).resolve().parent
+REPOSITORY = HERE.parents[1]
 COMMIT = "c" * 40
 TREE = "t" * 40
 STAGED = ("https://example.test/staging-v0.2.4-1-1", "d" * 64)
@@ -264,6 +265,94 @@ class StagedSignatureTests(unittest.TestCase):
                          {"PATH": "/bin", "RELIABURGER_ACCEPT_NIGHTLY": "1"})
         self.assertEqual(tier_environment({"PATH": "/bin", "RELIABURGER_ACCEPT_NIGHTLY": "1"}, "release"),
                          {"PATH": "/bin"})
+
+
+def compatibility(protocol, state):
+    return f"pub const CURRENT: Compatibility = Compatibility {{\n    protocol: {protocol},\n    state: {state},\n}};\n"
+
+
+def fake_git(previous_current=(54, 71), current=(54, 71), version="0.2.4", changed=("src/lib.rs",),
+             tag="v0.2.3"):
+    """A `git` that answers the questions required_gate asks about COMMIT and the previous tag."""
+    def answer(*arguments):
+        if arguments[0] == "rev-parse":
+            return TREE if arguments[-1].endswith("^{tree}") else COMMIT
+        if arguments[0] == "describe":
+            return tag
+        if arguments[:2] == ("show", f"{COMMIT}:Cargo.toml"):
+            return f'[package]\nname = "reliaburger"\nversion = "{version}"\n'
+        if arguments[0] == "show":
+            spec = arguments[1]
+            pair = current if spec.startswith(COMMIT) else previous_current
+            return compatibility(*pair)
+        if arguments[0] == "diff":
+            return "\n".join(changed)
+        raise AssertionError(f"unexpected git {arguments}")
+    return answer
+
+
+class GateTests(unittest.TestCase):
+    """The gate comes from the release, not from a default (#1428)."""
+
+    def test_a_patch_release_with_the_same_formats_needs_the_patch_gate(self):
+        gate, reasons, previous, release = required_gate(COMMIT, git=fake_git())
+        self.assertEqual((gate, previous, release), ("patch", "v0.2.3", "0.2.4"))
+
+    def test_a_release_that_moves_the_durable_state_needs_the_full_gate(self):
+        gate, reasons, _, _ = required_gate(COMMIT, git=fake_git(current=(55, 72)))
+        self.assertEqual(gate, "full")
+        self.assertIn("the durable state moved: state 71 -> 72", reasons)
+
+    def test_a_release_that_touches_the_agent_loop_needs_the_full_gate(self):
+        gate, _, _, _ = required_gate(COMMIT, git=fake_git(changed=("src/bun/agent/jobs.rs",)))
+        self.assertEqual(gate, "full")
+
+    def test_an_explicit_previous_release_is_used_instead_of_the_nearest_tag(self):
+        _, _, previous, _ = required_gate(COMMIT, previous="v0.2.2", git=fake_git(tag="v0.2.3"))
+        self.assertEqual(previous, "v0.2.2")
+
+    def test_without_a_gate_the_required_one_is_used(self):
+        self.assertEqual(choose_gate("full", None), ("full", None))
+        self.assertEqual(choose_gate("patch", None), ("patch", None))
+
+    def test_a_gate_below_the_required_one_is_refused(self):
+        gate, problem = choose_gate("full", "patch")
+        self.assertIsNone(gate)
+        self.assertIn("needs the full gate", problem)
+
+    def test_a_gate_above_the_required_one_is_allowed(self):
+        self.assertEqual(choose_gate("patch", "full"), ("full", None))
+
+    def test_freeze_check_refuses_the_patch_gate_for_a_full_gate_release(self):
+        with tempfile.TemporaryDirectory() as records:
+            night = Path(records) / "2026-10-28-release-0-2-4-cccccccc"
+            night.mkdir()
+            (night / "nightly.json").write_text(json.dumps(record("2026-10-28", PATCH_GREEN)))
+            status = main(["freeze-check", "--records", records, "--commit", COMMIT, "--gate", "patch"],
+                          git=fake_git(current=(55, 72)))
+        self.assertEqual(status, 2)
+
+    def test_freeze_check_without_a_gate_holds_a_full_gate_release_to_the_full_gate(self):
+        with tempfile.TemporaryDirectory() as records:
+            night = Path(records) / "2026-10-28-release-0-2-4-cccccccc"
+            night.mkdir()
+            (night / "nightly.json").write_text(json.dumps(record("2026-10-28", PATCH_GREEN)))
+            status = main(["freeze-check", "--records", records, "--commit", COMMIT],
+                          git=fake_git(current=(55, 72)))
+        self.assertEqual(status, 1)
+
+    def test_freeze_check_passes_a_patch_release_on_a_patch_green_night(self):
+        with tempfile.TemporaryDirectory() as records:
+            night = Path(records) / "2026-10-28-release-0-2-4-cccccccc"
+            night.mkdir()
+            (night / "nightly.json").write_text(json.dumps(record("2026-10-28", PATCH_GREEN)))
+            status = main(["freeze-check", "--records", records, "--commit", COMMIT], git=fake_git())
+        self.assertEqual(status, 0)
+
+    def test_no_example_passes_the_patch_gate_by_hand(self):
+        for path in (REPOSITORY / "docs" / "releasing.md", HERE / "nightly-qualify.plist.example",
+                     HERE / "nightly-qualify.sh"):
+            self.assertNotIn("--gate patch", path.read_text(), path)
 
 
 class WrapperTests(unittest.TestCase):
