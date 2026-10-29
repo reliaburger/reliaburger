@@ -1075,8 +1075,11 @@ is anywhere in its environment.
 
 The staged nightly gets its own name too, `nightly-v0.2.4-RUN-ATTEMPT`, and the website
 installer refuses a mirror by that name unless `RELIABURGER_ACCEPT_NIGHTLY=1` says
-qualification is asking. That isn't the security boundary (the keys are), it's a guard rail,
-so nobody installs one by pasting the wrong URL. Old nightlies don't pile up either: each
+qualification is asking. That's a guard rail, so nobody installs one by pasting the wrong URL,
+and on a fresh install it's the only one: with the variable set, the bootstrap runs the
+nightly's own `install.sh`, which installs the nightly's own `relish`, which trusts the
+nightly key. The keys guard the direction that matters, a released binary already on a
+machine taking a nightly one. Old nightlies don't pile up either: each
 nightly staging deletes all but the newest seven.
 
 ## Dependencies are code too
