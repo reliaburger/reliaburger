@@ -482,7 +482,9 @@ size = "50Gi"
 The body is ordinary `[app.*]` and `[job.*]` TOML. `${name}` is replaced by
 the parameter's value, and that's all a template can do: there are no
 conditionals, loops or functions. A parameter is a `string`, an `int` or a
-`bool`; one with a `default` is optional, and one without is required.
+`bool`; one with a `default` is optional, and one without is required. A
+`use` may expand to at most 4 MiB of TOML, and all the uses in one file to
+16 MiB together; past that the apply is refused, naming the use.
 
 Templates expand when the config is read, before anything else sees it.
 `relish apply`, `apply --dry-run`, `lint`, `diff` and `compile` all work on

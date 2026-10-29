@@ -1131,7 +1131,10 @@ with a `default`; without one, required) and a `body` string of ordinary
   anything but apps and jobs; a body that declares or uses a template (no
   nesting); an expanded name a declared resource or another use already has;
   template and use names that aren't DNS labels, and a parameter named
-  `template`.
+  `template`; and a use whose expansion would pass `MAX_EXPANDED_BYTES`
+  (4 MiB), or all the uses of one expansion (a manifest, or one file of a
+  tree) `MAX_TOTAL_EXPANDED_BYTES` (16 MiB), checked as the text grows so
+  nothing past the cap is allocated (#1425).
 - **What's stored.** Only ordinary apps and jobs. Each expanded one carries
   `provenance: { template, use }` (`AppSpec::provenance`,
   `JobSpec::provenance`), the one wire and state change. It's part of the

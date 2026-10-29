@@ -2344,6 +2344,38 @@ config itself? Uses expand in name order, because a `BTreeMap` iterates in
 key order, so the same files always give the same apps and the same first
 error.
 
+#### Substitution multiplies
+
+The injection argument above was about what a value can *say*. The review
+of the train found a problem with how much it can *weigh*
+([#1425](https://github.com/reliaburger/reliaburger/issues/1425)). A body
+of 250,000 `${v}` placeholders fits in a 2 MB request, and so does a
+megabyte-long value for `v`. Substitution writes the value once per
+placeholder: 250 gigabytes, asked for by one apply, before any namespace or
+permission check, on the leader. That's a denial of service anyone with a
+deploy token, or a commit to a GitOps repository, could send.
+
+So `substitute` now takes a `limit` and checks the running length before it
+appends each piece, text or value, rather than after the loop, by which time
+the memory is gone. A use may expand to at most 4 MiB
+(`MAX_EXPANDED_BYTES`), and all the uses in one expansion (one manifest, or
+one file of a GitOps tree) to 16 MiB together (`MAX_TOTAL_EXPANDED_BYTES`),
+because ten thousand uses that each stay under the first cap would add up to
+the same problem. `expand` keeps the remaining budget and hands each use the
+smaller of the two; a use that would pass it is refused with
+`TemplateError::TooLarge`, naming the use and the template.
+
+`substitute` used to return `Err((parameter, reason))`, a tuple, because
+the only failure was a value in the wrong place. A second failure that has
+no parameter at all made that tuple a lie, so the error is now a small
+private enum, `Unfillable`, with `Placement { parameter, reason }` and
+`TooLarge`, and `expand_one` maps each to its `TemplateError`. A tuple is
+fine for one kind of failure; as soon as there are two, an enum makes the
+compiler check every caller handles both. Each rendered value is a
+`Cow<str>`, "clone on write": a borrowed slice for a piece of the body, an
+owned `String` for a rendered value, so the length check reads the same
+for both without copying the body.
+
 #### Three callers, one function
 
 `expand` has three callers, all before validation and policy. The compiler
@@ -3044,6 +3076,13 @@ unit tests in `src/config/template/tests.rs`, with no node in sight:
   one name, a nested template or `use`, a body with a policy in it, a
   placeholder no parameter resolves, bad names, and a body that isn't valid
   TOML. The ones whose wording matters compare the whole message.
+- **Size** (#1425): `a_use_that_expands_past_the_limit_is_refused` turns
+  about 20 KiB of input (2,048 placeholders and a 4 KiB value) into a
+  refusal instead of 8 MiB; `uses_that_together_expand_past_the_total_are_refused`
+  has five uses of about 3.5 MiB each, every one under the per-use cap, and
+  checks the fifth is refused with the budget the first four left; and
+  `a_use_under_the_limit_expands` checks the cap doesn't bite ordinary
+  templates.
 - **A property test**, `expansion_is_deterministic_and_leaves_no_placeholders`,
   generates names, counts, flags and strings full of quotes, backslashes,
   newlines and Unicode, puts them in a basic string, a multi-line string, a
