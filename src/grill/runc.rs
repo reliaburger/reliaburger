@@ -2146,6 +2146,24 @@ mod tests {
         assert_eq!(sidecar_ip, None, "a sidecar reserves no address of its own");
     }
 
+    /// The host pid of the process with this command line that runs in a
+    /// user namespace other than the test's own: a container's.
+    fn container_process(cmdline: &[u8]) -> String {
+        let own_namespace = std::fs::read_link("/proc/self/ns/user").unwrap();
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                std::fs::read(entry.path().join("cmdline")).ok().as_deref() == Some(cmdline)
+                    && std::fs::read_link(entry.path().join("ns/user"))
+                        .is_ok_and(|namespace| namespace != own_namespace)
+            })
+            .expect("the container's process")
+            .file_name()
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// #1427: why the network capabilities and the `m` device permission
     /// are refused at parse time. The container's network namespace belongs
     /// to the node's user namespace. A process that joins the container's
@@ -2172,20 +2190,7 @@ mod tests {
         );
         grill.create(&id, &spec).await.unwrap();
         grill.start(&id).await.unwrap();
-        let own_namespace = std::fs::read_link("/proc/self/ns/user").unwrap();
-        let target = std::fs::read_dir("/proc")
-            .unwrap()
-            .flatten()
-            .find(|entry| {
-                std::fs::read(entry.path().join("cmdline")).ok().as_deref()
-                    == Some(b"sleep\x003607\x00".as_slice())
-                    && std::fs::read_link(entry.path().join("ns/user"))
-                        .is_ok_and(|namespace| namespace != own_namespace)
-            })
-            .expect("the container's process")
-            .file_name()
-            .to_string_lossy()
-            .into_owned();
+        let target = container_process(b"sleep\x003607\x00");
         // Every capability in the container's user namespace: setns into a
         // user namespace grants the full set there.
         let network = tokio::process::Command::new("nsenter")
@@ -2210,6 +2215,208 @@ mod tests {
         assert!(said.contains("not permitted"), "{said}");
         assert_ne!(mknod.exit_code, 0, "mknod worked: {}", mknod.output);
         assert_eq!(own.exit_code, 0, "{}", own.output);
+    }
+
+    /// The capabilities a container can't use whatever it holds: the kernel
+    /// checks each against the node's own user namespace (#1474). On the
+    /// host, as root, each probe's operation works; inside the container's
+    /// user namespace, with every capability there, it's refused.
+    /// `CAP_MAC_OVERRIDE` has no probe: only Smack checks it, against the
+    /// initial user namespace, and the test hosts run AppArmor.
+    const CAPABILITIES_CHECKED_AGAINST_THE_NODE: [&str; 21] = [
+        "CAP_AUDIT_CONTROL",
+        "CAP_AUDIT_READ",
+        "CAP_AUDIT_WRITE",
+        "CAP_BLOCK_SUSPEND",
+        "CAP_BPF",
+        "CAP_DAC_READ_SEARCH",
+        "CAP_IPC_LOCK",
+        "CAP_LEASE",
+        "CAP_LINUX_IMMUTABLE",
+        "CAP_MAC_ADMIN",
+        "CAP_MKNOD",
+        "CAP_PERFMON",
+        "CAP_SYSLOG",
+        "CAP_SYS_MODULE",
+        "CAP_SYS_NICE",
+        "CAP_SYS_PACCT",
+        "CAP_SYS_RAWIO",
+        "CAP_SYS_RESOURCE",
+        "CAP_SYS_TIME",
+        "CAP_SYS_TTY_CONFIG",
+        "CAP_WAKE_ALARM",
+    ];
+
+    /// The capabilities outside Docker's default set that work on what the
+    /// container's own namespaces own: its pid namespace (checkpoint and
+    /// restore, reboot, ptrace), its IPC namespace and its UTS namespace.
+    const CAPABILITIES_CHECKED_AGAINST_THE_CONTAINER: [&str; 5] = [
+        "CAP_CHECKPOINT_RESTORE",
+        "CAP_IPC_OWNER",
+        "CAP_SYS_ADMIN",
+        "CAP_SYS_BOOT",
+        "CAP_SYS_PTRACE",
+    ];
+
+    /// Run `tests/fixtures/capability_probe.py` for one capability: as root
+    /// on the host when `container` is `None`, or else in the container's
+    /// user, pid, IPC, UTS and network namespaces.
+    async fn capability_probe(
+        directory: &std::path::Path,
+        container: Option<&str>,
+        capability: &str,
+        drop: bool,
+    ) -> String {
+        let mut command = match container {
+            Some(target) => {
+                let mut nsenter = tokio::process::Command::new("nsenter");
+                nsenter.args(["--target", target, "--user", "--pid", "--ipc", "--uts"]);
+                nsenter.args(["--net", "--", "python3"]);
+                nsenter
+            }
+            None => tokio::process::Command::new("python3"),
+        };
+        command
+            .arg(directory.join("probe.py"))
+            .arg(capability)
+            .arg("--file")
+            .arg(directory.join("file"))
+            .arg("--dir")
+            .arg(directory);
+        if drop {
+            command.arg("--drop");
+        }
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{capability} probe crashed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// #1474: which capability knobs do anything. A container runs in its
+    /// own user namespace, and the kernel checks each capability against
+    /// some user namespace: the one owning the object for most, the
+    /// initial one for the rest. Joining the container's user namespace
+    /// from the host grants every capability in it, the most any knob
+    /// could, so a probe refused there can never work, and the parser
+    /// refuses that capability. The ones that work are probed there with
+    /// and without the capability, and granted through the knob to show it
+    /// reaches the container.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), python3, and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_capability_knobs_work_only_where_the_container_owns_the_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        // Container root (host uid HOST_ID_BASE) runs the probe from here.
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probes = tmp.path().join("probe");
+        std::fs::create_dir(&probes).unwrap();
+        std::fs::set_permissions(&probes, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let base = crate::grill::userns::HOST_ID_BASE;
+        std::os::unix::fs::chown(&probes, Some(base), Some(base)).unwrap();
+        std::fs::write(
+            probes.join("probe.py"),
+            include_str!("../../tests/fixtures/capability_probe.py"),
+        )
+        .unwrap();
+        // Another container user's file, for leases, file flags and FIBMAP.
+        std::fs::write(probes.join("file"), "burger\n").unwrap();
+        std::os::unix::fs::chown(probes.join("file"), Some(base + 1), Some(base + 1)).unwrap();
+        for file in ["probe.py", "file"] {
+            std::fs::set_permissions(probes.join(file), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+
+        let id = InstanceId("default__cap-probe-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let granted = CAPABILITIES_CHECKED_AGAINST_THE_CONTAINER
+            .map(|name| format!("\"{name}\""))
+            .join(", ");
+        let (grill, spec) = image_app(
+            tmp.path(),
+            &id,
+            &format!(
+                "image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3608\"]\n\
+                 [runtime]\ncapabilities = [{granted}]\n"
+            ),
+        );
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let target = container_process(b"sleep\x003608\x00");
+
+        let mut table = Vec::new();
+        let mut wrong = Vec::new();
+        for name in CAPABILITIES_CHECKED_AGAINST_THE_NODE {
+            let host = capability_probe(&probes, None, name, false).await;
+            let inside = capability_probe(&probes, Some(&target), name, false).await;
+            if !host.starts_with("allowed") || !inside.starts_with("denied") {
+                wrong.push(name);
+            }
+            table.push(format!(
+                "{name}: host root {host}; container, every capability {inside}"
+            ));
+        }
+        for name in CAPABILITIES_CHECKED_AGAINST_THE_CONTAINER {
+            let with = capability_probe(&probes, Some(&target), name, false).await;
+            let without = capability_probe(&probes, Some(&target), name, true).await;
+            if !with.starts_with("allowed") || !without.starts_with("denied") {
+                wrong.push(name);
+            }
+            table.push(format!(
+                "{name}: container {with}; container without it {without}"
+            ));
+        }
+
+        // The knob put the working ones in the container's own process.
+        let status = grill
+            .exec(&id, &["cat".to_string(), "/proc/self/status".to_string()])
+            .await
+            .unwrap()
+            .output;
+        let effective = status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .map(|hex| u64::from_str_radix(hex.trim(), 16).unwrap())
+            .unwrap();
+        for (name, bit) in [
+            ("CAP_CHECKPOINT_RESTORE", 40),
+            ("CAP_IPC_OWNER", 15),
+            ("CAP_SYS_ADMIN", 21),
+            ("CAP_SYS_BOOT", 22),
+            ("CAP_SYS_PTRACE", 19),
+        ] {
+            assert_ne!(
+                effective & (1 << bit),
+                0,
+                "the knob didn't grant {name}: {status}"
+            );
+        }
+        let hostname = grill
+            .exec(&id, &["hostname".to_string(), "rb-cap-probe".to_string()])
+            .await
+            .unwrap();
+        grill.kill(&id).await.unwrap();
+
+        eprintln!("{}", table.join("\n"));
+        assert!(
+            wrong.is_empty(),
+            "unexpected for {wrong:?}:\n{}",
+            table.join("\n")
+        );
+        assert_eq!(hostname.exit_code, 0, "{}", hostname.output);
+        // And the parser agrees with the kernel.
+        for name in CAPABILITIES_CHECKED_AGAINST_THE_NODE {
+            assert!(
+                name.parse::<super::super::knobs::Capability>().is_err(),
+                "{name}"
+            );
+        }
     }
 
     async fn redis_cli(grill: &RuncGrill, id: &InstanceId, command: &[&str]) -> String {

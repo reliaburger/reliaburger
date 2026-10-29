@@ -5392,6 +5392,17 @@
           "sources": [
             "src/grill/runc.rs"
           ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-grill-runc-tests-runc_capability_knobs_work_only_where_the_container_owns_the_check",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_capability_knobs_work_only_where_the_container_owns_the_check",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs"
+          ]
         }
       ]
     },

@@ -193,6 +193,12 @@ pub struct Compatibility {
 /// or the `m` device permission, and a device's permissions default to
 /// `rw`, not `rwm` (#1442), in desired state, OCI specs, instance records
 /// and the node's knob allowlist.
+/// A runtime knob no longer parses with a capability the kernel checks
+/// against the node's own user namespace (`HOST_CAPABILITIES`, 22 of them,
+/// `CAP_SYS_TIME`, `CAP_SYS_NICE` and `CAP_IPC_LOCK` among them), and only
+/// `CAP_SYS_ADMIN`, `CAP_SYS_BOOT` and `CAP_SYS_PTRACE` are escape hatches
+/// (#1474), in desired state, OCI specs, instance records and the node's
+/// knob allowlist.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 55,
     state: 72,

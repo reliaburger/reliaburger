@@ -4677,7 +4677,7 @@ spec:
         securityContext:
           privileged: true
           capabilities:
-            add: ["NET_ADMIN", "CAP_IPC_LOCK", "TELEPORT"]
+            add: ["NET_ADMIN", "CAP_IPC_OWNER", "SYS_TIME", "TELEPORT"]
             drop: ["ALL"]
         volumeMounts:
         - name: fuse
@@ -4706,7 +4706,7 @@ spec:
         let app = &result.config.app["lb"];
         let knobs = app.runtime.as_ref().unwrap();
         let capabilities: Vec<&str> = knobs.capabilities.iter().map(|c| c.name()).collect();
-        assert_eq!(capabilities, ["CAP_IPC_LOCK"]);
+        assert_eq!(capabilities, ["CAP_IPC_OWNER"]);
         let sysctls: Vec<(&str, &str)> = knobs
             .sysctls
             .iter()
@@ -4731,6 +4731,7 @@ spec:
             "kernel.panic",
             "TELEPORT",
             "NET_ADMIN is not imported: CAP_NET_ADMIN can't be granted",
+            "SYS_TIME is not imported: CAP_SYS_TIME can't be granted",
             "capabilities.drop",
             "privileged",
             "allowed_capabilities",
@@ -4767,14 +4768,14 @@ spec:
             [app.lb]
             image = "lb:v1"
             [app.lb.runtime]
-            capabilities = ["SYS_NICE"]
+            capabilities = ["IPC_OWNER"]
             sysctls = { "net.core.somaxconn" = "4096", "kernel.shmmax" = "1048576" }
             devices = [{ path = "/dev/fuse" }]
             "#,
         )
         .unwrap();
         let exported = crate::relish::k8s_export::export_kubernetes(&config).unwrap();
-        for expected in ["SYS_NICE", "net.core.somaxconn", "/dev/fuse"] {
+        for expected in ["IPC_OWNER", "net.core.somaxconn", "/dev/fuse"] {
             assert!(
                 exported.yaml.contains(expected),
                 "{expected}: {}",

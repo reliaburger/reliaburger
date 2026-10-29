@@ -547,13 +547,13 @@ mod tests {
         cluster.set_node(fuse);
         let mut network = node_state("network", 2000, 4096, BTreeMap::new(), true);
         network.capabilities.runtime_knobs = allowing(
-            "[runtime]\nallowed_capabilities = [\"SYS_NICE\"]\nallowed_sysctls = [\"net.*\"]\n",
+            "[runtime]\nallowed_capabilities = [\"IPC_OWNER\"]\nallowed_sysctls = [\"net.*\"]\n",
         );
         cluster.set_node(network);
         cluster.set_node(node_state("plain", 2000, 4096, BTreeMap::new(), true));
 
         let tuned: AppSpec = toml::from_str(
-            "image = \"lb:1\"\n[runtime]\ncapabilities = [\"SYS_NICE\"]\n\
+            "image = \"lb:1\"\n[runtime]\ncapabilities = [\"IPC_OWNER\"]\n\
              sysctls = { \"net.core.somaxconn\" = \"4096\" }\n",
         )
         .unwrap();

@@ -133,6 +133,12 @@ sysctls = { "net.core.somaxconn" = "4096" }
 devices = [{ path = "/dev/fuse", permissions = "rw" }]
 ```
 
+A capability the container's own namespaces can't use is refused when the
+config is parsed: the network ones, and every one the kernel checks against
+the host whatever the container holds, such as `CAP_SYS_TIME` or
+`CAP_SYS_NICE` (#1427, #1474). The [security manual](manual/10_security.md)
+lists which work.
+
 ### Jobs and cron
 
 Jobs arrived in 0.2.0. 0.2.3 keeps 0.2.2's formats, so a 0.2.2 cluster can

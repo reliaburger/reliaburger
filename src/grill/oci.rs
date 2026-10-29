@@ -2346,7 +2346,7 @@ mod tests {
     fn a_sidecar_gets_none_of_the_apps_runtime_knobs() {
         let app = app_oci(
             &toml::from_str(
-                "image = \"vpn:1\"\n[runtime]\ncapabilities = [\"SYS_NICE\"]\n\
+                "image = \"vpn:1\"\n[runtime]\ncapabilities = [\"IPC_OWNER\"]\n\
                  devices = [{ path = \"/dev/net/tun\" }]\n",
             )
             .unwrap(),

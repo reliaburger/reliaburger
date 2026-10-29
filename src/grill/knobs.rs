@@ -83,22 +83,58 @@ pub const NETWORK_CAPABILITIES: [&str; 4] = [
     "CAP_NET_RAW",
 ];
 
-/// The capabilities that amount to "nearly root": with one of these a
-/// process can mount filesystems, load kernel code, read any file or trace
-/// any process. No wildcard or pattern ever admits them; a node must name
-/// each one, and Bun warns at startup when it does.
-pub const ESCAPE_CAPABILITIES: [&str; 10] = [
-    "CAP_BPF",
-    "CAP_DAC_READ_SEARCH",
-    "CAP_MAC_ADMIN",
-    "CAP_MAC_OVERRIDE",
-    "CAP_PERFMON",
-    "CAP_SYS_ADMIN",
-    "CAP_SYS_BOOT",
-    "CAP_SYS_MODULE",
-    "CAP_SYS_PTRACE",
-    "CAP_SYS_RAWIO",
+/// The capabilities the kernel checks against the node's own user
+/// namespace, the initial one, whatever namespace the caller runs in
+/// (#1474), each with what it guards.
+///
+/// A container runs in a user namespace of its own, so holding one of these
+/// changes nothing: the operation still fails with "operation not
+/// permitted". `make test-linux` runs each guarded operation inside a
+/// container's user namespace holding every capability there, and checks
+/// it's refused (`CAP_MAC_OVERRIDE`, which only Smack checks, excepted).
+/// `CAP_MKNOD` and `CAP_AUDIT_WRITE` are in Docker's default set, which
+/// every container still gets, but asking for them grants nothing either.
+pub const HOST_CAPABILITIES: [(&str, &str); 22] = [
+    ("CAP_AUDIT_CONTROL", "controlling the audit system"),
+    ("CAP_AUDIT_READ", "reading the audit log"),
+    ("CAP_AUDIT_WRITE", "writing audit records"),
+    ("CAP_BLOCK_SUSPEND", "keeping the system awake"),
+    ("CAP_BPF", "privileged BPF maps and programs"),
+    (
+        "CAP_DAC_READ_SEARCH",
+        "opening files by handle (reading past file permissions is \
+         CAP_DAC_OVERRIDE, which every container has)",
+    ),
+    ("CAP_IPC_LOCK", "locking memory beyond RLIMIT_MEMLOCK"),
+    ("CAP_LEASE", "leases on other users' files"),
+    (
+        "CAP_LINUX_IMMUTABLE",
+        "the immutable and append-only file flags",
+    ),
+    ("CAP_MAC_ADMIN", "loading AppArmor, SELinux or Smack policy"),
+    ("CAP_MAC_OVERRIDE", "overriding Smack's access control"),
+    ("CAP_MKNOD", "making device nodes"),
+    ("CAP_PERFMON", "system-wide performance monitoring"),
+    ("CAP_SYSLOG", "the kernel log"),
+    ("CAP_SYS_MODULE", "loading kernel modules"),
+    (
+        "CAP_SYS_NICE",
+        "raising priority: negative nice values and realtime scheduling",
+    ),
+    ("CAP_SYS_PACCT", "process accounting"),
+    ("CAP_SYS_RAWIO", "raw I/O: FIBMAP, I/O ports and /dev/mem"),
+    ("CAP_SYS_RESOURCE", "raising hard resource limits"),
+    ("CAP_SYS_TIME", "setting the clock"),
+    ("CAP_SYS_TTY_CONFIG", "configuring terminals"),
+    ("CAP_WAKE_ALARM", "alarms that wake the system"),
 ];
+
+/// The capabilities that amount to "nearly root" inside the container's
+/// own namespaces: with one of these a process can mount filesystems,
+/// trace any of its processes or end them all. No wildcard or pattern ever
+/// admits them; a node must name each one, and Bun warns at startup when it
+/// does.
+pub const ESCAPE_CAPABILITIES: [&str; 3] = ["CAP_SYS_ADMIN", "CAP_SYS_BOOT", "CAP_SYS_PTRACE"];
 
 /// The sysctls a container may set: the ones the kernel keeps per network
 /// or IPC namespace. Anything else would change the whole node.
@@ -114,7 +150,7 @@ const MAX_DEVICE_PATH_LENGTH: usize = 255;
 /// A runtime knob that can't be used anywhere.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KnobError {
-    #[error("unknown capability {0:?}: use a Linux capability name such as \"CAP_SYS_NICE\"")]
+    #[error("unknown capability {0:?}: use a Linux capability name such as \"CAP_SYS_PTRACE\"")]
     UnknownCapability(String),
     #[error(
         "{0} can't be granted: a container's network namespace belongs to the node, and the \
@@ -123,6 +159,15 @@ pub enum KnobError {
          the node writes into the namespace for it"
     )]
     NetworkCapability(&'static str),
+    #[error(
+        "{capability} can't be granted: the kernel checks it against the node's own user \
+         namespace, not the container's, for {guards}, so the container would still get \
+         \"operation not permitted\""
+    )]
+    HostCapability {
+        capability: &'static str,
+        guards: &'static str,
+    },
     #[error(
         "{0:?} is not a capability: name each capability, because a wildcard would grant \
          CAP_SYS_ADMIN and the other escape hatches with it"
@@ -179,7 +224,7 @@ impl<'de> Deserialize<'de> for Capability {
 }
 
 impl Capability {
-    /// The canonical name, such as `"CAP_SYS_NICE"`.
+    /// The canonical name, such as `"CAP_SYS_PTRACE"`.
     pub fn name(self) -> &'static str {
         self.0
     }
@@ -199,9 +244,10 @@ impl fmt::Display for Capability {
 impl FromStr for Capability {
     type Err = KnobError;
 
-    /// Accept `CAP_SYS_NICE`, `SYS_NICE` or `sys_nice`, the forms Docker
-    /// and Kubernetes take. Refuse `ALL`, anything the kernel doesn't know,
-    /// and the [`NETWORK_CAPABILITIES`], which a container can't use.
+    /// Accept `CAP_SYS_PTRACE`, `SYS_PTRACE` or `sys_ptrace`, the forms
+    /// Docker and Kubernetes take. Refuse `ALL`, anything the kernel doesn't
+    /// know, and the [`NETWORK_CAPABILITIES`] and [`HOST_CAPABILITIES`],
+    /// which a container can't use.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let upper = value.trim().to_ascii_uppercase();
         if upper == "ALL" || upper == "CAP_ALL" || upper.contains('*') {
@@ -217,6 +263,12 @@ impl FromStr for Capability {
             .find(|network| **network == canonical)
         {
             return Err(KnobError::NetworkCapability(network));
+        }
+        if let Some((capability, guards)) = HOST_CAPABILITIES
+            .iter()
+            .find(|(host, _)| *host == canonical)
+        {
+            return Err(KnobError::HostCapability { capability, guards });
         }
         KNOWN_CAPABILITIES
             .iter()
