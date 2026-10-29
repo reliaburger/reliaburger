@@ -992,7 +992,13 @@ check_council_history() {
         > /dev/null || result=$?
     case $result in
         0) event --phase council-history --verdict ok ;;
-        3) event --phase council-history --verdict inconclusive --detail 'search over budget; see council-history-check.json' ;;
+        # A fast or final tier with no linearizability coverage isn't green (#1437).
+        3) if [ "$tier" = fast ] || [ "$tier" = final ]; then
+               event --phase council-history --verdict fail --detail 'search over budget; see council-history-check.json'
+               record_failure linearizability 'the council history check was inconclusive (search over budget); see council-history-check.json'
+           else
+               event --phase council-history --verdict inconclusive --detail 'search over budget; see council-history-check.json'
+           fi ;;
         *) event --phase council-history --verdict fail
            record_failure linearizability 'the council history is not linearizable; see council-history-check.json' ;;
     esac
