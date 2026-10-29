@@ -1060,6 +1060,9 @@ functions, one per kind of change:
 
 - **Where.** `cluster_apply` calls `skip_owned_apps` on the leader before
   policy admission, so a skipped app is neither judged nor written.
+  `job_apply` does the same for the apps of a job manifest (#1429): the
+  state machine's backstop only checks that a write keeps the stored owner,
+  not that the caller speaks for it, so the API is the only place that can.
   `cluster_app_change` (stop, delete, release) and `rollback_handler` check
   before forwarding to the leader, because a forwarded request reaches the
   leader as the service principal. The bootstrap window and the service
