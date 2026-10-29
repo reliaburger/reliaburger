@@ -709,7 +709,10 @@ A stop then runs four steps, each with its own limit:
 1. `pre_stop`, inside the instance, the way `relish exec` runs a command.
    It gets `pre_stop_timeout`. If it fails, can't start or runs over, Bun
    logs why and carries on: a broken hook never keeps an instance alive.
-2. `stop_signal`, sent to the workload's whole process group.
+2. `stop_signal`, sent to the workload's main process, its PID 1. A host
+   (`exec` or `script`) workload gets it on its whole process group. In a
+   container, PID 1 has to pass it on to any children it wants stopped
+   cleanly, as under Docker or Kubernetes.
 3. `stop_grace`, while Bun waits for the instance to exit.
 4. SIGKILL, if it's still running.
 

@@ -1703,7 +1703,13 @@ pub struct StopPolicy {
 Every runtime already keeps that spec. The process runtime signals the
 workload's process group with `entry.spec.stop_signal()`, the process owner
 reads the spec it was launched with, runc passes the name to `runc kill`, and
-Apple Container gets `container stop --signal`. Because the spec is in the
+Apple Container gets `container kill --signal`. Why not `container stop
+--signal`, which looks made for this? Because it waits for the exit itself
+and kills the workload after its own `--time`, 5 s unless told otherwise, so
+`stop_grace = "2m"` bought two minutes on Linux and five seconds on a Mac
+(#1435). `Grill::stop` only signals, on every runtime, and Bun owns the
+grace. `container kill` refuses a workload that's already gone, so Apple's
+`stop` checks the state before it calls that a failure. Because the spec is in the
 instance record too, a Bun that restarts and adopts its instances still
 knows how to stop them. And a deploy retires an old instance with *its own*
 policy, not the new spec's. That matters when the new image has dropped the
@@ -2902,6 +2908,20 @@ signals it, even though the new spec has none. The parsing tests in
 `relish export` and back in. To check the tests check something, we put
 SIGTERM back in both runtimes and skipped the pre-stop: eight of them failed,
 each saying what it saw instead.
+
+Two more came out of the review of the 0.2.4 train. On Apple silicon,
+`make test-apple` runs
+`a_stop_only_signals_so_a_slow_workload_finishes_within_bun_s_grace`: a
+workload traps SIGTERM, sleeps 10 s and prints `finished-cleanly`. The stop
+must return within 3 s, the workload must print its line, and a second stop
+of the exited workload must succeed. Against `container stop` it failed
+before it got that far: the CLI held the call for its own 5 s, then gave up
+with an XPC timeout. And `the_wait_for_remote_withdrawal_gives_up_at_its_patience`
+covers the wait before a rollout stops an old instance, the one that holds
+it serving until every node has dropped its backend (#1355). A node that
+never confirms mustn't hold the stop for ever, so the test answers
+"pending" to every ask, on tokio's paused clock, and checks the wait gives
+up at its 5 s patience, not before and not after.
 
 ### Testing sidecars
 
