@@ -855,23 +855,22 @@ soak_workloads() {
         -e "s/SOAK_SLO_GENERATION = \"[0-9]*\"/SOAK_SLO_GENERATION = \"$slo_generation\"/" "$workloads_template"
 }
 
-# The job fixtures go in their own manifest: the API refuses policies in a
-# manifest that has jobs, and the workloads carry the soak's policies (#1311).
+# The policies go in their own manifest: the API refuses policies in a
+# manifest that has jobs, and the job hooks must be applied with the apps
+# they hook, so the jobs stay with the apps (#1311). A table is a policy's
+# from its `[policy.` header to the next header that isn't one.
 write_workloads() {
-    soak_workloads > "$evidence/workloads.toml"
-    if jobs_applied; then
-        cp "$repository/scripts/release/sustained/soak-jobs.toml" "$evidence/jobs.toml"
-    else
-        rm -f "$evidence/jobs.toml"
-    fi
+    soak_workloads | awk -v policies="$evidence/policies.toml" -v rest="$evidence/workloads.toml" \
+        '/^\[/ { policy = ($0 ~ /^\[policy\./) } { print > (policy ? policies : rest) }'
+    ! jobs_applied || cat "$repository/scripts/release/sustained/soak-jobs.toml" >> "$evidence/workloads.toml"
 }
 
-# Apply the written workloads, then the job fixtures if the campaign wants
-# them, with both outputs in LOG.
+# Apply the policies, then the workloads (and the job fixtures with them),
+# with both outputs in LOG.
 apply_soak_manifests() {
     local log=$1
-    rel apply -f "$evidence/workloads.toml" > "$log" 2>&1 || return 1
-    [ ! -f "$evidence/jobs.toml" ] || rel apply -f "$evidence/jobs.toml" >> "$log" 2>&1
+    rel apply -f "$evidence/policies.toml" > "$log" 2>&1 || return 1
+    rel apply -f "$evidence/workloads.toml" >> "$log" 2>&1
 }
 
 apply_workloads() {

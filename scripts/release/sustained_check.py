@@ -1015,9 +1015,9 @@ def suppress_repeats(state, findings, now):
 # --- policies (#1311) --------------------------------------------------------
 
 def expected_policies(evidence):
-    """The `[policy.*]` tables of the workload file the harness applied
-    (EVIDENCE/workloads.toml), or None before it has written one."""
-    path = Path(evidence) / "workloads.toml"
+    """The `[policy.*]` tables of the policy manifest the harness applied
+    (EVIDENCE/policies.toml), or None before it has written one."""
+    path = Path(evidence) / "policies.toml"
     if not path.exists():
         return None
     return tomllib.loads(path.read_text()).get("policy", {})

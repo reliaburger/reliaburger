@@ -611,23 +611,22 @@ class DrainedCampaignApply(unittest.TestCase):
                            env=dict(PATH=os.environ["PATH"],HOME=directory,evidence=str(evidence),generation="7",
                                     workloads_template=str(root/"apps.toml"),repository=str(root)))
             self.workloads=(evidence/"workloads.toml").read_text()
-            jobs=evidence/"jobs.toml"
-            self.jobs=jobs.read_text() if jobs.exists() else ""
-            return self.workloads+self.jobs
+            self.policies=(evidence/"policies.toml").read_text()
+            return self.workloads
 
-    def test_the_job_fixtures_go_in_their_own_manifest_beside_the_policies(self):
-        # The API refuses policies in a manifest that has jobs: "policies
-        # apply only to a cluster, in a manifest without jobs" (0.2.4's
-        # first V02 fast tier stopped there).
+    def test_the_policies_go_in_their_own_manifest_and_the_jobs_stay_with_the_apps(self):
+        # The API refuses policies in a manifest that has jobs ("policies
+        # apply only to a cluster, in a manifest without jobs"), and a job's
+        # run_before hook must be applied with the app it hooks: 0.2.4's
+        # first V02 fast tiers stopped at each in turn.
         self.write(dict(job_stop_at=10**10))
-        self.assertIn("[policy.soak-team]",self.workloads)
-        self.assertNotIn("[job.",self.workloads)
-        self.assertIn("[job.soak-job-cron-runc]",self.jobs)
-        self.assertNotIn("[policy.",self.jobs)
-
-    def test_a_stale_jobs_manifest_is_removed_once_the_campaign_stops(self):
-        self.write(dict(job_stop_at=1000),now=2000)
-        self.assertEqual(self.jobs,"")
+        self.assertIn("[policy.soak-team]",self.policies)
+        self.assertIn('match = "true"',self.policies)
+        self.assertNotIn("[app.",self.policies)
+        self.assertNotIn("[job.",self.policies)
+        self.assertNotIn("[policy.",self.workloads)
+        self.assertIn("[app.soak-identity]",self.workloads)
+        self.assertIn("[job.soak-job-cron-runc]",self.workloads)
 
     def test_the_job_fixtures_are_applied_while_the_campaign_runs(self):
         text=self.write(dict(job_stop_at=10**10))
