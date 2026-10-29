@@ -1,0 +1,14 @@
+[app.hello]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/sh", "-c", "echo hello-started; mkdir -p /tmp/www; printf 'Reliaburger is running\\n' > /tmp/www/index.html; exec httpd -f -p 8080 -h /tmp/www"]
+port = 8080
+replicas = 3
+[app.hello.health]
+path = "/"
+interval = 1
+timeout = 1
+threshold_healthy = 1
+[app.hello.ingress]
+host = "localhost"
+[app.hello.env]
+PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
