@@ -855,15 +855,28 @@ soak_workloads() {
         -e "s/SOAK_SLO_GENERATION = \"[0-9]*\"/SOAK_SLO_GENERATION = \"$slo_generation\"/" "$workloads_template"
 }
 
+# The policies go in their own manifest: the API refuses policies in a
+# manifest that has jobs, and the job hooks must be applied with the apps
+# they hook, so the jobs stay with the apps (#1311). A table is a policy's
+# from its `[policy.` header to the next header that isn't one.
 write_workloads() {
-    soak_workloads > "$evidence/workloads.toml"
+    soak_workloads | awk -v policies="$evidence/policies.toml" -v rest="$evidence/workloads.toml" \
+        '/^\[/ { policy = ($0 ~ /^\[policy\./) } { print > (policy ? policies : rest) }'
     ! jobs_applied || cat "$repository/scripts/release/sustained/soak-jobs.toml" >> "$evidence/workloads.toml"
+}
+
+# Apply the policies, then the workloads (and the job fixtures with them),
+# with both outputs in LOG.
+apply_soak_manifests() {
+    local log=$1
+    rel apply -f "$evidence/policies.toml" > "$log" 2>&1 || return 1
+    rel apply -f "$evidence/workloads.toml" >> "$log" 2>&1
 }
 
 apply_workloads() {
     write_workloads
     rel apply -f "$podinfo" > "$evidence/config/apply-podinfo.log" 2>&1 || fail "applying $podinfo failed"
-    rel apply -f "$evidence/workloads.toml" > "$evidence/config/apply-workloads.log" 2>&1 || fail 'applying the soak workloads failed'
+    apply_soak_manifests "$evidence/config/apply-workloads.log" || fail 'applying the soak workloads failed'
     # The workload file carries a deny, a warn and a default policy (#1311);
     # every later check makes sure they stay in force.
     rel --output json policy list > "$evidence/config/policies.json" 2>&1 || fail 'listing the soak policies failed'
@@ -1369,7 +1382,7 @@ slot_deploy_kill() {
     offset=$(random_between deploy-kill-offset 0 "$kill_offset")
     say "fault: rolling deploy (generation $generation), SIGKILL bun on ${vm[node]} after $offset s"
     open_window deploy-kill
-    rel apply -f "$evidence/workloads.toml" > "$evidence/snapshots/apply-$generation.log" 2>&1 || true
+    apply_soak_manifests "$evidence/snapshots/apply-$generation.log" || true
     sleep "$offset"
     avoid=$node
     before=$(main_pid "$node")

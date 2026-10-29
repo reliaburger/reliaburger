@@ -905,7 +905,7 @@ class SoakPolicies(Evidence):
 
     def setUp(self):
         super().setUp()
-        (self.evidence / "workloads.toml").write_text(SOAK_WORKLOADS.read_text())
+        (self.evidence / "policies.toml").write_text(SOAK_WORKLOADS.read_text())
         self.declared = checker.expected_policies(self.evidence)
 
     def test_the_soak_workload_carries_a_deny_a_warn_and_a_default(self):
