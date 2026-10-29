@@ -79,14 +79,15 @@ pub(crate) async fn apply(
             let (policies, generation) = council
                 .read_desired(|desired| (desired.policies.clone(), desired.policy_generation))
                 .await;
-            match crate::policy::admit(
-                &policies,
+            match crate::policy::admit_blocking(
+                policies,
                 generation,
-                &config,
-                &super::api::apply::policy_caller(auth),
+                config.clone(),
+                super::api::apply::policy_caller(auth),
                 crate::policy::Source::Apply,
-                Vec::new(),
-            ) {
+            )
+            .await
+            {
                 // The apps commit with their policy defaults filled in
                 // (#1118). Job manifests never come from GitOps, so there's
                 // no declared spec to keep beside them.

@@ -309,6 +309,9 @@ The cluster checks a policy when you apply it, and refuses one that:
 - has an empty `deny` or `match`, or one over 1024 bytes, or a `message` over
   512 bytes;
 - isn't valid CEL;
+- nests `all`, `exists`, `exists_one`, `map` or `filter` more than two deep
+  (`app.args.all(a, app.args.exists_one(b, a == b))` is as deep as it goes),
+  because each level multiplies what the policy costs to run;
 - names anything other than `app`, `caller` and `source`, such as `policy`,
   `permission` or `namespaces`;
 - reads a field `app` or `caller` doesn't have (`app.memroy`);
@@ -327,6 +330,9 @@ The cluster checks a policy when you apply it, and refuses one that:
 An expression that fails while it runs, such as `app.memory == '1Gi'` on an
 app with no memory set, or a `deny` that isn't true or false, counts as
 broken: a deny policy refuses the app and says why, and a warn policy warns.
+So does a workload with a list or map of more than 1,024 entries (`env`,
+`command`, …): it's too big for a policy to judge cheaply, so every policy
+that applies to it fails closed, naming the field.
 
 Only an unscoped Admin token can apply or delete a policy, and every policy
 write is audited. A refused apply answers with every policy it broke, writes

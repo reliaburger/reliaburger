@@ -499,9 +499,11 @@ existing expressions mostly carry over. The other candidates were weaker fits:
   ([CUE spec](https://cuelang.org/docs/reference/spec/)), and only has a Go
   implementation.
 
-CEL's guarantee bounds evaluation by the size of the input times the size of
-the expression. The input is one spec, and we cap the expression's size when a
-policy is committed. Kubernetes goes further, with a cost model that refuses
+CEL's "linear time" is linear in the size of the program and the data it's
+handed, but its macros iterate, and a macro inside another multiplies. So the
+real bound is the expression's size times the input's size raised to how
+deeply the macros nest. We cap all three when a policy is committed or a
+workload is judged; the next section has the numbers. Kubernetes goes further, with a cost model that refuses
 expensive expressions at write time and halts them at run time
 ([CEL in Kubernetes](https://kubernetes.io/docs/reference/using-api/cel/)).
 
@@ -565,10 +567,27 @@ Here's what the check found, in `cel` 0.15:
   map, `startsWith` and `endsWith`, the `exists` and `all` macros, `size()`,
   `type()`, and int comparisons. Every row passed on the first run.
 - **Cost.** There's no cost model and no step limit. The parser caps nesting
-  at 96 levels, and that's all. So our own cap does the bounding: an
-  expression of at most 1,024 bytes, over one app's spec. CEL has no loops of
-  its own, and a macro like `exists` iterates over a list that came from the
-  spec, so the work is bounded by expression size times input size.
+  at 96 levels, and that's all. So our own caps do the bounding. The first
+  draft of this section said an expression of at most 1,024 bytes was enough,
+  because "the work is bounded by expression size times input size". The
+  review of the train proved it wrong
+  ([#1431](https://github.com/reliaburger/reliaburger/issues/1431)): a macro
+  like `all` runs its body once per element, so
+  `app.env.all(a, app.env.all(b, …))` costs the number of env entries
+  squared, and 1,024 bytes fit 96 levels of that. Worse, the deployer
+  chooses the input. An admin's perfectly plausible quadratic rule, "no
+  argument given twice", became a CPU amplifier for anyone with a deploy token
+  and a long list. Now three caps hold. The expression is still at most
+  1,024 bytes. `check_names`, which already walked every expression to
+  check its variables, counts comprehensions on the way down and refuses
+  nesting deeper than two (`MAX_COMPREHENSION_NESTING`), which still allows
+  comparing a list with itself. And the input: `workload_value` refuses a
+  workload with any list or map of more than 1,024 entries
+  (`MAX_COLLECTION_ENTRIES`), and every policy that applies to it fails
+  closed, naming the field, the same as an expression that can't be
+  evaluated. We could have truncated the list instead, but then padding
+  `env` with a thousand dummies would push the entry a deny looks for past
+  the end. Refusing is the only answer an attacker can't use.
 - **The calls.** `Env::stdlib()` plus the strings extension, `env.compile` to
   get a `Program`, `Context::with_env` and `add_variable_from_value` to bind
   `app`, `caller` and `source`, then `program.execute`. A spec becomes a CEL
@@ -1380,6 +1399,21 @@ schedule put back. `audit_workloads` takes plain slices and runs
 and jobs without building a cluster. The route runs it on a copy of
 desired state inside `tokio::task::spawn_blocking`, because judging every
 workload is CPU work that would otherwise hold up an async thread.
+
+At first only the audit did that. The apply path judged inline, on whichever
+tokio worker took the request, and so did the GitOps runner and the job
+routes ([#1431](https://github.com/reliaburger/reliaburger/issues/1431)).
+One judgement is microseconds, which is why nobody noticed, but its cost is
+partly the caller's to choose, and a worker busy judging is a worker not
+serving heartbeats and API calls. Now they all go through `spawn_blocking`.
+`policy::admit_blocking` wraps `admit`, taking every argument by value:
+`spawn_blocking` wants a `'static` closure, because the thread may outlive
+the function that started it, so nothing it holds can borrow from the
+caller's stack. In Go you'd capture what you like in a goroutine and the
+garbage collector keeps it alive; Rust makes you hand ownership over, and a
+clone of the config is the price. The GitOps runner's cached `PolicySet`
+moved into an `Arc` for the same reason: the blocking thread gets a second
+handle to the compiled set rather than a borrow of the cache.
 
 Who is the caller, when nobody is applying? The audit asks what the next
 write would get, so it judges each app as its next writer: GitOps for an app

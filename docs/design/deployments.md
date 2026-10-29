@@ -945,7 +945,14 @@ evaluates one.
 - **Commit checks.** `policy::check_policy`, run by `Config::validate`: a DNS
   label name, expressions of at most 1024 bytes, a message of at most 512,
   valid CEL, only the three variables, and only known `app` and `caller`
-  fields. The `cel` crate has no cost limit, so the size cap bounds evaluation.
+  fields, and no more than two nested macros (`all`, `exists`, `exists_one`,
+  `map`, `filter`; `MAX_COMPREHENSION_NESTING`). The `cel` crate has no cost
+  limit, so evaluation is bounded by expression size times input size squared,
+  and the input is capped too: a workload with any list or map over
+  `MAX_COLLECTION_ENTRIES` (1,024) entries fails every policy that applies to
+  it closed, naming the field (#1431). `admit` (as `admit_blocking`),
+  `judge_job` on the job routes and `judge_app` in the GitOps runner run in
+  `spawn_blocking`, never on an async worker.
 - **Failure.** An expression that errors or returns a non-boolean fails
   closed: a deny policy refuses, a warn policy warns. A committed policy that
   no longer compiles refuses every app apply until an admin replaces or
