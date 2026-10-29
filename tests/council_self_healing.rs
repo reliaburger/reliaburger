@@ -401,6 +401,21 @@ async fn two_node_cluster_survives_losing_the_non_voter() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // The other node is a learner, so it has the replicated state (an mTLS
+    // node's API waits for the tokens in it, #1477).
+    let members: BTreeSet<u64> = nodes[0]
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .nodes()
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(
+        members,
+        BTreeSet::from([rid(0), rid(1)]),
+        "the second node never joined as a learner"
+    );
 
     // The non-voter dies: its Raft stops and gossip drops it.
     nodes[1].shutdown().await.unwrap();
