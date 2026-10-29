@@ -453,6 +453,16 @@ class Leaks(Evidence):
         self.assertEqual(sample(start + 3000 + 3600, "b2", 657000), [])
         self.assertEqual([item["check"] for item in sample(start + 3000 + 7000, "b2", 830000)], ["leak-rss"])
 
+    def test_anonymous_and_file_backed_rss_are_trended_apart(self):
+        # #1417: heap growth and mapped files look the same in VmRSS.
+        state = {}
+        for ts, anon, mapped in ((NOW, 200000, 30000), (NOW + 600, 260000, 31000)):
+            text = INVENTORY + f"bun_rss_anon_kb {anon}\nbun_rss_file_kb {mapped}\n"
+            checker.resource_trend_findings(state, "rb-a-1", checker.parse_inventory(text), ts)
+        trend = state["trends"]["rb-a-1"]
+        self.assertEqual(trend["rss_anon_kb"], {"first": 200000, "last": 260000, "max": 260000})
+        self.assertEqual(trend["rss_file_kb"], {"first": 30000, "last": 31000, "max": 31000})
+
     def test_inventories_without_an_image_line_still_track_the_pid(self):
         state = {}
         def sample(ts, pid, rss_kb):
