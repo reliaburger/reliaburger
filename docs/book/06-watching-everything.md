@@ -932,6 +932,20 @@ the one line that's left. `a_rotated_capture_file_is_read_again_from_the_start`
 renames the capture file away and writes a longer one in its place, which is
 the case a length check alone gets wrong.
 
+`load` was also the only place that forgot a capture. Every singleton job
+that printed added its capture file's path to the checkpoint, the job's
+instance deleted the file when it retired, and the entry stayed until Bun
+restarted. Each flush cloned the whole map, wrote it into the Parquet footer
+and wrote it again as JSON, so a node running a printing cron job every
+minute carried one more entry a minute, three times over (#1417). Now each
+flush runs the same check on the blocking pool before it writes: a path that
+is gone, or is a different file now, leaves the copy being written, and once
+the flush is durable the store forgets it too, unless the path has meanwhile
+been ingested again as a new file. The test
+`the_checkpoint_forgets_captures_whose_files_are_gone` ingests from two
+hundred job captures, deletes them and checks that one flush leaves only the
+capture still on disk, in memory and in the saved checkpoint.
+
 ### Ask everyone, not just the current home
 
 All of that shipped, and the next soak still caught a stale tail. Right
@@ -1136,6 +1150,125 @@ would have to keep its name, port, lease and discovery address fenced, stay
 out of both "running" and "gone" in reports, and be retried. That's a
 design change with its own tests, and we've written it down for after
 0.1.0 rather than slip it in behind this fix.
+
+### Giving the disk back
+
+0.2.3's day run ran three nodes for 24 hours, and near the end node 1's
+disk crossed 80%. The soak's inventory blamed `instances/`, the directory
+that holds instance records and capture files: 949 MiB on node 1, against
+32 MiB and 24 MiB on the other two. We filed it as job instance storage,
+since the run had just started 194,000 fresh `runc` jobs.
+
+The numbers said otherwise. Plotted against time, node 1's `instances/` grew
+in a straight line, 26.4 MiB every 40 minutes, about 39.6 MiB an hour. Job
+load doesn't draw straight lines. The soak's log spammer does: twenty lines
+of about 57 bytes every tenth of a second, close to 11 KB a second, or about
+39 MiB an hour. It lived on node 1 for the whole run. Its capture file held every
+line it had ever printed, and so did the log store, which caps itself and
+prunes. Only the store's copy was bounded.
+
+Why not rotate the capture, the way `logrotate` would? The app writes into
+the file directly, through a descriptor its owner process opened with
+`O_APPEND`, so Bun can't swap the file under it without the app's
+cooperation. Truncating it in place loses whatever the app writes between
+our last read and the truncate. Worse, either one changes what an offset
+means, and the whole of "Resume, don't replay" rests on an offset naming one
+line for good.
+
+So we keep the offsets and drop the bytes. Linux's `fallocate` with
+`FALLOC_FL_PUNCH_HOLE` frees the blocks behind a byte range and leaves a
+*hole*: the range reads back as zeros, takes no disk, and the file keeps its
+length. `FALLOC_FL_KEEP_SIZE` makes that explicit. Writes with `O_APPEND`
+carry on at the end as if nothing happened. macOS has the same thing as an
+`fcntl` called `F_PUNCHHOLE`. `ls -l` still shows the file's full length;
+`du` shows what it takes.
+
+The new function lives in `grill/capture.rs`:
+
+```rust
+pub fn reclaim_ingested(
+    path: &Path,
+    identity: CaptureFileIdentity,
+    ingested_through: u64,
+) -> io::Result<u64> {
+    // ... open for writing, refuse a symlink, check the identity ...
+    let block = metadata.blksize().max(1);
+    let end = ingested_through.min(metadata.len().saturating_sub(RETAINED_CAPTURE_BYTES));
+    let end = end - end % block;
+    let start = data_start(&file, 0)?;
+    let start = start - start % block;
+    if start < end {
+        punch_hole(&file, start, end - start)?;
+    }
+    Ok(end.max(start))
+}
+```
+
+Three rules hide in those lines. It never frees a byte the store hasn't
+ingested (`ingested_through`). It keeps the last mebibyte
+(`RETAINED_CAPTURE_BYTES`), which is exactly the window a tail snapshot
+reads, so `relish logs -f` still starts from real lines. And it only frees
+whole filesystem blocks: a punch that ends mid-block zeroes the partial block
+without freeing it, which would only cost a write.
+
+Who calls it, and when? Not the forwarder: a line it has read may still be
+sitting in the store's memory buffer, and a crash would lose it. The store's
+flush calls it, on the blocking pool, after the Parquet file and the
+checkpoint are both durable. Only files the checkpoint has read more than a
+mebibyte of qualify, so a flush touches a handful of chatty captures, not the
+thousands of small job ones. A failure is printed and the flush stands; it
+costs disk, not data.
+
+The punch is one call per platform, picked at compile time with
+`#[cfg(target_os = "linux")]` and `#[cfg(target_os = "macos")]`. Only the
+matching function exists in the binary, the way an `#ifdef` works in C, and a
+third version for every other platform reports `Unsupported`. Linux goes
+through the `nix` crate's safe wrapper. macOS has none, so it calls `fcntl`
+through `libc` in an `unsafe` block, with the comment the project asks for:
+
+```rust
+// SAFETY: `file` is an open descriptor for the call's duration, and
+// F_PUNCHHOLE reads one `fpunchhole_t`, which `hole` is and outlives the
+// call. The kernel does not keep the pointer.
+let result = unsafe { nix::libc::fcntl(file.as_raw_fd(), nix::libc::F_PUNCHHOLE, &hole) };
+```
+
+`unsafe` doesn't switch the borrow checker off. It lets us do the one thing
+the compiler can't check (call a C function that takes a raw pointer), and
+the comment says why the pointer stays valid.
+
+Holes also change what a reader can meet. A store that loses its checkpoint
+reads the capture from byte 0 again, and byte 0 is now in a hole. Handing the
+store a megabyte of zeros as one line would be worse than useless. So
+`CaptureReader::read_chunk` asks the kernel where the data starts with
+`lseek(SEEK_DATA)`, jumps there, and drops everything up to the next newline,
+because the line the hole ends in may have lost its start. Every line in that
+stretch is already stored, so dropping one costs nothing. `read_retained`
+does the same for the code that reads a whole capture at once.
+
+`data_start` takes its file as `file: &impl std::os::fd::AsFd`. That's
+`impl Trait` in argument position: "any type that can lend out a file
+descriptor", decided at compile time like a C++ template, not a Go interface
+looked up at run time. The reader passes a `tokio::fs::File` and the punch
+passes a `std::fs::File`, and both get their own copy of the function.
+
+The tests use real files. `reclaiming_frees_ingested_bytes_but_keeps_the_length_and_identity`
+writes 8 MiB of numbered lines, reclaims, and checks the length and inode
+stayed while the allocated blocks fell to the last mebibyte;
+`reclaiming_never_frees_bytes_the_store_has_not_ingested` and
+`reclaiming_a_replaced_file_frees_nothing` hold the other two rules.
+`a_reader_from_byte_zero_skips_a_reclaimed_prefix` checks the first line a
+fresh reader returns is whole and numbered where it should be.
+`a_durable_flush_reclaims_the_ingested_capture_prefix` checks nothing is
+freed until the flush, and `a_chatty_instance_s_capture_stays_bounded_once_its_lines_are_stored`
+runs a real process that prints 8 MiB through `yes`, follows it into a store,
+flushes, and measures what's left on disk.
+
+What we didn't do: route every app's output through Bun, which would let us
+rotate at will but put Bun in the path of every byte every app writes, and
+make an app block when Bun is slow. The issue also asked about the soak's own
+export directory, which grows about 600 MiB a day on each node. That's the
+harness's to bound, and it stays open in #1418.
 
 ## When nothing looks like success
 

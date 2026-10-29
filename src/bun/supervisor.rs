@@ -123,6 +123,9 @@ pub struct WorkloadSupervisor<G: Grill> {
     /// Which host paths a volume or config-file `source` may mount
     /// (`[storage] allowed_host_paths`); refuses every one by default.
     host_paths: super::host_paths::HostPathPolicy,
+    /// Which runtime knobs an app may use here (`[runtime]` in `node.toml`,
+    /// #1122); allows none by default.
+    runtime_knobs: crate::grill::knobs::RuntimeAllowlist,
     /// What this node can actually enforce (GPU, rootless limits).
     capabilities: PlatformCapabilities,
     budget: std::sync::Arc<super::execution_budget::ExecutionBudget>,
@@ -159,6 +162,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
             app_instances: HashMap::new(),
             process_manager: crate::grill::process_workload::ProcessManager::new(process_config),
             host_paths: super::host_paths::HostPathPolicy::default(),
+            runtime_knobs: Default::default(),
             capabilities: PlatformCapabilities::default(),
             budget: super::execution_budget::ExecutionBudget::new(crate::meat::Resources::new(
                 u64::MAX,
@@ -248,6 +252,31 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.grill.runs_containers()
     }
 
+    /// Whether this node's runtime can run an app's sidecars in its
+    /// instance's network namespace (#1120). The leader places apps with
+    /// sidecars only where it can.
+    pub fn shares_network(&self) -> bool {
+        self.grill.shares_network_namespaces()
+    }
+
+    /// Refuse an app with sidecars on a runtime that can't share a network
+    /// namespace, before anything is allocated for it, with the reason the
+    /// operator needs: the leader's placement normally keeps such an app
+    /// away, so this is the standalone node's and a stale view's guard.
+    fn admit_sidecars(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
+        if spec.sidecar.is_empty() || self.shares_network() {
+            return Ok(());
+        }
+        let runtime = format!("{:?}", self.grill.runtime_kind()).to_lowercase();
+        Err(BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason: format!(
+                "sidecars join their app's network namespace, and this node's runtime \
+                 ({runtime}) can't share one; run it on rootful runc"
+            ),
+        })
+    }
+
     /// Replace the process-workloads policy (host-exec/script allowlist,
     /// mount isolation, script dir). The binary feeds the parsed
     /// `[process_workloads]` config here so the deny-by-default allowlist
@@ -265,14 +294,66 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.host_paths = policy;
     }
 
+    /// Replace the runtime knob allowlist. The binary feeds the one from
+    /// `node.toml`'s `[runtime]` section here; without it every knob is
+    /// refused.
+    pub fn set_runtime_allowlist(&mut self, allowlist: crate::grill::knobs::RuntimeAllowlist) {
+        self.runtime_knobs = allowlist;
+    }
+
+    /// The runtime knobs this node advertises to the scheduler: its
+    /// allowlist when its runtime applies knobs, nothing otherwise.
+    pub fn runtime_knob_capability(&self) -> crate::grill::knobs::RuntimeAllowlist {
+        if self.grill.applies_runtime_knobs() {
+            self.runtime_knobs.clone()
+        } else {
+            Default::default()
+        }
+    }
+
+    /// The node gate for runtime knobs (#1122): refuse an app whose
+    /// `[app.x.runtime]` asks for a knob this node's runtime can't apply,
+    /// or one its `[runtime]` allowlist doesn't list. The token gate
+    /// (`host-exec`) was checked at apply.
+    pub(crate) fn admit_runtime_knobs(
+        &self,
+        app_name: &str,
+        spec: &AppSpec,
+    ) -> Result<(), BunError> {
+        let refused = |refusal: crate::grill::knobs::KnobRefusal| BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason: refusal.to_string(),
+        };
+        let Some(knob) = spec.runtime_knob_uses().next() else {
+            return Ok(());
+        };
+        if !self.grill.applies_runtime_knobs() {
+            let runtime = match self.grill.runtime_kind_for_host(false) {
+                crate::grill::records::RuntimeKind::Process => "the process runtime",
+                crate::grill::records::RuntimeKind::Apple => "Apple Container",
+                crate::grill::records::RuntimeKind::Runc => "rootless runc",
+            };
+            return Err(refused(crate::grill::knobs::KnobRefusal::Unsupported {
+                knob,
+                runtime,
+            }));
+        }
+        match &spec.runtime {
+            Some(knobs) => self.runtime_knobs.check(knobs).map_err(refused),
+            None => Ok(()),
+        }
+    }
+
     /// Full admission check for an app: host-exec/script allowlist (for the
-    /// app and its host init containers), host-path allowlist, GPU
+    /// app and its host init containers), host-path allowlist, runtime knobs, GPU
     /// availability, rootless resource limits and egress enforcement.
     /// Returns the first refusal.
     fn admit_app(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
         self.admit_process_workload(app_name, spec.exec.as_deref(), spec.script.as_deref())?;
         self.admit_host_inits(app_name, spec)?;
+        self.admit_sidecars(app_name, spec)?;
         self.admit_host_paths(app_name, spec)?;
+        self.admit_runtime_knobs(app_name, spec)?;
         self.admit_gpu(app_name, spec.gpu.unwrap_or(0))?;
         self.admit_rootless_limits(
             app_name,
@@ -434,9 +515,9 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(())
     }
 
-    /// Refuse a host app whose image-less init container runs a binary the
-    /// allowlist doesn't name. Such an init runs its command on the host,
-    /// like its app (#935), so the same deny-by-default rule applies.
+    /// Refuse a host app whose image-less init container or pre-stop command
+    /// runs a binary the allowlist doesn't name. Both run on the host, like
+    /// their app (#935, #1121), so the same deny-by-default rule applies.
     fn admit_host_inits(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
         for binary in crate::meat::filter::host_init_binaries(spec) {
             self.process_manager
@@ -444,6 +525,15 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 .map_err(|e| BunError::DeployFailed {
                     app_name: app_name.to_string(),
                     reason: format!("init container rejected: {e}"),
+                })?;
+        }
+        // A host app's pre-stop command runs on the host too (#1121).
+        if let Some(binary) = crate::meat::filter::host_pre_stop_binary(spec) {
+            self.process_manager
+                .prepare_exec(binary)
+                .map_err(|e| BunError::DeployFailed {
+                    app_name: app_name.to_string(),
+                    reason: format!("pre_stop rejected: {e}"),
                 })?;
         }
         Ok(())
@@ -639,11 +729,8 @@ impl<G: Grill> WorkloadSupervisor<G> {
         // already inserted into `self.instances` and their ports allocated —
         // but `app_instances` was only written after the loop, so `remove_app`
         // couldn't find them and their ports leaked until agent restart.
-        let request = crate::meat::Resources::new(
-            spec.cpu.map_or(0, |r| r.request),
-            spec.memory.map_or(0, |r| r.request),
-            spec.gpu.unwrap_or(0),
-        );
+        // The app's own requests and its sidecars' (#1120).
+        let request = crate::meat::admission::app_requests(spec);
         let mut leases = HashMap::new();
         for index in indices {
             let id = crate::grill::InstanceIdentity::new(namespace, app_name, *index).instance_id();
@@ -1000,9 +1087,16 @@ mod tests {
             config_file: Vec::new(),
             volumes: Vec::new(),
             init: Vec::new(),
+            sidecar: Vec::new(),
             ingress: None,
             placement: None,
             deploy: None,
+            stop_signal: None,
+            stop_grace: None,
+            pre_stop: Vec::new(),
+            pre_stop_timeout: None,
+            runtime: None,
+            owner: None,
             firewall: None,
             egress: None,
             autoscale: None,
@@ -1012,6 +1106,7 @@ mod tests {
             working_dir: None,
             run_as_user: None,
             run_as_group: None,
+            provenance: None,
         }
     }
 
@@ -1152,6 +1247,75 @@ mod tests {
         WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000))
             .admit_app("db", &managed)
             .unwrap();
+    }
+
+    fn knob_allowlist(runtime_section: &str) -> crate::grill::knobs::RuntimeAllowlist {
+        crate::config::NodeConfig::parse(&format!("[runtime]\n{runtime_section}"))
+            .unwrap()
+            .runtime
+            .knob_allowlist()
+    }
+
+    fn app_with_knobs(knobs: &str) -> AppSpec {
+        let mut app = basic_app_spec(None);
+        app.runtime = Some(toml::from_str(knobs).unwrap());
+        app
+    }
+
+    /// #1122: the node gate refuses on its own, naming the field, the value
+    /// and the gate; a runtime that can't apply knobs refuses them whatever
+    /// the node lists; and both keys together admit the app.
+    #[tokio::test]
+    async fn runtime_knobs_pass_only_the_node_gate_of_a_runtime_that_applies_them() {
+        let app = app_with_knobs("capabilities = [\"IPC_OWNER\"]\n");
+
+        let grill = MockGrill::new();
+        grill.set_applies_runtime_knobs(true);
+        let mut sup = WorkloadSupervisor::new(grill, PortAllocator::new(30000, 31000));
+        let error = sup.admit_app("lb", &app).unwrap_err().to_string();
+        assert!(
+            error.contains("runtime.capabilities CAP_IPC_OWNER"),
+            "{error}"
+        );
+        assert!(error.contains("node gate"), "{error}");
+        assert!(error.contains("allowed_capabilities"), "{error}");
+
+        sup.set_runtime_allowlist(knob_allowlist("allowed_capabilities = [\"IPC_OWNER\"]\n"));
+        sup.admit_app("lb", &app).unwrap();
+        assert_eq!(
+            sup.runtime_knob_capability().capabilities.len(),
+            1,
+            "the node advertises what it allows"
+        );
+        let error = sup
+            .admit_app(
+                "fs",
+                &app_with_knobs("devices = [{ path = \"/dev/fuse\" }]\n"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("runtime.devices /dev/fuse"), "{error}");
+
+        // An app with no knobs, or an empty table, needs neither key.
+        sup.admit_app("plain", &basic_app_spec(None)).unwrap();
+        sup.admit_app("empty", &app_with_knobs("")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_cannot_apply_knobs_refuses_them_and_advertises_none() {
+        let mut sup = WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000));
+        sup.set_runtime_allowlist(knob_allowlist("allowed_capabilities = [\"IPC_OWNER\"]\n"));
+        let error = sup
+            .admit_app("lb", &app_with_knobs("capabilities = [\"IPC_OWNER\"]\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("runtime.capabilities CAP_IPC_OWNER"),
+            "{error}"
+        );
+        assert!(error.contains("the process runtime"), "{error}");
+        assert!(error.contains("can't apply runtime knobs"), "{error}");
+        assert!(sup.runtime_knob_capability().is_empty());
     }
 
     fn app_spec_with_health(port: u16) -> AppSpec {
@@ -1990,6 +2154,29 @@ mod tests {
         let mut image = basic_app_spec(None);
         image.memory = host.memory;
         sup.admit_app("image", &image).unwrap();
+    }
+
+    /// #1120: a node whose runtime can't share a network namespace (Apple
+    /// Container, rootless runc, the process runtime) refuses an app with
+    /// sidecars at admission, saying why, and still admits one without.
+    #[test]
+    fn an_app_with_sidecars_is_refused_where_the_runtime_cant_share_a_network() {
+        let grill = MockGrill::new();
+        grill.set_runtime_kind(crate::grill::records::RuntimeKind::Apple);
+        grill.set_shares_network(false);
+        let sup = WorkloadSupervisor::new(grill.clone(), PortAllocator::new(30000, 31000));
+        let app: AppSpec =
+            toml::from_str("image = \"web:1\"\n[[sidecar]]\nname = \"proxy\"\n").unwrap();
+
+        let error = sup.admit_app("web", &app).unwrap_err().to_string();
+        assert!(
+            error.contains("sidecars") && error.contains("apple"),
+            "{error}"
+        );
+        sup.admit_app("web", &basic_app_spec(None)).unwrap();
+
+        grill.set_shares_network(true);
+        sup.admit_app("web", &app).unwrap();
     }
 
     /// #935: a host app's init container that names no image runs its

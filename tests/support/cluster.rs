@@ -320,6 +320,8 @@ pub struct WiredNodeOptions {
     /// refuses image apps and reports no container runtime (#914). `false`
     /// runs [`host_containers::HostContainers`], which runs them.
     pub process_only: bool,
+    /// Most voters the council seats; `None` keeps Bun's default of seven.
+    pub council_size_cap: Option<usize>,
 }
 
 /// A running wired node and everything a test observes it through.
@@ -376,6 +378,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         task_arrays,
         task_arrays_on_agent_budget,
         process_only,
+        council_size_cap,
     } = options;
     let raft_port = gossip_port + 1;
     let reporting_port = gossip_port + 2;
@@ -429,6 +432,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             job_capabilities_rx: None,
             readiness: Some(readiness.clone()),
             recovery_probe_window: None,
+            council_size_cap,
         },
         shutdown.clone(),
     )

@@ -135,6 +135,15 @@ main() {
     *) fail 'release mirror must be an HTTPS URL without credentials, query or fragment' ;;
   esac
   release_base=${release_base%/}
+  # A release train's nightly build is unreleased code signed with the
+  # nightly key, which no release trusts. It exists for qualification, and
+  # only qualification asks for it.
+  case ${release_base##*/} in
+    nightly-*)
+      [ "${RELIABURGER_ACCEPT_NIGHTLY:-}" = 1 ] \
+        || fail "$release_base is a nightly build of unreleased code, for release qualification only; install a release instead"
+      ;;
+  esac
   staging=$(mktemp -d "${TMPDIR:-/tmp}/reliaburger-install.XXXXXXXX") || fail 'could not create a staging directory'
   trap 'rm -rf "$staging"' EXIT
   trap 'exit 130' INT

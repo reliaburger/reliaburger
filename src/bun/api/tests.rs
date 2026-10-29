@@ -47,6 +47,7 @@ fn desired_app_diagnostics_filter_to_the_token_scope() {
         scoped_namespaces: Some(vec!["tenant-a".to_string()]),
     };
     let evidence = |app: &str, namespace: &str| crate::bun::diagnostics::DesiredAppEvidence {
+        owner: None,
         app: app.to_string(),
         namespace: namespace.to_string(),
         desired_replicas: 1,
@@ -1781,6 +1782,17 @@ pub(super) fn serve_recording_leader(
 
 /// An in-memory council with `voters` voters, led by node 1.
 async fn council_of(voters: u64) -> Vec<Arc<crate::council::CouncilNode>> {
+    council_and_network(voters).await.0
+}
+
+/// An in-memory council with `voters` voters, led by node 1, and the
+/// network that joins them, so a test can cut and heal links.
+async fn council_and_network(
+    voters: u64,
+) -> (
+    Vec<Arc<crate::council::CouncilNode>>,
+    crate::council::network::InMemoryRaftRouter,
+) {
     use crate::council::CouncilNode;
     use crate::council::log_store::MemLogStore;
     use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
@@ -1821,7 +1833,7 @@ async fn council_of(voters: u64) -> Vec<Arc<crate::council::CouncilNode>> {
     })
     .await
     .unwrap();
-    nodes
+    (nodes, network)
 }
 
 /// The appliance lab's two-node cluster (#259): start and a cluster
@@ -1929,6 +1941,38 @@ async fn follower_of_a_recording_leader(
         None,
     );
     (follower, seen, nodes)
+}
+
+/// #1442: a follower forwards stop, delete and release as the caller, not
+/// as its own service identity, so the leader checks the app's owner
+/// against its own desired state and the caller's token. A follower's
+/// replica can lag a claim, and the leader used to wave the forwarded
+/// request through as the system principal.
+#[tokio::test]
+async fn a_follower_forwards_app_changes_to_the_leader_with_the_callers_token() {
+    let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+    let (follower, seen, nodes) = follower_of_a_recording_leader(deployer).await;
+    let calls = [
+        "/v1/stop/db/pg",
+        "/v1/delete/db/pg",
+        "/v1/delete/db/pg?force=true",
+        "/v1/release/db/pg",
+    ];
+    for path in calls {
+        let (status, reply) =
+            send_bounded(follower.clone(), "POST", path, &deployer_key, "", &[]).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}: {reply}");
+    }
+    let seen = seen.lock().await.clone();
+    assert_eq!(seen.len(), calls.len(), "{seen:?}");
+    assert!(
+        seen.iter().all(|(_, bearer, marked, _)| *marked
+            && bearer.as_deref() == Some(format!("Bearer {deployer_key}").as_str())),
+        "each forward carries the caller's token and the forwarded mark: {seen:?}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -2384,6 +2428,229 @@ async fn a_confirmed_leader_answers_404_for_a_run_it_does_not_hold() {
     for (method, path) in RUN_CALLS {
         let (status, reply) = send_bounded(app.clone(), method, path, &admin_key, "", &[]).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {reply}");
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// A request path, its body and the extra headers it carries.
+type Submission = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
+/// Job and task-array submissions a settled leader must serve after one
+/// heartbeat round its followers answer late. The runs submission carries
+/// the forwarded marker, as it does when a follower sent it on (#1253).
+const JOB_SUBMISSIONS: &[Submission] = &[
+    (
+        "/v1/batch/array",
+        r#"{"name":"bulk","namespace":"default","template":{"runtime":"process","exec":"/bin/true"},"spec":{"count":1}}"#,
+        &[],
+    ),
+    (
+        "/v1/batch/manifest",
+        r#"{"name":"mixed","namespace":"default","cohort":[{"name":"small","count":1,"template":{"runtime":"process","exec":"/bin/true"}}]}"#,
+        &[],
+    ),
+    (
+        "/v1/jobs/runs",
+        r#"{"name":"nightly","namespace":"ops","definition":{"template":{"runtime":"process","exec":"/bin/true"},"cron":{"expression":"0 0 1 1 *"}}}"#,
+        &[(super::LEADER_FORWARDED_HEADER, "1")],
+    ),
+];
+
+#[tokio::test]
+async fn a_settled_leader_accepts_job_submissions_after_its_quorum_misses_a_heartbeat_round() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Slow heartbeats, not a lost leader: the followers must not depose it
+    // while it can't reach them.
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let app = router_over(nodes[0].clone(), admin);
+
+    for (path, body, extra) in JOB_SUBMISSIONS {
+        network.partition(1, 2).await;
+        network.partition(1, 3).await;
+        // One confirmation round can't reach a quorum.
+        assert!(!nodes[0].is_leader().await);
+        let healer = {
+            let network = network.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                network.heal().await;
+            })
+        };
+        let (status, reply) =
+            send_bounded(app.clone(), "POST", path, &admin_key, body, extra).await;
+        healer.await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}: {reply}");
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// Send `method path` to a leader whose followers miss its first heartbeat
+/// round: the links heal 300 ms after the request starts.
+async fn send_while_heartbeats_lag(
+    app: &Router,
+    network: &crate::council::network::InMemoryRaftRouter,
+    leader: &crate::council::CouncilNode,
+    request: (&str, &str, &str),
+    bearer: &str,
+) -> (StatusCode, String) {
+    let (method, path, body) = request;
+    network.partition(1, 2).await;
+    network.partition(1, 3).await;
+    // One confirmation round can't reach a quorum.
+    assert!(!leader.is_leader().await, "{method} {path}");
+    let healer = {
+        let network = network.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            network.heal().await;
+        })
+    };
+    let mut request = axum::http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {bearer}"));
+    if path != "/v1/apply" && !body.is_empty() {
+        request = request.header("content-type", "application/json");
+    }
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        app.clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{method} {path} didn't answer in 30 s"))
+    .unwrap();
+    healer.await.unwrap();
+    let status = response.status();
+    // A job apply streams its progress until the jobs finish, which these
+    // never do: the status is what this test is about.
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        response.into_body().collect(),
+    )
+    .await
+    .map(|body| String::from_utf8_lossy(&body.unwrap().to_bytes()).to_string())
+    .unwrap_or_else(|_| "(still streaming)".to_string());
+    (status, body)
+}
+
+// #1441: the batch, apply, replay, disable and stop routes confirm
+// leadership the same way as the submissions above (#1253), but nothing
+// tested them. A settled leader whose followers answer one round late must
+// serve each, not refuse it with "can't confirm it with a quorum".
+#[tokio::test]
+async fn a_settled_leader_serves_batch_apply_replay_disable_and_stop_after_a_missed_heartbeat_round()
+ {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let app = router_over(nodes[0].clone(), admin);
+    let leader = nodes[0].as_ref();
+
+    // A scheduled definition, for disable and stop. Its first occurrence is
+    // a year away, so it has no run yet; replay uses the batch below.
+    let (status, reply) = send_bounded(
+        app.clone(),
+        "POST",
+        "/v1/jobs/runs",
+        &admin_key,
+        r#"{"name":"nightly","namespace":"ops","definition":{"template":{"runtime":"process","exec":"/bin/true"},"cron":{"expression":"0 0 1 1 *"}}}"#,
+        &[(super::LEADER_FORWARDED_HEADER, "1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
+
+    let batch = r#"{"jobs":[{"name":"render","namespace":"default","spec":{"image":"x:1","command":["true"]}}]}"#;
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        leader,
+        ("POST", "/v1/batch", batch),
+        &admin_key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "POST /v1/batch: {reply}");
+    let batch: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    let batch = batch["batch_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{reply}"));
+    // The batch is a manifest; replay takes the run of its one cohort.
+    let (_, reply) = send_bounded(
+        app.clone(),
+        "GET",
+        &format!("/v1/batch/{batch}"),
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    let status: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    let cohort = status["cohorts"][0]["batch_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{reply}"));
+
+    let calls: Vec<(&str, String, &str, StatusCode)> = vec![
+        ("GET", format!("/v1/batch/{batch}"), "", StatusCode::OK),
+        (
+            "POST",
+            "/v1/apply".into(),
+            "[job.report]\nimage = \"test:v1\"\n",
+            StatusCode::OK,
+        ),
+        // The batch has no worker of unknown fate, so the leader's state
+        // machine refuses the replay: a 409 the leader decided itself, not
+        // a 503 for want of a quorum.
+        (
+            "POST",
+            format!("/v1/jobs/runs/{cohort}/replay"),
+            r#"{"acknowledged":true,"node":"n9","grant_digest":"none"}"#,
+            StatusCode::CONFLICT,
+        ),
+        (
+            "POST",
+            "/v1/jobs/definitions/nightly/ops/disable".into(),
+            "",
+            StatusCode::OK,
+        ),
+        (
+            "POST",
+            "/v1/stop/nightly/ops".into(),
+            "",
+            StatusCode::ACCEPTED,
+        ),
+    ];
+    for (method, path, body, expected) in calls {
+        let (status, reply) =
+            send_while_heartbeats_lag(&app, &network, leader, (method, &path, body), &admin_key)
+                .await;
+        assert_eq!(status, expected, "{method} {path}: {reply}");
     }
     for node in nodes {
         node.shutdown().await.unwrap();
@@ -4456,6 +4723,80 @@ async fn setup_scoped_with_role(
     (app, shutdown, created.plaintext)
 }
 
+/// #1125: a controller's token is scoped to its namespace, and the event
+/// list answers it with that namespace's events only: not another
+/// tenant's, and not cluster events that name no namespace.
+#[tokio::test]
+async fn a_scoped_token_reads_only_its_own_namespaces_events() {
+    use crate::bun::events::{EventKind, EventSeverity, EventStore};
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let scope = crate::sesame::types::TokenScope {
+        apps: None,
+        namespaces: Some(vec!["team-a".to_string()]),
+    };
+    let created = crate::sesame::token::create_token(
+        "controller",
+        crate::sesame::types::ApiRole::Deployer,
+        scope,
+        None,
+    )
+    .unwrap();
+    let store = crate::sesame::auth::new_token_store();
+    store.write().await.push(created.token);
+    let mut events = EventStore::new();
+    let mut record = |app: Option<&str>, namespace: Option<&str>, message: &str| {
+        events.record(
+            1,
+            EventKind::Health,
+            EventSeverity::Warning,
+            app.map(str::to_string),
+            namespace.map(str::to_string),
+            Some("node-1".into()),
+            message.to_string(),
+        );
+    };
+    record(Some("db"), Some("team-a"), "ours");
+    record(Some("db"), Some("team-b"), "theirs");
+    record(None, Some("team-a"), "our namespace");
+    record(None, None, "the cluster's");
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(store),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        Some(Arc::new(RwLock::new(events))),
+    );
+    let response = app
+        .oneshot(
+            axum::http::Request::get("/v1/events?limit=10")
+                .header("Authorization", format!("Bearer {}", created.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let view: crate::bun::cluster_view::ClusterEvents = serde_json::from_slice(&body).unwrap();
+    let messages: Vec<&str> = view
+        .events
+        .iter()
+        .map(|event| event.message.as_str())
+        .collect();
+    assert_eq!(messages, vec!["ours", "our namespace"]);
+}
+
 /// Every route that upgrades, rolls back or re-elects the cluster.
 const CLUSTER_ADMIN_ROUTES: [&str; 7] = [
     "/v1/upgrade/apply",
@@ -5155,6 +5496,66 @@ async fn managed_volume_needs_only_deploy() {
     );
 }
 
+const RUNTIME_KNOBS: &str = "[app.lb]\nimage = \"test:v1\"\n\
+    [app.lb.runtime]\ncapabilities = [\"IPC_OWNER\"]\n";
+
+/// #1122: the token gate on its own. A deployer whose permission block
+/// grants `deploy` but not `host-exec` can't apply an app with a runtime
+/// knob, and the refusal names the field, the value and the gate. Nothing
+/// reaches Raft.
+#[tokio::test]
+async fn a_runtime_knob_needs_host_exec_and_the_refusal_names_the_token_gate() {
+    let (app, council, _commands) = workload_admission_fixture("knob-deploy-only").await;
+    council
+        .write(crate::council::RaftRequest::PermissionSpec {
+            name: "ci".into(),
+            spec: Box::new(crate::config::PermissionSpec {
+                actions: vec!["deploy".into()],
+                apps: vec!["*".into()],
+                namespaces: None,
+            }),
+        })
+        .await
+        .unwrap();
+    let mut request = axum::http::Request::post("/v1/apply")
+        .body(Body::from(RUNTIME_KNOBS))
+        .unwrap();
+    request.extensions_mut().insert(deployer_context());
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let message = String::from_utf8_lossy(&body);
+    assert!(
+        message.contains("runtime.capabilities CAP_IPC_OWNER"),
+        "{message}"
+    );
+    assert!(message.contains("token gate"), "{message}");
+    assert!(message.contains("host-exec"), "{message}");
+    assert!(council.desired_state().await.apps.is_empty());
+    council.shutdown().await.unwrap();
+
+    assert_ne!(
+        apply_under_permission_block("knob-host-exec", &["deploy", "host-exec"], RUNTIME_KNOBS)
+            .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[test]
+fn apply_notes_each_runtime_knob_needs_a_node_allowlist_entry() {
+    let config = crate::config::Config::parse(RUNTIME_KNOBS).unwrap();
+    let notes = super::apply::runtime_knob_notes(&config);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("app.lb"), "{notes:?}");
+    assert!(
+        notes[0].contains("runtime.capabilities CAP_IPC_OWNER"),
+        "{notes:?}"
+    );
+    assert!(notes[0].contains("allowed_capabilities"), "{notes:?}");
+}
+
 #[test]
 fn apply_notes_each_host_path_source_needs_a_node_allowlist_entry() {
     let config = crate::config::Config::parse(HOST_PATH_VOLUME).unwrap();
@@ -5468,21 +5869,16 @@ async fn scoped_token_is_refused_streaming_another_namespaces_logs() {
     let _ = server.await;
 }
 
-/// Audit events span every namespace, so `/v1/events` refuses a scoped
-/// token (C3). The live stream of the same events, `/v1/ws/events`, checked
-/// nothing: route authorisation lets any token through, and the handler
-/// upgraded straight away, so a token scoped to `team-a` streamed every
-/// tenant's events. It must refuse the upgrade the same way.
+/// The dashboard's live stream, `/v1/ws/events`, carries every tenant's
+/// events. It checked nothing: route authorisation lets any token through,
+/// and the handler upgraded straight away, so a token scoped to `team-a`
+/// streamed every tenant's events. It must refuse the upgrade. A scoped
+/// token reads its own events from `/v1/events` instead (#1125).
 #[tokio::test]
 async fn scoped_token_is_refused_the_live_event_stream() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
-    assert_eq!(
-        get_status(app.clone(), "/v1/events", Some(&tok)).await,
-        StatusCode::FORBIDDEN,
-        "the HTTP route already refuses"
-    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let serving = shutdown.clone();
@@ -5763,11 +6159,12 @@ async fn scoped_token_is_refused_faulting_another_namespace() {
     shutdown.cancel();
 }
 
-/// The cluster-wide metrics and events endpoints read across every app and
-/// namespace, so — like `/v1/logs/sql` — a scoped token is refused (C3)
-/// rather than served every tenant's data.
+/// The cluster-wide metrics endpoints read across every app and namespace,
+/// so — like `/v1/logs/sql` — a scoped token is refused (C3) rather than
+/// served every tenant's data. `/v1/events` used to be on this list; it now
+/// answers a scoped token with its own events only (#1125).
 #[tokio::test]
-async fn scoped_token_is_refused_cluster_wide_metrics_and_events() {
+async fn scoped_token_is_refused_cluster_wide_metrics() {
     for path in [
         "/v1/metrics?name=node_cpu_usage_percent",
         "/v1/metrics/summary",
@@ -5775,7 +6172,6 @@ async fn scoped_token_is_refused_cluster_wide_metrics_and_events() {
         "/v1/metrics/rollup",
         "/v1/metrics/rollup/owned",
         "/v1/metrics/cluster",
-        "/v1/events",
     ] {
         let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
         let status = get_status(app, path, Some(&tok)).await;
@@ -6986,6 +7382,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
     failed.state = "failed".into();
     let desired = vec![
         crate::bun::diagnostics::DesiredAppEvidence {
+            owner: None,
             app: "web".into(),
             namespace: "default".into(),
             desired_replicas: 3,
@@ -6999,6 +7396,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             volume_homes: Vec::new(),
         },
         crate::bun::diagnostics::DesiredAppEvidence {
+            owner: None,
             app: "pending".into(),
             namespace: "default".into(),
             desired_replicas: 2,

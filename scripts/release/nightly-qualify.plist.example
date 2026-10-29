@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  An example launchd job for the nightly qualification (#1363). Nothing
+  installs it. On the quiet host, from a checkout used only for this:
+
+    sed -e "s|CHECKOUT|$PWD|g" -e "s|HOME_DIR|$HOME|g" \
+      scripts/release/nightly-qualify.plist.example \
+      > ~/Library/LaunchAgents/com.reliaburger.nightly-qualify.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.reliaburger.nightly-qualify.plist
+
+  Edit the train (and the staged build and soak bun) first; the gate comes
+  from the release (release_tier.py). It starts at
+  18:00: the patch gate's tiers take about 3 hours, the full gate's about
+  14, so a full night ends around 08:00. A login shell (-l) gives it the PATH
+  that finds limactl, gh and python3. Remove it with
+  `launchctl bootout gui/$(id -u)/com.reliaburger.nightly-qualify`.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.reliaburger.nightly-qualify</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>scripts/release/nightly-qualify.sh --train release-0-2-4</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>CHECKOUT</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>18</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>HOME_DIR/reliaburger-nightly/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>HOME_DIR/reliaburger-nightly/launchd.log</string>
+</dict>
+</plist>

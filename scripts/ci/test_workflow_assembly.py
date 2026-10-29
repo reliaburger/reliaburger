@@ -2,10 +2,13 @@
 import copy
 import importlib
 from pathlib import Path
+import re
 import tempfile
 import unittest
 
 import contracts as c
+
+REPO = Path(__file__).resolve().parents[2]
 
 
 # This independent source fixture preserves existing Make argument spelling.
@@ -183,7 +186,8 @@ class WorkflowAssembly(unittest.TestCase):
             self.w.job_results(plan, needs)
 
     def test_genuine_archive_builder_command_is_not_downloaded_metadata(self):
-        self.assertEqual(self.w.ARCHIVE_COMMAND, ['cargo', 'nextest', 'archive', '--locked', '--archive-file', 'tests.tar.zst'])
+        self.assertEqual(self.w.ARCHIVE_COMMAND[:6], ['cargo', 'nextest', 'archive', '--locked', '--archive-file', 'tests.tar.zst'])
+        self.assertEqual(self.w.ARCHIVE_COMMAND[6:], [word for name in self.w.ARCHIVED_BINARIES for word in ('--test', name)])
         self.assertEqual(self.w.OCI_BUILD_COMMAND, ['cargo', 'test', '--features', 'ebpf', '--test', 'owned_runc', '--test', 'owned_network', '--test', 'oci_crash', '--no-run', '--message-format=json'])
 
     def test_original_owner_commands_are_not_late_keep_metadata(self):
@@ -252,3 +256,45 @@ class WorkflowAssembly(unittest.TestCase):
         with self.assertRaises(c.Invalid):
             self.w.entry_from_make(self.root, manifest, 'cluster-tests', 'linux',
                                    archive_origin=origin, archive_extraction=other)
+
+
+class ArchivedBinaries(unittest.TestCase):
+    """The archive holds only the test binaries its owners run (#977).
+
+    It used to hold all 47 binaries, 3.0 GB, for owners that run 12 of them,
+    and its download often ran past its 5-minute limit. Each binary name in
+    an archived owner's make filter must be archived, and nothing else.
+    """
+
+    def setUp(self):
+        self.w = importlib.import_module('workflow_assembly')
+
+    @staticmethod
+    def binaries(selectors):
+        expression = selectors[selectors.index('-E') + 1]
+        return set(re.findall(r'binary\(([a-z0-9_]+)\)', expression))
+
+    def filtered(self, gate):
+        selectors, _ = self.w.make_selection(REPO, self.w.OWNERS[gate][1], archived=True)
+        return self.binaries(selectors)
+
+    def test_the_archive_holds_exactly_the_binaries_its_owners_run(self):
+        wanted = set()
+        for gate in self.w.ARCHIVED_GATES:
+            with self.subTest(gate=gate):
+                names = self.filtered(gate)
+                self.assertTrue(names, 'an archived owner must select its binaries by name')
+                wanted |= names
+        self.assertEqual(set(self.w.ARCHIVED_BINARIES), wanted)
+        self.assertEqual(len(self.w.ARCHIVED_BINARIES), len(set(self.w.ARCHIVED_BINARIES)))
+
+    def test_each_archived_binary_is_an_integration_test_target(self):
+        for name in self.w.ARCHIVED_BINARIES:
+            with self.subTest(binary=name):
+                self.assertTrue((REPO / 'tests' / f'{name}.rs').is_file()
+                                or (REPO / 'tests' / name / 'main.rs').is_file())
+
+    def test_a_binary_an_owner_runs_but_the_archive_lacks_is_detected(self):
+        selectors = ['--profile', 'ci', '-E', "binary(cluster_failover) | binary(brand_new)"]
+        self.assertNotIn('brand_new', self.w.ARCHIVED_BINARIES)
+        self.assertIn('brand_new', self.binaries(selectors))

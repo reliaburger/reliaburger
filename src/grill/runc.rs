@@ -218,9 +218,36 @@ impl RuncGrill {
             });
         }
 
+        if self.rootless
+            && let Some(problem) = spec.runtime_knobs_refusal("rootless runc")
+        {
+            return Err(GrillError::LaunchRefused {
+                instance: instance.clone(),
+                problem,
+            });
+        }
+
+        // A sidecar joins its parent's named namespace (#1120). Rootless
+        // runc names none, and the parent's must still be there.
+        if let Some(joined) = spec.joined_network() {
+            let reason = if self.rootless {
+                Some("rootless runc can't share a network namespace with a sidecar".to_string())
+            } else if !std::path::Path::new(joined).exists() {
+                Some(format!("the parent's network namespace {joined} is gone"))
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err(GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason,
+                });
+            }
+        }
+
         // Set up per-container networking (root mode only, non-rootless).
         // For rootless, slirp4netns is set up after runc create (needs PID).
-        if !self.rootless {
+        if !self.rootless && spec.joined_network().is_none() {
             let container_index = container_index.ok_or_else(|| GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: "missing durable network reservation".into(),
@@ -337,6 +364,32 @@ impl RuncGrill {
                 .unwrap_or(rootfs)
                 .to_string_lossy()
                 .to_string();
+        }
+
+        // Runtime knobs (#1122) go in after the user namespace has set the
+        // default capabilities, so the added ones join them. The node writes
+        // the network sysctls into the namespace it made; runc writes the
+        // IPC ones.
+        if let Some(knobs) = spec.runtime_knobs.clone() {
+            let failed = |reason: String| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason,
+            };
+            let devices = super::knobs::host_devices(&knobs)
+                .await
+                .map_err(|e| failed(e.to_string()))?;
+            super::knobs::apply_to_spec(&mut spec, &knobs, |path| {
+                devices.get(path).copied().ok_or_else(|| {
+                    super::knobs::DeviceLookupError::NotADevice {
+                        path: path.display().to_string(),
+                    }
+                })
+            })
+            .map_err(|e| failed(e.to_string()))?;
+            let network_sysctls = super::knobs::take_network_sysctls(&mut spec);
+            netns::write_sysctls_with_commands(commands, instance, &network_sysctls)
+                .await
+                .map_err(|e| failed(e.to_string()))?;
         }
 
         // Point the container at the node's DNS responder with a per-instance
@@ -668,6 +721,19 @@ impl super::Grill for RuncGrill {
         !self.rootless
     }
 
+    /// Rootful runc applies runtime knobs (#1122). Rootless runc can't: it
+    /// owns no device cgroup and no capabilities beyond its own user's.
+    fn applies_runtime_knobs(&self) -> bool {
+        !self.rootless
+    }
+
+    /// Rootful runc names every instance's network namespace, so a sidecar
+    /// can join its parent's (#1120). Rootless networking is slirp4netns,
+    /// set up per container after create.
+    fn shares_network_namespaces(&self) -> bool {
+        !self.rootless
+    }
+
     async fn adopt(
         &self,
         instance: &InstanceId,
@@ -860,6 +926,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: "invalid.example/reliaburger/no-pull:latest".to_string(),
                 readonly: false,
@@ -881,7 +948,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         let error = grill.create(&id, &spec).await.unwrap_err();
@@ -924,6 +994,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: "./rootfs".into(),
                 readonly: true,
@@ -945,7 +1016,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
         let result = grill.create(&id, &spec).await;
         if result.is_ok() {
@@ -991,6 +1065,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 // Use a path (not an image ref) to skip the image pull step
                 path: "./rootfs".to_string(),
@@ -1013,7 +1088,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         // runc create will fail (no real rootfs), but the bundle dir
@@ -1087,6 +1165,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
                 readonly: false,
@@ -1121,7 +1200,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         // Read the first instance's spec while it still owns its bundle: once
@@ -1249,6 +1331,7 @@ mod tests {
                 host_process: false,
                 initialiser: false,
                 port_mapping: None,
+                stop: None,
                 root: crate::grill::oci::OciRoot {
                     path: ALPINE_IMAGE.to_string(),
                     readonly: false,
@@ -1277,7 +1360,10 @@ mod tests {
                     cgroups_path: None,
                     uid_mappings: None,
                     gid_mappings: None,
+                    sysctl: Default::default(),
+                    devices: Vec::new(),
                 },
+                runtime_knobs: None,
             };
         let specs = [spec_for("alpha", 0, 3), spec_for("beta", 1, 1)];
 
@@ -1417,6 +1503,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
                 readonly: false,
@@ -1438,7 +1525,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         let error = grill.create(&id, &spec).await.unwrap_err();
@@ -1479,6 +1569,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
                 readonly: false,
@@ -1504,7 +1595,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         let original = RuncGrill::new(
@@ -1676,6 +1770,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
                 readonly: true,
@@ -1697,7 +1792,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         grill
@@ -1996,6 +2094,329 @@ mod tests {
             redis_host_uid,
             "the volume still belongs to the app's user"
         );
+    }
+
+    /// #1120: a sidecar joins its app's network namespace, so it reaches the
+    /// app on `localhost`, and it gets no address of its own.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_sidecar_reaches_its_app_on_localhost() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let app_id = InstanceId("default__sidecar-redis-0".to_string());
+        let sidecar_id = crate::grill::oci::sidecar_instance_id(&app_id, "probe");
+        for id in [&app_id, &sidecar_id] {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(vec![app_id.clone(), sidecar_id.clone()]);
+        let app_toml = format!(
+            "image = \"{REDIS_IMAGE}\"\n[[sidecar]]\nname = \"probe\"\ncommand = [\"sleep\", \"3600\"]\n"
+        );
+        let (grill, app) = image_app(tmp.path(), &app_id, &app_toml);
+        let config: crate::config::app::AppSpec = toml::from_str(&app_toml).unwrap();
+        let sidecar =
+            crate::grill::oci::generate_sidecar_oci_spec(&config.sidecar[0], &app, &app_id);
+
+        // Bun's order: the app's create makes the namespace, the sidecar
+        // starts in it, then the app starts.
+        grill.create(&app_id, &app).await.unwrap();
+        grill.create(&sidecar_id, &sidecar).await.unwrap();
+        grill.start(&sidecar_id).await.unwrap();
+        grill.start(&app_id).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let answer = loop {
+            let answer = redis_cli(&grill, &sidecar_id, &["-h", "127.0.0.1", "ping"]).await;
+            if answer == "PONG" || std::time::Instant::now() >= deadline {
+                break answer;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        let sidecar_ip = grill.container_ip(&sidecar_id).await;
+        let app_ip = grill.container_ip(&app_id).await;
+        grill.kill(&app_id).await.unwrap();
+        grill.kill(&sidecar_id).await.unwrap();
+
+        assert_eq!(
+            answer, "PONG",
+            "the sidecar couldn't reach its app on localhost"
+        );
+        assert!(app_ip.is_some(), "the app has its address");
+        assert_eq!(sidecar_ip, None, "a sidecar reserves no address of its own");
+    }
+
+    /// The host pid of the process with this command line that runs in a
+    /// user namespace other than the test's own: a container's.
+    fn container_process(cmdline: &[u8]) -> String {
+        let own_namespace = std::fs::read_link("/proc/self/ns/user").unwrap();
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                std::fs::read(entry.path().join("cmdline")).ok().as_deref() == Some(cmdline)
+                    && std::fs::read_link(entry.path().join("ns/user"))
+                        .is_ok_and(|namespace| namespace != own_namespace)
+            })
+            .expect("the container's process")
+            .file_name()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// #1427: why the network capabilities and the `m` device permission
+    /// are refused at parse time. The container's network namespace belongs
+    /// to the node's user namespace. A process that joins the container's
+    /// user namespace from the host holds every capability there,
+    /// `CAP_NET_ADMIN` included, and still can't change that network. And
+    /// only the initial user namespace may make device nodes, so `mknod`
+    /// fails inside the container, though its default set has `CAP_MKNOD`
+    /// and runc's device cgroup allows it. If either starts working, the
+    /// refusal can go.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_a_container_cannot_use_a_network_capability_or_make_device_nodes() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__net-admin-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let (grill, spec) = image_app(
+            tmp.path(),
+            &id,
+            // An odd duration, to find this container's process on the host.
+            &format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3607\"]\n"),
+        );
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let target = container_process(b"sleep\x003607\x00");
+        // Every capability in the container's user namespace: setns into a
+        // user namespace grants the full set there.
+        let network = tokio::process::Command::new("nsenter")
+            .args(["--target", &target, "--user", "--net", "--"])
+            .args(["ip", "link", "set", "dev", "lo", "mtu", "1400"])
+            .output()
+            .await
+            .unwrap();
+        let run = |command: &[&str]| {
+            let argv: Vec<String> = command.iter().map(|part| part.to_string()).collect();
+            let grill = &grill;
+            let id = &id;
+            async move { grill.exec(id, &argv).await.unwrap() }
+        };
+        let mknod = run(&["mknod", "/tmp/rb-null", "c", "1", "3"]).await;
+        // The same container can change what its own namespaces own.
+        let own = run(&["chown", "65534", "/tmp"]).await;
+        grill.kill(&id).await.unwrap();
+
+        let said = String::from_utf8_lossy(&network.stderr);
+        assert!(!network.status.success(), "CAP_NET_ADMIN worked: {said}");
+        assert!(said.contains("not permitted"), "{said}");
+        assert_ne!(mknod.exit_code, 0, "mknod worked: {}", mknod.output);
+        assert_eq!(own.exit_code, 0, "{}", own.output);
+    }
+
+    /// The capabilities a container can't use whatever it holds: the kernel
+    /// checks each against the node's own user namespace (#1474). On the
+    /// host, as root, each probe's operation works; inside the container's
+    /// user namespace, with every capability there, it's refused.
+    /// `CAP_MAC_OVERRIDE` has no probe: only Smack checks it, against the
+    /// initial user namespace, and the test hosts run AppArmor.
+    const CAPABILITIES_CHECKED_AGAINST_THE_NODE: [&str; 21] = [
+        "CAP_AUDIT_CONTROL",
+        "CAP_AUDIT_READ",
+        "CAP_AUDIT_WRITE",
+        "CAP_BLOCK_SUSPEND",
+        "CAP_BPF",
+        "CAP_DAC_READ_SEARCH",
+        "CAP_IPC_LOCK",
+        "CAP_LEASE",
+        "CAP_LINUX_IMMUTABLE",
+        "CAP_MAC_ADMIN",
+        "CAP_MKNOD",
+        "CAP_PERFMON",
+        "CAP_SYSLOG",
+        "CAP_SYS_MODULE",
+        "CAP_SYS_NICE",
+        "CAP_SYS_PACCT",
+        "CAP_SYS_RAWIO",
+        "CAP_SYS_RESOURCE",
+        "CAP_SYS_TIME",
+        "CAP_SYS_TTY_CONFIG",
+        "CAP_WAKE_ALARM",
+    ];
+
+    /// The capabilities outside Docker's default set that work on what the
+    /// container's own namespaces own: its pid namespace (checkpoint and
+    /// restore, reboot, ptrace), its IPC namespace and its UTS namespace.
+    const CAPABILITIES_CHECKED_AGAINST_THE_CONTAINER: [&str; 5] = [
+        "CAP_CHECKPOINT_RESTORE",
+        "CAP_IPC_OWNER",
+        "CAP_SYS_ADMIN",
+        "CAP_SYS_BOOT",
+        "CAP_SYS_PTRACE",
+    ];
+
+    /// Run `tests/fixtures/capability_probe.py` for one capability: as root
+    /// on the host when `container` is `None`, or else in the container's
+    /// user, pid, IPC, UTS and network namespaces.
+    async fn capability_probe(
+        directory: &std::path::Path,
+        container: Option<&str>,
+        capability: &str,
+        drop: bool,
+    ) -> String {
+        let mut command = match container {
+            Some(target) => {
+                let mut nsenter = tokio::process::Command::new("nsenter");
+                nsenter.args(["--target", target, "--user", "--pid", "--ipc", "--uts"]);
+                nsenter.args(["--net", "--", "python3"]);
+                nsenter
+            }
+            None => tokio::process::Command::new("python3"),
+        };
+        command
+            .arg(directory.join("probe.py"))
+            .arg(capability)
+            .arg("--file")
+            .arg(directory.join("file"))
+            .arg("--dir")
+            .arg(directory);
+        if drop {
+            command.arg("--drop");
+        }
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{capability} probe crashed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// #1474: which capability knobs do anything. A container runs in its
+    /// own user namespace, and the kernel checks each capability against
+    /// some user namespace: the one owning the object for most, the
+    /// initial one for the rest. Joining the container's user namespace
+    /// from the host grants every capability in it, the most any knob
+    /// could, so a probe refused there can never work, and the parser
+    /// refuses that capability. The ones that work are probed there with
+    /// and without the capability, and granted through the knob to show it
+    /// reaches the container.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), python3, and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_capability_knobs_work_only_where_the_container_owns_the_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        // Container root (host uid HOST_ID_BASE) runs the probe from here.
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probes = tmp.path().join("probe");
+        std::fs::create_dir(&probes).unwrap();
+        std::fs::set_permissions(&probes, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let base = crate::grill::userns::HOST_ID_BASE;
+        std::os::unix::fs::chown(&probes, Some(base), Some(base)).unwrap();
+        std::fs::write(
+            probes.join("probe.py"),
+            include_str!("../../tests/fixtures/capability_probe.py"),
+        )
+        .unwrap();
+        // Another container user's file, for leases, file flags and FIBMAP.
+        std::fs::write(probes.join("file"), "burger\n").unwrap();
+        std::os::unix::fs::chown(probes.join("file"), Some(base + 1), Some(base + 1)).unwrap();
+        for file in ["probe.py", "file"] {
+            std::fs::set_permissions(probes.join(file), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+
+        let id = InstanceId("default__cap-probe-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let granted = CAPABILITIES_CHECKED_AGAINST_THE_CONTAINER
+            .map(|name| format!("\"{name}\""))
+            .join(", ");
+        let (grill, spec) = image_app(
+            tmp.path(),
+            &id,
+            &format!(
+                "image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3608\"]\n\
+                 [runtime]\ncapabilities = [{granted}]\n"
+            ),
+        );
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let target = container_process(b"sleep\x003608\x00");
+
+        let mut table = Vec::new();
+        let mut wrong = Vec::new();
+        for name in CAPABILITIES_CHECKED_AGAINST_THE_NODE {
+            let host = capability_probe(&probes, None, name, false).await;
+            let inside = capability_probe(&probes, Some(&target), name, false).await;
+            if !host.starts_with("allowed") || !inside.starts_with("denied") {
+                wrong.push(name);
+            }
+            table.push(format!(
+                "{name}: host root {host}; container, every capability {inside}"
+            ));
+        }
+        for name in CAPABILITIES_CHECKED_AGAINST_THE_CONTAINER {
+            let with = capability_probe(&probes, Some(&target), name, false).await;
+            let without = capability_probe(&probes, Some(&target), name, true).await;
+            if !with.starts_with("allowed") || !without.starts_with("denied") {
+                wrong.push(name);
+            }
+            table.push(format!(
+                "{name}: container {with}; container without it {without}"
+            ));
+        }
+
+        // The knob put the working ones in the container's own process.
+        let status = grill
+            .exec(&id, &["cat".to_string(), "/proc/self/status".to_string()])
+            .await
+            .unwrap()
+            .output;
+        let effective = status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .map(|hex| u64::from_str_radix(hex.trim(), 16).unwrap())
+            .unwrap();
+        for (name, bit) in [
+            ("CAP_CHECKPOINT_RESTORE", 40),
+            ("CAP_IPC_OWNER", 15),
+            ("CAP_SYS_ADMIN", 21),
+            ("CAP_SYS_BOOT", 22),
+            ("CAP_SYS_PTRACE", 19),
+        ] {
+            assert_ne!(
+                effective & (1 << bit),
+                0,
+                "the knob didn't grant {name}: {status}"
+            );
+        }
+        let hostname = grill
+            .exec(&id, &["hostname".to_string(), "rb-cap-probe".to_string()])
+            .await
+            .unwrap();
+        grill.kill(&id).await.unwrap();
+
+        eprintln!("{}", table.join("\n"));
+        assert!(
+            wrong.is_empty(),
+            "unexpected for {wrong:?}:\n{}",
+            table.join("\n")
+        );
+        assert_eq!(hostname.exit_code, 0, "{}", hostname.output);
+        // And the parser agrees with the kernel.
+        for name in CAPABILITIES_CHECKED_AGAINST_THE_NODE {
+            assert!(
+                name.parse::<super::super::knobs::Capability>().is_err(),
+                "{name}"
+            );
+        }
     }
 
     async fn redis_cli(grill: &RuncGrill, id: &InstanceId, command: &[&str]) -> String {

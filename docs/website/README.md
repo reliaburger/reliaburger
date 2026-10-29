@@ -60,7 +60,7 @@ to keep the samples as CSV with SVG charts in the soak charts' style, or
 `DEMO_RESOURCES=0` to leave the measuring out.
 
 Every promoted release re-records the tour against its published install
-([releasing step 9](../releasing.md#staging-a-candidate)). With no other
+([releasing step 10](../releasing.md#staging-a-candidate)). With no other
 quickstart cluster on the default ports, and a throwaway `RELIABURGER_HOME`
 so it can't touch yours:
 
@@ -157,7 +157,7 @@ scheme, so the charts stay light here too. At 720 px they're wider than a
 phone and shrink with the column.
 
 At a promotion, replace them with the new release's
-([releasing step 9](../releasing.md#staging-a-candidate)):
+([releasing step 10](../releasing.md#staging-a-candidate)):
 
 ```sh
 rm -r docs/website/assets/soak

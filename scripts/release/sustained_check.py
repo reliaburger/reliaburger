@@ -15,6 +15,7 @@ Subcommands:
   power-cut EVIDENCE                    a node lost power: a log tail may end below an earlier one once
   baseline EVIDENCE SNAPSHOT            record each node's leak inventory as the baseline
   evaluate EVIDENCE SNAPSHOT            findings; exit 1 on a new failure, 3 when not yet settled
+  policies EVIDENCE LISTING             exit 1 unless the soak workload's policies are all in force
   seen EVIDENCE KEY                     exit 0 if a harness failure KEY was bundled in the last half hour
   ingress-expect EVIDENCE NODE SERIAL   the serial a node must serve after a successful reload
   count EVIDENCE NAME [N]               add to a named counter in the record
@@ -49,9 +50,11 @@ import ssl
 import statistics
 import sys
 import time
+import tomllib
 import job_soak
 import job_soak_inventory
 import soak_charts
+import soak_slo
 
 # Thresholds from section 4 of the plan (seconds unless stated).
 NODE_CERT_MARGIN = 300
@@ -799,6 +802,8 @@ def evaluate(evidence, snapshot):
         forward_findings, cut = host_forward_findings(state, forwards, now)
         findings += forward_findings
     ingress_cut = any(name == "ingress" for _, name in cut)
+    # The latency SLOs' API reads (#1400) count only outside fault windows.
+    soak_slo.fold_snapshot(evidence, snapshot, fault_window, cut)
 
     http = read(snapshot, "http.txt")
     http_ok = None
@@ -954,6 +959,11 @@ def evaluate(evidence, snapshot):
     # Leaks only count once the cluster has settled; before that they are progress.
     findings += [dict(leak, severity="info") if fault_window else leak for leak in leaks]
 
+    expected = expected_policies(evidence)
+    listing = read_json(snapshot, "policies.json")
+    if expected and listing is not None:
+        findings += policy_findings(state, expected, listing)
+
     registry = read_json(snapshot, "registry.json")
     registry_cut = any(name == "registry" for _, name in cut)
     if registry is not None and registry_cut:
@@ -1002,6 +1012,71 @@ def suppress_repeats(state, findings, now):
     return result
 
 
+# --- policies (#1311) --------------------------------------------------------
+
+def expected_policies(evidence):
+    """The `[policy.*]` tables of the workload file the harness applied
+    (EVIDENCE/workloads.toml), or None before it has written one."""
+    path = Path(evidence) / "workloads.toml"
+    if not path.exists():
+        return None
+    return tomllib.loads(path.read_text()).get("policy", {})
+
+
+# What a policy decides. The message is for people, so a reworded one isn't
+# a lost policy.
+POLICY_KEYS = ("match", "deny", "action", "applies_to", "default")
+POLICY_DEFAULTS = {"action": "deny", "applies_to": "apps"}
+
+
+def policy_differences(declared, listed):
+    """The keys whose value differs between a declared policy and the one in
+    force, comparing absent keys by their default."""
+    return [key for key in POLICY_KEYS
+            if declared.get(key, POLICY_DEFAULTS.get(key)) != listed.get(key, POLICY_DEFAULTS.get(key))]
+
+
+def policy_findings(state, expected, listing):
+    """Fail when a policy the soak applied is gone or changed, or the policy
+    generation went backwards: Raft keeps both through every fault."""
+    policies = listing.get("policies") if isinstance(listing, dict) else None
+    if not isinstance(policies, dict):
+        return [finding("policies", "warn", "`relish policy list` answered without a policy map")]
+    findings = []
+    for name, declared in sorted(expected.items()):
+        listed = policies.get(name)
+        if listed is None:
+            findings.append(finding("policies", "fail", f"policy {name} is not in force", name))
+            continue
+        changed = policy_differences(declared, listed)
+        if changed:
+            findings.append(finding("policies", "fail",
+                                    f"policy {name} differs from the soak workload's in {', '.join(changed)}", name))
+    generation = listing.get("generation")
+    previous = state.get("policy_generation")
+    if isinstance(generation, int):
+        if isinstance(previous, int) and generation < previous:
+            findings.append(finding("policies", "fail", f"policy generation went from {previous} back to {generation}"))
+        state["policy_generation"] = max(generation, previous or 0)
+    state["policy_checks"] = state.get("policy_checks", 0) + 1
+    return findings
+
+
+def check_policies(evidence, listing_path):
+    """The configure step's check: 0 when every policy in the applied
+    workload file is in force, 1 (printing why) when one isn't."""
+    expected = expected_policies(evidence) or {}
+    try:
+        listing = json.loads(Path(listing_path).read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"fail: policies: cannot read {listing_path}: {error}")
+        return 1
+    problems = policy_findings({}, expected, listing)
+    for item in problems:
+        print(f"{item['severity']}: policies: {item['detail']}")
+    return 1 if problems else 0
+
+
 def turn_scrapes(samples):
     """A node's bun_agent_loop_turn_seconds_bucket samples, as /v1/metrics
     returns them, grouped per branch into scrapes, oldest first:
@@ -1044,6 +1119,12 @@ def turn_findings(state, node, samples):
         for stamp, counts in scrapes:
             total, within = counts.get("+Inf"), counts.get(TURN_BUDGET_LE)
             if total is None or within is None or stamp <= last.get("at", float("-inf")):
+                continue
+            # A Bun before #1419 read its turn count and its buckets apart, so
+            # a turn finishing in between could put le="1" above +Inf. That
+            # scrape is no evidence; counting from it made the next, honest,
+            # one look like a slow turn.
+            if within > total:
                 continue
             over = int(total - within)
             restarted = total < last.get("total", 0) or over < last.get("over", 0)
@@ -1148,7 +1229,9 @@ def resource_trend_findings(state, node, inventory, now):
     if fd is not None:
         node_state["fd_samples"] = [sample for sample in node_state["fd_samples"] if sample[0] >= now - (FD_RISES + 3) * FD_BUCKET] + [[now, fd]]
     trend = state.setdefault("trends", {}).setdefault(node, {})
-    for key, value in (("fd", fd), ("rss_kb", rss)):
+    # Anonymous against file-backed RSS tells heap growth from mapped files (#1417).
+    anon, mapped = inventory_number(inventory, "bun_rss_anon_kb"), inventory_number(inventory, "bun_rss_file_kb")
+    for key, value in (("fd", fd), ("rss_kb", rss), ("rss_anon_kb", anon), ("rss_file_kb", mapped)):
         if value is None:
             continue
         entry = trend.setdefault(key, {"first": value, "max": value})
@@ -1785,6 +1868,56 @@ def day_lines(day):
     return lines + [""]
 
 
+def council_history_section(evidence, metadata):
+    """The council history check (#1399): whether it failed the run, and the record's lines.
+
+    `linearizability.py check` writes council-history-check.json once the
+    soak is over. A run that started the history client (metadata
+    `council_history`) owes that check: without it, or with a violation, the
+    run fails. An inconclusive search fails a fast or final tier, which would
+    otherwise go green with no linearizability coverage (#1437); other runs
+    only report it.
+    """
+    gated = metadata.get("tier") in soak_slo.GATED_TIERS
+    path = Path(evidence) / "council-history-check.json"
+    if not path.exists():
+        if metadata.get("council_history") is not True:
+            return False, []
+        return True, ["## Council history (linearizability)", "",
+                      "- Not checked: the soak recorded a council history but never checked it", ""]
+    result = json.loads(path.read_text())
+    verdict = result.get("verdict")
+    lines = ["## Council history (linearizability)", "",
+             "Every test-lease grant, renew, read and release the history client made, checked against a "
+             "model of the council's leases. A write with no answer may or may not have happened; the check "
+             "allows both.", "",
+             f"- Operations checked: {result.get('checked', 0)} of {result.get('operations', 0)}, "
+             f"in {result.get('partitions', 0)} namespaces; {result.get('unanswered_writes', 0)} writes had no answer"]
+    if verdict == "linearizable":
+        lines.append("- Verdict: linearizable")
+    elif verdict == "inconclusive" and gated:
+        lines.append("- Verdict: **inconclusive**: the search ran out of budget in "
+                     + ", ".join(result.get("inconclusive", []))
+                     + "; a fast or final tier needs a conclusive check")
+    elif verdict == "inconclusive":
+        lines.append("- Verdict: inconclusive: the search ran out of budget in "
+                     + ", ".join(result.get("inconclusive", [])))
+    else:
+        violation = result.get("violation", {})
+        lines += [f"- Verdict: **not linearizable** in {violation.get('namespace', 'unknown')}; "
+                  "the smallest failing slice of its history:", "",
+                  "| Id | Client | Operation | Lease | Call | Return | Outcome | Expiry | Cleaning |",
+                  "|---|---|---|---|---|---|---|---|---|"]
+        for op in violation.get("slice", []):
+            returned = "no answer" if op.get("return") is None else f"{op['return']:.3f}"
+            lines.append(f"| {op.get('id')} | {op.get('client')} | {op.get('op')} | {op.get('lease') or ''} | "
+                         f"{op.get('call', 0):.3f} | {returned} | {op.get('outcome')} | "
+                         f"{op.get('expires_at_unix_ms') or ''} | {op.get('cleaning') if op.get('cleaning') is not None else ''} |")
+    lines.append("")
+    passed = verdict == "linearizable" or (verdict == "inconclusive" and not gated)
+    return not passed, lines
+
+
 def render(evidence, record):
     evidence = Path(evidence)
     record = Path(record)
@@ -1834,7 +1967,15 @@ def render(evidence, record):
     final_tier = metadata.get("tier") in ("final", "day")
     day = job_soak.report(job_report).get("day") if metadata.get("tier") == "day" and job_report else None
     exposure = exposure_shortfalls(state)
-    gate_failed = any(row[3] == "FAIL" for row in gates) or (final_tier and bool(missing or exposure))
+    # The latency SLOs (#1400): a breached gated one fails the tier.
+    slo_data = soak_slo.load(evidence)
+    slo_rows = soak_slo.rows(slo_data, job_soak.report(job_report) if job_report else None,
+                             metadata.get("tier") or "custom", metadata.get("job_soak") is True)
+    slo_failed = bool(soak_slo.failures(slo_rows))
+    # The council history (#1399): a violation, or a check owed and missing, fails the run.
+    history_failed, history_lines = council_history_section(evidence, metadata)
+    gate_failed = (any(row[3] == "FAIL" for row in gates) or (final_tier and bool(missing or exposure))
+                   or slo_failed or history_failed)
     open_failures = [row for row in failures if row.get("disposition", "open") == "open"]
     result = metadata.get("result") or ("FAIL" if open_failures or gate_failed else "PASS")
     if (open_failures or gate_failed) and result == "PASS":
@@ -1846,7 +1987,7 @@ def render(evidence, record):
     lines += [f"{time.strftime('%-d %B %Y', time.gmtime(started))}. {tier} tier, {schedule_text} "
               f"schedule, {duration_text(elapsed)} of soak on a three-node quickstart cluster.", ""]
     # The acceptance line tells a failed check apart from a run that was clean but incomplete.
-    clean_apart_from_inventory = "FAIL" if open_failures or metadata.get("result") == "FAIL" or any(
+    clean_apart_from_inventory = "FAIL" if open_failures or metadata.get("result") == "FAIL" or slo_failed or history_failed or any(
         row[3] == "FAIL" for row in gates) else "PASS"
     lines += [acceptance_line(metadata, clean_apart_from_inventory, elapsed, missing if final_tier else (),
                               job_final_ran(metadata, job_report, missing), exposure if final_tier else (), day), ""]
@@ -1912,6 +2053,7 @@ def render(evidence, record):
     lines += ["## Renewals and rotations", "", "| Measure | Observed | Required | Verdict |", "|---|---|---|---|"]
     lines += [f"| {label} | {observed} | {need} | {verdict} |" for label, observed, need, verdict in gates]
     lines.append("")
+    lines += soak_slo.table_lines(slo_rows, slo_data)
     progress = state.get("progress", {})
     if metadata.get("job_soak") is True:
         lines += ["## Jobs", "", "| Runtime | Accepted successes | Retries | Last accepted progress |", "|---|---|---|---|"]
@@ -1949,6 +2091,11 @@ def render(evidence, record):
             f"{node} {over_budget.get(node, 0)}" for node in checked))
     else:
         lines.append("- Agent-loop turns over the 1 s budget: not measured")
+    if state.get("policy_checks"):
+        lines.append(f"- Soak policies checked in force: {state['policy_checks']} times, "
+                     f"policy generation {state.get('policy_generation', 'unknown')} at the last check")
+    else:
+        lines.append("- Soak policies checked in force: not measured")
     clock_steps = state.get("clock_steps", {})
     lines.append("- Guest clock steps by Lima's guest agent: " + (", ".join(
         f"{node} {count}" for node, count in sorted(clock_steps.items())) or "none"))
@@ -1956,6 +2103,7 @@ def render(evidence, record):
     if progress:
         lines.append(f"- Last observed progress: {', '.join(f'{key} {value}' for key, value in sorted(progress.items()))}")
     lines.append("")
+    lines += history_lines
     lines += exposure_lines(state, final_tier)
     lines += ["## Resource trends", "", "| Node | Measure | First | Last | Max |", "|---|---|---|---|---|"]
     for node, trend in sorted(state.get("trends", {}).items()):
@@ -2101,6 +2249,9 @@ def main(argv=None):
         sub = commands.add_parser(name)
         sub.add_argument("evidence")
         sub.add_argument("snapshot")
+    policies = commands.add_parser("policies", help="exit 1 unless the soak workload's policies are all in force (#1311)")
+    policies.add_argument("evidence")
+    policies.add_argument("listing")
     seen = commands.add_parser("seen")
     seen.add_argument("evidence")
     seen.add_argument("key")
@@ -2198,6 +2349,8 @@ def main(argv=None):
         return 0
     if args.command == "evaluate":
         return evaluate(args.evidence, args.snapshot)
+    if args.command == "policies":
+        return check_policies(args.evidence, args.listing)
     if args.command == "seen":
         # A harness-detected failure already bundled in the last half hour is a repeat.
         state = load_state(args.evidence)

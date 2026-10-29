@@ -750,7 +750,11 @@ impl UpgradeManager {
     }
 
     /// Post-boot verification succeeded: the swap is permanent. Records
-    /// history, deletes the marker, prunes old binaries.
+    /// history, prunes old binaries, then deletes the marker, in that order:
+    /// the marker goes only once the history entry is durable.
+    ///
+    /// Blocking file work, deleting binaries of about 100 MB: the agent
+    /// runs it on a blocking thread, off the loop (#1381).
     pub fn commit(&self, marker: &UpgradeMarker) -> Result<(), UpgradeError> {
         self.append_history(&UpgradeHistoryEntry {
             upgrade_id: marker.upgrade_id.clone(),
@@ -977,13 +981,19 @@ impl UpgradeManager {
         if let Some(dir) = self.history_path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        // History is plain data; serialisation cannot fail.
-        let line = serde_json::to_string(entry).expect("history entry serialises");
+        let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
+        let created = !self.history_path.exists();
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.history_path)?;
         writeln!(file, "{line}")?;
+        // Durable before the caller removes the marker: a power cut must not
+        // leave a committed or reverted upgrade with neither.
+        file.sync_all()?;
+        if created && let Some(dir) = self.history_path.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
         Ok(())
     }
 
@@ -1727,6 +1737,49 @@ mod tests {
         // oldest stubs are gone.
         assert!(!fixture.binary_dir.join("bun-v0.0.1").exists());
         assert!(fixture.binary_dir.join("bun-v0.1.0").is_file());
+    }
+
+    /// The marker goes only after the history entry is recorded: a commit
+    /// whose history can't be written keeps the marker and prunes nothing,
+    /// so the next boot still sees the upgrade in flight (#1381).
+    #[test]
+    fn commit_keeps_the_marker_and_the_binaries_when_history_cannot_be_written() {
+        let fixture = fixture();
+        let stub = SignatureEnvelope {
+            schema: 1,
+            sha256: String::new(),
+            embedded: String::new(),
+            external: None,
+        };
+        for version in ["0.0.1", "0.0.2", "0.0.3", "0.2.0"] {
+            fixture
+                .manager
+                .store()
+                .stage(&v(version), b"x", &stub)
+                .unwrap();
+        }
+        let marker = UpgradeMarker {
+            schema: 1,
+            upgrade_id: "up-1".to_string(),
+            previous_version: v("0.1.0"),
+            previous_binary: v("0.1.0").file_name("bun"),
+            target_version: v("0.2.0"),
+            target_binary: v("0.2.0").file_name("bun"),
+            phase: MarkerPhase::Verifying,
+            boot_attempts: 1,
+            pre_upgrade_instances: vec![],
+        };
+        marker.store(&fixture.manager.marker_path).unwrap();
+        // A directory where the history file should be: appending fails.
+        std::fs::create_dir_all(&fixture.manager.history_path).unwrap();
+
+        assert!(fixture.manager.commit(&marker).is_err());
+
+        assert_eq!(
+            UpgradeMarker::load(&fixture.manager.marker_path).unwrap(),
+            Some(marker)
+        );
+        assert!(fixture.binary_dir.join("bun-v0.0.1").is_file());
     }
 
     #[test]

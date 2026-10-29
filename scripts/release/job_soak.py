@@ -379,7 +379,8 @@ class Campaign:
                               progress={m:{"succeeded":0,"retried":0,"last_progress":int(time.time())} for m in MODES},
                               errors=[], totals={}, stopped=False, cron_registered=False, discovered={}, fault_offset=0,
                               load=load, target_rate=target_rate, started=int(time.time()),
-                              metrics=dict(million_wall_seconds=[], start_lag_ms_counts=[0]*16, state_bytes_max=0, raft=None))
+                              metrics=dict(million_wall_seconds=[], start_lag_ms_counts=[0]*16, quiet_start_lag_ms_counts=[0]*16,
+                                           state_bytes_max=0, raft=None))
             self.save()
     def save(self): atomic(self.path, self.state)
     def error(self, message, refused=None):
@@ -510,6 +511,10 @@ class Campaign:
     def step(self, now, fault=False, stop=False):
         if fault: self.state["last_fault"]=now
         self.publish(now, fault)
+        if fault:
+            # A run that lived through any part of a fault window doesn't
+            # count towards the quiet-cluster job-start SLO (#1438).
+            for intent in self.state["active"].values(): intent["fault_overlap"]=True
         if not stop:
             try:
                 for mode in MODES:
@@ -607,7 +612,7 @@ class Campaign:
                     self.acknowledge(intent["id"],owner,"known replay-safe long fixture, two identical fenced observations",now)
                     self.state["coverage"][intent["mode"]]["unknown"]=True
                 if not drained(value): continue
-                self.record_metrics(value)
+                self.record_metrics(value,quiet=not intent.get("fault_overlap"))
                 rows=[]
                 if intent["purpose"] in ("failure","timeout","limit") and not stop:
                     page=self.api.request("GET",f'/v1/batch/{intent["id"]}/results?limit=1&index=0')
@@ -691,22 +696,28 @@ class Campaign:
             return cause
         first=next((line.strip() for line in output.splitlines() if line.strip()),"")
         return cause+(": "+first[:200] if first else "")
-    def record_metrics(self, value):
-        """Fold one drained run's M8 measurements into the bounded campaign record."""
-        metrics=self.state.setdefault("metrics",dict(million_wall_seconds=[],start_lag_ms_counts=[0]*16,state_bytes_max=0,raft=None))
+    def record_metrics(self, value, quiet=True):
+        """Fold one drained run's M8 measurements into the bounded campaign record.
+
+        Every run's start lag counts for M8; only a `quiet` run's, one no
+        fault window overlapped, counts for the job-start SLO (#1438)."""
+        metrics=self.state.setdefault("metrics",dict(million_wall_seconds=[],start_lag_ms_counts=[0]*16,quiet_start_lag_ms_counts=[0]*16,state_bytes_max=0,raft=None))
         if value["total"]==MILLION and value["succeeded"]==MILLION and type(value.get("elapsed_seconds")) is int:
             metrics["million_wall_seconds"]=(metrics["million_wall_seconds"]+[value["elapsed_seconds"]])[-64:]
         for node in value.get("nodes",[]):
             counts=node.get("counters",{}).get("start_lag_ms_counts")
             if isinstance(counts,list) and len(counts)==16 and all(type(c) is int and c>=0 for c in counts):
                 metrics["start_lag_ms_counts"]=[a+b for a,b in zip(metrics["start_lag_ms_counts"],counts)]
+                if quiet:
+                    quiet_counts=metrics.setdefault("quiet_start_lag_ms_counts",[0]*16)
+                    metrics["quiet_start_lag_ms_counts"]=[a+b for a,b in zip(quiet_counts,counts)]
         if type(value.get("state_bytes")) is int:
             metrics["state_bytes_max"]=max(metrics["state_bytes_max"],value["state_bytes"])
     def sample_raft(self, council, now):
         """Keep the first and latest Raft log index the cluster reported."""
         index=council.get("last_log_index") if isinstance(council,dict) else None
         if type(index) is not int: return
-        metrics=self.state.setdefault("metrics",dict(million_wall_seconds=[],start_lag_ms_counts=[0]*16,state_bytes_max=0,raft=None))
+        metrics=self.state.setdefault("metrics",dict(million_wall_seconds=[],start_lag_ms_counts=[0]*16,quiet_start_lag_ms_counts=[0]*16,state_bytes_max=0,raft=None))
         raft=metrics.get("raft") or dict(first=[now,index],leaders=[])
         raft["last"]=[now,index]
         leader=council.get("leader")
@@ -779,6 +790,7 @@ def report(snapshot):
     if raft.get("first") and raft.get("last") and raft["last"][0]>raft["first"][0]:
         raft_rate=(raft["last"][1]-raft["first"][1])/(raft["last"][0]-raft["first"][0])
     lag=metrics.get("start_lag_ms_counts") or [0]*16
+    quiet_lag=metrics.get("quiet_start_lag_ms_counts") or [0]*16
     rate=sum(accepted.values())/elapsed
     target=snapshot.get("target_rate")
     walls=metrics.get("million_wall_seconds") or []
@@ -796,6 +808,8 @@ def report(snapshot):
             million_task_array_wall_seconds=dict(runs=len(walls),max=max(walls) if walls else None,
                                                  median=sorted(walls)[len(walls)//2] if walls else None),
             p99_start_lag_ms=percentile(lag,0.99),start_lag_samples=sum(lag),
+            quiet_p99_start_lag_ms=percentile(quiet_lag,0.99) if sum(quiet_lag) else None,
+            quiet_start_lag_samples=sum(quiet_lag),
             raft_entries_per_second=raft_rate,raft_leaders=raft.get("leaders",[]),
             raft_state_bytes_max=metrics.get("state_bytes_max") or None,
             targets=dict(million_task_array_wall_seconds=600,p99_start_lag_ms=1000,

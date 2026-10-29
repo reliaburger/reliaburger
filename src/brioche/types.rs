@@ -36,7 +36,10 @@ pub fn safe_env(env: &BTreeMap<String, EnvValue>) -> Vec<SafeEnvValue> {
         .map(|(k, v)| SafeEnvValue {
             key: k.clone(),
             value: match v {
+                // A provider reference names where the secret lives, not
+                // the secret, so it's safe to show.
                 EnvValue::Plain(s) => s.clone(),
+                EnvValue::Provider(reference) => reference.as_str().to_string(),
                 EnvValue::Encrypted(_) => "[encrypted]".to_string(),
             },
             encrypted: v.is_encrypted(),

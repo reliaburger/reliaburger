@@ -10,6 +10,7 @@ the detail is in the GitHub milestones and issues.
 
 | Plan | What it is | Still open |
 |---|---|---|
+| [0.2.4: Extension points](2026-10-23-plan-0.2.4.md) | The 0.2.4 merge train on `release-0-2-4`, in five waves: the book chapter first, then policies in the council (deny and warn, defaults, audit), stop hooks, sidecars and gated runtime knobs, the exec secret provider, templates and the controller contract, ending with the exit test on a real cluster. | [Milestone 0.2.4](https://github.com/reliaburger/reliaburger/milestone/19) |
 | [Research: how Kubernetes tests its releases](2026-10-28-research-kubernetes-release-testing.md) | What the Kubernetes project runs before a release (blocking-job thresholds, e2e and conformance, scale tests and SLOs, etcd's history checks, OSS-Fuzz) against our gate, what we should copy and what we shouldn't. The source of the testing section on the Kubernetes comparison page. | [0.2.4](https://github.com/reliaburger/reliaburger/milestone/19): #1398–#1401 |
 | [CI and test efficiency](2026-10-11-ci-and-test-efficiency.md) | Faster CI and stronger test and soak evidence: one archive extraction per job (#1050), integration policy, test consolidation and compilation costs, with an 18 October status of what's done, tracked and proposed. | Merge queue on the current train; the proposed test, fixture and soak-evidence issues |
 | [Competitive review and comparison pages](2026-10-15-competitor-comparisons.md) | Source-linked comparisons and a wider review, matching the static homepage. | Review and merge into the 0.2.1 train |

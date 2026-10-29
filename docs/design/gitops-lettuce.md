@@ -623,7 +623,7 @@ The diff engine compares two `DesiredState` trees: one from the parsed git TOML,
 
 **Complexity:** The diff is O(n * m) where n is the number of resources and m is the average number of fields per resource. For a typical cluster (hundreds of resources, tens of fields each), this completes in sub-millisecond time.
 
-**Ownership (implemented, 0.2.1, #693).** Step 3 above applies only to resources in `DesiredState.gitops_owned`: a resource in Raft but not in git is removed only when GitOps wrote it. A resource present in both that matches git but isn't owned produces a `ResourceChange::Adopt` carrying the spec the cluster already runs (bound image digest included), so the write changes nothing but records ownership. Everything in an `rbtest-*` test-lease namespace is left out of both sides. The output is ordered: adds, updates and adoptions as namespaces, permissions, apps, the order `config_to_desired_writes` uses, then removals as apps, permissions, namespaces.
+**Ownership (implemented, 0.2.1, #693).** Step 3 above applies only to resources in `DesiredState.gitops_owned`: a resource in Raft but not in git is removed only when GitOps wrote it. A resource present in both that matches git but isn't owned produces a `ResourceChange::Adopt` carrying the spec the cluster already runs (bound image digest included), so the write changes nothing but records ownership. Everything in an `rbtest-*` test-lease namespace is left out of both sides, and so is every app a controller owns (#1125, §5.10). The output is ordered: adds, updates and adoptions as namespaces, permissions, apps, the order `config_to_desired_writes` uses, then removals as apps, permissions, namespaces.
 
 ### 5.5 Selective Apply
 
@@ -691,6 +691,49 @@ Per Section 17 of the whitepaper, Lettuce automatically enforces `require_signed
 **Implementation status (B13).** The first implementation grepped `git diff` for an added line containing `script`. That missed an edit to the body of a multiline script (the key sits in unchanged context), a deletion (no added line), and a failed `git diff` whose empty output read as "no change". The parsed comparison above replaced it.
 
 ---
+
+### 5.9 Policies (#1117)
+
+Policies are a GitOps kind like permissions: the diff carries
+`ChangePayload::Policy`, and the ownership set records `policies`, so GitOps
+prunes only the policies it wrote. Policy writes and removals come before any
+app write, so every app in a commit is judged by the policies that commit
+declares. Each added or changed app is judged in `apply_changes` as the
+caller `gitops` with role `system` and source `gitops`, and written inside a
+`PolicyFenced` entry. A denied app is a refused change in the partial sync
+result, named `app.<namespace>/<name>: denied by policy <name>: <message>`,
+and the rest of the commit applies. The commit stays unadvanced, so the next
+sync tries the app again.
+
+Policy defaults (#1118) fill fields in before the app is bound and written,
+so desired state holds a spec git never wrote. Binding a tag to a digest does
+the same. To keep that from looking like
+drift on every sync, the fenced write carries the spec git declared and the
+state machine keeps it in `DesiredState::declared_apps`. `compute_diff` takes
+it as `CurrentState::declared_apps` and compares git with the declared spec
+where there is one, the effective spec otherwise (with bound images read back
+as their tags, for apps written before #1118). An adopted app is written
+with the effective spec, which keeps its declared one. A new or changed
+default reaches a GitOps app only when git changes that app.
+
+GitOps refuses jobs, so `applies_to = "jobs"` policies never meet a sync. An
+`action = "audit"` finding (#1119) doesn't refuse the app; the runner logs it
+as `gitops: audit: …`, and `relish policy audit` lists it for as long as the
+app breaks the rule, judging GitOps-owned apps as the caller `gitops`.
+
+### 5.10 Controller-owned apps (#1125)
+
+GitOps owns what it wrote; a controller owns what it claimed. An app whose
+spec in Raft has an `owner` (the name of the controller's API token) is out of
+the diff entirely: `diff_apps` neither updates, adopts nor prunes it, whatever
+git says, the way it skips `rbtest-*` namespaces. A claim takes the app out of
+`gitops_owned.apps` in the same state-machine step, so a later commit that
+drops it can't prune it either.
+
+Git can't declare an owner. A controller claims apps with its own token, and a
+repository has none, so `apply_gitops_write` refuses an `AppSpec` that carries
+one: it's a refused change in the partial sync result, and the rest of the
+commit applies. The full rule table is in `deployments.md` §5.11.
 
 ## 6. Configuration
 

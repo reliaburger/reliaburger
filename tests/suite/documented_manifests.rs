@@ -43,11 +43,16 @@ fn toml_blocks(markdown: &str) -> Vec<String> {
     blocks
 }
 
-/// A manifest that parses and declares an app or a job: fragments and node
-/// configs don't, and are checked elsewhere.
-fn workload_manifest(toml: &str) -> Option<Config> {
-    let config = Config::parse(toml).ok()?;
-    (!config.app.is_empty() || !config.job.is_empty()).then_some(config)
+/// A manifest that parses and declares an app or a job, once its templates
+/// are expanded as `relish apply` expands them (#1124): fragments and node
+/// configs don't, and are checked elsewhere. A template that can't expand
+/// is an error, not a fragment.
+fn workload_manifest(toml: &str) -> Option<Result<Config, String>> {
+    let mut config = Config::parse(toml).ok()?;
+    if let Err(error) = config.expand_templates() {
+        return Some(Err(error.to_string()));
+    }
+    (!config.app.is_empty() || !config.job.is_empty()).then_some(Ok(config))
 }
 
 #[test]
@@ -84,7 +89,12 @@ fn every_published_manifest_passes_apply_validation() {
             continue;
         };
         checked += 1;
-        if let Err(error) = config.validate_intrinsic() {
+        let validated = config.and_then(|config| {
+            config
+                .validate_intrinsic()
+                .map_err(|error| error.to_string())
+        });
+        if let Err(error) = validated {
             refused.push(format!("{name}: {error}"));
         }
     }

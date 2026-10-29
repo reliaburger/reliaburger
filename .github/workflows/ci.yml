@@ -100,6 +100,10 @@ jobs:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          # The gate PR runs everything only once labelled release-gate, and
+          # a macos label asks for the macOS shards on any PR (#1443).
+          RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}
+          MACOS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}
         run: scripts/ci/select-jobs.sh
 
   ci-policy:
@@ -214,7 +218,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # About 25 minutes, but 35 to 41 on a slow runner (#1421). nextest's
+    # per-test timeouts catch a hung test, so this only catches a stuck runner.
+    timeout-minutes: 62
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -251,6 +257,12 @@ jobs:
           retention-days: 14
       - name: Doctests
         run: make test-doc
+      # A train's nightly build trusts the nightly key instead of every
+      # release key (#1363). The test that says so only compiles with the
+      # feature, so no other run has it (#1442). The doctests have just
+      # built the dependencies for this profile; only the crate rebuilds.
+      - name: Nightly-signing key trust
+        run: 'cargo test --locked --lib --features nightly-signing upgrade::keys::'
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v4
@@ -379,8 +391,10 @@ jobs:
       archive_sha256: ${{ steps.archive.outputs.archive_sha256 }}
       archive_origin_sha256: ${{ steps.archive.outputs.archive_origin_sha256 }}
       archive_runtime_sha256: ${{ steps.archive.outputs.archive_runtime_sha256 }}
-    # Compile the portable test binaries once. The acceptance jobs download
-    # this nextest archive instead of each rebuilding every test binary.
+    # Compile the test binaries the cluster and acceptance jobs run, once.
+    # They fetch this nextest archive instead of each rebuilding them.
+    # ARCHIVED_BINARIES in scripts/ci/workflow_assembly.py names them: all
+    # 47 binaries made a 3.0 GB archive that was slow to download (#977).
     # Runners check out to the same path, so the archive's compiled-in binary
     # paths still resolve after extraction.
     name: build tests
@@ -423,31 +437,33 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # actions: read lets the archive fetch list this run's artefacts.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.145
-      - name: Download the test archive
-        id: test_archive
-        # One attempt normally takes a minute or two. One stalled for 13
-        # minutes and pushed acceptance past its limit (#977), so each
-        # attempt gets 5 minutes and a failed one is retried once.
-        uses: actions/download-artifact@v4
-        timeout-minutes: 5
-        continue-on-error: true
-        with:
-          name: nextest-archive
-      - name: Retry downloading the test archive
-        if: ${{ !cancelled() && steps.test_archive.outcome == 'failure' }}
-        uses: actions/download-artifact@v4
-        timeout-minutes: 5
-        with:
-          name: nextest-archive
+      - name: Fetch the test archive
+        # actions/download-artifact took 33 s to almost 5 minutes for the
+        # 3 GB archive, logged nothing while it ran, and a retry after its
+        # 5-minute limit started again from the first byte, so a slow runner
+        # failed both attempts (#977). This resumes a dropped or stalled
+        # transfer where it stopped, gives up on an attempt only after 60 s
+        # without a byte, logs its progress and stops at 13 minutes.
+        timeout-minutes: 14
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ci/fetch_artifact.py --repository "$GITHUB_REPOSITORY"
+          --run-id "$GITHUB_RUN_ID" --name nextest-archive --destination .
+          --deadline 780 --stall 60
       - name: Extract the test archive once for every suite
         id: extract_archive
-        # Each suite used to extract the 2.9 GB archive twice, to list its
+        # Each suite used to extract the archive twice, to list its
         # tests and to run them (#1050). This checks the archive against the
         # build job's digest and extracts it once; every suite then reuses
         # the extracted build through nextest's build-reuse flags, naming
@@ -484,28 +500,33 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    # actions: read lets the archive fetch list this run's artefacts.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.145
-      - name: Download the test archive
-        id: test_archive
-        uses: actions/download-artifact@v4
-        timeout-minutes: 5
-        continue-on-error: true
-        with:
-          name: nextest-archive
-      - name: Retry downloading the test archive
-        if: ${{ !cancelled() && steps.test_archive.outcome == 'failure' }}
-        uses: actions/download-artifact@v4
-        timeout-minutes: 5
-        with:
-          name: nextest-archive
+      - name: Fetch the test archive
+        # actions/download-artifact took 33 s to almost 5 minutes for the
+        # 3 GB archive, logged nothing while it ran, and a retry after its
+        # 5-minute limit started again from the first byte, so a slow runner
+        # failed both attempts (#977). This resumes a dropped or stalled
+        # transfer where it stopped, gives up on an attempt only after 60 s
+        # without a byte, logs its progress and stops at 13 minutes.
+        timeout-minutes: 14
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ci/fetch_artifact.py --repository "$GITHUB_REPOSITORY"
+          --run-id "$GITHUB_RUN_ID" --name nextest-archive --destination .
+          --deadline 780 --stall 60
       - name: Extract the test archive once for every suite
         id: extract_archive
-        # Each suite used to extract the 2.9 GB archive twice, to list its
+        # Each suite used to extract the archive twice, to list its
         # tests and to run them (#1050). This checks the archive against the
         # build job's digest and extracts it once; every suite then reuses
         # the extracted build through nextest's build-reuse flags, naming
@@ -656,12 +677,16 @@ jobs:
           merge-multiple: false
       - name: Every selected owner and exact required case completed this run
         if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+        env:
+          # The release gate PR qualifies only with every owner (#1443).
+          RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}
         run: |
           python3 scripts/ci/workflow_adapter.py aggregate --root . \
             --manifest tests/contracts/manifest.json --directory incoming \
             --ignored-bindings tests/contracts/ignored-bindings.json \
             --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" \
-            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --event "$GITHUB_EVENT_NAME"
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --event "$GITHUB_EVENT_NAME" \
+            --release-gate "$RELEASE_GATE"
 
   macos:
     outputs:

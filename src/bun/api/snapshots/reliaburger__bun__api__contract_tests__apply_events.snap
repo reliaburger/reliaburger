@@ -1,0 +1,23 @@
+---
+source: src/bun/api/contract_tests.rs
+expression: events
+---
+[
+  {
+    "type": "Progress",
+    "message": "app 'db' in namespace 'pg' is owned by 'pg-failover'; skipped, so this apply doesn't fight it"
+  },
+  {
+    "type": "Progress",
+    "message": "app db-a: committed to the cluster"
+  },
+  {
+    "type": "Complete",
+    "created": 1,
+    "instances": []
+  },
+  {
+    "type": "Error",
+    "message": "app db-a: refused by the cluster: app pg/db-a is owned by \"other\""
+  }
+]

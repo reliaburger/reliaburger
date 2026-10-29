@@ -16,6 +16,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     dns: self.supervisor.dns_capability(),
                     process: self.supervisor.process_capability(),
                     containers: self.supervisor.runs_containers(),
+                    secret_providers: self.secret_providers.names(),
+                    runtime_knobs: self.supervisor.runtime_knob_capability(),
+                    shared_network: self.supervisor.shares_network(),
                 })
                 .await;
         }
@@ -38,6 +41,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     dns: self.supervisor.dns_capability(),
                     process: self.supervisor.process_capability(),
                     containers: self.supervisor.runs_containers(),
+                    secret_providers: self.secret_providers.names(),
+                    runtime_knobs: self.supervisor.runtime_knob_capability(),
+                    shared_network: self.supervisor.shares_network(),
                     ..Default::default()
                 },
                 Default::default(),
@@ -55,6 +61,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             dns: self.supervisor.dns_capability(),
             process: self.supervisor.process_capability(),
             containers: self.supervisor.runs_containers(),
+            secret_providers: self.secret_providers.names(),
+            runtime_knobs: self.supervisor.runtime_knob_capability(),
+            shared_network: self.supervisor.shares_network(),
         };
         let enforced_cgroups =
             crate::sesame::egress::list_enforced_cgroups(&mut ebpf.bpf).unwrap_or_default();
@@ -85,32 +94,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 dns: self.supervisor.dns_capability(),
                 process: self.supervisor.process_capability(),
                 containers: self.supervisor.runs_containers(),
+                secret_providers: self.secret_providers.names(),
+                runtime_knobs: self.supervisor.runtime_knob_capability(),
+                shared_network: self.supervisor.shares_network(),
                 ..Default::default()
             },
             Default::default(),
         )
     }
 
-    /// Program a freshly-started instance's kernel networking: mirror its
-    /// backend into `backend_map` (L8) and reconcile namespace-firewall maps
-    /// (NET5). Egress is deliberately absent here: it must already have been
-    /// programmed before `start`, never repaired in post-start bookkeeping.
-    pub(super) async fn finish_instance_networking(
-        &mut self,
-        app_name: &str,
-        namespace: &str,
-    ) -> Result<(), BunError> {
-        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
-        // Journals inline: rolling registration adds its replacements to
-        // `service_map` before it publishes (#1263).
-        self.publish_backend_ebpf(&service_id).await?;
-        self.sync_firewall_ebpf().await;
-        self.reconcile_network_faults().await;
-        Ok(())
-    }
-
-    /// [`Self::finish_instance_networking`] for a `service_map` the
-    /// discovery journal already records.
+    /// Program kernel networking for a `service_map` the discovery journal
+    /// already records: mirror the service's backends into `backend_map`
+    /// (L8) and reconcile namespace-firewall maps (NET5). Egress is
+    /// deliberately absent here: it must already have been programmed before
+    /// `start`, never repaired in post-start bookkeeping.
     pub(super) async fn finish_journalled_networking(
         &mut self,
         service_id: &crate::onion::service_id::ServiceId,

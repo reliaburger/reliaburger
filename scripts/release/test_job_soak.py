@@ -174,6 +174,42 @@ class Lifecycle(unittest.TestCase):
             self.assertEqual(len(api.runs),1)
             self.assertEqual(api.cancelled,1)
             self.assertFalse(c.state["errors"])
+    def drain_one_run(self, fault_while_active):
+        """Admit one run, maybe through a fault window, and drain it with a known start lag."""
+        lag=[0]*16; lag[9]=5
+        class API(FakeAPI):
+            def request(self,method,path,body=None,raw=False):
+                if path=="/v1/jobs/runs": return super().request(method,path,body)
+                identity=int(path.split("/")[3])
+                request=next(v for v in self.posts if self.runs[(v["name"],v["request_id"])]==identity)
+                if path.endswith("/cancel"): return {}
+                count=request["definition"]["tasks"]["count"]
+                value=summary(identity,total=count,done=True,not_run=count,name=request["name"],
+                              nodes=[dict(node="rb-a-1",counters=dict(running=0,start_lag_ms_counts=lag))])
+                value.update(runtime=request["definition"]["template"]["runtime"],cpu_request_millicores=25,
+                             memory_request_bytes=32<<20)
+                return value
+        with tempfile.TemporaryDirectory() as directory:
+            c=jobs.Campaign(directory,API(),[],"token")
+            c.prepare("process","short","work",100)
+            self.assertFalse(c.step(100,fault=fault_while_active,stop=True))
+            self.assertTrue(c.step(101,stop=True))
+            self.assertFalse(c.state["errors"])
+            c.state.update(stopped=True,stop_requested_at=101); c.publish(101)
+            return lag,c.state["metrics"],jobs.report(json.loads((Path(directory)/"snapshot.json").read_text()))["m8"]
+    def test_a_run_that_saw_a_fault_window_counts_for_m8_but_not_the_quiet_start_lag(self):
+        # The gated job-start SLO is a quiet-cluster number (#1438).
+        lag,metrics,m8=self.drain_one_run(fault_while_active=True)
+        self.assertEqual(metrics["start_lag_ms_counts"],lag)
+        self.assertEqual(metrics["quiet_start_lag_ms_counts"],[0]*16)
+        self.assertEqual(m8["start_lag_samples"],5)
+        self.assertEqual(m8["quiet_start_lag_samples"],0)
+        self.assertIsNone(m8["quiet_p99_start_lag_ms"])
+    def test_a_run_outside_every_fault_window_counts_for_both(self):
+        lag,metrics,m8=self.drain_one_run(fault_while_active=False)
+        self.assertEqual(metrics["quiet_start_lag_ms_counts"],lag)
+        self.assertEqual(m8["quiet_start_lag_samples"],5)
+        self.assertEqual(m8["quiet_p99_start_lag_ms"],m8["p99_start_lag_ms"])
     def test_timeout_requires_observed_launch_duration_and_timeout_outcome(self):
         value=summary(1,total=1,done=True,failed=1)
         good=dict(index=0,attempts=1,run_ms=3050,started_effect=True)

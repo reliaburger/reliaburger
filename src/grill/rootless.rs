@@ -108,6 +108,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: OciRoot {
                 path: "rootfs".to_string(),
                 readonly: false,
@@ -164,11 +165,15 @@ mod tests {
                     cpu: None,
                     memory: None,
                     unified: std::collections::BTreeMap::new(),
+                    devices: Vec::new(),
                 }),
                 cgroups_path: Some("/sys/fs/cgroup/test".to_string()),
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         }
     }
 

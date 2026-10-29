@@ -1124,7 +1124,7 @@ The following features are intentionally excluded from Reliaburger v1. Each is a
 | IPv6 | The current networking model (virtual IPs, eBPF hooks) is IPv4-only. IPv6 support is planned for v2. |
 | Pod affinity / anti-affinity | Replaced by simple placement hints via node labels. |
 | Pod Disruption Budgets | Reliaburger's intended drain logic respects the same constraints as rolling deploys: it never drains a node if doing so would reduce any app below `replicas - max_unavailable` healthy instances, checking all affected apps before proceeding. (The `relish drain` command itself is planned — see Section 16.) |
-| Sidecars | Some use cases genuinely require co-located processes sharing a network namespace (authentication proxies, log forwarders, protocol adapters). In v1, init containers cover per-instance startup tasks and separate Apps with service discovery cover most runtime co-location needs, though at the cost of a network hop. A `sidecar` field on the App spec (co-located containers sharing the parent's network namespace and lifecycle) is planned for v2. |
+| Sidecars | Some use cases genuinely require co-located processes sharing a network namespace (authentication proxies, log forwarders, protocol adapters). In v1, init containers cover per-instance startup tasks and separate Apps with service discovery cover most runtime co-location needs, though at the cost of a network hop. A `sidecar` field on the App spec (co-located containers sharing the parent's network namespace and lifecycle) was planned for v2, and arrived early, in 0.2.4 (#1120). |
 | Inference engines and training frameworks | Reliaburger hosts vLLM, SGLang, llama.cpp, Ray and torchrun as ordinary workloads instead of reimplementing them. They move fast and have large communities; the platform's job is placement, devices, weights, routing and recovery. |
 | Workflow / DAG language | Job dependencies (§5.2) cover "this array after that one". Full workflows with data passing, lineage and backfills stay in Airflow, Nextflow and their peers, which drive Reliaburger through a provider and an executor. |
 | GPU sharing by intercepting CUDA | Interception libraries enforce memory limits only while the workload cooperates. Pre-partitioned MIG instances are exposed as devices (0.6.0); time-slicing, MPS and changing MIG layouts are v2. |
@@ -1351,7 +1351,7 @@ idempotency costs. See the [execution and qualification plan](plans/archive/2026
 
 Fast delegated jobs use bounded grant lookahead derived from verified duration
 summaries, covering receipt acceptance and grant delivery without increasing
-control polling. Learned grant depth is capped at 32 chunks; actual execution
+control polling. Learned grant depth is capped at sixteen chunks; actual execution
 remains gated by per-node concurrency and resource admission. The trade-off is
 more granted work to reconcile after worker loss, with unchanged attempt fences.
 

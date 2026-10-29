@@ -1922,6 +1922,7 @@ mod tests {
             task_timeout_secs: None,
             overlap: None,
             replay_unknown: false,
+            provenance: None,
         })
     }
 

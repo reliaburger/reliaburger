@@ -107,7 +107,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish decommission-node --workloads-stopped --reason <REASON> <NODE_ID>`: Permanently retire a stopped or fenced node; return requires fresh enrolment
 - `relish uninstall`: Remove the CLI, its PATH link, the managed Lima tools and the image cache
 
-**Deploy and manage apps** ([deploy an app](docs/manual/01_deploy-an-app.md))
+**Deploy and manage apps** ([deploy an app](docs/manual/01_deploy-an-app.md), [writing a controller](docs/manual/15_writing-a-controller.md))
 
 - `relish apply [PATH_OR_URL]`: Apply a Reliaburger TOML or Kubernetes YAML manifest
 - `relish status`: Show cluster and app status
@@ -119,6 +119,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish rollback <APP>`: Rollback an app to the previous version
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
 - `relish delete <APP>`: Remove an app from the cluster and stop all its instances
+- `relish release <APP>`: Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin) *(0.2.4, not in 0.2.3)*
 - `relish batch [PATH]`: Submit a batch of jobs, or manage a task array
   - `relish batch submit <PATH>`: Submit a compact TOML manifest containing mixed resource profiles
   - `relish batch replay --node <NODE> --grant-digest <GRANT_DIGEST> --acknowledge-side-effects <ID>`: Acknowledge repeating side effects for the exact unknown owner grants
@@ -201,6 +202,11 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
 - `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster
+- `relish policy`: List, audit or delete the cluster's policies, or test policies offline *(0.2.4, not in 0.2.3)*
+  - `relish policy list`: List the cluster's policies, with their action and rule *(0.2.4, not in 0.2.3)*
+  - `relish policy delete <NAME>`: Delete a policy (admin only; audited). Policies never judge policies, so this works even when one refuses every app *(0.2.4, not in 0.2.3)*
+  - `relish policy audit`: List the committed apps and jobs the cluster's policies would now refuse, warn about or record. Changes nothing: a new policy never touches running work *(0.2.4, not in 0.2.3)*
+  - `relish policy test --file <FILES>...`: Judge the apps and jobs in some files by the policies in them, offline, the way the cluster would. Exits non-zero when an apply would be refused *(0.2.4, not in 0.2.3)*
 
 **Images and volumes** ([images and volumes](docs/manual/11_images-and-volumes.md))
 
@@ -282,7 +288,9 @@ who may connect at all.
 
 **Ingress with TLS.** Host-based HTTP and HTTPS routing, with certificates signed
 by the cluster's own ingress CA or files you provide. WebSockets and streaming
-pass through, and connections drain before an instance stops.
+pass through, and connections drain before an instance stops. Each app can
+pick its stop signal, its grace and a pre-stop command, and run sidecars
+that share its network and start before it and stop after it.
 
 **Security on by default.** A generated cluster requires mTLS between nodes.
 Nodes join with single-use tokens and certificate signing requests.
@@ -291,6 +299,8 @@ cluster's public key. Workloads get SPIFFE certificates, API tokens carry
 roles and namespace scopes, and the registry can refuse unsigned images.
 Every apply binds image tags to digests, so a moved tag can't change what runs,
 and node config can limit which upstream registries images may come from.
+An app that needs an extra capability, a namespaced sysctl or a host device
+gets it only where the node allows it and the token carries `host-exec`.
 
 **Tenants kept apart.** Namespaces can't reach each other, at a virtual IP or
 at a real address, unless an app or job's `allow_from` lets a named caller
@@ -326,6 +336,32 @@ a one-node cluster from a checkout, with
 [`examples/phase-1/proc-rollout.toml`](examples/phase-1/proc-rollout.toml) and
 [`examples/gitops/repository`](examples/gitops/repository), and measure Bun's
 memory and CPU as they go.
+
+**Policies.** `[policy.*]` rules in CEL, such as "apps in `prod` need a memory
+limit", are kept in the council and checked on the leader before an app is
+written, for `relish apply` and GitOps alike. A rule refuses the apply or only
+warns, every denial names its policy, and `relish policy test` *(0.2.4, not in 0.2.3)* runs the same
+check offline in CI. A policy can also fill in fields an app leaves out, such
+as a team label, without ever overwriting one you wrote, and GitOps doesn't
+mistake a filled-in field for a change. Policies can judge jobs too, an
+`audit` policy only records what it finds, and `relish policy audit` *(0.2.4, not in 0.2.3)* and
+`relish wtf` list the running apps and jobs a new policy would refuse. See [security and access](docs/manual/10_security.md#policies).
+
+**Your own controllers, without an operator SDK.** A controller is an ordinary
+app holding a token scoped to its namespace. It reads the API and the event
+stream, and claims the apps it manages with an `owner`, after which
+`relish apply` and GitOps leave them alone. The JSON it reads and writes is
+documented and pinned by tests. See
+[writing a controller](docs/manual/15_writing-a-controller.md) and the example
+in [`examples/controller`](examples/controller).
+
+**Templates, not CRDs.** A `[template.*]` has typed parameters and a body of
+ordinary apps and jobs; each `[use.*]` stamps it out with its own values.
+Expansion is substitution only, done when the config is read, so `relish
+apply --dry-run` and GitOps show the expanded apps, policies judge them, and
+the cluster stores plain apps with a note of the template that made them.
+See [deploy an app](docs/manual/01_deploy-an-app.md#templates) and
+[`examples/templates/container-postgres.toml`](examples/templates/container-postgres.toml).
 
 **A million jobs.** Every kind of job runs on one lifecycle: a one-off job, a
 cron schedule, a hook that runs before a deploy, and a task array that runs the
@@ -396,6 +432,8 @@ binary was built from. Neither needs a network.
 | Prometheus, Alertmanager | Built-in scraping, alert rules and webhooks |
 | A log shipper and store | Built-in capture, streaming and Parquet export |
 | Argo CD or Flux | Built-in GitOps |
+| Kyverno or Gatekeeper (validation, defaults, audit) | `[policy.*]` deny, warn and audit rules for apps and jobs, fill-only defaults, `relish policy audit` *(0.2.4, not in 0.2.3)* |
+| Helm charts or a CRD and its operator (the expansion half) | `[template.*]` and `[use.*]` |
 | Argo Workflows, Kueue or a Celery-style queue | Built-in jobs, cron, hooks and task arrays |
 | Chaos Mesh or Litmus | `relish fault` |
 | Grafana (for the basics) | TUI and web dashboard |

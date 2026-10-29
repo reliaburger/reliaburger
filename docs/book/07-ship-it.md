@@ -1895,6 +1895,71 @@ Nothing on the wire changed. The report has always carried a health status per i
 
 `one_replica_rollout_keeps_a_healthy_backend_on_every_node` in `tests/cluster_failover.rs` (`make test-cluster`) is the demo in miniature. Three real nodes run a one-replica `cheese`, the test writes v2, and every 50 ms it reads each node's installed view of the service until every node routes only to the replacement. Every sample must have a healthy backend. The first draft of the test passed on the unfixed code, which was the interesting part. In the test cluster, reports go out every second, and a `script` app that dies on `SIGTERM` let the whole rollout finish between two reports, so no report ever caught the bad moment. The demo's real containers took seconds to stop, and the default report interval is five. So the test's app ignores `SIGTERM` and the spec sets `drain_timeout = "3s"`, which holds the old instance in `Stopping` for longer than a report interval, as a server finishing its requests would. Then it failed: two to three seconds in which both remote nodes listed two backends, neither healthy. With the fix, those same samples list the replacement healthy and the old one unhealthy.
 
-### What's left
+### Stopping only once nobody routes to it
 
-The report fix closes the `EPERM` gap. It doesn't make a rollout seamless for other nodes. Once the old instance leaves the catalogue, the drain on its own node only waits for the ingress proxy's connections, and service-to-service callers on other nodes don't go through it. A server that exits the moment it gets `SIGTERM` can stop while a node that hasn't polled the new catalogue yet still routes to it, and that caller gets `ECONNREFUSED` instead of `EPERM`. Two replicas have the same window for each instance they replace. Closing it means holding the stop until the other nodes confirm the withdrawal, which the address-release protocol already collects, but only after the stop. Moving it in front is a change to how retirement and release fit together, and it's a separate piece of work.
+The report fix closes the `EPERM` gap. It didn't make a rollout seamless for other nodes, and the issue that came out of it (#1355) said why. Once the old instance's retirement began, the deploy worker drained it and stopped it. The drain waits for in-flight requests, but only the ones that came through this node's ingress proxy. A service-to-service caller on another node doesn't go through that proxy: its connect hook rewrites the virtual IP straight to the backend's address. So a server that exits the moment it gets `SIGTERM` could stop while another node, which hadn't polled the new catalogue yet, still routed to it. That caller got `ECONNREFUSED` instead of `EPERM`. Two replicas had the same window for each instance they replaced.
+
+The protocol that knows when every node has dropped a backend already existed. It's the producer release from Chapter 3: before a node reuses a retired instance's host port or runtime address, it asks the leader, the leader fences that runtime execution, takes it out of the catalogue, and answers "confirmed" only once every consumer has sent a withdrawal receipt for a view without it. Until then it answers `202 Accepted`. The release just ran at the wrong moment for this question, after the stop, because that's when addresses get freed.
+
+Nothing in the leader cares whether the process behind a fenced execution is still running. So the fix asks the same question twice. `retire_old_instance` in the deploy worker now waits for two things at once before the stop signal:
+
+```rust
+tokio::join!(
+    self.ops.await_remote_withdrawal(id),
+    drain_instance(&self.drains, id, drain_timeout),
+);
+stop_runtime_instance(&self.grill, id, &stop, self.stop_confirmation_timeout).await
+```
+
+`tokio::join!` polls both futures on the same task and finishes when both have. It's Go's `sync.WaitGroup` over two goroutines without the goroutines: nothing is spawned, so nothing can outlive the function, and the borrows of `self` and `id` stay legal. The rollout costs the longer of the two waits, not their sum.
+
+`await_remote_withdrawal` sends a new `DeployOp`, `AwaitRemoteWithdrawal`, to the agent loop every 500 ms, and the loop answers with `confirm_producer_release`, the same function the release after the stop calls. That function was already written for the loop's rules. It starts the leader request on its own task and waits for it only until the turn's deadline. A later ask collects the answer rather than sending another. So the waiting happens on the worker, between turns, never on the loop. The worker gives up after `PRODUCER_RELEASE_PATIENCE`, five seconds, the patience the release after the stop already had.
+
+What happens to a node that never answers? It costs at most those five seconds, and then the old instance stops anyway. That's a deliberate trade: a partitioned node can't hold every rollout in the cluster hostage. The leader discharges such a node once its view lease runs out (`onion::lease`), and the address release after the stop still holds the host port until the leader confirms, so nothing gets reused while somebody might route to it. An unreachable leader, or a node whose discovery ownership is uncertain, gets the same treatment, with a line in the log. A single node, or a cluster without durable discovery, has nothing to ask, so it doesn't wait at all.
+
+The early ask changes nothing on the wire. The request, the fence and the answer are the ones the release has always used, and asking twice is fine because fencing an execution that's already fenced is a no-op. The answer after the stop then comes straight back as "confirmed". `CURRENT` stays where it was.
+
+`a_rolling_retirement_stops_the_old_instance_only_after_other_nodes_drop_it` in the agent tests pins the order. It rolls a one-replica app against a fake leader that answers `202` once and then confirms, and at each request it records whether the mock runtime had already been told to stop the old instance. Before the fix, the first request arrived after the stop. Now both arrive while the old instance is still running.
+
+We'd have liked a cluster test here too, like the one above, but the in-process test cluster talks plain HTTP and runs without durable discovery, and the producer release refuses both on purpose, so the test cluster never runs a release at all. The release's own tests cover the leader's side. The agent test covers the order.
+
+The review of 0.2.4 found what that patience costs at scale (#1440). Picture a node that's slow to confirm, or down and not yet discharged. Every retirement then waits the full five seconds, and the deploy worker retired one instance at a time. Scaling 100 replicas to none spent eight minutes waiting on one node. And every 500 ms ask went to the leader as a `RetireEndpointExecution` write: up to ten Raft entries per retiring instance, each one fsynced on a quorum, to say "nothing has changed".
+
+The writes were the easy half. Fencing an execution that's already fenced changes nothing, and a test already proved it: the second write leaves the state byte for byte the same. So the leader now answers a repeat from what it has committed. `DesiredState::committed_producer_release` returns `Some(released)` when the execution's fence is already there, and `None` when only the write can answer. That's the first ask, or a node whose identity has been retired, which the write refuses:
+
+```rust
+pub fn committed_producer_release(
+    &self,
+    node_id: &str,
+    execution: &crate::grill::RuntimeExecution,
+) -> Option<bool> {
+    if self.security_state.crl.retired_nodes.contains_key(node_id)
+        || !self.producer_retirements.fences(node_id, execution)
+    {
+        return None;
+    }
+    // ...and None if the catalogue still names a fenced backend
+    Some(self.producer_retirements.release_confirmed(
+        node_id,
+        execution,
+        &self.endpoint_withdrawals,
+    ))
+}
+```
+
+`Option<bool>` reads oddly at first if you come from Go, where you'd return `(released bool, ok bool)`. It's the same thing, but the compiler won't let the handler use `released` without first saying what happens when there isn't one. The handler already does a linearizable read of the security state before it trusts the caller's certificate, and that read proves this node leads and has applied everything committed. So the state it reads next is current, and the answer is the one the write would have given. `a_fenced_retirement_reads_the_answer_its_write_would_give` checks that answer against the write's at every step. `a_repeated_producer_release_commits_no_new_log_entry`, in the integration suite, asks four times and reads openraft's `last_log_index` after each: the first ask commits the fence, the other three add nothing. On the old handler they added three entries. Nothing changed on the wire, so `CURRENT` stays put.
+
+The waits needed a different fix. The leader can't tell a slow node from a dead one any sooner than its view lease does, so we can't skip the wait. What we can do is stop queueing them. A scale-down, the surplus a rollout leaves behind and the whole of blue in a blue-green swap are batches: every instance in them is leaving anyway. `retire_old_instances` retires a batch together, 16 at a time:
+
+```rust
+for chunk in ids.chunks(RETIREMENT_CONCURRENCY) {
+    let retiring = chunk
+        .iter()
+        .map(|id| self.retire_old_instance(id, drain_timeout));
+    outcomes.extend(futures_util::future::join_all(retiring).await);
+}
+```
+
+`join_all` polls every future in the chunk on the deploy task, the way `tokio::join!` polls two, so a chunk costs its slowest retirement, not the sum. Our first version used a stream's `buffered(16)`, which keeps all 16 slots busy instead of waiting for a whole chunk. It didn't compile, with "implementation of `FnOnce` is not general enough", pointing at the `tokio::spawn` that starts the deploy task. `tokio::spawn` needs a future that's `Send`, and the compiler has to prove that for every lifetime of the borrowed `id`. With the closure stored inside a stream adapter it can't, a known limit of today's trait solver. Chunks lose a little overlap and keep the borrow checker happy. Now 100 replicas cost seven waits, not a hundred. Why 16 and not all of them? Each waiting retirement asks through the agent loop every 500 ms, and each stop drives the runtime.
+
+A rolling step still retires one old instance at a time, on purpose: `max_unavailable` is what decides how many may be down at once, and the rollout already waits on it. Scale-down changed in one more way. One failure used to stop the loop, and the rest weren't touched. Now they've all been stopped by the time we see the failure, so the worker finishes the bookkeeping for every one that stopped, then reports the first failure (`a_failed_retirement_in_a_batch_leaves_the_others_retired`). `a_batch_of_retirements_waits_out_the_patience_once` retires six instances while the loop's side answers "pending" for ever. On the serial code it took 27 seconds of paused tokio time. Now it's one patience.

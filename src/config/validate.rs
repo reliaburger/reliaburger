@@ -140,6 +140,15 @@ impl Config {
         &self,
         namespaces: Option<&[String]>,
     ) -> Result<(), ConfigError> {
+        // Templates expand in the compiler and on the apply endpoint before
+        // anything validates; a `use` left here would vanish silently.
+        if let Some(instance) = self.uses.keys().next() {
+            return Err(ConfigError::Validation {
+                field: format!("use.{instance}"),
+                context: "config".into(),
+                reason: "templates must be expanded before the config is validated".into(),
+            });
+        }
         self.validate_workload_names()?;
         for (name, app) in &self.app {
             validate_app(name, app)?;
@@ -156,6 +165,14 @@ impl Config {
         }
         for (name, build) in &self.build {
             validate_build(name, build, namespaces)?;
+        }
+        for (name, policy) in &self.policy {
+            crate::policy::check_policy(name, policy).map_err(|source| {
+                ConfigError::InvalidPolicy {
+                    name: name.clone(),
+                    source,
+                }
+            })?;
         }
         Ok(())
     }
@@ -270,6 +287,13 @@ fn validate_build(
     Ok(())
 }
 
+/// The built-in checks one app must pass, on their own. Policies run them
+/// again on an app their defaults filled in (#1118), so validation sees
+/// the final spec.
+pub(crate) fn validate_app_spec(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    validate_app(name, app)
+}
+
 fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
     // An app needs at least one of: image, command, exec, or script
     if app.image.is_none() && app.command.is_empty() && app.exec.is_none() && app.script.is_none() {
@@ -284,6 +308,16 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
     )?;
     validate_app_ingress(name, app)?;
     validate_app_honoured_fields(name, app)?;
+
+    if let Some(owner) = &app.owner
+        && let Err(reason) = crate::council::owner::validate_owner(owner)
+    {
+        return Err(ConfigError::Validation {
+            field: "owner".to_string(),
+            context: format!("app {name:?}"),
+            reason,
+        });
+    }
 
     // Ordinals come from the leader's placements, never from a config file.
     if app.ordinals.is_some() {
@@ -446,6 +480,22 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         });
     }
 
+    validate_app_stop(name, app)?;
+    validate_app_sidecars(name, app)?;
+
+    // Runtime knobs change a container's own kernel settings (#1122). A
+    // host app runs on the node itself, so there is no container for them
+    // to change.
+    if crate::meat::filter::host_binary(app).is_some() && app.runtime_knob_uses().next().is_some() {
+        return Err(ConfigError::Validation {
+            field: "runtime".to_string(),
+            context: format!("app {name:?}"),
+            reason: "runtime knobs apply to a container; an exec or script app runs on the \
+                     host, so give it an image or drop [runtime]"
+                .to_string(),
+        });
+    }
+
     // Autoscale block: bounds, windows and threshold are validated up front
     // so a bad `[autoscale]` fails the deploy instead of silently clamping
     // at runtime (DEP8). An unsupported metric, or one the app has no request
@@ -461,6 +511,102 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         });
     }
 
+    Ok(())
+}
+
+/// Refuse stop hooks that parse but can't work (#1121). The signal and the
+/// durations are checked as they parse; what's left is how the fields fit
+/// together: a pre-stop bound needs a pre-stop command, the command needs
+/// a program, and a host app's program is named by its full path, because
+/// the node's `allowed_binaries` must name it.
+fn validate_app_stop(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    let refuse = |field: &str, reason: &str| ConfigError::Validation {
+        field: field.to_string(),
+        context: format!("app {name:?}"),
+        reason: reason.to_string(),
+    };
+    if app.pre_stop_timeout.is_some() && app.pre_stop.is_empty() {
+        return Err(refuse(
+            "pre_stop_timeout",
+            "pre_stop_timeout bounds a pre_stop command, and this app has none",
+        ));
+    }
+    let Some(program) = app.pre_stop.first() else {
+        return Ok(());
+    };
+    if program.trim().is_empty() {
+        return Err(refuse(
+            "pre_stop",
+            "the first word must be the program to run",
+        ));
+    }
+    if crate::meat::filter::host_binary(app).is_some() && !program.starts_with('/') {
+        return Err(refuse(
+            "pre_stop",
+            "an exec or script app's pre_stop runs on the host, where allowed_binaries \
+             names programs by full path; start it with an absolute path",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse sidecars that can't run as declared (#1120): a name that isn't a
+/// DNS label or appears twice, a host app (whose network is the node's, so
+/// there's no namespace to share), no image to run, an encrypted value in a
+/// sidecar's own `env`, and an app with an egress allowlist, which would
+/// hold the app to it but not its sidecars.
+fn validate_app_sidecars(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    if app.sidecar.is_empty() {
+        return Ok(());
+    }
+    let context = format!("app {name:?}");
+    let refuse = |reason: String| ConfigError::Validation {
+        field: "sidecar".to_string(),
+        context: context.clone(),
+        reason,
+    };
+    if app.exec.is_some() || app.script.is_some() {
+        return Err(refuse(
+            "a sidecar joins a container's network namespace, and an exec or script app \
+             runs in the node's own"
+                .to_string(),
+        ));
+    }
+    if app
+        .egress
+        .as_ref()
+        .is_some_and(|egress| !egress.allow.is_empty())
+    {
+        return Err(refuse(
+            "an egress allowlist binds the app's own cgroup, not its sidecars', so a sidecar \
+             could reach what the app can't; the two can't be combined yet"
+                .to_string(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for sidecar in &app.sidecar {
+        validate_label(&sidecar.name, &context, "sidecar.name")?;
+        if !seen.insert(sidecar.name.as_str()) {
+            return Err(refuse(format!("two sidecars are named {:?}", sidecar.name)));
+        }
+        if sidecar.image.is_none() && app.image.is_none() {
+            return Err(refuse(format!(
+                "sidecar {:?} names no image, and the app has none to lend it",
+                sidecar.name
+            )));
+        }
+        if let Some(variable) = sidecar
+            .env
+            .iter()
+            .find_map(|(variable, value)| value.is_encrypted().then_some(variable))
+        {
+            return Err(refuse(format!(
+                "sidecar {:?} env {variable:?} is encrypted; put it in the app's env, which \
+                 every sidecar inherits",
+                sidecar.name
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -606,6 +752,21 @@ pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), 
         job.firewall.as_ref(),
         job.egress.as_ref(),
     )?;
+    // Providers resolve where an app's instance launches; the job runtimes
+    // don't call them yet, and a job must not run with the reference as its
+    // value (#1123).
+    if let Some(key) = job
+        .env
+        .iter()
+        .find_map(|(key, value)| value.is_provider().then_some(key))
+    {
+        return Err(ConfigError::Validation {
+            field: format!("env.{key}"),
+            context: format!("job {name:?}"),
+            reason: "PROVIDER[...] secrets resolve for apps only; a job can't use one yet"
+                .to_string(),
+        });
+    }
     validate_label(
         job.namespace.as_deref().unwrap_or("default"),
         name,
@@ -762,6 +923,17 @@ impl NodeConfig {
                     path: path.clone(),
                 });
             }
+        }
+
+        // Each secret provider runs an absolute binary within bounds (#1123).
+        for (name, provider) in &self.secret_providers {
+            provider
+                .validate()
+                .map_err(|reason| ConfigError::Validation {
+                    field: format!("secret_providers.{name}"),
+                    context: "node config".to_string(),
+                    reason,
+                })?;
         }
 
         // Port range validation
@@ -1031,6 +1203,21 @@ mod tests {
             matches!(err, ConfigError::Validation { ref field, .. } if field == "ordinals"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn an_owner_must_look_like_a_token_name() {
+        let config = config_with_app("web", app_with_metrics("owner = 'pg-failover'"));
+        config.validate().unwrap();
+        for bad in ["owner = ''", "owner = 'two words'"] {
+            let err = config_with_app("web", app_with_metrics(bad))
+                .validate()
+                .unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Validation { ref field, .. } if field == "owner"),
+                "{bad}: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1367,6 +1554,157 @@ mod tests {
         )
         .unwrap();
         config_with_app("web", app).validate().unwrap();
+    }
+
+    fn stop_refusal(app_toml: &str) -> Option<(String, String)> {
+        let app: AppSpec = toml::from_str(app_toml).unwrap();
+        match config_with_app("web", app).validate() {
+            Ok(()) => None,
+            Err(ConfigError::Validation { field, reason, .. }) => Some((field, reason)),
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_hooks_on_a_container_app_validate() {
+        assert_eq!(
+            stop_refusal(
+                "image = \"web:v1\"\nstop_signal = \"SIGQUIT\"\nstop_grace = \"45s\"\n\
+                 pre_stop = [\"nginx\", \"-s\", \"quit\"]\npre_stop_timeout = \"10s\"\n"
+            ),
+            None
+        );
+    }
+
+    /// The field and reason a sidecar refusal gives, or `None` when the
+    /// app validates.
+    fn sidecar_refusal(app_toml: &str) -> Option<(String, String)> {
+        stop_refusal(app_toml)
+    }
+
+    #[test]
+    fn sidecars_on_a_container_app_validate() {
+        assert_eq!(
+            sidecar_refusal(
+                "image = \"web:v1\"\n[[sidecar]]\nname = \"proxy\"\nimage = \"envoy:1\"\n\
+                 env = { MODE = \"edge\", TOKEN = \"PROVIDER[vault:proxy/token]\" }\n\
+                 [[sidecar]]\nname = \"logs\"\ncommand = [\"ship\"]\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_host_app_cannot_have_a_sidecar() {
+        let (field, reason) = sidecar_refusal(
+            "exec = \"/bin/sleep\"\n[[sidecar]]\nname = \"proxy\"\nimage = \"envoy:1\"\n",
+        )
+        .unwrap();
+        assert_eq!(field, "sidecar");
+        assert!(reason.contains("network namespace"), "{reason}");
+    }
+
+    #[test]
+    fn a_sidecar_name_must_be_a_unique_dns_label() {
+        let (field, _) =
+            sidecar_refusal("image = \"web:v1\"\n[[sidecar]]\nname = \"Proxy_1\"\n").unwrap();
+        assert_eq!(field, "sidecar.name");
+        let (field, reason) = sidecar_refusal(
+            "image = \"web:v1\"\n[[sidecar]]\nname = \"p\"\n[[sidecar]]\nname = \"p\"\n",
+        )
+        .unwrap();
+        assert_eq!(field, "sidecar");
+        assert!(reason.contains("two sidecars"), "{reason}");
+    }
+
+    #[test]
+    fn a_sidecar_needs_an_image_of_its_own_or_the_apps() {
+        let (_, reason) = sidecar_refusal(
+            "command = [\"/app/run\"]\n[[sidecar]]\nname = \"p\"\ncommand = [\"x\"]\n",
+        )
+        .unwrap();
+        assert!(reason.contains("no image"), "{reason}");
+    }
+
+    #[test]
+    fn an_encrypted_sidecar_env_value_is_refused() {
+        let (_, reason) = sidecar_refusal(
+            "image = \"web:v1\"\n[[sidecar]]\nname = \"p\"\nenv = { K = \"ENC[AGE:abc]\" }\n",
+        )
+        .unwrap();
+        assert!(reason.contains("app's env"), "{reason}");
+    }
+
+    #[test]
+    fn sidecars_and_an_egress_allowlist_are_refused_together() {
+        let (_, reason) = sidecar_refusal(
+            "image = \"web:v1\"\n[egress]\nallow = [\"api.example.com:443\"]\n\
+             [[sidecar]]\nname = \"p\"\n",
+        )
+        .unwrap();
+        assert!(reason.contains("egress"), "{reason}");
+    }
+
+    #[test]
+    fn pre_stop_timeout_without_pre_stop_is_refused() {
+        let (field, reason) =
+            stop_refusal("image = \"web:v1\"\npre_stop_timeout = \"10s\"\n").unwrap();
+        assert_eq!(field, "pre_stop_timeout");
+        assert!(reason.contains("has none"), "{reason}");
+    }
+
+    #[test]
+    fn pre_stop_with_an_empty_program_is_refused() {
+        let (field, _) = stop_refusal("image = \"web:v1\"\npre_stop = [\" \", \"x\"]\n").unwrap();
+        assert_eq!(field, "pre_stop");
+    }
+
+    #[test]
+    fn a_host_apps_pre_stop_must_name_its_program_by_full_path() {
+        let (field, reason) =
+            stop_refusal("exec = \"/bin/sleep\"\npre_stop = [\"echo\", \"bye\"]\n").unwrap();
+        assert_eq!(field, "pre_stop");
+        assert!(reason.contains("absolute path"), "{reason}");
+        assert_eq!(
+            stop_refusal("exec = \"/bin/sleep\"\npre_stop = [\"/bin/echo\", \"bye\"]\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_knobs_on_a_container_app_validate() {
+        assert_eq!(
+            stop_refusal(
+                "image = \"web:v1\"\n[runtime]\ncapabilities = [\"IPC_OWNER\"]\n\
+                 sysctls = { \"net.core.somaxconn\" = \"1024\" }\n\
+                 devices = [{ path = \"/dev/fuse\" }]\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_knobs_on_a_host_app_are_refused() {
+        for host in ["exec = \"/bin/sleep\"", "script = \"sleep 1\""] {
+            let (field, reason) = stop_refusal(&format!(
+                "{host}\n[runtime]\ncapabilities = [\"IPC_OWNER\"]\n"
+            ))
+            .unwrap();
+            assert_eq!(field, "runtime");
+            assert!(reason.contains("container"), "{reason}");
+        }
+        // An empty table asks for nothing, so it's harmless anywhere.
+        assert_eq!(stop_refusal("exec = \"/bin/sleep\"\n[runtime]\n"), None);
+    }
+
+    #[test]
+    fn a_host_wide_sysctl_fails_the_whole_config_at_parse() {
+        let error = Config::parse(
+            "[app.web]\nimage = \"web:v1\"\n[app.web.runtime]\nsysctls = { \"kernel.panic\" = \"1\" }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("isn't namespaced"), "{error}");
     }
 
     #[test]
@@ -1962,6 +2300,20 @@ mod tests {
             .unwrap();
             config.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn a_job_with_a_provider_secret_is_refused_and_an_app_is_not() {
+        let raw = "[job.migrate]\nimage = \"busybox\"\n[job.migrate.env]\nDB_PASSWORD = \"PROVIDER[vault:secret/db]\"\n";
+        let error = Config::parse(raw).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(error, ConfigError::Validation { ref field, .. } if field == "env.DB_PASSWORD"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("apps only"), "{error}");
+
+        let raw = "[app.api]\nimage = \"api:v1\"\n[app.api.env]\nDB_PASSWORD = \"PROVIDER[vault:secret/db]\"\n";
+        Config::parse(raw).unwrap().validate().unwrap();
     }
 
     #[test]

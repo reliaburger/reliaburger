@@ -26,6 +26,7 @@ pub(crate) fn validate_rerun(config: &Config) -> Result<(), &'static str> {
         || !config.app.is_empty()
         || !config.namespace.is_empty()
         || !config.permission.is_empty()
+        || !config.policy.is_empty()
         || !config.build.is_empty()
         || config.job.values().any(|spec| spec.schedule.is_some())
     {
@@ -50,9 +51,7 @@ pub(crate) async fn apply(
     rerun: bool,
     lease: Option<&crate::testkit::lease::TestLease>,
 ) -> Response {
-    if let Some(council) = &state.council
-        && !council.is_leader().await
-    {
+    if let Some(council) = super::task_array_api::council_to_forward_to(&state).await {
         return super::batch::forward_to_leader(&state, council, "/v1/apply", body, headers).await;
     }
     let _gate = if state.council.is_none() {
@@ -60,6 +59,7 @@ pub(crate) async fn apply(
     } else {
         None
     };
+    let mut owner_notes = Vec::new();
     if let Some(council) = &state.council {
         let namespaces: Vec<_> = council
             .desired_state()
@@ -70,6 +70,59 @@ pub(crate) async fn apply(
             .collect();
         if let Err(error) = config.validate_against(&namespaces) {
             return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
+        // The resource owner rules hold here as on any apply (#1125, #1429):
+        // an app a controller owns is skipped unless the manifest declares
+        // its owner, and only that owner's token (or an admin) may.
+        // Decided before policy, so a skipped app is neither judged nor
+        // written.
+        owner_notes = match super::api::apply::skip_owned_apps(
+            council,
+            &mut config,
+            &super::api::apply::owner_caller(auth),
+        )
+        .await
+        {
+            Ok(notes) => notes,
+            Err(error) => return super::api::apply::owner_refusal(&error),
+        };
+        // The apps and jobs in a job manifest are judged by the policies in
+        // force, as `relish apply` judges any app (#1117, #1119). The state
+        // machine commits them later, once their jobs have run, so their
+        // writes carry no policy fence: a policy committed in between
+        // doesn't stop them.
+        if !config.app.is_empty() || !config.job.is_empty() {
+            let (policies, generation) = council
+                .read_desired(|desired| (desired.policies.clone(), desired.policy_generation))
+                .await;
+            match crate::policy::admit_blocking(
+                policies,
+                generation,
+                config.clone(),
+                super::api::apply::policy_caller(auth),
+                crate::policy::Source::Apply,
+            )
+            .await
+            {
+                // The apps commit with their policy defaults filled in
+                // (#1118). Job manifests never come from GitOps, so there's
+                // no declared spec to keep beside them.
+                Ok(admitted) => {
+                    super::api::apply::record_policy_audits(&state, auth, &admitted.audits).await;
+                    for (name, spec) in config.app.iter_mut() {
+                        let app_id = crate::meat::AppId::new(
+                            name,
+                            spec.namespace.as_deref().unwrap_or("default"),
+                        );
+                        if let Some(app) = admitted.defaulted.get(&app_id) {
+                            *spec = app.effective.clone();
+                        }
+                    }
+                }
+                Err(error) => {
+                    return super::api::apply::policy_refusal(&state, auth, &error).await;
+                }
+            }
         }
     }
     if state.council.is_none() && !state.task_arrays.admission_configured() {
@@ -95,6 +148,7 @@ pub(crate) async fn apply(
             &namespace,
             &mut definition,
             lease,
+            super::job_api::PolicyCheck::Judged,
         )
         .await
         {
@@ -151,6 +205,9 @@ pub(crate) async fn apply(
         operation_id: operation_id.clone(),
     });
     tokio::spawn(async move {
+        for message in owner_notes {
+            let _ = tx.send(ApplyEvent::Progress { message }).await;
+        }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(900);
         loop {
             let arrays = read_task_arrays(&state).await;

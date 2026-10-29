@@ -453,6 +453,16 @@ class Leaks(Evidence):
         self.assertEqual(sample(start + 3000 + 3600, "b2", 657000), [])
         self.assertEqual([item["check"] for item in sample(start + 3000 + 7000, "b2", 830000)], ["leak-rss"])
 
+    def test_anonymous_and_file_backed_rss_are_trended_apart(self):
+        # #1417: heap growth and mapped files look the same in VmRSS.
+        state = {}
+        for ts, anon, mapped in ((NOW, 200000, 30000), (NOW + 600, 260000, 31000)):
+            text = INVENTORY + f"bun_rss_anon_kb {anon}\nbun_rss_file_kb {mapped}\n"
+            checker.resource_trend_findings(state, "rb-a-1", checker.parse_inventory(text), ts)
+        trend = state["trends"]["rb-a-1"]
+        self.assertEqual(trend["rss_anon_kb"], {"first": 200000, "last": 260000, "max": 260000})
+        self.assertEqual(trend["rss_file_kb"], {"first": 30000, "last": 31000, "max": 31000})
+
     def test_inventories_without_an_image_line_still_track_the_pid(self):
         state = {}
         def sample(ts, pid, rss_kb):
@@ -823,6 +833,19 @@ class AgentLoopTurns(Evidence):
         failure = next(item for item in verdict["findings"] if item["check"] == "agent-loop-turn")
         self.assertIn("1 command turn(s) over the 1 s budget", failure["detail"])
 
+    def test_a_torn_scrape_is_not_a_slow_turn(self):
+        # #1419: the 0.2.3 day run's node 3 scraped le="1" one above +Inf
+        # once, from a Bun that read its turn count before its buckets. No
+        # turn was slow, and the scrape after it was honest again.
+        torn = [dict(sample, value=sample["value"] + (1 if json.loads(sample["labels"])["le"] != "+Inf" else 0))
+                for sample in turns(branch="follow_up", within=105875, ts=NOW + 10)]
+        code, verdict = self.evaluate(self.snapshot(ts=NOW + 30, **{
+            "inventory__rb-a-3_txt": INVENTORY,
+            "turns__rb-a-3_json": turns(branch="follow_up", within=105850, ts=NOW)
+            + torn + turns(branch="follow_up", within=105904, ts=NOW + 20)}))
+        self.assertNotIn("agent-loop-turn", self.failures(verdict))
+        self.assertNotIn("rb-a-3", checker.load_state(self.evidence).get("turns_over_budget", {}))
+
     def slow_fsync_window(self, node):
         with contextlib.redirect_stdout(io.StringIO()):
             checker.main(["window", str(self.evidence), "open", "node-slow-fsync", "--node", node])
@@ -864,6 +887,88 @@ class AgentLoopTurns(Evidence):
         state = checker.load_state(self.evidence)
         self.assertEqual(state["turns_over_budget"], {"rb-a-1": 2})
         self.assertEqual(sorted(state["turns"]), ["rb-a-1", "rb-a-2"])
+
+
+SOAK_WORKLOADS = Path(__file__).resolve().parent / "sustained" / "soak-workloads.toml"
+
+
+def policy_listing(policies, generation=3):
+    """`relish --output json policy list` for `policies`, a {name: spec} map
+    in the TOML's shape (`match`, `deny`, `action`, `default`)."""
+    return {"policies": {name: dict({"action": "deny"}, **spec) for name, spec in policies.items()},
+            "generation": generation, "gitops_owned": []}
+
+
+class SoakPolicies(Evidence):
+    """The soak workload carries policies, and every check makes sure they're
+    still in force (#1311): a fault mustn't lose or change one."""
+
+    def setUp(self):
+        super().setUp()
+        (self.evidence / "workloads.toml").write_text(SOAK_WORKLOADS.read_text())
+        self.declared = checker.expected_policies(self.evidence)
+
+    def test_the_soak_workload_carries_a_deny_a_warn_and_a_default(self):
+        actions = {spec.get("action", "deny") for spec in self.declared.values() if "deny" in spec}
+        self.assertIn("deny", actions)
+        self.assertIn("warn", actions)
+        self.assertTrue(any("default" in spec for spec in self.declared.values()), self.declared)
+
+    def test_every_soak_policy_in_force_finds_nothing(self):
+        code, verdict = self.evaluate(self.snapshot(policies_json=policy_listing(self.declared)))
+        self.assertNotEqual(code, 1)
+        self.assertNotIn("policies", self.failures(verdict))
+        self.assertEqual(checker.load_state(self.evidence)["policy_checks"], 1)
+
+    def test_a_missing_soak_policy_fails_naming_it(self):
+        name = sorted(self.declared)[0]
+        listing = policy_listing({key: spec for key, spec in self.declared.items() if key != name})
+        code, verdict = self.evaluate(self.snapshot(policies_json=listing))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "policies")
+        self.assertIn(f"policy {name} is not in force", failure["detail"])
+
+    def test_a_changed_soak_policy_fails(self):
+        name = next(key for key, spec in self.declared.items() if "deny" in spec)
+        changed = dict(self.declared, **{name: dict(self.declared[name], deny="true")})
+        code, verdict = self.evaluate(self.snapshot(policies_json=policy_listing(changed)))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "policies")
+        self.assertIn(f"policy {name} differs from the soak workload's", failure["detail"])
+
+    def test_the_policy_generation_never_goes_backwards(self):
+        self.evaluate(self.snapshot(policies_json=policy_listing(self.declared, generation=9)))
+        code, verdict = self.evaluate(self.snapshot(ts=NOW + 600, policies_json=policy_listing(self.declared, generation=6)))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "policies")
+        self.assertIn("policy generation went from 9 back to 6", failure["detail"])
+
+    def test_a_snapshot_without_a_listing_is_not_judged(self):
+        # `relish policy list` can fail while there's no leader; the
+        # harness then removes the file, and the next check judges it.
+        code, verdict = self.evaluate(self.snapshot())
+        self.assertNotIn("policies", self.failures(verdict))
+        self.assertNotIn("policy_checks", checker.load_state(self.evidence))
+
+    def test_the_turn_budget_is_still_judged_with_the_policies_in_force(self):
+        # The apply path runs off the agent loop, so policies shouldn't
+        # move the turn budget; the soak checks that they don't.
+        code, verdict = self.evaluate(self.snapshot(**{
+            "policies_json": policy_listing(self.declared),
+            "turns__rb-a-1_json": turns(over=("2.5",))}))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.failures(verdict), ["agent-loop-turn"])
+
+    def test_the_configure_step_refuses_a_listing_without_the_soak_policies(self):
+        listing = self.evidence / "policies.json"
+        listing.write_text(json.dumps(policy_listing(self.declared)))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(checker.check_policies(self.evidence, listing), 0)
+        listing.write_text(json.dumps(policy_listing({})))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(checker.check_policies(self.evidence, listing), 1)
+        self.assertIn("is not in force", output.getvalue())
 
 
 class GuestClock(Evidence):
@@ -942,6 +1047,19 @@ class Record(Evidence):
         self.assertIn("not supplied: upgrade slots skipped", text)
         self.assertIn("short leaf lifetimes unavailable", text)
         self.assertIn("- Teardown: `relish local destroy --yes` and `relish uninstall --yes` succeeded", text)
+
+    def test_the_record_says_how_often_the_soak_policies_were_checked(self):
+        self.write_run()
+        record = self.evidence / "record.md"
+        checker.render(self.evidence, record)
+        self.assertIn("- Soak policies checked in force: not measured", record.read_text())
+        state = checker.load_state(self.evidence)
+        state.update(policy_checks=12, policy_generation=27)
+        checker.save_state(self.evidence, state)
+        again = self.evidence / "again.md"
+        checker.render(self.evidence, again)
+        self.assertIn("- Soak policies checked in force: 12 times, policy generation 27 at the last check",
+                      again.read_text())
 
     def test_an_open_failure_renders_fail_with_its_row(self):
         self.write_run(failures=["fault:power-off did not settle within 480 s"])
@@ -1050,7 +1168,10 @@ def passing_job_report(load, node_faults):
     return dict(stopped=True, active=[], errors=[], coverage=coverage, load=load,
                 target_rate=1390 if load == "target" else None, started=NOW, heartbeat=NOW + FINAL,
                 stop_requested_at=NOW + FINAL - 100,
-                progress={mode: {"succeeded": 20_000_000, "retried": 0} for mode in job_soak.MODES})
+                progress={mode: {"succeeded": 20_000_000, "retried": 0} for mode in job_soak.MODES},
+                # p99 job start lag 32 ms, inside its SLO (#1400).
+                metrics=dict(start_lag_ms_counts=[980, 0, 0, 0, 0, 20] + [0] * 10,
+                             quiet_start_lag_ms_counts=[980, 0, 0, 0, 0, 20] + [0] * 10))
 
 
 class ExecutionInventory(unittest.TestCase):

@@ -475,9 +475,50 @@ The sleep turned out to have been hiding a second bug. A leader rolling the clus
 
 While an upgrade is staged, the agent sets a **drain flag**: new deploys are refused with a clear message; running workloads are untouched. It's one `AtomicBool`: the cluster-level version of "don't schedule onto an upgrading node" comes later, in the orchestrator; this is the node defending itself.
 
-After the exec, the new binary's boot does what §14.4 and §14.5 built: startup recovery returns `Continue { verify: Some(marker) }`, workloads get adopted, and a task waits out `boot_grace_secs` (default 30; surviving the grace period is itself part of the proof, since crashing inside it burns a boot attempt). Then it commits: write history, delete the marker, GC old binaries (protecting the one we'd revert to: the §14.3 `protect` list in action). A genuinely broken new binary never reaches this point: it crash-loops inside the grace window and the boot-attempt budget (§14.4) reverts it first.
+After the exec, the new binary's boot does what §14.4 and §14.5 built: startup recovery returns `Continue { verify: Some(marker) }`, workloads get adopted, and a task waits out `boot_grace_secs` (default 30; surviving the grace period is itself part of the proof, since crashing inside it burns a boot attempt). Then it commits: write history, GC old binaries (protecting the one we'd revert to and the one now running: the §14.3 `protect` list in action), delete the marker. A genuinely broken new binary never reaches this point: it crash-loops inside the grace window and the boot-attempt budget (§14.4) reverts it first.
 
 There's a subtlety about *what* counts as a broken upgrade, and it bit us in the cluster tests. On a **single node**, the agent also checks the marker's inventory: every workload that was `Running` before the swap must be `Running` after. A vanished workload there really is a failed swap (nothing else could have moved it), so it triggers `mark_revert_pending` + `exit(1)`. But in a **cluster**, workload placement belongs to the scheduler, not the node: while the node bounces, the leader may legitimately reschedule an app elsewhere. A node that reverted its own (perfectly good) binary because the cluster moved a workload would be confusing correctness for coincidence. So in cluster mode the inventory mismatch is logged, not fatal: liveness through the grace window is the proof, and the "containers survive" guarantee rests on adoption (§14.5) plus the crash-loop budget, not on a placement census the node no longer owns. (The inventory skips jobs either way: a run-to-completion job finishing *during* the upgrade is success, not a casualty.)
+
+### Committing off the loop
+
+The commit is three bits of file work, and for a long time the agent did all three inside one turn of its loop: `handle_upgrade_verify` called `UpgradeManager::commit`, which is plain `std::fs`. On a healthy disk that's a millisecond or two. The GC step, though, deletes old Bun binaries of about 100 MB each, and a disk that's busy (or a VM whose host is busy) can make that take seconds. While it does, nothing else on the node gets a turn: no status, no deploy step, no health probe. The 0.2.3 candidate's soak caught one: `agent loop turn took 2260 ms in command (upgrade_verify)`, more than twice the 1 s turn budget (#1381).
+
+The fix is the deal every other slow writer on the loop already gets (chapter 15 tells that story at length): wait for the work only until the turn's deadline, then let it land off the loop. `commit_verified_upgrade` in `src/bun/agent/follow_ups.rs` hands the whole commit to a blocking thread and keeps the handle:
+
+```rust
+let committing = marker.clone();
+let mut commit = tokio::spawn(async move {
+    commit_outcome(tokio::task::spawn_blocking(move || manager.commit(&committing)).await)
+});
+match tokio::time::timeout_at(self.turn_deadline(), &mut commit).await {
+    Ok(joined) => finish_upgrade_commit(UpgradeCommit {
+        marker,
+        committed: commit_outcome(joined),
+        response,
+    }),
+    Err(_) => {
+        self.follow_ups.spawn(async move {
+            FollowUp::UpgradeCommitted(UpgradeCommit {
+                marker,
+                committed: commit_outcome(commit.await),
+                response,
+            })
+        });
+    }
+}
+```
+
+`spawn_blocking` runs a closure on Tokio's pool of threads set aside for blocking calls, so a slow `unlink` holds one of those, not the thread the loop runs on. The interesting Rust is `&mut commit`. A `JoinHandle` is itself a future, and `timeout_at` takes any future by value. Pass the handle by value and a timeout would drop it, and with it our only way to hear how the commit ended (dropping a `JoinHandle` doesn't stop the task; it just stops anyone listening). A `&mut F` is also a future whenever `F` is a future that's `Unpin`, which `JoinHandle` is. So we lend the handle to the timeout, and if the deadline wins we still own it, and can move it into a follow-up task that awaits the rest. On a healthy disk the commit finishes within the turn and the caller is answered there, exactly as before. On a slow one the turn ends at its 500 ms deadline, and a later `follow_up` turn answers once the commit lands.
+
+Who's waiting for that answer? Only the boot task in `bun` that sent `UpgradeVerify`, and it ignores what comes back. Nothing in `relish`, the orchestrator or the scripts calls verify, so it doesn't need the `StillRunning`-and-ask-again dance other commands use. The orchestrator learns the outcome the way it always did: it polls `/v1/version`, and `upgrade_in_flight` turns false once the marker has gone.
+
+What does have to hold is the order inside `commit`. The history entry is written first and now fsync'd (`sync_all` on the file, and on its directory the first time it's created), so the marker never disappears before the record that says the upgrade committed is on disk. Then GC, then the marker. Keeping GC *before* the marker matters twice over. It's the "do all the work first, flip the visible flag last" rule from §14.4. And it's what makes GC safe against the next upgrade: while the marker is on disk, `prepare` and `prepare_rollback` refuse anything but a re-delivery of the same upgrade, so no new binary can be staged while GC decides what to delete. GC protects the version we came from and the one now running; the marker protects everything else.
+
+The exec has the same kind of file work. `execute` writes and fsyncs the `Executed` marker and swaps the symlink before the exec. If the exec fails, it puts the old symlink back and appends an `Abandoned` entry to the history, fsync'd too (#1381). All of that ran on a Tokio worker thread, where the project's rule says no blocking call belongs. Since 0.2.4 the loop runs the whole of `execute` under `spawn_blocking` (#1442). Can a blocking-pool thread exec? Yes. `execv` replaces the whole process from whichever thread calls it, and the call never came from the main thread anyway: the agent loop is a spawned task. The loop's turn still waits for the answer, because there's nothing else for a node to do mid-exec. What changed is that the worker thread underneath it is free. The history entry's serialisation lost its `.expect` on the way. It can't fail, but `serde_json::to_string` returns a `Result`, and a library function that can return an error shouldn't panic instead.
+
+The tests are in the agent's loop harness. `status_answers_while_an_upgrade_verification_commits_to_a_stalled_disk` runs the whole loop with the commit stalled for 2.5 s and checks that a status queued meanwhile is answered within the budget, that the verify isn't answered before the commit lands, and that the marker is still there until it does. `an_upgrade_verification_leaves_its_slow_commit_in_flight` drives the turns by hand and counts: one commit, the turn under budget, the answer only from the landing turn. `an_upgrade_commit_prunes_old_binaries_off_the_loop_and_refuses_the_next_upgrade_meanwhile` sends a rollback while the commit is stalled and checks it's refused, and that GC kept the right binaries. Against the inline commit, the counting one failed with `the verification's turn waited for its commit: 2.517645416s in command (upgrade_verify)`. A unit test in `upgrade::manager`, `commit_keeps_the_marker_and_the_binaries_when_history_cannot_be_written`, pins the order: a history file that can't be written leaves the marker and every binary where they were.
+
+`commit_outcome` turns a task that panicked into an `UpgradeError::Io`, so the caller hears about it rather than seeing a dropped channel, and the marker stays for the next boot to sort out. (The test build also has the spawned task wait on a `LoopStall::UpgradeCommit` hook first; that's how the harness makes the commit slow without a slow disk.)
 
 ### The first-ever upgrade
 
@@ -1964,3 +2005,74 @@ We didn't add a size limit to the download. The registry already refuses uploads
 We didn't stream the hash. `fetch_once` could feed SHA-256 as the pieces arrive and refuse a wrong hash before the signature check reads the file again. But `verify_binary` checks the hash first anyway, from the page cache, and one check in one place is easier to trust than two.
 
 We didn't raise the adoption test's timeout either. A longer budget would have hidden the 837 MB, and it would have stretched again as the test binary grew.
+
+## A replacement that never answered
+
+On 21 October the version-form walk stopped dead in CI ([#1273](https://github.com/reliaburger/reliaburger/issues/1273)). n2 upgraded and committed. Then n1 exec'd into v0.2.0, printed its start-up lines down to `Pickle registry listening`, and went quiet. For three minutes it didn't answer `/v1/version` and didn't gossip, and the leader waited with "2 of 3 voters alive". Oddest of all, n1 never reached a verdict on its own upgrade. The verification from [section 14.9](#the-replacement-must-prove-rejoin-locally-too) always ends within one hash wait and one rejoin period, 20 s with the test's settings: the node either commits or writes `RevertPending` and exits. n1 did neither. A process whose timers don't fire isn't slow. It's stuck.
+
+The clue was a line the log didn't have. A restarted voter prints `council: no peer advertises a newer recovery epoch … serving raft` when its start-up probe ends (the recovery fence from [chapter 2](02-finding-friends.md#when-the-epoch-wasnt-enough)). n2 printed it and n1 never did. So we read the probe, `supervise_recovery_fence` in `src/cluster/recovery_fence.rs`. While the fence probed, it did this:
+
+```rust
+let directory = directory_rx.borrow_and_update();
+// ...
+let peers = peers(); // reads openraft's metrics channel
+```
+
+`borrow_and_update()` returns a `watch::Ref`, a guard that holds the channel's read lock until it's dropped. `peers()` borrows a second channel, openraft's metrics, while that guard is still alive. And the leader-target maintainer in `src/cluster/runtime.rs` takes the same two locks the other way round: metrics first, then the directory.
+
+Two readers taking two locks in opposite orders sounds harmless, because readers share. But a Tokio `watch` channel sits on `parking_lot`'s `RwLock`, and that lock is fair to writers: once a writer is waiting, a new reader waits behind it. On a restarting node both channels have busy writers. Openraft publishes metrics as it loads its log, and gossip publishes the directory as peers answer. So four tasks can line up like this:
+
+1. The fence supervisor holds the directory and waits to read the metrics, behind openraft's queued write.
+2. Openraft waits to write the metrics until the leader-target maintainer lets go of them.
+3. The maintainer holds the metrics and waits to read the directory, behind gossip's queued write.
+4. Gossip waits to write the directory until the supervisor lets go of it.
+
+Nobody lets go. These aren't `.await`s, where a task yields its thread; they're synchronous locks, so each one parks the worker thread it runs on. A GitHub runner has four cores, so Tokio gave Bun four workers, and there were four parked threads. Nothing was left to drive the timers or the sockets, so the verification never finished, the API never answered and gossip went silent. On a ten-core laptop the same knot parks four workers out of ten. Gossip and Raft die, but the verification timer still fires and the node reverts, so the walk pauses instead of hanging. That's part of why it took a CI runner, and a race at the right moment, to see it.
+
+Rust's borrow checker doesn't catch this one. A `watch::Ref` isn't `Send`, so the compiler refuses to hold one across an `.await` in a spawned task, which rules out the commonest way to deadlock on it. Two guards held side by side in one synchronous block are perfectly legal, though. Lock order is still the programmer's job.
+
+The fix keeps one order everywhere. Every other place that holds both borrows takes the metrics first, so the supervisor now copies the claims it needs out of the directory and drops the guard in the same statement:
+
+```rust
+let claims = directory_rx.borrow_and_update().recovery_claims.clone();
+```
+
+The `Ref` is a temporary there, and Rust drops a temporary at the end of the statement that made it. By the time `peers()` runs, the supervisor holds nothing. `probe_complete` takes the copied claims map instead of the whole directory, so the copy is one entry per node, not the directory.
+
+### Tests
+
+`the_probe_reads_the_membership_without_holding_the_gossip_directory` hands the supervisor a `peers` closure that, on its first call, starts a thread to write the directory and waits up to two seconds for it. Before the fix the write waited for the supervisor's guard and the test failed. Now it lands at once. The test pins the rule (no directory borrow during the membership read) rather than the four-way race. The race needs four threads lined up just so, and a test of it would pass nearly every time whether or not the bug was there.
+
+### What we decided not to do
+
+We didn't turn on `parking_lot`'s deadlock detector. It's a compile-time feature with a background thread, and it reports a deadlock after the fact. The node would still be wedged.
+
+We didn't clone every `watch` value out of its channel by habit. The directory carries an entry for every node, and the leader-target maintainer reads it on every change. We meant to take the borrows in one order instead, and that turned out to be harder to keep than it sounds.
+
+### One order wasn't enough
+
+"Every other place takes the metrics first" was wrong. A week later a review of the 0.2.4 train found Pickle doing it the other way round ([#1433](https://github.com/reliaburger/reliaburger/issues/1433)). When a follower forwards a registry write or an ownership query to the leader, `RegistryForwarder::send_request` in `src/pickle/authority.rs` looked up the leader's address like this:
+
+```rust
+let directory = self.directory.borrow();
+if let Some(council) = council {
+    let metrics = council.metrics();
+    let metrics = metrics.borrow();
+    leader_api_address(&metrics, &directory)
+}
+```
+
+That's the directory first, then the metrics: the fence supervisor's knot again, reached through the image registry. Nothing in the type system says which order is the right one, and the code that broke the rule was written long before the rule existed. Seven places in the tree took both borrows, each by hand. A rule that every caller has to remember will be broken again by the eighth.
+
+So now nobody takes both. The two functions that combine the channels, `resolve_leader` and `leader_api_address` in `src/cluster/directory.rs`, take the receivers instead of borrowed values, and they borrow each channel in turn:
+
+```rust
+let raft = metrics.map(|metrics| raft_leader(&metrics.borrow()));
+let directory = directory.borrow();
+```
+
+`raft_leader` copies out the three things resolution needs from the metrics: the leader's name, its Raft address and the term. The `Ref` from `metrics.borrow()` is a temporary, so Rust drops it when that statement ends, before the directory borrow starts. Copying a name, an address and a number costs nothing next to cloning the metrics, which carry the whole membership. Every caller (the leader-target maintainer, the placement poll, the producer release, workload signing, the upgrade and GitOps forwarding, and Pickle) now goes through those two functions, so the order lives in one place. `metrics` is an `Option` because a worker outside the council has no Raft metrics and resolves the leader from the gossip hint alone.
+
+The project's async rules gained a line too: never hold two `watch` borrows at once. Two more places broke it with other pairs of gossip channels: the council reconciler's membership filter in `src/cluster/recovery_fence.rs` held the membership and the directory, and Bun's roster refresher held the directory and the roster. Neither had a partner taking the pair the other way round yet, but neither should wait for one. Each now borrows one channel per statement.
+
+`directory_write_waits_for_metrics_read` in the same file is the test fixture. It holds a metrics borrow, as the maintainer does, and queues an openraft write behind it. Then it runs the code under test on its own thread, which blocks on the metrics behind that queued writer, and checks whether a gossip write can still land. Three tests use it: one each for `resolve_leader` and `leader_api_address`, and `forwarding_reads_the_metrics_without_holding_the_gossip_directory` for Pickle's forwarder. With the directory borrowed first, all three fail with "a gossip directory write waited for the metrics read". Every wait in the fixture has a timeout, so a regression fails the test instead of hanging it.

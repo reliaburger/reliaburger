@@ -1,0 +1,31 @@
+# A nightly job written as an inline script (process runtime).
+#
+# Bun writes the script to a temporary file, runs it with /bin/sh on the
+# host and removes it afterwards. This one backs up a Postgres database, so
+# it needs what a real backup needs: `pg_dump` and `gzip` on the node, a
+# reachable Postgres at pg.internal with a `backup` role, and the `ops`
+# namespace. It's a template to adapt, not something that runs on a laptop
+# as it stands.
+#
+# The node must allow /bin/sh in `[process_workloads] allowed_binaries`
+# (scripts run under it) and, on Linux, set `mount_isolation = false`. Apply
+# it with `relish apply`: GitOps refuses jobs.
+#
+# Deploy: relish apply examples/phase-8/proc-script-job.toml
+# It registers a cron schedule (03:00 UTC) and runs nothing until then.
+
+[namespace.ops]
+
+[job.db-backup]
+runtime = "process"
+script = """
+#!/bin/sh
+set -e
+echo "Starting database backup..."
+pg_dump -h pg.internal -U backup production > /tmp/backup.sql
+gzip /tmp/backup.sql
+echo "Backup complete: /tmp/backup.sql.gz"
+"""
+schedule = "0 3 * * *"
+namespace = "ops"
+task_timeout_secs = 3600

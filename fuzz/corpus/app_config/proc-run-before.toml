@@ -1,0 +1,34 @@
+# A migration that has to finish before its app starts (process runtime).
+#
+# `run_before = ["app.api"]` holds the api back until the migrate job has
+# exited 0. If the migration fails, the api keeps its old version and nothing
+# retries the migration by itself: a deployment hook gets one attempt. Apply
+# the job and the app it gates together, in one file.
+#
+# Both run on the host. Start Bun from the repository root with the process
+# runtime and the node config that allows /bin/echo and testapp:
+#
+#   cargo build --locked --bins
+#   target/debug/bun --runtime process --config examples/node/process-runtime.toml
+#   target/debug/relish apply examples/phase-8/proc-run-before.toml
+#   target/debug/relish logs migrate        # migrating the schema to v2
+#   target/debug/relish status              # api starts once migrate succeeded
+#
+# Swap /bin/echo for /bin/false (also allowed) to watch a failed migration
+# hold the api back.
+
+[job.migrate]
+runtime = "process"
+exec = "/bin/echo"
+command = ["migrating the schema to v2"]
+run_before = ["app.api"]
+
+[app.api]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8080"]
+port = 8080
+
+[app.api.health]
+path = "/healthz"
+interval = 2
+timeout = 1

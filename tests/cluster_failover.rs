@@ -146,6 +146,36 @@ impl Fixture {
         schedule: bool,
         operator: Option<reliaburger::sesame::types::ApiToken>,
     ) -> WiredNode {
+        self.start_node_with(index, seeds, schedule, operator, NodePlacement::default())
+            .await
+    }
+
+    /// Start a node that schedules, labelled `rack=<rack>`, whose API
+    /// leaves a dead peer out of cluster-wide reads once gossip says so.
+    async fn start_racked_node(
+        &mut self,
+        index: usize,
+        seeds: Vec<SocketAddr>,
+        operator: reliaburger::sesame::types::ApiToken,
+        rack: &str,
+    ) -> WiredNode {
+        let placement = NodePlacement {
+            labels: BTreeMap::from([("rack".to_string(), rack.to_string())]),
+            membership: Some(MembershipSource::Gossip),
+            test_operations: false,
+        };
+        self.start_node_with(index, seeds, true, Some(operator), placement)
+            .await
+    }
+
+    async fn start_node_with(
+        &mut self,
+        index: usize,
+        seeds: Vec<SocketAddr>,
+        schedule: bool,
+        operator: Option<reliaburger::sesame::types::ApiToken>,
+        placement: NodePlacement,
+    ) -> WiredNode {
         start_wired_node(WiredNodeOptions {
             name: format!("fo{index}"),
             gossip_port: self.gossip_port(index),
@@ -166,18 +196,30 @@ impl Fixture {
             lease_reaper: false,
             // The two worker nodes have no Raft view, so peers come from the
             // gossip directory.
-            membership: MembershipSource::Directory,
+            membership: placement.membership.unwrap_or(MembershipSource::Directory),
             service_identity: Some(RETIREMENT_SERVICE_TOKEN.into()),
             operator_token: operator,
-            fault_injection: false,
-            labels: Default::default(),
+            fault_injection: placement.test_operations,
+            labels: placement.labels,
             keep_data_dir: false,
             task_arrays: None,
             task_arrays_on_agent_budget: None,
             process_only: false,
+            council_size_cap: None,
         })
         .await
     }
+}
+
+/// Where a node sits: its labels, and where its API learns its peers.
+#[derive(Default)]
+struct NodePlacement {
+    labels: BTreeMap<String, String>,
+    /// The gossip directory when `None`.
+    membership: Option<MembershipSource>,
+    /// Serve the development test policy, which lets a client take test
+    /// leases.
+    test_operations: bool,
 }
 
 impl Drop for Fixture {
@@ -1258,4 +1300,866 @@ async fn decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_c
     );
     assert!(!state.test_leases.contains_key(&lease.lease_id));
     fixture.root.cancel();
+}
+
+/// POST `manifest` to `node`'s apply route as `bearer`, answering the
+/// status and body, or `None` when the node is gone.
+async fn post_apply(node: &WiredNode, bearer: &str, manifest: &str) -> Option<(u16, String)> {
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/v1/apply", node.api_port))
+        .bearer_auth(bearer)
+        .body(manifest.to_string())
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .ok()?;
+    let status = response.status().as_u16();
+    Some((status, response.text().await.unwrap_or_default()))
+}
+
+/// #1117: a leader killed while it applies apps under a policy leaves the
+/// policy in force. The new leader holds the same policy set at the same
+/// generation, refuses an app that breaks it, and accepts the interrupted
+/// apply when it's sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn a_leader_killed_during_an_apply_under_policy_leaves_the_policy_enforced() {
+    assert!(cluster_tests_enabled());
+    let operator = reliaburger::sesame::token::create_token(
+        "operator",
+        reliaburger::sesame::types::ApiRole::Admin,
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    let mut fixture = Fixture::new();
+    let mut nodes = vec![
+        fixture
+            .start_node(400, vec![], false, Some(operator.token.clone()))
+            .await,
+    ];
+    for index in 401..403 {
+        let seed = fixture.gossip(400);
+        nodes.push(
+            fixture
+                .start_node(index, vec![seed], false, Some(operator.token.clone()))
+                .await,
+        );
+    }
+    let (leader, survivors) = settled_roles(&nodes).await;
+
+    let policy = "[policy.no-latest]\ndeny = \"app.image.endsWith(':latest')\"\n";
+    let (status, body) = post_apply(&nodes[leader], &operator.plaintext, policy)
+        .await
+        .expect("the leader answers");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("policy no-latest: committed"), "{body}");
+
+    // Twenty pinned apps, applied while the leader is killed.
+    let apps: String = (0..20)
+        .map(|index| format!("[app.web-{index}]\nimage = 'web:v{index}'\n"))
+        .collect();
+    let interrupted = {
+        let api_port = nodes[leader].api_port;
+        let bearer = operator.plaintext.clone();
+        let apps = apps.clone();
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{api_port}/v1/apply"))
+                .bearer_auth(bearer)
+                .body(apps)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .ok()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    kill(&nodes[leader]).await;
+    let _ = interrupted.await;
+
+    let successor = wait_for_leader(&nodes, &survivors, Duration::from_secs(90)).await;
+    let state = nodes[successor].council.desired_state().await;
+    assert!(state.policies.contains_key("no-latest"));
+    assert_eq!(state.policy_generation, 1);
+
+    // The new leader enforces the same set.
+    let mut refused = None;
+    wait_until(
+        "the new leader judges an apply",
+        Duration::from_secs(60),
+        async || {
+            let leader = wait_for_leader(&nodes, &survivors, Duration::from_secs(30)).await;
+            refused = post_apply(
+                &nodes[leader],
+                &operator.plaintext,
+                "[app.bad]\nimage = 'bad:latest'\n",
+            )
+            .await;
+            refused.as_ref().is_some_and(|(status, _)| *status != 503)
+        },
+    )
+    .await;
+    let (status, body) = refused.unwrap();
+    assert_eq!(status, 422, "{body}");
+    assert!(
+        body.contains("policy no-latest denies app default/bad"),
+        "{body}"
+    );
+
+    // Sending the interrupted apply again commits every app, fenced on the
+    // generation the new leader holds.
+    let leader = wait_for_leader(&nodes, &survivors, Duration::from_secs(30)).await;
+    let (status, body) = post_apply(&nodes[leader], &operator.plaintext, &apps)
+        .await
+        .expect("the new leader answers");
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("\"Error\""), "{body}");
+    let state = nodes[leader].council.desired_state().await;
+    for index in 0..20 {
+        assert!(
+            state
+                .apps
+                .contains_key(&AppId::new(format!("web-{index}"), "default"))
+        );
+    }
+    assert!(!state.apps.contains_key(&AppId::new("bad", "default")));
+    fixture.root.cancel();
+}
+
+// --- The 0.2.4 exit test (#1126) and break-glass on a cluster (#1311) -------
+
+/// The four policies platform teams ask for most, exactly as published.
+const PLATFORM_POLICIES: &str = include_str!("../examples/policies/platform.toml");
+
+fn admin_token(name: &str) -> reliaburger::sesame::token::CreatedToken {
+    reliaburger::sesame::token::create_token(
+        name,
+        reliaburger::sesame::types::ApiRole::Admin,
+        Default::default(),
+        None,
+    )
+    .unwrap()
+}
+
+/// Give every node's API `token`, as `relish token create` would.
+async fn grant(nodes: &[WiredNode], token: &reliaburger::sesame::types::ApiToken) {
+    for node in nodes {
+        if let Some(store) = &node.token_store {
+            store.write().await.push(token.clone());
+        }
+    }
+}
+
+/// POST `manifest` to `/v1/apply` on whichever node in `among` leads, until
+/// one answers with something other than "no leader".
+async fn apply_on_leader(
+    nodes: &[WiredNode],
+    among: &[usize],
+    bearer: &str,
+    manifest: &str,
+) -> (u16, String) {
+    let mut answer = None;
+    wait_until(
+        "a leader answers an apply",
+        Duration::from_secs(90),
+        async || {
+            let leader = wait_for_leader(nodes, among, Duration::from_secs(60)).await;
+            answer = post_apply(&nodes[leader], bearer, manifest).await;
+            answer.as_ref().is_some_and(|(status, _)| *status != 503)
+        },
+    )
+    .await;
+    answer.unwrap()
+}
+
+/// POST `/v1/policies/{name}/delete` to `node` as `bearer`.
+async fn delete_policy(node: &WiredNode, bearer: &str, name: &str) -> Option<(u16, String)> {
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{}/v1/policies/{name}/delete",
+            node.api_port
+        ))
+        .bearer_auth(bearer)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .ok()?;
+    let status = response.status().as_u16();
+    Some((status, response.text().await.unwrap_or_default()))
+}
+
+fn run_git(dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "exit-test")
+        .env("GIT_AUTHOR_EMAIL", "exit-test@example.com")
+        .env("GIT_COMMITTER_NAME", "exit-test")
+        .env("GIT_COMMITTER_EMAIL", "exit-test@example.com")
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+}
+
+fn commit(repository: &std::path::Path, file: &str, contents: &str, message: &str) {
+    std::fs::write(repository.join(file), contents).unwrap();
+    run_git(repository, &["add", "."]);
+    run_git(repository, &["commit", "-q", "-m", message]);
+}
+
+/// Run the GitOps loop on every node, as `bun --cluster` does: only the
+/// leader syncs, so a new leader carries on where a killed one stopped.
+/// Each loop stops with its node. Hold the returned senders, the webhook
+/// channels, until the test ends.
+fn start_gitops(
+    nodes: &[WiredNode],
+    repository: &std::path::Path,
+    data: &std::path::Path,
+) -> Vec<tokio::sync::mpsc::Sender<()>> {
+    nodes
+        .iter()
+        .map(|node| {
+            let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(4);
+            reliaburger::lettuce::runner::spawn_gitops_sync(
+                std::sync::Arc::clone(&node.council),
+                Some(reliaburger::lettuce::types::GitOpsConfig {
+                    repo: repository.to_string_lossy().to_string(),
+                    branch: "main".to_string(),
+                    path: "/".to_string(),
+                    poll_interval_secs: 1,
+                    require_signed_commits: false,
+                    trusted_signing_keys: vec![],
+                    webhook_secret: None,
+                    webhook_rate_limit: 10,
+                }),
+                webhook_rx,
+                data.join(&node.name),
+                node.shutdown.clone(),
+                None,
+            );
+            webhook_tx
+        })
+        .collect()
+}
+
+/// The `TEAM` a stored app runs with, if any.
+fn team_of(state: &reliaburger::council::types::DesiredState, app: &AppId) -> Option<String> {
+    let spec = serde_json::to_value(state.apps.get(app)?).ok()?;
+    spec["env"]["TEAM"].as_str().map(str::to_string)
+}
+
+/// The leader's last GitOps error, read from whichever node in `among`
+/// leads, and whether `app` is in its desired state.
+async fn gitops_outcome(nodes: &[WiredNode], among: &[usize], app: &AppId) -> (bool, String) {
+    let Some(leader) = leader_of(nodes, among).await else {
+        return (false, String::new());
+    };
+    let state = nodes[leader].council.desired_state().await;
+    let error = state
+        .gitops_sync_state
+        .as_ref()
+        .and_then(|sync| sync.last_error.clone())
+        .unwrap_or_default();
+    (state.apps.contains_key(app), error)
+}
+
+/// #1126, the exit test's first two items: the four platform policies,
+/// written in TOML and applied unchanged, enforced through both `relish
+/// apply` and GitOps, and still enforced, at the same generation, by the
+/// leader that takes over when the first is killed during an apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn the_platform_policies_hold_through_apply_gitops_and_a_leader_kill() {
+    assert!(cluster_tests_enabled());
+    let operator = admin_token("operator");
+    let mut fixture = Fixture::new();
+    let mut nodes = vec![
+        fixture
+            .start_node(500, vec![], false, Some(operator.token.clone()))
+            .await,
+    ];
+    for index in 501..503 {
+        let seed = fixture.gossip(500);
+        nodes.push(
+            fixture
+                .start_node(index, vec![seed], false, Some(operator.token.clone()))
+                .await,
+        );
+    }
+    let (leader, followers) = settled_roles(&nodes).await;
+    let admin = operator.plaintext.as_str();
+
+    let (status, body) = post_apply(&nodes[leader], admin, "[namespace.prod]\n")
+        .await
+        .expect("the leader answers");
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post_apply(&nodes[leader], admin, PLATFORM_POLICIES)
+        .await
+        .expect("the leader answers");
+    assert_eq!(status, 200, "{body}");
+    for policy in [
+        "no-latest",
+        "prod-needs-memory-limits",
+        "team-env",
+        "trusted-registries",
+    ] {
+        assert!(
+            body.contains(&format!("policy {policy}: committed")),
+            "{body}"
+        );
+    }
+    let generation = nodes[leader]
+        .council
+        .desired_state()
+        .await
+        .policy_generation;
+
+    // Through `relish apply`, sent to a follower, which passes the apply
+    // and the caller's token to the leader: each rule refuses its case.
+    let refusals = [
+        (
+            "[app.web]\nnamespace = 'prod'\nimage = 'registry.example.com/web:1.4'\n",
+            "policy prod-needs-memory-limits denies app prod/web",
+        ),
+        (
+            "[app.web]\nimage = 'registry.example.com/web:latest'\n",
+            "policy no-latest denies app default/web",
+        ),
+        (
+            "[app.web]\nimage = 'docker.io/library/nginx:1.27'\n",
+            "policy trusted-registries denies app default/web",
+        ),
+        (
+            "[app.web]\nimage = 'registry.example.com/web:1.4'\nenv = { TEAM = '' }\n",
+            "policy team-env denies app default/web",
+        ),
+    ];
+    for (manifest, denial) in refusals {
+        let (status, body) = post_apply(&nodes[followers[0]], admin, manifest)
+            .await
+            .expect("the follower answers");
+        assert_eq!(status, 422, "{manifest}: {body}");
+        assert!(body.contains(denial), "{denial}: {body}");
+    }
+    let (status, body) = post_apply(
+        &nodes[followers[1]],
+        admin,
+        "[app.web]\nnamespace = 'prod'\nimage = 'registry.example.com/web:1.4'\nmemory = '256Mi-1Gi'\n",
+    )
+    .await
+    .expect("the follower answers");
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("policy team-env fills env.TEAM = \\\"platform\\\""),
+        "{body}"
+    );
+    let state = nodes[leader].council.desired_state().await;
+    let web = AppId::new("web", "prod");
+    assert_eq!(team_of(&state, &web).as_deref(), Some("platform"));
+    assert!(
+        state.declared_apps.contains_key(&web),
+        "the declared spec is kept beside the filled one"
+    );
+
+    // Through GitOps: a commit with three apps lands the one that passes
+    // and names the policy that refused each of the others.
+    let repository = tempfile::tempdir().unwrap();
+    run_git(repository.path(), &["init", "-q", "-b", "main"]);
+    commit(
+        repository.path(),
+        "apps.toml",
+        "[app.api]\nnamespace = 'prod'\nimage = 'ghcr.io/example/api:2.0'\nmemory = '128Mi'\n\n\
+         [app.mirror]\nimage = 'docker.io/library/nginx:1.27'\n\n\
+         [app.untagged]\nimage = 'registry.example.com/untagged'\n",
+        "three apps",
+    );
+    let gitops_data = tempfile::tempdir().unwrap();
+    let _webhooks = start_gitops(&nodes, repository.path(), gitops_data.path());
+    let api = AppId::new("api", "prod");
+    let mut last_error = String::new();
+    wait_until(
+        "GitOps reports its partial result",
+        Duration::from_secs(60),
+        async || {
+            let (landed, error) = gitops_outcome(&nodes, &[0, 1, 2], &api).await;
+            last_error = error;
+            landed && last_error.contains("untagged")
+        },
+    )
+    .await;
+    assert!(
+        last_error.contains("app.default/mirror: denied by policy trusted-registries"),
+        "{last_error}"
+    );
+    assert!(
+        last_error.contains("app.default/untagged: denied by policy no-latest"),
+        "{last_error}"
+    );
+    let leader = wait_for_leader(&nodes, &[0, 1, 2], Duration::from_secs(30)).await;
+    let state = nodes[leader].council.desired_state().await;
+    assert_eq!(team_of(&state, &api).as_deref(), Some("platform"));
+    assert!(!state.apps.contains_key(&AppId::new("mirror", "default")));
+    let survivors: Vec<usize> = (0..3).filter(|&index| index != leader).collect();
+
+    // Kill the leader while it applies twenty apps under the policies.
+    let apps: String = (0..20)
+        .map(|index| {
+            format!("[app.batch-{index}]\nimage = 'registry.example.com/batch:v{index}'\n")
+        })
+        .collect();
+    let interrupted = {
+        let api_port = nodes[leader].api_port;
+        let bearer = operator.plaintext.clone();
+        let apps = apps.clone();
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{api_port}/v1/apply"))
+                .bearer_auth(bearer)
+                .body(apps)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .ok()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    kill(&nodes[leader]).await;
+    let _ = interrupted.await;
+
+    // The new leader holds the same four policies at the same generation.
+    let successor = wait_for_leader(&nodes, &survivors, Duration::from_secs(90)).await;
+    let state = nodes[successor].council.desired_state().await;
+    assert_eq!(state.policies.len(), 4, "{:?}", state.policies.keys());
+    assert_eq!(state.policy_generation, generation);
+
+    // It refuses through `relish apply`...
+    let (status, body) = apply_on_leader(
+        &nodes,
+        &survivors,
+        admin,
+        "[app.bad]\nimage = 'registry.example.com/bad:latest'\n",
+    )
+    .await;
+    assert_eq!(status, 422, "{body}");
+    assert!(
+        body.contains("policy no-latest denies app default/bad"),
+        "{body}"
+    );
+
+    // ...and through GitOps, whose loop on the new leader picks up the
+    // next commit.
+    commit(
+        repository.path(),
+        "more.toml",
+        "[app.worker]\nimage = 'registry.example.com/worker:3'\n\n\
+         [app.drifter]\nimage = 'registry.example.com/drifter:latest'\n",
+        "two more apps",
+    );
+    let worker = AppId::new("worker", "default");
+    wait_until(
+        "the new leader's GitOps sync",
+        Duration::from_secs(60),
+        async || {
+            let (landed, error) = gitops_outcome(&nodes, &survivors, &worker).await;
+            last_error = error;
+            landed && last_error.contains("drifter")
+        },
+    )
+    .await;
+    assert!(
+        last_error.contains("app.default/drifter: denied by policy no-latest"),
+        "{last_error}"
+    );
+
+    // Sending the interrupted apply again commits every app, each with
+    // its team filled in.
+    let (status, body) = apply_on_leader(&nodes, &survivors, admin, &apps).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("\"Error\""), "{body}");
+    let leader = wait_for_leader(&nodes, &survivors, Duration::from_secs(30)).await;
+    let state = nodes[leader].council.desired_state().await;
+    for index in 0..20 {
+        let app = AppId::new(format!("batch-{index}"), "default");
+        assert_eq!(
+            team_of(&state, &app).as_deref(),
+            Some("platform"),
+            "{app:?}"
+        );
+    }
+    assert!(!state.apps.contains_key(&AppId::new("bad", "default")));
+    assert!(!state.apps.contains_key(&AppId::new("drifter", "default")));
+    fixture.root.cancel();
+}
+
+/// #1311 item 3 and the exit test's break-glass: a policy that denies
+/// everything refuses every app and job, for admins too, but never a
+/// policy write. With its leader killed, an admin removes it through a
+/// follower of the new leader, and applies work again. A deployer can't
+/// remove it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn an_admin_removes_a_policy_that_denies_everything_through_any_node() {
+    assert!(cluster_tests_enabled());
+    let operator = admin_token("operator");
+    let mut fixture = Fixture::new();
+    let mut nodes = vec![
+        fixture
+            .start_node(600, vec![], false, Some(operator.token.clone()))
+            .await,
+    ];
+    for index in 601..603 {
+        let seed = fixture.gossip(600);
+        nodes.push(
+            fixture
+                .start_node(index, vec![seed], false, Some(operator.token.clone()))
+                .await,
+        );
+    }
+    let deployer = reliaburger::sesame::token::create_token(
+        "ci",
+        reliaburger::sesame::types::ApiRole::Deployer,
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    grant(&nodes, &deployer.token).await;
+    let (leader, followers) = settled_roles(&nodes).await;
+    let admin = operator.plaintext.as_str();
+
+    let broken = "[policy.broken]\napplies_to = 'both'\ndeny = 'true'\nmessage = 'a typo that denies everything'\n";
+    let (status, body) = post_apply(&nodes[followers[0]], admin, broken)
+        .await
+        .expect("the follower answers");
+    assert_eq!(status, 200, "{body}");
+
+    let app = "[app.web]\nimage = 'registry.example.com/web:1'\n";
+    let job = "[job.report]\nimage = 'registry.example.com/report:1'\ncommand = ['report']\n";
+    for (bearer, manifest, denial) in [
+        (
+            deployer.plaintext.as_str(),
+            app,
+            "policy broken denies app default/web",
+        ),
+        (admin, app, "policy broken denies app default/web"),
+        (admin, job, "policy broken denies job default/report"),
+    ] {
+        let (status, body) = post_apply(&nodes[followers[1]], bearer, manifest)
+            .await
+            .expect("the follower answers");
+        assert_eq!(status, 422, "{manifest}: {body}");
+        assert!(body.contains(denial), "{denial}: {body}");
+    }
+    // A policy never judges a policy, so policy writes still work.
+    let (status, body) = post_apply(
+        &nodes[followers[1]],
+        admin,
+        "[policy.harmless]\naction = 'warn'\ndeny = 'false'\n",
+    )
+    .await
+    .expect("the follower answers");
+    assert_eq!(status, 200, "{body}");
+
+    kill(&nodes[leader]).await;
+    let successor = wait_for_leader(&nodes, &followers, Duration::from_secs(90)).await;
+    let follower = followers
+        .into_iter()
+        .find(|&index| index != successor)
+        .expect("two survivors");
+
+    // Only an admin may remove it.
+    let (status, body) = delete_policy(&nodes[follower], &deployer.plaintext, "broken")
+        .await
+        .expect("the follower answers");
+    assert_eq!(status, 403, "{body}");
+    let mut answer = None;
+    wait_until(
+        "the policy delete reaches the new leader",
+        Duration::from_secs(60),
+        async || {
+            answer = delete_policy(&nodes[follower], admin, "broken").await;
+            answer.as_ref().is_some_and(|(status, _)| *status != 503)
+        },
+    )
+    .await;
+    let (status, body) = answer.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"deleted\""), "{body}");
+
+    let (status, body) =
+        apply_on_leader(&nodes, &[successor, follower], &deployer.plaintext, app).await;
+    assert_eq!(status, 200, "{body}");
+    for index in [successor, follower] {
+        let node = &nodes[index];
+        wait_until(
+            "both survivors apply the delete",
+            Duration::from_secs(30),
+            async || {
+                let state = node.council.desired_state().await;
+                !state.policies.contains_key("broken")
+                    && state.policies.contains_key("harmless")
+                    && state.apps.contains_key(&AppId::new("web", "default"))
+            },
+        )
+        .await;
+    }
+    fixture.root.cancel();
+}
+
+// The example controller, compiled in as the portable suite does: it
+// imports nothing from `reliaburger`, only HTTP and JSON.
+#[allow(dead_code)]
+#[path = "../examples/controller/main.rs"]
+mod controller;
+
+const POSTGRES_PAIR: &str = include_str!("../examples/controller/postgres-pair.toml");
+
+/// The published Postgres pair template with a stand-in for Postgres. The
+/// fixture's nodes run each container's command as a host process and pull
+/// nothing, so the image can't run, and a host process can't enforce a
+/// memory limit, so the template's limit has to go too. The stand-in keeps
+/// the rest of the shape, one instance per member, a port, pinned to its
+/// rack, owned by the controller, and runs `sleep`. Its image comes from a
+/// registry the platform policies trust, so the controller's writes pass
+/// them.
+fn stand_in_pair() -> String {
+    let image = "image = \"postgres:${version}\"\n";
+    let memory = "memory = \"256Mi-1Gi\"\n";
+    assert!(
+        POSTGRES_PAIR.contains(image),
+        "the template's image line moved"
+    );
+    assert!(
+        POSTGRES_PAIR.contains(memory),
+        "the template's memory line moved"
+    );
+    POSTGRES_PAIR.replace(memory, "").replace(
+        image,
+        "image = \"registry.example.com/postgres:${version}\"\ncommand = [\"/bin/sleep\", \"600\"]\n",
+    )
+}
+
+/// The node, by name, whose report lists `app` running, as the leader in
+/// `among` sees it.
+async fn running_on(nodes: &[WiredNode], among: &[usize], app: &str) -> Option<String> {
+    node_running_app(&leader_state(nodes, among).await?, app)
+}
+
+/// How often the test's controller checks. The example checks every five
+/// seconds; with `CHECK_THRESHOLD` misses in a row before a failover, a
+/// fresh app gets about fifteen seconds to be placed and started, which a
+/// new leader's learning period needs.
+const CHECK_INTERVAL: Duration = Duration::from_secs(2);
+const CHECK_THRESHOLD: u32 = 7;
+
+/// Wait one interval, then check once with the controller, logging what it
+/// decided.
+async fn check_once(
+    controller: &mut controller::Controller,
+    api: &controller::Api,
+) -> Option<controller::Decision> {
+    tokio::time::sleep(CHECK_INTERVAL).await;
+    match controller.reconcile(api).await {
+        Ok(decision) => {
+            eprintln!("controller: {decision:?}");
+            Some(decision)
+        }
+        Err(error) => {
+            eprintln!("controller: {error}");
+            None
+        }
+    }
+}
+
+/// #1126, the exit test's third item: a template plus a small external
+/// controller that fails over a replica, against the public API only.
+///
+/// The controller is `examples/controller/main.rs`, driving the template in
+/// `examples/controller/postgres-pair.toml`, with a stand-in for Postgres
+/// (see [`stand_in_pair`]). Its token is scoped to `pg`, and the platform
+/// policies are in force. It starts `db-a` on rack `a`; when the node on
+/// rack `a` is killed, `db-a` has nowhere to run, and after
+/// `CHECK_THRESHOLD` missed checks the controller applies `db-b`, which
+/// runs on rack `b`, and deletes `db-a`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn a_controller_fails_a_templated_database_pair_over_when_its_node_dies() {
+    assert!(cluster_tests_enabled());
+    let operator = admin_token("operator");
+    let mut fixture = Fixture::new();
+    let mut nodes = vec![
+        fixture
+            .start_racked_node(700, vec![], operator.token.clone(), "a")
+            .await,
+    ];
+    for (index, rack) in [(701, "b"), (702, "c")] {
+        let seed = fixture.gossip(700);
+        nodes.push(
+            fixture
+                .start_racked_node(index, vec![seed], operator.token.clone(), rack)
+                .await,
+        );
+    }
+    let scoped = reliaburger::sesame::token::create_token(
+        "db-failover",
+        reliaburger::sesame::types::ApiRole::Deployer,
+        reliaburger::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["pg".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    grant(&nodes, &scoped.token).await;
+    settled_roles(&nodes).await;
+    let (status, body) = apply_on_leader(
+        &nodes,
+        &[0, 1, 2],
+        &operator.plaintext,
+        &format!("[namespace.pg]\n{PLATFORM_POLICIES}"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // The controller talks to the node on rack b, which survives.
+    let api = controller::Api::new(controller::Settings {
+        endpoint: format!("http://127.0.0.1:{}", nodes[1].api_port),
+        token: scoped.plaintext.clone(),
+        ca_cert: None,
+        name: "db-failover".to_string(),
+        namespace: "pg".to_string(),
+        manifest: stand_in_pair(),
+        threshold: CHECK_THRESHOLD,
+    })
+    .unwrap();
+    let mut db_failover = controller::Controller::default();
+
+    wait_until(
+        "the controller starts db-a, running on rack a",
+        Duration::from_secs(60),
+        async || {
+            let decision = check_once(&mut db_failover, &api).await;
+            matches!(decision, Some(controller::Decision::Wait { .. }))
+                && running_on(&nodes, &[0, 1, 2], "db-a").await.as_deref()
+                    == Some(nodes[0].name.as_str())
+        },
+    )
+    .await;
+
+    kill(&nodes[0]).await;
+    let db_a = AppId::new("db-a", "pg");
+    let db_b = AppId::new("db-b", "pg");
+    wait_until(
+        "the controller fails over to db-b, running on rack b",
+        Duration::from_secs(150),
+        async || {
+            check_once(&mut db_failover, &api).await;
+            let state = nodes[1].council.desired_state().await;
+            !state.apps.contains_key(&db_a)
+                && state.apps.contains_key(&db_b)
+                && running_on(&nodes, &[1, 2], "db-b").await.as_deref()
+                    == Some(nodes[1].name.as_str())
+        },
+    )
+    .await;
+
+    let state = nodes[1].council.desired_state().await;
+    let spec = &state.apps[&db_b];
+    assert_eq!(spec.owner.as_deref(), Some("db-failover"));
+    assert_eq!(
+        spec.provenance.as_ref().map(|p| p.template.as_str()),
+        Some("postgres-member")
+    );
+    assert_eq!(
+        team_of(&state, &db_b).as_deref(),
+        Some("platform"),
+        "the controller's write is judged by the cluster's policies"
+    );
+    // Steady again: the standby runs, so the next check changes nothing.
+    assert!(matches!(
+        check_once(&mut db_failover, &api).await,
+        Some(controller::Decision::Wait { .. })
+    ));
+    fixture.root.cancel();
+}
+
+/// #1399: four clients take, renew, read and release test leases through
+/// all three nodes while the leader is killed part-way, recording every
+/// operation; the history must check as linearizable. The same test with
+/// a deliberately broken read (a follower answering from its own copy
+/// without confirming leadership) fails the check: see "Checking the
+/// history, not just the invariants" in docs/testing.md.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1, a multi-core host and python3; run with make test-cluster"]
+async fn a_lease_history_through_a_leader_kill_is_linearizable() {
+    assert!(cluster_tests_enabled());
+    let operator = admin_token("history");
+    let mut fixture = Fixture::new();
+    let leases = || NodePlacement {
+        test_operations: true,
+        ..NodePlacement::default()
+    };
+    let mut nodes = vec![
+        fixture
+            .start_node_with(500, vec![], false, Some(operator.token.clone()), leases())
+            .await,
+    ];
+    for index in 501..503 {
+        let seed = fixture.gossip(500);
+        nodes.push(
+            fixture
+                .start_node_with(
+                    index,
+                    vec![seed],
+                    false,
+                    Some(operator.token.clone()),
+                    leases(),
+                )
+                .await,
+        );
+    }
+    let (leader, _) = settled_roles(&nodes).await;
+
+    let token_file = fixture.data.path().join("history-token");
+    std::fs::write(&token_file, &operator.plaintext).unwrap();
+    let history = fixture.data.path().join("council-history.jsonl");
+    let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/release");
+    let mut client = tokio::process::Command::new("python3");
+    client
+        .arg(scripts.join("council_history.py"))
+        .args(["run", "--clients", "4", "--pause", "0.05", "--timeout", "5"])
+        .args(["--duration", "40", "--history"])
+        .arg(&history)
+        .arg("--token-file")
+        .arg(&token_file)
+        .kill_on_drop(true);
+    for node in &nodes {
+        client
+            .arg("--node")
+            .arg(format!("{}={}", node.name, node.api_port));
+    }
+    let mut client = client.spawn().expect("python3 runs the history client");
+
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    kill(&nodes[leader]).await;
+    let finished = tokio::time::timeout(Duration::from_secs(120), client.wait())
+        .await
+        .expect("the history client stops after its duration")
+        .unwrap();
+    assert!(finished.success(), "history client exited with {finished}");
+
+    let checked = tokio::process::Command::new("python3")
+        .arg(scripts.join("linearizability.py"))
+        .arg("check")
+        .arg(&history)
+        .output()
+        .await
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&checked.stdout)
+        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&checked.stderr)));
+    assert_eq!(result["verdict"], "linearizable", "{result:#}");
+    assert!(
+        result["checked"].as_u64().unwrap_or(0) > 200,
+        "too few operations checked: {result:#}"
+    );
 }

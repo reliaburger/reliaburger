@@ -4,17 +4,29 @@ name: Stage candidate
 # `staging-v<version>-<run>-<attempt>` tag, so the real `curl ... | sh` install
 # can run against it before promotion (RELIABURGER_RELEASE_BASE_URL). Nothing
 # is tagged `v<version>` and nothing is marked latest; promote.yml does that.
+#
+# With channel=nightly it stages a release train's nightly build instead
+# (#1363): a manual Build & Release run on a `release-*` branch, signed with
+# the nightly key, under a `nightly-v<version>-<run>-<attempt>` tag that the
+# website installer refuses. The same run deletes all but the newest seven
+# nightly pre-releases.
 on:
   workflow_dispatch:
     inputs:
       candidate_run:
-        description: Successful manual Build & Release run on main that produced the candidate
+        description: Successful manual Build & Release run (on main, or on a release-* train for a nightly)
         required: true
         type: string
       qualified_digest:
         description: SHA-256 of candidate.json from that run's job summary
         required: true
         type: string
+      channel:
+        description: release (a candidate built on main) or nightly (a train's nightly build)
+        required: true
+        type: choice
+        options: [release, nightly]
+        default: release
 
 permissions:
   contents: read
@@ -36,6 +48,7 @@ jobs:
       RELEASE_REPOSITORY: ${{ github.repository }}
       CANDIDATE_RUN: ${{ inputs.candidate_run }}
       QUALIFIED_DIGEST: ${{ inputs.qualified_digest }}
+      CHANNEL: ${{ inputs.channel }}
     steps:
       # Scripts come from main, like promotion: this job holds a write token.
       - uses: actions/checkout@v4
@@ -43,11 +56,22 @@ jobs:
         run: |
           python3 scripts/release/candidate.py stage-fetch --directory dist \
             --repository "$RELEASE_REPOSITORY" --run-id "$CANDIDATE_RUN" \
-            --qualified-digest "$QUALIFIED_DIGEST"
+            --qualified-digest "$QUALIFIED_DIGEST" --channel "$CHANNEL"
       - name: Publish unchanged assets as a staging pre-release
         run: |
           base=$(python3 scripts/release/candidate.py stage --directory dist \
             --repository "$RELEASE_REPOSITORY" --run-id "$CANDIDATE_RUN" \
-            --qualified-digest "$QUALIFIED_DIGEST")
-          printf 'Staged base URL: `%s`\n\nQualify with:\n\n```sh\nscripts/release/qualify-staged-install.sh --base-url %s --qualified-digest %s\n```\n' \
-            "$base" "$base" "$QUALIFIED_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+            --qualified-digest "$QUALIFIED_DIGEST" --channel "$CHANNEL")
+          if [ "$CHANNEL" = nightly ]; then
+            printf 'Staged base URL: `%s`\n\nQualify the train tip with:\n\n```sh\nscripts/release/nightly-qualify.sh --train TRAIN --base-url %s --qualified-digest %s\n```\n' \
+              "$base" "$base" "$QUALIFIED_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'Staged base URL: `%s`\n\nQualify with:\n\n```sh\nscripts/release/qualify-staged-install.sh --base-url %s --qualified-digest %s\n```\n' \
+              "$base" "$base" "$QUALIFIED_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Delete all but the newest seven nightly pre-releases
+        # Only nightly-* pre-releases; releases and staging candidates are never touched.
+        if: inputs.channel == 'nightly'
+        run: |
+          python3 scripts/release/candidate.py prune-nightly \
+            --repository "$RELEASE_REPOSITORY" --keep 7

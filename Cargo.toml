@@ -1,6 +1,6 @@
 [package]
 name = "reliaburger"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -93,6 +93,8 @@ pulldown-cmark = "0.13.4"
 nucleo-matcher = "0.3.1"
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 libc = "0.2"
+# `[policy.*]` expressions (#1117). No chrono: policies see no clock.
+cel = { version = "0.15", default-features = false, features = ["regex"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.14", optional = true }
@@ -102,6 +104,12 @@ aya-log = { version = "0.3", optional = true }
 default = ["kubernetes"]
 kubernetes = ["dep:k8s-openapi"]
 ebpf = ["aya", "aya-log"]
+# A release train's nightly build (build.yml on `release-*`, #1363) trusts the
+# nightly signing key instead of the release keys. Never in a release build.
+nightly-signing = []
+# The fuzz target bodies in `src/fuzz/`, for the `fuzz/` crate (#1398).
+# Nothing else turns it on, so no binary carries them.
+fuzzing = []
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
@@ -125,6 +133,14 @@ tower = { version = "0.5", features = ["util"] }
 [profile.release]
 strip = true
 codegen-units = 1
+
+# The hollow-node harness (#1401) measures optimised code, but nothing built
+# with this profile ships. Sixteen codegen units build it in a fraction of
+# the release profile's time, at a small cost in speed.
+[profile.hollow]
+inherits = "release"
+codegen-units = 16
+strip = false
 
 [profile.dev]
 debug = "line-tables-only"
@@ -178,4 +194,8 @@ harness = false
 
 [[bench]]
 name = "scheduler"
+harness = false
+
+[[bench]]
+name = "policy"
 harness = false

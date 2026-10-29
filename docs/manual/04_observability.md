@@ -75,6 +75,17 @@ its data directory, because such a cap would never prune before the disk
 filled. Singleton jobs stream their output into the log store, so a busy job
 node reaches the log cap well within the seven days.
 
+The store's caps cover the store. Each running instance also has its raw
+capture files under the data directory's `instances/`, which the app writes
+into directly. Once the store has saved a stretch of output to disk, Bun hands
+those bytes of the capture back to the filesystem. It keeps the last mebibyte
+of each stream, for `relish logs -f` to start from, and anything not saved
+yet (the store saves once a minute). So a chatty app costs its node the
+store's copy plus a mebibyte or so, not everything it ever printed. The capture file's size, as `ls` shows it, still counts everything;
+`du` shows what it really takes. This needs a filesystem that can punch holes
+in a file (ext4, XFS, Btrfs and APFS can); on one that can't, the capture
+grows until the instance stops.
+
 Exported Parquet archives answer SQL:
 
 ```sh
@@ -218,8 +229,9 @@ relish events --app web --severity warning --limit 20
 `relish events` asks every live node for its events and merges them by time,
 oldest first, with each event's node; a node that doesn't answer is named on
 stderr. `--severity` keeps events at least that severe (`info`, `warning`,
-`critical`) and `-o json` prints the API's answer. Reading events needs a
-token that isn't scoped to some apps or namespaces.
+`critical`) and `-o json` prints the API's answer. A token scoped to some
+apps or namespaces sees only the events about them, and none that name no
+namespace (see `writing-a-controller`).
 
 The TUI shows apps, nodes, jobs, routes, live logs and events; press `?`
 inside for keys. It needs a terminal of at least 80×24.

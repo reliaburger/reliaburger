@@ -378,6 +378,7 @@ pub(super) async fn rollback_handler(
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
     Query(query): Query<super::apps::ForceQuery>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(resp) =
         crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
@@ -397,6 +398,18 @@ pub(super) async fn rollback_handler(
     .await
     {
         return resp;
+    }
+    // Who may roll back comes before whether we can (#1125).
+    if let Some(council) = &state.council
+        && let Some(refusal) = super::apply::owner_command_refusal(
+            council,
+            auth.as_deref(),
+            &crate::meat::AppId::new(&app, &namespace),
+            "roll back",
+        )
+        .await
+    {
+        return refusal;
     }
     if state.deploy_history.is_none() {
         return (
@@ -460,6 +473,9 @@ pub(super) async fn rollback_handler(
     // it. Those belong to the placement, not the spec, and an apply refuses
     // them; the leader numbers the replicas again (#398).
     spec.ordinals = None;
+    // Who manages the app isn't part of its version: the rollback keeps
+    // today's owner, whatever the old spec said (#1125).
+    spec.owner = current.as_ref().and_then(|current| current.owner.clone());
     // Re-apply the previous spec through the standard deploy path.
     let mut config = Config::default();
     config.app.insert(app.clone(), spec);
@@ -473,9 +489,14 @@ pub(super) async fn rollback_handler(
             config,
             raw,
             None,
-            HeaderMap::new(),
+            // A follower forwards the re-apply as the caller, so the
+            // leader's owner rules judge it against the leader's state
+            // (the spec declares today's owner) and the caller's token
+            // (#1442).
+            headers,
             None,
             binder,
+            auth.map(|extension| extension.0),
         )
         .await;
     }

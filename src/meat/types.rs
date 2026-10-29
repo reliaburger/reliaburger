@@ -224,8 +224,9 @@ pub enum UnplacedReason {
     /// process` (#914).
     NoContainerRuntime,
     /// No ready node with the labels can enforce what the app needs: an
-    /// egress allowlist, internal DNS, or its host binary in
-    /// `[process_workloads] allowed_binaries`.
+    /// egress allowlist, internal DNS, its host binary in
+    /// `[process_workloads] allowed_binaries`, its secret providers, or its
+    /// runtime knobs in `[runtime]` (#1122).
     NoCapableNode,
     /// Every node that could run it is short of CPU, memory or GPUs.
     NoRoom,
@@ -240,7 +241,8 @@ impl fmt::Display for UnplacedReason {
                 "no ready node has a container runtime to run its image"
             }
             UnplacedReason::NoCapableNode => {
-                "no ready node can enforce its egress or DNS needs or run its host binary"
+                "no ready node can enforce its egress or DNS needs, run its host binary, \
+                 call its secret providers or allow its runtime knobs"
             }
             UnplacedReason::NoRoom => "no node that can run it has room",
         })

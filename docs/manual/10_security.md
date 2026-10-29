@@ -70,7 +70,9 @@ scope; a scoped token can't push or pull a bare name like `api` at all (see
 `images-and-volumes`). Some
 operations need cluster-wide authority, so only an *unscoped* admin can manage
 tokens and join tokens, rotate secrets, sign images, decommission nodes, clear
-every fault, or apply `[namespace]` and `[permission]` declarations.
+every fault, or apply `[namespace]` and `[permission]` declarations. A
+`deployer` scoped to one namespace is what a controller runs with
+(`writing-a-controller`).
 
 `create` prints the plaintext token once, on stdout, and the cluster keeps
 only a hash, so `TOKEN="$(relish token create ...)"` captures it. Its expiry
@@ -183,7 +185,7 @@ do only what the block lists:
 | `deploy` | apply, delete and roll back the listed apps, cancel their deploys, create, restore and delete their volume snapshots, and `relish build` images that push to them |
 | `scale` | stop the listed apps |
 | `exec` | `relish exec` into the listed apps |
-| `host-exec` | jobs and process workloads that run host commands, and apps with a host-path `source` on a volume or `config_file` (each node also needs an allowlist entry, and mounts the resolved path it checked; see `images-and-volumes`) |
+| `host-exec` | jobs and process workloads that run host commands, apps with a host-path `source` on a volume or `config_file` (each node also needs an allowlist entry, and mounts the resolved path it checked; see `images-and-volumes`), and apps with `[runtime]` knobs (each node also lists each knob; see "Runtime knobs" below) |
 | `fault` | `relish fault` inject and clear on the listed apps; node faults and clearing every fault need it with `apps = ["*"]` and no `namespaces` |
 | `logs` | the listed apps' logs: `relish logs`, follow, WebSocket stream, entries |
 | `metrics` | the listed apps' metrics and charts, and their rows in `relish top` |
@@ -242,6 +244,343 @@ which is less than an anonymous caller can already do in that window. The
 moment the cluster has a master key or a first token, both need the service
 token again.
 
+## Policies
+
+A policy is a rule every app applied to the cluster must pass, such as "apps
+in `prod` need a memory limit". You write it in TOML, next to your apps, and
+apply it like anything else:
+
+```toml
+[policy.prod-needs-limits]
+match = "app.namespace == 'prod'"
+deny = "!has(app.memory)"
+message = "apps in prod need a memory limit"
+
+[policy.no-latest]
+deny = "app.image.endsWith(':latest')"
+action = "warn"
+```
+
+`match` and `deny` are [CEL](https://github.com/google/cel-spec)
+expressions, the language Kubernetes uses for ValidatingAdmissionPolicy. When
+`match` is true (or absent) and `deny` is true, the apply is refused with
+`message`. With `action = "warn"` it goes ahead, and `relish apply` prints the
+warning. With `action = "audit"` it goes ahead without a word to the caller,
+and the finding is recorded in the audit log as `policy.audited`. Without a
+`message`, the refusal says which policy it broke.
+
+An expression sees three things and nothing else:
+
+| Name | What it holds |
+|------|---------------|
+| `app` | The app's spec as you wrote it, every `[app.*]` field, plus `app.name` and `app.namespace` (`default` when the app names none). A field you didn't set is absent: test it with `has(app.memory)` |
+| `job` | The same for a job, every `[job.*]` field plus `job.name` and `job.namespace`, in a policy that applies to jobs |
+| `workload` | The app or job, with only the fields both have: `name`, `namespace`, `image`, `command`, `exec`, `script`, `memory`, `cpu`, `env`, `firewall` and `egress` |
+| `caller` | `caller.name`, the token's name, and `caller.role`: `admin`, `deployer`, `read-only`, or `system` for a GitOps sync |
+| `source` | `apply` or `gitops` |
+
+A policy judges apps unless it says otherwise. `applies_to` chooses:
+
+```toml
+[policy.pinned-jobs]
+applies_to = "jobs"            # apps (the default), jobs or both
+deny = "job.image.endsWith(':latest')"
+
+[policy.no-latest-anywhere]
+applies_to = "both"
+deny = "workload.image.endsWith(':latest')"
+```
+
+An apps policy sees `app` and `workload`, a jobs policy `job` and `workload`,
+and a policy for both only `workload`. Policies never judge other policies,
+permissions or namespaces. They judge a workload when it's applied: a new
+policy doesn't touch apps or jobs already running. `relish policy audit`
+shows which of them it would refuse.
+
+A job is judged however it arrives: `relish apply`, `relish run --batch`,
+`relish batch FILE`, `relish batch submit` (a task manifest) or `POST
+/v1/jobs/runs`. Each answers 422 when a deny policy refuses the job and
+prints a `warning:` line for each warn policy. `source` is `apply` on all of
+them.
+
+The cluster checks a policy when you apply it, and refuses one that:
+
+- has a name that isn't a lowercase DNS label;
+- has an empty `deny` or `match`, or one over 1024 bytes, or a `message` over
+  512 bytes;
+- isn't valid CEL;
+- nests `all`, `exists`, `exists_one`, `map` or `filter` more than two deep
+  (`app.args.all(a, app.args.exists_one(b, a == b))` is as deep as it goes),
+  because each level multiplies what the policy costs to run;
+- names anything other than `app`, `caller` and `source`, such as `policy`,
+  `permission` or `namespaces`;
+- reads a field `app` or `caller` doesn't have (`app.memroy`);
+- has neither a `deny` nor a `default`;
+- reads a workload variable its `applies_to` doesn't give it (`job` in an
+  apps policy, `app` in a policy for both), or a `workload` field apps and
+  jobs don't share;
+- has a `default` but doesn't apply to apps only;
+- has a `default` that's empty or over 4096 bytes, names a field an app
+  doesn't have (`memroy`, `deploy.max_unavaliable`) or one a default can't
+  fill (`namespace`, `replicas`, `sidecar`, `owner`, and the fields your
+  token's permissions gate: `exec`, `script`, `volumes`, `config_file`,
+  `init` and `runtime`), or gives a field a value of the wrong type
+  (`port = "eighty"`).
+
+An expression that fails while it runs, such as `app.memory == '1Gi'` on an
+app with no memory set, or a `deny` that isn't true or false, counts as
+broken: a deny policy refuses the app and says why, and a warn policy warns.
+So does a workload with a list or map of more than 1,024 entries (`env`,
+`command`, …): it's too big for a policy to judge cheaply, so every policy
+that applies to it fails closed, naming the field.
+
+Only an unscoped Admin token can apply or delete a policy, and every policy
+write is audited. A refused apply answers with every policy it broke, writes
+nothing, and is recorded as `policy.denied`:
+
+```console
+$ relish apply -f web.toml
+error: the cluster's policies refuse this apply:
+  policy no-latest denies app default/web: pin a version
+```
+
+`relish apply --dry-run` lists the denials and warnings the cluster's
+policies, together with any in the file, would give. GitOps applies the same
+policies: an app a policy refuses is named in the sync's partial result, and
+the rest of the commit still applies.
+
+```sh
+relish policy list                       # every policy, its action, what it applies to and who wrote it
+relish policy audit                      # committed apps and jobs the policies would now refuse
+relish policy delete no-latest           # admin only; always works
+relish policy test -f policies.toml -f apps.toml
+relish policy test -f policies.toml -f apps.toml --source gitops
+```
+
+`relish policy test` judges the apps and jobs in the files by the policies in
+the files, offline, with the same code the cluster runs, and exits non-zero
+when an apply would be refused. Run it in CI. `--caller` and `--role` set what
+`caller` holds.
+
+For a starting set, `examples/policies/platform.toml` has the four rules
+platform teams ask for most: a memory limit for every app in `prod`, no
+`:latest` (or untagged) images, images only from listed registries, and a
+`TEAM` variable every app gets by default. Change the namespace, registries
+and team to your own, then try them against your apps:
+
+```sh
+relish policy test -f examples/policies/platform.toml -f my-apps.toml
+```
+
+### Auditing running work
+
+A policy judges apps and jobs as they're applied, so a new one never stops
+anything already running. `relish policy audit` answers what it leaves open:
+which committed apps and jobs would the policies in force refuse, warn about
+or record, if they were applied again now?
+
+```console
+$ relish policy audit
+Checked 2 app(s) and 1 job(s) against 3 policy(ies) at generation 7.
+
+  DENY   app default/web      no-latest     pin a version
+  DENY   job default/nightly  no-latest     pin a version
+  AUDIT  app default/web      limits        breaks policy limits
+
+2 denial(s), 0 warning(s), 1 audit finding(s). Nothing was changed: each runs as it is until it's next applied.
+```
+
+It changes nothing and exits zero whatever it finds. Each app is judged as
+its next apply would be: the spec you declared, with the defaults filled in.
+An app a controller owns is judged as the controller's token, with that
+token's role, from `apply`, since only that token writes it (see
+`writing-a-controller`). An app GitOps owns is judged as a GitOps sync, and
+everything else as the cluster's own caller `audit`, role `system`, from
+`apply`; so is a controller-owned app whose token is gone. Jobs are judged from
+the definitions the cluster keeps, which are scheduled jobs and deployment
+hooks; a one-off job's definition goes once its runs are pruned. `relish wtf` shows the same
+denials and audit findings as warnings.
+
+Any token can run it, but a token limited to some apps or namespaces sees
+only those: the counts and findings leave out everything else, so a
+controller's token can't list another team's workloads or why they'd be
+refused.
+
+`action = "audit"` is the way to roll out a strict policy: commit it as
+`audit`, watch `relish policy audit` until nothing breaks it, then change it to
+`deny`.
+
+A policy never judges a policy, so `relish policy delete` works even when a
+broken policy refuses every app. A policy GitOps wrote comes back on the next
+sync unless you remove it from the repository too.
+
+### Defaults
+
+A policy can also fill in fields an app leaves out, with a `default` table
+shaped like an `[app.*]` table:
+
+```toml
+[policy.team-label]
+match = "app.namespace == 'payments'"
+
+[policy.team-label.default]
+env.TEAM = "payments"
+deploy.max_unavailable = 1
+```
+
+A default only fills gaps. It never overwrites a value you wrote: an app
+with its own `env.TEAM` keeps it, and an app with other `env` variables
+keeps them all and gains `TEAM`. To forbid a value, write a `deny`, not a
+default. A policy can have a `default`, a `deny`, or both.
+
+The cluster judges each app in a fixed order. It fills in every matching
+policy's default, in policy name order, so when two defaults fill the same
+field the one whose name sorts first wins. Each `match` sees the app as the
+policies before it left it. Then the app is validated as usual, and then
+every `deny` runs, on the filled-in app. A default that would leave the app
+invalid (`port = 0`, say) refuses the apply, naming the policy.
+
+A field counts as left out when the app doesn't set it at all. `replicas`
+always has a value, 1 when you leave it out, so a default can't fill it.
+
+`relish apply` and `relish apply --dry-run` show each field a default fills
+and the policy that fills it:
+
+```console
+$ relish apply --dry-run -f web.toml
+...
+Policies:
+  FILL  policy team-label fills deploy.max_unavailable = 1 on app payments/web
+  FILL  policy team-label fills env.TEAM = "payments" on app payments/web
+```
+
+`relish policy test` lists them too. The cluster stores the app as you
+declared it beside the filled-in spec it runs. GitOps compares the
+repository with the declared spec, so a filled-in field never looks like a
+change and a sync doesn't re-apply the app. A new or changed default
+reaches an app the next time the app itself is applied.
+
+## Runtime knobs
+
+Some apps need a little more from the kernel than a container gets by
+default. A load balancer wants a bigger `net.core.somaxconn`, a FUSE
+filesystem wants `CAP_SYS_ADMIN` and `/dev/fuse`. An app asks for these in
+its `[runtime]` table:
+
+```toml
+[app.files]
+image = "ghcr.io/example/files:2.0"
+
+[app.files.runtime]
+capabilities = ["SYS_ADMIN"]
+sysctls = { "net.core.somaxconn" = "4096" }
+devices = [{ path = "/dev/fuse", permissions = "rw" }]
+```
+
+Each use needs two keys, the same two a host-path `source` needs:
+
+- **The node** must list it under `[runtime]` in its `node.toml`. Every list
+  is empty by default, so a node allows nothing until you say so.
+- **The token** must carry `host-exec` when it has a `[permission]` block.
+
+```toml
+[runtime]
+allowed_capabilities = ["SYS_ADMIN"]
+allowed_sysctls = ["net.core.*"]
+allowed_devices = ["/dev/fuse"]
+```
+
+`apply` checks the token. A deploy-only token is refused before anything is
+written, with a reason that names the knob:
+
+```text
+app.files: runtime.capabilities CAP_SYS_ADMIN refused by the token gate: a runtime knob needs the host-exec permission, and this token's permission doesn't grant it
+```
+
+The node checks its own list. Each node advertises what it allows, and the
+scheduler places the app only on a node that allows every knob it asks for.
+If none does, the app stays unplaced and `relish wtf` says no node can run
+it. A node that's asked anyway (on a standalone node, or after you've
+shortened its list) refuses the deploy and names the key it's missing:
+
+```text
+runtime.devices /dev/fuse refused by the node gate: this node's [runtime] allowed_devices in node.toml doesn't list it
+```
+
+Only rootful runc applies knobs. A node on the process runtime, Apple
+Container or rootless runc advertises none, whatever its `[runtime]` says,
+and refuses an app that has them rather than running it without them. An
+`exec` or `script` app runs on the host, so it can't have knobs at all. The
+knobs are the app container's alone: its sidecars get none, though they share
+its network namespace and so see its `net.*` sysctls.
+
+What each kind accepts:
+
+- **`capabilities`**: Linux capability names, with or without `CAP_`
+  (`SYS_ADMIN` and `CAP_SYS_ADMIN` are the same). They're added to the
+  container's default set; nothing is dropped. There's no wildcard: `ALL`
+  is refused on both sides. The node names each capability, and the ones
+  that amount to root inside the container (`CAP_SYS_ADMIN`,
+  `CAP_SYS_PTRACE` and `CAP_SYS_BOOT`) are allowed only when listed by name.
+  Bun warns at startup for each one it finds. A container's root is still
+  an unprivileged user on the host (see `images-and-volumes`), so these act
+  on the container's own namespaces. As in Docker and Kubernetes, a
+  capability reaches a process that runs as root in the container; a
+  non-root user needs file capabilities on its binary.
+
+  That's also the limit of what a capability can do here. A container runs
+  in a user namespace of its own, and the kernel checks each capability
+  against a user namespace: for most, the one that owns the thing being
+  changed; for the rest, the host's own. The container's processes, files,
+  mounts and IPC belong to its namespace, so `CAP_SYS_ADMIN` (mounts,
+  hostname), `CAP_SYS_PTRACE`, `CAP_SYS_BOOT` (which can only end the
+  container), `CAP_CHECKPOINT_RESTORE` and `CAP_IPC_OWNER` work on them,
+  as do the defaults (`CAP_CHOWN`, `CAP_SETUID` and the rest of Docker's
+  set). Nothing else does, so everything else is refused on both sides:
+
+  - The network capabilities, `CAP_NET_ADMIN`, `CAP_NET_RAW`,
+    `CAP_NET_BIND_SERVICE` and `CAP_NET_BROADCAST`. Bun creates the
+    container's network namespace before the container exists, so the
+    node's user namespace owns it, and `ip link`, a TUN device or a raw
+    socket would still fail with "operation not permitted". Ask for `net.*`
+    sysctls instead, which the node writes into the namespace for the app,
+    and note that every port, low ones included, is already bindable.
+  - The ones the kernel checks against the host whatever namespace asks:
+    `CAP_SYS_TIME` (the clock), `CAP_SYS_NICE` (negative nice values and
+    realtime scheduling), `CAP_IPC_LOCK` (locking memory beyond
+    `RLIMIT_MEMLOCK`), `CAP_SYS_RESOURCE` (raising hard limits),
+    `CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, `CAP_SYS_PACCT`, `CAP_SYS_TTY_CONFIG`,
+    `CAP_SYSLOG`, `CAP_LINUX_IMMUTABLE`, `CAP_LEASE`, `CAP_WAKE_ALARM`,
+    `CAP_BLOCK_SUSPEND`, `CAP_BPF`, `CAP_PERFMON`, `CAP_MAC_ADMIN`,
+    `CAP_MAC_OVERRIDE`, the three `CAP_AUDIT_*` and `CAP_MKNOD`.
+    `CAP_DAC_READ_SEARCH` is refused too: its one call of its own,
+    opening a file by handle, is checked against the host, and reading
+    past file permissions is `CAP_DAC_OVERRIDE`, which every container
+    already has.
+
+  The error names the capability and what the kernel checks it for:
+
+  ```text
+  CAP_SYS_TIME can't be granted: the kernel checks it against the node's own user namespace, not the container's, for setting the clock, so the container would still get "operation not permitted"
+  ```
+
+- **`sysctls`**: only the ones the kernel keeps per container: `net.*`,
+  `kernel.shm*`, `kernel.msg*`, `kernel.sem` and `fs.mqueue.*`. Anything
+  else, `kernel.panic` or `vm.overcommit_memory` say, would change the whole
+  node, so it's refused at `lint` and `apply`, and a node can't list it
+  either. A node may list exact names or a `net.` or `fs.mqueue.` prefix
+  ending in `.*`.
+- **`devices`**: an absolute path under `/dev` and its `permissions`, `r`,
+  `w` or `rw` (the default). The device appears at the same path in the
+  container, and the cgroup lets the container use it with those
+  permissions. A node that lists a device lets an app read and write it.
+  There's no `m` (mknod): the kernel lets only the host's own user namespace
+  make device nodes, so the permission would grant nothing, and it's
+  refused. The file's own mode still applies to the container's mapped
+  user, so a device that only root or a group can open needs a mode or a
+  udev rule that lets the container in. `/dev/fuse` is `0666` on most
+  distributions.
+
 ## Audit log
 
 Every node keeps a log of who changed what on it, on disk, so you can answer
@@ -268,6 +607,7 @@ What's recorded:
 | Workloads | `app.applied`, `app.stopped`, `app.deleted`, `app.exec`, `deploy.rolled_back`, `deploy.cancelled`, `snapshot.created`, `snapshot.restored`, `snapshot.deleted` |
 | Jobs and builds | `job.submitted`, `job.replayed`, `job.schedule_disabled`, `batch.submitted`, `array.submitted`, `batch.cancelled`, `build.submitted` |
 | The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
+| Policies | `policy.denied`, `policy.deleted`; an apply that writes a policy is `app.applied` with the policy names under `policies` |
 | Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
 | Chaos | `fault.injected`, `fault.cleared`, `fault.cleared-by-service`, `fault.cleared-all-workload`, `fault.expired` |
 
@@ -360,6 +700,13 @@ that carries it is deleted when the instance stops. The runtime's record of a
 stopped instance keeps the names of its environment variables, never their
 values.
 
+A sidecar inherits its app's whole `env`, so every sidecar sees the app's
+decrypted secrets, and each `PROVIDER[...]` reference in it is fetched again
+for each sidecar as it starts. A third-party proxy image you run as a
+sidecar can read the app's database password. Sidecars get the app's
+mounts too, so a file is no hiding place either. If a sidecar shouldn't
+hold a secret, run it as an app of its own.
+
 To rotate the key: `relish secret rotate` makes a new keypair and prints its
 public key, while the old one keeps decrypting. Re-encrypt your values with the
 new key, re-apply, then run `relish secret rotate --finalize`. It refuses, and
@@ -435,6 +782,91 @@ The leader records `secret.namespace_key_created` (with how many values it
 re-sealed, never the values), and every rotation or finalise records
 `secret.rotated` or `secret.rotation_finalised` with the namespace in its
 details. See them with `relish events`.
+
+### Secrets from a provider
+
+If your secrets already live in Vault, AWS Secrets Manager or something of
+your own, you don't have to copy them into your config. An app's env value
+can name a provider and a path instead, and the node asks the provider for
+the secret each time an instance launches:
+
+```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+env = { DB_PASSWORD = "PROVIDER[vault:secret/db#password]" }
+```
+
+`vault` is the provider's name, and everything after the first `:` is the path
+it's asked for. What the path means is up to the provider. A value that starts
+with `PROVIDER[` but doesn't parse is refused at apply. Jobs can't use
+providers yet: a job with one is refused at apply too.
+
+A provider is a binary on the node, named in `node.toml`. Nothing else runs:
+the table is the allowlist.
+
+```toml
+[secret_providers.vault]
+binary = "/usr/local/bin/reliaburger-vault"
+timeout_secs = 5
+max_output_bytes = 65536
+env = { VAULT_ADDR = "https://vault.internal:8200" }
+```
+
+`binary` must be an absolute path. `timeout_secs` (default 5, at most 60) and
+`max_output_bytes` (default 64 KiB, at most 1 MiB) bound each call. The
+provider runs as Bun's user, in `/`, in its own process group, with only a
+default `PATH` and the `env` you give it. Bun's own environment isn't passed
+on.
+
+The protocol is the one git and Docker credential helpers use. Bun writes one
+JSON object to the provider's stdin, on one line ending in a newline, and
+closes it. Read up to the newline rather than waiting for end-of-file:
+
+```json
+{"version":1,"provider":"vault","path":"secret/db#password","namespace":"default","app":"api","instance":"default__api-0","variable":"DB_PASSWORD"}
+```
+
+The provider writes one object to stdout and exits 0:
+
+```json
+{"version":1,"value":"the secret"}
+```
+
+or, when it won't give the secret, an `error` instead of the `value`, with any
+exit status:
+
+```json
+{"version":1,"error":"permission denied for default/api"}
+```
+
+The namespace and app are there so the provider can decide who may read what.
+Bun ignores the provider's stderr, and never logs a value. The answer is
+complete when the provider exits: Bun reads for at most a tenth of a second
+after that, so don't leave a child behind that writes later.
+
+A node advertises the providers it runs, and the scheduler only places an app
+that names a provider on a node that has it. If no node does, the app stays
+unplaced, and `relish wtf` says no node can run it.
+
+It fails closed. When the provider is missing, slow, killed, writes too much,
+exits unsuccessfully or answers with anything but the protocol, the instance
+doesn't start, and `relish status` and `relish wtf` give the reason:
+
+```text
+cannot resolve secret DB_PASSWORD: secret provider "vault" did not answer within 5s and was killed
+```
+
+A timeout kills the provider's whole process group. Only the apps that name
+that provider are affected; everything else on the node keeps starting. In a
+cluster, the node tries the deploy again with its usual backoff (5 seconds,
+doubling up to 5 minutes), so a provider that comes back is picked up. A
+restart the provider refuses leaves that instance failed, with the reason,
+rather than spending its restart budget on the same failure.
+
+The node keeps only the reference. The secret goes into the container's
+environment, the same way a decrypted `ENC[AGE:...]` value does, and every
+restart asks the provider again, so a secret you rotate at the source reaches
+the next restart without a redeploy.
 
 ## Backing up the root CA
 

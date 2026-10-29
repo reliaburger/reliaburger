@@ -58,6 +58,7 @@ be visible until we remove its race.
 | `make test-slow` | Required wall-clock health and retry acceptance | Linux; PRs into `main`, `main` and nightly |
 | `make test-linux` | runc, namespaces, eBPF, Btrfs, Buildah and root-only tmpfs | Privileged Linux; PRs into `main`, `main` and nightly |
 | `make test-cluster` | Gossip, placement, failover, healing, recovery and chaos | Linux, serial resource group; PRs into `main`, `main` and nightly |
+| `make test-hollow` | A three-member council process in front of twenty hollow nodes (#1401); the measured sizes run through `scripts/release/qualify-hollow-nodes.sh` | Manual |
 | `make test-upgrade-node` | Real single-node binary replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-rootless-runc` | Rootless runc networking and port adoption as a non-root user | Privileged Linux; PRs into `main`, `main` and nightly |
@@ -69,6 +70,8 @@ be visible until we remove its race.
 | `make ci-bench` | `make ci`, then `make bench` | Local |
 | `make bench` | Criterion transport and 5–250-node measurements | `main`, nightly, and PRs touching gossip |
 | `make bench-large` | Criterion 500- and 1,000-node measurements | `main`, nightly, and PRs touching gossip |
+| `make fuzz-corpus-check` | Every fuzz target body over its seeds and checked-in corpus, on stable (also part of `make test`) | Local; `make test` everywhere |
+| `make fuzz-smoke` | Every cargo-fuzz target for `FUZZ_SECONDS` each (nightly Rust and cargo-fuzz) | `fuzz.yml`: 300 s a target nightly, 30 s on PRs touching a decoder |
 | `make coverage` | The portable suite, run once under line coverage; this is the Linux test gate too | Linux |
 | `make audit` | Current RustSec database, with new vulnerabilities and maintenance warnings denied | Pull requests, release gate and weekly schedule |
 | `tests/examples.rs` (part of `make test`) | Every checked-in workload config parses, validates and plans through Relish without deployment | Linux and hosted macOS |
@@ -85,8 +88,11 @@ PR targets `main`, and `ci-retarget.yml` reruns CI as soon as GitHub retargets o
 Pull requests into a release's merge-train branch (`release-*`) run the light set:
 lint, minimum Rust, portable Linux with coverage, the demo app and the optimised
 contract boundaries. Labelled `full-ci`, they run every heavy owner but not the
-macOS shards (the `train-full` selection). The merge queue on the train, the push to it and the gate PR
-into `main` run everything, including the three macOS shards
+macOS shards (the `train-full` selection), which is also what a code PR into
+`main` runs. The merge queue on the train, the push to it, pushes to `main`,
+the nightly and the gate PR into `main` labelled `release-gate` run
+everything, including the three macOS shards; any other PR runs them only
+when it touches macOS-specific code or carries a `macos` label
 ([which jobs run](../testing.md#which-jobs-a-pull-request-runs)).
 Documentation-only pull requests skip the Rust jobs entirely, except for the manual
 and the snippets `documentation_first_run` checks. `scripts/ci/test_select_jobs.py`
@@ -319,7 +325,7 @@ inventory, with the original policy visible in the generated matrix.
 
 `workflow_assembly.py` defines eleven literal owners and derives light, portable,
 train-full or full selection from trusted current workflow inputs; only a pull request may
-qualify with less than full. The macOS owner runs as three hash-partition
+qualify with less than full, and not a pull request labelled `release-gate`. The macOS owner runs as three hash-partition
 shards, and aggregation proves their lists cover every test exactly once. `workflow_adapter.py` preserves
 those commands and their complete selections. Ordinary nextest producers retain
 discovery and JUnit under one selector/environment plan. `completion.py` retains

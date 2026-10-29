@@ -164,6 +164,7 @@ impl JobBenchArgs {
             task_timeout_secs: None,
             overlap: None,
             replay_unknown: false,
+            provenance: None,
         };
         Ok(TaskManifestRequest {
             name: name.into(),

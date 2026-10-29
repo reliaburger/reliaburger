@@ -248,6 +248,22 @@ if let Some(council) = council_to_forward_to(&state).await {
 
 Four tests pin it, all in `src/bun/api/tests.rs`. `a_follower_without_the_run_forwards_cancel_results_and_logs_to_the_leader` sends all three to a follower whose replica has no run, with a fake leader that records what reaches it, and expects each call there with the caller's token and the forwarded mark. `a_node_with_no_leader_or_a_closed_fence_answers_run_calls_503_not_404` sends them to a node that hasn't seen an election and to a leader behind a closed recovery fence, and expects 503 from both. `a_confirmed_leader_answers_404_for_a_run_it_does_not_hold` checks that the honest 404 survives. The three routes also joined `LEADER_ONLY_CALLS`, so the loop tests from chapter 2 cover them: a leader without a quorum and a follower handed an already-forwarded request both answer 503. Before the fix, every one of those calls came back 404.
 
+Submissions still asked the old question. `POST /v1/batch/array`, the manifest and batch submissions, `GET /v1/batch/{id}`, `POST /v1/jobs/runs`, replay, disable, stop and job apply each decided "serve or forward" with `is_leader`, a single `ensure_linearizable` round that gives each follower one 150 ms heartbeat interval to answer. In a CI run for PR [#1252](https://github.com/reliaburger/reliaburger/pull/1252), the cluster test that fills all 96 bulk slots had one submission refused with `503 this node holds the leader role but can't confirm it with a quorum; retry shortly` ([#1253](https://github.com/reliaburger/reliaburger/issues/1253)). The test sends every bulk array straight to the leader, and the leader was settled: there was no election, and the next run passed. The CI log doesn't say more, but the likely story is this: three in-process nodes were starting a long-running process for every array they had just admitted, both followers answered one heartbeat round late, and the leader read that as "not leader". It then tried to forward the request, found its own name as leader, and refused.
+
+That's the #1009 bug again, on different routes. The quorum was never lost. The leader just gave up after one round. So every one of those handlers now calls `council_to_forward_to`, and `follower_council`, the single-round version, is gone. A settled leader gets 3 seconds to prove it leads, and a follower, which doesn't believe it leads, still forwards at once. A leader that is really cut off still answers 503 after the 3 seconds, so we didn't make the test retry the 503: a lost quorum there should still fail the test.
+
+`a_settled_leader_accepts_job_submissions_after_its_quorum_misses_a_heartbeat_round`, also in `src/bun/api/tests.rs`, builds the slow followers with the in-memory Raft router. It holds elections on all three voters, cuts the leader off from both followers, checks that one `is_leader` round fails, and heals the links 300 ms later. Meanwhile it sends a task-array submission, a manifest and a cron definition to the leader. The cron definition carries the forwarded mark, as it does when a follower sends it on. Before the fix the first call got the same 503 as CI. Now all three get 202.
+
+That fix had a cost we only saw on review ([#1441](https://github.com/reliaburger/reliaburger/issues/1441)). `confirm_leadership` runs a proof every heartbeat interval until one succeeds or 3 seconds pass, and a dozen job and task-array handlers now call it, through `council_to_forward_to`. A leader admitting a burst of submissions had every one of them proving its leadership on its own, in parallel. Each proof is a heartbeat to every follower. So the overload that made the followers slow in the first place got answered with a heartbeat round per request in flight. Can you see the feedback loop?
+
+The proofs now take turns. `SharedProof` in `src/council/proof.rs` runs at most one at a time, and `CouncilNode::is_leader` goes through it, so every caller shares it, not just the job handlers. The interesting part is which answer a caller may take. Say request B arrives while request A's proof is running. A's heartbeats left before B arrived, so a quorum answering them proves this node led *then*, not when B asked. B waits for the next proof instead, and so does everyone else who arrived during A's round. Fifty requests in one round cost one more proof, not fifty, and none of them waits longer than the rest of one round plus one more.
+
+The state lives in a `watch` channel: how many proofs have started, whether one is running, and the latest one's generation and answer. `send_if_modified` runs its closure under the channel's write lock, so "is there an answer for me yet, and if not, may I start the next proof?" is one atomic step. Everyone else awaits `changed()`. The caller that runs a proof holds a small guard, `Round`, whose `Drop` publishes the answer and clears the "running" flag. That matters because `confirm_leadership` wraps each proof in a timeout: when it fires, Rust drops the future mid-proof, the guard's `Drop` still runs, and a waiter takes over the next round instead of waiting for an answer that will never come.
+
+We didn't cache a proof for the leader lease. Followers refuse to vote while the lease runs, so a proof stays good for most of an election timeout, and we could have skipped proofs altogether for a while after one succeeded. But openraft 0.9's `ensure_linearizable` doesn't tell us when its heartbeats left, only when the quorum answered, and a lease read is only safe if you measure from the send, with a margin for clock drift. Getting that wrong serves a stale read from a deposed leader, quietly. Sharing proofs fixes the traffic and keeps every answer exactly as fresh as before.
+
+`concurrent_confirmations_share_one_proof_at_a_time` in `src/council/node.rs` cuts a leader off from its followers and counts the proofs one `confirm_leadership` runs in 600 ms. Then it runs fifty at once. Before the change, fifty requests ran 600 proofs where one alone ran 12; now they run between about 25 and 50. Why not exactly 12? A failed proof ends at once, and each request sleeps its own heartbeat pause before it asks again, so a request that wakes just after a round ends starts the next one. The count depends on scheduling, so the test pins the property that matters instead: a test hook records the most proofs ever running at once, and it must be one. The count only has to stay under ten times one request's, far below the fifty times it was. Our first version asserted four times, and a coverage build on CI ran 51 proofs against 12. The hook counts a proof in a guard whose `Drop` runs even when a caller's timeout cancels it mid-flight; an earlier version decremented after the `.await`, leaked a count on every cancelled proof and reported overlaps that never happened. The same test first sends fifty confirmations to the healthy leader, and all fifty share the answer: yes. `src/council/proof.rs` tests the rules themselves: waiters share the next proof, not the running one; a proof that finished before a call doesn't answer it; and a cancelled proof lets the waiters run their own. The handlers that had no test got one too: `a_settled_leader_serves_batch_apply_replay_disable_and_stop_after_a_missed_heartbeat_round` sends `POST /v1/batch`, `GET /v1/batch/{id}`, a job apply, a replay, a schedule disable and a stop to a leader whose followers miss its first round, and expects each to be served.
+
 ### Definitions, runs and durable trigger identities
 
 A template and a count describe work, but not why it runs. A manually submitted
@@ -1111,6 +1127,18 @@ sketched, and decided against it: every one-off run would mint a new series,
 and a daily `render-$DATE` would grow the store for ever. A test checks that
 no other label ever appears, and that a node never keeps more than 1,024
 label sets however many definitions come and go.
+
+The cap bounded the map but not the samples. The collection loop exported
+every label set it kept, every 10 seconds, whether anything had run under it
+for hours or not. The 0.2.3 day run gave each of its arrays a new name, so
+each node exported one more idle set every few minutes: its metrics export
+grew from 6 MiB an hour at the start to 42 MiB an hour at the end, and Bun
+built, buffered and queried all those rows (#1417). Now a set records when it
+last saw activity, and `samples` leaves it out once it has been idle for
+`IDLE_SERIES_AFTER`, 15 minutes. Its totals stay in the map, so a definition
+that runs again carries on counting from where it was. A Prometheus target
+that stops answering looks the same: its series go stale, and `rate()` over
+a counter that comes back still works.
 
 The telemetry is shared by async tasks and synchronous code, so it sits behind
 a `std::sync::Mutex`, not a tokio one. That's allowed here because no critical
@@ -2844,8 +2872,8 @@ gap. How much is enough? That depends on how long commands take, so the leader
 learns it from the final-attempt duration histogram the nodes already report.
 Bucket `i` counts commands that took up to `2^i` ms. Using the upper bound of
 each bucket gives a conservative estimate of throughput: slots × two seconds ÷
-average duration. Learned depth was capped at sixteen chunks, and 0.2.3
-raised the cap to 32 for a reason we'll come to.
+average duration. Learned depth was capped at sixteen chunks; 0.2.3 raised
+the cap to 32 and 0.2.4 put it back, for reasons we'll come to.
 
 That's the idea. The edges took four more fixes:
 
@@ -3440,6 +3468,188 @@ restarted `rb-bun`. It installed a new kernel too, which every later boot ran.
 A disposable VM is still a whole operating system with its own plans. The
 record discards that run, turns the timers off and repeats every session the
 upgrade could have touched.
+
+### Grants in the tick that commits them
+
+For 0.2.4 we took the second way (#1360), and the stopgap went: the cap is
+one line again, back at sixteen, and the lookahead tests that pinned 32
+chunks pin sixteen again.
+
+The change itself is small. Once a tick's entry has committed, the leader reads
+the committed state again and calls every node that entry gave a chunk it
+didn't know about:
+
+```rust
+pub fn follow_ups(
+    told: &HashMap<NodeId, HeldSet>,
+    requests: Vec<(NodeId, Option<String>, NodeSyncRequest)>,
+    calls: &SyncCalls,
+) -> Vec<(NodeId, Option<String>, NodeSyncRequest)> {
+    let nothing = HeldSet::new();
+    requests
+        .into_iter()
+        .filter(|(node, _, request)| {
+            let before = told.get(node).unwrap_or(&nothing);
+            !calls.is_waiting_on(node) && !held_chunks(request).is_subset(before)
+        })
+        .collect()
+}
+```
+
+`HeldSet` is a `BTreeSet<(u64, ChunkId, u64)>`: array, chunk and grant attempt,
+built from the request the tick sent at its start (`told`). Rust lets you name
+a type like that with `type`, which is an alias, not a new type; the compiler
+treats `HeldSet` and the `BTreeSet` as the same thing. A node gets a follow-up
+only if the committed request lists something the tick's own request didn't,
+which `is_subset` answers. A chunk the node just finished and lost isn't news,
+so a node whose work only shrank isn't called. A chunk granted again at a
+higher attempt is news, because the attempt is part of the tuple.
+`unwrap_or(&nothing)` covers a node that joined after the tick read its
+targets: it was told nothing, so any chunk it holds counts.
+
+Nobody waits for the follow-up's answer. The call goes into `SyncCalls` like
+any other, and the next tick folds the answer in. The next tick starts by
+taking every answer that's already there:
+
+```rust
+pub fn gather_ready(&mut self) -> Vec<SyncAnswer> {
+    let mut answers = Vec::new();
+    while let Some(Some(answer)) = self.pending.next().now_or_never() {
+        self.waiting_on.remove(&answer.node);
+        answers.push(answer);
+    }
+    answers
+}
+```
+
+`now_or_never` polls a future once and gives back `Some(output)` if it was
+ready and `None` if it wasn't, without waiting. Go has no direct equivalent;
+the nearest is a `select` with a `default` case. Here the future is
+`FuturesUnordered::next()`, which itself yields `Option<SyncAnswer>`, `None`
+once the set is empty, hence the two layers of `Some`. Taking these first
+matters. If the tick sent its requests before collecting, a node whose
+follow-up had answered would still look busy, the tick would skip it, and
+its report of the chunks it just finished would wait another tick. That's the
+two-tick cycle again, by a different road.
+
+So a node with fresh grants is now called twice a tick: once by the tick, to
+hear what it finished, and once after the commit, to hand it the
+replacements. One tick can therefore hold two answers from one node.
+`latest_per_node` keeps the later one, which is safe because a node repeats
+every finished chunk on every sync until the leader stops listing it. The
+later answer says everything the earlier one did, and more.
+
+Where can that go wrong? The control fence. Each node keeps the newest
+control version (recovery epoch, Raft term, applied index) it has acted on,
+and refuses anything older. The follow-up reads its version *after* the
+commit, so its index is never below the one the tick's own request carried,
+and the next tick reads later still. Three paths needed a closer look, and
+each has a test:
+
+- **A call that's still running.** The node refuses a second call while its
+  first one is busy with the disk (`SyncBusy`, from the stuck-disk work
+  earlier). `follow_ups` never calls a node the leader is still waiting on,
+  and `only_nodes_given_chunks_they_were_not_told_of_are_called_again`
+  checks that alongside the other cases: new chunk, same chunks, fewer
+  chunks, a new attempt, a node that joined late.
+- **An answer that lands after the next tick has started.** The follow-up
+  stays in `SyncCalls`, the node isn't called again until it answers, and a
+  later tick collects it. `a_tick_takes_answers_already_in_and_leaves_calls_still_out_for_later`
+  drives that on tokio's paused clock. On the node,
+  `a_follow_up_and_the_next_ticks_request_pass_the_fence_but_a_late_older_call_does_not`
+  plays the versions in the order the leader sends them, then an old one
+  late: the first three pass, and the late one is refused.
+- **A leader change mid-tick.** The leader checks it still leads before it
+  sends any follow-up. A deposed leader can still lose that race, so
+  `a_deposed_leaders_follow_up_is_refused_once_the_new_leader_has_called`
+  plays both orders. If the new leader's call (term 2) reached the node
+  first, the old leader's follow-up (term 1) is refused and its grant never
+  runs. If the follow-up got there first, it's a committed grant like any
+  other, and the new leader's call still passes.
+
+The test that shows the actual gain is the simplest:
+`a_grant_reaches_its_node_in_the_tick_that_commits_it` starts a standalone
+node with a one-*hour* sync interval. The loop's first tick fires at once,
+and the next one isn't due for an hour. Before this change the first tick
+granted chunks and sent them nowhere, so the fake executor never ran a task.
+Now the tasks run within milliseconds, and the node's fence holds the store's
+revision *after* the tick's entry, which shows the follow-up carried the
+committed version. Waiting an hour for a test to fail isn't a plan, so the
+test waits twenty seconds and calls that never.
+
+The review of 0.2.4 spotted a loose end in it (#1442): the test cancelled
+its shutdown token and returned, without checking that the leader loop had
+stopped. The loop doesn't watch that token. It stops when the agent's
+command channel closes, and the test's stand-in agent drops its receiver on
+cancel. So the test now waits for the loop to go, and it can tell because the
+loop owns a clone of the `ApiState`, which holds an `Arc` of the task-array
+service. `Arc::strong_count` counts the owners. When the count gets back to
+one, the test's own, nothing else is running with the service.
+
+What does it cost? Every new control version is a fence write and an fsync
+on the node, and on macOS an fsync flushes the whole device (#809). A busy
+node used to see one new version a tick; it now sees two. The leader sends at
+most one follow-up per node per tick, and only to nodes the tick gave work.
+An idle node costs what it did before. The gain should be the ceiling above,
+doubled: sixteen chunks turning over every tick, not every two, so 16,000
+host jobs a second on the same rig. "Should" because the bench numbers come
+from the profiling step (#1358), not from this test.
+
+### A profile in every release
+
+Look at what found the GitOps loop's wasted core. Not a test, and not a soak:
+both of those check that things work and don't leak, and a core spent cloning
+state broke neither. A person with `perf` found it, by hand, once. So from 0.2.4
+on, the profile is a release step ([`releasing.md`](../releasing.md#staging-a-candidate),
+step 9, after the tag), and `scripts/release/qualify-profile.sh` runs it in one command.
+
+The hard part isn't running `perf`. It's comparing the result with anything.
+The 0.2.0 throughput record ran on an M2 Max and the profile on an M1 Max, so
+a number stored with one release says nothing about the next. The script
+doesn't store numbers, then. It measures the previous release too, in the same
+fresh VM, in alternating rounds: previous then candidate, candidate then
+previous, and again. Whatever the host does to one build it does to the other.
+Each scenario's rate is also divided by the same version's raw-process rate,
+so a slower rig doesn't read as a slower release.
+
+Two builds of each version go into the VM. The rates come from the release
+binaries, byte for byte the ones we ship. The stacks come from a profiling
+build of the same commit, which `build.yml` now makes beside the candidate and
+never ships. It's the release build with two settings changed:
+
+```sh
+RUSTFLAGS="-C force-frame-pointers=yes" \
+CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=false \
+    cargo build --locked --release --features ebpf --bin bun --bin relish
+```
+
+`perf record -g` finds a sample's callers by walking frame pointers, a chain
+of saved stack addresses each function keeps in a register. An optimised
+build normally uses that register for something else, so the chain breaks
+after one frame. `-C force-frame-pointers=yes` tells `rustc` to keep it, for a
+cost of a percent or two. `line-tables-only` keeps just enough debug
+information to turn an address back into a function name, and not stripping
+the binary keeps the symbol table that holds those names. `CARGO_PROFILE_RELEASE_*`
+variables override `[profile.release]` in `Cargo.toml` for one build, so the
+shipped profile stays as it is.
+
+The comparison step, `compare_profile.py`, reports the ratio of medians with
+a bootstrap interval: resample the rounds with replacement a couple of
+thousand times, take the ratio each time, and keep the middle 95%. A scenario
+more than 10% slower whose interval excludes "no change", Bun above 2% of a
+core in an idle cluster, or a new category above 5% of Bun's CPU would fail. A
+category moving more than 5 points, or a scenario more than 10% *faster*, needs
+explaining. Faster needs a reason too: a speed-up nobody can explain is as
+likely to be a broken measurement as a win. For now none of it gates a
+release. The record says what each rule *would* flag, and whoever qualifies
+the release writes why, until a few releases show how noisy the rig is.
+
+The category map has a guard of its own. `profile_categories.py` names Bun's
+costs by frame: the GitOps loop, the Raft core, the ledger, the pool path and
+so on. Code moves, and a map that silently stops matching would make every
+release look the same. So when more than 5% of Bun's samples match no rule,
+the record says to extend the map. A hot path nobody has named is exactly
+what the step is there to find.
 
 ### What the measurements do and don't show
 

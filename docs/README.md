@@ -105,6 +105,40 @@ Raise it on hosts where `runc kill` routinely answers slowly under load. A
 stop that outlasts it is reported as unconfirmed and retried, never as
 Stopped.
 
+An app can choose how it's stopped: its signal, its grace after the signal,
+and a command run inside it first, with its own bound (#1121). A failing
+`pre_stop` is logged and the stop carries on:
+
+```toml
+[app.web]
+image = "nginx:alpine"
+stop_signal = "SIGQUIT"
+stop_grace = "45s"
+pre_stop = ["/bin/sh", "-c", "sleep 2"]
+pre_stop_timeout = "10s"
+```
+
+An app can ask for a few runtime knobs: added capabilities, namespaced
+sysctls and host devices (#1122). Each needs two keys, the node's `[runtime]`
+allowlist and the token's `host-exec`, and the scheduler places the app only
+on a node that allows all of them:
+
+```toml
+[app.files]
+image = "ghcr.io/example/files:2.0"
+
+[app.files.runtime]
+capabilities = ["SYS_ADMIN"]
+sysctls = { "net.core.somaxconn" = "4096" }
+devices = [{ path = "/dev/fuse", permissions = "rw" }]
+```
+
+A capability the container's own namespaces can't use is refused when the
+config is parsed: the network ones, and every one the kernel checks against
+the host whatever the container holds, such as `CAP_SYS_TIME` or
+`CAP_SYS_NICE` (#1427, #1474). The [security manual](manual/10_security.md)
+lists which work.
+
 ### Jobs and cron
 
 Jobs arrived in 0.2.0. 0.2.3 keeps 0.2.2's formats, so a 0.2.2 cluster can
@@ -416,6 +450,7 @@ make test-slow             # genuine wall-clock acceptance tests
 sudo make test-linux       # runc, netns, eBPF, Btrfs, Buildah and root-only tests
 make test-rootless-runc    # rootless runc port and replacement test (never sudo)
 make test-cluster          # failover, healing, recovery, placement and chaos
+make test-hollow           # a three-member council and twenty hollow nodes (#1401)
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement
 make coverage              # portable suite under line coverage (HTML and LCOV)
@@ -436,12 +471,24 @@ The deferred Apple Container adapter has manual development tests on Apple silic
 these aren't a release acceptance gate. See the [test harness design](design/test-harness.md)
 for the audit, exact suite contracts and CI mapping.
 
+### Fuzzing
+
+Every decoder that reads bytes from another machine (gossip, Raft frames, DNS,
+backups, OCI manifests, join CSRs, app and node TOML) has a
+[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) target in
+`fuzz/`. See [testing.md](testing.md#fuzzing).
+
+```sh
+make fuzz-corpus-check  # every target body over its checked-in corpus, on stable
+make fuzz-smoke         # every target for FUZZ_SECONDS (default 10); needs nightly and cargo-fuzz
+```
+
 ### Benchmarks
 
 Gossip protocol benchmarks use [criterion](https://docs.rs/criterion) for statistical analysis with regression detection.
 
 ```sh
-make bench         # reproducible transport and 5-250 node measurements, then one scheduling pass on 1k and 10k nodes
+make bench         # reproducible transport and 5-250 node measurements, one scheduling pass on 1k and 10k nodes, and policy evaluation for 10-1,000 policies
 make bench-large   # reproducible 500 and 1,000 node measurements
 make bench-task-arrays  # in-process task-array costs and the fork/exec floor
 ```
@@ -556,8 +603,8 @@ After bootstrap, cluster-wide token management, node join tokens, secret
 rotation, image signing, self-upgrades (start, apply, rollback, resume) and
 leader elections require an **unscoped Admin** credential. An Admin
 restricted by `--apps` or `--namespaces` cannot use those global operations.
-Ordinary `[namespace]` quota and `[permission]` declarations also require an
-unscoped Admin; a Deployer can apply workloads within its scope and configured
+Ordinary `[namespace]` quota, `[permission]` and `[policy]` declarations also
+require an unscoped Admin; a Deployer can apply workloads within its scope and configured
 permissions. Apps and jobs receive the same admission checks before any part
 of a manifest changes state. Lease-owned test namespace declarations retain
 their separate ownership checks. An administrator overriding another credential's
@@ -1019,6 +1066,7 @@ See [`examples/`](../examples/) for ready-to-apply configs:
 | [`container-full-featured.toml`](../examples/phase-1/container-full-featured.toml) | All Phase 1 features |
 | [`container-multi-app.toml`](../examples/phase-1/container-multi-app.toml) | Multiple apps in one config |
 | [`container-volumes.toml`](../examples/phase-1/container-volumes.toml) | Managed and HostPath volumes |
+| [`templates/container-postgres.toml`](../examples/templates/container-postgres.toml) | A `[template.*]` with typed parameters, stamped out twice by `[use.*]` |
 | [`container-egress.toml`](../examples/phase-1/container-egress.toml) | Job egress allowlist that resolves and reaches one host |
 | [`container-allow-from.toml`](../examples/phase-1/container-allow-from.toml) | One cross-namespace path opened with `allow_from` |
 | [`container-tls-ingress.toml`](../examples/phase-1/container-tls-ingress.toml) | HTTPS ingress with the cluster's own certificates |
@@ -1204,6 +1252,44 @@ image = "public.ecr.aws/docker/library/redis:8.8.0"
 command = ["echo", "initialising database"]
 ```
 
+### Sidecars
+
+A sidecar runs beside every instance of its app, in the instance's network
+namespace (#1120). It starts after the init containers and before the app,
+stops after the app, and restarts on its own if it crashes; when the app
+crashes, its sidecars restart with it. Its `cpu` and `memory` requests add to
+the app's when it's placed. Sidecars need rootful runc: the scheduler keeps
+such apps on nodes that report it, and Apple Container, rootless runc and the
+process runtime refuse them. See [Sidecars](manual/01_deploy-an-app.md#sidecars).
+
+```toml
+[app.web]
+image = "nginx:alpine"
+port = 8080
+
+[[app.web.sidecar]]
+name = "logs"
+image = "ghcr.io/example/shipper:3.0"
+memory = "32Mi-64Mi"
+```
+
+### Apps a controller owns
+
+A controller is an ordinary app with an API token scoped to its namespace
+(#1125). It claims an app by applying it with its token's name as the
+`owner`. From then on `relish apply` skips the app with a note, GitOps leaves
+it out of its diff, and only the owner or an admin can stop, delete, roll it
+back or release it. See [Writing a controller](manual/15_writing-a-controller.md)
+for the rules and the JSON, and [`examples/controller`](../examples/controller)
+for a small one that fails an app over to a standby.
+
+```toml
+[app.db-a]
+image = "postgres:17"
+namespace = "pg"
+owner = "db-failover"
+```
+
 For the full configuration reference (resource limits, replicas, environment variables, volumes, secrets, namespaces), see the [App fields](manual/13_reference.md#app-fields) table and the book chapter [Hello, Container](book/01-hello-container.md).
 
 ## Runtime auto-detection
@@ -1361,12 +1447,22 @@ against an earlier report of the same scenario and fails on a drop beyond
 `--tolerance` (10% by default). The 100-million-a-day claim itself needs the
 job final: 8 hours of faults and a 2¼-hour quiet tail (`scripts/release/qualify-jobs-sustained.sh --tier final`).
 
+From 0.2.4 every release is also profiled (`scripts/release/qualify-profile.sh`,
+[release step 9](releasing.md#staging-a-candidate), after the tag): raw processes, host
+jobs, shared containers and an idle cluster, measured for the candidate and
+the previous release in alternating rounds in one disposable Lima VM, with
+`perf` on a never-shipped profiling build. Its record says where the time
+goes and what each comparison rule would flag; the rules don't gate a
+release yet.
+
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,
 crashloops, stalled deploys, missing service backends, active faults and alerts,
 disk pressure, actual cgroup throttling, certificate lifecycle, Pickle
 redundancy and version skew (each node's bun version, commit and binary
-SHA-256; a warning names nodes on a different build). Use `--app <name>` for application scope or `--watch` for a
+SHA-256; a warning names nodes on a different build), and the committed apps
+and jobs the cluster's policies would now refuse (`relish policy audit` *(0.2.4, not in 0.2.3)* lists
+the same). Use `--app <name>` for application scope or `--watch` for a
 human refresh every 30 seconds (`--interval <secs>` changes the period). JSON and YAML use schema version 1. Exit status 0 means
 all selected evidence was observed and healthy, 1 means a critical finding,
 and 2 means warnings or unknown evidence. Bounded in-memory restart and deploy
@@ -1521,6 +1617,15 @@ a token scoped to other namespaces gets 403. Rotate it with
 Admin. Until the master key is split, every node can still unwrap every
 namespace's key.
 
+### Secrets from an exec provider
+
+An app env value `PROVIDER[name:path]` is resolved when an instance launches,
+by a binary the node names in `[secret_providers.name]` in `node.toml`, over
+JSON on stdin and stdout with a timeout and an output cap. The scheduler places
+such an app only on nodes that run its provider, and a provider that fails
+keeps that instance from starting, with the reason in `relish status` and
+`relish wtf`. See [Secrets from a provider](manual/10_security.md#secrets-from-a-provider).
+
 ### OCI release qualification
 
 These scripts exercise crash and reboot recovery on real hosts. They're manual:
@@ -1554,6 +1659,22 @@ machines.
   the first failure, writes the records and a rule-of-three summary
   (`DIR.md`), and deletes the VM and checkout (`--keep` keeps them). It
   refuses `reliaburger-test`, an existing VM and a dirty checkout.
+- `scripts/release/nightly-qualify.sh --train release-X-Y-Z`
+  runs the long tiers on a train's tip every night: the power-cut and reboot
+  runs, then the V02 and jobs fast soaks against a staged build of the tip,
+  then the job final when the release needs the full gate, which it works
+  out with `release_tier.py` (`--gate full` can raise it, never lower it).
+  The staged build is the train's nightly build: `build.yml` on the train
+  signs it with the nightly key, which
+  no release trusts, and `stage.yml -f channel=nightly` publishes it as a
+  `nightly-v…` pre-release that the website installer refuses
+  ([nightly signing key](releasing.md#nightly-signing-key)). It writes a dated record naming the
+  commit under `~/reliaburger-nightly/`; `--plan` prints the tiers and touches
+  nothing. At code freeze `scripts/release/nightly.py freeze-check --commit SHA`
+  checks that the latest green night ran the candidate's code, and
+  `scripts/release/release_tier.py --previous vA --release vB` says whether a
+  release needs the patch gate or the full one
+  ([the release gate](releasing.md#the-release-gate)).
 - `scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_LIMA_VM` runs from the
   host. It starts real OCI executions, force-stops the VM and checks recovery
   after the new kernel boot, including address retention until explicit
@@ -1605,3 +1726,10 @@ record what each kind of job costs for 60 seconds on a small VM, with the rig
 and its limits. The 12-hour job qualification on three nodes, at 4,600
 accepted jobs a second, is [its own record](qualification/2026-10-17-v0.2.0-job-qualification.md) (#668), and resident
 model workers (#641) are a separate, later feature.
+
+How a council copes with a big fleet is measured with hollow nodes: real
+agents with a runtime that runs nothing, hundreds in one process, in front of
+a real three-member council in another (#1401).
+`scripts/release/qualify-hollow-nodes.sh --sizes 100,500,1000` runs them one
+size at a time; the [first record](qualification/2026-10-28-hollow-nodes.md)
+has 100, 500 and 1,000 nodes on one Mac, and the limits it found.

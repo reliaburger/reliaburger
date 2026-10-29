@@ -100,20 +100,39 @@ async fn observe<G: Grill>(grill: &G, read: &StateRead) -> Observed {
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// The instances whose runtime state a sweep should read: running apps
-    /// (to catch a crash that no health check would), filtered by `include`.
+    /// (to catch a crash that no health check would), filtered by `include`,
+    /// and the sidecars that should be running beside a started instance
+    /// (#1120), each read under its instance's incarnation.
     pub(super) fn plan_state_reads(
         &self,
         include: impl Fn(&WorkloadInstance) -> bool,
     ) -> Vec<state_sweep::StateRead> {
-        self.supervisor
+        let instances: Vec<&WorkloadInstance> = self
+            .supervisor
             .list_instances()
             .into_iter()
-            .filter(|instance| instance.state == ContainerState::Running && include(instance))
+            .filter(|instance| include(instance))
+            .collect();
+        let apps = instances
+            .iter()
+            .filter(|instance| instance.state == ContainerState::Running)
             .map(|instance| state_sweep::StateRead {
                 id: instance.id.clone(),
                 incarnation: state_sweep::Incarnation::of(instance),
-            })
-            .collect()
+            });
+        let sidecars = instances
+            .iter()
+            .filter(|instance| sidecars::runs_beside(instance.state))
+            .flat_map(|instance| {
+                self.sidecars
+                    .running_beside(&instance.id)
+                    .into_iter()
+                    .map(|id| state_sweep::StateRead {
+                        id,
+                        incarnation: state_sweep::Incarnation::of(instance),
+                    })
+            });
+        apps.chain(sidecars).collect()
     }
 
     /// Start a sweep of every running app's runtime state, unless
@@ -150,6 +169,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let state_sweep::Observed::Exited = observed else {
                 continue;
             };
+            // A sidecar that exited restarts on its own, while its instance
+            // still runs as the read saw it (#1120).
+            if let Some(parent) = self.sidecars.parent_of(&read.id).cloned() {
+                let current = self
+                    .supervisor
+                    .get_instance(&parent)
+                    .is_some_and(|instance| {
+                        sidecars::runs_beside(instance.state)
+                            && state_sweep::Incarnation::of(instance) == read.incarnation
+                    });
+                if current {
+                    self.sidecars.mark_exited(&read.id, Instant::now());
+                }
+                continue;
+            }
             let current = self
                 .supervisor
                 .get_instance(&read.id)

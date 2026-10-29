@@ -251,6 +251,7 @@ fn cluster_params_from_config(
             .cluster
             .recovery_probe_window_secs
             .map(std::time::Duration::from_secs),
+        council_size_cap: None,
     })
 }
 
@@ -1402,11 +1403,27 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // policy and an operator's allowlist would be silently ignored — a
     // config deploy could run an arbitrary host binary through ProcessGrill.
     agent.set_process_config(config.process_workloads.clone());
+    // `PROVIDER[...]` env values resolve only through the providers
+    // `[secret_providers.*]` names (#1123).
+    agent.set_secret_providers(reliaburger::sesame::secret_provider::SecretProviders::new(
+        config.secret_providers.clone(),
+    ));
     // Host-path sources are refused unless `[storage] allowed_host_paths`
     // covers them, and never reach the node's own directories.
     agent.set_host_path_policy(
         reliaburger::bun::host_paths::HostPathPolicy::from_node_config(&config),
     );
+    // Runtime knobs are refused unless `[runtime]` lists each one (#1122).
+    // Naming an escape-hatch capability is allowed, but loudly.
+    let runtime_allowlist = config.runtime.knob_allowlist();
+    for capability in runtime_allowlist.escape_capabilities() {
+        eprintln!(
+            "bun: warning: [runtime] allowed_capabilities lists {capability}, which gives a \
+             container near-root power over its own namespaces; apps whose tokens carry \
+             host-exec may ask for it"
+        );
+    }
+    agent.set_runtime_allowlist(runtime_allowlist);
     // Bound fault durations by the `[smoker]` policy (default + maximum).
     agent.configure_perimeter(
         vec![
@@ -1678,10 +1695,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             let mut expiry = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 use reliaburger::mustard::state::NodeState;
+                // Copy the roster out before borrowing the directory: two
+                // `watch` borrows held at once can deadlock (#1433).
+                let members = refresher_rx.borrow().clone();
                 let roster: Vec<api::RosterMember> = {
                     let directory = refresher_directory_rx.borrow();
-                    refresher_rx
-                        .borrow()
+                    members
                         .iter()
                         .map(|m| api::RosterMember {
                             info: api::NodeMembershipInfo::from_gossip(

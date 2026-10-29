@@ -110,6 +110,7 @@ mod retirement;
 mod routing;
 mod runtime_inventory;
 mod scale_in_place;
+mod sidecars;
 mod signal_faults;
 mod startup_recovery;
 mod state_sweep;
@@ -223,6 +224,49 @@ fn new_shared_drains() -> crate::wrapper::draining::SharedDrains {
     ))
 }
 
+/// How one instance is stopped (#1121): the pre-stop command that runs
+/// first, if any, and how long the workload then gets to exit before it's
+/// killed. The stop signal itself travels in the instance's spec, where the
+/// runtime reads it, so even a stop that never builds one of these (a Bun
+/// shutdown) sends the app's own signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceStop {
+    /// Time to exit after the stop signal before the force-kill.
+    pub grace: std::time::Duration,
+    /// Run inside the instance before the signal, within its own bound.
+    pub pre_stop: Option<crate::grill::stop::PreStop>,
+    /// The instance's sidecars, stopped in turn once its own exit is
+    /// confirmed (#1120).
+    pub sidecars: Vec<InstanceId>,
+    /// Time each sidecar gets to exit after its stop signal.
+    pub sidecar_grace: std::time::Duration,
+}
+
+impl InstanceStop {
+    /// The stop an instance declared in `policy`, with the caller's
+    /// `default_grace` where it declares none. Its sidecars, if any, get
+    /// `default_grace` too.
+    pub fn for_policy(
+        policy: Option<&crate::grill::stop::StopPolicy>,
+        default_grace: std::time::Duration,
+    ) -> Self {
+        Self {
+            grace: policy
+                .and_then(|policy| policy.grace)
+                .unwrap_or(default_grace),
+            pre_stop: policy.and_then(|policy| policy.pre_stop.clone()),
+            sidecars: Vec::new(),
+            sidecar_grace: default_grace,
+        }
+    }
+
+    /// The same stop, followed by stopping `sidecars` (#1120).
+    pub fn with_sidecars(mut self, sidecars: Vec<InstanceId>) -> Self {
+        self.sidecars = sidecars;
+        self
+    }
+}
+
 /// Drain then stop a single instance using cloneable handles, so the wait can
 /// run on a spawned deploy task instead of the command loop (M7): start the
 /// drain (new traffic is routed away; the Wrapper proxy shares this drain
@@ -236,8 +280,24 @@ async fn drain_and_stop_instance<G: Grill>(
     grill: &G,
     id: &InstanceId,
     drain_timeout: std::time::Duration,
+    stop: &InstanceStop,
     confirmation_timeout: std::time::Duration,
 ) -> Result<(), BunError> {
+    drain_instance(drains, id, drain_timeout).await;
+    stop_runtime_instance(grill, id, stop, confirmation_timeout).await
+}
+
+/// Route new ingress traffic away from `id` and wait until its in-flight
+/// requests finish, or `drain_timeout` passes.
+///
+/// This sees only connections that come through this node's Wrapper. Other
+/// nodes connect to the backend directly; a rolling retirement waits for
+/// them separately, before the stop (#1355).
+async fn drain_instance(
+    drains: &crate::wrapper::draining::SharedDrains,
+    id: &InstanceId,
+    drain_timeout: std::time::Duration,
+) {
     let cmd = crate::wrapper::draining::DrainCommand {
         app_name: String::new(),
         instance_id: id.0.clone(),
@@ -245,31 +305,90 @@ async fn drain_and_stop_instance<G: Grill>(
     };
     drains.start_drain(&cmd).await;
     drains.wait_drained(&id.0).await;
-
-    stop_runtime_instance(grill, id, drain_timeout, confirmation_timeout).await
 }
 
 /// Stop one instance, requiring observed exit even after force-kill.
 ///
+/// Four explicit steps, each with its own bound: the pre-stop command
+/// (`stop.pre_stop`, within its timeout), the stop signal (accepted within
+/// `confirmation_timeout`), the grace (`stop.grace`) and, if the workload is
+/// still running, the force-kill and its confirmation. A pre-stop command
+/// that fails, can't run or overruns costs at most its bound: the signal and
+/// the kill still follow.
+///
 /// `confirmation_timeout` (`[runtime] stop_confirmation_timeout_secs`) bounds
 /// the runtime's own work: accepting the stop request, accepting a kill, and
-/// reporting exit after it. `grace` is the workload's time to exit.
-async fn stop_runtime_instance<G: Grill>(
+/// reporting exit after it.
+///
+/// Once the instance's exit is confirmed, its sidecars (`stop.sidecars`)
+/// stop in turn, so a proxy or log shipper outlives the app it serves
+/// (#1120).
+pub async fn stop_runtime_instance<G: Grill>(
     grill: &G,
     id: &InstanceId,
-    grace: std::time::Duration,
+    stop: &InstanceStop,
     confirmation_timeout: std::time::Duration,
 ) -> Result<(), BunError> {
+    stop_instance_alone(grill, id, stop, confirmation_timeout).await?;
+    if !stop.sidecars.is_empty() {
+        sidecars::stop_sidecars(
+            grill,
+            &stop.sidecars,
+            stop.sidecar_grace,
+            confirmation_timeout,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// [`stop_runtime_instance`]'s four steps for the instance itself, and for
+/// each of its sidecars in turn. A sidecar has no sidecars of its own, so
+/// calling this, not `stop_runtime_instance`, keeps the future from
+/// containing itself.
+async fn stop_instance_alone<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    stop: &InstanceStop,
+    confirmation_timeout: std::time::Duration,
+) -> Result<(), BunError> {
+    if let Some(pre_stop) = &stop.pre_stop {
+        run_pre_stop(grill, id, pre_stop).await;
+    }
     tokio::time::timeout(confirmation_timeout, grill.stop(id))
         .await
         .map_err(|_| BunError::StopUnconfirmed {
             instance_id: id.clone(),
             reason: "graceful stop request timed out",
         })??;
-    if observe_runtime_exit(grill, id, grace).await? {
+    if observe_runtime_exit(grill, id, stop.grace).await? {
         return Ok(());
     }
     kill_runtime_instance(grill, id, confirmation_timeout).await
+}
+
+/// Run an instance's pre-stop command inside it, within its bound.
+///
+/// The outcome is only reported: a pre-stop command is a courtesy to the
+/// workload, and a broken one must never keep an instance running. Dropping
+/// the exec at the bound ends the command, as an exec timeout always has.
+async fn run_pre_stop<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    pre_stop: &crate::grill::stop::PreStop,
+) {
+    match tokio::time::timeout(pre_stop.timeout, grill.exec(id, &pre_stop.command)).await {
+        Ok(Ok(output)) if output.exit_code == 0 => {}
+        Ok(Ok(output)) => eprintln!(
+            "bun: {id}: pre_stop exited with status {}; stopping anyway",
+            output.exit_code
+        ),
+        Ok(Err(error)) => eprintln!("bun: {id}: pre_stop could not run: {error}; stopping anyway"),
+        Err(_) => eprintln!(
+            "bun: {id}: pre_stop ran past its {}s bound; stopping anyway",
+            pre_stop.timeout.as_secs()
+        ),
+    }
 }
 
 /// Preserve ownership until both force-kill and observed runtime exit succeed.
@@ -375,6 +494,9 @@ enum LoopStall {
     /// one file per launch, which after a restart comes off a cold disk.
     /// Only counted; `MockGrill::set_inventory_delay` makes it slow.
     RuntimeInventory,
+    /// Committing a verified upgrade: appending its history entry, pruning
+    /// old binaries and removing the marker (#1381).
+    UpgradeCommit,
 }
 
 /// How long each [`LoopStall`] takes. Shared with the test through an `Arc`
@@ -659,6 +781,9 @@ pub struct BunAgent<G: Grill> {
     deploy_operations: crate::bun::deploy_operations::DeployOperationTracker,
     /// Initialisers whose runtime must retire before parent policy and records.
     initialisers: std::collections::HashMap<InstanceId, std::collections::HashSet<InstanceId>>,
+    /// Each instance's sidecars, which stop after it and retire with it,
+    /// and their restarts (#1120).
+    sidecars: sidecars::Sidecars,
     /// The runtime generation each parent's initialisers last launched, so
     /// the parent's retirement can forget exactly those journals and never
     /// a successor's under the same identity (#850).
@@ -754,6 +879,9 @@ pub struct BunAgent<G: Grill> {
     /// Per-step deadline for the runtime to confirm a stop or force-kill
     /// (`[runtime] stop_confirmation_timeout_secs`).
     stop_confirmation_timeout: std::time::Duration,
+    /// The `[secret_providers.*]` this node runs for `PROVIDER[...]` env
+    /// values, resolved off the loop just before a launch (#1123).
+    secret_providers: crate::sesame::secret_provider::SecretProviders,
     /// How long an ordinary stop waits after SIGTERM before SIGKILL.
     /// `STOP_GRACE_SECS` unless a test shortens it with `set_stop_grace`.
     stop_grace: std::time::Duration,
@@ -863,6 +991,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
+            secret_providers: Default::default(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: Default::default(),
@@ -928,6 +1057,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            sidecars: sidecars::Sidecars::default(),
             initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
@@ -1017,6 +1147,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
+            secret_providers: Default::default(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: Default::default(),
@@ -1093,6 +1224,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            sidecars: sidecars::Sidecars::default(),
             initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
@@ -1270,6 +1402,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.supervisor.set_host_path_policy(policy);
     }
 
+    /// Thread the `[runtime]` knob allowlist from `node.toml` into the
+    /// supervisor (#1122). Without this every runtime knob is refused.
+    pub fn set_runtime_allowlist(&mut self, allowlist: crate::grill::knobs::RuntimeAllowlist) {
+        self.supervisor.set_runtime_allowlist(allowlist);
+    }
+
     /// Thread the parsed `[smoker]` duration limits in, so faults are bounded
     /// by config rather than only the hardcoded 24h backstop.
     pub fn set_smoker_config(&mut self, config: crate::smoker::config::SmokerConfig) {
@@ -1279,6 +1417,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Set the node leaf lifetime this member signs joining nodes with.
     pub fn set_node_leaf_lifetime(&mut self, lifetime: std::time::Duration) {
         self.node_leaf_lifetime = lifetime;
+    }
+
+    /// Thread the `[secret_providers.*]` tables in. Without this the node
+    /// runs no provider, and every `PROVIDER[...]` launch fails closed.
+    pub fn set_secret_providers(
+        &mut self,
+        providers: crate::sesame::secret_provider::SecretProviders,
+    ) {
+        self.secret_providers = providers;
     }
 
     /// Thread `[runtime] stop_confirmation_timeout_secs` in: how long each
@@ -1742,6 +1889,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.refresh_egress_readiness().await;
         self.run_health_checks().await;
         self.begin_state_sweep();
+        self.relaunch_due_sidecars();
         self.drive_pending_restarts().await;
         self.expire_faults().await;
         self.reconcile_firewall();

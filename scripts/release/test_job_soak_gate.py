@@ -596,7 +596,7 @@ class DrainedCampaignApply(unittest.TestCase):
         import os,re,subprocess,time
         source=(self.release/"qualify-sustained.sh").read_text()
         functions="".join(re.search(rf"^{name}\(\) \{{.*?(?:^\}}\n|\}}\n)",source,re.S|re.M).group(0)
-                          for name in ("meta_get","jobs_applied","write_workloads"))
+                          for name in ("meta_get","jobs_applied","soak_workloads","write_workloads"))
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); evidence=root/"evidence"; (evidence/"jobs").mkdir(parents=True)
             (evidence/"jobs/installed").write_text("")

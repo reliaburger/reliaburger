@@ -170,8 +170,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Publish only positively adopted runtimes and retire confirmed empty allocations.
+    ///
+    /// Adoption runs this before the loop, and waits out every write. The
+    /// health tick runs it once the last startup retirement has gone, and
+    /// there it waits for no write in flight and for its own only until the
+    /// turn's deadline (#1336): it answers `StillRunning`, and the next tick
+    /// goes on from what the journal records. A backend already in
+    /// `service_map` was published by an earlier pass, so it isn't touched
+    /// again.
     pub(super) async fn finish_discovery_recovery(&mut self) -> Result<(), BunError> {
-        self.settle_discovery_write().await;
+        let settled = self.settle_discovery_write_outside_turn().await;
+        super::discovery_ownership::still_running_unless_landed(settled, || {
+            "a discovery journal write in flight".into()
+        })?;
         if !matches!(self.discovery_ownership, DiscoveryOwnership::Recovered(_)) {
             return Ok(());
         }
@@ -215,7 +226,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 continue;
             }
             let mut candidate = self.service_map.clone();
+            let mut adopted = Vec::new();
             for (id, port, has_health) in instances {
+                if entry
+                    .backends
+                    .iter()
+                    .any(|backend| backend.instance_id == id.0)
+                {
+                    continue;
+                }
                 // A runtime that can't answer within the turn's budget leaves
                 // recovery for the next tick, like any other uncertainty.
                 let late = || {
@@ -257,6 +276,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 candidate
                     .add_backend(&service, backend)
                     .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+                adopted.push((id, ip, has_health));
+            }
+            if adopted.is_empty() {
+                continue;
+            }
+            let landing = self
+                .journal_publication_within_turn(
+                    &service,
+                    &candidate,
+                    crate::bun::loop_meter::LoopBranch::HealthTick,
+                    "discovery_recovery/landed",
+                )
+                .await?;
+            super::discovery_ownership::still_running_unless_landed(landing, || {
+                format!("journalling {service}'s adopted backends")
+            })?;
+            self.publish_journalled_backends(&service, &candidate)
+                .await?;
+            self.service_map = candidate;
+            for (id, ip, has_health) in adopted {
                 if let Some(instance) = self.supervisor.get_instance_mut(&id) {
                     instance.container_ip = ip;
                     if has_health {
@@ -264,8 +303,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                 }
             }
-            self.publish_backend_snapshot(&service, &candidate).await?;
-            self.service_map = candidate;
         }
         self.sync_firewall_ebpf().await;
         self.rebuild_routing_table().await;

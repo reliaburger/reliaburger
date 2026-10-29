@@ -147,7 +147,7 @@ receipts to be pruned before reusing that identity for an app.
 A task array is a template and a count. The cluster assigns chunks to eligible
 nodes; each node starts tasks as CPU and memory become available. A chunk of
 1,000 tasks does not reserve 1,000 simultaneous executions. Fast verified
-completions can raise queued lookahead to 32 chunks to bridge control-report
+completions can raise queued lookahead to sixteen chunks to bridge control-report
 rounds. This changes queued ownership, not running concurrency or per-command
 resource admission. More granted work may require reconciliation or acknowledged
 replay after worker loss. Lookahead learns from roughly the last 4,096
@@ -306,6 +306,9 @@ Every node exports Mayo series for the attempts it ran itself, so they survive
 a leader change. Each carries only `namespace`, `definition` (the job or array
 name), `profile` (a manifest's resource profile, `default` otherwise) and
 `node`, never a task index or run ID. A node keeps at most 1,024 label sets.
+A label set drops out of the samples 15 minutes after its last attempt ended,
+and comes back with its old totals if the definition runs again, so a
+finished array doesn't keep adding rows to the metrics store.
 
 | Series | Meaning |
 |--------|---------|

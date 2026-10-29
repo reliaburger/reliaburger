@@ -87,6 +87,28 @@ fn apply_summary(created: usize, instances: &[String]) -> String {
     }
 }
 
+/// What the policies say about `config`'s apps, for `relish apply
+/// --dry-run`: the cluster's policies with the config's own replacing any
+/// of the same name, judged as a deployer applying by hand (#1117).
+pub(crate) fn plan_policies(
+    committed: &std::collections::BTreeMap<String, crate::config::PolicySpec>,
+    config: &Config,
+) -> super::plan::PolicyPlan {
+    let effective = crate::policy::effective_policies(committed, config);
+    match crate::policy::PolicySet::compile(&effective) {
+        Ok(set) => super::plan::PolicyPlan::from_evaluation(&crate::policy::evaluate(
+            &set,
+            config,
+            &crate::policy::Caller::token("relish", crate::sesame::types::ApiRole::Deployer),
+            crate::policy::Source::Apply,
+        )),
+        Err(error) => super::plan::PolicyPlan {
+            denials: vec![error.to_string()],
+            ..Default::default()
+        },
+    }
+}
+
 async fn apply_with_client(
     source: &super::manifest::ManifestSource,
     output: OutputFormat,
@@ -99,11 +121,20 @@ async fn apply_with_client(
         // Diff against the live agent's current state when one answers, so
         // updates and unchanged resources render as such instead of every
         // resource claiming to be a create. No agent → the all-create plan.
-        let current = match client.health().await {
-            Ok(()) => Some(client.current_resources().await?),
-            Err(_) => None,
+        let (current, committed_policies) = match client.health().await {
+            Ok(()) => (
+                Some(client.current_resources().await?),
+                // A standalone node has no council and so no policies.
+                client
+                    .policies()
+                    .await
+                    .map(|listing| listing.policies)
+                    .unwrap_or_default(),
+            ),
+            Err(_) => (None, Default::default()),
         };
-        let plan = generate_plan(&config, current.as_deref());
+        let mut plan = generate_plan(&config, current.as_deref());
+        plan.policy = plan_policies(&committed_policies, &config);
         let formatted = format_output(&plan, output)?;
         println!("{formatted}");
         // Human-only trailer: appending it to --output json|yaml would
@@ -587,6 +618,13 @@ async fn delete_with_client(
 ) -> Result<(), RelishError> {
     client.delete_with_force(app, namespace, force).await?;
     println!("delete requested for {app}; check `relish status` for remaining instances");
+    Ok(())
+}
+
+/// Hand an app a controller owns back to `relish apply` and GitOps (#1125).
+pub async fn release(app: &str, namespace: &str) -> Result<(), RelishError> {
+    BunClient::default_local().release(app, namespace).await?;
+    println!("released {app} in {namespace}; relish apply and GitOps manage it again");
     Ok(())
 }
 
@@ -2637,6 +2675,7 @@ async fn batch_with_client(
 
     let key = submission_key(idempotency_key, err)?;
     let result = client.submit_batch(&config.job, Some(&key)).await?;
+    print_policy_warnings(&result, err);
     println!(
         "batch {} admitted: {} queued jobs",
         result["batch_id"].as_u64().unwrap_or(0),
@@ -2804,6 +2843,7 @@ pub fn task_array_request(
             task_timeout_secs: None,
             overlap: None,
             replay_unknown: false,
+            provenance: None,
         },
         spec: run.spec,
     })
@@ -2872,6 +2912,7 @@ async fn submit_task_manifest_with_client(
     }
     let key = submission_key(idempotency_key, err)?;
     let response = client.submit_task_manifest(&request, Some(&key)).await?;
+    print_policy_warnings(&response, err);
     if matches!(output, OutputFormat::Human) {
         println!(
             "manifest {} submitted; watch with: relish batch watch {}",
@@ -3039,6 +3080,16 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
     output
 }
 
+/// Print what the `warn` policies said about a submitted job (#1424), one
+/// `warning:` line each, to `err`.
+fn print_policy_warnings(answer: &serde_json::Value, err: &mut dyn std::io::Write) {
+    for warning in answer["policy_warnings"].as_array().into_iter().flatten() {
+        if let Some(warning) = warning.as_str() {
+            let _ = writeln!(err, "warning: {warning}");
+        }
+    }
+}
+
 /// Submit a task array (`relish run --batch`).
 pub async fn run_task_array(run: TaskArrayRun) -> Result<(), RelishError> {
     run_task_array_with_client(run, &BunClient::default_local(), &mut std::io::stderr()).await
@@ -3060,6 +3111,7 @@ async fn run_task_array_with_client(
         submission_key(explicit, err)?
     };
     let answer = client.submit_task_array(&request, Some(&key)).await?;
+    print_policy_warnings(&answer, err);
     if let Some(id) = answer["batch_id"].as_u64() {
         println!(
             "job run {id} admitted: {} tasks in {} chunks; at-least-once replay policy",
@@ -4514,6 +4566,7 @@ spec:
 
     fn evidence(app: &str, replicas: u32) -> crate::bun::diagnostics::DesiredAppEvidence {
         crate::bun::diagnostics::DesiredAppEvidence {
+            owner: None,
             app: app.to_string(),
             namespace: "prod".to_string(),
             desired_replicas: replicas,
@@ -5209,6 +5262,37 @@ mod task_array_tests {
         let printed = String::from_utf8(err).unwrap();
         assert!(
             printed.contains(&format!("--idempotency-key {key}")),
+            "{printed}"
+        );
+    }
+
+    /// #1424: a `warn` policy's finding in the answer is printed as a
+    /// warning, so `relish run --batch` says what `relish apply` would.
+    #[tokio::test]
+    async fn run_batch_prints_the_policy_warnings_in_the_answer() {
+        let app = axum::Router::new().route(
+            "/v1/batch/array",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "batch_id": 7, "count": 1, "chunks": 1,
+                    "policy_warnings": ["policy pinned warns about job default/render: pin it"],
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut err = Vec::new();
+        run_task_array_with_client(run(), &client, &mut err)
+            .await
+            .unwrap();
+        server.abort();
+        let printed = String::from_utf8(err).unwrap();
+        assert!(
+            printed.contains("warning: policy pinned warns about job default/render: pin it"),
             "{printed}"
         );
     }

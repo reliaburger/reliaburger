@@ -90,10 +90,16 @@ fi
 
 repository=$(cd "$(dirname "$0")/../.." && pwd)
 checker=$repository/scripts/release/sustained_check.py
+slo_tool=$repository/scripts/release/soak_slo.py
 job_controller=$repository/scripts/release/job_soak.py
 job_inventory=$repository/scripts/release/job_soak_inventory.py
+export_retention=$repository/scripts/release/soak_export_retention.py
 guest_memory=$repository/scripts/release/sustained/guest-memory.sh
+history_client=$repository/scripts/release/council_history.py
+linearizability=$repository/scripts/release/linearizability.py
+history_clients=4
 jobs_pid=
+history_pid=
 workloads_template=$repository/scripts/release/sustained/soak-workloads.toml
 podinfo=$repository/examples/kubernetes/podinfo.yaml
 base_url=
@@ -245,6 +251,10 @@ quiet_tail=0
 job_runs=$(python3 "$job_controller" budget --duration "$(( duration + quiet_tail ))") || fail 'the job campaign would outgrow its retained-run limit'
 light_every=30
 heavy_every=300
+# The latency SLOs' quiet rolling update (#1400): twice a cycle, so a fast
+# tier gets about a dozen, a final about twenty and a day about fifty.
+slo_every=$(( cycle / 2 ))
+slo_rollout_budget=180
 leaf_lifetime=3600
 
 if [ "$resume" = true ]; then
@@ -298,6 +308,8 @@ chmod 700 "$evidence"
 [ "$plan" = true ] || say "evidence: $evidence"
 
 check() { python3 "$checker" "$@"; }
+slo() { python3 "$slo_tool" "$@"; }
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time() * 1000'; }
 event() { check event "$evidence" "$@" || true; }
 meta() { python3 - "$evidence/metadata.json" "$@" <<'PY'
 import json, sys
@@ -657,7 +669,7 @@ configure_nodes() {
     done
     probe_leaf_lifetime
     meta deviations+ 'node.toml `[testing] allowed_operations` adds `provision_isolated_workloads` (quickstart allows only inject_workload_faults and alter_node_state), so the catalogue pulse can lease test namespaces'
-    meta deviations+ 'node.toml `[logs]`/`[metrics]` export to file:///var/lib/reliaburger/soak-export every 60 s with max_storage_mb = 8, `[storage.snapshots]` every 900 s (compressed: 120 s), retain 4, uploaded to the same directory'
+    meta deviations+ 'node.toml `[logs]`/`[metrics]` export to file:///var/lib/reliaburger/soak-export every 60 s with max_storage_mb = 8 (the harness deletes a metrics export 30 minutes after its source has gone), `[storage.snapshots]` every 900 s (compressed: 120 s), retain 4, uploaded to the same directory'
     meta deviations+ 'node.toml `[ingress] tls_cert/tls_key` point at an operator pair from a soak CA, 45-minute leaves rotated by the harness'
     meta deviations+ 'Bun runs with auto/mixed; host jobs opt in to a single pinned BusyBox copy under /var/lib/reliaburger/soak-jobs, mount_isolation=false. The independent verifier listens on each private VM address, TCP 8189, with a separate run token'
     meta deviations+ 'node.toml `[node.labels] soak-volume` = "writer" on node 2 and "redis" on node 3, to pin the volume apps'
@@ -823,6 +835,7 @@ wait_cluster() {
 }
 
 generation=0
+slo_generation=0
 # Whether an apply may carry the job fixtures. Not once the campaign drains,
 # nor in the minute before (an apply's schedules commit after its hooks): an
 # apply re-registers each cron schedule the drain disabled and runs every
@@ -836,8 +849,14 @@ jobs_applied() {
     [ -z "$stop_at" ] || [ $(( $(date +%s) + 60 )) -lt "$stop_at" ]
 }
 
+# The soak workloads at the current generations, without the job fixtures.
+soak_workloads() {
+    sed -e "s/SOAK_GENERATION = \"[0-9]*\"/SOAK_GENERATION = \"$generation\"/" \
+        -e "s/SOAK_SLO_GENERATION = \"[0-9]*\"/SOAK_SLO_GENERATION = \"$slo_generation\"/" "$workloads_template"
+}
+
 write_workloads() {
-    sed "s/SOAK_GENERATION = \"[0-9]*\"/SOAK_GENERATION = \"$generation\"/" "$workloads_template" > "$evidence/workloads.toml"
+    soak_workloads > "$evidence/workloads.toml"
     ! jobs_applied || cat "$repository/scripts/release/sustained/soak-jobs.toml" >> "$evidence/workloads.toml"
 }
 
@@ -845,10 +864,14 @@ apply_workloads() {
     write_workloads
     rel apply -f "$podinfo" > "$evidence/config/apply-podinfo.log" 2>&1 || fail "applying $podinfo failed"
     rel apply -f "$evidence/workloads.toml" > "$evidence/config/apply-workloads.log" 2>&1 || fail 'applying the soak workloads failed'
+    # The workload file carries a deny, a warn and a default policy (#1311);
+    # every later check makes sure they stay in force.
+    rel --output json policy list > "$evidence/config/policies.json" 2>&1 || fail 'listing the soak policies failed'
+    check policies "$evidence" "$evidence/config/policies.json" || fail 'the soak policies are not all in force'
     local deadline=$(( $(date +%s) + 600 )) file=$evidence/.status.json
     until rel --output json status > "$file" 2>/dev/null && python3 - "$file" <<'PY'
 import json, sys
-want = {"soak-writer": 1, "soak-redis": 1, "soak-redis-client": 1, "soak-spammer": 1, "soak-identity": 3,
+want = {"soak-writer": 1, "soak-redis": 1, "soak-redis-client": 1, "soak-spammer": 1, "soak-identity": 3, "soak-slo": 3,
         "frontend": 3, "backend": 1, "redis": 1, "loadgen": 1}
 running = {}
 for instance in json.load(open(sys.argv[1])):
@@ -941,6 +964,47 @@ start_jobs() {
     python3 "$job_controller" run --evidence "$evidence" --api-port "$api_port" --ca "$ca" --limactl "$limactl" "${load[@]}" > "$evidence/jobs/controller.log" 2>&1 &
     jobs_pid=$!
 }
+# --- council history (#1399) ----------------------------------------------------
+# A client takes, renews, reads and releases test leases through every node for
+# the whole soak and records each operation; once the soak is over the history
+# is checked for linearizability. The day tier has no faults to check it under.
+start_council_history() {
+    [ "$tier" != day ] || return 0
+    python3 "$history_client" run --history "$evidence/council-history.jsonl" --ca "$ca" \
+        --token-file "$evidence/.token" --clients "$history_clients" \
+        --node "${vm[1]}=$api_port" --node "${vm[2]}=$(( api_port + 1 ))" --node "${vm[3]}=$(( api_port + 2 ))" \
+        >> "$evidence/council-history.log" 2>&1 &
+    history_pid=$!
+    meta council_history json:true
+}
+# SIGTERM: each client finishes its operation and releases its lease.
+stop_council_history() {
+    [ -n "$history_pid" ] || return 0
+    kill -TERM "$history_pid" 2>/dev/null || true
+    local until=$(( $(date +%s) + 90 ))
+    while kill -0 "$history_pid" 2>/dev/null && [ "$(date +%s)" -lt "$until" ]; do sleep 1; done
+    kill -KILL "$history_pid" 2>/dev/null || true
+    history_pid=
+}
+check_council_history() {
+    [ -f "$evidence/council-history.jsonl" ] || return 0
+    local result=0
+    python3 "$linearizability" check "$evidence/council-history.jsonl" --out "$evidence/council-history-check.json" \
+        > /dev/null || result=$?
+    case $result in
+        0) event --phase council-history --verdict ok ;;
+        # A fast or final tier with no linearizability coverage isn't green (#1437).
+        3) if [ "$tier" = fast ] || [ "$tier" = final ]; then
+               event --phase council-history --verdict fail --detail 'search over budget; see council-history-check.json'
+               record_failure linearizability 'the council history check was inconclusive (search over budget); see council-history-check.json'
+           else
+               event --phase council-history --verdict inconclusive --detail 'search over budget; see council-history-check.json'
+           fi ;;
+        *) event --phase council-history --verdict fail
+           record_failure linearizability 'the council history is not linearizable; see council-history-check.json' ;;
+    esac
+}
+
 # The controller allows the drain 110 s once it sees job_stop_at; give it that
 # and its last requests before the heavy check and teardown.
 wait_for_job_drain() {
@@ -967,6 +1031,9 @@ echo "bun_pid $pid"
 if [ "${pid:-0}" -gt 0 ]; then
     echo "bun_fd $(ls /proc/"$pid"/fd | wc -l)"
     echo "bun_rss_kb $(awk '/^VmRSS/ {print $2}' /proc/"$pid"/status)"
+    # Heap and other private memory against mapped files (#1417).
+    echo "bun_rss_anon_kb $(awk '/^RssAnon/ {print $2}' /proc/"$pid"/status)"
+    echo "bun_rss_file_kb $(awk '/^RssFile/ {print $2}' /proc/"$pid"/status)"
     # utime + stime: fields 14 and 15, counted after comm's closing parenthesis.
     echo "bun_cpu_ticks $(sed 's/.*) //' /proc/"$pid"/stat | awk '{print $12 + $13}')"
     echo "clk_tck $(getconf CLK_TCK)"
@@ -1024,6 +1091,13 @@ for kind in logs metrics; do
         fi
     done
 done
+GUEST
+    # Once listed, metrics exports whose source left 30 minutes ago go
+    # (#1418): the destination used to keep about 600 MiB a node a day.
+    printf "python3 - /var/lib/reliaburger/metrics /var/lib/reliaburger/soak-export/metrics <<'RETENTION' || true\n"
+    cat "$export_retention"
+    printf 'RETENTION\n'
+    cat <<'GUEST'
 find /var/lib/reliaburger/soak-export/snapshots -name '*.tar.gz' -type f 2>/dev/null | while read -r file; do
     if gzip -t "$file" 2>/dev/null; then state=ok; else state=bad; fi
     echo "snap ${file#/var/lib/reliaburger/soak-export/snapshots/} $state"
@@ -1069,6 +1143,7 @@ collect_light() {
     curl -s -o /dev/null -w '%{http_code} %{time_total}\n' --max-time 5 -H 'Host: podinfo.localhost' \
         "http://127.0.0.1:$ingress_port/" > "$directory/http.txt" 2>/dev/null || true
     probe_forwards "$directory"
+    [ -n "$window_label" ] || slo_reads "$directory"
     rel logs soak-writer --tail 20 > "$directory/writer-log.txt" 2>&1 || true
     rel logs soak-redis-client --tail 20 > "$directory/redis-log.txt" 2>&1 || true
 }
@@ -1085,6 +1160,18 @@ probe_forwards() {
     check forwards "$directory" --limactl "$limactl" --api-port "$api_port" --ingress-port "$ingress_port" \
         --registry-port "$registry_port" --node "${vm[1]}" --node "${vm[2]}" --node "${vm[3]}" \
         ${down_nodes[@]+"${down_nodes[@]}"} 2>> "$evidence/harness-errors.log" || true
+}
+
+# The latency SLOs' API reads (#1400): `relish status` and `relish nodes`
+# on every node that is up, timed from the host. Never inside a fault
+# window; the checker also drops a node whose forward the check above found
+# cut.
+slo_reads() {
+    local directory=$1 node down_nodes=()
+    for node in 1 2 3; do [ "${down[node]}" = 0 ] || down_nodes+=(--down "$node"); done
+    slo api-latency "$directory" --api-port "$api_port" --ca "$ca" --auth-header "$evidence/.auth-header" \
+        --node "${vm[1]}" --node "${vm[2]}" --node "${vm[3]}" ${down_nodes[@]+"${down_nodes[@]}"} \
+        2>> "$evidence/harness-errors.log" || true
 }
 
 # Lima truncates a VM's host-agent log (ha.stderr.log, where forwarding
@@ -1107,6 +1194,8 @@ collect() {
     echo "$exit_code" > "$directory/wtf.exit"
     rel --output json nodes > "$directory/nodes.json" 2>/dev/null || rm -f "$directory/nodes.json"
     rel --output json status > "$directory/status.json" 2>/dev/null || rm -f "$directory/status.json"
+    # The soak workload's policies must survive every fault (#1311).
+    rel --output json policy list > "$directory/policies.json" 2>/dev/null || rm -f "$directory/policies.json"
     for node in 1 2 3; do
         [ "${down[node]}" = 0 ] || continue
         # The agent loop's turn histogram, newest samples last: the checker
@@ -1201,6 +1290,7 @@ observe() {
 window_label=
 next_light=0
 next_heavy=$(( $(date +%s) + heavy_every ))
+next_slo=$(( $(date +%s) + slo_every ))
 next_rotation=$(( $(date +%s) + rotation ))
 open_window() { window_label=$1; check window "$evidence" open "$1" --down "${2:-0}" ${3:+--node "$3"}; }
 close_window() { check window "$evidence" "${1:-close}"; window_label=; }
@@ -1626,6 +1716,52 @@ wait_versions() {
     done
 }
 
+# One quiet rolling update for the latency SLOs (#1400): soak-slo at its
+# next generation, one instance on every node. The apply is an API write;
+# each node's new deploy entry, from its start until the instance passes its
+# health check, is an app start; from the apply returning until every node
+# completed is the deploy-to-ready. The apply never carries the job
+# fixtures, so it re-runs no job work (#963). Recorded, never a failure
+# bundle: the SLO table in the record judges it.
+slo_rollout() {
+    [ -z "$window_label" ] || return 0
+    local before=$evidence/.slo-before.json after=$evidence/.slo-after.json node expected=0 started applied
+    local deadline starts code ms args=()
+    for node in 1 2 3; do [ "${down[node]}" = 1 ] || expected=$(( expected + 1 )); done
+    node=$(api_node)
+    api_get "$node" /v1/deploys/history/soak-slo > "$before" 2>/dev/null || return 0
+    slo_generation=$(( slo_generation + 1 ))
+    meta slo_generation "$slo_generation"
+    soak_workloads > "$evidence/workloads-slo.toml"
+    started=$(now_ms)
+    if ! rel apply -f "$evidence/workloads-slo.toml" > "$evidence/snapshots/slo-apply-$slo_generation.log" 2>&1; then
+        slo rollout "$evidence" --apply-ms $(( $(now_ms) - started )) --failed "generation $slo_generation: relish apply failed"
+        event --phase slo:rollout --verdict fail --detail "generation $slo_generation: relish apply failed"
+        return 0
+    fi
+    applied=$(now_ms)
+    deadline=$(( $(date +%s) + slo_rollout_budget ))
+    while :; do
+        code=1
+        if api_get "$node" /v1/deploys/history/soak-slo > "$after" 2>/dev/null; then
+            code=0
+            starts=$(slo rolled "$before" "$after" "$expected") || code=$?
+        fi
+        [ "$code" -ne 0 ] || break
+        if [ "$code" -eq 2 ] || [ "$(date +%s)" -ge "$deadline" ]; then
+            [ "$code" -eq 2 ] || starts="not ready within $slo_rollout_budget s"
+            slo rollout "$evidence" --apply-ms $(( applied - started )) --failed "generation $slo_generation: $starts"
+            event --phase slo:rollout --verdict fail --detail "generation $slo_generation: $starts"
+            return 0
+        fi
+        sleep 1
+    done
+    ms=$(( $(now_ms) - applied ))
+    for code in $starts; do args+=(--start-ms "$code"); done
+    slo rollout "$evidence" --apply-ms $(( applied - started )) --ready-ms "$ms" ${args[@]+"${args[@]}"}
+    event --phase slo:rollout --verdict ok --detail "generation $slo_generation: apply $(( applied - started )) ms, ready $ms ms, starts $starts"
+}
+
 # Wait until T, running light, heavy and rotation work when due.
 wait_until() {
     local until=$1 now
@@ -1638,6 +1774,9 @@ wait_until() {
         elif [ "$now" -ge "$next_heavy" ]; then
             next_heavy=$(( now + heavy_every ))
             observe heavy || true
+        elif [ "$now" -ge "$next_slo" ] && [ -z "$window_label" ]; then
+            next_slo=$(( now + slo_every ))
+            run_slot slo_rollout
         elif [ "$now" -ge "$next_light" ]; then
             next_light=$(( now + light_every ))
             observe light || true
@@ -1761,6 +1900,7 @@ finish() {
         fi
     fi
     [ -z "${background_pid:-}" ] || kill "$background_pid" 2>/dev/null || true
+    [ -z "${history_pid:-}" ] || kill "$history_pid" 2>/dev/null || true
     [ -f "$evidence/metadata.json" ] || { printf 'sustained: stopped before the soak started\n' >&2; exit "$result"; }
     meta finished_at "json:$(date +%s)"
     [ -z "${vm[3]:-}" ] || keep_host_logs end 1 2 3
@@ -1859,6 +1999,7 @@ if [ "$plan" = true ]; then
     [ "$tier" != day ] || printf 'plan: host-busybox busybox-static %s %s\n' "$day_busybox_version" "$day_busybox_sha256"
     printf 'plan: %s\n' "$job_runs"
     printf 'plan: seed %s for every fault and node choice\n' "${seed:-random}"
+    [ "$tier" = day ] || printf 'plan: council-history %s clients, checked for linearizability after the soak\n' "$history_clients"
     for (( index = 0; index < plan_cycles; index++ )); do run_cycle "$index" 0; done
     [ "$quiet_tail" -eq 0 ] || printf 'plan: quiet-tail %s s with no faults, walks or specials after the last cycle\n' "$quiet_tail"
     rm -rf "$evidence"
@@ -1881,6 +2022,7 @@ if [ "$resume" = true ]; then
     [ "$(meta_get job_soak)" = True ] || fail '--resume needs a job-enabled campaign; start a fresh qualification for this harness'
     [ ! -f "$evidence/jobs/stop" ] || fail 'cannot resume a campaign already asked to drain'
     generation=$(meta_get generation); generation=${generation:-0}
+    slo_generation=$(meta_get slo_generation); slo_generation=${slo_generation:-0}
     first_cycle=$(meta_get cycles); first_cycle=${first_cycle:-0}
     started_at=$(meta_get started_at)
     release_version=$(meta_get release_version)
@@ -1946,9 +2088,11 @@ PY
     next_rotation=$(( started_at + rotation ))
 fi
 [ -n "$jobs_pid" ] || start_jobs
+start_council_history
 
 next_light=$(date +%s)
 next_heavy=$(( $(date +%s) + heavy_every ))
+next_slo=$(( $(date +%s) + slo_every / 2 ))
 index=$first_cycle
 # A day tier runs no cycles: its whole length is the wait below.
 while [ "$schedule" != none ]; do
@@ -1982,5 +2126,7 @@ if [ -n "${jobs_pid:-}" ]; then
     meta job_stop_at "json:$(date +%s)"
     wait_for_job_drain
 fi
+stop_council_history
+check_council_history
 observe heavy || true
 say "soak finished after $index cycles"

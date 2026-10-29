@@ -504,6 +504,72 @@ async fn producer_release_requires_authenticated_identity_and_every_consumer_rec
     ));
 }
 
+/// #1440: a producer asks every 500 ms while it waits for other nodes. Only
+/// the first ask commits the fence; later asks are answered from committed
+/// state, so they add nothing to the Raft log, and still see the release
+/// once every consumer has confirmed.
+#[tokio::test]
+async fn a_repeated_producer_release_commits_no_new_log_entry() {
+    let hierarchy = ca::generate_ca_hierarchy("producer-repeat", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+    council
+        .write(RaftRequest::RegisterEndpointConsumer {
+            node_id: "offline".into(),
+        })
+        .await
+        .unwrap();
+    let catalog = EndpointCatalog::rebuild([(
+        ServiceId::new("default", "web"),
+        8080,
+        vec![CatalogBackend {
+            node_id: "producer".into(),
+            node_ip: "127.0.0.1".parse().unwrap(),
+            host_port: 18080,
+            healthy: true,
+            execution: Some(producer_execution()),
+        }],
+    )])
+    .unwrap();
+    council
+        .write(RaftRequest::PublishEndpoints {
+            expected_generation: 0,
+            catalog: Box::new(catalog),
+        })
+        .await
+        .unwrap();
+    let app = router(council.clone(), Some(peer(&hierarchy, "producer", 10)));
+    let last_log = || council.raft().metrics().borrow().last_log_index;
+
+    assert_eq!(
+        retire_producer(app.clone(), producer_request(), "internal-token").await,
+        StatusCode::ACCEPTED
+    );
+    let fenced = last_log();
+    for _ in 0..3 {
+        assert_eq!(
+            retire_producer(app.clone(), producer_request(), "internal-token").await,
+            StatusCode::ACCEPTED
+        );
+    }
+    assert_eq!(last_log(), fenced, "a repeated ask committed an entry");
+
+    assert_eq!(
+        acknowledge(
+            router(council.clone(), Some(peer(&hierarchy, "offline", 11))),
+            receipt(1),
+            "internal-token"
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let acknowledged = last_log();
+    assert_eq!(
+        retire_producer(app, producer_request(), "internal-token").await,
+        StatusCode::OK
+    );
+    assert_eq!(last_log(), acknowledged);
+}
+
 #[tokio::test]
 async fn producer_release_refuses_missing_forged_retired_and_incompatible_authority() {
     let hierarchy = ca::generate_ca_hierarchy("producer-authority", &IKM).unwrap();

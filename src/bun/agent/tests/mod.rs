@@ -16,7 +16,11 @@ mod loop_rule;
 mod namespace_secrets;
 mod published_status;
 mod restart_ownership;
+mod runtime_knobs;
 mod runtime_metadata;
+mod secret_providers;
+mod sidecars;
+mod stop_hooks;
 mod upgrade_answer;
 
 #[test]
@@ -1152,6 +1156,98 @@ async fn a_published_rolling_replacement_reports_running_before_the_old_instance
     );
 }
 
+/// #1355: a retiring instance's drain waited only for this node's ingress
+/// connections. Other nodes connect to its backend directly, and they only
+/// drop it once their next view arrives, so a server that exits on SIGTERM
+/// could stop while they still routed to it, and their callers got
+/// `ECONNREFUSED`. The leader's producer release answers exactly "every
+/// node has dropped this backend", but it was asked only after the stop.
+/// Now the old instance keeps running until the leader confirms (or the
+/// patience runs out), and only then gets its stop signal.
+#[tokio::test]
+async fn a_rolling_retirement_stops_the_old_instance_only_after_other_nodes_drop_it() {
+    let grill = MockGrill::new();
+    grill.set_pid(std::process::id());
+    let allocator = PortAllocator::new(30000, 30010);
+    let (_, receiver) = mpsc::channel(8);
+    let mut agent = BunAgent::new(
+        grill.clone(),
+        allocator.clone(),
+        receiver,
+        CancellationToken::new(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    agent.set_volumes_dir(root.path().join("volumes"));
+    agent.set_records_dir(root.path().join("records"));
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let old = InstanceId("default__web-0".into());
+    let original = agent.supervisor.get_instance(&old).unwrap();
+    let execution = crate::grill::RuntimeExecution {
+        instance_id: old.clone(),
+        generation: crate::grill::RuntimeGeneration::process("original"),
+    };
+    grill
+        .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+            instance_id: old.clone(),
+            generation: execution.generation.clone(),
+            spec: original.oci_spec.clone().unwrap(),
+            network_reference: None,
+        }])
+        .await;
+    let (mut clustered, _, _) = test_cluster_fault_agent().await;
+    agent.cluster = clustered.cluster.take();
+
+    // The leader waits for one other node's receipt (202), then confirms.
+    // Each request notes whether the old instance had already been told to
+    // stop when it arrived.
+    let confirmation = serde_json::json!({"node_id": "test", "execution": execution}).to_string();
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+    let (client, leader) = crate::cluster::producer::test_scripted_fixture({
+        let requests = requests.clone();
+        let grill = grill.clone();
+        let old = old.clone();
+        move || {
+            let stopped = grill
+                .calls()
+                .iter()
+                .any(|(operation, id)| operation == "stop" && *id == old);
+            let mut requests = requests.lock().unwrap();
+            requests.push(stopped);
+            if requests.len() < 2 {
+                (axum::http::StatusCode::ACCEPTED, String::new())
+            } else {
+                (axum::http::StatusCode::OK, confirmation.clone())
+            }
+        }
+    })
+    .await;
+    agent.set_producer_release_client(client);
+
+    let replacement = Config::parse("[app.web]\nimage = 'web:v2'\nport = 8080\n").unwrap();
+    expect_complete(&drain_deploy(&mut agent, replacement).await);
+
+    let requests = requests.lock().unwrap().clone();
+    assert!(
+        requests.len() >= 2 && !requests[0] && !requests[1],
+        "the old instance must keep serving until the leader confirms every \
+         node has dropped it; stopped at each release request: {requests:?}"
+    );
+    assert!(
+        grill
+            .calls()
+            .iter()
+            .any(|(operation, id)| operation == "stop" && *id == old),
+        "the old instance was never stopped"
+    );
+    assert!(agent.supervisor.get_instance(&old).is_none());
+    leader.abort();
+    let _ = leader.await;
+}
+
 #[tokio::test]
 async fn slow_producer_release_does_not_stall_the_agent_loop() {
     let grill = MockGrill::new();
@@ -1383,6 +1479,160 @@ async fn a_producer_release_still_pending_after_the_patience_fails_the_retiremen
     ));
     assert!(started.elapsed() <= std::time::Duration::from_secs(30));
     assert!(attempts.load(std::sync::atomic::Ordering::SeqCst) >= 29);
+}
+
+/// #1355, #1442: the wait before an old instance's stop, for every node to
+/// drop its backend, gives up at its 5 s patience when a node never
+/// confirms, and the stop goes ahead.
+#[tokio::test(start_paused = true)]
+async fn the_wait_for_remote_withdrawal_gives_up_at_its_patience() {
+    use super::deploy_ops::{PRODUCER_RELEASE_PATIENCE, REMOTE_WITHDRAWAL_RETRY};
+
+    let (tx, mut rx) = mpsc::channel(4);
+    let ops = DeployOps { tx };
+    let id = InstanceId("default__web-0".into());
+    let started = tokio::time::Instant::now();
+    let mut asked = 0u32;
+    // The loop's side answers "pending" for ever, as it does while a lost
+    // node holds the withdrawal up. Driven in this task, not spawned, so
+    // the paused clock only moves when both sides wait.
+    let wait = ops.await_remote_withdrawal(&id);
+    tokio::pin!(wait);
+    loop {
+        tokio::select! {
+            () = &mut wait => break,
+            Some(op) = rx.recv() => {
+                let DeployOp::AwaitRemoteWithdrawal { reply, .. } = op else {
+                    panic!("unexpected op {}", op.name());
+                };
+                asked += 1;
+                let _ = reply.send(Err(pending_release()));
+            }
+        }
+    }
+    let waited = started.elapsed();
+
+    assert!(
+        waited + REMOTE_WITHDRAWAL_RETRY >= PRODUCER_RELEASE_PATIENCE,
+        "gave up before its patience: {waited:?}"
+    );
+    assert!(
+        waited <= PRODUCER_RELEASE_PATIENCE,
+        "waited past its patience: {waited:?}"
+    );
+    assert!(asked >= 9, "asked only {asked} times");
+}
+
+/// #1440: retiring a batch of old instances (a scale-down, the surplus a
+/// rollout leaves, all of blue) overlaps their waits for other nodes to
+/// drop them. With a node that never confirms, the batch costs one
+/// patience, not one per instance.
+#[tokio::test(start_paused = true)]
+async fn a_batch_of_retirements_waits_out_the_patience_once() {
+    use super::deploy_ops::PRODUCER_RELEASE_PATIENCE;
+
+    let (agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let (ops_tx, mut ops_rx) = mpsc::channel(64);
+    let worker = DeployWorker {
+        grill,
+        ops: DeployOps { tx: ops_tx },
+        drains: agent.drains.clone(),
+        operation: None,
+        stop_confirmation_timeout: agent.stop_confirmation_timeout,
+        egress: agent.egress_resolver(),
+        secrets: agent.secret_providers.clone(),
+    };
+    let ids: Vec<InstanceId> = (0..6)
+        .map(|n| InstanceId(format!("default__web-{n}")))
+        .collect();
+    let started = tokio::time::Instant::now();
+    // The loop's side: every retirement begins, and every node but one
+    // confirms nothing, for ever. Driven in this task, as above.
+    let retire = worker.retire_old_instances(&ids, std::time::Duration::ZERO);
+    tokio::pin!(retire);
+    let outcomes = loop {
+        tokio::select! {
+            outcomes = &mut retire => break outcomes,
+            Some(op) = ops_rx.recv() => match op {
+                DeployOp::BeginRetire { reply, .. } => {
+                    let _ = reply.send(Ok(super::retirement::BegunRetirement {
+                        restart: None,
+                        stop: None,
+                        sidecars: Vec::new(),
+                    }));
+                }
+                DeployOp::AwaitRemoteWithdrawal { reply, .. } => {
+                    let _ = reply.send(Err(pending_release()));
+                }
+                other => panic!("unexpected op {}", other.name()),
+            },
+        }
+    };
+    let waited = started.elapsed();
+
+    assert_eq!(outcomes.len(), ids.len());
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+    assert!(
+        waited < PRODUCER_RELEASE_PATIENCE * 2,
+        "{} retirements waited {waited:?}, one patience each",
+        ids.len()
+    );
+}
+
+/// #1440: one retirement in a batch failing doesn't stop the others; each
+/// instance gets its own outcome, in the order given.
+#[tokio::test(start_paused = true)]
+async fn a_failed_retirement_in_a_batch_leaves_the_others_retired() {
+    let (agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let (ops_tx, mut ops_rx) = mpsc::channel(64);
+    let ids: Vec<InstanceId> = (0..3)
+        .map(|n| InstanceId(format!("default__web-{n}")))
+        .collect();
+    // The runtime can't say whether the middle one exited, so its stop is
+    // unconfirmed.
+    grill.set_instance_inspection_failure(&ids[1], true);
+    let worker = DeployWorker {
+        grill: grill.clone(),
+        ops: DeployOps { tx: ops_tx },
+        drains: agent.drains.clone(),
+        operation: None,
+        stop_confirmation_timeout: agent.stop_confirmation_timeout,
+        egress: agent.egress_resolver(),
+        secrets: agent.secret_providers.clone(),
+    };
+    let retire = worker.retire_old_instances(&ids, std::time::Duration::ZERO);
+    tokio::pin!(retire);
+    let outcomes = loop {
+        tokio::select! {
+            outcomes = &mut retire => break outcomes,
+            Some(op) = ops_rx.recv() => match op {
+                DeployOp::BeginRetire { reply, .. } => {
+                    let _ = reply.send(Ok(super::retirement::BegunRetirement {
+                        restart: None,
+                        stop: None,
+                        sidecars: Vec::new(),
+                    }));
+                }
+                DeployOp::AwaitRemoteWithdrawal { reply, .. } => {
+                    let _ = reply.send(Ok(()));
+                }
+                other => panic!("unexpected op {}", other.name()),
+            },
+        }
+    };
+
+    let failed: Vec<bool> = outcomes.iter().map(Result::is_err).collect();
+    assert_eq!(failed, vec![false, true, false], "{outcomes:?}");
+    for id in [&ids[0], &ids[2]] {
+        assert!(
+            grill
+                .calls()
+                .iter()
+                .any(|(call, called)| call == "stop" && called == id),
+            "{} was never stopped",
+            id.0
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -2749,6 +2999,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             operation: None,
             stop_confirmation_timeout: self.stop_confirmation_timeout,
             egress: self.egress_resolver(),
+            secrets: self.secret_providers.clone(),
         };
         let events = events.clone();
         let mut task = tokio::spawn(async move { worker.run_deploy(config, events).await });
@@ -7623,7 +7874,9 @@ async fn rollout_retirement_fences_the_crash_restart_driver() {
         agent.check_apps().await;
         let old = agent.supervisor.get_instance(&old_id).unwrap();
         let observed = (old.state, old.restart_count, old.retry_pending);
-        grill.release_kills(1);
+        // Blue-green retires all of blue at once (#1440), so every old
+        // replica's kill may be held here, not just the first.
+        grill.release_kills(replicas as usize);
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             let mut events = Vec::new();
             loop {
@@ -9172,6 +9425,7 @@ fn adoption_record(
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: "/tmp/test".to_string(),
                 readonly: false,
@@ -9193,7 +9447,10 @@ fn adoption_record(
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         },
         rootless_network: None,
     }
@@ -9769,6 +10026,7 @@ pub(super) fn limited_adoption_record(
             "memory.high".to_string(),
             "33554432".to_string(),
         )]),
+        devices: Vec::new(),
     });
     record
 }
@@ -10472,11 +10730,13 @@ async fn retire_waits_for_in_flight_request_before_kill() {
     drains.increment_connections(&id.0).await;
 
     // Kick off the retire on a task; it must block on the drain.
+    let stop = InstanceStop::for_policy(None, std::time::Duration::from_secs(30));
     let retire = drain_and_stop_instance(
         &drains,
         &grill,
         &id,
         std::time::Duration::from_secs(30),
+        &stop,
         std::time::Duration::from_secs(10),
     );
     tokio::pin!(retire);
@@ -10532,11 +10792,13 @@ async fn retire_waits_for_in_flight_websocket_before_kill() {
     drains.increment_connections(&id.0).await;
     drains.increment_websocket(&id.0).await;
 
+    let stop = InstanceStop::for_policy(None, std::time::Duration::from_secs(30));
     let retire = drain_and_stop_instance(
         &drains,
         &grill,
         &id,
         std::time::Duration::from_secs(30),
+        &stop,
         std::time::Duration::from_secs(10),
     );
     tokio::pin!(retire);

@@ -64,6 +64,9 @@ pub struct TaskArraySubmitResponse {
     pub count: u32,
     /// Chunks the tasks are grouped into.
     pub chunks: u32,
+    /// What the `warn` policies said about the array (#1424).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_warnings: Vec<String>,
 }
 
 /// `GET /v1/batch/{id}/results` query.
@@ -143,27 +146,23 @@ fn validate_submission(request: &mut TaskArraySubmitRequest) -> Result<String, S
     Ok(namespace)
 }
 
-async fn follower_council(state: &ApiState) -> Option<&crate::council::CouncilNode> {
-    let council = state.council.as_deref()?;
-    if council.is_leader().await {
-        None
-    } else {
-        Some(council)
-    }
-}
-
-/// How long a leader gets to prove it leads before it answers a run it
-/// can't find (#1009, #1192).
+/// How long a leader gets to prove it leads before it serves a job or
+/// task-array request itself (#1009, #1192, #1253).
 const LEADER_CONFIRMATION: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// The council to forward a run's request to, or `None` when this node has
-/// proved it leads (or runs without a council) and its record is the truth.
+/// The council to forward a job or task-array request to, or `None` when
+/// this node has proved it leads (or runs without a council) and may serve
+/// the request itself.
 ///
 /// A follower's replica can lag, and a node back from a stop may hold a log
 /// older than the run, so only a confirmed leader may say "not found". The
 /// leader gets [`LEADER_CONFIRMATION`] to prove it, so one heartbeat round
-/// its followers answer late doesn't turn into a 503.
-async fn council_to_forward_to(state: &ApiState) -> Option<&crate::council::CouncilNode> {
+/// its followers answer late doesn't turn into a 503: a leader that fails a
+/// single round would forward to itself, which `leader_api_url` refuses. A
+/// follower answers at once, without waiting.
+pub(super) async fn council_to_forward_to(
+    state: &ApiState,
+) -> Option<&crate::council::CouncilNode> {
     let council = state.council.as_deref()?;
     if council.confirm_leadership(LEADER_CONFIRMATION).await {
         None
@@ -198,7 +197,7 @@ pub async fn submit_handler(
         return response;
     }
     crate::bun::audit::annotate_workload(&request.name, &namespace);
-    if let Some(council) = follower_council(&state).await {
+    if let Some(council) = council_to_forward_to(&state).await {
         return forward_to_leader(&state, council, "/v1/batch/array", body, &headers).await;
     }
     let count = request.spec.count;
@@ -215,7 +214,7 @@ pub async fn submit_handler(
         replay_unknown: true,
         hook: false,
     };
-    if let Err(response) = super::job_api::admit_definition(
+    let policy_warnings = match super::job_api::admit_definition(
         &state,
         auth,
         binder.as_deref(),
@@ -223,11 +222,13 @@ pub async fn submit_handler(
         &namespace,
         &mut definition,
         None,
+        super::job_api::PolicyCheck::Judge,
     )
     .await
     {
-        return response;
-    }
+        Ok(warnings) => warnings,
+        Err(response) => return response,
+    };
     let trigger = if definition.cron.is_some() {
         None
     } else {
@@ -251,10 +252,17 @@ pub async fn submit_handler(
                 batch_id,
                 count,
                 chunks,
+                policy_warnings,
             }),
         )
             .into_response(),
-        Ok(None) => (StatusCode::ACCEPTED, Json(serde_json::json!({"batch_id":null,"count":count,"chunks":chunks,"schedule_registered":true}))).into_response(),
+        Ok(None) => {
+            let mut answer = serde_json::json!({"batch_id":null,"count":count,"chunks":chunks,"schedule_registered":true});
+            if !policy_warnings.is_empty() {
+                answer["policy_warnings"] = serde_json::json!(policy_warnings);
+            }
+            (StatusCode::ACCEPTED, Json(answer)).into_response()
+        }
         Err(e) => write_error(e),
     }
 }
@@ -322,9 +330,10 @@ pub async fn manifest_handler(
         }
         cohort.template = array.template;
     }
-    if let Some(council) = follower_council(&state).await {
+    if let Some(council) = council_to_forward_to(&state).await {
         return forward_to_leader(&state, council, "/v1/batch/manifest", body, &headers).await;
     }
+    let mut policy_warnings = Vec::new();
     for cohort in &mut request.cohort {
         let mut definition = crate::meat::job::JobDefinition {
             template: cohort.template.clone(),
@@ -333,7 +342,7 @@ pub async fn manifest_handler(
             replay_unknown: true,
             hook: false,
         };
-        if let Err(response) = super::job_api::admit_definition(
+        match super::job_api::admit_definition(
             &state,
             auth,
             binder.as_deref(),
@@ -341,10 +350,12 @@ pub async fn manifest_handler(
             &request.namespace,
             &mut definition,
             None,
+            super::job_api::PolicyCheck::Judge,
         )
         .await
         {
-            return response;
+            Ok(warnings) => policy_warnings.extend(warnings),
+            Err(response) => return response,
         }
         cohort.template = definition.template;
     }
@@ -360,11 +371,13 @@ pub async fn manifest_handler(
         submitted_at_epoch_secs: epoch_now_secs(),
     };
     match write_task_array(&state, write).await {
-        Ok(Some(batch_id)) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({"batch_id": batch_id})),
-        )
-            .into_response(),
+        Ok(Some(batch_id)) => {
+            let mut answer = serde_json::json!({"batch_id": batch_id});
+            if !policy_warnings.is_empty() {
+                answer["policy_warnings"] = serde_json::json!(policy_warnings);
+            }
+            (StatusCode::ACCEPTED, Json(answer)).into_response()
+        }
         Ok(None) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "manifest admission returned no identity",
@@ -1356,6 +1369,7 @@ mod tests {
             task_timeout_secs: None,
             overlap: None,
             replay_unknown: false,
+            provenance: None,
         }
     }
 
