@@ -564,7 +564,7 @@ impl BunClient {
     fn build(base_url: &str, token: Option<&str>, ca_pem: Option<&[u8]>) -> Self {
         let mut websocket_tls = None;
         let client = (|| -> Result<reqwest::Client, String> {
-            let mut builder = reqwest::Client::builder()
+            let mut builder = crate::http_client::builder()
                 .timeout(std::time::Duration::from_secs(300))
                 .redirect(reqwest::redirect::Policy::none());
             if let Some(token) = token {
@@ -708,7 +708,7 @@ impl BunClient {
     /// the cluster CA, without the API bearer or client identity.
     pub fn workload_http_builder(&self) -> Result<reqwest::ClientBuilder, String> {
         self.http().map_err(|error| error.to_string())?;
-        let mut builder = reqwest::Client::builder()
+        let mut builder = crate::http_client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(3));
@@ -928,6 +928,17 @@ impl BunClient {
             {
                 return Err(RelishError::SchedulingRejected(refusal.error));
             }
+            if status == 422
+                && let Ok(refusal) =
+                    serde_json::from_str::<crate::bun::api::apply::PolicyRefusal>(&body)
+            {
+                for warning in &refusal.policy_warnings {
+                    eprintln!("warning: {warning}");
+                }
+                return Err(RelishError::PolicyDenied {
+                    denials: refusal.policy_denials,
+                });
+            }
             return Err(RelishError::ApiError { status, body });
         }
 
@@ -1128,6 +1139,15 @@ impl BunClient {
     ) -> Result<crate::bun::cluster_view::ClusterEvents, RelishError> {
         self.get_typed_json(&format!("/v1/events?limit={limit}"))
             .await
+    }
+
+    /// Fetch the newest events across the cluster that match `filter`,
+    /// oldest first, plus a warning per node that didn't answer.
+    pub async fn events_matching(
+        &self,
+        filter: &super::events_cmd::EventsFilter,
+    ) -> Result<crate::bun::cluster_view::ClusterEvents, RelishError> {
+        self.get_typed_json(&filter.path()).await
     }
 
     /// Fetch the newest `limit` events recorded by the node this client
@@ -1621,6 +1641,25 @@ impl BunClient {
         Ok(())
     }
 
+    /// Clear an app's owner (`POST /v1/release/{app}/{namespace}`, #1125),
+    /// handing it back to `relish apply` and GitOps. Only the owner's token
+    /// or an admin may.
+    pub async fn release(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
+        let url = format!("{}/v1/release/{}/{}", self.base_url, app, namespace);
+        let response = self
+            .http()?
+            .post(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        Ok(())
+    }
+
     /// Snapshot an app's managed volumes; returns the created
     /// snapshots' metadata.
     pub async fn snapshot_create(
@@ -1873,13 +1912,15 @@ impl BunClient {
         Ok(String::new())
     }
 
-    /// Execute a command inside a running instance.
+    /// Execute a command inside a running instance, once, without stdin or
+    /// a terminal. A command that ran answers with its output and exit
+    /// code, whatever the code.
     pub async fn exec(
         &self,
         app: &str,
         namespace: &str,
         command: &[String],
-    ) -> Result<String, RelishError> {
+    ) -> Result<crate::grill::ExecOutput, RelishError> {
         let url = format!("{}/v1/exec/{}/{}", self.base_url, app, namespace);
         let response = self
             .http()?
@@ -1895,12 +1936,10 @@ impl BunClient {
             return Err(RelishError::ApiError { status, body });
         }
 
-        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+        response.json().await.map_err(|e| RelishError::ApiError {
             status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
-
-        Ok(json["output"].as_str().unwrap_or("").to_string())
+            body: format!("failed to parse exec response: {e}"),
+        })
     }
 
     /// Permanently retire a node after explicit external workload fencing.
@@ -3060,6 +3099,25 @@ impl BunClient {
 
     /// The cluster's GitOps configuration and sync status, as the node
     /// this client talks to sees it (#693).
+    /// The cluster's policies and their generation (`GET /v1/policies`).
+    pub async fn policies(&self) -> Result<crate::policy::PolicyListing, RelishError> {
+        self.get_typed_json("/v1/policies").await
+    }
+
+    /// What the policies in force would now say about every committed app
+    /// and job (`GET /v1/policies/audit`, #1119).
+    pub async fn policy_audit(&self) -> Result<crate::policy::audit::PolicyAudit, RelishError> {
+        self.get_typed_json("/v1/policies/audit").await
+    }
+
+    /// Delete a policy (admin only).
+    pub async fn delete_policy(&self, name: &str) -> Result<(), RelishError> {
+        let name: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();
+        self.post_json(&format!("/v1/policies/{name}/delete"), String::new())
+            .await
+            .map(|_| ())
+    }
+
     pub async fn gitops_status(&self) -> Result<crate::lettuce::types::GitOpsStatus, RelishError> {
         self.get_typed_json("/v1/gitops").await
     }
@@ -3139,6 +3197,32 @@ mod tests {
         assert_eq!(
             secret_public_key_path(Some("a&b")),
             "/v1/secret/public-key?namespace=a%26b"
+        );
+    }
+
+    /// D34: a command that ran and failed is an answer, not an HTTP error.
+    #[tokio::test]
+    async fn exec_returns_the_remote_exit_code() {
+        let app = axum::Router::new().route(
+            "/v1/exec/web/default",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"output": "boom\n", "exit_code": 3}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let result = client.exec("web", "default", &["false".into()]).await;
+        server.abort();
+        assert_eq!(
+            result.unwrap(),
+            crate::grill::ExecOutput {
+                output: "boom\n".into(),
+                exit_code: 3,
+            }
         );
     }
 
@@ -3580,6 +3664,27 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Without a cluster CA, `wss://` falls back to tokio-tungstenite's
+    /// bundled public roots (`rustls-tls-webpki-roots`). A dependency bump
+    /// that stopped verifying certificates would let this private-CA server
+    /// through.
+    #[tokio::test]
+    async fn websocket_without_a_cluster_ca_refuses_a_private_certificate() {
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("websocket-no-ca", b"ikm").unwrap();
+        let identity = test_identity(&hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let address = spawn_tls_health(&identity, shutdown.clone()).await;
+        let client = BunClient::build(&format!("https://{address}"), Some("rbrg_ws"), None);
+        let result = client.ws_connect("/ws").await;
+        shutdown.cancel();
+        let error = format!("{:?}", result.err());
+        assert!(
+            error.contains("certificate"),
+            "expected a certificate verification failure, got {error}"
+        );
+    }
+
     /// The legitimate mTLS path must keep working with built-in roots disabled:
     /// a client trusting the cluster CA reaches the agent over HTTPS even though
     /// the server certificate's name (`node-01`) doesn't match `127.0.0.1`.
@@ -3864,6 +3969,42 @@ mod tests {
             client.health().await.is_err(),
             "a client trusting a different CA must refuse the connection"
         );
+
+        shutdown.cancel();
+    }
+
+    /// The workload client merges the cluster CA with the public roots, so
+    /// it's the one a changed reqwest trust default could widen. A different
+    /// cluster CA must still be refused, and the right one accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workload_client_refuses_a_server_signed_by_a_different_cluster_ca() {
+        let server_hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("server-ca", b"ikm").unwrap();
+        let other_hierarchy = crate::sesame::ca::generate_ca_hierarchy("other-ca", b"ikm").unwrap();
+        let server = test_identity(&server_hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let addr = spawn_tls_health(&server, shutdown.clone()).await;
+        // The workload client verifies hostnames; the node leaf names `node-01`.
+        let url = format!("https://node-01:{}/v1/health", addr.port());
+
+        let wrong_ca_pem = pem_cert(&other_hierarchy.node.ca.certificate_der);
+        let wrong = BunClient::build(&format!("https://{addr}"), None, Some(&wrong_ca_pem))
+            .workload_http_builder()
+            .unwrap()
+            .resolve("node-01", addr)
+            .build()
+            .unwrap();
+        let refused = wrong.get(&url).send().await;
+        assert!(refused.is_err(), "{refused:?}");
+
+        let right_ca_pem = pem_cert(&server_hierarchy.node.ca.certificate_der);
+        let right = BunClient::build(&format!("https://{addr}"), None, Some(&right_ca_pem))
+            .workload_http_builder()
+            .unwrap()
+            .resolve("node-01", addr)
+            .build()
+            .unwrap();
+        assert!(right.get(&url).send().await.unwrap().status().is_success());
 
         shutdown.cancel();
     }

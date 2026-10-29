@@ -211,6 +211,8 @@ async fn cancel_deploy_waits_for_terminal_evidence_and_refuses_unknown_success()
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+        crate::bun_process::first_launch_binaries();
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
@@ -273,6 +275,8 @@ async fn image_delete_parses_repo_and_tag() {
             .with_state(deleted.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
+    // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(60),
         tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
@@ -395,6 +399,8 @@ spec:
     )
     .unwrap();
 
+    // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(60),
         tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
@@ -431,6 +437,204 @@ spec:
     assert_eq!(web.args, ["-g", "daemon off;"]);
     assert_eq!(web.port, Some(80));
     assert_eq!(web.replicas, reliaburger::config::Replicas::Fixed(2));
+}
+
+/// #703: `--strict` is sold as a CI gate, so a dropped resource must fail it
+/// as surely as an approximated one.
+#[cfg(feature = "kubernetes")]
+#[test]
+fn import_strict_fails_when_a_resource_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("dropped.yaml");
+    std::fs::write(
+        &manifest,
+        r#"
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all
+spec:
+  podSelector: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+spec:
+  accessModes: ["ReadWriteOnce"]
+"#,
+    )
+    .unwrap();
+    let path = manifest.to_str().unwrap();
+
+    let lenient = run(&["import", "-f", path]);
+    assert!(
+        lenient.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lenient.stderr)
+    );
+
+    let strict = run(&["import", "--strict", "-f", path]);
+    assert_eq!(strict.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(stderr.contains("NetworkPolicy/deny-all"), "{stderr}");
+    assert!(stderr.contains("2 dropped"), "{stderr}");
+}
+
+#[cfg(feature = "kubernetes")]
+#[test]
+fn import_strict_passes_a_manifest_that_converts_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("clean.yaml");
+    std::fs::write(
+        &manifest,
+        r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+  ports:
+  - port: 8080
+"#,
+    )
+    .unwrap();
+    let output = run(&["import", "--strict", "-f", manifest.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("[app.web]"));
+}
+
+/// #1132: `export --strict` is the same CI gate as `import --strict`: a job
+/// whose egress rules Kubernetes can't carry must fail it, and the error says
+/// how many lines of each kind the report has.
+#[cfg(feature = "kubernetes")]
+#[test]
+fn export_strict_fails_when_a_field_is_not_exported() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("job.toml");
+    std::fs::write(
+        &config,
+        r#"
+[job.fetch]
+image = "fetcher:v1"
+
+[job.fetch.egress]
+allow = ["api.example.com:443"]
+"#,
+    )
+    .unwrap();
+    let path = config.to_str().unwrap();
+
+    let lenient = run(&["export", "-f", path]);
+    assert!(
+        lenient.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lenient.stderr)
+    );
+    assert!(String::from_utf8_lossy(&lenient.stderr).contains("[job.fetch.egress]"));
+
+    let strict = run(&["export", "--strict", "-f", path]);
+    assert_eq!(strict.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(stderr.contains("[job.fetch.egress]"), "{stderr}");
+    assert!(stderr.contains("1 unsupported"), "{stderr}");
+}
+
+#[cfg(feature = "kubernetes")]
+#[test]
+fn export_strict_passes_a_config_that_exports_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("cron.toml");
+    std::fs::write(
+        &config,
+        "[job.cleanup]\nimage = \"cleanup:v1\"\nschedule = \"0 3 * * *\"\noverlap = \"allow\"\n",
+    )
+    .unwrap();
+    let output = run(&["export", "--strict", "-f", config.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("concurrencyPolicy: Allow"));
+}
+
+/// #703: exporting used to keep `command` only, so Redis came back without
+/// `--maxmemory 64mb --save "" --appendonly no`.
+#[cfg(feature = "kubernetes")]
+#[test]
+fn podinfo_import_then_export_round_trips_args() {
+    let podinfo = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/kubernetes/podinfo.yaml"
+    );
+    let imported = run(&["import", "-f", podinfo]);
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let toml = dir.path().join("podinfo.toml");
+    std::fs::write(&toml, &imported.stdout).unwrap();
+
+    let exported = run(&["export", "-f", toml.to_str().unwrap()]);
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let yaml = String::from_utf8_lossy(&exported.stdout);
+    let redis = yaml
+        .split("\n---\n")
+        .filter_map(|document| yaml_serde::from_str::<yaml_serde::Value>(document).ok())
+        .find(|document| {
+            document["kind"].as_str() == Some("Deployment")
+                && document["metadata"]["name"].as_str() == Some("redis")
+        })
+        .unwrap_or_else(|| panic!("no redis Deployment in:\n{yaml}"));
+    let args: Vec<&str> = redis["spec"]["template"]["spec"]["containers"][0]["args"]
+        .as_sequence()
+        .unwrap_or_else(|| panic!("redis lost its args:\n{yaml}"))
+        .iter()
+        .filter_map(|arg| arg.as_str())
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "redis-server",
+            "--maxmemory",
+            "64mb",
+            "--maxmemory-policy",
+            "allkeys-lru",
+            "--save",
+            "",
+            "--appendonly",
+            "no",
+        ]
+    );
 }
 
 #[test]
@@ -504,6 +708,9 @@ async fn relish_batch(endpoint: &str, jobs: &str) -> u64 {
 async fn hung_toml_job_times_out() {
     let harness = crate::batch::Harness::start().await;
     let hang = "runtime = \"process\"\nexec = \"/bin/sleep\"\ncommand = [\"60\"]\ntask_timeout_secs = 1\nmax_attempts = 1\n";
+    // The elapsed-time check below times the jobs, not `relish`'s first
+    // launch, so pay that before the clock starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let started = std::time::Instant::now();
 
     // A job that is safe to repeat counts the timeout as a failed attempt.

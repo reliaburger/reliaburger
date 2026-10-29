@@ -1,0 +1,41 @@
+# The cold-standby pair as a template (#1124) instead of two hand-written
+# apps: one `[template.*]`, and a `[use.*]` for each member. The example
+# controller (examples/controller/main.rs) takes this file as its
+# CONTROLLER_MANIFEST just as it takes pair.toml. It applies only the
+# active member's `use`, passing its own token name as `owner` and its
+# namespace as `namespace`, so a template it drives must take those two
+# parameters, and each `use` names its app with `name`.
+#
+# The defaults below are what the controller passes anyway; they let
+# `relish compile` preview the file. Applying it by hand declares the
+# controller as owner, which only that token or an admin may do.
+#
+#   relish compile examples/controller/postgres-pair.toml
+#
+# This keeps one member running, with no data of its own: a real database
+# failover also streams the data to the standby and fences the old primary,
+# which is a database's job, not the contract's.
+
+[template.postgres-member]
+params = { name = "string", rack = "string", owner = { type = "string", default = "db-failover" }, namespace = { type = "string", default = "pg" }, version = { type = "string", default = "17" } }
+body = """
+[app.${name}]
+namespace = "${namespace}"
+owner = "${owner}"
+image = "postgres:${version}"
+port = 5432
+memory = "256Mi-1Gi"
+
+[app.${name}.placement]
+required = ["rack=${rack}"]
+"""
+
+[use.db-a]
+template = "postgres-member"
+name = "db-a"
+rack = "a"
+
+[use.db-b]
+template = "postgres-member"
+name = "db-b"
+rack = "b"

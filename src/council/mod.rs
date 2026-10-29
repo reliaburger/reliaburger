@@ -19,6 +19,7 @@ pub mod handover;
 pub mod log_store;
 pub mod network;
 pub mod node;
+pub mod owner;
 pub mod recovery;
 pub(crate) mod recovery_storage;
 pub mod selection;

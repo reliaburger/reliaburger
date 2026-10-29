@@ -372,11 +372,15 @@ async fn tui_websocket_logs_replay_known_line() {
 async fn job_failed_retries_then_fails() {
     let harness = TestHarness::start().await;
 
+    // `/bin/sh` is at that path on every Unix host. macOS has no
+    // `/bin/false` (it's `/usr/bin/false`), so a job naming it is refused
+    // there as a missing binary, without a retry (#934).
     let config = Config::parse(
         r#"
         [job.broken]
         runtime = "process"
-        exec = "/bin/false"
+        exec = "/bin/sh"
+        command = ["-c", "exit 1"]
     "#,
     )
     .unwrap();
@@ -412,7 +416,7 @@ async fn init_container_success_allows_app_start() {
         script = "exec sleep 60"
 
         [[app.web.init]]
-        command = ["echo", "init done"]
+        command = ["/bin/sh", "-c", "echo init done"]
     "#,
     )
     .unwrap();
@@ -434,7 +438,7 @@ async fn init_container_failure_prevents_start() {
         script = "exec sleep 60"
 
         [[app.web.init]]
-        command = ["false"]
+        command = ["/bin/sh", "-c", "false"]
     "#,
     )
     .unwrap();
@@ -673,7 +677,7 @@ async fn exec_runs_command_and_returns_output() {
         .await
         .unwrap();
 
-    assert_eq!(output.trim(), "hello");
+    assert_eq!(output.output.trim(), "hello");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -870,6 +874,8 @@ async fn kill_fault_actually_kills_the_instance() {
 
     // Kill one of the two replicas — within the safety budget (one survives).
     let fault = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::Kill { count: 1 },
         target_service: "victim".into(),
         namespace: None,
@@ -928,6 +934,8 @@ async fn network_fault_without_ebpf_is_rejected_not_faked() {
         .await;
 
     let fault = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::Delay {
             delay_ns: 100_000_000,
             jitter_ns: 0,

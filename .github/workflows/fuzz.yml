@@ -1,0 +1,125 @@
+name: Fuzz
+
+# Every decoder that reads bytes from another machine has a cargo-fuzz target
+# (fuzz/, bodies in src/fuzz/, #1398). Nightly, each one runs for five
+# minutes. A pull request that touches a decoder runs each for 30 seconds.
+# Any crash fails the job and its input is kept as an artefact. A nightly
+# crash gets an issue the same day, like a flake (docs/flakes.md), and
+# becomes a unit test before it's fixed (docs/testing.md, "Fuzzing").
+#
+# It is its own workflow, like flakes.yml: cargo-fuzz needs nightly Rust,
+# which nothing in ci.yml uses, and the evidence gate there waits on every
+# job it holds. The stable half (every target over its checked-in corpus)
+# already runs in ci.yml's portable suite.
+
+on:
+  schedule:
+    - cron: "29 2 * * *"
+  pull_request:
+    branches: [main, "codex/**", "fix/**", "release-*"]
+    # The decoders the targets drive, and the fuzzing set-up itself.
+    paths:
+      - src/fuzz/**
+      - fuzz/**
+      - src/mustard/message.rs
+      - src/council/network.rs
+      - src/council/backup.rs
+      - src/onion/dns.rs
+      - src/pickle/api.rs
+      - src/grill/oci_pull.rs
+      - src/sesame/ca.rs
+      - src/config/**
+      - Cargo.lock
+      - Makefile
+      - .github/workflows/fuzz.yml
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "300"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # A dated nightly, so the build cache below survives from one night to the
+  # next; a floating one changes its key every day. Move it forward by hand
+  # (and the cache with it) when a newer nightly is needed.
+  FUZZ_TOOLCHAIN: nightly-2026-10-28
+
+jobs:
+  fuzz:
+    name: fuzz every decoder
+    runs-on: ubuntu-latest
+    # Uncached: a 33-minute sanitizer build (run 40697356210), nine targets
+    # at five minutes each and about 3 minutes of set-up, 81 in all, with
+    # half that again to spare. Cached, only reliaburger itself rebuilds
+    # (14 minutes): a path dependency's fingerprint is its files' mtimes,
+    # which every checkout resets.
+    timeout-minutes: 130
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+      # rust-cache hashes every installed toolchain into its key, and the
+      # runner image's own stable changes as images roll out (1.99.0, then
+      # 1.99.1, between two attempts of one run). Keep only ours.
+      - name: Keep only the fuzzing toolchain
+        run: |
+          for toolchain in $(rustup toolchain list --quiet); do
+            case "$toolchain" in
+              "$FUZZ_TOOLCHAIN"-*) ;;
+              *) rustup toolchain uninstall "$toolchain" ;;
+            esac
+          done
+          rustup toolchain list
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      # The sanitizer build of the whole crate is most of the job. One key
+      # serves the nightly run and pull requests. Unlike ci.yml, pull
+      # requests save too: GitHub scopes a PR's cache to that PR, and the
+      # nightly on main otherwise leaves a decoder PR's later pushes cold.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz
+          cache-on-failure: true
+          # reliaburger is a path dependency here, which rust-cache would
+          # otherwise prune as a local crate; on a nightly with no new
+          # commits its build is reusable whole.
+          cache-workspace-crates: true
+      - name: Run each target
+        env:
+          FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '30' || inputs.seconds || '300' }}
+        run: make fuzz-smoke
+      - name: Report executions and coverage per target
+        if: always()
+        run: |
+          {
+            echo '## Fuzzing'
+            echo
+            echo '| Target | Last status line |'
+            echo '| --- | --- |'
+            for log in fuzz/target/logs/*.log; do
+              [ -e "$log" ] || continue
+              line=$(grep -E '^#[0-9]+' "$log" | tail -n 1)
+              echo "| $(basename "$log" .log) | \`${line}\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep any crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            fuzz/artifacts/
+            fuzz/target/logs/
+          if-no-files-found: ignore
+          retention-days: 30

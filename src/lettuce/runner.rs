@@ -19,7 +19,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::council::node::CouncilNode;
+use crate::council::node::{CouncilNode, RaftMetrics};
 use crate::council::types::{CouncilResponse, DesiredState, RaftRequest};
 use crate::pickle::binding::ImageBinder;
 
@@ -58,8 +58,11 @@ pub struct GitOpsSync {
 /// configuration, then syncs whatever Raft holds. The git clone and sync
 /// run in `spawn_blocking` because `GitRepo` shells out to `git`.
 ///
-/// It syncs when the poll timer fires or a webhook arrives (whichever
-/// comes first). Every sync reconciles Git against desired state, even
+/// It syncs when the poll timer fires, a webhook arrives or this node
+/// becomes leader, and resumes a committed trigger (`relish gitops sync`
+/// or a webhook another node accepted) when one is pending. It doesn't
+/// wake on other Raft commits, and it reads only the GitOps configuration
+/// until it knows a sync will run (#1030). Every sync reconciles Git against desired state, even
 /// when Git hasn't moved, so a manual change to a GitOps resource is
 /// repaired on the next tick (B16). The task finishes once `shutdown` is
 /// cancelled; a `git` child running at that moment is killed rather than
@@ -81,7 +84,8 @@ pub fn spawn_gitops_sync(
         let mut poll = local_config.as_ref().map_or(DEFAULT_POLL, poll_interval);
         let mut ticker = tokio::time::interval(poll);
         let mut triggers = council.gitops_trigger_updates();
-        let mut leadership = council.metrics();
+        let mut metrics = council.metrics();
+        let mut leadership = Leadership::of(&metrics.borrow_and_update());
 
         // Tracked locally so a run of failures backs off (GIT4): the delay
         // is `poll * 2^failures`, capped, and is also mirrored into the
@@ -93,7 +97,15 @@ pub fn spawn_gitops_sync(
                 _ = shutdown.cancelled() => break,
                 _ = ticker.tick() => false,
                 change = triggers.changed() => { if change.is_err() { break } true },
-                change = leadership.changed() => { if change.is_err() { break } true },
+                // Raft's metrics change on every commit; only a new term or
+                // leader matters here (#1030). A node that has just become
+                // leader syncs at once rather than waiting for its tick; any
+                // other move only resumes a pending trigger.
+                change = metrics.wait_for(leadership.moved()) => {
+                    let Ok(current) = change else { break };
+                    leadership = Leadership::of(&current);
+                    !leadership.names_this_node()
+                }
                 signal = webhook_rx.recv() => {
                     if signal.is_none() {
                         break; // sender dropped
@@ -108,10 +120,16 @@ pub fn spawn_gitops_sync(
             // The term comes first: a snapshot read after it is at least as
             // new, and every write below must commit in this same term, or
             // the state machine refuses it (finding 7).
+            //
+            // Only the configuration is read until this node is known to
+            // lead a cluster with GitOps on: the whole desired state, task
+            // arrays and all, is cloned only for a sync that will run (#1030).
             let term = council.current_term();
-            let mut desired = council.desired_state().await;
             let master_key = council.wrapping_ikm().map(|key| key.as_slice());
-            let mut cluster_config = unseal(desired.gitops_config.as_ref(), master_key);
+            let stored = council
+                .read_desired(|state| state.gitops_config.clone())
+                .await;
+            let mut cluster_config = unseal(stored.as_ref(), master_key);
             publish_local_check(&check_tx, local_config.as_ref(), cluster_config.as_ref());
 
             if !council.is_leader().await {
@@ -125,8 +143,10 @@ pub fn spawn_gitops_sync(
                 if !seed_cluster_config(&council, local, master_key).await {
                     continue;
                 }
-                desired = council.desired_state().await;
-                cluster_config = unseal(desired.gitops_config.as_ref(), master_key);
+                let stored = council
+                    .read_desired(|state| state.gitops_config.clone())
+                    .await;
+                cluster_config = unseal(stored.as_ref(), master_key);
                 publish_local_check(&check_tx, local_config.as_ref(), cluster_config.as_ref());
             }
             let config = match cluster_config {
@@ -134,6 +154,7 @@ pub fn spawn_gitops_sync(
                 Some(Ok(config)) => config,
                 Some(Err(error)) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
+                    let desired = council.desired_state().await;
                     record_failure(&council, &desired, &error.to_string(), None, 0).await;
                     backoff(poll, consecutive_failures, &shutdown).await;
                     continue;
@@ -147,17 +168,15 @@ pub fn spawn_gitops_sync(
                 ticker.reset();
             }
 
-            if durable_wake
-                && !desired
-                    .gitops_sync_state
-                    .as_ref()
-                    .is_some_and(|sync| sync.requested_generation > sync.completed_generation)
-            {
+            if durable_wake && !council.read_desired(sync_is_requested).await {
                 continue;
             }
+            let desired = council.desired_state().await;
             let current_apps = desired.apps.clone();
+            let declared_apps = desired.declared_apps.clone();
             let current_namespaces = desired.namespaces.clone();
             let current_permissions = desired.permissions.clone();
+            let current_policies = desired.policies.clone();
             let owned = desired.gitops_owned.clone();
             let overrides = desired.autoscale_overrides.clone();
             let last_sha = desired
@@ -191,8 +210,10 @@ pub fn spawn_gitops_sync(
                 )?;
                 let current = CurrentState {
                     apps: &current_apps,
+                    declared_apps: &declared_apps,
                     namespaces: &current_namespaces,
                     permissions: &current_permissions,
+                    policies: &current_policies,
                     owned: &owned,
                 };
                 Ok::<_, LettuceError>(execute_sync(
@@ -330,6 +351,47 @@ pub fn spawn_gitops_sync(
         }
     });
     GitOpsSync { task, local_check }
+}
+
+/// Who leads, as far as the GitOps loop cares: the term, the leader Raft
+/// names, and this node's own id.
+///
+/// Raft's metrics change on every commit (the log index moves), so the
+/// loop compares this instead of waking on each update (#1030).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Leadership {
+    term: u64,
+    leader: Option<u64>,
+    this_node: u64,
+}
+
+impl Leadership {
+    fn of(metrics: &RaftMetrics) -> Self {
+        Self {
+            term: metrics.current_term,
+            leader: metrics.current_leader,
+            this_node: metrics.id,
+        }
+    }
+
+    /// Whether Raft names this node as the leader.
+    fn names_this_node(&self) -> bool {
+        self.leader == Some(self.this_node)
+    }
+
+    /// A predicate for `watch::Receiver::wait_for`: true once the metrics
+    /// show a different term or leader from `self`.
+    fn moved(self) -> impl FnMut(&RaftMetrics) -> bool {
+        move |metrics| Leadership::of(metrics) != self
+    }
+}
+
+/// Whether a committed trigger asks for a sync that hasn't run yet.
+fn sync_is_requested(desired: &DesiredState) -> bool {
+    desired
+        .gitops_sync_state
+        .as_ref()
+        .is_some_and(|sync| sync.requested_generation > sync.completed_generation)
 }
 
 /// The poll interval a configuration asks for, at least a second.
@@ -662,12 +724,19 @@ fn now_millis() -> u64 {
 pub struct ApplyReport {
     /// Writes the cluster committed.
     pub applied: usize,
-    /// Every change that didn't apply, as `resource_id: reason`.
+    /// Every change that didn't apply, as `resource_id: reason`. A change
+    /// a policy refused names the policy.
     pub refused: Vec<String>,
+    /// What `warn` policies said about the apps that applied.
+    pub warnings: Vec<String>,
     /// Set when leadership changed part-way and the sync stopped: the
     /// remaining changes belong to the next leader's sync.
     pub abandoned: Option<String>,
 }
+
+/// How many times one app is evaluated again after the policy set moved
+/// under it, before the sync gives up on it until the next tick.
+const POLICY_ATTEMPTS: usize = 3;
 
 /// Apply a sync's changes to Raft, every one of them (#693, finding 4).
 ///
@@ -679,6 +748,12 @@ pub struct ApplyReport {
 /// advance `last_applied_commit` only when nothing was refused: that's the
 /// D12 guarantee that the next tick re-applies the (idempotent) set.
 ///
+/// Every added or changed app is first judged by the policies in force
+/// (#1117), the same ones `relish apply` uses, and its write is fenced on
+/// the policy generation it was judged under. A denied app is refused,
+/// naming the policy, and the rest still apply. When the policy set moves
+/// between judging and committing, the app is judged again.
+///
 /// When the term moves, or this node stops leading, the sync is abandoned
 /// at once rather than applying the rest of a stale diff.
 pub async fn apply_changes(
@@ -688,40 +763,58 @@ pub async fn apply_changes(
     binder: Option<&ImageBinder>,
 ) -> ApplyReport {
     let mut report = ApplyReport::default();
+    let mut policies = PolicyCache::default();
     for change in changes {
         if let Some(reason) = leadership_moved(council, term).await {
             report.abandoned = Some(reason);
             return report;
         }
-        let Some(mut request) = change_to_request(change) else {
+        let Some(request) = change_to_request(change) else {
             continue; // jobs/builds: not reconciled desired state
         };
         let adopting = matches!(change, ResourceChange::Adopt { .. });
-        if let (Some(binder), RaftRequest::AppSpec { app_id, spec }, false) =
-            (binder, &mut request, adopting)
-        {
-            let catalog = council.manifest_catalog().await;
-            match binder.bind_app(&app_id.name, spec, &catalog).await {
-                Ok(bindings) => {
-                    for binding in bindings {
-                        println!("gitops: {binding}");
+        // Policies judge what git declares, before an image is bound, the
+        // way `relish policy test` sees it. An adopted app changes nothing,
+        // and a new policy never touches what already runs.
+        let outcome = match (request, adopting) {
+            (RaftRequest::AppSpec { app_id, spec }, false) => {
+                let app = JudgedApp {
+                    term,
+                    binder,
+                    app_id: &app_id,
+                    declared: &spec,
+                };
+                match write_judged_app(council, &mut policies, app).await {
+                    Judged::Written { outcome, warnings } => {
+                        report.warnings.extend(warnings);
+                        outcome
+                    }
+                    Judged::Refused(reason) => {
+                        report
+                            .refused
+                            .push(format!("{}: {reason}", change_id(change)));
+                        continue;
+                    }
+                    Judged::Unbound(error) => {
+                        report
+                            .refused
+                            .push(format!("{} ({error})", change_id(change)));
+                        continue;
                     }
                 }
-                Err(error) => {
-                    report
-                        .refused
-                        .push(format!("{} ({error})", change_id(change)));
-                    continue;
-                }
             }
-        }
-        let write = RaftRequest::GitOpsWrite {
-            term,
-            change: Box::new(request),
+            (request, _) => {
+                council
+                    .write(RaftRequest::GitOpsWrite {
+                        term,
+                        change: Box::new(request),
+                    })
+                    .await
+            }
         };
         // A committed entry the state machine refused left desired state
         // unchanged, so it's as unapplied as a failed write (B15).
-        match council.write(write).await {
+        match outcome {
             Ok(CouncilResponse::Refused { reason }) => {
                 if let Some(moved) = leadership_moved(council, term).await {
                     report.abandoned = Some(moved);
@@ -746,6 +839,164 @@ pub async fn apply_changes(
     report
 }
 
+/// The policies last read from desired state, compiled, with the
+/// generation they were read at, so a sync compiles each set once.
+#[derive(Default)]
+struct PolicyCache {
+    compiled: Option<(
+        u64,
+        Result<crate::policy::PolicySet, crate::policy::AdmitError>,
+    )>,
+}
+
+impl PolicyCache {
+    /// The policies in force and their generation, read together.
+    async fn current(
+        &mut self,
+        council: &CouncilNode,
+    ) -> (
+        u64,
+        &Result<crate::policy::PolicySet, crate::policy::AdmitError>,
+    ) {
+        let generation = council
+            .read_desired(|desired| desired.policy_generation)
+            .await;
+        let fresh = match self.compiled.take() {
+            Some((at, set)) if at == generation => (at, set),
+            _ => {
+                let (at, specs) = council
+                    .read_desired(|desired| (desired.policy_generation, desired.policies.clone()))
+                    .await;
+                (at, crate::policy::PolicySet::compile(&specs))
+            }
+        };
+        let (at, set) = self.compiled.insert(fresh);
+        (*at, set)
+    }
+}
+
+/// What judging and writing one app did.
+enum Judged {
+    /// The write was proposed; `outcome` is what the council said.
+    Written {
+        outcome: Result<CouncilResponse, crate::council::CouncilError>,
+        warnings: Vec<String>,
+    },
+    /// A policy refused the app, or the policy set kept moving.
+    Refused(String),
+    /// The app's image couldn't be bound to a digest.
+    Unbound(String),
+}
+
+/// One app a sync adds or changes, as git declares it.
+struct JudgedApp<'a> {
+    /// The term the sync read desired state in.
+    term: u64,
+    /// Binds the app's images to digests, when the cluster has a registry.
+    binder: Option<&'a ImageBinder>,
+    /// The app's identity.
+    app_id: &'a crate::meat::types::AppId,
+    /// Its spec, as git declares it.
+    declared: &'a crate::config::AppSpec,
+}
+
+/// Judge one app by the policies in force, fill in their defaults, bind
+/// its images and write it fenced on their generation, judging again when
+/// the set moves before the write commits. A defaulted app's write
+/// carries its declared spec, so the next sync diffs git against that.
+async fn write_judged_app(
+    council: &CouncilNode,
+    policies: &mut PolicyCache,
+    app: JudgedApp<'_>,
+) -> Judged {
+    let caller = crate::policy::Caller::gitops();
+    for _ in 0..POLICY_ATTEMPTS {
+        let (generation, set) = policies.current(council).await;
+        let set = match set {
+            Ok(set) => set,
+            Err(error) => return Judged::Refused(error.to_string()),
+        };
+        let judgement = crate::policy::judge_app(
+            set,
+            app.app_id,
+            app.declared,
+            &caller,
+            crate::policy::Source::GitOps,
+        );
+        if !judgement.verdict.is_allowed() {
+            let denials: Vec<String> = judgement
+                .verdict
+                .denials
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            eprintln!("gitops: {}", denials.join("; "));
+            return Judged::Refused(denial_reason(&judgement.verdict.denials));
+        }
+        let warnings: Vec<String> = judgement
+            .verdict
+            .warnings
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        for filled in &judgement.filled {
+            println!("gitops: {filled}");
+        }
+        // An audit finding goes to the node's log; `relish policy audit`
+        // lists it while the app breaks the rule (#1119).
+        for audited in &judgement.verdict.audits {
+            eprintln!("gitops: audit: {audited}");
+        }
+        let mut spec = judgement.spec;
+        if let Some(binder) = app.binder {
+            let catalog = council.manifest_catalog().await;
+            match binder.bind_app(&app.app_id.name, &mut spec, &catalog).await {
+                Ok(bindings) => {
+                    for binding in bindings {
+                        println!("gitops: {binding}");
+                    }
+                }
+                Err(error) => return Judged::Unbound(error.to_string()),
+            }
+        }
+        // What git declared rides along when the stored spec differs from
+        // it, by a default or a bound image (#1118).
+        let declared = (spec != *app.declared).then(|| Box::new(app.declared.clone()));
+        let fenced = RaftRequest::PolicyFenced {
+            generation,
+            change: Box::new(RaftRequest::GitOpsWrite {
+                term: app.term,
+                change: Box::new(RaftRequest::AppSpec {
+                    app_id: app.app_id.clone(),
+                    spec: Box::new(spec),
+                }),
+            }),
+            declared,
+        };
+        match council.write(fenced).await {
+            Ok(CouncilResponse::PolicyGenerationMoved { .. }) => continue,
+            outcome => {
+                for warning in &warnings {
+                    println!("gitops: warning: {warning}");
+                }
+                return Judged::Written { outcome, warnings };
+            }
+        }
+    }
+    Judged::Refused(format!(
+        "the policies changed {POLICY_ATTEMPTS} times while it was being applied; the next sync tries again"
+    ))
+}
+
+/// How the partial sync result names the policies that refused an app.
+fn denial_reason(denials: &[crate::policy::Finding]) -> String {
+    let reasons: Vec<String> = denials
+        .iter()
+        .map(|finding| format!("denied by policy {}: {}", finding.policy, finding.message))
+        .collect();
+    reasons.join("; ")
+}
+
 /// Why this node may no longer apply a sync read in `term`, if it can't.
 async fn leadership_moved(council: &CouncilNode, term: u64) -> Option<String> {
     let current = council.current_term();
@@ -764,8 +1015,8 @@ async fn leadership_moved(council: &CouncilNode, term: u64) -> Option<String> {
 ///
 /// Returns `None` for kinds that aren't reconciled desired state (jobs,
 /// builds) — those carry a `Generic` payload, so their add/update yields
-/// nothing to write. Every declarative kind (app, namespace, permission)
-/// maps to a real write for both add/update and remove.
+/// nothing to write. Every declarative kind (app, namespace, permission,
+/// policy) maps to a real write for both add/update and remove.
 fn change_to_request(change: &ResourceChange) -> Option<RaftRequest> {
     match change {
         ResourceChange::Add { resource_id, spec }
@@ -800,6 +1051,10 @@ fn payload_to_request(resource_id: &str, payload: &ChangePayload) -> Option<Raft
             name: resource_id.strip_prefix("permission.")?.to_string(),
             spec: spec.clone(),
         }),
+        ChangePayload::Policy(spec) => Some(RaftRequest::PolicySpec {
+            name: resource_id.strip_prefix("policy.")?.to_string(),
+            spec: spec.clone(),
+        }),
         // Jobs (run to completion) and builds (imperative) aren't
         // reconciled desired state; nothing to write.
         ChangePayload::Generic => None,
@@ -818,6 +1073,11 @@ fn remove_to_request(resource_id: &str) -> Option<RaftRequest> {
     }
     if let Some(name) = resource_id.strip_prefix("permission.") {
         return Some(RaftRequest::PermissionDelete {
+            name: name.to_string(),
+        });
+    }
+    if let Some(name) = resource_id.strip_prefix("policy.") {
+        return Some(RaftRequest::PolicyDelete {
             name: name.to_string(),
         });
     }
@@ -972,13 +1232,13 @@ mod tests {
             .is_none()
         );
     }
-    async fn leader_council() -> Arc<CouncilNode> {
-        use std::collections::BTreeMap;
-
+    /// A single-voter council that hasn't been initialised, so it leads
+    /// nothing until [`become_leader`] runs.
+    async fn uninitialised_council() -> Arc<CouncilNode> {
         use crate::council::log_store::MemLogStore;
         use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
         use crate::council::state_machine::CouncilStateMachine;
-        use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+        use crate::council::types::CouncilConfig;
 
         let raft_router = InMemoryRaftRouter::new();
         let network = InMemoryRaftNetworkFactory::new(1, raft_router.clone());
@@ -993,6 +1253,15 @@ mod tests {
         .await
         .unwrap();
         raft_router.register(1, node.raft().clone()).await;
+        Arc::new(node)
+    }
+
+    /// Initialise `node` as the only voter and wait until it leads.
+    async fn become_leader(node: &CouncilNode) {
+        use std::collections::BTreeMap;
+
+        use crate::council::types::CouncilNodeInfo;
+
         let members = BTreeMap::from([(
             1,
             CouncilNodeInfo {
@@ -1006,7 +1275,12 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "no leader");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        Arc::new(node)
+    }
+
+    async fn leader_council() -> Arc<CouncilNode> {
+        let node = uninitialised_council().await;
+        become_leader(&node).await;
+        node
     }
 
     fn app_add(resource_id: &str) -> ResourceChange {
@@ -1101,5 +1375,217 @@ mod tests {
             .unwrap()
             .completed_generation = 1;
         assert!(sync_state_is_clean(&desired));
+    }
+
+    // ---------------------------------------------------------------------
+    // What wakes the loop (#1030)
+    // ---------------------------------------------------------------------
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Commit `apps.toml` with `toml` to the repository at `dir`, creating
+    /// the repository on the first call.
+    fn commit_apps(dir: &std::path::Path, toml: &str) {
+        if !dir.join(".git").exists() {
+            git(dir, &["init", "-q", "-b", "main"]);
+        }
+        std::fs::write(dir.join("apps.toml"), toml).unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "change"]);
+    }
+
+    fn app_toml(names: &[&str]) -> String {
+        names
+            .iter()
+            .map(|name| format!("[app.{name}]\nimage = \"{name}:v1\"\n\n"))
+            .collect()
+    }
+
+    /// Track `main` of the repository at `repo`, polling every `poll` seconds.
+    fn repo_config(repo: &std::path::Path, poll: u64) -> GitOpsConfig {
+        GitOpsConfig {
+            repo: repo.to_string_lossy().into_owned(),
+            branch: "main".to_string(),
+            path: "/".to_string(),
+            poll_interval_secs: poll,
+            require_signed_commits: false,
+            trusted_signing_keys: vec![],
+            webhook_secret: None,
+            webhook_rate_limit: 10,
+        }
+    }
+
+    /// A running loop and everything a test needs to drive it.
+    struct Harness {
+        council: Arc<CouncilNode>,
+        webhook: mpsc::Sender<()>,
+        shutdown: CancellationToken,
+        _data_dir: tempfile::TempDir,
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            self.shutdown.cancel();
+        }
+    }
+
+    fn start_loop(council: &Arc<CouncilNode>, config: Option<GitOpsConfig>) -> Harness {
+        let (webhook, webhook_rx) = mpsc::channel(4);
+        let data_dir = tempfile::tempdir().unwrap();
+        let shutdown = CancellationToken::new();
+        spawn_gitops_sync(
+            Arc::clone(council),
+            config,
+            webhook_rx,
+            data_dir.path().to_path_buf(),
+            shutdown.clone(),
+            None,
+        );
+        Harness {
+            council: Arc::clone(council),
+            webhook,
+            shutdown,
+            _data_dir: data_dir,
+        }
+    }
+
+    /// Whether the app `name` in `default` reaches desired state within
+    /// `within`. Reads through `read_desired`, so it never counts as a
+    /// whole-state clone.
+    async fn app_appears(council: &CouncilNode, name: &str, within: Duration) -> bool {
+        let id = AppId::new(name, "default");
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if council
+                .read_desired(|state| state.apps.contains_key(&id))
+                .await
+            {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Commit `count` no-op entries: each moves the log index and nothing
+    /// else, as a host job's ledger writes do.
+    async fn commit_noops(council: &CouncilNode, count: usize) {
+        for _ in 0..count {
+            council.write(RaftRequest::Noop).await.unwrap();
+        }
+    }
+
+    /// Start a leader whose loop has applied `first` from a repository it
+    /// polls once an hour, so only the wake under test can sync it again.
+    async fn synced_leader(repo: &std::path::Path) -> Harness {
+        commit_apps(repo, &app_toml(&["first"]));
+        let council = leader_council().await;
+        let harness = start_loop(&council, Some(repo_config(repo, 3600)));
+        assert!(
+            app_appears(&council, "first", Duration::from_secs(10)).await,
+            "the initial sync never applied the repository"
+        );
+        // Let the loop settle after recording its sync.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        harness
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_only_moves_the_log_index_does_not_read_the_desired_state() {
+        let repo = tempfile::tempdir().unwrap();
+        let harness = synced_leader(repo.path()).await;
+        let council = &harness.council;
+
+        let before = council.full_desired_reads();
+        commit_noops(council, 20).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            council.full_desired_reads(),
+            before,
+            "the loop cloned the desired state for commits that changed nothing it watches"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_gitops_unconfigured_a_wake_never_clones_the_desired_state() {
+        let council = leader_council().await;
+        let harness = start_loop(&council, None);
+        // The first poll tick fires at once; then commits and a webhook.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        commit_noops(&council, 20).await;
+        harness.webhook.send(()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(council.full_desired_reads(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_loop_syncs_promptly_when_this_node_becomes_leader() {
+        let repo = tempfile::tempdir().unwrap();
+        commit_apps(repo.path(), &app_toml(&["elected"]));
+        let council = uninitialised_council().await;
+        // An hour's poll: the first tick fires while the node leads
+        // nothing, so only gaining leadership can bring the next sync.
+        let _harness = start_loop(&council, Some(repo_config(repo.path(), 3600)));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        become_leader(&council).await;
+        assert!(
+            app_appears(&council, "elected", Duration::from_secs(10)).await,
+            "a new leader waited for its poll tick instead of syncing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gitops_trigger_still_wakes_a_sync() {
+        let repo = tempfile::tempdir().unwrap();
+        let harness = synced_leader(repo.path()).await;
+        commit_apps(repo.path(), &app_toml(&["first", "triggered"]));
+        harness
+            .council
+            .write(RaftRequest::GitOpsSyncRequested { delivery: [7; 32] })
+            .await
+            .unwrap();
+        assert!(
+            app_appears(&harness.council, "triggered", Duration::from_secs(10)).await,
+            "a committed trigger did not wake a sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_webhook_still_wakes_a_sync() {
+        let repo = tempfile::tempdir().unwrap();
+        let harness = synced_leader(repo.path()).await;
+        commit_apps(repo.path(), &app_toml(&["first", "hooked"]));
+        harness.webhook.send(()).await.unwrap();
+        assert!(
+            app_appears(&harness.council, "hooked", Duration::from_secs(10)).await,
+            "a webhook did not wake a sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_poll_tick_still_wakes_a_sync() {
+        let repo = tempfile::tempdir().unwrap();
+        commit_apps(repo.path(), &app_toml(&["first"]));
+        let council = leader_council().await;
+        let _harness = start_loop(&council, Some(repo_config(repo.path(), 1)));
+        assert!(app_appears(&council, "first", Duration::from_secs(10)).await);
+        commit_apps(repo.path(), &app_toml(&["first", "polled"]));
+        assert!(
+            app_appears(&council, "polled", Duration::from_secs(10)).await,
+            "the poll tick did not sync the new commit"
+        );
     }
 }

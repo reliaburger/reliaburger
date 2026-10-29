@@ -257,7 +257,9 @@ impl RuncGrill {
                 .await
                 .insert(id.clone(), context.clone());
             let result = async {
-                let index = if runtime.rootless {
+                // A sidecar joins its parent's namespace and address, so it
+                // reserves none of its own (#1120).
+                let index = if runtime.rootless || spec.joined_network().is_some() {
                     None
                 } else {
                     Some(
@@ -589,8 +591,10 @@ impl RuncGrill {
             ) {
                 return runtime.owned_cleanup(&id, &context).await;
             }
+            // The app's own stop signal (#1121), from its original intent.
+            let signal = context.intent().await?.spec.stop_signal().name();
             let output = runtime
-                .owned_runc_command(&context, &["kill", &id.0, "SIGTERM"])
+                .owned_runc_command(&context, &["kill", &id.0, signal])
                 .await?;
             if output.exit_code != Some(0) {
                 if matches!(
@@ -1168,7 +1172,7 @@ impl RuncGrill {
         &self,
         instance: &InstanceId,
         command: &[String],
-    ) -> Result<String, GrillError> {
+    ) -> Result<crate::grill::ExecOutput, GrillError> {
         if command.is_empty() {
             return Err(failure(instance, "no command specified"));
         }

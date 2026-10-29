@@ -227,6 +227,15 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
         Evidence::available(collected_at, Vec::new())
     };
     let gitops = collect_gitops(&endpoints, collected_at).await;
+    let policies = if cluster_enabled {
+        match bounded("policy audit", client.policy_audit()).await {
+            Ok(audit) => Evidence::available(collected_at, audit),
+            Err(reason) => Evidence::Unavailable { reason },
+        }
+    } else {
+        // Policies live in the council; a standalone node has none.
+        Evidence::available(collected_at, Default::default())
+    };
     let recent_logs = collect_logs(client, app, &restarts, collected_at).await;
 
     Ok(WtfInputs {
@@ -244,6 +253,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             tokens,
             isolation,
             gitops,
+            policies,
         },
         applications: ApplicationEvidence {
             restarts,
@@ -1254,6 +1264,7 @@ mod tests {
     fn service_evidence_uses_desire_even_when_resolver_has_no_entry() {
         let evidence = collect_services(
             Ok(vec![crate::bun::diagnostics::DesiredAppEvidence {
+                owner: None,
                 app: "api".to_string(),
                 namespace: "default".to_string(),
                 desired_replicas: 2,

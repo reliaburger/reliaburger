@@ -41,7 +41,7 @@ pub const CANCEL_GRACE: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskInvocation {
     /// Container template, when execution uses an owned runtime.
-    pub template: Option<Box<crate::config::job::JobSpec>>,
+    pub template: Option<Arc<crate::config::job::JobSpec>>,
     /// The task's index.
     pub index: u32,
     /// Attempt number, starting at 1.
@@ -479,7 +479,7 @@ impl TaskRunner for FakeRunner {
 #[derive(Debug, Clone)]
 pub struct ChunkWork {
     /// Container template carried with the committed assignment.
-    pub template: Option<Box<crate::config::job::JobSpec>>,
+    pub template: Option<Arc<crate::config::job::JobSpec>>,
     /// The array's batch id (goes into each task's environment).
     pub batch_id: u64,
     /// Count and policy.
@@ -658,9 +658,54 @@ impl LaunchLog {
     }
 }
 
+/// A chunk's place in its pool's dispatch order, from
+/// [`TaskPool::take_turn`].
+///
+/// A chunk starts taking slots only once every chunk ahead of it has
+/// taken a slot for each of its tasks. So chunks finish one after
+/// another, and each one's receipt can reach the leader while the
+/// rest still run (#1030), instead of all of them advancing in
+/// lockstep and finishing together.
+pub struct DispatchTurn {
+    /// Closes when the chunk ahead has dispatched all its tasks.
+    previous: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Dropped when this chunk has dispatched all its tasks, which lets
+    /// the next chunk go. Nothing is ever sent on it.
+    next: tokio::sync::oneshot::Sender<()>,
+}
+
+impl DispatchTurn {
+    /// Wait until the chunks ahead have dispatched, or until `cancel`.
+    /// Hold the returned sender while dispatching; dropping it lets the
+    /// next chunk start. `None` means cancelled: the next chunk is then
+    /// let go as soon as the ones ahead of this one have dispatched.
+    async fn wait(self, cancel: &CancellationToken) -> Option<tokio::sync::oneshot::Sender<()>> {
+        let Some(mut previous) = self.previous else {
+            return Some(self.next);
+        };
+        let cancelled = tokio::select! {
+            biased;
+            _ = &mut previous => false,
+            () = cancel.cancelled() => true,
+        };
+        if !cancelled {
+            return Some(self.next);
+        }
+        // A cancelled chunk dispatches nothing, but the chunk behind it
+        // still waits for the ones ahead of it.
+        let next = self.next;
+        tokio::spawn(async move {
+            let _ = previous.await;
+            drop(next);
+        });
+        None
+    }
+}
+
 /// Runs the tasks of any number of chunks through one shared set of
 /// slots. Several chunks can run at once; the slots, not the chunks,
 /// bound the work, so the tail of one chunk overlaps the head of the next.
+/// Chunks take slots in the order they took their [`DispatchTurn`].
 pub struct TaskPool<R: TaskRunner> {
     runner: Arc<R>,
     config: PoolConfig,
@@ -670,6 +715,10 @@ pub struct TaskPool<R: TaskRunner> {
     budget: Option<Arc<super::execution_budget::ExecutionBudget>>,
     resources: crate::meat::Resources,
     launch_log: Arc<LaunchLog>,
+    /// The turn of the chunk that took one last. A std mutex: it is only
+    /// held for a synchronous swap in [`Self::take_turn`], never across
+    /// an await.
+    last_turn: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl<R: TaskRunner> TaskPool<R> {
@@ -694,7 +743,22 @@ impl<R: TaskRunner> TaskPool<R> {
             budget: None,
             resources: crate::meat::Resources::default(),
             launch_log: Arc::default(),
+            last_turn: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Take the next place in the dispatch order. Take it when the chunk
+    /// is granted, not when its task first runs, so the order is the
+    /// grant order whatever order the runtime polls the chunks in.
+    pub fn take_turn(&self) -> DispatchTurn {
+        let (next, closed) = tokio::sync::oneshot::channel();
+        // A poisoned lock only means another chunk panicked mid-swap; the
+        // value is a plain receiver, so keep going with it.
+        let previous = match self.last_turn.lock() {
+            Ok(mut last) => last.replace(closed),
+            Err(poisoned) => poisoned.into_inner().replace(closed),
+        };
+        DispatchTurn { previous, next }
     }
 
     /// Account each running attempt against the shared application/task budget.
@@ -731,19 +795,22 @@ impl<R: TaskRunner> TaskPool<R> {
         finished: Vec<TaskRecord>,
         cancel: &CancellationToken,
     ) -> ChunkOutcome {
-        self.resume_chunk_streaming(work, finished, cancel, None)
+        self.resume_chunk_streaming(work, finished, cancel, None, self.take_turn())
             .await
     }
 
     /// Send each outcome as it finishes, allowing group commit during execution.
     /// The bounded channel applies backpressure if the disk cannot keep up.
+    /// The chunk takes slots only once the chunks ahead of `turn` have.
     pub async fn resume_chunk_streaming(
         &self,
         work: &ChunkWork,
         finished: Vec<TaskRecord>,
         cancel: &CancellationToken,
         outcomes: Option<tokio::sync::mpsc::Sender<TaskRecord>>,
+        turn: DispatchTurn,
     ) -> ChunkOutcome {
+        let turn = turn.wait(cancel).await;
         let pending = Arc::new(Semaphore::new(1024));
         let mut done = IndexRangeSet::new();
         for record in &finished {
@@ -812,6 +879,8 @@ impl<R: TaskRunner> TaskPool<R> {
                 records.extend(done.ok());
             }
         }
+        // Every task holds a slot or has ended: the next chunk may start.
+        drop(turn);
         // A task only fails to join if it panicked; its index then shows
         // up as missing, and the leader refuses the miscounted chunk
         // rather than retiring it.
@@ -1304,6 +1373,47 @@ mod tests {
         );
     }
 
+    /// #1030: every attempt of a chunk shares the chunk's template. Each
+    /// used to carry its own deep copy of the job spec.
+    #[tokio::test]
+    async fn every_attempt_of_a_chunk_shares_one_template() {
+        #[derive(Default)]
+        struct Recording(std::sync::Mutex<Vec<Arc<crate::config::job::JobSpec>>>);
+        impl TaskRunner for Recording {
+            async fn run(
+                &self,
+                task: &TaskInvocation,
+                _: Duration,
+                _: &CancellationToken,
+            ) -> Attempt {
+                if let Some(template) = &task.template {
+                    self.0.lock().unwrap().push(Arc::clone(template));
+                }
+                Attempt {
+                    // One retry each, so later attempts are covered too.
+                    outcome: AttemptOutcome::Exited {
+                        code: i32::from(task.attempt == 1),
+                    },
+                    output: CapturedOutput::default(),
+                    ran: None,
+                }
+            }
+        }
+        let runner = Arc::new(Recording::default());
+        let pool = TaskPool::new(Arc::clone(&runner), fast(4));
+        let mut work = work(8, 8, 0);
+        work.spec.max_attempts = 2;
+        work.template = Some(Arc::new(
+            toml::from_str("runtime='process'\nexec='/bin/true'").unwrap(),
+        ));
+        let outcome = pool.run_chunk(&work, &CancellationToken::new()).await;
+        assert_eq!(outcome.result.succeeded, 8);
+        let seen = runner.0.lock().unwrap();
+        assert_eq!(seen.len(), 16);
+        let chunk = work.template.as_ref().unwrap();
+        assert!(seen.iter().all(|template| Arc::ptr_eq(template, chunk)));
+    }
+
     #[tokio::test]
     async fn streaming_failures_transfer_output_without_retaining_it_for_the_whole_chunk() {
         struct LoudRunner;
@@ -1335,7 +1445,7 @@ mod tests {
             count
         };
         let (outcome, count) = tokio::join!(
-            pool.resume_chunk_streaming(&work, vec![], &cancel, Some(tx)),
+            pool.resume_chunk_streaming(&work, vec![], &cancel, Some(tx), pool.take_turn()),
             consume
         );
         assert_eq!(count, 64);
@@ -1628,6 +1738,77 @@ mod tests {
             runner.peak_concurrency()
         );
         assert!(runner.peak_concurrency() >= 2, "slots were never shared");
+    }
+
+    #[tokio::test]
+    async fn chunks_sharing_slots_finish_in_the_order_they_arrived() {
+        let runner = Arc::new(FakeRunner::new(Duration::from_millis(2), |_| {
+            AttemptOutcome::Exited { code: 0 }
+        }));
+        let pool = Arc::new(TaskPool::new(Arc::clone(&runner), fast(2)));
+        let cancel = CancellationToken::new();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        for chunk in 0..4 {
+            let (pool, cancel, runner, done) = (
+                Arc::clone(&pool),
+                cancel.clone(),
+                Arc::clone(&runner),
+                done_tx.clone(),
+            );
+            tokio::spawn(async move {
+                let outcome = pool.run_chunk(&work(32, 8, chunk), &cancel).await;
+                let _ = done.send((chunk, outcome.result.succeeded, runner.attempts()));
+            });
+        }
+        drop(done_tx);
+        let mut finished = Vec::new();
+        while let Some(done) = done_rx.recv().await {
+            finished.push(done);
+        }
+        let order: Vec<u32> = finished.iter().map(|&(chunk, ..)| chunk).collect();
+        assert_eq!(order, vec![0, 1, 2, 3], "{finished:?}");
+        assert!(finished.iter().all(|&(_, succeeded, _)| succeeded == 8));
+        // In lockstep the first chunk ends only when nearly all 32 tasks
+        // have started. In order, it ends after its own eight and the
+        // next chunk's first few.
+        let (_, _, started_by_first) = finished[0];
+        assert!(
+            started_by_first <= 12,
+            "the first chunk finished only after {started_by_first} of 32 attempts started"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunk_cancelled_while_queued_ends_at_once_and_keeps_the_order_behind_it() {
+        let runner = Arc::new(FakeRunner::new(Duration::from_millis(2), |_| {
+            AttemptOutcome::Exited { code: 0 }
+        }));
+        let pool = Arc::new(TaskPool::new(Arc::clone(&runner), fast(1)));
+        let queued = CancellationToken::new();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        for chunk in 0..3 {
+            let cancel = if chunk == 1 {
+                queued.clone()
+            } else {
+                CancellationToken::new()
+            };
+            let (pool, runner, done) = (Arc::clone(&pool), Arc::clone(&runner), done_tx.clone());
+            tokio::spawn(async move {
+                let outcome = pool.run_chunk(&work(30, 10, chunk), &cancel).await;
+                let _ = done.send((chunk, outcome.result.not_run, runner.attempts()));
+            });
+        }
+        drop(done_tx);
+        tokio::task::yield_now().await;
+        queued.cancel();
+        let mut finished = Vec::new();
+        while let Some(done) = done_rx.recv().await {
+            finished.push(done);
+        }
+        let order: Vec<(u32, u32)> = finished.iter().map(|&(c, n, _)| (c, n)).collect();
+        assert_eq!(order, vec![(1, 10), (0, 0), (2, 0)], "{finished:?}");
+        // Chunk 2 still waited for chunk 0 rather than sharing its slot.
+        assert!(finished[1].2 <= 11, "{finished:?}");
     }
 
     #[tokio::test]

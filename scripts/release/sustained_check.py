@@ -15,6 +15,7 @@ Subcommands:
   power-cut EVIDENCE                    a node lost power: a log tail may end below an earlier one once
   baseline EVIDENCE SNAPSHOT            record each node's leak inventory as the baseline
   evaluate EVIDENCE SNAPSHOT            findings; exit 1 on a new failure, 3 when not yet settled
+  policies EVIDENCE LISTING             exit 1 unless the soak workload's policies are all in force
   seen EVIDENCE KEY                     exit 0 if a harness failure KEY was bundled in the last half hour
   ingress-expect EVIDENCE NODE SERIAL   the serial a node must serve after a successful reload
   count EVIDENCE NAME [N]               add to a named counter in the record
@@ -29,6 +30,8 @@ Subcommands:
                                         keep Lima's host-agent logs before a stop truncates them
   curl-reason CODE                      name a curl exit code (refused, timeout, TLS...)
   test-failures REPORT [STDERR]         each failing case's reason from a `relish --output json test` report
+  seed EVIDENCE [--seed N]              start (or resume) the run's fault and node choices; prints the seed
+  choose EVIDENCE WHAT LOW HIGH         the run's next choice between LOW and HIGH, logged as an event
   render EVIDENCE RECORD                write the Markdown record (refuses to overwrite)
 """
 import argparse
@@ -39,15 +42,19 @@ import http.client
 import json
 import os
 from pathlib import Path
+import random
 import re
+import secrets
 import socket
 import ssl
 import statistics
 import sys
 import time
+import tomllib
 import job_soak
 import job_soak_inventory
 import soak_charts
+import soak_slo
 
 # Thresholds from section 4 of the plan (seconds unless stated).
 NODE_CERT_MARGIN = 300
@@ -79,6 +86,9 @@ FD_RISES = 3
 FD_STEP = 10
 FD_GROWTH = 1.25
 REPEAT_WINDOW = 1800
+# When each leak checker can first judge a process (#1062): leak-rss after
+# its warm-up, leak-fd once it has the warm-up and FD_RISES + 1 full windows.
+CHECKER_ARMED_AFTER = (("leak-rss", "rss_kb", RSS_WARMUP), ("leak-fd", "fd", FD_WARMUP + (FD_RISES + 1) * FD_BUCKET))
 # Snapshot kinds that collect the guest inventories (collect in qualify-sustained.sh).
 INVENTORY_KINDS = ("settle", "heavy")
 LEAK_KINDS = ("runc", "netns", "lease", "veth", "cgroup", "bpf", "listen")
@@ -119,6 +129,45 @@ def save_state(evidence, state):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(state, indent=1, sort_keys=True))
     os.replace(temporary, path)
+
+
+# --- seeded choices (#1062) -----------------------------------------------------
+
+def start_choices(evidence, seed):
+    """Start the run's choices from `seed` (a new random one when None), or
+    resume them. A resumed run keeps its seed and its place in the sequence;
+    asking it for a different seed is an error. Returns the seed."""
+    path = Path(evidence) / "choices.json"
+    if path.exists():
+        recorded = json.loads(path.read_text())
+        if seed is not None and seed != recorded["seed"]:
+            raise ValueError(f"this run's choices come from seed {recorded['seed']}, not {seed}")
+        return recorded["seed"]
+    if seed is None:
+        seed = secrets.randbelow(2 ** 32)
+    write_choices(path, {"seed": seed, "draws": 0})
+    return seed
+
+
+def write_choices(path, data):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, sort_keys=True))
+    os.replace(temporary, path)
+
+
+def choose(evidence, what, low, high):
+    """The run's next choice between `low` and `high`, inclusive.
+
+    Draw n of seed s is always the same number, so the same seed makes the
+    same choices in the same order. Each choice is logged as a `choice`
+    event naming what it chose."""
+    path = Path(evidence) / "choices.json"
+    data = json.loads(path.read_text())
+    draw = data["draws"]
+    value = random.Random(f"{data['seed']}:{draw}").randint(low, high)
+    write_choices(path, dict(data, draws=draw + 1))
+    append_event(evidence, phase="choice", target=what, detail=f"{value} of {low}-{high}, draw {draw}, seed {data['seed']}")
+    return value
 
 
 def append_event(evidence, **fields):
@@ -710,7 +759,9 @@ def job_findings(evidence, snapshot, now, fault_window, state=None):
     if metadata.get("job_soak") is not True: return []
     value=read_json(snapshot,"jobs.json")
     problems=job_soak.findings(value,now,fault_window)
-    if value and value.get("stopped") and now < metadata.get("job_stop_at",now):
+    # The harness sets job_stop_at only once the last cycle is over (#1338).
+    stop_at=metadata.get("job_stop_at")
+    if value and value.get("stopped") and (stop_at is None or now < stop_at):
         problems.append("job controller stopped before the final drain interval")
     errors=set(value.get("errors",[])) if isinstance(value,dict) else set()
     reported=state.setdefault("job_errors_reported",[]) if state is not None else []
@@ -751,6 +802,8 @@ def evaluate(evidence, snapshot):
         forward_findings, cut = host_forward_findings(state, forwards, now)
         findings += forward_findings
     ingress_cut = any(name == "ingress" for _, name in cut)
+    # The latency SLOs' API reads (#1400) count only outside fault windows.
+    soak_slo.fold_snapshot(evidence, snapshot, fault_window, cut)
 
     http = read(snapshot, "http.txt")
     http_ok = None
@@ -900,13 +953,16 @@ def evaluate(evidence, snapshot):
         if text is not None:
             findings += export_findings(state, node, text)
             findings += snapshot_archive_findings(state, node, text)
-        # After the inventory, so a new bun process is known before its
-        # turn counters are compared with the old one's.
         turns = read_json(snapshot, f"turns-{node}.json")
         if turns is not None:
             findings += turn_findings(state, node, turns)
     # Leaks only count once the cluster has settled; before that they are progress.
     findings += [dict(leak, severity="info") if fault_window else leak for leak in leaks]
+
+    expected = expected_policies(evidence)
+    listing = read_json(snapshot, "policies.json")
+    if expected and listing is not None:
+        findings += policy_findings(state, expected, listing)
 
     registry = read_json(snapshot, "registry.json")
     registry_cut = any(name == "registry" for _, name in cut)
@@ -956,10 +1012,76 @@ def suppress_repeats(state, findings, now):
     return result
 
 
-def turn_buckets(samples):
-    """The latest cumulative bucket count per (branch, le) of a node's
-    bun_agent_loop_turn_seconds_bucket samples, as /v1/metrics returns them."""
-    latest = {}
+# --- policies (#1311) --------------------------------------------------------
+
+def expected_policies(evidence):
+    """The `[policy.*]` tables of the workload file the harness applied
+    (EVIDENCE/workloads.toml), or None before it has written one."""
+    path = Path(evidence) / "workloads.toml"
+    if not path.exists():
+        return None
+    return tomllib.loads(path.read_text()).get("policy", {})
+
+
+# What a policy decides. The message is for people, so a reworded one isn't
+# a lost policy.
+POLICY_KEYS = ("match", "deny", "action", "applies_to", "default")
+POLICY_DEFAULTS = {"action": "deny", "applies_to": "apps"}
+
+
+def policy_differences(declared, listed):
+    """The keys whose value differs between a declared policy and the one in
+    force, comparing absent keys by their default."""
+    return [key for key in POLICY_KEYS
+            if declared.get(key, POLICY_DEFAULTS.get(key)) != listed.get(key, POLICY_DEFAULTS.get(key))]
+
+
+def policy_findings(state, expected, listing):
+    """Fail when a policy the soak applied is gone or changed, or the policy
+    generation went backwards: Raft keeps both through every fault."""
+    policies = listing.get("policies") if isinstance(listing, dict) else None
+    if not isinstance(policies, dict):
+        return [finding("policies", "warn", "`relish policy list` answered without a policy map")]
+    findings = []
+    for name, declared in sorted(expected.items()):
+        listed = policies.get(name)
+        if listed is None:
+            findings.append(finding("policies", "fail", f"policy {name} is not in force", name))
+            continue
+        changed = policy_differences(declared, listed)
+        if changed:
+            findings.append(finding("policies", "fail",
+                                    f"policy {name} differs from the soak workload's in {', '.join(changed)}", name))
+    generation = listing.get("generation")
+    previous = state.get("policy_generation")
+    if isinstance(generation, int):
+        if isinstance(previous, int) and generation < previous:
+            findings.append(finding("policies", "fail", f"policy generation went from {previous} back to {generation}"))
+        state["policy_generation"] = max(generation, previous or 0)
+    state["policy_checks"] = state.get("policy_checks", 0) + 1
+    return findings
+
+
+def check_policies(evidence, listing_path):
+    """The configure step's check: 0 when every policy in the applied
+    workload file is in force, 1 (printing why) when one isn't."""
+    expected = expected_policies(evidence) or {}
+    try:
+        listing = json.loads(Path(listing_path).read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"fail: policies: cannot read {listing_path}: {error}")
+        return 1
+    problems = policy_findings({}, expected, listing)
+    for item in problems:
+        print(f"{item['severity']}: policies: {item['detail']}")
+    return 1 if problems else 0
+
+
+def turn_scrapes(samples):
+    """A node's bun_agent_loop_turn_seconds_bucket samples, as /v1/metrics
+    returns them, grouped per branch into scrapes, oldest first:
+    {branch: [(timestamp, {le: cumulative count})]}."""
+    scrapes = {}
     for sample in samples if isinstance(samples, list) else []:
         labels = sample.get("labels") or {}
         if isinstance(labels, str):
@@ -967,48 +1089,49 @@ def turn_buckets(samples):
                 labels = json.loads(labels)
             except json.JSONDecodeError:
                 continue
-        key = (labels.get("branch"), labels.get("le"))
-        if None in key:
+        branch, le = labels.get("branch"), labels.get("le")
+        if branch is None or le is None:
             continue
         stamp = sample.get("timestamp", 0)
-        if key not in latest or stamp >= latest[key][0]:
-            latest[key] = (stamp, sample.get("value", 0))
-    return {key: value for key, (_, value) in latest.items()}
+        scrapes.setdefault(branch, {}).setdefault(stamp, {})[le] = sample.get("value", 0)
+    return {branch: sorted(by_stamp.items()) for branch, by_stamp in scrapes.items()}
 
 
 def turn_findings(state, node, samples):
     """Fail on every agent-loop turn over the 1 s budget since the last check.
 
     The buckets count from the bun process's start, so the check remembers
-    what it last saw per branch, and starts again from zero when the process
-    changes (a kill, an upgrade's exec), as the resource trends do.
+    the last scrape it counted per branch and adds up only the scrapes after
+    it, the way Prometheus's increase() does. A count going down is a new
+    process (a kill, an upgrade's exec), whose turns all count. A branch the
+    new process hasn't reported yet still shows the old process's last
+    scrapes, which add nothing (#1261).
 
     On the node whose writes the soak throttles (`node-slow-fsync`), a turn
     that journals is slow by construction: those turns are info, and stay out
     of the record's over-budget count, while the window lasts (#972)."""
     throttled = state.get("window") == "node-slow-fsync" and state.get("window_node") == node
-    buckets = turn_buckets(samples)
-    resources = state.get("resources", {}).get(node, {})
-    process = [resources.get("pid"), resources.get("image")]
     seen = state.setdefault("turns", {}).setdefault(node, {})
-    if seen.get("process") != process:
-        seen.update(process=process, over={})
     findings = []
-    for branch in sorted({branch for branch, _ in buckets}):
-        total = buckets.get((branch, "+Inf"))
-        within = buckets.get((branch, TURN_BUDGET_LE))
-        if total is None or within is None:
-            continue
-        over = int(total - within)
-        previous = seen["over"].get(branch, 0)
-        # Counters only go down when bun restarted between two checks
-        # without its pid changing; count that process from zero.
-        new = over - previous if over >= previous else over
-        seen["over"][branch] = over
+    for branch, scrapes in sorted(turn_scrapes(samples).items()):
+        last = seen.get(branch, {})
+        new, buckets = 0, None
+        for stamp, counts in scrapes:
+            total, within = counts.get("+Inf"), counts.get(TURN_BUDGET_LE)
+            if total is None or within is None or stamp <= last.get("at", float("-inf")):
+                continue
+            over = int(total - within)
+            restarted = total < last.get("total", 0) or over < last.get("over", 0)
+            previous = 0 if restarted else last.get("over", 0)
+            if over > previous:
+                new, buckets = new + over - previous, counts
+            last = {"at": stamp, "total": total, "over": over}
+        seen[branch] = last
         if new <= 0:
             continue
+        total = buckets["+Inf"]
         worst = next((bound for bound in TURN_BUCKET_BOUNDS
-                      if buckets.get((branch, bound)) == total), "+Inf")
+                      if buckets.get(bound) == total), "+Inf")
         lower = {"2.5": "1", "5": "2.5", "10": "5", "+Inf": "10"}[worst]
         span = f"over {lower} s" if worst == "+Inf" else f"between {lower} and {worst} s"
         detail = f"{new} {branch} turn(s) over the 1 s budget, the worst {span}"
@@ -1094,9 +1217,11 @@ def resource_trend_findings(state, node, inventory, now):
     rss = inventory_number(inventory, "bun_rss_kb")
     # An upgrade walk execs bun in place: same pid, a new image whose RSS
     # starts from nothing. Either change is a new process to warm up.
-    if pid != node_state.get("pid") or image != node_state.get("image"):
+    changed = pid != node_state.get("pid") or image != node_state.get("image")
+    if changed:
         node_state.update(pid=pid, image=image, fd_samples=[], started=now)
         node_state.pop("rss_warm_kb", None)
+    record_exposure(state, node, changed, dict(rss_kb=rss, fd=fd), now - node_state["started"], now)
     if fd is not None:
         node_state["fd_samples"] = [sample for sample in node_state["fd_samples"] if sample[0] >= now - (FD_RISES + 3) * FD_BUCKET] + [[now, fd]]
     trend = state.setdefault("trends", {}).setdefault(node, {})
@@ -1115,6 +1240,53 @@ def resource_trend_findings(state, node, inventory, now):
     findings = [dict(item, target=node) for item in fd_findings(node_state["fd_samples"], node_state["started"], now)]
     findings += [dict(item, target=node) for item in rss_findings(node_state, rss, now, node_state["started"])]
     return findings
+
+
+def record_exposure(state, node, changed, values, age, now):
+    """How long each leak checker could judge this node (#1062).
+
+    A checker is armed once the Bun process it watches has lived past the
+    checker's warm-up; a new pid or image starts the warm-up again. The
+    time between two armed samples of one process counts as armed; the
+    record reports the total, the longest unbroken window, the samples
+    judged and how many processes ever armed it. Reported only."""
+    for check, key, armed_after in CHECKER_ARMED_AFTER:
+        entry = state.setdefault("exposure", {}).setdefault(node, {}).setdefault(check, dict(
+            armed_seconds=0, longest_seconds=0, samples=0, processes_armed=0, window_seconds=0, last=None))
+        if changed:
+            entry.update(last=None, window_seconds=0)
+        if values[key] is None or age < armed_after:
+            continue
+        if entry["last"] is None:
+            entry["processes_armed"] += 1
+        else:
+            entry["armed_seconds"] += now - entry["last"]
+            entry["window_seconds"] += now - entry["last"]
+            entry["longest_seconds"] = max(entry["longest_seconds"], entry["window_seconds"])
+        entry["samples"] += 1
+        entry["last"] = now
+
+
+def exposure_lines(state, gated):
+    """The record's table of armed time per node and leak checker; a final
+    tier gates on it, other tiers record it."""
+    short = set(exposure_shortfalls(state))
+    lines = [f"## Leak-checker exposure ({'gated' if gated else 'recorded, not gated'})", "",
+             "How long each leak checker could judge each node's Bun. `leak-rss` arms after "
+             f"{RSS_WARMUP // 60} minutes in one process and `leak-fd` after "
+             f"{(FD_WARMUP + (FD_RISES + 1) * FD_BUCKET) // 60}; a restart, kill or upgrade exec starts the warm-up "
+             f"again. A final needs each armed for {EXPOSURE_ARMED_SECONDS // 60} minutes on every node, with one "
+             f"unbroken window of {EXPOSURE_WINDOW_SECONDS // 60} (#1062); its quiet tail gives them that.", "",
+             "| Node | Checker | Armed | Longest armed window | Evaluated samples | Processes armed | Verdict |",
+             "|---|---|---|---|---|---|---|"]
+    for node in state.get("nodes", []):
+        for check, _, _ in CHECKER_ARMED_AFTER:
+            entry = state.get("exposure", {}).get(node, {}).get(check, {})
+            verdict = ("SHORT" if gated else "short") if (node, check) in short else "ok"
+            lines.append(f"| {node} | {check} | {entry.get('armed_seconds', 0) // 60} min | "
+                         f"{entry.get('longest_seconds', 0) // 60} min | {entry.get('samples', 0)} | "
+                         f"{entry.get('processes_armed', 0)} | {verdict} |")
+    return lines + [""]
 
 
 def job_metric_samples(state, node, inventory, now):
@@ -1398,35 +1570,338 @@ def expected_renewals(elapsed, period):
 
 
 FINAL_TIER_SECONDS = 8 * 3600
+# A final ends with a quiet tail after its 8 hours of faults: no faults, walks
+# or specials, so every node's Bun lives long enough to arm the leak checkers
+# and give them comparison samples (#1062, maintainer decision 20 October
+# 2026). Each checker must be armed this long on every node, with one
+# unbroken window at least EXPOSURE_WINDOW_SECONDS long; a fast or custom run
+# records its exposure without gating on it. qualify-sustained.sh has the
+# same tail length. Two hours would be the warm-up plus the armed hour, but
+# the last cycle's graceful stop comes after its heavy sample, so each new Bun
+# is first seen up to one heavy interval (300 s) into the tail, and every
+# heavy observe pushes the next one back by its own run time. The extra
+# 15 minutes cover that sampling.
+QUIET_TAIL_SECONDS = 2 * 3600 + 15 * 60
+# The day tier (#1032) is one real day.
+DAY_TIER_SECONDS = 24 * 3600
+EXPOSURE_ARMED_SECONDS = 3600
+EXPOSURE_WINDOW_SECONDS = 1800
+
+# The execution inventory (#1061). The schedule below mirrors run_cycle and
+# special_for_cycle in qualify-sustained.sh; test_sustained_check compares
+# it with the harness's --plan, so the two can't drift apart unnoticed.
+CHAOS_KINDS = ("kill", "delay", "partition", "scenario", "pause", "drop", "dns", "cpu", "memory")
+SCHEDULES = {"full": dict(cycle=3600, chaos_per_slot=3, pulse_every=1, export_every=6),
+             "compressed": dict(cycle=600, chaos_per_slot=2, pulse_every=0, export_every=2)}
+CANDIDATE_ITEM = "candidate.json bytes match the qualified digest"
+BASELINE_ITEM = "app workloads settled at the baseline"
+WALK_ITEM = "upgrade walk (to the soak build and back)"
+PULSE_ITEM = "catalogue pulse"
+EXPORT_ITEM = "offline export"
+DRAIN_ITEM = "job campaign drained in its final two minutes"
+QUIET_ITEM = "quiet tail with no faults, walks or specials"
+SLOT_FAULTS = ("fault:bun-kill-follower", "fault:bun-kill-leader", "fault:deploy-kill", "fault:power-off")
+SPECIALS = ("special:graceful-stop", "special:quorum-loss", "special:all-off")
 
 
-def acceptance_line(metadata, result, elapsed):
-    """What the run says about the V02 gate (plan D3): only a clean final tier passes it."""
+def required_execution(metadata):
+    """What a run must have completed, as {item: count}.
+
+    A final tier is held to the 8-hour full schedule with upgrade walks
+    whatever its metadata says about schedule, length or soak build, so
+    relabelling a shorter run can't lower the bar. Node faults are required
+    when the run says it injected them. Other tiers get the schedule they
+    say they ran; their inventory is recorded, not gated. The counts are the
+    cycles every run completes (min_cycles in the harness), so a run whose
+    slots overran still owes them. Each fault kind is owed once; walks,
+    specials, pulses and exports are owed as often as the schedule runs them."""
+    final = metadata.get("tier") == "final"
+    if metadata.get("tier") == "day":
+        # The day run (#1032) owes no faults, walks or specials: only the
+        # candidate it verified, a settled baseline and the final drain.
+        return {CANDIDATE_ITEM: 1, BASELINE_ITEM: 1, DRAIN_ITEM: 1}
+    schedule = "full" if final else metadata.get("schedule", "full")
+    if schedule not in SCHEDULES:
+        schedule = "full"
+    plan = SCHEDULES[schedule]
+    duration = FINAL_TIER_SECONDS if final else int(metadata.get("duration_target") or 0)
+    walks = final or not str(metadata.get("soak_bun", "")).startswith("not supplied")
+    cycles = duration // plan["cycle"] if schedule == "full" else 4
+    hours = max(duration // 3600, 1)
+    half = max(hours // 2, 1)
+    required = {CANDIDATE_ITEM: 1, BASELINE_ITEM: 1, WALK_ITEM: 0}
+    slots = {phase: 0 for phase in SLOT_FAULTS}
+    specials = {phase: 0 for phase in SPECIALS}
+    node_kinds = {}
+    pulses = exports = chaos_rounds = 0
+    for index in range(cycles):
+        slots["fault:bun-kill-follower"] += 1
+        slots["fault:bun-kill-leader"] += 1
+        if index % 2 == 1 and walks:
+            required[WALK_ITEM] += 1
+            if schedule == "compressed":
+                chaos_rounds += plan["chaos_per_slot"]
+        else:
+            slots["fault:deploy-kill"] += 1
+            slots["fault:power-off"] += 1
+            chaos_rounds += plan["chaos_per_slot"]
+        if metadata.get("node_faults") is True:
+            kind = "fault:node-" + job_soak.NODE_FAULT_KINDS[index % 3]
+            node_kinds[kind] = 1
+        if (plan["pulse_every"] and index % plan["pulse_every"] == 0) or (schedule == "compressed" and index == 0):
+            pulses += 1
+        if index % plan["export_every"] == plan["export_every"] - 1:
+            exports += 1
+        if schedule == "compressed":
+            if 1 <= index <= 3:
+                specials[SPECIALS[index - 1]] += 1
+            continue
+        hour = index + 1
+        if hour % half == 0:
+            specials["special:graceful-stop"] += 1
+        if hour in ((hours * 40 + 50) // 100, (hours * 85 + 50) // 100):
+            specials["special:quorum-loss"] += 1
+        if hour == (hours * 70 + 50) // 100:
+            specials["special:all-off"] += 1
+    for phase, count in slots.items():
+        if count:
+            required[phase] = 1
+    for round_index in range(min(chaos_rounds, len(CHAOS_KINDS))):
+        required["fault:chaos-" + CHAOS_KINDS[round_index]] = 1
+    required.update(node_kinds)
+    required.update({phase: count for phase, count in specials.items() if count})
+    if pulses:
+        required[PULSE_ITEM] = pulses
+    if exports:
+        required[EXPORT_ITEM] = exports
+    if final:
+        required[QUIET_ITEM] = 1
+    required[DRAIN_ITEM] = 1
+    if not required[WALK_ITEM]:
+        del required[WALK_ITEM]
+    return required
+
+
+def candidate_verified(evidence, metadata):
+    """The candidate is known only when this run bootstrapped from it and the
+    bytes it kept hash to the digest it was asked to qualify. An adopted
+    --home installed whatever it installed before this run looked."""
+    digest = str(metadata.get("qualified_digest") or "")
+    path = Path(evidence) / "candidate.json"
+    if metadata.get("bootstrapped") not in (True, "true") or not re.fullmatch(r"[0-9a-f]{64}", digest) or not path.is_file():
+        return False
+    return hashlib.sha256(path.read_bytes()).hexdigest() == digest
+
+
+def completed_execution(evidence, metadata, events, job_report):
+    """What the run actually completed, as {item: count}, from its events,
+    the candidate bytes it kept and the job controller's final snapshot.
+
+    A fault counts once it was injected (no failed or refused injection) and
+    the cluster settled after it; a walk once it reached the soak build,
+    rolled back and settled; quorum loss once quorum came back too."""
+    def count(phase, **match):
+        return sum(1 for event in events if event.get("phase") == phase
+                   and all(event.get(key) == value for key, value in match.items()))
+
+    def injected(phase):
+        return sum(1 for event in events if event.get("phase") == phase and event.get("settle_seconds") is None
+                   and event.get("verdict") in (None, "ok") and event.get("exit") in (None, 0))
+
+    completed = {CANDIDATE_ITEM: 1 if candidate_verified(evidence, metadata) else 0,
+                 BASELINE_ITEM: min(count("baseline", verdict="ok"), 1),
+                 WALK_ITEM: min(count("upgrade:upgrade", verdict="ok"), count("upgrade:rollback", verdict="ok"),
+                                count("upgrade:settle", verdict="settled")),
+                 PULSE_ITEM: count("pulse", verdict="ok"),
+                 EXPORT_ITEM: count("storage:offline-export", verdict="ok")}
+    phases = {event.get("phase", "") for event in events}
+    for phase in phases | set(SLOT_FAULTS) | set(SPECIALS):
+        if phase.startswith(("fault:", "special:")) and phase != "special:quorum-back":
+            completed[phase] = min(injected(phase), count(phase, verdict="settled"))
+    completed["special:quorum-loss"] = min(completed["special:quorum-loss"], count("special:quorum-back", verdict="ok"))
+    report = job_report if isinstance(job_report, dict) else {}
+    stop = report.get("stop_requested_at")
+    drained = (metadata.get("job_soak") is True and report.get("stopped") is True and not report.get("active")
+               and type(stop) is int and stop >= metadata.get("job_stop_at", 0))
+    completed[DRAIN_ITEM] = 1 if drained else 0
+    completed[QUIET_ITEM] = quiet_tails(events)
+    return completed
+
+
+def quiet_tails(events):
+    """Quiet tails that lasted QUIET_TAIL_SECONDS (a minute's slack for the
+    clock) with no fault, walk or special inside them."""
+    complete, started, disturbed = 0, None, False
+    for event in events:
+        phase = event.get("phase", "")
+        if phase == "quiet" and event.get("verdict") is None:
+            started, disturbed = event.get("ts"), False
+        elif phase == "quiet" and started is not None:
+            if event.get("verdict") == "ok" and (event.get("duration") or 0) >= QUIET_TAIL_SECONDS - 60 and not disturbed:
+                complete += 1
+            started = None
+        elif started is not None and phase.startswith(("fault:", "upgrade", "special:")):
+            disturbed = True
+    return complete
+
+
+def exposure_shortfalls(state):
+    """(node, checker) pairs armed too briefly, or never for one unbroken window."""
+    short = []
+    for node in state.get("nodes", []):
+        for check, _, _ in CHECKER_ARMED_AFTER:
+            entry = state.get("exposure", {}).get(node, {}).get(check, {})
+            if (entry.get("armed_seconds", 0) < EXPOSURE_ARMED_SECONDS
+                    or entry.get("longest_seconds", 0) < EXPOSURE_WINDOW_SECONDS):
+                short.append((node, check))
+    return short
+
+
+def execution_inventory(evidence, metadata, events, job_report):
+    """Rows of (item, required, completed) in the order the record lists them."""
+    required = required_execution(metadata)
+    completed = completed_execution(evidence, metadata, events, job_report)
+    return [(item, need, completed.get(item, 0)) for item, need in required.items()]
+
+
+def job_final_ran(metadata, job_report, missing):
+    """A job final is the job controller at the target load with every node
+    fault completed; the labels alone don't make one."""
+    return (metadata.get("node_faults") is True and isinstance(job_report, dict) and job_report.get("load") == "target"
+            and not [item for item in missing if item.startswith("fault:node-")])
+
+
+def acceptance_line(metadata, result, elapsed, missing=(), job_final=False, exposure=(), day=None):
+    """What the run says about the V02 gate (plan D3) and the release gate's
+    final soak (#991): only a clean, complete final tier passes either. A day
+    tier (#1032) says whether the day held."""
     tier = metadata.get("tier") or "custom"
     clean = result == "PASS"
+    if tier == "day":
+        return day_acceptance_line(metadata, clean, elapsed, missing, exposure, day)
     if tier == "fast":
         if clean:
             return ("**Fast tier: clean.** The iteration loop only, not acceptance: the V02 gate needs a clean "
                     "final-tier run (8 h, full schedule) on the final candidate.")
         return "**Fast tier: not clean.** Fix what failed and run the fast tier again before a final-tier run."
     if tier != "final":
-        return "**No tier (a custom run).** Neither tier's evidence, so it says nothing about the V02 gate."
-    if not clean:
-        return ("**Final tier: not clean. The V02 gate does not pass.** A product fix means a fresh fast-tier run, "
-                "then a fresh final-tier run.")
+        return ("**Custom run: diagnostic only.** It ran no tier, so it says nothing about the V02 gate or the "
+                "release gate's final soak.")
     shortfalls = []
     if metadata.get("schedule", "full") != "full":
         shortfalls.append(f"it ran the {metadata['schedule']} schedule")
     if min(elapsed, metadata.get("duration_target") or 0) < FINAL_TIER_SECONDS:
         shortfalls.append(f"it soaked for {duration_text(elapsed)}")
-    digest = metadata.get("candidate_digest") or "`not checked`"
-    if "not checked" in digest:
-        shortfalls.append("the candidate digest was not checked (--qualified-digest)")
+    gaps = (["missing from the execution inventory: " + ", ".join(missing)] if missing else []) + (
+        ["leak-checker exposure too short: " + ", ".join(f"{node} {check}" for node, check in exposure)]
+        if exposure else [])
+    if not clean:
+        return ("**Final tier: not clean. The V02 gate does not pass.** A product fix means a fresh fast-tier run, "
+                "then a fresh final-tier run." + (" It is incomplete too: " + "; ".join(gaps) + "." if gaps else ""))
+    if gaps:
+        return ("**Final tier: incomplete. It passes neither the V02 gate nor the release gate's final soak:** "
+                + "; ".join(shortfalls + gaps)
+                + ". A final tier owes every walk, fault kind and special of its 8-hour schedule, then a quiet tail "
+                "long enough to arm every leak checker on every node.")
     if shortfalls:
         return (f"**Final tier: clean, but not acceptance:** {'; '.join(shortfalls)}. The V02 gate needs 8 h on "
                 "the full schedule against a pinned candidate.")
-    return (f"**Final tier: clean. The V02 soak gate passes** for the candidate whose `candidate.json` has "
-            f"SHA-256 {digest}, if it is the final candidate.")
+    digest = f"`{metadata.get('qualified_digest')}`"
+    if job_final:
+        return (f"**Final job tier: clean. The release gate's final soak passes** for the candidate whose "
+                f"`candidate.json` has SHA-256 {digest}, if it is the final candidate.")
+    return (f"**Final tier (V02 alone): clean. The V02 soak gate passes** for the candidate whose `candidate.json` "
+            f"has SHA-256 {digest}, if it is the final candidate. It is not the release gate's final soak, which is "
+            "the job final (`qualify-jobs-sustained.sh --tier final`, #991).")
+
+
+def day_acceptance_line(metadata, clean, elapsed, missing, exposure, day):
+    """What a day tier (#1032) says: the day's accepted host-job tasks, and
+    whether every check held for all of it."""
+    gaps = (["missing from the execution inventory: " + ", ".join(missing)] if missing else []) + (
+        ["leak-checker exposure too short: " + ", ".join(f"{node} {check}" for node, check in exposure)]
+        if exposure else [])
+    if elapsed < DAY_TIER_SECONDS:
+        gaps.append(f"it ran for {duration_text(elapsed)}, not a whole day")
+    if not clean or not day:
+        return ("**Day tier: not clean.** The day run doesn't hold; the record says what failed."
+                + (" It is incomplete too: " + "; ".join(gaps) + "." if gaps else ""))
+    if gaps:
+        return "**Day tier: incomplete.** " + "; ".join(gaps) + "."
+    return (f"**Day tier: clean.** {day['host_successes']:,} host-job tasks accepted in {duration_text(elapsed)}, "
+            f"{day['host_successes_per_second']:,.1f}/s against the {day['target_rate']}/s target, for the candidate "
+            f"whose `candidate.json` has SHA-256 `{metadata.get('qualified_digest')}`.")
+
+
+def day_lines(day):
+    """The record's section for the day run (#1032): the total against the
+    target and the floor, each node's share and every full hour's rate."""
+    elapsed = max(1, day.get("elapsed_seconds") or 1)
+    lines = ["## Day run (#1032)", "",
+             f"{day['host_successes']:,} accepted host-job tasks in {duration_text(elapsed)}: "
+             f"{day['host_successes_per_second']:,.1f}/s against the {day['target_rate']}/s target "
+             f"({'PASS' if day['target_met'] else 'FAIL'}). The billion-a-day floor is {day['floor_rate']:,}/s "
+             f"({'met' if day['floor_met'] else 'not met'}). At this rate a day is {day['day_equivalent']:,} tasks.", "",
+             "| Node | Slots | Host-job successes | Rate | Share | Fair share | Verdict |", "|---|---|---|---|---|---|---|"]
+    for row in day["per_node"]["nodes"]:
+        verdict = "OVER" if row["over_fair_share"] else "ok"
+        if row["restarted"]:
+            verdict += " (restarted)"
+        lines.append(f"| {row['node']} | {row['slots']} | {row['successes']:,} | {row['successes'] / elapsed:,.1f}/s | "
+                     f"{row['share_percent']:.1f}% | {row['fair_share_percent']:.1f}% | {verdict} |")
+    lines += ["", f"A node may take up to {day['per_node']['tolerance_percent']}% more than its fair share by slots, "
+              "as `relish bench` allows (#1362).", "",
+              "| Hour | Host jobs a second | |", "|---|---|---|"]
+    peak = max(day["hourly"], default=0) or 1
+    for hour, rate in enumerate(day["hourly"], 1):
+        lines.append(f"| Hour {hour} | {rate:,.1f} | {'█' * round(20 * rate / peak)} |")
+    if day["first_hour"] is not None:
+        lines += ["", f"Last hour against the first: {day['last_hour']:,.1f}/s against {day['first_hour']:,.1f}/s, "
+                  f"{'ok' if day['slowdown_ok'] else 'FAIL'} (at most {day['slowdown_percent']}% slower; the first "
+                  "hour includes the campaign's start and its host-job probes)."]
+    return lines + [""]
+
+
+def council_history_section(evidence, metadata):
+    """The council history check (#1399): whether it failed the run, and the record's lines.
+
+    `linearizability.py check` writes council-history-check.json once the
+    soak is over. A run that started the history client (metadata
+    `council_history`) owes that check: without it, or with a violation, the
+    run fails. An inconclusive search is reported but fails nothing.
+    """
+    path = Path(evidence) / "council-history-check.json"
+    if not path.exists():
+        if metadata.get("council_history") is not True:
+            return False, []
+        return True, ["## Council history (linearizability)", "",
+                      "- Not checked: the soak recorded a council history but never checked it", ""]
+    result = json.loads(path.read_text())
+    verdict = result.get("verdict")
+    lines = ["## Council history (linearizability)", "",
+             "Every test-lease grant, renew, read and release the history client made, checked against a "
+             "model of the council's leases. A write with no answer may or may not have happened; the check "
+             "allows both.", "",
+             f"- Operations checked: {result.get('checked', 0)} of {result.get('operations', 0)}, "
+             f"in {result.get('partitions', 0)} namespaces; {result.get('unanswered_writes', 0)} writes had no answer"]
+    if verdict == "linearizable":
+        lines.append("- Verdict: linearizable")
+    elif verdict == "inconclusive":
+        lines.append("- Verdict: inconclusive: the search ran out of budget in "
+                     + ", ".join(result.get("inconclusive", [])))
+    else:
+        violation = result.get("violation", {})
+        lines += [f"- Verdict: **not linearizable** in {violation.get('namespace', 'unknown')}; "
+                  "the smallest failing slice of its history:", "",
+                  "| Id | Client | Operation | Lease | Call | Return | Outcome | Expiry | Cleaning |",
+                  "|---|---|---|---|---|---|---|---|---|"]
+        for op in violation.get("slice", []):
+            returned = "no answer" if op.get("return") is None else f"{op['return']:.3f}"
+            lines.append(f"| {op.get('id')} | {op.get('client')} | {op.get('op')} | {op.get('lease') or ''} | "
+                         f"{op.get('call', 0):.3f} | {returned} | {op.get('outcome')} | "
+                         f"{op.get('expires_at_unix_ms') or ''} | {op.get('cleaning') if op.get('cleaning') is not None else ''} |")
+    lines.append("")
+    return verdict not in ("linearizable", "inconclusive"), lines
 
 
 def render(evidence, record):
@@ -1463,14 +1938,30 @@ def render(evidence, record):
     fault_kinds=job_soak.FAULT_KINDS+(job_soak.NODE_FAULT_KINDS if metadata.get("node_faults") is True else ())
     job_missing=job_soak.coverage_failures(job_report,state.get("nodes",[]),fault_kinds) if metadata.get("job_soak") is True else []
     if metadata.get("job_soak") is True:
-        if job_report and (type(job_report.get("stop_requested_at")) is not int or job_report["stop_requested_at"] < metadata.get("job_stop_at",0)):
-            job_missing.append("job campaign requested drain before the final two-minute interval")
+        if type(metadata.get("job_stop_at")) is not int:
+            job_missing.append("the harness never asked the job campaign to drain")
+        elif job_report and (type(job_report.get("stop_requested_at")) is not int or job_report["stop_requested_at"] < metadata["job_stop_at"]):
+            job_missing.append("job campaign requested drain before the harness asked for it")
         for node in state.get("nodes",[]):
             observed=state.get("job_resources",{}).get(node,{})
             if observed.get("complete") is not True or observed.get("ts",0)<(job_report or {}).get("heartbeat",0) or observed.get("live_owners")!=0:
                 job_missing.append(node+" lacks a complete empty owner inventory after campaign drain")
         gates.append(("mixed job campaign and positive drain",str(len(job_missing))+" missing/failing checks","0","FAIL" if job_missing else "PASS"))
-    gate_failed = any(row[3] == "FAIL" for row in gates)
+    inventory = execution_inventory(evidence, metadata, events, job_report)
+    missing = [item for item, need, done in inventory if done < need]
+    # The final and day tiers gate on their inventory and leak-checker exposure.
+    final_tier = metadata.get("tier") in ("final", "day")
+    day = job_soak.report(job_report).get("day") if metadata.get("tier") == "day" and job_report else None
+    exposure = exposure_shortfalls(state)
+    # The latency SLOs (#1400): a breached gated one fails the tier.
+    slo_data = soak_slo.load(evidence)
+    slo_rows = soak_slo.rows(slo_data, job_soak.report(job_report) if job_report else None,
+                             metadata.get("tier") or "custom", metadata.get("job_soak") is True)
+    slo_failed = bool(soak_slo.failures(slo_rows))
+    # The council history (#1399): a violation, or a check owed and missing, fails the run.
+    history_failed, history_lines = council_history_section(evidence, metadata)
+    gate_failed = (any(row[3] == "FAIL" for row in gates) or (final_tier and bool(missing or exposure))
+                   or slo_failed or history_failed)
     open_failures = [row for row in failures if row.get("disposition", "open") == "open"]
     result = metadata.get("result") or ("FAIL" if open_failures or gate_failed else "PASS")
     if (open_failures or gate_failed) and result == "PASS":
@@ -1478,9 +1969,14 @@ def render(evidence, record):
 
     tier = metadata.get("tier") or "custom"
     lines = [f"# Sustained soak (V02): {result}", ""]
-    lines += [f"{time.strftime('%-d %B %Y', time.gmtime(started))}. {tier} tier, {metadata.get('schedule', 'full')} "
+    schedule_text = "no fault" if metadata.get("schedule") == "none" else metadata.get("schedule", "full")
+    lines += [f"{time.strftime('%-d %B %Y', time.gmtime(started))}. {tier} tier, {schedule_text} "
               f"schedule, {duration_text(elapsed)} of soak on a three-node quickstart cluster.", ""]
-    lines += [acceptance_line(metadata, result, elapsed), ""]
+    # The acceptance line tells a failed check apart from a run that was clean but incomplete.
+    clean_apart_from_inventory = "FAIL" if open_failures or metadata.get("result") == "FAIL" or slo_failed or history_failed or any(
+        row[3] == "FAIL" for row in gates) else "PASS"
+    lines += [acceptance_line(metadata, clean_apart_from_inventory, elapsed, missing if final_tier else (),
+                              job_final_ran(metadata, job_report, missing), exposure if final_tier else (), day), ""]
     lines += ["## Candidate and host", "", "| | |", "|---|---|"]
     for key, label in (("base_url", "Staged base URL"), ("candidate_digest", "`candidate.json` SHA-256"),
                        ("versions", "Running versions"), ("soak_bun", "Soak build"),
@@ -1497,6 +1993,11 @@ def render(evidence, record):
     if paused:
         lines.append(f"- Soak clock paused for {duration_text(paused)} (environment)")
     lines.append(f"- Cycles completed: {metadata.get('cycles', 0)}")
+    choices_path = evidence / "choices.json"
+    if choices_path.exists():
+        choices = json.loads(choices_path.read_text())
+        lines.append(f"- Fault and node choices: {choices['draws']}, from seed {choices['seed']} "
+                     f"(`--seed {choices['seed']}` repeats them)")
     if metadata.get("teardown"):
         lines.append(f"- Teardown: {metadata['teardown']}")
     lines.append("")
@@ -1522,9 +2023,23 @@ def render(evidence, record):
         timing = f"{seconds[len(seconds) // 2]} s / {seconds[-1]} s" if seconds else "n/a"
         lines.append(f"| {phase} | {entry['runs']} | {entry['settled']} | {entry['failed']} | {entry['skipped']} | {timing} |")
     lines.append("")
+    lines += [f"## Execution inventory ({'gated' if final_tier else 'recorded, not gated'})", "",
+              "What the run completed, from its events and kept bytes, against what its schedule owes. "
+              "A fault counts once it was injected and the cluster settled after it.", "",
+              "| Item | Required | Completed | Verdict |", "|---|---|---|---|"]
+    lines += [f"| {item} | {need} | {done} | {'ok' if done >= need else 'MISSING'} |" for item, need, done in inventory]
+    lines.append("")
+    effects = [event for event in events if event.get("phase", "").startswith("effect:")]
+    if effects:
+        lines += ["## Observed fault effects", "", "What each injected fault was seen to do, read back from the node.", "",
+                  "| Fault | Target | Observed |", "|---|---|---|"]
+        lines += [f"| {event['phase']} | {event.get('target', '')} | "
+                  f"{str(event.get('detail', '')).replace('|', '/').replace(chr(10), ' ')} |" for event in effects]
+        lines.append("")
     lines += ["## Renewals and rotations", "", "| Measure | Observed | Required | Verdict |", "|---|---|---|---|"]
     lines += [f"| {label} | {observed} | {need} | {verdict} |" for label, observed, need, verdict in gates]
     lines.append("")
+    lines += soak_slo.table_lines(slo_rows, slo_data)
     progress = state.get("progress", {})
     if metadata.get("job_soak") is True:
         lines += ["## Jobs", "", "| Runtime | Accepted successes | Retries | Last accepted progress |", "|---|---|---|---|"]
@@ -1540,6 +2055,8 @@ def render(evidence, record):
         lines += ["", "Complete disk inventories are recorded. Global retention bounds and the 12-hour job qualification remain #668; this gate cannot certify an unimplemented retention policy.", ""]
         qualification = job_qualification(job_report, state, metadata, elapsed)
         lines += job_qualification_lines(qualification)
+        if day:
+            lines += day_lines(day)
         evidence_json = record.with_name(record.stem + ".jobs.json")
         if evidence_json.exists():
             raise SystemExit(f"{evidence_json} already exists")
@@ -1560,6 +2077,11 @@ def render(evidence, record):
             f"{node} {over_budget.get(node, 0)}" for node in checked))
     else:
         lines.append("- Agent-loop turns over the 1 s budget: not measured")
+    if state.get("policy_checks"):
+        lines.append(f"- Soak policies checked in force: {state['policy_checks']} times, "
+                     f"policy generation {state.get('policy_generation', 'unknown')} at the last check")
+    else:
+        lines.append("- Soak policies checked in force: not measured")
     clock_steps = state.get("clock_steps", {})
     lines.append("- Guest clock steps by Lima's guest agent: " + (", ".join(
         f"{node} {count}" for node, count in sorted(clock_steps.items())) or "none"))
@@ -1567,6 +2089,8 @@ def render(evidence, record):
     if progress:
         lines.append(f"- Last observed progress: {', '.join(f'{key} {value}' for key, value in sorted(progress.items()))}")
     lines.append("")
+    lines += history_lines
+    lines += exposure_lines(state, final_tier)
     lines += ["## Resource trends", "", "| Node | Measure | First | Last | Max |", "|---|---|---|---|---|"]
     for node, trend in sorted(state.get("trends", {}).items()):
         for measure, entry in sorted(trend.items()):
@@ -1605,7 +2129,8 @@ def job_qualification(job_report, state, metadata, elapsed):
         tier=metadata.get("tier"),
         schedule=metadata.get("schedule"),
         node_faults=metadata.get("node_faults") is True,
-        fault_kinds=list(job_soak.FAULT_KINDS + (job_soak.NODE_FAULT_KINDS if metadata.get("node_faults") is True else ())))
+        fault_kinds=[] if metadata.get("tier") == "day" else
+        list(job_soak.FAULT_KINDS + (job_soak.NODE_FAULT_KINDS if metadata.get("node_faults") is True else ())))
     return report
 
 
@@ -1710,6 +2235,9 @@ def main(argv=None):
         sub = commands.add_parser(name)
         sub.add_argument("evidence")
         sub.add_argument("snapshot")
+    policies = commands.add_parser("policies", help="exit 1 unless the soak workload's policies are all in force (#1311)")
+    policies.add_argument("evidence")
+    policies.add_argument("listing")
     seen = commands.add_parser("seen")
     seen.add_argument("evidence")
     seen.add_argument("key")
@@ -1755,6 +2283,14 @@ def main(argv=None):
     failures = commands.add_parser("test-failures", help="why a relish test JSON run failed (#1068)")
     failures.add_argument("report")
     failures.add_argument("stderr", nargs="?")
+    seed = commands.add_parser("seed", help="start or resume the run's seeded choices (#1062)")
+    seed.add_argument("evidence")
+    seed.add_argument("--seed", type=int)
+    choice = commands.add_parser("choose", help="the run's next seeded choice, logged")
+    choice.add_argument("evidence")
+    choice.add_argument("what")
+    choice.add_argument("low", type=int)
+    choice.add_argument("high", type=int)
     record = commands.add_parser("render")
     record.add_argument("evidence")
     record.add_argument("record")
@@ -1799,6 +2335,8 @@ def main(argv=None):
         return 0
     if args.command == "evaluate":
         return evaluate(args.evidence, args.snapshot)
+    if args.command == "policies":
+        return check_policies(args.evidence, args.listing)
     if args.command == "seen":
         # A harness-detected failure already bundled in the last half hour is a repeat.
         state = load_state(args.evidence)
@@ -1855,6 +2393,16 @@ def main(argv=None):
     if args.command == "test-failures":
         stderr_text = Path(args.stderr).read_text(errors="replace") if args.stderr and Path(args.stderr).exists() else ""
         print(test_failure_reasons(Path(args.report).read_text(errors="replace"), stderr_text))
+        return 0
+    if args.command == "seed":
+        try:
+            print(start_choices(args.evidence, args.seed))
+        except ValueError as error:
+            print(f"sustained_check: {error}", file=sys.stderr)
+            return 1
+        return 0
+    if args.command == "choose":
+        print(choose(args.evidence, args.what, args.low, args.high))
         return 0
     if args.command == "render-charts":
         directory = Path(args.directory)

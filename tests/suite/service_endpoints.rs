@@ -18,6 +18,8 @@ async fn bun_publishes_reachable_ephemeral_service_endpoints() {
     let path = root.path().join("node.toml");
     std::fs::write(&path, toml::to_string_pretty(&node).unwrap()).unwrap();
     let log = std::fs::File::create(root.path().join("bun.log")).unwrap();
+    // Pay `bun`'s first launch before the 30 s wait below starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"))
         .args([
             "--runtime",

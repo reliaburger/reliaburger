@@ -1,6 +1,6 @@
 //! Durable consumer publication, complete view withdrawal and receipt permissions.
 
-use super::discovery_ownership::Landing;
+use super::discovery_ownership::{Landing, WriteOwner};
 use super::{BunAgent, BunError, DiscoveryOwnership, Grill};
 use crate::bun::consumer_owners::{
     ConsumerIdentity, ConsumerOwnership, ConsumerPhase, ConsumerPublication, ConsumerReceipt,
@@ -192,6 +192,49 @@ impl ConsumerSyncs {
     }
 }
 
+/// Leader acknowledgements of locally proven receipts, and the journal
+/// write that forgets them (#1340). A confirmation changes the ownership as
+/// it is on disk, so it waits for any write in flight, but never on the
+/// loop: it waits here, and the loop takes it in a turn of its own once the
+/// journal is free.
+#[derive(Default)]
+pub(super) struct ReceiptConfirmations {
+    /// Acknowledgements the journal hasn't been asked to forget yet.
+    waiting: Vec<ReceiptConfirmation>,
+    /// Acknowledgements whose write outlasted its turn, answered once it lands.
+    forgetting: Vec<ReceiptConfirmation>,
+}
+
+/// The leader's exact acknowledgement of one receipt, and whoever waits to
+/// hear that the receipt is forgotten.
+struct ReceiptConfirmation {
+    generation: u64,
+    response: oneshot::Sender<Result<(), BunError>>,
+}
+
+impl ReceiptConfirmations {
+    /// Some acknowledgement waits for the journal to be free.
+    pub(super) fn is_waiting(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
+    /// Answer the acknowledgements whose write has just landed.
+    pub(super) fn write_landed(&mut self, result: &Result<(), BunError>) {
+        answer_receipts(std::mem::take(&mut self.forgetting), result);
+    }
+}
+
+/// Tell each confirmation how its write ended.
+fn answer_receipts(confirmations: Vec<ReceiptConfirmation>, result: &Result<(), BunError>) {
+    for confirmation in confirmations {
+        let answer = match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(failure(error)),
+        };
+        let _ = confirmation.response.send(answer);
+    }
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// The consumer's durable ownership. While a step's write is in flight
     /// this is the ownership before it; the view that write records counts
@@ -223,6 +266,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         next: ConsumerOwnership,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<Landing, BunError> {
+        self.write_consumer_for(next, deadline, WriteOwner::ConsumerStep)
+            .await
+    }
+
+    /// [`Self::write_consumer`], for `owner` to take over if the write
+    /// outlasts `deadline`.
+    async fn write_consumer_for(
+        &mut self,
+        next: ConsumerOwnership,
+        deadline: Option<tokio::time::Instant>,
+        owner: WriteOwner,
+    ) -> Result<Landing, BunError> {
         // `next` was built from the journal as it is: no write in flight.
         if self.discovery_write_in_flight() {
             return Err(failure("a consumer journal write is still in flight"));
@@ -234,6 +289,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             &ServiceId::new("system", "discovery"),
             |inventory| inventory.consumer = Some(next),
             deadline,
+            owner,
         )
         .await
     }
@@ -533,6 +589,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// every step below, back to back. The loop spreads the same steps over
     /// several turns instead ([`Self::request_consumer_sync`]); this is for
     /// callers that must see the view settled before they carry on.
+    ///
+    /// Outside a turn each step's write is waited out. Inside one a write
+    /// still in flight isn't (#1336): the rest of the synchronisation goes
+    /// to the loop, which takes it once the write has landed, as it would a
+    /// local republication, and this answers `StillRunning`. Call it only
+    /// with no synchronisation under way.
     pub(super) async fn synchronise_consumer(
         &mut self,
         generation: u64,
@@ -546,7 +608,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         loop {
             match progress {
                 Progress::Done(update) => return Ok(update),
-                Progress::Next(step) => progress = self.consumer_step(step).await?,
+                Progress::Next(next) => {
+                    if self.settle_discovery_write_outside_turn().await == Landing::InFlight {
+                        // Nobody hears how it ends; a failure marks the view
+                        // stale again (`answer_consumer_sync`).
+                        self.consumer_syncs.current = Some(ConsumerSync { next, answer: None });
+                        return Err(BunError::StillRunning {
+                            work: "a consumer view's journal write".into(),
+                        });
+                    }
+                    progress = self.consumer_step(next).await?;
+                }
             }
         }
     }
@@ -661,9 +733,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// started. Each step journals at most one discovery write, and reads
     /// the ownership afresh, so a receipt confirmed between turns stays gone.
     async fn consumer_step(&mut self, step: ConsumerStep) -> Result<Progress, BunError> {
-        // The loop takes a step only once any write has landed; a caller
-        // finishing a synchronisation inline waits for it here.
-        self.settle_discovery_write().await;
+        // Every driver takes a step only once the journal is free (#1336):
+        // the loop's branches wait for the landing, and the inline drivers
+        // settle the write outside a turn, or stop at it inside one.
+        if self.discovery_write_in_flight() {
+            return Err(failure("a consumer journal write is still in flight"));
+        }
         match step {
             ConsumerStep::Journal {
                 publication,
@@ -821,11 +896,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Finish every synchronisation under way or waiting, inline, for a
-    /// caller that needs the view settled now.
-    pub(super) async fn finish_consumer_syncs(&mut self) {
+    /// caller that needs the view settled now. Inside a turn a step's write
+    /// in flight isn't waited for (#1336): this stops there with `InFlight`,
+    /// and the loop takes the rest once the write has landed.
+    pub(super) async fn finish_consumer_syncs(&mut self) -> Landing {
         while !self.consumer_syncs.is_idle() {
+            if self.settle_discovery_write_outside_turn().await == Landing::InFlight {
+                return Landing::InFlight;
+            }
             self.continue_consumer_sync().await;
         }
+        Landing::Landed
     }
 
     /// Tell whoever asked how a synchronisation ended.
@@ -1012,9 +1093,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// local change, such as a health transition or a replaced instance,
     /// inline: the caller sees the view settled when this returns. The loop
     /// uses [`Self::start_consumer_refresh`] instead.
+    ///
+    /// Inside a turn it waits for no journal write in flight (#1336). It
+    /// answers `StillRunning` instead, the synchronisation goes on in the
+    /// loop's own turns, and the caller asks again.
     pub(super) async fn refresh_consumer_view(&mut self) -> Result<(), BunError> {
         // Steps of another synchronisation may not interleave with these.
-        self.finish_consumer_syncs().await;
+        let finished = self.finish_consumer_syncs().await;
+        super::discovery_ownership::still_running_unless_landed(finished, || {
+            "a consumer view's journal write".into()
+        })?;
         if !self.consumer_view_stale {
             return Ok(());
         }
@@ -1036,9 +1124,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.consumer_view_stale = false;
             return Ok(());
         };
-        self.synchronise_consumer(last.generation, last.catalog, last.ingress, vec![])
-            .await?;
+        // Cleared first: a synchronisation left to the loop marks the view
+        // stale again only if it fails, and the caller's next ask then
+        // synchronises inline again and hears why.
         self.consumer_view_stale = false;
+        let synchronised = self
+            .synchronise_consumer(last.generation, last.catalog, last.ingress, vec![])
+            .await;
+        if let Err(error) = synchronised {
+            if !matches!(error, BunError::StillRunning { .. }) {
+                self.consumer_view_stale = true;
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1100,25 +1198,88 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Forget only a locally proven receipt after its exact leader acknowledgement.
-    pub(super) async fn confirm_consumer_receipt(
+    /// Take the leader's exact acknowledgement of receipt `generation`, and
+    /// forget the receipt now if the journal is free. `response` hears once
+    /// forgetting it is durable, or why it wasn't forgotten (#1340).
+    pub(super) async fn request_receipt_confirmation(
         &mut self,
         generation: u64,
-    ) -> Result<(), BunError> {
-        // Change the ownership as it is on disk, after any write in flight.
-        self.settle_discovery_write().await;
-        let mut owner = self
-            .consumer_owner()
-            .cloned()
-            .ok_or_else(|| failure("consumer ownership is unavailable"))?;
-        let Some(receipt) = owner.receipts.get(&generation) else {
-            return Ok(());
-        };
-        if receipt.phase != ReceiptPhase::Ready {
-            return Err(failure("consumer receipt has no local withdrawal proof"));
+        response: oneshot::Sender<Result<(), BunError>>,
+    ) {
+        self.receipt_confirmations
+            .waiting
+            .push(ReceiptConfirmation {
+                generation,
+                response,
+            });
+        self.confirm_waiting_receipts().await;
+    }
+
+    /// Start the loop's turn for acknowledgements that waited for the journal.
+    pub(super) fn begin_receipt_turn(&mut self) -> crate::bun::loop_meter::Turn {
+        self.begin_turn(
+            crate::bun::loop_meter::LoopBranch::FollowUp,
+            Some("consumer_receipt/confirm"),
+        )
+    }
+
+    /// Forget every waiting receipt the leader acknowledged, in one journal
+    /// write. Only a locally proven receipt is forgotten; one that isn't is
+    /// refused at once, and one already forgotten is confirmed at once.
+    ///
+    /// The receipts change as they are on disk, after any write in flight.
+    /// Inside a turn that write isn't waited for: the acknowledgements wait,
+    /// and the loop comes back once it has landed. The write itself waits
+    /// only until the turn's deadline (#1340); one still going carries on
+    /// off the loop, and the turn that lands it answers. Until then the
+    /// receipt is still on disk, so the leader keeps hearing about it, as
+    /// after a crash, and acknowledges it again.
+    pub(super) async fn confirm_waiting_receipts(&mut self) {
+        if !self.receipt_confirmations.is_waiting() {
+            return;
         }
-        owner.receipts.remove(&generation);
-        self.save_consumer(owner).await
+        if self.settle_discovery_write_outside_turn().await == Landing::InFlight {
+            return;
+        }
+        let waiting = std::mem::take(&mut self.receipt_confirmations.waiting);
+        let Some(durable) = self.consumer_owner() else {
+            answer_receipts(waiting, &Err(failure("consumer ownership is unavailable")));
+            return;
+        };
+        let mut owner = durable.clone();
+        let mut forgetting = Vec::new();
+        for confirmation in waiting {
+            let proven = durable
+                .receipts
+                .get(&confirmation.generation)
+                .map(|receipt| receipt.phase == ReceiptPhase::Ready);
+            match proven {
+                None => {
+                    let _ = confirmation.response.send(Ok(()));
+                }
+                Some(true) => {
+                    owner.receipts.remove(&confirmation.generation);
+                    forgetting.push(confirmation);
+                }
+                Some(false) => {
+                    let _ = confirmation.response.send(Err(failure(
+                        "consumer receipt has no local withdrawal proof",
+                    )));
+                }
+            }
+        }
+        if forgetting.is_empty() {
+            return;
+        }
+        let deadline = self.turn_deadline();
+        let written = self
+            .write_consumer_for(owner, Some(deadline), WriteOwner::ConsumerReceipts)
+            .await;
+        match written {
+            Ok(Landing::InFlight) => self.receipt_confirmations.forgetting.extend(forgetting),
+            Ok(Landing::Landed) => answer_receipts(forgetting, &Ok(())),
+            Err(error) => answer_receipts(forgetting, &Err(error)),
+        }
     }
 
     /// Mark the published view out of date after a local change. The agent

@@ -34,10 +34,34 @@ OWNERS = {
     'upgrade-cluster': ['make', 'test-upgrade-cluster'],
     'standard-clients': ['make', 'test-standard-clients'],
 }
-ARCHIVE_COMMAND = ['cargo', 'nextest', 'archive', '--locked', '--archive-file', 'tests.tar.zst']
+# The integration test binaries the archived owners run: every `binary(...)`
+# in their make targets' filters. Archiving all 47 binaries made a 3.0 GB
+# archive whose download often ran past its limit (#977). Cargo still builds
+# bun, relish and testapp for these tests' `CARGO_BIN_EXE_*`, and nextest
+# archives them with the test binaries.
+ARCHIVED_BINARIES = (
+    'cluster_failover', 'cluster_gossip', 'council_self_healing', 'council_disaster_recovery',
+    'placement', 'cluster_task_arrays', 'registry_durability', 'demos',
+    'integration', 'self_upgrade', 'self_upgrade_cluster', 'suite',
+)
+ARCHIVE_COMMAND = (['cargo', 'nextest', 'archive', '--locked', '--archive-file', 'tests.tar.zst']
+                   + [word for name in ARCHIVED_BINARIES for word in ('--test', name)])
+# The owners that run from the build-tests job's nextest archive.
+ARCHIVED_GATES = ('cluster-tests', 'slow-tests', 'upgrade-node', 'upgrade-cluster', 'standard-clients')
+# Each consumer job extracts the archive once into its checkout. Listing only
+# the binaries extracts without running every test binary to list its tests.
+EXTRACTION_ARGUMENTS = [
+    'list', '--archive-file', 'tests.tar.zst', '--extract-to', '.', '--extract-overwrite',
+    '--workspace-remap', '.', '--list-type', 'binaries-only', '--message-format', 'json',
+]
+# What the extraction leaves behind that names the build: the test binaries
+# and their paths, and the workspace's cargo metadata.
+ARCHIVE_METADATA = ('target/nextest/binaries-metadata.json', 'target/nextest/cargo-metadata.json')
+# Every archived owner then reuses that one extracted build, nextest's own
+# build-reuse flags, instead of extracting the archive again (#1050).
 ARCHIVED_SELECTORS = [
-    '--archive-file', 'tests.tar.zst', '--extract-to', '.',
-    '--extract-overwrite', '--workspace-remap', '.', '--profile', 'ci',
+    '--binaries-metadata', ARCHIVE_METADATA[0], '--cargo-metadata', ARCHIVE_METADATA[1],
+    '--target-dir-remap', 'target', '--workspace-remap', '.', '--profile', 'ci',
 ]
 OCI_BUILD_COMMAND = [
     'cargo', 'test', '--features', 'ebpf', '--test', 'owned_runc',
@@ -93,6 +117,11 @@ def selected_workflow(expected, *, code, heavy, macos):
         jobs += ['linux', 'build-tests', 'cluster', 'acceptance']
     return dict(schema_version=1, **expected, mode='full' if full else 'portable',
                 jobs=jobs, gates=PORTABLE_GATES + (HEAVY_GATES if full else []))
+
+
+def extraction_command(nextest):
+    """The one archive extraction of a consumer job, run by the observed nextest."""
+    return [nextest, 'nextest'] + EXTRACTION_ARGUMENTS
 
 
 def partition(gate, shard):
@@ -170,7 +199,7 @@ def make_selection(root, target, *, archived=False, partition=None):
     return selectors, environment
 
 
-def entry_from_make(root, manifest, gate, host, *, archive_origin=None, shard=None):
+def entry_from_make(root, manifest, gate, host, *, archive_origin=None, archive_extraction=None, shard=None):
     """Build ordinary nextest selectors from the current committed owner recipe.
 
     This is a plan, not execution. Original Make must still run once around the
@@ -182,8 +211,9 @@ def entry_from_make(root, manifest, gate, host, *, archive_origin=None, shard=No
     owner = OWNERS[gate]
     c.require(gate in manifest['gates'] and manifest['gates'][gate]['command'] == owner
               and host in manifest['gates'][gate]['hosts'], 'wrong manifest owner or host')
-    archived = gate in ('cluster-tests', 'slow-tests', 'upgrade-node', 'upgrade-cluster', 'standard-clients')
+    archived = gate in ARCHIVED_GATES
     c.require(archived == (archive_origin is not None), 'archived owner needs trusted builder outputs')
+    c.require(archived == (archive_extraction is not None), "archived owner needs its job's archive extraction")
     split = partition(gate, shard) if shard is not None else None
     selectors, environment = make_selection(root, owner[1], archived=archived, partition=split)
     source_files = sorted({source for family in manifest['contracts'] for case in family['cases']
@@ -205,8 +235,13 @@ def entry_from_make(root, manifest, gate, host, *, archive_origin=None, shard=No
     if archived:
         c.require(archive_origin['builder']['command'] == ARCHIVE_COMMAND,
                   'wrong trusted actual archive builder command')
+        c.require(archive_extraction['archive_sha256'] == archive_origin['builder']['archive_sha256'],
+                  "archive extraction is not of the builder's archive")
         entry['archive_origin'] = archive_origin
-        inputs['tests.tar.zst'] = archive_origin['builder']['archive_sha256']
+        entry['archive_extraction'] = archive_extraction
+        # The job hashed the archive once before extracting it. Each owner
+        # checks only the small metadata files its discovery and run read.
+        inputs.update(archive_extraction['metadata'])
     gates.commands(entry)
     return entry
 

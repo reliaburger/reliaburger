@@ -59,6 +59,7 @@ mod metrics;
 mod node_info;
 mod nodes;
 mod os;
+pub(crate) mod policies;
 mod registry;
 mod secrets;
 mod snapshots;
@@ -72,7 +73,7 @@ pub(crate) use apply::{
     mark_leader_forwarded,
 };
 use apply::{apply_handler, cluster_apply};
-use apps::{delete_handler, exec_handler, stop_handler};
+use apps::{delete_handler, exec_handler, release_handler, stop_handler};
 use audit::audit_handler;
 use ca::{ca_rotation_begin_handler, ca_rotation_finalize_handler, ca_rotation_prepare_handler};
 use deploys::{
@@ -82,8 +83,8 @@ use deploys::{
 use discovery::{resolve_all_handler, resolve_handler, routes_handler};
 pub use faults::ClusterFaultList;
 use faults::{
-    chaos_status_handler, fault_clear_all_handler, fault_clear_handler, fault_inject_handler,
-    fault_list_handler, node_fault_fence_handler, node_fault_reserve_handler,
+    chaos_status_handler, fault_attempts_handler, fault_clear_all_handler, fault_clear_handler,
+    fault_inject_handler, fault_list_handler, node_fault_fence_handler, node_fault_reserve_handler,
     spawn_node_fault_reaper,
 };
 pub use gitops::GitOpsLocalCheck;
@@ -124,6 +125,7 @@ use os::{
     os_rollout_abort_handler, os_rollout_handler, os_rollout_resume_handler,
     os_rollout_start_handler, os_stage_handler,
 };
+use policies::{policies_handler, policy_audit_handler, policy_delete_handler};
 use registry::{
     images_handler, registry_proposal_deadline, registry_proposal_handler, registry_query_handler,
 };
@@ -683,6 +685,7 @@ pub fn router_with_upgrade(
         .route("/v1/top", get(top_handler))
         .route("/v1/stop/{app}/{namespace}", post(stop_handler))
         .route("/v1/delete/{app}/{namespace}", post(delete_handler))
+        .route("/v1/release/{app}/{namespace}", post(release_handler))
         .route("/v1/logs/{app}/{namespace}", get(logs_handler))
         .route(
             "/v1/logs/entries/{app}/{namespace}",
@@ -774,6 +777,7 @@ pub fn router_with_upgrade(
         .route("/v1/fault", axum::routing::delete(fault_clear_all_handler))
         .route("/v1/fault", get(fault_list_handler))
         .route("/v1/fault/{id}", axum::routing::delete(fault_clear_handler))
+        .route("/v1/fault/attempts", get(fault_attempts_handler))
         .route("/v1/resolve", get(resolve_all_handler))
         .route("/v1/resolve/{name}", get(resolve_handler))
         .route("/v1/routes", get(routes_handler))
@@ -807,6 +811,9 @@ pub fn router_with_upgrade(
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
         .route("/v1/gitops", get(gitops_status_handler))
         .route("/v1/gitops/config", post(gitops_config_handler))
+        .route("/v1/policies", get(policies_handler))
+        .route("/v1/policies/audit", get(policy_audit_handler))
+        .route("/v1/policies/{name}/delete", post(policy_delete_handler))
         .route("/v1/nodes/decommission", post(node_decommission_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))
         .route("/v1/discovery/retire", post(producer_retirement_handler))
@@ -1369,7 +1376,17 @@ async fn gather_statuses(state: &ApiState) -> Vec<InstanceStatus> {
 mod audit_tests;
 
 #[cfg(test)]
+mod late_publication_tests;
+
+#[cfg(test)]
 mod permission_tests;
+
+#[cfg(test)]
+mod contract_tests;
+#[cfg(test)]
+mod owner_tests;
+#[cfg(test)]
+mod policy_tests;
 
 #[cfg(test)]
 mod cluster_view_tests;

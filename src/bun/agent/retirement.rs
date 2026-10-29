@@ -3,6 +3,17 @@
 
 use super::*;
 
+/// What fencing an old instance for retirement hands the deploy worker.
+pub(super) struct BegunRetirement {
+    /// The restart in flight this retirement took the instance back from.
+    /// The worker lets its runtime step finish before it signals anything.
+    pub(super) restart: Option<restarts::TakenRestart>,
+    /// How the instance's launch spec says it stops (#1121).
+    pub(super) stop: Option<crate::grill::stop::StopPolicy>,
+    /// Its sidecars, which stop once it has exited (#1120).
+    pub(super) sidecars: Vec<InstanceId>,
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Retire a workload inline: the same steps a `Retire` command takes, for
     /// tests that drive the agent without running its loop.
@@ -221,6 +232,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         instance_id: &InstanceId,
     ) -> Result<(), BunError> {
         self.retire_initialisers(instance_id).await?;
+        self.retire_sidecars(instance_id).await?;
         if !self
             .poll_instance_withdrawal(instance_id, std::time::Duration::ZERO)
             .await?
@@ -365,12 +377,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub(super) async fn begin_instance_retirement(
         &mut self,
         id: &InstanceId,
-    ) -> Result<Option<restarts::TakenRestart>, BunError> {
-        if self.supervisor.get_instance(id).is_none() {
+    ) -> Result<BegunRetirement, BunError> {
+        let Some(instance) = self.supervisor.get_instance(id) else {
             return Err(BunError::InstanceNotFound {
                 instance_id: id.clone(),
             });
-        }
+        };
+        // The stop policy the instance was launched with, not its app's
+        // current one: a deploy retires the old spec's instances (#1121).
+        let stop = instance
+            .oci_spec
+            .as_ref()
+            .and_then(|spec| spec.stop.clone());
         self.withdraw_instance_backend(id).await?;
         if let Some(instance) = self.supervisor.get_instance_mut(id) {
             instance.retry_pending = false;
@@ -379,7 +397,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
         self.supervisor.health_checker_mut().unregister(id);
-        Ok(self.take_back_from_restart(id))
+        self.sidecars.cancel_relaunches(id);
+        Ok(BegunRetirement {
+            restart: self.take_back_from_restart(id),
+            stop,
+            sidecars: self.sidecars.of(id),
+        })
     }
 
     /// Drain, stop and forget one old instance (M7).
@@ -458,17 +481,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
-        // Ask everything to stop (SIGTERM), wait (up to a grace period, but no
-        // longer than needed) for it to exit, then force-kill (SIGKILL) whatever
-        // is still running so nothing is orphaned.
+        // Sidecars outlive their apps here too (#1120): they get their own
+        // round once every app has exited.
+        let sidecars = self.sidecars.all();
         for id in &ids {
+            self.sidecars.cancel_relaunches(id);
+        }
+        self.stop_or_kill_all(&ids).await;
+        self.stop_or_kill_all(&sidecars).await;
+    }
+
+    /// Ask everything in `ids` to stop (SIGTERM), wait (up to the shutdown
+    /// grace, but no longer than needed) for it to exit, then force-kill
+    /// (SIGKILL) whatever is still running so nothing is orphaned.
+    async fn stop_or_kill_all(&self, ids: &[InstanceId]) {
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
             // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
             let _ = self.supervisor.grill().stop(id).await;
         }
         let deadline = Instant::now() + self.shutdown_grace;
         loop {
             let mut all_stopped = true;
-            for id in &ids {
+            for id in ids {
                 if !matches!(
                     self.supervisor.grill().state(id).await,
                     Ok(ContainerState::Stopped)
@@ -483,7 +520,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        for id in &ids {
+        for id in ids {
             if !matches!(
                 self.supervisor.grill().state(id).await,
                 Ok(ContainerState::Stopped)

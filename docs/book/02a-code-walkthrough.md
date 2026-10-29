@@ -1,6 +1,6 @@
 # Code Walkthrough: Phase 2
 
-You've read the whitepaper. You know *what* Reliaburger is trying to be. Now you want to look at the code and understand how we actually built the cluster formation layer. Where do you start? There are nine modules, hundreds of files, and 544 unit tests in the library alone.
+You've read the whitepaper. You know *what* Reliaburger is trying to be. Now you want to look at the code and understand how we actually built the cluster formation layer. Where do you start? There are nine modules, hundreds of files, and hundreds of unit tests in the library alone.
 
 This chapter is your map. It tells you where things live, what order to read them in, and which paths through the code are the ones that matter. Think of it as the document you wish someone had written for you before you dove into a new codebase at work.
 
@@ -129,7 +129,7 @@ One subtlety worth noting: `wait_for_ack()` drains the transport while waiting. 
 `MustardTransport` is a trait with `send()` and `recv()` methods. Two implementations:
 
 - `InMemoryNetwork` + `InMemoryTransport`: for tests. Supports simulated partitions via a blocklist, `try_recv()` for deterministic test driving.
-- `UdpMustardTransport`: for production. Real UDP sockets, bincode serialisation.
+- `UdpMustardTransport`: for production. Real UDP sockets, bincode serialisation (postcard since 0.2.2; Chapter 2 explains the move).
 
 The in-memory transport deserves a close look if you're writing tests. It's what makes the gossip tests deterministic and fast.
 
@@ -421,25 +421,27 @@ The command-line interface that humans interact with.
 
 The test suite is the second codebase. You can learn almost as much from reading the tests as from reading the implementation.
 
-**544 unit tests** in `#[cfg(test)] mod tests` at the bottom of each source file. They cover state machines, conflict resolution, scoring, filtering, serialisation round-trips, and edge cases.
+**Unit tests** live in `#[cfg(test)] mod tests` at the bottom of each source file. They cover state machines, conflict resolution, scoring, filtering, serialisation round-trips, and edge cases.
 
-**58 integration tests** across 7 files in `tests/`:
+**Integration tests** for this phase's code live in `tests/`. The portable ones are modules of the single `tests/suite/` binary; the heavy or gated ones are binaries of their own:
 
-| File | Tests | What it covers |
-|------|-------|---------------|
-| `integration.rs` | 21 | Phase 1 lifecycle: deploy, health, stop, restart |
-| `agent_cluster.rs` | 6 | Agent wiring with cluster handle |
-| `scheduling.rs` | 5 | End-to-end scheduling (replicas, daemon, labels, quota) |
-| `chaos.rs` | 2 | Council partition, worker isolation |
-| `reconstruction.rs` | 1 | State reconstruction with real Raft |
-| `reporting_tree.rs` | 2 | Reporting failover when council changes |
-| `gossip_10k.rs` | 1 | One node handles 10,000-member protocol state (ignored by default) |
+| File | What it covers |
+|------|---------------|
+| `tests/integration.rs` | Phase 1 lifecycle: deploy, health, stop, restart |
+| `tests/suite/agent_cluster.rs` | Agent wiring with cluster handle |
+| `tests/placement.rs` | End-to-end scheduling across three real nodes (`make test-cluster`) |
+| `tests/council_self_healing.rs` | Council partition and member replacement |
+| `tests/suite/reconstruction.rs` | State reconstruction with real Raft |
+| `tests/suite/reporting_tree.rs` | Reporting failover when council changes |
+| `tests/gossip_10k.rs` | One node handles 10,000-member protocol state (ignored by default) |
+
+When this walkthrough was first written, scheduling and the partition scenarios had files of their own (`scheduling.rs` and `chaos.rs`). Neither survived. The in-memory partition tests became council unit tests, and we deleted `scheduling.rs` in July 2026 because it proved less than it appeared to; the three-node tests above replaced it.
 
 **Benchmarks** in `benches/`: gossip protocol performance via criterion.
 
 **Property tests**: proptest in the gossip module for conflict resolution invariants.
 
-A pattern you'll notice: most tests use in-memory transports and fast configs. The gossip tests use `InMemoryNetwork` with 20ms timeouts. The Raft tests use `InMemoryRaftRouter` with 50ms heartbeats. This keeps the test suite fast (under 3 seconds for all 544 lib tests) while still exercising the real protocol logic.
+A pattern you'll notice: most tests use in-memory transports and fast configs. The gossip tests use `InMemoryNetwork` with 20ms timeouts. The Raft tests use `InMemoryRaftRouter` with 50ms heartbeats. This keeps these tests fast (the whole phase's library tests ran in about three seconds) while still exercising the real protocol logic.
 
 ## Known limitations (deferred to later phases)
 

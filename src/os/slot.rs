@@ -291,7 +291,7 @@ impl OsSlot {
     async fn stage(&self, directive: &OsDirective) -> Result<(), String> {
         let version = &directive.version;
         let url = |file: &str| asset_url(&directive.channel_url, version, &self.arch, file);
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .user_agent("bun")
             .build()
             .map_err(|e| e.to_string())?;

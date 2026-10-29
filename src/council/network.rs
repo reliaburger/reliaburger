@@ -271,7 +271,10 @@ pub struct RaftRpcEnvelope {
 /// Returns `None` (drop the connection) for a malformed or incompatible
 /// frame, and otherwise the fence's verdict with the inner RPC. Kept free of
 /// I/O so the fence is unit-tested without a `Raft` instance.
-fn decode_and_admit(payload: &[u8], fence: &RecoveryFence) -> Option<(Admission, RaftRpc)> {
+pub(crate) fn decode_and_admit(
+    payload: &[u8],
+    fence: &RecoveryFence,
+) -> Option<(Admission, RaftRpc)> {
     let envelope = serde_json::from_slice::<RaftRpcEnvelope>(payload).ok()?;
     envelope.compatibility.require_current().ok()?;
     let sender = RecoveryClaim {
@@ -574,9 +577,10 @@ async fn handle_raft_frame<S: AsyncWrite + Unpin>(
     raft: &Raft<TypeConfig>,
     fence: &RecoveryFence,
 ) -> bool {
-    // JSON, not bincode: AppendEntries carries log entries whose
+    // JSON, not a binary format: AppendEntries carries log entries whose
     // `AppSpec` payload uses `deserialize_any` config types (see
-    // durable_log). bincode is not self-describing and corrupts them,
+    // durable_log). A positional format like postcard (or the bincode it
+    // replaced) isn't self-describing and corrupts them,
     // so a replicated AppSpec entry would never deserialise on the
     // follower and the write would hang forever.
     //

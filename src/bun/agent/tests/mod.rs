@@ -10,12 +10,17 @@ use crate::grill::mock::MockGrill;
 #[cfg(target_os = "linux")]
 mod cgroup_faults;
 mod fault_coverage;
+mod job_faults;
 mod loop_harness;
 mod loop_rule;
 mod namespace_secrets;
 mod published_status;
 mod restart_ownership;
+mod runtime_knobs;
 mod runtime_metadata;
+mod secret_providers;
+mod sidecars;
+mod stop_hooks;
 mod upgrade_answer;
 
 #[test]
@@ -142,6 +147,8 @@ async fn a_trace_lists_only_the_faults_that_act_on_its_own_path() {
         agent
             .fault_registry
             .insert(&FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type,
                 target_service: service.to_string(),
                 namespace: Some(namespace.to_string()),
@@ -1072,6 +1079,173 @@ async fn a_rollout_finishes_while_the_old_instance_waits_for_remote_release() {
     assert!(!allocator.is_allocated(old_port).await);
     confirmed.abort();
     let _ = confirmed.await;
+}
+
+/// The states the node's next report would give every instance, by host port.
+async fn reported_states(
+    agent: &TestAgent,
+) -> std::collections::BTreeMap<Option<u16>, ContainerState> {
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    rx.await
+        .unwrap()
+        .instances
+        .into_iter()
+        .map(|instance| (instance.port, instance.container_state))
+        .collect()
+}
+
+/// #1353: the leader builds the service catalogue from node reports, and a
+/// report counts an instance healthy only when it's Running. A rolling
+/// replacement stayed Starting until the rollout finalised, after the old
+/// instance had drained and stopped, so for that whole stretch the report
+/// had no healthy instance and every other node's connect hook refused the
+/// service. Once its health wait passed and its backend is published, the
+/// replacement serves traffic, and the report has to say so before the old
+/// instance's withdrawal goes out.
+#[tokio::test]
+async fn a_published_rolling_replacement_reports_running_before_the_old_instance_retires() {
+    let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let old = InstanceId("default__web-0".into());
+    let old_port = agent.supervisor.get_instance(&old).unwrap().host_port;
+
+    // What the deploy worker asks the loop for, step by step, up to the
+    // moment it starts retiring the old instance.
+    let spec = Config::parse("[app.web]\nimage = 'myapp:v2'\nport = 8080\n")
+        .unwrap()
+        .app
+        .remove("web")
+        .unwrap();
+    let new = crate::grill::InstanceIdentity::canary("default", "web", 1, 0).instance_id();
+    let new_port = agent
+        .reserve_rolling_instance(&new, "web", "default", &spec)
+        .await
+        .unwrap();
+    agent
+        .prepare_rolling_instance(&new, "web", "default", &spec, new_port)
+        .await
+        .unwrap();
+    agent
+        .transition_deploy_state(&new, ContainerState::Starting)
+        .await
+        .unwrap();
+    assert_eq!(
+        reported_states(&agent).await,
+        std::collections::BTreeMap::from([
+            (old_port, ContainerState::Running),
+            (new_port, ContainerState::Starting),
+        ]),
+        "an unpublished replacement isn't serving yet"
+    );
+
+    agent
+        .publish_new_backend("web", "default", &new, new_port, None, true)
+        .await
+        .unwrap();
+    agent.begin_instance_retirement(&old).await.unwrap();
+    assert_eq!(
+        reported_states(&agent).await,
+        std::collections::BTreeMap::from([
+            (old_port, ContainerState::Stopping),
+            (new_port, ContainerState::Running),
+        ]),
+        "the report must name a healthy instance while the old one drains"
+    );
+}
+
+/// #1355: a retiring instance's drain waited only for this node's ingress
+/// connections. Other nodes connect to its backend directly, and they only
+/// drop it once their next view arrives, so a server that exits on SIGTERM
+/// could stop while they still routed to it, and their callers got
+/// `ECONNREFUSED`. The leader's producer release answers exactly "every
+/// node has dropped this backend", but it was asked only after the stop.
+/// Now the old instance keeps running until the leader confirms (or the
+/// patience runs out), and only then gets its stop signal.
+#[tokio::test]
+async fn a_rolling_retirement_stops_the_old_instance_only_after_other_nodes_drop_it() {
+    let grill = MockGrill::new();
+    grill.set_pid(std::process::id());
+    let allocator = PortAllocator::new(30000, 30010);
+    let (_, receiver) = mpsc::channel(8);
+    let mut agent = BunAgent::new(
+        grill.clone(),
+        allocator.clone(),
+        receiver,
+        CancellationToken::new(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    agent.set_volumes_dir(root.path().join("volumes"));
+    agent.set_records_dir(root.path().join("records"));
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let old = InstanceId("default__web-0".into());
+    let original = agent.supervisor.get_instance(&old).unwrap();
+    let execution = crate::grill::RuntimeExecution {
+        instance_id: old.clone(),
+        generation: crate::grill::RuntimeGeneration::process("original"),
+    };
+    grill
+        .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+            instance_id: old.clone(),
+            generation: execution.generation.clone(),
+            spec: original.oci_spec.clone().unwrap(),
+            network_reference: None,
+        }])
+        .await;
+    let (mut clustered, _, _) = test_cluster_fault_agent().await;
+    agent.cluster = clustered.cluster.take();
+
+    // The leader waits for one other node's receipt (202), then confirms.
+    // Each request notes whether the old instance had already been told to
+    // stop when it arrived.
+    let confirmation = serde_json::json!({"node_id": "test", "execution": execution}).to_string();
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+    let (client, leader) = crate::cluster::producer::test_scripted_fixture({
+        let requests = requests.clone();
+        let grill = grill.clone();
+        let old = old.clone();
+        move || {
+            let stopped = grill
+                .calls()
+                .iter()
+                .any(|(operation, id)| operation == "stop" && *id == old);
+            let mut requests = requests.lock().unwrap();
+            requests.push(stopped);
+            if requests.len() < 2 {
+                (axum::http::StatusCode::ACCEPTED, String::new())
+            } else {
+                (axum::http::StatusCode::OK, confirmation.clone())
+            }
+        }
+    })
+    .await;
+    agent.set_producer_release_client(client);
+
+    let replacement = Config::parse("[app.web]\nimage = 'web:v2'\nport = 8080\n").unwrap();
+    expect_complete(&drain_deploy(&mut agent, replacement).await);
+
+    let requests = requests.lock().unwrap().clone();
+    assert!(
+        requests.len() >= 2 && !requests[0] && !requests[1],
+        "the old instance must keep serving until the leader confirms every \
+         node has dropped it; stopped at each release request: {requests:?}"
+    );
+    assert!(
+        grill
+            .calls()
+            .iter()
+            .any(|(operation, id)| operation == "stop" && *id == old),
+        "the old instance was never stopped"
+    );
+    assert!(agent.supervisor.get_instance(&old).is_none());
+    leader.abort();
+    let _ = leader.await;
 }
 
 #[tokio::test]
@@ -2671,6 +2845,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             operation: None,
             stop_confirmation_timeout: self.stop_confirmation_timeout,
             egress: self.egress_resolver(),
+            secrets: self.secret_providers.clone(),
         };
         let events = events.clone();
         let mut task = tokio::spawn(async move { worker.run_deploy(config, events).await });
@@ -9094,6 +9269,7 @@ fn adoption_record(
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: "/tmp/test".to_string(),
                 readonly: false,
@@ -9115,7 +9291,10 @@ fn adoption_record(
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         },
         rootless_network: None,
     }
@@ -9315,6 +9494,142 @@ async fn instances_are_created_with_their_assigned_ordinals() {
         })
         .collect();
     assert_eq!(ordinals, [2, 4, 5], "{rolled:?}");
+}
+
+/// The calls `grill` saw that stop or kill one of `ids`.
+fn stops_of(grill: &MockGrill, ids: &[&str]) -> Vec<(String, InstanceId)> {
+    grill
+        .calls()
+        .into_iter()
+        .filter(|(call, id)| (call == "stop" || call == "kill") && ids.contains(&id.0.as_str()))
+        .collect()
+}
+
+/// Whether any of the deploy's progress lines says it rolled the app.
+fn rolled(events: &[ApplyEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(event, ApplyEvent::Progress { message } if message.contains("rolling redeploy"))
+    })
+}
+
+/// #1111: when the leader moves one of a node's replicas elsewhere and
+/// gives it another, the version is the same, so only the two ordinals
+/// change hands. It used to roll every replica on the node to a new
+/// generation of the same spec.
+#[tokio::test]
+async fn a_moved_replica_starts_the_arriving_ordinal_and_retires_the_departing_one() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[0, 2])).await);
+
+    let events = drain_deploy(&mut agent, web_with_ordinals(&[0, 3])).await;
+
+    expect_complete(&events);
+    assert!(!rolled(&events), "a share move must not roll: {events:?}");
+    assert_eq!(live_web_ids(&agent), ["default__web-0", "default__web-3"]);
+    assert_eq!(
+        agent.supervisor.list_instances().len(),
+        2,
+        "the departing replica is gone"
+    );
+    assert!(stops_of(&grill, &["default__web-0"]).is_empty());
+    assert!(!stops_of(&grill, &["default__web-2"]).is_empty());
+}
+
+/// #1111: a share that loses a replica stops only that one.
+#[tokio::test]
+async fn a_shrunk_share_retires_only_the_departing_replica() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[0, 1, 2])).await);
+
+    let events = drain_deploy(&mut agent, web_with_ordinals(&[0, 2])).await;
+
+    expect_complete(&events);
+    assert!(
+        !rolled(&events),
+        "a smaller share must not roll: {events:?}"
+    );
+    assert_eq!(live_web_ids(&agent), ["default__web-0", "default__web-2"]);
+    assert!(stops_of(&grill, &["default__web-0", "default__web-2"]).is_empty());
+    let backends = agent
+        .service_map
+        .resolve(&crate::onion::service_id::ServiceId::new("default", "web"))
+        .map(|entry| entry.backends.len())
+        .unwrap_or(0);
+    assert_eq!(backends, 2, "the retired replica stops serving");
+}
+
+/// #1111: a node whose whole share is swapped for other ordinals of the
+/// same version starts the new ones under their own ordinals, without a
+/// generation.
+#[tokio::test]
+async fn a_swapped_share_starts_the_new_ordinals_without_a_new_generation() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[0, 2])).await);
+
+    let events = drain_deploy(&mut agent, web_with_ordinals(&[1, 3])).await;
+
+    expect_complete(&events);
+    assert!(
+        !rolled(&events),
+        "a swapped share must not roll: {events:?}"
+    );
+    assert_eq!(live_web_ids(&agent), ["default__web-1", "default__web-3"]);
+    assert_eq!(agent.supervisor.list_instances().len(), 2);
+}
+
+/// #1111: a share that moves in the same deploy as a new version still
+/// rolls every replica, under the new assignment.
+#[tokio::test]
+async fn a_moved_share_with_a_new_version_still_rolls() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[0, 2])).await);
+
+    let mut changed = web_with_ordinals(&[0, 3]);
+    changed.app.get_mut("web").unwrap().image = Some("myapp:v2".into());
+    let events = drain_deploy(&mut agent, changed).await;
+
+    expect_complete(&events);
+    assert!(rolled(&events), "{events:?}");
+    let ordinals: Vec<u32> = live_web_ids(&agent)
+        .iter()
+        .map(|id| {
+            let identity = crate::grill::InstanceIdentity::parse(id).unwrap();
+            assert!(identity.generation.is_some(), "{id} was not rolled");
+            identity.ordinal
+        })
+        .collect();
+    assert_eq!(ordinals, [0, 3]);
+}
+
+/// `budgeted_web` under the ordinals the leader assigned this node.
+fn budgeted_web_with_ordinals(image: &str, ordinals: &[u32]) -> Config {
+    let mut config = budgeted_web(image, ordinals.len() as u32);
+    config.app.get_mut("web").unwrap().ordinals = Some(ordinals.to_vec());
+    config
+}
+
+/// #1111, from the 0.2.1 jobs soak (#1110): on a full node, a rolling
+/// redeploy needs room for a new replica before an old one goes, so moving
+/// a replica failed and rolled back. Retiring the departing replica first
+/// frees the room the arriving one needs.
+#[tokio::test]
+async fn a_replica_moves_onto_a_full_node_where_a_redeploy_would_not_fit() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    let budget = agent.execution_budget();
+    budget.set_capacity(crate::meat::Resources::new(1000, 1 << 30, 0));
+    expect_complete(&drain_deploy(&mut agent, budgeted_web_with_ordinals("web:v1", &[0, 2])).await);
+
+    let events = drain_deploy(&mut agent, budgeted_web_with_ordinals("web:v1", &[0, 3])).await;
+
+    expect_complete(&events);
+    assert_eq!(live_web_ids(&agent), ["default__web-0", "default__web-3"]);
+    assert!(stops_of(&grill, &["default__web-0"]).is_empty());
+    assert!(reported_refusals(&mut agent).await.is_empty());
 }
 
 #[tokio::test]
@@ -9543,6 +9858,7 @@ pub(super) fn limited_adoption_record(
     let mut record = adoption_record(instance, app, false);
     record.oci_spec.linux.cgroups_path = Some(format!("/reliaburger/default/{app}/0"));
     record.oci_spec.linux.resources = Some(crate::grill::oci::OciResources {
+        pids: None,
         cpu: Some(crate::grill::oci::OciCpuResources {
             quota: 50_000,
             period: 100_000,
@@ -9554,6 +9870,7 @@ pub(super) fn limited_adoption_record(
             "memory.high".to_string(),
             "33554432".to_string(),
         )]),
+        devices: Vec::new(),
     });
     record
 }
@@ -10257,11 +10574,13 @@ async fn retire_waits_for_in_flight_request_before_kill() {
     drains.increment_connections(&id.0).await;
 
     // Kick off the retire on a task; it must block on the drain.
+    let stop = InstanceStop::for_policy(None, std::time::Duration::from_secs(30));
     let retire = drain_and_stop_instance(
         &drains,
         &grill,
         &id,
         std::time::Duration::from_secs(30),
+        &stop,
         std::time::Duration::from_secs(10),
     );
     tokio::pin!(retire);
@@ -10317,11 +10636,13 @@ async fn retire_waits_for_in_flight_websocket_before_kill() {
     drains.increment_connections(&id.0).await;
     drains.increment_websocket(&id.0).await;
 
+    let stop = InstanceStop::for_policy(None, std::time::Duration::from_secs(30));
     let retire = drain_and_stop_instance(
         &drains,
         &grill,
         &id,
         std::time::Duration::from_secs(30),
+        &stop,
         std::time::Duration::from_secs(10),
     );
     tokio::pin!(retire);
@@ -10690,6 +11011,8 @@ fn register_fault(
     agent
         .fault_registry
         .insert(&crate::smoker::types::FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type,
             target_service: String::new(),
             namespace: None,
@@ -10715,6 +11038,8 @@ async fn dns_fault_refuses_unknown_namespace_or_instance_scope_without_recording
                 reservation: None,
                 replica_evidence: None,
                 request: crate::smoker::types::FaultRequest {
+                    workload: Default::default(),
+                    task_index: None,
                     fault_type: crate::smoker::types::FaultType::DnsNxdomain,
                     target_service: "redis".into(),
                     namespace,
@@ -10744,6 +11069,8 @@ async fn workload_fault_without_a_namespace_is_refused_before_recording() {
             reservation: None,
             replica_evidence: None,
             request: crate::smoker::types::FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: crate::smoker::types::FaultType::Pause,
                 target_service: "web".into(),
                 namespace: None,
@@ -10807,6 +11134,8 @@ async fn dns_fault_keeps_its_namespace_and_each_owner_until_clear() {
                 reservation: None,
                 replica_evidence: None,
                 request: crate::smoker::types::FaultRequest {
+                    workload: Default::default(),
+                    task_index: None,
                     fault_type: crate::smoker::types::FaultType::DnsNxdomain,
                     target_service: "redis".into(),
                     namespace: Some("red".into()),
@@ -10856,6 +11185,8 @@ async fn node_fault_fence_reverses_before_acknowledging_and_blocks_late_activati
     };
     let (mut agent, gate, _) = test_cluster_fault_agent().await;
     let request = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::NodeKill {
             kill_containers: false,
         },
@@ -10932,6 +11263,8 @@ async fn clearing_a_reserved_node_fault_reports_its_reservation_until_fenced() {
     };
     let (mut agent, gate, _) = test_cluster_fault_agent().await;
     let request = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::NodeKill {
             kill_containers: false,
         },
@@ -11310,6 +11643,8 @@ async fn kill_all_is_refused_for_the_last_replica_without_a_cluster() {
     // `--count 0` means "all replicas"; killing all of a single-replica
     // service leaves zero survivors.
     let request = crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::Kill { count: 0 },
         target_service: "web".into(),
         namespace: Some("default".into()),
@@ -11347,6 +11682,8 @@ async fn cluster_replica_evidence_replaces_the_local_count() {
     while ev_rx.recv().await.is_some() {}
 
     let request = crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::Kill { count: 1 },
         target_service: "web".into(),
         namespace: Some("default".into()),
@@ -11764,8 +12101,17 @@ async fn durable_consumer_waits_for_http_and_websocket_release_then_recovers_rec
     let retry = reply.await.unwrap().unwrap();
     assert!(!retry.published);
     assert_eq!(retry.receipts, vec![1]);
-    recovered.confirm_consumer_receipt(1).await.unwrap();
-    recovered.confirm_consumer_receipt(1).await.unwrap();
+    // Confirmed twice: the second finds it already forgotten.
+    for _ in 0..2 {
+        let (response, reply) = oneshot::channel();
+        recovered
+            .handle_command(AgentCommand::ConfirmConsumerReceipt {
+                generation: 1,
+                response,
+            })
+            .await;
+        reply.await.unwrap().unwrap();
+    }
     drop(recovered);
     let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
     let consumer = journal.inventory().consumer.as_ref().unwrap();

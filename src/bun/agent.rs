@@ -81,6 +81,7 @@ use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 // to `BunAgent` (or owns a type the loop drives); `run_loop` stays here.
 mod adopted_placements;
 mod app_stop;
+mod attempt_faults;
 mod commands;
 mod consumer;
 mod council_requests;
@@ -109,6 +110,7 @@ mod retirement;
 mod routing;
 mod runtime_inventory;
 mod scale_in_place;
+mod sidecars;
 mod signal_faults;
 mod startup_recovery;
 mod state_sweep;
@@ -222,6 +224,49 @@ fn new_shared_drains() -> crate::wrapper::draining::SharedDrains {
     ))
 }
 
+/// How one instance is stopped (#1121): the pre-stop command that runs
+/// first, if any, and how long the workload then gets to exit before it's
+/// killed. The stop signal itself travels in the instance's spec, where the
+/// runtime reads it, so even a stop that never builds one of these (a Bun
+/// shutdown) sends the app's own signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceStop {
+    /// Time to exit after the stop signal before the force-kill.
+    pub grace: std::time::Duration,
+    /// Run inside the instance before the signal, within its own bound.
+    pub pre_stop: Option<crate::grill::stop::PreStop>,
+    /// The instance's sidecars, stopped in turn once its own exit is
+    /// confirmed (#1120).
+    pub sidecars: Vec<InstanceId>,
+    /// Time each sidecar gets to exit after its stop signal.
+    pub sidecar_grace: std::time::Duration,
+}
+
+impl InstanceStop {
+    /// The stop an instance declared in `policy`, with the caller's
+    /// `default_grace` where it declares none. Its sidecars, if any, get
+    /// `default_grace` too.
+    pub fn for_policy(
+        policy: Option<&crate::grill::stop::StopPolicy>,
+        default_grace: std::time::Duration,
+    ) -> Self {
+        Self {
+            grace: policy
+                .and_then(|policy| policy.grace)
+                .unwrap_or(default_grace),
+            pre_stop: policy.and_then(|policy| policy.pre_stop.clone()),
+            sidecars: Vec::new(),
+            sidecar_grace: default_grace,
+        }
+    }
+
+    /// The same stop, followed by stopping `sidecars` (#1120).
+    pub fn with_sidecars(mut self, sidecars: Vec<InstanceId>) -> Self {
+        self.sidecars = sidecars;
+        self
+    }
+}
+
 /// Drain then stop a single instance using cloneable handles, so the wait can
 /// run on a spawned deploy task instead of the command loop (M7): start the
 /// drain (new traffic is routed away; the Wrapper proxy shares this drain
@@ -235,8 +280,24 @@ async fn drain_and_stop_instance<G: Grill>(
     grill: &G,
     id: &InstanceId,
     drain_timeout: std::time::Duration,
+    stop: &InstanceStop,
     confirmation_timeout: std::time::Duration,
 ) -> Result<(), BunError> {
+    drain_instance(drains, id, drain_timeout).await;
+    stop_runtime_instance(grill, id, stop, confirmation_timeout).await
+}
+
+/// Route new ingress traffic away from `id` and wait until its in-flight
+/// requests finish, or `drain_timeout` passes.
+///
+/// This sees only connections that come through this node's Wrapper. Other
+/// nodes connect to the backend directly; a rolling retirement waits for
+/// them separately, before the stop (#1355).
+async fn drain_instance(
+    drains: &crate::wrapper::draining::SharedDrains,
+    id: &InstanceId,
+    drain_timeout: std::time::Duration,
+) {
     let cmd = crate::wrapper::draining::DrainCommand {
         app_name: String::new(),
         instance_id: id.0.clone(),
@@ -244,31 +305,90 @@ async fn drain_and_stop_instance<G: Grill>(
     };
     drains.start_drain(&cmd).await;
     drains.wait_drained(&id.0).await;
-
-    stop_runtime_instance(grill, id, drain_timeout, confirmation_timeout).await
 }
 
 /// Stop one instance, requiring observed exit even after force-kill.
 ///
+/// Four explicit steps, each with its own bound: the pre-stop command
+/// (`stop.pre_stop`, within its timeout), the stop signal (accepted within
+/// `confirmation_timeout`), the grace (`stop.grace`) and, if the workload is
+/// still running, the force-kill and its confirmation. A pre-stop command
+/// that fails, can't run or overruns costs at most its bound: the signal and
+/// the kill still follow.
+///
 /// `confirmation_timeout` (`[runtime] stop_confirmation_timeout_secs`) bounds
 /// the runtime's own work: accepting the stop request, accepting a kill, and
-/// reporting exit after it. `grace` is the workload's time to exit.
-async fn stop_runtime_instance<G: Grill>(
+/// reporting exit after it.
+///
+/// Once the instance's exit is confirmed, its sidecars (`stop.sidecars`)
+/// stop in turn, so a proxy or log shipper outlives the app it serves
+/// (#1120).
+pub async fn stop_runtime_instance<G: Grill>(
     grill: &G,
     id: &InstanceId,
-    grace: std::time::Duration,
+    stop: &InstanceStop,
     confirmation_timeout: std::time::Duration,
 ) -> Result<(), BunError> {
+    stop_instance_alone(grill, id, stop, confirmation_timeout).await?;
+    if !stop.sidecars.is_empty() {
+        sidecars::stop_sidecars(
+            grill,
+            &stop.sidecars,
+            stop.sidecar_grace,
+            confirmation_timeout,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// [`stop_runtime_instance`]'s four steps for the instance itself, and for
+/// each of its sidecars in turn. A sidecar has no sidecars of its own, so
+/// calling this, not `stop_runtime_instance`, keeps the future from
+/// containing itself.
+async fn stop_instance_alone<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    stop: &InstanceStop,
+    confirmation_timeout: std::time::Duration,
+) -> Result<(), BunError> {
+    if let Some(pre_stop) = &stop.pre_stop {
+        run_pre_stop(grill, id, pre_stop).await;
+    }
     tokio::time::timeout(confirmation_timeout, grill.stop(id))
         .await
         .map_err(|_| BunError::StopUnconfirmed {
             instance_id: id.clone(),
             reason: "graceful stop request timed out",
         })??;
-    if observe_runtime_exit(grill, id, grace).await? {
+    if observe_runtime_exit(grill, id, stop.grace).await? {
         return Ok(());
     }
     kill_runtime_instance(grill, id, confirmation_timeout).await
+}
+
+/// Run an instance's pre-stop command inside it, within its bound.
+///
+/// The outcome is only reported: a pre-stop command is a courtesy to the
+/// workload, and a broken one must never keep an instance running. Dropping
+/// the exec at the bound ends the command, as an exec timeout always has.
+async fn run_pre_stop<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    pre_stop: &crate::grill::stop::PreStop,
+) {
+    match tokio::time::timeout(pre_stop.timeout, grill.exec(id, &pre_stop.command)).await {
+        Ok(Ok(output)) if output.exit_code == 0 => {}
+        Ok(Ok(output)) => eprintln!(
+            "bun: {id}: pre_stop exited with status {}; stopping anyway",
+            output.exit_code
+        ),
+        Ok(Err(error)) => eprintln!("bun: {id}: pre_stop could not run: {error}; stopping anyway"),
+        Err(_) => eprintln!(
+            "bun: {id}: pre_stop ran past its {}s bound; stopping anyway",
+            pre_stop.timeout.as_secs()
+        ),
+    }
 }
 
 /// Preserve ownership until both force-kill and observed runtime exit succeed.
@@ -374,6 +494,9 @@ enum LoopStall {
     /// one file per launch, which after a restart comes off a cold disk.
     /// Only counted; `MockGrill::set_inventory_delay` makes it slow.
     RuntimeInventory,
+    /// Committing a verified upgrade: appending its history entry, pruning
+    /// old binaries and removing the marker (#1381).
+    UpgradeCommit,
 }
 
 /// How long each [`LoopStall`] takes. Shared with the test through an `Arc`
@@ -507,6 +630,9 @@ pub struct BunAgent<G: Grill> {
     trust_domain: String,
     /// Smoker fault registry — active faults on this node.
     fault_registry: crate::smoker::registry::FaultRegistry,
+    /// Job and task-array attempts running on this node, shared with the
+    /// task runtime that lists them, so faults can target them.
+    live_attempts: Arc<crate::bun::live_attempts::LiveAttempts>,
     /// Kernel state this node has installed for its active network faults.
     network_faults: InstalledNetworkFaults,
     /// Smoker duration limits (`[smoker]`): default + maximum fault lifetime.
@@ -529,11 +655,14 @@ pub struct BunAgent<G: Grill> {
     /// id, the raw allow list, and the last-resolved destinations — so
     /// enforcement can be lifted on stop and the allowlist re-resolved as
     /// DNS changes (L16).
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    egress_bindings: std::collections::HashMap<InstanceId, EgressBinding>,
+    #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+    egress_bindings: std::collections::HashMap<InstanceId, super::egress_owners::EgressBinding>,
     /// Block policy mutations until restart resolves an uncertain checkpoint write.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
     egress_store_uncertain: bool,
+    /// An egress owners checkpoint write that outlasted its turn (#1263).
+    #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+    egress_write: Option<egress_ownership::EgressWrite>,
     /// Workloads fenced by the current live-enforcement incident. Kept after
     /// stop so the next capability report records what happened; cleared only
     /// after every required hook and pre-start guarantee recovers.
@@ -619,6 +748,9 @@ pub struct BunAgent<G: Grill> {
     /// The consumer synchronisation part of the way through its steps, and
     /// the leader answer waiting behind it (#505).
     consumer_syncs: consumer::ConsumerSyncs,
+    /// Leader-acknowledged receipts waiting for the journal to forget them
+    /// (#1340).
+    receipt_confirmations: consumer::ReceiptConfirmations,
     /// While the view lease has lapsed, the local-only view installed in
     /// place of the last publication: this node's own backends and nothing
     /// else. `None` while the published view is the whole cluster's.
@@ -632,6 +764,10 @@ pub struct BunAgent<G: Grill> {
     /// Journal to reopen after a discovery write whose outcome is unknown,
     /// and whether it had been recovered from an earlier process.
     discovery_reopen: Option<(std::path::PathBuf, bool)>,
+    /// Services whose retirement removed their allocation in a journal
+    /// write that outlasted its turn; the stop's next ask finds them
+    /// retired (#1263).
+    retired_discovery_services: std::collections::HashSet<crate::onion::service_id::ServiceId>,
     /// Perimeter firewall config. Disabled in rootless mode.
     perimeter_config: crate::firewall::rules::PerimeterConfig,
     /// Last applied cluster-node set and join windows for firewall
@@ -648,6 +784,9 @@ pub struct BunAgent<G: Grill> {
     deploy_operations: crate::bun::deploy_operations::DeployOperationTracker,
     /// Initialisers whose runtime must retire before parent policy and records.
     initialisers: std::collections::HashMap<InstanceId, std::collections::HashSet<InstanceId>>,
+    /// Each instance's sidecars, which stop after it and retire with it,
+    /// and their restarts (#1120).
+    sidecars: sidecars::Sidecars,
     /// The runtime generation each parent's initialisers last launched, so
     /// the parent's retirement can forget exactly those journals and never
     /// a successor's under the same identity (#850).
@@ -743,6 +882,9 @@ pub struct BunAgent<G: Grill> {
     /// Per-step deadline for the runtime to confirm a stop or force-kill
     /// (`[runtime] stop_confirmation_timeout_secs`).
     stop_confirmation_timeout: std::time::Duration,
+    /// The `[secret_providers.*]` this node runs for `PROVIDER[...]` env
+    /// values, resolved off the loop just before a launch (#1123).
+    secret_providers: crate::sesame::secret_provider::SecretProviders,
     /// How long an ordinary stop waits after SIGTERM before SIGKILL.
     /// `STOP_GRACE_SECS` unless a test shortens it with `set_stop_grace`.
     stop_grace: std::time::Duration,
@@ -846,20 +988,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster: None,
             trust_domain: "default".to_string(),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
+            live_attempts: crate::bun::live_attempts::LiveAttempts::new(),
             network_faults: InstalledNetworkFaults::default(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
+            secret_providers: Default::default(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: Default::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
-            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
             egress_bindings: std::collections::HashMap::new(),
-            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
             egress_store_uncertain: false,
+            #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+            egress_write: None,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_affected_workloads: std::collections::BTreeSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -899,10 +1045,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
             consumer_syncs: Default::default(),
+            receipt_confirmations: Default::default(),
             lapsed_view: None,
             deferred_retirements: Default::default(),
             view_lease: Default::default(),
             discovery_reopen: None,
+            retired_discovery_services: std::collections::HashSet::new(),
             // Single-node mode: no nftables needed (no cluster ports to protect)
             perimeter_config: crate::firewall::rules::PerimeterConfig {
                 enabled: false,
@@ -913,6 +1061,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            sidecars: sidecars::Sidecars::default(),
             initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
@@ -996,20 +1145,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster: Some(cluster),
             trust_domain,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
+            live_attempts: crate::bun::live_attempts::LiveAttempts::new(),
             network_faults: InstalledNetworkFaults::default(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
+            secret_providers: Default::default(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: Default::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
-            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
             egress_bindings: std::collections::HashMap::new(),
-            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
             egress_store_uncertain: false,
+            #[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+            egress_write: None,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_affected_workloads: std::collections::BTreeSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1049,10 +1202,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
             consumer_syncs: Default::default(),
+            receipt_confirmations: Default::default(),
             lapsed_view: None,
             deferred_retirements: Default::default(),
             view_lease: Default::default(),
             discovery_reopen: None,
+            retired_discovery_services: std::collections::HashSet::new(),
             #[cfg(target_os = "linux")]
             perimeter_config: {
                 let mut cfg = if crate::grill::rootless::is_rootless() {
@@ -1074,6 +1229,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            sidecars: sidecars::Sidecars::default(),
             initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
@@ -1251,6 +1407,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.supervisor.set_host_path_policy(policy);
     }
 
+    /// Thread the `[runtime]` knob allowlist from `node.toml` into the
+    /// supervisor (#1122). Without this every runtime knob is refused.
+    pub fn set_runtime_allowlist(&mut self, allowlist: crate::grill::knobs::RuntimeAllowlist) {
+        self.supervisor.set_runtime_allowlist(allowlist);
+    }
+
     /// Thread the parsed `[smoker]` duration limits in, so faults are bounded
     /// by config rather than only the hardcoded 24h backstop.
     pub fn set_smoker_config(&mut self, config: crate::smoker::config::SmokerConfig) {
@@ -1260,6 +1422,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Set the node leaf lifetime this member signs joining nodes with.
     pub fn set_node_leaf_lifetime(&mut self, lifetime: std::time::Duration) {
         self.node_leaf_lifetime = lifetime;
+    }
+
+    /// Thread the `[secret_providers.*]` tables in. Without this the node
+    /// runs no provider, and every `PROVIDER[...]` launch fails closed.
+    pub fn set_secret_providers(
+        &mut self,
+        providers: crate::sesame::secret_provider::SecretProviders,
+    ) {
+        self.secret_providers = providers;
     }
 
     /// Thread `[runtime] stop_confirmation_timeout_secs` in: how long each
@@ -1333,7 +1504,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) -> std::io::Result<super::task_runtime::OwnedRunner<G>> {
         let mut runner =
             super::task_runtime::OwnedRunner::for_data_dir(self.supervisor.grill().clone(), data)?
-                .with_log_sink(self.log_tx.clone(), self.capture_offsets.clone());
+                .with_log_sink(self.log_tx.clone(), self.capture_offsets.clone())
+                .with_live_attempts(self.live_attempts.clone());
         if let Some(cluster) = &self.cluster
             && let (Some(council), Some(ikm)) = (&cluster.council, cluster.wrapping_ikm)
         {
@@ -1341,6 +1513,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         Ok(runner)
     }
+    /// The job and task-array attempts running on this node, as the task
+    /// runtime lists them.
+    pub fn live_attempts(&self) -> Arc<crate::bun::live_attempts::LiveAttempts> {
+        self.live_attempts.clone()
+    }
+
     /// The network state delegated job runtimes share with this agent.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub fn delegated_network(
@@ -1589,20 +1767,32 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     // (#505). Its steps take turns with everything below:
                     // this branch yields once after each step, and the one
                     // under commands takes the step when nothing else waits.
-                    // No step runs while a step's write is in flight.
+                    // No step runs while a step's or a probe's write is in
+                    // flight.
                     _ = std::future::ready(()), if self.consumer_syncs.step_first()
                         && !self.discovery_write_in_flight() => {
                         let turn = self.begin_consumer_sync_turn();
                         self.continue_consumer_sync().await;
                         turn
                     }
-                    // A step's write that outlasted its turn has landed
-                    // (#890): take the step's remainder now.
+                    // A write that outlasted its turn has landed (#890,
+                    // #1255, #1266, #1263): take the step's remainder, or
+                    // install the probe's publication, now. Every other
+                    // writer's next ask collects its own.
                     outcome = Self::discovery_write_done(&mut self.discovery_ownership),
                         if self.discovery_write_in_flight() => {
-                        let turn = self.begin_consumer_sync_turn();
-                        self.land_discovery_write(outcome).await;
-                        self.continue_consumer_sync().await;
+                        let turn = self.begin_landing_turn();
+                        self.land_write_in_flight(outcome).await;
+                        turn
+                    }
+                    // Receipt acknowledgements that arrived while a write
+                    // was in flight (#1340) take the journal once it is
+                    // free. They come only from commands, below, and one
+                    // turn takes all of them, so this branch can't flood.
+                    _ = std::future::ready(()), if self.receipt_confirmations.is_waiting()
+                        && !self.discovery_write_in_flight() => {
+                        let turn = self.begin_receipt_turn();
+                        self.confirm_waiting_receipts().await;
                         turn
                     }
                     Some(op) = self.deploy_ops_rx.recv() => {
@@ -1664,6 +1854,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.begin_turn(LoopBranch::FollowUp, Some(step))
     }
 
+    /// Start the turn that takes a write in flight once it has landed,
+    /// named after whoever waited for the write.
+    fn begin_landing_turn(&mut self) -> super::loop_meter::Turn {
+        if let Some((branch, landed)) = self.write_in_flight_landing_turn() {
+            return self.begin_turn(branch, Some(landed));
+        }
+        self.begin_consumer_sync_turn()
+    }
+
     /// When the turn in progress must give up on a runtime read or other
     /// work it can retry later. Outside a turn (startup adoption, or a test
     /// driving a handler directly) nothing else is waiting, so each wait gets
@@ -1686,6 +1885,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// fault expiry, firewall reconciliation and identity rotation.
     async fn run_health_tick(&mut self) {
         self.reopen_uncertain_discovery().await;
+        self.collect_landed_egress_write().await;
         if let Err(error) = self.fence_lapsed_view().await {
             eprintln!("bun: withdrawing the lapsed cluster view awaits retry: {error}");
         }
@@ -1694,6 +1894,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.refresh_egress_readiness().await;
         self.run_health_checks().await;
         self.begin_state_sweep();
+        self.relaunch_due_sidecars();
         self.drive_pending_restarts().await;
         self.expire_faults().await;
         self.reconcile_firewall();

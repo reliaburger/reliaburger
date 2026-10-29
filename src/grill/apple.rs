@@ -17,7 +17,6 @@ use super::{GrillError, InstanceId};
 
 /// Entry for an Apple Container-managed instance.
 struct AppleEntry {
-    #[allow(dead_code)]
     spec: OciSpec,
     #[allow(dead_code)]
     image: String,
@@ -221,6 +220,22 @@ impl AppleContainerGrill {
             instance: instance.clone(),
             reason: reason.to_string(),
         };
+        if let Some(problem) = spec.runtime_knobs_refusal("Apple Container") {
+            return Err(GrillError::LaunchRefused {
+                instance: instance.clone(),
+                problem,
+            });
+        }
+        // Each Apple container is a VM with its own network stack, and the
+        // CLI has no way to put one into another's (#1120). Admission
+        // refuses sidecars here first; this keeps a stray one from starting
+        // with a network of its own, where `localhost` isn't its app.
+        if spec.joined_network().is_some() {
+            return Err(invalid(
+                "a sidecar shares its app's network namespace, and Apple Container gives \
+                 every container a VM of its own",
+            ));
+        }
         let mut args: Vec<String> = vec![
             "create".to_string(),
             "--name".to_string(),
@@ -325,6 +340,17 @@ impl AppleContainerGrill {
     fn exec_command_args(instance: &InstanceId, command: &[String]) -> Vec<String> {
         let mut args = vec!["exec".to_string(), instance.0.clone()];
         args.extend(command.iter().cloned());
+        args
+    }
+
+    /// Build `container stop` arguments. The default SIGTERM is left to the
+    /// CLI; any other stop signal (#1121) is named with `--signal`.
+    fn stop_command_args(instance: &InstanceId, signal: super::stop::StopSignal) -> Vec<String> {
+        let mut args = vec!["stop".to_string()];
+        if signal != super::stop::StopSignal::Term {
+            args.extend(["--signal".to_string(), signal.name().to_string()]);
+        }
+        args.push(instance.0.clone());
         args
     }
 }
@@ -445,9 +471,16 @@ impl super::Grill for AppleContainerGrill {
     }
 
     async fn stop(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        let output = self
-            .container_command(&["stop", &instance.0], instance)
-            .await?;
+        let signal = self
+            .entries
+            .lock()
+            .await
+            .get(instance)
+            .map(|entry| entry.spec.stop_signal())
+            .unwrap_or_default();
+        let args = Self::stop_command_args(instance, signal);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self.container_command(&args, instance).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -483,7 +516,11 @@ impl super::Grill for AppleContainerGrill {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+    async fn exec(
+        &self,
+        instance: &InstanceId,
+        command: &[String],
+    ) -> Result<super::ExecOutput, GrillError> {
         if command.is_empty() {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
@@ -505,7 +542,12 @@ impl super::Grill for AppleContainerGrill {
                 result.push_str(&stderr);
             }
         }
-        Ok(result)
+        Ok(super::ExecOutput {
+            output: result,
+            // `container exec` passes the command's status through; a
+            // signal-killed command has none, so report a plain failure.
+            exit_code: output.status.code().unwrap_or(1),
+        })
     }
 
     async fn follow_logs(
@@ -591,15 +633,16 @@ mod tests {
 
     #[tokio::test]
     async fn adoption_requires_positive_runtime_evidence() {
-        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("container-fixture");
-        std::fs::write(
+        // A shared, already-launched script, so the ten-second inspection
+        // bound times the inspection rather than macOS assessing a new file
+        // (#1149). A timeout would also pass the first, refusing case
+        // silently.
+        crate::first_launch::install_script(
             &program,
             "#!/bin/sh\ndir=${0%/*}\ncat \"$dir/output\"\nexit \"$(cat \"$dir/status\")\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let id = InstanceId("apple-evidence".into());
         let record = serde_json::from_value(serde_json::json!({
             "schema": crate::grill::records::RECORD_SCHEMA, "instance_id": id.0, "namespace": "default",
@@ -703,6 +746,26 @@ mod tests {
         .expect("timed-out container CLI was left alive");
     }
 
+    /// #1120: a sidecar's spec joins its parent's network namespace, which
+    /// an Apple Container VM can't, so it's refused before the CLI runs.
+    #[test]
+    fn create_refuses_a_sidecar_that_would_join_another_network() {
+        let app: crate::config::app::AppSpec =
+            toml::from_str("image = \"web:1\"\n[[sidecar]]\nname = \"proxy\"\n").unwrap();
+        let parent = InstanceId("default__web-0".into());
+        let app_spec = crate::grill::oci::generate_oci_spec(
+            "web", "default", &app, &parent.0, None, "/cg", None, None,
+        );
+        let sidecar =
+            crate::grill::oci::generate_sidecar_oci_spec(&app.sidecar[0], &app_spec, &parent);
+        let error = AppleContainerGrill::create_command_args(
+            &crate::grill::oci::sidecar_instance_id(&parent, "proxy"),
+            &sidecar,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("VM of its own"), "{error}");
+    }
+
     #[test]
     fn create_preserves_mounts_identity_ports_and_process_settings() {
         let spec: OciSpec = serde_json::from_value(serde_json::json!({
@@ -754,6 +817,21 @@ mod tests {
             )
             .is_err()
         );
+        let mut knobbed = spec.clone();
+        knobbed.runtime_knobs =
+            Some(toml::from_str("devices = [{ path = \"/dev/fuse\" }]\n").unwrap());
+        let refusal = AppleContainerGrill::create_command_args(
+            &InstanceId("apple-settings".into()),
+            &knobbed,
+        )
+        .unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("runtime.devices /dev/fuse can't be applied"),
+            "{refusal}"
+        );
+        assert!(refusal.to_string().contains("Apple Container"), "{refusal}");
         unsupported = spec;
         unsupported.mounts[0].source = Some("/tmp/source,target=/escape".into());
         assert!(
@@ -825,7 +903,8 @@ mod tests {
                     ],
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+                .output;
             let lines: Vec<_> = output.lines().collect();
             if lines.len() < 4
                 || lines[..3] != ["123", "456", "/work"]
@@ -915,6 +994,19 @@ mod tests {
     }
 
     #[test]
+    fn stop_names_only_a_non_default_signal() {
+        let id = InstanceId("apple-0".to_string());
+        assert_eq!(
+            AppleContainerGrill::stop_command_args(&id, super::super::stop::StopSignal::Term),
+            ["stop", "apple-0"]
+        );
+        assert_eq!(
+            AppleContainerGrill::stop_command_args(&id, super::super::stop::StopSignal::Int),
+            ["stop", "--signal", "SIGINT", "apple-0"]
+        );
+    }
+
+    #[test]
     fn exec_command_does_not_insert_a_docker_style_separator() {
         let id = InstanceId("apple-0".to_string());
         let args = AppleContainerGrill::exec_command_args(
@@ -947,6 +1039,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
                 readonly: false,
@@ -968,7 +1061,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         let result: Result<(), String> = async {
@@ -993,7 +1089,8 @@ mod tests {
                     ],
                 )
                 .await
-                .map_err(|error| format!("pinned image exec failed: {error}"))?;
+                .map_err(|error| format!("pinned image exec failed: {error}"))?
+                .output;
             if output != "reliaburger-pinned-workload" {
                 return Err(format!("unexpected pinned image output: {output:?}"));
             }
@@ -1022,6 +1119,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
                 readonly: false,
@@ -1043,7 +1141,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
 
         // Best-effort cleanup of any leftover from an earlier aborted run, so

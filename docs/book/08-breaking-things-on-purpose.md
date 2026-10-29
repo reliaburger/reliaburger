@@ -295,38 +295,42 @@ Egress is opt-in. Apps without `[egress]` have all egress allowed. This is backw
 
 ## Scripted chaos scenarios
 
-For repeatable tests, faults can be defined in a TOML file:
+For repeatable tests, faults can be defined in a TOML file. This is the start of `examples/phase-8/container-chaos-scenario.toml`, which targets the podinfo apps from the five-minute tour:
 
 ```toml
-name = "Payment cascade failure"
+name = "Cache cascade"
 
 [[step]]
-description = "Database CPU starvation"
-fault = "cpu"
-target = "pg"
-value = "80%"
+description = "The cache slows down for the frontend"
+fault = "delay"
+target = "redis"
+from = "frontend"
+value = "300ms"
+jitter = "100ms"
 duration = "2m"
 
 [[step]]
-description = "Database drops connections"
+description = "The cache starts dropping connections"
 fault = "drop"
-target = "pg"
+target = "redis"
 value = "25%"
 start_after = "2m"
-duration = "3m"
+duration = "2m"
 ```
 
 The executor builds a timeline, sorts by activation time, and runs each step at the right moment. A speed multiplier lets you run scenarios faster for CI:
 
 ```bash
-relish fault scenario payment-cascade.toml --speed 10.0 --acknowledge
+relish fault scenario examples/phase-8/container-chaos-scenario.toml --speed 10.0 --acknowledge
 ```
 
 Dry-run mode prints the timeline without executing:
 
 ```bash
-relish fault scenario payment-cascade.toml --dry-run
+relish fault scenario examples/phase-8/container-chaos-scenario.toml --dry-run
 ```
+
+The shipped example used to target `pg` and `payment-service`, apps no example defined, and its header left out `--acknowledge`, so it couldn't run as written. `chaos_scenario_example_targets_apps_a_shipped_example_defines` in `tests/examples.rs` now parses the scenario, collects every app a shipped example declares (TOML `[app.*]` tables and Kubernetes Deployments) and fails on a step aimed at anything else.
 
 The first version of the runner had three habits that made it useless in CI.
 It parsed each step only when its turn came, so a typo in step three surfaced
@@ -712,6 +716,30 @@ namespace, not in Bun, so a Bun that crashed mid-experiment would leave its
 callers slow forever. The first reconcile after start-up sweeps any `fa01:`
 root it finds.
 
+Programming a delay runs `tc` once per band in every caller's namespace, all
+callers at once, under the agent turn's time budget. On a loaded node six
+callers don't always finish inside one turn. The ones cut short are marked
+unknown, and the next tick rebuilds them. That's fine for the reconcile, but
+the injection used to treat a cut-short caller as a failure. `relish fault
+delay` then got a 400 saying the fault was rejected, and a tick later the delay
+was in place anyway (#1199). Now `reconcile_delays` returns a `DelayFailure`
+enum rather than a bare string. `Pending` covers a caller that ran out of turn
+or is waiting on the start-up sweep; `Failed` covers a `tc` that actually
+failed. `delay_injection_outcome` refuses the injection only for a `Failed`
+caller of this rule. A `match` on the enum, rather than a search through the
+message text, is what keeps the two from being confused.
+
+Once jobs could be faulted (#704), every runc job attempt became a caller
+too, and a soak runs thousands of them an hour. The 0.2.2 soak caught one
+finishing while `tc` ran: `Cannot find device "eth0"`, a `Failed`, and the
+whole delay refused for a caller that no longer existed (#1291). Now the
+reconcile asks again after programming what each failed caller is, as a
+`CallerNow` enum: `Gone`, `Attempt` or `Instance`. `delay_program_failure`
+drops a `Gone` caller, treats an `Attempt` without its namespace or `eth0` as
+`Pending`, and leaves an app instance's failures as they were. Here the text
+match on `tc`'s stderr is the only signal we have, but it's contained in one
+function, and only an attempt's failure can be softened by it.
+
 On the podinfo demo, `relish fault delay redis 300ms --from frontend` took a
 cache read from 43 ms to 945 ms: about three redis round trips (podinfo's
 read runs `EXISTS` and then `GET`, and its pool talks to redis too), each
@@ -778,6 +806,150 @@ is the whole point of pinning.
 So the rule is now simple to state: a fault dies with the Bun that injected
 it, and the next Bun tidies up after it. If you still want the fault, inject
 it again.
+
+### Faults for things that finish
+
+0.2.0 made a million jobs a day the headline, and Smoker couldn't touch a
+single one of them. `relish fault kill migrate` was refused by the replica
+rail every time: a job is one task, and killing one of one leaves zero. And a
+task-array attempt doesn't live in the supervisor at all, so every lookup
+Smoker made (whose pids to signal, whose cgroup to throttle, who's calling)
+came back empty. The release's qualification broke whole nodes under its jobs
+instead. That's honest, but it can't answer the question a batch user
+actually asks: what does my job do when *its* attempt dies?
+
+Two things had to change, and the first is a one-liner with a long
+justification. The replica rail exists to keep a service serving. A job isn't
+serving anything; it's meant to finish, and when an attempt dies the job's
+own retry policy decides what happens next. So the rail now asks what it's
+looking at:
+
+```rust
+// A job or task-array attempt is meant to finish, and a killed one is
+// retried under its own policy: "keep one replica serving" doesn't apply.
+if !kills_instances || context.workload.runs_to_completion() {
+    return None;
+}
+```
+
+`workload` is a new enum on the request and the safety context, `App`, `Job`
+or `TaskArray`. The dangerous part isn't the rail, it's who fills that field
+in. If the caller could, `"workload": "job"` in a JSON body would turn the
+rail off for any app. So the API overwrites it on the way in, and decides
+from evidence instead: the receiving node looks for app instances by that
+name, and only when there are none does it ask every node which job attempts
+it's running. Apps and jobs can't share a name in one namespace, so at most
+one list has anything in it. The owning node's agent then makes the same call
+again from its own supervisor, and the supervisor wins: if it runs an app
+called `migrate`, the target is an app, whatever the request says.
+
+The new wire fields are `#[serde(default)]`. That attribute tells serde to
+use `Default::default()` when a field is missing from the JSON, so a scenario
+file or a script that never heard of `task_index` still parses. It isn't a
+compatibility promise between versions (we don't make those before 1.0, and
+0.2.2 bumped the protocol anyway); it just keeps `workload` optional for the
+people writing requests by hand.
+
+The second change is finding attempts at all. They run in the task runtime:
+either in a container of their own (a fresh runtime generation per attempt),
+or as one command in a reusable executor, a warm container that runs one task
+after another. Neither is something the agent can see. So the runtime now
+writes each attempt into a list it shares with the agent, `LiveAttempts`, and
+takes it out again when the attempt ends. "When the attempt ends" is the
+interesting part, because `run` can return early from a dozen places: a
+refusal, a timeout, a cancellation, a launch failure. Rust's answer is to tie
+the listing to a value's lifetime:
+
+```rust
+impl Drop for AttemptListing {
+    fn drop(&mut self) {
+        self.attempts
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+```
+
+`register` hands back an `AttemptListing`, the runner keeps it in a local
+variable, and when that variable goes out of scope, by any path, `drop`
+removes the entry. It's the same idea as Go's `defer` or Python's `with`,
+except the compiler attaches it to the value rather than to a block, so you
+can't forget to write it. C++ programmers will know it as RAII. The list
+itself sits behind a `std::sync::Mutex`, not tokio's: every critical section
+is a map insert, remove or copy, nobody holds the lock across an `.await`, and
+`drop` can't be `async` anyway.
+
+Each entry says how to reach the attempt, and that's an enum too:
+
+```rust
+pub enum AttemptHandle {
+    Instance(InstanceId),
+    TaskGroup(PathBuf),
+}
+```
+
+An attempt in its own container is a runtime instance: the runtime names its
+main pid, and it has its own cgroup and network namespace, so every fault
+works on it the way it works on an app replica. A command in a reusable
+executor is reached through the executor's `task` cgroup. The executor's
+helper lives in a sibling `helper` cgroup, and the pool runs one command at a
+time, so `task/cgroup.procs` holds exactly that command's processes. Kill and
+pause signal every pid in it and nothing else.
+
+The other faults are a different story, and this is where we chose refusal
+over cleverness. A CPU cap written to the executor's `task` cgroup stays
+there when the task ends, and the next task, a different index, starts under
+it. A netem delay on the container's interface slows whoever runs next too.
+We could have tried to lift the fault between tasks, but then a fault you
+asked for on task 41 would silently stop applying the moment task 41 finished
+its first attempt and quietly reappear on task 42's. So Bun refuses, and says
+why:
+
+```text
+cpu 50% can't be confined to task 41 of render: it runs in reusable executor
+default/executor-…-0, whose cgroup and network the job's other tasks share;
+only kill and pause act on one task there
+```
+
+The signal path needed one more change. It used to count pids: `kill
+--count 2` read every instance's pid and kept the first two. An executor's
+task group can hold several processes (a shell and its child, say), so
+counting pids would kill one task twice and miss the second. Now it counts
+*targets*: it reads each target's pids, keeps the first `count` targets that
+still have any, and only then flattens them into one list to signal.
+
+What happens after a kill is the job's business, and we left it that way.
+A command in a reusable executor reports the signal through its helper, so
+it's a failed attempt and retries. An attempt in its own process or container
+dies with no exit status, and a job without a status is the conservative case
+"A signal is not proof of exit" sets out further down this chapter: the work
+may have half happened, so it comes back `Unknown`. An array (or a job
+with `replay_unknown = true`) runs it again; any other job waits for an
+operator's `relish batch replay`. The end-to-end test in `tests/suite` sets
+`replay_unknown` for exactly that reason. Smoker could have told the job "it
+was me, count it as a failure", but then a chaos experiment would test a code
+path real crashes never take.
+
+`--instance` takes a task index for a job, since that's the identity a task
+keeps across retries. The router moves a numeric `--instance` into
+`task_index` and plans the fault onto the node that runs that task, in the
+same pure function it uses for apps.
+
+The tests come in three layers. The rail tests check that a job or array
+passes a kill-everything that an app with one replica can't, and that the
+quorum rail doesn't care what the request calls itself. The agent tests in
+`src/bun/agent/tests/job_faults.rs` stand a plain directory in for a task
+cgroup: a `cgroup.procs` file listing a real `sleep` process is all the agent
+reads, so they run on a laptop. One drives a real `TaskPool` whose first
+attempt sleeps until the agent kills it, and checks the task succeeds on its
+second. `tests/suite/batch.rs` does the same end to end through the HTTP API
+with a process job. Then the gated ones: on Linux, a real shared-runc command
+is listed, frozen and thawed through its task cgroup, and a partition `--from`
+a job keys the attempt's cgroup in the kernel's fault map; on a three-node
+cluster, attempts killed from different nodes mid-array are retried and every
+task still completes exactly once.
 
 ## One experiment at a time
 
@@ -1025,6 +1197,18 @@ need their interpreter (`/bin/sh`) on the list. `mount_isolation` defaults to
 `true` on Linux, but process mode doesn't implement a mount namespace, so a host
 workload is refused until you set it to `false` and accept running unisolated.
 Use Linux containers when the workload needs that boundary.
+
+The phase-8 example used to say the opposite: an empty allowlist "allows all".
+It never did. `examples/phase-8/proc-exec-app.toml` now says deny-by-default,
+runs testapp so it works as written against
+`examples/node/process-runtime.toml`, and `proc-run-before.toml` beside it
+gates an app on a host migration job. Since #914 a process-only node refuses
+an app with an `image`, so `process_examples_run_no_images` in
+`tests/examples.rs` keeps every `proc-*` example image-free, and
+`example_names_follow_the_runtime_prefix_convention` fails on any file under
+`examples/phase-*` without a `proc-`, `container-`, `apple-` or `runc-`
+prefix. That caught the unprefixed batch, build and chaos examples, now
+`container-*`.
 
 ### How it fits together
 
@@ -1401,6 +1585,18 @@ restart's step result goes through the same `launch_problem()` test, and a
 refusal moves the instance straight to `Failed` with the reason, as a fresh
 deploy does. Failures that might pass on a retry still take the budget path.
 
+The test for this runs a real agent and a script that deletes itself and
+exits. Its first version had the script sleep for one second first, "long
+enough for the deploy to see it start". On a busy Mac it failed once (#1130).
+The deploy records each workload's pid and start time once `start` returns,
+and a workload that has already exited by then fails the deploy with "runtime
+process identity is unavailable". Timing the fixture under load showed the
+margin going: the script could be running for a full second before the deploy
+finished, after a 667 ms agent-loop turn. The one-second sleep was a
+deadline in disguise. Now the script waits for a file that the test writes
+once the deploy has returned, and only then deletes itself. The test no
+longer depends on how fast the host is.
+
 What we didn't change is the cluster's placement reconciler. It still retries a
 refused deploy on its backoff, 5 s doubling to 5 min, so installing the binary
 is picked up without a re-apply. Each retry fails at once with the real
@@ -1427,10 +1623,16 @@ fn spec_problem(spec: &OciSpec) -> Option<super::LaunchProblem> {
 }
 ```
 
-`host_process` is set only for an `exec` or `script` app, so anything else is
-a container. The exception is an init container of a host app that names no
-image of its own: it inherits the app's root, `HOST_ROOT`, and runs on the host
-like its app. The last expression uses `bool::then_some`, which turns `true`
+`host_process` is set for an `exec` or `script` app, and for an init container
+of one that names no image of its own: that init inherits the app's root,
+`HOST_ROOT`, and runs on the host like its app. Anything else is a container.
+The init used to be the exception, recorded with `host_process = false` and let
+through only by the `HOST_ROOT` check. The process runtime didn't mind, but the
+mixed runtime routes by `host_process` alone, so it sent the init to runc, and a
+Bun restarted from `--runtime process` to `mixed` while one was running couldn't
+adopt it (#935). Now `generate_init_oci_spec` sets the flag from the app's:
+`app.host_process && init.image.is_none()`, so the durable owner record says
+what the launch really is. The `HOST_ROOT` check stays as a second line. The last expression uses `bool::then_some`, which turns `true`
 into `Some(LaunchProblem::NoCommand)` and `false` into `None`, so a spec with
 something to run has no problem. Both new variants ride the `LaunchRefused`
 path above: the deploy fails at once with `needs a container runtime to run
@@ -1727,12 +1929,12 @@ To build this inside the cluster and push it to Pickle, you write a build config
 [build.my-api]
 context = "./my-api"
 dockerfile = "Dockerfile"
-destination = "pickle://my-api:v1.2.3"
+destination = "pickle://production/my-api:v1.2.3"
 namespace = "production"
 platform = ["linux/amd64", "linux/arm64"]
 ```
 
-That's it. `context` is the directory containing your source. Everything inside it gets sent to the builder. `dockerfile` defaults to `"Dockerfile"` if you leave it out. `destination` uses the `pickle://` protocol, which means "push to the local Pickle registry on this cluster". `platform` defaults to both amd64 and arm64, so the image works on mixed-architecture clusters.
+That's it. `context` is the directory containing your source. Everything inside it gets sent to the builder. `dockerfile` defaults to `"Dockerfile"` if you leave it out. `destination` uses the `pickle://` protocol, which means "push to the local Pickle registry on this cluster". `platform` defaults to both amd64 and arm64, so the image works on mixed-architecture clusters. The destination's first path segment, `production`, is the namespace the image lives in, and it has to match the build's `namespace` (more on that below).
 
 You can pass build arguments too:
 
@@ -1754,7 +1956,8 @@ Once the build completes, deploy the image like any other app:
 
 ```toml
 [app.my-api]
-image = "my-api:v1.2.3"
+image = "production/my-api:v1.2.3"
+namespace = "production"
 port = 8080
 replicas = 3
 
@@ -1762,7 +1965,7 @@ replicas = 3
 path = "/healthz"
 ```
 
-Pickle resolves `my-api:v1.2.3` locally — no Docker Hub round-trip. The scheduler pulls the image from whichever Pickle node has it cached (or replicates it if needed).
+Pickle resolves `production/my-api:v1.2.3` locally — no Docker Hub round-trip. The scheduler pulls the image from whichever Pickle node has it cached (or replicates it if needed).
 
 The `pickle://` protocol is enforced at config validation time — you can't accidentally push to Docker Hub or a remote registry from a build job.
 
@@ -1811,7 +2014,7 @@ The digest of the tar becomes the context's identity. If two builds use the same
 ```
 buildah bud --storage-driver vfs -f Dockerfile \
   --platform linux/amd64,linux/arm64 \
-  --manifest localhost:9117/my-api:v1.2.3 .
+  --manifest localhost:9117/production/my-api:v1.2.3 .
 ```
 
 `--storage-driver vfs` tells buildah to use plain file copies instead of overlayfs. No kernel modules, no FUSE, no privileged access. Slower than overlay, but works anywhere without special permissions. Buildah reads the Dockerfile, pulls base images (e.g. `python:3.12-slim` from Docker Hub), runs each instruction, and produces an OCI image. With `--platform linux/amd64,linux/arm64`, it builds for both architectures and creates a manifest list (OCI index) so the image works on mixed clusters.
@@ -1851,17 +2054,24 @@ The `relish dev create` command installs it automatically when provisioning Lima
 
 ### Namespace-scoped pushes
 
-If the image name contains a slash (`pickle://production/myapp:v1`), the prefix is treated as a namespace scope. A build in namespace "staging" can't push to `production/myapp`:
+If the image name contains a slash (`pickle://production/myapp:v1`), the prefix is the namespace the image lives in. A build in namespace "staging" can't push to `production/myapp`.
+
+What about a build in "staging" whose destination has no prefix at all, `pickle://myapp:v1`? For a long time it was simply accepted. The check only looked at destinations that had a slash, so the build pushed to the bare `myapp` repository, which belongs to no namespace and which every namespace can pull. A doc comment even claimed the field "restricts push to namespace-scoped repositories". It didn't (#1066).
+
+We had two ways to close it. We could quietly rewrite the destination to `pickle://staging/myapp:v1`, or refuse the build. Rewriting is friendlier for about a minute, until someone deploys `image = "myapp:v1"` because that's what the config said, and gets yesterday's image or none. The registry chapter had already been through the same argument: guessing a namespace for a bare name is how scoped tokens end up with more than they were given. So a namespaced build is refused unless its destination is in its own namespace, and the error names the fix:
 
 ```rust
-if let Some(build_ns) = &spec.namespace
-    && ns_prefix != build_ns
-{
-    return Err(BuildError::NamespaceMismatch { ... });
-}
+let reason = match crate::pickle::registry_auth::repository_namespace(&destination.name) {
+    Some((dest_namespace, _)) if dest_namespace == namespace => return Ok(()),
+    Some((dest_namespace, _)) => format!(/* pushes to namespace {dest_namespace:?} */),
+    None if destination.name.contains('/') => format!(/* not in any namespace */),
+    None => format!(/* names no namespace; use pickle://{namespace}/{name}:{tag} */),
+};
 ```
 
-No prefix means the build can push anywhere — fine for shared infrastructure images. Layer caching is deferred to Phase 12.
+`match` with a guard (`if dest_namespace == namespace`) picks the first arm whose pattern fits *and* whose guard holds, so the happy path returns early and every other arm builds the reason for one way of being wrong. `repository_namespace` is the registry's own rule for placing a repository, the one a scoped `docker push` meets, so `cache/myapp` and `production//myapp` are refused here for the same reasons they're refused there.
+
+The check lives in `config::build::check_destination_namespace`, and two places call it. `relish build` runs it as part of config validation, so you hear about it before your context uploads. `POST /v1/build` runs it again before anything else, with or without a council, because the API is where the trust decision is made: a raw `curl` never meets `relish`'s validation. A build with no `namespace` is still held only by its caller's token, so an unscoped admin can build a shared, bare-named image. Layer caching is deferred to Phase 12.
 
 ## Lessons learned
 
@@ -1918,7 +2128,7 @@ A chaos tool poses an awkward testing question: how do you test something whose 
 
 ### Unit tests — the logic
 
-The 91 tests in `src/smoker/` cover the parts that must never be wrong:
+The tests in `src/smoker/` cover the parts that must never be wrong:
 
 - **Safety rails** — one test per `SafetyViolation` variant, plus the evaluation-order test (quorum reported before leader when both trip). These are the tests that let us promise quorum protection can't be bypassed.
 - **The registry** — expiry via the min-heap, and the property that a `bun` restart leaves it empty.

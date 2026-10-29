@@ -2375,6 +2375,11 @@ fn spawn_placement_reconciler_with_io_timeout(
                 // ordinals the leader gave it.
                 spec.replicas = Replicas::Fixed(assignment.ordinals.len() as u32);
                 spec.ordinals = Some(assignment.ordinals.clone());
+                // Who manages an app is the council's business, not the
+                // node's: a controller claiming it mustn't redeploy it (#1125).
+                // Nor does the node need to know which template made it (#1124).
+                spec.owner = None;
+                spec.provenance = None;
                 let fingerprint = serde_json::to_string(&spec).unwrap_or_default();
                 if matches!(applied.get(&key), Some(AssignmentState::Applied { fingerprint: previous }) if previous == &fingerprint)
                 {
@@ -2866,14 +2871,24 @@ const DEPLOY_TERMINAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long the reconciler waits for a deploy of `spec` (this node's share)
 /// to finish: [`DEPLOY_TERMINAL_TIMEOUT`] for image pulls and the like, plus
-/// a health wait and a drain for every replica, twice over, since an aborted
+/// a health wait, a drain and the stop hooks for every replica, twice over, since an aborted
 /// rollout restores the previous spec at the same pace (#692). A fixed five
 /// minutes gave up on a ten-replica share with a one-minute health timeout
 /// while it was still rolling.
 fn deploy_terminal_timeout(spec: &AppSpec) -> Duration {
     let config = crate::meat::deploy_types::DeployConfig::for_app(spec);
     let share = spec.replica_ordinals().len() as u32;
-    let per_replica = config.health_timeout.saturating_add(config.drain_timeout);
+    // An old replica's own stop hooks (#1121) come on top of its drain.
+    let stop = crate::grill::stop::StopPolicy::from_app(spec).map_or(Duration::ZERO, |stop| {
+        let pre_stop = stop
+            .pre_stop
+            .map_or(Duration::ZERO, |pre_stop| pre_stop.timeout);
+        stop.grace.unwrap_or_default().saturating_add(pre_stop)
+    });
+    let per_replica = config
+        .health_timeout
+        .saturating_add(config.drain_timeout)
+        .saturating_add(stop);
     DEPLOY_TERMINAL_TIMEOUT.saturating_add(per_replica.saturating_mul(share.saturating_mul(2)))
 }
 
@@ -2924,6 +2939,12 @@ async fn deploy_outcome(
                 reason,
                 ..
             } => {
+                // The abort says what happened to the instances; the first
+                // error says why. The leader's mark needs both (#1111).
+                let reason = match failure {
+                    Some(DeployWaitError::Failed(cause)) => format!("{cause}; {reason}"),
+                    _ => reason,
+                };
                 failure = Some(DeployWaitError::RolloutAborted {
                     rolled_back,
                     reason,
@@ -4810,6 +4831,61 @@ image = "busybox:latest"
         assert!(matches!(
             deploy_outcome(rx, Duration::from_secs(5)).await,
             Err(DeployWaitError::RolloutAborted { rolled_back: true, ref reason })
+                if reason.ends_with("rolled back — old instances preserved")
+        ));
+    }
+
+    /// #1111: the abort alone says only that the node rolled back. The
+    /// error before it says why, and the leader's `RolloutFailed` mark and
+    /// `relish wtf` need that too.
+    #[tokio::test]
+    async fn a_rollout_abort_reason_keeps_the_first_error() {
+        let (tx, rx) = mpsc::channel(8);
+        for event in [
+            ApplyEvent::Error {
+                message: "node capacity cannot admit cpu=100m mem=32Mi".into(),
+            },
+            ApplyEvent::Error {
+                message: "a later error".into(),
+            },
+            ApplyEvent::RolloutAborted {
+                app: "web".into(),
+                rolled_back: true,
+                reason: "rolled back — old instances preserved".into(),
+            },
+            ApplyEvent::Error {
+                message: "rolled back — old instances preserved".into(),
+            },
+        ] {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        let Err(DeployWaitError::RolloutAborted { reason, .. }) =
+            deploy_outcome(rx, Duration::from_secs(5)).await
+        else {
+            panic!("the abort must be the outcome");
+        };
+        assert_eq!(
+            reason,
+            "node capacity cannot admit cpu=100m mem=32Mi; rolled back — old instances preserved"
+        );
+    }
+
+    /// An abort with no error before it keeps its own reason.
+    #[tokio::test]
+    async fn a_rollout_abort_without_an_earlier_error_keeps_its_reason() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(ApplyEvent::RolloutAborted {
+            app: "web".into(),
+            rolled_back: true,
+            reason: "rolled back — old instances preserved".into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        assert!(matches!(
+            deploy_outcome(rx, Duration::from_secs(5)).await,
+            Err(DeployWaitError::RolloutAborted { ref reason, .. })
                 if reason == "rolled back — old instances preserved"
         ));
     }
@@ -4832,6 +4908,22 @@ image = "busybox:latest"
         assert_eq!(
             deploy_terminal_timeout(&spec(10)),
             DEPLOY_TERMINAL_TIMEOUT + Duration::from_secs(1800)
+        );
+    }
+
+    /// #1121: retiring an old replica also waits out its pre-stop bound and
+    /// its own stop grace, so the deadline grows by both.
+    #[test]
+    fn deploy_terminal_timeout_counts_the_stop_hooks() {
+        let spec: AppSpec = toml::from_str(
+            "image = \"web:v1\"\nstop_grace = \"45s\"\npre_stop = [\"drain\"]\n\
+             pre_stop_timeout = \"15s\"\n[deploy]\nhealth_timeout = \"60s\"\n\
+             drain_timeout = \"30s\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            deploy_terminal_timeout(&spec),
+            DEPLOY_TERMINAL_TIMEOUT + Duration::from_secs(2 * (60 + 30 + 45 + 15))
         );
     }
 
@@ -5016,6 +5108,9 @@ image = "busybox:latest"
                 dns: Default::default(),
                 process: Default::default(),
                 containers: true,
+                secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
+                shared_network: false,
             },
             egress_enforcement: Vec::new(),
             egress_degraded: false,

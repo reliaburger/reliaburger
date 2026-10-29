@@ -36,6 +36,8 @@ async fn watch_recovers_from_collection_failure_and_retains_warning_exit() {
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
+    // Pay `relish`'s first launch before the first 40 s wait starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
         .args([
             "--endpoint",
@@ -82,8 +84,8 @@ async fn watch_recovers_from_collection_failure_and_retains_warning_exit() {
             .await
             .map_err(|_| "watch ignored interrupt".to_string())?
             .map_err(|error| error.to_string())?;
-        if status.code() != Some(2) {
-            return Err(format!("expected warning exit 2, got {status}"));
+        if status.code() != Some(3) {
+            return Err(format!("expected warning exit 3, got {status}"));
         }
         Ok(())
     }

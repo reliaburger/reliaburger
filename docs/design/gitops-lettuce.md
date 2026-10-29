@@ -6,7 +6,7 @@ Lettuce is Reliaburger's built-in GitOps sync engine, compiled directly into the
 
 Lettuce watches a configured git repository and continuously reconciles the desired state declared in that repository against the actual state of the cluster. Reconciliation is triggered either by a configurable poll interval (default 30 seconds) or by an incoming webhook from a git hosting provider. When differences are detected, Lettuce computes a minimal diff and applies only the changed resources, forwarding write operations to the Raft leader.
 
-The engine runs on a single council member elected as the **GitOps coordinator**. This isn't necessarily the Raft leader -- the coordinator role is a separate election that distributes work across the council. If the coordinator fails, another council member assumes the role within seconds, inheriting the last-known sync state from Raft.
+The engine runs on the Raft leader, which is the **GitOps coordinator**. Only the leader can write desired state, so only the leader can apply a sync. If it fails, Raft elects a new leader, whose sync loop takes over within seconds, inheriting the last-known sync state from Raft.
 
 Lettuce isn't a separate daemon, sidecar, or CRD controller. It's a module within Bun, sharing the same process, the same mTLS identity, and the same Raft client as every other subsystem. There's no additional binary to deploy, upgrade, or monitor.
 
@@ -26,19 +26,19 @@ Lettuce isn't a separate daemon, sidecar, or CRD controller. It's a module withi
 
 | Subsystem | Role in Lettuce | Notes |
 |-----------|----------------|-------|
-| **Bun** | Host process. Lettuce runs as a module inside the Bun binary on the elected GitOps coordinator (a council member). | Shares the Bun process lifecycle, mTLS identity, and signal handling. |
-| **Raft (Council)** | Stores sync state, coordinator election, and desired state replication. Lettuce reads current desired state from Raft to compute diffs and forwards applies to the leader. | Coordinator election is a Raft-replicated state machine entry, not a separate protocol. |
+| **Bun** | Host process. Lettuce runs as a module inside the Bun binary; its sync loop is active only on the Raft leader, the GitOps coordinator. | Shares the Bun process lifecycle, mTLS identity, and signal handling. |
+| **Raft (Council)** | Stores sync state (including the coordinator's node ID) and desired state. Lettuce reads current desired state from Raft to compute diffs and writes changes as the leader. | There's no coordinator election of its own: Raft leader election decides it. |
 | **Sesame** | Provides the mTLS identity Bun uses cluster-wide. | Commit-signature verification is **not** delegated to Sesame: Lettuce shells out to `git verify-commit` (which handles both GPG and SSH), then checks the reported key fingerprint against the trusted set. There is no PGP/SSH parsing in Rust. |
 | **Meat** | Scheduler. After Lettuce applies a changed app spec to Raft, Meat handles scheduling decisions (replica placement, rolling deploys). | Lettuce doesn't schedule directly; it writes desired state and Meat reacts. |
-| **Brioche** | Web UI. Displays sync status, last applied commit, pending change preview, and sync history. | Brioche reads Lettuce state from the Raft-replicated `SyncState` struct. |
-| **Mustard** | Gossip protocol. Used to detect coordinator node health. If the coordinator's gossip heartbeat stops, the council elects a replacement. | Lettuce doesn't use Mustard directly; the council handles coordinator failover. |
+| **Brioche** | Web UI. Displays sync status, the last applied commit, the coordinator and sync history. A pending-change preview is planned. | Brioche reads Lettuce state from the Raft-replicated `SyncState` struct. |
+| **Mustard** | Gossip protocol. Not used by Lettuce. | Coordinator failover is Raft leader election. |
 
 ### External
 
 | External | Purpose |
 |----------|---------|
 | **Git remote** | The repository containing TOML configuration files. Accessed via SSH or HTTPS. |
-| **Webhook source** (optional) | GitHub, GitLab, Gitea, or any provider that sends POST webhooks on push events. |
+| **Webhook source** (optional) | GitHub, GitLab, or any provider that signs POST webhooks the way one of them does. |
 
 ---
 
@@ -75,7 +75,7 @@ The core of Lettuce is a continuous sync loop running on the coordinator:
 
 **Step-by-step flow:**
 
-1. **Trigger.** Either the poll timer fires (every `poll_interval`, default 30s) or a validated webhook arrives.
+1. **Trigger.** The poll timer fires (every `poll_interval`, default 30s), a validated webhook arrives, a committed trigger (`relish gitops sync`, or a webhook another node accepted) is pending, or this node has just become leader. The loop watches Raft's metrics only for a new term or leader, not for every commit, and reads only `gitops_config` and the trigger generations until it knows it leads a cluster with GitOps on; the whole `DesiredState` is cloned only for a sync that will run (#1030).
 2. **Git fetch.** Lettuce performs `git fetch origin <branch>` on the local bare clone. If the remote HEAD hasn't moved, the loop carries on with the current HEAD rather than stopping: every tick reconciles (B16), so a manual change to desired state is repaired without waiting for a commit. Each `git` call runs under a deadline and the shutdown token (see Section 5.3).
 3. **Commit signature verification.** If `require_signed_commits` is enabled globally, or if the commit adds, changes or removes any `script` value (auto-enforcement per Section 17, Section 5.8), the commit signature is verified against `trusted_signing_keys`. Unsigned or untrusted commits are rejected and the reason is recorded in `SyncState.last_error`. (A dedicated alert on rejection is **planned — not yet implemented**; today the rejection surfaces through sync state, not the alerting subsystem.)
 4. **TOML parse.** All `.toml` files under the configured `path` are parsed into the internal `DesiredState` representation. Parse errors are non-fatal per file -- a single malformed file doesn't block sync of other files, but the malformed file is flagged as an error in sync status.
@@ -85,21 +85,15 @@ The core of Lettuce is a continuous sync loop running on the coordinator:
 
 ### 3.2 Coordinator Election
 
-The GitOps coordinator is a council member role, elected via a Raft-replicated state machine entry. The election process:
+The GitOps coordinator is the Raft leader. There's no separate election: the sync loop is leader-gated, because only the leader can write desired state.
 
-1. When GitOps is first enabled (via `relish apply` of a config containing `[gitops]`, or via the initial cluster config), the leader writes a `CoordinatorElection` entry to the Raft log.
-2. The leader selects the coordinator from council members using the same scoring heuristic as council selection (stability, resource availability, zone diversity), with a preference for non-leader members to distribute load.
-3. The elected coordinator receives the `CoordinatorElection` entry via Raft replication and starts the Lettuce sync loop.
-4. All other council members see the election entry and know not to start their own sync loops.
+1. Every council member runs the Lettuce runner, but only the current leader's loop syncs.
+2. On each recorded sync, `coordinator_for_leader` (`src/lettuce/sync.rs`) stamps the leader's node ID into `SyncState.coordinator_node_id`, with reason `Initial`, or `Failover` when the previous coordinator was another node.
+3. When leadership moves, the new leader's loop takes over at once, without waiting for its poll tick. It reads the last `SyncState` from Raft and resumes from the last applied commit, cloning the repository first if it has no usable local clone.
 
-**Failover:**
+An earlier draft elected a separate coordinator, preferring a non-leader to spread load, with its own `CoordinatorElection` Raft entry and heartbeat-based failover. It was never built that way: a non-leader can't apply a sync, so the coordinator it named never synced.
 
-- The council monitors the coordinator via Raft heartbeats (not gossip -- the coordinator is always a council member, so Raft heartbeats are authoritative).
-- If the coordinator misses heartbeats (default: 3 consecutive, approximately 450ms with 150ms Raft heartbeat interval, not the 500ms Mustard gossip interval), the leader writes a new `CoordinatorElection` entry selecting a replacement.
-- The replacement coordinator reads the last `SyncState` from Raft (which includes the last applied commit hash and the local bare clone path) and resumes the sync loop from where the previous coordinator left off.
-- The replacement coordinator must `git clone` the repository fresh if it doesn't already have a local clone. During this window (typically a few seconds), sync is paused but not lost -- the next poll after clone completion catches up.
-
-**Implementation status.** The sync loop is **leader-driven**, and the coordinator is now
+**Implementation notes.** The coordinator is
 defined as the Raft leader: only the leader can write desired state, so only it can apply a
 sync, and `coordinator_for_leader` records the leader in `SyncState.coordinator_node_id`,
 tagging a change of leader as a `Failover`. Failover therefore rides Raft leader election —
@@ -419,8 +413,8 @@ pub enum ResourceKind {
 ### 4.5 WebhookPayload
 
 ```rust
-/// Parsed and validated webhook payload. Lettuce supports GitHub, GitLab,
-/// and Gitea webhook formats. The payload is validated for HMAC-SHA256
+/// Parsed and validated webhook payload. Lettuce supports GitHub and
+/// GitLab webhook formats. The payload is validated for HMAC-SHA256
 /// signature before parsing.
 #[derive(Debug, Clone)]
 pub struct WebhookPayload {
@@ -495,29 +489,24 @@ impl SigningKeySet {
 ### 4.7 CoordinatorElection
 
 ```rust
-/// Raft log entry for GitOps coordinator election.
+/// Records which node is the GitOps coordinator (always the Raft leader).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoordinatorElection {
-    /// Node ID of the elected coordinator.
+    /// Node ID of the coordinator.
     pub node_id: String,
-
-    /// Term in which this election occurred (Raft term).
-    pub raft_term: u64,
-
-    /// Timestamp of election (Unix ms).
-    pub elected_at: u64,
-
-    /// Reason for election (initial, failover, rebalance).
+    /// Reason for the election (initial, failover, rebalance).
     pub reason: CoordinatorElectionReason,
+    /// Timestamp of the election (Unix ms).
+    pub timestamp: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoordinatorElectionReason {
-    /// GitOps was just enabled.
+    /// First election when GitOps is enabled.
     Initial,
-    /// Previous coordinator failed.
-    Failover { previous_node_id: String },
-    /// Manual rebalance or council membership change.
+    /// Leadership moved to another node.
+    Failover,
+    /// Reserved; nothing produces it today.
     Rebalance,
 }
 ```
@@ -528,7 +517,7 @@ pub enum CoordinatorElectionReason {
 
 ### 5.1 Poll-Based Sync
 
-The default sync mode. A tokio timer fires every `poll_interval` (default 30 seconds, configurable from 5s to 1h).
+The default sync mode. A tokio timer fires every `poll_interval_secs` (default 30 seconds). There's no upper bound, and a value below one second is raised to one (`poll_interval_secs.max(1)` in `src/lettuce/runner.rs`).
 
 **Procedure:**
 
@@ -634,7 +623,7 @@ The diff engine compares two `DesiredState` trees: one from the parsed git TOML,
 
 **Complexity:** The diff is O(n * m) where n is the number of resources and m is the average number of fields per resource. For a typical cluster (hundreds of resources, tens of fields each), this completes in sub-millisecond time.
 
-**Ownership (implemented, 0.2.1, #693).** Step 3 above applies only to resources in `DesiredState.gitops_owned`: a resource in Raft but not in git is removed only when GitOps wrote it. A resource present in both that matches git but isn't owned produces a `ResourceChange::Adopt` carrying the spec the cluster already runs (bound image digest included), so the write changes nothing but records ownership. Everything in an `rbtest-*` test-lease namespace is left out of both sides. The output is ordered: adds, updates and adoptions as namespaces, permissions, apps, the order `config_to_desired_writes` uses, then removals as apps, permissions, namespaces.
+**Ownership (implemented, 0.2.1, #693).** Step 3 above applies only to resources in `DesiredState.gitops_owned`: a resource in Raft but not in git is removed only when GitOps wrote it. A resource present in both that matches git but isn't owned produces a `ResourceChange::Adopt` carrying the spec the cluster already runs (bound image digest included), so the write changes nothing but records ownership. Everything in an `rbtest-*` test-lease namespace is left out of both sides, and so is every app a controller owns (#1125, §5.10). The output is ordered: adds, updates and adoptions as namespaces, permissions, apps, the order `config_to_desired_writes` uses, then removals as apps, permissions, namespaces.
 
 ### 5.5 Selective Apply
 
@@ -676,22 +665,14 @@ This is critical to prevent Lettuce from fighting the autoscaler during traffic 
 > **Status: implemented (as leader handover).** See Section 3.2. The coordinator
 > is the Raft leader: `coordinator_for_leader` records it in
 > `SyncState.coordinator_node_id` on every recorded sync and tags a change of
-> leader `Failover`. So a failover *is* an ordinary Raft leader election — the
-> new leader resumes syncing and stamps itself coordinator on its first recorded
-> sync. The separate Raft-heartbeat coordinator election of earlier drafts is not
-> used; the timeline below describes the equivalent leader-handover flow.
-
-See Section 3.2. Summary of the (planned) failover timeline:
+> leader `Failover`. A failover *is* an ordinary Raft leader election.
 
 | Time | Event |
 |------|-------|
-| T+0 | Coordinator node fails (Raft heartbeat stops). |
-| T+500ms | First missed heartbeat detected by council. |
-| T+1.5s | Third missed heartbeat. Council marks coordinator as failed. |
-| T+1.5s | Leader writes new `CoordinatorElection` entry to Raft. |
-| T+1.6s | New coordinator receives election entry, begins startup. |
-| T+1.6s-5s | New coordinator clones git repo (if not already cached locally). |
-| T+5s | Sync loop resumes. First poll fetches from git and reconciles. |
+| T+0 | The leader fails. |
+| T+1–2s | Raft elects a new leader. |
+| T+1–5s | The new leader's sync loop starts, cloning the repository if it has no usable local clone. |
+| next tick | The first sync fetches from git, reconciles, and records the new leader as coordinator with reason `Failover`. |
 
 **Worst-case sync gap:** `poll_interval + failover_time` (approximately 35 seconds with default settings). In webhook mode, the gap is just the failover time (approximately 5 seconds), since the next push webhook triggers immediate sync.
 
@@ -710,6 +691,49 @@ Per Section 17 of the whitepaper, Lettuce automatically enforces `require_signed
 **Implementation status (B13).** The first implementation grepped `git diff` for an added line containing `script`. That missed an edit to the body of a multiline script (the key sits in unchanged context), a deletion (no added line), and a failed `git diff` whose empty output read as "no change". The parsed comparison above replaced it.
 
 ---
+
+### 5.9 Policies (#1117)
+
+Policies are a GitOps kind like permissions: the diff carries
+`ChangePayload::Policy`, and the ownership set records `policies`, so GitOps
+prunes only the policies it wrote. Policy writes and removals come before any
+app write, so every app in a commit is judged by the policies that commit
+declares. Each added or changed app is judged in `apply_changes` as the
+caller `gitops` with role `system` and source `gitops`, and written inside a
+`PolicyFenced` entry. A denied app is a refused change in the partial sync
+result, named `app.<namespace>/<name>: denied by policy <name>: <message>`,
+and the rest of the commit applies. The commit stays unadvanced, so the next
+sync tries the app again.
+
+Policy defaults (#1118) fill fields in before the app is bound and written,
+so desired state holds a spec git never wrote. Binding a tag to a digest does
+the same. To keep that from looking like
+drift on every sync, the fenced write carries the spec git declared and the
+state machine keeps it in `DesiredState::declared_apps`. `compute_diff` takes
+it as `CurrentState::declared_apps` and compares git with the declared spec
+where there is one, the effective spec otherwise (with bound images read back
+as their tags, for apps written before #1118). An adopted app is written
+with the effective spec, which keeps its declared one. A new or changed
+default reaches a GitOps app only when git changes that app.
+
+GitOps refuses jobs, so `applies_to = "jobs"` policies never meet a sync. An
+`action = "audit"` finding (#1119) doesn't refuse the app; the runner logs it
+as `gitops: audit: …`, and `relish policy audit` lists it for as long as the
+app breaks the rule, judging GitOps-owned apps as the caller `gitops`.
+
+### 5.10 Controller-owned apps (#1125)
+
+GitOps owns what it wrote; a controller owns what it claimed. An app whose
+spec in Raft has an `owner` (the name of the controller's API token) is out of
+the diff entirely: `diff_apps` neither updates, adopts nor prunes it, whatever
+git says, the way it skips `rbtest-*` namespaces. A claim takes the app out of
+`gitops_owned.apps` in the same state-machine step, so a later commit that
+drops it can't prune it either.
+
+Git can't declare an owner. A controller claims apps with its own token, and a
+repository has none, so `apply_gitops_write` refuses an `AppSpec` that carries
+one: it's a refused change in the partial sync result, and the rest of the
+commit applies. The full rule table is in `deployments.md` §5.11.
 
 ## 6. Configuration
 
@@ -758,35 +782,13 @@ webhook_rate_limit = 10
 
 ### 6.2 Git Credentials
 
-Git credentials aren't stored in the `[gitops]` config block (which is Raft-replicated and visible to all council members). Instead, each council member node configures them via `node.toml`:
-
-```toml
-# In /etc/reliaburger/node.toml
-[gitops.credentials]
-# For SSH: path to the private key.
-ssh_key_path = "/etc/reliaburger/git_ssh_key"
-
-# For HTTPS: username and token/password.
-# These values can be encrypted with age (same as secrets).
-https_username = "git"
-https_token = "ENC[AGE:Z2hwX3Rva2VuX3ZhbHVl...]"
-```
-
-The coordinator loads credentials from its local `node.toml`. On failover, the new coordinator loads credentials from its own `node.toml`. All council members must have valid git credentials configured if they may become the GitOps coordinator.
+An earlier draft kept git credentials out of the `[gitops]` block, in a per-node `[gitops.credentials]` table in `node.toml`. That table doesn't exist.
 
 **As implemented (0.2.1, #693).** There's no `[gitops.credentials]` table. Credentials travel inside the configuration (`user:token@` in the repository URL, and `webhook_secret`), and `StoredGitOpsConfig::seal` lifts them out before the configuration reaches Raft. They're sealed with HKDF + AES-256-GCM under a key derived from the cluster master key (`wrap_key`, info `reliaburger-gitops-credentials-wrap-v1`), the same wrapping the CA keys use, so every council member with the master key can unseal them and the Raft log never holds them in clear. A configuration with a credential and no master key is refused. An SSH key on disk still works as before, through the node's own SSH configuration.
 
 ### 6.3 Validation
 
-`relish lint` validates the `[gitops]` configuration:
-
-- `repo` is a valid git URL (SSH or HTTPS).
-- `branch` is non-empty.
-- `poll_interval_secs` is a non-negative integer within bounds.
-- `webhook_secret` is at least 32 characters (if present).
-- `trusted_signing_keys` is non-empty if `require_signed_commits` is true.
-- `webhook_rate_limit` is between 1 and 1000.
-- If any file under `path` contains a `script` field and `trusted_signing_keys` is empty, a warning is emitted.
+*Planned.* Nothing validates a `[gitops]` configuration before it's used: `relish lint` doesn't read it, and the API stores what it's given. The checks we want are a valid SSH or HTTPS `repo`, a non-empty `branch`, a minimum `webhook_secret` length, non-empty `trusted_signing_keys` when `require_signed_commits` is true, bounds on `webhook_rate_limit`, and a warning when files under `path` contain a `script` field and no signing keys are trusted. Today a bad repository or branch shows up as a sync error in `SyncState`.
 
 ---
 
@@ -826,7 +828,7 @@ The coordinator loads credentials from its local `node.toml`. On failover, the n
 
 **Cause:** Node crash, hardware failure, network partition isolating the coordinator from the council.
 
-**Behaviour (target design — see the Section 3.2 and 5.7 status notes):** the council would detect the failure via Raft heartbeat timeout (approximately 1.5 seconds), the leader would elect a new coordinator, and the new coordinator would clone the repo (if needed) and resume syncing. Today, because syncing is leader-driven, a coordinator node failing is only consequential if it was also the Raft leader, in which case ordinary Raft leader election restores syncing.
+**Behaviour:** the coordinator is the leader, so this is a leader failure. Raft elects a new leader, and its sync loop clones the repository (if needed) and resumes syncing (Section 5.7).
 
 **Impact:** Sync gap of approximately 5 seconds (failover) plus up to `poll_interval` for the next poll. In webhook mode, the gap is just the failover time because the next webhook triggers immediate sync. Applications continue running unaffected.
 
@@ -870,7 +872,7 @@ The primary security boundary. Signed commits ensure that only authorised develo
 
 ### 8.2 Webhook HMAC Validation
 
-Every incoming webhook is validated using HMAC-SHA256 before any processing occurs. The validation uses constant-time comparison to prevent timing attacks. The `webhook_secret` must be at least 32 characters.
+Every incoming webhook is validated using HMAC-SHA256 before any processing occurs. The validation uses constant-time comparison to prevent timing attacks. Use a long random `webhook_secret`; a minimum length is planned (Section 6.3) but not enforced.
 
 **Provider compatibility:**
 
@@ -878,9 +880,8 @@ Every incoming webhook is validated using HMAC-SHA256 before any processing occu
 |----------|-----------------|--------|
 | GitHub | `X-Hub-Signature-256` | `sha256=<hex>` |
 | GitLab | `X-Gitlab-Token` | Direct comparison |
-| Gitea | `X-Gitea-Signature` | `<hex>` |
 
-Lettuce auto-detects the provider from the headers present in the request.
+Lettuce reads only those two headers (`src/bun/api/gitops.rs`). Gitea's `X-Gitea-Signature` isn't read, so a Gitea webhook is accepted only when it also sends `X-Hub-Signature-256`.
 
 ### 8.3 Git Credential Storage
 
@@ -902,7 +903,7 @@ The multi-layered defense against arbitrary code execution via git:
 2. **Binary allowlist.** Even if a malicious script is deployed, it can only call binaries on the node's allowlist (`node.toml` `[process_workloads] allowed_binaries`). A script that tries to call `/usr/bin/curl` fails if `curl` isn't on the allowlist.
 3. **Isolation.** Scripts run in a restricted namespace: cgroup limits, PID namespace, network namespace with Onion eBPF, restricted mount namespace, seccomp profile. They run as the `burger` user, not root.
 4. **Audit logging.** The SHA-256 hash of every deployed script is logged in the event history. `relish history` shows which script content was deployed and by which commit.
-5. **Lint warnings.** `relish lint` flags scripts containing suspicious patterns: `eval`, `base64 -d`, `curl | sh`, `wget | bash`, `python -c`, and downloads from unknown URLs.
+5. **Lint warnings (planned).** `relish lint` would flag scripts containing suspicious patterns: `eval`, `base64 -d`, `curl | sh`, `wget | bash`, `python -c`, and downloads from unknown URLs.
 
 ### 8.5 TLS for Webhooks
 
@@ -1064,9 +1065,9 @@ All dependencies are Rust crates, compiled into the Bun binary. No runtime depen
 
 | Crate | Version (min) | Purpose | Notes |
 |-------|--------------|---------|-------|
-| `toml` | 0.8 | TOML parsing and serialisation. | Already used throughout Reliaburger for config parsing. |
-| `sha2` | 0.10 | SHA-256 hash computation. Used for webhook HMAC and script content hashing. | Already used elsewhere in Bun. |
-| `reqwest` | 0.12 | HTTP client (not for webhook receiving, which uses the existing Bun API server). Reserved for future use: outbound notifications on sync events. | Optional dependency; may not be needed if notifications go through the existing alerting subsystem. |
+| `toml` | 1 | TOML parsing and serialisation. | Already used throughout Reliaburger for config parsing. |
+| `sha2` | 0.11 | SHA-256 hash computation, for webhook delivery receipts. Webhook HMAC uses `ring`. | Already used elsewhere in Bun. |
+| `reqwest` | 0.13 | HTTP client (not for webhook receiving, which uses the existing Bun API server). Reserved for future use: outbound notifications on sync events. | Optional dependency; may not be needed if notifications go through the existing alerting subsystem. |
 | `serde` / `serde_json` | 1.0 | Serialisation for webhook payload parsing and `SyncState` Raft replication. | Already a core dependency. |
 | `tokio` | 1.0 | Async runtime for the sync loop timer, webhook handler, and git fetch. | Already the async runtime for Bun. |
 | `ring` | 0.17 | Constant-time HMAC-SHA256 computation and comparison for webhook validation. | `ring::hmac::verify` gives constant-time comparison built in. |

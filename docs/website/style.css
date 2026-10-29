@@ -119,7 +119,10 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .recording-chapters button { font: inherit; color: var(--ink); background: none; border: 1px solid var(--line); border-radius: 3px; padding: 4px 8px; cursor: pointer; }
 .recording-chapters button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 
-.install-grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 44px; align-items: start; }
+/* The command gets the section's full width so it shows in full; the text goes
+   below it at every width (#1369). */
+.install-grid { display: grid; grid-template-columns: 1fr; gap: 24px; }
+.install-copy { max-width: 700px; }
 .install-copy p { color: var(--muted); }
 .install-copy p:first-child { color: var(--ink); }
 .install-links { font-size: .875rem; margin: 0; }
@@ -172,7 +175,7 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
   .status { grid-template-columns: 1fr auto; gap: 10px 22px; }
   .status p { grid-column: 1; }
   .status a { grid-column: 2; grid-row: 1; }
-  .start-grid, .install-grid { grid-template-columns: 1fr; gap: 24px; }
+  .start-grid { grid-template-columns: 1fr; gap: 24px; }
   .start-copy { max-width: 700px; }
   .subsystems > div { grid-template-columns: 1fr; gap: 2px; }
   .tour-steps li { grid-template-columns: 2rem minmax(0, 1fr); }

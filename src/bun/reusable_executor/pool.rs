@@ -9,6 +9,7 @@ use crate::grill::runc::RuncGrill;
 use crate::grill::{ContainerState, Grill, InstanceId, InstanceIdentity};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -51,6 +52,9 @@ const RETIREMENT_DEADLINE: Duration = Duration::from_secs(10);
 /// #759, and the command never reached that executor, so a second, fresh
 /// one runs it at most once. Both share the command's deadline.
 const STARTUP_ATTEMPTS: u32 = 2;
+/// How often a running command's namespace enforcement is checked again.
+#[cfg(feature = "ebpf")]
+const POLICY_TICK: Duration = Duration::from_millis(100);
 /// How one try at starting a cold executor ended.
 enum Startup {
     Started,
@@ -66,6 +70,8 @@ pub(crate) struct CommandReporting<'a> {
     pub singletons: &'a std::sync::Mutex<
         std::collections::BTreeMap<u64, Arc<crate::bun::task_runtime::SingletonRuntime>>,
     >,
+    /// Where each running command is listed for Smoker, if anywhere.
+    pub attempts: Option<&'a Arc<crate::bun::live_attempts::LiveAttempts>>,
 }
 
 struct Slot {
@@ -74,9 +80,12 @@ struct Slot {
     /// it (a charged executor, or an admitted reservation), until release.
     /// A caller still waiting for admission holds nothing, so isn't counted.
     holder: Option<u64>,
-    active_run: Option<u64>,
-    /// The running executor's cgroup while `active_run` is set: the context
-    /// itself is checked out of the slot then, so metrics read it here.
+    /// The run whose caller has this slot checked out. Its command counts
+    /// as active only once the slot's flag in [`ReusablePool::started`] is
+    /// set too.
+    run: Option<u64>,
+    /// The checked-out executor's cgroup, for metrics: the context itself
+    /// is out of the slot while its command runs.
     cgroup: Option<PathBuf>,
     key: Option<ExecutorKey>,
     context: Option<Context>,
@@ -101,6 +110,9 @@ struct Context {
     /// Filesystem cleanup may continue after the caller times out. Keep its
     /// handle until completion before releasing or reusing the slot.
     cleanup: Option<tokio::task::JoinHandle<bool>>,
+    /// A host executor's share of Bun's environment, read once at start
+    /// rather than for every command (#1030).
+    host_environment: Option<std::collections::BTreeMap<String, String>>,
     #[cfg(feature = "ebpf")]
     namespace: Option<crate::bun::task_namespace::NamespaceLease>,
 }
@@ -115,9 +127,24 @@ pub(crate) struct ReusablePool<G> {
     prefix: String,
     budget: Arc<ExecutionBudget>,
     slots: Mutex<Vec<Slot>>,
+    /// One flag per slot: the command of the run checked out there has
+    /// started. The command's task sets it without the slot lock, so a
+    /// start costs no lock (#1030); checkout clears it under the lock.
+    /// Readers count a command only when the slot's `run` matches as well.
+    started: Box<[AtomicBool]>,
     changed: Notify,
     #[cfg(feature = "ebpf")]
     policy: Option<Arc<crate::bun::task_namespace::TaskNamespacePolicy>>,
+    /// Advances every [`POLICY_TICK`] while the pool has a policy. Running
+    /// commands re-check their namespace on it, so no command creates a
+    /// timer of its own (#1030).
+    #[cfg(feature = "ebpf")]
+    policy_ticks: tokio::sync::watch::Receiver<u64>,
+    /// Slot locks taken on a task's own path (checkout, admission, start
+    /// and hand-back), counted so a test can hold that path to its budget.
+    /// Eviction and the metrics readers lock without counting.
+    #[cfg(test)]
+    task_locks: std::sync::atomic::AtomicUsize,
 }
 impl<G: Grill + Clone + 'static> ReusablePool<G> {
     pub(crate) fn new(
@@ -173,6 +200,11 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             Arc<crate::bun::task_namespace::TaskNamespacePolicy>,
         >,
     ) -> Arc<Self> {
+        let count = count.clamp(1, super::MAX_EXECUTOR_SLOTS);
+        #[cfg(feature = "ebpf")]
+        let (tick, policy_ticks) = tokio::sync::watch::channel(0u64);
+        #[cfg(feature = "ebpf")]
+        let supervised = policy.is_some();
         let pool = Arc::new(Self {
             runtime,
             group_kill,
@@ -181,11 +213,11 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             prefix,
             budget,
             slots: Mutex::new(
-                (0..count.clamp(1, super::MAX_EXECUTOR_SLOTS))
+                (0..count)
                     .map(|_| Slot {
                         busy: false,
                         holder: None,
-                        active_run: None,
+                        run: None,
                         cgroup: None,
                         key: None,
                         context: None,
@@ -193,9 +225,14 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     })
                     .collect(),
             ),
+            started: (0..count).map(|_| AtomicBool::new(false)).collect(),
             changed: Notify::new(),
             #[cfg(feature = "ebpf")]
             policy,
+            #[cfg(feature = "ebpf")]
+            policy_ticks,
+            #[cfg(test)]
+            task_locks: std::sync::atomic::AtomicUsize::new(0),
         });
         let weak = Arc::downgrade(&pool);
         tokio::spawn(async move {
@@ -205,7 +242,30 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 pool.evict_idle().await;
             }
         });
+        // Its own task, not the eviction loop's: a retirement can hold that
+        // loop for seconds, and supervision must not wait for it. When the
+        // pool goes, the sender drops and any receiver left fails closed.
+        #[cfg(feature = "ebpf")]
+        if supervised {
+            let weak = Arc::downgrade(&pool);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(POLICY_TICK);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                interval.tick().await;
+                while weak.strong_count() > 0 {
+                    interval.tick().await;
+                    tick.send_modify(|count| *count = count.wrapping_add(1));
+                }
+            });
+        }
         pool
+    }
+    /// Lock the slots on a task's own path.
+    async fn lock_slots(&self) -> tokio::sync::MutexGuard<'_, Vec<Slot>> {
+        #[cfg(test)]
+        self.task_locks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.slots.lock().await
     }
     pub(crate) fn timings(&self) -> TimingSnapshot {
         self.timings.snapshot()
@@ -269,28 +329,39 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     /// for CPU and memory sampling. An executor's group holds its helper and
     /// its task groups, so the sample includes the helper's small overhead.
     pub(crate) async fn run_cgroups(&self, run: u64) -> Vec<PathBuf> {
-        self.slots
-            .lock()
-            .await
-            .iter()
-            .filter(|slot| slot.active_run == Some(run))
+        let slots = self.slots.lock().await;
+        self.running(&slots, run)
             .filter_map(|slot| slot.cgroup.clone())
             .collect()
     }
     pub(crate) async fn active_commands(&self, run: u64) -> u64 {
-        self.slots
-            .lock()
-            .await
+        let slots = self.slots.lock().await;
+        self.running(&slots, run).count() as u64
+    }
+    /// The slots, read under their lock, running a command of `run`.
+    fn running<'a>(&'a self, slots: &'a [Slot], run: u64) -> impl Iterator<Item = &'a Slot> {
+        // Acquire pairs with the Release in `command_started`: a command
+        // seen as started has its caller's earlier increments visible too.
+        slots
             .iter()
-            .filter(|slot| slot.active_run == Some(run))
-            .count() as u64
+            .zip(&self.started)
+            .filter_map(move |(slot, started)| {
+                (slot.run == Some(run) && started.load(Ordering::Acquire)).then_some(slot)
+            })
+    }
+    /// Mark the command of the run checked out at `index` as started.
+    fn command_started(&self, index: usize) {
+        self.started[index].store(true, Ordering::Release);
     }
     /// This run's active commands and its `callers`, read while holding the
     /// slot lock. A caller counts itself before it checks a slot out, and
     /// stops counting only after it has vacated that slot, which also takes
     /// the lock. So every command counted here has its caller counted too:
     /// the lock orders the caller's increment before, and its decrement
-    /// after, this read, even though the counter itself is `Relaxed`.
+    /// after, this read, even though the counter itself is `Relaxed`. A
+    /// command's start flag is set outside the lock, after its caller's
+    /// increment, with `Release`; reading it with `Acquire` carries that
+    /// increment along.
     pub(crate) async fn command_activity(
         &self,
         run: u64,
@@ -298,10 +369,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     ) -> crate::bun::task_executor::CommandActivity {
         let slots = self.slots.lock().await;
         crate::bun::task_executor::CommandActivity {
-            active: slots
-                .iter()
-                .filter(|slot| slot.active_run == Some(run))
-                .count() as u64,
+            active: self.running(&slots, run).count() as u64,
             callers: callers.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -346,7 +414,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             if cancel.is_cancelled() {
                 return None;
             }
-            let mut slots = self.slots.lock().await;
+            let mut slots = self.lock_slots().await;
             let warm = (!self.budget.has_waiters())
                 .then(|| {
                     slots.iter().position(|slot| {
@@ -382,6 +450,15 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     slots[index].holder = holder;
                 }
                 slots[index].key = Some(key);
+                slots[index].run = holder;
+                // A warm executor's cgroup is known now; a cold one's is
+                // recorded once it has started.
+                slots[index].cgroup = slots[index]
+                    .context
+                    .as_ref()
+                    .filter(|context| context.key == key)
+                    .map(|context| context.base.clone());
+                self.started[index].store(false, Ordering::Relaxed);
                 return Some((index, slots[index].context.take(), lease));
             }
             drop(slots);
@@ -399,7 +476,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         cancel: &CancellationToken,
     ) -> Option<ResourceLease> {
         let lease = self.budget.acquire(reservation, cancel).await?;
-        self.slots.lock().await[index].holder = holder;
+        self.lock_slots().await[index].holder = holder;
         Some(lease)
     }
     /// One retirement attempt: true once the helper has stopped and its task
@@ -555,6 +632,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         .await?;
         let helper = context.directory.join("helper");
         install_helper(helper.clone(), HOST_HELPER).await?;
+        context.host_environment = Some(crate::grill::process::inherited_host_environment());
         // Socket credentials and the durable owner's unreaped helper identity
         // authenticate this short address. Hash the executor directory too,
         // so two Buns on one host never share a name.
@@ -820,6 +898,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             request: HELPER_MEMORY_BYTES,
             limit: HELPER_MEMORY_BYTES,
         });
+        // The job's `pids` is for its commands. runc would write it over the
+        // helper's own limit, which `prepare_cgroups` already set.
+        helper_profile.pids = None;
         spec.linux.resources = crate::grill::oci::generate_job_oci_spec(
             "helper",
             "default",
@@ -894,7 +975,11 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     where
         F: std::future::Future<Output = Result<JobSpec, String>> + Send,
     {
-        let CommandReporting { sink, singletons } = reporting;
+        let CommandReporting {
+            sink,
+            singletons,
+            attempts,
+        } = reporting;
         // The command never ran, so the reason is the only output the task
         // keeps: without it a failed task shows nothing at all (#786). A
         // refusal about the job fails the task; a runtime, host, registry or
@@ -961,6 +1046,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         let mut reservation = reservation;
         let mut image = None;
         let mut startup_attempt = 1;
+        let cold = checkout.context.is_none();
         while checkout.context.is_none() {
             let lease = match reservation.take() {
                 Some(lease) => Some(lease),
@@ -1059,6 +1145,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 idle_since: tokio::time::Instant::now(),
                 probe: None,
                 cleanup: None,
+                host_environment: None,
                 #[cfg(feature = "ebpf")]
                 namespace: None,
             });
@@ -1115,6 +1202,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             return failed(error);
         }
         drop(admission_timer.take());
+        if cold && let Some(context) = checkout.context.as_ref() {
+            self.lock_slots().await[index].cgroup = Some(context.base.clone());
+        }
         let Some(context) = checkout.context.as_mut() else {
             checkout.release().await;
             return failed(ExecutorError::Unavailable("missing executor context"));
@@ -1142,21 +1232,21 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 crate::config::types::EnvValue::Plain(value.clone()),
             );
         }
-        let mut process = crate::grill::oci::generate_job_oci_spec(
-            "task",
-            "default",
-            &template,
-            "/sys/fs/cgroup/unused",
-            None,
-        )
-        .process;
+        // A command needs only a process, not a whole container spec.
+        let mut process = crate::grill::oci::job_process(&template);
         if self.runtime.host() {
             // Preserve the existing owned host contract: commands run as Bun's
             // effective user, while the helper has a separate protected identity.
             process.user.uid = nix::unistd::geteuid().as_raw();
             process.user.gid = nix::unistd::getegid().as_raw();
-            // The helper execs with exactly this environment.
-            process.env = crate::grill::process::host_environment(&process.env)
+            // The helper execs with exactly this environment: Bun's own
+            // variables, read once when the executor started, overlaid with
+            // this command's.
+            let inherited = match &context.host_environment {
+                Some(inherited) => inherited.clone(),
+                None => crate::grill::process::inherited_host_environment(),
+            };
+            process.env = crate::grill::process::host_environment_over(inherited, &process.env)
                 .into_iter()
                 .map(|(key, value)| format!("{key}={value}"))
                 .collect();
@@ -1184,8 +1274,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 return failed(error);
             }
         };
-        let run_id = task.run.as_ref().map(|run| run.batch_id);
         let executor_cgroup = context.base.clone();
+        let context_id = context.id.clone();
         // Only the command's own run time, from the helper's start receipt to
         // its exit: not slot queueing, admission, image pulls or cleanup.
         let mut ran = None;
@@ -1207,6 +1297,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             let mut started = false;
             let mut began = tokio::time::Instant::now();
             let mut logs = CommandLogs::new(task, &template, sink);
+            // Listed for Smoker from the start receipt until this future
+            // ends, however it ends (#704).
+            let mut _listed = None;
             if let Some(run) = task
                 .run
                 .as_ref()
@@ -1236,9 +1329,18 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     protocol::Event::Started if !started => {
                         started = true;
                         began = tokio::time::Instant::now();
-                        let mut slots = self.slots.lock().await;
-                        slots[index].active_run = run_id;
-                        slots[index].cgroup = Some(executor_cgroup.clone());
+                        self.command_started(index);
+                        _listed = attempts
+                            .zip(crate::bun::live_attempts::LiveAttempt::of_task(
+                                task,
+                                template.namespace.as_deref().unwrap_or("default"),
+                                crate::bun::live_attempts::AttemptHandle::TaskGroup(
+                                    executor_cgroup.join("task"),
+                                ),
+                                None,
+                                Some(context_id.clone()),
+                            ))
+                            .map(|(attempts, attempt)| attempts.register(attempt));
                     }
                     protocol::Event::Output { stream, bytes } if started => {
                         output.push(&bytes);
@@ -1280,23 +1382,22 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 }
             }
         };
+        // A command with no namespace policy has nothing to supervise, and
+        // one with a policy waits on the pool's tick, not a timer of its own.
         let policy_monitor = async {
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                #[cfg(feature = "ebpf")]
-                if let Some(policy) = &self.policy {
-                    policy
-                        .check(template.namespace.as_deref().unwrap_or("default"))
-                        .await?;
-                }
+            #[cfg(feature = "ebpf")]
+            if let Some(policy) = &self.policy {
+                let mut ticks = self.policy_ticks.clone();
+                ticks.mark_unchanged();
+                let namespace = template.namespace.as_deref().unwrap_or("default");
+                return supervise_policy(ticks, || policy.check(namespace)).await;
             }
-            #[allow(unreachable_code)]
-            Ok::<(), std::io::Error>(())
+            std::future::pending::<std::io::Error>().await
         };
         let outcome = tokio::select! { biased;
             () = cancel.cancelled() => AttemptOutcome::Cancelled,
             () = crate::bun::task_executor::wait_deadline(deadline) => AttemptOutcome::TimedOut,
-            result = policy_monitor => AttemptOutcome::Unknown { reason: result.err().map_or_else(|| "namespace supervision stopped".into(), |error| error.to_string()) },
+            error = policy_monitor => AttemptOutcome::Unknown { reason: error.to_string() },
             result = observe => match result { Ok(outcome) => outcome, Err(error) => AttemptOutcome::Unknown { reason: error.to_string() } },
         };
         bytes.fill(0);
@@ -1321,13 +1422,35 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     }
 }
 
+/// Run `check` at every tick of `ticks` until it fails, and return why. A
+/// tick that stops for good ends supervision too: the command is then no
+/// longer watched, so it must not keep running.
+#[cfg(any(feature = "ebpf", test))]
+async fn supervise_policy<C, F>(
+    mut ticks: tokio::sync::watch::Receiver<u64>,
+    mut check: C,
+) -> std::io::Error
+where
+    C: FnMut() -> F,
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    loop {
+        if ticks.changed().await.is_err() {
+            return std::io::Error::other("namespace supervision stopped");
+        }
+        if let Err(error) = check().await {
+            return error;
+        }
+    }
+}
+
 /// Hand a slot back, holding `context` warm or empty.
 fn vacate(slot: &mut Slot, context: Option<Context>) {
     slot.key = context.as_ref().map(|context| context.key);
     slot.context = context;
     slot.busy = false;
     slot.holder = None;
-    slot.active_run = None;
+    slot.run = None;
     slot.cgroup = None;
 }
 
@@ -1339,7 +1462,7 @@ fn quarantine(slot: &mut Slot, context: Context, budget: Duration) {
         context.id.0
     );
     slot.holder = None;
-    slot.active_run = None;
+    slot.run = None;
     slot.cgroup = None;
     slot.retiring = Some(context);
 }
@@ -1371,7 +1494,7 @@ struct Checkout<G: Grill + Clone + 'static> {
 impl<G: Grill + Clone + 'static> Checkout<G> {
     /// Hand the slot back, keeping its executor (if any) warm.
     async fn release(mut self) {
-        let mut slots = self.pool.slots.lock().await;
+        let mut slots = self.pool.lock_slots().await;
         vacate(&mut slots[self.index], self.context.take());
         self.returned = true;
         drop(slots);
@@ -1383,7 +1506,7 @@ impl<G: Grill + Clone + 'static> Checkout<G> {
             Some(context) => self.pool.retire(context, RETIREMENT_DEADLINE).await,
             None => true,
         };
-        let mut slots = self.pool.slots.lock().await;
+        let mut slots = self.pool.lock_slots().await;
         match self.context.take() {
             Some(context) if !retired => {
                 quarantine(&mut slots[self.index], context, RETIREMENT_DEADLINE)
@@ -1404,7 +1527,7 @@ impl<G: Grill + Clone + 'static> Checkout<G> {
             return true;
         };
         let retired = self.pool.retire(old, RETIREMENT_DEADLINE).await;
-        let mut slots = self.pool.slots.lock().await;
+        let mut slots = self.pool.lock_slots().await;
         let Some(old) = self.context.take() else {
             return true;
         };
@@ -1428,12 +1551,12 @@ impl<G: Grill + Clone + 'static> Drop for Checkout<G> {
         let context = self.context.take();
         // Drop can't wait for the slot lock, so a task finishes the hand-over.
         let handoff = async move {
-            let mut slots = pool.slots.lock().await;
+            let mut slots = pool.lock_slots().await;
             match context {
                 Some(context) => {
                     let slot = &mut slots[index];
                     slot.holder = None;
-                    slot.active_run = None;
+                    slot.run = None;
                     slot.cgroup = None;
                     slot.retiring = Some(context);
                 }
@@ -1597,7 +1720,7 @@ fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()>
     std::fs::write(task.join("memory.swap.max"), "0")?;
     std::fs::write(task.join("memory.high"), profile.memory.request.to_string())?;
     std::fs::write(task.join("memory.oom.group"), "1")?;
-    std::fs::write(task.join("pids.max"), "256")?;
+    std::fs::write(task.join("pids.max"), profile.pids.to_string())?;
     std::fs::write(
         base.join("helper/cpu.max"),
         crate::grill::cpu_max_from_millicores(100),
@@ -1611,7 +1734,7 @@ fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()>
         HELPER_MEMORY_BYTES.to_string(),
     )?;
     std::fs::write(base.join("helper/memory.swap.max"), "0")?;
-    std::fs::write(base.join("helper/pids.max"), "16")?;
+    std::fs::write(base.join("helper/pids.max"), super::HELPER_PIDS.to_string())?;
     std::fs::write(
         base.join("helper/memory.max"),
         HELPER_MEMORY_BYTES.to_string(),
@@ -1912,6 +2035,7 @@ mod tests {
             host_process: true,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: OciRoot {
                 path: crate::grill::oci::HOST_ROOT.into(),
                 readonly: false,
@@ -1933,7 +2057,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         };
         process.create(&id, &spec).await.unwrap();
         process.start(&id).await.unwrap();
@@ -1957,9 +2084,263 @@ mod tests {
             idle_since: tokio::time::Instant::now(),
             probe: None,
             cleanup: None,
+            host_environment: None,
             #[cfg(feature = "ebpf")]
             namespace: None,
         }
+    }
+
+    /// One command as a helper received it.
+    #[derive(Debug)]
+    struct ReceivedCommand {
+        args: Vec<String>,
+        env: Vec<String>,
+    }
+
+    /// Read one command frame the way the C helper does.
+    async fn read_command(socket: &mut UnixStream) -> std::io::Result<(u64, ReceivedCommand)> {
+        let length = socket.read_u32().await? as usize;
+        let mut frame = vec![0; length];
+        socket.read_exact(&mut frame).await?;
+        let mut frame = &frame[..];
+        let sequence = frame.read_u64().await?;
+        let args = frame.read_u32().await? as usize;
+        let env = frame.read_u32().await? as usize;
+        let _uid = frame.read_u32().await?;
+        let _gid = frame.read_u32().await?;
+        let mut strings = Vec::new();
+        for _ in 0..1 + args + env {
+            let length = frame.read_u32().await? as usize;
+            let mut bytes = vec![0; length];
+            frame.read_exact(&mut bytes).await?;
+            strings.push(String::from_utf8(bytes).unwrap());
+        }
+        let env = strings.split_off(1 + args);
+        let args = strings.split_off(1);
+        Ok((sequence, ReceivedCommand { args, env }))
+    }
+
+    /// A helper on the far end of a warm executor's connection. It runs
+    /// nothing: it answers each command as one that started and exited 0,
+    /// then confirms its cleanup, and hands every command it got to the
+    /// returned channel.
+    fn fake_helper(
+        mut socket: UnixStream,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<ReceivedCommand> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((sequence, command)) = read_command(&mut socket).await {
+                let _ = sender.send(command);
+                let mut reply = vec![1];
+                reply.extend_from_slice(&sequence.to_be_bytes());
+                reply.push(3);
+                reply.extend_from_slice(&sequence.to_be_bytes());
+                reply.extend_from_slice(&0i32.to_be_bytes());
+                if socket.write_all(&reply).await.is_err()
+                    || socket.read_u8().await.ok() != Some(b'C')
+                    || socket.read_u64().await.ok() != Some(sequence)
+                {
+                    break;
+                }
+                let mut ready = vec![4];
+                ready.extend_from_slice(&sequence.to_be_bytes());
+                if socket.write_all(&ready).await.is_err() {
+                    break;
+                }
+            }
+        });
+        receiver
+    }
+
+    fn host_template() -> JobSpec {
+        toml::from_str(
+            "runtime='process'\nexec='/bin/echo'\ncpu='100m'\nmemory='32Mi'\n\
+             env={ FROM_TEMPLATE='yes' }",
+        )
+        .unwrap()
+    }
+
+    /// A one-slot host pool holding a warm executor for `template`, whose
+    /// helper is [`fake_helper`].
+    async fn warm_pool(
+        root: &Path,
+        template: &JobSpec,
+    ) -> (
+        Arc<ReusablePool<Forgetting>>,
+        tokio::sync::mpsc::UnboundedReceiver<ReceivedCommand>,
+    ) {
+        let budget = ExecutionBudget::new(Resources::new(4000, 4 << 30, 0));
+        let pool = pool_with(
+            &ProcessGrill::new(),
+            Forgetting::default(),
+            &budget,
+            GroupKill::CgroupKill,
+            1,
+        );
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let mut warm = context(&budget, InstanceId("rbtest-warm-host".into()), root);
+        warm.key = ExecutorKey::new(template).unwrap();
+        warm.connection = Some(ours);
+        warm.host_environment = Some(crate::grill::process::inherited_host_environment());
+        // The task group the helper empties after every command.
+        std::fs::create_dir_all(warm.base.join("task")).unwrap();
+        std::fs::write(warm.base.join("task/cgroup.events"), "populated 0\n").unwrap();
+        pool.release(0, Some(warm)).await;
+        (pool, fake_helper(theirs))
+    }
+
+    fn host_task(index: u32, args: &[&str], env: &[(&str, &str)]) -> TaskInvocation {
+        TaskInvocation {
+            template: None,
+            index,
+            attempt: 1,
+            program: "/bin/echo".into(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            env: env
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            run: Some(crate::bun::task_executor::RunIdentity {
+                batch_id: 7,
+                task_count: 2,
+                job_name: None,
+            }),
+        }
+    }
+
+    async fn run_warm<G: Grill + Clone + 'static>(
+        pool: &Arc<ReusablePool<G>>,
+        task: &TaskInvocation,
+        template: &JobSpec,
+    ) -> Attempt {
+        let singletons = std::sync::Mutex::new(std::collections::BTreeMap::new());
+        pool.run(
+            task,
+            template.clone(),
+            Duration::from_secs(10),
+            &CancellationToken::new(),
+            None::<fn() -> std::future::Ready<Result<JobSpec, String>>>,
+            CommandReporting {
+                sink: None,
+                singletons: &singletons,
+                attempts: None,
+            },
+        )
+        .await
+    }
+
+    /// #1030: the process is built once per command from the template and
+    /// that command alone, and the host environment read at the executor's
+    /// start never carries one command's arguments or variables into the
+    /// next.
+    #[tokio::test]
+    async fn each_warm_command_gets_exactly_its_own_arguments_and_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let template = host_template();
+        let (pool, mut received) = warm_pool(root.path(), &template).await;
+        let tasks = [
+            host_task(
+                0,
+                &["first", "--loud"],
+                &[("ONLY_FIRST", "1"), ("SHARED", "a")],
+            ),
+            host_task(1, &["second"], &[("SHARED", "b")]),
+            host_task(2, &[], &[]),
+        ];
+        for task in &tasks {
+            let attempt = run_warm(&pool, task, &template).await;
+            assert_eq!(attempt.outcome, AttemptOutcome::Exited { code: 0 });
+            let command = received.recv().await.unwrap();
+            // What a fresh host command would get for this task alone.
+            let mut fresh = template.clone();
+            fresh.command = Some(task.args.clone());
+            for (key, value) in &task.env {
+                fresh.env.insert(
+                    key.clone(),
+                    crate::config::types::EnvValue::Plain(value.clone()),
+                );
+            }
+            let spec = crate::grill::oci::generate_job_oci_spec(
+                "task",
+                "default",
+                &fresh,
+                "/sys/fs/cgroup/unused",
+                None,
+            );
+            let env: Vec<String> = crate::grill::process::host_environment(&spec.process.env)
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect();
+            assert_eq!(command.args, spec.process.args, "task {}", task.index);
+            assert_eq!(command.env, env, "task {}", task.index);
+        }
+    }
+
+    /// #1030: a running command re-checks its namespace on the pool's tick
+    /// and never on a timer of its own, so starting one creates no timer.
+    #[tokio::test(start_paused = true)]
+    async fn policy_supervision_checks_on_each_pool_tick_and_never_on_its_own_clock() {
+        let (tick, ticks) = tokio::sync::watch::channel(0u64);
+        let checks = AtomicUsize::new(0);
+        let supervision = supervise_policy(ticks, || {
+            checks.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        });
+        tokio::pin!(supervision);
+        // An hour of a paused clock with no tick: nothing of its own fires.
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(futures_util::poll!(supervision.as_mut()).is_pending());
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+        for expected in 1..=3 {
+            tick.send_modify(|count| *count += 1);
+            assert!(futures_util::poll!(supervision.as_mut()).is_pending());
+            assert_eq!(checks.load(Ordering::SeqCst), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_supervision_ends_the_command_at_the_first_failed_check() {
+        let (tick, ticks) = tokio::sync::watch::channel(0u64);
+        let mut results = vec![Err(std::io::Error::other("enforcement was lost")), Ok(())];
+        let supervision = supervise_policy(ticks, || std::future::ready(results.pop().unwrap()));
+        tokio::pin!(supervision);
+        tick.send_modify(|count| *count += 1);
+        assert!(futures_util::poll!(supervision.as_mut()).is_pending());
+        tick.send_modify(|count| *count += 1);
+        let error = supervision.await;
+        assert_eq!(error.to_string(), "enforcement was lost");
+    }
+
+    #[tokio::test]
+    async fn policy_supervision_fails_closed_when_its_tick_stops() {
+        let (tick, ticks) = tokio::sync::watch::channel(0u64);
+        let supervision = supervise_policy(ticks, || std::future::ready(Ok(())));
+        drop(tick);
+        assert_eq!(
+            supervision.await.to_string(),
+            "namespace supervision stopped"
+        );
+    }
+
+    /// #1030: a warm command takes the slot lock to check its executor out
+    /// and to hand it back, and nowhere in between. Its start used to take
+    /// it a third time.
+    #[tokio::test]
+    async fn a_warm_command_takes_the_slot_lock_only_to_check_out_and_hand_back() {
+        let root = tempfile::tempdir().unwrap();
+        let template = host_template();
+        let (pool, mut received) = warm_pool(root.path(), &template).await;
+        for index in 0..3 {
+            let before = pool.task_locks.load(Ordering::Relaxed);
+            let attempt = run_warm(&pool, &host_task(index, &["hello"], &[]), &template).await;
+            assert_eq!(attempt.outcome, AttemptOutcome::Exited { code: 0 });
+            assert_eq!(pool.task_locks.load(Ordering::Relaxed) - before, 2);
+            let command = received.recv().await.unwrap();
+            assert_eq!(command.args, ["/bin/echo", "hello"]);
+            assert!(command.env.iter().any(|entry| entry == "FROM_TEMPLATE=yes"));
+        }
+        // Still warm: no command retired it.
+        assert!(pool.slots.lock().await[0].context.is_some());
     }
 
     #[test]
@@ -2237,7 +2618,7 @@ mod tests {
                         .slot(key(1), reservation(), Some(7), &cancel)
                         .await
                         .unwrap();
-                    pool.slots.lock().await[index].active_run = Some(7);
+                    pool.command_started(index);
                     // The command runs for a moment...
                     tokio::task::yield_now().await;
                     pool.release(index, None).await;
@@ -2507,7 +2888,7 @@ mod tests {
         )
         .unwrap();
         let task = TaskInvocation {
-            template: Some(Box::new(template.clone())),
+            template: Some(std::sync::Arc::new(template.clone())),
             index: 0,
             attempt: 1,
             program: "/bin/true".into(),
@@ -2535,6 +2916,7 @@ mod tests {
                 CommandReporting {
                     sink: None,
                     singletons: &singletons,
+                    attempts: None,
                 },
             )
             .await;
@@ -2562,7 +2944,7 @@ mod tests {
             toml::from_str("runtime='process'\nexec='/bin/true'\ncpu='1000m'\nmemory='32Mi'")
                 .unwrap();
         let task = TaskInvocation {
-            template: Some(Box::new(template.clone())),
+            template: Some(std::sync::Arc::new(template.clone())),
             index: 0,
             attempt: 1,
             program: "/bin/true".into(),
@@ -2581,6 +2963,7 @@ mod tests {
                 CommandReporting {
                     sink: None,
                     singletons: &singletons,
+                    attempts: None,
                 },
             )
             .await;

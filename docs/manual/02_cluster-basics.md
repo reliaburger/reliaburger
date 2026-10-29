@@ -130,6 +130,27 @@ voter is lost, `relish council recover` rebuilds the council from a stopped
 voter's own snapshot and committed log, or from a sealed backup (see
 `operations`). Read its `--help` first: writes after the last backup are lost.
 
+## How fast it should feel
+
+Every release is soaked for hours on a quiet three-node cluster (three small
+VMs on one laptop), and each soak record has a table of these latencies,
+measured while no fault is running. On a cluster like that, 99 in 100 of each
+should come in under:
+
+| What you do | Under |
+|---|---|
+| A job task waits for a pooled executor to start it | 256 ms |
+| `relish status` or `relish nodes` answers | 1 s |
+| `relish apply` returns, its change committed | 2 s |
+| A new instance of an app passes its health check | 5 s |
+| A rolling update reaches every node | 30 s |
+
+Only the first one fails a release today. The other four were first measured
+in October 2026 and are recorded, not yet enforced: treat them as targets
+until the soak records show where they really sit. Bigger clusters, real
+networks and slow image pulls add to all of them, and none of them holds
+while a node is down or a leader is being elected.
+
 ## When a node is gone for good
 
 Every node that reads the service catalogue promises to confirm when it stops

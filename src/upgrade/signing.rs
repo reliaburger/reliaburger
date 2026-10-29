@@ -296,6 +296,32 @@ mod tests {
         }
     }
 
+    // Known answers pin the digest bytes, so a hash-crate upgrade that
+    // changed the output (or its hex form) would fail here, not in the field.
+    #[test]
+    fn sha256_hex_matches_the_fips_known_answers() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn a_file_spanning_two_read_pieces_hashes_to_its_known_answer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("binary");
+        std::fs::write(&path, vec![b'a'; HASH_CHUNK_BYTES + 1]).unwrap();
+
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            "4a3f0c0c213adea174f9a3d4c13177315b588bdb2e9c1012d3d0bf0453ca0f6a"
+        );
+    }
+
     #[test]
     fn a_file_hashes_like_its_bytes_across_read_pieces() {
         let directory = tempfile::tempdir().unwrap();

@@ -20,7 +20,11 @@ pub mod council;
 pub(crate) mod durable;
 pub mod file_lock;
 pub mod firewall;
+// Fuzz target bodies (#1398): the crate's own tests and the `fuzz/` crate only.
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzz;
 pub mod grill;
+pub mod http_client;
 pub mod ketchup;
 pub mod lettuce;
 pub mod mayo;
@@ -30,6 +34,7 @@ pub(crate) mod object_storage;
 pub mod onion;
 pub mod os;
 pub mod pickle;
+pub mod policy;
 pub mod reconstruction;
 pub mod relish;
 pub mod reporting;

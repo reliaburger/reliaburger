@@ -188,5 +188,160 @@ class StageWorkflowTests(unittest.TestCase):
             self.assertNotIn("${{ inputs.", block)
 
 
+class NightlyStagingTests(unittest.TestCase):
+    """A train's nightly build stages as a `nightly-` pre-release that can't pass for a release (#1363)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        source = {"file": "ubuntu.img", "url": "https://images.example/ubuntu.img", "sha256": "5" * 64}
+        self.pins = {"packages": ["runc"], "images": {"fixture": {"asset": "guest.qcow2", "source": source}}}
+        metadata = {"schema": 1, "version": "v0.2.4", "images": {"fixture": {
+            "asset": "guest.qcow2", "sha256": hashlib.sha256(b"guest").hexdigest(), "size": 5,
+            "signature": "c2ln", "source": {"url": source["url"], "sha256": source["sha256"]}}}}
+        contents = {"guest.qcow2": b"guest", GUEST_METADATA: json.dumps(metadata).encode()}
+        for name in candidate_names(self.pins):
+            (self.directory / name).write_bytes(contents.get(name, name.encode()))
+        self.identity = dict(version="v0.2.4", repository="reliaburger/reliaburger", commit="a" * 40,
+                             run_id=123, run_attempt=1)
+        self.digest = record_candidate(self.directory, self.pins, channel="nightly", **self.identity)
+        self.run = dict(id=123, run_attempt=1, head_sha="a" * 40, head_branch="release-0-2-4",
+                        event="workflow_dispatch", path=".github/workflows/build.yml",
+                        status="completed", conclusion="success",
+                        repository={"full_name": "reliaburger/reliaburger"},
+                        head_repository={"full_name": "reliaburger/reliaburger"})
+
+    def test_the_record_says_nightly(self):
+        document = json.loads((self.directory / "candidate.json").read_text())
+        self.assertEqual(document["channel"], "nightly")
+
+    def test_a_nightly_record_never_verifies_as_a_release_candidate(self):
+        with self.assertRaises(ValueError):
+            candidate.verify_candidate(self.directory, self.pins, self.digest, **self.identity)
+        document = candidate.verify_candidate(self.directory, self.pins, self.digest, channel="nightly",
+                                              **self.identity)
+        self.assertEqual(document["channel"], "nightly")
+
+    def test_a_release_record_never_verifies_as_a_nightly(self):
+        (self.directory / "candidate.json").unlink()
+        digest = record_candidate(self.directory, self.pins, **self.identity)
+        with self.assertRaises(ValueError):
+            candidate.verify_candidate(self.directory, self.pins, digest, channel="nightly", **self.identity)
+
+    def test_the_channel_comes_from_the_digest_pinned_record(self):
+        document = verify_downloaded(self.directory, self.pins, "reliaburger/reliaburger", self.run, self.digest)
+        self.assertEqual(document["channel"], "nightly")
+
+    def test_only_a_manual_build_of_a_train_supplies_a_nightly(self):
+        candidate.verify_run(self.run, "reliaburger/reliaburger", "a" * 40, 123, channel="nightly")
+        for branch in ("main", "release-0-2-4-evil/x", "feature", "release-"):
+            with self.subTest(branch=branch), self.assertRaises(ValueError):
+                candidate.verify_run(dict(self.run, head_branch=branch), "reliaburger/reliaburger",
+                                     "a" * 40, 123, channel="nightly")
+        with self.assertRaises(ValueError):
+            candidate.verify_run(dict(self.run, event="push"), "reliaburger/reliaburger", "a" * 40, 123,
+                                 channel="nightly")
+
+    def test_a_train_build_never_supplies_a_release_candidate(self):
+        with self.assertRaises(ValueError):
+            candidate.verify_run(self.run, "reliaburger/reliaburger", "a" * 40, 123)
+
+    def test_the_artefact_and_tag_say_nightly(self):
+        self.assertEqual(candidate.artefact_name("nightly", "a" * 40, 1), f"nightly-{'a' * 40}-1")
+        self.assertEqual(candidate.artefact_name("release", "a" * 40, 1), f"candidate-{'a' * 40}-1")
+        tag = staging_tag("v0.2.4", 123, 1, channel="nightly")
+        self.assertEqual(tag, "nightly-v0.2.4-123-1")
+        promote = (WORKFLOWS / "promote.yml").read_text()
+        pattern = re.search(r'\[\[ "\$RELEASE_TAG" =~ (\S+) \]\]', promote).group(1)
+        self.assertIsNone(re.search(pattern, tag))
+        self.assertIn('[[ "$RELEASE_TAG" != *nightly* ]]', promote)
+        with self.assertRaises(ValueError):
+            identity(tag, "reliaburger/reliaburger", "a" * 40, 123, 1)
+
+    def test_the_notes_say_it_is_not_a_release_and_how_qualification_opts_in(self):
+        document = dict(self.identity, channel="nightly")
+        notes = candidate.staging_notes(document, "nightly-v0.2.4-123-1", self.digest)
+        self.assertIn("not a release", notes)
+        self.assertIn("nightly key", notes)
+        self.assertIn("RELIABURGER_ACCEPT_NIGHTLY=1", notes)
+        self.assertIn(self.digest, notes)
+
+    def test_staging_publishes_under_the_nightly_tag_never_as_latest(self):
+        document = verify_downloaded(self.directory, self.pins, "reliaburger/reliaburger", self.run, self.digest)
+        tag = "nightly-v0.2.4-123-1"
+        assets = [{"name": path.name, "size": path.stat().st_size, "state": "uploaded",
+                   "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()}
+                  for path in self.directory.iterdir()]
+        published = dict(tag_name=tag, draft=False, prerelease=True, assets=assets)
+        calls = []
+        with mock.patch.object(candidate, "find_release", side_effect=[None, dict(published, draft=True), published]), \
+                mock.patch.object(candidate, "gh", side_effect=lambda *a: calls.append(a)), \
+                mock.patch.object(candidate, "gh_json", return_value={"sha": "a" * 40}):
+            self.assertEqual(candidate.stage(self.directory, document, self.digest), tag)
+        create = calls[0]
+        self.assertEqual(create[2], tag)
+        self.assertIn("Nightly build", create[create.index("--title") + 1])
+        for call in calls:
+            self.assertIn("--latest=false", call)
+
+
+class NightlyPruneTests(unittest.TestCase):
+    """Old nightly pre-releases are deleted by the staging run that adds a new one."""
+
+    def releases(self):
+        def release(tag, day, prerelease=True):
+            return dict(tag_name=tag, prerelease=prerelease, created_at=f"2026-10-{day:02d}T18:00:00Z")
+        return [release(f"nightly-v0.2.4-{day}-1", day) for day in range(1, 11)] + [
+            release("staging-v0.2.3-5-1", 2), release("v0.2.3", 3, prerelease=False),
+            # A hand-made release that happens to be called nightly-something
+            # but isn't a pre-release is never touched.
+            release("nightly-notes", 1, prerelease=False)]
+
+    def test_keeps_the_newest_nightlies_and_deletes_the_rest(self):
+        doomed = candidate.nightly_tags_to_delete(self.releases(), keep=7)
+        self.assertEqual(doomed, ["nightly-v0.2.4-3-1", "nightly-v0.2.4-2-1", "nightly-v0.2.4-1-1"])
+
+    def test_never_touches_releases_or_staging_candidates(self):
+        doomed = candidate.nightly_tags_to_delete(self.releases(), keep=0)
+        self.assertEqual(len(doomed), 10)
+        self.assertTrue(all(tag.startswith("nightly-v") for tag in doomed))
+
+    def test_keep_must_leave_the_newest_one(self):
+        with self.assertRaises(ValueError):
+            candidate.prune_nightly("reliaburger/reliaburger", keep=0)
+
+    def test_prune_deletes_each_release_and_its_tag(self):
+        calls = []
+        with mock.patch.object(candidate, "list_releases", return_value=self.releases()), \
+                mock.patch.object(candidate, "gh", side_effect=lambda *a: calls.append(a)):
+            deleted = candidate.prune_nightly("reliaburger/reliaburger", keep=7)
+        self.assertEqual(deleted, ["nightly-v0.2.4-3-1", "nightly-v0.2.4-2-1", "nightly-v0.2.4-1-1"])
+        for call, tag in zip(calls, deleted):
+            self.assertEqual(call, ("release", "delete", tag, "--repo", "reliaburger/reliaburger",
+                                    "--cleanup-tag", "--yes"))
+
+
+class NightlyStageWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.text = (WORKFLOWS / "stage.yml").read_text()
+
+    def test_the_channel_is_a_choice_that_defaults_to_release(self):
+        inputs = self.text.split("\npermissions:")[0]
+        self.assertRegex(inputs, r"channel:\n(.*\n)*?\s+type: choice\n\s+options: \[release, nightly\]\n"
+                                 r"\s+default: release")
+
+    def test_the_channel_reaches_the_scripts_through_the_environment(self):
+        self.assertIn("CHANNEL: ${{ inputs.channel }}", self.text)
+        scripts = "\n".join(run_blocks(self.text))
+        self.assertEqual(scripts.count('--channel "$CHANNEL"'), 2)
+
+    def test_old_nightlies_are_pruned_only_by_a_nightly_staging(self):
+        prune = [block for block in run_blocks(self.text) if "prune-nightly" in block]
+        self.assertEqual(len(prune), 1)
+        self.assertIn("if: inputs.channel == 'nightly'", self.text)
+        self.assertIn("--keep 7", prune[0])
+
+
 if __name__ == "__main__":
     unittest.main()

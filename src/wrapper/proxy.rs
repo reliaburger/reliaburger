@@ -187,7 +187,7 @@ pub async fn bind_proxy_with_tls(
     view_lease: Option<Arc<crate::onion::lease::ViewLease>>,
     shutdown: CancellationToken,
 ) -> Result<BoundProxy, WrapperError> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(30))
@@ -195,7 +195,7 @@ pub async fn bind_proxy_with_tls(
         .pool_idle_timeout(UPSTREAM_POOL_IDLE_TIMEOUT)
         .build()
         .map_err(|e| WrapperError::ProxyFailed(format!("failed to build http client: {e}")))?;
-    let fresh_client = reqwest::Client::builder()
+    let fresh_client = crate::http_client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(30))
@@ -1981,14 +1981,22 @@ mod tests {
     }
 
     /// ING2: stalled TLS handshakes are bounded and reclaimed on the deadline.
-    /// We open more silent connections than the handshake cap and never send a
-    /// TLS ClientHello. If the handshakes weren't bounded and deadlined, a real
-    /// TLS client afterwards would be starved; instead the stalled ones drop on
-    /// their timeout and the real handshake succeeds.
+    ///
+    /// Two silent connections fill both handshake slots without sending a
+    /// ClientHello. While they hold them, a real rustls client is refused,
+    /// which proves the bound. Once the deadline passes the server closes the
+    /// silent sockets, and the same client then completes a real handshake and
+    /// gets an HTTP response, which proves the slots were reclaimed. Without
+    /// the bound the first real request succeeds; without the deadline the
+    /// silent sockets never close and the slots stay full.
     #[tokio::test]
     async fn stalled_tls_handshakes_are_bounded_and_reclaimed() {
         use std::time::Duration;
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::AsyncReadExt;
+
+        // Long enough that the refused request below lands well inside it,
+        // even on a loaded runner.
+        const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(2);
 
         let routing_table = Arc::new(RwLock::new(RoutingTable::new()));
         let shutdown = CancellationToken::new();
@@ -1997,7 +2005,7 @@ mod tests {
                 http_port: 0,
                 https_port: 0,
                 max_tls_handshakes: 2,
-                tls_handshake_timeout: Duration::from_millis(200),
+                tls_handshake_timeout: HANDSHAKE_DEADLINE,
                 ..WrapperConfig::default()
             },
             routing_table,
@@ -2010,36 +2018,62 @@ mod tests {
             bound.serve().await.ok();
         });
 
-        // Open several silent connections that hold a handshake slot without
-        // ever sending a ClientHello.
+        // The listener accepts in arrival order, so these two take both slots
+        // before the real client below connects.
         let mut stalled = Vec::new();
-        for _ in 0..5 {
-            if let Ok(sock) = tokio::net::TcpStream::connect(("127.0.0.1", https_port)).await {
-                stalled.push(sock);
-            }
+        for _ in 0..2 {
+            stalled.push(
+                tokio::net::TcpStream::connect(("127.0.0.1", https_port))
+                    .await
+                    .unwrap(),
+            );
         }
 
-        // Wait past the handshake deadline so the stalled slots are reclaimed.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-
-        // A real TLS ClientHello now gets a response (the handshake proceeds,
-        // even though the self-signed cert won't validate — we only need the
-        // server to engage, proving capacity wasn't exhausted).
-        let mut real = tokio::net::TcpStream::connect(("127.0.0.1", https_port))
-            .await
+        // The proxy serves a self-signed `localhost` certificate.
+        let client = crate::http_client::builder()
+            .danger_accept_invalid_certs(true)
+            .pool_max_idle_per_host(0)
+            .timeout(Duration::from_secs(10))
+            .build()
             .unwrap();
-        // Minimal TLS record header for a ClientHello handshake message. The
-        // server should respond (or at least not hang); we just assert the
-        // write path is accepted and the connection is live.
-        let client_hello_prefix = [0x16u8, 0x03, 0x01, 0x00, 0x2f];
-        assert!(
-            real.write_all(&client_hello_prefix).await.is_ok(),
-            "server refused a real handshake after stalled ones — capacity exhausted"
-        );
+        let url = format!("https://127.0.0.1:{https_port}/");
 
-        for s in stalled {
-            drop(s);
+        let refused = client.get(&url).header("host", "web.test").send().await;
+        assert!(
+            refused.is_err(),
+            "a real handshake succeeded while both slots were held: the bound is missing"
+        );
+        // The refusal must come from the full slots, not from the deadline
+        // having already reclaimed them.
+        for sock in &stalled {
+            let mut probe = [0u8; 1];
+            assert!(
+                matches!(sock.try_read(&mut probe), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "a stalled handshake was already closed when the real one was refused"
+            );
         }
+
+        // Past the deadline the server drops each silent socket: the read
+        // ends with EOF or a reset rather than hanging.
+        for mut sock in stalled {
+            let mut buf = [0u8; 16];
+            let closed = tokio::time::timeout(HANDSHAKE_DEADLINE * 5, sock.read(&mut buf)).await;
+            assert!(
+                matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+                "a stalled handshake was never reclaimed: {closed:?}"
+            );
+        }
+
+        // The reclaimed slots now admit a real handshake and request. An
+        // empty routing table answers 404, which proves HTTP flowed over TLS.
+        let response = client
+            .get(&url)
+            .header("host", "web.test")
+            .send()
+            .await
+            .expect("a real handshake after the deadline must succeed");
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
         shutdown.cancel();
     }
 

@@ -1,0 +1,33 @@
+bun pid 1675
+2026-10-20T17:46:45Z c27-probe-host jobs-host-processes c=27 perf=probe exit 0
+2026-10-20T17:47:57Z c27-r1-host jobs-host-processes c=27 perf=none exit 0
+2026-10-20T17:49:07Z c27-r1-raw jobs-vm-baseline c=27 perf=none exit 0
+2026-10-20T17:50:18Z c27-r2-raw jobs-vm-baseline c=27 perf=none exit 0
+2026-10-20T17:51:29Z c27-r2-host jobs-host-processes c=27 perf=none exit 0
+2026-10-20T17:52:41Z c27-r3-host jobs-host-processes c=27 perf=none exit 0
+2026-10-20T17:53:51Z c27-r3-raw jobs-vm-baseline c=27 perf=none exit 0
+2026-10-20T17:55:02Z c27-r4-raw jobs-vm-baseline c=27 perf=none exit 0
+2026-10-20T17:56:13Z c27-r4-host jobs-host-processes c=27 perf=none exit 0
+2026-10-20T17:57:25Z c27-r5-host jobs-host-processes c=27 perf=none exit 0
+2026-10-20T17:58:36Z c27-r5-raw jobs-vm-baseline c=27 perf=none exit 0
+2026-10-20T17:59:48Z c32-r1-host jobs-host-processes c=32 perf=none exit 0
+2026-10-20T18:00:59Z c32-r1-raw jobs-vm-baseline c=32 perf=none exit 0
+2026-10-20T18:02:10Z c32-r2-raw jobs-vm-baseline c=32 perf=none exit 0
+2026-10-20T18:03:22Z c32-r2-host jobs-host-processes c=32 perf=none exit 0
+2026-10-20T18:04:34Z c32-r3-host jobs-host-processes c=32 perf=none exit 0
+2026-10-20T18:05:45Z c32-r3-raw jobs-vm-baseline c=32 perf=none exit 0
+2026-10-20T18:06:56Z c32-r4-raw jobs-vm-baseline c=32 perf=none exit 0
+2026-10-20T18:08:08Z c32-r4-host jobs-host-processes c=32 perf=none exit 0
+2026-10-20T18:09:19Z c32-r5-host jobs-host-processes c=32 perf=none exit 0
+2026-10-20T18:10:30Z c32-r5-raw jobs-vm-baseline c=32 perf=none exit 0
+2026-10-20T18:11:42Z c16-r1-host jobs-host-processes c=16 perf=none exit 0
+2026-10-20T18:12:54Z c16-r1-raw jobs-vm-baseline c=16 perf=none exit 0
+2026-10-20T18:14:05Z c16-r2-raw jobs-vm-baseline c=16 perf=none exit 0
+2026-10-20T18:15:16Z c16-r2-host jobs-host-processes c=16 perf=none exit 0
+2026-10-20T18:16:28Z c16-r3-host jobs-host-processes c=16 perf=none exit 0
+2026-10-20T18:17:39Z c16-r3-raw jobs-vm-baseline c=16 perf=none exit 0
+2026-10-20T18:18:50Z c16-r4-raw jobs-vm-baseline c=16 perf=none exit 0
+2026-10-20T18:20:01Z c16-r4-host jobs-host-processes c=16 perf=none exit 0
+2026-10-20T18:21:12Z c16-r5-host jobs-host-processes c=16 perf=none exit 0
+2026-10-20T18:22:23Z c16-r5-raw jobs-vm-baseline c=16 perf=none exit 0
+2026-10-20T18:22:33Z DONE

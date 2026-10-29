@@ -13,8 +13,10 @@ on:
     # train run everything.
     branches: [main, "codex/**", "fix/**", "feat/appliance-*", "release-*"]
     # labeled lets a `full-ci` label start the heavy suites on any PR (on a
-    # PR into a train, everything but the macOS shards).
-    types: [opened, synchronize, reopened, labeled]
+    # PR into a train, everything but the macOS shards). closed starts a
+    # no-op run in the PR's concurrency group, which cancels the run still
+    # working on the closed (or merged) PR; every other job skips it.
+    types: [opened, synchronize, reopened, labeled, closed]
   merge_group:
     # The merge queue on release-* tests each batch, merged onto the train,
     # with every job before any of it lands. It requires one check:
@@ -25,8 +27,9 @@ on:
     - cron: "17 3 * * *"
 
 # A newer push to a PR, or to a merge train, supersedes the older run: the
-# newer commit contains the older one. Main, merge-queue and called runs each
-# keep their own group; the queue cancels its own groups when it re-forms.
+# newer commit contains the older one, and closing a PR supersedes its run.
+# Main, merge-queue and called runs each keep their own group; the queue
+# cancels its own groups when it re-forms.
 # Fixed prefixes also keep reusable source CI separate from its release caller,
 # and github.workflow (the caller's name when called) keeps a retarget run
 # (ci-retarget.yml) from cancelling the pull request's own run.
@@ -62,9 +65,21 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
+  closed-pull-request:
+    # A closed PR's run exists only to cancel the older run in its
+    # concurrency group. Every job that doesn't need select jobs has its own
+    # guard; the rest are skipped with select jobs.
+    name: closed pull request
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo "The pull request was closed; its older CI run is cancelled."
+
   changes:
     # Which job groups this run needs; see scripts/ci/select-jobs.sh.
     name: select jobs
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.select.outputs.code }}
@@ -93,6 +108,7 @@ jobs:
     # keeping) and the rule that every #[ignore] names who runs it. Cheap,
     # so it runs on every change, documentation included.
     name: CI policy
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -109,6 +125,7 @@ jobs:
 
   dependency-audit:
     name: dependency advisory audit
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -198,7 +215,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # About 25 minutes, but 35 to 41 on a slow runner (#1421). nextest's
+    # per-test timeouts catch a hung test, so this only catches a stuck runner.
+    timeout-minutes: 62
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -363,8 +382,10 @@ jobs:
       archive_sha256: ${{ steps.archive.outputs.archive_sha256 }}
       archive_origin_sha256: ${{ steps.archive.outputs.archive_origin_sha256 }}
       archive_runtime_sha256: ${{ steps.archive.outputs.archive_runtime_sha256 }}
-    # Compile the portable test binaries once. The acceptance jobs download
-    # this nextest archive instead of each rebuilding every test binary.
+    # Compile the test binaries the cluster and acceptance jobs run, once.
+    # They fetch this nextest archive instead of each rebuilding them.
+    # ARCHIVED_BINARIES in scripts/ci/workflow_assembly.py names them: all
+    # 47 binaries made a 3.0 GB archive that was slow to download (#977).
     # Runners check out to the same path, so the archive's compiled-in binary
     # paths still resolve after extraction.
     name: build tests
@@ -407,23 +428,47 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      ARCHIVED: cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite --workspace-remap . --profile ci --no-tests=fail
+    # actions: read lets the archive fetch list this run's artefacts.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.145
-      - uses: actions/download-artifact@v4
-        with:
-          name: nextest-archive
+      - name: Fetch the test archive
+        # actions/download-artifact took 33 s to almost 5 minutes for the
+        # 3 GB archive, logged nothing while it ran, and a retry after its
+        # 5-minute limit started again from the first byte, so a slow runner
+        # failed both attempts (#977). This resumes a dropped or stalled
+        # transfer where it stopped, gives up on an attempt only after 60 s
+        # without a byte, logs its progress and stops at 13 minutes.
+        timeout-minutes: 14
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ci/fetch_artifact.py --repository "$GITHUB_REPOSITORY"
+          --run-id "$GITHUB_RUN_ID" --name nextest-archive --destination .
+          --deadline 780 --stall 60
+      - name: Extract the test archive once for every suite
+        id: extract_archive
+        # Each suite used to extract the archive twice, to list its
+        # tests and to run them (#1050). This checks the archive against the
+        # build job's digest and extracts it once; every suite then reuses
+        # the extracted build through nextest's build-reuse flags, naming
+        # this step's receipt digest in its evidence.
+        run: |
+          mkdir -p target
+          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
+          python3 scripts/ci/workflow_adapter.py extract --root . --host linux --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Multi-node cluster suites
         id: cluster_tests
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate cluster-tests --host linux --directory target/contracts/linux/cluster-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate cluster-tests --host linux --directory target/contracts/linux/cluster-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain cluster-tests current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -446,23 +491,47 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    env:
-      ARCHIVED: cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite --workspace-remap . --profile ci --no-tests=fail
+    # actions: read lets the archive fetch list this run's artefacts.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.145
-      - uses: actions/download-artifact@v4
-        with:
-          name: nextest-archive
+      - name: Fetch the test archive
+        # actions/download-artifact took 33 s to almost 5 minutes for the
+        # 3 GB archive, logged nothing while it ran, and a retry after its
+        # 5-minute limit started again from the first byte, so a slow runner
+        # failed both attempts (#977). This resumes a dropped or stalled
+        # transfer where it stopped, gives up on an attempt only after 60 s
+        # without a byte, logs its progress and stops at 13 minutes.
+        timeout-minutes: 14
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ci/fetch_artifact.py --repository "$GITHUB_REPOSITORY"
+          --run-id "$GITHUB_RUN_ID" --name nextest-archive --destination .
+          --deadline 780 --stall 60
+      - name: Extract the test archive once for every suite
+        id: extract_archive
+        # Each suite used to extract the archive twice, to list its
+        # tests and to run them (#1050). This checks the archive against the
+        # build job's digest and extracts it once; every suite then reuses
+        # the extracted build through nextest's build-reuse flags, naming
+        # this step's receipt digest in its evidence.
+        run: |
+          mkdir -p target
+          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
+          python3 scripts/ci/workflow_adapter.py extract --root . --host linux --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Wall-clock acceptance
         id: slow_tests
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate slow-tests --host linux --directory target/contracts/linux/slow-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate slow-tests --host linux --directory target/contracts/linux/slow-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain slow-tests current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -477,7 +546,7 @@ jobs:
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-node --host linux --directory target/contracts/linux/upgrade-node --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-node --host linux --directory target/contracts/linux/upgrade-node --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain upgrade-node current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -492,7 +561,7 @@ jobs:
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-cluster --host linux --directory target/contracts/linux/upgrade-cluster --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-cluster --host linux --directory target/contracts/linux/upgrade-cluster --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain upgrade-cluster current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -526,7 +595,7 @@ jobs:
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate standard-clients --host linux --directory target/contracts/linux/standard-clients --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate standard-clients --host linux --directory target/contracts/linux/standard-clients --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain standard-clients current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -565,10 +634,11 @@ jobs:
     # The final gate, and the one check the merge queue requires: it waits
     # for every other job, fails if any of them failed, and then checks that
     # every selected evidence owner completed its exact cases this run. It
-    # always reports, so a skipped owner can never stand in for a pass.
+    # always reports, so a skipped owner can never stand in for a pass. A
+    # closed PR's run has nothing to report.
     name: ignored-test evidence
     needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, portable, linux, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks]
-    if: ${{ always() }}
+    if: ${{ always() && github.event.action != 'closed' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -578,8 +648,20 @@ jobs:
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
           python3 scripts/ci/every_job.py --needs target/workflow-needs.json --event "$GITHUB_EVENT_NAME"
-      - uses: actions/download-artifact@v4
+      - name: Download every evidence envelope
+        id: evidence
         if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+        uses: actions/download-artifact@v4
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          pattern: contract-*
+          path: incoming
+          merge-multiple: false
+      - name: Retry downloading every evidence envelope
+        if: ${{ !cancelled() && steps.evidence.outcome == 'failure' }}
+        uses: actions/download-artifact@v4
+        timeout-minutes: 5
         with:
           pattern: contract-*
           path: incoming
@@ -681,8 +763,10 @@ jobs:
     # only when one is more than twice as slow as the rest, or the run's
     # median is more than twice as slow (#857). A benchmark over that limit
     # is measured once more on its own, and fails only when it's over the
-    # limit both times, so one disk stall isn't a regression (#936). The full
-    # Criterion output is kept for the trend #668 reads.
+    # limit both times, so one disk stall isn't a regression (#936). The
+    # on-disk ledger benchmark measures this runner's disk, which can stay
+    # slow for the whole job, so it's report only; its tmpfs variant is gated
+    # (#1038). The full Criterion output is kept for the trend #668 reads.
     name: task-array benchmarks
     needs: changes
     if: needs.changes.outputs.task_arrays == 'true'
@@ -704,7 +788,7 @@ jobs:
           restore-keys: task-array-bench-
       - run: make bench-task-arrays
       - name: Compare with main's baseline
-        run: python3 scripts/ci/bench_baseline.py compare --criterion target/criterion --baseline target/task-array-baseline/baseline.json --max-ratio 2 --summary "$GITHUB_STEP_SUMMARY" --remeasure 'cargo bench --bench task_arrays --'
+        run: python3 scripts/ci/bench_baseline.py compare --criterion target/criterion --baseline target/task-array-baseline/baseline.json --max-ratio 2 --summary "$GITHUB_STEP_SUMMARY" --remeasure 'cargo bench --bench task_arrays --' --report-only storage/ledger_and_index_64k
       - name: Record this run as main's baseline
         if: github.ref == 'refs/heads/main'
         run: python3 scripts/ci/bench_baseline.py save --criterion target/criterion --baseline target/task-array-baseline/baseline.json

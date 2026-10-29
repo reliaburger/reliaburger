@@ -150,6 +150,11 @@ pub struct ClusterParams {
     /// sooner (`[cluster] recovery_probe_window_secs`, #694). `None` uses
     /// two anti-entropy intervals.
     pub recovery_probe_window: Option<Duration>,
+    /// Most voters the council reconciler seats. `None` uses the default
+    /// of up to seven. Bun always leaves it unset; the hollow-node harness
+    /// holds its council at three while hundreds of hollow nodes join, so
+    /// none of them becomes a voter (#1401).
+    pub council_size_cap: Option<usize>,
 }
 
 /// Open and validate the durable Raft stores under `raft_dir`.
@@ -577,7 +582,7 @@ pub async fn start(
         port_offset,
         raft_id,
         self_info,
-        CouncilReconcilerConfig::default(),
+        CouncilReconcilerConfig::with_size_cap(params.council_size_cap),
         shutdown.clone(),
     );
 
@@ -1184,6 +1189,20 @@ impl Default for CouncilReconcilerConfig {
     }
 }
 
+impl CouncilReconcilerConfig {
+    /// The default reconciler, with the council held at `cap` voters when
+    /// `cap` is set. `None` keeps the default of up to seven. A cap below
+    /// the default minimum of three lowers the minimum with it.
+    pub fn with_size_cap(cap: Option<usize>) -> Self {
+        let mut config = Self::default();
+        if let Some(cap) = cap {
+            config.selection.max_council_size = cap;
+            config.selection.min_council_size = config.selection.min_council_size.min(cap);
+        }
+        config
+    }
+}
+
 /// Spawn the council reconciler: on the leader, each tick re-plans the Raft
 /// membership from observed state (gossip health, Raft metrics) and executes
 /// at most one action — add a learner, promote a caught-up learner, evict a
@@ -1629,6 +1648,28 @@ mod tests {
     use super::*;
     use crate::cluster::identity::raft_id_from_name;
     use crate::mustard::state::NodeState;
+
+    #[test]
+    fn reconciler_without_a_size_cap_grows_the_council_to_seven() {
+        let config = CouncilReconcilerConfig::with_size_cap(None);
+        assert_eq!(config.selection.max_council_size, 7);
+        assert_eq!(config.selection.min_council_size, 3);
+        assert_eq!(config.selection.min_node_age, Duration::ZERO);
+    }
+
+    #[test]
+    fn reconciler_with_a_size_cap_of_three_never_seats_a_fourth_voter() {
+        let config = CouncilReconcilerConfig::with_size_cap(Some(3));
+        assert_eq!(config.selection.max_council_size, 3);
+        assert_eq!(config.selection.min_council_size, 3);
+    }
+
+    #[test]
+    fn a_size_cap_below_three_lowers_the_minimum_too() {
+        let config = CouncilReconcilerConfig::with_size_cap(Some(1));
+        assert_eq!(config.selection.max_council_size, 1);
+        assert_eq!(config.selection.min_council_size, 1);
+    }
 
     #[tokio::test]
     async fn bootstrap_propagates_initialisation_failure_and_persists_security() {

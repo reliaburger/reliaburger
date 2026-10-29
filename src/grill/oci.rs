@@ -61,9 +61,36 @@ pub struct OciSpec {
     /// the serialised spec, so `#[serde(default)]` reads it back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_mapping: Option<PortMapping>,
+    /// How the workload asks to be stopped (#1121): its signal, grace and
+    /// pre-stop command. Not part of the OCI runtime spec either; runtimes
+    /// read the signal from it on every graceful stop. `None` is SIGTERM,
+    /// the caller's grace and no pre-stop command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<super::stop::StopPolicy>,
+    /// The app's gated runtime knobs (#1122): added capabilities, sysctls
+    /// and devices. Not part of the OCI runtime spec: only rootful runc
+    /// applies them, writing them into `process.capabilities`,
+    /// `linux.sysctl` and `linux.devices` just before it creates the
+    /// container (see [`super::knobs::apply_to_spec`]). Every other runtime
+    /// refuses a spec that carries them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_knobs: Option<super::knobs::RuntimeKnobs>,
 }
 
 impl OciSpec {
+    /// The refusal a runtime that can't apply runtime knobs (#1122) gives
+    /// this spec, naming its first knob and the `runtime`. `None` when the
+    /// spec carries none.
+    pub fn runtime_knobs_refusal(&self, runtime: &'static str) -> Option<super::LaunchProblem> {
+        let knob = self.runtime_knobs.as_ref()?.uses().next()?;
+        Some(super::LaunchProblem::RuntimeKnobsUnsupported { knob, runtime })
+    }
+
+    /// The signal a graceful stop sends this workload.
+    pub fn stop_signal(&self) -> super::stop::StopSignal {
+        super::stop::StopPolicy::signal_of(self.stop.as_ref())
+    }
+
     /// The same spec with every environment entry cut down to its variable
     /// name, so no value (decrypted secrets included) remains.
     ///
@@ -210,6 +237,46 @@ pub struct OciLinux {
     pub uid_mappings: Option<Vec<OciIdMapping>>,
     #[serde(rename = "gidMappings", skip_serializing_if = "Option::is_none")]
     pub gid_mappings: Option<Vec<OciIdMapping>>,
+    /// Sysctls runc writes inside the container's namespaces (#1122).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sysctl: BTreeMap<String, String>,
+    /// Device nodes runc creates or binds in the container (#1122).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<OciDevice>,
+}
+
+/// A device node in the container (the OCI `linux.devices` entry).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciDevice {
+    pub path: PathBuf,
+    /// `c` for a character device, `b` for a block device.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub major: i64,
+    pub minor: i64,
+    #[serde(rename = "fileMode", default, skip_serializing_if = "Option::is_none")]
+    pub file_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
+}
+
+/// A cgroup device controller rule (the OCI `linux.resources.devices`
+/// entry). runc denies every device but its defaults, so a passed-in
+/// device needs an allow rule as well as its node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciDeviceRule {
+    pub allow: bool,
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub major: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minor: Option<i64>,
+    /// Some subset of `rwm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
 }
 
 impl OciLinux {
@@ -274,12 +341,15 @@ pub struct OciNamespace {
 /// The `cpu`/`memory` blocks carry the *hard* limits (quota and OOM
 /// ceiling). Resource *requests* have no dedicated field in the classic
 /// OCI schema, so they ride in `unified` — see that field's doc comment.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OciResources {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<OciCpuResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<OciMemoryResources>,
+    /// The process and thread ceiling (`pids.max`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids: Option<OciPidsResources>,
     /// cgroup v2 native controller keys, written verbatim by runc into
     /// the workload's cgroup. We use it for the resource *requests* that
     /// the classic `cpu`/`memory` blocks can't express:
@@ -298,6 +368,9 @@ pub struct OciResources {
     /// omitted so specs without requests are unchanged.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub unified: BTreeMap<String, String>,
+    /// Allow rules for devices passed in with runtime knobs (#1122).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<OciDeviceRule>,
 }
 
 /// CPU resource limits.
@@ -310,6 +383,12 @@ pub struct OciCpuResources {
 /// Memory resource limits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OciMemoryResources {
+    pub limit: i64,
+}
+
+/// Process-count limit: runc writes `limit` to the cgroup's `pids.max`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OciPidsResources {
     pub limit: i64,
 }
 
@@ -423,11 +502,15 @@ pub fn generate_oci_spec_with_decryptor(
             cgroups_path: Some(hierarchy_cgroup_path(cgroup_path)),
             uid_mappings: None,
             gid_mappings: None,
+            sysctl: Default::default(),
+            devices: Vec::new(),
         },
         port_mapping: host_port.zip(spec.port).map(|(hp, cp)| PortMapping {
             host_port: hp,
             container_port: cp,
         }),
+        stop: super::stop::StopPolicy::from_app(spec),
+        runtime_knobs: spec.runtime.clone().filter(|knobs| !knobs.is_empty()),
     })
 }
 
@@ -454,6 +537,9 @@ pub fn build_env_with_decryptor(
     for (key, value) in &spec.env {
         match value {
             EnvValue::Plain(v) => env.push(format!("{key}={v}")),
+            // Passed through as written: the node resolves it just before
+            // the runtime creates the instance, off the agent loop (#1123).
+            EnvValue::Provider(reference) => env.push(format!("{key}={}", reference.as_str())),
             EnvValue::Encrypted(v) => {
                 if let Some(decrypt) = decryptor {
                     let plaintext =
@@ -749,9 +835,11 @@ fn build_resources_from_ranges(
 
     if cpu_res.is_some() || memory_res.is_some() {
         Some(OciResources {
+            pids: None,
             cpu: cpu_res,
             memory: memory_res,
             unified,
+            devices: Vec::new(),
         })
     } else {
         None
@@ -769,26 +857,6 @@ pub fn generate_job_oci_spec(
     cgroup_path: &str,
     netns_path: Option<&str>,
 ) -> OciSpec {
-    let env: Vec<String> = spec
-        .env
-        .iter()
-        .map(|(key, value)| match value {
-            EnvValue::Plain(v) => format!("{key}={v}"),
-            EnvValue::Encrypted(v) => format!("{key}={v}"),
-        })
-        .collect();
-
-    // Process workloads: exec binary or inline script via /bin/sh
-    let args = if let Some(ref exec_path) = spec.exec {
-        let mut a = vec![exec_path.to_string_lossy().to_string()];
-        a.extend(spec.command.clone().unwrap_or_default());
-        a
-    } else if let Some(ref script) = spec.script {
-        vec!["/bin/sh".to_string(), "-c".to_string(), script.clone()]
-    } else {
-        spec.command.clone().unwrap_or_default()
-    };
-
     let mut resources = build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref());
     if spec.image.is_some()
         && spec.exec.is_none()
@@ -801,6 +869,21 @@ pub fn generate_job_oci_spec(
         resources
             .unified
             .insert("memory.swap.max".into(), "0".into());
+    }
+    if let Some(limit) = spec.pids {
+        // Only a reused executor's commands get a default; a fresh container
+        // without `pids` keeps no limit, like one without `cpu` or `memory`.
+        resources
+            .get_or_insert_with(|| OciResources {
+                cpu: None,
+                memory: None,
+                pids: None,
+                unified: BTreeMap::new(),
+                devices: Vec::new(),
+            })
+            .pids = Some(OciPidsResources {
+            limit: i64::from(limit.get()),
+        });
     }
 
     OciSpec {
@@ -817,24 +900,7 @@ pub fn generate_job_oci_spec(
             },
             readonly: false,
         },
-        process: OciProcess {
-            rlimits: Vec::new(),
-            args,
-            env,
-            cwd: "/".to_string(),
-            user: OciUser {
-                uid: 65534,
-                gid: 65534,
-            },
-            capabilities: None,
-            oom_score_adj: Some(WORKLOAD_OOM_SCORE_ADJ),
-            overrides: (spec.image.is_some() && spec.exec.is_none() && spec.script.is_none()).then(
-                || ProcessOverrides {
-                    command: spec.command.clone().unwrap_or_default(),
-                    ..ProcessOverrides::default()
-                },
-            ),
-        },
+        process: job_process(spec),
         mounts: standard_mounts(),
         linux: OciLinux {
             namespaces: standard_namespaces(netns_path),
@@ -842,9 +908,60 @@ pub fn generate_job_oci_spec(
             cgroups_path: Some(hierarchy_cgroup_path(cgroup_path)),
             uid_mappings: None,
             gid_mappings: None,
+            sysctl: Default::default(),
+            devices: Vec::new(),
         },
         // Jobs run to completion and don't publish ports.
         port_mapping: None,
+        stop: None,
+        runtime_knobs: None,
+    }
+}
+
+/// The process of a job's container: its command, environment and user,
+/// as [`generate_job_oci_spec`] sets them. A reused executor runs each
+/// command with just this, so it builds this alone rather than a whole
+/// container spec per command.
+pub fn job_process(spec: &JobSpec) -> OciProcess {
+    let env: Vec<String> = spec
+        .env
+        .iter()
+        .map(|(key, value)| match value {
+            EnvValue::Plain(v) => format!("{key}={v}"),
+            EnvValue::Encrypted(v) => format!("{key}={v}"),
+            // Validation refuses provider values in jobs (#1123).
+            EnvValue::Provider(reference) => format!("{key}={}", reference.as_str()),
+        })
+        .collect();
+
+    // Process workloads: exec binary or inline script via /bin/sh
+    let args = if let Some(ref exec_path) = spec.exec {
+        let mut a = vec![exec_path.to_string_lossy().to_string()];
+        a.extend(spec.command.clone().unwrap_or_default());
+        a
+    } else if let Some(ref script) = spec.script {
+        vec!["/bin/sh".to_string(), "-c".to_string(), script.clone()]
+    } else {
+        spec.command.clone().unwrap_or_default()
+    };
+
+    OciProcess {
+        rlimits: Vec::new(),
+        args,
+        env,
+        cwd: "/".to_string(),
+        user: OciUser {
+            uid: 65534,
+            gid: 65534,
+        },
+        capabilities: None,
+        oom_score_adj: Some(WORKLOAD_OOM_SCORE_ADJ),
+        overrides: (spec.image.is_some() && spec.exec.is_none() && spec.script.is_none()).then(
+            || ProcessOverrides {
+                command: spec.command.clone().unwrap_or_default(),
+                ..ProcessOverrides::default()
+            },
+        ),
     }
 }
 
@@ -852,7 +969,7 @@ pub fn generate_job_oci_spec(
 /// `app`.
 ///
 /// The init runs `init.command` in its own image, or the app's when it names
-/// none, with the app's environment (secrets already decrypted), the app's
+/// none (on the host, for an `exec` or `script` app), with the app's environment (secrets already decrypted), the app's
 /// mounts (volumes, config files and identity, host paths already approved)
 /// and the app's cgroup. It takes nothing from the app's process settings and
 /// publishes no port. Building on the app's finished spec rather than its
@@ -867,7 +984,9 @@ pub fn generate_init_oci_spec(
     let from_image = init.image.is_some() || app.process.overrides.is_some();
     OciSpec {
         reusable_executor: false,
-        host_process: false,
+        // A host app's init that names no image runs on the host like its
+        // app, so the mixed runtime routes it there too (#935).
+        host_process: app.host_process && init.image.is_none(),
         initialiser: true,
         root: OciRoot {
             path: root,
@@ -896,9 +1015,148 @@ pub fn generate_init_oci_spec(
             cgroups_path: app.linux.cgroups_path.clone(),
             uid_mappings: None,
             gid_mappings: None,
+            sysctl: Default::default(),
+            devices: Vec::new(),
         },
         // Init containers run before the app and don't publish ports.
         port_mapping: None,
+        stop: None,
+        runtime_knobs: None,
+    }
+}
+
+/// Where rootful runc keeps an instance's named network namespace. Bun
+/// creates one per instance, and an instance's sidecars join it by this
+/// path (#1120).
+pub fn network_namespace_path(instance: &crate::grill::InstanceId) -> String {
+    format!("/var/run/netns/rb-{}", instance.0)
+}
+
+/// The runtime identity of the sidecar `name` of instance `parent`:
+/// `{parent}__sidecar-{name}`. A DNS workload label can't hold `__`, so no
+/// app's instance can take it, as with an init container's `__init-N`.
+pub fn sidecar_instance_id(
+    parent: &crate::grill::InstanceId,
+    name: &str,
+) -> crate::grill::InstanceId {
+    crate::grill::InstanceId(format!("{}__sidecar-{name}", parent.0))
+}
+
+/// Generate the OCI spec for `sidecar`, which runs beside instance `parent`
+/// of an app whose own spec is `app` (#1120).
+///
+/// Like an init container it builds on the app's finished spec: its own
+/// image (or the app's), the app's environment with the sidecar's own `env`
+/// on top, and the app's mounts. Unlike one it joins `parent`'s network
+/// namespace instead of getting its own, so the two talk over `localhost`,
+/// and it gets its own cgroup beside the app's, with its own `cpu` and
+/// `memory`, because two runc containers can't share one cgroup. It
+/// publishes no port: the app's port mapping already reaches the namespace
+/// they share.
+pub fn generate_sidecar_oci_spec(
+    sidecar: &crate::config::app::SidecarSpec,
+    app: &OciSpec,
+    parent: &crate::grill::InstanceId,
+) -> OciSpec {
+    let root = sidecar
+        .image
+        .clone()
+        .unwrap_or_else(|| app.root.path.clone());
+    let from_image = sidecar.image.is_some() || app.process.overrides.is_some();
+    let mut namespaces = app.linux.namespaces.clone();
+    let shared = network_namespace_path(parent);
+    match namespaces.iter_mut().find(|ns| ns.ns_type == "network") {
+        Some(network) => network.path = Some(shared),
+        None => namespaces.push(OciNamespace {
+            ns_type: "network".to_string(),
+            path: Some(shared),
+        }),
+    }
+    OciSpec {
+        reusable_executor: false,
+        host_process: false,
+        // A sidecar borrows the app's volumes as an init does, so a runtime
+        // that hands a managed volume to its container's user leaves this
+        // one alone.
+        initialiser: true,
+        root: OciRoot {
+            path: root,
+            readonly: false,
+        },
+        process: OciProcess {
+            rlimits: Vec::new(),
+            args: sidecar
+                .command
+                .iter()
+                .chain(&sidecar.args)
+                .cloned()
+                .collect(),
+            env: sidecar_env(&app.process.env, &sidecar.env),
+            cwd: "/".to_string(),
+            user: OciUser {
+                uid: 65534,
+                gid: 65534,
+            },
+            capabilities: None,
+            oom_score_adj: Some(WORKLOAD_OOM_SCORE_ADJ),
+            overrides: from_image.then(|| ProcessOverrides {
+                command: sidecar.command.clone(),
+                args: sidecar.args.clone(),
+                ..ProcessOverrides::default()
+            }),
+        },
+        mounts: app.mounts.clone(),
+        linux: OciLinux {
+            namespaces,
+            resources: build_resources_from_ranges(sidecar.cpu.as_ref(), sidecar.memory.as_ref()),
+            cgroups_path: app
+                .linux
+                .cgroups_path
+                .as_ref()
+                .map(|path| format!("{path}-sidecar-{}", sidecar.name)),
+            uid_mappings: None,
+            gid_mappings: None,
+            sysctl: Default::default(),
+            devices: Vec::new(),
+        },
+        port_mapping: None,
+        stop: None,
+        // A sidecar gets none of the app's runtime knobs (#1122): the gates
+        // admitted them for the app's own container. It shares the app's
+        // network namespace, so the app's `net.*` sysctls reach it anyway.
+        runtime_knobs: None,
+    }
+}
+
+/// The app's environment entries with a sidecar's own on top: an entry the
+/// sidecar names replaces the app's. Encrypted values never reach here
+/// (validation refuses them in a sidecar's `env`), so one is left out
+/// rather than passed on as ciphertext.
+fn sidecar_env(app: &[String], own: &BTreeMap<String, EnvValue>) -> Vec<String> {
+    let inherited = app.iter().filter(|entry| {
+        let name = entry
+            .split_once('=')
+            .map_or(entry.as_str(), |(name, _)| name);
+        !own.contains_key(name)
+    });
+    let added = own.iter().filter_map(|(name, value)| match value {
+        EnvValue::Plain(value) => Some(format!("{name}={value}")),
+        EnvValue::Provider(reference) => Some(format!("{name}={}", reference.as_str())),
+        EnvValue::Encrypted(_) => None,
+    });
+    inherited.cloned().chain(added).collect()
+}
+
+impl OciSpec {
+    /// The network namespace this workload joins instead of getting its
+    /// own: its parent instance's, for a sidecar (#1120). `None` for every
+    /// other workload, whose runtime gives it a namespace of its own.
+    pub fn joined_network(&self) -> Option<&str> {
+        self.linux
+            .namespaces
+            .iter()
+            .find(|ns| ns.ns_type == "network")
+            .and_then(|ns| ns.path.as_deref())
     }
 }
 
@@ -906,6 +1164,14 @@ pub fn generate_init_oci_spec(
 mod tests {
     use super::*;
     use crate::config::types::{ConfigFileSpec, VolumeSpec};
+
+    #[test]
+    fn inline_config_file_name_is_the_first_eight_bytes_of_the_path_digest() {
+        assert_eq!(
+            inline_config_file_name(Path::new("/etc/app.conf")),
+            "8670dcb679766bcc"
+        );
+    }
 
     fn minimal_app() -> AppSpec {
         toml::from_str(r#"image = "test:v1""#).unwrap()
@@ -952,6 +1218,32 @@ mod tests {
         // Without an image of its own it inherits the app's.
         let inherited = generate_init_oci_spec(&init_container(None, &["true"]), &app);
         assert_eq!(inherited.root.path, "myapp:v1");
+    }
+
+    /// #935: an `exec` or `script` app's init container that names no image
+    /// runs on the host like its app, so it records as a host spec. One
+    /// that names an image, or an image app's init, stays a container.
+    #[test]
+    fn an_init_container_of_a_host_app_records_as_a_host_spec() {
+        for host_app in [r#"exec = "/bin/sleep""#, r#"script = "sleep 60""#] {
+            let app = app_oci(&toml::from_str(host_app).unwrap());
+            assert!(app.host_process, "{host_app}");
+
+            let init = generate_init_oci_spec(&init_container(None, &["/bin/true"]), &app);
+            assert!(init.host_process, "{host_app}: init must be a host spec");
+            assert_eq!(init.root.path, HOST_ROOT);
+
+            let own_image =
+                generate_init_oci_spec(&init_container(Some("migrate:v2"), &["migrate"]), &app);
+            assert!(
+                !own_image.host_process,
+                "{host_app}: an init with its own image is a container"
+            );
+        }
+
+        let image_app = app_oci(&minimal_app());
+        let init = generate_init_oci_spec(&init_container(None, &["true"]), &image_app);
+        assert!(!init.host_process, "an image app's init is a container");
     }
 
     #[test]
@@ -1879,6 +2171,31 @@ mod tests {
         assert!(oci.linux.resources.is_none());
     }
 
+    #[test]
+    fn a_fresh_job_container_enforces_an_explicit_pids_limit() {
+        let mut spec = minimal_job();
+        spec.pids = Some(crate::config::types::PidsLimit::try_from(512).unwrap());
+        let oci = generate_job_oci_spec("migrate", "default", &spec, "/cg", None);
+        let resources = oci.linux.resources.clone().unwrap();
+        assert_eq!(resources.pids, Some(OciPidsResources { limit: 512 }));
+        // A pids limit alone sets no CPU or memory limit.
+        assert_eq!((resources.cpu, resources.memory), (None, None));
+        // runc reads the OCI field `linux.resources.pids.limit`.
+        let json = serde_json::to_value(&oci).unwrap();
+        assert_eq!(
+            json["linux"]["resources"]["pids"],
+            serde_json::json!({ "limit": 512 })
+        );
+        // It combines with CPU and memory rather than replacing them.
+        spec.memory = Some(ResourceRange::parse_memory("64Mi").unwrap());
+        let combined = generate_job_oci_spec("migrate", "default", &spec, "/cg", None)
+            .linux
+            .resources
+            .unwrap();
+        assert_eq!(combined.pids, Some(OciPidsResources { limit: 512 }));
+        assert!(combined.memory.is_some());
+    }
+
     // -- OOM score (#984) -----------------------------------------------------
 
     #[test]
@@ -1983,6 +2300,164 @@ mod tests {
         let json = serde_json::to_string(&oci).unwrap();
         assert!(!json.contains("uidMappings"));
         assert!(!json.contains("gidMappings"));
+    }
+
+    // -- Sidecars (#1120) -----------------------------------------------------
+
+    fn sidecar(toml: &str) -> crate::config::app::SidecarSpec {
+        let app: AppSpec =
+            toml::from_str(&format!("image = \"x:1\"\n[[sidecar]]\n{toml}")).unwrap();
+        app.sidecar.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn a_sidecar_joins_its_parents_network_namespace_and_nothing_else_does() {
+        let app = app_oci(&minimal_app());
+        let parent = crate::grill::InstanceId("default__web-0".into());
+        let spec = generate_sidecar_oci_spec(&sidecar("name = \"proxy\""), &app, &parent);
+
+        assert_eq!(
+            spec.joined_network(),
+            Some("/var/run/netns/rb-default__web-0")
+        );
+        assert_eq!(
+            app.joined_network(),
+            None,
+            "the app gets a namespace of its own"
+        );
+        // Every other namespace is its own, as for any container.
+        for ns in spec
+            .linux
+            .namespaces
+            .iter()
+            .filter(|ns| ns.ns_type != "network")
+        {
+            assert_eq!(ns.path, None, "{}", ns.ns_type);
+        }
+        assert_eq!(
+            sidecar_instance_id(&parent, "proxy").0,
+            "default__web-0__sidecar-proxy"
+        );
+    }
+
+    /// #1122: the gates admitted the app's runtime knobs for the app's own
+    /// container, so a sidecar built from its finished spec carries none.
+    #[test]
+    fn a_sidecar_gets_none_of_the_apps_runtime_knobs() {
+        let app = app_oci(
+            &toml::from_str(
+                "image = \"vpn:1\"\n[runtime]\ncapabilities = [\"NET_ADMIN\"]\n\
+                 devices = [{ path = \"/dev/net/tun\" }]\n",
+            )
+            .unwrap(),
+        );
+        assert!(app.runtime_knobs.is_some(), "the app carries its knobs");
+        let parent = crate::grill::InstanceId("default__vpn-0".into());
+        let spec = generate_sidecar_oci_spec(&sidecar("name = \"proxy\""), &app, &parent);
+        assert_eq!(spec.runtime_knobs, None);
+        assert!(spec.linux.sysctl.is_empty() && spec.linux.devices.is_empty());
+        assert_eq!(spec.process.capabilities, None);
+    }
+
+    #[test]
+    fn a_sidecar_runs_its_own_image_and_argv_or_the_apps_image() {
+        let app = app_oci(&toml::from_str("image = \"myapp:v1\"").unwrap());
+        let parent = crate::grill::InstanceId("default__web-0".into());
+        let proxy = generate_sidecar_oci_spec(
+            &sidecar(
+                "name = \"proxy\"\nimage = \"envoy:1.31\"\ncommand = [\"envoy\"]\n\
+                 args = [\"-c\", \"/etc/envoy.yaml\"]",
+            ),
+            &app,
+            &parent,
+        );
+        assert_eq!(proxy.root.path, "envoy:1.31");
+        assert_eq!(proxy.process.args, ["envoy", "-c", "/etc/envoy.yaml"]);
+        let overrides = proxy.process.overrides.unwrap();
+        assert_eq!(overrides.command, ["envoy"]);
+        assert_eq!(overrides.args, ["-c", "/etc/envoy.yaml"]);
+
+        let worker = generate_sidecar_oci_spec(
+            &sidecar("name = \"worker\"\ncommand = [\"/app/worker\"]"),
+            &app,
+            &parent,
+        );
+        assert_eq!(worker.root.path, "myapp:v1");
+        assert!(!worker.host_process);
+    }
+
+    #[test]
+    fn a_sidecar_gets_the_apps_env_and_mounts_with_its_own_env_on_top() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "myapp:v1"
+            env = { MODE = "app", DATABASE_URL = "postgres://db/app" }
+
+            [[volumes]]
+            path = "/data"
+            "#,
+        )
+        .unwrap();
+        let app = generate_oci_spec(
+            "web",
+            "default",
+            &app,
+            "default__web-0",
+            None,
+            "/cg",
+            Some(tmp.path()),
+            None,
+        );
+        let spec = generate_sidecar_oci_spec(
+            &sidecar(
+                "name = \"logs\"\nenv = { MODE = \"sidecar\", TOKEN = \"PROVIDER[vault:logs/token]\" }",
+            ),
+            &app,
+            &crate::grill::InstanceId("default__web-0".into()),
+        );
+
+        let mut env = spec.process.env.clone();
+        env.sort();
+        assert_eq!(
+            env,
+            [
+                "DATABASE_URL=postgres://db/app",
+                "MODE=sidecar",
+                "TOKEN=PROVIDER[vault:logs/token]",
+            ]
+        );
+        assert_eq!(spec.mounts, app.mounts);
+        // Borrowed volumes stay the app's.
+        assert!(spec.initialiser);
+        assert_eq!(spec.port_mapping, None);
+    }
+
+    #[test]
+    fn a_sidecar_has_its_own_cgroup_and_limits_beside_the_apps() {
+        let app: AppSpec = toml::from_str("image = \"myapp:v1\"\ncpu = \"1\"").unwrap();
+        let app = generate_oci_spec(
+            "web",
+            "default",
+            &app,
+            "default__web-0",
+            None,
+            "/sys/fs/cgroup/reliaburger/default/web/0",
+            None,
+            None,
+        );
+        let spec = generate_sidecar_oci_spec(
+            &sidecar("name = \"proxy\"\ncpu = \"100m-200m\"\nmemory = \"64Mi-128Mi\""),
+            &app,
+            &crate::grill::InstanceId("default__web-0".into()),
+        );
+        assert_eq!(
+            spec.linux.cgroups_path.as_deref(),
+            Some("/reliaburger/default/web/0-sidecar-proxy")
+        );
+        let resources = spec.linux.resources.unwrap();
+        assert_eq!(resources.memory.unwrap().limit, 128 * 1024 * 1024);
+        assert_eq!(resources.cpu.unwrap().quota, 20_000);
     }
 
     // -- Network namespace path -----------------------------------------------

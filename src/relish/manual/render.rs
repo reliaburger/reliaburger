@@ -302,6 +302,21 @@ mod tests {
         insta::assert_snapshot!(text.join("\n"));
     }
 
+    /// Doc snippet markers (#708) steer `tests/suite/doc_snippets.rs`; a
+    /// reader of `relish manual` never sees them.
+    #[test]
+    fn snippet_markers_are_not_shown() {
+        let lines = markdown_to_lines(
+            "Intro.\n\n<!-- snippet: fragment -->\n```toml\n[app.web.env]\n```\n",
+        );
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(
+            text.iter().all(|line| !line.contains("snippet")),
+            "{text:?}"
+        );
+        assert!(text.iter().any(|line| line.contains("[app.web.env]")));
+    }
+
     #[test]
     fn headings_are_bold() {
         let lines = rendered();

@@ -40,13 +40,14 @@ pub(super) enum DeployOp {
         namespace: String,
         reply: oneshot::Sender<Vec<InstanceId>>,
     },
-    /// How many replicas a deploy adds beside the running ones, when it
-    /// only raises the replica count. Asked before the spec is stored.
-    ReplicasToAddInPlace {
+    /// What a deploy that changes only this node's share of the same
+    /// version does to the running replicas (#1111). Asked before the spec
+    /// is stored.
+    ShareChangeInPlace {
         app_name: String,
         namespace: String,
         spec: Box<AppSpec>,
-        reply: oneshot::Sender<Option<u32>>,
+        reply: oneshot::Sender<Option<super::scale_in_place::InPlaceChange>>,
     },
     /// Create Pending instances for the replicas a scale-up adds.
     AddAppReplicas {
@@ -134,6 +135,13 @@ pub(super) enum DeployOp {
         instance_id: InstanceId,
         initialiser: InstanceId,
         reply: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Reserve an instance's sidecar identities before the first is
+    /// created, so its retirement finds every one (#1120).
+    RegisterSidecars {
+        instance_id: InstanceId,
+        names: Vec<String>,
+        reply: oneshot::Sender<Result<Vec<InstanceId>, BunError>>,
     },
     /// Program source and egress policy before create → program → start. On
     /// failure the caller stops the created container and fails the deploy.
@@ -250,7 +258,14 @@ pub(super) enum DeployOp {
     /// settle before it signals the runtime.
     BeginRetire {
         old_id: InstanceId,
-        reply: oneshot::Sender<Result<Option<restarts::TakenRestart>, BunError>>,
+        reply: oneshot::Sender<Result<super::retirement::BegunRetirement, BunError>>,
+    },
+    /// Ask the leader whether every node has dropped a retiring old
+    /// instance's backend (#1355). Sent before the stop signal, while the
+    /// instance still serves; the reply is the producer release's answer.
+    AwaitRemoteWithdrawal {
+        old_id: InstanceId,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Hand a stopped old instance whose addresses still await remote
     /// withdrawal confirmations to the agent loop, so the rollout can finish.
@@ -281,7 +296,7 @@ impl DeployOp {
             DeployOp::EnforceImageSignature { .. } => "enforce_image_signature",
             DeployOp::StoreDeployedSpec { .. } => "store_deployed_spec",
             DeployOp::ListExistingOwned { .. } => "list_existing_owned",
-            DeployOp::ReplicasToAddInPlace { .. } => "replicas_to_add_in_place",
+            DeployOp::ShareChangeInPlace { .. } => "share_change_in_place",
             DeployOp::AddAppReplicas { .. } => "add_app_replicas",
             DeployOp::NextDeployGen { .. } => "next_deploy_gen",
             DeployOp::SupervisorDeployApp { .. } => "supervisor_deploy_app",
@@ -294,6 +309,7 @@ impl DeployOp {
             DeployOp::RegisterInitialiser { .. } => "register_initialiser",
             DeployOp::RecordInitialiserGeneration { .. } => "record_initialiser_generation",
             DeployOp::ForgetInitialiser { .. } => "forget_initialiser",
+            DeployOp::RegisterSidecars { .. } => "register_sidecars",
             DeployOp::ApplyNetworkPreStart { .. } => "apply_network_pre_start",
             DeployOp::TransitionState { .. } => "transition_state",
             DeployOp::RecordLaunchFailure { .. } => "record_launch_failure",
@@ -307,6 +323,7 @@ impl DeployOp {
             DeployOp::PublishNewBackend { .. } => "publish_new_backend",
             DeployOp::FinishRetire { .. } => "finish_retire",
             DeployOp::BeginRetire { .. } => "begin_retire",
+            DeployOp::AwaitRemoteWithdrawal { .. } => "await_remote_withdrawal",
             DeployOp::DeferRetire { .. } => "defer_retire",
             DeployOp::PushDeployHistory { .. } => "push_deploy_history",
             DeployOp::RebuildRoutingTable { .. } => "rebuild_routing_table",
@@ -373,6 +390,12 @@ pub(super) const PRODUCER_RELEASE_PATIENCE: std::time::Duration = std::time::Dur
 
 /// Pause between two producer release attempts.
 pub(super) const PRODUCER_RELEASE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Pause between two asks, before an old instance's stop, whether every node
+/// has dropped its backend (#1355). Shorter than [`PRODUCER_RELEASE_RETRY`]:
+/// the rollout waits on this one, so the answer is collected sooner.
+pub(super) const REMOTE_WITHDRAWAL_RETRY: std::time::Duration =
+    std::time::Duration::from_millis(500);
 
 /// Run `attempt` until it stops reporting a pending producer release, or
 /// until `patience` runs out; returns the last outcome either way.
@@ -519,14 +542,14 @@ impl DeployOps {
         .await
     }
 
-    pub(super) async fn replicas_to_add_in_place(
+    pub(super) async fn share_change_in_place(
         &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
-    ) -> Option<u32> {
+    ) -> Option<super::scale_in_place::InPlaceChange> {
         self.call(
-            |reply| DeployOp::ReplicasToAddInPlace {
+            |reply| DeployOp::ShareChangeInPlace {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
                 spec: Box::new(spec.clone()),
@@ -615,19 +638,23 @@ impl DeployOps {
         port: u16,
         firewall: Option<Vec<String>>,
     ) -> Result<(), BunError> {
-        self.call(
-            |reply| DeployOp::RegisterServiceApp {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                port,
-                firewall,
-                reply,
-            },
-            Err(BunError::BackendPublication {
-                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
-                reason: "agent loop closed before service registration".into(),
-            }),
-        )
+        // The loop answers `StillRunning` while the service's journal write
+        // is in flight (#1263); ask again until it has landed.
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::RegisterServiceApp {
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    port,
+                    firewall: firewall.clone(),
+                    reply,
+                },
+                Err(BunError::BackendPublication {
+                    service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                    reason: "agent loop closed before service registration".into(),
+                }),
+            )
+        })
         .await
     }
 
@@ -637,18 +664,20 @@ impl DeployOps {
         namespace: &str,
         spec: &AppSpec,
     ) -> Result<(), BunError> {
-        self.call(
-            |reply| DeployOp::RestoreStoppedRouting {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                spec: Box::new(spec.clone()),
-                reply,
-            },
-            Err(BunError::BackendPublication {
-                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
-                reason: "agent loop closed before service registration".into(),
-            }),
-        )
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::RestoreStoppedRouting {
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    spec: Box::new(spec.clone()),
+                    reply,
+                },
+                Err(BunError::BackendPublication {
+                    service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                    reason: "agent loop closed before service registration".into(),
+                }),
+            )
+        })
         .await
     }
 
@@ -736,6 +765,24 @@ impl DeployOps {
             |reply| DeployOp::RegisterInitialiser {
                 instance_id: instance_id.clone(),
                 index,
+                reply,
+            },
+            Err(BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .await
+    }
+
+    pub(super) async fn register_sidecars(
+        &self,
+        instance_id: &InstanceId,
+        names: Vec<String>,
+    ) -> Result<Vec<InstanceId>, BunError> {
+        self.call(
+            |reply| DeployOp::RegisterSidecars {
+                instance_id: instance_id.clone(),
+                names,
                 reply,
             },
             Err(BunError::InstanceNotFound {
@@ -843,16 +890,20 @@ impl DeployOps {
         namespace: &str,
         evidence: launch_evidence::LaunchEvidence,
     ) -> Result<(), BunError> {
-        self.call(
-            |reply| DeployOp::FinishFreshInstance {
-                instance_id: instance_id.clone(),
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                evidence: Box::new(evidence),
-                reply,
-            },
-            Ok(()),
-        )
+        // The loop answers `StillRunning` while the backend's journal write
+        // is in flight (#1263); ask again until it has landed.
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::FinishFreshInstance {
+                    instance_id: instance_id.clone(),
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    evidence: Box::new(evidence.clone()),
+                    reply,
+                },
+                Ok(()),
+            )
+        })
         .await
     }
 
@@ -970,24 +1021,29 @@ impl DeployOps {
         new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
     ) -> Result<(), BunError> {
-        self.call(
-            |reply| DeployOp::FinaliseRollingDeploy {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                spec: Box::new(spec.clone()),
-                existing,
-                new_ids,
-                new_ports,
-                new_ips,
-                new_specs,
-                now,
-                reply,
-            },
-            Err(BunError::DeployFailed {
-                app_name: app_name.into(),
-                reason: "agent loop closed before finalisation".into(),
-            }),
-        )
+        // The loop answers `StillRunning`, having changed nothing, while the
+        // rolled-out service's journal write is in flight (#1336); ask again
+        // until it has landed.
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::FinaliseRollingDeploy {
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    spec: Box::new(spec.clone()),
+                    existing: existing.clone(),
+                    new_ids: new_ids.clone(),
+                    new_ports: new_ports.clone(),
+                    new_ips: new_ips.clone(),
+                    new_specs: new_specs.clone(),
+                    now,
+                    reply,
+                },
+                Err(BunError::DeployFailed {
+                    app_name: app_name.into(),
+                    reason: "agent loop closed before finalisation".into(),
+                }),
+            )
+        })
         .await
     }
 
@@ -1001,28 +1057,32 @@ impl DeployOps {
         container_ip: Option<std::net::Ipv4Addr>,
         has_port: bool,
     ) -> Result<(), BunError> {
-        self.call(
-            |reply| DeployOp::PublishNewBackend {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                new_id: new_id.clone(),
-                host_port,
-                container_ip,
-                has_port,
-                reply,
-            },
-            Err(BunError::BackendPublication {
-                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
-                reason: "agent loop closed before backend publication".into(),
-            }),
-        )
+        // The loop answers `StillRunning` while the backend's journal write
+        // is in flight (#1263); ask again until it has landed.
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::PublishNewBackend {
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    new_id: new_id.clone(),
+                    host_port,
+                    container_ip,
+                    has_port,
+                    reply,
+                },
+                Err(BunError::BackendPublication {
+                    service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                    reason: "agent loop closed before backend publication".into(),
+                }),
+            )
+        })
         .await
     }
 
     pub(super) async fn begin_retire(
         &self,
         old_id: &InstanceId,
-    ) -> Result<Option<restarts::TakenRestart>, BunError> {
+    ) -> Result<super::retirement::BegunRetirement, BunError> {
         self.call(
             |reply| DeployOp::BeginRetire {
                 old_id: old_id.clone(),
@@ -1062,6 +1122,39 @@ impl DeployOps {
             })
         })
         .await
+    }
+
+    /// Wait, before an old instance's stop, until the leader confirms that
+    /// every node has dropped its backend, for at most
+    /// [`PRODUCER_RELEASE_PATIENCE`] (#1355).
+    ///
+    /// Other nodes connect to the backend directly and drop it only when
+    /// their next view arrives. Stopping before then refuses their callers'
+    /// connections. The question is the producer release's, asked early:
+    /// the leader fences the execution, takes it out of the catalogue and
+    /// answers "confirmed" once every consumer's withdrawal receipt is in.
+    /// The wait is best effort. A node that never answers, an uncertain
+    /// ownership or an unreachable leader costs at most the patience, and
+    /// the stop goes ahead; the release after the stop still holds the
+    /// addresses until the leader confirms.
+    pub(super) async fn await_remote_withdrawal(&self, old_id: &InstanceId) {
+        let outcome =
+            retry_while_release_pending(PRODUCER_RELEASE_PATIENCE, REMOTE_WITHDRAWAL_RETRY, || {
+                self.call(
+                    |reply| DeployOp::AwaitRemoteWithdrawal {
+                        old_id: old_id.clone(),
+                        reply,
+                    },
+                    Ok(()),
+                )
+            })
+            .await;
+        if let Err(error) = outcome {
+            eprintln!(
+                "bun: stopping {} before every node confirmed it is withdrawn: {error}",
+                old_id.0
+            );
+        }
     }
 
     /// Let the agent loop finish releasing a stopped old instance's addresses
@@ -1191,13 +1284,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .collect();
                 let _ = reply.send(ids);
             }
-            DeployOp::ReplicasToAddInPlace {
+            DeployOp::ShareChangeInPlace {
                 app_name,
                 namespace,
                 spec,
                 reply,
             } => {
-                let _ = reply.send(self.replicas_to_add_in_place(&app_name, &namespace, &spec));
+                let _ = reply.send(self.share_change_in_place(&app_name, &namespace, &spec));
             }
             DeployOp::AddAppReplicas {
                 app_name,
@@ -1271,13 +1364,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reply,
             } => {
                 let service_id = crate::onion::service_id::ServiceId::new(&namespace, &app_name);
-                let result = async {
-                    self.register_local_service(&service_id, port, firewall)?;
-                    self.publish_backend_ebpf(&service_id).await?;
-                    self.sync_firewall_ebpf().await;
-                    Ok(())
-                }
-                .await;
+                let result = self
+                    .register_and_publish_service(
+                        &service_id,
+                        port,
+                        firewall,
+                        "register_service_app/landed",
+                    )
+                    .await;
                 let _ = reply.send(result);
             }
             DeployOp::RestoreStoppedRouting {
@@ -1417,6 +1511,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 };
                 let _ = reply.send(result);
             }
+            DeployOp::RegisterSidecars {
+                instance_id,
+                names,
+                reply,
+            } => {
+                let _ = reply.send(self.register_sidecars(&instance_id, &names));
+            }
             DeployOp::ApplyNetworkPreStart {
                 instance_id,
                 app_name,
@@ -1438,8 +1539,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .await;
                 // On failure, mark the instance Failed. The worker stops the
                 // created container, off the loop, so no half-started
-                // workload lingers.
-                if result.is_err()
+                // workload lingers. A start whose network reference is still
+                // being journalled isn't failed: the worker asks again (#1266).
+                if result
+                    .as_ref()
+                    .is_err_and(|error| !matches!(error, BunError::StillRunning { .. }))
                     && let Some(instance) = self.supervisor.get_instance_mut(&instance_id)
                     && let Ok(state) = instance.state.transition_to(ContainerState::Failed)
                 {
@@ -1602,6 +1706,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             DeployOp::FinishRetire { old_id, reply } => {
                 let result = self.finish_retire_bookkeeping(&old_id).await;
+                let _ = reply.send(result);
+            }
+            DeployOp::AwaitRemoteWithdrawal { old_id, reply } => {
+                let result = self.confirm_producer_release(&old_id).await.map(|_| ());
                 let _ = reply.send(result);
             }
             DeployOp::DeferRetire { old_id, reply } => {

@@ -270,6 +270,7 @@ fn cluster_params_from_config(
             .cluster
             .recovery_probe_window_secs
             .map(std::time::Duration::from_secs),
+        council_size_cap: None,
     })
 }
 
@@ -367,8 +368,8 @@ fn metrics_archive_owner(
     if let Some(live) = load_node_identity(config)? {
         let identity = live.snapshot();
         return Ok(format!(
-            "tls:{:x}:{}",
-            Sha256::digest(&identity.root_ca_der),
+            "tls:{}:{}",
+            hex::encode(Sha256::digest(&identity.root_ca_der)),
             identity.node_id
         ));
     }
@@ -1025,10 +1026,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     .context("state compatibility check failed")??;
 
     // Recover temporary uploads before any registry or replication writer starts.
+    // `execv` runs no destructors: after a self-upgrade the old image's lock
+    // lives on in any child another thread was forking at that moment, until
+    // that child's own `exec`, so wait a little before calling it busy (#1198).
     let pickle_dir = storage_directory(&config.storage.images, "images").await?;
     let blob_store = Arc::new(BlobStore::new(&pickle_dir));
     let _upload_owner = blob_store
-        .claim_upload_directory()
+        .claim_upload_directory(UPLOAD_OWNER_WAIT)
         .await
         .context("cannot recover registry upload ownership")?;
     blob_store
@@ -1431,11 +1435,27 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // policy and an operator's allowlist would be silently ignored — a
     // config deploy could run an arbitrary host binary through ProcessGrill.
     agent.set_process_config(config.process_workloads.clone());
+    // `PROVIDER[...]` env values resolve only through the providers
+    // `[secret_providers.*]` names (#1123).
+    agent.set_secret_providers(reliaburger::sesame::secret_provider::SecretProviders::new(
+        config.secret_providers.clone(),
+    ));
     // Host-path sources are refused unless `[storage] allowed_host_paths`
     // covers them, and never reach the node's own directories.
     agent.set_host_path_policy(
         reliaburger::bun::host_paths::HostPathPolicy::from_node_config(&config),
     );
+    // Runtime knobs are refused unless `[runtime]` lists each one (#1122).
+    // Naming an escape-hatch capability is allowed, but loudly.
+    let runtime_allowlist = config.runtime.knob_allowlist();
+    for capability in runtime_allowlist.escape_capabilities() {
+        eprintln!(
+            "bun: warning: [runtime] allowed_capabilities lists {capability}, which gives a \
+             container near-root power over its own namespaces; apps whose tokens carry \
+             host-exec may ask for it"
+        );
+    }
+    agent.set_runtime_allowlist(runtime_allowlist);
     // Bound fault durations by the `[smoker]` policy (default + maximum).
     agent.configure_perimeter(
         vec![
@@ -1547,7 +1567,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 use sha2::{Digest, Sha256};
                 let directory = std::fs::canonicalize(&data_base)?;
                 let identity = Sha256::digest(directory.as_os_str().as_encoded_bytes());
-                let pins = PathBuf::from(format!("/sys/fs/bpf/reliaburger-{identity:x}"));
+                let pins =
+                    PathBuf::from(format!("/sys/fs/bpf/reliaburger-{}", hex::encode(identity)));
                 let cgroup = config.ebpf.cgroup_path.clone();
                 let program = config.ebpf.resolve_program_dir();
                 tokio::task::spawn_blocking(move || {
@@ -2324,7 +2345,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let scrape_cmd_tx = cmd_tx.clone();
         let scrape_node = node_name.clone();
         feeder_handles.push(tokio::spawn(async move {
-            let client = reqwest::Client::builder()
+            let client = reliaburger::http_client::builder()
                 .timeout(timeout)
                 .build()
                 .unwrap_or_default();
@@ -2805,7 +2826,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .with_telemetry(Arc::clone(&job_telemetry)),
         )))
         .with_job_notifier(WebhookDispatcher::new(
-            reqwest::Client::builder()
+            reliaburger::http_client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
@@ -2947,7 +2968,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     let leader_directory = registry_directory.clone().map(api::LeaderDirectory);
     let registry_forwarder = if let Some(directory) = registry_directory {
-        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        let mut builder =
+            reliaburger::http_client::builder().redirect(reqwest::redirect::Policy::none());
         if let Some(identity) = &api_identity {
             builder = builder.use_preconfigured_tls(
                 (*reliaburger::sesame::mtls::build_live_mtls_client_config(
@@ -3203,7 +3225,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let eval_interval = config.alerts.evaluation_interval_secs;
         let cluster_name = config.cluster.name.clone();
 
-        let webhook_client = reqwest::Client::builder()
+        let webhook_client = reliaburger::http_client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
@@ -3762,6 +3784,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// How long startup waits for the registry upload lock before refusing to
+/// start beside another owner.
+const UPLOAD_OWNER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 const APPLE_RUNTIME_DEFERRED: &str = "direct Apple Container is disabled for 0.1.0; use the managed Linux VM with `relish setup --quickstart`";
 

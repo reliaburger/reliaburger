@@ -1,0 +1,101 @@
+{
+ "accepted_successes": {
+  "process": 8,
+  "runc": 0,
+  "shared-runc": 6
+ },
+ "accepted_successes_per_second": 2.0,
+ "api_fallbacks": {
+  "answered": {},
+  "missed": {}
+ },
+ "audited_attempts": 8,
+ "complete": false,
+ "elapsed_seconds": 7,
+ "errors": [],
+ "fault_markers": 0,
+ "gate": {
+  "decision": "D18-C",
+  "fault_kinds": [
+   "leader-kill",
+   "follower-kill",
+   "power-off"
+  ],
+  "node_faults": false,
+  "nodes": 3,
+  "schedule": "compressed",
+  "soak_seconds": 468,
+  "tier": "fast"
+ },
+ "load": "calibration",
+ "m8": {
+  "api_node": "rb-7b24139af8c6-1",
+  "bun_rss_worst": null,
+  "executor_overhead_cores_per_node": null,
+  "leader_cpu_cores": null,
+  "million_task_array_wall_seconds": {
+   "max": null,
+   "median": null,
+   "runs": 0
+  },
+  "node_ledger_mib_per_million_tasks": null,
+  "p99_start_lag_ms": 128,
+  "per_node": {},
+  "raft_entries_per_second": null,
+  "raft_leaders": [
+   "rb-7b24139af8c6-1"
+  ],
+  "raft_state_bytes_max": 619,
+  "retained_log_mb": null,
+  "start_lag_samples": 8,
+  "targets": {
+   "bun_steady_rss_mib": {
+    "api_node": 512,
+    "other_nodes": 384
+   },
+   "executor_overhead_cores_per_node": 0.5,
+   "leader_cpu_cores": 1,
+   "million_task_array_wall_seconds": 600,
+   "node_ledger_mib_per_million_tasks": 64,
+   "p99_start_lag_ms": 1000,
+   "raft_entries_per_second": "recorded only; the batch target counts only task-array writes",
+   "raft_state_bytes_per_million_tasks": 262144,
+   "retained_log_mb": 50
+  }
+ },
+ "operator_replay_decisions": 0,
+ "retries": {
+  "process": 0,
+  "runc": 0,
+  "shared-runc": 0
+ },
+ "retry_causes": {
+  "process": {
+   "exit_code": 0,
+   "launch": 0,
+   "signal": 0,
+   "timeout": 0,
+   "unknown": 0,
+   "unrecorded": 0
+  },
+  "runc": {
+   "exit_code": 0,
+   "launch": 0,
+   "signal": 0,
+   "timeout": 0,
+   "unknown": 0,
+   "unrecorded": 0
+  },
+  "shared-runc": {
+   "exit_code": 0,
+   "launch": 0,
+   "signal": 0,
+   "timeout": 0,
+   "unknown": 0,
+   "unrecorded": 0
+  }
+ },
+ "schema": 1,
+ "target_met": null,
+ "target_rate": null
+}

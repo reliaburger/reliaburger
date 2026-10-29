@@ -16,6 +16,7 @@ pub mod council_view;
 pub mod dashboard;
 pub mod dev;
 pub mod diff;
+pub mod events_cmd;
 pub mod fault;
 pub mod fmt;
 pub mod image;
@@ -45,6 +46,7 @@ pub mod os;
 pub mod output;
 pub mod path_cmd;
 pub mod plan;
+pub mod policy_cmd;
 pub mod quickstart;
 pub mod reader;
 pub mod readiness;
@@ -80,8 +82,12 @@ pub enum CommandOutcome {
     Clean,
     /// Ran fine, but found failures the caller should act on. Exit 1.
     Problems,
-    /// Ran fine, found only warnings. Exit 2.
+    /// Ran fine, found only warnings. Exit 3: clap already uses 2 for a
+    /// usage error, and a script must be able to tell the two apart.
     Warnings,
+    /// `relish exec` ran a command that exited with this code; relish exits
+    /// with it too.
+    Exited(u8),
 }
 
 impl CommandOutcome {
@@ -90,7 +96,8 @@ impl CommandOutcome {
         match self {
             CommandOutcome::Clean => 0,
             CommandOutcome::Problems => 1,
-            CommandOutcome::Warnings => 2,
+            CommandOutcome::Warnings => 3,
+            CommandOutcome::Exited(code) => code,
         }
     }
 }
@@ -133,6 +140,13 @@ pub enum RelishError {
     /// The API returned an error.
     #[error("API error (status {status}): {body}")]
     ApiError { status: u16, body: String },
+
+    /// The cluster's policies refused the apply, or would (#1117).
+    #[error("the cluster's policies refuse this apply:\n  {}", denials.join("\n  "))]
+    PolicyDenied {
+        /// One line per denial, naming the policy and the app.
+        denials: Vec<String>,
+    },
 
     /// Explicit refusal from the live scheduler's capacity admission check.
     #[error("scheduler refused placement: {0}")]

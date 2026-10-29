@@ -177,9 +177,10 @@ pub fn node_index_from_id(node_id: &str) -> u16 {
     ((hash % (MAX_NODE_INDEX as u32)) + 1) as u16
 }
 
-/// Generate the namespace path for an instance.
+/// Generate the namespace path for an instance. The portable spec builder
+/// names the same path when a sidecar joins it (#1120).
 pub fn namespace_path(instance_id: &InstanceId) -> PathBuf {
-    PathBuf::from(format!("/var/run/netns/rb-{}", instance_id.0))
+    PathBuf::from(super::oci::network_namespace_path(instance_id))
 }
 
 /// Generate the host-side veth name for an instance.
@@ -485,6 +486,32 @@ pub async fn setup_container_network_with_commands(
         container_veth: c_veth,
         rootless,
     })
+}
+
+/// Write an app's network sysctls (#1122) into the namespace
+/// [`setup_container_network_with_commands`] made for `instance_id`.
+///
+/// The namespace belongs to the node's user namespace, not the container's,
+/// so container root can't write them and runc writing them from inside
+/// would fail. The node can, as it does for the low-ports sysctls above.
+pub async fn write_sysctls_with_commands(
+    executor: &impl RuntimeCommandExecutor,
+    instance_id: &InstanceId,
+    sysctls: &std::collections::BTreeMap<String, String>,
+) -> Result<(), NetnsError> {
+    let ns_name = format!("rb-{}", instance_id.0);
+    for (name, value) in sysctls {
+        let setting = format!("{name}={value}");
+        run_cmd(
+            executor,
+            "ip",
+            &["netns", "exec", &ns_name, "sysctl", "-w", &setting],
+            instance_id,
+            "write the app's network sysctl",
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Recover an existing rootful network only when the live container owns it.

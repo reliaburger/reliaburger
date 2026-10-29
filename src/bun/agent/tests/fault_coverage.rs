@@ -16,6 +16,8 @@ const SLOW_CGROUP_READ: std::time::Duration = std::time::Duration::from_millis(3
 
 fn partition_from_frontend() -> FaultRequest {
     FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::Partition {
             source_app: Some("frontend".into()),
         },
@@ -154,4 +156,93 @@ fn delays_shape_container_callers_and_skip_host_processes() {
         &addressed,
     );
     assert_eq!(kept, vec![caller("default__frontend-0")]);
+}
+
+/// Programming a delay that outlasts the turn, or waits on an earlier Bun's
+/// sweep, finishes on the next tick: the rule is in the registry. Refusing
+/// the injection for it told the client a fault had failed that then went
+/// ahead (#1199). Only a real failure for one of this rule's callers refuses.
+#[test]
+fn a_delay_still_being_programmed_is_accepted_and_only_a_real_failure_refuses() {
+    use super::super::faults::{DelayFailure, delay_injection_outcome};
+    let callers = vec!["default__frontend-0".to_string()];
+    let pending = vec![(
+        "default__frontend-0".to_string(),
+        DelayFailure::Pending("programming the delay did not finish within the turn".into()),
+    )];
+    assert_eq!(delay_injection_outcome(&callers, &pending), Ok(()));
+
+    let failed = vec![
+        (
+            "default__frontend-0".to_string(),
+            DelayFailure::Pending("programming the delay did not finish within the turn".into()),
+        ),
+        (
+            "default__frontend-0".to_string(),
+            DelayFailure::Failed("RTNETLINK answers: File exists".into()),
+        ),
+    ];
+    assert_eq!(
+        delay_injection_outcome(&callers, &failed),
+        Err("cannot delay traffic: RTNETLINK answers: File exists".to_string())
+    );
+
+    let elsewhere = vec![(
+        "default__backend-0".to_string(),
+        DelayFailure::Failed("RTNETLINK answers: File exists".into()),
+    )];
+    assert_eq!(delay_injection_outcome(&callers, &elsewhere), Ok(()));
+}
+
+/// A runc job attempt is a delay caller too (#704), and thousands of them
+/// start and finish an hour. One that finished while `tc` ran took its
+/// `eth0` with it, and that refused the operator's whole delay (#1291).
+/// A caller that has gone drops out; an attempt without its interface waits
+/// for the next tick; an app instance that can't be shaped still refuses.
+#[test]
+fn a_job_attempt_that_finishes_mid_delay_does_not_refuse_the_fault() {
+    use super::super::faults::{CallerNow, DelayFailure, delay_program_failure};
+    use crate::smoker::network::NetnsCommandError;
+    let no_device = || NetnsCommandError::Failed {
+        instance: "default__executor-f2-254".to_string(),
+        program: "tc".to_string(),
+        stderr: "Cannot find device \"eth0\"".to_string(),
+    };
+    let no_namespace = || NetnsCommandError::NoNamespace {
+        instance: "default__executor-f2-254".to_string(),
+    };
+
+    assert_eq!(delay_program_failure(CallerNow::Gone, &no_device()), None);
+    assert_eq!(
+        delay_program_failure(CallerNow::Gone, &no_namespace()),
+        None
+    );
+    assert!(matches!(
+        delay_program_failure(CallerNow::Attempt, &no_device()),
+        Some(DelayFailure::Pending(_))
+    ));
+    assert!(matches!(
+        delay_program_failure(CallerNow::Attempt, &no_namespace()),
+        Some(DelayFailure::Pending(_))
+    ));
+
+    let file_exists = NetnsCommandError::Failed {
+        instance: "default__executor-f2-254".to_string(),
+        program: "tc".to_string(),
+        stderr: "RTNETLINK answers: File exists".to_string(),
+    };
+    assert!(matches!(
+        delay_program_failure(CallerNow::Attempt, &file_exists),
+        Some(DelayFailure::Failed(_))
+    ));
+    assert!(matches!(
+        delay_program_failure(CallerNow::Instance, &no_device()),
+        Some(DelayFailure::Failed(_))
+    ));
+    assert_eq!(
+        delay_program_failure(CallerNow::Instance, &no_namespace()),
+        Some(DelayFailure::Failed(
+            "instance default__executor-f2-254 has no network namespace".to_string()
+        ))
+    );
 }

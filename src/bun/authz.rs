@@ -196,6 +196,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Get, "/v1/top", AnyToken, Filtered(METRICS)),
     gated(Post, "/v1/stop/{app}/{namespace}", Deployer, App(SCALE)),
     gated(Post, "/v1/delete/{app}/{namespace}", Deployer, App(DEPLOY)),
+    gated(Post, "/v1/release/{app}/{namespace}", Deployer, App(DEPLOY)),
     gated(Get, "/v1/logs/{app}/{namespace}", AnyToken, App(LOGS)),
     gated(
         Get,
@@ -252,6 +253,11 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // changing the cluster's configuration is an Admin operation (#693).
     route(Get, "/v1/gitops", AnyToken),
     gated(Post, "/v1/gitops/config", Admin, Cluster(ADMIN)),
+    // Policies (#1117): anyone may read them; deleting one is an Admin
+    // operation, like writing one through `relish apply`.
+    route(Get, "/v1/policies", AnyToken),
+    route(Get, "/v1/policies/audit", AnyToken),
+    gated(Post, "/v1/policies/{name}/delete", Admin, Cluster(ADMIN)),
     // Chaos.
     route(Post, "/v1/chaos/reserve", System),
     route(Post, "/v1/chaos/fence", System),
@@ -284,6 +290,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/fault", Deployer, Body(FAULT)),
     gated(Delete, "/v1/fault", Deployer, Body(FAULT)),
     route(Get, "/v1/fault", AnyToken),
+    route(Get, "/v1/fault/attempts", AnyToken),
     gated(Delete, "/v1/fault/{id}", Deployer, Body(FAULT)),
     // Discovery + routing.
     route(Post, "/v1/discovery/retire", System),
@@ -663,6 +670,7 @@ mod tests {
         include_str!("api/node_info.rs"),
         include_str!("api/nodes.rs"),
         include_str!("api/os.rs"),
+        include_str!("api/policies.rs"),
         include_str!("api/registry.rs"),
         include_str!("api/secrets.rs"),
         include_str!("api/snapshots.rs"),
@@ -1008,19 +1016,24 @@ mod tests {
         );
     }
 
-    /// Audit events span every tenant and their routes name no app, so the
-    /// per-app scan above can't see them. Both the listing and its live
-    /// stream must refuse a scoped token; the stream once didn't.
+    /// Events span every tenant and their routes name no app, so the
+    /// per-app scan above can't see them. The listing filters each event by
+    /// the caller's scope, so a controller reads its own namespace's
+    /// (#1125); the dashboard's live stream refuses a scoped token, which
+    /// it once didn't.
     #[test]
-    fn both_event_routes_refuse_scoped_tokens() {
+    fn both_event_routes_keep_a_scoped_token_to_its_own_events() {
         let source = include_str!("api.rs");
-        for handler in ["events_handler", "ws_events_handler"] {
-            let body = mounted_handler_body(source, handler).expect(handler);
-            assert!(
-                body.contains("require_unscoped"),
-                "{handler} serves every tenant's events to a scoped token"
-            );
-        }
+        let listing = mounted_handler_body(source, "events_handler").expect("events_handler");
+        assert!(
+            listing.matches("event_visible").count() >= 2,
+            "events_handler must filter both the listing and the live feed by scope"
+        );
+        let stream = mounted_handler_body(source, "ws_events_handler").expect("ws_events_handler");
+        assert!(
+            stream.contains("require_unscoped"),
+            "ws_events_handler serves every tenant's events to a scoped token"
+        );
     }
 
     /// F05 I1: the routes that change who can do what record who called

@@ -19,7 +19,7 @@ run 35841814073.
 **Most of that is compiling.** About two-thirds of runner time is compilation.
 Every job builds its own copy of the same thing:
 
-- The portable suite (about 4,150 tests, about 5 minutes per run) runs **seven
+- The portable suite (about 5 minutes per run) runs **seven
   times per push**:
   - `portable Linux` default and no-default;
   - `minimum Rust` default and no-default;
@@ -28,7 +28,7 @@ Every job builds its own copy of the same thing:
 - About 12 separate full test-profile builds of all 75 test binaries happen per
   push, at 8–9 minutes each when cold.
 - `wall-clock acceptance`, `multi-node cluster` and both upgrade jobs each
-  spend about 9 minutes compiling everything to run 3–31 tests (13 seconds to
+  spend about 9 minutes compiling everything to run a handful of tests (13 seconds to
   4 minutes of execution).
 - Three optimised builds of about 21 minutes each: `fast benchmarks`,
   `large benchmarks` and `10k-member scale`. The 10k test itself runs for
@@ -52,13 +52,13 @@ pipeline that takes 30 or more. Four stacked PRs pushed together queued for
 
 **Runs that add no coverage.** `default = ["kubernetes"]` is the only default
 feature, and nothing in `src/` is `cfg(not(feature = "kubernetes"))`. The
-no-default run is the same 4,110 tests minus 40 Kubernetes ones. All it proves
+no-default run is the same suite minus the Kubernetes tests. All it proves
 is that the crate builds without `k8s-openapi`, which
 `cargo clippy --no-default-features --all-targets` proves in seconds.
 
 **Duplicates inside the privileged job.**
 `scripts/release/qualify-oci-interruptions.sh` runs `owned_runc` (13) and
-`owned_network` (4). `make test-linux` then runs the same 17 tests again,
+`owned_network` (4). `make test-linux` then runs the same tests again,
 because it excludes only `oci_crash`.
 
 **Tests no job runs, or that pass without testing anything.**
@@ -92,7 +92,7 @@ The EPIPE family (process owners) and the host-netns collisions are fixed (T2.9,
 T1.11, `crash-recovery` test group).
 
 **Slow tests.** Test time sums to about 1,150 seconds for about 300 seconds of
-wall clock. 19 tests (231 s) take an exact multiple of 5 seconds because they
+wall clock. A group of tests (231 s between them) take an exact multiple of 5 seconds because they
 wait out their whole timeout on the happy path. Examples: the four
 `process_recovery::cancelled_queued_*` tests at 20 s each, `wtf_watch` at 30 s,
 and `documentation_first_run` at 190 s, which has grown well past the "two
@@ -250,7 +250,7 @@ VM). A fix counts only when the loop that used to fail passes.
 ### Phase 4: tidy the layout (smaller builds, less duplication)
 
 - [x] **C4.1 Merge the small integration binaries.**
-  - Move the 47 small `tests/*.rs` files (1–18 tests each, no gating) into one
+  - Move the 47 small `tests/*.rs` files (a few tests each, no gating) into one
     `tests/suite/` binary with a module per file.
   - Keep the gated, heavy binaries separate: ebpf, oci_crash, owned_*, cluster,
     upgrade, `documentation_first_run`.
@@ -283,7 +283,7 @@ VM). A fix counts only when the loop that used to fail passes.
   `registry_authority`, `job_recovery` or a gated acceptance binary, so the
   portable suite loses about 150 seconds of serialised work.
 - [x] **C4.5 Stop waiting out timeouts.**
-  - For the 19 happy-path tests that sleep a full 5/10/20/30 s, prove absence
+  - For the happy-path tests that sleep a full 5/10/20/30 s, prove absence
     with `tokio::time::pause` where the code allows it, or shorten the bound
     through an injectable deadline.
   - Target: portable suite wall time down from about 300 s to under 200 s.

@@ -166,7 +166,7 @@ pub(super) async fn program_delay_tree(
 }
 
 /// Say what to do when the kernel has no netem, rather than echo tc.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn delay_error_hint(error: &crate::smoker::network::NetnsCommandError) -> String {
     let text = error.to_string();
     if text.contains("netem") && (text.contains("Unknown") || text.contains("not found")) {
@@ -175,6 +175,88 @@ pub(super) fn delay_error_hint(error: &crate::smoker::network::NetnsCommandError
         )
     } else {
         text
+    }
+}
+
+/// Why a caller's delay wasn't programmed on this pass.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DelayFailure {
+    /// Programming ran out of turn, or waits on an earlier Bun's sweep; the
+    /// next tick finishes it.
+    Pending(String),
+    /// Programming the interface failed.
+    Failed(String),
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl std::fmt::Display for DelayFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DelayFailure::Pending(reason) => write!(formatter, "{reason}; the next tick retries"),
+            DelayFailure::Failed(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+/// Decide a delay injection from one reconcile pass: the rule is already in
+/// the registry, so a caller still being programmed is accepted, and only a
+/// real failure for one of `callers` refuses it.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn delay_injection_outcome(
+    callers: &[String],
+    failures: &[(String, DelayFailure)],
+) -> Result<(), String> {
+    let failed = failures
+        .iter()
+        .find_map(|(instance, failure)| match failure {
+            DelayFailure::Failed(reason) if callers.contains(instance) => Some(reason),
+            _ => None,
+        });
+    match failed {
+        None => Ok(()),
+        Some(reason) => Err(format!("cannot delay traffic: {reason}")),
+    }
+}
+
+/// What a delay caller is once programming it has failed.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CallerNow {
+    /// No longer running here: it took its namespace, and its qdisc, with it.
+    Gone,
+    /// A job or task-array attempt, which starts and finishes in seconds.
+    Attempt,
+    /// An app instance.
+    Instance,
+}
+
+/// Decide what a failed delay program means for one caller.
+///
+/// Thousands of job attempts start and finish an hour, so one can lose its
+/// interface while `tc` runs (#1291). A caller that has gone drops out, and an
+/// attempt without its namespace or `eth0` waits for the next tick; any other
+/// failure, and every failure on an app instance, refuses.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn delay_program_failure(
+    caller: CallerNow,
+    error: &crate::smoker::network::NetnsCommandError,
+) -> Option<DelayFailure> {
+    use crate::smoker::network::NetnsCommandError;
+    let interface_missing = match error {
+        NetnsCommandError::NoNamespace { .. } => true,
+        NetnsCommandError::Failed { stderr, .. } => stderr.contains("Cannot find device"),
+        _ => false,
+    };
+    match caller {
+        CallerNow::Gone => None,
+        CallerNow::Attempt if interface_missing => Some(DelayFailure::Pending(format!(
+            "job attempt is starting or finishing ({error})"
+        ))),
+        _ if matches!(error, NetnsCommandError::NoNamespace { .. }) => {
+            Some(DelayFailure::Failed(error.to_string()))
+        }
+        _ => Some(DelayFailure::Failed(delay_error_hint(error))),
     }
 }
 
@@ -388,6 +470,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
 
         crate::smoker::types::SafetyContext {
+            workload: request.workload,
             council_size,
             council_nodes_with_active_faults: active_node_faults,
             leader_node_id,
@@ -686,6 +769,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         rule: &crate::smoker::types::FaultRule,
     ) -> Vec<(InstanceId, std::path::PathBuf)> {
+        if rule.workload.runs_to_completion() {
+            // A command in a reusable executor was refused before this, so
+            // every attempt with a cgroup has one of its own.
+            return self
+                .attempt_targets(rule)
+                .into_iter()
+                .filter_map(|attempt| match attempt.handle {
+                    crate::bun::live_attempts::AttemptHandle::Instance(id) => {
+                        Some((id, attempt.cgroup?))
+                    }
+                    crate::bun::live_attempts::AttemptHandle::TaskGroup(_) => None,
+                })
+                .collect();
+        }
         self.supervisor
             .list_instances()
             .iter()
@@ -1020,6 +1117,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         rule: &crate::smoker::types::FaultRule,
         saved: &[(String, String)],
     ) -> Vec<(String, std::path::PathBuf, String)> {
+        if rule.workload.runs_to_completion() {
+            // Only an attempt still running under the same runtime instance
+            // gets its value back; a finished one took its cgroup with it.
+            let attempts = self.attempt_targets(rule);
+            return saved
+                .iter()
+                .filter_map(|(id, value)| {
+                    let path = attempts.iter().find_map(|attempt| match &attempt.handle {
+                        crate::bun::live_attempts::AttemptHandle::Instance(instance)
+                            if &instance.0 == id =>
+                        {
+                            attempt.cgroup.clone()
+                        }
+                        _ => None,
+                    })?;
+                    Some((id.clone(), path, value.clone()))
+                })
+                .collect();
+        }
         saved
             .iter()
             .filter_map(|(id, value)| {
@@ -1217,6 +1333,61 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             });
         }
         self.network_faults.pending_callers = pending;
+        callers.extend(self.attempt_callers(deadline).await);
+        callers
+    }
+
+    /// Job and task-array attempts in a runtime instance of their own, as
+    /// callers. A command in a reusable executor shares the executor's
+    /// cgroup and network with the tasks around it, so it is never one; a
+    /// fault from it is refused at injection.
+    ///
+    /// An attempt's cgroup is read afresh each time rather than cached: a
+    /// runtime slot's instance id comes back for the next task, under a new
+    /// cgroup. One the runtime can't name before `deadline` is left out
+    /// until the next reconcile, a second later.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    async fn attempt_callers(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Vec<crate::smoker::network::LocalCaller> {
+        use crate::smoker::network::applies_to_caller;
+        let mut callers = Vec::new();
+        for attempt in self.live_attempts.snapshot() {
+            let crate::bun::live_attempts::AttemptHandle::Instance(id) = attempt.handle else {
+                continue;
+            };
+            if attempt.shared_executor.is_some() {
+                continue;
+            }
+            let named_as_source = self.fault_registry.iter().any(|rule| {
+                rule.fault_type.source_app().is_some()
+                    && applies_to_caller(rule, &attempt.job, &attempt.namespace)
+            });
+            let cgroup_id = if named_as_source {
+                match tokio::time::timeout_at(
+                    deadline,
+                    self.supervisor.grill().workload_cgroup(&id),
+                )
+                .await
+                {
+                    Ok(Ok(cgroup)) => cgroup,
+                    Ok(Err(error)) => {
+                        eprintln!("smoker: attempt {id} has no provable cgroup: {error}");
+                        None
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            callers.push(crate::smoker::network::LocalCaller {
+                instance_id: id.0,
+                app: attempt.job,
+                namespace: attempt.namespace,
+                cgroup_id,
+            });
+        }
         callers
     }
 
@@ -1303,28 +1474,38 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "no running instance of source app {source} runs on this node"
             ));
         }
-        let failures: Vec<String> = self
-            .reconcile_delays()
-            .await
-            .into_iter()
-            .filter(|(instance, _)| callers.contains(instance))
-            .map(|(_, error)| error)
-            .collect();
-        match failures.first() {
-            None => Ok(()),
-            Some(error) => Err(format!("cannot delay traffic: {error}")),
+        let failures = self.reconcile_delays().await;
+        for (instance, failure) in &failures {
+            if matches!(failure, DelayFailure::Pending(_)) {
+                eprintln!("smoker: delay on {instance}: {failure}");
+            }
         }
+        delay_injection_outcome(&callers, &failures)
     }
 
     /// Instances with their own container address, the only ones a delay
-    /// can shape.
+    /// can shape: app instances with an address, and job attempts in a
+    /// container with its own network namespace.
     #[cfg(target_os = "linux")]
     fn addressed(&self) -> std::collections::HashSet<String> {
+        let attempts = self
+            .live_attempts
+            .snapshot()
+            .into_iter()
+            .filter(|attempt| attempt.shared_executor.is_none())
+            .filter_map(|attempt| match attempt.handle {
+                crate::bun::live_attempts::AttemptHandle::Instance(id) => Some(id),
+                crate::bun::live_attempts::AttemptHandle::TaskGroup(_) => None,
+            })
+            // `/run/netns` is a tmpfs, so this stat never waits on a disk.
+            .filter(|id| crate::grill::netns::namespace_path(id).exists())
+            .map(|id| id.0);
         self.supervisor
             .list_instances()
             .into_iter()
             .filter(|instance| instance.container_ip.is_some())
             .map(|instance| instance.id.0.clone())
+            .chain(attempts)
             .collect()
     }
 
@@ -1377,14 +1558,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Converge every local caller's netem delays on what the active delay
-    /// faults ask for. Returns `(instance, error)` for each caller whose
-    /// interface couldn't be programmed; those are retried next tick.
+    /// faults ask for. Returns `(instance, failure)` for each caller whose
+    /// interface wasn't programmed; those are retried next tick.
     ///
     /// The callers are programmed at once, under the turn's runtime budget
-    /// (#351, stage 3). One that doesn't finish in time is a failure, and
-    /// its interface is marked unknown so the next pass rebuilds it.
+    /// (#351, stage 3). One that doesn't finish in time is pending, not
+    /// failed, and its interface is marked unknown so the next pass rebuilds
+    /// it.
     #[cfg(target_os = "linux")]
-    pub(super) async fn reconcile_delays(&mut self) -> Vec<(String, String)> {
+    pub(super) async fn reconcile_delays(&mut self) -> Vec<(String, DelayFailure)> {
         use crate::smoker::network::{NetnsCommandError, desired_delays};
 
         let delaying = self.fault_registry.iter().any(|rule| {
@@ -1445,7 +1627,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .map(|instance| {
                     (
                         instance,
-                        "the sweep of delays an earlier Bun left is still running".to_string(),
+                        DelayFailure::Pending(
+                            "the sweep of delays an earlier Bun left is still running".to_string(),
+                        ),
                     )
                 })
                 .collect();
@@ -1465,6 +1649,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .unwrap_or_default();
         let mut outcomes = outcomes.into_iter();
         let mut failures = Vec::new();
+        // Asked after programming, so an attempt that finished meanwhile is gone.
+        let attempts: std::collections::HashSet<String> = self
+            .live_attempts
+            .snapshot()
+            .into_iter()
+            .filter_map(|attempt| match attempt.handle {
+                crate::bun::live_attempts::AttemptHandle::Instance(id) => Some(id.0),
+                crate::bun::live_attempts::AttemptHandle::TaskGroup(_) => None,
+            })
+            .collect();
+        let live: std::collections::HashSet<String> = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .map(|instance| instance.id.0.clone())
+            .collect();
         for instance in changed {
             let wanted = desired.get(&instance);
             let restart = restarts.get(&instance).copied().unwrap_or_default();
@@ -1476,8 +1676,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .insert(instance.clone(), (u32::MAX, Vec::new()));
                 failures.push((
                     instance,
-                    "programming the delay did not finish within the turn; the next tick retries"
-                        .to_string(),
+                    DelayFailure::Pending(
+                        "programming the delay did not finish within the turn".to_string(),
+                    ),
                 ));
                 continue;
             };
@@ -1492,22 +1693,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         self.network_faults.delays.remove(&instance);
                     }
                 },
-                // A caller without its own namespace (host networking)
-                // can't be shaped; remember that so we don't retry every
-                // tick, and report it once.
-                Err(error @ NetnsCommandError::NoNamespace { .. }) => {
-                    if let Some(wanted) = wanted {
-                        self.network_faults
-                            .delays
-                            .insert(instance.clone(), (restart, wanted.clone()));
-                        failures.push((instance, error.to_string()));
-                    } else {
-                        self.network_faults.delays.remove(&instance);
-                    }
-                }
                 Err(error) => {
-                    self.network_faults.delays.remove(&instance);
-                    failures.push((instance, delay_error_hint(&error)));
+                    let now = if live.contains(&instance) {
+                        CallerNow::Instance
+                    } else if attempts.contains(&instance) {
+                        CallerNow::Attempt
+                    } else {
+                        CallerNow::Gone
+                    };
+                    let failure = delay_program_failure(now, &error);
+                    // An app instance without its own namespace (host
+                    // networking) can't be shaped; remember that so we don't
+                    // retry every tick, and report it once.
+                    match (&failure, &error, wanted) {
+                        (
+                            Some(DelayFailure::Failed(_)),
+                            NetnsCommandError::NoNamespace { .. },
+                            Some(wanted),
+                        ) => {
+                            self.network_faults
+                                .delays
+                                .insert(instance.clone(), (restart, wanted.clone()));
+                        }
+                        (_, NetnsCommandError::NoNamespace { .. }, None) => {
+                            self.network_faults.delays.remove(&instance);
+                            continue;
+                        }
+                        _ => {
+                            self.network_faults.delays.remove(&instance);
+                        }
+                    }
+                    if let Some(failure) = failure {
+                        failures.push((instance, failure));
+                    }
                 }
             }
         }

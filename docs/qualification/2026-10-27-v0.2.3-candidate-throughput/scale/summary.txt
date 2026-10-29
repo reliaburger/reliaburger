@@ -1,0 +1,20 @@
+window              rate  raft/s               leader lead bun cores lead rss MiB   per node: bun cores / VM busy
+n3-r1-host       30766.7     1.1  reliaburger-scale-1           0.64          118   1: 0.64 /  89%  2: 0.66 /  89%  3: 0.64 /  89%
+n3-r2-host       28416.7     1.0  reliaburger-scale-1           0.64          122   1: 0.64 /  85%  2: 0.66 /  85%  3: 0.65 /  85%
+n3-r3-host       29383.3     1.0  reliaburger-scale-1           0.64          125   1: 0.64 /  87%  2: 0.66 /  86%  3: 0.64 /  87%
+n3-r4-host       29350.0     1.0  reliaburger-scale-1           0.65          127   1: 0.65 /  87%  2: 0.66 /  87%  3: 0.65 /  87%
+n3-r5-host       29283.3     1.0  reliaburger-scale-1           0.65          129   1: 0.65 /  87%  2: 0.66 /  87%  3: 0.64 /  87%
+n2-r1-host       27450.0     1.0  reliaburger-scale-3           0.02           96   1: 0.67 /  89%  2: 0.66 /  84%  3: 0.02 /   1%
+n2-r2-host       27550.0     1.0  reliaburger-scale-3           0.02           96   1: 0.67 /  89%  2: 0.66 /  84%  3: 0.02 /   1%
+n2-r3-host       27400.0     1.0  reliaburger-scale-3           0.02           96   1: 0.67 /  89%  2: 0.67 /  84%  3: 0.02 /   1%
+n2-r4-host       27133.3     1.0  reliaburger-scale-3           0.02           96   1: 0.67 /  88%  2: 0.66 /  83%  3: 0.02 /   1%
+n2-r5-host       27200.0     1.0  reliaburger-scale-3           0.02           96   1: 0.68 /  89%  2: 0.65 /  83%  3: 0.02 /   1%
+n1-r1-host       14666.7     1.0  reliaburger-scale-1           0.62          124   1: 0.62 /  76%  2: 0.01 /   0%  3: 0.01 /   0%
+n1-r2-host       14583.3     1.0  reliaburger-scale-1           0.62          125   1: 0.62 /  77%  2: 0.01 /   0%  3: 0.01 /   0%
+n1-r3-host       14566.7     1.0  reliaburger-scale-1           0.63          126   1: 0.63 /  77%  2: 0.01 /   0%  3: 0.01 /   0%
+n1-r4-host       14083.3     1.0  reliaburger-scale-1           0.61          126   1: 0.61 /  75%  2: 0.01 /   0%  3: 0.01 /   0%
+n1-r5-host       14550.0     1.0  reliaburger-scale-1           0.64          128   1: 0.64 /  77%  2: 0.01 /   0%  3: 0.01 /   0%
+
+3 node(s): rate median 29350.0, Raft writes/s median 1.0, leader Bun cores median 0.64, leader RSS median 125 MiB
+2 node(s): rate median 27400.0, Raft writes/s median 1.0, leader Bun cores median 0.02, leader RSS median 96 MiB
+1 node(s): rate median 14566.7, Raft writes/s median 1.0, leader Bun cores median 0.62, leader RSS median 126 MiB

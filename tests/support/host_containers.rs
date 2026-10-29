@@ -36,6 +36,11 @@ impl HostContainers {
         }
     }
 
+    /// The `ProcessGrill` underneath, sharing its instances.
+    pub fn process_runtime(&self) -> ProcessGrill {
+        self.runtime.clone()
+    }
+
     /// Plain `ProcessGrill`, as a node on `--runtime process` runs it.
     pub fn process_only() -> Self {
         Self {
@@ -133,7 +138,11 @@ impl Grill for HostContainers {
         self.runtime.logs(instance).await
     }
 
-    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+    async fn exec(
+        &self,
+        instance: &InstanceId,
+        command: &[String],
+    ) -> Result<reliaburger::grill::ExecOutput, GrillError> {
         self.runtime.exec(instance, command).await
     }
 

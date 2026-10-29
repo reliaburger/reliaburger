@@ -735,6 +735,8 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
             reservation: None,
             replica_evidence: None,
             request: FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: FaultType::Drop { probability: 100 },
                 target_service: name.clone(),
                 namespace: Some("default".into()),
@@ -953,6 +955,8 @@ async fn partition_answers_only_once_every_source_instance_is_covered() {
             reservation: None,
             replica_evidence: None,
             request: FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: FaultType::Partition {
                     source_app: Some(source.clone()),
                 },
@@ -1002,6 +1006,133 @@ async fn partition_answers_only_once_every_source_instance_is_covered() {
         "the partition was reported in place before it covered {missing:?}"
     );
     shutdown.cancel();
+}
+
+/// #704: a job's attempt is a caller like an app's instance. A partition
+/// `--from` the job keys the attempt's own cgroup in `fault_connect_map`, so
+/// the kernel refuses its connections to the target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn partition_from_an_array_attempt_blocks_its_cgroup() {
+    use reliaburger::bun::agent::AgentCommand;
+    use reliaburger::bun::live_attempts::{AttemptHandle, LiveAttempt};
+    use reliaburger::config::Config;
+    use reliaburger::grill::mock::MockGrill;
+    use reliaburger::grill::port::PortAllocator;
+    use reliaburger::grill::{Grill, InstanceId};
+    use reliaburger::smoker::bpf_maps;
+    use reliaburger::smoker::bpf_types::partition_fault_key;
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc, oneshot};
+
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
+    let grill = MockGrill::new();
+    grill.set_honours_cgroup_path(true);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let volumes = TestVolumes::new();
+    let mut agent = test_agent(
+        grill.clone(),
+        PortAllocator::new(42800, 43000),
+        cmd_rx,
+        shutdown.clone(),
+        volumes.path(),
+    );
+    let target = root_app_name("store", volumes.path());
+    let _target_cgroups = AppCgroups::new("default", &target);
+
+    // The attempt: a runtime instance with a cgroup of its own, as a fresh
+    // task container has.
+    let relative = format!("/rbtest-704-attempt-{}", std::process::id());
+    let cgroup = std::path::PathBuf::from(format!("/sys/fs/cgroup{relative}"));
+    std::fs::create_dir_all(&cgroup).unwrap();
+    let job: reliaburger::config::job::JobSpec =
+        toml::from_str("runtime='process'\nexec='/bin/sh'").unwrap();
+    let spec =
+        reliaburger::grill::oci::generate_job_oci_spec("task", "default", &job, &relative, None);
+    let attempt_id = InstanceId("default__executor-704-0".into());
+    grill.create(&attempt_id, &spec).await.unwrap();
+    let _listing = agent.live_attempts().register(LiveAttempt {
+        namespace: "default".into(),
+        job: "render".into(),
+        batch_id: 704,
+        task_count: 8,
+        index: 5,
+        attempt: 1,
+        handle: AttemptHandle::Instance(attempt_id.clone()),
+        cgroup: Some(cgroup.clone()),
+        shared_executor: None,
+    });
+
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let agent_task = tokio::spawn(async move { agent.run().await });
+    let _tasks = TestTasks::new(shutdown.clone(), vec![agent_task]);
+
+    let target_port: u16 = 6380;
+    let config = Config::parse(&format!(
+        "[app.{target}]\nimage = \"mock:image\"\nport = {target_port}\n"
+    ))
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy {
+            config,
+            events: ev_tx,
+        })
+        .await
+        .unwrap();
+    while let Some(event) = ev_rx.recv().await {
+        assert!(
+            !matches!(event, reliaburger::bun::agent::ApplyEvent::Error { .. }),
+            "deployment failed: {event:?}"
+        );
+    }
+
+    let (response, answer) = oneshot::channel();
+    cmd_tx
+        .send(AgentCommand::InjectFault {
+            reservation: None,
+            replica_evidence: None,
+            request: FaultRequest {
+                workload: Default::default(),
+                task_index: None,
+                fault_type: FaultType::Partition {
+                    source_app: Some("render".into()),
+                },
+                target_service: target.clone(),
+                namespace: Some("default".into()),
+                target_instance: None,
+                target_node: None,
+                duration: Duration::from_secs(60),
+                injected_by: "test".into(),
+                reason: None,
+                include_leader: false,
+                override_safety: false,
+                acknowledged: true,
+            },
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), answer)
+        .await
+        .expect("the partition was never answered")
+        .unwrap()
+        .expect("a job's attempt is a partition source");
+
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", target.as_str()));
+    let cgroup_id = Grill::workload_cgroup(&grill, &attempt_id)
+        .await
+        .unwrap()
+        .expect("the attempt has a cgroup");
+    let key = partition_fault_key(vip.to_network_byte_order(), target_port.to_be(), cgroup_id);
+    let keyed = bpf_maps::read_connect_fault(&mut ebpf.lock().await.bpf, &key)
+        .unwrap()
+        .is_some();
+    shutdown.cancel();
+    let _ = std::fs::remove_dir(&cgroup);
+    assert!(keyed, "the partition didn't key the attempt's cgroup");
 }
 
 // ---------------------------------------------------------------------------

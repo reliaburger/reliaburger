@@ -1,6 +1,6 @@
 # Hello, Container
 
-You're about to build a container orchestrator from scratch. By the end of this chapter, you'll have a Rust project that compiles, a CLI that responds to commands, and the skeleton of a node agent that will eventually run your containers. No containers yet — we'll get there. First, we need a foundation that isn't going to fall over the moment we start stacking things on top of it.
+You're about to build a container orchestrator from scratch. By the end of this chapter, you'll have a Rust project that compiles, a CLI that responds to commands, and the skeleton of a node agent that will eventually run your containers. No containers yet. We'll get there. First, we need a foundation that isn't going to fall over the moment we start stacking things on top of it.
 
 ## Setting up Rust
 
@@ -68,11 +68,11 @@ That gives you a C compiler and linker. You don't need the full Xcode IDE.
 
 ### Editor setup
 
-Any editor works. If you want autocompletion, inline errors, and go-to-definition, install [rust-analyzer](https://rust-analyzer.github.io/). It's available as a VS Code extension, a Neovim plugin via LSP, and for most other editors too. We won't go deeper into editor setup here — the rust-analyzer docs cover it well.
+Any editor works. If you want autocompletion, inline errors, and go-to-definition, install [rust-analyzer](https://rust-analyzer.github.io/). It's available as a VS Code extension, a Neovim plugin via LSP, and for most other editors too. We won't go deeper into editor setup here. The rust-analyzer docs cover it well.
 
 ### What's the 2024 edition?
 
-Rust uses *editions* to introduce breaking language changes without breaking existing code. Each crate declares which edition it uses, and the compiler handles the rest. The 2024 edition (stabilised in Rust 1.85) is the latest, and it's what we'll use throughout this book. If you've used an earlier edition, the differences are mostly small refinements — the `unsafe` rules are a bit tighter, `impl Trait` is more flexible in return position, and a few other niceties. Nothing that will trip you up.
+Rust uses *editions* to introduce breaking language changes without breaking existing code. Each crate declares which edition it uses, and the compiler handles the rest. The 2024 edition (stabilised in Rust 1.85) is the latest, and it's what we'll use throughout this book. If you've used an earlier edition, the differences are mostly small refinements: the `unsafe` rules are a bit tighter, `impl Trait` is more flexible in return position, and a few other niceties. Nothing that will trip you up.
 
 ## The project skeleton
 
@@ -80,14 +80,14 @@ Now let's create the Reliaburger project. We're going to make some structural de
 
 ### One crate, two binaries
 
-Reliaburger ships as a single binary — that's one of the core design principles. No plugins to install, no ecosystem to assemble, no dependency hell. But the single binary actually has two entry points:
+Reliaburger ships as a single binary. That's one of the core design principles. No plugins to install, no ecosystem to assemble, no dependency hell. But the single binary actually has two entry points:
 
-- **bun** — the node agent. This is the long-running daemon that manages containers, runs health checks, participates in cluster gossip, and reports state to the leader. Every node in the cluster runs bun.
-- **relish** — the CLI. This is what operators use to deploy apps, check status, stream logs, and generally interact with the cluster.
+- **bun**: the node agent. This is the long-running daemon that manages containers, runs health checks, participates in cluster gossip, and reports state to the leader. Every node in the cluster runs bun.
+- **relish**: the CLI. This is what operators use to deploy apps, check status, stream logs, and generally interact with the cluster.
 
 Both binaries share the same core library, `reliaburger`, which contains all the actual logic. The binaries are just thin entry points that wire things together.
 
-We considered splitting these into separate crates in a Cargo workspace — a `crates/bun/` binary, a `crates/relish/` binary, and a `crates/reliaburger/` library. That's a perfectly valid pattern for larger Rust projects where you want strict dependency boundaries between crates. But for Reliaburger, a single crate with multiple `[[bin]]` targets is simpler: one `Cargo.toml`, one set of dependencies, and no inter-crate version management to think about. We can always split later if we need to. We won't need to.
+We considered splitting these into separate crates in a Cargo workspace: a `crates/bun/` binary, a `crates/relish/` binary, and a `crates/reliaburger/` library. That's a perfectly valid pattern for larger Rust projects where you want strict dependency boundaries between crates. But for Reliaburger, a single crate with multiple `[[bin]]` targets is simpler: one `Cargo.toml`, one set of dependencies, and no inter-crate version management to think about. We can always split later if we need to. We won't need to.
 
 ### Cargo.toml
 
@@ -119,7 +119,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-toml = "0.8"
+toml = "1"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
@@ -128,23 +128,23 @@ proptest = "1"
 
 Let's walk through the choices.
 
-**Edition 2024** — we already covered this. Use the latest.
+**Edition 2024**: we already covered this. Use the latest.
 
-**`[lib]` and `[[bin]]`** — the `[lib]` section declares the library crate, which is where all the real code lives. The `[[bin]]` sections (note the double brackets — that's TOML array syntax) declare the two binaries. Each points to its own entry-point file under `src/bin/`.
+**`[lib]` and `[[bin]]`**: the `[lib]` section declares the library crate, which is where all the real code lives. The `[[bin]]` sections (note the double brackets, that's TOML array syntax) declare the two binaries. Each points to its own entry-point file under `src/bin/`.
 
-**Dependencies — why these six?**
+**Dependencies: why these six?**
 
-- **[tokio](https://tokio.rs/)** — the async runtime. Reliaburger is fundamentally an async system: it manages network connections, health check timers, container events, and cluster gossip, all concurrently. Tokio is the standard choice here. The `"full"` feature enables everything — we'll need most of it eventually, and cherry-picking features buys us nothing at this stage.
-- **[serde](https://serde.rs/)** — serialisation and deserialisation. Every config file, every API payload, every state snapshot flows through serde. The `"derive"` feature lets us annotate structs with `#[derive(Serialize, Deserialize)]` instead of writing conversion code by hand.
-- **[toml](https://docs.rs/toml)** — Reliaburger uses TOML for all configuration. It's more readable than YAML for the kind of structured config we need, and it doesn't have YAML's footguns (the Norway problem, the boolean problem, the indentation-is-semantic problem).
-- **[clap](https://docs.rs/clap)** — argument parsing for the CLI. The `"derive"` feature lets us define CLI structure as Rust types, which the compiler then validates. We'll see this in action in a moment.
-- **[thiserror](https://docs.rs/thiserror)** — for defining error types in library code. It generates `Display` and `Error` implementations from an enum, with format strings that include context. No boilerplate.
-- **[anyhow](https://docs.rs/anyhow)** — for error handling in binaries. Where `thiserror` is about *defining* precise error types, `anyhow` is about *propagating* errors with context. The split is deliberate: library code uses `thiserror` (callers need to match on specific errors), binary code uses `anyhow` (errors just need to be reported clearly).
+- **[tokio](https://tokio.rs/)**: the async runtime. Reliaburger is fundamentally an async system: it manages network connections, health check timers, container events, and cluster gossip, all concurrently. Tokio is the standard choice here. The `"full"` feature enables everything: we'll need most of it eventually, and cherry-picking features buys us nothing at this stage.
+- **[serde](https://serde.rs/)**: serialisation and deserialisation. Every config file, every API payload, every state snapshot flows through serde. The `"derive"` feature lets us annotate structs with `#[derive(Serialize, Deserialize)]` instead of writing conversion code by hand.
+- **[toml](https://docs.rs/toml)**: Reliaburger uses TOML for all configuration. It's more readable than YAML for the kind of structured config we need, and it doesn't have YAML's footguns (the Norway problem, the boolean problem, the indentation-is-semantic problem).
+- **[clap](https://docs.rs/clap)**: argument parsing for the CLI. The `"derive"` feature lets us define CLI structure as Rust types, which the compiler then validates. We'll see this in action in a moment.
+- **[thiserror](https://docs.rs/thiserror)**: for defining error types in library code. It generates `Display` and `Error` implementations from an enum, with format strings that include context. No boilerplate.
+- **[anyhow](https://docs.rs/anyhow)**: for error handling in binaries. Where `thiserror` is about *defining* precise error types, `anyhow` is about *propagating* errors with context. The split is deliberate: library code uses `thiserror` (callers need to match on specific errors), binary code uses `anyhow` (errors just need to be reported clearly).
 
-**Dev-dependencies — testing tools:**
+**Dev-dependencies, for testing:**
 
-- **[insta](https://insta.rs/)** — snapshot testing. We'll use it to verify CLI output, serialised configs, and TUI rendering. You write a test that produces output, `insta` captures it in a file, and future runs compare against the snapshot.
-- **[proptest](https://docs.rs/proptest)** — property-based testing. Instead of writing specific test cases, you describe the *properties* your code should satisfy, and proptest generates thousands of random inputs to find violations. We'll use it for the scheduler, port allocator, and other algorithmic code.
+- **[insta](https://insta.rs/)**: snapshot testing. We'll use it to verify CLI output, serialised configs, and TUI rendering. You write a test that produces output, `insta` captures it in a file, and future runs compare against the snapshot.
+- **[proptest](https://docs.rs/proptest)**: property-based testing. Instead of writing specific test cases, you describe the *properties* your code should satisfy, and proptest generates thousands of random inputs to find violations. We'll use it for the scheduler, port allocator, and other algorithmic code.
 
 ### The binaries
 
@@ -158,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-`#[tokio::main]` sets up the async runtime. `env!("CARGO_PKG_VERSION")` pulls the version string from `Cargo.toml` at compile time — no version string duplication. And `todo!("Phase 1")` is our convention for code that exists structurally but isn't implemented yet. It compiles, but panics if you run it. That's intentional: it marks exactly where work needs to happen.
+`#[tokio::main]` sets up the async runtime. `env!("CARGO_PKG_VERSION")` pulls the version string from `Cargo.toml` at compile time. No version string duplication. And `todo!("Phase 1")` is our convention for code that exists structurally but isn't implemented yet. It compiles, but panics if you run it. That's intentional: it marks exactly where work needs to happen.
 
 The relish CLI is a bit more interesting. Even as a skeleton, it shows the structure:
 
@@ -198,9 +198,9 @@ enum Command {
 }
 ```
 
-This is clap's derive API. The `Cli` struct *is* the argument parser. Each variant of the `Command` enum is a subcommand. The `///` doc comments become the help text automatically. If someone passes invalid arguments, clap generates the error message. If someone runs `relish --help`, clap generates the help output. We get all of that for free — no manual parsing, no string matching.
+This is clap's derive API. The `Cli` struct *is* the argument parser. Each variant of the `Command` enum is a subcommand. The `///` doc comments become the help text automatically. If someone passes invalid arguments, clap generates the error message. If someone runs `relish --help`, clap generates the help output. We get all of that for free: no manual parsing, no string matching.
 
-Look at `Logs` for a moment. The `name` field is a positional argument (no `#[arg]` annotation), so `relish logs web` captures "web" as the app name. The `--tail` flag takes an optional number (`Option<usize>` means it's not required), and `--follow` is a boolean flag with a `-f` short alias. So `relish logs web --tail 10` shows the last 10 lines, `relish logs web -f` streams new output as it's produced, and `relish logs web --follow --tail 5` shows the last 5 lines then keeps streaming. All of that falls out of the type definitions — clap figures out the argument parsing from the struct fields.
+Look at `Logs` for a moment. The `name` field is a positional argument (no `#[arg]` annotation), so `relish logs web` captures "web" as the app name. The `--tail` flag takes an optional number (`Option<usize>` means it's not required), and `--follow` is a boolean flag with a `-f` short alias. So `relish logs web --tail 10` shows the last 10 lines, `relish logs web -f` streams new output as it's produced, and `relish logs web --follow --tail 5` shows the last 5 lines then keeps streaming. All of that falls out of the type definitions: clap figures out the argument parsing from the struct fields.
 
 Can you see what we're doing here? We're letting the type system do the work. The compiler guarantees that every subcommand is handled in the `match` statement. Add a new variant to `Command` and forget to handle it? Compilation error. That's the kind of guarantee we'll lean on throughout this book.
 
@@ -208,11 +208,11 @@ Can you see what we're doing here? We're letting the type system do the work. Th
 
 Rust has two kinds of tests:
 
-**Unit tests** live in the same file as the code they test, inside a `#[cfg(test)] mod tests` block at the bottom. The `#[cfg(test)]` attribute means this module is only compiled when running `cargo test` — it doesn't bloat the production binary. Unit tests can access private functions, which is useful for testing internal logic without exposing it publicly.
+**Unit tests** live in the same file as the code they test, inside a `#[cfg(test)] mod tests` block at the bottom. The `#[cfg(test)]` attribute means this module is only compiled when running `cargo test`. It doesn't bloat the production binary. Unit tests can access private functions, which is useful for testing internal logic without exposing it publicly.
 
-**Integration tests** live in the `tests/` directory at the crate root. Each `.rs` file there becomes a separate test binary that can only use the crate's public API, just like any external consumer would. This is where we'll put our end-to-end tests — deploying apps, checking health, verifying restart behaviour.
+**Integration tests** live in the `tests/` directory at the crate root. Each `.rs` file there becomes a separate test binary that can only use the crate's public API, just like any external consumer would. This is where we'll put our end-to-end tests: deploying apps, checking health, verifying restart behaviour.
 
-Right now our `tests/integration.rs` has a single placeholder test. It's there to confirm the test infrastructure works. We'll replace it with real tests before writing any real code — that's the tests-first approach, and we'll stick to it religiously.
+Right now our `tests/integration.rs` has a single placeholder test. It's there to confirm the test infrastructure works. We'll replace it with real tests before writing any real code. That's the tests-first approach, and we'll stick to it religiously.
 
 Run `cargo test` and you should see:
 
@@ -231,7 +231,7 @@ Before we write any real code, let's get familiar with the tools we'll use every
 
 ### cargo build
 
-Compiles your code. By default it builds in debug mode, which compiles fast but produces a slower, larger binary. Debug builds include overflow checks, debug symbols, and no optimisations — exactly what you want during development.
+Compiles your code. By default it builds in debug mode, which compiles fast but produces a slower, larger binary. Debug builds include overflow checks, debug symbols, and no optimisations: exactly what you want during development.
 
 ```sh
 $ cargo build
@@ -281,7 +281,7 @@ We'll use `cargo test` constantly. The tests-first approach means it's usually t
 
 ### cargo fmt
 
-Formats your code according to rustfmt's rules. There's no configuration to argue about — the defaults are the community standard, and we use them as-is.
+Formats your code according to rustfmt's rules. There's no configuration to argue about: the defaults are the community standard, and we use them as-is.
 
 ```sh
 $ cargo fmt
@@ -355,7 +355,7 @@ Before we write any implementation code, we need to decide how users will descri
 
 TOML, not YAML. Here's why.
 
-YAML has footguns that have bitten every team that's used it at scale. The "Norway problem" — where the country code `NO` gets silently parsed as boolean `false`. The version number `1.10` becoming the float `1.1`. Indentation-as-structure meaning a single misplaced space changes the meaning of your file. These aren't theoretical concerns; they're production incidents.
+YAML has footguns that have bitten every team that's used it at scale. The "Norway problem", where the country code `NO` gets silently parsed as boolean `false`. The version number `1.10` becoming the float `1.1`. Indentation-as-structure meaning a single misplaced space changes the meaning of your file. These aren't theoretical concerns; they're production incidents.
 
 TOML is explicit about types. `true` is a boolean. `"NO"` is a string. `1.10` stays `1.10`. Structure comes from headers and key-value pairs, not whitespace. It supports comments (JSON doesn't). It supports multiline strings (JSON doesn't). And it's less verbose than JSON for the kind of nested configuration we need.
 
@@ -365,13 +365,13 @@ JSON was never a serious contender. No comments, no multiline strings, and trail
 
 Kubernetes has Deployments, Services, Ingresses, ConfigMaps, Secrets, PersistentVolumeClaims, HorizontalPodAutoscalers, Jobs, CronJobs, and more. We have seven.
 
-1. **App** — a long-running containerised process with replicas, health checks, ingress, autoscaling. Replaces Deployment + Service + Ingress + HPA.
-2. **Job** — a run-to-completion task, optionally on a cron schedule. Replaces Job + CronJob.
-3. **Secret** — not a separate resource type. Encrypted values in the `[env]` section, prefixed with `ENC[AGE:`. Lives inline, right next to the plain-text env vars.
-4. **ConfigFile** — a file injected into the container at a specific path. Inline content, or a `source` naming a file on the node (a host path, not a path in git, so the node gates it like a host-path volume).
-5. **Volume** — local persistent storage. One line: path and size.
-6. **Permission** — who can do what. Actions, apps, optionally scoped to namespaces.
-7. **Namespace** — resource quotas. CPU, memory, GPU limits, max app count.
+1. **App**: a long-running containerised process with replicas, health checks, ingress, autoscaling. Replaces Deployment + Service + Ingress + HPA.
+2. **Job**: a run-to-completion task, optionally on a cron schedule. Replaces Job + CronJob.
+3. **Secret**: not a separate resource type. Encrypted values in the `[env]` section, prefixed with `ENC[AGE:`. Lives inline, right next to the plain-text env vars.
+4. **ConfigFile**: a file injected into the container at a specific path. Inline content, or a `source` naming a file on the node (a host path, not a path in git, so the node gates it like a host-path volume).
+5. **Volume**: local persistent storage. One line: path and size.
+6. **Permission**: who can do what. Actions, apps, optionally scoped to namespaces.
+7. **Namespace**: resource quotas. CPU, memory, GPU limits, max app count.
 
 That's it. Seven types cover what Kubernetes needs dozens for.
 
@@ -406,7 +406,7 @@ command = ["npm", "run", "migrate"]
 run_before = ["app.api"]
 ```
 
-`[app.web]` is TOML's table syntax. The dot creates a nested structure: a table called `app` containing a table called `web`. In Rust, that maps to `BTreeMap<String, AppSpec>` — a sorted map from app name to app definition. Multiple apps? Multiple tables. No arrays-of-objects, no anchor-reference tricks, no indentation puzzles.
+`[app.web]` is TOML's table syntax. The dot creates a nested structure: a table called `app` containing a table called `web`. In Rust, that maps to `BTreeMap<String, AppSpec>`, a sorted map from app name to app definition. Multiple apps? Multiple tables. No arrays-of-objects, no anchor-reference tricks, no indentation puzzles.
 
 We use `BTreeMap` rather than `HashMap` for a reason that matters in practice: deterministic ordering. When you serialise a config back to TOML, or display it in the CLI, or diff it in git, the keys always come out in the same order. With `HashMap`, they'd be random. Small detail, big quality-of-life improvement.
 
@@ -435,7 +435,7 @@ pub struct Config {
 
 A few things to notice. If you're new to Rust, those `#[...]` annotations above the struct and its fields might look strange. They're called *attributes*, and they're Rust's equivalent of Java's `@Annotations` or Python's `@decorators`, though they work at compile time rather than at runtime. `#[derive(Serialize, Deserialize)]` tells the compiler to generate serialisation code. `#[serde(default)]` is an attribute specific to the serde crate, configuring how that generated code behaves. You'll see attributes everywhere in Rust: `#[test]` marks a test function, `#[cfg(test)]` makes code conditional, `#[tokio::main]` sets up the async runtime. The pattern is always the same: metadata that tells the compiler or a library how to handle the item that follows.
 
-`#[serde(default)]` on the struct means every section is optional — a config file with only `[app.web]` parses fine, with empty maps for jobs, namespaces, and permissions. `#[serde(default)]` on each field does the same thing at the field level. The redundancy is intentional: struct-level default handles missing sections in TOML, field-level default handles the Rust `Default` trait.
+`#[serde(default)]` on the struct means every section is optional: a config file with only `[app.web]` parses fine, with empty maps for jobs, namespaces, and permissions. `#[serde(default)]` on each field does the same thing at the field level. The redundancy is intentional: struct-level default handles missing sections in TOML, field-level default handles the Rust `Default` trait.
 
 `Option<T>` handles optional fields within each spec. If TOML doesn't have a key, serde fills in `None`. No sentinel values, no empty strings meaning "absent", no `-1` meaning "not set". The type system tells you whether a value is present.
 
@@ -443,7 +443,7 @@ A few things to notice. If you're new to Rust, those `#[...]` annotations above 
 
 Most fields are straightforward derives. But some need custom logic. The `replicas` field is our first example.
 
-In TOML, `replicas = 3` is an integer. `replicas = "*"` is a string. Same field, two types. TOML doesn't care — it's dynamically typed at the value level. But Rust does care. We need a type that can be either.
+In TOML, `replicas = 3` is an integer. `replicas = "*"` is a string. Same field, two types. TOML doesn't care: it's dynamically typed at the value level. But Rust does care. We need a type that can be either.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,7 +459,7 @@ impl Default for Replicas {
 }
 ```
 
-The default is 1 replica — a reasonable starting point. Now the serde part. We implement `Deserialize` by hand, using a *visitor*. The visitor pattern lets serde call different methods depending on what it finds in the input:
+The default is 1 replica, a reasonable starting point. Now the serde part. We implement `Deserialize` by hand, using a *visitor*. The visitor pattern lets serde call different methods depending on what it finds in the input:
 
 ```rust
 impl<'de> Deserialize<'de> for Replicas {
@@ -498,13 +498,13 @@ impl<'de> Deserialize<'de> for Replicas {
 
 This is the densest piece of Rust we've seen so far, so let's slow down and unpack the syntax.
 
-**`impl<'de> Deserialize<'de> for Replicas`** — this says "I'm implementing the `Deserialize` trait for the `Replicas` type." In Rust, a *trait* is like an interface in Java or Go: it defines a set of methods that a type must provide. `Deserialize` is serde's trait for types that can be constructed from serialised data. The `<'de>` part is a *lifetime parameter*. Lifetimes are Rust's way of tracking how long references are valid, so the compiler can guarantee you never use data after it's been freed. Here, `'de` represents the lifetime of the input data being deserialised. You don't need to fully understand lifetimes right now. Just read `<'de>` as "this code works with borrowed data that lives for some duration `'de`." We'll encounter lifetimes again in later chapters, and they'll make more sense once you've seen a few more examples.
+**`impl<'de> Deserialize<'de> for Replicas`**: this says "I'm implementing the `Deserialize` trait for the `Replicas` type." In Rust, a *trait* is like an interface in Java or Go: it defines a set of methods that a type must provide. `Deserialize` is serde's trait for types that can be constructed from serialised data. The `<'de>` part is a *lifetime parameter*. Lifetimes are Rust's way of tracking how long references are valid, so the compiler can guarantee you never use data after it's been freed. Here, `'de` represents the lifetime of the input data being deserialised. You don't need to fully understand lifetimes right now. Just read `<'de>` as "this code works with borrowed data that lives for some duration `'de`." We'll encounter lifetimes again in later chapters, and they'll make more sense once you've seen a few more examples.
 
-**`fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error>`** — three things packed into one function signature. `<D: serde::Deserializer<'de>>` introduces a *generic type parameter* `D` with a *trait bound*: `D` can be any type that implements the `Deserializer` trait. If you're coming from C++, think of it as a template with a concept constraint. From Go, it's like a function that takes an interface parameter, except the Rust compiler generates specialised code for each concrete type rather than using dynamic dispatch. `Self` refers to the type we're implementing for (`Replicas`). And `D::Error` is an *associated type* on the `Deserializer` trait — each deserialiser defines its own error type, and we use whatever it provides. `Result<Self, D::Error>` means this function either succeeds with a `Replicas` value or fails with whatever error type the deserialiser uses.
+**`fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error>`**: three things packed into one function signature. `<D: serde::Deserializer<'de>>` introduces a *generic type parameter* `D` with a *trait bound*: `D` can be any type that implements the `Deserializer` trait. If you're coming from C++, think of it as a template with a concept constraint. From Go, it's like a function that takes an interface parameter, except the Rust compiler generates specialised code for each concrete type rather than using dynamic dispatch. `Self` refers to the type we're implementing for (`Replicas`). And `D::Error` is an *associated type* on the `Deserializer` trait: each deserialiser defines its own error type, and we use whatever it provides. `Result<Self, D::Error>` means this function either succeeds with a `Replicas` value or fails with whatever error type the deserialiser uses.
 
-**The visitor pattern.** We define a zero-sized `ReplicasVisitor` struct and implement `de::Visitor` for it. The visitor has methods for each data type serde might encounter: `visit_u64` for integers, `visit_str` for strings. We implement the ones we care about and let the default implementations of the others return errors using the `expecting` message. When we call `deserializer.deserialize_any(ReplicasVisitor)`, we're saying "parse whatever's in the input and call the appropriate visitor method." If the TOML contains an integer, serde calls `visit_u64`. If it contains a string, serde calls `visit_str`. If it contains something else — a boolean, an array — serde calls the default method, which returns an error saying "expected a positive integer or `*`."
+**The visitor pattern.** We define a zero-sized `ReplicasVisitor` struct and implement `de::Visitor` for it. The visitor has methods for each data type serde might encounter: `visit_u64` for integers, `visit_str` for strings. We implement the ones we care about and let the default implementations of the others return errors using the `expecting` message. When we call `deserializer.deserialize_any(ReplicasVisitor)`, we're saying "parse whatever's in the input and call the appropriate visitor method." If the TOML contains an integer, serde calls `visit_u64`. If it contains a string, serde calls `visit_str`. If it contains something else (a boolean, an array), serde calls the default method, which returns an error saying "expected a positive integer or `*`."
 
-This pattern — enum type, custom visitor, `deserialize_any` — is the standard way to handle TOML values that can be more than one type. You'll see it again. The syntax is admittedly heavy for what it does, but most of it is mechanical: define a visitor, implement the methods you need, call `deserialize_any`. Once you've written one, the rest are copy-paste-and-modify.
+This pattern (enum type, custom visitor, `deserialize_any`) is the standard way to handle TOML values that can be more than one type. You'll see it again. The syntax is admittedly heavy for what it does, but most of it is mechanical: define a visitor, implement the methods you need, call `deserialize_any`. Once you've written one, the rest are copy-paste-and-modify.
 
 ### Custom deserialisers: ResourceRange
 
@@ -537,13 +537,13 @@ The fractional part is parsed by hand rather than through `f64`, because `0.1` h
 
 Two pieces of Rust syntax here deserve a closer look, because they'll appear constantly from now on.
 
-**`if let Some(num) = s.strip_suffix("Gi")`** — this combines two concepts. First, `strip_suffix` doesn't return a plain string. It returns `Option<&str>`, which is Rust's way of saying "this might or might not have a value." `Option` is an enum with two variants: `Some(value)` when there's a result, and `None` when there isn't. No nulls, no null pointer exceptions, no checking for `-1` or empty strings. The compiler forces you to handle both cases.
+**`if let Some(num) = s.strip_suffix("Gi")`**: this combines two concepts. First, `strip_suffix` doesn't return a plain string. It returns `Option<&str>`, which is Rust's way of saying "this might or might not have a value." `Option` is an enum with two variants: `Some(value)` when there's a result, and `None` when there isn't. No nulls, no null pointer exceptions, no checking for `-1` or empty strings. The compiler forces you to handle both cases.
 
 `if let` is pattern matching in a conditional. It says "if this value matches the pattern `Some(num)`, bind the inner value to `num` and run the block. Otherwise, skip it." In Python you'd write `if (num := s.removesuffix("Gi")) != s:` or check the return value for `None`. In Go you'd check `if strings.HasSuffix(s, "Gi")` and then strip it in a separate step. Rust fuses the check and the extraction into one expression, and the compiler guarantees you can't accidentally use `num` when the suffix wasn't there.
 
-**`s.parse::<u64>().map_err(/* ... */)`** — two things here. `s.parse::<u64>()` calls the `parse` method on a string, and the `::<u64>` part is a *turbofish* (yes, that's what the Rust community actually calls it). It tells the compiler which type to parse into. Without it, the compiler would need to infer the type from context, which isn't always possible. You could also write `let n: u64 = s.parse()` and let the type annotation do the work, but turbofish keeps it inline.
+**`s.parse::<u64>().map_err(/* ... */)`**: two things here. `s.parse::<u64>()` calls the `parse` method on a string, and the `::<u64>` part is a *turbofish* (yes, that's what the Rust community actually calls it). It tells the compiler which type to parse into. Without it, the compiler would need to infer the type from context, which isn't always possible. You could also write `let n: u64 = s.parse()` and let the type annotation do the work, but turbofish keeps it inline.
 
-`parse` returns `Result<u64, ParseIntError>`, which is Rust's other "might fail" type. Where `Option` is "value or nothing," `Result` is "value or error." `.map_err(...)` transforms the error variant: it takes the `ParseIntError` from the standard library and converts it into our `ConfigError` type, keeping the success value untouched. This kind of chaining — calling a method, then mapping the error — is idiomatic Rust. You'll see `.map()`, `.map_err()`, `.and_then()`, and `?` used together to build pipelines that handle errors without nested `if` statements.
+`parse` returns `Result<u64, ParseIntError>`, which is Rust's other "might fail" type. Where `Option` is "value or nothing," `Result` is "value or error." `.map_err(...)` transforms the error variant: it takes the `ParseIntError` from the standard library and converts it into our `ConfigError` type, keeping the success value untouched. This kind of chaining (calling a method, then mapping the error) is idiomatic Rust. You'll see `.map()`, `.map_err()`, `.and_then()`, and `?` used together to build pipelines that handle errors without nested `if` statements.
 
 `ResourceRange` splits the string on `-` and parses both halves. If there's no `-`, request and limit are the same value. The struct itself is just two `u64`s, and it doesn't know whether they're millicores or bytes, so the unit has to come from the field. Serde lets a field pick its own (de)serialisation functions:
 
@@ -592,7 +592,7 @@ The compiler won't let you forget a variant. If you handle `Plain` but not `Encr
 
 You might wonder why we don't validate everything during parsing. An app without an image should be an error, right? A config file with both `content` and `source` set should be rejected.
 
-We *could* do this in the serde layer, but we'd lose something valuable. TOML parse errors come with line numbers: "expected a string at line 42, column 8". Domain validation errors need different context: "app 'web' requires an image". If we mix them, we get confusing error messages — a line number for a semantic problem, or a semantic message for a syntax problem.
+We *could* do this in the serde layer, but we'd lose something valuable. TOML parse errors come with line numbers: "expected a string at line 42, column 8". Domain validation errors need different context: "app 'web' requires an image". If we mix them, we get confusing error messages: a line number for a semantic problem, or a semantic message for a syntax problem.
 
 So we separate the two. First, parse the TOML. If that fails, the user sees a TOML error with a line number. If it succeeds, run validation. If *that* fails, the user sees a domain error with the resource name and a clear description.
 
@@ -656,13 +656,13 @@ fn replicas_deserialise_integer() {
 }
 ```
 
-Let's walk through this line by line. `#[test]` marks the function as a test case — `cargo test` will find it and run it. The function takes no arguments and returns nothing; if it panics, the test fails.
+Let's walk through this line by line. `#[test]` marks the function as a test case: `cargo test` will find it and run it. The function takes no arguments and returns nothing; if it panics, the test fails.
 
 `struct W { replicas: Replicas }` defines a throwaway wrapper struct *inside* the test function. Yes, you can define types inside functions in Rust. We need this because TOML has key-value pairs (`replicas = 3`), not bare values. Serde needs a struct with a field named `replicas` to know which key to look for. The `#[derive(Deserialize)]` on the line above generates the deserialisation code for this struct, same as it would at the top level.
 
-`let w: W = toml::from_str("replicas = 3").unwrap();` parses the TOML string into our wrapper struct. `let` declares a variable (`w`), and `: W` is a type annotation telling the compiler what type we expect. `toml::from_str` returns a `Result<W, Error>` — remember, parsing can fail. `.unwrap()` says "if this is `Ok`, give me the value; if it's `Err`, panic." We said earlier that `.unwrap()` is banned in production code because panicking crashes the programme. But in tests, panicking *is* how you signal failure. If this parse fails, the test fails with a clear error message showing what went wrong.
+`let w: W = toml::from_str("replicas = 3").unwrap();` parses the TOML string into our wrapper struct. `let` declares a variable (`w`), and `: W` is a type annotation telling the compiler what type we expect. `toml::from_str` returns a `Result<W, Error>`: remember, parsing can fail. `.unwrap()` says "if this is `Ok`, give me the value; if it's `Err`, panic." We said earlier that `.unwrap()` is banned in production code because panicking crashes the programme. But in tests, panicking *is* how you signal failure. If this parse fails, the test fails with a clear error message showing what went wrong.
 
-`assert_eq!(w.replicas, Replicas::Fixed(3))` checks that the parsed value matches what we expect. `assert_eq!` is a macro (the `!` suffix is how Rust marks macros) that compares two values and panics with a nice diff if they're not equal. This works because we derived `PartialEq` on `Replicas` earlier — without that derive, the compiler wouldn't know how to compare two `Replicas` values.
+`assert_eq!(w.replicas, Replicas::Fixed(3))` checks that the parsed value matches what we expect. `assert_eq!` is a macro (the `!` suffix is how Rust marks macros) that compares two values and panics with a nice diff if they're not equal. This works because we derived `PartialEq` on `Replicas` earlier. Without that derive, the compiler wouldn't know how to compare two `Replicas` values.
 
 Now the other two tests:
 
@@ -680,23 +680,21 @@ fn parse_resource_range_request_exceeds_limit_rejected() {
 }
 ```
 
-Read the test name and you know exactly what behaviour it's verifying. `replicas_deserialise_zero_rejected` — replicas of zero should fail. `parse_resource_range_request_exceeds_limit_rejected` — asking for more than your limit is an error.
+Read the test name and you know exactly what behaviour it's verifying. `replicas_deserialise_zero_rejected`: replicas of zero should fail. `parse_resource_range_request_exceeds_limit_rejected`: asking for more than your limit is an error.
 
-The full test suite for config parsing has 66 tests. Each one was written before the code it tests. Some of them describe happy paths (minimal app parses, all fields parse, round-trip works). Others describe failure modes (missing image rejected, invalid port rejected, non-absolute path rejected). Every one passed before we moved on.
+Each config parsing test was written before the code it tests. Some of them describe happy paths (minimal app parses, all fields parse, round-trip works). Others describe failure modes (missing image rejected, invalid port rejected, non-absolute path rejected). Every one passed before we moved on.
 
 `cargo test` runs them all in under a second. That's the feedback loop we want: make a change, run the tests, know immediately if something broke.
 
 ```
-running 66 tests
 test config::types::tests::parse_resource_range_cpu_with_range ... ok
 test config::types::tests::replicas_deserialise_star ... ok
 test config::app::tests::parse_app_with_health_check ... ok
 test config::validate::tests::validate_app_missing_image_rejected ... ok
 ...
-test result: ok. 66 passed; 0 failed; 0 ignored
 ```
 
-66 passing tests. No containers yet, no networking, no gossip protocol. Just a solid configuration layer that we can trust completely. Everything we build from here — the container runtime, the health checker, the scheduler — will parse its config through these types. And we know they work.
+All passing. No containers yet, no networking, no gossip protocol. Just a solid configuration layer that we can trust completely. Everything we build from here (the container runtime, the health checker, the scheduler) will parse its config through these types. And we know they work.
 
 ## The container runtime interface
 
@@ -714,7 +712,7 @@ For Phase 1, we're building the parts of Grill that work without real containers
 
 ## State machines in Rust
 
-Every container goes through a lifecycle. It starts as a request, gets prepared, starts running, might become unhealthy, gets stopped, and might restart. We need to track this precisely, because the wrong state transition — marking a container as "running" when it hasn't passed its health check yet — means sending traffic to a process that isn't ready.
+Every container goes through a lifecycle. It starts as a request, gets prepared, starts running, might become unhealthy, gets stopped, and might restart. We need to track this precisely, because the wrong state transition (marking a container as "running" when it hasn't passed its health check yet) means sending traffic to a process that isn't ready.
 
 Here's the state machine:
 
@@ -736,18 +734,18 @@ pub enum ContainerState {
 
 Ten states. Each one means something specific:
 
-- **Pending** — we've received the spec but haven't started work.
-- **Preparing** — pulling the container image.
-- **Initialising** — running init containers (setup tasks that must complete before the main process).
-- **Starting** — the main process is launching.
-- **HealthWait** — it's running, but we haven't confirmed it's healthy yet. No traffic.
-- **Running** — healthy and receiving traffic.
-- **Unhealthy** — health checks are failing. Removed from the service map, no new traffic.
-- **Stopping** — graceful shutdown in progress, draining existing connections.
-- **Stopped** — process has exited, resources cleaned up.
-- **Failed** — permanent failure. Exceeded restart limits, or an init container crashed.
+- **Pending**: we've received the spec but haven't started work.
+- **Preparing**: pulling the container image.
+- **Initialising**: running init containers (setup tasks that must complete before the main process).
+- **Starting**: the main process is launching.
+- **HealthWait**: it's running, but we haven't confirmed it's healthy yet. No traffic.
+- **Running**: healthy and receiving traffic.
+- **Unhealthy**: health checks are failing. Removed from the service map, no new traffic.
+- **Stopping**: graceful shutdown in progress, draining existing connections.
+- **Stopped**: process has exited, resources cleaned up.
+- **Failed**: permanent failure. Exceeded restart limits, or an init container crashed.
 
-The key insight is that not all transitions are valid. You can't go from `Pending` directly to `Running` — you have to prepare first, start, and pass health checks. You can't go from `Failed` to `Running` — you have to start over from `Pending`. The state machine enforces this:
+The key insight is that not all transitions are valid. You can't go from `Pending` directly to `Running`: you have to prepare first, start, and pass health checks. You can't go from `Failed` to `Running`: you have to start over from `Pending`. The state machine enforces this:
 
 ```rust
 impl ContainerState {
@@ -778,7 +776,7 @@ impl ContainerState {
 
 This uses `match`, which is Rust's pattern matching. If you're coming from C, think of `switch`, but the compiler guarantees you handle every case. If you add a new variant to `ContainerState` and forget to add its transitions here, the code won't compile. In C, the `switch` would silently fall through to `default`. In Go, the compiler wouldn't complain either. Rust catches it at build time.
 
-The `matches!()` macro is shorthand for "does this value match any of these patterns?" It returns a `bool`. The `(self, next)` creates a tuple, and each `(Pending, Preparing)` is a pattern that matches when `self` is `Pending` and `next` is `Preparing`. The `|` between patterns means "or" — match any of these.
+The `matches!()` macro is shorthand for "does this value match any of these patterns?" It returns a `bool`. The `(self, next)` creates a tuple, and each `(Pending, Preparing)` is a pattern that matches when `self` is `Pending` and `next` is `Preparing`. The `|` between patterns means "or": match any of these.
 
 The `_` wildcard pattern (which you'll see in other `match` expressions) means "I don't care what this value is." It's the catch-all case. But notice we don't use `_` here. We list every valid transition explicitly. If we'd used a catch-all `_ => false`, adding a new state wouldn't trigger a compilation error, and we'd silently miss transitions. By listing them exhaustively, the compiler works for us.
 
@@ -797,9 +795,9 @@ impl fmt::Display for ContainerState {
 }
 ```
 
-This is the first time we're implementing a trait by hand rather than deriving it. When we wrote `#[derive(Debug)]`, the compiler generated the `Debug` trait implementation automatically. But `Display` can't be derived — the compiler doesn't know how you want your type displayed to users (should it say "Pending" or "pending" or "PENDING"?). So we write the `impl` block ourselves.
+This is the first time we're implementing a trait by hand rather than deriving it. When we wrote `#[derive(Debug)]`, the compiler generated the `Debug` trait implementation automatically. But `Display` can't be derived: the compiler doesn't know how you want your type displayed to users (should it say "Pending" or "pending" or "PENDING"?). So we write the `impl` block ourselves.
 
-An `impl Trait for Type` block is like implementing an interface in Go or Java, but explicit. In Go, a type satisfies an interface just by having the right methods — you don't declare it. In Rust, you say `impl Display for ContainerState` and the compiler checks that you've provided all the required methods. The `write!()` macro inside `fmt` works like `format!()` but writes to the formatter instead of creating a new string.
+An `impl Trait for Type` block is like implementing an interface in Go or Java, but explicit. In Go, a type satisfies an interface just by having the right methods: you don't declare it. In Rust, you say `impl Display for ContainerState` and the compiler checks that you've provided all the required methods. The `write!()` macro inside `fmt` works like `format!()` but writes to the formatter instead of creating a new string.
 
 ## Port allocation: randomness and concurrency
 
@@ -816,11 +814,11 @@ pub struct PortAllocator {
 
 Three new concepts packed into one struct.
 
-**`Arc`** stands for "Atomically Reference Counted." In Rust, every value has exactly one owner. When the owner goes out of scope, the value is dropped (freed). This is how Rust avoids garbage collection — the compiler knows at compile time when to free memory. But sometimes multiple parts of your program need to share a value. `Arc` solves this: it wraps a value and keeps a count of how many references exist. When the count reaches zero, the value is dropped. If you're coming from Python or Java, this is roughly what the garbage collector does, but deterministic — you know exactly when it happens, and there are no GC pauses.
+**`Arc`** stands for "Atomically Reference Counted." In Rust, every value has exactly one owner. When the owner goes out of scope, the value is dropped (freed). This is how Rust avoids garbage collection: the compiler knows at compile time when to free memory. But sometimes multiple parts of your program need to share a value. `Arc` solves this: it wraps a value and keeps a count of how many references exist. When the count reaches zero, the value is dropped. If you're coming from Python or Java, this is roughly what the garbage collector does, but deterministic: you know exactly when it happens, and there are no GC pauses.
 
-**`Mutex`** provides mutual exclusion. Rust normally prevents you from mutating shared data — if two tasks could modify the `HashSet` simultaneously, you'd get a data race, and Rust's ownership rules are designed to make data races a compile-time error. `Mutex` is the escape hatch: it lets you mutate shared data, but only after acquiring a lock. The key word here is `tokio::sync::Mutex`, not `std::sync::Mutex`. The standard library's mutex blocks the OS thread when waiting for the lock. In an async programme, that's catastrophic — it blocks the entire Tokio worker thread, starving every other task on that thread. Tokio's mutex suspends the async task instead, letting the worker thread run other tasks while waiting. In Go, goroutines are preemptively scheduled, so a blocked goroutine doesn't starve others. In Rust, you have to make the right choice yourself.
+**`Mutex`** provides mutual exclusion. Rust normally prevents you from mutating shared data: if two tasks could modify the `HashSet` simultaneously, you'd get a data race, and Rust's ownership rules are designed to make data races a compile-time error. `Mutex` is the escape hatch: it lets you mutate shared data, but only after acquiring a lock. The key word here is `tokio::sync::Mutex`, not `std::sync::Mutex`. The standard library's mutex blocks the OS thread when waiting for the lock. In an async programme, that's catastrophic: it blocks the entire Tokio worker thread, starving every other task on that thread. Tokio's mutex suspends the async task instead, letting the worker thread run other tasks while waiting. In Go, goroutines are preemptively scheduled, so a blocked goroutine doesn't starve others. In Rust, you have to make the right choice yourself.
 
-**`Arc<Mutex<HashSet<u16>>>`** is the idiomatic Rust way to share mutable data across async tasks. `Arc` handles the sharing, `Mutex` handles the mutation, `HashSet` is the actual data. In Go, you'd write a `struct` with a `sync.Mutex` and a `map`. The difference is that in Rust, the compiler won't let you access the `HashSet` without going through the `Mutex` — there's no way to accidentally forget the lock.
+**`Arc<Mutex<HashSet<u16>>>`** is the idiomatic Rust way to share mutable data across async tasks. `Arc` handles the sharing, `Mutex` handles the mutation, `HashSet` is the actual data. In Go, you'd write a `struct` with a `sync.Mutex` and a `map`. The difference is that in Rust, the compiler won't let you access the `HashSet` without going through the `Mutex`: there's no way to accidentally forget the lock.
 
 Here's how allocation works:
 
@@ -831,8 +829,8 @@ pub async fn allocate(&self) -> Result<u16, PortError> {
         return Err(PortError::Exhausted { ... });
     }
 
-    let mut rng = rand::thread_rng();
-    let first = rng.gen_range(0..self.total_ports());
+    let mut rng = rand::rng();
+    let first = rng.random_range(0..self.total_ports());
     for offset in 0..self.total_ports() {
         let port = self.range_start + ((first + offset) % self.total_ports()) as u16;
         if allocated.insert(port) {
@@ -843,13 +841,13 @@ pub async fn allocate(&self) -> Result<u16, PortError> {
 }
 ```
 
-`async fn` and `.await` — this is the first async code in the project. Rust's async model is fundamentally different from Go's goroutines. In Go, every goroutine is independently scheduled by the runtime — you call a function, it might be suspended at any point, and you don't explicitly mark where. In Rust, `async fn` returns a *future* — a value that represents work that hasn't happened yet. Nothing executes until you `.await` it. Each `.await` is an explicit point where the runtime can suspend your task and run another. This is more verbose than Go (you have to write `.await` everywhere), but it makes suspension points visible in the code. You always know where your task might be paused.
+`async fn` and `.await`: this is the first async code in the project. Rust's async model is fundamentally different from Go's goroutines. In Go, every goroutine is independently scheduled by the runtime: you call a function, it might be suspended at any point, and you don't explicitly mark where. In Rust, `async fn` returns a *future*: a value that represents work that hasn't happened yet. Nothing executes until you `.await` it. Each `.await` is an explicit point where the runtime can suspend your task and run another. This is more verbose than Go (you have to write `.await` everywhere), but it makes suspension points visible in the code. You always know where your task might be paused.
 
 `self.allocated.lock().await` acquires the mutex lock. The `.await` is crucial: it means "if the lock is held by another task, suspend me and let other tasks run." Without `.await`, this would be `std::sync::Mutex::lock()`, which blocks the thread.
 
-Why random port selection instead of sequential? Two reasons. Sequential assignment is predictable, which is a minor security concern (an attacker who knows your allocation pattern can guess which ports are in use). And sequential assignment creates hot-spots when containers are frequently created and destroyed — you'd keep reusing the same low ports while the rest of the range sits idle.
+Why random port selection instead of sequential? Two reasons. Sequential assignment is predictable, which is a minor security concern (an attacker who knows your allocation pattern can guess which ports are in use). And sequential assignment creates hot-spots when containers are frequently created and destroyed: you'd keep reusing the same low ports while the rest of the range sits idle.
 
-`rand::thread_rng()` creates a thread-local random number generator. `rng.gen_range(start..end)` picks a random number in the half-open range `[start, end)`. These come from the `rand` crate, which we added to our dependencies. `allocated.insert(port)` tries to add the port to the set. If it's already there (collision), `insert` returns `false` and we move on. If it succeeds, `insert` returns `true` and we return the port.
+`rand::rng()` returns a handle to a thread-local random number generator, seeded from the operating system. `rng.random_range(start..end)` picks a random number in the half-open range `[start, end)`. These come from the `rand` crate, which we added to our dependencies. `random_range` is a method of the `RngExt` trait, and a trait's methods are only callable when the trait is in scope, so the file starts with `use rand::RngExt;`. (Before `rand` 0.9 these were `thread_rng()` and `gen_range`, and the trait was called `Rng`; you'll still see the old names in older code.) `allocated.insert(port)` tries to add the port to the set. If it's already there (collision), `insert` returns `false` and we move on. If it succeeds, `insert` returns `true` and we return the port.
 
 Only the starting point is random. From there we walk the range once, wrapping around with `%`. Our first version kept guessing at random, capped at a thousand attempts. That's fine in an empty range and wrong in a nearly full one: with one free port in 64,000, a thousand guesses almost always miss it and report exhaustion that isn't there. Walking the range can't miss, and the regression test proves it by reserving 63,999 ports and asking for the last one, over and over.
 
@@ -857,7 +855,7 @@ Only the starting point is random. From there we walk the range once, wrapping a
 
 Cgroups (control groups) are a Linux kernel feature that limits how much CPU, memory, and other resources a process can use. Every container orchestrator uses them. Kubernetes uses them. Docker uses them. We use them.
 
-cgroup v2 organises limits as a filesystem hierarchy under `/sys/fs/cgroup`. To limit a container's CPU, you write a value to a file. No system calls, no APIs — just write a string to a file. The kernel reads it and enforces the limit.
+cgroup v2 organises limits as a filesystem hierarchy under `/sys/fs/cgroup`. To limit a container's CPU, you write a value to a file. No system calls, no APIs: just write a string to a file. The kernel reads it and enforces the limit.
 
 Reliaburger creates its cgroup hierarchy under `/sys/fs/cgroup/reliaburger/{namespace}/{app_name}/{instance}`:
 
@@ -880,7 +878,7 @@ pub fn cpu_max_from_millicores(millicores: u64) -> String {
 }
 ```
 
-500 millicores means "half a CPU." With a 100ms (100,000 microsecond) period, that's 50,000 microseconds of quota: `"50000 100000"`. 1000 millicores is a full CPU: `"100000 100000"`. 2000 millicores is two CPUs: `"200000 100000"` — the kernel allows quota larger than the period.
+500 millicores means "half a CPU." With a 100ms (100,000 microsecond) period, that's 50,000 microseconds of quota: `"50000 100000"`. 1000 millicores is a full CPU: `"100000 100000"`. 2000 millicores is two CPUs: `"200000 100000"`. The kernel allows quota larger than the period.
 
 For `cpu.weight`, we convert millicores to the kernel's 1-10000 range using `.clamp()`:
 
@@ -893,9 +891,9 @@ pub fn cpu_weight_from_millicores(millicores: u64) -> u32 {
 
 `.clamp(min, max)` is a standard library method on numeric types that bounds a value: if it's below `min`, return `min`; if it's above `max`, return `max`; otherwise return it unchanged.
 
-Memory limits are simpler. `memory.max` is the hard limit in bytes — exceed it and the kernel OOM-kills your process. `memory.high` is a soft limit — exceed it and the kernel starts reclaiming memory aggressively, slowing your process down but not killing it. We set `memory.max` to the configured limit and `memory.high` to the request. This gives containers breathing room between "the kernel starts pushing back" and "the kernel kills you."
+Memory limits are simpler. `memory.max` is the hard limit in bytes: exceed it and the kernel OOM-kills your process. `memory.high` is a soft limit: exceed it and the kernel starts reclaiming memory aggressively, slowing your process down but not killing it. We set `memory.max` to the configured limit and `memory.high` to the request. This gives containers breathing room between "the kernel starts pushing back" and "the kernel kills you."
 
-Notice that none of these functions touch the filesystem. They compute values and return them. The actual writing to `/sys/fs/cgroup` happens elsewhere, when we're running on Linux with the right permissions. This separation is deliberate. These functions are pure: same input, same output, no side effects. That makes them testable on any platform — your CI server, your macOS laptop, anywhere. We test the computation now and test the filesystem operations in integration tests on Linux later.
+Notice that none of these functions touch the filesystem. They compute values and return them. The actual writing to `/sys/fs/cgroup` happens elsewhere, when we're running on Linux with the right permissions. This separation is deliberate. These functions are pure: same input, same output, no side effects. That makes them testable on any platform: your CI server, your macOS laptop, anywhere. We test the computation now and test the filesystem operations in integration tests on Linux later.
 
 ## Generating OCI specs
 
@@ -930,7 +928,7 @@ pub struct OciMount {
 }
 ```
 
-`#[serde(rename = "type")]` maps the Rust field name `mount_type` to `"type"` in JSON. We can't name the field `type` because it's a reserved keyword in Rust — you'd use it to define a type alias or trait object. So we pick a Rust-friendly name and tell serde to use the JSON-friendly name on the wire. Every language with JSON serialisation has the same problem. In Go, you'd use a struct tag:
+`#[serde(rename = "type")]` maps the Rust field name `mount_type` to `"type"` in JSON. We can't name the field `type` because it's a reserved keyword in Rust: you'd use it to define a type alias or trait object. So we pick a Rust-friendly name and tell serde to use the JSON-friendly name on the wire. Every language with JSON serialisation has the same problem. In Go, you'd use a struct tag:
 
 ```go
 type OciMount struct {
@@ -953,9 +951,9 @@ class OciMount(BaseModel):
     options: list[str] = []
 ```
 
-The Rust version is more verbose than Go's struct tags, but more flexible. `skip_serializing_if` lets you control exactly when a field is omitted, rather than relying on Go's all-or-nothing `omitempty` (which, by the way, treats `0` and `false` as empty too — a footgun if you actually want to serialise a zero value).
+The Rust version is more verbose than Go's struct tags, but more flexible. `skip_serializing_if` lets you control exactly when a field is omitted, rather than relying on Go's all-or-nothing `omitempty` (which, by the way, treats `0` and `false` as empty too, a footgun if you actually want to serialise a zero value).
 
-`#[serde(skip_serializing_if = "Option::is_none")]` omits the field from JSON output when it's `None`. Without it, you'd get `"source": null` in the JSON. The OCI spec doesn't expect null fields — it expects them to be absent entirely. `skip_serializing_if` takes a function name (as a string) that returns `bool`. For `Vec`, we use `"Vec::is_empty"` to skip empty arrays. You can pass any function here — including your own custom ones — which is something neither Go's `omitempty` nor Python's `exclude_none` can do without extra work.
+`#[serde(skip_serializing_if = "Option::is_none")]` omits the field from JSON output when it's `None`. Without it, you'd get `"source": null` in the JSON. The OCI spec doesn't expect null fields: it expects them to be absent entirely. `skip_serializing_if` takes a function name (as a string) that returns `bool`. For `Vec`, we use `"Vec::is_empty"` to skip empty arrays. You can pass any function here (including your own custom ones), which is something neither Go's `omitempty` nor Python's `exclude_none` can do without extra work.
 
 The `generate_oci_spec` function builds the spec from our `AppSpec`:
 
@@ -980,9 +978,9 @@ for (key, value) in &spec.env {
 }
 ```
 
-`for (key, value) in &spec.env` iterates over the `BTreeMap` by reference. The `&` is important: without it, Rust would try to *move* the map out of `spec`, taking ownership. Since we're borrowing `spec` (the function takes `&AppSpec`, not `AppSpec`), we can only borrow its contents. In Go, `range` over a map copies the key and value — there's no distinction. In Rust, you choose between borrowing (`&`), mutable borrowing (`&mut`), and consuming (no `&`). Most of the time you want borrowing.
+`for (key, value) in &spec.env` iterates over the `BTreeMap` by reference. The `&` is important: without it, Rust would try to *move* the map out of `spec`, taking ownership. Since we're borrowing `spec` (the function takes `&AppSpec`, not `AppSpec`), we can only borrow its contents. In Go, `range` over a map copies the key and value: there's no distinction. In Rust, you choose between borrowing (`&`), mutable borrowing (`&mut`), and consuming (no `&`). Most of the time you want borrowing.
 
-You might notice that encrypted values are passed through as the literal `ENC[AGE:...]` string. That's intentional. The decryption infrastructure (Sesame PKI) doesn't exist yet — that's Phase 4. Rather than stubbing it out or adding a no-op decrypt function, we pass the encrypted blob through and leave a `// TODO(Phase 4)` comment. The container will see the encrypted string as its environment variable. That's not useful, but it's honest — and it compiles, tests, and ships.
+You might notice that encrypted values are passed through as the literal `ENC[AGE:...]` string. That's intentional. The decryption infrastructure (Sesame PKI) doesn't exist yet. That's Phase 4. Rather than stubbing it out or adding a no-op decrypt function, we pass the encrypted blob through and leave a `// TODO(Phase 4)` comment. The container will see the encrypted string as its environment variable. That's not useful, but it's honest, and it compiles, tests, and ships.
 
 Inline config files need somewhere on the host to live, because runc can only bind-mount a file that exists. The first version wrote each one to `.config/<namespace>/<app>/<basename>`, and that path had two bugs, both found in the 0.2.1 audit (#701). `/etc/a/config.yaml` and `/etc/b/config.yaml` share a basename, so both mounts got whichever was written last. And every instance of the app shared the file, so a rollout rewrote it under the old instances while they were still serving: they saw the new config before the new version had passed a single health check. Now the copy lives under the instance and a hash of its container path:
 
@@ -1017,9 +1015,9 @@ pub trait Grill: Send + Sync {
 }
 ```
 
-In Go, any type with the right methods automatically satisfies an interface. In Rust, you write `impl Grill for ContainerdGrill { ... }` and the compiler verifies that you've implemented every method. This is more verbose, but it means you can't accidentally satisfy a trait — it's always intentional.
+In Go, any type with the right methods automatically satisfies an interface. In Rust, you write `impl Grill for ContainerdGrill { ... }` and the compiler verifies that you've implemented every method. This is more verbose, but it means you can't accidentally satisfy a trait: it's always intentional.
 
-The trait methods return `impl Future<Output = Result<(), GrillError>> + Send`. Let's break that down. `impl Future<Output = ...>` is Rust 2024's way of writing async methods in traits — earlier editions needed a separate `async-trait` crate to do this. `Result<(), GrillError>` means the method either succeeds (returning nothing, `()`) or fails with a `GrillError`. And `+ Send` means the future can be moved between threads. Tokio is a multi-threaded runtime — it might start running your future on one thread and resume it on another. `Send` is a *marker trait* that tells the compiler "this is safe to send to another thread." If your future holds a reference to something that isn't thread-safe (like an `Rc`, which is a non-atomic reference count), the compiler would reject the `+ Send` bound at compile time.
+The trait methods return `impl Future<Output = Result<(), GrillError>> + Send`. Let's break that down. `impl Future<Output = ...>` is Rust 2024's way of writing async methods in traits. Earlier editions needed a separate `async-trait` crate to do this. `Result<(), GrillError>` means the method either succeeds (returning nothing, `()`) or fails with a `GrillError`. And `+ Send` means the future can be moved between threads. Tokio is a multi-threaded runtime: it might start running your future on one thread and resume it on another. `Send` is a *marker trait* that tells the compiler "this is safe to send to another thread." If your future holds a reference to something that isn't thread-safe (like an `Rc`, which is a non-atomic reference count), the compiler would reject the `+ Send` bound at compile time.
 
 `InstanceId` is a newtype:
 
@@ -1028,7 +1026,7 @@ The trait methods return `impl Future<Output = Result<(), GrillError>> + Send`. 
 pub struct InstanceId(pub String);
 ```
 
-This is a tuple struct with one field — it's just a `String` at runtime, with zero overhead. But the compiler treats `InstanceId` and `String` as different types. If you write a function that takes an `InstanceId` and accidentally pass it a `String`, the compiler rejects it. This is Rust's answer to "stringly-typed" APIs. In Go or Python, you'd pass `string` everywhere and rely on variable names and documentation to keep track of what's what. In Rust, the type system does it for you.
+This is a tuple struct with one field: it's just a `String` at runtime, with zero overhead. But the compiler treats `InstanceId` and `String` as different types. If you write a function that takes an `InstanceId` and accidentally pass it a `String`, the compiler rejects it. This is Rust's answer to "stringly-typed" APIs. In Go or Python, you'd pass `string` everywhere and rely on variable names and documentation to keep track of what's what. In Rust, the type system does it for you.
 
 The `GrillError` enum shows another thiserror pattern:
 
@@ -1047,9 +1045,9 @@ pub enum GrillError {
 
 `#[from]` on a variant generates a `From<InvalidTransition> for GrillError` implementation. This means anywhere you have a `Result<_, InvalidTransition>`, you can use `?` to automatically convert it to `Result<_, GrillError>`. No manual error wrapping, no `map_err` calls. The `?` operator does three things: if the result is `Ok`, unwrap the value and continue; if it's `Err`, convert the error using `From` and return early. It's the Rust equivalent of Go's `if err != nil { return err }`, but in three characters instead of three lines.
 
-With the trait defined, Phase 1's implementation focuses on the parts that don't need a real container runtime: the state machine, port allocator, cgroup computation, and OCI spec generation. Together, these four modules add 69 tests to the project — bringing the total to 135. Every transition in the state machine is validated. Every edge case in port allocation is covered. Every cgroup parameter is verified against known-correct values. And the OCI spec serialises to valid JSON with the right structure.
+With the trait defined, Phase 1's implementation focuses on the parts that don't need a real container runtime: the state machine, port allocator, cgroup computation, and OCI spec generation. Every transition in the state machine is validated. Every edge case in port allocation is covered. Every cgroup parameter is verified against known-correct values. And the OCI spec serialises to valid JSON with the right structure.
 
-When we implement the runc integration (the part that creates real containers), we'll write a struct that implements the `Grill` trait. For testing, we can write a mock that also implements the trait. The business logic that uses Grill — the supervisor, the health checker, the scheduler — won't know or care which implementation it's talking to. That's the point of the trait boundary.
+When we implement the runc integration (the part that creates real containers), we'll write a struct that implements the `Grill` trait. For testing, we can write a mock that also implements the trait. The business logic that uses Grill (the supervisor, the health checker, the scheduler) won't know or care which implementation it's talking to. That's the point of the trait boundary.
 
 ## The process supervisor
 
@@ -1575,7 +1573,7 @@ Now you can test that the scheduler correctly places a workload requiring 2 GPUs
 
 The trait boundary is a seam for testing, not just for polymorphism. Define the trait now, use the stub, swap in the real implementation later without changing any callers. This is dependency inversion in Rust: the same principle as in Go or Java, but with zero runtime cost because the compiler monomorphises generic code.
 
-With the Bun agent core in place, we've added 62 tests (bringing the total to 197) covering the supervisor, health checking, restart backoff, and GPU detection. Every state transition is tested. Every edge case in backoff computation is covered. The priority queue correctly orders, lazily deletes, and reschedules. And the mock-based testing pattern we've established here will scale to every subsystem we build next.
+With the Bun agent core in place, the new tests cover the supervisor, health checking, restart backoff, and GPU detection. Every state transition is tested. Every edge case in backoff computation is covered. The priority queue correctly orders, lazily deletes, and reschedules. And the mock-based testing pattern we've established here will scale to every subsystem we build next.
 
 ## The Relish CLI
 
@@ -1624,9 +1622,9 @@ enum Command {
 
 Two attributes do the heavy lifting here.
 
-`#[derive(Parser)]` generates the argument parsing code at compile time. It reads the field names and types from your struct, figures out what flags and positional arguments to expect, and writes the parser for you. No runtime reflection, no code generation step — the Rust compiler does it during the normal build. If you add a field with the wrong type, you get a compile error, not a runtime crash.
+`#[derive(Parser)]` generates the argument parsing code at compile time. It reads the field names and types from your struct, figures out what flags and positional arguments to expect, and writes the parser for you. No runtime reflection, no code generation step: the Rust compiler does it during the normal build. If you add a field with the wrong type, you get a compile error, not a runtime crash.
 
-`#[derive(Subcommand)]` does the same for the command enum. Each variant becomes a subcommand. The variant's fields become that subcommand's arguments. `Apply { path: PathBuf }` means `relish apply <path>` — clap figures out that `path` is a positional argument because it doesn't have `#[arg(long)]` or `#[arg(short)]`.
+`#[derive(Subcommand)]` does the same for the command enum. Each variant becomes a subcommand. The variant's fields become that subcommand's arguments. `Apply { path: PathBuf }` means `relish apply <path>`: clap figures out that `path` is a positional argument because it doesn't have `#[arg(long)]` or `#[arg(short)]`.
 
 Compare this to Go's standard `flag` package, where you manually define each flag, parse them, then check which subcommand was used with `os.Args`:
 
@@ -1670,7 +1668,7 @@ pub enum OutputFormat {
 
 `#[derive(clap::ValueEnum)]` teaches clap how to parse this enum from command-line text. `--output human`, `--output json`, and `--output yaml` all just work. Anything else gets a clear error message. No string matching, no `if output == "json"` scattered through your code.
 
-The `#[default]` attribute on `Human` means you don't even need to specify `--output` — it defaults to human-readable text. This is a Rust enum feature that works with the `Default` trait. In Go you'd check for an empty string; in Python you'd pass `default=` to `argparse`. Here the default is part of the type definition itself.
+The `#[default]` attribute on `Human` means you don't even need to specify `--output`: it defaults to human-readable text. This is a Rust enum feature that works with the `Default` trait. In Go you'd check for an empty string; in Python you'd pass `default=` to `argparse`. Here the default is part of the type definition itself.
 
 Why does this matter? Because we use `OutputFormat` in a `match` expression later:
 
@@ -1724,13 +1722,13 @@ pub fn generate_plan(config: &Config) -> ApplyPlan {
 }
 ```
 
-Notice `if let Some(ref image) = app.image`. This is pattern matching with a reference — `ref` borrows the inner `String` instead of moving it out of the `Option`. In Rust, `match` and `if let` can destructure values, and `ref` says "I want to look at this, not take ownership of it." Without `ref`, the compiler would complain that you're trying to move `image` out of a borrowed `app`.
+Notice `if let Some(ref image) = app.image`. This is pattern matching with a reference: `ref` borrows the inner `String` instead of moving it out of the `Option`. In Rust, `match` and `if let` can destructure values, and `ref` says "I want to look at this, not take ownership of it." Without `ref`, the compiler would complain that you're trying to move `image` out of a borrowed `app`.
 
-A confession about this plan, added much later. The diffing half — `Update`, `Unchanged`, and the comparison against current state — sat fully written and fully unit-tested for a long time while every production caller passed `current = None`, because no agent endpoint existed to fetch current state from. So `apply --dry-run` showed every resource as a create, forever, and the tests happily verified logic that nothing could reach. The fix (a `GET /v1/apps` endpoint serving the deployed apps and their images, which the dry-run path queries whenever an agent answers) came with a naming correction: the plan used to have a `Destroy` action for resources running but absent from your config. But `relish apply` is additive — removal is `relish stop` — so "destroy" promised something apply would never do. Those entries are now labelled `not_in_config`, with a note telling you apply leaves them alone. A plan is a contract about what will happen; an action name that doesn't match the verb is a bug even when the code around it works.
+A confession about this plan, added much later. The diffing half (`Update`, `Unchanged`, and the comparison against current state) sat fully written and fully unit-tested for a long time while every production caller passed `current = None`, because no agent endpoint existed to fetch current state from. So `apply --dry-run` showed every resource as a create, forever, and the tests happily verified logic that nothing could reach. The fix (a `GET /v1/apps` endpoint serving the deployed apps and their images, which the dry-run path queries whenever an agent answers) came with a naming correction: the plan used to have a `Destroy` action for resources running but absent from your config. But `relish apply` is additive (removal is `relish stop`) so "destroy" promised something apply would never do. Those entries are now labelled `not_in_config`, with a note telling you apply leaves them alone. A plan is a contract about what will happen; an action name that doesn't match the verb is a bug even when the code around it works.
 
-The function iterates `config.app`, which is a `BTreeMap<String, AppSpec>`. We chose `BTreeMap` over `HashMap` back in the config chapter for deterministic ordering — and here's the payoff. The plan entries come out in alphabetical order. Tests can assert on ordering without fragility. The YAML and JSON output is stable across runs. Small decision, compound benefit.
+The function iterates `config.app`, which is a `BTreeMap<String, AppSpec>`. We chose `BTreeMap` over `HashMap` back in the config chapter for deterministic ordering, and here's the payoff. The plan entries come out in alphabetical order. Tests can assert on ordering without fragility. The YAML and JSON output is stable across runs. Small decision, compound benefit.
 
-In Phase 1 every resource gets `PlanAction::Create` because there's no cluster state to compare against. In Phase 2, when we have a running cluster, this function will diff the desired state (config file) against the actual state (cluster) and produce `Update`, `Destroy`, and `Unchanged` entries too. The structure is ready for that — we just haven't implemented it yet.
+In Phase 1 every resource gets `PlanAction::Create` because there's no cluster state to compare against. In Phase 2, when we have a running cluster, this function will diff the desired state (config file) against the actual state (cluster) and produce `Update`, `Destroy`, and `Unchanged` entries too. The structure is ready for that: we just haven't implemented it yet.
 
 ### One data structure, three output formats
 
@@ -1769,7 +1767,7 @@ $ relish --output json apply cluster.toml
 }
 ```
 
-YAML output is there for Kubernetes refugees who want the comfort of familiar syntax. `yaml_serde` (the maintained successor to `serde_yaml`; Chapter 9 explains the swap) makes it trivial — same `#[derive(Serialize)]`, different serialiser.
+YAML output is there for Kubernetes refugees who want the comfort of familiar syntax. `yaml_serde` (the maintained successor to `serde_yaml`; Chapter 9 explains the swap) makes it trivial: same `#[derive(Serialize)]`, different serialiser.
 
 The `Display` implementation for `ApplyPlan` uses `write!` and `writeln!` macros, which work like `format!` but write directly to a formatter instead of allocating a new string. The `+` prefix on each entry is the `Display` implementation for `PlanAction`:
 
@@ -1814,7 +1812,7 @@ pub enum RelishError {
 
 Two things worth pointing out. First, `#[from] ConfigError` generates a `From<ConfigError> for RelishError` implementation, which lets the `?` operator automatically convert config errors. When `Config::from_file(path)?` fails inside `apply()`, the `ConfigError` gets wrapped into `RelishError::Config` without any manual conversion.
 
-Second, the two serialisation variants (`SerialiseJson` and `SerialiseYaml`) don't use `#[from]`. They can't, because `#[from]` generates `From<E>` implementations, and both `serde_json::Error` and `yaml_serde::Error` would conflict — Rust's orphan rules don't allow two blanket `From` impls that could overlap. Instead, we use `.map_err(RelishError::SerialiseJson)` at the call site. A small bit of ceremony, but it makes the error's origin unambiguous.
+Second, the two serialisation variants (`SerialiseJson` and `SerialiseYaml`) don't use `#[from]`. They can't, because `#[from]` generates `From<E>` implementations, and both `serde_json::Error` and `yaml_serde::Error` would conflict: Rust's orphan rules don't allow two blanket `From` impls that could overlap. Instead, we use `.map_err(RelishError::SerialiseJson)` at the call site. A small bit of ceremony, but it makes the error's origin unambiguous.
 
 The binary's `main()` function doesn't use `anyhow::Result` anymore. Instead, it returns `ExitCode`:
 
@@ -1891,11 +1889,11 @@ mod tests {
 }
 ```
 
-`Cli::try_parse_from` parses from a string slice instead of reading `std::env::args()`. Same parsing logic, no process spawning needed. The test for invalid output proves that clap rejects unknown formats at parse time — our `ValueEnum` derive handles it.
+`Cli::try_parse_from` parses from a string slice instead of reading `std::env::args()`. Same parsing logic, no process spawning needed. The test for invalid output proves that clap rejects unknown formats at parse time: our `ValueEnum` derive handles it.
 
 The command functions themselves are tested through the library. `apply()` gets tested with temporary files (created by the `tempfile` crate), exercising the full pipeline: read file, parse TOML, validate config, generate plan, format output. Commands like `status`, `logs`, and `exec` get tested by pointing them at a bogus agent address and verifying they return the right `AgentUnreachable` error.
 
-With the Relish CLI skeleton, we've added 36 tests (bringing the total to 233). The CLI parses five subcommands with a global `--output` flag. `apply` does real work — it reads, validates, and plans. The other four commands fail gracefully instead of panicking. Three output formats — human, JSON, YAML — work through a single `format_output` function that dispatches on a type-safe enum. And the error handling follows the pattern we'll use everywhere: `thiserror` in the library, manual formatting in the binary.
+With the Relish CLI skeleton in place, the CLI parses five subcommands with a global `--output` flag. `apply` does real work: it reads, validates, and plans. The other four commands fail gracefully instead of panicking. Three output formats (human, JSON, YAML) work through a single `format_output` function that dispatches on a type-safe enum. And the error handling follows the pattern we'll use everywhere: `thiserror` in the library, manual formatting in the binary.
 
 ## A process-based runtime
 
@@ -1920,7 +1918,7 @@ struct ProcessEntry {
 }
 ```
 
-Two things worth noting here. First, the `Arc<Mutex<HashMap<...>>>` pattern. `Arc` is Rust's atomic reference counter — it lets multiple owners share the same data. `Mutex` (from `tokio::sync`, not `std::sync` — never use the standard mutex in async code, it blocks the runtime) guards mutation. Together they give you shared mutable state across async tasks. In Go you'd use a `sync.Mutex` with a map; in Python you'd just rely on the GIL. Rust makes you be explicit about every shared mutation, which is verbose but prevents data races at compile time.
+Two things stand out here. First, the `Arc<Mutex<HashMap<...>>>` pattern. `Arc` is Rust's atomic reference counter: it lets multiple owners share the same data. `Mutex` (from `tokio::sync`, not `std::sync`; never use the standard mutex in async code, it blocks the runtime) guards mutation. Together they give you shared mutable state across async tasks. In Go you'd use a `sync.Mutex` with a map; in Python you'd just rely on the GIL. Rust makes you be explicit about every shared mutation, which is verbose but prevents data races at compile time.
 
 Second, we store `Option<tokio::process::Child>` rather than always having a child. A container can be created without being started (the OCI spec separates `create` from `start`). The `Option` reflects this: `None` before start, `Some(child)` after. If you try to start something that already has a child, that's a bug, and we reject it.
 
@@ -1942,7 +1940,7 @@ cmd.stdout(std::process::Stdio::piped());
 cmd.stderr(std::process::Stdio::piped());
 ```
 
-`tokio::process::Command` is the async version of `std::process::Command`. Same API, but the process is managed by tokio's event loop instead of blocking a thread. We pipe stdout and stderr so we can capture logs — each gets a spawned task that reads into a buffer:
+`tokio::process::Command` is the async version of `std::process::Command`. Same API, but the process is managed by tokio's event loop instead of blocking a thread. We pipe stdout and stderr so we can capture logs. Each gets a spawned task that reads into a buffer:
 
 ```rust
 let stdout_buf = entry.stdout_buf.clone();
@@ -1964,9 +1962,9 @@ if let Some(stdout) = child.stdout.take() {
 }
 ```
 
-`tokio::spawn(async move { ... })` has two parts worth unpacking. `tokio::spawn` takes a future and runs it as an independent task on the runtime — like launching a goroutine in Go or starting a thread, but cooperatively scheduled. The `async move` block is how you create that future. `async` makes it a future (code that can be paused and resumed at each `.await` point). `move` tells the compiler to *move* captured variables into the block, transferring ownership. Without `move`, the block would try to borrow `stdout_buf` and `stdout` from the surrounding scope. But the surrounding function might return before the spawned task finishes, which would leave the task holding dangling references. Rust's borrow checker catches this at compile time and refuses to compile it. `move` fixes it by giving the task its own copy of `stdout_buf` (which is an `Arc`, so "copy" means incrementing a reference count) and full ownership of `stdout`. The spawned task now owns everything it needs and can outlive the function that created it.
+`tokio::spawn(async move { ... })` has two parts worth unpacking. `tokio::spawn` takes a future and runs it as an independent task on the runtime, like launching a goroutine in Go or starting a thread, but cooperatively scheduled. The `async move` block is how you create that future. `async` makes it a future (code that can be paused and resumed at each `.await` point). `move` tells the compiler to *move* captured variables into the block, transferring ownership. Without `move`, the block would try to borrow `stdout_buf` and `stdout` from the surrounding scope. But the surrounding function might return before the spawned task finishes, which would leave the task holding dangling references. Rust's borrow checker catches this at compile time and refuses to compile it. `move` fixes it by giving the task its own copy of `stdout_buf` (which is an `Arc`, so "copy" means incrementing a reference count) and full ownership of `stdout`. The spawned task now owns everything it needs and can outlive the function that created it.
 
-`child.stdout.take()` is a pattern you'll see a lot. `take()` moves the value out of the `Option`, leaving `None` behind. We need ownership of the stdout handle to send it into the spawned task — but we also need the `child` struct to keep existing. `take()` lets us split the child from its stdout cleanly.
+`child.stdout.take()` is a pattern you'll see a lot. `take()` moves the value out of the `Option`, leaving `None` behind. We need ownership of the stdout handle to send it into the spawned task, but we also need the `child` struct to keep existing. `take()` lets us split the child from its stdout cleanly.
 
 Stopping a process uses Unix signals via the `nix` crate:
 
@@ -1981,7 +1979,7 @@ if let Some(ref child) = entry.child
 
 That `if let ... && let ...` syntax is a Rust 2024 edition feature called *let chains*. It lets you chain multiple pattern matches in a single `if`. The previous edition would have required nested `if let` blocks.
 
-`kill()` is simpler — it uses `child.kill().await` from tokio, which sends SIGKILL. And `state()` calls `child.try_wait()` to check if the process has exited without blocking:
+`kill()` is simpler: it uses `child.kill().await` from tokio, which sends SIGKILL. And `state()` calls `child.try_wait()` to check if the process has exited without blocking:
 
 ```rust
 match child.try_wait() {
@@ -1993,11 +1991,11 @@ match child.try_wait() {
 
 `try_wait` returns `Ok(None)` if the process is still running, `Ok(Some(status))` if it's exited, and `Err` if something went wrong checking. We map all terminal cases to `Stopped`.
 
-ProcessGrill now has 8 tests covering every lifecycle transition. They run in milliseconds, on any platform, without root privileges. That's the whole point: by abstracting the runtime behind a trait, we can test everything at full speed and add real containers later.
+ProcessGrill's tests cover every lifecycle transition. They run in milliseconds, on any platform, without root privileges. That's the whole point: by abstracting the runtime behind a trait, we can test everything at full speed and add real containers later.
 
 ## Real containers: runc and Apple Container
 
-ProcessGrill is a cheat — it spawns processes, not containers. For Phase 1 that's fine, but we also want to prove that the OCI specs we've been generating actually work with real container runtimes.
+ProcessGrill is a cheat: it spawns processes, not containers. For Phase 1 that's fine, but we also want to prove that the OCI specs we've been generating actually work with real container runtimes.
 
 ### Runc on Linux
 
@@ -2257,9 +2255,9 @@ pub async fn run(&mut self) {
 
 `tokio::select!` is like Go's `select` statement but for Rust futures. It polls all branches simultaneously and runs whichever one completes first. The others are cancelled (dropped). Three things can happen:
 
-1. **Shutdown requested** — the `CancellationToken` fires. Stop all instances, break the loop.
-2. **Command received** — dispatch to the appropriate handler.
-3. **Health check timer fires** — probe all instances that have health checks configured.
+1. **Shutdown requested**: the `CancellationToken` fires. Stop all instances, break the loop.
+2. **Command received**: dispatch to the appropriate handler.
+3. **Health check timer fires**: probe all instances that have health checks configured.
 
 The order matters. Rust's `select!` checks branches in the order they appear, so shutdown always takes priority. In practice, since all three are polled simultaneously and only one can fire per iteration, this mainly matters during shutdown: if a command arrives at the same time as the cancellation, we process the cancellation.
 
@@ -2296,7 +2294,7 @@ async fn drive_instance_startup(
 }
 ```
 
-Each `transition_to` call validates the transition against the state machine. Try to go from Pending to Running directly? The state machine rejects it. This isn't defensive programming — it's the compiler and the state machine working together to ensure the lifecycle always follows the expected sequence.
+Each `transition_to` call validates the transition against the state machine. Try to go from Pending to Running directly? The state machine rejects it. This isn't defensive programming: it's the compiler and the state machine working together to ensure the lifecycle always follows the expected sequence.
 
 Health checks happen on the timer tick. For each instance in `HealthWait` or `Running`, the agent probes the health endpoint and feeds the result to the health checker. If the health checker says the instance is now healthy (enough consecutive successful probes), the agent transitions it to `Running`. If it's unhealthy, the agent stops and restarts it, applying backoff between retries.
 
@@ -2522,7 +2520,7 @@ pub fn router(cmd_tx: mpsc::Sender<AgentCommand>) -> Router {
 }
 ```
 
-axum is Rust's answer to Express or Gin. Routes map HTTP methods and paths to handler functions. `.with_state(state)` makes the `ApiState` available to every handler via the `State` extractor. If you've used dependency injection in other frameworks, this is similar — but resolved at compile time, not runtime.
+axum is Rust's answer to Express or Gin. Routes map HTTP methods and paths to handler functions. `.with_state(state)` makes the `ApiState` available to every handler via the `State` extractor. If you've used dependency injection in other frameworks, this is similar, but resolved at compile time, not runtime.
 
 Each handler follows the same pattern:
 
@@ -2541,7 +2539,7 @@ async fn status_handler(
 }
 ```
 
-Create a oneshot channel. Send the command with the sender half. Await the receiver half. Return the result as JSON. The handler doesn't know how the agent processes commands — it just sends and waits. This separation means we can test the API layer independently from the agent logic.
+Create a oneshot channel. Send the command with the sender half. Await the receiver half. Return the result as JSON. The handler doesn't know how the agent processes commands: it just sends and waits. This separation means we can test the API layer independently from the agent logic.
 
 Status was the first command to outgrow this. It's the one everybody polls, and each poll waited for whatever the loop was doing. Since 0.1.3 the loop publishes a snapshot of its instances after every turn on a `watch` channel, and `/v1/status` reads that instead of asking (Chapter 15, "Three awaits leave the loop").
 
@@ -2580,7 +2578,7 @@ async fn apply_handler(State(state): State<ApiState>, body: String) -> Response 
 
 The logs endpoint supports two query parameters: `?tail=N` returns only the last N lines, and `?follow=true` switches from a JSON response to an SSE stream. When following, the API sends each new log line as a Server-Sent Event, reusing the same streaming pattern we built for `apply`. The client reads the stream and prints each line to stdout. When the process exits or the user hits Ctrl-C, the stream ends cleanly. This gives us `tail -f` behaviour without polling.
 
-The API listens on `127.0.0.1:9117` — localhost only. In Phase 1, there's no cluster, no mTLS, no authentication. Opening it to the network would be a security hole. We'll add proper auth in Phase 4 and bind to all interfaces when the cluster needs it.
+The API listens on `127.0.0.1:9117`, localhost only. In Phase 1, there's no cluster, no mTLS, no authentication. Opening it to the network would be a security hole. We'll add proper auth in Phase 4 and bind to all interfaces when the cluster needs it.
 
 ## Relish talks to Bun
 
@@ -2694,37 +2692,37 @@ impl TestHarness {
 
 Port 0 is the key trick here. Binding to port 0 tells the OS to assign any available ephemeral port. This means tests don't fight over port numbers, and you can run the whole suite in parallel without conflicts.
 
-The `Drop` implementation cancels the shutdown token, which stops the agent and the API server. Tests don't need explicit cleanup — when the harness goes out of scope, everything shuts down.
+The `Drop` implementation cancels the shutdown token, which stops the agent and the API server. Tests don't need explicit cleanup: when the harness goes out of scope, everything shuts down.
 
 Here's what the integration tests cover:
 
-**`deploy_app_reaches_running`** — send an apply with a no-health-check config, verify the instance reaches Running state. This tests the full pipeline: HTTP request → TOML parsing → agent command → supervisor deploy → process start → state transition.
+**`deploy_app_reaches_running`**: send an apply with a no-health-check config, verify the instance reaches Running state. This tests the full pipeline: HTTP request → TOML parsing → agent command → supervisor deploy → process start → state transition.
 
-**`health_check_healthy_app_transitions_to_running`** — deploy an app with a health check pointing at a `TestApp` (a built-in test HTTP server). Wait a few seconds for the health check timer to fire and the probe to succeed. Verify the instance transitions through HealthWait to Running.
+**`health_check_healthy_app_transitions_to_running`**: deploy an app with a health check pointing at a `TestApp` (a built-in test HTTP server). Wait a few seconds for the health check timer to fire and the probe to succeed. Verify the instance transitions through HealthWait to Running.
 
-**`health_check_failing_app_marked_unhealthy`** — deploy against a TestApp that always returns 500. Verify the instance stays in HealthWait (never gets healthy enough to transition).
+**`health_check_failing_app_marked_unhealthy`**: deploy against a TestApp that always returns 500. Verify the instance stays in HealthWait (never gets healthy enough to transition).
 
-**`stop_app_transitions_to_stopped`** — deploy, verify running, send stop, verify stopped.
+**`stop_app_transitions_to_stopped`**: deploy, verify running, send stop, verify stopped.
 
-**`deploy_multiple_apps`** — deploy a config with two apps, verify both appear in status.
+**`deploy_multiple_apps`**: deploy a config with two apps, verify both appear in status.
 
-**`status_empty_when_nothing_deployed`** — verify that a fresh agent reports no instances.
+**`status_empty_when_nothing_deployed`**: verify that a fresh agent reports no instances.
 
-**`logs_for_deployed_app`** — deploy an app, fetch logs, verify the call succeeds.
+**`logs_for_deployed_app`**: deploy an app, fetch logs, verify the call succeeds.
 
-**`logs_with_tail_returns_limited_lines`** — deploy an app that echoes three lines ("line1", "line2", "line3"), then fetch logs with `tail=1`. Verify we get exactly one line back, and it's "line3". This exercises the full `--tail` pipeline: query param parsing in the API, tail truncation in the agent, and the client passing the parameter through.
+**`logs_with_tail_returns_limited_lines`**: deploy an app that echoes three lines ("line1", "line2", "line3"), then fetch logs with `tail=1`. Verify we get exactly one line back, and it's "line3". This exercises the full `--tail` pipeline: query param parsing in the API, tail truncation in the agent, and the client passing the parameter through.
 
-**`relish_status_returns_expected_output`** — deploy via the command channel directly (not HTTP), verify the status API reflects the expected app name.
+**`relish_status_returns_expected_output`**: deploy via the command channel directly (not HTTP), verify the status API reflects the expected app name.
 
-**`job_runs_to_completion`** — deploy a job with `command = ["echo", "migration complete"]`. Wait a few seconds for the process to exit, then verify the instance reaches Stopped state. This tests the full job pipeline: deploy, `drive_job_startup`, process exit detection in `check_jobs`, and the success path.
+**`job_runs_to_completion`**: deploy a job with `command = ["echo", "migration complete"]`. Wait a few seconds for the process to exit, then verify the instance reaches Stopped state. This tests the full job pipeline: deploy, `drive_job_startup`, process exit detection in `check_jobs`, and the success path.
 
-**`job_failed_retries_then_fails`** — deploy a job with `command = ["false"]`. The `false` command exits immediately with code 1. Wait for all retries to exhaust (3 retries with exponential backoff takes about 12 seconds), then verify the instance reaches Failed state and `restart_count > 0`.
+**`job_failed_retries_then_fails`**: deploy a job with `command = ["false"]`. The `false` command exits immediately with code 1. Wait for all retries to exhaust (3 retries with exponential backoff takes about 12 seconds), then verify the instance reaches Failed state and `restart_count > 0`.
 
-**`init_container_success_allows_app_start`** — deploy an app with an init container that runs `echo "init done"`. Verify the deploy succeeds and the app reaches Running. Tests the Preparing → Initialising → Starting path.
+**`init_container_success_allows_app_start`**: deploy an app with an init container that runs `echo "init done"`. Verify the deploy succeeds and the app reaches Running. Tests the Preparing → Initialising → Starting path.
 
-**`init_container_failure_prevents_start`** — deploy an app with an init container that runs `false`. Verify the deploy returns an error. The app should never start.
+**`init_container_failure_prevents_start`**: deploy an app with an init container that runs `false`. Verify the deploy returns an error. The app should never start.
 
-**`health_check_triggers_restart`** — deploy an app with a health check pointing at a TestApp in `UnhealthyAfter(3)` mode. The app passes 3 health checks (reaching Running), then starts failing. Wait long enough for the failure threshold to trip and the restart to happen. Verify `restart_count > 0`. This is the full lifecycle test: healthy, unhealthy, restart.
+**`health_check_triggers_restart`**: deploy an app with a health check pointing at a TestApp in `UnhealthyAfter(3)` mode. The app passes 3 health checks (reaching Running), then starts failing. Wait long enough for the failure threshold to trip and the restart to happen. Verify `restart_count > 0`. This is the full lifecycle test: healthy, unhealthy, restart.
 
 Each test is end-to-end: real HTTP, real process spawning, real state machine transitions. The only thing that's fake is the container runtime (ProcessGrill instead of runc). That's exactly the line we want: test the orchestration logic with real I/O, but don't require root privileges or a container runtime to be installed.
 
@@ -2780,9 +2778,9 @@ pub struct ImageReference {
 
 The parser handles bare names (`alpine`), names with tags (`alpine:3.19`), user repos (`myuser/myimage:v1`), and custom registries (`ghcr.io/org/image:sha`). It distinguishes registries from user names by checking for a `.` or `:` in the first path component.
 
-### The `oci-distribution` crate
+### The `oci-client` crate
 
-We use the `oci-distribution` crate for the registry protocol. It handles HTTP authentication (we only need anonymous pulls for now), manifest parsing, and blob downloads. The key call is:
+We use the `oci-client` crate for the registry protocol. It handles HTTP authentication (we only need anonymous pulls for now), manifest parsing, and blob downloads. It used to be called `oci-distribution`, and we shipped that name until 0.2.2; upstream renamed it and kept going under the new name. The key call is:
 
 ```rust
 let (manifest, digest, config) = client
@@ -2791,6 +2789,29 @@ let (manifest, digest, config) = client
 ```
 
 This returns an `OciImageManifest` with the layer descriptors. If the registry returns a manifest index (multi-platform), the client's built-in platform resolver automatically selects the right architecture.
+
+Who decides which servers the client trusts? `oci-client` builds its own `reqwest` HTTP client inside, and it doesn't let us hand it one. So every registry client in Reliaburger starts from one function, `registry_client` in `src/grill/oci_pull.rs`, which sets what `oci-client`'s config does expose:
+
+```rust
+pub(crate) fn registry_client_config(protocol: ClientProtocol) -> ClientConfig {
+    ClientConfig {
+        protocol,
+        tls_certs_only: bundled_roots(),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn registry_client(protocol: ClientProtocol) -> Result<Client, OciDistributionError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Client::try_from(registry_client_config(protocol))
+}
+```
+
+`tls_certs_only` trusts the Mozilla root list compiled into the binary (the `webpki-root-certs` crate) and nothing else. Left alone, reqwest 0.13 would read the operating system's trust store instead, and on a host with no CA bundle it would refuse to build a client at all. Installing *ring* as the process's crypto provider stops reqwest falling back to aws-lc. The `let _ =` throws away the error `install_default` returns when a provider is already installed, which is the normal case after the first call.
+
+The last line matters more than it looks. `Client::new` would be the obvious call, but when the config fails to build it logs a warning and quietly hands back a client with reqwest's own defaults. That's a different trust policy wearing the same type. `Client::try_from` returns the error instead. `try_from` comes from the standard `TryFrom` trait, Rust's general shape for a conversion that can fail: here, from a `ClientConfig` into a `Client`.
+
+One default we can't pin is the HTTP version. `oci-client` has no switch for it, and another crate in our build turns on reqwest's HTTP/2 support for everyone (chapter 15 explains how that happens), so registry pulls offer HTTP/2 in the TLS handshake and use it when the registry agrees. The test `registry_client_offers_http2_alongside_http1` pins that, so we notice if it changes.
 
 ### Layer unpacking and whiteouts
 
@@ -2992,25 +3013,30 @@ The V02 soak found the same mistake one phase earlier. When a rollout stops an i
 
 An external tester then hit the same message on their own Ubuntu servers (issue #241). The binary on the node turned out to predate the fix, but their report raised a case we'd never tested: a unit without `KillMode=process`. systemd's default, `KillMode=control-group`, sends SIGTERM and then SIGKILL to every process in Bun's cgroup, and that includes the runtime owners Bun started. The container itself lives in its own cgroup, so the question is what the next Bun sees. `restart_after_unit_cgroup_stop_recovers_a_running_generation` and `..._a_retiring_generation` rebuild that stop for real: the test creates a stand-in unit cgroup, starts the fixture inside it, signals every member the way systemd does and writes `1` to `cgroup.kill`. Then a fresh runtime adopts. Both cases start cleanly, retire the generation and keep discovery's address held until the original reference releases it. Put the old adoption check back and the retiring case fails with the exact error from the issue.
 
-**Hold a lock for as long as you act.** A Tokio mutex coordinates tasks inside one Bun. It can't coordinate the Bun that died with the one that replaced it. So each instance has a lock file, and anyone who wants to act on a generation must first *claim* it: take an exclusive lock on that file, then re-read the journal and check that the generation is still the one they expected. The lock lives inside the claim and is released by `Drop`:
+**Hold a lock for as long as you act.** A Tokio mutex coordinates tasks inside one Bun. It can't coordinate the Bun that died with the one that replaced it. So each instance has a lock file, and anyone who wants to act on a generation must first *claim* it: take an exclusive lock on that file, then re-read the journal and check that the generation is still the one they expected. The lock lives inside the claim (`src/grill/runc_intent.rs`) and is released by `Drop`:
 
 ```rust
-// Never unlink or replace a lock file: another process may already hold it.
-#[derive(Debug)]
-struct LifecycleLock(File);
+pub struct IntentClaim {
+    journal: IntentJournal,
+    instance: InstanceId,
+    record: Option<RuntimeIntent>,
+    _lock: FileLock,
+}
 
-impl Drop for LifecycleLock {
+impl Drop for FileLock {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        let _ = self.file.unlock();
     }
 }
 ```
 
-`Drop` is Rust's destructor trait. The compiler calls `drop` when the value goes out of scope, including when a `?` returns early with an error, so no path out of a function can forget to unlock. Go would need a `defer`; C would need discipline again. We never delete the lock file, because a second process could then lock a fresh file under the same name while the first still holds the old one.
+`Drop` is Rust's destructor trait. The compiler calls `drop` when the value goes out of scope, including when a `?` returns early with an error, so no path out of a function can forget to unlock. Go would need a `defer`; C would need discipline again. Dropping an `IntentClaim` drops each of its fields, so the lock goes with the claim. The leading underscore in `_lock` tells the compiler we keep the field only for its `Drop`, so it doesn't warn that nobody reads it. `FileLock` lives in `src/file_lock.rs`, and every file lock in Bun goes through it: this claim first had a guard type of its own, and Chapter 9's "Resume the operation, don't create a second cluster" tells how eight such guards became one. We never delete the lock file, because a second process could then lock a fresh file under the same name while the first still holds the old one.
 
 The methods that write to the journal take the claim by value and hand it back: `pub async fn retire(mut self, exit_code: Option<i32>) -> io::Result<Self>`. Taking `self` rather than `&self` *moves* the claim into the function, and from there into the `spawn_blocking` worker doing the write. If the async caller is cancelled mid-write, the worker still owns the lock until the write finishes. Ownership, not convention, keeps the lock alive.
 
 **Let something else own the process.** Every command Runc runs, from the long-lived `runc run` launcher to a two-second `ip link add`, starts under an independent *process owner*: a small Bun helper process that outlives Bun. The owner records the child's identity on disk before opening an execution gate that lets the command actually start. It holds its own lock file for its whole life, makes itself the subreaper so orphaned grandchildren come back to it, and is the only thing that ever reaps or signals the child. Bun talks to it over a private Unix socket. If Bun can take an owner's lock, the owner is gone, and an owner that vanished without recording a result is an error, never "probably finished". A timed-out wait means "still running", and the command stays on the books until its owner confirms it has retired.
+
+That socket conversation once panicked a Bun that had already shut down cleanly. Bun's owner bookkeeping takes file locks, so it runs in `tokio::task::spawn_blocking`, which hands a closure to a separate pool of threads where blocking is allowed. Inside it, `request` borrowed the runtime back with `Handle::current().block_on(...)` so it could put a Tokio `timeout` around the connect, write and read. Tokio's shutdown order is what broke it: when the runtime is dropped, async tasks are dropped first, then the timer stops, and only then does Tokio wait for blocking threads to finish. A status request still running at that moment registered a timer on a stopped driver, and Tokio panics with "A Tokio 1.x context was found, but it is being shutdown". It happened once in a jobs soak, during a graceful stop. The request now uses a plain `std` Unix socket instead. A nonblocking `connect` still fails at once on a full backlog, and socket read and write timeouts, plus one overall deadline, replace the Tokio timer. The code that runs on a blocking thread no longer needs the runtime at all, and a test calls it from a thread that has no runtime.
 
 With those three pieces, restart becomes a matter of reading and checking. For each instance, Bun finds its *adoption record* (its own note of what it was running: spec, PID, process start time, log location). `owned_adopt` claims the generation and cross-checks everything:
 
@@ -3102,15 +3128,15 @@ Phase 1 started with parsing TOML and ended with a working container lifecycle t
 - Init containers run sequentially before the main app, with failure halting the deploy
 - Unhealthy apps get restarted automatically with exponential backoff
 
-339 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI with its init command, streaming apply progress via SSE, log tailing and follow support, exec command execution, and 21 integration tests that exercise the full stack end to end.
+The tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI with its init command, streaming apply progress via SSE, log tailing and follow support, exec command execution, and integration tests that exercise the full stack end to end.
 
 ### Two bugs the abstraction hid (post-audit fix)
 
 Getting the trait boundaries right doesn't stop you from wiring them up wrong. A later audit found two.
 
-First, restart re-drive stores the container's OCI spec on the instance so a crashed workload can be re-created from it. The rolling-redeploy path — added later to swap instances during a deploy — built the spec, started the container, and then stored `None`. The restart driver silently skips any instance without a spec, so a replica that crashed *after* a redeploy sat wedged in `Pending` forever. Nothing errored; the instance just never came back. The fix is one line (store the spec you already built), but the lesson is about test coverage: the redeploy test asserted the new instances were *running*, not that they were *restartable*. A second deploy is the common case, not the edge case, so that's exactly the path that needed the crash-and-recover assertion.
+First, restart re-drive stores the container's OCI spec on the instance so a crashed workload can be re-created from it. The rolling-redeploy path (added later to swap instances during a deploy) built the spec, started the container, and then stored `None`. The restart driver silently skips any instance without a spec, so a replica that crashed *after* a redeploy sat wedged in `Pending` forever. Nothing errored; the instance just never came back. The fix is one line (store the spec you already built), but the lesson is about test coverage: the redeploy test asserted the new instances were *running*, not that they were *restartable*. A second deploy is the common case, not the edge case, so that's exactly the path that needed the crash-and-recover assertion.
 
-Second, `WorkloadInstance` carries a `container_ip` field so health probes and service routing target the address the workload actually listens on. Runtimes with per-container networking (runc, Apple) know that IP — but nobody ever asked them for it, so the field stayed `None` and everything fell back to `127.0.0.1`. On ProcessGrill that's correct by luck (the process really is on loopback), which is why the tests passed. The fix adds one method to the `Grill` trait, `container_ip`, and calls it right after `start()`. This is the flip side of "getting the abstractions right": a clean trait boundary means a missing method is invisible until something on the other side of it needs the value.
+Second, `WorkloadInstance` carries a `container_ip` field so health probes and service routing target the address the workload actually listens on. Runtimes with per-container networking (runc, Apple) know that IP, but nobody ever asked them for it, so the field stayed `None` and everything fell back to `127.0.0.1`. On ProcessGrill that's correct by luck (the process really is on loopback), which is why the tests passed. The fix adds one method to the `Grill` trait, `container_ip`, and calls it right after `start()`. This is the flip side of "getting the abstractions right": a clean trait boundary means a missing method is invisible until something on the other side of it needs the value.
 
 What we deferred: real multi-node clustering (Phase 2), network namespaces (Phase 3), mTLS and authentication (Phase 4), the Pickle registry (Phase 5). ProcessGrill doesn't provide real isolation, and there's no scheduler, no gossip protocol, no persistent state. All of that is coming.
 

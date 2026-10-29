@@ -17,8 +17,9 @@ use k8s_openapi::api::autoscaling::v2::{
 };
 use k8s_openapi::api::batch::v1::{CronJob, CronJobSpec, Job, JobSpec, JobTemplateSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, Namespace, PodSpec, PodTemplateSpec, ResourceQuota,
-    ResourceQuotaSpec, ResourceRequirements, Service, ServicePort, ServiceSpec,
+    Container, ContainerPort, EnvVar, ExecAction, Lifecycle, LifecycleHandler, Namespace, PodSpec,
+    PodTemplateSpec, ResourceQuota, ResourceQuotaSpec, ResourceRequirements, SecurityContext,
+    Service, ServicePort, ServiceSpec,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
@@ -29,6 +30,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use crate::config::Config;
 use crate::config::app::AppSpec;
+use crate::config::job::OverlapPolicy;
 use crate::config::types::Replicas;
 
 use super::RelishError;
@@ -139,6 +141,23 @@ fn export_app(
     if !app.command.is_empty() {
         container.command = Some(app.command.clone());
     }
+    // #703: `args`, the working directory and the user were dropped too, so
+    // Redis came back without `--maxmemory 64mb --save ""` and an image
+    // running as a fixed user came back as root.
+    if !app.args.is_empty() {
+        container.args = Some(app.args.clone());
+    }
+    container.working_dir = app
+        .working_dir
+        .as_ref()
+        .map(|dir| dir.display().to_string());
+    if app.run_as_user.is_some() || app.run_as_group.is_some() {
+        container.security_context = Some(SecurityContext {
+            run_as_user: app.run_as_user.map(i64::from),
+            run_as_group: app.run_as_group.map(i64::from),
+            ..SecurityContext::default()
+        });
+    }
 
     if let Some(port) = app.port {
         container.ports = Some(vec![ContainerPort {
@@ -148,15 +167,36 @@ fn export_app(
     }
 
     // Env vars — shared with the job path, which used to drop them (M28).
-    container.env = env_vars(&app.env);
+    container.env = env_vars(&format!("app.{name}"), &app.env, report);
 
     // M28: resource requests were dropped entirely, so an app with a 512Mi
     // memory limit exported as an unlimited pod — the scheduler saw a
     // different workload from the one that was configured.
     container.resources = resource_requirements(app.memory.as_ref(), app.cpu.as_ref(), app.gpu);
+    container.lifecycle = stop_lifecycle(app);
+    // Kubernetes runs preStop inside terminationGracePeriodSeconds; it has
+    // no bound of its own to carry this one.
+    if let Some(timeout) = app.pre_stop_timeout {
+        report.unsupported.push(format!(
+            "[app.{name}] pre_stop_timeout = \"{}\" — Kubernetes bounds preStop by \
+             terminationGracePeriodSeconds instead",
+            String::from(timeout)
+        ));
+    }
 
+    let knobs = export_runtime_knobs(name, app, &mut container, report);
+
+    let sidecars: Vec<Container> = app
+        .sidecar
+        .iter()
+        .map(|sidecar| sidecar_container(name, app, sidecar, report))
+        .collect();
     let pod_spec = PodSpec {
         containers: vec![container],
+        init_containers: (!sidecars.is_empty()).then_some(sidecars),
+        termination_grace_period_seconds: termination_grace(app),
+        security_context: knobs.security_context,
+        volumes: knobs.volumes,
         ..PodSpec::default()
     };
 
@@ -344,7 +384,7 @@ fn export_app(
                     namespace: app_namespace.clone(),
                     ..ObjectMeta::default()
                 },
-                spec: Some(HorizontalPodAutoscalerSpec {
+                spec: HorizontalPodAutoscalerSpec {
                     scale_target_ref:
                         k8s_openapi::api::autoscaling::v2::CrossVersionObjectReference {
                             api_version: Some("apps/v1".to_string()),
@@ -355,7 +395,7 @@ fn export_app(
                     max_replicas: auto.max as i32,
                     metrics,
                     ..HorizontalPodAutoscalerSpec::default()
-                }),
+                },
                 ..HorizontalPodAutoscaler::default()
             };
             docs.push(to_yaml(&hpa)?);
@@ -443,6 +483,28 @@ fn export_job(
             "[job.{name}] runtime = \"shared-runc\" container reuse — exported as a Job with a fresh Pod per attempt"
         ));
     }
+    if job.pids.is_some() {
+        report.unsupported.push(format!(
+            "[job.{name}] pids — a Pod spec has no process limit; the kubelet sets one per node (podPidsLimit)"
+        ));
+    }
+    // #1132: these used to vanish without a report line. Firewall and egress
+    // read the same as the app exporter's, since they mean the same thing.
+    if job.firewall.is_some() {
+        report.unsupported.push(format!(
+            "[job.{name}.firewall] — use NetworkPolicy manually"
+        ));
+    }
+    if job.egress.is_some() {
+        report
+            .unsupported
+            .push(format!("[job.{name}.egress] — use NetworkPolicy manually"));
+    }
+    if job.replay_unknown {
+        report.unsupported.push(format!(
+            "[job.{name}] replay_unknown — a Job retries failed Pods (backoffLimit) but has no switch for runs whose node was lost"
+        ));
+    }
     let app_namespace = job.namespace.clone();
     // Env and resources go through the same helpers as the app path — the job
     // exporter used to drop both, so a job with a memory limit and database
@@ -451,16 +513,27 @@ fn export_job(
         name: name.to_string(),
         image: job.image.clone(),
         command: job.command.clone(),
-        env: env_vars(&job.env),
+        env: env_vars(&format!("job.{name}"), &job.env, report),
         resources: resource_requirements(job.memory.as_ref(), job.cpu.as_ref(), None),
         ..Container::default()
     };
 
+    // Each retry is a fresh Pod, so the Pod's deadline is per attempt, exactly
+    // like task_timeout_secs (0 means no deadline, which is Kubernetes'
+    // default too).
     let pod_spec = PodSpec {
         containers: vec![container],
         restart_policy: Some("Never".to_string()),
+        active_deadline_seconds: job
+            .task_timeout_secs
+            .filter(|seconds| *seconds > 0)
+            .map(i64::from),
         ..PodSpec::default()
     };
+    // backoffLimit counts retries; max_attempts counts the first try too.
+    let backoff_limit = job
+        .max_attempts
+        .map(|attempts| i32::from(attempts.saturating_sub(1)));
 
     let template = PodTemplateSpec {
         spec: Some(pod_spec),
@@ -478,17 +551,19 @@ fn export_job(
                 namespace: app_namespace.clone(),
                 ..ObjectMeta::default()
             },
-            spec: Some(CronJobSpec {
+            spec: CronJobSpec {
                 schedule: schedule.clone(),
+                concurrency_policy: Some(concurrency_policy(job.overlap).to_string()),
                 job_template: JobTemplateSpec {
                     spec: Some(JobSpec {
                         template,
+                        backoff_limit,
                         ..JobSpec::default()
                     }),
                     ..JobTemplateSpec::default()
                 },
                 ..CronJobSpec::default()
-            }),
+            },
             ..CronJob::default()
         };
         docs.push(to_yaml(&cj)?);
@@ -506,6 +581,7 @@ fn export_job(
             },
             spec: Some(JobSpec {
                 template,
+                backoff_limit,
                 ..JobSpec::default()
             }),
             ..Job::default()
@@ -520,6 +596,17 @@ fn export_job(
         ));
     }
     Ok(())
+}
+
+/// The CronJob `concurrencyPolicy` for a job's `overlap`.
+///
+/// Always set, never left to Kubernetes: an omitted `overlap` means `forbid`
+/// in Reliaburger but an omitted `concurrencyPolicy` means `Allow`.
+fn concurrency_policy(overlap: Option<OverlapPolicy>) -> &'static str {
+    match overlap.unwrap_or_default() {
+        OverlapPolicy::Allow => "Allow",
+        OverlapPolicy::Forbid => "Forbid",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +685,119 @@ fn export_namespace(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// An app's stop signal and pre-stop command as a container lifecycle
+/// (#1121). `None` when it sets neither, so the pod keeps Kubernetes'
+/// defaults, which are the same as Reliaburger's.
+fn stop_lifecycle(app: &AppSpec) -> Option<Lifecycle> {
+    if app.stop_signal.is_none() && app.pre_stop.is_empty() {
+        return None;
+    }
+    Some(Lifecycle {
+        stop_signal: app.stop_signal.map(String::from),
+        pre_stop: (!app.pre_stop.is_empty()).then(|| LifecycleHandler {
+            exec: Some(ExecAction {
+                command: Some(app.pre_stop.clone()),
+            }),
+            ..LifecycleHandler::default()
+        }),
+        ..Lifecycle::default()
+    })
+}
+
+/// `terminationGracePeriodSeconds` from an app's `stop_grace` (#1121).
+/// The pod-level half of an app's runtime knobs: its sysctls and the
+/// hostPath volumes behind its devices.
+struct PodKnobs {
+    security_context: Option<k8s_openapi::api::core::v1::PodSecurityContext>,
+    volumes: Option<Vec<k8s_openapi::api::core::v1::Volume>>,
+}
+
+/// Export `[app.x.runtime]` (#1122): capabilities to the container's
+/// `securityContext.capabilities.add` (without the `CAP_` prefix, as
+/// Kubernetes writes them), sysctls to the pod's `securityContext.sysctls`,
+/// and each device to a hostPath volume mounted at the same path. That last
+/// one is only half a mapping, so it's reported.
+fn export_runtime_knobs(
+    name: &str,
+    app: &AppSpec,
+    container: &mut Container,
+    report: &mut ExportReport,
+) -> PodKnobs {
+    use k8s_openapi::api::core::v1::{
+        Capabilities, HostPathVolumeSource, PodSecurityContext, Sysctl, Volume, VolumeMount,
+    };
+    let Some(knobs) = &app.runtime else {
+        return PodKnobs {
+            security_context: None,
+            volumes: None,
+        };
+    };
+    if !knobs.capabilities.is_empty() {
+        let added = knobs
+            .capabilities
+            .iter()
+            .map(|capability| capability.name().trim_start_matches("CAP_").to_string())
+            .collect();
+        container
+            .security_context
+            .get_or_insert_with(SecurityContext::default)
+            .capabilities = Some(Capabilities {
+            add: Some(added),
+            drop: None,
+        });
+    }
+    let security_context = (!knobs.sysctls.is_empty()).then(|| PodSecurityContext {
+        sysctls: Some(
+            knobs
+                .sysctls
+                .iter()
+                .map(|(sysctl, value)| Sysctl {
+                    name: sysctl.as_str().to_string(),
+                    value: value.as_str().to_string(),
+                })
+                .collect(),
+        ),
+        ..PodSecurityContext::default()
+    });
+    if knobs.devices.is_empty() {
+        return PodKnobs {
+            security_context,
+            volumes: None,
+        };
+    }
+    report.unsupported.push(format!(
+        "[app.{name}.runtime] devices — Kubernetes grants device access only through a device \
+         plugin or a privileged container; exported as hostPath mounts, without their \
+         permissions"
+    ));
+    let mut volumes = Vec::new();
+    let mut mounts = Vec::new();
+    for (index, device) in knobs.devices.iter().enumerate() {
+        let volume = format!("device-{index}");
+        let path = device.path.to_string();
+        mounts.push(VolumeMount {
+            name: volume.clone(),
+            mount_path: path.clone(),
+            ..VolumeMount::default()
+        });
+        volumes.push(Volume {
+            name: volume,
+            host_path: Some(HostPathVolumeSource { path, type_: None }),
+            ..Volume::default()
+        });
+    }
+    container.volume_mounts = Some(mounts);
+    PodKnobs {
+        security_context,
+        volumes: Some(volumes),
+    }
+}
+
+fn termination_grace(app: &AppSpec) -> Option<i64> {
+    app.stop_grace
+        .map(|grace| i64::try_from(grace.duration().as_secs()).unwrap_or(i64::MAX))
+}
+
 fn label_selector(
     labels: &BTreeMap<String, String>,
 ) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector {
@@ -615,8 +815,43 @@ fn to_yaml<T: serde::Serialize>(resource: &T) -> Result<String, RelishError> {
 ///
 /// Encrypted values export as the placeholder `ENCRYPTED_VALUE` — the sealed
 /// ciphertext is useless outside the cluster that holds the key, and leaking
-/// it would be worse than a placeholder that fails loudly.
-fn env_vars(env: &BTreeMap<String, crate::config::types::EnvValue>) -> Option<Vec<EnvVar>> {
+/// it would be worse than a placeholder. A placeholder doesn't fail loudly,
+/// though: the pod starts with the wrong password. So each one is listed in
+/// the report, under `[table]`, as needing a Secret (#703).
+/// A sidecar as a Kubernetes native sidecar (#1120): an init container
+/// with `restartPolicy: Always`, which starts before the app's container,
+/// keeps running beside it and stops after it, as Reliaburger's does. It
+/// gets the app's image when it names none, and the app's env with its own
+/// on top, which Reliaburger gives it implicitly and Kubernetes doesn't.
+fn sidecar_container(
+    app_name: &str,
+    app: &crate::config::app::AppSpec,
+    sidecar: &crate::config::app::SidecarSpec,
+    report: &mut ExportReport,
+) -> Container {
+    let mut env = app.env.clone();
+    env.extend(sidecar.env.clone());
+    Container {
+        name: sidecar.name.clone(),
+        image: sidecar.image.clone().or_else(|| app.image.clone()),
+        command: (!sidecar.command.is_empty()).then(|| sidecar.command.clone()),
+        args: (!sidecar.args.is_empty()).then(|| sidecar.args.clone()),
+        env: env_vars(
+            &format!("app.{app_name}.sidecar.{}", sidecar.name),
+            &env,
+            report,
+        ),
+        resources: resource_requirements(sidecar.memory.as_ref(), sidecar.cpu.as_ref(), None),
+        restart_policy: Some("Always".to_string()),
+        ..Container::default()
+    }
+}
+
+fn env_vars(
+    table: &str,
+    env: &BTreeMap<String, crate::config::types::EnvValue>,
+    report: &mut ExportReport,
+) -> Option<Vec<EnvVar>> {
     if env.is_empty() {
         return None;
     }
@@ -625,7 +860,22 @@ fn env_vars(env: &BTreeMap<String, crate::config::types::EnvValue>) -> Option<Ve
             .map(|(k, v)| {
                 let value = match v {
                     crate::config::types::EnvValue::Plain(s) => s.clone(),
-                    crate::config::types::EnvValue::Encrypted(_) => "ENCRYPTED_VALUE".to_string(),
+                    crate::config::types::EnvValue::Provider(reference) => {
+                        report.dropped.push(format!(
+                            "[{table}] env {k} — resolved by a secret provider at launch, \
+                             exported as the reference; create a Secret and reference it with \
+                             valueFrom.secretKeyRef"
+                        ));
+                        reference.as_str().to_string()
+                    }
+                    crate::config::types::EnvValue::Encrypted(_) => {
+                        report.dropped.push(format!(
+                            "[{table}] env {k} — encrypted, exported as the placeholder \
+                             ENCRYPTED_VALUE; create a Secret and reference it with \
+                             valueFrom.secretKeyRef"
+                        ));
+                        "ENCRYPTED_VALUE".to_string()
+                    }
                 };
                 EnvVar {
                     name: k.clone(),
@@ -842,6 +1092,100 @@ mod tests {
                 .unsupported
                 .iter()
                 .any(|u| u.contains("shared-runc") && u.contains("fresh Pod"))
+        );
+    }
+
+    #[test]
+    fn a_jobs_pids_limit_is_reported_because_a_pod_spec_cannot_carry_one() {
+        let config = parse_config("[job.worker]\nimage='fixture:v1'\npids=512");
+        let result = export_kubernetes(&config).unwrap();
+        assert_eq!(result.report.resources_created, vec!["Job/worker"]);
+        assert!(
+            result
+                .report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("[job.worker] pids") && u.contains("podPidsLimit")),
+            "{:?}",
+            result.report.unsupported
+        );
+        let plain = export_kubernetes(&parse_config("[job.worker]\nimage='fixture:v1'")).unwrap();
+        assert!(plain.report.unsupported.is_empty());
+    }
+
+    /// #1132: a job's firewall and egress have no field on a Job or its Pod
+    /// (NetworkPolicy is a separate resource), so they must be reported, not
+    /// silently dropped as they used to be.
+    #[test]
+    fn a_jobs_firewall_and_egress_are_reported_as_unsupported() {
+        let config = parse_config(
+            r#"
+            [job.fetch]
+            image = "fetcher:v1"
+
+            [job.fetch.firewall]
+            allow_from = ["web"]
+
+            [job.fetch.egress]
+            allow = ["api.example.com:443"]
+            "#,
+        );
+        let result = export_kubernetes(&config).unwrap();
+        assert_eq!(result.report.resources_created, vec!["Job/fetch"]);
+        let unsupported = &result.report.unsupported;
+        for field in ["firewall", "egress"] {
+            assert!(
+                unsupported
+                    .iter()
+                    .any(|u| u.contains(&format!("[job.fetch.{field}]"))
+                        && u.contains("NetworkPolicy")),
+                "{field} missing from {unsupported:?}"
+            );
+        }
+    }
+
+    /// #1132: `overlap` is a CronJob's `concurrencyPolicy`. Reliaburger's
+    /// default is `forbid` and Kubernetes' is `Allow`, so an omitted overlap
+    /// must still export as `Forbid` or the CronJob would start overlapping.
+    #[test]
+    fn a_cron_jobs_overlap_exports_as_its_concurrency_policy() {
+        for (overlap, expected) in [
+            ("overlap = \"allow\"\n", "Allow"),
+            ("overlap = \"forbid\"\n", "Forbid"),
+            ("", "Forbid"),
+        ] {
+            let config = parse_config(&format!(
+                "[job.cleanup]\nimage = \"cleanup:v1\"\nschedule = \"0 3 * * *\"\n{overlap}"
+            ));
+            let result = export_kubernetes(&config).unwrap();
+            let cron: CronJob = yaml_serde::from_str(&result.yaml).unwrap();
+            assert_eq!(
+                cron.spec.concurrency_policy.as_deref(),
+                Some(expected),
+                "overlap {overlap:?}"
+            );
+            assert!(
+                result.report.unsupported.is_empty() && result.report.dropped.is_empty(),
+                "{:?}",
+                result.report
+            );
+        }
+    }
+
+    /// #1132: Kubernetes has no "replay a run whose worker vanished" switch,
+    /// so `replay_unknown` is reported rather than lost.
+    #[test]
+    fn a_jobs_replay_unknown_is_reported_as_unsupported() {
+        let config = parse_config("[job.worker]\nimage='fixture:v1'\nreplay_unknown=true");
+        let result = export_kubernetes(&config).unwrap();
+        assert!(
+            result
+                .report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("[job.worker] replay_unknown")),
+            "{:?}",
+            result.report.unsupported
         );
     }
 
@@ -1141,5 +1485,95 @@ mod tests {
             "{:?}",
             result.report.unsupported
         );
+    }
+
+    /// #703: only `command` used to reach the container, so Redis's
+    /// `--maxmemory 64mb --save ""` vanished and the image's user and
+    /// directory came back as the image defaults.
+    #[test]
+    fn export_keeps_args_working_dir_and_user() {
+        let config = parse_config(
+            r#"
+            [app.redis]
+            image = "redis:8"
+            command = ["redis-server"]
+            args = ["--maxmemory", "64mb", "--save", ""]
+            working_dir = "/data"
+            run_as_user = 999
+            run_as_group = 1000
+            "#,
+        );
+        let result = export_kubernetes(&config).unwrap();
+        let deployment: Deployment = yaml_serde::from_str(&result.yaml).unwrap();
+        let pod = deployment.spec.unwrap().template.spec.unwrap();
+        let container = &pod.containers[0];
+        assert_eq!(container.command, Some(vec!["redis-server".to_string()]));
+        assert_eq!(
+            container.args,
+            Some(vec![
+                "--maxmemory".to_string(),
+                "64mb".to_string(),
+                "--save".to_string(),
+                String::new(),
+            ])
+        );
+        assert_eq!(container.working_dir.as_deref(), Some("/data"));
+        let security = container.security_context.as_ref().unwrap();
+        assert_eq!(security.run_as_user, Some(999));
+        assert_eq!(security.run_as_group, Some(1000));
+    }
+
+    #[test]
+    fn export_reports_encrypted_values() {
+        let config = parse_config(
+            r#"
+            [app.web]
+            image = "web:v1"
+            env = { DB_PASSWORD = "ENC[AGE:abc123]", MODE = "fast" }
+
+            [job.backup]
+            image = "backup:v1"
+            env = { S3_SECRET = "ENC[AGE:def456]" }
+            "#,
+        );
+        let result = export_kubernetes(&config).unwrap();
+        assert!(!result.yaml.contains("abc123"), "ciphertext never leaks");
+        for (table, variable) in [("app.web", "DB_PASSWORD"), ("job.backup", "S3_SECRET")] {
+            assert!(
+                result
+                    .report
+                    .dropped
+                    .iter()
+                    .any(|d| d.contains(&format!("[{table}]"))
+                        && d.contains(variable)
+                        && d.contains("Secret")),
+                "{variable} must be reported as needing a Secret: {:?}",
+                result.report.dropped
+            );
+        }
+        assert!(
+            !result.report.dropped.iter().any(|d| d.contains("MODE")),
+            "{:?}",
+            result.report.dropped
+        );
+    }
+
+    #[test]
+    fn export_maps_job_attempts_and_timeout() {
+        let config = parse_config(
+            r#"
+            [job.migrate]
+            image = "migrate:v1"
+            command = ["migrate"]
+            max_attempts = 3
+            task_timeout_secs = 300
+            "#,
+        );
+        let result = export_kubernetes(&config).unwrap();
+        let job: Job = yaml_serde::from_str(&result.yaml).unwrap();
+        let spec = job.spec.unwrap();
+        assert_eq!(spec.backoff_limit, Some(2));
+        let pod = spec.template.spec.unwrap();
+        assert_eq!(pod.active_deadline_seconds, Some(300));
     }
 }
