@@ -81,6 +81,13 @@ for i in 0 1; do
     echo "--- node $((i + 1)) console ---"
     cat "$work/node$i.log" || true
 done
+if [ "$result" != pass ]; then
+    # The cluster's own view, from node 1, which answers when node 2 won't.
+    for command in nodes council events; do
+        echo "--- relish $command ---"
+        "$relish" "$command" 2>&1 || true
+    done
+fi
 {
     echo "### Seeded pair: $result after ${elapsed} s"
     echo '```'
