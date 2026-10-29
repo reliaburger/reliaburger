@@ -131,6 +131,7 @@ pub(crate) async fn apply(
             &namespace,
             &mut definition,
             lease,
+            super::job_api::PolicyCheck::Judged,
         )
         .await
         {

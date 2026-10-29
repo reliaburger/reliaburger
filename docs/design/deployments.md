@@ -984,7 +984,13 @@ evaluates one.
   serde). `judge_job` evaluates denies only: a `default` belongs to an apps
   policy. `evaluate` judges a config's apps then its jobs, `admit` judges
   both, and `job_apply` calls it whenever a manifest has apps or jobs; job
-  writes stay unfenced, like the apps of a job manifest. `Finding` carries a
+  writes stay unfenced, like the apps of a job manifest. Every other job
+  route (`/v1/jobs/runs`, `/v1/batch`, `/v1/batch/array`,
+  `/v1/batch/manifest`) judges each job in `job_api::admit_definition`
+  (`PolicyCheck::Judge`; `job_apply` passes `Judged`) under the committed
+  policies, as `JobDefinition::to_spec` (schedule and run policy put back),
+  before its image is bound (#1424). A denial is the same 422 and
+  `policy.denied` event; warnings come back as `policy_warnings`. `Finding` carries a
   `WorkloadKind` and names the workload (`policy p denies job ns/name: …`).
   `PolicyAction::Audit` puts a finding in `Verdict::audits`: the apply goes
   ahead, the caller isn't told, and `cluster_apply` and `job_apply` record one
