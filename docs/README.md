@@ -124,13 +124,13 @@ allowlist and the token's `host-exec`, and the scheduler places the app only
 on a node that allows all of them:
 
 ```toml
-[app.vpn]
-image = "ghcr.io/example/vpn:2.0"
+[app.files]
+image = "ghcr.io/example/files:2.0"
 
-[app.vpn.runtime]
-capabilities = ["NET_ADMIN"]
-sysctls = { "net.ipv4.ip_forward" = "1" }
-devices = [{ path = "/dev/net/tun", permissions = "rw" }]
+[app.files.runtime]
+capabilities = ["SYS_ADMIN"]
+sysctls = { "net.core.somaxconn" = "4096" }
+devices = [{ path = "/dev/fuse", permissions = "rw" }]
 ```
 
 ### Jobs and cron

@@ -189,6 +189,10 @@ pub struct Compatibility {
 /// the owner checks the state machine applies to app writes, `owner` in
 /// `GET /v1/diagnostics/apps`, and `GET /v1/events` answering scoped tokens
 /// with their own namespaces' events (#1125).
+/// A runtime knob no longer parses with a `CAP_NET_*` capability (#1427)
+/// or the `m` device permission, and a device's permissions default to
+/// `rw`, not `rwm` (#1442), in desired state, OCI specs, instance records
+/// and the node's knob allowlist.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 55,
     state: 72,

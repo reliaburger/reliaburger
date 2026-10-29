@@ -1675,7 +1675,7 @@ mod tests {
     fn runtime_knobs_on_a_container_app_validate() {
         assert_eq!(
             stop_refusal(
-                "image = \"web:v1\"\n[runtime]\ncapabilities = [\"NET_ADMIN\"]\n\
+                "image = \"web:v1\"\n[runtime]\ncapabilities = [\"SYS_NICE\"]\n\
                  sysctls = { \"net.core.somaxconn\" = \"1024\" }\n\
                  devices = [{ path = \"/dev/fuse\" }]\n"
             ),
@@ -1687,7 +1687,7 @@ mod tests {
     fn runtime_knobs_on_a_host_app_are_refused() {
         for host in ["exec = \"/bin/sleep\"", "script = \"sleep 1\""] {
             let (field, reason) = stop_refusal(&format!(
-                "{host}\n[runtime]\ncapabilities = [\"NET_ADMIN\"]\n"
+                "{host}\n[runtime]\ncapabilities = [\"SYS_NICE\"]\n"
             ))
             .unwrap();
             assert_eq!(field, "runtime");

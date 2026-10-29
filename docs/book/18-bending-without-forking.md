@@ -933,23 +933,27 @@ refused at apply, with a reason. That's the Swarm `--privileged` and
 without them:
 
 ```toml
-[app.vpn]
-image = "ghcr.io/example/vpn:2.0"
+[app.files]
+image = "ghcr.io/example/files:2.0"
 
-[app.vpn.runtime]
-capabilities = ["NET_ADMIN"]
-sysctls = { "net.ipv4.ip_forward" = "1" }
-devices = [{ path = "/dev/net/tun", permissions = "rw" }]
+[app.files.runtime]
+capabilities = ["SYS_ADMIN"]
+sysctls = { "net.core.somaxconn" = "4096" }
+devices = [{ path = "/dev/fuse", permissions = "rw" }]
 ```
 
 The node's half lives in its own `node.toml`:
 
 ```toml
 [runtime]
-allowed_capabilities = ["NET_ADMIN"]
-allowed_sysctls = ["net.ipv4.ip_forward"]
-allowed_devices = ["/dev/net/tun"]
+allowed_capabilities = ["SYS_ADMIN"]
+allowed_sysctls = ["net.core.somaxconn"]
+allowed_devices = ["/dev/fuse"]
 ```
+
+(The first version of this example was a VPN client with `CAP_NET_ADMIN`
+and `/dev/net/tun`. It couldn't have worked, and the walkthrough below says
+why.)
 
 ### The exec secret provider
 
@@ -2066,7 +2070,7 @@ question for each app with a knob, and refuse with a message that names the
 knob and the gate:
 
 ```text
-app.vpn: runtime.capabilities CAP_NET_ADMIN refused by the token gate: a runtime knob needs the host-exec permission, and this token's permission doesn't grant it
+app.files: runtime.capabilities CAP_SYS_ADMIN refused by the token gate: a runtime knob needs the host-exec permission, and this token's permission doesn't grant it
 ```
 
 The node half is `WorkloadSupervisor::admit_runtime_knobs`, which `admit_app`
@@ -2209,8 +2213,12 @@ where
 
 The `where F: Fn(...)` clause says `lookup` can be any function or closure
 that takes a path and returns a device, the way a Go function might take a
-`func(string) (Device, error)`. runc passes `host_device`, which `stat`s the
-real node. The tests pass a closure over a table, so they can describe a
+`func(string) (Device, error)`. runc reads the real devices first, with
+`host_devices`, and passes a closure that looks them up there. (The first
+version passed `host_device` itself, which called the blocking
+`std::fs::metadata` from the async `create`; reading them up front with
+`tokio::fs` keeps the `stat` off the runtime's worker threads, and keeps
+`apply_to_spec` synchronous and easy to test.) The tests pass a closure over a table, so they can describe a
 block device with major 8 on a Mac that has no such thing. Because the
 compiler generates a copy of `apply_to_spec` for each `F` it's called with,
 there's no indirect call, as with the `Grill` generics in chapter 1.
@@ -2237,6 +2245,62 @@ netns::write_sysctls_with_commands(commands, instance, &network_sysctls)
     .await
     .map_err(|e| failed(e.to_string()))?;
 ```
+
+We fixed the sysctls and didn't follow the thought to its end. If container
+root can't write the namespace's sysctls, it can't configure the namespace
+either. The kernel checks `CAP_NET_ADMIN`, `CAP_NET_RAW` and the other
+network capabilities against the user namespace that owns the network
+namespace, which is the node's. So the manual's own example, a VPN client
+with `CAP_NET_ADMIN` and `/dev/net/tun`, passed both gates, started, and then
+got "operation not permitted" from `TUNSETIFF`, `ip route` and every raw
+socket. The review of the 0.2.4 train spotted it from the code (#1427), and
+nothing had caught it because no test ran runc with a knob.
+
+So the first thing we wrote was one.
+`runc_net_admin_knob_changes_the_containers_network` started Alpine with
+`capabilities = ["NET_ADMIN"]` and ran `ip link set dev lo mtu 1400` inside
+it. It failed with exit code 2 and `ip: ioctl 0x8922 failed: Operation not
+permitted` (0x8922 is `SIOCSIFMTU`), exactly as predicted.
+
+There were two ways out. One was to make it work: create the network
+namespace *inside* the container's user namespace, so container root owns
+it. But Bun wires up the veth pair and the address before runc runs, and
+adoption, rootless networking and the eBPF bindings all assume that order.
+Moving that setup into a runc hook is a redesign of chapter 3's networking
+for a feature with no user yet. The other was to say no, clearly, at parse
+time, the way `kernel.panic` is refused: a value no node could make work
+shouldn't be one a node can allow. We chose that.
+
+```rust
+pub const NETWORK_CAPABILITIES: [&str; 4] = [
+    "CAP_NET_ADMIN",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_NET_BROADCAST",
+    "CAP_NET_RAW",
+];
+```
+
+`Capability::from_str` checks this table before the list of known ones,
+and the error explains the namespace and points at `sysctls`, which do
+work. `CAP_NET_BIND_SERVICE` goes too, though it's harmless: every port is
+already bindable, thanks to the node's `ip_unprivileged_port_start=0`. The
+runc test turned into its mirror image,
+`runc_a_container_cannot_use_a_network_capability_or_make_device_nodes`.
+It can't ask for `CAP_NET_ADMIN` any more, and forcing it into the spec
+doesn't work either: the runtime's intent is stored and read back through
+the same parser, which refuses it, so the refusal goes deeper than we'd
+planned. Instead, the test runs `ip link` through `nsenter` from the host
+into the container's user and network namespaces. Joining a user namespace
+grants every capability in it, `CAP_NET_ADMIN` included, and the kernel
+still says no. If a future kernel or a redesign changes that, the
+test fails and tells us the refusal can go.
+
+The same reasoning took `m` out of device permissions. A device cgroup rule
+with `m` lets a process `mknod` that device, but the kernel only lets a
+process holding `CAP_MKNOD` in the *initial* user namespace make a device
+node at all. No container has that, so `m` granted nothing, and it was the
+default. Permissions are now `r`, `w` or `rw` (the default), `m` is a parse
+error, and the same runc test checks `mknod` fails inside the container.
 
 The knobs are new fields in Raft desired state, OCI specs and the capability
 report, so they get a line under the 0.2.4 heading in `src/compatibility.rs`.
@@ -3094,9 +3158,9 @@ Each gate is tested alone first, then both together, because a double gate
 whose halves are never tested apart can quietly become a single gate.
 
 - **The token gate alone**: `a_runtime_knob_needs_host_exec_and_the_refusal_names_the_token_gate`
-  applies an app with `CAP_NET_ADMIN` as a deployer whose permission block
+  applies an app with `CAP_SYS_NICE` as a deployer whose permission block
   grants only `deploy`. It must get a 403 whose body names
-  `runtime.capabilities CAP_NET_ADMIN` and "token gate", and the council
+  `runtime.capabilities CAP_SYS_NICE` and "token gate", and the council
   must hold no app. The same manifest under `deploy` and `host-exec` goes
   through.
 - **The node gate alone**: `runtime_knobs_pass_only_the_node_gate_of_a_runtime_that_applies_them`
@@ -3117,7 +3181,7 @@ whose halves are never tested apart can quietly become a single gate.
   `a_host_wide_sysctl_fails_the_whole_config_at_parse` shows the error at
   `relish lint`, before any gate is asked.
 - **Escape hatches**: `an_escape_hatch_capability_needs_the_node_to_name_it`
-  shows that a node allowing `CAP_NET_ADMIN` doesn't admit `CAP_SYS_ADMIN`,
+  shows that a node allowing `CAP_SYS_NICE` doesn't admit `CAP_SYS_ADMIN`,
   and that naming it does, and appears in the startup warning's list.
   `a_capability_wildcard_is_refused_with_its_reason` covers `ALL`, `all` and
   `CAP_*`.
@@ -3138,9 +3202,16 @@ whose halves are never tested apart can quietly become a single gate.
   unmapped, and a round trip sends an app's knobs through `relish export`
   and back in.
 
-None of these run runc. The runc half is two calls and a `stat`, and it's
-Linux-only, so it's exercised by `make test-linux` rather than by the
-portable suite.
+- **What no container can use**: `a_network_capability_is_refused_in_an_app_and_in_a_node`
+  tries all four network capabilities, spelt three ways, in an app and in
+  `node.toml`, and `the_mknod_device_permission_is_refused` tries `m`,
+  `rwm` and `mr`.
+
+None of those run runc. The first version said the runc half was
+"exercised by `make test-linux`", and it wasn't: no Linux test ran a knob.
+`runc_a_container_cannot_use_a_network_capability_or_make_device_nodes`
+is the first, and it's the one that proved #1427 before we touched the
+code.
 
 ### Testing templates
 

@@ -22,14 +22,14 @@ fn allowlist(toml_source: &str) -> RuntimeAllowlist {
 #[test]
 fn a_full_runtime_table_parses_into_canonical_values() {
     let parsed = knobs(
-        "capabilities = [\"NET_ADMIN\", \"cap_sys_nice\"]\n\
+        "capabilities = [\"IPC_LOCK\", \"cap_sys_nice\"]\n\
          sysctls = { \"net.core.somaxconn\" = \"1024\", \"kernel.shmmax\" = \"68719476736\" }\n\
          devices = [{ path = \"/dev/fuse\" }, { path = \"/dev/net/tun\", permissions = \"rw\" }]\n",
     );
     let names: Vec<&str> = parsed.capabilities.iter().map(|c| c.name()).collect();
-    assert_eq!(names, ["CAP_NET_ADMIN", "CAP_SYS_NICE"]);
+    assert_eq!(names, ["CAP_IPC_LOCK", "CAP_SYS_NICE"]);
     assert_eq!(parsed.sysctls.len(), 2);
-    assert_eq!(parsed.devices[0].permissions.to_string(), "rwm");
+    assert_eq!(parsed.devices[0].permissions.to_string(), "rw");
     assert_eq!(parsed.devices[1].permissions.to_string(), "rw");
     assert!(!parsed.is_empty());
 }
@@ -37,17 +37,43 @@ fn a_full_runtime_table_parses_into_canonical_values() {
 #[test]
 fn knobs_round_trip_through_json_and_postcard() {
     let parsed = knobs(
-        "capabilities = [\"CAP_NET_ADMIN\"]\nsysctls = { \"fs.mqueue.msg_max\" = \"64\" }\n\
+        "capabilities = [\"CAP_SYS_NICE\"]\nsysctls = { \"fs.mqueue.msg_max\" = \"64\" }\n\
          devices = [{ path = \"/dev/fuse\", permissions = \"r\" }]\n",
     );
     let json = serde_json::to_string(&parsed).unwrap();
-    assert!(json.contains("\"CAP_NET_ADMIN\""), "{json}");
+    assert!(json.contains("\"CAP_SYS_NICE\""), "{json}");
     assert_eq!(serde_json::from_str::<RuntimeKnobs>(&json).unwrap(), parsed);
     let bytes = postcard::to_allocvec(&parsed).unwrap();
     assert_eq!(
         postcard::from_bytes::<RuntimeKnobs>(&bytes).unwrap(),
         parsed
     );
+}
+
+/// #1427: the container's network namespace belongs to the node's user
+/// namespace, so a network capability granted in the container's own does
+/// nothing. An app can't ask for one and a node can't allow one.
+#[test]
+fn a_network_capability_is_refused_in_an_app_and_in_a_node() {
+    for name in [
+        "NET_ADMIN",
+        "CAP_NET_RAW",
+        "net_bind_service",
+        "NET_BROADCAST",
+    ] {
+        let error = parse_error(&format!("capabilities = [\"{name}\"]\n"));
+        assert!(error.contains("can't be granted"), "{name}: {error}");
+        assert!(
+            error.contains("network namespace belongs to the node"),
+            "{error}"
+        );
+        let node = crate::config::NodeConfig::parse(&format!(
+            "[runtime]\nallowed_capabilities = [\"{name}\"]\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(node.contains("can't be granted"), "{name}: {node}");
+    }
 }
 
 #[test]
@@ -140,10 +166,24 @@ fn device_paths_must_be_absolute_under_dev() {
 }
 
 #[test]
-fn device_permissions_are_a_subset_of_rwm() {
-    assert_eq!("mr".parse::<DevicePermissions>().unwrap().to_string(), "rm");
+fn device_permissions_are_read_write_or_both() {
+    assert_eq!("wr".parse::<DevicePermissions>().unwrap().to_string(), "rw");
+    assert_eq!("r".parse::<DevicePermissions>().unwrap().to_string(), "r");
     for bad in ["", "rr", "x", "rwx", "RW"] {
         assert!(bad.parse::<DevicePermissions>().is_err(), "{bad}");
+    }
+}
+
+/// #1442: `m` would let the app make device nodes, if the kernel let a
+/// container's user namespace do that at all. It doesn't, so the
+/// permission is refused rather than granted for nothing.
+#[test]
+fn the_mknod_device_permission_is_refused() {
+    for permissions in ["m", "rwm", "mr"] {
+        let error = parse_error(&format!(
+            "devices = [{{ path = \"/dev/fuse\", permissions = \"{permissions}\" }}]\n"
+        ));
+        assert!(error.contains("mknod"), "{permissions}: {error}");
     }
 }
 
@@ -158,7 +198,7 @@ fn an_unknown_runtime_field_is_refused() {
 #[test]
 fn the_node_allowlist_parses_from_its_runtime_section() {
     let allowed = allowlist(
-        "[runtime]\nallowed_capabilities = [\"NET_ADMIN\"]\n\
+        "[runtime]\nallowed_capabilities = [\"SYS_NICE\"]\n\
          allowed_sysctls = [\"net.ipv4.*\", \"kernel.shmmax\"]\n\
          allowed_devices = [\"/dev/fuse\"]\n",
     );
@@ -195,9 +235,9 @@ fn a_node_cannot_allow_every_capability_at_once() {
 
 #[test]
 fn the_node_gate_names_the_field_the_value_and_the_gate() {
-    let allowed = allowlist("[runtime]\nallowed_capabilities = [\"CAP_NET_ADMIN\"]\n");
+    let allowed = allowlist("[runtime]\nallowed_capabilities = [\"CAP_IPC_LOCK\"]\n");
     let refusal = allowed
-        .check(&knobs("capabilities = [\"NET_ADMIN\", \"SYS_NICE\"]\n"))
+        .check(&knobs("capabilities = [\"IPC_LOCK\", \"SYS_NICE\"]\n"))
         .unwrap_err()
         .to_string();
     assert!(
@@ -228,12 +268,12 @@ fn the_node_gate_names_the_field_the_value_and_the_gate() {
 #[test]
 fn the_node_gate_admits_exactly_what_it_lists() {
     let allowed = allowlist(
-        "[runtime]\nallowed_capabilities = [\"CAP_NET_ADMIN\"]\n\
+        "[runtime]\nallowed_capabilities = [\"CAP_SYS_NICE\"]\n\
          allowed_sysctls = [\"net.ipv4.*\", \"kernel.shmmax\"]\n\
          allowed_devices = [\"/dev/fuse\"]\n",
     );
     assert!(allowed.admits(&knobs(
-        "capabilities = [\"NET_ADMIN\"]\n\
+        "capabilities = [\"SYS_NICE\"]\n\
          sysctls = { \"net.ipv4.tcp_syncookies\" = \"1\", \"kernel.shmmax\" = \"1\" }\n\
          devices = [{ path = \"/dev/fuse\", permissions = \"rw\" }]\n"
     )));
@@ -248,7 +288,7 @@ fn the_node_gate_admits_exactly_what_it_lists() {
 
 #[test]
 fn an_escape_hatch_capability_needs_the_node_to_name_it() {
-    let ordinary = allowlist("[runtime]\nallowed_capabilities = [\"CAP_NET_ADMIN\"]\n");
+    let ordinary = allowlist("[runtime]\nallowed_capabilities = [\"CAP_SYS_NICE\"]\n");
     let wants_admin = knobs("capabilities = [\"SYS_ADMIN\"]\n");
     assert!(!ordinary.admits(&wants_admin));
     assert!(ordinary.escape_capabilities().is_empty());
@@ -270,7 +310,7 @@ fn every_escape_hatch_is_a_known_capability() {
         assert!(name.parse::<Capability>().unwrap().is_escape_hatch());
     }
     assert!(
-        !"CAP_NET_ADMIN"
+        !"CAP_SYS_NICE"
             .parse::<Capability>()
             .unwrap()
             .is_escape_hatch()
@@ -350,7 +390,7 @@ fn added_capabilities_join_the_user_namespace_defaults() {
     crate::grill::userns::apply(&mut spec).unwrap();
     apply_to_spec(
         &mut spec,
-        &knobs("capabilities = [\"NET_ADMIN\", \"CHOWN\"]\n"),
+        &knobs("capabilities = [\"SYS_NICE\", \"CHOWN\"]\n"),
         fuse,
     )
     .unwrap();
@@ -360,7 +400,7 @@ fn added_capabilities_join_the_user_namespace_defaults() {
         &capabilities.effective,
         &capabilities.permitted,
     ] {
-        assert!(set.iter().any(|c| c == "CAP_NET_ADMIN"), "{set:?}");
+        assert!(set.iter().any(|c| c == "CAP_SYS_NICE"), "{set:?}");
         assert!(set.iter().any(|c| c == "CAP_SETUID"), "{set:?}");
         assert_eq!(
             set.iter().filter(|c| *c == "CAP_CHOWN").count(),
@@ -373,10 +413,10 @@ fn added_capabilities_join_the_user_namespace_defaults() {
 #[test]
 fn capabilities_on_a_spec_with_none_become_the_whole_set() {
     let mut spec = base_spec();
-    apply_to_spec(&mut spec, &knobs("capabilities = [\"NET_RAW\"]\n"), fuse).unwrap();
+    apply_to_spec(&mut spec, &knobs("capabilities = [\"SYS_NICE\"]\n"), fuse).unwrap();
     assert_eq!(
         spec.process.capabilities.unwrap().effective,
-        ["CAP_NET_RAW"]
+        ["CAP_SYS_NICE"]
     );
 }
 
@@ -504,16 +544,30 @@ fn linux_device_numbers_split_like_glibc() {
 }
 
 #[cfg(unix)]
-#[test]
-fn a_regular_file_is_not_a_device() {
+#[tokio::test]
+async fn a_regular_file_is_not_a_device() {
     let file = tempfile::NamedTempFile::new().unwrap();
-    let error = host_device(file.path()).unwrap_err().to_string();
+    let error = host_device(file.path()).await.unwrap_err().to_string();
     assert!(error.contains("not a character or block device"), "{error}");
 }
 
 #[cfg(unix)]
-#[test]
-fn dev_null_reads_as_a_character_device() {
-    let device = host_device(Path::new("/dev/null")).unwrap();
+#[tokio::test]
+async fn dev_null_reads_as_a_character_device() {
+    let device = host_device(Path::new("/dev/null")).await.unwrap();
     assert_eq!(device.kind, DeviceKind::Char);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn every_requested_device_is_read_by_its_path() {
+    let devices = host_devices(&knobs("devices = [{ path = \"/dev/null\" }]\n"))
+        .await
+        .unwrap();
+    assert_eq!(devices[Path::new("/dev/null")].kind, DeviceKind::Char);
+    let missing = host_devices(&knobs("devices = [{ path = \"/dev/rb-missing\" }]\n"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(missing.contains("/dev/rb-missing"), "{missing}");
 }

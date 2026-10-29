@@ -358,7 +358,7 @@ mod tests {
                 .unwrap()]
                 .into(),
                 runtime_knobs: crate::config::NodeConfig::parse(
-                    "[runtime]\nallowed_capabilities = [\"NET_ADMIN\"]\n\
+                    "[runtime]\nallowed_capabilities = [\"SYS_NICE\"]\n\
                      allowed_sysctls = [\"net.*\"]\nallowed_devices = [\"/dev/fuse\"]\n",
                 )
                 .unwrap()

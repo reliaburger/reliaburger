@@ -96,6 +96,12 @@
     "test": "grill::runc::tests::runc_sidecar_reaches_its_app_on_localhost"
   },
   {
+    "source": "src/grill/runc.rs",
+    "function": "runc_a_container_cannot_use_a_network_capability_or_make_device_nodes",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_a_container_cannot_use_a_network_capability_or_make_device_nodes"
+  },
+  {
     "source": "src/grill/snapshot.rs",
     "function": "btrfs_snapshot_restore_recovers_corrupted_data",
     "binary": "reliaburger",
