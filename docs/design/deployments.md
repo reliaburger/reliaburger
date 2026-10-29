@@ -898,7 +898,7 @@ pre_stop_timeout = "20s"    # default 30s, 1s to 1h
 
 **Where the policy lives.** `grill::oci::generate_oci_spec` copies the four fields into the instance's `OciSpec` as a `StopPolicy` (`stop`), so it's fixed per instance at launch, recorded with every instance record, runtime intent and process owner record, and survives adoption after a Bun restart. A rolling deploy retires each old instance with the policy that instance was launched with, not the new spec's, because the new spec's pre-stop command may not exist in the old image.
 
-**Who sends the signal.** Each runtime reads the signal from the spec it holds: `ProcessGrill` signals the process group itself or asks the process owner, which reads its launch spec; runc runs `runc kill <id> <SIGNAL>` from the runtime intent; Apple Container passes `container stop --signal`. Every graceful stop, including a Bun shutdown, therefore sends the app's signal, and `Grill::stop` keeps its one-argument shape.
+**Who sends the signal.** Each runtime reads the signal from the spec it holds: `ProcessGrill` signals the process group itself or asks the process owner, which reads its launch spec; runc runs `runc kill <id> <SIGNAL>` from the runtime intent; Apple Container runs `container kill --signal <SIGNAL>`, not `container stop`, which would kill the workload after its own 5 s default and cut every longer `stop_grace` short (#1435). Every runtime's `stop` only signals; Bun waits out the grace and sends the kill. Every graceful stop, including a Bun shutdown, therefore sends the app's signal, and `Grill::stop` keeps its one-argument shape.
 
 **Who runs the sequence.** `bun::agent::stop_runtime_instance` runs the four steps, each with its own bound:
 
@@ -984,7 +984,13 @@ evaluates one.
   serde). `judge_job` evaluates denies only: a `default` belongs to an apps
   policy. `evaluate` judges a config's apps then its jobs, `admit` judges
   both, and `job_apply` calls it whenever a manifest has apps or jobs; job
-  writes stay unfenced, like the apps of a job manifest. `Finding` carries a
+  writes stay unfenced, like the apps of a job manifest. Every other job
+  route (`/v1/jobs/runs`, `/v1/batch`, `/v1/batch/array`,
+  `/v1/batch/manifest`) judges each job in `job_api::admit_definition`
+  (`PolicyCheck::Judge`; `job_apply` passes `Judged`) under the committed
+  policies, as `JobDefinition::to_spec` (schedule and run policy put back),
+  before its image is bound (#1424). A denial is the same 422 and
+  `policy.denied` event; warnings come back as `policy_warnings`. `Finding` carries a
   `WorkloadKind` and names the workload (`policy p denies job ns/name: …`).
   `PolicyAction::Audit` puts a finding in `Verdict::audits`: the apply goes
   ahead, the caller isn't told, and `cluster_apply` and `job_apply` record one

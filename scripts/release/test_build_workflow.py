@@ -187,6 +187,8 @@ class SourceCiReuseTests(unittest.TestCase):
     def test_the_summary_says_which_ci_run_the_candidate_rests_on(self):
         record = step_named(self.text, "Record exact candidate identity and all asset digests")
         self.assertIn("CI_RUN: ${{ needs.ci-evidence.outputs.ci_run }}", record)
+        self.assertIn("CI_RUN_ATTEMPT: ${{ needs.ci-evidence.outputs.ci_run_attempt }}", record)
+        self.assertIn('source_ci="reused ci.yml run $CI_RUN, attempt $CI_RUN_ATTEMPT"', record)
         self.assertIn('echo "Source CI: $source_ci"', record)
 
 

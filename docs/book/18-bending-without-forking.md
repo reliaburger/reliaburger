@@ -616,6 +616,25 @@ would be fine on apps and broken on jobs, and you'd find out from a refused
 cron job at three in the morning. Making the variable name carry the kind
 keeps the commit check honest.
 
+A job also has more than one way in. `relish apply` posts a manifest to
+`/v1/apply`, but `relish run --batch` posts to `/v1/batch/array`, `relish
+batch FILE` to `/v1/batch`, `relish batch submit` to `/v1/batch/manifest`, and a cron
+job can be registered straight through `/v1/jobs/runs`. The first cut judged
+jobs only on `/v1/apply`, so the same `:latest` job a policy refused there
+went through untouched on the other four
+([#1424](https://github.com/reliaburger/reliaburger/issues/1424)). The fix
+puts the check where every route already meets: `admit_definition` in
+`src/bun/job_api.rs`, which each of them calls to authorise and bind a job
+before it's written. It takes a `PolicyCheck`, `Judge` or `Judged`, because
+`/v1/apply` has already judged the job together with the rest of its
+manifest and shouldn't record its audit findings twice. An enum with two
+named variants reads better at the call site than a bare `true`, and the
+compiler won't let a new caller forget to choose. A job definition keeps
+its schedule and retry policy outside its template, so
+`JobDefinition::to_spec` puts them back before judging: `job.schedule` reads
+the same whichever route the job came in by. Warnings come back in the
+answer as `policy_warnings`, and `relish` prints each as a `warning:` line.
+
 The second addition is a third action. `action = "audit"` lets the apply go
 ahead without telling the caller and records the finding in the audit log.
 It's how you roll out a strict rule: commit it as `audit`, watch what it
@@ -1703,7 +1722,13 @@ pub struct StopPolicy {
 Every runtime already keeps that spec. The process runtime signals the
 workload's process group with `entry.spec.stop_signal()`, the process owner
 reads the spec it was launched with, runc passes the name to `runc kill`, and
-Apple Container gets `container stop --signal`. Because the spec is in the
+Apple Container gets `container kill --signal`. Why not `container stop
+--signal`, which looks made for this? Because it waits for the exit itself
+and kills the workload after its own `--time`, 5 s unless told otherwise, so
+`stop_grace = "2m"` bought two minutes on Linux and five seconds on a Mac
+(#1435). `Grill::stop` only signals, on every runtime, and Bun owns the
+grace. `container kill` refuses a workload that's already gone, so Apple's
+`stop` checks the state before it calls that a failure. Because the spec is in the
 instance record too, a Bun that restarts and adopts its instances still
 knows how to stop them. And a deploy retires an old instance with *its own*
 policy, not the new spec's. That matters when the new image has dropped the
@@ -2792,6 +2817,12 @@ Jobs and the audit action
   GitOps-owned app is judged as a GitOps sync. Its report is an `insta`
   snapshot. Another test covers the three quiet answers: every workload
   passes, there are no policies, and a policy no longer compiles.
+- **Every job route** (`a_jobs_policy_refuses_a_job_on_every_submission_route`,
+  `a_jobs_warn_policy_warns_on_every_submission_route`, #1424) posts the same
+  `:latest` job to `/v1/jobs/runs` (with a cron), `/v1/batch`,
+  `/v1/batch/array` and `/v1/batch/manifest`. A deny policy refuses it with
+  422 and a `policy.denied` record on each, and writes no definition; a warn
+  policy lets it through with the finding in `policy_warnings`.
 - **Through the router**: a jobs policy refuses a job manifest with 422 and a
   `policy.denied` record, and writes no job definition; an audit policy lets
   an apply through, says nothing to the caller, and leaves one
@@ -2902,6 +2933,20 @@ signals it, even though the new spec has none. The parsing tests in
 `relish export` and back in. To check the tests check something, we put
 SIGTERM back in both runtimes and skipped the pre-stop: eight of them failed,
 each saying what it saw instead.
+
+Two more came out of the review of the 0.2.4 train. On Apple silicon,
+`make test-apple` runs
+`a_stop_only_signals_so_a_slow_workload_finishes_within_bun_s_grace`: a
+workload traps SIGTERM, sleeps 10 s and prints `finished-cleanly`. The stop
+must return within 3 s, the workload must print its line, and a second stop
+of the exited workload must succeed. Against `container stop` it failed
+before it got that far: the CLI held the call for its own 5 s, then gave up
+with an XPC timeout. And `the_wait_for_remote_withdrawal_gives_up_at_its_patience`
+covers the wait before a rollout stops an old instance, the one that holds
+it serving until every node has dropped its backend (#1355). A node that
+never confirms mustn't hold the stop for ever, so the test answers
+"pending" to every ask, on tokio's paused clock, and checks the wait gives
+up at its 5 s patience, not before and not after.
 
 ### Testing sidecars
 

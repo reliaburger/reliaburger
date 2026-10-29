@@ -64,6 +64,9 @@ pub struct TaskArraySubmitResponse {
     pub count: u32,
     /// Chunks the tasks are grouped into.
     pub chunks: u32,
+    /// What the `warn` policies said about the array (#1424).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_warnings: Vec<String>,
 }
 
 /// `GET /v1/batch/{id}/results` query.
@@ -211,7 +214,7 @@ pub async fn submit_handler(
         replay_unknown: true,
         hook: false,
     };
-    if let Err(response) = super::job_api::admit_definition(
+    let policy_warnings = match super::job_api::admit_definition(
         &state,
         auth,
         binder.as_deref(),
@@ -219,11 +222,13 @@ pub async fn submit_handler(
         &namespace,
         &mut definition,
         None,
+        super::job_api::PolicyCheck::Judge,
     )
     .await
     {
-        return response;
-    }
+        Ok(warnings) => warnings,
+        Err(response) => return response,
+    };
     let trigger = if definition.cron.is_some() {
         None
     } else {
@@ -247,10 +252,17 @@ pub async fn submit_handler(
                 batch_id,
                 count,
                 chunks,
+                policy_warnings,
             }),
         )
             .into_response(),
-        Ok(None) => (StatusCode::ACCEPTED, Json(serde_json::json!({"batch_id":null,"count":count,"chunks":chunks,"schedule_registered":true}))).into_response(),
+        Ok(None) => {
+            let mut answer = serde_json::json!({"batch_id":null,"count":count,"chunks":chunks,"schedule_registered":true});
+            if !policy_warnings.is_empty() {
+                answer["policy_warnings"] = serde_json::json!(policy_warnings);
+            }
+            (StatusCode::ACCEPTED, Json(answer)).into_response()
+        }
         Err(e) => write_error(e),
     }
 }
@@ -321,6 +333,7 @@ pub async fn manifest_handler(
     if let Some(council) = council_to_forward_to(&state).await {
         return forward_to_leader(&state, council, "/v1/batch/manifest", body, &headers).await;
     }
+    let mut policy_warnings = Vec::new();
     for cohort in &mut request.cohort {
         let mut definition = crate::meat::job::JobDefinition {
             template: cohort.template.clone(),
@@ -329,7 +342,7 @@ pub async fn manifest_handler(
             replay_unknown: true,
             hook: false,
         };
-        if let Err(response) = super::job_api::admit_definition(
+        match super::job_api::admit_definition(
             &state,
             auth,
             binder.as_deref(),
@@ -337,10 +350,12 @@ pub async fn manifest_handler(
             &request.namespace,
             &mut definition,
             None,
+            super::job_api::PolicyCheck::Judge,
         )
         .await
         {
-            return response;
+            Ok(warnings) => policy_warnings.extend(warnings),
+            Err(response) => return response,
         }
         cohort.template = definition.template;
     }
@@ -356,11 +371,13 @@ pub async fn manifest_handler(
         submitted_at_epoch_secs: epoch_now_secs(),
     };
     match write_task_array(&state, write).await {
-        Ok(Some(batch_id)) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({"batch_id": batch_id})),
-        )
-            .into_response(),
+        Ok(Some(batch_id)) => {
+            let mut answer = serde_json::json!({"batch_id": batch_id});
+            if !policy_warnings.is_empty() {
+                answer["policy_warnings"] = serde_json::json!(policy_warnings);
+            }
+            (StatusCode::ACCEPTED, Json(answer)).into_response()
+        }
         Ok(None) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "manifest admission returned no identity",

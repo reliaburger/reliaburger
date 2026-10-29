@@ -50,6 +50,9 @@ pub struct BatchSubmitResponse {
     pub batch_id: u64,
     pub assigned: usize,
     pub unschedulable: Vec<String>,
+    /// What the `warn` policies said about the jobs (#1424).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_warnings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -233,10 +236,11 @@ pub async fn batch_submit_handler(
     } else {
         None
     };
+    let mut policy_warnings = Vec::new();
     for job in &mut jobs {
         let namespace = job.namespace().to_owned();
         let mut definition = crate::meat::job::JobDefinition::from_spec(job.spec.clone());
-        if let Err(response) = super::job_api::admit_definition(
+        match super::job_api::admit_definition(
             &state,
             auth.as_deref(),
             binder.as_deref(),
@@ -244,10 +248,12 @@ pub async fn batch_submit_handler(
             &namespace,
             &mut definition,
             None,
+            super::job_api::PolicyCheck::Judge,
         )
         .await
         {
-            return response;
+            Ok(warnings) => policy_warnings.extend(warnings),
+            Err(response) => return response,
         }
         // Admission binds the image and settles the namespace. Copy only
         // those back: the run policy stays on the spec for `RegisterJobs`.
@@ -288,6 +294,7 @@ pub async fn batch_submit_handler(
                     batch_id,
                     assigned: manifest.cohorts.len(),
                     unschedulable: Vec::new(),
+                    policy_warnings,
                 }),
             )
                 .into_response()

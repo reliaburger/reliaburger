@@ -297,6 +297,12 @@ permissions or namespaces. They judge a workload when it's applied: a new
 policy doesn't touch apps or jobs already running. `relish policy audit`
 shows which of them it would refuse.
 
+A job is judged however it arrives: `relish apply`, `relish run --batch`,
+`relish batch FILE`, `relish batch submit` (a task manifest) or `POST
+/v1/jobs/runs`. Each answers 422 when a deny policy refuses the job and
+prints a `warning:` line for each warn policy. `source` is `apply` on all of
+them.
+
 The cluster checks a policy when you apply it, and refuses one that:
 
 - has a name that isn't a lowercase DNS label;

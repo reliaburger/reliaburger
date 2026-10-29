@@ -8,7 +8,11 @@ cluster, and getting the council back when everything else has gone wrong.
 `relish upgrade` rolls a new `bun` across the cluster: workers first
 (`--parallel` at a time), then council members one by one, the leader last.
 The new binary adopts running workloads without restarting them, and one that
-crash-loops on boot reverts to the previous version by itself.
+crash-loops on boot reverts to the previous version by itself. Adopted
+replicas stay on their node: while a restarted bun's subsystems are still in
+their first start, the leader keeps that node's placements and places nothing
+new there. (Up to 0.2.3, a bun restart in a multi-node cluster could move its
+replicas to another node, #1449.)
 
 Until 1.0 it works only between builds of the same format. Every build speaks
 one cluster protocol and one state format (`bun --compatibility` prints them),

@@ -57,7 +57,7 @@ pub struct CommittedApp {
 /// An app is judged as an apply would judge it: its declared spec (#1118)
 /// where the cluster kept one, filled in by the defaults, validated, then
 /// every `deny`. A job is judged from its stored definition, its schedule
-/// put back, with its image read back as the tag it was bound from.
+/// and run policy put back, with its image read back as the tag it was bound from.
 pub fn audit(desired: &DesiredState) -> PolicyAudit {
     let mut apps: Vec<CommittedApp> = desired
         .apps
@@ -85,12 +85,7 @@ pub fn audit(desired: &DesiredState) -> PolicyAudit {
         .definitions()
         .filter_map(|(key, record)| {
             let (namespace, name) = key.split_once('/')?;
-            let mut spec = record.definition.template.clone();
-            spec.schedule = record
-                .definition
-                .cron
-                .as_ref()
-                .map(|cron| cron.expression.clone());
+            let mut spec = record.definition.to_spec();
             spec.image = spec.image.as_deref().map(unbound);
             Some((AppId::new(name, namespace), spec))
         })
