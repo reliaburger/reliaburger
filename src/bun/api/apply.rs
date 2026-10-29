@@ -761,14 +761,15 @@ pub(super) async fn cluster_apply(
     let (committed_policies, committed_generation) = council
         .read_desired(|desired| (desired.policies.clone(), desired.policy_generation))
         .await;
-    let admission = match crate::policy::admit(
-        &committed_policies,
+    let admission = match crate::policy::admit_blocking(
+        committed_policies,
         committed_generation,
-        &config,
-        &caller,
+        config.clone(),
+        caller.clone(),
         crate::policy::Source::Apply,
-        Vec::new(),
-    ) {
+    )
+    .await
+    {
         Ok(admitted) => admitted,
         Err(error) => return policy_refusal(&state, auth.as_ref(), &error).await,
     };
@@ -1138,14 +1139,14 @@ pub(super) async fn rejudge(
     let (policies, generation) = council
         .read_desired(|desired| (desired.policies.clone(), desired.policy_generation))
         .await;
-    let admitted = crate::policy::admit(
-        &policies,
+    let admitted = crate::policy::admit_blocking(
+        policies,
         generation,
-        &remaining,
-        caller,
+        remaining,
+        caller.clone(),
         crate::policy::Source::Apply,
-        Vec::new(),
     )
+    .await
     .map_err(|error| error.to_string())?;
     for app_id in pending.iter().filter_map(written_app) {
         let before = defaulted.get(&app_id).map(|app| &app.effective);
@@ -1191,7 +1192,8 @@ pub(crate) async fn policy_refusal(
             denied.denials.iter().map(ToString::to_string).collect(),
             denied.warnings.iter().map(ToString::to_string).collect(),
         ),
-        crate::policy::AdmitError::Broken { .. } => (vec![error.to_string()], Vec::new()),
+        crate::policy::AdmitError::Broken { .. }
+        | crate::policy::AdmitError::Interrupted { .. } => (vec![error.to_string()], Vec::new()),
     };
     let policies: std::collections::BTreeSet<&str> = match error {
         crate::policy::AdmitError::Denied(denied) => denied
@@ -1200,6 +1202,7 @@ pub(crate) async fn policy_refusal(
             .map(|finding| finding.policy.as_str())
             .collect(),
         crate::policy::AdmitError::Broken { name, .. } => [name.as_str()].into(),
+        crate::policy::AdmitError::Interrupted { .. } => std::collections::BTreeSet::new(),
     };
     let mut details = std::collections::BTreeMap::new();
     details.insert(
