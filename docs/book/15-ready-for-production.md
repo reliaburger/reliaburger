@@ -978,6 +978,28 @@ means every heavy job except macOS: select jobs says `heavy=true, macos=false`, 
 aggregator calls that selection `train-full`, accepted, like the light set, only when the
 event is `pull_request`. The queue and the push to the train still demand all three shards.
 
+That still left the pool running dry. The organisation's plan runs five macOS jobs at once,
+and a full run takes three, so two full runs at once is already one too many. Over 60 runs
+from 25 to 28 October the shards queued a median of 0 minutes, but 24 at p90 and 47 at
+worst, and on 28 October one pull request's shards waited 70 to 90 minutes. Counting where
+the runs came from showed a duplicate: every merge into a train started two full runs on the
+same code, the push to the train and the gate PR's `synchronize`, six macOS jobs per merge.
+Dependabot and ordinary pull requests into `main` took more slots for code that had nothing
+to do with macOS ([#1443](https://github.com/reliaburger/reliaburger/issues/1443)).
+
+The rule now is that macOS runs where it can find something Linux can't. Every push, to a
+train or to `main`, and the nightly still run all three shards, so no commit lands without
+them, and the candidate build demands them. The gate PR gets the light set on each push,
+because the push to the train has just run everything; at code freeze the maintainer labels
+it `release-gate`, and from then on it runs everything and the evidence gate refuses it
+without every owner. Any other pull request gets macOS only if it touches macOS-specific
+code, or someone labels it `macos`. "macOS-specific" is a list of paths (the Apple runtime,
+the installers, the demo scripts) plus any Rust file holding a `target_os = "macos"` cfg on
+either side of the change, so deleting macOS code counts too. `select-jobs.sh` reads that
+with `git show` into a variable and matches it with `case`, not `git show | grep -q`: under
+`set -o pipefail`, `grep -q` exits at its first match, `git show` can die of `SIGPIPE`
+writing the rest, and the pipeline then reports failure for a file that matched.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took

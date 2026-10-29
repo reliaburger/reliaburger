@@ -440,12 +440,15 @@ def sealed_context(sealed, current):
     return dict(sealed)
 
 
-def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None, event=None):
+def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None, event=None,
+              release_gate=False):
     """Waited job results and trusted output hashes authorize artifact consumption.
 
     `event` is the workflow's own event name. Only a pull request may qualify
     with fewer than every owner (`light`, `portable` or `train-full`); the
-    command line always passes it.
+    command line always passes it. `release_gate` is true for a pull request
+    labelled `release-gate`, which needs every owner too, macOS included
+    (#1443).
     """
     root, incoming = Path(root), Path(incoming)
     manifest = c.inventory(c.read_json(manifest_path), root)
@@ -455,6 +458,8 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None,
     c.require(selection is not None, 'no selected code qualification')
     c.require(event in (None, 'pull_request') or selection['mode'] == 'full',
               'only a pull request may qualify without every owner')
+    c.require(not release_gate or selection['mode'] == 'full',
+              'the release gate pull request needs every owner, macOS included')
     w.job_results(selection, needs)
     expected_gates = {(name, host) for name, gate in manifest['gates'].items()
                       if gate['mode'] == 'ci' and selection['mode'] in gate.get('required_in', ['portable', 'full'])
@@ -542,6 +547,8 @@ def main(argv=None):
     for name in ('manifest', 'gate', 'host', 'directory', 'needs', 'github-output', 'ignored-bindings',
                  'shard', 'event', 'archive-extraction'):
         parser.add_argument('--' + name)
+    parser.add_argument('--release-gate', choices=['true', 'false'], default='false',
+                        help="whether the pull request carries the release-gate label")
     args = parser.parse_args(argv)
     context = dict(commit=args.commit, run_id=args.run_id, attempt=args.attempt)
     if args.operation == 'archive':
@@ -597,6 +604,7 @@ def main(argv=None):
             c.read_json(args.needs),
             args.ignored_bindings,
             event=args.event,
+            release_gate=args.release_gate == 'true',
         )
         return 0
     c.require(args.gate and args.host and args.github_output, 'current owner gate/host/output required')

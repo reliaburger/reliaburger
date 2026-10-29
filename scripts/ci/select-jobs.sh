@@ -10,29 +10,41 @@
 #                  criterion's version
 #   macos        - run the portable suite on macOS (three shards)
 #
-# Pushes, merge-queue groups, schedules and manual runs get everything. Pull
-# requests are judged by the files they change against their base:
+# Pushes (to main and to every train), merge-queue groups, schedules and
+# manual runs get everything; so does build.yml's call. Pull requests are
+# judged by the files they change against their base:
 #
 #   - into a release's merge train (`release-*`): the light set. Lint, MSRV,
 #     portable Linux, the demo app and the optimized contract boundaries
-#     answer in about 15 minutes; macOS, the heavy suites and the benchmarks
-#     wait for the merge queue and the push to the train, which run
-#     everything on the merged result. A `full-ci` label adds the heavy suites
-#     and the benchmarks but still not macOS: three macOS runners per PR
-#     queued for over an hour. A head that is itself a train gets everything.
-#   - into main, or from a train: everything the change touches.
-#   The evidence gate names the full-ci train selection `train-full`
-#   (scripts/ci/workflow_assembly.py) and accepts it on pull requests only.
-#   - other stacked PRs: macOS but not the heavy suites, unless labelled
-#     full-ci; they run in full once the PR targets main.
+#     answer in about 15 minutes; the heavy suites and the benchmarks wait
+#     for the push to the train, which runs everything on the merged result.
+#     A `full-ci` label adds the heavy suites and the benchmarks.
+#   - from a train (the gate PR into main): the light set too, since the
+#     push to the train has just run everything on the same code (#1443).
+#     A `release-gate` label, put on at code freeze, runs everything; a
+#     `full-ci` label adds the heavy suites.
+#   - into main: everything the change touches except macOS.
+#   - other stacked PRs: the light set, plus the heavy suites with full-ci.
+#
+# macOS runs only where it adds something (#1443, maintainer decision of 28
+# October 2026): on pushes and the nightly, on the release gate PR, on a PR
+# that touches macOS-specific code (the Apple runtime, a Rust file with a
+# `target_os = "macos"` cfg before or after the change, the installers, the
+# demo scripts) and on any code PR labelled `macos`. A gate PR's diff holds
+# the whole train, so only its labels give it macOS. Dependabot never gets
+# it unless labelled; the nightly covers it. The evidence gate names a
+# heavy selection without macOS `train-full` (scripts/ci/workflow_assembly.py)
+# and accepts it, like the light set, on pull requests only.
 #
 # Retargeting a PR (GitHub does it when the branch under it merges) reruns
 # this through ci-retarget.yml, so the new base's rules apply at once.
 #
 # Fixtures: scripts/ci/test_select_jobs.py.
 #
-# Inputs (environment): EVENT, BASE_REF, HEAD_REF, BASE_SHA, FULL_CI
-# ("true"/"false"), and optionally HEAD_SHA (defaults to HEAD).
+# Inputs (environment): EVENT, BASE_REF, HEAD_REF, BASE_SHA, FULL_CI,
+# RELEASE_GATE and MACOS_LABEL (each "true"/"false": whether the PR carries
+# the full-ci, release-gate or macos label), and optionally HEAD_SHA
+# (defaults to HEAD).
 set -euo pipefail
 
 output="${GITHUB_OUTPUT:-/dev/stdout}"
@@ -70,12 +82,33 @@ is_docs_only() {
     esac
 }
 
+# Code that only macOS builds or runs. A Rust file counts when either side of
+# the change has a macOS cfg, so removing one counts too.
+macos_code_file() {
+    case "$1" in
+        src/grill/apple* | docs/website/install.sh | scripts/release/install.sh.in | scripts/demo/*)
+            return 0 ;;
+        *.rs) ;;
+        *) return 1 ;;
+    esac
+    local side content
+    for side in "${HEAD_SHA:-HEAD}" "${BASE_SHA}"; do
+        content=$(git show "$side:$1" 2>/dev/null || true)
+        case "$content" in
+            *'target_os = "macos"'*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 code=false
 gossip=false
 task_arrays=false
+macos_code=false
 while IFS= read -r file; do
     [ -z "$file" ] && continue
     is_docs_only "$file" || code=true
+    if [ "$macos_code" = false ] && macos_code_file "$file"; then macos_code=true; fi
     case "$file" in
         src/mustard/* | benches/gossip* | benches/support/* | tests/gossip_*) gossip=true ;;
     esac
@@ -116,24 +149,41 @@ case "${BASE_REF}" in
     release-*) into_a_train=true ;;
     *) into_a_train=false ;;
 esac
+case "${HEAD_REF:-}" in
+    dependabot/*) dependabot=true ;;
+    *) dependabot=false ;;
+esac
 
 if [ "$code" = false ]; then
     emit false "$gossip" false "$task_arrays" false
     exit 0
 fi
 
-if [ "$into_a_train" = true ] && [ "$from_a_train" = false ] && [ "${FULL_CI}" != true ]; then
-    emit true false false false false
+macos=false
+if [ "${MACOS_LABEL:-false}" = true ]; then
+    macos=true
+elif [ "$macos_code" = true ] && [ "$from_a_train" = false ] && [ "$dependabot" = false ]; then
+    macos=true
+fi
+
+if [ "$from_a_train" = true ] && [ "${RELEASE_GATE:-false}" = true ]; then
+    emit true true true true true
     exit 0
 fi
 
-if [ "$into_a_train" = true ] && [ "$from_a_train" = false ]; then
-    emit true "$gossip" true "$task_arrays" false
+# Into a train, or from one: the light set, or with full-ci the heavy suites
+# and the benchmarks the change touches.
+if [ "$into_a_train" = true ] || [ "$from_a_train" = true ]; then
+    if [ "${FULL_CI}" = true ]; then
+        emit true "$gossip" true "$task_arrays" "$macos"
+    else
+        emit true false false false "$macos"
+    fi
     exit 0
 fi
 
 heavy=false
-if [ "${BASE_REF}" = main ] || [ "$into_a_train" = true ] || [ "$from_a_train" = true ] || [ "${FULL_CI}" = true ]; then
+if [ "${BASE_REF}" = main ] || [ "${FULL_CI}" = true ]; then
     heavy=true
 fi
-emit true "$gossip" "$heavy" "$task_arrays" true
+emit true "$gossip" "$heavy" "$task_arrays" "$macos"

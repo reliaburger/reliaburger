@@ -67,16 +67,27 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   portable Linux with the coverage floor, the demo app and the optimised
   contract boundaries, in 15–20 minutes. A `full-ci` label adds everything
   except the three macOS shards: privileged Linux, cluster, acceptance,
-  upgrades and benchmarks. macOS runs in the queue and on the push.
-- **The merge queue** on `release-*` runs every job, macOS shards and heavy
-  suites included, on the batch merged onto the train, before any of it
-  lands. The queue requires the single check `ignored-test evidence`, which
-  waits for every other job and demands every evidence owner.
-- **The push to the train**, and the gate PR into `main` (its head is a
-  train), run everything again on the result.
+  upgrades and benchmarks. The macOS shards run on the PR only when it
+  touches macOS-specific code or carries a `macos` label.
+- **The merge queue**, where a train has one, runs every job, macOS shards
+  and heavy suites included, on the batch merged onto the train, before any
+  of it lands. The queue requires the single check `ignored-test evidence`,
+  which waits for every other job and demands every evidence owner.
+- **The push to the train** runs everything on the result, macOS included.
+- **The gate PR** into `main` gets the light set on each push, because the
+  push to the train has just run everything on the same code
+  ([#1443](https://github.com/reliaburger/reliaburger/issues/1443)). At code
+  freeze, label it `release-gate`: from then on it runs everything, and the
+  evidence gate refuses it without every owner, macOS included. Merging it
+  pushes to `main`, which runs everything again, and that run is the one the
+  candidate build reuses.
 
 So nothing reaches a train, or `main`, without the full set having passed on
-that exact commit.
+that exact commit. macOS runs on every push and on the nightly, on the
+release gate PR and on the candidate build, but not on ordinary pull
+requests: the organisation's plan runs at most five macOS jobs at once, and
+each full run takes three. Dependabot's PRs never get macOS unless labelled;
+the nightly on `main` covers them.
 
 ## Refreshing dependencies
 
