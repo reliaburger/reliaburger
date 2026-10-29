@@ -3265,6 +3265,15 @@ the owner table has a test at the level where it lives.
   release hands the app back; the controller's token can't touch another
   namespace; and the desired-apps listing names the owner within the token's
   scope.
+- **Job manifests** (`a_job_manifest_cant_take_an_owned_app`,
+  `a_job_manifest_skips_an_owned_app`, #1429). A manifest with a `[job.*]`
+  goes down a different path, `job_apply`, and the first cut forgot the
+  owner check there: a deployer who added any job to a file could replace
+  a controller's app, because the state machine's backstop only checks that
+  a write keeps the stored owner, not who's asking. Now the same
+  `skip_owned_apps` runs first. Declaring someone else's owner is a 403, a
+  rival's is a 409, and a manifest that doesn't declare the owner deploys
+  its jobs without the owned app.
 - **GitOps** (`lettuce::diff::tests::diff_leaves_controller_owned_apps_alone`):
   git declaring a newer image doesn't update an owned app, and git dropping
   one GitOps wrote before the claim doesn't prune it.

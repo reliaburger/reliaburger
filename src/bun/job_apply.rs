@@ -59,6 +59,7 @@ pub(crate) async fn apply(
     } else {
         None
     };
+    let mut owner_notes = Vec::new();
     if let Some(council) = &state.council {
         let namespaces: Vec<_> = council
             .desired_state()
@@ -70,6 +71,21 @@ pub(crate) async fn apply(
         if let Err(error) = config.validate_against(&namespaces) {
             return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
         }
+        // The resource owner rules hold here as on any apply (#1125, #1429):
+        // an app a controller owns is skipped unless the manifest declares
+        // its owner, and only that owner's token (or an admin) may.
+        // Decided before policy, so a skipped app is neither judged nor
+        // written.
+        owner_notes = match super::api::apply::skip_owned_apps(
+            council,
+            &mut config,
+            &super::api::apply::owner_caller(auth),
+        )
+        .await
+        {
+            Ok(notes) => notes,
+            Err(error) => return super::api::apply::owner_refusal(&error),
+        };
         // The apps and jobs in a job manifest are judged by the policies in
         // force, as `relish apply` judges any app (#1117, #1119). The state
         // machine commits them later, once their jobs have run, so their
@@ -188,6 +204,9 @@ pub(crate) async fn apply(
         operation_id: operation_id.clone(),
     });
     tokio::spawn(async move {
+        for message in owner_notes {
+            let _ = tx.send(ApplyEvent::Progress { message }).await;
+        }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(900);
         loop {
             let arrays = read_task_arrays(&state).await;
