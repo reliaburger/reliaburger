@@ -981,8 +981,7 @@ impl UpgradeManager {
         if let Some(dir) = self.history_path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        // History is plain data; serialisation cannot fail.
-        let line = serde_json::to_string(entry).expect("history entry serialises");
+        let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
         let created = !self.history_path.exists();
         let mut file = std::fs::OpenOptions::new()
             .create(true)

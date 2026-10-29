@@ -6750,6 +6750,19 @@ bookkeeping, keeping the reservation the retained replacements need. And
 every node has dropped it, isn't affected: that wait happens on the
 worker before the stop, long before this op.
 
+The 0.2.4 review asked about the space between those two moments (#1442).
+After the journal write, the bookkeeping can still fail: a backend add, a
+retirement, a kernel withdrawal. Each returns with `?`, leaving the journal
+on the rolled-out service and memory on the old one. Should the op install
+`rolled_out` first? No, and a comment there now says why. The journal is a
+write-ahead record of what *might* be exposed, and the one rule is that
+nothing gets exposed before the journal names it (#351). A journal ahead of
+memory breaks nothing: it only claims more than is exposed. A restart
+withdraws everything the journal names before it publishes anything, and
+the service's next publication, built from memory, journals over it.
+Installing `rolled_out` early would be the risky order, because the
+bookkeeping would then edit the very map the journal had just recorded.
+
 The second wait hid in the consumer. A service retirement on a cluster
 node republishes the view before it retires the allocation, and it needs
 the view settled, so it ran the synchronisation's steps back to back. Each
