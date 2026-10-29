@@ -1,0 +1,153 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 272" width="720" height="272" role="img" aria-labelledby="t">
+<title id="t">Bun CPU per node</title>
+<style>svg{--surface:#fcfcfb;--ink:#0b0b0b;--ink-2:#52514e;--muted:#8a8984;--grid:#e6e5e0;--series-1:#2a78d6;--series-2:#eb6834;--series-3:#1baf7a;--series-other:#8a8984}
+@media (prefers-color-scheme: dark){svg{--surface:#1a1a19;--ink:#f0efec;--ink-2:#c3c2b7;--muted:#8f8e86;--grid:#33332f;--series-1:#3987e5;--series-2:#d95926;--series-3:#199e70;--series-other:#8f8e86}}
+text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;font-size:11px;fill:var(--ink-2,#52514e)}
+.title{font-size:13px;font-weight:600;fill:var(--ink,#0b0b0b)}
+.surface{fill:var(--surface,#fcfcfb)}
+.grid{stroke:var(--grid,#e6e5e0);stroke-width:1}
+.axis{stroke:var(--muted,#8a8984);stroke-width:1}
+.line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.s1{stroke:var(--series-1,#2a78d6)}.f1{fill:var(--series-1,#2a78d6)}.s2{stroke:var(--series-2,#eb6834)}.f2{fill:var(--series-2,#eb6834)}.s3{stroke:var(--series-3,#1baf7a)}.f3{fill:var(--series-3,#1baf7a)}.s0{stroke:var(--series-other,#8a8984)}.f0{fill:var(--series-other,#8a8984)}
+.target{stroke:var(--ink-2,#52514e);stroke-width:1;stroke-dasharray:4 3}
+.mark{stroke:var(--ink-2,#52514e);fill:none;stroke-width:1.5}
+.mark.failure{stroke:var(--ink,#0b0b0b);stroke-width:2}
+.mark.special,.mark.upgrade{fill:var(--surface,#fcfcfb)}</style>
+<rect class="surface" x="0" y="0" width="720" height="272" rx="6"/>
+<text class="title" x="56" y="20">Bun CPU per node</text>
+<rect class="f3" x="558" y="12" width="10" height="10" rx="2"/><text x="572" y="21">node 3</text>
+<rect class="f2" x="492" y="12" width="10" height="10" rx="2"/><text x="506" y="21">node 2</text>
+<rect class="f1" x="426" y="12" width="10" height="10" rx="2"/><text x="440" y="21">node 1</text>
+<line class="grid" x1="56" y1="210.0" x2="624" y2="210.0"/><text x="50" y="214.0" text-anchor="end">0</text>
+<line class="grid" x1="56" y1="168.5" x2="624" y2="168.5"/><text x="50" y="172.5" text-anchor="end">20</text>
+<line class="grid" x1="56" y1="127.0" x2="624" y2="127.0"/><text x="50" y="131.0" text-anchor="end">40</text>
+<line class="grid" x1="56" y1="85.5" x2="624" y2="85.5"/><text x="50" y="89.5" text-anchor="end">60</text>
+<line class="grid" x1="56" y1="44.0" x2="624" y2="44.0"/><text x="50" y="48.0" text-anchor="end">80</text>
+<text x="56" y="36">% of one core</text>
+<line class="axis" x1="56.0" y1="210" x2="56.0" y2="214"/><text x="56.0" y="226" text-anchor="middle">0 h</text>
+<line class="axis" x1="103.3" y1="210" x2="103.3" y2="214"/><text x="103.3" y="226" text-anchor="middle">2 h</text>
+<line class="axis" x1="150.6" y1="210" x2="150.6" y2="214"/><text x="150.6" y="226" text-anchor="middle">4 h</text>
+<line class="axis" x1="198.0" y1="210" x2="198.0" y2="214"/><text x="198.0" y="226" text-anchor="middle">6 h</text>
+<line class="axis" x1="245.3" y1="210" x2="245.3" y2="214"/><text x="245.3" y="226" text-anchor="middle">8 h</text>
+<line class="axis" x1="292.6" y1="210" x2="292.6" y2="214"/><text x="292.6" y="226" text-anchor="middle">10 h</text>
+<line class="axis" x1="339.9" y1="210" x2="339.9" y2="214"/><text x="339.9" y="226" text-anchor="middle">12 h</text>
+<line class="axis" x1="387.3" y1="210" x2="387.3" y2="214"/><text x="387.3" y="226" text-anchor="middle">14 h</text>
+<line class="axis" x1="434.6" y1="210" x2="434.6" y2="214"/><text x="434.6" y="226" text-anchor="middle">16 h</text>
+<line class="axis" x1="481.9" y1="210" x2="481.9" y2="214"/><text x="481.9" y="226" text-anchor="middle">18 h</text>
+<line class="axis" x1="529.2" y1="210" x2="529.2" y2="214"/><text x="529.2" y="226" text-anchor="middle">20 h</text>
+<line class="axis" x1="576.5" y1="210" x2="576.5" y2="214"/><text x="576.5" y="226" text-anchor="middle">22 h</text>
+<line class="axis" x1="623.9" y1="210" x2="623.9" y2="214"/><text x="623.9" y="226" text-anchor="middle">24 h</text>
+<polyline class="line s1" points="56.0,194.5 56.0,194.2 56.0,157.9 58.0,78.5 60.0,68.5 62.0,71.4 64.0,70.7 65.9,70.0 67.9,72.7 69.9,70.6 71.9,73.3 73.9,72.9 75.9,74.0 77.9,71.4 79.9,70.0 81.9,72.6 83.8,71.5 85.8,73.1 87.8,71.2 89.8,70.2 91.8,70.2 93.8,68.6 95.8,70.9 97.7,68.5 99.7,68.0 101.7,69.7 103.7,67.5 105.7,69.8 107.7,71.3 109.7,70.7 111.6,73.8 113.6,72.0 115.6,72.3 117.6,71.1 119.6,72.1 121.6,71.4 123.6,68.5 125.6,72.5 127.6,69.0 129.6,67.6 131.6,70.2 133.5,68.4 135.5,70.2 137.5,70.2 139.5,69.5 141.5,72.7 143.5,70.2 145.5,72.7 147.4,69.3 149.4,69.8 151.5,73.0 153.5,68.6 155.4,70.0 157.5,69.7 159.4,70.0 161.4,72.3 163.4,68.7 165.4,69.1 167.4,78.0 169.4,73.1 171.3,79.3 173.3,73.9 175.4,77.1 177.3,77.3 179.3,74.4 181.3,77.9 183.3,75.3 185.3,76.7 187.3,77.0 189.3,73.2 191.2,73.5 193.2,69.9 195.2,69.5 197.2,73.4 199.2,74.0 201.2,75.0 203.2,73.2 205.2,75.2 207.2,76.5 209.2,76.8 211.1,75.9 213.1,79.1 215.1,75.4 217.1,77.3 219.1,75.0 221.1,74.8 223.1,76.9 225.0,72.9 227.0,72.7 229.0,71.8 231.0,71.2 233.0,73.6 235.0,70.5 237.0,69.9 238.9,71.2 240.9,70.4 242.9,71.7 244.9,69.4 246.9,69.2 248.9,71.4 250.9,70.9 252.9,73.4 254.9,72.0 256.9,72.1 258.9,73.6 260.9,72.3 262.9,74.4 264.8,74.6 266.8,71.2 268.8,72.5 270.8,71.0 272.8,71.6 274.8,72.2 276.8,72.1 278.8,71.0 280.8,73.0 282.8,70.7 284.7,72.4 286.7,69.4 288.7,68.5 290.7,70.2 292.7,68.4 294.7,69.2 296.7,71.5 298.7,69.6 300.7,71.7 302.7,70.5 304.6,70.9 306.6,72.3 308.6,72.7 310.6,74.1 312.6,77.2 314.6,74.2 316.6,76.8 318.6,75.8 320.6,75.2 322.6,76.8 324.6,75.0 326.5,74.4 328.5,75.9 330.5,74.6 332.5,76.7 334.5,73.8 336.5,73.3 338.4,75.0 340.4,72.8 342.5,73.6 344.4,75.2 346.4,72.8 348.4,75.1 350.4,71.9 352.4,70.6 354.4,72.2 356.4,71.2 358.3,72.1 360.3,84.2 362.3,75.6 364.3,66.2 366.3,72.5 368.3,68.2 370.3,71.1 372.3,69.2 374.3,69.4 376.3,68.5 378.3,66.9 380.3,67.3 382.2,70.0 384.3,69.7 386.3,67.0 388.3,68.6 390.3,68.3 392.3,68.3 394.2,69.1 396.2,67.3 398.2,69.8 400.2,66.8 402.2,68.0 404.2,70.6 406.2,69.2 408.2,69.2 410.2,71.1 412.1,69.4 414.2,72.0 416.1,70.3 418.1,69.7 420.1,71.8 422.1,69.4 424.1,69.5 426.1,71.7 428.1,70.2 430.1,70.9 432.1,70.2 434.1,68.9 436.0,68.9 438.1,67.9 440.0,66.7 442.0,68.9 444.0,68.2 446.0,68.1 448.0,70.7 450.0,68.6 452.0,69.6 454.0,69.2 456.0,68.0 458.0,71.9 460.0,69.4 461.9,68.3 463.9,71.3 465.9,68.3 467.9,69.1 469.9,70.1 471.9,67.5 473.9,70.7 475.9,69.3 477.9,68.5 479.8,70.8 481.8,69.2 483.8,69.0 485.9,69.3 487.8,67.8 489.8,67.8 491.8,69.9 493.8,67.1 495.8,70.1 497.8,68.1 499.8,68.1 501.8,70.5 503.8,69.0 505.7,68.5 507.7,71.4 509.8,69.0 511.8,71.2 513.8,68.3 515.7,69.5 517.7,69.7 519.7,68.4 521.7,67.4 523.7,71.6 525.7,68.2 527.7,69.2 529.7,69.7 531.7,67.3 533.7,69.7 535.7,65.5 537.7,64.8 539.7,67.0 541.6,65.8 543.6,63.4 545.6,70.0 547.6,66.6 549.6,67.8 551.6,66.3 553.6,66.5 555.5,67.6 557.5,67.0 559.5,67.8 561.5,69.5 563.5,68.0 565.4,68.2 567.4,70.9 569.4,68.5 571.4,70.1 573.4,68.8 575.4,69.6 577.4,70.7 579.4,70.3 581.4,68.3 583.4,72.1 585.4,65.9 587.3,66.6 589.3,68.8 591.3,67.7 593.3,69.3 595.3,66.4 597.3,66.5 599.3,66.6 601.3,67.0 603.2,66.4 605.3,69.6 607.3,68.1 609.2,69.0 611.2,71.5 613.2,68.7 615.2,71.4 617.2,68.7 619.2,68.9 621.2,70.7 623.2,68.0 623.9,79.8"><title>node 1</title></polyline>
+<polyline class="line s2" points="56.0,204.8 56.0,204.1 56.0,186.1 58.0,87.2 60.0,76.8 62.0,77.3 64.0,70.5 65.9,70.1 67.9,72.7 69.9,70.1 71.9,73.5 73.9,72.0 75.9,73.6 77.9,71.4 79.9,69.9 81.9,71.6 83.8,70.8 85.8,73.4 87.8,70.1 89.8,69.4 91.8,72.2 93.8,70.4 95.8,72.5 97.7,70.0 99.7,70.1 101.7,70.7 103.7,68.5 105.7,69.5 107.7,69.3 109.7,69.1 111.6,72.5 113.6,69.7 115.6,70.5 117.6,68.3 119.6,70.4 121.6,73.8 123.6,70.9 125.6,75.4 127.6,71.7 129.6,71.1 131.6,73.8 133.5,72.3 135.5,74.1 137.5,72.5 139.5,72.5 141.5,74.4 143.5,72.6 145.5,76.2 147.4,72.3 149.4,72.1 151.5,76.7 153.5,71.7 155.4,73.9 157.5,73.4 159.4,72.9 161.4,75.5 163.4,71.6 165.4,71.6 167.4,79.5 169.4,75.7 171.3,80.6 173.3,75.8 175.4,78.2 177.3,77.6 179.3,75.1 181.3,78.6 183.3,75.5 185.3,77.5 187.3,77.7 189.3,74.6 191.2,76.4 193.2,75.3 195.2,74.1 197.2,78.5 199.2,75.3 201.2,77.3 203.2,75.1 205.2,76.3 207.2,77.1 209.2,77.6 211.1,76.6 213.1,80.1 215.1,76.1 217.1,78.5 219.1,76.4 221.1,75.7 223.1,77.5 225.0,76.5 227.0,77.4 229.0,76.5 231.0,75.7 233.0,79.0 235.0,76.1 237.0,74.8 238.9,78.9 240.9,76.0 242.9,77.1 244.9,75.2 246.9,74.8 248.9,79.0 250.9,76.9 252.9,78.4 254.9,76.9 256.9,77.1 258.9,78.2 260.9,76.4 262.9,76.1 264.8,79.1 266.8,75.6 268.8,77.0 270.8,75.6 272.8,76.4 274.8,77.2 276.8,76.5 278.8,75.5 280.8,77.6 282.8,75.4 284.7,77.5 286.7,74.6 288.7,74.6 290.7,76.3 292.7,74.1 294.7,75.0 296.7,77.2 298.7,75.6 300.7,77.8 302.7,76.6 304.6,75.9 306.6,77.9 308.6,78.2 310.6,78.9 312.6,81.1 314.6,79.0 316.6,80.6 318.6,79.7 320.6,78.9 322.6,81.0 324.6,79.2 326.5,78.2 328.5,80.1 330.5,78.3 332.5,80.6 334.5,77.7 336.5,78.2 338.4,79.9 340.4,78.1 342.5,77.9 344.4,80.1 346.4,77.2 348.4,81.1 350.4,76.3 352.4,75.3 354.4,77.6 356.4,75.6 358.3,75.8 360.3,79.9 362.3,88.0 364.3,73.0 366.3,77.9 368.3,73.5 370.3,75.8 372.3,74.2 374.3,73.8 376.3,73.2 378.3,72.2 380.3,72.0 382.2,75.1 384.3,74.9 386.3,72.1 388.3,74.1 390.3,73.4 392.3,75.9 394.2,72.3 396.2,72.7 398.2,75.3 400.2,71.8 402.2,74.2 404.2,76.1 406.2,74.4 408.2,74.0 410.2,76.7 412.1,74.2 414.2,76.4 416.1,74.4 418.1,73.7 420.1,76.3 422.1,73.5 424.1,73.6 426.1,76.5 428.1,74.1 430.1,76.7 432.1,73.9 434.1,73.3 436.0,73.7 438.1,73.0 440.0,72.2 442.0,74.8 444.0,74.1 446.0,73.7 448.0,76.1 450.0,73.0 452.0,74.6 454.0,74.9 456.0,73.6 458.0,76.8 460.0,73.8 461.9,73.4 463.9,75.2 465.9,73.0 467.9,72.9 469.9,75.1 471.9,72.4 473.9,75.6 475.9,74.1 477.9,73.2 479.8,75.6 481.8,73.5 483.8,73.8 485.9,74.7 487.8,73.0 489.8,72.7 491.8,75.0 493.8,72.0 495.8,75.8 497.8,73.1 499.8,72.9 501.8,75.6 503.8,73.1 505.7,73.1 507.7,76.7 509.8,74.0 511.8,77.1 513.8,72.0 515.7,73.9 517.7,74.6 519.7,73.2 521.7,72.4 523.7,75.7 525.7,73.3 527.7,74.1 529.7,75.5 531.7,72.5 533.7,75.3 535.7,71.6 537.7,71.2 539.7,73.9 541.6,71.8 543.6,71.2 545.6,75.0 547.6,72.7 549.6,74.8 551.6,71.8 553.6,72.4 555.5,74.1 557.5,73.1 559.5,74.2 561.5,76.2 563.5,73.3 565.4,73.7 567.4,76.7 569.4,73.9 571.4,76.6 573.4,73.6 575.4,74.9 577.4,75.9 579.4,75.4 581.4,74.0 583.4,76.9 585.4,72.5 587.3,73.1 589.3,75.0 591.3,73.7 593.3,75.4 595.3,71.8 597.3,72.7 599.3,74.2 601.3,73.4 603.2,73.5 605.3,75.3 607.3,73.9 609.2,77.8 611.2,73.7 613.2,74.0 615.2,76.9 617.2,74.0 619.2,74.1 621.2,76.3 623.2,74.1 623.9,92.9"><title>node 2</title></polyline>
+<polyline class="line s3" points="56.0,206.5 56.0,205.4 56.0,185.4 58.0,89.6 60.0,77.5 62.0,77.9 64.0,75.7 65.9,75.9 67.9,78.1 69.9,76.2 71.9,78.6 73.9,77.7 75.9,79.1 77.9,76.5 79.9,75.4 81.9,77.4 83.8,75.7 85.8,77.6 87.8,75.8 89.8,75.3 91.8,77.6 93.8,76.3 95.8,77.5 97.7,75.3 99.7,75.4 101.7,76.6 103.7,74.8 105.7,75.3 107.7,74.7 109.7,74.4 111.6,78.1 113.6,75.2 115.6,76.6 117.6,74.3 119.6,76.3 121.6,80.3 123.6,77.8 125.6,81.6 127.6,79.0 129.6,78.5 131.6,80.6 133.5,78.7 135.5,80.4 137.5,79.3 139.5,79.3 141.5,81.4 143.5,78.6 145.5,82.4 147.4,78.9 149.4,79.1 151.5,83.7 153.5,79.2 155.4,80.7 157.5,79.4 159.4,79.4 161.4,82.9 163.4,78.5 165.4,78.9 167.4,86.3 169.4,82.1 171.3,87.2 173.3,82.1 175.4,84.6 177.3,84.7 179.3,81.6 181.3,85.1 183.3,82.4 185.3,83.7 187.3,84.7 189.3,81.1 191.2,81.8 193.2,79.0 195.2,77.4 197.2,81.3 199.2,78.1 201.2,79.8 203.2,77.7 205.2,79.6 207.2,79.9 209.2,80.0 211.1,79.2 213.1,82.4 215.1,78.6 217.1,81.2 219.1,79.0 221.1,78.5 223.1,80.7 225.0,79.2 227.0,80.0 229.0,78.7 231.0,78.1 233.0,81.0 235.0,77.9 237.0,77.2 238.9,80.1 240.9,79.0 242.9,80.8 244.9,78.6 246.9,78.2 248.9,81.2 250.9,79.1 252.9,81.3 254.9,79.5 256.9,79.9 258.9,80.9 260.9,79.1 262.9,80.6 264.8,81.8 266.8,78.0 268.8,79.4 270.8,78.6 272.8,78.6 274.8,79.5 276.8,79.6 278.8,78.4 280.8,80.6 282.8,77.9 284.7,79.6 286.7,77.2 288.7,77.5 290.7,79.0 292.7,77.6 294.7,78.5 296.7,82.2 298.7,79.2 300.7,80.0 302.7,79.3 304.6,79.0 306.6,80.8 308.6,79.8 310.6,78.1 312.6,80.8 314.6,77.9 316.6,80.1 318.6,79.1 320.6,79.0 322.6,80.3 324.6,78.5 326.5,77.7 328.5,79.3 330.5,77.8 332.5,79.8 334.5,77.1 336.5,77.6 338.4,79.0 340.4,78.1 342.5,78.1 344.4,80.1 346.4,77.6 348.4,80.2 350.4,79.0 352.4,78.3 354.4,79.9 356.4,78.7 358.3,78.3 360.3,78.5 362.3,79.1 364.3,79.9 366.3,91.2 368.3,75.9 370.3,78.5 372.3,76.5 374.3,76.8 376.3,75.8 378.3,74.2 380.3,74.5 382.2,77.9 384.3,77.5 386.3,75.3 388.3,77.5 390.3,77.3 392.3,80.2 394.2,75.5 396.2,77.6 398.2,79.3 400.2,75.6 402.2,77.7 404.2,79.1 406.2,77.4 408.2,77.3 410.2,79.3 412.1,77.3 414.2,79.4 416.1,77.5 418.1,76.7 420.1,78.8 422.1,76.1 424.1,76.9 426.1,79.2 428.1,76.5 430.1,79.7 432.1,76.3 434.1,75.6 436.0,77.3 438.1,76.7 440.0,76.0 442.0,78.3 444.0,77.5 446.0,76.8 448.0,79.7 450.0,76.3 452.0,77.8 454.0,77.6 456.0,76.0 458.0,79.2 460.0,76.5 461.9,76.2 463.9,78.0 465.9,76.1 467.9,76.0 469.9,77.6 471.9,75.5 473.9,78.4 475.9,76.9 477.9,76.0 479.8,78.9 481.8,76.8 483.8,76.3 485.9,78.6 487.8,77.3 489.8,76.9 491.8,78.7 493.8,75.9 495.8,79.8 497.8,77.0 499.8,77.2 501.8,79.3 503.8,77.0 505.7,75.8 507.7,79.0 509.8,76.3 511.8,79.3 513.8,75.6 515.7,76.7 517.7,77.3 519.7,76.2 521.7,75.1 523.7,79.1 525.7,76.5 527.7,77.0 529.7,78.7 531.7,75.2 533.7,78.6 535.7,75.2 537.7,75.4 539.7,78.0 541.6,75.9 543.6,74.4 545.6,79.5 547.6,76.5 549.6,77.8 551.6,75.4 553.6,75.6 555.5,77.1 557.5,75.3 559.5,75.1 561.5,77.8 563.5,75.6 565.4,75.8 567.4,79.3 569.4,76.2 571.4,78.5 573.4,76.5 575.4,80.8 577.4,82.5 579.4,81.8 581.4,80.3 583.4,83.6 585.4,79.2 587.3,80.3 589.3,81.8 591.3,81.3 593.3,82.7 595.3,80.0 597.3,80.6 599.3,81.3 601.3,80.4 603.2,76.9 605.3,78.8 607.3,76.3 609.2,80.8 611.2,74.8 613.2,76.4 615.2,79.3 617.2,76.7 619.2,76.2 621.2,77.5 623.2,75.8 623.9,102.5"><title>node 3</title></polyline>
+<text x="630" y="83.8">node 1</text>
+<text x="630" y="96.9">node 2</text>
+<text x="630" y="109.9">node 3</text>
+<path class="mark failure" d="M213.2,236.0 L221.2,244.0 M221.2,236.0 L213.2,244.0"><title>failure: heavy-check at 408 min</title></path>
+<path class="mark failure" d="M217.2,236.0 L225.2,244.0 M225.2,236.0 L217.2,244.0"><title>failure: heavy-check at 418 min</title></path>
+<path class="mark failure" d="M221.2,236.0 L229.2,244.0 M229.2,236.0 L221.2,244.0"><title>failure: heavy-check at 429 min</title></path>
+<path class="mark failure" d="M225.2,236.0 L233.2,244.0 M233.2,236.0 L225.2,244.0"><title>failure: heavy-check at 439 min</title></path>
+<path class="mark failure" d="M229.1,236.0 L237.1,244.0 M237.1,236.0 L229.1,244.0"><title>failure: heavy-check at 449 min</title></path>
+<path class="mark failure" d="M233.1,236.0 L241.1,244.0 M241.1,236.0 L233.1,244.0"><title>failure: heavy-check at 459 min</title></path>
+<path class="mark failure" d="M237.1,236.0 L245.1,244.0 M245.1,236.0 L237.1,244.0"><title>failure: heavy-check at 469 min</title></path>
+<path class="mark failure" d="M241.0,236.0 L249.0,244.0 M249.0,236.0 L241.0,244.0"><title>failure: heavy-check at 479 min</title></path>
+<path class="mark failure" d="M245.1,236.0 L253.1,244.0 M253.1,236.0 L245.1,244.0"><title>failure: heavy-check at 489 min</title></path>
+<path class="mark failure" d="M249.0,236.0 L257.0,244.0 M257.0,236.0 L249.0,244.0"><title>failure: heavy-check at 499 min</title></path>
+<path class="mark failure" d="M253.0,236.0 L261.0,244.0 M261.0,236.0 L253.0,244.0"><title>failure: heavy-check at 509 min</title></path>
+<path class="mark failure" d="M257.0,236.0 L265.0,244.0 M265.0,236.0 L257.0,244.0"><title>failure: heavy-check at 519 min</title></path>
+<path class="mark failure" d="M261.0,236.0 L269.0,244.0 M269.0,236.0 L261.0,244.0"><title>failure: heavy-check at 529 min</title></path>
+<path class="mark failure" d="M265.0,236.0 L273.0,244.0 M273.0,236.0 L265.0,244.0"><title>failure: heavy-check at 540 min</title></path>
+<path class="mark failure" d="M269.0,236.0 L277.0,244.0 M277.0,236.0 L269.0,244.0"><title>failure: heavy-check at 550 min</title></path>
+<path class="mark failure" d="M273.0,236.0 L281.0,244.0 M281.0,236.0 L273.0,244.0"><title>failure: heavy-check at 560 min</title></path>
+<path class="mark failure" d="M276.9,236.0 L284.9,244.0 M284.9,236.0 L276.9,244.0"><title>failure: heavy-check at 570 min</title></path>
+<path class="mark failure" d="M280.9,236.0 L288.9,244.0 M288.9,236.0 L280.9,244.0"><title>failure: heavy-check at 580 min</title></path>
+<path class="mark failure" d="M284.9,236.0 L292.9,244.0 M292.9,236.0 L284.9,244.0"><title>failure: heavy-check at 590 min</title></path>
+<path class="mark failure" d="M288.8,236.0 L296.8,244.0 M296.8,236.0 L288.8,244.0"><title>failure: heavy-check at 600 min</title></path>
+<path class="mark failure" d="M292.8,236.0 L300.8,244.0 M300.8,236.0 L292.8,244.0"><title>failure: heavy-check at 610 min</title></path>
+<path class="mark failure" d="M296.8,236.0 L304.8,244.0 M304.8,236.0 L296.8,244.0"><title>failure: heavy-check at 620 min</title></path>
+<path class="mark failure" d="M300.8,236.0 L308.8,244.0 M308.8,236.0 L300.8,244.0"><title>failure: heavy-check at 630 min</title></path>
+<path class="mark failure" d="M304.8,236.0 L312.8,244.0 M312.8,236.0 L304.8,244.0"><title>failure: heavy-check at 640 min</title></path>
+<path class="mark failure" d="M308.7,236.0 L316.7,244.0 M316.7,236.0 L308.7,244.0"><title>failure: heavy-check at 651 min</title></path>
+<path class="mark failure" d="M312.7,236.0 L320.7,244.0 M320.7,236.0 L312.7,244.0"><title>failure: heavy-check at 661 min</title></path>
+<path class="mark failure" d="M316.7,236.0 L324.7,244.0 M324.7,236.0 L316.7,244.0"><title>failure: heavy-check at 671 min</title></path>
+<path class="mark failure" d="M320.7,236.0 L328.7,244.0 M328.7,236.0 L320.7,244.0"><title>failure: heavy-check at 681 min</title></path>
+<path class="mark failure" d="M324.7,236.0 L332.7,244.0 M332.7,236.0 L324.7,244.0"><title>failure: heavy-check at 691 min</title></path>
+<path class="mark failure" d="M328.6,236.0 L336.6,244.0 M336.6,236.0 L328.6,244.0"><title>failure: heavy-check at 701 min</title></path>
+<path class="mark failure" d="M332.6,236.0 L340.6,244.0 M340.6,236.0 L332.6,244.0"><title>failure: heavy-check at 711 min</title></path>
+<path class="mark failure" d="M336.6,236.0 L344.6,244.0 M344.6,236.0 L336.6,244.0"><title>failure: heavy-check at 721 min</title></path>
+<path class="mark failure" d="M340.6,236.0 L348.6,244.0 M348.6,236.0 L340.6,244.0"><title>failure: heavy-check at 731 min</title></path>
+<path class="mark failure" d="M344.6,236.0 L352.6,244.0 M352.6,236.0 L344.6,244.0"><title>failure: heavy-check at 741 min</title></path>
+<path class="mark failure" d="M348.5,236.0 L356.5,244.0 M356.5,236.0 L348.5,244.0"><title>failure: heavy-check at 751 min</title></path>
+<path class="mark failure" d="M352.5,236.0 L360.5,244.0 M360.5,236.0 L352.5,244.0"><title>failure: heavy-check at 762 min</title></path>
+<path class="mark failure" d="M356.5,236.0 L364.5,244.0 M364.5,236.0 L356.5,244.0"><title>failure: heavy-check at 772 min</title></path>
+<path class="mark failure" d="M360.5,236.0 L368.5,244.0 M368.5,236.0 L360.5,244.0"><title>failure: heavy-check at 782 min</title></path>
+<path class="mark failure" d="M364.5,236.0 L372.5,244.0 M372.5,236.0 L364.5,244.0"><title>failure: heavy-check at 792 min</title></path>
+<path class="mark failure" d="M368.5,236.0 L376.5,244.0 M376.5,236.0 L368.5,244.0"><title>failure: heavy-check at 802 min</title></path>
+<path class="mark failure" d="M372.5,236.0 L380.5,244.0 M380.5,236.0 L372.5,244.0"><title>failure: heavy-check at 812 min</title></path>
+<path class="mark failure" d="M376.4,236.0 L384.4,244.0 M384.4,236.0 L376.4,244.0"><title>failure: heavy-check at 822 min</title></path>
+<path class="mark failure" d="M380.4,236.0 L388.4,244.0 M388.4,236.0 L380.4,244.0"><title>failure: heavy-check at 832 min</title></path>
+<path class="mark failure" d="M384.4,236.0 L392.4,244.0 M392.4,236.0 L384.4,244.0"><title>failure: heavy-check at 842 min</title></path>
+<path class="mark failure" d="M388.4,236.0 L396.4,244.0 M396.4,236.0 L388.4,244.0"><title>failure: heavy-check at 853 min</title></path>
+<path class="mark failure" d="M392.4,236.0 L400.4,244.0 M400.4,236.0 L392.4,244.0"><title>failure: heavy-check at 863 min</title></path>
+<path class="mark failure" d="M396.4,236.0 L404.4,244.0 M404.4,236.0 L396.4,244.0"><title>failure: heavy-check at 873 min</title></path>
+<path class="mark failure" d="M400.4,236.0 L408.4,244.0 M408.4,236.0 L400.4,244.0"><title>failure: heavy-check at 883 min</title></path>
+<path class="mark failure" d="M404.3,236.0 L412.3,244.0 M412.3,236.0 L404.3,244.0"><title>failure: heavy-check at 893 min</title></path>
+<path class="mark failure" d="M408.3,236.0 L416.3,244.0 M416.3,236.0 L408.3,244.0"><title>failure: heavy-check at 903 min</title></path>
+<path class="mark failure" d="M412.3,236.0 L420.3,244.0 M420.3,236.0 L412.3,244.0"><title>failure: heavy-check at 913 min</title></path>
+<path class="mark failure" d="M416.3,236.0 L424.3,244.0 M424.3,236.0 L416.3,244.0"><title>failure: heavy-check at 923 min</title></path>
+<path class="mark failure" d="M420.3,236.0 L428.3,244.0 M428.3,236.0 L420.3,244.0"><title>failure: heavy-check at 933 min</title></path>
+<path class="mark failure" d="M424.2,236.0 L432.2,244.0 M432.2,236.0 L424.2,244.0"><title>failure: heavy-check at 943 min</title></path>
+<path class="mark failure" d="M428.2,236.0 L436.2,244.0 M436.2,236.0 L428.2,244.0"><title>failure: heavy-check at 954 min</title></path>
+<path class="mark failure" d="M432.2,236.0 L440.2,244.0 M440.2,236.0 L432.2,244.0"><title>failure: heavy-check at 964 min</title></path>
+<path class="mark failure" d="M436.2,236.0 L444.2,244.0 M444.2,236.0 L436.2,244.0"><title>failure: heavy-check at 974 min</title></path>
+<path class="mark failure" d="M440.2,236.0 L448.2,244.0 M448.2,236.0 L440.2,244.0"><title>failure: heavy-check at 984 min</title></path>
+<path class="mark failure" d="M444.2,236.0 L452.2,244.0 M452.2,236.0 L444.2,244.0"><title>failure: heavy-check at 994 min</title></path>
+<path class="mark failure" d="M448.2,236.0 L456.2,244.0 M456.2,236.0 L448.2,244.0"><title>failure: heavy-check at 1004 min</title></path>
+<path class="mark failure" d="M452.1,236.0 L460.1,244.0 M460.1,236.0 L452.1,244.0"><title>failure: heavy-check at 1014 min</title></path>
+<path class="mark failure" d="M456.1,236.0 L464.1,244.0 M464.1,236.0 L456.1,244.0"><title>failure: heavy-check at 1024 min</title></path>
+<path class="mark failure" d="M460.1,236.0 L468.1,244.0 M468.1,236.0 L460.1,244.0"><title>failure: heavy-check at 1034 min</title></path>
+<path class="mark failure" d="M464.1,236.0 L472.1,244.0 M472.1,236.0 L464.1,244.0"><title>failure: heavy-check at 1044 min</title></path>
+<path class="mark failure" d="M468.1,236.0 L476.1,244.0 M476.1,236.0 L468.1,244.0"><title>failure: heavy-check at 1055 min</title></path>
+<path class="mark failure" d="M472.1,236.0 L480.1,244.0 M480.1,236.0 L472.1,244.0"><title>failure: heavy-check at 1065 min</title></path>
+<path class="mark failure" d="M476.0,236.0 L484.0,244.0 M484.0,236.0 L476.0,244.0"><title>failure: heavy-check at 1075 min</title></path>
+<path class="mark failure" d="M480.0,236.0 L488.0,244.0 M488.0,236.0 L480.0,244.0"><title>failure: heavy-check at 1085 min</title></path>
+<path class="mark failure" d="M484.0,236.0 L492.0,244.0 M492.0,236.0 L484.0,244.0"><title>failure: heavy-check at 1095 min</title></path>
+<path class="mark failure" d="M488.0,236.0 L496.0,244.0 M496.0,236.0 L488.0,244.0"><title>failure: heavy-check at 1105 min</title></path>
+<path class="mark failure" d="M492.0,236.0 L500.0,244.0 M500.0,236.0 L492.0,244.0"><title>failure: heavy-check at 1115 min</title></path>
+<path class="mark failure" d="M496.0,236.0 L504.0,244.0 M504.0,236.0 L496.0,244.0"><title>failure: heavy-check at 1125 min</title></path>
+<path class="mark failure" d="M499.9,236.0 L507.9,244.0 M507.9,236.0 L499.9,244.0"><title>failure: heavy-check at 1135 min</title></path>
+<path class="mark failure" d="M503.9,236.0 L511.9,244.0 M511.9,236.0 L503.9,244.0"><title>failure: heavy-check at 1145 min</title></path>
+<path class="mark failure" d="M507.9,236.0 L515.9,244.0 M515.9,236.0 L507.9,244.0"><title>failure: heavy-check at 1156 min</title></path>
+<path class="mark failure" d="M511.9,236.0 L519.9,244.0 M519.9,236.0 L511.9,244.0"><title>failure: heavy-check at 1166 min</title></path>
+<path class="mark failure" d="M515.9,236.0 L523.9,244.0 M523.9,236.0 L515.9,244.0"><title>failure: heavy-check at 1176 min</title></path>
+<path class="mark failure" d="M519.9,236.0 L527.9,244.0 M527.9,236.0 L519.9,244.0"><title>failure: heavy-check at 1186 min</title></path>
+<path class="mark failure" d="M523.8,236.0 L531.8,244.0 M531.8,236.0 L523.8,244.0"><title>failure: heavy-check at 1196 min</title></path>
+<path class="mark failure" d="M527.8,236.0 L535.8,244.0 M535.8,236.0 L527.8,244.0"><title>failure: heavy-check at 1206 min</title></path>
+<path class="mark failure" d="M531.8,236.0 L539.8,244.0 M539.8,236.0 L531.8,244.0"><title>failure: heavy-check at 1216 min</title></path>
+<path class="mark failure" d="M535.8,236.0 L543.8,244.0 M543.8,236.0 L535.8,244.0"><title>failure: heavy-check at 1226 min</title></path>
+<path class="mark failure" d="M539.8,236.0 L547.8,244.0 M547.8,236.0 L539.8,244.0"><title>failure: heavy-check at 1237 min</title></path>
+<path class="mark failure" d="M543.8,236.0 L551.8,244.0 M551.8,236.0 L543.8,244.0"><title>failure: heavy-check at 1247 min</title></path>
+<path class="mark failure" d="M547.8,236.0 L555.8,244.0 M555.8,236.0 L547.8,244.0"><title>failure: heavy-check at 1257 min</title></path>
+<path class="mark failure" d="M551.7,236.0 L559.7,244.0 M559.7,236.0 L551.7,244.0"><title>failure: heavy-check at 1267 min</title></path>
+<path class="mark failure" d="M555.7,236.0 L563.7,244.0 M563.7,236.0 L555.7,244.0"><title>failure: heavy-check at 1277 min</title></path>
+<path class="mark failure" d="M559.7,236.0 L567.7,244.0 M567.7,236.0 L559.7,244.0"><title>failure: heavy-check at 1287 min</title></path>
+<path class="mark failure" d="M563.6,236.0 L571.6,244.0 M571.6,236.0 L563.6,244.0"><title>failure: heavy-check at 1297 min</title></path>
+<path class="mark failure" d="M567.6,236.0 L575.6,244.0 M575.6,236.0 L567.6,244.0"><title>failure: heavy-check at 1307 min</title></path>
+<path class="mark failure" d="M571.6,236.0 L579.6,244.0 M579.6,236.0 L571.6,244.0"><title>failure: heavy-check at 1317 min</title></path>
+<path class="mark failure" d="M575.5,236.0 L583.5,244.0 M583.5,236.0 L575.5,244.0"><title>failure: heavy-check at 1327 min</title></path>
+<path class="mark failure" d="M579.6,236.0 L587.6,244.0 M587.6,236.0 L579.6,244.0"><title>failure: heavy-check at 1337 min</title></path>
+<path class="mark failure" d="M583.5,236.0 L591.5,244.0 M591.5,236.0 L583.5,244.0"><title>failure: heavy-check at 1347 min</title></path>
+<path class="mark failure" d="M587.5,236.0 L595.5,244.0 M595.5,236.0 L587.5,244.0"><title>failure: heavy-check at 1357 min</title></path>
+<path class="mark failure" d="M591.5,236.0 L599.5,244.0 M599.5,236.0 L591.5,244.0"><title>failure: heavy-check at 1368 min</title></path>
+<path class="mark failure" d="M595.5,236.0 L603.5,244.0 M603.5,236.0 L595.5,244.0"><title>failure: heavy-check at 1378 min</title></path>
+<path class="mark failure" d="M599.4,236.0 L607.4,244.0 M607.4,236.0 L599.4,244.0"><title>failure: heavy-check at 1388 min</title></path>
+<path class="mark failure" d="M603.5,236.0 L611.5,244.0 M611.5,236.0 L603.5,244.0"><title>failure: heavy-check at 1398 min</title></path>
+<path class="mark failure" d="M607.4,236.0 L615.4,244.0 M615.4,236.0 L607.4,244.0"><title>failure: heavy-check at 1408 min</title></path>
+<path class="mark failure" d="M611.3,236.0 L619.3,244.0 M619.3,236.0 L611.3,244.0"><title>failure: heavy-check at 1418 min</title></path>
+<path class="mark failure" d="M615.4,236.0 L623.4,244.0 M623.4,236.0 L615.4,244.0"><title>failure: heavy-check at 1428 min</title></path>
+<path class="mark failure" d="M619.3,236.0 L627.3,244.0 M627.3,236.0 L619.3,244.0"><title>failure: heavy-check at 1438 min</title></path>
+<line class="mark fault" x1="61.0" y1="255.0" x2="61.0" y2="263.0"/><text x="70.0" y="263">fault</text>
+<path class="mark upgrade" d="M117.5,254.0 L122.5,263.0 L112.5,263.0 Z"/><text x="126.5" y="263">upgrade walk</text>
+<path class="mark special" d="M219.5,254.0 L224.5,259.0 L219.5,264.0 L214.5,259.0 Z"/><text x="228.5" y="263">special</text>
+<path class="mark failure" d="M285.0,255.0 L293.0,263.0 M293.0,255.0 L285.0,263.0"/><text x="298.0" y="263">failure</text>
+</svg>

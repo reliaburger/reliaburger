@@ -1,0 +1,46 @@
+# The four policies platform teams ask for most (#1126), in one file an
+# admin applies like any other manifest:
+#
+#   relish apply -f examples/policies/platform.toml
+#
+# Try them offline against your own apps first; nothing is sent anywhere:
+#
+#   relish policy test -f examples/policies/platform.toml -f my-apps.toml
+#
+# Change the namespace, the registries and the team to your own. The 0.2.4
+# exit test (tests/cluster_failover.rs) applies this file, unchanged, to a
+# three-node cluster.
+
+# 1. Every app in `prod` declares a memory limit. `memory = "512Mi"` asks for
+#    512Mi and may use no more; `"256Mi-1Gi"` asks for 256Mi and may grow to
+#    1Gi.
+[policy.prod-needs-memory-limits]
+match = "app.namespace == 'prod'"
+deny = "!has(app.memory)"
+message = "apps in prod need a memory limit, such as memory = \"256Mi-1Gi\""
+
+# 2. No `:latest`, and no image without a tag, which means `:latest` too.
+#    A digest (`web@sha256:...`) is a pin, so it passes. Jobs as well as apps.
+[policy.no-latest]
+applies_to = "both"
+match = "has(workload.image)"
+deny = "workload.image.matches(':latest(@|$)') || !workload.image.matches(':[^/:@]+(@|$)')"
+message = "pin an image version: no :latest, and no image without a tag"
+
+# 3. Images come only from the registries listed here. The trailing `/`
+#    matters: without it, `registry.example.com.evil.net/` would pass.
+[policy.trusted-registries]
+applies_to = "both"
+match = "has(workload.image)"
+deny = "!['registry.example.com/', 'ghcr.io/example/'].exists(prefix, workload.image.startsWith(prefix))"
+message = "images come from registry.example.com or ghcr.io/example only"
+
+# 4. Every app names its team in env.TEAM. The default fills it in when an
+#    app leaves it out, and never replaces a team the app names. The deny
+#    then catches the one way round it: a team set to the empty string.
+[policy.team-env]
+deny = "app.env.TEAM == ''"
+message = "env.TEAM names the team that owns this app; leave it out to get the default"
+
+[policy.team-env.default]
+env.TEAM = "platform"

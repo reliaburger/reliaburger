@@ -21,7 +21,9 @@ jobs:
     # Pushes and manual runs build everything. A pull request builds the PDF
     # only when the docs change, only the Linux x86-64 binaries when Rust
     # or packaging inputs change, and the guest images only when their build
-    # script or pins change; main builds the whole matrix.
+    # script or pins change; main builds the whole matrix. The profiling
+    # build runs on pushes and manual runs, and on a pull request only when
+    # this workflow changes.
     name: select builds
     runs-on: ubuntu-latest
     outputs:
@@ -29,6 +31,7 @@ jobs:
       binaries: ${{ steps.select.outputs.binaries }}
       matrix: ${{ steps.select.outputs.matrix }}
       guest_images: ${{ steps.select.outputs.guest_images }}
+      profiling: ${{ steps.select.outputs.profiling }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,22 +41,60 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          all='[{"target":"aarch64-unknown-linux-gnu","suffix":"linux-aarch64","runner":"ubuntu-22.04-arm","arguments":"--features ebpf --bin bun --bin relish"},{"target":"x86_64-unknown-linux-gnu","suffix":"linux-x86_64","runner":"ubuntu-22.04","arguments":"--features ebpf --bin bun --bin relish"},{"target":"aarch64-apple-darwin","suffix":"macos-aarch64","runner":"macos-15","arguments":"--bin relish"},{"target":"x86_64-apple-darwin","suffix":"macos-x86_64","runner":"macos-15-intel","arguments":"--bin relish"}]'
+          all='[{"target":"aarch64-unknown-linux-gnu","suffix":"linux-aarch64","runner":"ubuntu-22.04-arm","arguments":"--features ebpf --bin bun --bin relish"},{"target":"x86_64-unknown-linux-gnu","suffix":"linux-x86_64","runner":"ubuntu-22.04","arguments":"--features ebpf --bin bun --bin relish"},{"target":"aarch64-apple-darwin","suffix":"macos-aarch64","runner":"macos-15","arguments":"--bin relish"}]'
           if [ "$EVENT" != pull_request ]; then
-            pdf=true binaries=true guest_images=true matrix="$all"
+            pdf=true binaries=true guest_images=true profiling=true matrix="$all"
           else
             changed=$(git diff --name-only "$BASE_SHA...HEAD")
-            pdf=false binaries=false guest_images=false
+            pdf=false binaries=false guest_images=false profiling=false
             grep -qE '^docs/|^Makefile$|^\.github/workflows/build\.yml$' <<<"$changed" && pdf=true
             grep -qE '^(src|ebpf|brioche|assets|docs/manual|scripts/release)/|^(build\.rs|Cargo\.(toml|lock)|rust-toolchain.*|\.github/workflows/build\.yml)$' <<<"$changed" && binaries=true
             grep -qE '^scripts/release/(build_guest_image\.sh|guest-images\.json)$|^\.github/workflows/build\.yml$' <<<"$changed" && guest_images=true
+            grep -qE '^\.github/workflows/build\.yml$' <<<"$changed" && profiling=true
             matrix=$(jq -c '[.[] | select(.suffix == "linux-x86_64")]' <<<"$all")
           fi
-          { echo "pdf=$pdf"; echo "binaries=$binaries"; echo "matrix=$matrix"; echo "guest_images=$guest_images"; } >>"$GITHUB_OUTPUT"
-          echo "pdf=$pdf binaries=$binaries guest_images=$guest_images"
+          { echo "pdf=$pdf"; echo "binaries=$binaries"; echo "matrix=$matrix"; echo "guest_images=$guest_images"; echo "profiling=$profiling"; } >>"$GITHUB_OUTPUT"
+          echo "pdf=$pdf binaries=$binaries guest_images=$guest_images profiling=$profiling"
+
+  ci-evidence:
+    # A candidate's commit has normally passed ci.yml already, on the push to
+    # main (#1363). If a push, merge-queue or nightly run on exactly this
+    # commit passed every job, ignored-test evidence included, the build
+    # reuses it instead of running the suite again, saving about an hour,
+    # most of it spent waiting for hosted macOS runners. Any doubt, an API
+    # error included, says reuse=false and the suite runs below.
+    name: find passing CI
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse: ${{ steps.find.outputs.reuse }}
+      ci_run: ${{ steps.find.outputs.ci_run }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find a passing CI run on this commit
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          CANDIDATE_COMMIT: ${{ github.sha }}
+        run: >-
+          python3 scripts/release/ci_reuse.py
+          --repository "$RELEASE_REPOSITORY" --commit "$CANDIDATE_COMMIT"
 
   validate-release:
-    if: github.event_name == 'workflow_dispatch'
+    # The whole suite, only when no passing run was found or the search
+    # itself failed (a failed search leaves reuse empty).
+    needs: ci-evidence
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && needs.ci-evidence.outputs.reuse != 'true' }}
+    # ci.yml's cluster and acceptance jobs list this run's artefacts to
+    # fetch the test archive (#977); a called workflow gets no more than this.
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/ci.yml
 
   build-pdf:
@@ -89,11 +130,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test signing and metadata with ephemeral keys
         run: python3 -m unittest discover -s scripts/release -p 'test_*.py'
-      - name: Require main for a manually signed candidate
+      - name: Require main or a release train for a signed build
+        # Main's candidate gets the release key; a train's nightly build
+        # (#1363) gets the nightly key, which no release trusts. Nothing
+        # else is ever signed.
         if: github.event_name == 'workflow_dispatch'
         env:
           CANDIDATE_REF: ${{ github.ref }}
-        run: test "$CANDIDATE_REF" = refs/heads/main
+        run: |
+          case "$CANDIDATE_REF" in
+            refs/heads/main|refs/heads/release-*) ;;
+            *) echo "only main and release-* trains are signed, not $CANDIDATE_REF" >&2; exit 1 ;;
+          esac
 
   build-binaries:
     needs: changes
@@ -105,6 +153,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       RELIABURGER_GIT_SHA: ${{ github.sha }}
+      # A train's nightly build trusts the nightly key instead of the release
+      # keys (src/upgrade/keys.rs), so the bun it signs can never reach a
+      # released cluster. Main's build never has the feature.
+      NIGHTLY_FEATURES: ${{ startsWith(github.ref, 'refs/heads/release-') && '--features nightly-signing' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -120,7 +172,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang llvm libbpf-dev
       - name: Build locked release binaries
-        run: cargo build --locked --release --target ${{ matrix.target }} ${{ matrix.arguments }}
+        run: cargo build --locked --release --target ${{ matrix.target }} ${{ matrix.arguments }} $NIGHTLY_FEATURES
       - name: Smoke test and package native binaries
         shell: bash
         run: |
@@ -138,6 +190,53 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 7
+
+  build-profiling:
+    # Never shipped. The release profile step (qualify-profile.sh, #1358)
+    # takes its rates from the candidate's own binaries and its attribution
+    # from this build: the same commit, compiler and features as
+    # bun-linux-aarch64 and relish-linux-aarch64, plus frame pointers and line
+    # tables so `perf -g` can name Bun's frames. Its artefact name matches
+    # neither `binaries-*` nor `candidate-*`, so the candidate job, staging
+    # and promotion never see it, and the candidate job doesn't wait for it.
+    needs: changes
+    if: needs.changes.outputs.profiling == 'true'
+    runs-on: ubuntu-22.04-arm
+    env:
+      RELIABURGER_GIT_SHA: ${{ github.sha }}
+      CARGO_PROFILE_RELEASE_STRIP: "false"
+      CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+      RUSTFLAGS: -C force-frame-pointers=yes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: profiling-aarch64-unknown-linux-gnu
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install native Linux eBPF build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm libbpf-dev
+      - name: Build the profiling binaries
+        run: cargo build --locked --release --target aarch64-unknown-linux-gnu --features ebpf --bin bun --bin relish
+      - name: Smoke test and package the profiling binaries
+        run: |
+          mkdir -p profiling
+          target/aarch64-unknown-linux-gnu/release/bun --version
+          target/aarch64-unknown-linux-gnu/release/relish --version
+          cp target/aarch64-unknown-linux-gnu/release/bun profiling/bun-linux-aarch64
+          cp target/aarch64-unknown-linux-gnu/release/relish profiling/relish-linux-aarch64
+      - name: Upload the profiling build, never shipped
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiling-build-${{ github.sha }}-${{ github.run_attempt }}
+          path: profiling/*
+          if-no-files-found: error
+          # Long enough for the next release's profile to measure this one.
+          retention-days: 90
 
   build-guest-images:
     # The quickstart's VM image: pinned Ubuntu plus the node packages, so a
@@ -177,8 +276,20 @@ jobs:
           retention-days: 7
 
   candidate:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
-    needs: [validate-release, build-pdf, build-binaries, build-guest-images, test-packaging]
+    # Signs only a commit that passed the whole of ci.yml: in this run, or in
+    # the run ci-evidence found. A skipped validate-release counts only with
+    # that run, and every build job must have succeeded either way. Main's
+    # candidate is signed with the release key; a release train's nightly
+    # build (#1363) with the nightly key, and it's uploaded as `nightly-*`.
+    if: >-
+      ${{ !cancelled() && github.event_name == 'workflow_dispatch'
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release-'))
+      && needs.build-pdf.result == 'success' && needs.build-binaries.result == 'success'
+      && needs.build-guest-images.result == 'success' && needs.test-packaging.result == 'success'
+      && (needs.validate-release.result == 'success'
+      || (needs.validate-release.result == 'skipped' && needs.ci-evidence.result == 'success'
+      && needs.ci-evidence.outputs.reuse == 'true')) }}
+    needs: [ci-evidence, validate-release, build-pdf, build-binaries, build-guest-images, test-packaging]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -199,6 +310,15 @@ jobs:
           pattern: guest-image-*
           merge-multiple: true
           path: dist
+      - name: Choose the release or nightly channel
+        env:
+          CANDIDATE_REF: ${{ github.ref }}
+        run: |
+          case "$CANDIDATE_REF" in
+            refs/heads/main) printf 'CHANNEL=release\nARTEFACT=candidate\n' >> "$GITHUB_ENV" ;;
+            refs/heads/release-*) printf 'CHANNEL=nightly\nARTEFACT=nightly\n' >> "$GITHUB_ENV" ;;
+            *) echo "never signed: $CANDIDATE_REF" >&2; exit 1 ;;
+          esac
       - name: Read candidate version
         run: |
           python3 - <<'PYCODE' >> "$GITHUB_ENV"
@@ -207,11 +327,22 @@ jobs:
               print("RELEASE_TAG=v" + tomllib.load(source)["package"]["version"])
           PYCODE
       - name: Sign complete matrix and generate release metadata
+        if: github.ref == 'refs/heads/main'
         env:
           RELIABURGER_RELEASE_KEY: ${{ secrets.RELIABURGER_RELEASE_KEY }}
           RELEASE_REPOSITORY: ${{ github.repository }}
         run: >-
           python3 scripts/release/package.py --directory dist
+          --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY"
+      - name: Sign a train's nightly build with the nightly key
+        # Unreleased code never sees the release key. Only binaries built
+        # with the nightly-signing feature trust this one.
+        if: startsWith(github.ref, 'refs/heads/release-')
+        env:
+          RELIABURGER_NIGHTLY_KEY: ${{ secrets.RELIABURGER_NIGHTLY_KEY }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: >-
+          python3 scripts/release/package.py --channel nightly --directory dist
           --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY"
       - name: Record exact candidate identity and all asset digests
         env:
@@ -219,31 +350,35 @@ jobs:
           CANDIDATE_RUN: ${{ github.run_id }}
           CANDIDATE_ATTEMPT: ${{ github.run_attempt }}
           RELEASE_REPOSITORY: ${{ github.repository }}
+          CI_RUN: ${{ needs.ci-evidence.outputs.ci_run }}
         run: |
           digest=$(python3 scripts/release/candidate.py record --directory dist \
             --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" \
             --commit "$CANDIDATE_COMMIT" --run-id "$CANDIDATE_RUN" \
-            --run-attempt "$CANDIDATE_ATTEMPT")
+            --run-attempt "$CANDIDATE_ATTEMPT" --channel "$CHANNEL")
           # The log line is what `gh run view --log` finds; the summary is
           # for people reading the run page.
           echo "Qualification manifest SHA-256: $digest"
-          printf 'Candidate commit: `%s`\n\nRun: `%s`, attempt: `%s`\n\nQualification manifest SHA-256: `%s`\n' \
-            "$CANDIDATE_COMMIT" "$CANDIDATE_RUN" "$CANDIDATE_ATTEMPT" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$CI_RUN" ]; then source_ci="reused ci.yml run $CI_RUN"; else source_ci="ran in this build"; fi
+          echo "Source CI: $source_ci"
+          printf 'Channel: %s\n\nCandidate commit: `%s`\n\nRun: `%s`, attempt: `%s`\n\nSource CI: %s\n\nQualification manifest SHA-256: `%s`\n' \
+            "$CHANNEL" "$CANDIDATE_COMMIT" "$CANDIDATE_RUN" "$CANDIDATE_ATTEMPT" "$source_ci" "$digest" >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve the qualification manifest on its own
         # A few kilobytes that hash to the digest above, so qualification
         # can read it without the whole candidate. Staging and promotion
         # still download the full artefact and verify every byte.
         uses: actions/upload-artifact@v4
         with:
-          name: candidate-manifest-${{ github.sha }}-${{ github.run_attempt }}
+          name: ${{ env.ARTEFACT }}-manifest-${{ github.sha }}-${{ github.run_attempt }}
           path: dist/candidate.json
           if-no-files-found: error
           retention-days: 1
       - name: Preserve signed candidate without publishing a release
         uses: actions/upload-artifact@v4
         with:
-          name: candidate-${{ github.sha }}-${{ github.run_attempt }}
+          name: ${{ env.ARTEFACT }}-${{ github.sha }}-${{ github.run_attempt }}
           path: dist/*
           if-no-files-found: error
           compression-level: 0
-          retention-days: 90
+          # A nightly is staged the same day and superseded the next.
+          retention-days: ${{ env.CHANNEL == 'nightly' && 7 || 90 }}

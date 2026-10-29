@@ -135,6 +135,7 @@ impl JobBenchArgs {
         spec.chunk_size = if runtime == JobRuntime::Runc { 1 } else { 1000 };
         spec.per_node_concurrency = Some(self.concurrency);
         let template = JobSpec {
+            pids: None,
             runtime,
             image: (runtime != JobRuntime::Process).then(|| self.image.clone()),
             exec: (runtime == JobRuntime::Process)
@@ -163,6 +164,7 @@ impl JobBenchArgs {
             task_timeout_secs: None,
             overlap: None,
             replay_unknown: false,
+            provenance: None,
         };
         Ok(TaskManifestRequest {
             name: name.into(),
@@ -272,6 +274,143 @@ pub struct JobBenchReport {
     pub daily_projection: String,
     /// Always false: a fixed window is not a daily reliability qualification.
     pub qualified_100m_per_day: bool,
+    /// Successes per node inside the window, from what each node told the
+    /// leader at its last sync. Absent from the raw baseline, from a server
+    /// whose summary has no node views and from reports made before 0.2.3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_node: Option<NodeBreakdown>,
+}
+
+/// Most a node's share of the window's successes may exceed its fair share,
+/// as a percentage of that fair share: a third of the work on three equal
+/// nodes may grow to 40%, half on two to 60%.
+pub const NODE_SHARE_TOLERANCE_PERCENT: u32 = 20;
+
+/// How the window's successes split across the nodes that ran them.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NodeBreakdown {
+    /// See [`NODE_SHARE_TOLERANCE_PERCENT`].
+    pub tolerance_percent: u32,
+    /// Some work ran and no node took more than its fair share plus the
+    /// tolerance. A scale-out measurement with this false has failed.
+    pub balanced: bool,
+    /// One entry per node, by name.
+    pub nodes: Vec<NodeShare>,
+}
+
+/// One node's part of the window's successes.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NodeShare {
+    /// The node's name.
+    pub node: String,
+    /// Most slots the node offered the benchmark's arrays in the window.
+    pub slots: u32,
+    /// Successes the node reported inside the window.
+    pub successes: u64,
+    /// `successes` over the requested window.
+    pub successes_per_second: f64,
+    /// This node's percentage of every node's successes.
+    pub share_percent: f64,
+    /// Its percentage of the slots every node offered.
+    pub fair_share_percent: f64,
+    /// Its share exceeds the fair share by more than the tolerance.
+    pub over_fair_share: bool,
+    /// Its counter went backwards, so it restarted inside the window and
+    /// counting carried on from the new counter.
+    pub counters_restarted: bool,
+}
+
+/// Per-node success counters seen through the window, one per node and
+/// array, so that a node reporting on several arrays adds up.
+#[derive(Default)]
+struct NodeCounts {
+    previous: std::collections::HashMap<(u64, String), u64>,
+    successes: std::collections::BTreeMap<String, u64>,
+    slots: std::collections::BTreeMap<String, u32>,
+    restarted: std::collections::BTreeSet<String>,
+}
+impl NodeCounts {
+    /// Take each node's counters from an array summary, or from every
+    /// cohort of a manifest summary. A summary without node views adds
+    /// nothing; the breakdown is then absent, not an error.
+    fn observe(&mut self, summary: &Value) {
+        let arrays = match summary["cohorts"].as_array() {
+            Some(cohorts) => cohorts.iter().collect(),
+            None => vec![summary],
+        };
+        for array in arrays {
+            let Some(id) = array["batch_id"].as_u64() else {
+                continue;
+            };
+            for view in array["nodes"].as_array().into_iter().flatten() {
+                let (Some(node), Some(succeeded)) = (
+                    view["node"].as_str(),
+                    view["counters"]["succeeded"].as_u64(),
+                ) else {
+                    continue;
+                };
+                let slots = view["slots"]
+                    .as_u64()
+                    .map_or(0, |slots| u32::try_from(slots).unwrap_or(u32::MAX));
+                let entry = self.slots.entry(node.into()).or_default();
+                *entry = (*entry).max(slots);
+                let before = self
+                    .previous
+                    .insert((id, node.into()), succeeded)
+                    .unwrap_or(0);
+                let delta = if succeeded < before {
+                    self.restarted.insert(node.into());
+                    succeeded
+                } else {
+                    succeeded - before
+                };
+                *self.successes.entry(node.into()).or_default() += delta;
+            }
+        }
+    }
+
+    fn breakdown(&self, seconds: u32) -> Option<NodeBreakdown> {
+        if self.successes.is_empty() {
+            return None;
+        }
+        let total: u64 = self.successes.values().sum();
+        let total_slots: u64 = self.slots.values().map(|slots| u64::from(*slots)).sum();
+        let tolerance = u128::from(100 + NODE_SHARE_TOLERANCE_PERCENT);
+        let nodes: Vec<NodeShare> = self
+            .successes
+            .iter()
+            .map(|(node, successes)| {
+                let slots = self.slots.get(node).copied().unwrap_or(0);
+                NodeShare {
+                    node: node.clone(),
+                    slots,
+                    successes: *successes,
+                    successes_per_second: *successes as f64 / f64::from(seconds),
+                    share_percent: percent(*successes, total),
+                    fair_share_percent: percent(u64::from(slots), total_slots),
+                    // In whole numbers, so 40% of three equal nodes' work is
+                    // exactly at the limit rather than a rounding error over:
+                    // successes/total > slots/total_slots × (100 + tolerance)/100.
+                    over_fair_share: u128::from(*successes) * u128::from(total_slots) * 100
+                        > u128::from(slots) * u128::from(total) * tolerance,
+                    counters_restarted: self.restarted.contains(node),
+                }
+            })
+            .collect();
+        Some(NodeBreakdown {
+            tolerance_percent: NODE_SHARE_TOLERANCE_PERCENT,
+            balanced: total > 0 && nodes.iter().all(|node| !node.over_fair_share),
+            nodes,
+        })
+    }
+}
+
+fn percent(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        part as f64 / whole as f64 * 100.0
+    }
 }
 impl JobBenchReport {
     fn new(args: &JobBenchArgs) -> Self {
@@ -323,6 +462,7 @@ impl JobBenchReport {
             extrapolated_runs_per_day: 0.0,
             daily_projection: "extrapolation from this window; not an observed daily total".into(),
             qualified_100m_per_day: false,
+            per_node: None,
         }
     }
     fn count(&self) -> u64 {
@@ -545,6 +685,7 @@ async fn measure_public(
     let started = Instant::now();
     let deadline = started + Duration::from_secs(u64::from(args.seconds));
     let mut active: Option<AcceptedCounts> = None;
+    let mut nodes = NodeCounts::default();
     let mut next_progress = started;
     let mut unknown_submission = false;
     let measured:Result<(),RelishError>=async {
@@ -568,6 +709,7 @@ async fn measure_public(
             if !within_window(Instant::now(),deadline) {break;}
             report.last_accepted_sample_seconds=Some(started.elapsed().as_secs_f64());
             let delta=tracker.observe(&answer)?;
+            nodes.observe(&answer);
             report.unique_accepted_successes+=delta[0];report.terminal_failures+=delta[1];report.accepted_retries+=delta[2];
             if answer["done"].as_bool().is_none() {return Err(failure("summary omitted terminal status"));}
             if answer["done"]==true {
@@ -585,6 +727,7 @@ async fn measure_public(
         }
         Ok(())
     }.await;
+    report.per_node = nodes.breakdown(args.seconds);
     report.interrupted = cancel.is_cancelled();
     report.measurement_complete =
         measured.is_ok() && !report.interrupted && Instant::now() >= deadline;
@@ -654,7 +797,7 @@ async fn measure_raw(args: &JobBenchArgs, cancel: &CancellationToken) -> JobBenc
             return report;
         }
     };
-    report.executable_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+    report.executable_sha256 = Some(hex::encode(Sha256::digest(&bytes)));
     drop(bytes);
     report.started_at = crate::testkit::runner::now_rfc3339();
     let measured_start = Instant::now();
@@ -877,7 +1020,10 @@ pub async fn run(args: JobBenchArgs) -> Result<CommandOutcome, RelishError> {
         );
     }
     Ok(
-        if report.healthy() && !comparison.as_ref().is_some_and(JobBenchComparison::failed) {
+        if report.healthy()
+            && report.per_node.as_ref().is_none_or(|nodes| nodes.balanced)
+            && !comparison.as_ref().is_some_and(JobBenchComparison::failed)
+        {
             CommandOutcome::Clean
         } else {
             CommandOutcome::Problems
@@ -911,7 +1057,7 @@ fn render_comparison(comparison: &JobBenchComparison) -> String {
 
 fn render_human(args: &JobBenchArgs, report: &JobBenchReport) -> String {
     format!(
-        "{}: {} {} in {} seconds ({:.1}/s)\n{} failures, {} retries; cleanup {}\n{} runs/day extrapolated — not an observed daily total{}",
+        "{}: {} {} in {} seconds ({:.1}/s)\n{} failures, {} retries; cleanup {}\n{} runs/day extrapolated — not an observed daily total{}{}",
         args.scenario.name(),
         report.count(),
         if args.scenario == JobScenario::VmBaseline {
@@ -929,11 +1075,58 @@ fn render_human(args: &JobBenchArgs, report: &JobBenchReport) -> String {
             "UNVERIFIED"
         },
         human_count(report.extrapolated_runs_per_day),
+        if args.scenario == JobScenario::VmBaseline {
+            String::new()
+        } else {
+            render_nodes(report.per_node.as_ref())
+        },
         report
             .error
             .as_ref()
             .map_or(String::new(), |error| format!("\nfailed: {error}"))
     )
+}
+
+fn render_nodes(breakdown: Option<&NodeBreakdown>) -> String {
+    let Some(breakdown) = breakdown else {
+        return "\nper node: not recorded".into();
+    };
+    let width = breakdown
+        .nodes
+        .iter()
+        .map(|node| node.node.len())
+        .max()
+        .unwrap_or(0);
+    let mut out = format!(
+        "\nper node (successes each node reported; fair share by slots, +{}% allowed): {}",
+        breakdown.tolerance_percent,
+        if breakdown.balanced {
+            "balanced"
+        } else {
+            "UNBALANCED"
+        }
+    );
+    for node in &breakdown.nodes {
+        out.push_str(&format!(
+            "\n  {:width$}  {:>9.1}/s  {:>5.1}% of successes, fair {:>5.1}%, {} slots{}{}",
+            node.node,
+            node.successes_per_second,
+            node.share_percent,
+            node.fair_share_percent,
+            node.slots,
+            if node.over_fair_share {
+                "  OVER FAIR SHARE"
+            } else {
+                ""
+            },
+            if node.counters_restarted {
+                "  (restarted)"
+            } else {
+                ""
+            },
+        ));
+    }
+    out
 }
 fn human_count(value: f64) -> String {
     for (scale, suffix) in [(1e9, "B"), (1e6, "M"), (1e3, "k")] {
@@ -1154,7 +1347,7 @@ mod tests {
                     if status_error { return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE); }
                     let first=p.fetch_add(1,Ordering::SeqCst)==0;
                     if late && !first {tokio::time::sleep(Duration::from_millis(1500)).await;}
-                    Ok(Json(json!({"batch_id":7,"total":16000000,"succeeded":if first {1000}else{5000},"failed":0,"not_run":0,"retried":0,"done":false})))
+                    Ok(Json(json!({"batch_id":7,"kind":"array","total":16000000,"succeeded":if first {1000}else{5000},"failed":0,"not_run":0,"retried":0,"done":false,"nodes":[{"node":"node-1","slots":27,"counters":{"running":0,"attempts_started":1000,"succeeded":if first {1000}else{5000},"failed":0,"retried":0}}]})))
                 }
             }))
             .route("/v1/batch/{id}/cancel",post(move || {let c=post_c.clone();async move {
@@ -1173,6 +1366,8 @@ mod tests {
         let (client, cancels, server) = fixture(true, false, false).await;
         let report = measure_public(&args(), &client, &CancellationToken::new()).await;
         assert_eq!(report.unique_accepted_successes, 1000);
+        // The per-node breakdown uses the same cutoff as the total.
+        assert_eq!(report.per_node.as_ref().unwrap().nodes[0].successes, 1000);
         assert_eq!(cancels.load(Ordering::SeqCst), 1);
         assert!(report.measurement_complete);
         assert!(report.cleanup_verified);
@@ -1209,6 +1404,130 @@ mod tests {
         assert_eq!(cancels.load(Ordering::SeqCst), 1);
         assert!(!report.healthy());
         server.abort();
+    }
+
+    fn node(name: &str, slots: u32, succeeded: u64) -> Value {
+        json!({"node":name,"slots":slots,"counters":{"running":0,"attempts_started":succeeded,"succeeded":succeeded,"failed":0,"retried":0}})
+    }
+
+    fn manifest_summary(nodes: Vec<Value>) -> Value {
+        json!({"batch_id":7,"kind":"manifest","cohorts":[{"batch_id":8,"kind":"array","nodes":nodes}]})
+    }
+
+    #[test]
+    fn node_counts_split_window_successes_by_node() {
+        let mut counts = NodeCounts::default();
+        counts.observe(&manifest_summary(vec![
+            node("node-1", 27, 1000),
+            node("node-2", 27, 0),
+        ]));
+        counts.observe(&manifest_summary(vec![
+            node("node-1", 27, 5000),
+            node("node-2", 0, 4000),
+        ]));
+        let breakdown = counts.breakdown(60).unwrap();
+        let nodes: Vec<_> = breakdown
+            .nodes
+            .iter()
+            .map(|n| (n.node.as_str(), n.slots, n.successes, n.counters_restarted))
+            .collect();
+        // A transient zero-slot sample doesn't erase what the node offered.
+        assert_eq!(
+            nodes,
+            vec![("node-1", 27, 5000, false), ("node-2", 27, 4000, false)]
+        );
+        assert_eq!(breakdown.nodes[0].fair_share_percent, 50.0);
+        assert!((breakdown.nodes[0].share_percent - 5000.0 / 9000.0 * 100.0).abs() < 1e-9);
+        assert!((breakdown.nodes[1].successes_per_second - 4000.0 / 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_restarted_node_counts_from_its_new_counter_and_is_flagged() {
+        let mut counts = NodeCounts::default();
+        counts.observe(&manifest_summary(vec![node("node-1", 27, 5000)]));
+        counts.observe(&manifest_summary(vec![node("node-1", 27, 300)]));
+        let breakdown = counts.breakdown(60).unwrap();
+        assert_eq!(breakdown.nodes[0].successes, 5300);
+        assert!(breakdown.nodes[0].counters_restarted);
+    }
+
+    #[test]
+    fn a_summary_without_node_views_leaves_the_breakdown_absent() {
+        let mut counts = NodeCounts::default();
+        counts.observe(&json!({"batch_id":7,"succeeded":1000}));
+        assert!(counts.breakdown(60).is_none());
+        // An array summary carries its nodes at the top level.
+        counts.observe(&json!({"batch_id":7,"kind":"array","nodes":[node("node-1", 27, 10)]}));
+        assert_eq!(counts.breakdown(60).unwrap().nodes[0].successes, 10);
+    }
+
+    #[test]
+    fn breakdown_flags_a_node_over_its_fair_share() {
+        let shares = |successes: [u64; 3]| {
+            let mut counts = NodeCounts::default();
+            counts.observe(&manifest_summary(
+                successes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| node(&format!("node-{}", i + 1), 27, *s))
+                    .collect(),
+            ));
+            counts.breakdown(60).unwrap()
+        };
+        // 40% is the most a third may take at the documented 20% tolerance.
+        assert!(shares([4000, 3000, 3000]).balanced);
+        assert!(!shares([4100, 2950, 2950]).balanced);
+        assert!(!shares([0, 0, 0]).balanced, "no work is no evidence");
+        let mut single = NodeCounts::default();
+        single.observe(&manifest_summary(vec![node("node-1", 27, 450_000)]));
+        assert!(single.breakdown(60).unwrap().balanced);
+    }
+
+    #[test]
+    fn an_older_report_without_a_breakdown_still_compares() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/qualification/2026-10-09-timed-job-scenarios/five-round-rerun/review-fixes/r1-jobs-shared-containers.json"
+        );
+        let baseline: JobBenchReport =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(baseline.per_node.is_none());
+        let mut current = measured(JobScenario::SharedContainers, 120_000);
+        let mut counts = NodeCounts::default();
+        counts.observe(&manifest_summary(vec![node("node-1", 27, 120_000)]));
+        current.per_node = counts.breakdown(60);
+        let comparison = compare_reports(&baseline, &current, 10.0).unwrap();
+        assert!(!comparison.informational, "{comparison:?}");
+        let options = JobBenchArgs {
+            seconds: 60,
+            ..args()
+        };
+        assert!(render_human(&options, &baseline).contains("per node: not recorded"));
+    }
+
+    #[test]
+    fn human_report_shows_each_nodes_rate_and_share() {
+        let options = JobBenchArgs {
+            scenario: JobScenario::HostProcesses,
+            seconds: 60,
+            ..args()
+        };
+        let mut report = measured(JobScenario::HostProcesses, 1_350_000);
+        let mut counts = NodeCounts::default();
+        counts.observe(&manifest_summary(vec![
+            node("node-1", 27, 460_000),
+            node("node-2", 27, 450_000),
+            node("node-3", 27, 440_000),
+        ]));
+        report.per_node = counts.breakdown(60);
+        insta::assert_snapshot!(render_human(&options, &report));
+        let mut lopsided = NodeCounts::default();
+        lopsided.observe(&manifest_summary(vec![
+            node("node-1", 27, 900_000),
+            node("node-2", 27, 450_000),
+        ]));
+        report.per_node = lopsided.breakdown(60);
+        assert!(render_human(&options, &report).contains("OVER FAIR SHARE"));
     }
 
     #[cfg(target_os = "linux")]

@@ -2,10 +2,13 @@
 import copy
 import importlib
 from pathlib import Path
+import re
 import tempfile
 import unittest
 
 import contracts as c
+
+REPO = Path(__file__).resolve().parents[2]
 
 
 # This independent source fixture preserves existing Make argument spelling.
@@ -107,10 +110,31 @@ class WorkflowAssembly(unittest.TestCase):
         plan = self.w.selected_workflow(self.expected, code='true', heavy='false', macos='true')
         self.assertEqual(plan['commit'], self.expected['commit'])
 
-    def test_cluster_suffix_keeps_trailing_filter_space_and_archive_options(self):
+    def test_cluster_suffix_keeps_trailing_filter_space_and_reuses_the_extracted_build(self):
         selectors, environment = self.w.make_selection(self.root, 'test-cluster', archived=True)
-        self.assertEqual(selectors, ['--archive-file', 'tests.tar.zst', '--extract-to', '.', '--extract-overwrite', '--workspace-remap', '.', '--profile', 'ci', '--run-ignored=only', '-E', 'binary(cluster_failover) | binary(cluster_gossip) '])
+        self.assertEqual(selectors, ['--binaries-metadata', 'target/nextest/binaries-metadata.json',
+                                     '--cargo-metadata', 'target/nextest/cargo-metadata.json',
+                                     '--target-dir-remap', 'target', '--workspace-remap', '.',
+                                     '--profile', 'ci', '--run-ignored=only', '-E',
+                                     'binary(cluster_failover) | binary(cluster_gossip) '])
         self.assertEqual(environment, {'RELIABURGER_CLUSTER_TESTS': '1'})
+
+    def test_an_archived_owner_never_opens_the_archive_itself(self):
+        # The job extracts once; an owner that named the archive would
+        # extract it again for both its discovery and its run (#1050).
+        selectors, _ = self.w.make_selection(self.root, 'test-cluster', archived=True)
+        for option in ('--archive-file', '--extract-to', '--extract-overwrite'):
+            self.assertFalse(any(word == option or word.startswith(option + '=') for word in selectors), option)
+        self.assertEqual(self.w.ARCHIVE_METADATA, ('target/nextest/binaries-metadata.json',
+                                                   'target/nextest/cargo-metadata.json'))
+
+    def test_the_job_extracts_the_archive_once_by_listing_only_its_binaries(self):
+        # Listing binaries only extracts without running every test binary
+        # to enumerate its tests; the owners list their own selections later.
+        self.assertEqual(self.w.extraction_command('/runner/bin/cargo-nextest'), [
+            '/runner/bin/cargo-nextest', 'nextest', 'list', '--archive-file', 'tests.tar.zst',
+            '--extract-to', '.', '--extract-overwrite', '--workspace-remap', '.',
+            '--list-type', 'binaries-only', '--message-format', 'json'])
 
     def test_linux_preserves_ebpf_exclusion_and_image_environment(self):
         selectors, environment = self.w.make_selection(self.root, 'test-linux')
@@ -162,7 +186,8 @@ class WorkflowAssembly(unittest.TestCase):
             self.w.job_results(plan, needs)
 
     def test_genuine_archive_builder_command_is_not_downloaded_metadata(self):
-        self.assertEqual(self.w.ARCHIVE_COMMAND, ['cargo', 'nextest', 'archive', '--locked', '--archive-file', 'tests.tar.zst'])
+        self.assertEqual(self.w.ARCHIVE_COMMAND[:6], ['cargo', 'nextest', 'archive', '--locked', '--archive-file', 'tests.tar.zst'])
+        self.assertEqual(self.w.ARCHIVE_COMMAND[6:], [word for name in self.w.ARCHIVED_BINARIES for word in ('--test', name)])
         self.assertEqual(self.w.OCI_BUILD_COMMAND, ['cargo', 'test', '--features', 'ebpf', '--test', 'owned_runc', '--test', 'owned_network', '--test', 'oci_crash', '--no-run', '--message-format=json'])
 
     def test_original_owner_commands_are_not_late_keep_metadata(self):
@@ -192,3 +217,84 @@ class WorkflowAssembly(unittest.TestCase):
                     'contracts': [{'cases': [{'requires': ['cluster-tests'], 'sources': ['tests/cluster_failover.rs']}]}]}
         with self.assertRaises(c.Invalid):
             self.w.entry_from_make(self.root, manifest, 'cluster-tests', 'linux')
+
+    def archived_inputs(self):
+        self.root.joinpath('.config').mkdir(exist_ok=True)
+        self.root.joinpath('.config/nextest.toml').write_text('synthetic expected config')
+        manifest = {'gates': {'cluster-tests': {'command': ['make', 'test-cluster'], 'hosts': ['linux']}},
+                    'contracts': [{'cases': [{'requires': ['cluster-tests'], 'sources': ['tests/cluster_failover.rs']}]}]}
+        builder = dict(schema_version=1, commit='a' * 40, run_id='123', attempt='2', host='linux',
+                       command=self.w.ARCHIVE_COMMAND, exit_code=0, archive_sha256='1' * 64)
+        origin = dict(path='archive-origin.json', sha256='2' * 64, builder=builder)
+        extraction = dict(schema_version=1, context=dict(commit='a' * 40, run_id='123', attempt='2', host='linux'),
+                          archive_sha256='1' * 64, archive_origin_sha256='2' * 64,
+                          command=self.w.extraction_command('/runner/bin/cargo-nextest'), exit_code=0,
+                          metadata={'target/nextest/binaries-metadata.json': '3' * 64,
+                                    'target/nextest/cargo-metadata.json': '4' * 64})
+        return manifest, origin, extraction
+
+    def test_an_archived_owner_runs_the_metadata_its_job_extracted(self):
+        manifest, origin, extraction = self.archived_inputs()
+        entry = self.w.entry_from_make(self.root, manifest, 'cluster-tests', 'linux',
+                                       archive_origin=origin, archive_extraction=extraction)
+        self.assertEqual(entry['archive_extraction'], extraction)
+        self.assertEqual(entry['selectors'][:len(self.w.ARCHIVED_SELECTORS)], self.w.ARCHIVED_SELECTORS)
+        # The owner checks these before discovery: the metadata it runs is
+        # the metadata extracted from the builder's archive.
+        self.assertEqual(entry['inputs']['target/nextest/binaries-metadata.json'], '3' * 64)
+        self.assertEqual(entry['inputs']['target/nextest/cargo-metadata.json'], '4' * 64)
+        # The archive itself was hashed once, by the extraction, not per owner.
+        self.assertNotIn('tests.tar.zst', entry['inputs'])
+
+    def test_an_archived_owner_needs_an_extraction_of_its_builders_archive(self):
+        manifest, origin, extraction = self.archived_inputs()
+        with self.assertRaises(c.Invalid):
+            self.w.entry_from_make(self.root, manifest, 'cluster-tests', 'linux', archive_origin=origin)
+        with self.assertRaises(c.Invalid):
+            self.w.entry_from_make(self.root, manifest, 'cluster-tests', 'linux', archive_extraction=extraction)
+        other = dict(extraction, archive_sha256='9' * 64)
+        with self.assertRaises(c.Invalid):
+            self.w.entry_from_make(self.root, manifest, 'cluster-tests', 'linux',
+                                   archive_origin=origin, archive_extraction=other)
+
+
+class ArchivedBinaries(unittest.TestCase):
+    """The archive holds only the test binaries its owners run (#977).
+
+    It used to hold all 47 binaries, 3.0 GB, for owners that run 12 of them,
+    and its download often ran past its 5-minute limit. Each binary name in
+    an archived owner's make filter must be archived, and nothing else.
+    """
+
+    def setUp(self):
+        self.w = importlib.import_module('workflow_assembly')
+
+    @staticmethod
+    def binaries(selectors):
+        expression = selectors[selectors.index('-E') + 1]
+        return set(re.findall(r'binary\(([a-z0-9_]+)\)', expression))
+
+    def filtered(self, gate):
+        selectors, _ = self.w.make_selection(REPO, self.w.OWNERS[gate][1], archived=True)
+        return self.binaries(selectors)
+
+    def test_the_archive_holds_exactly_the_binaries_its_owners_run(self):
+        wanted = set()
+        for gate in self.w.ARCHIVED_GATES:
+            with self.subTest(gate=gate):
+                names = self.filtered(gate)
+                self.assertTrue(names, 'an archived owner must select its binaries by name')
+                wanted |= names
+        self.assertEqual(set(self.w.ARCHIVED_BINARIES), wanted)
+        self.assertEqual(len(self.w.ARCHIVED_BINARIES), len(set(self.w.ARCHIVED_BINARIES)))
+
+    def test_each_archived_binary_is_an_integration_test_target(self):
+        for name in self.w.ARCHIVED_BINARIES:
+            with self.subTest(binary=name):
+                self.assertTrue((REPO / 'tests' / f'{name}.rs').is_file()
+                                or (REPO / 'tests' / name / 'main.rs').is_file())
+
+    def test_a_binary_an_owner_runs_but_the_archive_lacks_is_detected(self):
+        selectors = ['--profile', 'ci', '-E', "binary(cluster_failover) | binary(brand_new)"]
+        self.assertNotIn('brand_new', self.w.ARCHIVED_BINARIES)
+        self.assertIn('brand_new', self.binaries(selectors))

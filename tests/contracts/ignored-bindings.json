@@ -90,6 +90,12 @@
     "test": "grill::runc::tests::runc_init_container_runs_its_own_image_with_app_env"
   },
   {
+    "source": "src/grill/runc.rs",
+    "function": "runc_sidecar_reaches_its_app_on_localhost",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_sidecar_reaches_its_app_on_localhost"
+  },
+  {
     "source": "src/grill/snapshot.rs",
     "function": "btrfs_snapshot_restore_recovers_corrupted_data",
     "binary": "reliaburger",
@@ -247,6 +253,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "one_replica_rollout_keeps_a_healthy_backend_on_every_node",
+    "binary": "reliaburger::cluster_failover",
+    "test": "one_replica_rollout_keeps_a_healthy_backend_on_every_node"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "lease_retirement_waits_for_paused_worker_across_leader_change",
     "binary": "reliaburger::cluster_failover",
     "test": "lease_retirement_waits_for_paused_worker_across_leader_change"
@@ -256,6 +268,36 @@
     "function": "decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change",
     "binary": "reliaburger::cluster_failover",
     "test": "decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "a_leader_killed_during_an_apply_under_policy_leaves_the_policy_enforced",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_leader_killed_during_an_apply_under_policy_leaves_the_policy_enforced"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "the_platform_policies_hold_through_apply_gitops_and_a_leader_kill",
+    "binary": "reliaburger::cluster_failover",
+    "test": "the_platform_policies_hold_through_apply_gitops_and_a_leader_kill"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "a_lease_history_through_a_leader_kill_is_linearizable",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_lease_history_through_a_leader_kill_is_linearizable"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "an_admin_removes_a_policy_that_denies_everything_through_any_node",
+    "binary": "reliaburger::cluster_failover",
+    "test": "an_admin_removes_a_policy_that_denies_everything_through_any_node"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "a_controller_fails_a_templated_database_pair_over_when_its_node_dies",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_controller_fails_a_templated_database_pair_over_when_its_node_dies"
   },
   {
     "source": "tests/cluster_gossip.rs",
@@ -1254,6 +1296,18 @@
     "test": "runc_warm_pinned_executor_cold_starts_make_no_registry_requests"
   },
   {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_cancelling_an_array_interrupts_a_slow_cold_pull",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_cancelling_an_array_interrupts_a_slow_cold_pull"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_a_deadline_interrupts_a_slow_cold_pull",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_a_deadline_interrupts_a_slow_cold_pull"
+  },
+  {
     "source": "tests/placement.rs",
     "function": "apply_on_any_node_places_across_the_cluster",
     "binary": "reliaburger::placement",
@@ -1495,12 +1549,6 @@
   },
   {
     "source": "tests/self_upgrade_cluster.rs",
-    "function": "upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader",
-    "binary": "reliaburger::self_upgrade_cluster",
-    "test": "upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader"
-  },
-  {
-    "source": "tests/self_upgrade_cluster.rs",
     "function": "start_refuses_same_version_other_bytes_and_unrequested_downgrades",
     "binary": "reliaburger::self_upgrade_cluster",
     "test": "start_refuses_same_version_other_bytes_and_unrequested_downgrades"
@@ -1681,6 +1729,12 @@
   },
   {
     "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
     "function": "cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
     "binary": "reliaburger::owned_task_arrays",
     "test": "cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart"
@@ -1738,6 +1792,12 @@
     "function": "cgroup_host_executor_adds_no_drain_wait_to_quiet_commands",
     "binary": "reliaburger::owned_task_arrays",
     "test": "cgroup_host_executor_adds_no_drain_wait_to_quiet_commands"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_executor_spawns_without_copy_on_write_faults",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_executor_spawns_without_copy_on_write_faults"
   },
   {
     "source": "src/bun/supervisor.rs",
@@ -1816,5 +1876,41 @@
     "function": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
     "binary": "reliaburger::placement",
     "test": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace"
+  },
+  {
+    "source": "tests/cluster_task_arrays.rs",
+    "function": "killing_attempts_mid_array_still_completes_every_task",
+    "binary": "reliaburger::cluster_task_arrays",
+    "test": "killing_attempts_mid_array_still_completes_every_task"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_array_attempt_can_be_paused_and_resumed",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_array_attempt_can_be_paused_and_resumed"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "partition_from_an_array_attempt_blocks_its_cgroup",
+    "binary": "reliaburger::ebpf",
+    "test": "partition_from_an_array_attempt_blocks_its_cgroup"
+  },
+  {
+    "source": "tests/demos.rs",
+    "function": "rollout_demo_rolls_back_a_bad_version_and_marks_it_failed",
+    "binary": "reliaburger::demos",
+    "test": "rollout_demo_rolls_back_a_bad_version_and_marks_it_failed"
+  },
+  {
+    "source": "tests/demos.rs",
+    "function": "rollout_demo_on_a_plaintext_cluster_marks_a_bad_version_failed_and_stops_retrying",
+    "binary": "reliaburger::demos",
+    "test": "rollout_demo_on_a_plaintext_cluster_marks_a_bad_version_failed_and_stops_retrying"
+  },
+  {
+    "source": "tests/demos.rs",
+    "function": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone",
+    "binary": "reliaburger::demos",
+    "test": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone"
   }
 ]

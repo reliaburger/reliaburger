@@ -72,14 +72,23 @@ cluster's real state where the tour says to wait. `tests/suite/website.rs`
 runs `tour.sh --check`, which fails if the page gains a command the script
 doesn't know how to run.
 
+Once the cluster is up, the script samples every node VM every five seconds
+through `limactl shell` (`scripts/demo/resources.py`): Bun's memory and CPU,
+the whole guest's, and the guest's network traffic. Each wait ends with a
+one-line readout of the latest sample, so the recording shows the cluster's
+footprint at the moment it describes, whatever idle time the player trims, and
+the tour ends with each measure's average and peak. Set `DEMO_RESOURCES_OUT`
+to keep the samples as CSV with SVG charts in the soak charts' style, or
+`DEMO_RESOURCES=0` to leave the measuring out.
+
 Every promoted release re-records the tour against its published install
-([releasing step 9](../releasing.md#staging-a-candidate)). With no other
+([releasing step 10](../releasing.md#staging-a-candidate)). With no other
 quickstart cluster on the default ports, and a throwaway `RELIABURGER_HOME`
 so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.2.0
+  --record docs/website/assets/tour.cast --install v0.2.3
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -104,15 +113,16 @@ seconds) and then plays the setup step four times faster, because setup redraws
 its timers several times a second and idle trimming can't shorten it. The
 narration says both, and every wait prints how long it really took. It applies
 the demo URL when it answers, and `examples/kubernetes/podinfo.yaml` (with a
-note) when it doesn't; likewise it copies `examples/demo/burger` when the
-tarball isn't published yet. The build step runs in a scratch directory, so
+note) when it doesn't; likewise it copies `examples/demo/burger` unless the
+published tarball holds exactly that directory. Until a promotion's site
+change deploys, the live tarball is the previous release's, so a re-record
+always shows the repository copy, and says so on screen. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.2.0 --api-port 29117 --ingress-port 28080 --registry-port 25050`,
-beside a laptop cluster on the default ports.
+`--install v0.2.3` on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
 `--record` writes the installed version into the cast's title (`Reliaburger
-0.2.0: the five-minute tour`), and the caption under the player names it too.
+0.2.3: the five-minute tour`), and the caption under the player names it too.
 `tests/suite/website.rs` checks that both match `install.sh`'s default, so a
 promotion that forgets the re-record fails CI.
 
@@ -130,11 +140,11 @@ command-line definition, and does the same for the manual's copy of the tour
 (`docs/manual/08_five-minute-tour.md`), so edit both together.
 `scripts/ci/select-jobs.sh` treats this page as code for that reason.
 
-The tour applies `https://reliaburger.com/demo/podinfo.yaml` and builds from
-`https://reliaburger.com/demo/burger.tar.gz`. Neither is committed here: the
-Pages workflow copies `examples/kubernetes/podinfo.yaml` into `demo/` and packs
-`examples/demo/burger` as `demo/burger.tar.gz` at deploy time, both taken from
-the tag `install.sh` installs. Someone running the tour has that release, and
+The tour builds from `https://reliaburger.com/demo/burger.tar.gz`, and the
+manual's Kubernetes chapter applies `https://reliaburger.com/demo/podinfo.yaml`.
+Neither is committed here: the Pages workflow packs `examples/demo/burger` as
+`demo/burger.tar.gz` and copies `examples/kubernetes/podinfo.yaml` into `demo/`
+at deploy time, both taken from the tag `install.sh` installs. Someone running the tour has that release, and
 `main`'s demo may need features it doesn't have yet. To preview them locally, make them the same way
 (`demo/` is ignored by version control).
 
@@ -169,7 +179,7 @@ scheme, so the charts stay light here too. At 720 px they're wider than a
 phone and shrink with the column.
 
 At a promotion, replace them with the new release's
-([releasing step 9](../releasing.md#staging-a-candidate)):
+([releasing step 10](../releasing.md#staging-a-candidate)):
 
 ```sh
 rm -r docs/website/assets/soak
@@ -178,10 +188,16 @@ cp -R docs/qualification/<app soak record>-charts docs/qualification/<job soak r
   docs/website/assets/soak/
 ```
 
-then point the `<img>` and record links at them. `tests/suite/website.rs`
+then point the `<img>` and record links at them. From 0.2.1 the gate's only
+final soak is the 8-hour job soak ([#991](https://github.com/reliaburger/reliaburger/issues/991)),
+so the app soak's charts come from the V02 fast tier, and the section says so.
+The page shows an app soak's memory, fds and CPU but not its job rate, so
+delete the `jobs.svg` an app soak record also draws. `tests/suite/website.rs`
 fails while a chart differs from its record's copy, comes from another
 release, lacks alt text, a size or lazy loading, or sits in `assets/soak/`
 without being shown, and while the section misses any of the seven charts.
+A release with a headline record of its own can show its charts too: 0.2.3
+adds the day run's job rate and memory, copied the same way.
 
 ### Commands the installed release doesn't have
 
@@ -193,7 +209,7 @@ written from the published binary's own help by
 `tests/suite/website.rs` checks every `relish …` command on this page, in the
 README and in the tour chapter against it. The tour may only use released
 commands. Anything else has to say which release adds it, in the words
-"0.3.0, not in 0.2.0" (the build's version, then the installer's), in the
+"0.3.0, not in 0.2.2" (the build's version, then the installer's), in the
 same paragraph, `<details>` or section. The README's generated command list
 labels such commands itself. When the installer's default changes, regenerate
 the snapshot; the test refuses a snapshot for another version.
@@ -208,8 +224,35 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.2.0` unless `RELIABURGER_VERSION` names another release; bump
-that default when you promote a newer one. If the requested release isn't
+It installs `v0.2.3` unless `RELIABURGER_VERSION` names another release; bump
+that default when you promote a newer one. Every line the site shows names a
+mode (`sh -s -- --laptop`): with no arguments both scripts only explain the
+choices and exit 2, and the bootstrap does it before downloading anything.
+Asked for a release from before 0.2.2, which doesn't know `--laptop`, the
+bootstrap drops the flag, so the site's line works while the default still
+names an older release. If the requested release isn't
 published, it fails with a message saying so. The generated installer itself
 lives in the GitHub release, with native CLI checksums supplied by release
 packaging.
+
+### Comparison pages
+
+`compare/index.html` links six practical comparisons; `compare/methodology.html`
+explains the evidence and version boundaries. Public pages foreground Reliaburger’s
+strengths and honest trade-offs. Adaptation recommendations belong in the separate
+[Markdown research writeup](../research/2026-10-15-competitor-review.md).
+Each public page is hand-maintained static HTML,
+using `style.css` and the small `comparisons.css` extension. There is no generated
+copy or build dependency. The homepage links them under the stable `compare` id.
+
+Keep evidence adjacent to factual claims. Pin source-code links to the inspected
+commit or tag; date moving documentation. Distinguish the public installer release,
+the reviewed train implementation and planned features. Learning-curve judgements
+are qualitative, and source inspection is not a benchmark or security certification.
+When refreshing a comparison, review commands, installation assumptions and both
+application and platform upgrade procedures. Preserve section anchors.
+
+Serve the directory with the preview command above and open `/compare/` or
+`/compare/methodology.html`. Check all local links and fragments, desktop and narrow
+layouts, and the command examples with the current CLI's `RELISH_PARSE_ONLY=1`.
+The comparison pages use only `assets/copy.js`; they don't load the tour player.

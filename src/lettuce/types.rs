@@ -249,6 +249,8 @@ pub struct GitOpsOwnership {
     pub namespaces: BTreeSet<String>,
     /// Permissions GitOps wrote, by name.
     pub permissions: BTreeSet<String>,
+    /// Policies GitOps wrote, by name (#1117).
+    pub policies: BTreeSet<String>,
 }
 
 impl GitOpsOwnership {
@@ -266,13 +268,22 @@ impl GitOpsOwnership {
             .keys()
             .filter(|name| self.permissions.contains(*name))
             .map(|name| format!("permission '{name}'"));
+        let policies = config
+            .policy
+            .keys()
+            .filter(|name| self.policies.contains(*name))
+            .map(|name| format!("policy '{name}'"));
         let apps = config.app.iter().filter_map(|(name, spec)| {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
             self.apps
                 .contains(&AppId::new(name, namespace))
                 .then(|| app_label(name, namespace))
         });
-        namespaces.chain(permissions).chain(apps).collect()
+        namespaces
+            .chain(permissions)
+            .chain(policies)
+            .chain(apps)
+            .collect()
     }
 }
 
@@ -410,7 +421,11 @@ pub fn plaintext_secret_warnings(config: &crate::config::Config) -> Vec<String> 
     for (name, spec) in &config.app {
         let namespace = spec.namespace.as_deref().unwrap_or("default");
         for (key, value) in &spec.env {
-            if is_secret_looking_key(key) && !value.is_encrypted() && !value.as_str().is_empty() {
+            if is_secret_looking_key(key)
+                && !value.is_encrypted()
+                && !value.is_provider()
+                && !value.as_str().is_empty()
+            {
                 warnings.push(format!(
                     "app {namespace}/{name}: env {key} looks like a secret but is plaintext \
                      in git; encrypt it with `relish secret encrypt` (ENC[AGE:...])"

@@ -48,6 +48,7 @@ async fn start_with_a_seed(
             job_capabilities_rx: None,
             readiness: None,
             recovery_probe_window: None,
+            council_size_cap: None,
         },
         cancel.clone(),
     )

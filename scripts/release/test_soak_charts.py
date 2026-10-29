@@ -186,6 +186,30 @@ class Draw(Evidence):
         self.assertEqual(written, [])
 
 
+class ShortRuns(unittest.TestCase):
+    """The demos (#671) draw minutes, not hours, with their steps as marks."""
+
+    LINE = [("bun", 1, [(0, 40.0), (90, 42.0), (180, 41.0)])]
+
+    def test_a_run_of_a_few_minutes_labels_its_time_axis_in_seconds(self):
+        svg = charts.draw("Bun memory", "MiB", self.LINE, 180, [], key=())
+        self.assertIn(">60 s</text>", svg)
+        self.assertNotIn(" min</text>", svg)
+
+    def test_a_soak_keeps_its_minute_and_hour_axis(self):
+        self.assertEqual(charts.time_step(3600), 300)
+        self.assertEqual(charts.time_step(8 * 3600), 3600)
+
+    def test_a_chart_marks_demo_steps_under_its_own_key(self):
+        svg = charts.draw("Bun memory", "MiB", self.LINE, 180, [(30, "step", "Deploy v1")],
+                          key=(("step", "demo step"),))
+        self.assertIn('class="mark step"', svg)
+        self.assertIn("<title>step: Deploy v1 at 30 s</title>", svg)
+        self.assertIn(">demo step</text>", svg)
+        self.assertNotIn(">upgrade walk</text>", svg)
+        ET.fromstring(svg)
+
+
 class Record(Evidence):
     def test_render_writes_charts_beside_the_record_and_links_them(self):
         self.full_run()

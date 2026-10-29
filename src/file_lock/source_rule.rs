@@ -132,6 +132,20 @@ fn violations(source: &str) -> Vec<Violation> {
     visitor.violations
 }
 
+/// Whether `source` names anything the parser flags. Every flagged name and
+/// method is spelt out in the source, so a file naming none of them can't
+/// take a lock, and the rule needn't parse it. Parsing all of `src/` took
+/// about 5 s of CPU in a debug build, and over 30 s of wall clock on a
+/// loaded machine, against nextest's 60 s limit (#1140); this check leaves
+/// a few dozen files to parse.
+fn may_take_a_lock(source: &str) -> bool {
+    LOCK_NAMES
+        .iter()
+        .chain(LOCK_METHODS)
+        .chain(&["try_lock"])
+        .any(|name| source.contains(name))
+}
+
 fn rust_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(directory).unwrap() {
         let path = entry.unwrap().path();
@@ -156,6 +170,9 @@ fn every_file_lock_in_src_goes_through_the_guard() {
             continue;
         }
         let source = std::fs::read_to_string(&path).unwrap();
+        if !may_take_a_lock(&source) {
+            continue;
+        }
         for violation in violations(&source) {
             found.push(format!(
                 "{}:{}: {}",
@@ -233,4 +250,28 @@ fn locks_inside_macro_bodies_are_flagged() {
 #[test]
 fn a_mutex_field_try_lock_is_allowed() {
     assert!(violations("fn f(&self) { let _ = self.rx.try_lock(); }").is_empty());
+}
+
+#[test]
+fn a_source_naming_no_file_lock_is_cleared_without_parsing() {
+    assert!(!may_take_a_lock(
+        "fn f(&self) -> Result<(), Error> { let state = self.state.lock(); Ok(()) }"
+    ));
+}
+
+#[test]
+fn every_lock_the_parser_flags_keeps_its_source_for_parsing() {
+    for name in LOCK_NAMES.iter().chain(LOCK_METHODS) {
+        for source in [
+            format!("fn f() {{ let _ = {name}; }}"),
+            format!("fn f(file: File) {{ let _ = file.{name}(); }}"),
+        ] {
+            if !violations(&source).is_empty() {
+                assert!(may_take_a_lock(&source), "{source}");
+            }
+        }
+    }
+    let local_try_lock = "fn f(file: File) { file.try_lock(); }";
+    assert!(!violations(local_try_lock).is_empty());
+    assert!(may_take_a_lock(local_try_lock));
 }

@@ -426,6 +426,7 @@ async fn rootless_caller_death_recovers_without_an_adoption_record() {
             )
             .await
             .unwrap()
+            .output
             .trim(),
         "recovered"
     );

@@ -224,9 +224,9 @@ pub enum RaftRequest {
     RevokeCertificate(crate::sesame::types::CrlEntry),
     /// No-op entry (used for leader commit on election).
     Noop,
-    // NOTE: the log is bincode-encoded (variant index on the wire), so new
-    // variants are APPENDED here — never inserted or reordered — or every
-    // existing log entry decodes as the wrong variant.
+    // NOTE: the log and the Raft RPC are JSON, which tags each variant by its
+    // name, so renaming a variant changes the format and reordering doesn't.
+    // New variants still go at the end, which keeps the history readable.
     /// Start or advance a cluster-wide rolling binary upgrade (Phase 14).
     UpgradeUpdate {
         state: Box<crate::upgrade::types::ClusterUpgradeState>,
@@ -476,7 +476,7 @@ pub enum RaftRequest {
     },
     /// A desired-state write Lettuce makes for the repository (#693).
     ///
-    /// `change` is an app, namespace or permission spec or delete. It
+    /// `change` is an app, namespace, permission or policy spec or delete. It
     /// applies, and the GitOps ownership set records (or forgets) the
     /// resource, in this one entry. `term` is the Raft term the sync read
     /// its snapshot in; an entry proposed in any other term is refused, so
@@ -512,6 +512,42 @@ pub enum RaftRequest {
     /// record it as the newest rollback target. Refused unless `spec` is
     /// still the app's current spec.
     RolloutReleased { app_id: AppId, spec: Box<AppSpec> },
+    /// Register or replace a named policy (#1117). Every applied entry moves
+    /// `DesiredState::policy_generation` by one. The leader checked the
+    /// policy before proposing it; the state machine only stores it.
+    PolicySpec {
+        name: String,
+        spec: Box<crate::config::PolicySpec>,
+    },
+    /// Remove a named policy. Refused when there's no such policy, so every
+    /// applied entry moves `DesiredState::policy_generation` by one.
+    PolicyDelete { name: String },
+    /// An app write the leader evaluated against the policy set at
+    /// `generation` (#1117). The state machine applies `change` only while
+    /// its own `policy_generation` is still `generation`, and otherwise
+    /// answers `CouncilResponse::PolicyGenerationMoved`, so the leader
+    /// evaluates again. It compares two numbers and never runs a policy.
+    ///
+    /// `change` is an `AppSpec`, a `TestLeaseAppSpec`, or a `GitOpsWrite`
+    /// carrying an `AppSpec`.
+    ///
+    /// `declared` is the app's spec as written, when the stored spec differs
+    /// from it (#1118): a policy default filled fields in, or an image was
+    /// bound to a digest. `change` carries the stored spec, and the
+    /// state machine keeps this one beside it in
+    /// `DesiredState::declared_apps`, so GitOps diffs git against what git
+    /// said. `None` clears any declared spec the app had.
+    PolicyFenced {
+        generation: u64,
+        change: Box<RaftRequest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        declared: Option<Box<AppSpec>>,
+    },
+    /// Clear an app's `owner`, handing it back to `relish apply` and GitOps
+    /// (#1125). The API checked that the caller is the owner or an admin;
+    /// the state machine refuses a release of an app that isn't there or
+    /// has no owner.
+    AppRelease { app_id: AppId },
 }
 
 // ---------------------------------------------------------------------------
@@ -536,8 +572,8 @@ pub enum CouncilResponse {
     GcApproved {
         approved: Vec<crate::pickle::types::Digest>,
     },
-    // NOTE: like `RaftRequest`, responses ride the bincode-encoded wire,
-    // so new variants are appended, never inserted or reordered.
+    // NOTE: like `RaftRequest`, responses are JSON tagged by variant name, so
+    // a rename changes the format. New variants go at the end.
     /// The entry was applied but the state machine refused to act on it —
     /// e.g. finalising a secret rotation while stored secrets are still
     /// sealed under an old generation (PKI8). The state is unchanged;
@@ -568,6 +604,10 @@ pub enum CouncilResponse {
     /// A leader tick's task-array writes applied; these were refused, by
     /// array id, with the reason.
     TaskArrayTicked { refused: Vec<(u64, String)> },
+    /// A `PolicyFenced` write was evaluated against an older policy set:
+    /// the policies are now at `current`. Nothing applied; the leader
+    /// evaluates the app again and retries (#1117).
+    PolicyGenerationMoved { current: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -690,6 +730,27 @@ pub struct DesiredState {
     pub namespaces: std::collections::BTreeMap<String, crate::config::NamespaceSpec>,
     /// Declared permission grants keyed by name (12b.2 T6).
     pub permissions: std::collections::BTreeMap<String, crate::config::PermissionSpec>,
+    /// Declared policies keyed by name (#1117). The leader evaluates them
+    /// before it proposes an app; the state machine only stores them. No
+    /// serde default: a snapshot that lost its policies must not load as a
+    /// cluster without any.
+    pub policies: std::collections::BTreeMap<String, crate::config::PolicySpec>,
+    /// How many policy writes have applied. Each app write a policy was
+    /// evaluated for carries the generation it saw, and is refused once
+    /// this has moved on (#1117).
+    pub policy_generation: u64,
+    /// The spec each app was declared with, for the apps whose stored spec
+    /// differs from it: a policy default filled fields in, or an image was
+    /// bound to a digest (#1118). `apps` holds the filled, effective spec;
+    /// this holds what the config said, so GitOps diffs git against it and
+    /// doesn't re-apply a defaulted app on every sync. An app write that
+    /// changes the effective spec without carrying a declared one clears
+    /// the entry. No serde default, like `policies`.
+    #[serde(
+        serialize_with = "map_as_vec::serialize",
+        deserialize_with = "map_as_vec::deserialize"
+    )]
+    pub declared_apps: HashMap<AppId, AppSpec>,
     /// Cluster-wide service endpoint catalogue (12b.4): every namespace's
     /// services, their VIPs and healthy backends across all nodes. Built by
     /// the leader from health reports and replicated so any node resolves
@@ -719,28 +780,28 @@ pub struct DesiredState {
 
 impl DesiredState {
     /// Every image digest an app or job in desired state pins
-    /// (`web:v1@sha256:…`): app and init-container images, the rollback
-    /// targets in each app's rollout record (#692), job definitions and
-    /// task-array templates. Registry expiry never removes these.
+    /// (`web:v1@sha256:…`): app, init-container and sidecar images, the
+    /// rollback targets in each app's rollout record (#692), job definitions
+    /// and task-array templates. Registry expiry never removes these.
     pub fn pinned_image_digests(&self) -> std::collections::HashSet<String> {
         let rollback_targets = self
             .rollouts
             .values()
             .flat_map(|rollouts| rollouts.released.iter());
-        let apps = self.apps.values().chain(rollback_targets).flat_map(|spec| {
-            spec.image
-                .iter()
-                .chain(spec.init.iter().filter_map(|init| init.image.as_ref()))
-        });
+        let apps = self
+            .apps
+            .values()
+            .chain(rollback_targets)
+            .flat_map(|spec| spec.image_references());
         let jobs = self
             .task_arrays
             .jobs()
             .definitions()
-            .filter_map(|(_, record)| record.definition.template.image.as_ref());
+            .filter_map(|(_, record)| record.definition.template.image.as_deref());
         let arrays = self
             .task_arrays
             .iter()
-            .filter_map(|(_, record)| record.template.image.as_ref());
+            .filter_map(|(_, record)| record.template.image.as_deref());
         apps.chain(jobs)
             .chain(arrays)
             .filter_map(|image| crate::pickle::types::image_pin_digest(image))
@@ -1015,11 +1076,56 @@ mod tests {
             RaftRequest::PermissionDelete {
                 name: "deployer".to_string(),
             },
+            RaftRequest::PolicySpec {
+                name: "no-latest".to_string(),
+                spec: Box::new(crate::config::PolicySpec {
+                    match_expression: Some("app.namespace == 'prod'".to_string()),
+                    deny: Some("app.image.endsWith(':latest')".to_string()),
+                    message: Some("pin a version".to_string()),
+                    action: crate::config::PolicyAction::Warn,
+                    applies_to: crate::config::PolicyTarget::Both,
+                    default: serde_json::json!({ "env": { "TEAM": "payments" } })
+                        .as_object()
+                        .cloned(),
+                }),
+            },
+            RaftRequest::PolicyDelete {
+                name: "no-latest".to_string(),
+            },
+            RaftRequest::PolicyFenced {
+                generation: 7,
+                change: Box::new(RaftRequest::AppDelete {
+                    app_id: AppId::new("web", "default"),
+                }),
+                declared: None,
+            },
+            RaftRequest::PolicyFenced {
+                generation: 8,
+                change: Box::new(RaftRequest::AppDelete {
+                    app_id: AppId::new("web", "default"),
+                }),
+                declared: Some(Box::new(
+                    toml::from_str::<AppSpec>("image = 'web:v1'").unwrap(),
+                )),
+            },
+            RaftRequest::AppRelease {
+                app_id: AppId::new("db", "pg"),
+            },
         ];
         for req in &requests {
             let json = serde_json::to_string(req).unwrap();
             let decoded: RaftRequest = serde_json::from_str(&json).unwrap();
             assert_eq!(*req, decoded);
+        }
+    }
+
+    #[test]
+    fn snapshot_must_not_forget_its_policies() {
+        for field in ["policies", "policy_generation", "declared_apps"] {
+            let mut snapshot = serde_json::to_value(DesiredState::default()).unwrap();
+            snapshot.as_object_mut().unwrap().remove(field);
+            let error = serde_json::from_value::<DesiredState>(snapshot).unwrap_err();
+            assert!(error.to_string().contains(field), "{error}");
         }
     }
 
@@ -1092,6 +1198,24 @@ mod tests {
         assert!(state.scheduling.is_empty());
         assert!(state.config.is_empty());
         assert!(state.last_applied_log.is_none());
+    }
+
+    /// #1120: a sidecar's pinned image is kept from registry expiry like
+    /// its app's and its init containers'.
+    #[test]
+    fn a_sidecars_pinned_image_is_never_expired() {
+        let mut state = DesiredState::default();
+        let spec: AppSpec = toml::from_str(
+            "image = \"web:v1@sha256:aaa\"\n\
+             [[init]]\nimage = \"migrate:v1@sha256:bbb\"\n\
+             [[sidecar]]\nname = \"proxy\"\nimage = \"envoy:1@sha256:ccc\"\n",
+        )
+        .unwrap();
+        state.apps.insert(AppId::new("web", "default"), spec);
+        let pinned = state.pinned_image_digests();
+        for digest in ["sha256:aaa", "sha256:bbb", "sha256:ccc"] {
+            assert!(pinned.contains(digest), "{digest} missing from {pinned:?}");
+        }
     }
 
     #[test]

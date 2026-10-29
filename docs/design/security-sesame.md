@@ -482,7 +482,7 @@ pub enum AgeKeyScope {
     /// Cluster-wide default keypair.
     ClusterWide,
 
-    /// Namespace-scoped keypair (planned — no code creates one yet; see §5.5).
+    /// Namespace-scoped keypair, for a namespace with `secret_key = true` (§5.5).
     Namespace(String),
 }
 ```
@@ -963,7 +963,11 @@ inherit it silently, for example after a revoke and re-create. `POST
 **Scope enforcement (shipped):** `--apps` and `--namespaces` restrict a token
 on every route that names an app and namespace (`authorize_scoped`), filter
 cluster-wide listings such as `/v1/status` and `/v1/images` to the scope, and
-refuse routes that need cluster-wide authority (`require_unscoped`). The Pickle
+refuse routes that need cluster-wide authority (`require_unscoped`).
+`/v1/events` filters too (#1125): a scoped token sees the events about apps
+its scope allows, or about a namespace it names when it isn't limited to some
+apps, and nothing that names no namespace. That's the stream a controller
+reads; the dashboard's `/v1/ws/events` still refuses a scoped token. The Pickle
 registry applies the same scope to repositories: a scoped token may push and
 (on a routable listener) pull only repositories named `<namespace>/<app>` whose
 namespace and app it covers, over Bearer and Basic alike; bare names such as
@@ -1104,6 +1108,22 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 4. The operator (or CI) re-encrypts all secrets with the new public key and commits to git. Each applied `AppSpec` records which generation seals its encrypted values (`SecurityState.secret_seals`, keyed `namespace/app/ENV_KEY`) — age ciphertext does not disclose its recipient, so write time is the only moment this is knowable.
 5. Once all `ENC[AGE:...]` values use the new key, the operator runs `relish secret rotate --finalize` to delete the old keypair. Finalise verifies the seal records first: any secret still sealed under an older generation — or with no record at all — refuses the retirement and is named in the error, so the key that can decrypt it is never deleted early.
 
+### 5.5a Exec Secret Providers (#1123)
+
+An app env value `PROVIDER[name:path]` names a secret kept outside the cluster. `config::EnvValue::Provider` holds the parsed `sesame::secret_provider::SecretReference`; a value starting with `PROVIDER[` that doesn't parse fails deserialisation, so apply refuses it, and `validate_job` refuses provider values in jobs (the job runtimes don't call providers). The reference, not a secret, is what Raft stores.
+
+**Node config.** `[secret_providers.<name>]` in `node.toml` (`SecretProviderConfig`): an absolute `binary`, `timeout_secs` (default 5, 1..=60), `max_output_bytes` (default 64 KiB, up to 1 MiB) and the provider's `env`. The table is the allowlist; `NodeConfig::validate` checks each entry at startup. `SecretProviders` (an `Arc`'d map) goes to the agent through `set_secret_providers`.
+
+**Placement.** `NodeCapabilities::secret_providers` lists the names a node runs, in its capability report. `WorkloadRequirements::secret_providers` collects the names an app's env uses, and `meat::filter::node_can_run` requires them to be a subset, so the scheduler only places a provider-backed app where its providers exist (`UnplacedReason::NoCapableNode` otherwise).
+
+**Resolution at launch.** `grill::oci::build_env_with_decryptor` passes a provider value through as `KEY=PROVIDER[...]`. Just before the runtime creates the instance, on the deploy worker or restart task (never the agent loop), `bun::agent::launch::create_with_secrets` resolves each such entry through `SecretProviders::resolve_env` and hands the runtime a resolved copy. The supervisor keeps the unresolved spec, so every restart calls the provider again. Init containers get the resolved environment of the app they precede.
+
+**Protocol, version 1.** Bun spawns the binary with `env_clear()`, a default `PATH` plus the configured `env`, cwd `/`, stderr discarded, `kill_on_drop` and its own process group. It writes one JSON object on one newline-terminated line to stdin and closes it: `{"version":1,"provider","path","namespace","app","instance","variable"}`. It reads at most `max_output_bytes + 1` bytes of stdout while waiting for exit, all inside `tokio::time::timeout(timeout_secs)`. Once the provider exits, reading gets 100 ms more rather than waiting for end-of-file, because a leftover child, or on macOS a process spawned concurrently that inherited the pipe before `FD_CLOEXEC` was set, can hold the write end open. The answer is `{"version":1,"value":"..."}` with exit 0, or `{"version":1,"error":"..."}`. Unknown fields are ignored.
+
+**Failure.** Every failure is a `ProviderError`: not configured, spawn failure, pipe I/O, timeout, output over the cap, unsuccessful exit (status or signal), malformed answer, unsupported version, a provider `error` (kept to one line of at most 200 characters), or a value holding NUL. A timeout or oversize answer `killpg`s the provider's group, so its children die too. The error, wrapped in `SecretResolutionError { variable, problem }`, becomes `LaunchProblem::SecretUnavailable`, the same launch refusal a missing binary produces (#881): the fresh path records it as the instance's `launch_failure`, shown as the instance `reason` in `/v1/status` and `relish wtf`; a restart refusal is terminal without spending the restart budget; a rollout's replacement fails the rollout and leaves the old instances serving. In a cluster the placement reconciler's deploy backoff retries a failed fresh deploy.
+
+**What never leaks.** Nothing in `secret_provider` logs. The response type isn't `Debug`. A JSON parse error's text isn't kept, because serde quotes the input; malformed answers carry a fixed reason. The provider's stderr is discarded. The resolved spec reaches disk only where an `ENC[AGE:...]` plaintext already does (5.5, step 5).
+
 ### 5.6 Raft Log Encryption
 
 > **Status: log entries encrypted, keyed by the master key; snapshot plaintext.**
@@ -1118,7 +1138,7 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 > plaintext entry (leading `{`) still decodes, so plaintext and encrypted logs
 > interoperate and a keyless/dev cluster stays plaintext. An encrypted entry
 > opened without the key errors rather than reading as empty (CP3-safe). Vote and
-> log-id metadata remain plaintext bincode (not app data). The HKDF *wrapping* of
+> log-id metadata remain plaintext postcard (not app data). The HKDF *wrapping* of
 > sensitive keys inside the log (step 5) ships as before. TPM sealing (step 2) is
 > still not implemented.
 
@@ -1542,7 +1562,7 @@ council_size = 3
 
 **Response:**
 
-1. Immediately run `relish ca rotate` for the compromised CA. **(Planned — CA rotation is not implemented yet, §5.8. Until it ships, the practical response is CRL-revoking affected certificates and, in the worst case, re-bootstrapping the PKI.)**
+1. Immediately run `relish ca rotate --role ROLE --root-backup FILE` for the compromised intermediate CA (§5.8). Root rotation is planned ([#362](https://github.com/reliaburger/reliaburger/issues/362)).
 2. Revoke all certificates issued by the compromised CA (via the CRL, §5.7).
 3. The dual-signing period ensures existing legitimate certificates continue working during the transition.
 4. Investigate how the key was exfiltrated. Council nodes should have restricted access. At-rest encryption covers Raft log entries only, under the master key on the same host (§5.6); TPM sealing is planned hardening, not yet active.
@@ -1661,9 +1681,9 @@ The threat model assumes:
 **Response:**
 
 1. Isolate the compromised council node immediately.
-2. Rotate all intermediate CAs: `relish ca rotate`. **(Planned — not implemented, §5.8.)**
+2. Rotate all intermediate CAs: `relish ca rotate --role ROLE --root-backup FILE` for each role (§5.8).
 3. Rotate the age keypair: `relish secret rotate`.
-4. Rotate the OIDC signing keypair (re-minting all JWTs).
+4. Rotate the OIDC signing keypair, re-minting all JWTs. **(Planned, [#709](https://github.com/reliaburger/reliaburger/issues/709): there's no OIDC key rotation yet.)**
 5. Rotate all API tokens.
 6. Audit all cluster activity during the compromise window: `relish audit --cluster --since <start> --until <end>` lists every node's records, with the principal and source address of each action (§5.11). Read the compromised node's log before you rebuild it; there is no central copy yet.
 7. Investigate the attack vector and harden council node access.

@@ -21,6 +21,7 @@
         <a href="#netboot">Bare metal</a>
         <a href="#start">Build it</a>
         <a href="#docs">Read the docs</a>
+        <a href="#compare">Compare</a>
         <a href="https://github.com/reliaburger/reliaburger">GitHub <span aria-hidden="true">↗</span></a>
       </nav>
     </header>
@@ -28,15 +29,15 @@
     <main id="main">
       <section id="intro" class="intro" aria-labelledby="title">
         <div class="intro-copy">
-          <div class="eyebrow">RUST · APACHE 2.0 · 0.2.0 PROTOTYPE</div>
+          <div class="eyebrow">RUST · APACHE 2.0 · 0.2.3 PROTOTYPE</div>
           <h1 id="title">One agent, one CLI.<br>A container platform with nothing to assemble.</h1>
           <p class="lede">Kubernetes gave us container orchestration, and gave every team an accidental
             platform engineering department. Reliaburger compiles the platform into one Rust agent:
             scheduling, mTLS, ingress, a registry, metrics, logs, GitOps, jobs and chaos testing.
-            It’s a prototype. Try it on a laptop cluster, on macOS or on Linux with KVM; five
+            It’s a prototype. Try it on a laptop cluster, on an Apple silicon Mac or on Linux with KVM; five
             minutes from install to cluster is the target.</p>
           <div class="intro-links">
-            <a class="primary-link" href="#install">Install 0.2.0 <span aria-hidden="true">↓</span></a>
+            <a class="primary-link" href="#install">Install 0.2.3 <span aria-hidden="true">↓</span></a>
             <a href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
             <span class="link-pair"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">Read the whitepaper</a>
               <a class="pdf-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf" aria-label="The whitepaper as a PDF">PDF</a></span>
@@ -64,17 +65,20 @@
         <div class="install-grid">
           <div class="terminal">
             <div class="terminal-heading">INSTALL <span>sh</span></div>
-            <pre><code>curl -fsSL https://reliaburger.com/install.sh | sh</code></pre>
+            <pre><code>curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop</code></pre>
           </div>
           <div class="install-copy">
             <p>One line installs <code>relish</code>, then builds a three-node cluster in Linux
               VMs on your laptop, running real containers. It checks every download against a
-              pinned digest or the release’s signing key.</p>
-            <p>You’ll need macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory
+              pinned digest or the release’s signing key. Without <code>--laptop</code> it only
+              explains the choices, such as Linux machines you already have, and installs nothing.</p>
+            <p>Until 1.0.0, Reliaburger is for developers and enthusiasts trying it out, not for
+              production.</p>
+            <p>You’ll need a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB of free memory
               and 15 GiB of disk. No Rust, no checkout.</p>
             <p class="install-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a>
               · <a href="install.sh">Read the bootstrap script</a>
-              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.0">Release notes <span aria-hidden="true">↗</span></a></p>
+              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.3">Release notes <span aria-hidden="true">↗</span></a></p>
           </div>
         </div>
       </section>
@@ -82,23 +86,22 @@
       <!-- Release cards use the roadmap's release names (docs/roadmap.md); a date
            appears only where the roadmap states one. tests/suite/website.rs checks both. -->
       <aside class="status" aria-label="Release status: what the installer fetches">
-        <strong>0.2.0: A million jobs</strong>
-        <p>The prototype you install today, released on 16 October 2026. One-off jobs, cron,
-          deployment hooks and task arrays (a template and a count, not a record per task)
-          share one durable lifecycle, packed onto nodes beside your apps. Each job picks
-          its isolation: a fresh container, a reused container or an allowlisted host
-          command. Signed binaries for Linux and macOS, and a one-line installer that
-          builds a laptop cluster from them. The documentation lists what 0.2.0 doesn’t
-          do yet.</p>
-        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.0">Release notes <span aria-hidden="true">↗</span></a>
+        <strong>0.2.3: Two billion a day</strong>
+        <p>The prototype you install today, released on 28 October 2026. Host jobs got
+          faster: 14,917 a second on one node and 29,350 on three. Then one
+          real 24-hour day on three laptop VMs counted 1.81 billion of them, short of
+          the two billion we aimed for, with every task accounted for. Signed binaries
+          for Linux and Apple silicon Macs, and a one-line installer that builds a
+          laptop cluster from them. The documentation lists what 0.2.3 doesn’t do yet.</p>
+        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.3">Release notes <span aria-hidden="true">↗</span></a>
       </aside>
 
       <aside class="status" aria-label="Release status: next">
-        <strong>0.2.1: Cluster safety</strong>
-        <p>Next. The bug-fix release after 0.2.0: the data-loss and availability bugs
-          an audit found in rollouts, GitOps, council recovery, backups, the registry
-          and networking.</p>
-        <a href="https://github.com/reliaburger/reliaburger/milestone/16">Milestone <span aria-hidden="true">↗</span></a>
+        <strong>0.2.4: Extension points</strong>
+        <p>Next. Bend Reliaburger to your own rules without forking it: policies,
+          templates instead of CRDs, sidecars, stop hooks, a secret provider and a
+          contract for your own controllers.</p>
+        <a href="https://github.com/reliaburger/reliaburger/milestone/19">Milestone <span aria-hidden="true">↗</span></a>
       </aside>
 
       <aside class="status" aria-label="Release status: planned">
@@ -124,13 +127,14 @@
           <h2 id="tour-title">Try it in five minutes <a class="permalink" href="#tour" aria-label="Link to the tour">#</a></h2>
         </div>
         <div class="tour">
-          <p class="tour-note">Install, then put the cluster through its paces: a real
-            Kubernetes app, an app of your own, a batch of jobs, a network fault, a killed
-            replica and a lost node. Same prerequisites as the install line.</p>
+          <p class="tour-note">Install, then put the cluster through its paces with a burger
+            built from six apps: watch a layer cut off, a rolling deploy, a rollback, a
+            scale-up, a killed patty, a batch of jobs, a network fault and a lost node. Same
+            prerequisites as the install line.</p>
           <!-- The recording is always on show. assets/tour-player.js loads the vendored
                asciinema player (assets/asciinema/) and the recording from this site as the
                figure nears the viewport. -->
-          <figure id="tour-recording" class="recording" data-cast="./assets/tour.cast" data-poster="npt:2:31">
+          <figure id="tour-recording" class="recording" data-cast="./assets/tour.cast" data-poster="npt:4:18">
             <div class="recording-screen"></div>
             <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
               <a href="./assets/tour.cast">download the recording</a> and play it in a terminal with
@@ -138,7 +142,7 @@
             <figcaption>
               <span>The whole tour on a real laptop cluster, run by
                 <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>
-                against the published 0.2.0 install.
+                against the published 0.2.3 install.
                 Setup plays four times faster and idle time is cut to two seconds; every wait
                 says how long it really took.</span>
               <span class="recording-speed" role="group" aria-label="Playback speed" hidden>speed
@@ -153,83 +157,118 @@
             <summary>Show the commands <span class="tour-commands-note">every step, with what to look for</span></summary>
             <ol class="tour-steps">
               <li>
-                <pre><code data-tour>curl -fsSL https://reliaburger.com/install.sh | sh</code></pre>
+                <pre><code data-tour>curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop</code></pre>
                 <p>Installs <code>relish</code>, then builds a three-node cluster in Linux VMs on your
                   laptop. It checks every download against a pinned digest, and it’s the only step
                   that takes minutes.</p>
               </li>
               <li>
-                <pre><code data-tour>relish apply -f https://reliaburger.com/demo/podinfo.yaml</code></pre>
-                <p>A real Kubernetes app: podinfo’s frontend, backend and Redis cache, plus a small
-                  load generator so there’s always traffic. Relish converts the YAML as it applies it
-                  and tells you what it had to change.</p>
-              </li>
-              <li>
-                <pre><code data-tour>relish status</code>
-<code data-tour>relish council status</code></pre>
-                <p>Give it half a minute. Three frontend replicas, one on each node, named
-                  <code>frontend-0</code>, <code>-1</code> and <code>-2</code>. The scheduler
-                  spread them and numbered them across the cluster, not you. <code>status</code>
-                  opens with a line on the council, the Raft group that holds the cluster’s state;
-                  <code>council status</code> asks every node for its own view of it: its role,
-                  term and log position, with the leader and quorum on top.</p>
-              </li>
-              <li>
-                <pre><code>open http://podinfo.localhost:18080</code></pre>
-                <p>Or paste the address into a browser. It comes in through the built-in ingress;
-                  reload and the hostname changes as each replica answers.</p>
-              </li>
-              <li>
                 <pre><code data-tour>curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz</code>
 <code data-tour>relish build burger/burger.toml</code>
-<code data-tour>relish images</code>
-<code data-tour>relish apply burger/burger.toml</code>
-<code data-tour>curl http://burger.localhost:18080/order</code></pre>
-                <p>Now an app of your own: a small Go service and its Dockerfile. A node builds it
-                  with Buildah, straight into the cluster’s own registry, signed, for both
+<code data-tour>relish images</code></pre>
+                <p>An app of your own: one small Go program and its Dockerfile. A node builds it with
+                  Buildah, straight into the cluster’s own registry, signed, for both
                   <code>linux/amd64</code> and <code>linux/arm64</code>: <code>images</code> lists
-                  <code>burger:v1</code> once, with its platforms. Each order names the podinfo
-                  backend that cooked it, found by its service name.</p>
+                  <code>burger:v1</code> once, with its platforms. It’s the only image the tour
+                  needs.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish apply burger/burger.toml</code>
+<code data-tour>relish status</code>
+<code data-tour>relish council status</code></pre>
+                <p>Eight apps from that one image: a layer of the burger each (top bun, lettuce,
+                  tomato, cheese, patty, bottom bun), a counter in front and a diner who keeps
+                  ordering. Give it half a minute. Three counters, one on each node, named
+                  <code>counter-0</code>, <code>-1</code> and <code>-2</code>: the scheduler spread
+                  and numbered them, not you. <code>status</code> opens with a line on the council,
+                  the Raft group that holds the cluster’s state; <code>council status</code> asks
+                  every node for its own view of it.</p>
+              </li>
+              <li>
+                <pre><code data-tour>curl http://burger.localhost:18080</code></pre>
+                <p>The burger, through the built-in ingress. The counter asks each layer by its
+                  service name and stacks whatever answers: one coloured line per layer, with its
+                  version and the node and instance that served it. Open the same address in a
+                  browser and it’s drawn in SVG, redrawn every second, so keep it open for what
+                  follows.</p>
               </li>
               <li>
                 <pre><code data-tour>relish batch submit burger/jobs.toml</code>
 <code data-tour>relish batch watch 1</code>
 <code data-tour>relish jobs</code></pre>
-                <p>Then ten jobs beside it: 8 small and 2 larger hashing tasks from
+                <p>Now cook some patties beside it: 8 small and 2 larger hashing jobs from
                   the same image, in two resource profiles. Each profile is stored as a template
                   and a count, not a record per task, and its tasks are packed around the apps
                   already running. <code>watch</code> takes the number <code>submit</code>
                   printed and shows the rate and how long tasks take; <code>jobs</code> lists
-                  the finished run. The burger keeps taking orders throughout.</p>
+                  the finished run. Each task tells the counter its patty is done, and the
+                  burger’s footer counts them. It keeps serving throughout.</p>
               </li>
               <li>
-                <pre><code data-tour>relish path frontend --to redis</code></pre>
-                <p>Walk the path from a frontend to Redis, hop by hop: DNS, the virtual IP, the eBPF service map in
-                  the kernel, the firewall, any active faults, then a real TCP connect from inside the
-                  frontend. On Kubernetes you’d piece that together from five tools and a debug pod.</p>
+                <pre><code data-tour>relish fault partition lettuce --from counter --duration 30s --acknowledge</code>
+<code data-tour>curl http://burger.localhost:18080</code></pre>
+                <p>Cut the lettuce off from the counters, and there’s a gap where it was: the
+                  cluster refuses their connections. Nothing else notices, and after thirty
+                  seconds the fault lifts itself and the lettuce is back. No chaos tooling to
+                  install.</p>
               </li>
               <li>
-                <pre><code data-tour>relish metrics frontend</code></pre>
-                <p>podinfo’s own Prometheus metrics, from every replica. Each node read the manifest’s
-                  <code>prometheus.io</code> annotations and scrapes its own replicas. There’s no
+                <pre><code data-tour>relish apply burger/cheese-v2.toml</code>
+<code data-tour>curl http://burger.localhost:18080</code></pre>
+                <p>A rolling deploy: the same two cheese slices at <code>v2</code>. The node
+                  starts a blue cheese beside the cheddar, waits for its health check, then drains
+                  a cheddar, and goes again. The other slice keeps serving meanwhile, so the
+                  burger never loses its cheese; it turns blue a slice at a time.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish apply burger/patty-v3.toml</code>
+<code data-tour>relish status</code>
+<code data-tour>relish history patty</code></pre>
+                <p>A bad deploy: patty <code>v3</code> is raw in the middle and fails its health
+                  check. It never joins the service, so the burger keeps its beef patty. After
+                  twenty seconds the node rolls it back on its own, and <code>status</code> marks
+                  the patty <code>RolloutFailed</code> so nothing retries it. <code>history</code>
+                  shows what shipped when, on every node.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish apply burger/triple-patty.toml</code>
+<code data-tour>curl http://burger.localhost:18080</code></pre>
+                <p>Three patty replicas, and the counter finds all three: a triple patty, one
+                  line per instance. Any change to the spec clears the <code>RolloutFailed</code>
+                  mark, so this one goes out.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish fault kill patty --acknowledge</code>
+<code data-tour>curl http://burger.localhost:18080</code>
+<code data-tour>relish events --app patty</code></pre>
+                <p>Kill a patty. For a few seconds it’s a double; then the node agent has
+                  restarted it and it’s a triple again, the new patty under a new instance number.
+                  The cluster won’t kill an app’s last replica, which is why this is a patty and
+                  not the lettuce. <code>events</code> asks every node what happened and merges
+                  the answers by time: the deploys, the failed <code>v3</code> and its rollback,
+                  the kill and the restart, each with its node.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish path counter --to patty</code></pre>
+                <p>Walk the path from a counter to the patties, hop by hop: DNS, the virtual IP,
+                  the eBPF service map in the kernel, the firewall, any active faults, then a real
+                  TCP connect from inside the counter. On Kubernetes you’d piece that together
+                  from five tools and a debug pod.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish metrics counter</code></pre>
+                <p>The counters’ own Prometheus metrics, from every replica. Each node scrapes
+                  the replicas it runs, because the app says <code>metrics = {}</code>. There’s no
                   Prometheus to install.</p>
               </li>
               <li>
-                <pre><code data-tour>relish fault delay redis 300ms --from frontend --duration 2m --acknowledge</code></pre>
-                <p>Now make Redis slow, but only for the frontends. Every packet they send it waits
-                  300 ms; anything else calling Redis doesn’t notice. It lifts itself after two
-                  minutes. No chaos tooling to install either.</p>
-              </li>
-              <li>
-                <pre><code data-tour>relish path frontend --to redis --count 3</code></pre>
-                <p>The same path, now DEGRADED. It names the fault, shows the delay it found on
-                  the frontend’s network interface, and every connect takes 300 ms.</p>
-              </li>
-              <li>
-                <pre><code data-tour>relish metrics frontend --name http_request_duration_seconds</code></pre>
-                <p>Wait twenty seconds, then look at latency per replica. It was under a millisecond;
-                  now it’s in the hundreds, and a cache read through the ingress takes almost a
-                  second.</p>
+                <pre><code data-tour>relish fault delay patty 300ms --from counter --duration 2m --acknowledge</code>
+<code data-tour>relish path counter --to patty --count 3</code></pre>
+                <p>Now make the patties slow, but only for the counters. Every packet they send
+                  a patty waits 300 ms; the other layers don’t notice, and it lifts itself after
+                  two minutes. The path is now DEGRADED: it names the fault, shows the delay on
+                  the counter’s network interface, and every connect takes 300 ms. Your browser
+                  shows the same thing, each patty line in the hundreds of milliseconds.</p>
               </li>
               <li>
                 <pre><code data-tour>relish dashboard</code></pre>
@@ -238,18 +277,12 @@
                   cluster keeps running.</p>
               </li>
               <li>
-                <pre><code data-tour>relish fault kill frontend --count 1 --acknowledge</code>
-<code data-tour>relish status</code></pre>
-                <p>Kill a frontend. Run <code>status</code> again a few seconds later and it’s back,
-                  with a restart counted: the node agent restarts what should be running.</p>
-              </li>
-              <li>
                 <pre><code data-tour>relish local stop node-3</code>
-<code data-tour>relish inspect frontend</code></pre>
-                <p>Now lose a whole machine. About a minute later there are three running frontends
+<code data-tour>relish inspect counter</code></pre>
+                <p>Now lose a whole machine. About a minute later there are three running counters
                   again, spread over the two nodes that are left: each keeps the one it had, and one
-                  of them starts a replacement under the lost one’s name. Nobody had to notice
-                  first. <code>inspect</code>
+                  of them starts a replacement under the lost one’s name. Any layer that lived on
+                  node-3 comes back the same way. Nobody had to notice first. <code>inspect</code>
                   asks every node, lists each instance, running or stopped, with the node it’s on,
                   and names the node that didn’t answer.</p>
               </li>
@@ -280,6 +313,17 @@
         <div class="tour">
         <p class="tour-note">The same command, run four ways on the same VM with the same
           concurrency, so you can see what each kind of isolation costs.</p>
+        <p><strong>1,807,742,226 host jobs in one real day.</strong> 0.2.3 ran host jobs
+          for 24 hours on three 4-vCPU VMs on one laptop: 20,920 a second, counted as the
+          council accepted them, not extrapolated from a minute. That’s 1.81 billion
+          against the two billion we aimed for, with no failed tasks and every node
+          within a point of its share. The same release ran 14,917 a second on one node
+          and 29,350 on three in a short benchmark; a whole day on a laptop whose cores
+          the VMs fill runs slower. Bun’s memory grew through the day, inside its budget,
+          and 0.2.4 finds out why.
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-28-v0.2.3-day-run.md">Day-run record</a> ·
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-27-v0.2.3-candidate-throughput/README.md">Benchmark record</a> ·
+          <a href="#soak-charts-day">Charts</a></p>
         <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:258.78089525790324">
           <div class="recording-screen"></div>
           <noscript><p class="recording-fallback">The demonstration plays with JavaScript.
@@ -408,7 +452,7 @@
         <div class="tour">
         <p class="tour-note">Green unit tests don't ship a release. Every candidate is built
           and signed once, installed the way you'd install it, then left running under
-          faults for a day's worth of hours. Only the maintainer promotes it, and only
+          faults for hours. Only the maintainer promotes it, and only
           the exact files that passed.</p>
         <ol class="release-pipeline">
           <li><strong>Build and sign.</strong> CI builds every binary and guest image at one
@@ -416,12 +460,13 @@
           <li><strong>Stage.</strong> The signed files go up as a private pre-release.</li>
           <li><strong>Install it like you would.</strong> <code>curl | sh</code> from empty
             caches, twice, then the five-minute tour and a full teardown.</li>
-          <li><strong>Soak, fast then final.</strong> Three VMs run apps, a volume writer, Redis,
+          <li><strong>Soak.</strong> Three VMs run apps, a volume writer, Redis,
             a log spammer and exporters while the harness breaks things every few
-            minutes: 90 minutes compressed, then 8 hours on the full schedule.</li>
-          <li><strong>Soak with jobs.</strong> The same, plus a job campaign at more than the
-            rate of 100 million jobs a day and a node-level fault every cycle: 90 minutes,
-            then 12 hours.</li>
+            minutes, for about an hour on a compressed schedule.</li>
+          <li><strong>Soak with jobs, fast then final.</strong> The same, plus a job campaign at
+            more than the rate of 100 million jobs a day and a node-level fault every cycle:
+            about an hour compressed, then 8 hours on the full schedule, which checks
+            everything the app soak does as well as the jobs.</li>
           <li><strong>Pull the plug.</strong> A throwaway VM loses power mid-write, 10 to 25 times
             per storage path, and reboots as often with containers and network rules in
             place.</li>
@@ -449,70 +494,92 @@
           drains. A failure gets a root cause before anything else happens. A product fix
           means a new candidate, and every soak starts again.</p>
         <details class="tour-commands" id="release-testing-results">
-          <summary>Show 0.2.0's results <span class="tour-commands-note">headline numbers and charts, each with its record</span></summary>
+          <summary>Show 0.2.3's results <span class="tour-commands-note">headline numbers and charts, each with its record</span></summary>
           <ul>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-15-v0.2.0-sustained-v02-final.md">8-hour soak</a>:
-              clean, 8 cycles, 4 upgrade round trips; the API node's agent held 390 MiB steady
-              against a 512 MiB target.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-17-v0.2.0-job-qualification.md">12-hour job soak</a>:
-              4,600 accepted jobs a second against a target of 1,390, every fault, no data lost,
-              agent memory within target. Its 15 failures were all the test harness's own, and the
-              record says why.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-16-power-cut-reboot.md">Power cuts and reboots</a>:
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-27-v0.2.3-job-qualification.md">8-hour job soak</a>:
+              7,300 accepted jobs a second against a target of 1,390, every fault and upgrade
+              walk settled, no data lost, every job drained, agent memory within target, and
+              a 2¼-hour quiet tail with every leak check armed. A clean pass.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-27-v0.2.3-sustained-v02-fast.md">One-hour app soak</a>:
+              6 cycles and 3 upgrade round trips, a clean pass. The first run failed on one
+              2.3-second agent-loop turn waiting on disk while the host’s disk stalled; the
+              maintainer accepted it as a host stall, and 0.2.4 moves that write off the loop.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-27-power-cut-reboot.md">Power cuts and reboots</a>:
               25 of 25 in each of five lanes.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-16-v0.2.0-release-closure.md">Every gate and every candidate</a>:
-              eight candidates, seven of them stopped by the soaks.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-28-v0.2.3-day-run.md">24-hour day run</a>, outside the gate:
+              1,807,742,226 host jobs, below the two billion target and above the one billion
+              floor. The harness failed it on Bun’s memory growing, a full disk on one node
+              and one slow turn; the maintainer accepted the run, and 0.2.4 fixes all three.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-28-v0.2.3-release-closure.md">Every gate and every candidate</a>:
+              one candidate, which passed every gate.</li>
           </ul>
           <p class="soak-charts-note">Time runs from the start of each soak. The marks under a
             chart are its faults and upgrade walks, and the dashed lines its targets. Open a
             chart to see it full size, with every mark named when you point at it.</p>
-          <div class="soak-charts" role="group" aria-labelledby="soak-charts-v02">
-            <h3 id="soak-charts-v02"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-15-v0.2.0-sustained-v02-final.md">The 8-hour soak</a></h3>
-            <figure class="soak-chart">
-              <a href="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/rss.svg"><img src="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/rss.svg" width="720" height="272" loading="lazy"
-                alt="Bun resident memory per node over the 8-hour soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
-              <figcaption>Bun memory per node, with the 512 and 384 MiB targets.</figcaption>
-            </figure>
-            <figure class="soak-chart">
-              <a href="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/fds.svg"><img src="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/fds.svg" width="720" height="272" loading="lazy"
-                alt="Open file descriptors per node over the 8-hour soak, with the faults marked along the time axis"></a>
-              <figcaption>Open file descriptors per node.</figcaption>
-            </figure>
-            <figure class="soak-chart">
-              <a href="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/cpu.svg"><img src="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/cpu.svg" width="720" height="272" loading="lazy"
-                alt="Bun CPU per node over the 8-hour soak, as a percentage of one core, with the faults marked along the time axis"></a>
-              <figcaption>Bun CPU per node, as a percentage of one core.</figcaption>
-            </figure>
-          </div>
           <div class="soak-charts" role="group" aria-labelledby="soak-charts-jobs">
-            <h3 id="soak-charts-jobs"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-17-v0.2.0-job-qualification.md">The 12-hour job soak</a></h3>
+            <h3 id="soak-charts-jobs"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-27-v0.2.3-job-qualification.md">The 8-hour job soak</a></h3>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/jobs.svg"><img src="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/jobs.svg" width="720" height="272" loading="lazy"
-                alt="Accepted jobs a second in 10-minute windows over the 12-hour job soak, against the target rate, with the faults marked along the time axis"></a>
+              <a href="assets/soak/2026-10-27-v0.2.3-job-qualification-charts/jobs.svg"><img src="assets/soak/2026-10-27-v0.2.3-job-qualification-charts/jobs.svg" width="720" height="272" loading="lazy"
+                alt="Accepted jobs a second in 10-minute windows over the 8-hour job soak, against the target rate, with the faults marked along the time axis"></a>
               <figcaption>Accepted jobs a second, in 10-minute windows, against the target.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/rss.svg"><img src="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/rss.svg" width="720" height="272" loading="lazy"
-                alt="Bun resident memory per node over the 12-hour job soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
+              <a href="assets/soak/2026-10-27-v0.2.3-job-qualification-charts/rss.svg"><img src="assets/soak/2026-10-27-v0.2.3-job-qualification-charts/rss.svg" width="720" height="272" loading="lazy"
+                alt="Bun resident memory per node over the 8-hour job soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
               <figcaption>Bun memory per node, with the 512 and 384 MiB targets.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/fds.svg"><img src="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/fds.svg" width="720" height="272" loading="lazy"
-                alt="Open file descriptors per node over the 12-hour job soak, with the faults marked along the time axis"></a>
+              <a href="assets/soak/2026-10-27-v0.2.3-job-qualification-charts/fds.svg"><img src="assets/soak/2026-10-27-v0.2.3-job-qualification-charts/fds.svg" width="720" height="272" loading="lazy"
+                alt="Open file descriptors per node over the 8-hour job soak, with the faults marked along the time axis"></a>
               <figcaption>Open file descriptors per node.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/cpu.svg"><img src="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/cpu.svg" width="720" height="272" loading="lazy"
-                alt="Bun CPU per node over the 12-hour job soak, as a percentage of one core, with the faults marked along the time axis"></a>
+              <a href="assets/soak/2026-10-27-v0.2.3-job-qualification-charts/cpu.svg"><img src="assets/soak/2026-10-27-v0.2.3-job-qualification-charts/cpu.svg" width="720" height="272" loading="lazy"
+                alt="Bun CPU per node over the 8-hour job soak, as a percentage of one core, with the faults marked along the time axis"></a>
               <figcaption>Bun CPU per node, as a percentage of one core.</figcaption>
             </figure>
           </div>
+          <div class="soak-charts" role="group" aria-labelledby="soak-charts-v02">
+            <h3 id="soak-charts-v02"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-27-v0.2.3-sustained-v02-fast.md">The one-hour app soak</a></h3>
+            <p class="soak-charts-note">The gate has no separate 8-hour app soak: the job soak
+              above runs the same apps and faults. These are from the compressed one.</p>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-10-27-v0.2.3-sustained-v02-fast-charts/rss.svg"><img src="assets/soak/2026-10-27-v0.2.3-sustained-v02-fast-charts/rss.svg" width="720" height="272" loading="lazy"
+                alt="Bun resident memory per node over the one-hour app soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
+              <figcaption>Bun memory per node, with the 512 and 384 MiB targets.</figcaption>
+            </figure>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-10-27-v0.2.3-sustained-v02-fast-charts/fds.svg"><img src="assets/soak/2026-10-27-v0.2.3-sustained-v02-fast-charts/fds.svg" width="720" height="272" loading="lazy"
+                alt="Open file descriptors per node over the one-hour app soak, with the faults marked along the time axis"></a>
+              <figcaption>Open file descriptors per node.</figcaption>
+            </figure>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-10-27-v0.2.3-sustained-v02-fast-charts/cpu.svg"><img src="assets/soak/2026-10-27-v0.2.3-sustained-v02-fast-charts/cpu.svg" width="720" height="272" loading="lazy"
+                alt="Bun CPU per node over the one-hour app soak, as a percentage of one core, with the faults marked along the time axis"></a>
+              <figcaption>Bun CPU per node, as a percentage of one core.</figcaption>
+            </figure>
+          </div>
+          <div class="soak-charts" role="group" aria-labelledby="soak-charts-day">
+            <h3 id="soak-charts-day"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-28-v0.2.3-day-run.md">The 24-hour day run</a></h3>
+            <p class="soak-charts-note">Host jobs only, no faults, on 4-vCPU VMs: the count
+              behind 0.2.3’s headline.</p>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-10-28-v0.2.3-day-run-charts/jobs.svg"><img src="assets/soak/2026-10-28-v0.2.3-day-run-charts/jobs.svg" width="720" height="272" loading="lazy"
+                alt="Accepted host jobs a second in 10-minute windows over the 24-hour day run, against the two-billion-a-day target rate"></a>
+              <figcaption>Accepted host jobs a second, in 10-minute windows, against the target.</figcaption>
+            </figure>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-10-28-v0.2.3-day-run-charts/rss.svg"><img src="assets/soak/2026-10-28-v0.2.3-day-run-charts/rss.svg" width="720" height="272" loading="lazy"
+                alt="Bun resident memory per node over the 24-hour day run, growing from about 200 to about 345 MiB, against the 512 MiB target for node 1 and 384 MiB for the others"></a>
+              <figcaption>Bun memory per node, with the 512 and 384 MiB targets.</figcaption>
+            </figure>
+          </div>
         </details>
-        <p><strong>The latest: 0.2.0, 16 October 2026.</strong> Eight candidates over five
-          days. The soaks stopped seven of them, on Bun memory, a launch failure that was never
-          retried, stale executor slots and a replica that never moved. The eighth's first
-          12-hour job soak found a socket leak in the VM manager's port forwarder that let the
-          kernel kill the agent.
+        <p><strong>The latest: 0.2.3, 28 October 2026.</strong> One candidate over three
+          days, and it passed every gate. Its first one-hour app soak failed on an agent-loop
+          turn waiting on the host’s stalled disk, which the maintainer accepted, and the
+          rerun passed. Then the day run: 24 hours of host jobs, published with the harness’s
+          own FAIL verdict and every failure explained.
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/release-log.md">The release log</a>
           has every release's story.</p>
         <p>What the soaks don't prove: they run three small VMs on one laptop, so they say
@@ -520,7 +587,8 @@
           A VM forced off isn't a real power loss, the fault rates are a schedule, not
           production traffic, and zero failures in 25 runs only rules out failure rates above
           about 12%.
-          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release">How each gate works</a>.</p>
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release">How each gate works</a>, and
+          <a href="./compare/kubernetes.html#testing">how it compares with Kubernetes' release testing</a>.</p>
         </div>
       </section>
 
@@ -555,7 +623,7 @@
             </figcaption>
           </figure>
           <details class="tour-commands" id="netboot-commands">
-            <summary>Show the commands <span class="tour-commands-note">from blank disks to a cluster (0.2.1, not in 0.2.0)</span></summary>
+            <summary>Show the commands <span class="tour-commands-note">from blank disks to a cluster (0.3.0, not in 0.2.3)</span></summary>
             <ol class="tour-steps">
               <li>
                 <p>In each machine’s firmware setup, turn on UEFI network boot and turn Secure
@@ -611,7 +679,7 @@
               runs the binaries the node config allows and no images; it doesn’t create
               an isolated container or a multi-node cluster.</p>
             <p>For real OCI containers, use runc on Linux. On macOS, the managed laptop
-              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.0.</p>
+              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.3.</p>
             <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/README.md">Build requirements &amp; runtime setup <span aria-hidden="true">↗</span></a>
           </div>
           <div class="terminal">
@@ -671,7 +739,7 @@ target/debug/relish</code></pre>
           <article class="reading-item">
             <span class="filetype">CURRENT STATE</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">Roadmap &amp; backlog <span aria-hidden="true">↗</span></a></h3>
-            <p>What’s implemented, what 0.2.0 leaves out and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
+            <p>What’s implemented, what 0.2.3 leaves out and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
           </article>
         </div>
         <p class="pdf-note">Every release carries PDFs, and these links always fetch the latest:
@@ -680,6 +748,45 @@ target/debug/relish</code></pre>
           <a href="https://github.com/reliaburger/reliaburger/releases/latest/download/building-reliaburger.pdf">the book</a> and
           <a href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-roadmap.pdf">roadmap</a>. The Markdown on GitHub
           follows <code>main</code>, so it can be newer.</p>
+      </section>
+
+      <section id="compare" class="section" aria-labelledby="compare-title">
+        <div class="section-heading"><span class="section-number" aria-hidden="true">06 /</span><h2 id="compare-title">Compare the alternatives <a class="permalink" href="#compare" aria-label="Link to the comparisons">#</a></h2></div>
+        <p class="section-intro">See how Reliaburger’s integrated deployment and diagnosis compare, with practical commands and sources beside the claims.
+          These pages describe 0.2.3, the release the installer installs, and were last re-checked on 21 October 2026.</p>
+        <div class="reading-list">
+          <article class="reading-item">
+            <span class="filetype">THE PLATFORM API</span>
+            <h3><a href="./compare/kubernetes.html">Reliaburger vs Kubernetes <span aria-hidden="true">↗</span></a></h3>
+            <p>Pods, controllers, storage and extensibility; installation with kubeadm and the cost of operating the platform.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">THE WORKLOAD SCHEDULER</span>
+            <h3><a href="./compare/nomad.html">Reliaburger vs Nomad <span aria-hidden="true">↗</span></a></h3>
+            <p>Jobs, groups, allocations and service discovery; what comes with the scheduler and what you integrate.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">KUBERNETES, PACKAGED</span>
+            <h3><a href="./compare/k3s.html">Reliaburger vs k3s <span aria-hidden="true">↗</span></a></h3>
+            <p>What its bundled runtime, networking and ingress simplify, and which Kubernetes concepts remain.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">THE SINGLE-HOST BASELINE</span>
+            <h3><a href="./compare/docker-compose.html">Reliaburger vs Docker Compose <span aria-hidden="true">↗</span></a></h3>
+            <p>Services, networks and volumes; where a single Docker host is enough and what changes when you need a cluster.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">THE APPLICATION PLATFORM</span>
+            <h3><a href="./compare/coolify.html">Reliaburger vs Coolify <span aria-hidden="true">↗</span></a></h3>
+            <p>Git deployments, preview environments, domains and backups; the difference between deployment to servers and cluster reconciliation.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">THE SMALL-CLUSTER ALTERNATIVE</span>
+            <h3><a href="./compare/uncloud.html">Reliaburger vs Uncloud <span aria-hidden="true">↗</span></a></h3>
+            <p>Compose, WireGuard and Caddy; straightforward deployment across machines and the limits of automatic recovery.</p>
+          </article>
+        </div>
+        <p class="pdf-note"><a href="./compare/index.html">All comparisons</a> · <a href="./compare/methodology.html">Evidence and comparison method</a></p>
       </section>
 
       <section id="internals" class="section" aria-labelledby="internals-title">

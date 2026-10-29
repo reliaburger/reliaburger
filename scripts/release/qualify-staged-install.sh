@@ -112,11 +112,18 @@ step() {
     return "$status"
 }
 
-# Two burger instances running: the demo app's replicas.
+# The demo app's apps from one image, all running: three counters, the
+# diner and one of each burger layer.
+burger_apps='counter diner top-bun lettuce tomato cheese patty bottom-bun'
 burgers_running() {
-    "$relish" status 2>/dev/null | awk '
+    "$relish" status 2>/dev/null | awk -v apps="$burger_apps" '
         $1 == "NODE" { rows = 1; next }
-        rows && $3 == "burger" && $5 == "running" { n++ } END { exit !(n >= 2) }'
+        rows && $5 == "running" { n[$3]++ }
+        END {
+            split(apps, want, " ")
+            for (i in want) if (n[want[i]] < 1) exit 1
+            exit !(n["counter"] >= 3)
+        }'
 }
 
 # The quickstart's ingress forward, from the context setup saved.
@@ -172,7 +179,7 @@ write_record() {
         printf -- '- Bootstrap: `%s` (SHA-256 `%s`)\n' "$bootstrap" "${bootstrap_digest:-not fetched}"
         printf -- '- `candidate.json` SHA-256: `%s`%s\n' "${candidate_digest:-not fetched}" \
             "${qualified_digest:+ (required: \`$qualified_digest\`)}"
-        printf -- '- Command: `curl -fsSL %s | RELIABURGER_RELEASE_BASE_URL=%s sh -s -- --timings%s`\n' \
+        printf -- '- Command: `curl -fsSL %s | RELIABURGER_RELEASE_BASE_URL=%s sh -s -- --laptop --timings%s`\n' \
             "$bootstrap" "$base_url" "${setup_args[*]+ ${setup_args[*]}}"
         printf -- '- Relish: `%s`\n' "${relish_version:-not installed}"
         if [ "$result" = PASS ]; then printf -- '- Finished every step\n\n'; else printf -- '- Failed during: %s\n\n' "$stage"; fi
@@ -258,10 +265,11 @@ bootstrap_digest=$(sha256 "$evidence/bootstrap.sh")
 
 stage='install (curl | sh)'
 started=$(date +%s)
-# The same pipeline a user types; the bootstrap passes --timings to setup.
+# The same pipeline a user types; --laptop picks the laptop cluster, and the
+# installer passes --timings on to setup.
 # (`${a[@]+...}` because macOS's bash 3.2 calls an empty array unbound.)
 curl -fsSL "$bootstrap" | RELIABURGER_RELEASE_BASE_URL=$base_url \
-    sh -s -- --timings ${setup_args[@]+"${setup_args[@]}"} 2>&1 | tee "$evidence/install.log"
+    sh -s -- --laptop --timings ${setup_args[@]+"${setup_args[@]}"} 2>&1 | tee "$evidence/install.log"
 install_seconds=$(( $(date +%s) - started ))
 relish_version=$("$relish" --version)
 grep -q 'using an explicit release mirror' "$evidence/install.log" \
@@ -288,6 +296,24 @@ step 'path' path frontend --to redis
 sleep 10
 step 'metrics' metrics frontend
 
+# `relish wtf` asks every node for its GitOps view through node 1's relay. A
+# route missing from the relay's list left that check UNKNOWN on every
+# cluster (#1286). With GitOps unconfigured, as here, a healthy check prints
+# no row at all, so what's gated is that gitops isn't UNKNOWN. Only gitops is
+# gated: wtf's other verdicts on a cluster this young belong to the soak.
+stage='relish wtf checks GitOps on every node'
+printf '\n$ relish wtf\n' | tee -a "$evidence/tour.log"
+started=$(date +%s)
+wtf_status=0
+"$relish" wtf > "$evidence/wtf.txt" 2>&1 || wtf_status=$?
+tee -a "$evidence/tour.log" < "$evidence/wtf.txt"
+tour_rows+="| \`relish wtf\` | $(( $(date +%s) - started )) s | $wtf_status |"$'\n'
+awk '/^[A-Z]+ \([0-9]+\)$/ { section = $1 }
+     section == "UNKNOWN" && $1 == "[gitops]" { unknown = 1 }
+     /^Summary: / { summary = 1 }
+     END { exit !(summary && !unknown) }' "$evidence/wtf.txt" \
+    || fail 'relish wtf could not check GitOps on every node (#1286)'
+
 # The tour's build step, unconditionally: the release's guest image carries
 # Buildah, so a candidate whose nodes can't build fails here rather than in
 # front of a user. The build's own wait bounds it (960 s by default).
@@ -302,22 +328,26 @@ until burgers_running; do
     fi
     sleep 5
 done
-stage='ordering a burger through the ingress'
+stage='a whole burger through the ingress'
 ingress=$(ingress_origin)
 ingress=${ingress:-http://127.0.0.1:18080}
 deadline=$(( $(date +%s) + 60 ))
-# An order names the podinfo backend that answered, so it proves the built
-# image runs, the ingress routes to it and it found `backend` by name.
-until order=$(curl -fsS -H 'Host: burger.localhost' "$ingress/order" 2>>"$evidence/tour.log") \
-        && printf '%s\n' "$order" | grep -q '"kitchen":"[^"]'; do
+# A complete burger has every layer, each found by its service name, so it
+# proves the built image runs, the ingress routes to the counter and the
+# counter found all six layers by name.
+until burger=$(curl -fsS -H 'Host: burger.localhost' -H 'Accept: application/json' "$ingress/" 2>>"$evidence/tour.log") \
+        && printf '%s\n' "$burger" | grep -q '"complete":true'; do
     if [ "$(date +%s)" -ge "$deadline" ]; then
-        fail "no burger order through $ingress after 60 s"
+        fail "no whole burger through $ingress after 60 s"
     fi
     sleep 3
 done
-printf '\n$ curl -H "Host: burger.localhost" %s/order\n%s\n' "$ingress" "$order" | tee -a "$evidence/tour.log"
-tour_rows+="| \`curl http://burger.localhost/order\` (through $ingress) | | 0 |"$'\n'
+printf '\n$ curl -H "Host: burger.localhost" %s/\n' "$ingress" | tee -a "$evidence/tour.log"
+curl -fsS -H 'Host: burger.localhost' "$ingress/" 2>&1 | tee -a "$evidence/tour.log" || true
+tour_rows+="| \`curl http://burger.localhost/\` (through $ingress) | | 0 |"$'\n'
 # qualify-sustained.sh soaks the cluster this leaves (--keep); hand it the
 # same apps as before the build step.
-step 'remove the demo app' delete burger
+for app in $burger_apps; do
+    step "remove the demo app's $app" delete "$app"
+done
 result=PASS

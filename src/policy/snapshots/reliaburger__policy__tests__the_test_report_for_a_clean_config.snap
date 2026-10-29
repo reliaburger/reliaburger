@@ -1,0 +1,7 @@
+---
+source: src/policy/tests.rs
+expression: "report::render_test(&evaluation, 1, 0, 2)"
+---
+Checked 1 app(s) against 2 policy(ies).
+
+0 denial(s), 0 warning(s): an apply would be accepted.

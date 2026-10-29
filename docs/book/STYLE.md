@@ -11,6 +11,16 @@ Analysed from *Chaos Engineering* (Manning, 2021) by Miko Pawlikowski. Key refer
 - [Chaos Engineering 2021 — Conf42 talk transcript](https://www.conf42.com/Chaos_Engineering_2021_Mikolaj_Pawlikowski_chaos_engineering_2021)
 - [Break Things on Purpose podcast — Gremlin](https://www.gremlin.com/blog/podcast-break-things-on-purpose-mikolaj-pawlikowski-engineering-lead-at-bloomberg)
 
+## Snippets must work
+
+Every `relish` command and TOML block in the manual, the READMEs and the
+whitepaper is parse-checked by `tests/suite/doc_snippets.rs`. Write snippets a
+reader can paste: a sub-table like `[app.api.health]` carries the
+`[app.api]` and `image` lines above it. Use `<!-- snippet: fragment -->` on
+the line before the fence only when a block really can't stand alone, and
+`<!-- snippet: planned #N -->` or `<!-- snippet: pending #N -->` for features
+an open issue is building ([docs/testing.md](../testing.md#doc-snippets)).
+
 ## Voice Summary
 
 Miko writes like a knowledgeable colleague explaining something over coffee. Informal-authoritative. Direct, honest, confident without being arrogant. British English. Engineer's pragmatism: values clarity over elegance.

@@ -5,8 +5,8 @@
 //! ```sh blocks) show the same tour. Every `relish …` line in them must parse
 //! with the real CLI definition: we run the compiled binary with
 //! `RELISH_PARSE_ONLY=1`, which parses the arguments and exits without doing
-//! anything. The two copies must list the same commands, and the demo
-//! manifest the tour applies must exist and be published by the Pages workflow.
+//! anything. The two copies must list the same commands, and the demo app
+//! the tour builds must exist and be published by the Pages workflow.
 //!
 //! `scripts/ci/select-jobs.sh` counts `docs/website/index.html` as code so an
 //! edit to the page alone still runs this test.
@@ -22,15 +22,19 @@ const PENDING: &[(&str, &str)] = &[];
 
 const DEMO_MANIFEST_PENDING: bool = false;
 
-const INSTALL_LINE: &str = "curl -fsSL https://reliaburger.com/install.sh | sh";
+/// The one-line install names its mode: without one the installer only
+/// explains the choices (#670).
+const INSTALL_LINE: &str = "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop";
+/// The Kubernetes demo the manual's Kubernetes chapter applies. The tour
+/// used it until 0.2.3 (#1343); the site still publishes it.
 const DEMO_URL: &str = "https://reliaburger.com/demo/podinfo.yaml";
 const DEMO_SOURCE: &str = "examples/kubernetes/podinfo.yaml";
 
-fn repository() -> PathBuf {
+pub(crate) fn repository() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn read(path: &str) -> String {
+pub(crate) fn read(path: &str) -> String {
     std::fs::read_to_string(repository().join(path)).unwrap()
 }
 
@@ -235,6 +239,47 @@ fn homepage_and_manual_show_the_same_tour() {
     );
 }
 
+/// Every place that shows someone how to pipe the installer to a shell
+/// names a mode, `--laptop` or `--install-only`. A bare `| sh` now only
+/// prints the choices, so a page showing one would leave its reader with
+/// nothing installed (#670).
+#[test]
+fn every_shown_install_line_names_a_mode() {
+    let mut pages = vec![
+        "README.md".to_string(),
+        "docs/website/index.html".to_string(),
+        "docs/website/README.md".to_string(),
+        "scripts/demo/tour.sh".to_string(),
+        "scripts/release/install.sh.in".to_string(),
+    ];
+    for directory in ["docs", "docs/manual", "docs/book"] {
+        for entry in std::fs::read_dir(repository().join(directory)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|extension| extension == "md") {
+                let relative = path.strip_prefix(repository()).unwrap();
+                pages.push(relative.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut failures = Vec::new();
+    for page in &pages {
+        for (number, line) in read(page).lines().enumerate() {
+            let Some(at) = line.find("reliaburger.com/install.sh |") else {
+                continue;
+            };
+            let rest = &line[at..];
+            if !rest.contains("sh -s -- --laptop") && !rest.contains("sh -s -- --install-only") {
+                failures.push(format!("{page}:{}: {}", number + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "these install lines name no mode; add `sh -s -- --laptop` or `--install-only`:\n{}",
+        failures.join("\n")
+    );
+}
+
 /// The recording's script (`scripts/demo/tour.sh`) reads its commands from
 /// the page, and knows how to run and wait for each one. A command added to
 /// the tour must be taught to the script too, or the recording drifts.
@@ -262,8 +307,7 @@ fn manual_tour_opens_the_tour_chapter() {
 
 #[test]
 fn the_demo_manifest_is_published_from_the_tested_example() {
-    let page = read("docs/website/index.html");
-    assert!(page.contains(DEMO_URL));
+    assert!(read("docs/manual/09_kubernetes.md").contains(DEMO_URL));
     let workflow = read(".github/workflows/static.yml");
     assert!(
         workflow.contains(&format!("cp {DEMO_SOURCE} docs/website/demo/podinfo.yaml")),
@@ -291,11 +335,36 @@ const BURGER_FILES: &[&str] = &[
     "batch.go",
     "batch_test.go",
     "burger.toml",
+    "cheese-v2.toml",
+    "counter.go",
+    "counter_test.go",
     "go.mod",
     "jobs.toml",
+    "layer.go",
+    "layer_test.go",
     "main.go",
-    "main_test.go",
+    "metrics.go",
+    "metrics_test.go",
+    "patty-v3.toml",
+    "render.go",
+    "render_test.go",
+    "triple-patty.toml",
 ];
+
+/// The burger's layers, top to bottom: one app each, named as the counter
+/// asks for them (`layerOrder` in `layer.go`).
+const BURGER_LAYERS: &[&str] = &[
+    "top-bun",
+    "lettuce",
+    "tomato",
+    "cheese",
+    "patty",
+    "bottom-bun",
+];
+
+fn burger_config(file: &str) -> reliaburger::config::Config {
+    reliaburger::config::Config::from_file(&repository().join(BURGER_SOURCE).join(file)).unwrap()
+}
 
 fn burger_files_on_disk() -> Vec<String> {
     let mut files: Vec<String> = std::fs::read_dir(repository().join(BURGER_SOURCE))
@@ -322,16 +391,74 @@ fn the_demo_app_is_published_from_the_tested_example() {
     );
     assert_eq!(burger_files_on_disk(), BURGER_FILES);
 
-    let config = reliaburger::config::Config::from_file(
-        &repository().join(BURGER_SOURCE).join("burger.toml"),
-    )
-    .unwrap();
+    let config = burger_config("burger.toml");
     let build = &config.build["burger"];
     assert_eq!(build.context, Path::new("."));
     assert_eq!(build.destination, "pickle://burger:v1");
-    // The app runs what the build pushed, by the bare name nodes resolve
-    // through Pickle.
-    assert_eq!(config.app["burger"].image.as_deref(), Some("burger:v1"));
+    // One image plays every part: each app runs what the build pushed, by
+    // the bare name nodes resolve through Pickle.
+    let mut apps: Vec<&str> = config.app.keys().map(String::as_str).collect();
+    apps.sort();
+    let mut expected = BURGER_LAYERS.to_vec();
+    expected.extend(["counter", "diner"]);
+    expected.sort();
+    assert_eq!(apps, expected);
+    for (name, app) in &config.app {
+        assert_eq!(app.image.as_deref(), Some("burger:v1"), "{name}");
+    }
+    for layer in BURGER_LAYERS {
+        let env = &config.app[*layer].env;
+        assert_eq!(
+            env.get("LAYER"),
+            Some(&reliaburger::config::EnvValue::Plain(layer.to_string())),
+            "{layer} must serve its own layer"
+        );
+        assert_eq!(
+            env.get("VERSION"),
+            Some(&reliaburger::config::EnvValue::Plain("v1".into()))
+        );
+    }
+    let counter = &config.app["counter"];
+    assert_eq!(
+        counter
+            .ingress
+            .as_ref()
+            .map(|ingress| ingress.host.as_str()),
+        Some("burger.localhost")
+    );
+}
+
+/// The tour changes one layer at a time with a small file each. Each must be
+/// `burger.toml`'s app with exactly the change the tour describes, so a later
+/// edit to `burger.toml` can't leave a step silently changing more.
+#[test]
+fn each_tour_change_file_changes_one_thing() {
+    use reliaburger::config::{EnvValue, Replicas};
+    let base = burger_config("burger.toml");
+    let changes: [(&str, &str, &str, Option<u32>); 3] = [
+        ("cheese-v2.toml", "cheese", "v2", None),
+        ("patty-v3.toml", "patty", "v3", None),
+        ("triple-patty.toml", "patty", "v1", Some(3)),
+    ];
+    for (file, app, version, replicas) in changes {
+        let config = burger_config(file);
+        let names: Vec<&String> = config.app.keys().collect();
+        assert_eq!(names, [app], "{file} should change {app} alone");
+        assert!(config.build.is_empty() && config.job.is_empty(), "{file}");
+        let mut expected = base.app[app].clone();
+        expected
+            .env
+            .insert("VERSION".into(), EnvValue::Plain(version.into()));
+        if let Some(replicas) = replicas {
+            expected.replicas = Replicas::Fixed(replicas);
+        }
+        assert_eq!(config.app[app], expected, "{file}");
+        let page = read("docs/website/index.html");
+        assert!(
+            page.contains(&format!("relish apply burger/{file}")),
+            "the tour doesn't apply {file}"
+        );
+    }
 }
 
 /// Most tasks the tour's jobs step may submit. Fresh containers run at about
@@ -341,7 +468,10 @@ const TOUR_JOBS_MAX: i64 = 16;
 
 /// Each cohort's `count` in the tour's job manifest, by cohort name.
 fn burger_job_counts() -> std::collections::BTreeMap<String, i64> {
-    let manifest: toml::Value = read(&format!("{BURGER_SOURCE}/jobs.toml")).parse().unwrap();
+    // `toml::from_str`, not `.parse::<toml::Value>()`: since toml 0.9,
+    // `Value`'s `FromStr` reads a single value, not a whole document.
+    let manifest: toml::Table =
+        toml::from_str(&read(&format!("{BURGER_SOURCE}/jobs.toml"))).unwrap();
     manifest["cohort"]
         .as_array()
         .unwrap()
@@ -1059,7 +1189,9 @@ fn release_cards_use_roadmap_release_names() {
         );
         cards.push(version.to_string());
     }
-    for release in ["0.2.0", "0.3.0", "0.4.0"] {
+    // The installed release's card, wherever the installer's default points.
+    let installed = installer_default();
+    for release in [installed.trim_start_matches('v'), "0.3.0", "0.4.0"] {
         assert!(
             cards.iter().any(|card| card == release),
             "no {release} card"
@@ -1174,7 +1306,7 @@ fn the_release_testing_section_shows_the_installed_release() {
         assert!(
             version >= current,
             "the release-testing section names {version:?}, older than {installed}; \
-             refresh it (docs/releasing.md, step 9)"
+             refresh it (docs/releasing.md, step 10)"
         );
     }
     let log = read("docs/release-log.md");
@@ -1245,7 +1377,7 @@ fn the_release_testing_section_shows_the_installed_release_s_soak_charts() {
         assert!(
             record.contains(&format!("-{installed}-")),
             "{source} comes from another release's record, not {installed}'s; \
-             refresh the charts (docs/releasing.md, step 9)"
+             refresh the charts (docs/releasing.md, step 10)"
         );
         let copy = std::fs::read(repository().join("docs/website").join(source))
             .unwrap_or_else(|error| panic!("{source} isn't in docs/website: {error}"));

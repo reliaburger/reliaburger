@@ -988,7 +988,7 @@ All dependencies are Rust crates compiled into the single `reliaburger` binary.
 | [`tokio`](https://crates.io/crates/tokio) | 1.x | Async runtime | Multi-threaded runtime with work-stealing scheduler. Provides `TcpListener`, `TcpStream`, timers, channels, and task spawning. Already used throughout the Bun agent. |
 | [`instant-acme`](https://crates.io/crates/instant-acme) *(candidate, not currently a dependency)* | To decide | Deferred ACME protocol client | Reassess when automatic public certificates enter the roadmap; library choice follows the issuer and challenge design. |
 | [`tokio-tungstenite`](https://crates.io/crates/tokio-tungstenite) | 0.24.x | WebSocket protocol implementation | Used by the API/CLI clients (`bun/api`, `relish`). Wrapper itself does *not* use it: it detects upgrades by hand on raw headers (`is_websocket_upgrade`) and, after the handshake, proxies at the raw TCP level. |
-| [`rcgen`](https://crates.io/crates/rcgen) | 0.13.x | X.509 certificate generation | Used for the development certificate and cluster-CA leaf certificates. |
+| [`rcgen`](https://crates.io/crates/rcgen) | 0.14.x | X.509 certificate generation | Used for the development certificate and cluster-CA leaf certificates. |
 | [`webpki`](https://crates.io/crates/webpki) *(candidate, not currently a direct dependency)* | To decide | Deferred certificate validation | Reassess with ACME and explicit-certificate validation work. |
 | [`rustls-pemfile`](https://crates.io/crates/rustls-pemfile) | 2.x | PEM file parsing | Used to load certificates from disk cache and from operator-provided manual certificate files. |
 

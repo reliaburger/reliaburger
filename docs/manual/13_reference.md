@@ -10,7 +10,7 @@ The flags, variables, files and ports you'll reach for. `relish help COMMAND`
 | `--endpoint URL` | `RELIABURGER_ENDPOINT` | Bun API to talk to |
 | `--token TOKEN` | `RELIABURGER_TOKEN` | API bearer token |
 | `--ca-cert PATH` | `RELIABURGER_CA_CERT` | cluster root CA; switches the default to HTTPS |
-| `--output FORMAT` | | `human` (default), `json` or `yaml` |
+| `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; a command with no machine output refuses `json` and `yaml` |
 
 A flag beats its variable. With neither, `relish` uses the laptop cluster's
 saved context, then `http://127.0.0.1:9117`.
@@ -126,19 +126,39 @@ is a field the node can't honour; nothing is silently dropped.
 | `port` | Port the app listens on; published on the node and in service discovery |
 | `cpu`, `memory` | Request–limit ranges, such as `"250m-1000m"` and `"256Mi-512Mi"` |
 | `gpu` | Refused above 0 until GPU support lands ([#359](https://github.com/reliaburger/reliaburger/issues/359)) |
-| `env` | Environment variables, plain or encrypted |
+| `env` | Environment variables: plain, encrypted (`ENC[AGE:...]`) or from a secret provider (`PROVIDER[name:path]`, see `security`) |
 | `namespace` | Namespace; `default` when omitted |
+| `owner` | The name of the API token of the controller that manages the app. Only that token or an admin may set it; `relish apply` and GitOps then leave the app alone, and `relish release` hands it back (see `writing-a-controller`) |
 | `health` | `path`, `port` (default: the app's `port`), `protocol` (`http` or `https`), `interval` (10 s), `timeout` (5 s, at most `interval`), `threshold_unhealthy` (3), `threshold_healthy` (1), `initial_delay` (0 s). No zeros |
 | `[[init]]` | `image` (default: the app's) and `command`; runs before the app with its env and mounts |
+| `[[sidecar]]` | `name` (a DNS label), `image` (default: the app's), `command`, `args`, `env` (on top of the app's; no encrypted values), `cpu` and `memory`. Runs beside each instance in its network namespace, after the init containers and before the app, and stops after it. Restarts on its own with a backoff up to a minute. Its requests add to the app's. Needs rootful runc; refused on `exec` and `script` apps and alongside an `egress` allowlist |
 | `[[config_file]]` | `path` and exactly one of `content` (a per-instance read-only copy) or `source` (a node file, allowlisted); not on `exec` or `script` apps |
 | `[[volumes]]` | `path`, and `source` (a node directory, allowlisted) or a managed volume with optional `size`; not on `exec` or `script` apps. A `size` needs root, and can't change once the volume exists |
 | `placement` | `required` and `preferred` node labels, `key=value` |
 | `deploy` | `strategy` (`rolling` or `blue-green`), `max_surge`, `max_unavailable`, `drain_timeout`, `health_timeout`, `auto_rollback` |
+| `stop_signal` | The signal a stop sends: `SIGTERM` (default), `SIGINT`, `SIGQUIT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2` or `SIGWINCH` |
+| `stop_grace` | Time to exit after that signal before the kill, `"1s"` to `"1h"`. Default: the deploy's `drain_timeout`, or 10 s for a plain stop |
+| `runtime` | A `[app.NAME.runtime]` table: `capabilities` to add, namespaced `sysctls` and `devices` (`path`, `permissions`). Each needs the node's `[runtime]` allowlist and `host-exec`; not on `exec` or `script` apps (see `security`) |
+| `pre_stop`, `pre_stop_timeout` | A command run inside each instance before its signal, and its bound (default 30 s, at most an hour). A failure is logged, never fatal. On `exec` and `script` apps it runs on the host and needs an absolute, allowlisted path |
 | `autoscale` | `metric` (`cpu` or `memory`), `target`, `min` (at least 1), `max`, `evaluation_window`, `cooldown`, `scale_down_threshold`. Removing it returns the app to `replicas` |
 | `ingress` | `host`, `path`, `tls` (`cluster`, `explicit` or `none`), `websocket`, `rate_limit_rps`, `rate_limit_burst` |
 | `firewall` | `allow_from`: apps (or `namespace/app`) allowed to connect |
 | `egress` | `allow`: outside destinations the app may reach. `allow_franchise` is refused |
 | `metrics` | `port` (default: the app's) and `path` (default `/metrics`) to scrape |
+| `provenance` | `template` and `use`: the template and `[use.*]` that made the app. Template expansion writes it, and `relish compile` keeps it in its output; changing it alone restarts nothing, and a policy `default` can't set it |
+
+## Template fields
+
+A `[template.NAME]` table takes `params` and `body`; a `[use.NAME]` table
+takes `template` and one key per parameter. Both names are lowercase DNS
+labels. See `deploy` for a worked example.
+
+| Field | Meaning |
+|-------|---------|
+| `params` | Parameter names to types: `"string"`, `"int"` or `"bool"`, or `{ type = "...", default = ... }`. A parameter without a default is required. Names start with a letter or `_`, and `template` is taken |
+| `body` | Ordinary `[app.*]` and `[job.*]` TOML with `${param}` placeholders, and nothing else: no other tables, templates or uses |
+| `template` (in `[use.*]`) | The template to expand |
+| any other key (in `[use.*]`) | A parameter's value, of the parameter's type |
 
 ## Job fields
 
@@ -151,7 +171,8 @@ A `[job.NAME]` table takes these fields. Unknown fields are refused.
 | `exec`, `script` | Host binary or inline script, for `process` only |
 | `command` | Command and arguments |
 | `cpu`, `memory` | Request–limit ranges, as for apps |
-| `env` | Environment variables, plain or encrypted |
+| `pids` | Most processes and threads one command may hold (`pids.max`), 1–32768. Default 256 for `shared-runc` and host executor commands; no limit for a fresh `runc` container |
+| `env` | Environment variables, plain or encrypted; `PROVIDER[...]` values are refused (apps only) |
 | `namespace` | Namespace; `default` when omitted |
 | `schedule` | Cron schedule in UTC: five fields or a macro such as `@daily` |
 | `run_before` | `["app.NAME"]`: run as a hook before that app publishes |
@@ -160,8 +181,10 @@ A `[job.NAME]` table takes these fields. Unknown fields are refused.
 | `max_attempts` | 1–10. Default 4, or 1 for a hook |
 | `task_timeout_secs` | 0–86400 per attempt; 0 means no deadline. Default none, or 600 for a hook |
 | `overlap` | Cron only: `forbid` (default) skips an occurrence while a run is active; `allow` starts another |
-| `replay_unknown` | `true` replays automatically after an unknown outcome and counts a timeout as an ordinary failure; hooks refuse it. Default `false` | Ordinary TOML jobs,
-cron and hooks use the same executor as arrays. See [batch jobs](14_batch-jobs.md)
+| `replay_unknown` | `true` replays automatically after an unknown outcome and counts a timeout as an ordinary failure; hooks refuse it. Default `false` |
+| `provenance` | `template` and `use`: the template and `[use.*]` that made the job, written by template expansion, as for an app |
+
+Ordinary TOML jobs, cron and hooks use the same executor as arrays. See [batch jobs](14_batch-jobs.md)
 for retry, overlap, retention, supported runtimes and API shapes.
 
 Job limits, all enforced by the council:
@@ -208,15 +231,16 @@ startup instead of being ignored.
 | `[storage]` | data directories, `allowed_host_paths`, `audit_max_bytes` (see `security`), `[storage.snapshots]` (see `images-and-volumes`) |
 | `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
 | `[network]` | `advertise_address`, host `port_range` (default `{ start = 10000, end = 32767 }`, end exclusive: below Linux's ephemeral range; ports something on the host already listens on are skipped) |
-| `[security]` | master key, bootstrap and identity paths, `require_mtls` (default `true`: `bun --cluster` refuses to start without an identity from `relish init` or `relish join`; `false` is the explicit plaintext opt-in, and single-node `bun` ignores it), `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below), `[security.tokens] default_ttl` (the lifetime of a new deployer or read-only token, `"90d"` unless set; see `security`) |
+| `[security]` | master key, bootstrap and identity paths, `require_mtls` (default `true`: `bun --cluster` refuses to start without an identity from `relish init` or `relish join`; `false` is the explicit plaintext opt-in, and single-node `bun` ignores it; a plaintext cluster with no master key and no token takes a node's placement poll and rollout-failure report without a service token, see `security`), `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below), `[security.tokens] default_ttl` (the lifetime of a new deployer or read-only token, `"90d"` unless set; see `security`) |
 | `[ebpf]`, `[dns]`, `[ingress]` | the data plane (see `networking`); `[dns] upstream` defaults to the host's `/etc/resolv.conf` nameservers |
 | `[images]` | registry, pull-through cache, mirrors, trust policy and upstream rules (see `security`), builds (`build_timeout_secs`, `max_context_bytes`, `build_cache_max_bytes`: 100 GiB, 2 GiB on a quickstart; see `images-and-volumes`) |
 | `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |
 | `[gitops]`, `[upgrades]` | see `operations` |
 | `[smoker]`, `[testing]` | fault durations and the fault and test policy (see `chaos`) |
 | `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none; a `script` needs `/bin/sh`), which the scheduler also places by; host commands inherit only `PATH`, `HOME`, `LANG`, `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun |
+| `[secret_providers.NAME]` | `binary` (absolute), `timeout_secs` (5, at most 60), `max_output_bytes` (64 KiB, at most 1 MiB), `env`: the exec secret providers this node runs for `PROVIDER[NAME:path]` values, which the scheduler also places by (see `security`) |
 | `[reporting_tree]` | `report_interval_secs` (5), `stale_report_timeout_secs` (30), `stale_node_grace_secs` (300: how long a live node whose reports stopped keeps its replicas before they move; see `deploy-an-app`) |
-| `[runtime]` | `stop_confirmation_timeout_secs` |
+| `[runtime]` | `stop_confirmation_timeout_secs`; `allowed_capabilities`, `allowed_sysctls` and `allowed_devices`, the runtime knobs apps may use here, which the scheduler also places by (empty: none; see `security`) |
 
 ### Shorter certificates for soak runs
 
@@ -250,6 +274,14 @@ lacks the setting renews once per half-override instead of spinning.
 
 ## Exit codes
 
-Most commands exit `0` on success and `1` on error. `wtf`, `path`, `test` and
-`bench` exit `1` when they find a failure, and `wtf` and `path` exit `2` for
-warnings, degraded paths or incomplete evidence.
+Most commands exit `0` on success and `1` on error. A usage error (an
+unknown flag, a missing argument, or `--output json` on a command that has no
+JSON) exits `2`.
+
+`wtf`, `path`, `test` and `bench` exit `1` when they find a failure, and `wtf`
+and `path` exit `3` for warnings, degraded paths or incomplete evidence. Before
+0.2.2 that was `2`, which a script couldn't tell from a usage error.
+
+`relish exec` exits with the remote command's own exit code, so
+`relish exec web ls /ready` works in a shell `if`. It exits `1` when it
+can't run the command at all, with an `error:` line on stderr.

@@ -92,6 +92,8 @@ async fn partition(
     inject_node_fault_once_council_settles(
         node,
         &reliaburger::smoker::types::FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: reliaburger::smoker::types::FaultType::CouncilPartition {
                 peers: peers.to_vec(),
             },
@@ -250,6 +252,7 @@ async fn start_node_with(
         task_arrays: None,
         task_arrays_on_agent_budget: None,
         process_only,
+        council_size_cap: None,
     })
     .await;
 
@@ -1619,6 +1622,8 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
         .copied()
         .expect("follower exists");
     let request = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::NodeKill {
             kill_containers: false,
         },
@@ -1987,6 +1992,8 @@ async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
     let summary = inject_node_fault_once_council_settles(
         entry,
         &FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::NodeKill {
                 kill_containers: true,
             },
@@ -2116,6 +2123,8 @@ async fn a_kill_sent_to_one_node_kills_a_replica_on_another() {
     let (bystander_pid, _) = web_process(bystander).await.expect("bystander runs web");
 
     let kill = |count, node: Option<&str>| FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::Kill { count },
         target_service: "web".to_string(),
         namespace: None,
@@ -2207,6 +2216,8 @@ async fn a_network_fault_sent_to_one_node_is_installed_where_every_caller_runs()
     let summary = entry
         .client
         .inject_fault(&FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::DnsNxdomain,
             target_service: "web".to_string(),
             namespace: None,
@@ -2791,6 +2802,8 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
         .copied()
         .collect();
     let request = |target: &Node, duration| FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::NodeKill {
             kill_containers: false,
         },
@@ -3807,7 +3820,7 @@ async fn three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy(
         replicas = 3
 
         [[app.web.init]]
-        command = ["sleep", "3"]
+        command = ["/bin/sleep", "3"]
 
         [app.web.deploy]
         max_surge = 0

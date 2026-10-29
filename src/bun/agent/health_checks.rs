@@ -1,6 +1,7 @@
 //! Health on the loop: the probes each tick runs, what their results do to
 //! an instance, and the exits the tick notices.
 
+use super::discovery_ownership::{Landing, WriteOwner};
 use super::*;
 
 /// What [`BunAgent::publish_instance_health`] did with an instance's health.
@@ -10,9 +11,24 @@ pub(super) enum HealthPublication {
     Current,
     /// Journalled and installed in this turn.
     Published,
-    /// A discovery journal write is in flight off the loop, so publishing
-    /// would wait for it. Nothing changed; the next probe publishes.
+    /// Not installed in this turn. Either a discovery journal write was
+    /// already in flight off the loop, so publishing would have waited for
+    /// it (#1100), or this publication's own write outlasted the turn's
+    /// runtime budget and goes on off the loop (#1255). `service_map` is
+    /// unchanged until the write lands, so nothing restarts meanwhile.
     Deferred,
+}
+
+/// A health publication whose journal write outlasted its turn: what to
+/// install once the write lands (#1255).
+#[derive(Debug, Clone)]
+pub(super) struct HealthWrite {
+    instance_id: InstanceId,
+    /// The registration the probe was for; a replaced instance's next
+    /// probe publishes afresh.
+    created_at: Instant,
+    service: crate::onion::service_id::ServiceId,
+    healthy: bool,
 }
 
 /// Wait for a replacement instance to become healthy, on the deploy worker
@@ -227,17 +243,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         // A later probe can complete publication that the transition probe failed.
+        self.restart_published_unhealthy(&instance_id, now).await;
+
+        self.supervisor
+            .health_checker_mut()
+            .schedule_next(instance_id, now);
+    }
+
+    /// Restart an unhealthy instance whose withdrawal is published.
+    async fn restart_published_unhealthy(&mut self, instance_id: &InstanceId, now: Instant) {
         // LOOP-INLINE: in-memory lock, no I/O
         if self
             .supervisor
-            .get_instance(&instance_id)
+            .get_instance(instance_id)
             .is_some_and(|instance| instance.state == ContainerState::Unhealthy)
             && self
                 .supervisor
-                .maybe_restart(&instance_id, now)
+                .maybe_restart(instance_id, now)
                 .await
                 .unwrap_or(false)
-            && let Some(instance) = self.supervisor.get_instance(&instance_id)
+            && let Some(instance) = self.supervisor.get_instance(instance_id)
         {
             self.record_event(
                 crate::bun::events::EventKind::Restart,
@@ -251,10 +276,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             )
             .await;
         }
-
-        self.supervisor
-            .health_checker_mut()
-            .schedule_next(instance_id, now);
     }
 
     /// Confirm health publication before routing changes or automatic restart.
@@ -294,23 +315,98 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if self.discovery_write_in_flight() {
             return Ok(HealthPublication::Deferred);
         }
+        let write = HealthWrite {
+            instance_id: id.clone(),
+            created_at: instance.created_at,
+            service: service.clone(),
+            healthy,
+        };
+        let candidate = self.health_candidate(&write)?;
+        // Its own write waits only until the turn's runtime budget runs
+        // out, as a consumer step's does: a host disk stall held one probe's
+        // turn for 3.9 s (#1255). A write still going then is installed once
+        // it lands (`finish_health_publication`).
+        let deadline = self.turn_deadline();
+        let landing = self
+            .journal_discovery_publication(
+                &service,
+                &candidate,
+                Some(deadline),
+                WriteOwner::HealthProbe(write),
+            )
+            .await?;
+        if landing == Landing::InFlight {
+            return Ok(HealthPublication::Deferred);
+        }
+        self.install_health_candidate(&service, candidate).await?;
+        Ok(HealthPublication::Published)
+    }
+
+    /// The service map with `write`'s health in it.
+    fn health_candidate(
+        &self,
+        write: &HealthWrite,
+    ) -> Result<crate::onion::service_map::ServiceMap, BunError> {
         let mut candidate = self.service_map.clone();
         candidate
-            .set_backend_health(&service, &id.0, healthy)
+            .set_backend_health(&write.service, &write.instance_id.0, write.healthy)
             .map_err(|error| BunError::BackendPublication {
-                service: service.clone(),
+                service: write.service.clone(),
                 reason: error.to_string(),
             })?;
-        self.publish_backend_snapshot(&service, &candidate).await?;
+        Ok(candidate)
+    }
+
+    /// Publish a journalled health candidate and make it the service map.
+    async fn install_health_candidate(
+        &mut self,
+        service: &crate::onion::service_id::ServiceId,
+        candidate: crate::onion::service_map::ServiceMap,
+    ) -> Result<(), BunError> {
+        self.publish_journalled_backends(service, &candidate)
+            .await?;
         self.service_map = candidate;
         self.rebuild_routing_table().await;
-        Ok(HealthPublication::Published)
+        Ok(())
+    }
+
+    /// Install a health publication whose journal write outlasted its turn
+    /// and has now landed, then restart the instance if the publication
+    /// withdrew it, as the probe would have (#1255). An instance that went
+    /// or was replaced meanwhile gets nothing: its next probe publishes
+    /// whatever its health is then.
+    pub(super) async fn finish_health_publication(&mut self, write: HealthWrite) {
+        let now = Instant::now();
+        if self
+            .supervisor
+            .get_instance(&write.instance_id)
+            .is_none_or(|instance| instance.created_at != write.created_at)
+        {
+            return;
+        }
+        let installed = match self.health_candidate(&write) {
+            Ok(candidate) => {
+                self.install_health_candidate(&write.service, candidate)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = installed {
+            eprintln!("bun: {error}");
+            return;
+        }
+        if !write.healthy {
+            self.restart_published_unhealthy(&write.instance_id, now)
+                .await;
+        }
     }
 
     /// A running app's process has exited, which a health check catches
     /// only if the app has one. Mark it Stopped and route it through the
     /// restart path.
     pub(super) async fn observe_app_exit(&mut self, id: &InstanceId) {
+        // Its sidecars restart with it, not on their own (#1120).
+        self.sidecars.cancel_relaunches(id);
         if let Some(instance) = self.supervisor.get_instance_mut(id) {
             instance.retry_pending = true;
             if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {

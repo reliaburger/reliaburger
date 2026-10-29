@@ -32,9 +32,18 @@
 #       the tour's requests use the ingress port. The recording says so and
 #       shows the commands with the ports it really used.
 #
+# Once the cluster exists, scripts/demo/resources.py samples every node VM
+# every five seconds (#671): Bun's memory and CPU, the whole guest's, and the
+# guest's network traffic. Each wait ends with a one-line readout of the
+# latest sample, so a recording shows the cluster's footprint at the moment
+# it describes, and the tour ends with each measure's average and peak.
+#
 # Environment:
 #   RELISH             the relish binary to run (default: the one on PATH)
 #   RELIABURGER_HOME   where --install puts relish (default: ~/.reliaburger)
+#   DEMO_RESOURCES=0   don't measure the tour's resource use
+#   DEMO_RESOURCES_OUT keep the samples there as resources.csv and steps.tsv,
+#                      with cpu.svg, memory.svg and network.svg charts
 #
 # The script needs bash 3.2 (macOS's /bin/bash), so no associative arrays.
 
@@ -42,12 +51,12 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 PAGE="${REPO_DIR}/docs/website/index.html"
-DEMO_URL="https://reliaburger.com/demo/podinfo.yaml"
-DEMO_FILE="examples/kubernetes/podinfo.yaml"
 BURGER_URL="https://reliaburger.com/demo/burger.tar.gz"
 BURGER_FETCH="curl -fsSL ${BURGER_URL} | tar xz"
-# The order request as the page shows it, on the default ingress port.
-BURGER_ORDER="http://burger.localhost:18080/order"
+# The burger as the page shows it, on the default ingress port.
+BURGER="curl http://burger.localhost:18080"
+# The burger's layers, top to bottom, each its own app.
+LAYERS="top-bun lettuce tomato cheese patty bottom-bun"
 
 IDLE_LIMIT=2
 SETUP_SPEEDUP=4
@@ -80,8 +89,7 @@ if [[ -n "${SETUP_BINARIES}" && -n "${INSTALL_VERSION}" ]]; then
     echo "--install and --setup are alternatives; pass one" >&2
     exit 64
 fi
-INGRESS="http://podinfo.localhost:${INGRESS_PORT}"
-BURGER_ORDER_SENT="http://burger.localhost:${INGRESS_PORT}/order"
+BURGER_SENT="http://burger.localhost:${INGRESS_PORT}"
 # Set when this script runs inside its own recording, so the narration only
 # mentions trimming and speed-ups that really happen.
 RECORDING="${TOUR_RECORDING:-}"
@@ -98,27 +106,31 @@ tour_commands() {
 # script learns it.
 known_command() {
     case "$1" in
-        "curl -fsSL https://reliaburger.com/install.sh | sh" \
-        | "relish apply -f ${DEMO_URL}" \
-        | "relish status" \
-        | "relish council status" \
+        "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop" \
         | "${BURGER_FETCH}" \
         | "relish build burger/burger.toml" \
         | "relish images" \
         | "relish apply burger/burger.toml" \
-        | "curl ${BURGER_ORDER}" \
+        | "relish status" \
+        | "relish council status" \
+        | "${BURGER}" \
         | "relish batch submit burger/jobs.toml" \
         | "relish batch watch 1" \
         | "relish jobs" \
-        | "relish path frontend --to redis" \
-        | "relish metrics frontend" \
-        | "relish fault delay redis 300ms --from frontend --duration 2m --acknowledge" \
-        | "relish path frontend --to redis --count 3" \
-        | "relish metrics frontend --name http_request_duration_seconds" \
+        | "relish fault partition lettuce --from counter --duration 30s --acknowledge" \
+        | "relish apply burger/cheese-v2.toml" \
+        | "relish apply burger/patty-v3.toml" \
+        | "relish history patty" \
+        | "relish apply burger/triple-patty.toml" \
+        | "relish fault kill patty --acknowledge" \
+        | "relish events --app patty" \
+        | "relish path counter --to patty" \
+        | "relish metrics counter" \
+        | "relish fault delay patty 300ms --from counter --duration 2m --acknowledge" \
+        | "relish path counter --to patty --count 3" \
         | "relish dashboard" \
-        | "relish fault kill frontend --count 1 --acknowledge" \
         | "relish local stop node-3" \
-        | "relish inspect frontend" \
+        | "relish inspect counter" \
         | "relish wtf" \
         | "relish local destroy --yes" \
         | "relish uninstall" \
@@ -203,7 +215,35 @@ fi
 # points back at the repository for the unpublished-tarball fallback.
 BURGER_WORK=$(mktemp -d)
 ln -s "${REPO_DIR}/examples" "${BURGER_WORK}/examples"
-trap 'rm -rf "${BURGER_WORK}"' EXIT
+
+RESOURCES="${REPO_DIR}/scripts/demo/resources.py"
+RESOURCES_HOME="${RELIABURGER_HOME:-${HOME}/.reliaburger}"
+SAMPLER_PID=""
+SAMPLER_START=""
+
+stop_sampling() {
+    if [[ -n "${SAMPLER_PID}" ]]; then
+        kill -TERM "${SAMPLER_PID}" 2>/dev/null || true
+        wait "${SAMPLER_PID}" 2>/dev/null || true
+        SAMPLER_PID=""
+    fi
+}
+trap 'stop_sampling; rm -rf "${BURGER_WORK}"' EXIT
+
+# Start sampling the quickstart cluster's VMs, once it exists. Without
+# python3 or a cluster the tour runs unmeasured.
+start_sampling() {
+    if [[ -n "${SAMPLER_PID}" || "${DEMO_RESOURCES:-1}" == 0 ]] \
+        || [[ ! -f "${RESOURCES_HOME}/clusters/laptop/state.json" ]] \
+        || ! command -v python3 >/dev/null; then
+        return 0
+    fi
+    SAMPLER_START=$(date +%s)
+    printf '0\tcluster up\n' >"${BURGER_WORK}/steps.tsv"
+    python3 "${RESOURCES}" sample --quickstart "${RESOURCES_HOME}" --interval 5 \
+        --start "${SAMPLER_START}" --csv "${BURGER_WORK}/resources.csv" 2>"${BURGER_WORK}/resources.log" &
+    SAMPLER_PID=$!
+}
 
 BOLD=$'\033[1m'
 DIM=$'\033[2m'
@@ -246,6 +286,18 @@ show_in_work() {
     sleep 1.5
 }
 
+# Whether the published demo archive holds exactly the repository's
+# examples/demo/burger, so the tour can show the real download.
+live_burger_matches_repository() {
+    local live
+    live=$(mktemp -d)
+    curl -fsSL "${BURGER_URL}" 2>/dev/null | tar xz -C "${live}" 2>/dev/null \
+        && diff -rq "${live}/burger" "${REPO_DIR}/examples/demo/burger" >/dev/null 2>&1
+    local matches=$?
+    rm -rf "${live}"
+    return "${matches}"
+}
+
 # Poll a check function until it succeeds, then say how long it took.
 # $1: what we're waiting for, $2: timeout in seconds, $3...: the check.
 wait_for() {
@@ -263,6 +315,40 @@ wait_for() {
     done
     elapsed=$(( $(date +%s) - start ))
     say "done after ${elapsed} s"
+    resource_readout "${what}"
+}
+
+# Note step $1 for the charts and narrate the latest sample.
+resource_readout() {
+    local line
+    if [[ -z "${SAMPLER_PID}" ]]; then
+        return 0
+    fi
+    printf '%s\t%s\n' "$(( $(date +%s) - SAMPLER_START ))" "$1" >>"${BURGER_WORK}/steps.tsv"
+    line=$(python3 "${RESOURCES}" readout --csv "${BURGER_WORK}/resources.csv" 2>/dev/null || true)
+    if [[ -n "${line}" ]]; then
+        say "${line}"
+    fi
+}
+
+# The average and peak of each measure, narrated; the samples and charts are
+# kept in DEMO_RESOURCES_OUT if it's set.
+resource_summary() {
+    local line
+    if [[ -z "${SAMPLER_PID}" ]]; then
+        return 0
+    fi
+    stop_sampling
+    while IFS= read -r line; do
+        say "${line}"
+    done < <(python3 "${RESOURCES}" summary --csv "${BURGER_WORK}/resources.csv")
+    if [[ -n "${DEMO_RESOURCES_OUT:-}" ]]; then
+        mkdir -p "${DEMO_RESOURCES_OUT}"
+        cp "${BURGER_WORK}/resources.csv" "${BURGER_WORK}/steps.tsv" "${DEMO_RESOURCES_OUT}/"
+        python3 "${RESOURCES}" chart --csv "${BURGER_WORK}/resources.csv" \
+            --steps "${BURGER_WORK}/steps.tsv" --out "${DEMO_RESOURCES_OUT}" >/dev/null || true
+    fi
+    printf '\n'
 }
 
 # Running instances of an app, from `relish status` (NODE INSTANCE APP
@@ -273,35 +359,72 @@ running() {
             '$3 == app && $5 == "running" && (skip == "" || $1 !~ skip "$") { n++ } END { print n + 0 }'
 }
 
-all_apps_running() {
-    [[ $(running frontend) -ge 3 && $(running backend) -ge 1 \
-        && $(running redis) -ge 1 && $(running loadgen) -ge 1 ]]
+# Every burger app running: three counters, the diner and each layer.
+burger_running() {
+    local layer
+    [[ $(running counter) -ge 3 && $(running diner) -ge 1 ]] || return 1
+    for layer in ${LAYERS}; do
+        [[ $(running "${layer}") -ge 1 ]] || return 1
+    done
 }
 
 path_passes() {
-    relish path frontend --to redis >/dev/null 2>&1
+    relish path counter --to patty >/dev/null 2>&1
 }
 
 metrics_scraped() {
-    relish metrics frontend 2>/dev/null \
+    relish metrics counter 2>/dev/null \
         | awk '$1 == "http_requests_total" && $4 >= 3 { found = 1 } END { exit !found }'
 }
 
-frontend_restarted() {
-    relish status 2>/dev/null \
-        | awk '$3 == "frontend" && $5 == "running" { n++; if ($7 >= 1) r = 1 } END { exit !(n >= 3 && r) }'
-}
-
-two_burgers_running() {
-    [[ $(running burger) -ge 2 ]]
+# Whether the burger the counter serves passes a check: a Python expression
+# over `b`, the burger as JSON, and `rows(layer)`, that layer's slices.
+burger_is() {
+    curl -fsS -m 10 -H 'Accept: application/json' "${BURGER_SENT}" 2>/dev/null \
+        | python3 -c '
+import json, sys
+b = json.load(sys.stdin)
+def rows(layer):
+    return [r for r in b["layers"] if r["layer"] == layer and not r.get("missing")]
+sys.exit(0 if eval(sys.argv[1]) else 1)' "$1" 2>/dev/null
 }
 
 burger_takes_orders() {
-    curl -fsS "${BURGER_ORDER_SENT}" >/dev/null 2>&1
+    curl -fsS -m 10 "${BURGER_SENT}/order" >/dev/null 2>&1
 }
 
-three_frontends_without_node_3() {
-    [[ $(running frontend '-3') -ge 3 ]]
+# While waiting on a rollout, note any moment the layer went missing, so the
+# script can say whether the burger kept it throughout.
+LOST_LAYER=0
+rolled_to() {
+    burger_is "len(rows('$1')) > 0" || LOST_LAYER=1
+    burger_is "{r['version'] for r in rows('$1')} == {'$2'}"
+}
+
+patty_rollout_failed() {
+    burger_is "len(rows('patty')) > 0" || LOST_LAYER=1
+    relish status 2>/dev/null | grep -q '^patty (namespace default) RolloutFailed'
+}
+
+# The patties' instance numbers, sorted, one line.
+patty_instances() {
+    curl -fsS -m 10 -H 'Accept: application/json' "${BURGER_SENT}" 2>/dev/null \
+        | python3 -c '
+import json, sys
+b = json.load(sys.stdin)
+print(" ".join(sorted(r["instance"] for r in b["layers"] if r["layer"] == "patty" and not r.get("missing"))))' 2>/dev/null
+}
+
+# Three patties again, and not the three there were before the kill.
+PATTIES_BEFORE=""
+new_patty_replaced_one() {
+    local now
+    now=$(patty_instances)
+    [[ $(wc -w <<<"${now}") -eq 3 && "${now}" != "${PATTIES_BEFORE}" ]]
+}
+
+three_counters_without_node_3() {
+    [[ $(running counter '-3') -ge 3 ]]
 }
 
 run_dashboard() {
@@ -339,8 +462,9 @@ sleep 2
 # can't swallow the rest of the tour.
 previous=""
 while IFS= read -r command <&3; do
+    start_sampling
     case "${command}" in
-        "curl -fsSL https://reliaburger.com/install.sh | sh")
+        "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop")
             if [[ -n "${INSTALL_VERSION}" ]]; then
                 say "Step 1 installs the published ${INSTALL_VERSION} release, then runs"
                 say "\`relish setup --quickstart\`. The times on the right are real."
@@ -348,7 +472,7 @@ while IFS= read -r command <&3; do
                     say "This step plays ${SETUP_SPEEDUP}× faster than it ran."
                 fi
                 if [[ -n "${SETUP_PORTS}" ]]; then
-                    show "${command} -s --${SETUP_PORTS}"
+                    show "${command}${SETUP_PORTS}"
                 else
                     show "${command}"
                 fi
@@ -366,27 +490,20 @@ while IFS= read -r command <&3; do
                 show "relish setup --quickstart --development-binaries ${SETUP_BINARIES}${SETUP_PORTS}"
             fi
             ;;
-        "relish apply -f ${DEMO_URL}")
-            if curl -fsSI "${DEMO_URL}" >/dev/null 2>&1; then
-                show "${command}"
-            else
-                say "${DEMO_URL} is published with the site; until then,"
-                say "the same file from the repository:"
-                show "relish apply -f ${DEMO_FILE}"
-            fi
-            ;;
         "relish status")
             case "${previous}" in
-                "relish apply -f ${DEMO_URL}")
-                    wait_for "the images to arrive and all four apps to run" 300 all_apps_running
+                "relish apply burger/burger.toml")
+                    wait_for "the image to arrive and all eight apps to run" 300 burger_running
                     show "${command}"
-                    say "Step 4 opens ${INGRESS} in a browser. The same address from curl:"
-                    show "for i in 1 2 3; do curl -s -H 'Accept: application/json' ${INGRESS} | grep hostname; done"
                     ;;
-                "relish fault kill frontend --count 1 --acknowledge")
-                    sleep 2
-                    show "${command}"
-                    wait_for "the killed replica to come back" 120 frontend_restarted
+                "relish apply burger/patty-v3.toml")
+                    LOST_LAYER=0
+                    wait_for "patty v3 to fail its health check and roll back" 180 patty_rollout_failed
+                    if [[ "${LOST_LAYER}" == 0 ]]; then
+                        say "The burger kept its v1 patty throughout."
+                    else
+                        say "The burger lost its patty for a moment during the rollout."
+                    fi
                     show "${command}"
                     ;;
                 *)
@@ -397,9 +514,9 @@ while IFS= read -r command <&3; do
         "${BURGER_FETCH}")
             # The site publishes the demo from the tag the installer fetches,
             # so until a promotion's site change deploys, the live archive is
-            # the previous release's: published, but missing what this tour
-            # uses (0.1.6's had no jobs.toml).
-            if curl -fsSL "${BURGER_URL}" 2>/dev/null | tar tz 2>/dev/null | grep -qx 'burger/jobs.toml'; then
+            # the previous release's: published, but not what this tour uses
+            # (0.1.6's had no jobs.toml, and 0.2.0's ran 1,064 tasks).
+            if live_burger_matches_repository; then
                 show_in_work "${command}"
             else
                 say "${BURGER_URL} is published with the site, and this release's"
@@ -434,34 +551,78 @@ while IFS= read -r command <&3; do
             wait "${WATCH_PID}"
             relish --output json batch-status "${BATCH_ID}" >"${BURGER_WORK}/summary.json"
             python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); assert s["done"] and s["succeeded"]==10 and s["failed"]==0 and s["not_run"]==0, s' "${BURGER_WORK}/summary.json"
-            say "All 10 tasks succeeded; the burger app kept serving orders."
+            say "All 10 tasks succeeded; the burger kept serving orders."
+            resource_readout "the batch"
             printf '\n'
             sleep 1.5
             ;;
-        "relish build burger/burger.toml" | "relish apply burger/burger.toml")
+        "relish build burger/burger.toml" | "relish apply burger/burger.toml" \
+        | "relish apply burger/cheese-v2.toml" | "relish apply burger/patty-v3.toml" \
+        | "relish apply burger/triple-patty.toml")
             show_in_work "${command}"
             ;;
-        "curl ${BURGER_ORDER}")
-            wait_for "both burger replicas to run" 180 two_burgers_running
-            wait_for "the ingress to route burger.localhost" 60 burger_takes_orders
-            show "curl ${BURGER_ORDER_SENT}"
+        "relish jobs")
+            show "${command}"
+            wait_for "the counter to count the 10 patties" 60 burger_is "b['patties_cooked'] >= 10"
+            show "curl ${BURGER_SENT}"
             ;;
-        "relish inspect frontend")
-            wait_for "three frontends on the two surviving nodes" 240 three_frontends_without_node_3
+        "relish fault kill patty --acknowledge")
+            PATTIES_BEFORE=$(patty_instances)
             show "${command}"
             ;;
-        "relish path frontend --to redis")
-            wait_for "redis to reach the service map" 120 path_passes
+        "${BURGER}")
+            case "${previous}" in
+                "relish council status")
+                    wait_for "the ingress to serve a whole burger" 120 burger_is "b['complete']"
+                    show "curl ${BURGER_SENT}"
+                    ;;
+                "relish fault partition lettuce --from counter --duration 30s --acknowledge")
+                    wait_for "the gap" 30 burger_is "not rows('lettuce')"
+                    show "curl ${BURGER_SENT}"
+                    wait_for "the fault to lift and the lettuce to come back" 90 burger_is "b['complete']"
+                    show "curl ${BURGER_SENT}"
+                    ;;
+                "relish fault kill patty --acknowledge")
+                    show "curl ${BURGER_SENT}"
+                    wait_for "a new patty in the killed one's place" 120 new_patty_replaced_one
+                    show "curl ${BURGER_SENT}"
+                    ;;
+                "relish apply burger/cheese-v2.toml")
+                    LOST_LAYER=0
+                    wait_for "the cheese to roll to v2" 180 rolled_to cheese v2
+                    if [[ "${LOST_LAYER}" == 0 ]]; then
+                        say "The burger kept its cheese throughout the rollout."
+                    else
+                        say "The burger lost its cheese for a moment during the rollout."
+                    fi
+                    show "curl ${BURGER_SENT}"
+                    ;;
+                "relish apply burger/triple-patty.toml")
+                    wait_for "three patties" 120 burger_is "len(rows('patty')) == 3"
+                    show "curl ${BURGER_SENT}"
+                    ;;
+                *)
+                    show "curl ${BURGER_SENT}"
+                    ;;
+            esac
+            ;;
+        "relish inspect counter")
+            wait_for "three counters on the two surviving nodes" 240 three_counters_without_node_3
             show "${command}"
             ;;
-        "relish metrics frontend")
+        "relish path counter --to patty")
+            wait_for "the patties to reach the service map" 120 path_passes
+            show "${command}"
+            ;;
+        "relish metrics counter")
             wait_for "a few scrapes from every replica" 120 metrics_scraped
             show "${command}"
             ;;
-        "relish metrics frontend --name http_request_duration_seconds")
-            say "twenty seconds for the slow requests to reach the metrics, as the tour says"
-            sleep 20
+        "relish path counter --to patty --count 3")
             show "${command}"
+            say "The counters ask the patties through the same delay; the burger shows it:"
+            sleep 3
+            show "curl ${BURGER_SENT}"
             ;;
         "relish dashboard")
             say "--no-open so no browser pops up in the recording; without it, relish opens"
@@ -483,6 +644,7 @@ while IFS= read -r command <&3; do
     previous="${command}"
 done 3< <(tour_commands)
 
+resource_summary
 say "That's the tour. \`relish local destroy --yes\` removes the cluster,"
 say "and \`relish uninstall\` removes relish itself."
 sleep 3

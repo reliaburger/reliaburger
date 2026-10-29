@@ -58,6 +58,7 @@ be visible until we remove its race.
 | `make test-slow` | Required wall-clock health and retry acceptance | Linux; PRs into `main`, `main` and nightly |
 | `make test-linux` | runc, namespaces, eBPF, Btrfs, Buildah and root-only tmpfs | Privileged Linux; PRs into `main`, `main` and nightly |
 | `make test-cluster` | Gossip, placement, failover, healing, recovery and chaos | Linux, serial resource group; PRs into `main`, `main` and nightly |
+| `make test-hollow` | A three-member council process in front of twenty hollow nodes (#1401); the measured sizes run through `scripts/release/qualify-hollow-nodes.sh` | Manual |
 | `make test-upgrade-node` | Real single-node binary replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-rootless-runc` | Rootless runc networking and port adoption as a non-root user | Privileged Linux; PRs into `main`, `main` and nightly |
@@ -69,6 +70,8 @@ be visible until we remove its race.
 | `make ci-bench` | `make ci`, then `make bench` | Local |
 | `make bench` | Criterion transport and 5–250-node measurements | `main`, nightly, and PRs touching gossip |
 | `make bench-large` | Criterion 500- and 1,000-node measurements | `main`, nightly, and PRs touching gossip |
+| `make fuzz-corpus-check` | Every fuzz target body over its seeds and checked-in corpus, on stable (also part of `make test`) | Local; `make test` everywhere |
+| `make fuzz-smoke` | Every cargo-fuzz target for `FUZZ_SECONDS` each (nightly Rust and cargo-fuzz) | `fuzz.yml`: 300 s a target nightly, 30 s on PRs touching a decoder |
 | `make coverage` | The portable suite, run once under line coverage; this is the Linux test gate too | Linux |
 | `make audit` | Current RustSec database, with new vulnerabilities and maintenance warnings denied | Pull requests, release gate and weekly schedule |
 | `tests/examples.rs` (part of `make test`) | Every checked-in workload config parses, validates and plans through Relish without deployment | Linux and hosted macOS |
@@ -261,11 +264,22 @@ files on `PATH`. Prefer this
 shape for a new fixture whose caller can take an interpreter; use `install_script` when the
 caller needs a single executable path.
 
-The `[[bin]]` targets (`bun`, `relish`, `testapp`) are not the fixtures' job: `make test`
+The `[[bin]]` targets (`bun`, `relish`, `testapp`) get the same treatment twice. `make test`
 depends on `make warm-executables`, which builds them with `cargo test --no-run`, as the
 suite will, and runs each of them once before the suite
 ([#722](https://github.com/reliaburger/reliaburger/issues/722),
-[#846](https://github.com/reliaburger/reliaburger/issues/846)).
+[#846](https://github.com/reliaburger/reliaburger/issues/846)). That doesn't cover a filtered
+`cargo nextest run` straight after a build, or an assessment the host has to repeat, so a
+test that starts one of them under a deadline also pays its first launch before the clock
+starts ([#1134](https://github.com/reliaburger/reliaburger/issues/1134),
+[#1149](https://github.com/reliaburger/reliaburger/issues/1149)). The shared fixtures do it
+for their callers: `bun_process::first_launch_binaries()` launches all three together, and
+`BunProcess::spawn_runtime`, `wait_for_relish` and `wait_for_relish_output` call it first.
+A test that spawns `bun` or `relish` itself, or hands `bun` to `ProcessControl` as an owner
+(15 s to answer), calls it, or `first_launch` directly, before its own deadline. A
+candidate binary under the upgrade compatibility query is always a fresh private copy, so no
+warm-up applies there; `QUERY_DEADLINE` (60 s) stays a hang guard
+([#1078](https://github.com/reliaburger/reliaburger/issues/1078)).
 
 ## Benchmarks and coverage
 

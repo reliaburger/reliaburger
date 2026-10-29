@@ -84,6 +84,7 @@ fn instance(id: &str, app: &str, state: &str) -> InstanceStatus {
 
 fn summary_of(id: u64, request: &FaultRequest) -> FaultSummary {
     FaultSummary {
+        task_index: None,
         id,
         fault_type: request.fault_type.to_string(),
         target_service: request.target_service.clone(),
@@ -371,6 +372,8 @@ async fn start_cluster_with_desired(
 
 fn kill(count: u32) -> FaultRequest {
     FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::Kill { count },
         target_service: "web".to_string(),
         namespace: None,
@@ -503,6 +506,8 @@ async fn a_fault_with_no_running_target_is_refused_before_anything_runs() {
 
 fn network(fault_type: FaultType) -> FaultRequest {
     FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type,
         duration: std::time::Duration::from_secs(60),
         ..kill(0)
@@ -999,6 +1004,18 @@ fn the_relay_forwards_each_nodes_version_for_wtf() {
     assert!(!relay_allows(&axum::http::Method::POST, "v1/version"));
 }
 
+/// `relish wtf` asks every node for its GitOps view, since only a node knows
+/// whether its own `[gitops]` drifts; without this every cluster's check
+/// came back UNKNOWN (#1286). Configuring GitOps stays off the relay.
+#[test]
+fn the_relay_forwards_each_nodes_gitops_status_for_wtf() {
+    let get = axum::http::Method::GET;
+    assert!(relay_allows(&get, "v1/gitops"));
+    assert!(!relay_allows(&axum::http::Method::POST, "v1/gitops"));
+    assert!(!relay_allows(&axum::http::Method::POST, "v1/gitops/config"));
+    assert!(!relay_allows(&get, "v1/gitops/config"));
+}
+
 #[test]
 fn the_relay_forwards_exec_to_one_app_and_nothing_nested() {
     let post = axum::http::Method::POST;
@@ -1077,6 +1094,7 @@ async fn the_relay_keeps_the_query_string() {
 /// `default/db`, a managed-volume app whose volumes live on `homes`.
 fn volume_app(homes: &[&str]) -> crate::bun::diagnostics::DesiredAppEvidence {
     crate::bun::diagnostics::DesiredAppEvidence {
+        owner: None,
         app: "db".to_string(),
         namespace: "default".to_string(),
         desired_replicas: u32::try_from(homes.len()).unwrap(),

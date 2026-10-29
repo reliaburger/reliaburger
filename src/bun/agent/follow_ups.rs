@@ -35,6 +35,10 @@ pub(super) enum FollowUp {
     CallersRead(super::fault_coverage::CallersRead),
     /// A node-pressure helper started or stopped.
     NodePressure(super::node_pressure_work::PressureDone),
+    /// A crashed sidecar was started again on its own, or wasn't (#1120).
+    SidecarRelaunched(super::sidecars::Relaunched),
+    /// A verified upgrade's commit that outlived its turn has landed (#1381).
+    UpgradeCommitted(UpgradeCommit),
     /// The egress allowlists were re-resolved.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     EgressResolved(Vec<super::egress_resolution::Resolution>),
@@ -67,6 +71,21 @@ pub(super) struct UpgradePreparation {
     response: oneshot::Sender<Result<(), BunError>>,
     /// Resolves once the answer has reached the caller.
     answer_delivered: Option<crate::sesame::connection::ConnectionClosed>,
+}
+
+/// A verified upgrade's commit and the caller waiting on it.
+pub(super) struct UpgradeCommit {
+    marker: crate::upgrade::marker::UpgradeMarker,
+    committed: Result<(), crate::upgrade::UpgradeError>,
+    response: oneshot::Sender<Result<bool, BunError>>,
+}
+
+/// How a commit task ended: a panicked or cancelled task is an I/O failure
+/// as far as the caller is concerned, and the marker stays for the next boot.
+fn commit_outcome(
+    joined: Result<Result<(), crate::upgrade::UpgradeError>, tokio::task::JoinError>,
+) -> Result<(), crate::upgrade::UpgradeError> {
+    joined.map_err(|error| crate::upgrade::UpgradeError::Io(std::io::Error::other(error)))?
 }
 
 /// How long the exec waits for the "upgrading" answer to reach the caller.
@@ -128,6 +147,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Ok((_, FollowUp::NodePressure(done))) => {
                 self.finish_node_pressure(done).await;
             }
+            Ok((_, FollowUp::SidecarRelaunched(relaunched))) => {
+                self.finish_sidecar_relaunch(relaunched).await;
+            }
+            Ok((_, FollowUp::UpgradeCommitted(commit))) => finish_upgrade_commit(commit),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             Ok((_, FollowUp::EgressResolved(resolutions))) => {
                 self.egress_resolving = None;
@@ -309,6 +332,45 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.upgrade_preparing = Some((preparing, task.id()));
     }
 
+    /// Commit a verified upgrade: record its history entry (fsync'd), prune
+    /// old binaries, then remove the marker, all on a blocking thread
+    /// (#1381). A slow disk held one `upgrade_verify` turn for 2,260 ms
+    /// when this ran inline. The turn waits for the commit only until its
+    /// deadline; a commit still going lands in a follow-up turn, which
+    /// answers the caller. Until it lands the marker is still on disk, so
+    /// the node reports the upgrade in flight and refuses the next one.
+    pub(super) async fn commit_verified_upgrade(
+        &mut self,
+        manager: crate::upgrade::manager::UpgradeManager,
+        marker: crate::upgrade::marker::UpgradeMarker,
+        response: oneshot::Sender<Result<bool, BunError>>,
+    ) {
+        #[cfg(test)]
+        let stalls = std::sync::Arc::clone(&self.loop_stalls);
+        let committing = marker.clone();
+        let mut commit = tokio::spawn(async move {
+            #[cfg(test)]
+            stalls.hold(super::LoopStall::UpgradeCommit).await;
+            commit_outcome(tokio::task::spawn_blocking(move || manager.commit(&committing)).await)
+        });
+        match tokio::time::timeout_at(self.turn_deadline(), &mut commit).await {
+            Ok(joined) => finish_upgrade_commit(UpgradeCommit {
+                marker,
+                committed: commit_outcome(joined),
+                response,
+            }),
+            Err(_) => {
+                self.follow_ups.spawn(async move {
+                    FollowUp::UpgradeCommitted(UpgradeCommit {
+                        marker,
+                        committed: commit_outcome(commit.await),
+                        response,
+                    })
+                });
+            }
+        }
+    }
+
     /// Answer the caller, then exec the staged binary. Only the exec, and
     /// the wait before it for the answer to reach the caller, stay on the
     /// loop.
@@ -422,5 +484,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             FollowUp::FirewallApplied { inputs, result }
         });
         self.firewall_applying = Some(task.id());
+    }
+}
+
+/// Answer the verification once its commit has landed.
+fn finish_upgrade_commit(commit: UpgradeCommit) {
+    let UpgradeCommit {
+        marker,
+        committed,
+        response,
+    } = commit;
+    match committed {
+        Ok(()) => {
+            println!(
+                "bun: upgrade to {} verified and committed",
+                marker.target_version
+            );
+            let _ = response.send(Ok(true));
+        }
+        Err(error) => {
+            eprintln!(
+                "bun: committing the upgrade to {} failed: {error}",
+                marker.target_version
+            );
+            let _ = response.send(Err(BunError::Upgrade(error)));
+        }
     }
 }

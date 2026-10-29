@@ -813,7 +813,7 @@ async fn forward_upstream_tcp(
 /// Decode the complete packet before admitting its one Internet-class question.
 /// The codec owns name lengths, compression and record boundaries; Onion owns
 /// which operations and service-name representations it supports.
-fn decode_query(packet: &[u8]) -> Option<Message> {
+pub(crate) fn decode_query(packet: &[u8]) -> Option<Message> {
     if packet.len() < 12 || packet[3] & 0x40 != 0 {
         return None;
     }
@@ -847,7 +847,7 @@ fn decode_query(packet: &[u8]) -> Option<Message> {
     Some(message)
 }
 
-fn parse_query(packet: &[u8]) -> Option<(String, u16)> {
+pub(crate) fn parse_query(packet: &[u8]) -> Option<(String, u16)> {
     let message = decode_query(packet)?;
     let question = &message.queries[0];
     Some((
@@ -889,12 +889,12 @@ fn build_response(query: &[u8], rcode: u8, vip: Option<VirtualIP>) -> Vec<u8> {
 }
 
 /// Build an authoritative, zero-TTL IPv4 answer.
-fn build_a_response(query: &[u8], vip: VirtualIP) -> Vec<u8> {
+pub(crate) fn build_a_response(query: &[u8], vip: VirtualIP) -> Vec<u8> {
     build_response(query, 0, Some(vip))
 }
 
 /// Build an authoritative answerless response with the given RCODE.
-fn build_status_response(query: &[u8], rcode: u8) -> Vec<u8> {
+pub(crate) fn build_status_response(query: &[u8], rcode: u8) -> Vec<u8> {
     build_response(query, rcode, None)
 }
 

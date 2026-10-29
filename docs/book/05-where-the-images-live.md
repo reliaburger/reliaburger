@@ -162,7 +162,7 @@ The acceptance test for the whole story reads like the incident report we never 
 
 Once an image is in the catalog, a worker that doesn't hold it locally fetches the layers from a peer that does. `pull.rs` reads the Raft layer-holder set, picks a peer, and downloads each missing blob over the same `GET /v2/{repository}/blobs/{digest}` endpoint, verifying the digest before storing. That's live in Phase 5 — push once, and every other node pulls internally.
 
-The tempting next step is a *pull-through cache*: your apps reference `alpine:latest` or `nginx:1.25`, and the first node to need one transparently pulls it from Docker Hub (via the `oci-distribution` client from Phase 1), stores the layers, and commits the manifest to Raft so the next node gets it from a peer. The plumbing is sketched in `pull.rs`, but wiring it end to end — intercepting the miss, caching upstream, committing to Raft — is deferred to Phase 12. For now, public base images are still pulled from Docker Hub per node; only images you've explicitly pushed to Pickle replicate across the cluster. We'll come back to it in Chapter 12.
+The tempting next step is a *pull-through cache*: your apps reference `alpine:latest` or `nginx:1.25`, and the first node to need one transparently pulls it from Docker Hub (via the `oci-client` crate from Phase 1), stores the layers, and commits the manifest to Raft so the next node gets it from a peer. The plumbing is sketched in `pull.rs`, but wiring it end to end — intercepting the miss, caching upstream, committing to Raft — is deferred to Phase 12. For now, public base images are still pulled from Docker Hub per node; only images you've explicitly pushed to Pickle replicate across the cluster. We'll come back to it in Chapter 12.
 
 (It landed there: the cache stores upstream images under `cache/<host>/<repository>` and serves them from peers. And since 0.1.6 an apply binds every tag to a digest, so the cache and every node agree on which bytes `nginx:1.25` means. Chapter 10's "A tag is a promise nobody keeps" tells that part.)
 
@@ -991,6 +991,22 @@ found an unrecognised entry and returned an error, closing the file without
 unlocking it. So the claim now builds the `UploadDirectoryOwner` as it takes
 the lock, and every refusal after that point unlocks through the same `Drop`.
 
+`Drop` has one blind spot: `execv`. A self-upgrade or rollback (Chapter 14)
+replaces the Bun process image in place, and no destructor runs on the way.
+The descriptor is close-on-exec, so Bun's own copy goes, but a child another
+thread was forking at that moment still holds one until its own `exec`. In the
+0.2.1 qualification soak a rollback hit exactly that window. The new image's
+claim was a non-waiting `try_lock`, found the lock busy and exited, and systemd
+restarted Bun (#1198). The child holding the lock was still listed under the
+name of the Tokio worker thread that forked it. So startup now claims with
+`FileLock::lock_within` and waits up to ten seconds (`UPLOAD_OWNER_WAIT`). A
+forking child lets go within milliseconds, and a real second Bun on the same
+store keeps its lock and is still refused, just ten seconds later.
+`a_claim_waits_out_a_briefly_held_lock_and_refuses_a_lasting_one` holds the
+lock from another descriptor, releases it after 300 ms and expects the claim
+to succeed. It then expects a claim that waits 200 ms to fail against a lock
+that stays held.
+
 The test that ties this together launches the real binary, pushes the same
 content into an ordinary and a leased repository, leaves another upload half
 finished, and sends SIGKILL. A replacement Bun must retire the lease on its own,
@@ -1221,6 +1237,38 @@ Queuing costs little. Builds are rare, each stage still has its timeout, and the
 
 A `RUN` step that fetches packages makes Buildah (netavark, on Ubuntu 24.04) create a `podman0` bridge on `10.88.0.0/16` with firewall rules of its own. We read our nftables code to see whether the two collide. They don't, in the ways that matter. The perimeter firewall lives in its own tables, filters only the `input` hook with an `accept` policy, and deletes only its own tables when it reloads. Container networking masquerades `10.0.0.0/8`, which covers Buildah's range too, and a second masquerade is harmless. A build step that tries to reach the node's API or registry comes from `10.88.x.x`, which the perimeter treats as a stranger. One node in 256 draws a container subnet inside `10.88.0.0/16`, but every Reliaburger container has its own `/32` route, so traffic still finds it. So we left Buildah's network alone, and the manual suggests `RUN --network=none` for steps that don't need it, as the burger's Dockerfile does.
 
+### A burger you can watch
+
+The burger did its job: it proved you could build your own image on the cluster. As a demo, though, it was dull. `curl` returned a line of JSON naming the podinfo replica that "cooked" the order, and the rest of the tour went on with podinfo, somebody else's app from somebody else's registry. Watch a rolling deploy of podinfo and you see a hostname change in a JSON field. Kill a frontend and you see... nothing, unless you know which field to read. A friend of the project pointed at [podtato-head](https://github.com/podtato-head/podtato-head), the CNCF App Delivery group's demo, where a character is assembled from parts that are each their own service, so a broken deploy is a wrong arm you can see. In 0.2.3 ([#1343](https://github.com/reliaburger/reliaburger/issues/1343)) the burger became that, with our own artwork and code: a burger you can watch.
+
+It's still one Go program and one image. Each layer of the burger (top bun, lettuce, tomato, cheese, patty, bottom bun) is its own app in `burger.toml`, the same image with `LAYER` and `VERSION` set, and answers `GET /layer` with its version, the node and instance that served it, and its own drawing. The counter, behind the ingress, asks every layer for its slice and stacks whatever answers:
+
+```text
+  ▟  '  .  '  .  '  .  '  .▙   top bun     v1  sesame         rb-bab43735aab6-1 #f56d    3.0 ms
+   · · · · · · · · · · · ·     lettuce     missing: blocked by the cluster
+  ▐  o    o    o    o    o ▌   tomato      v1  beef tomato    rb-bab43735aab6-1 #721d    3.8 ms
+```
+
+In a terminal each line is in colour, which is what the tour's recording shows; a browser gets the same burger as flat SVG, redrawn every second, and a script gets JSON. Now the tour's features read at a glance. A lettuce partitioned off from the counters is a gap until the fault lifts. A rolling deploy turns the cheddar into blue cheese a slice at a time. Patty `v3` fails its health check on purpose, so the rollback is a burger that stays beef. Three patty replicas are a triple patty, and killing one makes it a double until the node agent restarts it under a new instance number. The layer draws itself, so a new version changes the burger without the counter knowing anything about cheese.
+
+The counter finds the layers the way any client in the cluster does: by service name. `http://cheese:8080/layer` resolves to cheese's virtual IP, and the eBPF connect hook from chapter 3 turns the connection into one to a healthy instance. That hook picks backends round-robin, per connection, and refuses the connection (`EPERM`) when an app has no healthy instance at all. Both shape the counter. To find every patty it asks each layer several times, concurrently, over fresh connections:
+
+```go
+client: &http.Client{Transport: &http.Transport{DisableKeepAlives: true}},
+```
+
+Go's HTTP client normally keeps connections alive and reuses them, which would send every ask to the same patty. With keep-alive off, every ask is a new `connect()`, and the hook hands each one the next instance. Each instance names itself with a random id it picks at start, so three distinct answers are three patties. A refused connection is a missing layer, and the counter says why in a few words: "blocked by the cluster" for `EPERM` (no healthy instance, or a partition fault), "not answering" for a refused connection, "timed out", or the status code a layer answered with.
+
+Round-robin is shared by every caller on a node, though. When the diner's order and a browser's refresh land at once, two of one counter's asks can hit the same patty, and a triple patty would flicker to a double. So the counter asks six times rather than three, and remembers each instance it saw for five seconds, drawing the union of what answered now and what answered recently. A layer that nothing answers for right now is a gap at once, whatever it remembers: the whole point is that a fault shows. The first run on a laptop cluster turned up one more flicker. Three counters each have their own memory, and the ingress takes turns between them, so stacking instances in the order each counter first saw them made the patties swap places from one refresh to the next. They're stacked by node and instance now, which every counter agrees on.
+
+The batch step needed the same trick in reverse. Each task cooks a patty (it hashes a block of memory, as before) and then tells the counter, by its service name, with a `POST /cooked`. The service spreads those reports over three counters, so each knows only its share. Rather than give the counters shared state, each one asks the counter service for every counter's tally, the same six asks, and adds them up. It's a demo, so a counter that dies takes its share of the tally with it. We were happy with that.
+
+The Go code leans on the standard library alone, as before, so the Buildah step still downloads nothing but the Go toolchain. The Prometheus metrics the tour's `relish metrics counter` reads are about a hundred lines of Go instead of the client library. Writing goroutines for the concurrent asks is close to what we'd write with `tokio::spawn` in Rust, with one difference worth noticing. Each goroutine writes its answer into its own slot of a slice and a `sync.WaitGroup` waits for them all; Go lets every goroutine capture the slice, and the race detector, not the compiler, is what would catch two of them writing the same slot. Rust would make us prove at compile time that the slots don't overlap, with `split_at_mut` or by collecting the results from the `JoinHandle`s.
+
+That first run taught us three more things that no unit test could have. `relish fault kill lettuce` was refused: the chaos tooling's replica-minimum rail won't kill an app's last replica, and that rail isn't overridable. So the tour cuts the lettuce off with `relish fault partition lettuce --from counter` instead, which is a gap without a casualty, and kills one of three patties. `relish path counter --to patty` came back UNKNOWN, because its TCP probe runs `sh`, `nc` and `date` inside the source container and the burger's final stage was `scratch`, an image with nothing in it but our binary. It's Alpine now, pinned by digest like the Go image. And the rolling deploy of a cheese with one replica left the burger without cheese for three to six seconds, even with `max_unavailable = 0`: the old instance left the nodes' service maps before the new one arrived in them. Cheese now runs two replicas, so the other slice serves while one is replaced. The window itself was a question for the deploy and service-map code, not for a demo. A published replacement kept reporting `Starting` until its rollout finished, and the leader's catalogue counts only `Running` backends, so for a few seconds every other node saw no healthy cheese at all. Chapter 7 tells how that was found and fixed ([#1353](https://github.com/reliaburger/reliaburger/issues/1353)). A shorter window, where a retiring instance could stop before every node had stopped routing to it, closed later: the old slice now keeps serving until the leader confirms that every node has dropped it ([#1355](https://github.com/reliaburger/reliaburger/issues/1355)).
+
+What we didn't do: one image per layer (six images to build, sign and host for a demo, when an environment variable does the job), podtato-head's artwork (it isn't ours), and replacing the quickstart's `hello` app, which stays the minimal smoke test that setup runs. The tour no longer applies a Kubernetes manifest, either. podinfo's YAML is still published, and the Kubernetes chapter of the manual still applies it, but the five minutes now go to things you can see.
+
 ## Copies that can still answer
 
 The 0.2.0 audit asked a simple question: push an image, let heal copy it to a second node, then lose that node for good. What happens?
@@ -1298,6 +1346,8 @@ pub fn requires_mtls(&self) -> bool {
 
 `#[cfg(test)]` isn't only for whole modules. It can sit on a struct field, a statement or an `if`, and the compiler drops whatever it marks from a normal build, so production code has no way to switch the check off. The unit tests that drive the forwarder against a plaintext stand-in for the leader (an axum handler that takes no certificate) opt in with `against_plaintext_stand_in()`.
 
+Those stand-in tests grew a flake of their own. One test checked two bounds with one forwarder. An answer one chunk over the 8 MiB limit must be refused for its size, and an answer that never ends must give up at the deadline, cut from ten seconds to two by a test-only `with_timeout`. On a Mac busy with other agents' builds, the first case lost the race: streaming 1,025 chunks of 8 KiB took more than two seconds, and the forwarder said "timed out" where the test expected "limit" ([#1145](https://github.com/reliaburger/reliaburger/issues/1145)). Plain load didn't reproduce it, because alone the case takes half a second. A stand-in that waits 3 ms between chunks did, every time. The size check is about bytes, so its test shouldn't race a clock. Now there are two tests. The over-limit one calls `send_request`, the exchange without the deadline wrapped around it, so its verdict counts bytes. The stalled one keeps the two seconds, which a body that never ends meets however slow the machine is. `send_request` is private, and the test can still call it because Rust's privacy is per module, not per file or type: an item is visible in the module that declares it and in that module's children, and the `tests` module sits inside `authority.rs`.
+
 Every proposal and query on a plaintext cluster now ends in `PickleError::RegistryNeedsMtls`, whose message names the fix: start the cluster with TLS, `relish init` then `relish join`. A push answers 503 with that text, `relish status` prints `registry: needs mTLS`, and `relish wtf` raises one `registry-needs-mtls` warning listing the nodes, rather than one per node.
 
 That leaves the once-a-second log line. The reaper keeps running (a transient leader loss should still clear itself up), but it logs through a small struct that remembers the last thing it said:
@@ -1333,7 +1383,7 @@ Pickle is almost entirely testable in-process. A blob store is a directory, the 
 
 ### Unit tests — the registry without the network
 
-The 104 tests in `src/pickle/` cover:
+The tests in `src/pickle/` cover:
 
 - **Digest and manifest** — `Digest::new` accepts well-formed digests and rejects everything else; manifests round-trip through serde unchanged.
 - **Blob store** — write/read, upload sessions, and the digest-mismatch rejection path (`PickleError::DigestMismatch`).
@@ -1377,8 +1427,6 @@ cargo test --lib pickle       # the whole registry, in-process
 ```
 
 Reach for the gated commands only when you want to exercise real images or real runtimes. The full env-var table lives in `docs/README.md`.
-
-Phase 5 adds 72 tests, bringing the total to 867.
 
 
 ### Sharing the authentication budget

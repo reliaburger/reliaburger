@@ -351,6 +351,7 @@ mod tests {
 
     fn recorded_resources() -> OciResources {
         OciResources {
+            pids: None,
             cpu: Some(crate::grill::oci::OciCpuResources {
                 quota: 50_000,
                 period: 100_000,
@@ -362,6 +363,7 @@ mod tests {
                 "memory.high".to_string(),
                 "33554432".to_string(),
             )]),
+            devices: Vec::new(),
         }
     }
 

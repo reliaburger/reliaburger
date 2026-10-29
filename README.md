@@ -23,48 +23,56 @@ batch of jobs on it, breaks it and watches it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-0.2.0 was released on 16 October 2026, and the one-line installer fetches
-its signed binaries. You'll need macOS, or Linux with QEMU and KVM, plus about
-8 GiB of free memory and 15 GiB of disk.
+0.2.3 was released on 28 October 2026, and the one-line installer fetches
+its signed binaries. You'll need a Mac with Apple silicon, or Linux with QEMU
+and KVM, plus about 8 GiB of free memory and 15 GiB of disk.
+
+`--laptop` asks for a development cluster on this computer. Without a flag the
+installer only explains the choices, including clusters on Linux machines you
+already have (`--install-only`, then the [Linux servers guide](docs/linux-servers.md)).
+Until 1.0.0, every Reliaburger cluster is for developers and enthusiasts
+trying it out, not for production.
 
 ```sh
-# Install relish and build a three-node cluster in Linux VMs
-curl -fsSL https://reliaburger.com/install.sh | sh
+# Install relish and build a three-node cluster in Linux VMs on this laptop
+curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
 
-# Run a real Kubernetes app: podinfo's frontend, backend and Redis
-relish apply -f https://reliaburger.com/demo/podinfo.yaml
-relish status                        # frontend-0, -1 and -2, one on each node
-relish council status                # every node's view of the council
-open http://podinfo.localhost:18080  # through the built-in ingress
-
-# Build a small Go app on the cluster (Buildah on a node, into the built-in
-# registry, signed), then run it next to podinfo
+# Build a burger on the cluster (Buildah on a node, into the built-in
+# registry, signed): one Go program that plays every layer
 curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz
 relish build burger/burger.toml
 relish images                        # burger:v1, built for amd64 and arm64
-relish apply burger/burger.toml
-curl http://burger.localhost:18080/order   # calls podinfo's backend by name
+relish apply burger/burger.toml      # six layers, a counter and a diner
+relish status                        # counter-0, -1 and -2, one on each node
+relish council status                # every node's view of the council
+curl http://burger.localhost:18080   # the burger, layer by layer; open it in a browser too
 
-# Ten jobs from the same image, packed around the running apps
+# Ten jobs from the same image cook patties beside the running apps
 relish batch submit burger/jobs.toml
 relish batch watch 1                 # the number submit printed
 relish jobs                          # the finished run and its rate
 
-# See every hop from frontend to Redis: DNS, VIP, eBPF map, firewall, TCP
-relish path frontend --to redis
+# Cut a layer off, roll one forward, roll a bad one back, scale one up, kill one
+relish fault partition lettuce --from counter --duration 30s --acknowledge  # a gap
+relish apply burger/cheese-v2.toml        # a rolling deploy to blue cheese
+relish apply burger/patty-v3.toml         # fails its health check, rolled back
+relish history patty
+relish apply burger/triple-patty.toml     # a triple patty
+relish fault kill patty --acknowledge     # a double, then a triple again
+relish events --app patty                 # what happened, from every node
 
-# podinfo's own Prometheus metrics, scraped from its pod annotations
-relish metrics frontend
+# See every hop from counter to patty: DNS, VIP, eBPF map, firewall, TCP
+relish path counter --to patty
+relish metrics counter               # its own Prometheus metrics, scraped for you
 
-# Make Redis slow, but only for the frontends, for two minutes
-relish fault delay redis 300ms --from frontend --duration 2m --acknowledge
-relish path frontend --to redis --count 3
+# Make the patties slow, but only for the counters, for two minutes
+relish fault delay patty 300ms --from counter --duration 2m --acknowledge
+relish path counter --to patty --count 3
 relish dashboard                     # live charts in the browser
 
-# Break things and watch the cluster recover
-relish fault kill frontend --count 1 --acknowledge
-relish local stop node-3             # lose a whole machine
-relish inspect frontend              # three frontends again, over the survivors
+# Lose a whole machine and watch the cluster recover
+relish local stop node-3
+relish inspect counter               # three counters again, over the survivors
 relish wtf                           # what's wrong and what to do about it
 
 # Clean up
@@ -87,48 +95,49 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish setup`: Guided setup: detect or install bun, then write a starter config
 - `relish local <status|start|stop|destroy> [NODE]`: Manage a laptop cluster created by setup --quickstart
 - `relish init [DIR]`: Initialise a new cluster (generates CAs, age keypair, node identity)
-- `relish cluster`: Create a cluster of bare-metal appliances (docs/manual/15_appliance.md) *(0.2.1, not in 0.2.0)*
-  - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick *(0.2.1, not in 0.2.0)*
-- `relish image`: Appliance OS images: download, write to a disk, and seed machines *(0.2.1, not in 0.2.0)*
-  - `relish image download`: Download the newest OS build for every architecture and check it against the release key *(0.2.1, not in 0.2.0)*
-  - `relish image write <IMAGE> <DEVICE>`: Write a disk image (.raw or .raw.zst) onto a device, erasing it *(0.2.1, not in 0.2.0)*
-  - `relish image seed <DIRECTORY> <MACHINES>...`: Write seeds for machines joining a running bare-metal cluster *(0.2.1, not in 0.2.0)*
-  - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete` *(0.2.1, not in 0.2.0)*
-- `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network *(0.2.1, not in 0.2.0)*
-  - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them) *(0.2.1, not in 0.2.0)*
-- `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved *(0.2.1, not in 0.2.0)*
-- `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node *(0.2.1, not in 0.2.0)*
-  - `relish os list`: Each node's OS version, and the newest release *(0.2.1, not in 0.2.0)*
-  - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots *(0.2.1, not in 0.2.0)*
-  - `relish os status`: The rollout in progress, or the last one *(0.2.1, not in 0.2.0)*
-  - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it *(0.2.1, not in 0.2.0)*
-  - `relish os abort`: Stop the rollout; nodes keep the version they're on *(0.2.1, not in 0.2.0)*
+- `relish cluster`: Create a cluster of bare-metal appliances (docs/manual/15_appliance.md) *(0.3.0, not in 0.2.3)*
+  - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick *(0.3.0, not in 0.2.3)*
+- `relish image`: Appliance OS images: download, write to a disk, and seed machines *(0.3.0, not in 0.2.3)*
+  - `relish image download`: Download the newest OS build for every architecture and check it against the release key *(0.3.0, not in 0.2.3)*
+  - `relish image write <IMAGE> <DEVICE>`: Write a disk image (.raw or .raw.zst) onto a device, erasing it *(0.3.0, not in 0.2.3)*
+  - `relish image seed <DIRECTORY> <MACHINES>...`: Write seeds for machines joining a running bare-metal cluster *(0.3.0, not in 0.2.3)*
+  - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete` *(0.3.0, not in 0.2.3)*
+- `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network *(0.3.0, not in 0.2.3)*
+  - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them) *(0.3.0, not in 0.2.3)*
+- `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved *(0.3.0, not in 0.2.3)*
+- `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node *(0.3.0, not in 0.2.3)*
+  - `relish os list`: Each node's OS version, and the newest release *(0.3.0, not in 0.2.3)*
+  - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots *(0.3.0, not in 0.2.3)*
+  - `relish os status`: The rollout in progress, or the last one *(0.3.0, not in 0.2.3)*
+  - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it *(0.3.0, not in 0.2.3)*
+  - `relish os abort`: Stop the rollout; nodes keep the version they're on *(0.3.0, not in 0.2.3)*
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node
-  - `relish join-token list`: List join tokens: node id, expiry and whether each has been used *(0.2.1, not in 0.2.0)*
-  - `relish join-token revoke <NODE_ID>`: Revoke every unused join token for a node id *(0.2.1, not in 0.2.0)*
+  - `relish join-token list`: List join tokens: node id, expiry and whether each has been used *(0.3.0, not in 0.2.3)*
+  - `relish join-token revoke <NODE_ID>`: Revoke every unused join token for a node id *(0.3.0, not in 0.2.3)*
 - `relish nodes`: List cluster nodes and their gossip state
 - `relish council`: Show the council (Raft) on every node, or recover from full loss
   - `relish council status`: Show every node's view of the council (the default)
   - `relish council recover --data-dir <DATA_DIR>`: Recover a cluster whose entire council was lost
-  - `relish council backups --from <FROM>`: List the sealed council backups at an object-store URL *(0.2.1, not in 0.2.0)*
+  - `relish council backups --from <FROM>`: List the sealed council backups at an object-store URL
   - `relish council re-enrol --data-dir <DATA_DIR>`: Re-enrol a voter fenced out by `council recover`
 - `relish decommission-node --workloads-stopped --reason <REASON> <NODE_ID>`: Permanently retire a stopped or fenced node; return requires fresh enrolment
 - `relish uninstall`: Remove the CLI, its PATH link, the managed Lima tools and the image cache
 
-**Deploy and manage apps** ([deploy an app](docs/manual/01_deploy-an-app.md))
+**Deploy and manage apps** ([deploy an app](docs/manual/01_deploy-an-app.md), [writing a controller](docs/manual/15_writing-a-controller.md))
 
 - `relish apply [PATH_OR_URL]`: Apply a Reliaburger TOML or Kubernetes YAML manifest
 - `relish status`: Show cluster and app status
 - `relish inspect <NAME>`: Show every instance of an app across the cluster, with its node
-- `relish exec <APP> [COMMAND]...`: Execute a command inside a running container
+- `relish exec <APP> [COMMAND]...`: Run a command once inside a running instance and exit with its exit code. Not interactive: no stdin and no terminal
 - `relish deploy <PATH>`: Trigger a rolling deploy for an app
 - `relish cancel-deploy <OPERATION_ID>`: Cancel a node-local deploy and wait for its current work to finish
 - `relish history <APP>`: Show deploy history for an app, from every node
 - `relish rollback <APP>`: Rollback an app to the previous version
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
 - `relish delete <APP>`: Remove an app from the cluster and stop all its instances
+- `relish release <APP>`: Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin) *(0.3.0, not in 0.2.3)*
 - `relish batch [PATH]`: Submit a batch of jobs, or manage a task array
   - `relish batch submit <PATH>`: Submit a compact TOML manifest containing mixed resource profiles
   - `relish batch replay --node <NODE> --grant-digest <GRANT_DIGEST> --acknowledge-side-effects <ID>`: Acknowledge repeating side effects for the exact unknown owner grants
@@ -163,6 +172,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish logs <NAME>`: Stream logs from an app or job
 - `relish logs-export --dest <DEST>`: Export Parquet log files to a destination directory
 - `relish logs-search <SOURCE> <SQL>`: Search exported Parquet log archives with SQL
+- `relish events`: Show the cluster's recent events: deploys, restarts, health, faults, tokens, secrets and audited operations, newest last
 
 **Diagnose and test** ([diagnostics](docs/manual/07_diagnostics.md))
 
@@ -182,8 +192,8 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish fault cpu <TARGET> <PERCENTAGE>`: Consume CPU in a service's cgroup
   - `relish fault memory <TARGET> <VALUE>`: Push memory usage toward a service's limit
   - `relish fault disk-io <TARGET> <LIMIT>`: Throttle disk I/O for a service
-  - `relish fault kill <TARGET>`: Kill instances of a service (SIGKILL)
-  - `relish fault pause <TARGET>`: Freeze instances of a service (SIGSTOP)
+  - `relish fault kill <TARGET>`: Kill instances of a service, or running attempts of a job (SIGKILL)
+  - `relish fault pause <TARGET>`: Freeze instances of a service, or running attempts of a job (SIGSTOP)
   - `relish fault resume <TARGET>`: Resume (unfreeze) previously paused instances of a service
   - `relish fault node-drain <TARGET>`: Simulate graceful node departure
   - `relish fault node-kill <TARGET>`: Simulate abrupt node failure
@@ -210,11 +220,16 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
 - `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster
+- `relish policy`: List, audit or delete the cluster's policies, or test policies offline *(0.3.0, not in 0.2.3)*
+  - `relish policy list`: List the cluster's policies, with their action and rule *(0.3.0, not in 0.2.3)*
+  - `relish policy delete <NAME>`: Delete a policy (admin only; audited). Policies never judge policies, so this works even when one refuses every app *(0.3.0, not in 0.2.3)*
+  - `relish policy audit`: List the committed apps and jobs the cluster's policies would now refuse, warn about or record. Changes nothing: a new policy never touches running work *(0.3.0, not in 0.2.3)*
+  - `relish policy test --file <FILES>...`: Judge the apps and jobs in some files by the policies in them, offline, the way the cluster would. Exits non-zero when an apply would be refused *(0.3.0, not in 0.2.3)*
 
 **Images and volumes** ([images and volumes](docs/manual/11_images-and-volumes.md))
 
 - `relish images`: List images in the Pickle registry, or delete a tag
-  - `relish images delete <REFERENCE>`: Delete a tag (`repository:tag`). The image stays pullable by digest until it has been untagged for `[images] gc_retain_days`; then it expires, unless an app or job pins it, and GC reclaims its layers *(0.2.1, not in 0.2.0)*
+  - `relish images delete <REFERENCE>`: Delete a tag (`repository:tag`). The image stays pullable by digest until it has been untagged for `[images] gc_retain_days`; then it expires, unless an app or job pins it, and GC reclaims its layers
 - `relish build <PATH>`: Build an OCI image and push to Pickle
 - `relish snapshot`: Manage volume snapshots (Btrfs-backed volumes only)
   - `relish snapshot create <APP>`: Snapshot an app's managed volumes
@@ -232,10 +247,10 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish upgrade rollback [VERSION]`: Roll back to a previous version (cluster: version required)
   - `relish upgrade resume`: Resume a paused upgrade
   - `relish upgrade abort`: End a paused upgrade in which no node has moved. When some nodes already swapped, use `rollback <version>` instead
-- `relish gitops`: Show or change the cluster's GitOps configuration *(0.2.1, not in 0.2.0)*
-  - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown *(0.2.1, not in 0.2.0)*
-  - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft *(0.2.1, not in 0.2.0)*
-  - `relish gitops disable`: Turn GitOps off for the whole cluster (admin only; audited). What GitOps wrote stays in place *(0.2.1, not in 0.2.0)*
+- `relish gitops`: Show or change the cluster's GitOps configuration
+  - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown
+  - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft
+  - `relish gitops disable`: Turn GitOps off for the whole cluster (admin only; audited). What GitOps wrote stays in place
 
 **Learn** ([under the hood](docs/manual/06_under-the-hood.md))
 
@@ -264,15 +279,17 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 ## What's in the binary
 
-This is what 0.2.0, the release the installer fetches, does.
+This is what 0.2.3, the release the installer fetches, does.
 
-**Runs Kubernetes YAML.** `relish apply -f` takes Deployments, StatefulSets,
-DaemonSets, Services, Ingresses, ConfigMaps, Secrets, Jobs, CronJobs, HPAs and
-Namespaces. It converts them on the way in and tells you what it had to
-change. ConfigMaps and Secrets aren't wired into workloads yet: each one gets
-a warning, `envFrom` is dropped, and their values have to move into `env` or
+**Runs Kubernetes YAML.** `relish apply -f` converts Deployments, StatefulSets,
+DaemonSets, Services, Ingresses, Jobs, CronJobs, HPAs and Namespaces on the
+way in and tells you everything it had to approximate or drop. Services attach
+to workloads by label selector, as they do in Kubernetes. A ConfigMap that a
+workload reads with `envFrom` is copied into its `env`; any other ConfigMap,
+and every Secret, only gets a warning, so those values move into `env` or
 `config_file` by hand.
-`relish import` writes the equivalent TOML if you'd rather keep that.
+`relish import` writes the equivalent TOML if you'd rather keep that, and
+`--strict` fails a CI run on anything it couldn't convert exactly.
 
 **Clustering without etcd.** Nodes find each other and detect failure with SWIM
 gossip. A small Raft council, embedded in the agent, holds cluster state. It
@@ -289,7 +306,9 @@ who may connect at all.
 
 **Ingress with TLS.** Host-based HTTP and HTTPS routing, with certificates signed
 by the cluster's own ingress CA or files you provide. WebSockets and streaming
-pass through, and connections drain before an instance stops.
+pass through, and connections drain before an instance stops. Each app can
+pick its stop signal, its grace and a pre-stop command, and run sidecars
+that share its network and start before it and stop after it.
 
 **Security on by default.** A generated cluster requires mTLS between nodes.
 Nodes join with single-use tokens and certificate signing requests.
@@ -298,6 +317,8 @@ cluster's public key. Workloads get SPIFFE certificates, API tokens carry
 roles and namespace scopes, and the registry can refuse unsigned images.
 Every apply binds image tags to digests, so a moved tag can't change what runs,
 and node config can limit which upstream registries images may come from.
+An app that needs an extra capability, a namespaced sysctl or a host device
+gets it only where the node allows it and the token carries `host-exec`.
 
 **Tenants kept apart.** Namespaces can't reach each other, at a virtual IP or
 at a real address, unless an app or job's `allow_from` lets a named caller
@@ -328,7 +349,37 @@ it would take out every replica or put the council's quorum at risk.
 **Deploys and GitOps.** Health-gated rolling deploys with automatic rollback,
 blue-green switches and autoscaling on metrics. Point the cluster at a Git
 repository and the leader keeps it in sync, verifying commit signatures if you
-ask it to.
+ask it to. `scripts/demo/rollout.sh` and `scripts/demo/gitops.sh` show both on
+a one-node cluster from a checkout, with
+[`examples/phase-1/proc-rollout.toml`](examples/phase-1/proc-rollout.toml) and
+[`examples/gitops/repository`](examples/gitops/repository), and measure Bun's
+memory and CPU as they go.
+
+**Policies.** `[policy.*]` rules in CEL, such as "apps in `prod` need a memory
+limit", are kept in the council and checked on the leader before an app is
+written, for `relish apply` and GitOps alike. A rule refuses the apply or only
+warns, every denial names its policy, and `relish policy test` *(0.3.0, not in 0.2.3)* runs the same
+check offline in CI. A policy can also fill in fields an app leaves out, such
+as a team label, without ever overwriting one you wrote, and GitOps doesn't
+mistake a filled-in field for a change. Policies can judge jobs too, an
+`audit` policy only records what it finds, and `relish policy audit` *(0.3.0, not in 0.2.3)* and
+`relish wtf` list the running apps and jobs a new policy would refuse. See [security and access](docs/manual/10_security.md#policies).
+
+**Your own controllers, without an operator SDK.** A controller is an ordinary
+app holding a token scoped to its namespace. It reads the API and the event
+stream, and claims the apps it manages with an `owner`, after which
+`relish apply` and GitOps leave them alone. The JSON it reads and writes is
+documented and pinned by tests. See
+[writing a controller](docs/manual/15_writing-a-controller.md) and the example
+in [`examples/controller`](examples/controller).
+
+**Templates, not CRDs.** A `[template.*]` has typed parameters and a body of
+ordinary apps and jobs; each `[use.*]` stamps it out with its own values.
+Expansion is substitution only, done when the config is read, so `relish
+apply --dry-run` and GitOps show the expanded apps, policies judge them, and
+the cluster stores plain apps with a note of the template that made them.
+See [deploy an app](docs/manual/01_deploy-an-app.md#templates) and
+[`examples/templates/container-postgres.toml`](examples/templates/container-postgres.toml).
 
 **A million jobs.** Every kind of job runs on one lifecycle: a one-off job, a
 cron schedule, a hook that runs before a deploy, and a task array that runs the
@@ -350,6 +401,10 @@ jobs-shared-containers` and its siblings rerun them on your own cluster, and
 release, 0.2.0 ran 12 hours on a three-VM laptop cluster with apps, faults
 and upgrades at 4,600 accepted jobs a second, against 1,158 for 100 million a
 day ([record](docs/qualification/2026-10-17-v0.2.0-job-qualification.md), [#668](https://github.com/reliaburger/reliaburger/issues/668)).
+0.2.3 ran host jobs for one real 24-hour day on three 4-vCPU VMs and counted
+1,807,742,226, 20,920 a second, with no failed tasks: 1.81 billion against
+the 2 billion it aimed for
+([record](docs/qualification/2026-10-28-v0.2.3-day-run.md)).
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary
@@ -395,6 +450,8 @@ binary was built from. Neither needs a network.
 | Prometheus, Alertmanager | Built-in scraping, alert rules and webhooks |
 | A log shipper and store | Built-in capture, streaming and Parquet export |
 | Argo CD or Flux | Built-in GitOps |
+| Kyverno or Gatekeeper (validation, defaults, audit) | `[policy.*]` deny, warn and audit rules for apps and jobs, fill-only defaults, `relish policy audit` *(0.3.0, not in 0.2.3)* |
+| Helm charts or a CRD and its operator (the expansion half) | `[template.*]` and `[use.*]` |
 | Argo Workflows, Kueue or a Celery-style queue | Built-in jobs, cron, hooks and task arrays |
 | Chaos Mesh or Litmus | `relish fault` |
 | Grafana (for the basics) | TUI and web dashboard |
@@ -402,7 +459,7 @@ binary was built from. Neither needs a network.
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
-## Limits in 0.2.0
+## Limits in 0.2.3
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
   managed Linux VMs; native macOS `bun` runs plain processes only.

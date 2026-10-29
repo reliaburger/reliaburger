@@ -15,6 +15,9 @@ WORKFLOWS = REPO / ".github" / "workflows"
 NEXTEST_TARGETS = re.compile(r"\bmake (coverage|test(?:-[a-z-]+)?)(?![\w-])")
 NOT_NEXTEST = {"test-doc", "test-images", "test-ci-scripts"}
 
+# The no-op job a closed pull request's run starts instead of CI.
+CLOSED_JOB = "closed-pull-request"
+
 
 def jobs(text):
     """{job id: the job's lines}, for the top-level jobs of a workflow."""
@@ -421,12 +424,49 @@ class TrainAndQueueTests(unittest.TestCase):
         # Main and merge-queue runs fall back to their own run id.
         self.assertTrue(group.rstrip().endswith("|| github.run_id }}"), group)
 
+    def test_closing_a_pull_request_starts_a_run_that_cancels_its_older_one(self):
+        types = re.search(r"\n  pull_request:\n(?:\s+#.*\n|\s+branches: .*\n)*\s+types: \[(.*)\]\n",
+                          self.triggers).group(1).split(", ")
+        self.assertIn("closed", types)
+        # The closed run joins the pull request's group, so cancel-in-progress
+        # ends the run that was still working on the closed PR.
+        cancel = re.search(r"\n  cancel-in-progress: (.*)", self.ci).group(1)
+        self.assertNotIn("github.event.action", cancel)
+        closed = self.jobs[CLOSED_JOB]
+        self.assertIn("    if: github.event.action == 'closed'\n", closed)
+        self.assertNotIn("needs:", closed)
+        # A no-op: it neither checks out nor builds anything.
+        self.assertEqual([step for step in steps(closed) if "uses:" in step], [])
+        self.assertLessEqual(int(re.search(r"timeout-minutes: (\d+)", closed).group(1)), 5)
+
+    def test_a_closed_pull_requests_run_does_no_other_work(self):
+        guard = "github.event.action != 'closed'"
+        for name, job in self.jobs.items():
+            if name == CLOSED_JOB:
+                continue
+            condition = re.search(r"\n    if: (.*)\n", "\n" + job + "\n")
+            if condition and guard in condition.group(1):
+                continue
+            # Without the guard, a job may only run after select jobs ran,
+            # and only when that succeeded: a status function such as
+            # always() would start it on a closed run too.
+            needs = re.search(r"\n    needs: (.*)\n", "\n" + job + "\n")
+            self.assertIsNotNone(needs, name)
+            self.assertIn("changes", needs.group(1), name)
+            if condition:
+                self.assertNotRegex(condition.group(1), r"always\(\)|failure\(\)|cancelled\(\)", name)
+        for name in ["changes", "ci-policy", "dependency-audit", "ignored-evidence"]:
+            self.assertIn(guard, self.jobs[name], name)
+
     def test_the_final_gate_waits_for_every_other_job_and_always_reports(self):
         gate = self.jobs["ignored-evidence"]
         needs = set(re.search(r"needs: \[([^\]]*)\]", gate).group(1).split(", "))
-        self.assertEqual(needs, set(self.jobs) - {"ignored-evidence"})
+        # The closed-PR job never runs alongside the gate.
+        self.assertEqual(needs, set(self.jobs) - {"ignored-evidence", CLOSED_JOB})
         self.assertIn("    name: ignored-test evidence\n", gate)
-        self.assertIn("    if: ${{ always() }}\n", gate)
+        # It reports whatever the other jobs did, except on a closed PR's
+        # run, where there is nothing to report.
+        self.assertIn("    if: ${{ always() && github.event.action != 'closed' }}\n", gate)
         blocks = steps(gate)
         first = next(index for index, step in enumerate(blocks) if "every_job.py" in step)
         aggregate = next(index for index, step in enumerate(blocks) if "workflow_adapter.py aggregate" in step)
@@ -453,6 +493,14 @@ class TrainAndQueueTests(unittest.TestCase):
         for name in ["lint", "minimum-rust", "portable", "contract-boundaries", "demo-app"]:
             self.assertIn("if: needs.changes.outputs.code == 'true'", self.jobs[name])
 
+    def test_the_portable_suite_finishes_on_a_slow_runner_with_headroom(self):
+        # About 25 minutes normally and 35 to 41 on a slow runner (#1421).
+        # nextest's per-test timeouts catch a hung test, so the job limit
+        # only has to outlast a slow runner by half again.
+        limit = re.search(r"\n    timeout-minutes: (\d+)\n", self.jobs["portable"])
+        self.assertIsNotNone(limit)
+        self.assertGreaterEqual(int(limit.group(1)), 41 * 3 // 2)
+
 
 class BenchmarkTests(unittest.TestCase):
     def setUp(self):
@@ -475,6 +523,27 @@ class BenchmarkTests(unittest.TestCase):
         job = self.jobs["task-array-benchmarks"]
         compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
         self.assertIn("--remeasure 'cargo bench --bench task_arrays --'", compare)
+
+    def test_the_on_disk_ledger_benchmark_is_reported_not_gated(self):
+        # Its speed is the runner's disk, which varies several-fold within one
+        # job (#1038); the tmpfs variant beside it is gated instead.
+        job = self.jobs["task-array-benchmarks"]
+        compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
+        self.assertEqual(re.findall(r"--report-only (\S+)", compare),
+                         ["storage/ledger_and_index_64k"])
+
+    def test_every_report_only_benchmark_has_a_gated_variant_in_the_bench(self):
+        job = self.jobs["task-array-benchmarks"]
+        compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
+        bench = (REPO / "benches" / "task_arrays.rs").read_text()
+        names = re.findall(r"--report-only (\S+)", compare)
+        self.assertTrue(names)
+        for name in names:
+            with self.subTest(benchmark=name):
+                group, function = name.split("/", 1)
+                self.assertIn(f'benchmark_group("{group}")', bench)
+                self.assertIn(f'"{function}"', bench)
+                self.assertIn(f'"{function}_tmpfs"', bench)
 
     def test_only_main_saves_the_task_array_baseline(self):
         job = self.jobs["task-array-benchmarks"]
@@ -499,6 +568,244 @@ class BenchmarkTests(unittest.TestCase):
         for target in targets:
             with self.subTest(target=target):
                 self.assertRegex(workflows, rf"(?m)run: make {re.escape(target)}$")
+
+
+class ArtifactDownloadTests(unittest.TestCase):
+    """A stalled artefact download fails fast and is retried once (#977).
+
+    `actions/download-artifact` normally takes a minute or two, but one run
+    took 13 minutes and pushed `acceptance` past its 40-minute limit. Each
+    download gets its own short limit and one retry, so a stall costs at most
+    two short limits instead of the job's whole budget. That's enough for the
+    small evidence envelopes; ci.yml's test archive is fetched by
+    `fetch_artifact.py` instead (ArchiveFetchTests).
+    """
+
+    # The longest any one attempt may take; downloads normally take 1 to 2.
+    LIMIT_MINUTES = 5
+    WORKFLOW_FILES = ("ci.yml", "v02-loops.yml")
+
+    def setUp(self):
+        self.workflows = {name: jobs((WORKFLOWS / name).read_text())
+                          for name in self.WORKFLOW_FILES}
+
+    @staticmethod
+    def with_block(step):
+        """The step's `with:` inputs, as text."""
+        found = re.search(r"\n        with:\n((?:          .*\n?)*)", step)
+        return found.group(1).rstrip() if found else ""
+
+    def assert_downloads_retried(self, workflow_jobs):
+        """Every download is a bounded attempt followed by one bounded retry.
+
+        No subTest here: the detection test expects the first failure to raise.
+        """
+        pairs = 0
+        for name, job in workflow_jobs.items():
+            blocks = steps(job)
+            downloads = [index for index, step in enumerate(blocks)
+                         if "uses: actions/download-artifact@" in step]
+            remaining = list(downloads)
+            while remaining:
+                first = remaining.pop(0)
+                attempt = blocks[first]
+                self.assertIn("\n        continue-on-error: true", attempt, f"{name}: the first attempt must not fail the job")
+                step_id = re.search(r"\n        id: ([a-z_]+)\n", attempt)
+                self.assertIsNotNone(step_id, "the first attempt needs an id")
+                self.assertTrue(remaining and remaining[0] == first + 1,
+                                "the first attempt must be followed by its retry")
+                retry = blocks[remaining.pop(0)]
+                self.assertNotIn("continue-on-error", retry)
+                condition = re.search(r"\n        if: (.*)", retry)
+                self.assertIsNotNone(condition, "the retry runs only when the first attempt failed")
+                # !cancelled(): an earlier failed step in the job must not
+                # skip the retry of a download that runs regardless.
+                self.assertIn("!cancelled()", condition.group(1))
+                self.assertIn(f"steps.{step_id.group(1)}.outcome == 'failure'", condition.group(1))
+                self.assertEqual(self.with_block(attempt), self.with_block(retry))
+                self.assertNotEqual(self.with_block(attempt), "")
+                for step in (attempt, retry):
+                    limit = re.search(r"\n        timeout-minutes: (\d+)\n", step + "\n")
+                    self.assertIsNotNone(limit, "each attempt needs its own timeout-minutes")
+                    self.assertLessEqual(int(limit.group(1)), self.LIMIT_MINUTES)
+                pairs += 1
+        return pairs
+
+    def test_a_stalled_artefact_download_fails_fast_and_is_retried_once(self):
+        for name, workflow_jobs in self.workflows.items():
+            with self.subTest(workflow=name):
+                self.assertGreater(self.assert_downloads_retried(workflow_jobs), 0)
+
+    def test_the_jobs_that_download_the_test_archive_keep_their_own_limits(self):
+        ci = self.workflows["ci.yml"]
+        for name, minutes in (("cluster", 30), ("acceptance", 40), ("ignored-evidence", 10)):
+            with self.subTest(job=name):
+                self.assertIn(f"\n    timeout-minutes: {minutes}\n", ci[name])
+
+    def test_an_unbounded_unretried_or_skippable_download_is_detected(self):
+        ci = self.workflows["ci.yml"]
+        self.assert_downloads_retried(ci)
+        original = ci["ignored-evidence"]
+        blocks = steps(original)
+        downloads = [step for step in blocks if "uses: actions/download-artifact@" in step]
+        self.assertEqual(len(downloads), 2)
+        attempt, retry = downloads
+        changes = [
+            original.replace(retry + "\n", ""),
+            original.replace(attempt, re.sub(r"\n        timeout-minutes: \d+", "", attempt)),
+            original.replace(retry, re.sub(r"timeout-minutes: \d+", "timeout-minutes: 15", retry)),
+            original.replace(attempt, attempt.replace("\n        continue-on-error: true", "")),
+            original.replace(retry, retry.replace("!cancelled() && ", "")),
+            original.replace(retry, retry.replace("outcome == 'failure'", "outcome == 'success'")),
+            original.replace(retry, retry.replace("pattern: contract-*", "pattern: something-else")),
+            original.replace(retry, retry + "\n" + retry),
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_downloads_retried(dict(ci, **{"ignored-evidence": changed}))
+
+
+class ArchiveFetchTests(unittest.TestCase):
+    """The test archive is fetched by a transfer that resumes (#977).
+
+    With `actions/download-artifact`, the 3.0 GB archive took 33 s to almost
+    5 minutes in passing runs, against a 5-minute limit per attempt, and a
+    retry started again from the first byte, so a slow runner failed both
+    attempts. `fetch_artifact.py` resumes where a transfer stopped and stops
+    at its own deadline, inside the step's limit, inside the job's.
+    """
+
+    CONSUMERS = {"cluster": 30, "acceptance": 40}
+    # The fetch, then everything else the job does, must fit the job's limit.
+    LIMIT_MINUTES = 15
+
+    def setUp(self):
+        self.text = (WORKFLOWS / "ci.yml").read_text()
+        self.ci = jobs(self.text)
+
+    def assert_fetches_once(self, job, job_minutes):
+        """No subTest here: the detection test expects the first failure to raise."""
+        fetches = [step for step in steps(job) if "fetch_artifact.py" in step]
+        self.assertEqual(len(fetches), 1, "exactly one fetch of the archive per consumer job")
+        fetch = fetches[0]
+        self.assertIn("--name nextest-archive", fetch)
+        self.assertNotIn("continue-on-error", fetch, "a failed fetch must fail the job")
+        self.assertNotIn("\n        if:", fetch, "a skipped fetch must fail the job")
+        self.assertIn("GH_TOKEN: ${{ github.token }}", fetch)
+        limit = re.search(r"\n        timeout-minutes: (\d+)\n", fetch + "\n")
+        self.assertIsNotNone(limit, "the fetch needs its own timeout-minutes")
+        self.assertLessEqual(int(limit.group(1)), self.LIMIT_MINUTES)
+        self.assertLess(int(limit.group(1)), job_minutes)
+        deadline = re.search(r"--deadline (\d+)", fetch)
+        self.assertIsNotNone(deadline, "the fetch stops itself before the step's limit")
+        self.assertLess(int(deadline.group(1)), int(limit.group(1)) * 60)
+        self.assertRegex(fetch, r"--stall \d+")
+        self.assertNotIn("actions/download-artifact@", job, "the archive has one fetch, not two")
+        self.assertRegex(job, r"\n    permissions:\n      contents: read\n      actions: read\n",
+                         "listing this run's artefacts needs actions: read")
+
+    def test_each_archive_consumer_fetches_the_archive_once_with_a_deadline(self):
+        for name, minutes in self.CONSUMERS.items():
+            with self.subTest(job=name):
+                self.assert_fetches_once(self.ci[name], minutes)
+
+    def test_no_job_downloads_the_archive_with_the_action(self):
+        for name, job in self.ci.items():
+            for step in steps(job):
+                if "actions/download-artifact@" in step:
+                    with self.subTest(job=name):
+                        self.assertNotIn("nextest-archive", step)
+
+    def test_every_caller_of_ci_grants_what_the_fetch_needs(self):
+        callers = 0
+        for path in WORKFLOWS.glob("*.yml"):
+            for name, job in jobs(path.read_text()).items():
+                if "uses: ./.github/workflows/ci.yml" not in job:
+                    continue
+                callers += 1
+                with self.subTest(workflow=path.name, job=name):
+                    self.assertRegex(job, r"\n    permissions:\n      contents: read\n      actions: read\n")
+        self.assertGreater(callers, 0)
+
+    def test_an_unbounded_skippable_or_doubled_fetch_is_detected(self):
+        original = self.ci["acceptance"]
+        fetch = next(step for step in steps(original) if "fetch_artifact.py" in step)
+        changes = [
+            original.replace(fetch + "\n", ""),
+            original.replace(fetch, fetch + "\n" + fetch),
+            original.replace(fetch, re.sub(r"\n        timeout-minutes: \d+", "", fetch)),
+            original.replace(fetch, re.sub(r"timeout-minutes: \d+", "timeout-minutes: 40", fetch)),
+            original.replace(fetch, re.sub(r"--deadline \d+", "--deadline 900", fetch)),
+            original.replace(fetch, re.sub(r" --deadline \d+", "", fetch)),
+            original.replace(fetch, re.sub(r" --stall \d+", "", fetch)),
+            original.replace(fetch, fetch.replace("timeout-minutes:", "continue-on-error: true\n        timeout-minutes:")),
+            original.replace(fetch, fetch.replace("timeout-minutes:", "if: ${{ !cancelled() }}\n        timeout-minutes:")),
+            original.replace(fetch, fetch.replace("--name nextest-archive", "--name something-else")),
+            original.replace(fetch, fetch.replace("\n          GH_TOKEN: ${{ github.token }}", "")),
+            original.replace("      actions: read\n", ""),
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_fetches_once(changed, 40)
+
+
+class ArchiveExtractionTests(unittest.TestCase):
+    """Each archive consumer extracts the test archive once (#1050).
+
+    `acceptance` has four owners and `cluster` one, and each owner used to
+    extract the 2.9 GB archive twice, for its discovery and for its run. Now
+    one step per job extracts it, and every owner names that step's receipt
+    digest, so its evidence is bound to the archive the step checked.
+    """
+
+    CONSUMERS = ("cluster", "acceptance")
+
+    def setUp(self):
+        self.ci = jobs((WORKFLOWS / "ci.yml").read_text())
+
+    def assert_extracts_once(self, job):
+        """No subTest here: the detection test expects the first failure to raise."""
+        blocks = steps(job)
+        extracts = [index for index, step in enumerate(blocks) if "workflow_adapter.py extract" in step]
+        self.assertEqual(len(extracts), 1, "exactly one extraction per consumer job")
+        extract = blocks[extracts[0]]
+        step_id = re.search(r"\n        id: ([a-z_]+)\n", extract)
+        self.assertIsNotNone(step_id, "the extraction needs an id for its output")
+        self.assertNotIn("\n        if:", extract, "a skipped extraction must fail the owners")
+        fetches = [index for index, step in enumerate(blocks) if "fetch_artifact.py" in step]
+        self.assertTrue(fetches and max(fetches) < extracts[0], "extract after the fetch")
+        producers = [index for index, step in enumerate(blocks) if "workflow_adapter.py produce" in step]
+        self.assertTrue(producers and extracts[0] < min(producers), "extract before every owner")
+        reference = ('--archive-extraction "${{ steps.' + step_id.group(1)
+                     + '.outputs.archive_extraction_sha256 }}"')
+        for index in producers:
+            self.assertIn(reference, blocks[index], "every owner names the job's extraction")
+        for option in ("--archive-file", "--extract-to", "--extract-overwrite"):
+            self.assertNotIn(option, job, "an owner must not open the archive again")
+        return len(producers)
+
+    def test_each_archive_consumer_extracts_once_before_its_owners(self):
+        owners = {name: self.assert_extracts_once(self.ci[name]) for name in self.CONSUMERS}
+        self.assertEqual(owners, {"cluster": 1, "acceptance": 4})
+
+    def test_a_missing_repeated_late_or_unreferenced_extraction_is_detected(self):
+        original = self.ci["acceptance"]
+        blocks = steps(original)
+        extract = next(step for step in blocks if "workflow_adapter.py extract" in step)
+        first = next(step for step in blocks if "workflow_adapter.py produce" in step)
+        last = [step for step in blocks if "workflow_adapter.py produce" in step][-1]
+        changes = [
+            original.replace(extract + "\n", ""),
+            original.replace(extract, extract + "\n" + extract.replace("id: ", "id: again_")),
+            original.replace(extract + "\n", "").replace(first, first + "\n" + extract),
+            original.replace(extract, extract.replace("\n        id: ", "\n        if: ${{ !cancelled() }}\n        id: ")),
+            original.replace(last, last.replace(" --archive-extraction", " --unrelated")),
+            original.replace(last, last.replace("outputs.archive_extraction_sha256", "outputs.something_else")),
+            original + "\n    env:\n      ARCHIVED: cargo nextest run --archive-file tests.tar.zst",
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_extracts_once(changed)
 
 
 class RetargetTests(unittest.TestCase):

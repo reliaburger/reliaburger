@@ -19,7 +19,8 @@ accepted one retry.
 | Host jobs | 4,666.7/s (3,766.7–4,833.3) | 280,000 accepted | 403.2M | 4,900.0/s |
 
 Runs/day multiplies the minute count by 1,440; it isn't an observed daily
-total. The container paths are 3 to 3.6 times the development build's single
+total. Where the host-job time goes, and why its windows land on a few fixed
+counts, is in the [20 October host-job profile](../2026-10-20-host-job-profile/README.md). The container paths are 3 to 3.6 times the development build's single
 recording, in line with the [independent five-round
 rerun](../2026-10-09-timed-job-scenarios/README.md#independent-five-round-rerun),
 which measured them 1.7 to 3 times higher on later builds. Raw and host rates

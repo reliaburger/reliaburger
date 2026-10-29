@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-Meat is the centralized scheduling engine of the Reliaburger container orchestrator. It runs exclusively on the current Raft leader node as a dedicated async task and is responsible for all workload placement decisions in the cluster: placing App replicas across nodes, allocating batch Jobs at high throughput, orchestrating rolling deployments, enforcing namespace resource quotas, and driving autoscaling reactions.
+Meat is the centralized scheduling engine of the Reliaburger container orchestrator. It runs exclusively on the current Raft leader node as a dedicated async task and is responsible for all workload placement decisions in the cluster: placing App replicas across nodes, granting job tasks to workers in chunks, releasing rollouts node by node, enforcing namespace resource quotas, and driving autoscaling reactions.
 
 ### Role in the System
 
@@ -12,7 +12,7 @@ Meat is the single decision-maker for "what runs where." Every App placement, Jo
 
 - **Single-leader scheduling.** All scheduling decisions are made on one node. This eliminates coordination overhead between multiple schedulers and makes the Raft log the single source of truth for placement decisions. The tradeoff -- a single point of decision-making -- is mitigated by fast leader failover (< 5 seconds) and the delegated batch model.
 
-- **Delegated batch execution.** Meat does not schedule individual Jobs from high-throughput batch workloads. Instead, it allocates capacity budgets to nodes ("Node 7, here are your next 200 jobs"), and nodes execute and report completions asynchronously. This is the mechanism meant to reach 100M+ jobs/day without the leader becoming a bottleneck. It's a target: the allocator ships, the delegated pipeline isn't wired end to end, and the throughput is unmeasured (see the status note in the batch section).
+- **Delegated job execution.** Meat does not place individual job tasks. Every job (a TOML job, a `relish batch` array, a cron occurrence, a `run_before` hook) is a run of a durable definition, and the leader grants chunks of task indices to workers that report how many requests fit. Workers run the attempts and the leader accepts aggregate outcomes, so the Raft log grows with chunks, not tasks. §5.2 and the [delegated task-array appendix](#delegated-task-array-implementation-020) describe it; the job qualification records in `docs/qualification/` hold the measured throughput.
 
 - **Bin-packing first.** Meat uses a bin-packing algorithm as its primary placement strategy, maximising node utilisation before spreading to new nodes. This reduces the number of active nodes under low load and improves cache locality for images already present on a node.
 
@@ -81,11 +81,11 @@ Meat is structured as a set of cooperating async tasks within the leader's Bun p
 │  └─────────────────────────────────────────────────────────────┘ │
 │                                                                  │
 │  ┌─────────────────────────────────────────────────────────────┐ │
-│  │                   Batch Allocator                           │ │
+│  │                Task-Array Leader Loop                       │ │
 │  │                                                             │ │
-│  │  - Partitions pending jobs across eligible nodes            │ │
-│  │  - Sends batch assignments via reporting tree               │ │
-│  │  - Tracks completion counts, retries, timeouts              │ │
+│  │  - Grants chunks of task indices to workers that fit them   │ │
+│  │  - Polls workers for progress; one Tick entry per tick      │ │
+│  │  - Requeues or holds a lost holder's chunks (§5.2)          │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -102,7 +102,8 @@ Meat uses a four-phase placement pipeline for App scheduling:
 - Node is not cordoned or draining.
 - Namespace quota would not be exceeded by this placement.
 - For image workloads: node runs containers. An app that names an `image` (or has only a `command`, which runs in a root filesystem), or an init container that names its own image, needs a container runtime (#914). Each node reports `NodeCapabilities::containers`, true when its runtime is runc, Apple Container or the mixed runtime, and false on `--runtime process`, which refuses image apps. A missing capability report counts as false. If no ready node with the labels runs containers, the app is unschedulable with `UnplacedReason::NoContainerRuntime` ("no ready node has a container runtime to run its image"), checked before the other capabilities.
-- For process workloads: node has the required binary in its allowlist. Each node reports its `[process_workloads]` policy in its capability report (`NodeCapabilities::process`): whether it runs host processes at all (its runtime can, and `mount_isolation` is off, since a node refuses every host workload under mount isolation until #714 implements it) and its `allowed_binaries`. An `exec` app needs its path there, and a `script` app needs `/bin/sh`. `meat::filter::host_binary` is the one place that says which binary an app needs, so the node's own refusal and app validation agree with placement. A placement whose node stops allowing the binary moves.
+- For process workloads: node has the required binary in its allowlist. Each node reports its `[process_workloads]` policy in its capability report (`NodeCapabilities::process`): whether it runs host processes at all (its runtime can, and `mount_isolation` is off, since a node refuses every host workload under mount isolation until #714 implements it) and its `allowed_binaries`. An `exec` app needs its path there, and a `script` app needs `/bin/sh`. An init container of such an app that names no image runs on the host too, so the first word of its command needs to be there as well (`meat::filter::host_init_binaries`, #935). `meat::filter::host_binary` is the one place that says which binary an app needs, so the node's own refusal and app validation agree with placement. A placement whose node stops allowing the binary moves.
+- For runtime knobs: the node allows every one. An app's `[runtime]` capabilities, sysctls and devices (#1122) must all be admitted by the allowlist the node reports (`NodeCapabilities::runtime_knobs`), which is empty unless the node runs rootful runc. Otherwise the app is unplaced with `NoCapableNode`.
 
 The filter checks every node against one `WorkloadRequirements` value built from the spec, and so do daemon placement and the leader's check that a committed placement still holds (`meat::filter::node_can_run`), so the three can't disagree.
 
@@ -173,7 +174,7 @@ Spread was once a weight (60, scored on whether a node ran the App at all). That
 
 ## 4. Data Structures
 
-All types are Rust structs using `serde` for serialisation (Raft log entries are serialised with `bincode` for compactness; API responses use JSON).
+All types are Rust structs using `serde` for serialisation (Raft log entries and the council's Raft RPCs are self-describing JSON, because config types such as `Replicas` need serde's `deserialize_any`; API responses use JSON too).
 
 ### Core Scheduling Types
 
@@ -264,35 +265,33 @@ pub enum WorkloadSource {
     Script(String),
 }
 
-/// Deploy strategy configuration for an App.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DeployStrategy {
-    /// Deployment strategy type: `rolling` (default) or `blue-green`.
-    pub strategy: DeployStrategyType,
-    /// Maximum number of extra instances during a rolling update.
+/// Deploy configuration for an App (`meat::deploy_types::DeployConfig`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeployConfig {
+    /// `Rolling` (replace a few at a time) or `BlueGreen` (stand up the
+    /// whole new fleet, then swap).
+    pub strategy: DeployStrategy,
+    /// Max instances above target during rollout.
     pub max_surge: u32,
-    /// Time to wait for in-flight requests to drain before stopping old instances.
+    /// Max instances below target during rollout.
+    pub max_unavailable: u32,
+    /// How long to wait for connections to drain.
     pub drain_timeout: Duration,
-    /// Time to wait for health checks to pass on new instances.
+    /// How long to wait for health checks after start.
     pub health_timeout: Duration,
-    /// If true, revert all instances to the previous version on health check failure.
-    /// If false (default), halt the rollout and leave partial state.
+    /// Automatically revert on health check failure.
     pub auto_rollback: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum DeployStrategyType {
-    Rolling,
-}
-
-impl Default for DeployStrategy {
+impl Default for DeployConfig {
     fn default() -> Self {
         Self {
-            strategy: DeployStrategyType::Rolling,
+            strategy: DeployStrategy::Rolling,
             max_surge: 1,
+            max_unavailable: 0,
             drain_timeout: Duration::from_secs(30),
             health_timeout: Duration::from_secs(60),
-            auto_rollback: false,
+            auto_rollback: true,
         }
     }
 }
@@ -345,42 +344,74 @@ pub struct AppSpec {
     pub health: Option<String>,
     pub resources: ResourceRange,
     pub placement: PlacementConstraint,
-    pub deploy: DeployStrategy,
+    pub deploy: DeployConfig,
     pub autoscale: Option<AutoscaleConfig>,
     pub init_containers: Vec<InitContainer>,
     pub env: BTreeMap<String, String>,
     pub gpu: u32,
-    /// Dependency ordering: jobs that must complete before this app starts.
-    pub run_after_jobs: Vec<JobId>,
+    // Dependency ordering lives on the job: `run_before = ["app.NAME"]`.
     /// Spec version, incremented on each change. Used to detect stale state.
     pub spec_version: u64,
 }
 
-/// Full specification for a Job as consumed by the scheduler.
+/// A job's execution template (`config::job::JobSpec`, trimmed). Trigger
+/// policy lives outside it, in the definition below.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JobSpec {
-    pub id: JobId,
-    pub source: WorkloadSource,
-    pub command: Vec<String>,
-    /// Cron schedule expression. If None, the job is on-demand only.
+    /// `runc` (default), `shared-runc` or `process`.
+    pub runtime: JobRuntime,
+    pub image: Option<String>,
+    pub command: Option<Vec<String>>,
+    pub exec: Option<PathBuf>,
+    pub script: Option<String>,
+    /// Cron schedule (UTC), e.g. "0 3 * * *".
     pub schedule: Option<String>,
-    /// Maximum concurrent instances for batch jobs.
-    pub parallelism: u32,
-    /// Number of retries on failure per instance.
-    pub retry: u32,
-    /// Maximum duration per instance before it is killed.
-    pub timeout: Duration,
-    pub resources: Resources,
-    pub placement: PlacementConstraint,
-    pub gpu: u32,
-    /// Apps that depend on this job completing (run_before relationship).
-    pub run_before: Vec<AppId>,
-    /// Whether this is a build job with Pickle write access.
-    pub build: bool,
-    /// Scoped Pickle repositories this build job can push to.
-    pub build_push_to: Vec<String>,
-    /// Replica mode for scheduled jobs: fixed count or daemon ("*").
-    pub replicas: ReplicaMode,
+    /// `["app.NAME"]`: run as a hook before that app publishes.
+    pub run_before: Vec<String>,
+    pub cpu: Option<ResourceRange>,
+    pub memory: Option<ResourceRange>,
+    pub namespace: Option<String>,
+    /// Attempts per run (1–10). Omitted: 4, or 1 for a hook.
+    pub max_attempts: Option<u8>,
+    /// Per-attempt limit in seconds; 0 means none. Omitted: none, or 600 for a hook.
+    pub task_timeout_secs: Option<u32>,
+    /// Cron only: whether an occurrence may start while a run is active.
+    pub overlap: Option<OverlapPolicy>,
+    /// Replay automatically after an unknown outcome instead of waiting
+    /// for `relish batch replay`. Hooks refuse it.
+    pub replay_unknown: bool,
+    // ... env, pids, firewall, egress
+}
+
+/// Reusable work and the policy a trigger uses to create a run (`meat::job`).
+pub struct JobDefinition {
+    pub template: JobSpec,
+    /// Indexed tasks; a TOML job is one task.
+    pub tasks: TaskArraySpec,
+    /// Durable UTC schedule, if the definition runs periodically.
+    pub cron: Option<CronPolicy>,
+    pub replay_unknown: bool,
+    /// A deployment hook: kept like a schedule, because the next apply
+    /// that names it runs it again.
+    pub hook: bool,
+}
+
+/// Count and execution policy of a task array (`meat::task_array`).
+pub struct TaskArraySpec {
+    pub count: u32,
+    pub chunk_size: u32,
+    pub max_attempts: u8,
+    pub max_failed_indexes: Option<u32>,
+    pub task_timeout_secs: u32,
+    pub per_node_concurrency: Option<u32>,
+}
+
+/// Stable source identity of one requested run, so a retried request or
+/// a re-elected leader can't start the same run twice.
+pub enum RunTrigger {
+    Manual { request_id: String },
+    Hook { operation_id: String },
+    Cron { minute: i64 },
 }
 ```
 
@@ -459,36 +490,13 @@ pub struct SchedulingDecision {
     pub spec_version: u64,
 }
 
-/// A batch allocation decision for high-throughput jobs.
-/// Instead of scheduling individual jobs, Meat sends a batch to a node.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BatchAllocation {
-    pub allocation_id: u64,
-    pub job_id: JobId,
-    pub target_node: NodeId,
-    /// Number of job instances assigned to this node in this batch.
-    pub instance_count: u32,
-    /// Resources budgeted for this batch on the target node.
-    pub resource_budget: Resources,
-    /// Per-instance timeout.
-    pub instance_timeout: Duration,
-    /// Per-instance retry limit.
-    pub retry_limit: u32,
-    pub timestamp: Instant,
-}
+```
 
-/// Report from a node about batch job completion.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BatchCompletionReport {
-    pub allocation_id: u64,
-    pub job_id: JobId,
-    pub node_id: NodeId,
-    pub completed: u32,
-    pub failed: u32,
-    pub retries_exhausted: u32,
-    /// Instances still running at report time.
-    pub in_progress: u32,
-}
+Jobs have no per-node allocation decision. The leader's `TaskArrayWrite`
+entries (`Register`, `Sync` with chunk results and new grants, `Requeue`,
+`Unknown`, `Replay`, `Cancel`, batched into one `Tick` per leader tick) carry
+grants and outcomes; the appendix describes them.
+
 ```
 
 ### Namespace Quotas
@@ -524,57 +532,29 @@ pub struct NamespaceUsage {
 
 ### Rolling Deploy State
 
+There is no rollout state machine in Raft. Each node rolls its own share with
+the pure planner `meat::deploy_types::plan_rolling_step`, and the leader's
+record of an app's rollouts is small:
+
 ```rust
-/// State machine for an in-progress rolling deploy.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RollingDeployState {
-    pub app_id: AppId,
-    pub deploy_id: u64,
-    pub old_image: String,
-    pub new_image: String,
-    pub strategy: DeployStrategy,
-    /// Instances already upgraded to the new version.
-    pub upgraded: Vec<InstanceState>,
-    /// Instances still running the old version.
-    pub pending: Vec<InstanceState>,
-    /// Current step in the rolling process.
-    pub phase: RollingDeployPhase,
-    pub started_at: Instant,
+/// What a rolling replacement should do next.
+pub enum RollingStep {
+    StartNew,
+    RetireOld,
+    /// Surge is exhausted by instances that haven't gone healthy yet.
+    Wait,
+    Done,
+    /// Neither move is allowed; only reachable with both bounds at zero,
+    /// which validation refuses.
+    Stuck,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InstanceState {
-    pub instance_id: String,
-    pub node_id: NodeId,
-    pub image: String,
-    pub port: u16,
-    pub health: HealthStatus,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum HealthStatus {
-    Starting,
-    Healthy,
-    Unhealthy,
-    Unknown,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum RollingDeployPhase {
-    /// Starting a new instance on the next target node.
-    StartingNew { target_node: NodeId },
-    /// Waiting for the new instance's health check to pass.
-    WaitingHealth { instance_id: String, deadline: Instant },
-    /// Draining the old instance (Wrapper removes from routing pool).
-    Draining { old_instance: String, deadline: Instant },
-    /// Stopping the old instance and releasing its port.
-    StoppingOld { old_instance: String },
-    /// Deploy completed successfully.
-    Completed,
-    /// Deploy halted due to health check failure (without auto_rollback).
-    Halted { reason: String },
-    /// Rolling back all upgraded instances to the old version.
-    RollingBack,
+/// The council's per-app rollout record (`meat::deploy_types::AppRollouts`):
+/// the last specs that rolled out on every node, and the spec whose rollout
+/// failed, by fingerprint.
+pub struct AppRollouts {
+    pub released: Vec<AppSpec>,
+    pub failed: Option<RolloutFailure>,
 }
 ```
 
@@ -759,124 +739,135 @@ When `replicas = "*"` is specified, Meat does not run the placement pipeline. In
    ordinal like any other replica (see Instance Ordinals).
 4. Meat subscribes to Mustard membership events: when a new node joins the cluster and matches the placement constraints, an instance is automatically scheduled. When a node leaves, the instance is removed.
 
-Daemon mode is not bin-packed -- every qualifying node gets exactly one instance regardless of its current load. This is appropriate for system-level workloads (node exporters, log forwarders, caches).
+Daemon mode is not bin-packed: every qualifying node that has room gets exactly one instance. "Qualifying" is the same `filter_nodes` check fixed replicas pass (`daemon_candidates` in `src/meat/scheduler.rs`), so a node without room for the request, or one that can't run the workload, gets none. This is appropriate for system-level workloads (node exporters, log forwarders, caches).
 
 A node already running the daemon's committed copy doesn't need room for a second one. Eligibility credits that copy back at the footprint it was committed with, in a throwaway view of the cache, and the pass trades it for the new request; the real cache keeps the allocation, so no other app can spend the room (#433). A copy the node runs without a committed placement earns no credit.
 
-### 5.2 Batch Job Allocation (Delegated Model)
+### 5.2 Jobs: the Common Lifecycle
 
-> **Status (0.2.0).** This section is the original Phase 12 target. What shipped instead is the [delegated task-array implementation](#delegated-task-array-implementation-020) below: the leader grants chunks of indexed runs and accepts aggregate outcomes, and every job (apply, batch, cron) takes that one lifecycle. The Phase 12 pieces that approximated this section (the `meat::batch::schedule_batch` allocator, the leader's `BatchTracker` with its `BatchRegister` reservations in Raft, node-to-node `/v1/batch/run` dispatch and completion callbacks) were retired in 0.2.0 (#681). Read the rest of this section as background.
+Every job takes one path, whatever started it: a `[job.NAME]` table in an
+apply, a `relish batch` array or manifest, `relish run --batch`, a cron
+occurrence or a `run_before` hook. The types are in `src/meat/job.rs`,
+`src/meat/task_array.rs` and `src/meat/task_array_store.rs`; the leader loop
+is `src/bun/task_array_leader.rs`.
 
-The 100M jobs/day target (approximately 1,150 jobs/sec sustained) requires a fundamentally different approach than scheduling each job individually through Raft.
+- **Definitions.** A `JobDefinition` holds the execution template (the
+  `JobSpec`), a `TaskArraySpec` (a TOML job is one task), an optional
+  `CronPolicy` and the `hook` flag. Definitions are revisioned. One-off
+  definitions expire with their last run; schedules and hooks last, because
+  the next minute or the next apply runs them again.
+- **Runs.** A trigger creates a run. `RunTrigger` gives each run a stable
+  identity (a manual request id, a hook's deployment operation id, or a
+  definition revision plus UTC minute), so a retried request or a new
+  leader returns the existing run instead of starting a second.
+- **Chunks.** The leader hands out chunks of task indices to workers that
+  report how many requests fit, and a node-wide `ExecutionBudget` reserves the
+  CPU and memory each attempt needs. Chunk size is queue depth, not
+  simultaneous resource use. Workers stream task outcomes into checksummed
+  ledgers and return finished chunks fenced by their grant attempt. The
+  leader commits one `Tick` entry per tick with every array's progress, so
+  the Raft log grows with chunks, not tasks.
+- **Unknown outcomes.** A holder that goes quiet past the silence window, or
+  refuses the array, loses its chunks. With `replay_unknown = true` the
+  leader requeues them (`TaskArrayWrite::Requeue`) at the next grant attempt.
+  Without it, which is the default, the leader records the node as an
+  unknown owner (`TaskArrayWrite::Unknown`) and keeps its tasks off every
+  other node: they may have run, and a second run could repeat their side
+  effects. An operator who has checked acknowledges the exact grant with
+  `relish batch replay ID --node NODE --grant-digest DIGEST
+  --acknowledge-side-effects`, which writes `Replay`. Without
+  `replay_unknown`, an attempt that times out or ends `Unknown` on a live
+  worker is treated the same way: the task isn't retried.
+- **Cron.** The leader observes each UTC minute once (`CronObserve`) and
+  claims every matching minute of every schedule as one run. `overlap =
+  "forbid"` (the default) skips an occurrence while a run is active; `allow`
+  starts another. Minutes missed while no leader was available are skipped,
+  not replayed (`MissedRunPolicy::Skip`). An occurrence with no active-run
+  slot free is recorded as skipped for capacity, and while a definition has
+  an unknown owner its occurrences are skipped too, whatever `overlap` says.
+- **Hooks.** An apply with `run_before` jobs writes `DeployBegin`, which
+  persists the deployment intent and admits only the hooks. When every hook
+  has an accepted successful outcome, `DeployCommitted` publishes the apps
+  and admits the ordinary jobs and schedules in one entry. A failed hook
+  fails the deploy before any instance changes; an unknown one never opens
+  the gate.
 
-#### Allocation Flow
+Execution is at least once, so external effects need business idempotency
+keys. Limits (active runs, definitions per namespace, retained receipts) are
+council-enforced; the [manual](../manual/14_batch-jobs.md) lists them, and
+§5.6 covers quotas. The [appendix](#delegated-task-array-implementation-020)
+has the details of grants, budgets, ledgers and recovery.
 
-1. A batch job spec arrives (e.g., `job.render-frame` with `parallelism = 1000`).
-2. Meat computes eligible nodes using the Filter phase (resources, labels, process workload allowlist).
-3. Meat partitions the total instance count across eligible nodes, weighted by available resources:
-
-```rust
-fn allocate_batch(
-    job: &JobSpec,
-    total_instances: u32,
-    eligible_nodes: &[NodeCapacity],
-) -> Vec<BatchAllocation> {
-    // Compute each node's share based on available resources.
-    let total_capacity: f64 = eligible_nodes.iter()
-        .map(|n| compute_job_capacity(n, &job.resources))
-        .sum();
-
-    let mut allocations = Vec::new();
-    let mut remaining = total_instances;
-
-    for node in eligible_nodes {
-        if remaining == 0 { break; }
-        let node_capacity = compute_job_capacity(node, &job.resources);
-        let share = ((node_capacity / total_capacity) * total_instances as f64).ceil() as u32;
-        let count = share.min(remaining);
-        remaining -= count;
-
-        allocations.push(BatchAllocation {
-            allocation_id: next_allocation_id(),
-            job_id: job.id.clone(),
-            target_node: node.node_id.clone(),
-            instance_count: count,
-            resource_budget: Resources {
-                cpu_millis: job.resources.cpu_millis * count,
-                memory_bytes: job.resources.memory_bytes * count as u64,
-                gpus: job.resources.gpus * count,
-                disk_bytes: 0,
-            },
-            instance_timeout: job.timeout,
-            retry_limit: job.retry,
-            timestamp: Instant::now(),
-        });
-    }
-    allocations
-}
-
-/// How many instances of this job a node can run concurrently.
-fn compute_job_capacity(node: &NodeCapacity, per_instance: &Resources) -> f64 {
-    let cpu_slots = (node.allocatable.cpu_millis - node.allocated.cpu_millis) / per_instance.cpu_millis;
-    let mem_slots = (node.allocatable.memory_bytes - node.allocated.memory_bytes) / per_instance.memory_bytes;
-    let gpu_slots = if per_instance.gpus > 0 {
-        (node.gpu_count - node.allocated.gpus) / per_instance.gpus
-    } else {
-        u32::MAX
-    };
-    cpu_slots.min(mem_slots).min(gpu_slots) as f64
-}
-```
-
-4. Meat commits a single `BatchAllocation` entry per node to the Raft log (not per-instance).
-5. Bun agents on target nodes receive their allocation and execute instances locally, managing concurrency up to the resource budget.
-6. Nodes report `BatchCompletionReport` back via the hierarchical reporting tree at configurable intervals (default: every 5 seconds or on batch completion, whichever is sooner).
-7. If a node reports `retries_exhausted > 0`, Meat re-allocates those failed instances to other eligible nodes.
-
-This model means the Raft log records O(nodes) entries per batch, not O(instances). For a 1000-instance batch across 50 nodes, that is 50 Raft entries instead of 1000.
-
-#### Scheduled Jobs (Cron)
-
-Meat maintains a cron scheduler (using a priority queue keyed by next-fire-time). When a scheduled job's cron expression matches, Meat treats it as a new job submission:
-
-- If `parallelism` is set, it goes through the batch allocation path.
-- If `replicas = "*"`, the job runs on every qualifying node (e.g., log rotation on all nodes).
-- Otherwise, it is placed on a single node via the standard placement pipeline.
+> **What this section used to say.** The Phase 12 design here partitioned a
+> batch's `parallelism` across nodes with a `BatchAllocation` per node,
+> re-allocated failed instances to other nodes, and ran `replicas = "*"` cron
+> jobs on every node. The pieces that approximated it (the
+> `meat::batch::schedule_batch` allocator, the leader's `BatchTracker` with
+> its `BatchRegister` reservations, node-to-node `/v1/batch/run` dispatch)
+> were retired in 0.2.0 (#681). Re-allocating a failed task to another node
+> is exactly what the unknown-outcome rule forbids; there is no
+> `parallelism` field and no daemon cron.
 
 ### 5.3 Rolling Deploys
 
-When an App's image changes (new deploy via CLI, API, or Lettuce GitOps), Meat orchestrates a rolling deployment:
+Meat doesn't drive a rollout instance by instance. Each node rolls its own
+share of an app, and the leader decides which nodes may start a new version.
 
-```
-For each instance (old version) in the App:
-  1. Schedule a NEW instance (new version) on the same node.
-     - Host ports are dynamically allocated, so old and new coexist.
-  2. Wait for the new instance to pass health checks (up to health_timeout).
-     - If health check fails:
-       a. If auto_rollback = false: HALT. Log the failure. Keep upgraded
-          instances on new version, remaining on old version.
-       b. If auto_rollback = true: revert all already-upgraded instances
-          back to the old version using the same rolling mechanism.
-  3. Tell Wrapper to add the new instance to the routing pool.
-  4. Tell Wrapper to remove the old instance from the routing pool.
-  5. Wait for drain_timeout (default 30s) to allow in-flight requests to complete.
-  6. Stop the old instance. Release its host port.
-  7. Move to the next instance.
-```
+**On a node.** The deploy worker (`rolling_redeploy` in
+`src/bun/agent/deploy_worker.rs`) asks the pure planner
+`meat::deploy_types::plan_rolling_step` what to do next, acts, and asks
+again until it answers `Done`:
 
-The `max_surge` parameter controls how many extra instances can exist simultaneously during the transition. With `max_surge = 1` (default), only one node is being transitioned at a time. With `max_surge = 2`, two nodes can be in transition simultaneously, cutting deploy time roughly in half at the cost of temporarily using more resources.
+1. `StartNew`: start a replacement, wait for its health check (up to
+   `health_timeout`) and publish it as a backend.
+2. `RetireOld`: drain an old instance (up to `drain_timeout`) and stop it.
 
-Meat tracks the rolling deploy as a `RollingDeployState` in memory (and checkpointed to Raft after each step). If the leader fails mid-deploy, the new leader reconstructs the deploy state from the Raft log and resumes from the last committed step.
+`max_surge` caps how far above the target the total may go, which decides
+whether another replacement may start; `max_unavailable` caps how far below
+it the serving count may fall, which decides whether an old instance may
+retire. The defaults (1 and 0) replace one instance at a time without ever
+dipping. A managed-volume app rolls stop-first, because two processes must
+never write one directory. `strategy = "blue-green"` dispatches to
+`blue_green_redeploy` instead: the whole new fleet comes up healthy beside the
+old one, is published, and then the old fleet retires.
+
+If a replacement fails its health check, `abort_rollout` decides:
+
+- `auto_rollback = false`: keep the healthy replacements, record `Halted`.
+- `auto_rollback = true` (the default) and nothing retired yet: tear the
+  replacements down; the old fleet carries on.
+- `auto_rollback = true` after a retirement: roll backwards with the same
+  planner, starting previous-spec instances before retiring a healthy
+  replacement, so an abort never ends below the capacity it started with.
+
+**Across the cluster.** The leader releases a spec change to one node at a
+time (`plan_release` in `src/cluster/rollout.rs`) and waits for that node's
+share to report healthy before the next. Progress lives in the nodes' state
+reports, not in Raft, so a new leader carries on where the old one stopped. A
+held node keeps the spec it runs. Versions are compared by
+`rollout_fingerprint`, which sets `replicas` and ordinals aside, so a scale
+change is never mistaken for a rollout.
+
+When a node aborts, it reports the failure and the leader commits
+`RolloutFailed` with the fingerprint, node and reason. From then on that spec
+goes to nobody who doesn't already run it, until the operator applies a
+different spec. When every node runs the current spec healthy, the leader
+commits `RolloutReleased`, which keeps the last ten distinct specs that rolled
+out everywhere: what held nodes fall back on, and where `relish rollback`
+looks first.
+
+Full leader-coordinated rollouts, with one surge budget across the cluster and
+the rollout's progress in Raft, remain a possible future design (decision D10
+in #674).
 
 #### Dependency Ordering
 
-Jobs with `run_before = ["app.api"]` create a deploy dependency. When a deploy includes both the job and the app:
-
-1. Meat schedules the job and waits for it to complete.
-2. Only after successful job completion does Meat begin the rolling deploy of the dependent App.
-3. If the job fails, the deploy is halted and an alert fires.
-
-Dependencies are expressed as a DAG. Meat performs a topological sort at deploy time and executes stages in dependency order.
+Jobs with `run_before = ["app.api"]` are hooks. They run on the common job
+lifecycle before the app publishes (§5.2): the apply admits the hooks, waits
+for their accepted successful outcomes, and only then publishes the app and
+admits the ordinary jobs in one Raft entry. A failed hook fails the deploy.
+Each hook names an app in the same apply and namespace; there is no DAG of
+hooks depending on hooks.
 
 ### 5.4 Autoscaling Logic
 
@@ -964,7 +955,7 @@ enum ScaleAction {
 When a scale action is determined:
 
 - **Scale up:** Meat runs the placement pipeline for the additional replicas, identical to initial placement.
-- **Scale down:** Meat selects replicas to remove using inverse scoring (remove from the lowest-scoring node first, to reclaim the least-efficient placements). Removed instances go through the drain flow (Wrapper removes from routing, wait for drain_timeout, stop).
+- **Scale down:** Meat retires the replicas with the highest ordinals, wherever they run, so the surviving replicas keep ordinals 0 to N-1 (`a_scale_down_retires_the_highest_ordinals` in `src/cluster/orchestrate.rs`). Removed instances go through the drain flow (Wrapper removes them from routing, waits for `drain_timeout`, stops them).
 
 #### Interaction with GitOps (Lettuce)
 
@@ -1065,7 +1056,7 @@ The `default` namespace has no quotas unless explicitly configured, which is app
 
 #### Jobs: quotas at grant time and admission caps
 
-Jobs never pass through the app placement pass: every job is a task array, and the task-array leader (`leader_tick` in `src/bun/task_array_leader.rs`) hands out chunks once a second. So that is where job quotas are enforced (decision D20). Each tick, `GrantBudget::new` builds one `QuotaLedger` per namespace from `DesiredState::namespaces`, charges every app placement's reserved resources first, then every job attempt already in flight, and only then plans new grants, oldest run first. An attempt in flight on a node is `min(tasks it holds, its slots for that run)` (`TaskArrayState::in_flight_on`), because a node never runs more of an array at once than its slots. `fit_grants` trims each run's planned grants to the room that's left; a chunk that would start more attempts than fit stops the run's grants for that tick. Deeper chunks on a node already running a full round cost nothing extra, so lookahead survives.
+Jobs never pass through the app placement pass: every job is a task array, and the task-array leader (`leader_tick` in `src/bun/task_array_leader.rs`) hands out chunks once a second. So that is where job quotas are enforced (decision D20). Each tick, `GrantBudget::new` builds one `QuotaLedger` per namespace from `DesiredState::namespaces`, charges every app placement's reserved resources first, then every job attempt already in flight, and only then plans new grants, oldest run first. An attempt in flight on a node is `min(tasks it holds, its slots for that run)` (`TaskArrayState::in_flight_on`), because a node never runs more of an array at once than its slots. `fit_grants` trims each run's planned grants to the room that's left; a chunk that would start more attempts than fit stops the run's grants for that tick. Deeper chunks on a node already running a full round cost nothing extra, so lookahead survives. Learned lookahead stops at `MAX_LEARNED_GRANT_DEPTH`, 16 chunks. Since 0.2.4 the leader delivers grants in the tick that commits them ([#1360](https://github.com/reliaburger/reliaburger/issues/1360)), so a held chunk turns over once a tick and this cap sets how fast one node can run: 16 chunks of 1,000 tasks is 16,000 a second. 0.2.3 had raised the cap to 32 (#1361) while a chunk still took two ticks to turn over.
 
 A run whose grants were held back gets a durable `quota_blocked` reason through a `TaskArrayWrite::QuotaBlocked` entry, written only when the limit it names changes (`same_limit` ignores the usage numbers, which move with every task). It clears when grants fit again or the run finishes. Running attempts are never cancelled. Apps go first in the ledger and the app pass doesn't count jobs, so a namespace's jobs can never displace an app that fits its quota. `max_apps` and `max_replicas` stay app-only.
 
@@ -1088,9 +1079,10 @@ Definitions with no cron and no hook expire in the same deterministic `prune` th
 Each tick (`SYNC_INTERVAL`, one second) the leader:
 
 1. Reads the job control state in place with `read_control`, a closure run under the state machine's read lock, and builds each node's sync request. It never clones the whole `DesiredState`; `read_task_arrays` copies only `TaskArrays`, and only for callers that need an owned copy.
-2. Calls every node that isn't still answering an earlier call, and gathers answers until the tick's deadline, `sync_deadline(interval)` (half the interval). Calls that miss it stay in `SyncCalls` and are collected by a later tick; their node isn't called again meanwhile, and `NODE_SYNC_TIMEOUT` (3 s for the request, 3 s for the body) still bounds each one. A node that missed the deadline keeps its chunks and counts towards `SILENCE_TIMEOUT` (30 s) like any silent node, so a hung or slow node delays only its own grants.
+2. Takes every answer already in (`SyncCalls::gather_ready`, mostly the previous tick's follow-ups, step 5), then calls every node that isn't still answering an earlier call, and gathers answers until the tick's deadline, `sync_deadline(interval)` (half the interval). Calls that miss it stay in `SyncCalls` and are collected by a later tick; their node isn't called again meanwhile, and `NODE_SYNC_TIMEOUT` (3 s for the request, 3 s for the body) still bounds each one. A node that missed the deadline keeps its chunks and counts towards `SILENCE_TIMEOUT` (30 s) like any silent node, so a hung or slow node delays only its own grants.
 3. Plans every running array with `plan_tick`, again under the read lock: a lost holder's `Requeue` (or `Unknown`, for runs that need acknowledged replay), then the array's `Sync`, then its `QuotaBlocked` note when the limit changed. Planning copies an array's state only when a chunk finished (`Cow`).
 4. Commits the whole batch as one `TaskArrayWrite::Tick` entry (`tick_entries`; at most `MAX_TICK_WRITES` = 1,024 writes per entry, so more would split). The state machine refuses a `Tick` holding anything but those four progress writes, and otherwise applies each on its own: a refused write (an array pruned since planning, a stale `Unknown`) leaves its array unchanged and is reported by array in `TaskArrayApplied::Ticked` / `CouncilResponse::TaskArrayTicked`; the others apply.
+5. Once the entry has committed, re-reads the committed state and, if it still leads, calls each node the entry gave a chunk (or a new attempt at one) that this tick's own request didn't list (`follow_ups`, #1360). Without this a grant waited a whole tick for the next request, so a held chunk turned over once every two ticks. A node whose call is still out gets no follow-up; its grant goes with its next regular request. The follow-up's control version is read after the commit, so it's never older than the tick's own and each node's fence only moves forward; the next tick collects the answer, and when a node answers twice in one tick `latest_per_node` keeps the later answer (a node reports every finished chunk until the leader retires it). A node with fresh grants every tick is called twice a tick, which costs it a second fence write and fsync per tick.
 
 The dispatch loop therefore writes at most one Raft entry per tick, however many arrays run, plus a `CronObserve` once a minute and one entry per cron fire. The 0.2.0 budget (#668, D18) is at most three entries a second. `make bench-task-arrays` reports the tick's cost in the `leader_tick` group, with 64 arrays on three nodes (about 1.1 ms of planning and applying on the development laptop) and with one array of one-task chunks on ten nodes (about 160 µs).
 
@@ -1132,13 +1124,14 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 | `scheduler.scoring.image_locality_weight` | `15` | Weight for image cache locality (0-100). |
 | `scheduler.scoring.stability_weight` | `5` | Weight for node uptime/stability (0-100). |
 
-### Batch Jobs
+### Jobs
 
-| Knob | Default | Description |
-|------|---------|-------------|
-| `scheduler.batch.report_interval` | `5s` | How often nodes report batch completion status. |
-| `scheduler.batch.max_allocation_size` | `10000` | Maximum instances in a single batch allocation to one node. |
-| `scheduler.batch.reallocation_delay` | `10s` | Delay before re-allocating failed instances to other nodes. |
+Job limits (active runs, definitions per namespace, retained receipts, chunk
+size and per-node concurrency) are constants enforced by the council, and a
+job's own policy lives in its `[job.NAME]` table; the
+[manual](../manual/14_batch-jobs.md) lists both. There are no
+`scheduler.batch.*` knobs, planned or otherwise: the allocation model they
+configured was retired (§5.2).
 
 ### Rolling Deploys
 
@@ -1148,7 +1141,8 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 | `defaults.app.deploy.max_surge` | `1` | Default max extra instances during rolling deploy. |
 | `defaults.app.deploy.drain_timeout` | `"30s"` | Default drain timeout for connection draining. |
 | `defaults.app.deploy.health_timeout` | `"60s"` | Default timeout for health checks on new instances. |
-| `defaults.app.deploy.auto_rollback` | `false` | Whether to auto-revert all instances on health failure. |
+| `defaults.app.deploy.max_unavailable` | `0` | Default max instances below target during a rolling deploy. |
+| `defaults.app.deploy.auto_rollback` | `true` | Whether to roll back on health failure. |
 
 ### Autoscaling
 
@@ -1173,20 +1167,19 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 
 ## 7. Failure Modes
 
-### 7.1 Node Failure During Batch Job Execution
+### 7.1 Node Failure During Job Execution
 
-**Scenario:** A node executing batch job instances becomes unreachable mid-execution.
+**Scenario:** A node holding chunks of a job run becomes unreachable mid-execution.
 
-**Detection:** Mustard gossip detects the node as unreachable within seconds. The hierarchical reporting tree detects missed reports at the aggregation interval.
+**Detection:** The leader polls each worker for its arrays' progress every tick. A holder that stays silent past the silence window, or answers that it can no longer run the array (its allowlist, runtime or `mount_isolation` changed), counts as lost.
 
 **Response:**
 
-1. Meat marks all `BatchAllocation` entries assigned to the failed node as `PartiallyFailed`.
-2. The number of instances that had not yet reported completion is computed: `remaining = allocation.instance_count - last_report.completed - last_report.failed`.
-3. Meat re-allocates these `remaining` instances to other eligible nodes via a new `BatchAllocation`.
-4. Already-completed instances are not re-run (completion reports are idempotent and stored in the Raft log).
+1. Tasks the node already reported in an accepted chunk stay done: acceptance is durable, and each chunk result is fenced by its grant attempt, so a late answer from an old grant can't overwrite a newer one.
+2. With `replay_unknown = true`, the leader requeues the node's chunks (`TaskArrayWrite::Requeue`) and grants them again at the next attempt, on whichever node fits.
+3. Without it, the default, the leader records the node as an unknown owner of the run (`TaskArrayWrite::Unknown`). Its unfinished tasks aren't handed to anyone else, because they may have run. The run waits until an operator checks and writes `relish batch replay ID --node NODE --grant-digest DIGEST --acknowledge-side-effects`, which names the exact grant acknowledged. A cron definition with an unknown owner skips its occurrences meanwhile.
 
-**Edge case:** If the node was mid-execution and rejoins before the re-allocation, the node's Bun agent will report its completed instances. Meat deduplicates: if a re-allocated instance completes on both the original and new node, the second completion is ignored.
+**Edge case:** A node that returns with work from before a new recovery epoch is refused: its array directories are kept behind a durable refusal, its attempts are cancelled, and an operator archives the old data and re-enrols it (see the appendix).
 
 ### 7.2 Scheduling with Incomplete State (Post-Election)
 
@@ -1221,17 +1214,9 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 
 ### 7.4 Leader Failure Mid-Deploy
 
-**Scenario:** The leader fails while a rolling deploy is in progress (some instances upgraded, others not).
+**Scenario:** The leader fails while a rollout is in progress (some nodes on the new spec, others not).
 
-**Response:**
-
-1. Raft elects a new leader.
-2. The new leader enters the learning period, collects state reports.
-3. It loads the `RollingDeployState` from the Raft log (checkpointed after each step).
-4. It detects the partial deploy: some instances are running the new version, others the old.
-5. It resumes the rolling deploy from the last committed step.
-
-If `auto_rollback = true` and the health check of the in-progress step was pending when the leader failed, the new leader restarts the health check timer from zero (conservative approach -- it does not assume the previous leader's timer was accurate).
+**Response:** Nothing to resume, because there is no rollout state to lose. Each node's share rolls on its own deploy worker, which doesn't need the leader once it has the spec. The new leader rebuilds the release plan from the nodes' state reports (each reports the spec it last finished deploying) and the council's `AppRollouts` record, then carries on releasing the spec one node at a time. Until a node's report arrives, the new leader treats it as unsettled and may hold it; holding means "don't touch", so a stale view costs time, never a wrong deploy.
 
 ### 7.5 Losing One Node
 
@@ -1255,7 +1240,7 @@ If `auto_rollback = true` and the health check of the in-progress step was pendi
 1. For each failed node's App instances, Meat attempts to reschedule to surviving nodes.
 2. If surviving capacity is insufficient, Meat places the replicas that fit and records each short app's reason (§5.1, Short Capacity): `relish status` and `relish wtf` show it, and the leader records a `placement` event. No Mayo alert fires yet.
 3. Rescheduling currently processes apps in a deterministic order (alphabetical by app id), not by remaining healthy replicas. Priority ordering by criticality — rescheduling the apps with the fewest remaining healthy replicas first — is **planned, not yet implemented**.
-4. Batch jobs on failed nodes are re-allocated as described in 7.1.
+4. Job chunks on failed nodes are requeued or held as unknown, as described in 7.1.
 
 ---
 
@@ -1280,8 +1265,8 @@ If `auto_rollback = true` and the health check of the in-progress step was pendi
 
 - **Namespace quotas** cap the total CPU, memory, GPU, app count, and replica count per namespace. A single tenant cannot exceed their quota.
 - **Admission validation:** Meat validates all resource requests at submission time. Requests exceeding remaining quota are rejected immediately.
-- **Batch parallelism limits:** The `parallelism` field caps the maximum concurrent instances for a batch job. Meat enforces this limit and does not allocate more than `parallelism` instances across all nodes combined.
-- **Rate limiting:** The leader's API server rate-limits deploy and job submission requests per authenticated identity (configurable, default 100 requests/minute). This prevents a compromised CI pipeline from flooding the scheduler.
+- **Job admission caps:** the council bounds active runs (128 in the cluster, 32 of them kept for cron fires and deployment hooks, 64 per namespace), job definitions and retained receipts, and a run's `per_node_concurrency` caps how many of its tasks one node runs at once. Each attempt also reserves its CPU and memory in the node's execution budget.
+- **Rate limiting (planned):** per-identity rate limits on deploy and job submission don't exist yet; the admission caps above are what bound a flood today.
 
 ### 8.3 Process Workload Escalation
 
@@ -1308,21 +1293,27 @@ If `auto_rollback = true` and the health check of the in-progress step was pendi
 
 ### 9.1 Throughput Targets
 
-| Metric | Target | Measured (12-node bench) |
-|--------|--------|--------------------------|
-| Sustained job scheduling rate | >= 1,150 jobs/sec | 2,847 jobs/sec |
-| Peak scheduling rate (burst) | -- | 4,210 jobs/sec |
-| Scheduling latency p50 | < 5ms | 0.8ms |
-| Scheduling latency p99 | < 20ms | 4.2ms |
-| Scheduling latency p99.9 | < 50ms | 12.1ms |
-| Queue depth at sustained rate | < 100 | 3 jobs |
+The target is the whitepaper's: about 1,150 accepted jobs a second sustained
+(100M a day). An earlier version of this section showed a table of "measured"
+rates and latencies from a 12-node bench that was never run; we deleted it.
+What exists instead:
 
-These numbers reflect the benchmark methodology described in the whitepaper (Section 19): a batch job with `parallelism = 10000` is submitted, and nodes immediately complete instances (no actual work), measuring pure scheduling overhead.
+- `benches/task_arrays.rs` measures, in one process, the leader's control-plane
+  cost for a 1M-task array on 3 and 200 nodes, one leader tick with 64
+  concurrent arrays, the node pool's overhead per task with a fake runner, the
+  machine's fork/exec floor, and a worker's disk cost per task.
+- The job qualification runs measure real clusters at the #668 target (1,390
+  accepted a second by default) with node-level faults. The 0.2.0 records are
+  [`2026-10-17-v0.2.0-job-qualification.md`](../qualification/2026-10-17-v0.2.0-job-qualification.md)
+  and the [throughput record](../qualification/2026-10-17-v0.2.0-job-throughput/);
+  [testing.md](../testing.md) describes the tiers.
 
 ### 9.2 Latency Bounds
 
-- **App placement decision:** < 5ms for a single replica on a 10,000-node cluster. The Filter phase is O(N) in nodes, but is optimised by maintaining a pre-filtered index of nodes by label combination. The Score phase runs only on filtered candidates (typically 10-1000 nodes for constrained workloads).
-- **Batch allocation:** < 20ms for partitioning 10,000 instances across eligible nodes. This is a single Raft commit, not per-instance.
+These are design targets, not measurements; §9.4 has what `benches/scheduler.rs` measured.
+
+- **App placement decision:** < 5ms for a single replica on a 10,000-node cluster. The Filter phase is O(N) in nodes; an index of nodes by label combination would cut that and is planned. The Score phase runs only on filtered candidates.
+- **Job chunk grants:** one leader tick plans every array's grants and commits them in one `Tick` entry; `benches/task_arrays.rs` measures a tick with 64 concurrent arrays.
 - **Rolling deploy step:** Dominated by health_timeout (default 60s), not scheduler overhead. The scheduling overhead per step is < 10ms.
 - **Autoscale evaluation:** < 5ms per App. With 1,000 autoscaled Apps, the full evaluation cycle completes in < 5 seconds (well within the 30-second default interval).
 
@@ -1335,16 +1326,15 @@ NodeCapacity per node:   ~2 KB (labels, resource counters, image set)
 Per-App scheduling state: ~500 bytes
 5,000 Apps (500/node avg): ~2.5 MB
 
-Batch tracking state:    ~100 bytes per active allocation
-10,000 active allocations: ~1 MB
+Job state:               compact index ranges per active run,
+                         bounded by the active-run caps (§8.2)
 
-Rolling deploy state:    ~2 KB per in-progress deploy
-100 concurrent deploys:  ~200 KB
+Rollout record:          up to ten specs per app (AppRollouts)
 
 Autoscale state:         ~4 KB per App (metric sample window)
 1,000 autoscaled Apps:   ~4 MB
 
-Total Meat memory:      ~28 MB (at 10,000 nodes, peak)
+Total Meat memory:      ~30 MB estimated (at 10,000 nodes, peak; unmeasured)
 ```
 
 This fits comfortably within a typical server's memory. The 312 MB total Bun agent memory (at 500 apps) noted in the whitepaper benchmarks includes all Bun subsystems, not just Meat.
@@ -1357,106 +1347,55 @@ Meat's scheduling loop is designed to consume < 15% of a single core at sustaine
 - An earlier version of this section estimated ~270 µs per decision with nothing to measure it against. The measurement above is close at 1,000 nodes and an order of magnitude off at 10,000; App placement rates are far below the job rates below, so it fits the budget, but per-node work in Filter and Score is the place to look if large clusters need faster placement.
 - With core pinning at > 1,000 nodes, this would be isolated from other Bun tasks (core pinning is planned, not yet implemented — see Section 1).
 
-In practice, the batch model means most scheduling decisions are batch allocations (one per node per batch, not one per instance), so the actual decision rate for 100M jobs/day is closer to 50-200 allocation decisions per second, well within budget.
+Jobs don't go through placement at all: the leader grants chunks of task indices, so its work grows with chunks and ticks, not with tasks. `benches/task_arrays.rs` measures that cost (§9.1).
 
 ---
 
 ## 10. Testing Strategy
 
-### 10.1 Scheduler Simulation
+### 10.1 Unit and Property Tests
 
-Meat includes a deterministic simulation mode that can be driven without a real cluster. The simulator replaces the Raft log, Mustard gossip, and reporting tree with in-memory fakes.
+What ships are property tests over random clusters (`meat::scheduler::properties`, with proptest): placement never overcommits a node, spreads no more than `ceil(replicas / eligible nodes)` per node when every node has room, gives the same plan whatever order the nodes were inserted in, and a pass never places more CPU than a namespace's quota. The unit tests in `cluster::orchestrate` drive `plan_pass` directly, including the stale-node grace and short capacity (`scheduler_policy`), and a proptest there checks that a capacity refusal moves exactly the replicas it names (`a_refusal_moves_exactly_the_refused_replicas`). The rollout planner's tests in `meat::deploy_types` walk whole rollouts through `plan_rolling_step`, and `cluster::rollout` tests the one-node-at-a-time release. Jobs are tested in `meat::task_array_state`, `meat::task_array_store` and `bun::task_array_leader`, from chunk planning to unknown owners and replay.
 
-```rust
-#[cfg(test)]
-mod simulation {
-    use super::*;
-
-    /// A simulated cluster with configurable nodes and workloads.
-    struct SchedulerSimulation {
-        scheduler: MeatScheduler,
-        nodes: Vec<SimulatedNode>,
-        clock: FakeClock,
-        raft_log: Vec<RaftEntry>,
-    }
-
-    impl SchedulerSimulation {
-        /// Create a simulation with N nodes, each with the given capacity.
-        fn new(node_count: usize, capacity: Resources) -> Self { /* ... */ }
-
-        /// Add labels to a subset of nodes.
-        fn label_nodes(&mut self, range: Range<usize>, labels: BTreeMap<String, String>) { /* ... */ }
-
-        /// Submit an app spec and run the scheduler until all replicas are placed.
-        fn deploy_app(&mut self, spec: AppSpec) -> Vec<SchedulingDecision> { /* ... */ }
-
-        /// Submit a batch job and run until all instances complete.
-        fn run_batch(&mut self, spec: JobSpec, instances: u32) -> Vec<BatchAllocation> { /* ... */ }
-
-        /// Simulate a node failure and verify rescheduling.
-        fn fail_node(&mut self, node_id: &NodeId) { /* ... */ }
-
-        /// Advance the simulated clock and process pending events.
-        fn advance(&mut self, duration: Duration) { /* ... */ }
-
-        /// Assert that all replicas of an App are placed on distinct nodes.
-        fn assert_spread(&self, app_id: &AppId) { /* ... */ }
-
-        /// Assert that all replicas are on nodes matching the given labels.
-        fn assert_labels(&self, app_id: &AppId, labels: &BTreeMap<String, String>) { /* ... */ }
-    }
-}
-```
-
-Key simulation test scenarios:
-
-- **Bin-packing correctness:** Deploy 100 apps with varied resource requirements across 10 nodes. Verify that utilisation is balanced and no node is over-committed.
-- **Required label enforcement:** Deploy an app requiring `gpu_model = "a100"` to a cluster with mixed GPU types. Verify placement only on A100 nodes.
-- **Preferred label fallback:** Deploy an app preferring `storage = "ssd"` when SSD nodes are full. Verify fallback to non-SSD nodes.
-- **Daemon mode join/leave:** Deploy a `replicas = "*"` app, then add and remove nodes. Verify instance count tracks node count.
-- **Quota enforcement:** Configure a namespace quota and attempt to exceed it. Verify rejection.
-- **Batch throughput:** Simulate 100,000 job instances across 100 nodes and verify allocation completes in < 1 second of simulated time.
-- **Autoscaler stability:** Feed a sinusoidal load pattern into the autoscaler and verify it does not flap (the smoothing window and cooldown prevent oscillation).
-- **Rolling deploy with failure:** Start a rolling deploy where the new version fails health checks on the third replica. Verify halt (without auto_rollback) and full revert (with auto_rollback).
-
-The simulator above is the design; what ships today are property tests over random clusters (`meat::scheduler::properties`, with proptest): placement never overcommits a node, spreads no more than `ceil(replicas / eligible nodes)` per node when every node has room, gives the same plan whatever order the nodes were inserted in, and a pass never places more CPU than a namespace's quota. The unit tests in `cluster::orchestrate` drive `plan_pass` directly, including the stale-node grace and short capacity (`scheduler_policy`), and a proptest there checks that a capacity refusal moves exactly the replicas it names (`a_refusal_moves_exactly_the_refused_replicas`).
+A deterministic whole-scheduler simulation, with fake Raft, gossip and reporting driving a `SchedulerSimulation` through deploys, node failures and simulated time, was the original design. It's **planned, not yet implemented**; the property tests above cover its placement scenarios, and the cluster tests below cover the rest against real nodes.
 
 ### 10.2 Integration Tests
 
-The following tests from the built-in `relish test` suite exercise Meat against a live cluster:
+The built-in `relish test` suite (`src/testkit/cases/`) exercises Meat against a live cluster:
 
-| Test | Description | Expected Duration |
-|------|-------------|-------------------|
-| Deploy 3 replicas, verify distinct nodes | Basic placement spread | 1.8s |
-| Deploy daemon app, verify on all nodes | `replicas = "*"` mode | 2.4s |
-| Deploy with required labels | Hard constraint enforcement | 1.6s |
-| Deploy with preferred labels | Soft constraint with fallback | 1.9s |
-| Namespace quota rejection | Quota enforcement | 0.4s |
-| Rolling deploy zero-downtime | Continuous health probe during deploy | 8.2s |
-| Deploy broken image, auto-rollback | Rollback mechanism | 12.4s |
-| Job runs before app starts | Dependency ordering | 4.1s |
-| Failed job retries | Retry logic | 3.8s |
+| Case | What it checks |
+|------|----------------|
+| `schedule_fixed_replicas_across_nodes` | Basic placement spread |
+| `schedule_respects_required_placement_label` | Hard constraint enforcement |
+| `schedule_rejects_app_exceeding_namespace_quota` | Quota enforcement |
+| `rolling_deploy_keeps_the_app_running` | Continuous health probe during a rollout |
+| `failed_deploy_rolls_back_automatically` | Rollback of a broken version |
+| `deploy_history_records_each_version` | Deploy history |
+| `job_runs_to_completion_and_reports_exit` | A job's run and exit code |
+| `scheduled_job_fires_on_its_schedule` | Cron |
+| `job_logs_are_retrievable_after_completion` | Retained job output |
+
+There are no daemon-set or preferred-label cases yet. The repository's own cluster suites (`tests/placement.rs` and `tests/cluster_task_arrays.rs`, run by `make test-cluster`) cover three real nodes: spread, rollouts one node at a time, `RolloutFailed`, rollback after restarts, and job arrays across nodes.
 
 ### 10.3 Chaos Tests
 
-From the `relish test --chaos` suite:
+From the `relish test --chaos` suite (`src/testkit/chaos/scenarios.rs`):
 
-| Test | Description | Expected Duration |
-|------|-------------|-------------------|
-| Kill leader mid-deploy | Deploy completes after election | 8.4s |
-| Kill node, verify rescheduling | Replicas move to surviving nodes | 12.3s |
-| Drain node, zero-downtime migration | Graceful node removal | 9.8s |
-| Kill 2 of 3 replicas simultaneously | Service stays up | 4.8s |
-| Rapid leader elections (3 in 30s) | Cluster stabilizes | 22.4s |
+| Case | What it checks |
+|------|----------------|
+| `leader_failure_elects_new_leader_and_cluster_recovers` | A new leader takes over and the cluster recovers |
+| `dead_worker_node_has_workloads_rescheduled` | Replicas move to surviving nodes |
+| `minority_partition_degrades_and_heals` | A partitioned minority degrades and rejoins |
+| `resource_exhaustion_degrades_gracefully` | Pressure on a node doesn't take the cluster down |
+| `node_death_during_deploy_ends_clean` | A node lost mid-rollout leaves no half-finished state |
+
+Draining a node with zero-downtime migration needs drain itself, which is #656.
 
 ### 10.4 Benchmark Tests
 
-The `relish bench` scheduler throughput test:
-
-1. Deploys a batch job with `parallelism = 10000`.
-2. Nodes immediately complete (zero-work stub).
-3. Measures sustained and peak scheduling rates.
-4. Ramps submission rate until p99 latency exceeds 50ms to find the saturation point.
+- `benches/scheduler.rs` (`make bench`): one leader pass placing replicas on 1,000 and 10,000 nodes, and a converged pass (§9.4).
+- `benches/task_arrays.rs`: the job control plane in one process (§9.1).
+- `relish bench --scenario …` runs timed job scenarios against a real cluster (60 seconds at concurrency 27 by default) and can save and compare JSON reports; the job qualification scripts build on it.
 
 ---
 
@@ -1485,7 +1424,7 @@ Nomad uses a bin-packing scheduler for services and a batch scheduler for batch 
 **What we do differently:**
 
 - Nomad evaluates scheduling plans using a plan-apply model with optimistic concurrency. Multiple schedulers can compute plans concurrently, and the leader merges them. This is more complex than Meat's single-leader model but provides higher throughput in multi-datacenter deployments. Meat's single-leader model is simpler and sufficient for the single-cluster use case.
-- Nomad's batch scheduler queues individual allocations. Meat's delegated batch model pushes entire batches to nodes, keeping the leader's hot path O(nodes) rather than O(jobs).
+- Nomad's batch scheduler queues individual allocations. Meat grants chunks of task indices to nodes, keeping the leader's hot path proportional to chunks rather than jobs.
 
 **Reference:** [Nomad Scheduler Design](https://developer.hashicorp.com/nomad/docs/concepts/scheduling/scheduling), [Nomad Architecture](https://developer.hashicorp.com/nomad/docs/concepts/architecture)
 
@@ -1493,7 +1432,7 @@ Nomad uses a bin-packing scheduler for services and a batch scheduler for batch 
 
 Borg is Google's internal cluster manager. Its scheduler handles both long-running "production" workloads and batch workloads in a single system. Borg uses a priority-based model where production workloads preempt batch workloads when resources are scarce.
 
-**What we borrow:** Borg's batch model -- the insight that high-throughput batch scheduling requires delegation rather than centralized per-task decisions. Borg assigns "allocs" (resource reservations) and lets tasks fill them. Meat's `BatchAllocation` model is a simplified version of this concept.
+**What we borrow:** Borg's batch model -- the insight that high-throughput batch scheduling requires delegation rather than centralized per-task decisions. Borg assigns "allocs" (resource reservations) and lets tasks fill them. Meat's chunk grants, where a worker takes a range of task indices and fills it within its own execution budget, are a simplified version of this concept.
 
 **What we do differently:**
 
@@ -1532,8 +1471,7 @@ Meat is compiled into the Reliaburger binary. The following Rust crates are used
 |-------|---------|---------|
 | `tokio` | 1.x | Async runtime for the scheduling loop, timers, and channel communication. |
 | `tokio::sync::mpsc` | (part of tokio) | Unbounded channels for the scheduling queue (deploy requests flow in, decisions flow out). |
-| `serde` + `bincode` | 1.x / 2.x | Serialisation for Raft log entries (`SchedulingDecision`, `BatchAllocation`). Bincode for compactness on the hot path; JSON for API responses. |
-| `rand` | 0.8.x | Tie-breaking during node selection when scores are equal (optional jitter mode). |
+| `serde` + `serde_json` | 1.x | Serialisation for Raft log entries (`SchedulingDecision`, `TaskArrayWrite`), which must be self-describing; JSON for API responses. |
 
 No external scheduling frameworks or orchestration libraries are used. The scheduling algorithm is implemented directly in Reliaburger-specific code to avoid abstraction overhead and maintain full control over the hot path.
 
@@ -1632,5 +1570,5 @@ retire. Summary APIs,
 watch and the dashboard avoid task enumeration; indexed pages bound inspected
 indexes and returned rows and contact at most eight workers per page. Terminal
 retention begins at completion. See the
-[manual](../manual/14_batch-jobs.md) and [implementation plan](../plans/2026-10-04-plan-delegated-jobs.md)
+[manual](../manual/14_batch-jobs.md) and [implementation plan](../plans/archive/2026-10-04-plan-delegated-jobs.md)
 for limits and qualification requirements.

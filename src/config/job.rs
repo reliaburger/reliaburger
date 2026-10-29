@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::types::{EnvValue, ResourceRange};
+use super::types::{EnvValue, PidsLimit, ResourceRange};
 
 /// The job execution backend. Image containers are the default; other backends are explicit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -61,6 +61,11 @@ pub struct JobSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub cpu: Option<ResourceRange>,
+    /// Most processes and threads one command may hold (`pids.max`, 1 to
+    /// [`PidsLimit::MAX`]). Omitted: 256 for a reused executor's commands,
+    /// no limit for a fresh container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids: Option<PidsLimit>,
     /// Environment variables (plain or encrypted).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, EnvValue>,
@@ -100,6 +105,9 @@ pub struct JobSpec {
     /// instead of waiting for `relish batch replay`. Hooks refuse it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replay_unknown: bool,
+    /// The template and `[use.*]` that made this job, when one did (#1124).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<super::template::Provenance>,
 }
 
 /// Whether a matching cron occurrence may overlap an earlier run.
@@ -303,6 +311,49 @@ mod tests {
         let plain: JobSpec = toml::from_str("image='fetcher:v1'").unwrap();
         let plain_encoded = toml::to_string(&plain).unwrap();
         assert!(!plain_encoded.contains("egress") && !plain_encoded.contains("firewall"));
+    }
+
+    #[test]
+    fn pids_limit_is_part_of_the_job_and_absent_stays_absent_on_the_wire() {
+        let job: JobSpec = toml::from_str("image='fixture:v1'\npids = 512").unwrap();
+        assert_eq!(job.pids.map(PidsLimit::get), Some(512));
+        // It survives both encodings a job spec travels in: TOML into Raft
+        // desired state and JSON through the API.
+        let encoded = toml::to_string(&job).unwrap();
+        assert!(encoded.contains("pids = 512"), "{encoded}");
+        assert_eq!(toml::from_str::<JobSpec>(&encoded).unwrap(), job);
+        let json = serde_json::to_string(&job).unwrap();
+        assert!(json.contains(r#""pids":512"#), "{json}");
+        assert_eq!(serde_json::from_str::<JobSpec>(&json).unwrap(), job);
+        let plain: JobSpec = toml::from_str("image='fixture:v1'").unwrap();
+        assert_eq!(plain.pids, None);
+        assert!(!toml::to_string(&plain).unwrap().contains("pids"));
+        assert!(!serde_json::to_string(&plain).unwrap().contains("pids"));
+    }
+
+    #[test]
+    fn pids_limit_accepts_one_to_the_maximum_and_refuses_everything_else() {
+        for accepted in [1, 256, PidsLimit::MAX] {
+            let job: JobSpec =
+                toml::from_str(&format!("image='fixture:v1'\npids = {accepted}")).unwrap();
+            assert_eq!(job.pids.map(PidsLimit::get), Some(accepted));
+        }
+        for refused in ["0", "32769", "4294967295", "-1", "'512'", "1.5"] {
+            assert!(
+                toml::from_str::<JobSpec>(&format!("image='fixture:v1'\npids = {refused}"))
+                    .is_err(),
+                "pids = {refused} was accepted"
+            );
+        }
+        // The JSON API refuses the same values.
+        assert!(serde_json::from_str::<JobSpec>(r#"{"image":"fixture:v1","pids":0}"#).is_err());
+        assert!(PidsLimit::try_from(0).is_err());
+        assert!(PidsLimit::try_from(PidsLimit::MAX + 1).is_err());
+        // A whole config names the bounds in its refusal.
+        let error = crate::config::Config::parse("[job.worker]\nimage='fixture:v1'\npids = 0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("between 1 and 32768"), "{error}");
     }
 
     #[test]

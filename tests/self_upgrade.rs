@@ -22,6 +22,12 @@ mod bun_process;
 /// How long to wait for slow conditions (binary boots, verification).
 const WAIT: Duration = Duration::from_secs(30);
 
+/// How long an accepted upgrade may stay in flight before a version wait
+/// gives up. A hang guard, not a speed target: while the marker is on disk
+/// the node is still working on the swap, and the node itself commits or
+/// reverts it.
+const IN_FLIGHT_HANG_GUARD: Duration = Duration::from_secs(300);
+
 /// These tests spawn the real compiled binary under a supervisor loop and
 /// take minutes; they'd blow the default CI test job's timeout. Gated
 /// behind `RELIABURGER_UPGRADE_TESTS=1` (like the runc/eBPF suites), run
@@ -54,6 +60,12 @@ impl RealNodeHarness {
     }
 
     async fn start_with_cluster(cluster: bool) -> Self {
+        Self::start_configured(cluster, &["v0.1.0", "v0.2.0"], "v0.1.0").await
+    }
+
+    /// Install every version in `installed`, point the symlink at
+    /// `running`, and start the supervisor there.
+    async fn start_configured(cluster: bool, installed: &[&str], running: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let bin_dir = root.path().join("bin");
         let data_dir = root.path().join("data");
@@ -63,9 +75,10 @@ impl RealNodeHarness {
         let (release_pkcs8, release_public) = signing::generate_keypair().unwrap();
         let (external_pkcs8, external_public) = signing::generate_keypair().unwrap();
 
-        install_version(&bin_dir, "v0.1.0");
-        install_version(&bin_dir, "v0.2.0");
-        std::os::unix::fs::symlink("bun-v0.1.0", bin_dir.join("bun")).unwrap();
+        for version in installed {
+            install_version(&bin_dir, version);
+        }
+        std::os::unix::fs::symlink(format!("bun-{running}"), bin_dir.join("bun")).unwrap();
 
         // Every upgrade exec and respawn closes the API socket and binds the
         // same port again. A `bind(0)` port comes from the ephemeral range,
@@ -206,11 +219,40 @@ retain_versions = 3
         Some(value["version"].as_str()?.to_string())
     }
 
+    /// Wait until the node reports `expected`.
+    ///
+    /// While the upgrade marker is on disk the node hasn't decided the swap
+    /// yet: it is starting the new binary, hashing it (the version answer
+    /// carries the digest) and verifying. With a 600 MB debug build that
+    /// takes as long as the host allows, and on a loaded Mac it went past
+    /// 30 s (#1049). So the wait lasts as long as the marker does, up to a
+    /// hang guard. Once the marker is gone the node has settled, and the
+    /// version has `WAIT` to show.
     async fn wait_for_version(&self, expected: &str) {
-        wait_for(&format!("version {expected}"), WAIT, || async {
-            self.version().await.as_deref() == Some(expected)
-        })
-        .await;
+        let marker = self.data_dir.join("upgrade/marker.json");
+        let started = tokio::time::Instant::now();
+        let mut settled_at = None;
+        loop {
+            if self.version().await.as_deref() == Some(expected) {
+                return;
+            }
+            let now = tokio::time::Instant::now();
+            if marker.exists() {
+                settled_at = None;
+                assert!(
+                    now - started < IN_FLIGHT_HANG_GUARD,
+                    "timed out waiting for version {expected}: the upgrade was still in flight after {:?}",
+                    now - started
+                );
+            } else {
+                let settled = *settled_at.get_or_insert(now);
+                assert!(
+                    now - settled < WAIT,
+                    "timed out waiting for version {expected}: no upgrade in flight for {WAIT:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     /// Wait until no upgrade marker is in flight (commit or revert done).
@@ -289,6 +331,20 @@ command = ["--mode", "healthy", "--port", "{port}"]
             network_provenance: false,
             allow_downgrade: false,
         }
+    }
+
+    /// Write the signature envelope a staged upgrade leaves beside
+    /// `bin/bun-{version}`, for a version installed by hand.
+    fn seed_signature(&self, version: &str) {
+        let bytes = std::fs::read(self.bin_dir.join(format!("bun-{version}"))).unwrap();
+        signing::SignatureEnvelope {
+            schema: 1,
+            sha256: signing::sha256_hex(&bytes),
+            embedded: signing::sign(&self.release_pkcs8, &bytes).unwrap(),
+            external: Some(signing::sign(&self.external_pkcs8, &bytes).unwrap()),
+        }
+        .store(&self.bin_dir.join(format!("bun-{version}.sig")))
+        .unwrap();
     }
 
     /// POST an upgrade directive; returns the HTTP status code.
@@ -617,27 +673,48 @@ async fn version_retention_gc_keeps_last_three() {
         "set RELIABURGER_UPGRADE_TESTS=1 before running ignored upgrade tests"
     );
     let _serial = SERIAL.lock().await;
-    let harness = RealNodeHarness::start().await;
-
-    for (i, version) in ["v0.2.0", "v0.3.0", "v0.4.0", "v0.5.0"].iter().enumerate() {
-        install_version(&harness.bin_dir, version);
-        let directive = harness.directive(version, &format!("up-{i}"));
-        assert_eq!(
-            harness.post_upgrade(&directive).await,
-            202,
-            "upgrade to {version}"
-        );
-        harness.wait_for_version(version).await;
-        harness.wait_upgrade_settled().await;
+    // Start on v0.4.0 with three older versions already installed, each
+    // with its signature sidecar, so one real upgrade crosses the window.
+    // Starting on v0.1.0 would not do: GC protects the version a commit
+    // came from, so the oldest binary would legitimately survive.
+    let older = ["v0.1.0", "v0.2.0", "v0.3.0"];
+    let mut installed = older.to_vec();
+    installed.push("v0.4.0");
+    let harness = RealNodeHarness::start_configured(false, &installed, "v0.4.0").await;
+    harness.wait_for_version("v0.4.0").await;
+    for version in older {
+        harness.seed_signature(version);
     }
 
-    // retain_versions = 3: only the newest three binaries remain.
+    install_version(&harness.bin_dir, "v0.5.0");
+    let directive = harness.directive("v0.5.0", "up-retention");
+    assert_eq!(
+        harness.post_upgrade(&directive).await,
+        202,
+        "upgrade to v0.5.0"
+    );
+    harness.wait_for_version("v0.5.0").await;
+    // Commit prunes before it clears the in-flight marker, so once the node
+    // reports settled the store must already hold only the retained set.
+    harness.wait_upgrade_settled().await;
+
+    // retain_versions = 3: only the newest three binaries remain, and the
+    // pruned ones took their `.sig` sidecars with them.
     assert_eq!(
         harness.installed_versions(),
         vec!["v0.3.0", "v0.4.0", "v0.5.0"]
     );
-    assert!(!harness.bin_dir.join("bun-v0.1.0").exists());
-    assert!(!harness.bin_dir.join("bun-v0.2.0.sig").exists());
+    for pruned in ["v0.1.0", "v0.2.0"] {
+        assert!(!harness.bin_dir.join(format!("bun-{pruned}")).exists());
+        assert!(
+            !harness.bin_dir.join(format!("bun-{pruned}.sig")).exists(),
+            "{pruned}'s signature outlived its binary"
+        );
+    }
+    assert!(
+        harness.bin_dir.join("bun-v0.3.0.sig").exists(),
+        "a retained version lost its signature"
+    );
 
     harness.shutdown().await;
 }

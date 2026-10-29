@@ -1,21 +1,20 @@
 //! Cluster rolling-upgrade integration tests (Phase 14).
 //!
-//! Three REAL bun processes form a gossip+Raft cluster on localhost; the
-//! test plays systemd for each of them and drives upgrades through the
-//! same HTTP API relish uses. These are the slowest tests in the repo
-//! (a couple of minutes each) — they earn it by proving the rolling walk,
+//! Real bun processes form a gossip+Raft cluster on localhost; the test
+//! plays systemd for each of them and drives upgrades through the same
+//! HTTP API relish uses. These are the slowest tests in the repo (a couple
+//! of minutes each) — they earn it by proving the rolling walk,
 //! leader-last in-place upgrade, pause/resume, and cluster rollback
 //! against real processes exec'ing themselves.
 //!
-//! Note on roles: with three nodes the council reconciler makes ALL of
-//! them Raft voters (the council holds the largest odd number of voters
-//! the live nodes allow, D12), and the harness waits until it has before
-//! any test starts, so every upgrade walk takes real voters down one at a
-//! time against a three-voter quorum. (Four nodes would leave one as a
-//! plain worker.) "Worker" here is a
-//! label in the upgrade plan, not a Raft status: the leader corrects it
-//! to `Council`. The ordering mechanics the tests assert (council one at
-//! a time, leader last, in place) are exactly the mechanics under test.
+//! Note on roles: the council reconciler holds the largest odd number of
+//! voters the live nodes allow (D12), and the harness waits for that full
+//! council before any test starts. Most tests start three nodes, so ALL of
+//! them are Raft voters and every walk takes real voters down one at a
+//! time against a three-voter quorum. There "Worker" is only a label in
+//! the upgrade plan, which the leader corrects to `Council`. The rolling
+//! walk starts four nodes, so three vote and one is a real worker; it reads
+//! which one from Raft membership and asserts worker, council, leader.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -392,6 +391,64 @@ retain_versions = 3
             .collect()
     }
 
+    /// `node`'s own view of the council: the Raft membership it holds and
+    /// the part it plays in it.
+    async fn council_from(
+        &self,
+        node: &ClusterNode,
+    ) -> Option<reliaburger::bun::agent::CouncilStatus> {
+        self.client
+            .get(format!("http://{}/v1/cluster/council", node.api))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()
+    }
+
+    /// A council voter that is not the leader, by its own account: it
+    /// reports the `Follower` role and names `leader` as the leader. The
+    /// node must also know every member's API, or it can't forward a plan.
+    async fn wait_for_follower(&self, leader: &str) -> String {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            for node in self.nodes.iter().filter(|node| node.name != leader) {
+                let Some(council) = self.council_from(node).await else {
+                    continue;
+                };
+                if council.role == reliaburger::bun::agent::CouncilRole::Follower
+                    && council.leader.as_deref() == Some(leader)
+                    && self.knows_every_member(node).await
+                {
+                    return node.name.clone();
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for a follower of {leader}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// The Raft voter set as `node`'s council view reports it: the names
+    /// of the members whose `voter` flag is set. Learners and nodes outside
+    /// Raft are absent.
+    async fn raft_voters_from(&self, node: &ClusterNode) -> Option<HashSet<String>> {
+        let council = self.council_from(node).await?;
+        Some(
+            council
+                .members
+                .into_iter()
+                .filter(|member| member.voter)
+                .map(|member| member.name)
+                .collect(),
+        )
+    }
+
     async fn leader_from(&self, node: &ClusterNode) -> Option<String> {
         let response = self
             .client
@@ -550,7 +607,23 @@ retain_versions = 3
         through: Option<&str>,
     ) -> (String, String, String) {
         let (nodes, leader, worker) = self.plan_nodes().await;
-        let leader_node = self.node(&leader);
+        let upgrade_id = self
+            .start_upgrade_with_plan(nodes, &leader, registry, through)
+            .await;
+        (upgrade_id, leader, worker)
+    }
+
+    /// Push the signed v0.2.0 binary to `leader`'s registry and start an
+    /// upgrade over exactly the `nodes` plan given, sent to node `through`
+    /// (the leader when `None`). Returns the upgrade id.
+    async fn start_upgrade_with_plan(
+        &self,
+        nodes: Vec<serde_json::Value>,
+        leader: &str,
+        registry: Option<String>,
+        through: Option<&str>,
+    ) -> String {
+        let leader_node = self.node(leader);
         let registry_address = registry.unwrap_or_else(|| leader_node.registry.clone());
 
         let bytes = std::fs::read(leader_node.bin_dir.join("bun-v0.2.0")).unwrap();
@@ -593,7 +666,7 @@ retain_versions = 3
             .client
             .post(format!(
                 "http://{}/v1/upgrade/start",
-                self.node(through.unwrap_or(&leader)).api
+                self.node(through.unwrap_or(leader)).api
             ))
             // The leader probes every node (5 s) and checks the candidate
             // (up to 20 s) before it records the run, so a start can take
@@ -607,11 +680,7 @@ retain_versions = 3
         let body = response.text().await.unwrap_or_default();
         assert_eq!(status, 202, "upgrade start refused: {body}");
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-        (
-            body["upgrade_id"].as_str().unwrap_or("?").to_string(),
-            leader,
-            worker,
-        )
+        body["upgrade_id"].as_str().unwrap_or("?").to_string()
     }
 
     /// Poll the cluster upgrade until it completes (or a pause, if
@@ -852,7 +921,80 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(3).await;
+    // Four nodes: the council holds the largest odd number of voters the
+    // nodes allow (D12), so three vote and one is a real worker.
+    let harness = ClusterHarness::start(4).await;
+    let old_leader = harness.wait_for_idle_leader().await;
+
+    // Read the topology from Raft membership, not from a node's index.
+    // The leader's council view names the voters; the one node outside
+    // that set must also say it is no voter, and the leader's gossip view
+    // must agree on who sits on the council.
+    let voters = harness
+        .raft_voters_from(harness.node(&old_leader))
+        .await
+        .expect("the leader's council view");
+    assert_eq!(
+        voters.len(),
+        3,
+        "a four-node council has three voters: {voters:?}"
+    );
+    assert!(voters.contains(&old_leader), "{voters:?}");
+    assert_eq!(harness.voters().await, voters, "gossip and Raft disagree");
+    let workers: Vec<String> = harness
+        .nodes
+        .iter()
+        .map(|node| node.name.clone())
+        .filter(|name| !voters.contains(name))
+        .collect();
+    let [worker] = workers.as_slice() else {
+        panic!("expected exactly one non-voter, got {workers:?}");
+    };
+    let worker = worker.clone();
+    let worker_role = harness
+        .council_from(harness.node(&worker))
+        .await
+        .expect("the worker's council view")
+        .role;
+    assert!(
+        matches!(
+            worker_role,
+            reliaburger::bun::agent::CouncilRole::Worker
+                | reliaburger::bun::agent::CouncilRole::Learner
+        ),
+        "{worker} is outside the voter set but says it is {worker_role:?}"
+    );
+    let council: HashSet<String> = voters
+        .iter()
+        .filter(|name| **name != old_leader)
+        .cloned()
+        .collect();
+
+    // The role-correction regression: the start request swaps the labels,
+    // calling the real worker "Council" and one voter "Worker". The leader
+    // must record the roles Raft gives them, or a client's claim would
+    // decide which nodes the walk takes down first.
+    let mislabelled_voter = council.iter().min().expect("two council voters").clone();
+    let nodes: Vec<serde_json::Value> = harness
+        .nodes
+        .iter()
+        .map(|node| {
+            let claimed = if node.name == old_leader {
+                "Leader"
+            } else if node.name == worker {
+                "Council"
+            } else if node.name == mislabelled_voter {
+                "Worker"
+            } else {
+                "Council"
+            };
+            serde_json::json!({
+                "node_id": node.name,
+                "address": node.api,
+                "role": claimed,
+            })
+        })
+        .collect();
 
     // This test owns the rolling *order* and clean convergence. Workload
     // survival across a node's in-place exec is a node-level invariant,
@@ -860,16 +1002,33 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
     // cluster the scheduler owns placement and a single-replica app on a
     // bouncing node is inherently at risk for its ~1s window, so it's the
     // wrong thing to pin here.
-    let (upgrade_id, old_leader, worker) = harness.start_upgrade().await;
+    //
+    // The start goes to a council follower, not the leader: the walk also
+    // proves that a follower forwards the plan to the leader Raft names
+    // (#250), so no separate forwarding walk is needed (#1055). The worker
+    // reports itself a worker or learner, so it is never the one picked.
+    let follower = harness.wait_for_follower(&old_leader).await;
+    assert!(
+        council.contains(&follower),
+        "{follower} is not a council voter"
+    );
+    let upgrade_id = harness
+        .start_upgrade_with_plan(nodes, &old_leader, None, Some(&follower))
+        .await;
+    assert_eq!(
+        harness
+            .leader_from(harness.node(&follower))
+            .await
+            .as_deref(),
+        Some(old_leader.as_str()),
+        "{follower} must still follow {old_leader} after forwarding the start"
+    );
 
-    // The leader derives each node's role from the Raft voter set. Every
-    // node but the leader must be walked as a council member, or this run
-    // never took a voter down (#373).
     let recorded = harness
         .cluster_state_from(harness.node(&old_leader))
         .await
         .expect("cluster upgrade state");
-    let roles: Vec<(String, String)> = recorded["active"]["nodes"]
+    let roles: HashMap<String, String> = recorded["active"]["nodes"]
         .as_array()
         .expect("the started run is active")
         .iter()
@@ -880,15 +1039,17 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
             )
         })
         .collect();
+    assert_eq!(roles.len(), harness.nodes.len(), "{roles:?}");
     for (node, role) in &roles {
         let expected = if *node == old_leader {
             "Leader"
+        } else if *node == worker {
+            "Worker"
         } else {
             "Council"
         };
         assert_eq!(role, expected, "{node} walked as {role}: {roles:?}");
     }
-    assert_eq!(roles.len(), harness.nodes.len(), "{roles:?}");
 
     let (healthy_order, phase) = harness.watch_upgrade(&upgrade_id, false).await;
     assert_eq!(phase, "Completed");
@@ -904,20 +1065,24 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
         );
     }
 
-    // Rolling order: the node labelled worker (first in the plan, so first
-    // of the council members) goes first, the (old) leader last. The leader
-    // upgrades itself in place (openraft 0.9 can't gracefully hand off
-    // against a live leader), so it may still be leader afterwards — what
-    // matters is that it went last and the cluster still has a leader.
+    // Rolling order: the worker first, then the two council voters one at
+    // a time, the (old) leader last. The leader upgrades itself in place
+    // (openraft 0.9 can't gracefully hand off against a live leader), so it
+    // may still be leader afterwards — what matters is that it went last
+    // and the cluster still has a leader.
+    assert_eq!(healthy_order.len(), 4, "{healthy_order:?}");
     assert_eq!(
-        healthy_order.first(),
-        Some(&worker),
-        "worker did not upgrade first: {healthy_order:?}"
+        healthy_order[0], worker,
+        "the worker did not upgrade first: {healthy_order:?}"
+    );
+    let middle: HashSet<String> = healthy_order[1..3].iter().cloned().collect();
+    assert_eq!(
+        middle, council,
+        "the council voters did not upgrade between the worker and the leader: {healthy_order:?}"
     );
     assert_eq!(
-        healthy_order.last(),
-        Some(&old_leader),
-        "old leader did not upgrade last: {healthy_order:?}"
+        healthy_order[3], old_leader,
+        "the old leader did not upgrade last: {healthy_order:?}"
     );
     harness.wait_for_leader().await;
 
@@ -1123,46 +1288,6 @@ async fn version_form_rolls_the_nodes_platform_build_countersigned_by_relish() {
         .as_str()
         .unwrap()
         .to_string();
-    let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
-    assert_eq!(phase, "Completed");
-    harness.wait_for_versions("v0.2.0").await;
-
-    harness.shutdown().await;
-}
-
-/// The V02 soak ran `relish upgrade start` against node 1 after a leader
-/// kill had made it a follower, and got 409 "could not record the upgrade
-/// (are we the leader?)". A node that isn't the leader now forwards the call,
-/// with the caller's credential, and the run it starts completes.
-///
-/// Every node in this harness is a voter, so the node here is a Raft
-/// follower and forwards to the leader Raft names. A worker outside Raft
-/// finds the leader through the gossip directory instead; that case is
-/// `bun::api`'s
-/// `a_worker_outside_raft_forwards_upgrade_calls_to_the_leader_gossip_names`.
-#[tokio::test]
-#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
-async fn upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader() {
-    assert!(
-        upgrade_tests_enabled(),
-        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
-    );
-    let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(3).await;
-    let leader = harness.wait_for_idle_leader().await;
-    let other = harness
-        .nodes
-        .iter()
-        .find(|node| node.name != leader)
-        .unwrap();
-    wait_for("the node to know every member's API", WAIT, || async {
-        harness.knows_every_member(other).await
-    })
-    .await;
-
-    let (upgrade_id, _, _) = harness
-        .start_upgrade_fetching_from(None, Some(&other.name))
-        .await;
     let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
     assert_eq!(phase, "Completed");
     harness.wait_for_versions("v0.2.0").await;

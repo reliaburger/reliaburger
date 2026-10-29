@@ -143,7 +143,7 @@ pub async fn gather(paths: &super::Paths) -> Status {
 
 /// bun's local `/v1/health`, over plain HTTP or the node's own TLS.
 async fn healthy() -> Option<bool> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(2))
         .build()

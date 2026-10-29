@@ -68,6 +68,9 @@ listed in `reference`.
 ## Health checks
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.health]
 path = "/healthz"
 port = 8081               # default: the app's `port`
@@ -87,6 +90,9 @@ probes (about ten minutes at the default interval) and restarted.
 ## Init containers
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [[app.api.init]]
 image = "ghcr.io/example/migrate:2.1"   # default: the app's image
 command = ["migrate", "up"]
@@ -101,9 +107,108 @@ migration can read `DATABASE_URL` and a config generator can write a volume.
 The volume stays the app's: an init container doesn't take it over, so run it
 as root (most images do) or as the app's user.
 
+An `exec` or `script` app's init container that names no image runs its
+command on the host, like the app. The node's `[process_workloads]
+allowed_binaries` must name the command's first word by its full path, or the
+deploy is refused, and the scheduler only places the app where it does:
+
+```toml
+[app.worker]
+exec = "/usr/bin/python3"
+command = ["worker.py"]
+
+[[app.worker.init]]
+command = ["/bin/sh", "-c", "mkdir -p /tmp/worker"]   # /bin/sh must be allowed
+```
+
+`relish lint` and `relish apply` warn about a host init whose command starts
+with a bare name such as `echo`, and suggest the full path. It's a warning,
+not a refusal: a node that allowlists the bare name word for word runs it,
+looking it up on its `PATH`.
+
+```text
+warning: app default/worker: init container command "echo" is a bare name, but it runs on the host, where allowed_binaries names binaries by full path; use the full path (`command -v echo` on the node prints it)
+```
+
+## Sidecars
+
+A sidecar is a container that runs beside every instance of an app for the
+instance's whole life: a proxy in front of it, a log shipper reading its
+files, an adapter for a protocol it doesn't speak.
+
+```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+port = 8080
+cpu = "250m-1"
+memory = "256Mi-512Mi"
+
+[[app.api.sidecar]]
+name = "proxy"                         # a DNS label, unique in the app
+image = "envoyproxy/envoy:v1.31.0"     # default: the app's image
+args = ["-c", "/etc/envoy/envoy.yaml"]
+cpu = "50m-200m"
+memory = "64Mi-128Mi"
+env = { ENVOY_LOG_LEVEL = "warn" }
+
+[[app.api.sidecar]]
+name = "logs"
+image = "ghcr.io/example/shipper:3.0"
+```
+
+A sidecar joins its instance's network namespace, so the app reaches the
+proxy on `localhost:10000` and the proxy reaches the app on `localhost:8080`.
+It gets its own cgroup with its own `cpu` and `memory` limits. Like an init
+container, it runs its own `image` (pulled, trust-checked and pinned), or the
+app's, and it gets the app's environment and volume and config-file mounts.
+Its own `env` goes on top: plain values and `PROVIDER[...]` references,
+which are resolved when it starts. An encrypted value belongs in the app's
+`env`, which every sidecar inherits.
+
+The order is fixed:
+
+1. The app's instance is created, with its network namespace.
+2. Its init containers run, each to completion.
+3. Its sidecars start, in the order you list them.
+4. The app starts.
+
+A stop goes the other way. The app gets its `pre_stop`, signal and grace
+first. Only once it has exited does each sidecar get SIGTERM and the same
+grace, then SIGKILL if it's still running. A proxy keeps answering until
+the app is gone, and a log shipper sees the app's last lines. One catch: on
+runc the network interface belongs to the app's instance and goes when the
+app exits, so a sidecar spends its own grace with `localhost` but no route
+out. A shipper that must flush to a remote store should flush as it goes.
+
+When a sidecar exits, Bun starts it again on its own, while the app keeps
+running and keeps its address. The first restart is immediate, then they
+back off: 1 s, 2 s, 4 s, up to a minute. When the app exits, its sidecars
+restart with it: they stop after it and start again before it, because on
+runc the network namespace goes with the app's instance.
+
+The scheduler adds each sidecar's `cpu` and `memory` requests to the app's
+when it places a replica, and a namespace quota counts them too. Above, one
+replica of `api` requests 300m of CPU and 320 MiB of memory.
+
+Sidecars need a runtime that can share a network namespace, which today means
+rootful runc. The scheduler only places an app with sidecars on such nodes.
+A node on Apple Container (each container is its own VM), rootless runc or
+`--runtime process` refuses one at apply, saying why. `relish lint` and
+`apply` also refuse sidecars on an `exec` or `script` app, which runs in the
+node's own network, and on an app with an `egress` allowlist: the allowlist
+binds the app's cgroup, not its sidecars', so a sidecar could reach what the
+app can't.
+
+A Bun restart adopts running apps but not their sidecars, which have no
+adoption records. Bun starts them again on its next tick, a second or so
+later.
+
 ## Config files
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [[app.api.config_file]]
 path = "/etc/api/config.yaml"
 content = """
@@ -137,6 +242,9 @@ different from the config:
 An `autoscale` block lets the leader move `replicas` between `min` and `max`:
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.autoscale]
 metric = "cpu"            # or "memory" (needs a memory request)
 target = "70%"            # of each replica's request
@@ -275,12 +383,18 @@ relish apply app.toml            # deploy (or converge) everything in the file
 relish apply app.toml --dry-run  # preview; no-agent output states its offline assumption
 relish lint app.toml             # validate only
 relish logs web -f               # stream logs from every node (--tail 20 for the last 20)
-relish exec web env              # run a command inside an instance, on whichever node runs it
+relish exec web env              # run a command once inside an instance; exits with its exit code
+relish events --app web          # the cluster's recent events for one app
 relish top                       # every workload on every node, with CPU and memory
 relish inspect web               # every instance on every node, desired vs running
 relish stop web                  # scale to zero; `relish apply` starts it again
 relish delete web                # remove the app from the cluster
 ```
+
+`relish exec` runs its command once, with no stdin and no terminal, so
+`relish exec web sh` exits straight away: name the command you want, as in
+`relish exec web ls /data`. Relish prints the output and exits with the
+command's exit code.
 
 `apply` and `deploy` check the file's syntax and field values locally. In a cluster, the leader checks permission/build namespace references against both the file and namespaces already created. You don't need to repeat a namespace declaration, which could replace its existing budget. `relish lint` works offline, so it requires those references to be declared in the file. Applying a build declaration validates its namespace; use `relish build` to execute the build.
 
@@ -314,7 +428,7 @@ standalone node with no cluster numbers its replicas from 0.
 ```sh
 relish compile config/ > all.toml   # merge, apply _defaults.toml, derive namespaces
 relish diff old.toml all.toml       # structural diff between two configs
-relish fmt all.toml --check         # canonical ordering; drop --check to rewrite
+relish fmt all.toml --check         # canonical ordering, comments kept; drop --check to rewrite
 relish apply all.toml
 ```
 
@@ -341,6 +455,79 @@ duplicate resource definitions, while `relish compile` warns about overrides
 within one namespace. Parse, read and namespace-identity errors refuse the whole
 tree in both paths.
 
+## Templates
+
+Five teams each want a Postgres, and each copy of the app drifts a little
+from the others. A template is one shape with typed parameters, and a
+`[use.*]` table stamps it out:
+
+```toml
+[template.postgres]
+params = { name = "string", size = "string", replicas = { type = "int", default = 1 } }
+body = """
+[app.${name}]
+image = "postgres:17"
+replicas = ${replicas}
+[[app.${name}.volumes]]
+path = "/var/lib/postgresql/data"
+size = "${size}"
+"""
+
+[use.orders-db]
+template = "postgres"
+name = "orders-db"
+size = "50Gi"
+```
+
+The body is ordinary `[app.*]` and `[job.*]` TOML. `${name}` is replaced by
+the parameter's value, and that's all a template can do: there are no
+conditionals, loops or functions. A parameter is a `string`, an `int` or a
+`bool`; one with a `default` is optional, and one without is required.
+
+Templates expand when the config is read, before anything else sees it.
+`relish apply`, `apply --dry-run`, `lint`, `diff` and `compile` all work on
+the expanded apps, and so does GitOps. The cluster never stores a template.
+It stores the apps, each with a `provenance` naming the template and the
+`use` that made it, and `apply --dry-run` shows it:
+
+```text
+  + app.orders-db
+      image     postgres:17
+      replicas  1
+      from      use.orders-db (template postgres)
+```
+
+Policies judge the expanded apps like any others, and can match on where
+they came from with `app.provenance.template` or `app.provenance.use`
+(`job.provenance` for a job). A body may declare an `owner`, and the same
+owner rules apply as to an app you wrote by hand. A
+directory's `_defaults.toml` and namespace apply to the apps a `use` in it
+makes, wherever the template lives. In a tree, a template in one file serves
+a `use` in any other.
+
+Where a placeholder sits matters. Inside a quoted string, the value is
+escaped, so it can hold quotes, backslashes or newlines and still be one
+string. Outside quotes, as in `[app.${name}]`, a string must be a plain key
+of letters, digits, `-` and `_`, and integers and booleans go in as they
+are. Inside a single-quoted string a value can't hold a `'` or a newline.
+Placeholders in comments are left alone. Write `$${` for a literal `${`,
+such as a shell variable in a command.
+
+These are refused, with the `use` and template named:
+
+- a `use` of a template nobody declared, a parameter the template doesn't
+  have, a required one left out, or a value of the wrong type;
+- a placeholder that names no parameter, even in a template nobody uses;
+- an expanded app or job whose name a declared one, or another `use`,
+  already has (also across files, where `compile` would otherwise let the
+  later file win);
+- a body with anything but apps and jobs in it, including another template
+  or `use`: templates don't nest;
+- a template declared in two files.
+
+Templates come from your files or your GitOps repository; there's no
+registry. `examples/templates/container-postgres.toml` is a complete one.
+
 ## Rolling deploys
 
 Apply a changed app and Bun replaces its instances one at a time, waiting for
@@ -358,6 +545,9 @@ one node rolls. A brand-new app, a node getting its first replica and a change
 to `replicas` alone don't wait.
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.deploy]
 strategy = "rolling"      # or "blue-green"
 max_surge = 1             # default 1
@@ -431,16 +621,117 @@ Any change to the spec clears the mark and starts a new rollout: a fixed image,
 releases the same version node by node again, so if it's still broken it fails
 again and is marked again.
 
+The node reports the failure to the leader with the cluster's service token.
+A plaintext development cluster with no master key has no service token, and
+until its first API token exists nobody holds a credential at all, so there
+the leader takes the report without one. It takes it only for a node the app
+is placed on, and once any credential exists (a master key or a first token)
+it requires the service token again. If `bun` logs
+`the leader refused the rollout failure of default/web` with a 401 or 403,
+the cluster has a token but its nodes have no master key to sign with: set
+`[security] master_key_path` on every node.
+
 `cancel-deploy` takes the operation id that `apply` prints and waits for the
 in-flight step to finish. It works on a single node only: a cluster `apply`
 returns once the council has recorded the spec, and prints no operation id,
 because each node runs its own deploy later. `examples/phase-1/proc-restarts.toml`
 shows the health checker restarting an app that goes unhealthy.
 
+To watch all of this happen, run the rollout demo from a checkout. It starts a
+one-node cluster on the process runtime, applies
+`examples/phase-1/proc-rollout.toml` as v1, rolls it to v2, rolls it back, then
+applies a v3 that fails its health check and shows it rolled back and marked
+`RolloutFailed`. Every step checks what the app really serves:
+
+```sh
+scripts/demo/rollout.sh
+```
+
+With `DEMO_PLAINTEXT=1` in its environment the demo runs the same steps on a
+plaintext cluster with no master key and no token, and checks the node stops
+retrying v3 once it's marked.
+
+The demo measures what it costs as it goes. Before each step it prints Bun's
+latest memory and CPU, and its workloads', on one line, and it ends with each
+measure's average and peak:
+
+```text
+    resources: bun 109.5 MiB, 66.7 % CPU · 2 workloads 23.8 MiB, 1.0 % CPU
+
+==> Resource use: 25 samples over 24 s on demo-node
+                     average           peak
+  bun CPU               70.4 %         94.6 %
+  bun memory           109.7 MiB      117.3 MiB
+  ...
+```
+
+CPU is a percentage of one core. The numbers come from the operating system
+(`/proc` on Linux, `ps` on macOS), sampled once a second, and anything it
+can't measure is left out rather than guessed: network traffic isn't
+measured, because a one-node demo talks to itself over loopback. Workloads
+are everything Bun started: each app, the owner process that keeps it
+running, and a GitOps sync's `git`. Those numbers are from a debug build on a
+busy laptop, which is what the demo builds by default. For numbers you'd
+quote, point `BUN` at a release build (`cargo build --release --bin bun`). Set
+`DEMO_RESOURCES_OUT` to a directory to keep the samples as `resources.csv`,
+with `cpu.svg` and `memory.svg` charts that mark each step on the time axis,
+or `DEMO_RESOURCES=0` to turn the measuring off. Every demo in
+`scripts/demo/` does the same, and so does the [five-minute
+tour](08_five-minute-tour.md)'s script.
+
+`examples/phase-1/container-rollout.toml` is the same story with real
+containers and `strategy = "blue-green"`, for a cluster with runc.
+
 `relish lint` and `apply` refuse a `[deploy]` table they can't honour: a
 `strategy` other than `rolling` or `blue-green`, and a `drain_timeout` or
 `health_timeout` that isn't a whole number of seconds, minutes or hours
 (`"90s"`, `"5m"`, `"1h"`; not `"1m30s"` or `"500ms"`).
+
+## Stopping gracefully
+
+Every stop goes the same way: Bun takes the instance out of routing, lets
+in-flight requests drain, sends SIGTERM, waits, and kills it if it's still
+running. Plenty of programs want something else. A dev server may only stop
+cleanly on Ctrl-C, nginx finishes its requests on SIGQUIT, and a queue worker
+may need a minute to hand back its jobs. An app says so with four fields:
+
+```toml
+[app.worker]
+image = "registry.example.com/worker:2.1"
+stop_signal = "SIGQUIT"     # default SIGTERM
+stop_grace = "2m"           # time to exit after the signal, 1s to 1h
+pre_stop = ["/app/bin/worker", "hand-back-jobs"]
+pre_stop_timeout = "20s"    # default 30s
+```
+
+A stop then runs four steps, each with its own limit:
+
+1. `pre_stop`, inside the instance, the way `relish exec` runs a command.
+   It gets `pre_stop_timeout`. If it fails, can't start or runs over, Bun
+   logs why and carries on: a broken hook never keeps an instance alive.
+2. `stop_signal`, sent to the workload's whole process group.
+3. `stop_grace`, while Bun waits for the instance to exit.
+4. SIGKILL, if it's still running.
+
+Without `stop_grace`, a deploy gives each old instance its `drain_timeout`,
+and any other stop (`relish stop`, or the leader moving a replica off a node)
+gives it 10 s, as before. The signal travels with the instance, so when Bun
+itself shuts down and stops its workloads they get it too, though with Bun's
+own 5 s grace and no `pre_stop`.
+
+The longest a stop can now take is `pre_stop_timeout` plus `stop_grace` plus
+a few seconds for the runtime. That can outlast the placement loop's deadline
+for one retirement, which is sized for the default grace. The loop then logs
+that the retirement ran over and asks again on its next pass, and that
+request joins the stop already running, so a long grace is still honoured.
+
+`relish lint` and `apply` refuse a signal outside that list (`SIGKILL`
+included, since that's what the grace ends in, and numbers, which differ
+between Linux and macOS), a grace or bound of zero or over an hour, a
+`pre_stop_timeout` without a `pre_stop`, and a `pre_stop` whose first word is
+empty. On an `exec` or `script` app `pre_stop` runs on the host, so it must
+start with an absolute path that the node's `[process_workloads]
+allowed_binaries` names, like the app's own binary.
 
 ## Jobs and cron
 
@@ -449,6 +740,9 @@ shows the health checker restarting an app that goes unhealthy.
 image = "ghcr.io/example/api:1.4.2"
 command = ["./migrate", "up"]
 run_before = ["app.api"]  # finish before the api starts
+
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
 
 [job.report]
 image = "ghcr.io/example/report:2"
@@ -476,8 +770,10 @@ definition and claims every matching UTC minute itself, so a leader change
 neither loses nor repeats an occurrence. An app or job whose name an unsettled
 deployment still owns is refused until that deployment settles, and apply
 refuses an overlapping app or job while an earlier run of it still has an
-uncertain outcome. Leadership changes or recovery preserve that fence; there is no automatic expiry or replay of an
-uncertain migration.
+uncertain outcome. Leadership changes or recovery preserve that fence, and
+nothing replays an uncertain migration on its own: after checking its side
+effects, acknowledge it with `relish batch replay` (see [batch
+jobs](14_batch-jobs.md)).
 
 A failed ordinary job gets four attempts in all, unless it sets `max_attempts`.
 A job whose exit Bun couldn't observe (say, the node crashed) is `unknown`, and
@@ -532,8 +828,13 @@ lost with a worker's disk; accepted aggregate counts remain replicated.
 - Volumes (managed + host path): `examples/phase-1/container-volumes.toml`
   (volumes need a container runtime)
 - Several apps per file: `examples/phase-1/proc-multi-app.toml`
-- Batch scheduling: `relish batch examples/phase-8/batch-jobs.toml`, then
-  `relish batch-status <ID> --wait`
+- Rolling deploys and rollback: `examples/phase-1/proc-rollout.toml`
+  (`scripts/demo/rollout.sh` runs it), `container-rollout.toml` (blue-green)
+- An encrypted secret: `examples/phase-1/container-secrets.toml`
+- A migration that gates its app: `examples/phase-8/proc-run-before.toml`
+- A host binary as an app: `examples/phase-8/proc-exec-app.toml`
+- Batch scheduling: `relish batch examples/phase-8/container-batch-jobs.toml`,
+  then `relish batch-status <ID> --wait`
   Batch jobs must be non-scheduled and have no `run_before` declarations. Use
   ordinary apply for cron schedules and jobs that gate apps in the same manifest.
 

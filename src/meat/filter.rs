@@ -27,12 +27,24 @@ pub struct WorkloadRequirements {
     /// The cluster runs internal DNS, so every placement needs a node whose
     /// resolver is ready and reachable from workloads.
     pub requires_dns: bool,
-    /// The host binary an `exec` or `script` app runs (see [`host_binary`]).
-    pub host_binary: Option<PathBuf>,
+    /// The host binaries an `exec` or `script` app runs: its own (see
+    /// [`host_binary`]), those of its image-less init containers (see
+    /// [`host_init_binaries`]) and its pre-stop command's (see
+    /// [`host_pre_stop_binary`]). Empty for a container.
+    pub host_binaries: Vec<PathBuf>,
     /// The app runs an image: its own (or, with only a `command`, a root
     /// filesystem), or an init container's. Only a node whose runtime runs
     /// containers may take it (#914).
     pub requires_containers: bool,
+    /// The secret providers the app's env names (`PROVIDER[name:...]`): the
+    /// node must run every one (#1123).
+    pub secret_providers: std::collections::BTreeSet<crate::sesame::secret_provider::ProviderName>,
+    /// The runtime knobs the app asks for in `[app.x.runtime]`: the node's
+    /// advertised allowlist must admit every one (#1122).
+    pub runtime_knobs: crate::grill::knobs::RuntimeKnobs,
+    /// The app has sidecars, which join its network namespace: only a
+    /// runtime that can share one may run it (#1120).
+    pub requires_shared_network: bool,
 }
 
 impl WorkloadRequirements {
@@ -48,9 +60,24 @@ impl WorkloadRequirements {
                 .unwrap_or_default(),
             requires_egress: spec.requires_network_policy(),
             requires_dns,
-            host_binary: host_binary(spec).map(Path::to_path_buf),
+            host_binaries: host_binary(spec)
+                .into_iter()
+                .chain(host_init_binaries(spec))
+                .chain(host_pre_stop_binary(spec))
+                .map(Path::to_path_buf)
+                .collect(),
             requires_containers: (spec.exec.is_none() && spec.script.is_none())
                 || spec.init.iter().any(|init| init.image.is_some()),
+            // A sidecar's own env can name a provider too.
+            secret_providers: spec
+                .env
+                .values()
+                .chain(spec.sidecar.iter().flat_map(|sidecar| sidecar.env.values()))
+                .filter_map(|value| value.provider_reference())
+                .map(|reference| reference.provider().clone())
+                .collect(),
+            runtime_knobs: spec.runtime.clone().unwrap_or_default(),
+            requires_shared_network: !spec.sidecar.is_empty(),
         }
     }
 }
@@ -71,19 +98,51 @@ pub fn host_binary(spec: &AppSpec) -> Option<&Path> {
     })
 }
 
+/// The host binaries a process workload's init containers run: the first
+/// word of each image-less init's command. An `exec` or `script` app's init
+/// that names no image runs on the host like its app (#935), so the node
+/// must allow its binary too. Empty for a container, whose inits run in an
+/// image. An init with no command names no binary; the runtime refuses it.
+pub fn host_init_binaries(spec: &AppSpec) -> impl Iterator<Item = &Path> {
+    let host = host_binary(spec).is_some();
+    spec.init
+        .iter()
+        .filter(move |init| host && init.image.is_none())
+        .filter_map(|init| init.command.first())
+        .map(Path::new)
+}
+
+/// The host binary a process workload's `pre_stop` runs (#1121). Like an
+/// image-less init, it runs on the host beside its app, so the node must
+/// allow it too. `None` for a container, whose pre-stop runs in its image.
+pub fn host_pre_stop_binary(spec: &AppSpec) -> Option<&Path> {
+    host_binary(spec)?;
+    spec.pre_stop.first().map(Path::new)
+}
+
 /// Whether `node` can run a workload with these requirements, room and
 /// labels aside: it's ready, runs containers when the workload is one, and
-/// can enforce egress, resolve internal DNS and run the host binary when
-/// the workload needs them.
+/// can enforce egress, resolve internal DNS, run the host binary, call the
+/// secret providers, share a network namespace and apply the runtime knobs
+/// when the workload needs
+/// them.
 pub fn node_can_run(node: &SchedulerNodeState, requirements: &WorkloadRequirements) -> bool {
     node.ready
         && runs_its_kind(node, requirements)
+        && (!requirements.requires_shared_network || node.capabilities.shared_network)
         && (!requirements.requires_egress || node.capabilities.egress.can_enforce_allowlist())
         && (!requirements.requires_dns || node.capabilities.dns.can_resolve_internal())
         && requirements
-            .host_binary
-            .as_deref()
-            .is_none_or(|binary| node.capabilities.process.runs(binary))
+            .host_binaries
+            .iter()
+            .all(|binary| node.capabilities.process.runs(binary))
+        && requirements
+            .secret_providers
+            .is_subset(&node.capabilities.secret_providers)
+        && node
+            .capabilities
+            .runtime_knobs
+            .admits(&requirements.runtime_knobs)
 }
 
 /// Whether `node` runs this kind of workload at all: a container needs a
@@ -95,7 +154,9 @@ fn runs_its_kind(node: &SchedulerNodeState, requirements: &WorkloadRequirements)
 /// Filter the cluster to nodes eligible for placing this workload.
 ///
 /// A node passes the filter if:
-/// 1. It is ready (not unknown, draining, or cordoned).
+/// 1. It is ready: it has a fresh readiness report, its egress enforcement
+///    isn't degraded, and it hasn't been retired. Drain and cordon don't
+///    exist yet (#656).
 /// 2. It matches all required placement labels.
 /// 3. It runs containers if the workload is one, can enforce any security
 ///    capability the workload requires, and runs its host binary if it has
@@ -236,8 +297,11 @@ mod tests {
                 labels: BTreeMap::new(),
                 requires_egress: false,
                 requires_dns: false,
-                host_binary: None,
+                host_binaries: Vec::new(),
                 requires_containers: false,
+                secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
+                requires_shared_network: false,
             },
             &cluster,
         );
@@ -271,8 +335,11 @@ mod tests {
                 labels: required.clone(),
                 requires_egress: false,
                 requires_dns: false,
-                host_binary: None,
+                host_binaries: Vec::new(),
                 requires_containers: false,
+                secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
+                requires_shared_network: false,
             },
             &cluster,
         );
@@ -293,8 +360,11 @@ mod tests {
                 labels: BTreeMap::new(),
                 requires_egress: false,
                 requires_dns: false,
-                host_binary: None,
+                host_binaries: Vec::new(),
                 requires_containers: false,
+                secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
+                requires_shared_network: false,
             },
             &cluster,
         );
@@ -322,8 +392,11 @@ mod tests {
                 labels: BTreeMap::new(),
                 requires_egress: false,
                 requires_dns: false,
-                host_binary: None,
+                host_binaries: Vec::new(),
                 requires_containers: false,
+                secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
+                requires_shared_network: false,
             },
             &cluster,
         );
@@ -359,8 +432,11 @@ mod tests {
                 labels: BTreeMap::new(),
                 requires_egress: false,
                 requires_dns: true,
-                host_binary: None,
+                host_binaries: Vec::new(),
                 requires_containers: false,
+                secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
+                requires_shared_network: false,
             },
             &cluster,
         );
@@ -411,8 +487,11 @@ mod tests {
                 labels: BTreeMap::new(),
                 requires_egress: false,
                 requires_dns: false,
-                host_binary: None,
+                host_binaries: Vec::new(),
                 requires_containers: false,
+                secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
+                requires_shared_network: false,
             },
             &cluster,
         );
@@ -462,6 +541,99 @@ mod tests {
         node
     }
 
+    /// #1123: an app whose env names a secret provider lands only on nodes
+    /// that run that provider; an app without one lands anywhere.
+    #[test]
+    fn an_app_naming_a_secret_provider_skips_nodes_without_it() {
+        let provider = |name: &str| {
+            crate::sesame::secret_provider::ProviderName::try_from(name.to_string()).unwrap()
+        };
+        let mut cluster = ClusterStateCache::new();
+        let mut vault = node_state("vault", 2000, 4096, BTreeMap::new(), true);
+        vault.capabilities.secret_providers = [provider("vault")].into();
+        cluster.set_node(vault);
+        let mut aws = node_state("aws", 2000, 4096, BTreeMap::new(), true);
+        aws.capabilities.secret_providers = [provider("aws")].into();
+        cluster.set_node(aws);
+        cluster.set_node(node_state("plain", 2000, 4096, BTreeMap::new(), true));
+
+        let spec: AppSpec = toml::from_str(
+            "image = \"api:1\"\n[env]\nDB_PASSWORD = \"PROVIDER[vault:secret/db]\"\nMODE = \"x\"\n",
+        )
+        .unwrap();
+        let requirements = WorkloadRequirements::for_app(&spec, false);
+        assert_eq!(
+            filter_nodes(&requirements, &cluster),
+            vec![NodeId::new("vault")]
+        );
+
+        let mut cluster_without = ClusterStateCache::new();
+        cluster_without.set_node(node_state("plain", 2000, 4096, BTreeMap::new(), true));
+        assert_eq!(
+            unplaced_reason(&requirements, &cluster_without),
+            UnplacedReason::NoCapableNode
+        );
+
+        let plain: AppSpec = toml::from_str("image = \"api:1\"\n").unwrap();
+        let anywhere = filter_nodes(&WorkloadRequirements::for_app(&plain, false), &cluster);
+        assert_eq!(anywhere.len(), 3);
+    }
+
+    /// #1122: an app that asks for runtime knobs lands only on a node whose
+    /// advertised `[runtime]` allowlist admits every one of them. A node
+    /// whose runtime can't apply knobs advertises an empty allowlist.
+    #[test]
+    fn an_app_with_runtime_knobs_lands_only_where_the_node_allows_them() {
+        let allowing = |toml_source: &str| {
+            crate::config::NodeConfig::parse(toml_source)
+                .unwrap()
+                .runtime
+                .knob_allowlist()
+        };
+        let mut cluster = ClusterStateCache::new();
+        let mut fuse = node_state("fuse", 2000, 4096, BTreeMap::new(), true);
+        fuse.capabilities.runtime_knobs = allowing(
+            "[runtime]\nallowed_capabilities = [\"SYS_ADMIN\"]\nallowed_devices = [\"/dev/fuse\"]\n",
+        );
+        cluster.set_node(fuse);
+        let mut network = node_state("network", 2000, 4096, BTreeMap::new(), true);
+        network.capabilities.runtime_knobs = allowing(
+            "[runtime]\nallowed_capabilities = [\"NET_ADMIN\"]\nallowed_sysctls = [\"net.*\"]\n",
+        );
+        cluster.set_node(network);
+        cluster.set_node(node_state("plain", 2000, 4096, BTreeMap::new(), true));
+
+        let tuned: AppSpec = toml::from_str(
+            "image = \"lb:1\"\n[runtime]\ncapabilities = [\"NET_ADMIN\"]\n\
+             sysctls = { \"net.core.somaxconn\" = \"4096\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            filter_nodes(&WorkloadRequirements::for_app(&tuned, false), &cluster),
+            vec![NodeId::new("network")]
+        );
+
+        // Each knob must be allowed: SYS_ADMIN alone isn't enough for fuse
+        // plus a sysctl the fuse node doesn't list.
+        let mixed: AppSpec = toml::from_str(
+            "image = \"fs:1\"\n[runtime]\ncapabilities = [\"SYS_ADMIN\"]\n\
+             devices = [{ path = \"/dev/fuse\" }]\nsysctls = { \"net.core.somaxconn\" = \"1\" }\n",
+        )
+        .unwrap();
+        let requirements = WorkloadRequirements::for_app(&mixed, false);
+        assert!(filter_nodes(&requirements, &cluster).is_empty());
+        assert_eq!(
+            unplaced_reason(&requirements, &cluster),
+            UnplacedReason::NoCapableNode
+        );
+
+        let plain: AppSpec = toml::from_str("image = \"api:1\"\n[runtime]\n").unwrap();
+        assert_eq!(
+            filter_nodes(&WorkloadRequirements::for_app(&plain, false), &cluster).len(),
+            3
+        );
+    }
+
     /// #702: nodes with different `[process_workloads]` policies. An exec
     /// app lands only where the node will start it; anywhere else the node
     /// refuses it and the placement used to hold there for good.
@@ -489,6 +661,28 @@ mod tests {
         assert_eq!(result.len(), 4);
     }
 
+    /// #935: a host app's image-less init container runs its command on the
+    /// host, so the app lands only where the node allows that binary too,
+    /// or the node would refuse it after placement.
+    #[test]
+    fn a_host_apps_init_binary_must_be_allowlisted_for_placement() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(running("app-only", true, &["/usr/bin/python3"]));
+        cluster.set_node(running(
+            "both",
+            true,
+            &["/usr/bin/python3", "/usr/bin/migrate"],
+        ));
+        let spec: AppSpec = toml::from_str(
+            "exec = \"/usr/bin/python3\"\n[[init]]\ncommand = [\"/usr/bin/migrate\"]",
+        )
+        .unwrap();
+
+        let result = filter_nodes(&WorkloadRequirements::for_app(&spec, false), &cluster);
+
+        assert_eq!(result, vec![NodeId::new("both")]);
+    }
+
     #[test]
     fn an_empty_cluster_says_no_node_is_ready() {
         let mut cluster = ClusterStateCache::new();
@@ -507,7 +701,7 @@ mod tests {
         cluster.set_node(running("ruby", true, &["/usr/bin/ruby"]));
         let mut needs = WorkloadRequirements {
             labels: labels(&[("zone", "east")]),
-            host_binary: Some(PathBuf::from("/usr/bin/python3")),
+            host_binaries: vec![PathBuf::from("/usr/bin/python3")],
             resources: Resources::new(9000, 0, 0),
             ..Default::default()
         };
@@ -522,9 +716,62 @@ mod tests {
             UnplacedReason::NoCapableNode
         );
 
-        needs.host_binary = None;
+        needs.host_binaries.clear();
         assert_eq!(unplaced_reason(&needs, &cluster), UnplacedReason::NoRoom);
         assert!(filter_nodes(&needs, &cluster).is_empty());
+    }
+
+    /// #1120: an app with a sidecar lands only on a node whose runtime can
+    /// share a network namespace (rootful runc), and its sidecars' requests
+    /// count towards the room it needs.
+    #[test]
+    fn an_app_with_a_sidecar_needs_a_shared_network_and_room_for_both() {
+        let mut cluster = ClusterStateCache::new();
+        let mut runc = node_state("runc", 1000, 4096, BTreeMap::new(), true);
+        runc.capabilities.shared_network = true;
+        cluster.set_node(runc);
+        cluster.set_node(node_state("apple", 4000, 8192, BTreeMap::new(), true));
+
+        let spec: AppSpec = toml::from_str(
+            "image = \"api:1\"\ncpu = \"600m\"\n[[sidecar]]\nname = \"proxy\"\ncpu = \"300m\"\n",
+        )
+        .unwrap();
+        let requirements = WorkloadRequirements::for_app(&spec, false);
+        assert!(requirements.requires_shared_network);
+        assert_eq!(requirements.resources.cpu_millicores, 900);
+        assert_eq!(
+            filter_nodes(&requirements, &cluster),
+            vec![NodeId::new("runc")]
+        );
+
+        // Room for the app alone isn't room for the app and its sidecar.
+        let bigger: AppSpec = toml::from_str(
+            "image = \"api:1\"\ncpu = \"600m\"\n[[sidecar]]\nname = \"proxy\"\ncpu = \"500m\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            unplaced_reason(&WorkloadRequirements::for_app(&bigger, false), &cluster),
+            UnplacedReason::NoRoom
+        );
+
+        let mut without = ClusterStateCache::new();
+        without.set_node(node_state("apple", 4000, 8192, BTreeMap::new(), true));
+        assert_eq!(
+            unplaced_reason(&requirements, &without),
+            UnplacedReason::NoCapableNode
+        );
+    }
+
+    /// #1120: a provider named only in a sidecar's env is still one the
+    /// node must run.
+    #[test]
+    fn a_secret_provider_named_by_a_sidecar_is_required_too() {
+        let spec: AppSpec = toml::from_str(
+            "image = \"api:1\"\n[[sidecar]]\nname = \"p\"\nenv = { T = \"PROVIDER[vault:x]\" }\n",
+        )
+        .unwrap();
+        let requirements = WorkloadRequirements::for_app(&spec, false);
+        assert_eq!(requirements.secret_providers.len(), 1);
     }
 
     /// `node` on `--runtime process`: no container runtime.
@@ -573,6 +820,26 @@ mod tests {
         assert_eq!(
             reason.to_string(),
             "no ready node has a container runtime to run its image"
+        );
+    }
+
+    /// #1121: a host app's pre-stop command runs on the host, so placement
+    /// needs a node that allows its program too. A container's runs in its
+    /// image and asks nothing of the node.
+    #[test]
+    fn a_host_apps_pre_stop_program_is_a_host_binary_it_needs() {
+        let host: AppSpec =
+            toml::from_str("exec = \"/bin/sleep\"\npre_stop = [\"/bin/echo\", \"bye\"]").unwrap();
+        assert_eq!(
+            WorkloadRequirements::for_app(&host, false).host_binaries,
+            vec![PathBuf::from("/bin/sleep"), PathBuf::from("/bin/echo")]
+        );
+        let container: AppSpec =
+            toml::from_str("image = \"web:1\"\npre_stop = [\"/bin/echo\"]").unwrap();
+        assert!(
+            WorkloadRequirements::for_app(&container, false)
+                .host_binaries
+                .is_empty()
         );
     }
 }

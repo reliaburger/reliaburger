@@ -55,22 +55,43 @@ pub fn host_environment(workload: &[String]) -> std::collections::BTreeMap<Strin
     host_environment_from(std::env::vars_os(), workload)
 }
 
-fn host_environment_from(
-    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+/// The variables of Bun's own environment a host command inherits, read
+/// now. A caller that starts many commands reads them once and overlays
+/// each command's entries with [`host_environment_over`].
+pub fn inherited_host_environment() -> std::collections::BTreeMap<String, String> {
+    inherited_from(std::env::vars_os())
+}
+
+/// `inherited` overlaid with the workload's `KEY=value` entries: the same
+/// environment [`host_environment`] builds, from variables read earlier.
+pub fn host_environment_over(
+    mut inherited: std::collections::BTreeMap<String, String>,
     workload: &[String],
 ) -> std::collections::BTreeMap<String, String> {
-    let mut environment: std::collections::BTreeMap<String, String> = inherited
-        .into_iter()
-        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-        .filter(|(key, _)| inherited_by_host_commands(key))
-        .collect();
-    environment.extend(
+    inherited.extend(
         workload
             .iter()
             .filter_map(|entry| entry.split_once('='))
             .map(|(key, value)| (key.to_owned(), value.to_owned())),
     );
-    environment
+    inherited
+}
+
+fn inherited_from(
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> std::collections::BTreeMap<String, String> {
+    inherited
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(key, _)| inherited_by_host_commands(key))
+        .collect()
+}
+
+fn host_environment_from(
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    workload: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    host_environment_over(inherited_from(inherited), workload)
 }
 
 #[cfg(test)]
@@ -333,6 +354,9 @@ fn spec_problem(spec: &OciSpec) -> Option<super::LaunchProblem> {
     use super::LaunchProblem;
     if !spec.host_process && spec.root.path != super::oci::HOST_ROOT {
         return Some(LaunchProblem::NeedsContainerRuntime(spec.root.path.clone()));
+    }
+    if let Some(problem) = spec.runtime_knobs_refusal("process") {
+        return Some(problem);
     }
     spec.process
         .args
@@ -917,15 +941,15 @@ impl super::Grill for ProcessGrill {
         if entry.state == ContainerState::Stopped {
             return Ok(());
         }
+        // The app's own stop signal (#1121), SIGTERM unless it names one.
+        let signal = entry.spec.stop_signal().to_nix();
         if entry.child.as_ref().and_then(|child| child.id()).is_some() {
-            signal_child_group(entry, nix::sys::signal::Signal::SIGTERM).map_err(error)?;
+            signal_child_group(entry, signal).map_err(error)?;
             if entry.state != ContainerState::Stopped {
                 entry.state = ContainerState::Stopping;
             }
         } else if entry.adopted.is_some() {
-            entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGTERM)
-                .map_err(error)?
-            {
+            entry.state = if signal_adopted_process(entry, signal).map_err(error)? {
                 ContainerState::Stopping
             } else {
                 ContainerState::Stopped
@@ -1240,7 +1264,11 @@ impl super::Grill for ProcessGrill {
         Ok(logs)
     }
 
-    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+    async fn exec(
+        &self,
+        instance: &InstanceId,
+        command: &[String],
+    ) -> Result<super::ExecOutput, GrillError> {
         // Verify the instance exists and is running
         if let Some(control) = &self.control {
             return control
@@ -1271,10 +1299,13 @@ impl super::Grill for ProcessGrill {
         }
 
         // Spawn the command directly (no namespace entry for ProcessGrill)
+        // A caller's timeout drops this future (a pre-stop command's bound,
+        // #1121); the command mustn't outlive it.
         let output = Command::new(&command[0])
             .args(&command[1..])
             .env_clear()
             .envs(environment)
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| GrillError::StartFailed {
@@ -1290,7 +1321,11 @@ impl super::Grill for ProcessGrill {
             }
             result.push_str(&stderr);
         }
-        Ok(result)
+        Ok(super::ExecOutput {
+            output: result,
+            // A signal-killed command has no code; report a plain failure.
+            exit_code: output.status.code().unwrap_or(1),
+        })
     }
 
     async fn follow_logs(
@@ -1439,6 +1474,7 @@ mod tests {
             host_process: true,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: OciRoot {
                 path: "/tmp/test".to_string(),
                 readonly: false,
@@ -1460,7 +1496,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         }
     }
 
@@ -2053,7 +2092,7 @@ mod tests {
         spec.process.env = vec!["JOB=1".into(), format!("PATH={path}")];
         grill.create(&id, &spec).await.unwrap();
         grill.start(&id).await.unwrap();
-        let env = grill.exec(&id, &["env".to_string()]).await.unwrap();
+        let env = grill.exec(&id, &["env".to_string()]).await.unwrap().output;
         let resolved = grill.exec(&id, &["rb-exec-tool".to_string()]).await;
         grill.kill(&id).await.unwrap();
         assert!(env.lines().any(|line| line == "JOB=1"), "{env}");
@@ -2066,7 +2105,7 @@ mod tests {
                 .any(|line| line.starts_with(&format!("{private}="))),
             "{private} leaked: {env}"
         );
-        assert_eq!(resolved.unwrap().trim(), "found");
+        assert_eq!(resolved.unwrap().output.trim(), "found");
     }
 
     #[tokio::test]
@@ -3225,6 +3264,28 @@ mod tests {
             matches!(grill.start(&id).await, Err(GrillError::NotFound { .. })),
             "a refused image app must leave nothing to start"
         );
+    }
+
+    /// #1122: a spec carrying runtime knobs is refused, not run without
+    /// them. Validation keeps knobs off host apps, so this guards a spec
+    /// that reaches the wrong runtime some other way.
+    #[tokio::test]
+    async fn create_refuses_a_spec_with_runtime_knobs_instead_of_ignoring_them() {
+        let grill = ProcessGrill::new();
+        let id = InstanceId("default__lb-0".to_string());
+        let mut spec = echo_spec("hello");
+        spec.runtime_knobs = Some(toml::from_str("capabilities = [\"NET_ADMIN\"]\n").unwrap());
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem.to_string(),
+            "runtime.capabilities CAP_NET_ADMIN can't be applied: runtime knobs need rootful \
+             runc, and this node's runtime is process"
+        );
+        assert!(matches!(
+            grill.start(&id).await,
+            Err(GrillError::NotFound { .. })
+        ));
     }
 
     /// #914: an image app without a command used to run `sleep 86400` as a

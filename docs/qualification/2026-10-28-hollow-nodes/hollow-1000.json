@@ -1,0 +1,164 @@
+{
+  "plan": {
+    "hollow_nodes": 1000,
+    "council_members": 3,
+    "start_parallelism": 25,
+    "report_interval_secs": 5,
+    "steady_secs": 60,
+    "churn_fraction": 0.1
+  },
+  "host": "Apple M1 Max, 10 logical CPUs",
+  "started_at_unix": 1793178352,
+  "start_all_ms": 58463,
+  "gossip_converged_ms": null,
+  "council_sees_all_ms": 23,
+  "nodes_seeing_everyone": 0,
+  "peers_seen_min": 459,
+  "peers_seen_median": 650,
+  "council_voters": 3,
+  "hollow_voters": 0,
+  "replicas": 1000,
+  "apply_ms": 1605,
+  "first_replica_ms": 4682,
+  "all_replicas_ms": 124256,
+  "small_applies": {
+    "count": 20,
+    "errors": 0,
+    "p50": 2621.3856250000003,
+    "p90": 2784.620417,
+    "p99": 3268.65625,
+    "max": 3268.65625
+  },
+  "raft_commit": [
+    {
+      "phase": "council-alone",
+      "latency": {
+        "count": 9,
+        "errors": 0,
+        "p50": 23.849,
+        "p90": 31.025,
+        "p99": 31.025,
+        "max": 31.025
+      }
+    },
+    {
+      "phase": "join",
+      "latency": {
+        "count": 412,
+        "errors": 0,
+        "p50": 24.925,
+        "p90": 35.168,
+        "p99": 68.0,
+        "max": 93.348
+      }
+    },
+    {
+      "phase": "deploy",
+      "latency": {
+        "count": 172,
+        "errors": 0,
+        "p50": 24.292,
+        "p90": 34.13,
+        "p99": 64.366,
+        "max": 127.358
+      }
+    },
+    {
+      "phase": "steady",
+      "latency": {
+        "count": 59,
+        "errors": 0,
+        "p50": 24.865,
+        "p90": 31.708,
+        "p99": 83.88,
+        "max": 83.88
+      }
+    },
+    {
+      "phase": "churn",
+      "latency": {
+        "count": 773,
+        "errors": 0,
+        "p50": 29.089,
+        "p90": 41.432,
+        "p99": 66.861,
+        "max": 86.34
+      }
+    },
+    {
+      "phase": "done",
+      "latency": {
+        "count": 1,
+        "errors": 0,
+        "p50": 31.615,
+        "p90": 31.615,
+        "p99": 31.615,
+        "max": 31.615
+      }
+    }
+  ],
+  "resources": [
+    {
+      "phase": "council-alone",
+      "seconds": 9.227625625,
+      "council_cpu_percent": 1.950664312955371,
+      "council_rss_mb_max": 39.65625,
+      "fleet_cpu_percent": 0.43348095843452683,
+      "fleet_rss_mb_max": 12.59375,
+      "load_average_max": 2.95
+    },
+    {
+      "phase": "join",
+      "seconds": 422.624412125,
+      "council_cpu_percent": 59.63687680338114,
+      "council_rss_mb_max": 980.46875,
+      "fleet_cpu_percent": 642.7243486343128,
+      "fleet_rss_mb_max": 7318.140625,
+      "load_average_max": 21.83
+    },
+    {
+      "phase": "deploy",
+      "seconds": 176.019224375,
+      "council_cpu_percent": 62.254563607521305,
+      "council_rss_mb_max": 991.484375,
+      "fleet_cpu_percent": 790.2545900534966,
+      "fleet_rss_mb_max": 7388.34375,
+      "load_average_max": 18.51
+    },
+    {
+      "phase": "steady",
+      "seconds": 58.873346333,
+      "council_cpu_percent": 57.598220777528006,
+      "council_rss_mb_max": 999.59375,
+      "fleet_cpu_percent": 721.2601736585581,
+      "fleet_rss_mb_max": 7663.015625,
+      "load_average_max": 17.97
+    },
+    {
+      "phase": "churn",
+      "seconds": 797.359092,
+      "council_cpu_percent": 44.397813174995434,
+      "council_rss_mb_max": 1107.078125,
+      "fleet_cpu_percent": 540.8805196141162,
+      "fleet_rss_mb_max": 8377.390625,
+      "load_average_max": 30.37
+    },
+    {
+      "phase": "done",
+      "seconds": 0.0,
+      "council_cpu_percent": 0.0,
+      "council_rss_mb_max": 1107.078125,
+      "fleet_cpu_percent": 0.0,
+      "fleet_rss_mb_max": 8377.390625,
+      "load_average_max": 15.5
+    }
+  ],
+  "churn": {
+    "stopped_nodes": 100,
+    "replicas_lost": 69,
+    "detected_ms": 73883,
+    "rescheduled_ms": null,
+    "rejoined_ms": null
+  },
+  "stopped": null
+}

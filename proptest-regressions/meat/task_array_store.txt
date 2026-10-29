@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 80eb9cec05b110f5c84437d0aaa6a5829badb1994329ea28e492f185e6588c52 # shrinks to steps = [Request { key: 0, variant: 1 }, Grant, Schedule { forbid_overlap: false }, Lose { run: 0, node: 0 }, Cancel { run: 0 }]

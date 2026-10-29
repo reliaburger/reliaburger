@@ -142,13 +142,62 @@ pub struct Compatibility {
 /// couldn't start, so a refused scale-up moves only those (#971).
 /// The Raft `log.redb` and `snapshot.redb` files are redb's v3 file format
 /// (redb 4), which can't open the v2 files redb 2 wrote (#1024).
-/// The appliance OS rollout (a new Raft request and a new field in council
-/// state) and the cluster-wide council size (`RaftRequest::CouncilSize` and
-/// `DesiredState::council_size`) on the 0.3.0 train (54/71). The train skips
-/// 53/70, which the 0.2.2 train already carries for its own formats.
+///
+/// 0.2.2, UX patch (53/70): one bump for the whole release, made when the
+/// train opened. Each 0.2.2 change to the wire or durable state adds its
+/// line below this one, not another bump.
+/// An exec answer, from `POST /v1/exec` and from a process owner's
+/// exec socket, carries the command's `exit_code` beside its `output` (#522).
+/// `JobSpec::pids`, the per-command process limit, in Raft desired state,
+/// task-array templates and node syncs, and the OCI `linux.resources.pids`
+/// block in fresh job containers' specs and their owner records (#741).
+/// `FaultRequest`, `FaultRule` and routed workload faults carry a `workload`
+/// kind and a `task_index`, `FaultSummary` a `task_index`, and nodes answer
+/// `GET /v1/fault/attempts` with their running job attempts (#704).
+/// Gossip datagrams, reporting frames and the Raft log's vote, log ids and
+/// encrypted-entry envelope are postcard, not bincode (#1026).
+///
+/// 0.2.4, Extension points (55/72): one bump for the whole release, made by its first wire or state change. Each later 0.2.4 change adds its line below this one, not another bump.
+/// A node's capability report lists the secret providers it runs
+/// (`NodeCapabilities::secret_providers`), and an app's env value
+/// `PROVIDER[name:path]` is a provider reference in Raft desired state,
+/// not plain text (#1123).
+/// An app's `stop_signal`, `stop_grace`, `pre_stop` and `pre_stop_timeout`
+/// in Raft desired state and node syncs, and the `stop` policy in OCI
+/// specs, instance records, runtime intents and process owner records (#1121).
+/// Policies in the council: the `PolicySpec`, `PolicyDelete` and
+/// `PolicyFenced` Raft requests, the `PolicyGenerationMoved` response,
+/// `DesiredState::policies` and `policy_generation`, the GitOps ownership
+/// set's `policies`, `[policy.*]` in applied configs, `GET /v1/policies`
+/// and the 422 `PolicyRefusal` body of a refused apply (#1117).
+/// Fill-only policy defaults: `PolicySpec::deny` is optional and a
+/// policy may carry a `default` table, `PolicyFenced` carries the
+/// declared spec, and `DesiredState::declared_apps` keeps it beside the
+/// effective one (#1118).
+/// Policies for jobs and the audit action: `PolicySpec::applies_to`,
+/// `PolicyAction::Audit`, a finding's `kind` and `workload` in API JSON,
+/// `Verdict::audits`, and `GET /v1/policies/audit` (#1119).
+/// An app's `[runtime]` knobs in Raft desired state and node syncs, the
+/// knobs and the OCI `linux.sysctl`, `linux.devices` and device rules in OCI
+/// specs and instance records, and the node's knob allowlist in its
+/// capability report (`NodeCapabilities::runtime_knobs`) (#1122).
+/// An app's `sidecar` list in Raft desired state, node syncs and instance
+/// records, and `NodeCapabilities::shared_network` in the capability report
+/// (#1120).
+/// An app's and a job's `provenance` (the template and `use` that made it)
+/// in Raft desired state, node syncs, job definitions and the apply API,
+/// and `[template.*]` and `[use.*]` in applied configs (#1124).
+/// An app's `owner` in Raft desired state, the `AppRelease` Raft request,
+/// the owner checks the state machine applies to app writes, `owner` in
+/// `GET /v1/diagnostics/apps`, and `GET /v1/events` answering scoped tokens
+/// with their own namespaces' events (#1125).
+///
+/// 0.3.0, Bare metal in an hour (56/73): the appliance OS rollout (a new Raft
+/// request and a new field in council state) and the cluster-wide council
+/// size (`RaftRequest::CouncilSize` and `DesiredState::council_size`).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 54,
-    state: 71,
+    protocol: 56,
+    state: 73,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
@@ -387,13 +436,13 @@ mod tests {
     }
 
     /// The generations before the appliance OS rollout and the cluster-wide
-    /// council size: main's 0.2.1 cluster safety formats.
+    /// council size: 0.2.4's extension point formats.
     const BEFORE_APPLIANCE: Compatibility = Compatibility {
-        protocol: 52,
-        state: 69,
+        protocol: 55,
+        state: 72,
     };
 
-    /// The 0.2.2 train's generation, which the appliance train skips.
+    /// 0.2.2's and 0.2.3's generation.
     const PATCH_TRAIN: Compatibility = Compatibility {
         protocol: 53,
         state: 70,

@@ -254,13 +254,21 @@ pub enum MembershipSource {
 }
 
 /// How to start one fully wired node.
-/// Builds a node's task-array service on its agent's execution budget, so
-/// task attempts and app replicas share one ledger as they do in Bun.
+/// What a node's agent shares with its task-array executor, as Bun wires it.
+pub struct AgentExecution {
+    /// The agent's execution budget: task attempts and app replicas share
+    /// one ledger.
+    pub budget: Arc<reliaburger::bun::execution_budget::ExecutionBudget>,
+    /// The agent's list of running attempts, which faults target (#704).
+    pub live_attempts: Arc<reliaburger::bun::live_attempts::LiveAttempts>,
+    /// The process runtime under the agent's runtime, so an owned runner's
+    /// attempts are instances the agent can signal.
+    pub runtime: reliaburger::grill::process::ProcessGrill,
+}
+
+/// Builds a node's task-array service on what its agent shares.
 pub type TaskArraysOnBudget = Box<
-    dyn FnOnce(
-            Arc<reliaburger::bun::execution_budget::ExecutionBudget>,
-        ) -> Arc<reliaburger::bun::task_array_leader::TaskArrayService>
-        + Send,
+    dyn FnOnce(AgentExecution) -> Arc<reliaburger::bun::task_array_leader::TaskArrayService> + Send,
 >;
 
 pub struct WiredNodeOptions {
@@ -312,6 +320,8 @@ pub struct WiredNodeOptions {
     /// refuses image apps and reports no container runtime (#914). `false`
     /// runs [`host_containers::HostContainers`], which runs them.
     pub process_only: bool,
+    /// Most voters the council seats; `None` keeps Bun's default of seven.
+    pub council_size_cap: Option<usize>,
 }
 
 /// A running wired node and everything a test observes it through.
@@ -368,6 +378,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         task_arrays,
         task_arrays_on_agent_budget,
         process_only,
+        council_size_cap,
     } = options;
     let raft_port = gossip_port + 1;
     let reporting_port = gossip_port + 2;
@@ -422,6 +433,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             job_capabilities_rx: None,
             readiness: Some(readiness.clone()),
             recovery_probe_window: None,
+            council_size_cap,
         },
         shutdown.clone(),
     )
@@ -448,12 +460,14 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     // The agent stops with the node, or on its own to wedge its reports
     // while gossip carries on.
     let agent_shutdown = shutdown.child_token();
+    let containers = if process_only {
+        host_containers::HostContainers::process_only()
+    } else {
+        host_containers::HostContainers::new()
+    };
+    let process_runtime = containers.process_runtime();
     let mut agent = BunAgent::with_cluster(
-        if process_only {
-            host_containers::HostContainers::process_only()
-        } else {
-            host_containers::HostContainers::new()
-        },
+        containers,
         PortAllocator::new(gossip_port + 100, gossip_port + 400),
         cmd_rx,
         agent_shutdown.clone(),
@@ -485,7 +499,11 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     // host firewall (`with_cluster` enables it by default on Linux).
     agent.set_perimeter_enabled(false);
     let task_arrays = match task_arrays_on_agent_budget {
-        Some(build) => Some(build(agent.execution_budget())),
+        Some(build) => Some(build(AgentExecution {
+            budget: agent.execution_budget(),
+            live_attempts: agent.live_attempts(),
+            runtime: process_runtime,
+        })),
         None => task_arrays,
     };
     // The API answers status from the loop's published snapshot, and reads
@@ -636,7 +654,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             None,
             None,
             Some(status_reader.clone()),
-            None,
+            task_arrays,
         )
     } else if task_arrays.is_some() {
         api::router_with_upgrade(

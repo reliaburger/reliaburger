@@ -352,6 +352,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: OciRoot {
                 path: "/tmp/test".to_string(),
                 readonly: false,
@@ -373,7 +374,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         }
     }
 
@@ -594,6 +598,24 @@ mod tests {
         let start = process_start_time(my_pid).unwrap();
         assert!(process_matches(my_pid, start + 2));
         assert!(!process_matches(my_pid, start + 3));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn absolute_start_time_is_unix_seconds() {
+        // sysinfo reports the start as seconds since the Unix epoch. Pin the
+        // unit, so a crate bump to milliseconds or to "seconds since boot"
+        // can't silently make every recorded process look like another one.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let start = process_start_time(std::process::id()).unwrap();
+        assert!(start <= now, "start {start} is after now {now}");
+        assert!(
+            now - start < 24 * 3600,
+            "start {start} is not a recent Unix time (now {now})"
+        );
     }
 
     // -- M23: adopted-pid reuse on the ECHILD liveness path ------------------

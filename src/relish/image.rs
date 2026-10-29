@@ -208,7 +208,7 @@ pub async fn download(
     if let Some(warning) = trust.warning() {
         eprintln!("relish image download: {warning}");
     }
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .user_agent("relish")
         .build()
         .map_err(|e| failed(&e.to_string()))?;

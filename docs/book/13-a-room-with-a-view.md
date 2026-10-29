@@ -129,7 +129,7 @@ Every recorded event also goes to a Tokio `broadcast` channel. A broadcast sende
 
 The agent emits deploy, restart, unhealthy, stop, job-completed and job-failed events. Node membership and alert transitions live outside the agent task, so they remain deferred. We say that plainly rather than inventing data.
 
-The new `/v1/jobs` endpoint follows the same rule. It exposes the supervisor's raw state, restart count and age. It doesn't manufacture a cron schedule or a duration that the supervisor never stored.
+The new `/v1/jobs` endpoint followed the same rule. It exposed the supervisor's raw state, restart count and age, and didn't manufacture a cron schedule or a duration that the supervisor never stored. Since 0.2.0 it reads the leader's task arrays instead, because that's where every job lives now (Chapter 17), and the web dashboard shows the same runs and schedules in its job card (Chapter 11).
 
 ## Upgrading the connection
 
@@ -362,6 +362,17 @@ timestamp is there because sequences are per process: a member that restarts
 counts from one again, and without it its first new events would look like
 ones the backlog already sent. `the_live_event_stream_merges_every_members_events`
 checks both halves against a fake peer.
+
+The manual, meanwhile, told operators three times to run `relish events`, a
+command that didn't exist: the merged listing had an API and a client method,
+and only the TUI called them. The 0.2.2 CLI review (D36) added the command.
+It's thin on purpose. `EventsFilter` turns `--app`, `--severity` and
+`--limit` into the `/v1/events` query, the node does the filtering and the
+fan-out, and `EventsReport` renders the answer as a table with the same
+`TIME (UTC)` and `app@namespace` columns as `relish audit`. A `#[serde(transparent)]`
+newtype is how one value gets two faces: `Serialize` passes straight through to
+the API's `ClusterEvents`, so `-o json` prints exactly what the API sent,
+while `Display` belongs to the wrapper and draws the table.
 
 The NODE column exposed one thing the views hadn't been ready for. Pressing
 Enter on a job opened `View::JobDetail { name, namespace }`, and the page

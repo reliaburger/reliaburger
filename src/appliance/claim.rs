@@ -75,7 +75,7 @@ impl ClaimKey {
                 .map_err(std::io::Error::other)?;
         let key = ClaimKey {
             cert_der: generated.cert.der().to_vec(),
-            key_der: generated.key_pair.serialize_der(),
+            key_der: generated.signing_key.serialize_der(),
         };
         super::prepare::write_atomic(&key_path, &key.key_der, 0o600)?;
         super::prepare::write_atomic(&cert_path, &key.cert_der, 0o644)?;

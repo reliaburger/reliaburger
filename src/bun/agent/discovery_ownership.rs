@@ -15,17 +15,28 @@ pub(super) enum DiscoveryOwnership {
     Disabled,
     Ready(DiscoveryJournal),
     Recovered(DiscoveryJournal),
-    /// A consumer step's write outlasted its turn and goes on off the loop
-    /// (#890). The journal itself is inside the write's task until it lands.
+    /// A write outlasted its turn and goes on off the loop (#890, #1255,
+    /// #1266, #1263). The journal itself is inside the write's task until it
+    /// lands.
     Writing(Box<DiscoveryWrite>),
     Uncertain,
 }
 
 impl DiscoveryOwnership {
     /// The inventory on disk: the journal's, or while a write is in flight,
-    /// the one before it. Only consumer steps leave a write in flight, and
-    /// they change only the consumer's ownership, so the services and
-    /// runtime references read the same either side of it.
+    /// the one before it. A consumer step changes only the consumer's
+    /// ownership. A health probe changes one backend's health, and can add
+    /// only services the kernel has never seen, since every kernel
+    /// publication journals the whole service map first. A workload start
+    /// adds one network reference, for an instance that can't run until it
+    /// lands; [`BunAgent::reference_write_in_flight`] tells a retirement to
+    /// ask again rather than read it as unrecorded. A deploy's or a
+    /// restart's publication adds backends that neither the kernel nor
+    /// `service_map` has until it lands. A release or a retirement settles
+    /// any write in flight before it reads the journal, and its own write
+    /// only marks or removes what is already withdrawn. So the services
+    /// list everything that could need withdrawing, and every other runtime
+    /// reference reads the same either side of a write in flight.
     pub(super) fn durable(&self) -> Option<&DiscoveryInventory> {
         match self {
             DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal) => {
@@ -52,6 +63,48 @@ pub(super) struct DiscoveryWrite {
     service: crate::onion::service_id::ServiceId,
     /// When the write started, for the log line a slow one leaves.
     started: std::time::Instant,
+    /// Who runs once the write lands.
+    owner: WriteOwner,
+}
+
+/// Who takes over a discovery write that outlasts its turn, and runs once
+/// it lands.
+#[derive(Debug)]
+pub(super) enum WriteOwner {
+    /// A consumer-sync step, whose remainder is [`super::consumer`]'s
+    /// `ConsumerStep::Landed`.
+    ConsumerStep,
+    /// A health probe's publication (#1255), installed once its write lands.
+    HealthProbe(super::health_checks::HealthWrite),
+    /// A workload start recording the instance's network reference (#1266).
+    /// Nothing runs on landing: the start stays pending until its deploy
+    /// worker or restart asks again and finds the reference recorded.
+    NetworkReference(crate::grill::InstanceId),
+    /// A deploy's or a restart's publication, a release or a service
+    /// retirement (#1263). Nothing runs on landing: whoever wrote it asks
+    /// again, finds the journal recording what it wrote, and goes on. The
+    /// landing turn is named `branch (detail)`.
+    AskAgain {
+        branch: crate::bun::loop_meter::LoopBranch,
+        detail: &'static str,
+    },
+    /// Forgetting receipts the leader acknowledged (#1340). The
+    /// acknowledgements are answered once it lands.
+    ConsumerReceipts,
+}
+
+/// What waited for a write in flight that has just landed.
+#[derive(Debug)]
+pub(super) enum LandedWrite {
+    /// A consumer-sync step, which now holds how the write ended.
+    ConsumerStep,
+    /// A health probe's publication: `Some` when the write is durable.
+    HealthProbe(Option<super::health_checks::HealthWrite>),
+    /// A write whose writer's next ask collects it: a workload start's
+    /// network reference, a publication, a release or a retirement.
+    AskAgain,
+    /// Forgetting acknowledged receipts, whose callers have been answered.
+    ConsumerReceipts,
 }
 
 /// How a discovery write ended, as the loop's `select!` branch sees it.
@@ -66,6 +119,31 @@ pub(super) enum Landing {
     /// The turn's runtime budget ran out first. The step's next part waits
     /// for [`BunAgent::settle_discovery_write`].
     InFlight,
+}
+
+/// The owner of a release's write: forgetting a released reference, or the
+/// permission before it (#1263).
+const RELEASE_WRITE: WriteOwner = WriteOwner::AskAgain {
+    branch: crate::bun::loop_meter::LoopBranch::FollowUp,
+    detail: "discovery_release/landed",
+};
+
+/// The owner of a service retirement's writes (#1263).
+const RETIREMENT_WRITE: WriteOwner = WriteOwner::AskAgain {
+    branch: crate::bun::loop_meter::LoopBranch::FollowUp,
+    detail: "service_retirement/landed",
+};
+
+/// `Ok` once a write has landed; `StillRunning`, naming `work`, while it is
+/// in flight, so whoever asked asks again.
+pub(super) fn still_running_unless_landed(
+    landing: Landing,
+    work: impl FnOnce() -> String,
+) -> Result<(), BunError> {
+    match landing {
+        Landing::Landed => Ok(()),
+        Landing::InFlight => Err(BunError::StillRunning { work: work() }),
+    }
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -164,58 +242,94 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
-    /// Preserve attempted publications before any kernel or userspace acknowledgement.
+    /// Journal a publication and wait for the write however long it takes,
+    /// for tests that set up a journal directly. Every loop writer journals
+    /// within its turn's deadline instead (#1263, #1336).
+    #[cfg(test)]
     pub(super) async fn persist_discovery_publication(
         &mut self,
         id: &crate::onion::service_id::ServiceId,
         services: &crate::onion::service_map::ServiceMap,
     ) -> Result<(), BunError> {
+        let landing = self
+            .journal_discovery_publication(id, services, None, WriteOwner::ConsumerStep)
+            .await?;
+        self.wait_for_landing(landing).await;
+        Ok(())
+    }
+
+    /// Journal an attempted publication, waiting for the write until
+    /// `deadline` at most, as [`Self::write_discovery_inventory`] does.
+    pub(super) async fn journal_discovery_publication(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+        services: &crate::onion::service_map::ServiceMap,
+        deadline: Option<tokio::time::Instant>,
+        write_owner: WriteOwner,
+    ) -> Result<Landing, BunError> {
         use crate::bun::discovery_owners::{ServiceOwner, ServicePhase};
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
-            return Ok(());
+            return Ok(Landing::Landed);
         }
         // What each backend's launch ran, as whoever started it read it:
         // no runtime read here, inside the turn (#419).
         let executions = self.launch_executions.clone();
-        self.update_discovery_inventory(id, |next| {
-            // Absence from the candidate is not withdrawal proof. Preserve
-            // earlier allocations until their confirmed retirement removes them.
-            for entry in services.resolve_all() {
-                let owner = ServiceOwner {
-                    executions: entry
-                        .backends
-                        .iter()
-                        .filter_map(|backend| {
-                            let id = crate::grill::InstanceId(backend.instance_id.clone());
-                            executions
-                                .get(&id)
-                                .map(|generation| (backend.instance_id.clone(), generation.clone()))
-                        })
-                        .collect(),
-                    entry: entry.clone(),
-                    phase: ServicePhase::Owned,
-                };
-                if let Some(previous) = next.services.iter_mut().find(|previous| {
-                    previous.entry.namespace == entry.namespace
-                        && previous.entry.app_name == entry.app_name
-                }) {
-                    *previous = owner;
-                } else {
-                    next.services.push(owner);
+        self.write_discovery_inventory(
+            id,
+            |next| {
+                // Absence from the candidate is not withdrawal proof. Preserve
+                // earlier allocations until their confirmed retirement removes them.
+                for entry in services.resolve_all() {
+                    let owner = ServiceOwner {
+                        executions: entry
+                            .backends
+                            .iter()
+                            .filter_map(|backend| {
+                                let id = crate::grill::InstanceId(backend.instance_id.clone());
+                                executions.get(&id).map(|generation| {
+                                    (backend.instance_id.clone(), generation.clone())
+                                })
+                            })
+                            .collect(),
+                        entry: entry.clone(),
+                        phase: ServicePhase::Owned,
+                    };
+                    if let Some(previous) = next.services.iter_mut().find(|previous| {
+                        previous.entry.namespace == entry.namespace
+                            && previous.entry.app_name == entry.app_name
+                    }) {
+                        *previous = owner;
+                    } else {
+                        next.services.push(owner);
+                    }
                 }
-            }
-        })
+            },
+            deadline,
+            write_owner,
+        )
         .await
     }
 
-    /// Record the original held runtime generation before allowing its launch.
+    /// Record the original held runtime generation before allowing its
+    /// launch, waiting for the write until the turn's runtime budget runs
+    /// out at most (#1266). [`Landing::InFlight`] means the launch must wait:
+    /// the hold isn't durable yet, and asking again once the write has
+    /// landed finds it recorded. A write already in flight, anyone's, is
+    /// `InFlight` too, without waiting for it here.
     pub(super) async fn persist_discovery_reference(
         &mut self,
         reference: &crate::grill::runc_intent::NetworkReference,
-    ) -> Result<(), BunError> {
+    ) -> Result<Landing, BunError> {
         use crate::bun::discovery_owners::{ReferenceOwner, ReferencePhase};
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
-            return Ok(());
+            return Ok(Landing::Landed);
+        }
+        if self.discovery_write_in_flight() {
+            return Ok(Landing::InFlight);
+        }
+        // An earlier ask's write recorded exactly this hold.
+        if self.journal_holds(reference) {
+            return Ok(Landing::Landed);
         }
         let instance = self
             .supervisor
@@ -225,26 +339,63 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })?;
         let service =
             crate::onion::service_id::ServiceId::new(&instance.namespace, &instance.app_name);
-        self.update_discovery_inventory(&service, |next| {
-            let owner = ReferenceOwner {
-                service: service.clone(),
-                reference: reference.clone(),
-                phase: ReferencePhase::Held,
-            };
-            if let Some(previous) = next
-                .references
-                .iter_mut()
-                .find(|previous| previous.reference.instance_id == reference.instance_id)
-            {
-                *previous = owner;
-            } else {
-                next.references.push(owner);
-            }
-        })
+        let deadline = self.turn_deadline();
+        self.write_discovery_inventory(
+            &service,
+            |next| {
+                let owner = ReferenceOwner {
+                    service: service.clone(),
+                    reference: reference.clone(),
+                    phase: ReferencePhase::Held,
+                };
+                if let Some(previous) = next
+                    .references
+                    .iter_mut()
+                    .find(|previous| previous.reference.instance_id == reference.instance_id)
+                {
+                    *previous = owner;
+                } else {
+                    next.references.push(owner);
+                }
+            },
+            Some(deadline),
+            WriteOwner::NetworkReference(reference.instance_id.clone()),
+        )
         .await
     }
 
-    /// Persist release permission after local withdrawal and exact cluster confirmation.
+    /// Whether the journal itself, not the one before a write in flight,
+    /// records `reference` as held.
+    pub(super) fn journal_holds(
+        &self,
+        reference: &crate::grill::runc_intent::NetworkReference,
+    ) -> bool {
+        use crate::bun::discovery_owners::ReferencePhase;
+        let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+            &self.discovery_ownership
+        else {
+            return false;
+        };
+        journal
+            .inventory()
+            .references
+            .iter()
+            .any(|owner| owner.reference == *reference && owner.phase == ReferencePhase::Held)
+    }
+
+    /// Whether a write in flight may be recording `id`'s network reference.
+    pub(super) fn reference_write_in_flight(&self, id: &crate::grill::InstanceId) -> bool {
+        matches!(
+            &self.discovery_ownership,
+            DiscoveryOwnership::Writing(write)
+                if matches!(&write.owner, WriteOwner::NetworkReference(owner) if owner == id)
+        )
+    }
+
+    /// Persist release permission after local withdrawal and exact cluster
+    /// confirmation. The write, and any write already in flight, holds the
+    /// turn only until its deadline (#1263): `StillRunning` means ask
+    /// again, and the ask after the write has landed finds the permission.
     pub(super) async fn authorise_local_discovery_release(
         &mut self,
         reference: &crate::grill::runc_intent::NetworkReference,
@@ -255,7 +406,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return Ok(());
         }
         // Decide against the journal itself, not the one before a write.
-        self.settle_discovery_write().await;
+        self.require_settled_discovery().await?;
         // The original grant was fsynced before the runtime release. Replaying
         // that exact permission must also work while the leader is unavailable.
         if self.require_discovery_release_permission(reference).is_ok() {
@@ -312,28 +463,42 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             return Err(refuse("original service withdrawal is unproven"));
         }
-        self.update_discovery_inventory(&service, |next| {
-            for owner in &mut next.services {
-                if owner.entry.namespace == service.namespace
-                    && owner.entry.app_name == service.name
-                {
-                    owner
-                        .entry
-                        .backends
-                        .retain(|backend| backend.instance_id != reference.instance_id.0);
-                    owner.executions.remove(&reference.instance_id.0);
-                }
-            }
-            for owner in &mut next.references {
-                if owner.reference == *reference {
-                    owner.phase = ReferencePhase::ReleaseAuthorised;
-                }
-            }
+        let deadline = self.turn_deadline();
+        let landing = self
+            .write_discovery_inventory(
+                &service,
+                |next| {
+                    for owner in &mut next.services {
+                        if owner.entry.namespace == service.namespace
+                            && owner.entry.app_name == service.name
+                        {
+                            owner
+                                .entry
+                                .backends
+                                .retain(|backend| backend.instance_id != reference.instance_id.0);
+                            owner.executions.remove(&reference.instance_id.0);
+                        }
+                    }
+                    for owner in &mut next.references {
+                        if owner.reference == *reference {
+                            owner.phase = ReferencePhase::ReleaseAuthorised;
+                        }
+                    }
+                },
+                Some(deadline),
+                RELEASE_WRITE,
+            )
+            .await?;
+        still_running_unless_landed(landing, || {
+            format!("journalling {}'s release permission", reference.instance_id)
         })
-        .await
     }
 
-    /// Retire an exact local allocation after consumer withdrawal and runtime cleanup.
+    /// Retire an exact local allocation after consumer withdrawal and runtime
+    /// cleanup. It takes two journal writes, `Withdrawn` and then removing
+    /// the allocation. Each, and any write already in flight, holds the
+    /// turn only until its deadline (#1263): `StillRunning` means ask again,
+    /// and the next ask goes on from what the journal records.
     pub(super) async fn retire_discovery_service(
         &mut self,
         service: &crate::onion::service_id::ServiceId,
@@ -342,7 +507,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
             return Ok(());
         }
-        self.settle_discovery_write().await;
+        self.require_settled_discovery().await?;
         let refuse = |reason: &str| BunError::BackendPublication {
             service: service.clone(),
             reason: reason.into(),
@@ -362,10 +527,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 owner.entry.namespace == service.namespace && owner.entry.app_name == service.name
             })
             .cloned();
+        // Removing the allocation outlasted an earlier ask's turn. Either
+        // it landed, and the journal no longer holds the allocation, or it
+        // failed and the reopened journal still does.
+        let removal_in_flight = self.retired_discovery_services.remove(service);
         let live = self.service_map.resolve(service);
         let Some(original) = original else {
             // Portless workloads and repeated acknowledged stops own no allocation.
-            return if live.is_none() {
+            return if live.is_none() || removal_in_flight {
                 Ok(())
             } else {
                 Err(refuse("original service allocation is missing"))
@@ -430,27 +599,53 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "captured ingress requests still require confirmed release",
             ));
         }
-        self.update_discovery_inventory(service, |next| {
-            for owner in &mut next.services {
-                if owner.entry.namespace == service.namespace
-                    && owner.entry.app_name == service.name
-                {
-                    owner.entry.backends.clear();
-                    owner.executions.clear();
-                    owner.phase = ServicePhase::Withdrawn;
-                }
-            }
-        })
-        .await?;
-        self.update_discovery_inventory(service, |next| {
-            next.services.retain(|owner| {
-                owner.entry.namespace != service.namespace || owner.entry.app_name != service.name
-            });
-        })
-        .await
+        let still_running = || format!("journalling {service}'s retirement");
+        let deadline = self.turn_deadline();
+        // An earlier ask's `Withdrawn` may have landed after its turn.
+        if original.phase != ServicePhase::Withdrawn {
+            let landing = self
+                .write_discovery_inventory(
+                    service,
+                    |next| {
+                        for owner in &mut next.services {
+                            if owner.entry.namespace == service.namespace
+                                && owner.entry.app_name == service.name
+                            {
+                                owner.entry.backends.clear();
+                                owner.executions.clear();
+                                owner.phase = ServicePhase::Withdrawn;
+                            }
+                        }
+                    },
+                    Some(deadline),
+                    RETIREMENT_WRITE,
+                )
+                .await?;
+            still_running_unless_landed(landing, still_running)?;
+        }
+        let landing = self
+            .write_discovery_inventory(
+                service,
+                |next| {
+                    next.services.retain(|owner| {
+                        owner.entry.namespace != service.namespace
+                            || owner.entry.app_name != service.name
+                    });
+                },
+                Some(deadline),
+                RETIREMENT_WRITE,
+            )
+            .await?;
+        if landing == Landing::InFlight {
+            self.retired_discovery_services.insert(service.clone());
+        }
+        still_running_unless_landed(landing, still_running)
     }
 
-    /// Forget a permission only after the runtime acknowledges the exact release.
+    /// Forget a permission only after the runtime acknowledges the exact
+    /// release. The write, and any write already in flight, holds the turn
+    /// only until its deadline (#1263): `StillRunning` means ask again, and
+    /// the ask after the write has landed finds nothing left to forget.
     pub(super) async fn forget_released_discovery_reference(
         &mut self,
         reference: &crate::grill::runc_intent::NetworkReference,
@@ -458,7 +653,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
             return Ok(());
         }
-        self.settle_discovery_write().await;
+        self.require_settled_discovery().await?;
         self.require_discovery_release_permission(reference)?;
         let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
             &self.discovery_ownership
@@ -480,11 +675,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             });
         };
         let service = owner.service.clone();
-        self.update_discovery_inventory(&service, |next| {
-            next.references
-                .retain(|owner| owner.reference != *reference);
+        let deadline = self.turn_deadline();
+        let landing = self
+            .write_discovery_inventory(
+                &service,
+                |next| {
+                    next.references
+                        .retain(|owner| owner.reference != *reference);
+                },
+                Some(deadline),
+                RELEASE_WRITE,
+            )
+            .await?;
+        still_running_unless_landed(landing, || {
+            format!(
+                "journalling {}'s released network reference",
+                reference.instance_id
+            )
         })
-        .await
     }
 
     /// Refuse address release until an exact durable permission exists.
@@ -512,31 +720,40 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Journal `update` and wait for it to land.
+    /// Journal `update` and wait for it to land, for tests that set up a
+    /// journal directly.
+    #[cfg(test)]
     pub(super) async fn update_discovery_inventory(
         &mut self,
         id: &crate::onion::service_id::ServiceId,
         update: impl FnOnce(&mut DiscoveryInventory) + Send,
     ) -> Result<(), BunError> {
-        match self.write_discovery_inventory(id, update, None).await? {
-            Landing::Landed => Ok(()),
-            // With no deadline the write is waited for; this only settles
-            // what can't happen.
-            Landing::InFlight => {
-                self.settle_discovery_write().await;
-                Ok(())
-            }
+        let landing = self
+            .write_discovery_inventory(id, update, None, WriteOwner::ConsumerStep)
+            .await?;
+        self.wait_for_landing(landing).await;
+        Ok(())
+    }
+
+    /// A write with no deadline is waited for; this only settles what can't
+    /// happen.
+    #[cfg(test)]
+    async fn wait_for_landing(&mut self, landing: Landing) {
+        if landing == Landing::InFlight {
+            self.settle_discovery_write().await;
         }
     }
 
     /// Journal `update`, waiting for the write until `deadline` at most:
     /// [`Landing::InFlight`] when it ran out first, and the write goes on off
-    /// the loop (#890). `None` waits for the write however long it takes.
+    /// the loop (#890) for `owner` to take over once it lands. `None` waits
+    /// for the write however long it takes.
     pub(super) async fn write_discovery_inventory(
         &mut self,
         id: &crate::onion::service_id::ServiceId,
         update: impl FnOnce(&mut DiscoveryInventory) + Send,
         deadline: Option<tokio::time::Instant>,
+        owner: WriteOwner,
     ) -> Result<Landing, BunError> {
         let failure = |reason: String| BunError::BackendPublication {
             service: id.clone(),
@@ -599,6 +816,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 directory,
                 service: id.clone(),
                 started,
+                owner,
             }));
             return Ok(Landing::InFlight);
         };
@@ -607,9 +825,114 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|()| Landing::Landed)
     }
 
-    /// Whether a consumer step's write is still going on off the loop.
+    /// Whether a write is still going on off the loop.
     pub(super) fn discovery_write_in_flight(&self) -> bool {
         matches!(self.discovery_ownership, DiscoveryOwnership::Writing(_))
+    }
+
+    /// The branch and detail that name the turn landing the write in
+    /// flight; `None` for a consumer step's, or with no write in flight.
+    pub(super) fn write_in_flight_landing_turn(
+        &self,
+    ) -> Option<(crate::bun::loop_meter::LoopBranch, &'static str)> {
+        use crate::bun::loop_meter::LoopBranch;
+        let DiscoveryOwnership::Writing(write) = &self.discovery_ownership else {
+            return None;
+        };
+        match write.owner {
+            WriteOwner::ConsumerStep => None,
+            WriteOwner::HealthProbe(_) => {
+                Some((LoopBranch::DeployOp, "health_probe_result/landed"))
+            }
+            WriteOwner::NetworkReference(_) => {
+                Some((LoopBranch::DeployOp, "apply_network_pre_start/landed"))
+            }
+            WriteOwner::AskAgain { branch, detail } => Some((branch, detail)),
+            WriteOwner::ConsumerReceipts => Some((LoopBranch::FollowUp, "consumer_receipt/landed")),
+        }
+    }
+
+    /// Whether the journal is free for a write or a decision: `InFlight`
+    /// when a write is still in flight inside a turn, which isn't waited
+    /// for (#1263). The loop's `select!` lands it. Outside a turn (startup
+    /// adoption, or a test driving a handler) nothing else is waiting, so
+    /// the write is waited out.
+    pub(super) async fn settle_discovery_write_outside_turn(&mut self) -> Landing {
+        if !self.discovery_write_in_flight() {
+            return Landing::Landed;
+        }
+        if self.turn_deadline.is_some() {
+            return Landing::InFlight;
+        }
+        self.settle_discovery_write().await;
+        Landing::Landed
+    }
+
+    /// [`Self::settle_discovery_write_outside_turn`], as the `StillRunning`
+    /// a retirement or release asks again on.
+    async fn require_settled_discovery(&mut self) -> Result<(), BunError> {
+        still_running_unless_landed(self.settle_discovery_write_outside_turn().await, || {
+            "a discovery journal write in flight".into()
+        })
+    }
+
+    /// Journal `candidate` as `id`'s publication for a deploy op or a
+    /// restart, waiting for the write only until the turn's deadline, and
+    /// for a write already in flight not at all (#1263). `InFlight` means
+    /// ask again: nothing in memory changed, and an ask after the write has
+    /// landed finds `id`'s entry recorded and writes nothing. The landing
+    /// turn is named `branch (detail)`.
+    pub(super) async fn journal_publication_within_turn(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+        candidate: &crate::onion::service_map::ServiceMap,
+        branch: crate::bun::loop_meter::LoopBranch,
+        detail: &'static str,
+    ) -> Result<Landing, BunError> {
+        if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
+            return Ok(Landing::Landed);
+        }
+        if self.settle_discovery_write_outside_turn().await == Landing::InFlight {
+            return Ok(Landing::InFlight);
+        }
+        if self.journal_records_publication(id, candidate) {
+            return Ok(Landing::Landed);
+        }
+        let deadline = self.turn_deadline();
+        self.journal_discovery_publication(
+            id,
+            candidate,
+            Some(deadline),
+            WriteOwner::AskAgain { branch, detail },
+        )
+        .await
+    }
+
+    /// Whether the journal itself records `id`'s entry in `candidate`
+    /// exactly as [`Self::journal_discovery_publication`] would write it.
+    fn journal_records_publication(
+        &self,
+        id: &crate::onion::service_id::ServiceId,
+        candidate: &crate::onion::service_map::ServiceMap,
+    ) -> bool {
+        use crate::bun::discovery_owners::ServicePhase;
+        let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+            &self.discovery_ownership
+        else {
+            return false;
+        };
+        let Some(entry) = candidate.resolve(id) else {
+            return true;
+        };
+        journal.inventory().services.iter().any(|owner| {
+            owner.phase == ServicePhase::Owned
+                && owner.entry == *entry
+                && entry.backends.iter().all(|backend| {
+                    let instance = crate::grill::InstanceId(backend.instance_id.clone());
+                    owner.executions.get(&backend.instance_id)
+                        == self.launch_executions.get(&instance)
+                })
+        })
     }
 
     /// Resolves when the write in flight lands; never, if there is none.
@@ -623,9 +946,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Wait for a write a consumer step left in flight, and hand its result
-    /// to that step. Every journal write and every decision made against
-    /// the journal itself settles first.
+    /// Wait for a write a consumer step, a health probe or a workload start
+    /// left in flight.
+    /// Every journal write and every decision made against the journal
+    /// itself settles first.
+    ///
+    /// A consumer step gets the write's result. A health probe's landed
+    /// publication isn't installed here, in the middle of whoever settles:
+    /// `service_map` still differs from the instance's health, so its next
+    /// probe publishes it again.
     pub(super) async fn settle_discovery_write(&mut self) {
         let DiscoveryOwnership::Writing(write) = &mut self.discovery_ownership else {
             return;
@@ -642,19 +971,40 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.land_discovery_write(outcome).await;
     }
 
+    /// The loop's turn for a write in flight that has landed: take it back,
+    /// then run what waited for it.
+    pub(super) async fn land_write_in_flight(&mut self, outcome: DiscoveryWriteOutcome) {
+        match self.land_discovery_write(outcome).await {
+            Some(LandedWrite::ConsumerStep) | None => self.continue_consumer_sync().await,
+            Some(LandedWrite::HealthProbe(Some(write))) => {
+                self.finish_health_publication(write).await;
+            }
+            Some(
+                LandedWrite::HealthProbe(None)
+                | LandedWrite::AskAgain
+                | LandedWrite::ConsumerReceipts,
+            ) => {}
+        }
+    }
+
     /// Take back the journal a write in flight returned, or fence discovery
-    /// if it failed, and hand the result to the consumer step waiting for it.
-    pub(super) async fn land_discovery_write(&mut self, outcome: DiscoveryWriteOutcome) {
+    /// if it failed. A consumer step waiting for it gets the result; a
+    /// health probe's publication comes back once it is durable.
+    async fn land_discovery_write(
+        &mut self,
+        outcome: DiscoveryWriteOutcome,
+    ) -> Option<LandedWrite> {
         let DiscoveryOwnership::Writing(write) =
             std::mem::replace(&mut self.discovery_ownership, DiscoveryOwnership::Uncertain)
         else {
-            return;
+            return None;
         };
         let DiscoveryWrite {
             recovered,
             directory,
             service,
             started,
+            owner,
             ..
         } = *write;
         let took = started.elapsed();
@@ -665,7 +1015,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let landed = self
             .finish_discovery_write(outcome, recovered, directory, &service)
             .await;
-        self.consumer_syncs.write_landed(landed);
+        match owner {
+            WriteOwner::ConsumerStep => {
+                self.consumer_syncs.write_landed(landed);
+                Some(LandedWrite::ConsumerStep)
+            }
+            WriteOwner::HealthProbe(write) => match landed {
+                Ok(()) => Some(LandedWrite::HealthProbe(Some(write))),
+                Err(error) => {
+                    eprintln!("bun: {error}");
+                    Some(LandedWrite::HealthProbe(None))
+                }
+            },
+            WriteOwner::NetworkReference(id) => {
+                if let Err(error) = landed {
+                    eprintln!("bun: recording {id}'s network reference: {error}");
+                }
+                Some(LandedWrite::AskAgain)
+            }
+            WriteOwner::AskAgain { .. } => {
+                if let Err(error) = landed {
+                    eprintln!("bun: {error}");
+                }
+                Some(LandedWrite::AskAgain)
+            }
+            WriteOwner::ConsumerReceipts => {
+                self.receipt_confirmations.write_landed(&landed);
+                Some(LandedWrite::ConsumerReceipts)
+            }
+        }
     }
 
     /// Put the journal back after its write, or fence discovery after a

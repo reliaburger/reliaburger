@@ -219,7 +219,7 @@ fn claim_client(
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .use_preconfigured_tls(tls)
         .timeout(Duration::from_secs(15))
         .build()
