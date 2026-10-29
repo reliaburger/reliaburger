@@ -416,6 +416,17 @@ against a real run is a guess, and a guess that fails a release on its first nig
 everyone to ignore it. Those four start in record-only mode, with provisional thresholds,
 until the first 0.2.4 fast and final records show where they actually sit.
 
+"Outside fault windows only" was true of four of the five at first, and review caught the
+fifth ([#1438](https://github.com/reliaburger/reliaburger/issues/1438)). The API reads skip
+any check that runs inside a fault window, but the job start lag came from the campaign's
+histogram, summed over every run that drained, including runs that lived through a leader
+kill. A p99 is exactly the statistic a few slow recoveries move, so the one gated SLO could
+fail a tier for something the faults were meant to cause, while the record claimed it
+measured a quiet cluster. The fix keeps both numbers. Each step of the job campaign knows
+whether a fault window is open, and marks every run active at that moment. When a run
+drains, its start lag goes into the M8 buckets either way, and into a second, quiet set only
+if it was never marked. The SLO reads the quiet set.
+
 Measuring them cost almost nothing, because the harness was already doing the work. Every
 light check talks to each node's API, so it now times two of the reads `relish` makes. For
 the writes, the app start and the rollout, the harness gives itself an app of its own,
