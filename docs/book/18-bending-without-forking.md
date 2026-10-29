@@ -1956,6 +1956,42 @@ plain `<<` panics in a debug build and wraps in a release one, and
 `checked_shl` returns `None` instead, which turns into "a very long time"
 and then the one-minute cap.
 
+The first version never counted back down. A sidecar that crashed seven
+times over a few days waited a full minute after every crash from then on,
+as if it were in a crash loop. A kubelet forgets a container's back-off
+once it has run for ten minutes, and the registry now does the same: each
+restart alone records when it succeeded, and a crash at least
+`SIDECAR_STABLE_RUN` later starts the count from zero, so it's restarted at
+once again.
+
+Restarting it from *what* turned out to matter too (#1434). The first
+version rebuilt a crashed sidecar from the app's current spec, the one
+`deployed_specs` holds. That's right until a rollout begins: the deploy
+worker stores the new spec as it starts, while the old instances still run.
+An old instance's proxy that crashed then came back with the new proxy
+image, next to the old app. A sidecar the new spec added was created but
+never registered, so nothing would ever retire it. And one the new spec
+dropped was never relaunched and stayed due on every tick. The fix is to
+remember what each instance was launched with. `RegisterSidecars` now
+carries the `SidecarSpec`s, not just their names, and every registered
+sidecar keeps its own:
+
+```rust
+struct SidecarRun {
+    id: InstanceId,
+    spec: SidecarSpec,
+    restarts: u32,
+    restarted_at: Option<Instant>,
+    due: Option<Instant>,
+    relaunching: Option<CancellationToken>,
+}
+```
+
+A restart alone, and a whole-instance restart's Start step, build their
+launches from those and the instance's own stored OCI spec, never from the
+app's current one. An adopted instance registers the sidecars of the app
+spec in its own record, for the same reason.
+
 An app that crashes is different. On runc the network namespace belongs to
 the app's launch. The restart's Clear step tears it down with the app and
 the Create step makes a new one, so a sidecar left running would sit in a
@@ -2927,6 +2963,13 @@ two sidecars, `proxy` and `logs`:
   is still Running.
 - `a_sidecar_that_keeps_crashing_waits_out_its_backoff`: the first restart
   is immediate and the second isn't.
+- `a_sidecar_that_crashes_mid_rollout_comes_back_from_its_own_instances_spec`
+  swaps the stored spec for one with a newer proxy image, a new `metrics`
+  sidecar and no `logs`, the way a rollout's start does, then crashes both
+  of the old instance's sidecars. `proxy` must come back on its old image,
+  `logs` must come back at all, nothing called `metrics` may appear, and
+  nothing may stay due. Before the fix it failed on the first: the proxy
+  came back on the new image.
 - `an_app_that_crashes_restarts_with_its_sidecars_stopped_after_and_started_before_it`:
   the restart's Clear kills the app before `proxy` and `proxy` before
   `logs`, and its Start starts both sidecars before the app.
@@ -2952,7 +2995,10 @@ that only a node reporting `shared_network` is a candidate.
 CLI runs, `pickle::binding` pins a sidecar's image, and the Kubernetes
 importer turns a native sidecar and a pod's second container into sidecars
 and survives a round trip through `relish export`. The registry's backoff
-and cancellation have their own tests in `bun::agent::sidecars`.
+and cancellation have their own tests in `bun::agent::sidecars`, and
+`a_sidecar_that_ran_stably_restarts_at_once_again` crashes a sidecar seven
+times, checks a crash a minute later still waits the longest backoff, and
+one ten quiet minutes later doesn't wait at all.
 
 To check that the agent tests check something, we started the sidecars
 after the app and stopped them before it. Four tests failed: the start
