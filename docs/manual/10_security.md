@@ -297,12 +297,21 @@ permissions or namespaces. They judge a workload when it's applied: a new
 policy doesn't touch apps or jobs already running. `relish policy audit`
 shows which of them it would refuse.
 
+A job is judged however it arrives: `relish apply`, `relish run --batch`,
+`relish batch FILE`, `relish batch submit` (a task manifest) or `POST
+/v1/jobs/runs`. Each answers 422 when a deny policy refuses the job and
+prints a `warning:` line for each warn policy. `source` is `apply` on all of
+them.
+
 The cluster checks a policy when you apply it, and refuses one that:
 
 - has a name that isn't a lowercase DNS label;
 - has an empty `deny` or `match`, or one over 1024 bytes, or a `message` over
   512 bytes;
 - isn't valid CEL;
+- nests `all`, `exists`, `exists_one`, `map` or `filter` more than two deep
+  (`app.args.all(a, app.args.exists_one(b, a == b))` is as deep as it goes),
+  because each level multiplies what the policy costs to run;
 - names anything other than `app`, `caller` and `source`, such as `policy`,
   `permission` or `namespaces`;
 - reads a field `app` or `caller` doesn't have (`app.memroy`);
@@ -321,6 +330,9 @@ The cluster checks a policy when you apply it, and refuses one that:
 An expression that fails while it runs, such as `app.memory == '1Gi'` on an
 app with no memory set, or a `deny` that isn't true or false, counts as
 broken: a deny policy refuses the app and says why, and a warn policy warns.
+So does a workload with a list or map of more than 1,024 entries (`env`,
+`command`, …): it's too big for a policy to judge cheaply, so every policy
+that applies to it fails closed, naming the field.
 
 Only an unscoped Admin token can apply or delete a policy, and every policy
 write is audited. A refused apply answers with every policy it broke, writes
@@ -388,6 +400,11 @@ everything else as the cluster's own caller `audit`, role `system`, from
 the definitions the cluster keeps, which are scheduled jobs and deployment
 hooks; a one-off job's definition goes once its runs are pruned. `relish wtf` shows the same
 denials and audit findings as warnings.
+
+Any token can run it, but a token limited to some apps or namespaces sees
+only those: the counts and findings leave out everything else, so a
+controller's token can't list another team's workloads or why they'd be
+refused.
 
 `action = "audit"` is the way to roll out a strict policy: commit it as
 `audit`, watch `relish policy audit` until nothing breaks it, then change it to

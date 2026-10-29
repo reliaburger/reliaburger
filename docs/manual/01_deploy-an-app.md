@@ -182,7 +182,10 @@ out. A shipper that must flush to a remote store should flush as it goes.
 
 When a sidecar exits, Bun starts it again on its own, while the app keeps
 running and keeps its address. The first restart is immediate, then they
-back off: 1 s, 2 s, 4 s, up to a minute. When the app exits, its sidecars
+back off: 1 s, 2 s, 4 s, up to a minute. A sidecar that then runs for ten
+minutes is forgiven, and its next crash restarts it at once again. It
+always comes back as its instance launched it, so mid-rollout an old
+instance keeps its old sidecars. When the app exits, its sidecars
 restart with it: they stop after it and start again before it, because on
 runc the network namespace goes with the app's instance.
 
@@ -482,7 +485,9 @@ size = "50Gi"
 The body is ordinary `[app.*]` and `[job.*]` TOML. `${name}` is replaced by
 the parameter's value, and that's all a template can do: there are no
 conditionals, loops or functions. A parameter is a `string`, an `int` or a
-`bool`; one with a `default` is optional, and one without is required.
+`bool`; one with a `default` is optional, and one without is required. A
+`use` may expand to at most 4 MiB of TOML, and all the uses in one file to
+16 MiB together; past that the apply is refused, naming the use.
 
 Templates expand when the config is read, before anything else sees it.
 `relish apply`, `apply --dry-run`, `lint`, `diff` and `compile` all work on
@@ -499,7 +504,11 @@ It stores the apps, each with a `provenance` naming the template and the
 
 Policies judge the expanded apps like any others, and can match on where
 they came from with `app.provenance.template` or `app.provenance.use`
-(`job.provenance` for a job). A body may declare an `owner`, and the same
+(`job.provenance` for a job). Treat it as a label, not a credential: anyone
+who can apply can declare a template of any name, or write `provenance` on
+an app by hand, so a policy should never exempt an app because of it. Use it
+to aim a rule at template-made apps (`a database needs a standby`), not to
+let them off one. A body may declare an `owner`, and the same
 owner rules apply as to an app you wrote by hand. A
 directory's `_defaults.toml` and namespace apply to the apps a `use` in it
 makes, wherever the template lives. In a tree, a template in one file serves
@@ -709,7 +718,10 @@ A stop then runs four steps, each with its own limit:
 1. `pre_stop`, inside the instance, the way `relish exec` runs a command.
    It gets `pre_stop_timeout`. If it fails, can't start or runs over, Bun
    logs why and carries on: a broken hook never keeps an instance alive.
-2. `stop_signal`, sent to the workload's whole process group.
+2. `stop_signal`, sent to the workload's main process, its PID 1. A host
+   (`exec` or `script`) workload gets it on its whole process group. In a
+   container, PID 1 has to pass it on to any children it wants stopped
+   cleanly, as under Docker or Kubernetes.
 3. `stop_grace`, while Bun waits for the instance to exit.
 4. SIGKILL, if it's still running.
 

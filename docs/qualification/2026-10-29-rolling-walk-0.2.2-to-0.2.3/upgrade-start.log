@@ -1,0 +1,5 @@
+downloading https://github.com/reliaburger/reliaburger/releases/download/v0.2.3/bun-linux-aarch64 ...
+pushing the linux-aarch64 binary via https://127.0.0.1:15050; nodes fetch it from 192.168.104.1:5050
+cluster upgrade to v0.2.3 started (up-v0.2.3-1793232033788)
+watch it with: relish upgrade status
+$R upgrade start v0.2.3 --external-key $W/operator.key  0.73s user 1.20s system 7% cpu 24.769 total

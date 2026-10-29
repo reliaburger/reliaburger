@@ -1481,6 +1481,48 @@ async fn a_producer_release_still_pending_after_the_patience_fails_the_retiremen
     assert!(attempts.load(std::sync::atomic::Ordering::SeqCst) >= 29);
 }
 
+/// #1355, #1442: the wait before an old instance's stop, for every node to
+/// drop its backend, gives up at its 5 s patience when a node never
+/// confirms, and the stop goes ahead.
+#[tokio::test(start_paused = true)]
+async fn the_wait_for_remote_withdrawal_gives_up_at_its_patience() {
+    use super::deploy_ops::{PRODUCER_RELEASE_PATIENCE, REMOTE_WITHDRAWAL_RETRY};
+
+    let (tx, mut rx) = mpsc::channel(4);
+    let ops = DeployOps { tx };
+    let id = InstanceId("default__web-0".into());
+    let started = tokio::time::Instant::now();
+    let mut asked = 0u32;
+    // The loop's side answers "pending" for ever, as it does while a lost
+    // node holds the withdrawal up. Driven in this task, not spawned, so
+    // the paused clock only moves when both sides wait.
+    let wait = ops.await_remote_withdrawal(&id);
+    tokio::pin!(wait);
+    loop {
+        tokio::select! {
+            () = &mut wait => break,
+            Some(op) = rx.recv() => {
+                let DeployOp::AwaitRemoteWithdrawal { reply, .. } = op else {
+                    panic!("unexpected op {}", op.name());
+                };
+                asked += 1;
+                let _ = reply.send(Err(pending_release()));
+            }
+        }
+    }
+    let waited = started.elapsed();
+
+    assert!(
+        waited + REMOTE_WITHDRAWAL_RETRY >= PRODUCER_RELEASE_PATIENCE,
+        "gave up before its patience: {waited:?}"
+    );
+    assert!(
+        waited <= PRODUCER_RELEASE_PATIENCE,
+        "waited past its patience: {waited:?}"
+    );
+    assert!(asked >= 9, "asked only {asked} times");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_refused_producer_release_is_not_retried() {
     let attempts = std::sync::atomic::AtomicU32::new(0);

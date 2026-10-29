@@ -62,7 +62,7 @@ class Rows(unittest.TestCase):
 
     def job_report(self, p99_ms=32, samples=1000):
         counts = lag_counts(p99_ms, samples) if samples else [0] * 16
-        return {"m8": {"p99_start_lag_ms": soak_slo.job_p99(counts), "start_lag_samples": sum(counts)}}
+        return {"m8": {"quiet_p99_start_lag_ms": soak_slo.job_p99(counts), "quiet_start_lag_samples": sum(counts)}}
 
     def verdicts(self, rows):
         return {row["name"]: row["verdict"] for row in rows}
@@ -81,10 +81,19 @@ class Rows(unittest.TestCase):
     def test_a_job_start_past_the_last_bucket_fails(self):
         counts = [0] * 16
         counts[-1] = 100
-        report = {"m8": {"p99_start_lag_ms": soak_slo.job_p99(counts), "start_lag_samples": 100}}
+        report = {"m8": {"quiet_p99_start_lag_ms": soak_slo.job_p99(counts), "quiet_start_lag_samples": 100}}
         rows = soak_slo.rows(self.measured(), report, "fast")
         self.assertEqual(self.verdicts(rows)["job-start"], "FAIL")
         self.assertIn("over every start-lag bucket", soak_slo.failures(rows)[0])
+
+    def test_the_job_start_slo_judges_only_runs_outside_fault_windows(self):
+        # Start lag during a leader kill is the M8 number, not the SLO (#1438).
+        noisy = lag_counts(1024, 1000)
+        report = self.job_report(p99_ms=32)
+        report["m8"].update(p99_start_lag_ms=soak_slo.job_p99(noisy), start_lag_samples=sum(noisy))
+        rows = soak_slo.rows(self.measured(), report, "final")
+        self.assertEqual(self.verdicts(rows)["job-start"], "PASS")
+        self.assertEqual(next(row for row in rows if row["name"] == "job-start")["p99"], 32)
 
     def test_a_gated_slo_with_no_samples_fails(self):
         for report in (None, self.job_report(samples=0)):
@@ -275,7 +284,7 @@ class Record(unittest.TestCase):
         checker.append_event(self.evidence, ts=NOW, phase="baseline", verdict="ok", detail="1")
         (self.evidence / "jobs").mkdir(exist_ok=True)
         (self.evidence / "jobs" / "snapshot.json").write_text(json.dumps(dict(
-            started=NOW, heartbeat=NOW + 3500, metrics=dict(start_lag_ms_counts=lag))))
+            started=NOW, heartbeat=NOW + 3500, metrics=dict(start_lag_ms_counts=lag, quiet_start_lag_ms_counts=lag))))
         for _ in range(20):
             soak_slo.record_rollout(self.evidence, apply_ms=300, ready_ms=9000, starts=[2000, 2500, 3000])
         for _ in range(20):

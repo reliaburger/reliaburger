@@ -898,7 +898,7 @@ pre_stop_timeout = "20s"    # default 30s, 1s to 1h
 
 **Where the policy lives.** `grill::oci::generate_oci_spec` copies the four fields into the instance's `OciSpec` as a `StopPolicy` (`stop`), so it's fixed per instance at launch, recorded with every instance record, runtime intent and process owner record, and survives adoption after a Bun restart. A rolling deploy retires each old instance with the policy that instance was launched with, not the new spec's, because the new spec's pre-stop command may not exist in the old image.
 
-**Who sends the signal.** Each runtime reads the signal from the spec it holds: `ProcessGrill` signals the process group itself or asks the process owner, which reads its launch spec; runc runs `runc kill <id> <SIGNAL>` from the runtime intent; Apple Container passes `container stop --signal`. Every graceful stop, including a Bun shutdown, therefore sends the app's signal, and `Grill::stop` keeps its one-argument shape.
+**Who sends the signal.** Each runtime reads the signal from the spec it holds: `ProcessGrill` signals the process group itself or asks the process owner, which reads its launch spec; runc runs `runc kill <id> <SIGNAL>` from the runtime intent; Apple Container runs `container kill --signal <SIGNAL>`, not `container stop`, which would kill the workload after its own 5 s default and cut every longer `stop_grace` short (#1435). Every runtime's `stop` only signals; Bun waits out the grace and sends the kill. Every graceful stop, including a Bun shutdown, therefore sends the app's signal, and `Grill::stop` keeps its one-argument shape.
 
 **Who runs the sequence.** `bun::agent::stop_runtime_instance` runs the four steps, each with its own bound:
 
@@ -945,7 +945,14 @@ evaluates one.
 - **Commit checks.** `policy::check_policy`, run by `Config::validate`: a DNS
   label name, expressions of at most 1024 bytes, a message of at most 512,
   valid CEL, only the three variables, and only known `app` and `caller`
-  fields. The `cel` crate has no cost limit, so the size cap bounds evaluation.
+  fields, and no more than two nested macros (`all`, `exists`, `exists_one`,
+  `map`, `filter`; `MAX_COMPREHENSION_NESTING`). The `cel` crate has no cost
+  limit, so evaluation is bounded by expression size times input size squared,
+  and the input is capped too: a workload with any list or map over
+  `MAX_COLLECTION_ENTRIES` (1,024) entries fails every policy that applies to
+  it closed, naming the field (#1431). `admit` (as `admit_blocking`),
+  `judge_job` on the job routes and `judge_app` in the GitOps runner run in
+  `spawn_blocking`, never on an async worker.
 - **Failure.** An expression that errors or returns a non-boolean fails
   closed: a deny policy refuses, a warn policy warns. A committed policy that
   no longer compiles refuses every app apply until an admin replaces or
@@ -984,13 +991,20 @@ evaluates one.
   serde). `judge_job` evaluates denies only: a `default` belongs to an apps
   policy. `evaluate` judges a config's apps then its jobs, `admit` judges
   both, and `job_apply` calls it whenever a manifest has apps or jobs; job
-  writes stay unfenced, like the apps of a job manifest. `Finding` carries a
+  writes stay unfenced, like the apps of a job manifest. Every other job
+  route (`/v1/jobs/runs`, `/v1/batch`, `/v1/batch/array`,
+  `/v1/batch/manifest`) judges each job in `job_api::admit_definition`
+  (`PolicyCheck::Judge`; `job_apply` passes `Judged`) under the committed
+  policies, as `JobDefinition::to_spec` (schedule and run policy put back),
+  before its image is bound (#1424). A denial is the same 422 and
+  `policy.denied` event; warnings come back as `policy_warnings`. `Finding` carries a
   `WorkloadKind` and names the workload (`policy p denies job ns/name: …`).
   `PolicyAction::Audit` puts a finding in `Verdict::audits`: the apply goes
   ahead, the caller isn't told, and `cluster_apply` and `job_apply` record one
   `policy.audited` event; the GitOps runner logs it to stderr. `GET
-  /v1/policies/audit` (any token) runs `policy::audit::audit` on a copy of
-  desired state in `spawn_blocking`: every committed app (declared spec where
+  /v1/policies/audit` (any token) runs `policy::audit::audit_visible` on a copy of
+  desired state in `spawn_blocking`, keeping only the workloads the token's
+  scope allows (counts included, #1432): every committed app (declared spec where
   kept, else the stored one with its image read back as its tag) through
   `judge_app`, as the owner's token (with its role) for apps a controller
   owns (#1125), as `gitops` for apps GitOps owns and as the system caller
@@ -1060,6 +1074,9 @@ functions, one per kind of change:
 
 - **Where.** `cluster_apply` calls `skip_owned_apps` on the leader before
   policy admission, so a skipped app is neither judged nor written.
+  `job_apply` does the same for the apps of a job manifest (#1429): the
+  state machine's backstop only checks that a write keeps the stored owner,
+  not that the caller speaks for it, so the API is the only place that can.
   `cluster_app_change` (stop, delete, release) checks on the leader, against
   the leader's desired state: a follower forwards the request with the
   caller's credentials, not its service token, because its replica can lag a
@@ -1135,7 +1152,10 @@ with a `default`; without one, required) and a `body` string of ordinary
   anything but apps and jobs; a body that declares or uses a template (no
   nesting); an expanded name a declared resource or another use already has;
   template and use names that aren't DNS labels, and a parameter named
-  `template`.
+  `template`; and a use whose expansion would pass `MAX_EXPANDED_BYTES`
+  (4 MiB), or all the uses of one expansion (a manifest, or one file of a
+  tree) `MAX_TOTAL_EXPANDED_BYTES` (16 MiB), checked as the text grows so
+  nothing past the cap is allocated (#1425).
 - **What's stored.** Only ordinary apps and jobs. Each expanded one carries
   `provenance: { template, use }` (`AppSpec::provenance`,
   `JobSpec::provenance`), the one wire and state change. It's part of the
@@ -1145,7 +1165,10 @@ with a `default`; without one, required) and a `body` string of ordinary
   node's placement fingerprint set it aside, so moving an app into or out of
   a template restarts nothing when the expansion is the same. Policies see
   it as `app.provenance` or `job.provenance`; a policy `default` can't set
-  it. A body may declare an `owner`, and the owner rules judge the expanded
+  it. It is not a trust signal (#1430): any manifest may declare a template
+  of any name, and a hand-written spec may set the field, which the apply
+  endpoint can't tell from `relish`'s local expansion. A policy may aim a
+  rule at it, never exempt on it. A body may declare an `owner`, and the owner rules judge the expanded
   app exactly as they judge a hand-written one. `relish apply
   --dry-run` shows it as `from use.NAME (template NAME)`.
 - **Not done.** No registry: templates come from files or git. No logic in

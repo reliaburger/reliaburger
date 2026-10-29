@@ -65,7 +65,7 @@ impl StopSignal {
     ];
 
     /// The canonical name, such as `"SIGTERM"`. Runc's `kill` and Apple's
-    /// `container stop --signal` both take it as it is.
+    /// `container kill --signal` both take it as it is.
     pub fn name(self) -> &'static str {
         match self {
             StopSignal::Term => "SIGTERM",

@@ -89,10 +89,10 @@ class WorkflowAdapter(unittest.TestCase):
             return required
         return required & c.partitioned(c.read_json(Path(directory) / 'discovery.json'))[0]
 
-    def aggregate(self, event='pull_request'):
+    def aggregate(self, event='pull_request', release_gate=False):
         with patch.object(self.a.gates, 'candidate_sources'), patch.object(self.a, 'verify_owner', self.oracle):
             return self.a.aggregate(self.root, self.manifest_path, self.incoming, self.context, self.needs,
-                                    event=event)
+                                    event=event, release_gate=release_gate)
 
     def test_selected_portable_hosts_and_optimized_gate_all_complete(self):
         self.assertEqual(len(self.aggregate()), 3)
@@ -202,6 +202,17 @@ class WorkflowAdapter(unittest.TestCase):
         self.needs['changes']['outputs']['macos'] = 'true'
         self.assertEqual(len(self.aggregate(event='pull_request')), 3)
 
+    def test_the_release_gate_pull_request_must_qualify_with_every_owner(self):
+        # An ordinary PR may leave macOS out; the release gate PR may not,
+        # whatever select jobs said (#1443).
+        self.needs['changes']['outputs']['macos'] = 'false'
+        del self.needs['macos']
+        for shard in (1, 2, 3):
+            shutil.rmtree(self.incoming / ('contract-darwin-portable-darwin-' + str(shard)))
+        self.assertEqual(len(self.aggregate()), 2)
+        with self.assertRaisesRegex(c.Invalid, 'release gate'):
+            self.aggregate(release_gate=True)
+
     def heavy_owners(self, macos):
         """Add every heavy owner, sealed and successful, to the synthetic run.
 
@@ -242,7 +253,7 @@ class WorkflowAdapter(unittest.TestCase):
                 shutil.rmtree(self.incoming / ('contract-darwin-portable-darwin-' + str(shard)))
         return []
 
-    def aggregate_heavy(self, legacy, event='pull_request'):
+    def aggregate_heavy(self, legacy, event='pull_request', release_gate=False):
         legacy_owner = importlib.import_module('oci_legacy_owner')
         ignored = importlib.import_module('ignored_owners')
 
@@ -254,7 +265,7 @@ class WorkflowAdapter(unittest.TestCase):
                 patch.object(legacy_owner, 'qualify', return_value=set()), \
                 patch.object(ignored, 'evidence_problems', problems):
             return self.a.aggregate(self.root, self.manifest_path, self.incoming, self.context, self.needs,
-                                    self.bindings, event=event)
+                                    self.bindings, event=event, release_gate=release_gate)
 
     def test_a_full_ci_train_pull_request_needs_every_heavy_owner_but_not_macos(self):
         legacy = self.heavy_owners(macos='false')
@@ -289,6 +300,16 @@ class WorkflowAdapter(unittest.TestCase):
             with self.subTest(event=event, macos='claimed'), \
                     self.assertRaisesRegex(c.Invalid, 'missing successful owner step output'):
                 self.aggregate_heavy(legacy, event=event)
+
+    def test_the_release_gate_pull_request_passes_with_every_owner(self):
+        legacy = self.heavy_owners(macos='true')
+        self.assertEqual(len(self.aggregate_heavy(legacy, release_gate=True)), len(self.a.w.OWNERS))
+
+    def test_the_release_gate_pull_request_refuses_the_heavy_set_without_macos(self):
+        legacy = self.heavy_owners(macos='false')
+        self.assertEqual(len(self.aggregate_heavy(legacy)), len(self.a.w.OWNERS) - 1)
+        with self.assertRaisesRegex(c.Invalid, 'release gate'):
+            self.aggregate_heavy(legacy, release_gate=True)
 
     def test_push_and_merge_queue_pass_with_every_owner_macos_included(self):
         legacy = self.heavy_owners(macos='true')

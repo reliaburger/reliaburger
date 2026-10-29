@@ -1207,6 +1207,39 @@ message = "a database needs a standby"
     assert!(evaluation.verdict.denials.is_empty());
 }
 
+/// #1430: `provenance` is a label, not a trust signal. A policy that
+/// exempts template-made apps exempts a hand-written app that sets
+/// `provenance` itself, and one made by a template the manifest declares
+/// itself, because templates aren't something only an admin can write.
+/// The manual and chapter 18 say so; this test keeps them honest.
+#[test]
+fn provenance_is_a_label_anyone_can_write() {
+    let set = compile(
+        r#"
+[policy.pinned]
+match = "!has(app.provenance) || app.provenance.template != 'approved'"
+deny = "app.image.endsWith(':latest')"
+"#,
+    );
+    let by_hand = expanded(
+        "[app.web]\nimage = 'web:latest'\nprovenance = { template = 'approved', use = 'x' }\n",
+    );
+    let own_template = expanded(
+        "[template.approved]\nparams = { name = 'string' }\nbody = \"[app.${name}]\\nimage = 'web:latest'\\n\"\n[use.x]\ntemplate = 'approved'\nname = 'web'\n",
+    );
+    for config in [by_hand, own_template] {
+        assert_eq!(
+            config.app["web"]
+                .provenance
+                .as_ref()
+                .map(|p| p.template.as_str()),
+            Some("approved")
+        );
+        let evaluation = evaluate(&set, &config, &deployer(), Source::Apply);
+        assert!(evaluation.verdict.denials.is_empty());
+    }
+}
+
 #[test]
 fn a_policy_default_fills_an_app_a_template_expanded_to() {
     let set = compile(
@@ -1663,4 +1696,108 @@ fn an_audit_with_nothing_to_report_says_so() {
             .as_deref()
             .is_some_and(|reason| reason.contains("relish policy delete old"))
     );
+}
+
+/// #1431: each nested macro multiplies the cost by the input's size, so a
+/// policy may nest them two deep (a list compared with itself) and no
+/// deeper. The check counts comprehensions, not text: macros side by side,
+/// or one in another's range, are fine.
+#[test]
+fn macros_nest_at_most_two_deep() {
+    let check = |deny: &str| {
+        let spec = PolicySpec {
+            deny: Some(deny.to_string()),
+            ..policies("[policy.p]\ndeny = 'true'\n")["p"].clone()
+        };
+        check_policy("p", &spec)
+    };
+    for allowed in [
+        "app.command.all(a, a != '')",
+        "app.command.all(a, app.command.exists_one(b, a == b))",
+        "app.command.map(a, a).all(b, b != '') && app.command.exists(c, c == 'x')",
+    ] {
+        assert_eq!(check(allowed), Ok(()), "{allowed}");
+    }
+    let error =
+        check("app.command.all(a, app.command.all(b, app.command.all(c, a == b)))").unwrap_err();
+    assert_eq!(
+        error,
+        PolicyError::TooDeep {
+            field: PolicyField::Deny,
+            depth: 3,
+            limit: MAX_COMPREHENSION_NESTING,
+        }
+    );
+    assert!(error.to_string().contains("over the limit of 2"), "{error}");
+}
+
+/// #1431: a workload with a list or map bigger than the cap isn't judged.
+/// Every policy that applies fails closed, naming the field, as a broken
+/// expression does: a deny refuses, a warn warns. At the cap it's judged
+/// as usual.
+#[test]
+fn a_workload_with_too_big_a_collection_fails_closed() {
+    let set = compile(
+        "[policy.refuse]\ndeny = \"app.image == 'nope'\"\n\
+         [policy.mention]\naction = 'warn'\ndeny = \"app.image == 'nope'\"\n",
+    );
+    let env = |entries: usize| {
+        (0..entries)
+            .map(|index| format!("K{index} = 'v'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let at_cap = apps(&format!(
+        "[app.web]\nimage = 'web:v1'\nenv = {{ {} }}\n",
+        env(MAX_COLLECTION_ENTRIES)
+    ));
+    let evaluation = evaluate(&set, &at_cap, &deployer(), Source::Apply);
+    assert!(evaluation.verdict.is_empty(), "{:?}", evaluation.verdict);
+
+    let over = apps(&format!(
+        "[app.web]\nimage = 'web:v1'\nenv = {{ {} }}\n",
+        env(MAX_COLLECTION_ENTRIES + 1)
+    ));
+    let evaluation = evaluate(&set, &over, &deployer(), Source::Apply);
+    assert_eq!(
+        decisions(&evaluation.verdict),
+        vec![
+            (
+                "refuse".to_string(),
+                PolicyAction::Deny,
+                "default/web".to_string()
+            ),
+            (
+                "mention".to_string(),
+                PolicyAction::Warn,
+                "default/web".to_string()
+            ),
+        ]
+    );
+    assert!(
+        evaluation.verdict.denials[0]
+            .message
+            .contains("env has more than 1024 entries"),
+        "{}",
+        evaluation.verdict.denials[0].message
+    );
+}
+
+/// #1431: `admit_blocking` gives the same answer as `admit`, from a
+/// blocking thread.
+#[tokio::test]
+async fn admit_blocking_judges_like_admit() {
+    let committed = policies("[policy.no-latest]\ndeny = \"app.image.endsWith(':latest')\"\n");
+    let config = apps("[app.web]\nimage = 'web:latest'\n");
+    let inline = admit(
+        &committed,
+        3,
+        &config,
+        &deployer(),
+        Source::Apply,
+        Vec::new(),
+    );
+    let blocking = admit_blocking(committed, 3, config, deployer(), Source::Apply).await;
+    assert_eq!(blocking, inline);
+    assert!(matches!(blocking, Err(AdmitError::Denied(_))));
 }

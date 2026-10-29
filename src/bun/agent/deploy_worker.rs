@@ -654,13 +654,11 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         if spec.sidecar.is_empty() {
             return Ok(());
         }
-        let names = spec
-            .sidecar
-            .iter()
-            .map(|sidecar| sidecar.name.clone())
-            .collect();
-        let registered = self.ops.register_sidecars(instance_id, names).await?;
-        let launches = super::sidecars::sidecar_launches(spec, instance_id, app_oci);
+        let registered = self
+            .ops
+            .register_sidecars(instance_id, spec.sidecar.clone())
+            .await?;
+        let launches = super::sidecars::sidecar_launches(&spec.sidecar, instance_id, app_oci);
         let Err(failure) = super::sidecars::launch_sidecars(
             &self.grill,
             &self.secrets,
