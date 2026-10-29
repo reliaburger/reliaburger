@@ -717,8 +717,21 @@ never marked latest. Nothing can mistake it for a release:
 - `docs/website/install.sh` refuses a mirror whose last path segment starts
   with `nightly-` unless `RELIABURGER_ACCEPT_NIGHTLY=1`, and
   `nightly-qualify.sh` sets that for its soaks and nothing else does;
-- even with that set by hand, a released `relish` or `bun` refuses the
-  nightly's signatures, because it doesn't trust the nightly key.
+- on a fresh install that variable is the only guard. Set by hand, it lets
+  the bootstrap run the nightly's own `install.sh`, which installs the
+  nightly's own `relish`, and that one trusts the nightly key. What the keys
+  guarantee is the other direction: a released `relish` or `bun` already on a
+  machine refuses the nightly's signatures, so nothing released installs or
+  upgrades to a nightly.
+
+The nightly's binaries aren't the candidate's bytes, either. They're built
+from the same commit, but with the `nightly-signing` feature, which changes
+the keys `src/upgrade/keys.rs` trusts and nothing else. A green night says
+the candidate's *code* passed the long tiers; the staged installs at freeze
+still run on the candidate's own signed build. The portable Linux CI job runs
+the nightly build's key test (`cargo test --features nightly-signing
+upgrade::keys::`), so the one difference is tested on every run
+([#1442](https://github.com/reliaburger/reliaburger/issues/1442)).
 
 Before any tier, `nightly-qualify.sh` checks the staged build's
 `candidate.json` against the digest and the tip, and checks its guest images'
