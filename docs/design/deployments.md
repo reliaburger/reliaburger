@@ -989,8 +989,9 @@ evaluates one.
   `PolicyAction::Audit` puts a finding in `Verdict::audits`: the apply goes
   ahead, the caller isn't told, and `cluster_apply` and `job_apply` record one
   `policy.audited` event; the GitOps runner logs it to stderr. `GET
-  /v1/policies/audit` (any token) runs `policy::audit::audit` on a copy of
-  desired state in `spawn_blocking`: every committed app (declared spec where
+  /v1/policies/audit` (any token) runs `policy::audit::audit_visible` on a copy of
+  desired state in `spawn_blocking`, keeping only the workloads the token's
+  scope allows (counts included, #1432): every committed app (declared spec where
   kept, else the stored one with its image read back as its tag) through
   `judge_app`, as the owner's token (with its role) for apps a controller
   owns (#1125), as `gitops` for apps GitOps owns and as the system caller

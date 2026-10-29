@@ -86,7 +86,8 @@ pub(super) async fn policy_delete_handler(
 
 /// `GET /v1/policies/audit` — every committed app and job the policies in
 /// force would now refuse, warn about or record (#1119). It judges and
-/// changes nothing. Any token may read it, as it may read the policies.
+/// changes nothing. Any token may read it, as it may read the policies,
+/// but a token limited to some apps or namespaces sees only those (#1432).
 pub(super) async fn policy_audit_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -102,7 +103,15 @@ pub(super) async fn policy_audit_handler(
     // Judging every workload is CPU work, so it runs off the async
     // threads, on a copy of desired state rather than under its lock.
     let desired = council.desired_state().await;
-    match tokio::task::spawn_blocking(move || crate::policy::audit::audit(&desired)).await {
+    let auth = auth.map(|auth| auth.0);
+    let visible = move |id: &crate::meat::AppId| {
+        crate::sesame::auth::authorize_scoped(auth.as_ref(), &id.name, &id.namespace).is_ok()
+    };
+    match tokio::task::spawn_blocking(move || {
+        crate::policy::audit::audit_visible(&desired, visible)
+    })
+    .await
+    {
         Ok(audit) => Json(audit).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
