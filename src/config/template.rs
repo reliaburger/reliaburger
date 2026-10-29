@@ -50,6 +50,16 @@ const ESCAPED_OPEN: &str = "$${";
 /// The `[use.*]` key that names the template, so no parameter can take it.
 const TEMPLATE_KEY: &str = "template";
 
+/// The most text one `use` may expand to (#1425). A body of `${v}`
+/// placeholders and a long value multiply, so without a cap a request
+/// under the 2 MB body limit could ask for hundreds of gigabytes.
+pub const MAX_EXPANDED_BYTES: usize = 4 * 1024 * 1024;
+
+/// The most text all the `use`s in one expansion (one manifest, or one
+/// file of a GitOps tree) may expand to together, so many uses each under
+/// [`MAX_EXPANDED_BYTES`] can't add up to the same problem.
+pub const MAX_TOTAL_EXPANDED_BYTES: usize = 16 * 1024 * 1024;
+
 /// A `[template.NAME]` table: typed parameters and a body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -336,6 +346,20 @@ pub enum TemplateError {
         template: String,
         table: String,
     },
+    /// The expansion would pass the size limit (#1425). `limit` is the
+    /// budget this use had: [`MAX_EXPANDED_BYTES`], or less once earlier
+    /// uses had spent part of [`MAX_TOTAL_EXPANDED_BYTES`].
+    #[error(
+        "use.{instance}: template {template:?} expands to more than {} KiB; template expansion is limited to {} KiB per use and {} KiB per file",
+        limit / 1024,
+        MAX_EXPANDED_BYTES / 1024,
+        MAX_TOTAL_EXPANDED_BYTES / 1024
+    )]
+    TooLarge {
+        instance: String,
+        template: String,
+        limit: usize,
+    },
     /// An expanded name someone else already has.
     #[error("use.{instance} expands to {resource}, which {other} already declares")]
     Clash {
@@ -373,8 +397,11 @@ pub fn expand(
     let uses = std::mem::take(&mut config.uses);
     // Which `use` made each resource so far, to name it in a clash.
     let mut made: BTreeMap<String, String> = BTreeMap::new();
+    let mut remaining = MAX_TOTAL_EXPANDED_BYTES;
     for (instance, spec) in &uses {
-        let body = expand_one(instance, spec, templates)?;
+        let limit = remaining.min(MAX_EXPANDED_BYTES);
+        let (body, size) = expand_one(instance, spec, templates, limit)?;
+        remaining -= size;
         let provenance = Provenance {
             template: spec.template.clone(),
             instance: instance.clone(),
@@ -421,12 +448,14 @@ fn resource_kind(resource: &str) -> &str {
     resource.split('.').next().unwrap_or(resource)
 }
 
-/// Expand one `use` into the config its body declares.
+/// Expand one `use` into the config its body declares, and the size of
+/// the text it expanded to, which may be at most `limit` bytes.
 fn expand_one(
     instance: &str,
     spec: &UseSpec,
     templates: &BTreeMap<String, TemplateSpec>,
-) -> Result<Config, TemplateError> {
+    limit: usize,
+) -> Result<(Config, usize), TemplateError> {
     if !super::valid_workload_label(instance) {
         return Err(TemplateError::InvalidUse {
             instance: instance.to_string(),
@@ -440,13 +469,18 @@ fn expand_one(
             template: spec.template.clone(),
         })?;
     let values = bind(instance, spec, template)?;
-    let text = substitute(&template.body, &values).map_err(|(parameter, reason)| {
-        TemplateError::Placement {
+    let text = substitute(&template.body, &values, limit).map_err(|error| match error {
+        Unfillable::Placement { parameter, reason } => TemplateError::Placement {
             instance: instance.to_string(),
             template: spec.template.clone(),
             parameter: parameter.to_string(),
             reason,
-        }
+        },
+        Unfillable::TooLarge => TemplateError::TooLarge {
+            instance: instance.to_string(),
+            template: spec.template.clone(),
+            limit,
+        },
     })?;
     let body = Config::parse(&text).map_err(|error| TemplateError::Body {
         instance: instance.to_string(),
@@ -454,7 +488,7 @@ fn expand_one(
         reason: error.to_string(),
     })?;
     check_body(instance, &spec.template, &body)?;
-    Ok(body)
+    Ok((body, text.len()))
 }
 
 /// Give every parameter its value: the `use`'s, or the default.
@@ -709,27 +743,46 @@ fn advance(context: Context, rest: &str) -> (Context, usize) {
     }
 }
 
-/// Fill every placeholder in `body`. An error names the parameter and why
-/// its value can't go where its placeholder is.
+/// Why [`substitute`] couldn't fill a body.
+enum Unfillable<'a> {
+    /// A value can't go where its placeholder is.
+    Placement { parameter: &'a str, reason: String },
+    /// The text would pass its size limit.
+    TooLarge,
+}
+
+/// Fill every placeholder in `body`, producing at most `limit` bytes. An
+/// error names the parameter and why its value can't go where its
+/// placeholder is, or says the text grew past `limit`. The length is
+/// checked before each piece is added, so a body that would expand to
+/// gigabytes stops at `limit`.
 fn substitute<'a>(
     body: &str,
     values: &BTreeMap<&'a str, &ParamValue>,
-) -> Result<String, (&'a str, String)> {
+    limit: usize,
+) -> Result<String, Unfillable<'a>> {
+    let placement =
+        |parameter: &'a str, reason: String| Unfillable::Placement { parameter, reason };
     // `check_template` ran first, so the body scans and every placeholder
     // names a parameter; `bind` gave every parameter a value.
-    let pieces = scan(body).map_err(|reason| ("", reason))?;
-    let mut text = String::with_capacity(body.len());
+    let pieces = scan(body).map_err(|reason| placement("", reason))?;
+    let mut text = String::with_capacity(body.len().min(limit));
     for piece in pieces {
-        match piece {
-            Piece::Text(part) => text.push_str(part),
+        let rendered = match piece {
+            Piece::Text(part) => std::borrow::Cow::Borrowed(part),
             Piece::Placeholder { name, slot } => {
                 let (parameter, value) = values
                     .get_key_value(name)
-                    .ok_or(("", format!("${{{name}}} has no value")))?;
-                let rendered = render(value, slot).map_err(|reason| (*parameter, reason))?;
-                text.push_str(&rendered);
+                    .ok_or_else(|| placement("", format!("${{{name}}} has no value")))?;
+                std::borrow::Cow::Owned(
+                    render(value, slot).map_err(|reason| placement(parameter, reason))?,
+                )
             }
+        };
+        if text.len().saturating_add(rendered.len()) > limit {
+            return Err(Unfillable::TooLarge);
         }
+        text.push_str(&rendered);
     }
     Ok(text)
 }
