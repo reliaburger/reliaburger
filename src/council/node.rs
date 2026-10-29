@@ -78,6 +78,9 @@ pub struct CouncilNode {
     /// Whether this voter is holding its elections while leadership moves
     /// off it (#755).
     election_hold: ElectionHold,
+    /// The leadership proof callers share, so a burst of requests doesn't
+    /// send a burst of heartbeat rounds (#1441).
+    leadership_proof: super::proof::SharedProof,
     /// Test hook: writes and linearizable reads never return, as they don't
     /// on a leader that has lost its quorum and not yet stepped down.
     #[cfg(test)]
@@ -89,6 +92,9 @@ pub struct CouncilNode {
     /// desired state, so a loop can be shown not to (#1030).
     #[cfg(test)]
     full_desired_reads: std::sync::atomic::AtomicU64,
+    /// Test hook: how many leadership proofs this node has run (#1441).
+    #[cfg(test)]
+    leadership_proofs: std::sync::atomic::AtomicU64,
 }
 
 impl CouncilNode {
@@ -132,6 +138,7 @@ impl CouncilNode {
             raft,
             raft_id,
             election_hold,
+            leadership_proof: super::proof::SharedProof::new(),
             state_machine,
             node_fault_membership: tokio::sync::Mutex::new(()),
             consumer_contacts: tokio::sync::Mutex::new(crate::onion::lease::ConsumerContacts::new(
@@ -145,6 +152,8 @@ impl CouncilNode {
             hung_writes: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             full_desired_reads: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            leadership_proofs: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -287,12 +296,24 @@ impl CouncilNode {
         self.raft.current_leader().await
     }
 
-    /// Return `true` if this node is the current leader.
+    /// Return `true` if this node is the current leader, proved by a quorum
+    /// answering a heartbeat sent after this call.
+    ///
+    /// Concurrent callers share one proof at a time (#1441): a caller that
+    /// arrives while one runs waits for the next, which every caller that
+    /// arrived meanwhile shares.
     pub async fn is_leader(&self) -> bool {
         if self.fenced_error().is_some() {
             return false;
         }
-        self.raft.ensure_linearizable().await.is_ok()
+        self.leadership_proof
+            .run(|| async {
+                #[cfg(test)]
+                self.leadership_proofs
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.raft.ensure_linearizable().await.is_ok()
+            })
+            .await
     }
 
     /// Return `true` once this node proves it leads, trying until `within`
@@ -1269,6 +1290,56 @@ mod tests {
                 .is_err()
         );
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    // #1441: every request a loaded leader serves asks it to confirm it
+    // leads. Each used to run its own proof, a heartbeat to every follower,
+    // in parallel and every heartbeat interval, multiplying heartbeat traffic
+    // just when the followers were slow to answer it.
+    #[tokio::test]
+    async fn concurrent_confirmations_share_one_proof_at_a_time() {
+        use std::sync::atomic::Ordering;
+
+        let (nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        for node in &nodes {
+            node.hold_elections_until(std::time::Instant::now() + Duration::from_secs(30));
+        }
+        let leader = &nodes[(leader_id - 1) as usize];
+        // Requests that share a proof all get its answer.
+        let answers = futures_util::future::join_all(
+            (0..50).map(|_| leader.confirm_leadership(Duration::from_secs(5))),
+        )
+        .await;
+        assert!(answers.iter().all(|confirmed| *confirmed));
+
+        for follower in (1..=3).filter(|id| *id != leader_id) {
+            router.partition(leader_id, follower).await;
+        }
+        let window = Duration::from_millis(600);
+
+        // How many proofs one request runs while the followers can't answer.
+        let before = leader.leadership_proofs.load(Ordering::SeqCst);
+        assert!(!leader.confirm_leadership(window).await);
+        let alone = leader.leadership_proofs.load(Ordering::SeqCst) - before;
+
+        // Fifty requests at once.
+        let before = leader.leadership_proofs.load(Ordering::SeqCst);
+        let confirmations = (0..50).map(|_| leader.confirm_leadership(window));
+        let answers = futures_util::future::join_all(confirmations).await;
+        let together = leader.leadership_proofs.load(Ordering::SeqCst) - before;
+        assert!(answers.iter().all(|confirmed| !confirmed));
+        // Proofs never overlap now, but a failed one ends at once and each
+        // request sleeps its own retry pause, so requests that wake just
+        // after a round start the next. Unshared, fifty ran fifty times as
+        // many as one alone.
+        assert!(
+            together <= 4 * alone,
+            "fifty requests ran {together} proofs; one alone ran {alone}"
+        );
     }
 
     #[tokio::test]
