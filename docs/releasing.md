@@ -211,8 +211,11 @@ is the first to keep its predecessor's pair, so a 0.2.2 cluster could roll
 onto it in place
 ([upgrading from 0.2.2](#upgrading-from-022)). That walk, the first between
 two published releases, ran on 29 October 2026
-([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md)). Qualifying a release's walk from its predecessor
-is a goal, not a release gate. The pre-1.0 rule for known harness artefacts in
+([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md)). 0.2.4
+bumps both again (protocol 55, state format 72), so a 0.2.3 cluster moves to
+it as a fresh cluster ([upgrading from 0.2.3](#upgrading-from-023)).
+Qualifying a release's walk from its predecessor is a goal, not a release
+gate. The pre-1.0 rule for known harness artefacts in
 the V02 soak (step 4 of [staging a candidate](#staging-a-candidate))
 stays as it is.
 
@@ -485,6 +488,21 @@ moved its replicas
 releases do it on any Bun restart; 0.2.4 fixes it. Expect your apps to
 restart, and sometimes move, once per node during this walk.
 
+### Upgrading from 0.2.3
+
+0.2.4 can't roll onto a 0.2.3 cluster. Policies, templates, sidecars, stop
+hooks, secret provider references, runtime knobs and resource owners all
+live in Raft desired state and node syncs, and nodes report the secret
+providers, runtime knobs and shared networks they support (the full list is
+in `src/compatibility.rs`). So the protocol moved from 53 to 55 and the state
+format from 70 to 72, and a 0.2.3 leader refuses `relish upgrade start v0.2.4`
+before it records a run.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses. The next release that keeps 0.2.4's pair can
+roll from it, and it won't move a restarting node's replicas
+([#1449](https://github.com/reliaburger/reliaburger/issues/1449)).
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
@@ -653,7 +671,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.2.3` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.4` today), so
 bump that default in the same change that announces a newer release. Both
 scripts need a mode, `--laptop` or `--install-only`; with none they explain the
 choices and exit 2. For a release from before 0.2.2 the bootstrap drops

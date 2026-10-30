@@ -2,7 +2,7 @@
 
 **A whitepaper on the design, architecture, and vision for Reliaburger, a radically simplified container orchestration platform written in Rust.**
 
-**Version 0.2.3, October 2026**
+**Version 0.2.4, October 2026**
 
 ---
 
@@ -1048,7 +1048,7 @@ guard, never a daily qualification: the 100-million-a-day claim needs the
 
 ## 20. Self-Upgrades
 
-Since every component of a node lives in the one `bun` binary, upgrading a node means replacing that binary and restarting the Bun process. The system automates this in a rolling fashion: workers upgrade first (with configurable parallelism), then council members one at a time to maintain quorum, then the leader upgrades last (in place — a council of three or more keeps quorum through the sub-second exec bounce; openraft 0.9 has no graceful leadership transfer). Application workloads are never interrupted, because the container runtime manages containers independently of Bun. During the rolling upgrade window, old and new binaries coexist, but only when both speak the same formats. Every binary carries a cluster protocol generation and a durable state generation (`src/compatibility.rs`), and nodes refuse peers, snapshots, backups and data directories stamped with a different pair. Before 1.0.0 we don't keep backwards compatibility at all: a release that changes a wire or storage format bumps a generation, and upgrading across that bump means starting a fresh cluster, with no migration (see [compatibility before 1.0.0](releasing.md#compatibility-before-100)). So until 1.0, self-upgrade works only between builds of the same format. Every release from 0.1.0 to 0.2.2 bumped one. 0.2.3 is the first patch release that keeps its predecessor's formats; qualifying a real published-to-published rolling walk from 0.2.2 to it is a goal. A compatibility promise across versions is a post-1.0 goal.
+Since every component of a node lives in the one `bun` binary, upgrading a node means replacing that binary and restarting the Bun process. The system automates this in a rolling fashion: workers upgrade first (with configurable parallelism), then council members one at a time to maintain quorum, then the leader upgrades last (in place — a council of three or more keeps quorum through the sub-second exec bounce; openraft 0.9 has no graceful leadership transfer). Application workloads are never interrupted, because the container runtime manages containers independently of Bun. During the rolling upgrade window, old and new binaries coexist, but only when both speak the same formats. Every binary carries a cluster protocol generation and a durable state generation (`src/compatibility.rs`), and nodes refuse peers, snapshots, backups and data directories stamped with a different pair. Before 1.0.0 we don't keep backwards compatibility at all: a release that changes a wire or storage format bumps a generation, and upgrading across that bump means starting a fresh cluster, with no migration (see [compatibility before 1.0.0](releasing.md#compatibility-before-100)). So until 1.0, self-upgrade works only between builds of the same format. Every release from 0.1.0 to 0.2.2 bumped one. 0.2.3 is the first patch release that kept its predecessor's formats, and a three-node cluster rolled from the published 0.2.2 onto it in place ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md)). 0.2.4 bumps both again, so a 0.2.3 cluster moves to it as a fresh cluster. A compatibility promise across versions is a post-1.0 goal.
 
 Reliaburger verifies binary integrity via dual signatures: an embedded signing key set compiled into the binary AND an external signing key configured in `node.toml`. Network upgrades require both signatures. Published release metadata carries only the release signature, so `relish upgrade start <version>` countersigns each download with the operator's key (`--external-key`) or takes a countersigned envelope (`--sig`). It picks the build for the platform each node reports rather than the one relish runs on, and a cluster that mixes architectures gets one build per platform. Before staging, each node runs the verified candidate once with `--compatibility` and refuses a binary whose formats differ or that doesn't answer within 60 seconds, a hang guard sized for macOS, which assesses every new executable before its first run. Automatic rollback triggers if a node fails to start on the new version.
 
@@ -1159,7 +1159,7 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 
 ## 23. Comparison Matrix
 
-The Reliaburger column describes 0.2.3. Rows marked *Target* are design goals from §2 that no release has measured yet, and *Planned* rows aren't in the binary; the [scope and limits](README.md#scope-and-limits) and the [release order](roadmap.md#releases-after-010) say what ships and when the rest is due.
+The Reliaburger column describes 0.2.4. Rows marked *Target* are design goals from §2 that no release has measured yet, and *Planned* rows aren't in the binary; the [scope and limits](README.md#scope-and-limits) and the [release order](roadmap.md#releases-after-010) say what ships and when the rest is due.
 
 | | Kubernetes | k3s / k0s | Nomad | Docker Compose | **Reliaburger** |
 |---|---|---|---|---|---|

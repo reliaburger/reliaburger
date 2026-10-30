@@ -23,6 +23,8 @@ measurement=importlib.util.module_from_spec(spec);spec.loader.exec_module(measur
 spec=importlib.util.spec_from_file_location('tiers',HERE/'record-job-tiers.py')
 tiers=importlib.util.module_from_spec(spec);spec.loader.exec_module(tiers)
 SCENARIOS=['jobs-vm-baseline','jobs-containers','jobs-shared-containers','jobs-host-processes']
+# The chapter each scenario opens, as the homepage's chapter buttons name it.
+CHAPTERS=dict(zip(SCENARIOS,['VM baseline','Fresh containers','Shared containers','Host jobs']))
 RUNTIMES=dict(zip(SCENARIOS[1:],['runc','shared-runc','process']))
 
 
@@ -117,6 +119,7 @@ def main():
             env=dict(os.environ,RELIABURGER_BENCH_EXEC=str(options.host_binary),RELIABURGER_BENCH_REPORT=str(destination/'report.json'))
             args=command(scenario,options.seconds,options.concurrency,prefix)
             report['chapters'].append(dict(scenario=scenario,start_seconds=time.monotonic()-started))
+            cast.marker(CHAPTERS[scenario],time.monotonic())
             cast.emit('$ '+shlex.join(args),time.monotonic())
             observer=Observations(options);observer.thread.start()
             process=None

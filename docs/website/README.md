@@ -66,7 +66,7 @@ so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.2.3
+  --record docs/website/assets/tour.cast --install v0.2.4
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -89,18 +89,22 @@ port. The recording says which ports it used and shows the commands with them.
 `--record` runs the tour inside `asciinema rec` (110x32, idle time cut to two
 seconds) and then plays the setup step four times faster, because setup redraws
 its timers several times a second and idle trimming can't shorten it. The
-narration says both, and every wait prints how long it really took. It applies
+narration says both, and every wait prints how long it really took. Each step
+opens with a bold `» Title` line, and the post-processing puts an asciicast
+marker (`"m"` event) on it with the same title. The vendored player shows
+markers as chapters on its progress bar without any option, and `[` and `]`
+jump between them. The script applies
 the demo URL when it answers, and `examples/kubernetes/podinfo.yaml` (with a
 note) when it doesn't; likewise it copies `examples/demo/burger` unless the
 published tarball holds exactly that directory. Until a promotion's site
 change deploys, the live tarball is the previous release's, so a re-record
 always shows the repository copy, and says so on screen. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.2.3` on the default ports.
+`--install v0.2.4` on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
 `--record` writes the installed version into the cast's title (`Reliaburger
-0.2.3: the five-minute tour`), and the caption under the player names it too.
+0.2.4: the five-minute tour`), and the caption under the player names it too.
 `tests/suite/website.rs` checks that both match `install.sh`'s default, so a
 promotion that forgets the re-record fails CI.
 
@@ -174,8 +178,11 @@ delete the `jobs.svg` an app soak record also draws. `tests/suite/website.rs`
 fails while a chart differs from its record's copy, comes from another
 release, lacks alt text, a size or lazy loading, or sits in `assets/soak/`
 without being shown, and while the section misses any of the seven charts.
-A release with a headline record of its own can show its charts too: 0.2.3
-adds the day run's job rate and memory, copied the same way.
+A release with a headline record of its own can show its charts while it's
+the installed release, copied the same way: 0.2.3 showed the day run's job
+rate and memory. The test wants every chart from the installed release's
+records, so the next promotion removes them; the headline paragraph in the
+jobs section keeps its links to the record.
 
 ### Commands the installed release doesn't have
 
@@ -202,7 +209,7 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.2.3` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.2.4` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. Every line the site shows names a
 mode (`sh -s -- --laptop`): with no arguments both scripts only explain the
 choices and exit 2, and the bootstrap does it before downloading anything.

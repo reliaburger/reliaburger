@@ -25,6 +25,10 @@
 #       2 s), then play the setup step SETUP_SPEEDUP (4) times faster. Setup
 #       redraws its timers several times a second, so idle trimming alone
 #       would leave a minute and a half of VM boots. Both are said on screen.
+#       Each step of the tour starts with a bold "» Title" line, and the
+#       recording gets a marker there with the same title, which
+#       asciinema-player shows as a chapter on its progress bar ([ and ]
+#       jump between them).
 #   ... [--api-port PORT] [--ingress-port PORT] [--registry-port PORT]
 #       Give the tour's cluster these host ports instead of the defaults
 #       (19117, 18080, 15050), so it can run beside another laptop cluster.
@@ -53,6 +57,10 @@ REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 PAGE="${REPO_DIR}/docs/website/index.html"
 BURGER_URL="https://reliaburger.com/demo/burger.tar.gz"
 BURGER_FETCH="curl -fsSL ${BURGER_URL} | tar xz"
+# 0.2.4's example policies, from the release's tag: the demo archive is
+# built from the tag too, so the tour never needs a file the release lacks.
+PLATFORM_FETCH="curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.4/examples/policies/platform.toml"
+POLICY_TEST="relish policy test -f platform.toml -f burger/burger.toml"
 # The burger as the page shows it, on the default ingress port.
 BURGER="curl http://burger.localhost:18080"
 # The burger's layers, top to bottom, each its own app.
@@ -122,6 +130,8 @@ known_command() {
         | "relish apply burger/patty-v3.toml" \
         | "relish history patty" \
         | "relish apply burger/triple-patty.toml" \
+        | "${PLATFORM_FETCH}" \
+        | "${POLICY_TEST}" \
         | "relish fault kill patty --acknowledge" \
         | "relish events --app patty" \
         | "relish path counter --to patty" \
@@ -177,7 +187,7 @@ if [[ "${MODE}" == "record" ]]; then
     # Play setup faster: divide the gaps between its first and last lines.
     # asciicast v3 stores each event's gap since the previous one.
     python3 - "${CAST}" "${SETUP_SPEEDUP}" <<'PYTHON'
-import json, sys
+import json, re, sys
 path, factor = sys.argv[1], float(sys.argv[2])
 lines = open(path, encoding="utf-8").read().splitlines()
 header, events = json.loads(lines[0]), [json.loads(line) for line in lines[1:]]
@@ -189,9 +199,21 @@ if start is not None:
     end = next(i for i, e in enumerate(events[start:], start) if "ready in" in str(e[2]))
     for event in events[start + 1 : end + 1]:
         event[0] = round(event[0] / factor, 3)
+# A marker at each step's "» Title" line. asciicast v3 stores each event's
+# gap since the one before, so the marker takes the line's gap and the line
+# follows it with none; v2 stores absolute times.
+heading = re.compile("\x1b\\[1m» ([^\x1b]+)\x1b\\[0m")
+marked = []
+for event in events:
+    if event[1] == "o":
+        for found in heading.finditer(event[2]):
+            marked.append([event[0], "m", found.group(1)])
+            if header.get("version") == 3:
+                event[0] = 0.0
+    marked.append(event)
 with open(path, "w", encoding="utf-8") as cast:
     cast.write(json.dumps(header) + "\n")
-    for event in events:
+    for event in marked:
         cast.write(json.dumps(event, ensure_ascii=False) + "\n")
 PYTHON
     exit 0
@@ -255,16 +277,48 @@ say() {
     printf '%s# %s%s\n' "${DIM}" "$*" "${RESET}"
 }
 
+# The title of the tour step that command $1 opens, after command $2, or
+# nothing when $1 carries on a step. The titles follow the manual's
+# five-minute tour, shortened to fit a chapter list.
+step_title() {
+    case "$1" in
+        "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop") echo "Install" ;;
+        "${BURGER_FETCH}") echo "Build the burger" ;;
+        "relish apply burger/burger.toml") echo "Run it" ;;
+        "${BURGER}") [[ "$2" == "relish council status" ]] && echo "The burger" ;;
+        "relish batch submit burger/jobs.toml") echo "Cook a batch" ;;
+        "relish fault partition lettuce --from counter --duration 30s --acknowledge") echo "Cut a layer off" ;;
+        "relish apply burger/cheese-v2.toml") echo "Roll forward" ;;
+        "relish apply burger/patty-v3.toml") echo "Roll back" ;;
+        "relish apply burger/triple-patty.toml") echo "Scale up" ;;
+        "${PLATFORM_FETCH}") echo "House rules" ;;
+        "relish fault kill patty --acknowledge") echo "Kill a patty" ;;
+        "relish path counter --to patty") echo "The whole path" ;;
+        "relish metrics counter") echo "Metrics" ;;
+        "relish fault delay patty 300ms --from counter --duration 2m --acknowledge") echo "Slow it down" ;;
+        "relish dashboard") echo "Dashboard" ;;
+        "relish local stop node-3") echo "Lose a node" ;;
+        "relish wtf") echo "What's wrong?" ;;
+    esac
+    return 0
+}
+
+# A step's bold title line. The recording's post-processing puts a chapter
+# marker on it.
+step_heading() {
+    printf '%s» %s%s\n' "${BOLD}" "$1" "${RESET}"
+}
+
 # Type a command at a prompt, a character at a time.
 type_command() {
     local text="$1" i
     printf '%s$%s ' "${GREEN}${BOLD}" "${RESET}"
-    sleep 0.6
+    sleep 0.3
     for ((i = 0; i < ${#text}; i++)); do
         printf '%s' "${text:i:1}"
-        sleep "0.0$((RANDOM % 5 + 2))"
+        sleep "0.0$((RANDOM % 3 + 1))"
     done
-    sleep 0.5
+    sleep 0.3
     printf '\n'
 }
 
@@ -275,7 +329,7 @@ show() {
     type_command "$1"
     eval "$1" || true
     printf '\n'
-    sleep 1.5
+    sleep 1
 }
 
 # The same, in the build step's scratch directory.
@@ -283,7 +337,7 @@ show_in_work() {
     type_command "$1"
     (cd "${BURGER_WORK}" && eval "$1") || true
     printf '\n'
-    sleep 1.5
+    sleep 1
 }
 
 # Whether the published demo archive holds exactly the repository's
@@ -438,12 +492,12 @@ run_dashboard() {
         sleep 0.5
     done
     cat "${log}"
-    sleep 4
+    sleep 3
     kill -INT "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
     printf '^C\n\n'
     rm -f "${log}"
-    sleep 1
+    sleep 0.5
 }
 
 say "The five-minute tour from reliaburger.com, on a real three-node laptop cluster,"
@@ -456,13 +510,17 @@ if [[ -n "${SETUP_PORTS}" ]]; then
     say "Another laptop cluster holds the default ports, so this one uses${SETUP_PORTS}."
 fi
 printf '\n'
-sleep 2
+sleep 1
 
 # The commands arrive on descriptor 3, so a command that reads standard input
 # can't swallow the rest of the tour.
 previous=""
 while IFS= read -r command <&3; do
     start_sampling
+    title=$(step_title "${command}" "${previous}")
+    if [[ -n "${title}" ]]; then
+        step_heading "${title}"
+    fi
     case "${command}" in
         "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop")
             if [[ -n "${INSTALL_VERSION}" ]]; then
@@ -532,7 +590,7 @@ while IFS= read -r command <&3; do
             BATCH_ID=$(sed -n 's/^manifest \([0-9][0-9]*\) submitted.*/\1/p' "${BURGER_WORK}/submit.log")
             [[ -n "${BATCH_ID}" ]] || { echo "batch submit printed no manifest number" >&2; exit 1; }
             printf '\n'
-            sleep 1.5
+            sleep 1
             ;;
         "relish batch watch 1")
             type_command "relish batch watch ${BATCH_ID}"
@@ -554,11 +612,11 @@ while IFS= read -r command <&3; do
             say "All 10 tasks succeeded; the burger kept serving orders."
             resource_readout "the batch"
             printf '\n'
-            sleep 1.5
+            sleep 1
             ;;
         "relish build burger/burger.toml" | "relish apply burger/burger.toml" \
         | "relish apply burger/cheese-v2.toml" | "relish apply burger/patty-v3.toml" \
-        | "relish apply burger/triple-patty.toml")
+        | "relish apply burger/triple-patty.toml" | "${PLATFORM_FETCH}" | "${POLICY_TEST}")
             show_in_work "${command}"
             ;;
         "relish jobs")
@@ -647,4 +705,4 @@ done 3< <(tour_commands)
 resource_summary
 say "That's the tour. \`relish local destroy --yes\` removes the cluster,"
 say "and \`relish uninstall\` removes relish itself."
-sleep 3
+sleep 2

@@ -19,7 +19,7 @@ This chapter is unusual for the book: we wrote it before the code. The design
 needs more context than any of the issues can carry, and the context is mostly
 other people's mistakes. The research behind it is in the
 [extension points note](../plans/2026-10-19-research-extension-points.md), and
-the order of the work is in the [0.2.4 plan](../plans/2026-10-23-plan-0.2.4.md).
+the order of the work is in the [0.2.4 plan](../plans/archive/2026-10-23-plan-0.2.4.md).
 The sections near the end that show the Rust and the tests were
 placeholders when we started. Each issue on the 0.2.4 train filled in its
 part as it landed, and the exit test, which uses all of them, came last.

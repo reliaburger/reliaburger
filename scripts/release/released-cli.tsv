@@ -1,7 +1,7 @@
-# What relish v0.2.3 accepts, read from its -h pages by
+# What relish v0.2.4 accepts, read from its -h pages by
 # scripts/release/released_cli.py. Regenerate it when docs/website/install.sh's
 # default version changes; tests/suite/website.rs checks the two match.
-version	v0.2.3
+version	v0.2.4
 argument	relish apply	[PATH_OR_URL]
 argument	relish batch	[PATH]
 argument	relish batch cancel	<ID>
@@ -71,6 +71,8 @@ argument	relish logs-search	<SQL>
 argument	relish manual	[CHAPTER]
 argument	relish metrics	<APP>
 argument	relish path	<SOURCE>
+argument	relish policy delete	<NAME>
+argument	relish release	<APP>
 argument	relish resolve	<NAME>
 argument	relish rollback	<APP>
 argument	relish run	[ARGS]...
@@ -179,6 +181,12 @@ command	relish manual examples
 command	relish metrics
 command	relish nodes
 command	relish path
+command	relish policy
+command	relish policy audit
+command	relish policy delete
+command	relish policy list
+command	relish policy test
+command	relish release
 command	relish resolve
 command	relish rollback
 command	relish routes
@@ -494,6 +502,11 @@ option	relish path	--namespace	<NAMESPACE>
 option	relish path	--port	<PORT>	
 option	relish path	--to	<TO>	
 option	relish path	--to-namespace	<TO_NAMESPACE>	
+option	relish policy test	--caller	<CALLER>	
+option	relish policy test	--role	<ROLE>	admin,deployer,read-only
+option	relish policy test	--source	<SOURCE>	apply,gitops
+option	relish policy test	-f,--file	<FILES>	
+option	relish release	--namespace	<NAMESPACE>	
 option	relish resolve	--namespace	<NAMESPACE>	
 option	relish rollback	--force		
 option	relish rollback	--namespace	<NAMESPACE>	
