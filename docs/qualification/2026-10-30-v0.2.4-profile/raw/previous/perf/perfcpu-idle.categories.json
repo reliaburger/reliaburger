@@ -1,0 +1,31 @@
+{
+  "bun_categories": {
+    "Bun: uncategorised (extend the map)": 271.0
+  },
+  "bun_total": 271.0,
+  "categories": {
+    "Bun: uncategorised (extend the map)": 271.0,
+    "idle (no runnable work)": 38329.0,
+    "other processes and kernel threads": 151.0
+  },
+  "other_by_command": {
+    "buildkitd": 2.0,
+    "containerd": 16.0,
+    "containerd-star": 2.0,
+    "exe": 53.0,
+    "kcompactd": 1.0,
+    "ksoftirqd/": 1.0,
+    "kworker/0:0-mm_": 1.0,
+    "kworker/0:1H-kb": 1.0,
+    "kworker/1:3-eve": 1.0,
+    "kworker/u8:0-fl": 2.0,
+    "lima-guestagent": 37.0,
+    "multipathd": 1.0,
+    "perf": 8.0,
+    "rcu_preempt": 19.0,
+    "vmstat": 6.0
+  },
+  "rate": 0.0,
+  "total": 38751.0,
+  "uncategorised_share": 1.0
+}

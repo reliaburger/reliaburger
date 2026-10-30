@@ -131,7 +131,8 @@ mode=release
 [ "$(uname -s)" = Darwin ] || fail 'the bench VM is Lima with VZ on macOS'
 command -v limactl >/dev/null || fail 'limactl is required'
 command -v curl >/dev/null || fail 'curl is required'
-compilers() { { pgrep -x rustc; pgrep -x cargo; } 2>/dev/null | wc -l | tr -d ' '; }
+# pgrep exits 1 when nothing matches, which pipefail would turn into a silent exit (#1488).
+compilers() { { pgrep -x rustc || true; pgrep -x cargo || true; } 2>/dev/null | wc -l | tr -d ' '; }
 load1() { sysctl -n vm.loadavg | awk '{print $2}'; }
 running=$(compilers)
 if [ "$running" -gt 0 ]; then

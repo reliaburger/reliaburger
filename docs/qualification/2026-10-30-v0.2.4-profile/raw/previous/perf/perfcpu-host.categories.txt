@@ -1,0 +1,14 @@
+samples 39916, Bun 5609
+ 25.30%                   idle (no runnable work)
+ 14.05%  100.00% of Bun    Bun: uncategorised (extend the map)
+  4.19%                   helper/child: clone3 (process creation)
+  9.35%                   helper/child: execve
+  8.82%                   helper/child: exit and address-space teardown
+  8.79%                   helper/child: page faults
+ 12.85%                   helper: wait, poll, pipes and socket syscalls
+  2.21%                   helper: user space and other kernel
+ 11.42%                   busybox task: user space and other kernel
+  0.02%                   relish (raw scenario spawner and bench client)
+  3.01%                   other processes and kernel threads
+other by command: ksoftirqd/ 1.25%, exe 0.67%, migration/ 0.48%, perf 0.11%, kworker/1:0-eve 0.09%, kworker/3:0-eve 0.09%, lima-guestagent 0.08%, kworker/2:2-eve 0.07%, kworker/0:0-eve 0.06%, rcu_preempt 0.03%, jbd2/vda1 0.03%, containerd 0.02%
+100.0% of Bun's samples are uncategorised, over the 5% limit: extend BUN_RULES in scripts/release/profiling/profile_categories.py
