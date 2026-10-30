@@ -731,6 +731,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 format!("journalling {service_id}'s replacements")
             })?;
         }
+        // From here to `self.service_map = rolled_out?` below, a failed
+        // backend add, retirement or kernel withdrawal returns with the
+        // journal already recording the rolled-out service and memory still
+        // on the old one. That's safe, so `rolled_out` isn't applied early:
+        // the journal is a write-ahead record of what might be exposed, and
+        // being ahead of memory only makes it claim more than is exposed.
+        // A restart withdraws everything the journal names before it
+        // publishes anything, and this service's next publication, built
+        // from memory, journals over it. Only the opposite, something
+        // exposed that the journal doesn't name, would be unsafe (#351).
+        // Applying `rolled_out` before the bookkeeping instead would let
+        // that bookkeeping change the map the journal recorded.
         // DEP5: the worker routed traffic to the fresh instances (published
         // backends) before draining and stopping the old ones, so by the time
         // this op runs the cut-over has already happened. What's left is to

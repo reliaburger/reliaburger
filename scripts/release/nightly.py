@@ -9,8 +9,14 @@ README naming the exact commit. At code freeze, `freeze-check` asks whether the
 latest green nightly ran the candidate's code; if it did, the gate only adds
 the staged installs.
 
-    nightly.py run --train release-0-2-4 [--gate patch|full] [options]
-    nightly.py freeze-check --records DIR --commit SHA [--gate patch|full]
+    nightly.py run --train release-0-2-4 [--previous vX.Y.Z] [--gate full] [options]
+    nightly.py freeze-check --records DIR --commit SHA [--previous vX.Y.Z] [--gate full]
+
+Both work out the gate the commit's release needs with `release_tier.py`:
+the release is the version in the commit's Cargo.toml, the previous release
+the nearest `v*` tag behind it (`--previous` names another). `--gate` may only
+raise it: asking for the patch gate on a release that needs the full one is
+refused (#1428).
 
 The soaks install a staged build of the tip: normally the train's nightly
 build, signed with the nightly key and staged under a `nightly-` tag
@@ -38,6 +44,7 @@ import tempfile
 import time
 import urllib.request
 
+import release_tier
 from package import GUEST_METADATA, guest_image_statement, trusted_keys, verify_signature
 
 HERE = Path(__file__).resolve().parent
@@ -187,6 +194,57 @@ def freeze_problems(records, commit, tree, gate):
             for record in later]
 
 
+def required_gate(commit, previous=None, git=None):
+    """(gate, reasons, previous, release): the gate `commit`'s release needs, by release_tier's rule.
+
+    The release is the version in the commit's Cargo.toml; the previous
+    release is `previous`, or the nearest `v*` tag behind the commit.
+    Raises ValueError or CalledProcessError when git can't answer.
+    """
+    git = git or globals()["git"]
+    if previous is None:
+        previous = git("describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", commit).strip()
+    release = release_tier.cargo_version(git("show", f"{commit}:Cargo.toml"))
+    gate, reasons = release_tier.decide(
+        previous, release,
+        release_tier.parse_current(git("show", f"{previous}:{release_tier.COMPATIBILITY}")),
+        release_tier.parse_current(git("show", f"{commit}:{release_tier.COMPATIBILITY}")),
+        git("diff", "--no-renames", "--name-only", previous, commit).split(),
+    )
+    return gate, reasons, previous, release
+
+
+def choose_gate(required, requested):
+    """(gate, None) to run, or (None, why) when `requested` is below what the release needs."""
+    order = list(GATE_TIERS)
+    if requested is None:
+        return required, None
+    if order.index(requested) < order.index(required):
+        return None, (f"this release needs the {required} gate (release_tier.py says why); "
+                      f"--gate {requested} would skip its tiers")
+    return requested, None
+
+
+def resolve_gate(args, commit, git, label):
+    """The gate to use, printing the rule's reasons, or None after printing why not."""
+    try:
+        required, reasons, previous, release = required_gate(commit, args.previous, git)
+    except (ValueError, subprocess.CalledProcessError) as error:
+        detail = getattr(error, "stderr", None) or error
+        print(f"{label}: can't work out the gate: {str(detail).strip()}", file=sys.stderr)
+        return None
+    gate, problem = choose_gate(required, args.gate)
+    if problem:
+        print(f"{label}: {problem}", file=sys.stderr)
+        for reason in reasons:
+            print(f"  {reason}", file=sys.stderr)
+        return None
+    print(f"{label}: v{release} over {previous} needs the {required} gate; running the {gate} gate")
+    for reason in reasons:
+        print(f"  {reason}")
+    return gate
+
+
 def staged_problems(manifest, digest, commit, same_tree):
     """Why a staged build isn't the tip's, or an empty list. `same_tree(a, b)` compares commits' trees."""
     if hashlib.sha256(manifest).hexdigest() != digest:
@@ -275,19 +333,23 @@ def fetch(base_url, name):
         return response.read()
 
 
-def command_run(args):
+def command_run(args, git=git):
     remote_tip = git("ls-remote", args.remote, f"refs/heads/{args.train}").split()
     if not remote_tip:
         print(f"nightly: {args.remote} has no branch {args.train}", file=sys.stderr)
         return 2
     commit = remote_tip[0]
+    git("fetch", "--quiet", args.remote, f"refs/heads/{args.train}")
+    gate = resolve_gate(args, commit, git, "nightly")
+    if gate is None:
+        return 2
     date = datetime.date.today().isoformat()
     run_dir = Path(args.records).expanduser() / f"{date}-{args.train}-{commit[:8]}"
     staged = (args.base_url, args.qualified_digest) if args.base_url and args.qualified_digest else None
     checkout = Path(tempfile.gettempdir()) / f"reliaburger-nightly-{commit[:8]}"
-    steps = plan_steps(args.gate, commit, run_dir, checkout, args.iterations, staged, args.soak_bun)
+    steps = plan_steps(gate, commit, run_dir, checkout, args.iterations, staged, args.soak_bun)
     if args.plan:
-        print(f"nightly {args.gate} gate on {args.train} at {commit}; records in {run_dir}")
+        print(f"nightly {gate} gate on {args.train} at {commit}; records in {run_dir}")
         for name, argv, note in steps:
             print(f"  {name}: {shlex.join(argv) if argv else 'not run: ' + note}")
         return 0
@@ -297,7 +359,6 @@ def command_run(args):
     if run_dir.exists():
         print(f"nightly: {run_dir} exists; records are never overwritten", file=sys.stderr)
         return 2
-    git("fetch", "--quiet", args.remote, f"refs/heads/{args.train}")
     channel = "release"
     if staged:
         manifest = fetch(args.base_url, "candidate.json")
@@ -318,23 +379,26 @@ def command_run(args):
     finally:
         git("worktree", "remove", "--force", str(checkout))
     record = dict(schema=SCHEMA, train=args.train, commit=commit, tree=tree_of(commit), date=date,
-                  started=started, finished=now(), host=os.uname().nodename, gate=args.gate,
+                  started=started, finished=now(), host=os.uname().nodename, gate=gate,
                   staged=dict(base_url=staged[0], qualified_digest=staged[1]) if staged else None,
                   tiers=results)
     (run_dir / RECORD).write_text(json.dumps(record, indent=2) + "\n")
     (run_dir / README).write_text(render_readme(record))
     print(f"nightly: {run_dir / README}")
-    return 0 if green(record, args.gate) else 1
+    return 0 if green(record, gate) else 1
 
 
-def command_freeze_check(args):
+def command_freeze_check(args, git=git):
     try:
         commit = git("rev-parse", "--verify", f"{args.commit}^{{commit}}")
-        tree = tree_of(commit)
+        tree = git("rev-parse", f"{commit}^{{tree}}")
     except subprocess.CalledProcessError:
         print(f"freeze-check: no commit {args.commit} here; fetch it first", file=sys.stderr)
         return 2
-    problems = freeze_problems(load_records(Path(args.records).expanduser()), commit, tree, args.gate)
+    gate = resolve_gate(args, commit, git, "freeze-check")
+    if gate is None:
+        return 2
+    problems = freeze_problems(load_records(Path(args.records).expanduser()), commit, tree, gate)
     for problem in problems:
         print(f"freeze-check: {problem}", file=sys.stderr)
     if not problems:
@@ -343,15 +407,22 @@ def command_freeze_check(args):
     return 1 if problems else 0
 
 
-def main(argv=None):
+def add_gate_arguments(parser):
+    parser.add_argument("--previous",
+                        help="the previous release's tag (default: the nearest v* tag behind the commit)")
+    parser.add_argument("--gate", choices=list(GATE_TIERS),
+                        help="default: the gate release_tier.py says the release needs, which this may "
+                             "only raise (patch: the fast tiers and the power-cut runs; full adds the "
+                             "job final)")
+
+
+def main(argv=None, git=git):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="qualify the train's tip tonight")
     run.add_argument("--train", required=True, help="the merge train, such as release-0-2-4")
     run.add_argument("--remote", default="origin")
-    run.add_argument("--gate", choices=sorted(GATE_TIERS), default="patch",
-                     help="patch: the fast tiers and the power-cut runs; full adds the job final "
-                          "(release_tier.py says which a release needs)")
+    add_gate_arguments(run)
     run.add_argument("--records", default="~/reliaburger-nightly")
     run.add_argument("--base-url", help="a staged build of the tip, for the soaks")
     run.add_argument("--qualified-digest", help="its candidate.json SHA-256")
@@ -361,9 +432,9 @@ def main(argv=None):
     check = commands.add_parser("freeze-check", help="does the latest green nightly cover the candidate?")
     check.add_argument("--records", default="~/reliaburger-nightly")
     check.add_argument("--commit", required=True, help="the candidate commit")
-    check.add_argument("--gate", choices=sorted(GATE_TIERS), default="patch")
+    add_gate_arguments(check)
     args = parser.parse_args(argv)
-    return command_run(args) if args.command == "run" else command_freeze_check(args)
+    return command_run(args, git) if args.command == "run" else command_freeze_check(args, git)
 
 
 if __name__ == "__main__":

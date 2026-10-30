@@ -1151,7 +1151,7 @@ fn import_security_context(
 ///
 /// What can't map is reported: a capability Linux doesn't know, a sysctl
 /// that isn't namespaced, `capabilities.drop` and `privileged`. Kubernetes
-/// has no device permissions, so a device gets the default `rwm`.
+/// has no device permissions, so a device gets the default `rw`.
 fn import_runtime_knobs(
     resource: &str,
     pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
@@ -4677,7 +4677,7 @@ spec:
         securityContext:
           privileged: true
           capabilities:
-            add: ["NET_ADMIN", "CAP_IPC_LOCK", "TELEPORT"]
+            add: ["NET_ADMIN", "CAP_IPC_OWNER", "SYS_TIME", "TELEPORT"]
             drop: ["ALL"]
         volumeMounts:
         - name: fuse
@@ -4706,7 +4706,7 @@ spec:
         let app = &result.config.app["lb"];
         let knobs = app.runtime.as_ref().unwrap();
         let capabilities: Vec<&str> = knobs.capabilities.iter().map(|c| c.name()).collect();
-        assert_eq!(capabilities, ["CAP_IPC_LOCK", "CAP_NET_ADMIN"]);
+        assert_eq!(capabilities, ["CAP_IPC_OWNER"]);
         let sysctls: Vec<(&str, &str)> = knobs
             .sysctls
             .iter()
@@ -4718,7 +4718,7 @@ spec:
             .iter()
             .map(|device| format!("{} {}", device.path, device.permissions))
             .collect();
-        assert_eq!(devices, ["/dev/fuse rwm", "/dev/sdb rwm"]);
+        assert_eq!(devices, ["/dev/fuse rw", "/dev/sdb rw"]);
         result.config.validate().unwrap();
 
         let messages: Vec<&str> = result
@@ -4730,6 +4730,8 @@ spec:
         for expected in [
             "kernel.panic",
             "TELEPORT",
+            "NET_ADMIN is not imported: CAP_NET_ADMIN can't be granted",
+            "SYS_TIME is not imported: CAP_SYS_TIME can't be granted",
             "capabilities.drop",
             "privileged",
             "allowed_capabilities",
@@ -4758,7 +4760,7 @@ spec:
 
     /// #1122: knobs leave as a securityContext and device hostPaths and
     /// come back as the same `[runtime]` table. Kubernetes has no device
-    /// permissions, so only the default `rwm` survives the trip.
+    /// permissions, so only the default `rw` survives the trip.
     #[test]
     fn runtime_knobs_survive_an_export_and_import_round_trip() {
         let config = crate::config::Config::parse(
@@ -4766,14 +4768,14 @@ spec:
             [app.lb]
             image = "lb:v1"
             [app.lb.runtime]
-            capabilities = ["NET_ADMIN"]
+            capabilities = ["IPC_OWNER"]
             sysctls = { "net.core.somaxconn" = "4096", "kernel.shmmax" = "1048576" }
             devices = [{ path = "/dev/fuse" }]
             "#,
         )
         .unwrap();
         let exported = crate::relish::k8s_export::export_kubernetes(&config).unwrap();
-        for expected in ["NET_ADMIN", "net.core.somaxconn", "/dev/fuse"] {
+        for expected in ["IPC_OWNER", "net.core.somaxconn", "/dev/fuse"] {
             assert!(
                 exported.yaml.contains(expected),
                 "{expected}: {}",

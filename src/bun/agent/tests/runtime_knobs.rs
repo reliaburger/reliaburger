@@ -8,7 +8,7 @@ use super::*;
 
 fn knobbed_app() -> Config {
     Config::parse(
-        "[app.lb]\nimage = \"lb:v1\"\n[app.lb.runtime]\ncapabilities = [\"NET_ADMIN\"]\n\
+        "[app.lb]\nimage = \"lb:v1\"\n[app.lb.runtime]\ncapabilities = [\"IPC_OWNER\"]\n\
          sysctls = { \"net.core.somaxconn\" = \"4096\" }\n",
     )
     .unwrap()
@@ -16,7 +16,7 @@ fn knobbed_app() -> Config {
 
 fn allowing_both() -> crate::grill::knobs::RuntimeAllowlist {
     crate::config::NodeConfig::parse(
-        "[runtime]\nallowed_capabilities = [\"NET_ADMIN\"]\nallowed_sysctls = [\"net.core.*\"]\n",
+        "[runtime]\nallowed_capabilities = [\"IPC_OWNER\"]\nallowed_sysctls = [\"net.core.*\"]\n",
     )
     .unwrap()
     .runtime
@@ -33,7 +33,7 @@ async fn a_deploy_the_node_gate_refuses_never_reaches_the_runtime() {
         panic!("the deploy must fail: {events:?}");
     };
     assert!(
-        message.contains("runtime.capabilities CAP_NET_ADMIN refused by the node gate"),
+        message.contains("runtime.capabilities CAP_IPC_OWNER refused by the node gate"),
         "{message}"
     );
     assert!(

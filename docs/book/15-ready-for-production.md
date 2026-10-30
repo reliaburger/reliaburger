@@ -416,6 +416,26 @@ against a real run is a guess, and a guess that fails a release on its first nig
 everyone to ignore it. Those four start in record-only mode, with provisional thresholds,
 until the first 0.2.4 fast and final records show where they actually sit.
 
+"Outside fault windows only" was true of four of the five at first, and review caught the
+fifth ([#1438](https://github.com/reliaburger/reliaburger/issues/1438)). The API reads skip
+any check that runs inside a fault window, but the job start lag came from the campaign's
+histogram, summed over every run that drained, including runs that lived through a leader
+kill. A p99 is exactly the statistic a few slow recoveries move, so the one gated SLO could
+fail a tier for something the faults were meant to cause, while the record claimed it
+measured a quiet cluster. The fix keeps both numbers. Each step of the job campaign knows
+whether a fault window is open, and marks every run active at that moment. When a run
+drains, its start lag goes into the M8 buckets either way, and into a second, quiet set only
+if it was never marked. The SLO reads the quiet set.
+
+That fix went too far in the fast tiers, and the 0.2.4 candidate found it
+([#1485](https://github.com/reliaburger/reliaburger/issues/1485)). A fast tier's faults come
+back to back, so out of 15.7 million job tasks only 20 ran in runs that missed every fault
+window. The p99 of 20 samples is simply the largest, and 4 of those 20 took between one and
+two seconds, so both fast tiers failed on a number that was really one slow task. Now the
+gate wants at least 1,000 quiet samples before it judges the p99. A fast tier with fewer
+records the value and says it had too few to judge. A final has a quiet tail of more than two
+hours with the job campaign at full load, so it can't run short, and if it does, it fails.
+
 Measuring them cost almost nothing, because the harness was already doing the work. Every
 light check talks to each node's API, so it now times two of the reads `relish` makes. For
 the writes, the app start and the rollout, the harness gives itself an app of its own,
@@ -967,6 +987,28 @@ means every heavy job except macOS: select jobs says `heavy=true, macos=false`, 
 aggregator calls that selection `train-full`, accepted, like the light set, only when the
 event is `pull_request`. The queue and the push to the train still demand all three shards.
 
+That still left the pool running dry. The organisation's plan runs five macOS jobs at once,
+and a full run takes three, so two full runs at once is already one too many. Over 60 runs
+from 25 to 28 October the shards queued a median of 0 minutes, but 24 at p90 and 47 at
+worst, and on 28 October one pull request's shards waited 70 to 90 minutes. Counting where
+the runs came from showed a duplicate: every merge into a train started two full runs on the
+same code, the push to the train and the gate PR's `synchronize`, six macOS jobs per merge.
+Dependabot and ordinary pull requests into `main` took more slots for code that had nothing
+to do with macOS ([#1443](https://github.com/reliaburger/reliaburger/issues/1443)).
+
+The rule now is that macOS runs where it can find something Linux can't. Every push, to a
+train or to `main`, and the nightly still run all three shards, so no commit lands without
+them, and the candidate build demands them. The gate PR gets the light set on each push,
+because the push to the train has just run everything; at code freeze the maintainer labels
+it `release-gate`, and from then on it runs everything and the evidence gate refuses it
+without every owner. Any other pull request gets macOS only if it touches macOS-specific
+code, or someone labels it `macos`. "macOS-specific" is a list of paths (the Apple runtime,
+the installers, the demo scripts) plus any Rust file holding a `target_os = "macos"` cfg on
+either side of the change, so deleting macOS code counts too. `select-jobs.sh` reads that
+with `git show` into a variable and matches it with `case`, not `git show | grep -q`: under
+`set -o pipefail`, `grep -q` exits at its first match, `git show` can die of `SIGPIPE`
+writing the rest, and the pipeline then reports failure for a file that matched.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took
@@ -993,6 +1035,16 @@ from each one on a list it keeps of every job `ci.yml` has, `ignored-test eviden
 included. A test parses `ci.yml` and fails when that list drifts, so a new CI job can't be
 quietly left out. Only a push, merge-queue or nightly run counts: a pull request's run tests a
 merge commit rather than its head, and may have skipped the heavy jobs on purpose.
+
+The first version had a hole the review found
+([#1436](https://github.com/reliaburger/reliaburger/issues/1436)). The API reports a run's
+*latest* attempt: its conclusion is the last attempt's, and `filter=latest` lists that
+attempt's jobs. So a flaky failure on `main`, re-run until it passed, looked exactly like a
+clean pass and became the candidate's whole source-CI evidence. That quietly undid retries
+= 0, the rule that a test passing on a second try is a flake to register, not a pass. The
+run's `run_attempt` field says which attempt the result came from, and the script now
+accepts only attempt 1. A re-run's green can still merge a pull request; it just can't
+stand in for the candidate's own suite, and the job summary names the run and the attempt.
 
 Then the workflow has to say "run the suite unless we found that". GitHub Actions has a trap
 here. By default a job whose dependency was skipped is skipped too, so a candidate job that
@@ -1021,6 +1073,17 @@ new to find. So patch releases run the fast tiers and the power-cut and reboot r
 final is for minor releases and for anything that moves `CURRENT` in `src/compatibility.rs`
 or touches `src/bun/agent*`. That rule is mechanical, so `release_tier.py` applies it to a
 tag range rather than leaving it to someone's judgement at the end of a long week.
+
+At first, though, only a person ran it. `nightly.py` took the gate as `--gate` and defaulted
+to `patch`, and the runbook's examples passed `--gate patch` for 0.2.4, a release that moves
+`CURRENT` and the agent loop
+([#1428](https://github.com/reliaburger/reliaburger/issues/1428)). Follow the doc, or leave
+the flag out, and `freeze-check` would pass a nightly green only for the patch gate, and the
+8-hour final would never run. A rule that's mechanical should be applied by the machine at
+the point it matters, so `run` and `freeze-check` now work out the gate themselves: the
+release is the version in the commit's `Cargo.toml`, the previous release the nearest `v*`
+tag behind it, and the rest is `release_tier.decide`. `--gate` survives only to raise the
+gate; asking for less than the rule says is refused, with the rule's reasons.
 
 **Publish performance after the tag.** Benchmarks, the profile and the day run don't decide
 whether a release works, so they no longer stand between it and its users. A regression they
@@ -1075,8 +1138,11 @@ is anywhere in its environment.
 
 The staged nightly gets its own name too, `nightly-v0.2.4-RUN-ATTEMPT`, and the website
 installer refuses a mirror by that name unless `RELIABURGER_ACCEPT_NIGHTLY=1` says
-qualification is asking. That isn't the security boundary (the keys are), it's a guard rail,
-so nobody installs one by pasting the wrong URL. Old nightlies don't pile up either: each
+qualification is asking. That's a guard rail, so nobody installs one by pasting the wrong URL,
+and on a fresh install it's the only one: with the variable set, the bootstrap runs the
+nightly's own `install.sh`, which installs the nightly's own `relish`, which trusts the
+nightly key. The keys guard the direction that matters, a released binary already on a
+machine taking a nightly one. Old nightlies don't pile up either: each
 nightly staging deletes all but the newest seven.
 
 ## Dependencies are code too
@@ -4247,15 +4313,14 @@ a histogram labelled by branch:
 
 ```rust
 struct BranchHistogram {
-    buckets: [AtomicU64; BUCKET_BOUNDS.len()],
+    buckets: [AtomicU64; BUCKET_BOUNDS.len() + 1],
     sum_nanos: AtomicU64,
-    count: AtomicU64,
 }
 
 impl BranchHistogram {
     const fn new() -> Self {
         Self {
-            buckets: [const { AtomicU64::new(0) }; BUCKET_BOUNDS.len()],
+            buckets: [const { AtomicU64::new(0) }; BUCKET_BOUNDS.len() + 1],
             // ...
         }
     }
@@ -4266,9 +4331,12 @@ impl BranchHistogram {
 `Copy`, and an atomic isn't (two copies of one counter would defeat the
 point). `const { ... }` is an *inline const*: a block the compiler evaluates at
 build time, and an array can repeat a constant expression whether or not its
-type is `Copy`. The loop increments with `Ordering::Relaxed`, as Wrapper's
-round-robin counter does, because nobody needs the buckets to agree with each
-other to the nanosecond, only to add up. The metrics collector holds the same
+type is `Copy`. The extra bucket at the end counts turns past the last bound,
+10 s. The loop increments with `Ordering::Relaxed`, as Wrapper's round-robin
+counter does, because nobody needs the buckets to agree with each other to
+the nanosecond, only to add up. (That turned out to be true only if every
+number a scrape exports comes from the same reading; more on that below.)
+The metrics collector holds the same
 meter through an `Arc` and writes it into Mayo every interval as
 `bun_agent_loop_turn_seconds_bucket{branch, le}`, plus `_sum` and `_count`,
 the way Prometheus histograms look. Reading it is the usual game: the ratio
@@ -5364,6 +5432,48 @@ The finding says which bucket the
 worst turn landed in, `1 deploy_op turn(s) over the 1 s budget, the worst
 between 2.5 and 5 s`, and Bun's own log line from the meter says which op it
 was.
+
+Then 0.2.3's day run failed on `1 follow_up turn(s) over the 1 s budget, the
+worst between 1 and 2.5 s` on node 3, and Bun's log had no line for it (#1419).
+The fifteen minutes of journal kept with the failure held fourteen lines, the
+slowest turn among them 273 ms. Nothing was rate-limiting the slow-turn line:
+it's a plain `eprintln!` on every turn over 250 ms. So either a turn finished
+without being logged, or no turn was slow.
+
+The scrapes settled it. Across the run's 182,000 samples of the histogram, on
+every node and branch, `+Inf` minus `le="1"` was never above zero. Once, at
+05:10:08 on node 3, it was *below* zero: `le="1"` said 105,877 and `+Inf` said
+105,876. A cumulative histogram can't do that. The old `samples` read the turn
+count first and the buckets after, from another thread while the loop kept
+finishing turns. One short turn landed between the two reads, so it was in
+the bucket and not in the count. The checker then saw "over the budget" go
+from 0 to -1, which looks like a count going down, so it decided Bun had
+restarted and remembered -1. Ten seconds later an honest scrape said 0, an
+increase of one. That's the phantom turn, and replaying failure 30's own
+samples through the checker reproduces its finding word for word.
+
+The fix makes a scrape one reading. There's no separate count any more: a
+turn past 10 s goes in the extra bucket, `counts()` loads every bucket once
+into a plain array, and `+Inf` and `_count` are that array's sum. Each bucket
+can still be a moment older or newer than its neighbour, but cumulative sums
+of one array can't decrease and can't exceed their own total, so `+Inf` minus
+`le="1"` only ever counts turns that really landed above a second.
+
+```rust
+fn counts(&self) -> [u64; BUCKET_BOUNDS.len() + 1] {
+    std::array::from_fn(|bucket| self.buckets[bucket].load(Ordering::Relaxed))
+}
+```
+
+`std::array::from_fn` builds a fixed-size array by calling the closure once
+per index, which is how you fill an array from a computation without first
+making a dummy array to overwrite. The checker got the matching guard: a
+scrape with `le="1"` above `+Inf` is no evidence either way, so it's skipped,
+which keeps older binaries' torn scrapes from failing a tier.
+`a_scrape_racing_finished_turns_is_one_consistent_histogram` finishes turns on
+one thread while another scrapes 20,000 times and requires every scrape to be
+consistent; the old code tore 19,800 of them.
+`test_a_torn_scrape_is_not_a_slow_turn` replays node 3's three scrapes.
 
 Looking back over the whole arc, the lesson isn't about `select!` at all. We
 spent a dozen PRs arranging the order in which slow things waited, and three
@@ -6692,6 +6802,19 @@ bookkeeping, keeping the reservation the retained replacements need. And
 #1355, which landed the same week and makes a retiring instance wait until
 every node has dropped it, isn't affected: that wait happens on the
 worker before the stop, long before this op.
+
+The 0.2.4 review asked about the space between those two moments (#1442).
+After the journal write, the bookkeeping can still fail: a backend add, a
+retirement, a kernel withdrawal. Each returns with `?`, leaving the journal
+on the rolled-out service and memory on the old one. Should the op install
+`rolled_out` first? No, and a comment there now says why. The journal is a
+write-ahead record of what *might* be exposed, and the one rule is that
+nothing gets exposed before the journal names it (#351). A journal ahead of
+memory breaks nothing: it only claims more than is exposed. A restart
+withdraws everything the journal names before it publishes anything, and
+the service's next publication, built from memory, journals over it.
+Installing `rolled_out` early would be the risky order, because the
+bookkeeping would then edit the very map the journal had just recorded.
 
 The second wait hid in the consumer. A service retirement on a cluster
 node republishes the view before it retires the allocation, and it needs
@@ -8026,8 +8149,15 @@ history takes a twentieth of a second, and so does one where nearly half the req
 or fail.
 
 It's still exponential in the worst case, and a soak can't hang on its own checker. Each
-namespace gets a budget of states, and a search that runs out reports *inconclusive*. The
-record says so, without failing the run. A violation fails it, and the record shows the
+namespace gets a budget of states, and a search that runs out reports *inconclusive*. At
+first the record said so without failing the run, and the deadline, 600 seconds, was shared
+by every namespace. Review found what that adds up to
+([#1437](https://github.com/reliaburger/reliaburger/issues/1437)): if the first namespace
+used the whole 600 seconds, every later one gave up after its first 1,024 states, and the
+soak went green with next to no linearizability coverage. A check that can quietly not
+happen isn't a gate. So each namespace now gets its own deadline, and an inconclusive check
+fails a fast or final tier; only a custom run, which gates nothing, reports it and moves on.
+A violation fails every run, and the record shows the
 smallest failing slice: the shortest prefix of the history that fails, then the latest
 quiet point (no answered operation in flight) from which the tail still fails, starting from
 any state at all. For the stale read above, that's two operations, the renew and the read,

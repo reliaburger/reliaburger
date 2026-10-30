@@ -378,6 +378,7 @@ pub(super) async fn rollback_handler(
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
     Query(query): Query<super::apps::ForceQuery>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(resp) =
         crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
@@ -488,7 +489,11 @@ pub(super) async fn rollback_handler(
             config,
             raw,
             None,
-            HeaderMap::new(),
+            // A follower forwards the re-apply as the caller, so the
+            // leader's owner rules judge it against the leader's state
+            // (the spec declares today's owner) and the caller's token
+            // (#1442).
+            headers,
             None,
             binder,
             auth.map(|extension| extension.0),

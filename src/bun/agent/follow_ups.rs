@@ -430,7 +430,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Only returns on failure (the symlink is already reverted then).
         #[cfg(test)]
         eprintln!("upgrade-fixture phase=answer-wait-ended-exec-begin");
-        let error = manager.execute(prepared);
+        // `execute` writes and fsyncs the marker, swaps the symlink and, if
+        // the exec fails, puts the old one back and fsyncs a history entry:
+        // blocking work, so it runs on a blocking thread, and the exec
+        // replaces the process from there just as well.
+        let executing = manager.clone();
+        // LOOP-INLINE: the exec turn: the node is draining, and either becomes the new binary or reports why not
+        let error = tokio::task::spawn_blocking(move || executing.execute(prepared))
+            .await
+            .unwrap_or_else(|error| crate::upgrade::UpgradeError::ExecFailed {
+                reason: format!("the exec task ended without an answer: {error}"),
+            });
         self.draining
             .store(false, std::sync::atomic::Ordering::Relaxed);
         let what = match kind {

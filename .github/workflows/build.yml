@@ -59,8 +59,9 @@ jobs:
   ci-evidence:
     # A candidate's commit has normally passed ci.yml already, on the push to
     # main (#1363). If a push, merge-queue or nightly run on exactly this
-    # commit passed every job, ignored-test evidence included, the build
-    # reuses it instead of running the suite again, saving about an hour,
+    # commit passed every job, ignored-test evidence included, on its first
+    # attempt (a run re-run until it went green doesn't count, #1436), the
+    # build reuses it instead of running the suite again, saving about an hour,
     # most of it spent waiting for hosted macOS runners. Any doubt, an API
     # error included, says reuse=false and the suite runs below.
     name: find passing CI
@@ -73,6 +74,7 @@ jobs:
     outputs:
       reuse: ${{ steps.find.outputs.reuse }}
       ci_run: ${{ steps.find.outputs.ci_run }}
+      ci_run_attempt: ${{ steps.find.outputs.ci_run_attempt }}
     steps:
       - uses: actions/checkout@v4
       - name: Find a passing CI run on this commit
@@ -351,6 +353,7 @@ jobs:
           CANDIDATE_ATTEMPT: ${{ github.run_attempt }}
           RELEASE_REPOSITORY: ${{ github.repository }}
           CI_RUN: ${{ needs.ci-evidence.outputs.ci_run }}
+          CI_RUN_ATTEMPT: ${{ needs.ci-evidence.outputs.ci_run_attempt }}
         run: |
           digest=$(python3 scripts/release/candidate.py record --directory dist \
             --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" \
@@ -359,7 +362,7 @@ jobs:
           # The log line is what `gh run view --log` finds; the summary is
           # for people reading the run page.
           echo "Qualification manifest SHA-256: $digest"
-          if [ -n "$CI_RUN" ]; then source_ci="reused ci.yml run $CI_RUN"; else source_ci="ran in this build"; fi
+          if [ -n "$CI_RUN" ]; then source_ci="reused ci.yml run $CI_RUN, attempt $CI_RUN_ATTEMPT"; else source_ci="ran in this build"; fi
           echo "Source CI: $source_ci"
           printf 'Channel: %s\n\nCandidate commit: `%s`\n\nRun: `%s`, attempt: `%s`\n\nSource CI: %s\n\nQualification manifest SHA-256: `%s`\n' \
             "$CHANNEL" "$CANDIDATE_COMMIT" "$CANDIDATE_RUN" "$CANDIDATE_ATTEMPT" "$source_ci" "$digest" >> "$GITHUB_STEP_SUMMARY"

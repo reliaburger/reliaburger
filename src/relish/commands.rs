@@ -2635,6 +2635,7 @@ async fn batch_with_client(
 
     let key = submission_key(idempotency_key, err)?;
     let result = client.submit_batch(&config.job, Some(&key)).await?;
+    print_policy_warnings(&result, err);
     println!(
         "batch {} admitted: {} queued jobs",
         result["batch_id"].as_u64().unwrap_or(0),
@@ -2871,6 +2872,7 @@ async fn submit_task_manifest_with_client(
     }
     let key = submission_key(idempotency_key, err)?;
     let response = client.submit_task_manifest(&request, Some(&key)).await?;
+    print_policy_warnings(&response, err);
     if matches!(output, OutputFormat::Human) {
         println!(
             "manifest {} submitted; watch with: relish batch watch {}",
@@ -3038,6 +3040,16 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
     output
 }
 
+/// Print what the `warn` policies said about a submitted job (#1424), one
+/// `warning:` line each, to `err`.
+fn print_policy_warnings(answer: &serde_json::Value, err: &mut dyn std::io::Write) {
+    for warning in answer["policy_warnings"].as_array().into_iter().flatten() {
+        if let Some(warning) = warning.as_str() {
+            let _ = writeln!(err, "warning: {warning}");
+        }
+    }
+}
+
 /// Submit a task array (`relish run --batch`).
 pub async fn run_task_array(run: TaskArrayRun) -> Result<(), RelishError> {
     run_task_array_with_client(run, &BunClient::default_local(), &mut std::io::stderr()).await
@@ -3059,6 +3071,7 @@ async fn run_task_array_with_client(
         submission_key(explicit, err)?
     };
     let answer = client.submit_task_array(&request, Some(&key)).await?;
+    print_policy_warnings(&answer, err);
     if let Some(id) = answer["batch_id"].as_u64() {
         println!(
             "job run {id} admitted: {} tasks in {} chunks; at-least-once replay policy",
@@ -5306,6 +5319,37 @@ mod task_array_tests {
         let printed = String::from_utf8(err).unwrap();
         assert!(
             printed.contains(&format!("--idempotency-key {key}")),
+            "{printed}"
+        );
+    }
+
+    /// #1424: a `warn` policy's finding in the answer is printed as a
+    /// warning, so `relish run --batch` says what `relish apply` would.
+    #[tokio::test]
+    async fn run_batch_prints_the_policy_warnings_in_the_answer() {
+        let app = axum::Router::new().route(
+            "/v1/batch/array",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "batch_id": 7, "count": 1, "chunks": 1,
+                    "policy_warnings": ["policy pinned warns about job default/render: pin it"],
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut err = Vec::new();
+        run_task_array_with_client(run(), &client, &mut err)
+            .await
+            .unwrap();
+        server.abort();
+        let printed = String::from_utf8(err).unwrap();
+        assert!(
+            printed.contains("warning: policy pinned warns about job default/render: pin it"),
             "{printed}"
         );
     }

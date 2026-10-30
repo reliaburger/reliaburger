@@ -191,6 +191,16 @@ pub struct Compatibility {
 /// the owner checks the state machine applies to app writes, `owner` in
 /// `GET /v1/diagnostics/apps`, and `GET /v1/events` answering scoped tokens
 /// with their own namespaces' events (#1125).
+/// A runtime knob no longer parses with a `CAP_NET_*` capability (#1427)
+/// or the `m` device permission, and a device's permissions default to
+/// `rw`, not `rwm` (#1442), in desired state, OCI specs, instance records
+/// and the node's knob allowlist.
+/// A runtime knob no longer parses with a capability the kernel checks
+/// against the node's own user namespace (`HOST_CAPABILITIES`, 22 of them,
+/// `CAP_SYS_TIME`, `CAP_SYS_NICE` and `CAP_IPC_LOCK` among them), and only
+/// `CAP_SYS_ADMIN`, `CAP_SYS_BOOT` and `CAP_SYS_PTRACE` are escape hatches
+/// (#1474), in desired state, OCI specs, instance records and the node's
+/// knob allowlist.
 ///
 /// 0.3.0, Bare metal in an hour (56/73): the appliance OS rollout (a new Raft
 /// request and a new field in council state) and the cluster-wide council

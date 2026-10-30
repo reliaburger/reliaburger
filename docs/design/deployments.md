@@ -898,7 +898,7 @@ pre_stop_timeout = "20s"    # default 30s, 1s to 1h
 
 **Where the policy lives.** `grill::oci::generate_oci_spec` copies the four fields into the instance's `OciSpec` as a `StopPolicy` (`stop`), so it's fixed per instance at launch, recorded with every instance record, runtime intent and process owner record, and survives adoption after a Bun restart. A rolling deploy retires each old instance with the policy that instance was launched with, not the new spec's, because the new spec's pre-stop command may not exist in the old image.
 
-**Who sends the signal.** Each runtime reads the signal from the spec it holds: `ProcessGrill` signals the process group itself or asks the process owner, which reads its launch spec; runc runs `runc kill <id> <SIGNAL>` from the runtime intent; Apple Container passes `container stop --signal`. Every graceful stop, including a Bun shutdown, therefore sends the app's signal, and `Grill::stop` keeps its one-argument shape.
+**Who sends the signal.** Each runtime reads the signal from the spec it holds: `ProcessGrill` signals the process group itself or asks the process owner, which reads its launch spec; runc runs `runc kill <id> <SIGNAL>` from the runtime intent; Apple Container runs `container kill --signal <SIGNAL>`, not `container stop`, which would kill the workload after its own 5 s default and cut every longer `stop_grace` short (#1435). Every runtime's `stop` only signals; Bun waits out the grace and sends the kill. Every graceful stop, including a Bun shutdown, therefore sends the app's signal, and `Grill::stop` keeps its one-argument shape.
 
 **Who runs the sequence.** `bun::agent::stop_runtime_instance` runs the four steps, each with its own bound:
 
@@ -945,7 +945,14 @@ evaluates one.
 - **Commit checks.** `policy::check_policy`, run by `Config::validate`: a DNS
   label name, expressions of at most 1024 bytes, a message of at most 512,
   valid CEL, only the three variables, and only known `app` and `caller`
-  fields. The `cel` crate has no cost limit, so the size cap bounds evaluation.
+  fields, and no more than two nested macros (`all`, `exists`, `exists_one`,
+  `map`, `filter`; `MAX_COMPREHENSION_NESTING`). The `cel` crate has no cost
+  limit, so evaluation is bounded by expression size times input size squared,
+  and the input is capped too: a workload with any list or map over
+  `MAX_COLLECTION_ENTRIES` (1,024) entries fails every policy that applies to
+  it closed, naming the field (#1431). `admit` (as `admit_blocking`),
+  `judge_job` on the job routes and `judge_app` in the GitOps runner run in
+  `spawn_blocking`, never on an async worker.
 - **Failure.** An expression that errors or returns a non-boolean fails
   closed: a deny policy refuses, a warn policy warns. A committed policy that
   no longer compiles refuses every app apply until an admin replaces or
@@ -984,13 +991,20 @@ evaluates one.
   serde). `judge_job` evaluates denies only: a `default` belongs to an apps
   policy. `evaluate` judges a config's apps then its jobs, `admit` judges
   both, and `job_apply` calls it whenever a manifest has apps or jobs; job
-  writes stay unfenced, like the apps of a job manifest. `Finding` carries a
+  writes stay unfenced, like the apps of a job manifest. Every other job
+  route (`/v1/jobs/runs`, `/v1/batch`, `/v1/batch/array`,
+  `/v1/batch/manifest`) judges each job in `job_api::admit_definition`
+  (`PolicyCheck::Judge`; `job_apply` passes `Judged`) under the committed
+  policies, as `JobDefinition::to_spec` (schedule and run policy put back),
+  before its image is bound (#1424). A denial is the same 422 and
+  `policy.denied` event; warnings come back as `policy_warnings`. `Finding` carries a
   `WorkloadKind` and names the workload (`policy p denies job ns/name: …`).
   `PolicyAction::Audit` puts a finding in `Verdict::audits`: the apply goes
   ahead, the caller isn't told, and `cluster_apply` and `job_apply` record one
   `policy.audited` event; the GitOps runner logs it to stderr. `GET
-  /v1/policies/audit` (any token) runs `policy::audit::audit` on a copy of
-  desired state in `spawn_blocking`: every committed app (declared spec where
+  /v1/policies/audit` (any token) runs `policy::audit::audit_visible` on a copy of
+  desired state in `spawn_blocking`, keeping only the workloads the token's
+  scope allows (counts included, #1432): every committed app (declared spec where
   kept, else the stored one with its image read back as its tag) through
   `judge_app`, as the owner's token (with its role) for apps a controller
   owns (#1125), as `gitops` for apps GitOps owns and as the system caller
@@ -1018,24 +1032,24 @@ evaluates one.
 An app can ask for added capabilities, namespaced sysctls and host devices (#1122):
 
 ```toml
-[app.vpn]
-image = "ghcr.io/example/vpn:2.0"
+[app.files]
+image = "ghcr.io/example/files:2.0"
 
-[app.vpn.runtime]
-capabilities = ["NET_ADMIN"]
-sysctls = { "net.ipv4.ip_forward" = "1" }
-devices = [{ path = "/dev/net/tun", permissions = "rw" }]
+[app.files.runtime]
+capabilities = ["SYS_ADMIN"]
+sysctls = { "net.core.somaxconn" = "4096" }
+devices = [{ path = "/dev/fuse", permissions = "rw" }]
 ```
 
 **Two gates.** Each use needs the node and the token, the double gate host paths use. The token gate runs at apply, in the same place as `host-exec` for host binaries and host-path sources: a token with a `[permission]` block needs `host-exec` for an app with any knob, and its refusal names the first knob and "the token gate". The node gate is the `[runtime]` allowlist in `node.toml` (`allowed_capabilities`, `allowed_sysctls`, `allowed_devices`), checked by `WorkloadSupervisor::admit_runtime_knobs` in `admit_app` and again before every rolling or blue-green replacement, with a refusal that names the knob, the allowlist key and "the node gate".
 
-**What can be asked for at all.** `grill::knobs` parses each field into a type that can't hold a value no node could allow. `Capability` holds a name from the 41 Linux capabilities, accepts `NET_ADMIN` or `CAP_NET_ADMIN`, and refuses `ALL` or any wildcard. `SysctlName` accepts only the per-namespace families (`net.*`, `kernel.shm*`, `kernel.msg*`, `kernel.sem`, `fs.mqueue.*`), and the node's `SysctlPattern` accepts those names or a `net.`/`fs.mqueue.` prefix ending in `.*`, so `kernel.panic` is refused in a node's list as well as an app's. `DevicePath` is an absolute path under `/dev` with no `.` or `..` part; `DevicePermissions` is a subset of `rwm`. `validate_app` refuses knobs on an `exec` or `script` app, which has no container to change.
+**What can be asked for at all.** `grill::knobs` parses each field into a type that can't hold a value no node could allow. `Capability` holds a name from the 41 Linux capabilities, accepts `SYS_PTRACE` or `CAP_SYS_PTRACE`, and refuses `ALL` or any wildcard. It also refuses the four `NETWORK_CAPABILITIES` (`CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_NET_BIND_SERVICE`, `CAP_NET_BROADCAST`), in an app and in a node's list (#1427). The kernel checks those against the user namespace that owns the network namespace, and Bun creates each container's network namespace before runc creates the container's user namespace, so the node's user namespace owns it and a granted network capability does nothing. Making it work would mean creating the network namespace inside the container's user namespace, which moves the veth setup into a runc hook and changes adoption; refusing is the honest answer until something needs it. Every port is bindable anyway (`ip_unprivileged_port_start=0`), and `net.*` sysctls are written by the node. The same reasoning refuses the 22 `HOST_CAPABILITIES` (#1474): the kernel checks them against the initial user namespace whatever namespace the caller is in (`capable()` rather than `ns_capable()`), so a container never has them. They include `CAP_SYS_TIME`, `CAP_SYS_NICE` (negative nice and realtime), `CAP_IPC_LOCK` (mlock beyond the limit), `CAP_SYS_RESOURCE`, `CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, `CAP_BPF`, `CAP_PERFMON`, `CAP_MAC_*`, `CAP_AUDIT_*`, `CAP_MKNOD` and `CAP_DAC_READ_SEARCH` (whose in-namespace half is the default set's `CAP_DAC_OVERRIDE`). The error names what each one guards. `runc_capability_knobs_work_only_where_the_container_owns_the_check` (`make test-linux`) runs each one's operation on the host, where it works, and inside a container's user namespace holding every capability, where it's refused, so a kernel that changes the rule fails the test. What's left works on the container's own namespaces: Docker's defaults, `CAP_CHECKPOINT_RESTORE`, `CAP_IPC_OWNER`, `CAP_SYS_ADMIN`, `CAP_SYS_BOOT` and `CAP_SYS_PTRACE`. `SysctlName` accepts only the per-namespace families (`net.*`, `kernel.shm*`, `kernel.msg*`, `kernel.sem`, `fs.mqueue.*`), and the node's `SysctlPattern` accepts those names or a `net.`/`fs.mqueue.` prefix ending in `.*`, so `kernel.panic` is refused in a node's list as well as an app's. `DevicePath` is an absolute path under `/dev` with no `.` or `..` part; `DevicePermissions` is `r`, `w` or `rw` (the default): `m` is refused, because mknod of a device node needs `CAP_MKNOD` in the initial user namespace, which no container has, so a device rule allowing it would grant nothing (#1442). `validate_app` refuses knobs on an `exec` or `script` app, which has no container to change.
 
-**Escape-hatch capabilities.** Ten capabilities give near-root power inside the container's namespaces (`ESCAPE_CAPABILITIES`: `CAP_SYS_ADMIN`, `CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, `CAP_SYS_PTRACE`, `CAP_SYS_BOOT`, `CAP_DAC_READ_SEARCH`, `CAP_MAC_ADMIN`, `CAP_MAC_OVERRIDE`, `CAP_BPF`, `CAP_PERFMON`). They aren't refused outright, because FUSE and some network tools genuinely need `CAP_SYS_ADMIN`. They're admitted only when a node names each one: there is no wildcard or pattern that could include them by accident, and Bun prints a startup warning for each one its `[runtime]` lists.
+**Escape-hatch capabilities.** Three capabilities give near-root power inside the container's namespaces (`ESCAPE_CAPABILITIES`: `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SYS_BOOT`). The other seven the first version listed (`CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, `CAP_DAC_READ_SEARCH`, `CAP_MAC_ADMIN`, `CAP_MAC_OVERRIDE`, `CAP_BPF`, `CAP_PERFMON`) are host capabilities, refused outright. They aren't refused outright, because FUSE and some network tools genuinely need `CAP_SYS_ADMIN`. They're admitted only when a node names each one: there is no wildcard or pattern that could include them by accident, and Bun prints a startup warning for each one its `[runtime]` lists.
 
 **Placement.** A node reports its allowlist in its capability report (`NodeCapabilities::runtime_knobs`), and only when its runtime applies knobs (`Grill::applies_runtime_knobs`, true for rootful runc and the mixed runtime's runc side). `WorkloadRequirements::runtime_knobs` carries the app's knobs and `node_can_run` admits a node only when its allowlist admits every one, so an app needing a knob that some nodes allow lands only on those. Otherwise it's unplaced with `NoCapableNode`.
 
-**Applying them.** `generate_oci_spec` copies the knobs into the instance's `OciSpec` (`runtime_knobs`, not part of the OCI spec proper). Rootful runc's prepare step calls `grill::knobs::apply_to_spec` after the user namespace has set its default capabilities: added capabilities join the bounding, effective and permitted sets; sysctls go to `linux.sysctl`; each device is read from the host (`stat`) into `linux.devices` with an allow rule in `linux.resources.devices`. The network namespace belongs to the node's user namespace, not the container's, so container root can't write `net.*` sysctls; `take_network_sysctls` moves them out of the spec and Bun writes them with `ip netns exec`, as it writes the low-ports sysctls. runc writes the IPC ones in the container's own IPC namespace. ProcessGrill, Apple Container and rootless runc refuse a spec that carries knobs (`LaunchProblem::RuntimeKnobsUnsupported`) rather than run it without them. A sidecar's spec (`generate_sidecar_oci_spec`) carries no knobs: the gates admitted them for the app's container. It shares the app's network namespace, so the app's `net.*` sysctls reach it anyway.
+**Applying them.** `generate_oci_spec` copies the knobs into the instance's `OciSpec` (`runtime_knobs`, not part of the OCI spec proper). Rootful runc's prepare step calls `grill::knobs::apply_to_spec` after the user namespace has set its default capabilities: added capabilities join the bounding, effective and permitted sets; sysctls go to `linux.sysctl`; each device is read from the host (`stat`, with `tokio::fs` in `host_devices`, before the synchronous `apply_to_spec`) into `linux.devices` with an allow rule in `linux.resources.devices`. The network namespace belongs to the node's user namespace, not the container's, so container root can't write `net.*` sysctls; `take_network_sysctls` moves them out of the spec and Bun writes them with `ip netns exec`, as it writes the low-ports sysctls. runc writes the IPC ones in the container's own IPC namespace. ProcessGrill, Apple Container and rootless runc refuse a spec that carries knobs (`LaunchProblem::RuntimeKnobsUnsupported`) rather than run it without them. A sidecar's spec (`generate_sidecar_oci_spec`) carries no knobs: the gates admitted them for the app's container. It shares the app's network namespace, so the app's `net.*` sysctls reach it anyway.
 
 **Kubernetes.** `relish import` maps `securityContext.capabilities.add`, the pod's `securityContext.sysctls` and device `hostPath` volumes; unknown capabilities, host-wide sysctls, `capabilities.drop` and `privileged` are warnings. `relish export` writes them back, devices as `hostPath` mounts reported as unsupported.
 
@@ -1060,9 +1074,16 @@ functions, one per kind of change:
 
 - **Where.** `cluster_apply` calls `skip_owned_apps` on the leader before
   policy admission, so a skipped app is neither judged nor written.
-  `cluster_app_change` (stop, delete, release) and `rollback_handler` check
-  before forwarding to the leader, because a forwarded request reaches the
-  leader as the service principal. The bootstrap window and the service
+  `job_apply` does the same for the apps of a job manifest (#1429): the
+  state machine's backstop only checks that a write keeps the stored owner,
+  not that the caller speaks for it, so the API is the only place that can.
+  `cluster_app_change` (stop, delete, release) checks on the leader, against
+  the leader's desired state: a follower forwards the request with the
+  caller's credentials, not its service token, because its replica can lag a
+  claim (#1442). `rollback_handler` checks on the node that's asked, then
+  re-applies through `cluster_apply`, forwarding the caller's credentials too,
+  so the leader's `skip_owned_apps` judges the re-apply (it declares today's
+  owner) as the caller. The bootstrap window and the service
   principal count as admins.
 - **Defaults.** The checks run on the declared spec, before policy defaults
   (#1118) fill it, so `owner` is in `policy::check::UNFILLABLE_FIELDS`: a
@@ -1131,7 +1152,10 @@ with a `default`; without one, required) and a `body` string of ordinary
   anything but apps and jobs; a body that declares or uses a template (no
   nesting); an expanded name a declared resource or another use already has;
   template and use names that aren't DNS labels, and a parameter named
-  `template`.
+  `template`; and a use whose expansion would pass `MAX_EXPANDED_BYTES`
+  (4 MiB), or all the uses of one expansion (a manifest, or one file of a
+  tree) `MAX_TOTAL_EXPANDED_BYTES` (16 MiB), checked as the text grows so
+  nothing past the cap is allocated (#1425).
 - **What's stored.** Only ordinary apps and jobs. Each expanded one carries
   `provenance: { template, use }` (`AppSpec::provenance`,
   `JobSpec::provenance`), the one wire and state change. It's part of the
@@ -1141,7 +1165,10 @@ with a `default`; without one, required) and a `body` string of ordinary
   node's placement fingerprint set it aside, so moving an app into or out of
   a template restarts nothing when the expansion is the same. Policies see
   it as `app.provenance` or `job.provenance`; a policy `default` can't set
-  it. A body may declare an `owner`, and the owner rules judge the expanded
+  it. It is not a trust signal (#1430): any manifest may declare a template
+  of any name, and a hand-written spec may set the field, which the apply
+  endpoint can't tell from `relish`'s local expansion. A policy may aim a
+  rule at it, never exempt on it. A body may declare an `owner`, and the owner rules judge the expanded
   app exactly as they judge a hand-written one. `relish apply
   --dry-run` shows it as `from use.NAME (template NAME)`.
 - **Not done.** No registry: templates come from files or git. No logic in

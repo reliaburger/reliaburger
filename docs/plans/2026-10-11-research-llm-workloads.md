@@ -3,8 +3,9 @@
 Status: research, 11 October 2026. Checked against `main` at `b2affe93`. A
 follow-up to [the batch scheduler landscape](2026-10-11-research-batch-schedulers.md),
 which this page assumes you've read. The maintainer decided the release order
-on 11 October (see [Decisions](#decisions)) and is re-reading the analysis
-before it becomes milestones.
+on 11 October (see [Decisions](#decisions)). On 19 October the 0.6.0, 0.7.0,
+0.7.1 and 0.8.0 milestones and their issues were created, and 0.7.0 was
+renamed from "Models" to "LLMs".
 
 The question: what would make Reliaburger the obvious choice for running LLM
 inference *and* training on your own GPUs? Which projects would we have to
@@ -353,17 +354,17 @@ Pipelines and 0.8.0 Fair share. For LLM workloads, three things change:
 1. **The GPU release grows.** Placing GPUs by count isn't enough: without
    devices, CDI, shared memory, health and topology inside a node, vLLM with
    tensor parallelism doesn't run.
-2. **A new "Models" release for serving**, before pipelines. Single-node
+2. **A new "LLMs" release for serving**, before pipelines. Single-node
    serving (a 70B model on four to eight GPUs) is what most 8–256 GPU teams
    want first, and it's where our registry and ingress pay off.
-3. **Groups become their own release, straight after Models.** Gangs were
+3. **Groups become their own release, straight after LLMs.** Gangs were
    part of the fair-share release; for LLMs they have to carry ranks and a
    leader address, roles, topology domains and hot spares, because the same
    group runs multi-node inference, multi-node training and RL. That's too
    important to wait behind pipelines and fair share.
 
-So the order becomes 0.6.0 GPUs, 0.7.0 Models, 0.8.0 Groups, 0.9.0
-Pipelines and 0.10.0 Fair share. The maintainer decided the Models release
+So the order becomes 0.6.0 GPUs, 0.7.0 LLMs, 0.8.0 Groups, 0.9.0
+Pipelines and 0.10.0 Fair share. The maintainer decided the LLMs release
 and moving groups earlier on 11 October. Pipelines still comes before fair
 share, as decided on the landscape page. Each release below says what it contains, what using
 it would look like, how we'd build it, the demo we'd put on the landing page,
@@ -477,7 +478,7 @@ nobody else can do it in one command.
 > serving GPUs: the node is cordoned within two minutes, the job moves, and
 > `relish` says which device failed.
 
-### 0.7.0: Models
+### 0.7.0: LLMs
 
 Serving LLMs on one node per replica, from a model name to an endpoint:
 
@@ -598,7 +599,7 @@ llama.cpp` and a chat completion with `curl`.
 
 ### 0.7.1: GPU dev environments
 
-A small release straight after Models: `relish dev start --gpu 1 --image
+A small release straight after LLMs: `relish dev start --gpu 1 --image
 pytorch:2.9 --idle 2h` gives a researcher a GPU container to work in over
 SSH, VS Code Remote or Jupyter, with a persistent home volume. It's an
 ordinary app with an SSH server; Sesame issues short-lived SSH certificates
@@ -612,7 +613,7 @@ priority class.
 
 Multi-node work as one unit, which multi-node inference, multi-node training
 and RL all need. Groups were part of the fair-share release; the maintainer
-brought them forward on 11 October, so they come straight after Models:
+brought them forward on 11 October, so they come straight after LLMs:
 
 1. All-or-nothing placement with ranks, size and leader address injected (the
    [torchrun](https://docs.pytorch.org/docs/main/elastic/run.html) and
@@ -923,7 +924,7 @@ What each tier proves, release by release:
 | Release | One GPU (`make test-gpu`) | Eight-GPU node | Multi-node InfiniBand |
 |---|---|---|---|
 | 0.6.0 GPUs | Inventory, CDI, isolation, metrics, `relish gpus`, an injected XID leading to a cordon | Several GPUs per job, NVLink topology, moving work to a healthy GPU | – |
-| 0.7.0 Models | `relish model run`, weights in Pickle, readiness, scale to zero, cold start, keys and token limits | Tensor-parallel serving, peer-loaded replicas, prefix routing across replicas | – |
+| 0.7.0 LLMs | `relish model run`, weights in Pickle, readiness, scale to zero, cold start, keys and token limits | Tensor-parallel serving, peer-loaded replicas, prefix routing across replicas | – |
 | 0.8.0 Groups | Group mechanics with CPU members and one GPU member | Groups within a node | Multi-node training, RDMA, spares, verl |
 | 0.9.0 Pipelines | GPU task arrays and the batch API | Batch filling idle GPUs beside a served model | – |
 | 0.10.0 Fair share | Queues, preemption and grace periods | Shares settling across eight GPUs | Shares across nodes |
@@ -939,7 +940,7 @@ times as long as the validation itself:
 | Release | One GPU (gate runs and a dev box) | Eight-GPU node | Multi-node InfiniBand | Total |
 |---|---|---|---|---|
 | 0.6.0 GPUs | $140 | 21 h, $670 | – | $810 |
-| 0.7.0 Models | $100 | 24 h, $770 | – | $870 |
+| 0.7.0 LLMs | $100 | 24 h, $770 | – | $870 |
 | 0.8.0 Groups | $100 | 10 h, $320 | 2 nodes × 8 h and 3 nodes × 5 h, $1,120 | $1,540 |
 | 0.9.0 Pipelines | $100 | 10 h, $320 | – | $420 |
 | 0.10.0 Fair share | $100 | 12 h, $385 | 2 nodes × 4 h, $290 | $775 |
@@ -998,9 +999,10 @@ the choice for a frontier pre-training run, and we should say that plainly.
 
 The maintainer decided on 11 October 2026:
 
-1. **A Models release.** 0.7.0 Models comes before pipelines.
+1. **An LLMs release.** 0.7.0 comes before pipelines. It was called
+   "Models" until the maintainer renamed it "LLMs" on 19 October.
 2. **Groups earlier.** Groups become their own release, 0.8.0, straight after
-   Models; Pipelines moves to 0.9.0 and Fair share to 0.10.0.
+   LLMs; Pipelines moves to 0.9.0 and Fair share to 0.10.0.
 3. **The GPU release carries all eight items**, health and metrics included.
 4. **Models are `[model.*]`**, shorthand that expands to an `[app.*]`.
 5. **GPU dev environments** are a small release of their own, 0.7.1.
@@ -1012,8 +1014,13 @@ The maintainer decided on 11 October 2026:
    of about $5,250 for 0.6.0 to 0.10.0 (see
    [Testing on real GPUs](#testing-on-real-gpus)).
 
-Still open: the maintainer is re-reading the analysis before any milestones
-or issues are created.
+On 19 October the maintainer approved the milestones and issues for
+[0.6.0](https://github.com/reliaburger/reliaburger/milestone/23),
+[0.7.0](https://github.com/reliaburger/reliaburger/milestone/24),
+[0.7.1](https://github.com/reliaburger/reliaburger/milestone/25) and
+[0.8.0](https://github.com/reliaburger/reliaburger/milestone/26). 0.9.0
+Pipelines and 0.10.0 Fair share get theirs after 0.8.0 ships, when the
+maintainer revisits them.
 
 ## Sources
 

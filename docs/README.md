@@ -124,14 +124,20 @@ allowlist and the token's `host-exec`, and the scheduler places the app only
 on a node that allows all of them:
 
 ```toml
-[app.vpn]
-image = "ghcr.io/example/vpn:2.0"
+[app.files]
+image = "ghcr.io/example/files:2.0"
 
-[app.vpn.runtime]
-capabilities = ["NET_ADMIN"]
-sysctls = { "net.ipv4.ip_forward" = "1" }
-devices = [{ path = "/dev/net/tun", permissions = "rw" }]
+[app.files.runtime]
+capabilities = ["SYS_ADMIN"]
+sysctls = { "net.core.somaxconn" = "4096" }
+devices = [{ path = "/dev/fuse", permissions = "rw" }]
 ```
+
+A capability the container's own namespaces can't use is refused when the
+config is parsed: the network ones, and every one the kernel checks against
+the host whatever the container holds, such as `CAP_SYS_TIME` or
+`CAP_SYS_NICE` (#1427, #1474). The [security manual](manual/10_security.md)
+lists which work.
 
 ### Jobs and cron
 
@@ -1656,11 +1662,13 @@ machines.
   the first failure, writes the records and a rule-of-three summary
   (`DIR.md`), and deletes the VM and checkout (`--keep` keeps them). It
   refuses `reliaburger-test`, an existing VM and a dirty checkout.
-- `scripts/release/nightly-qualify.sh --train release-X-Y-Z [--gate patch|full]`
+- `scripts/release/nightly-qualify.sh --train release-X-Y-Z`
   runs the long tiers on a train's tip every night: the power-cut and reboot
   runs, then the V02 and jobs fast soaks against a staged build of the tip,
-  then the job final for the full gate. The staged build is the train's
-  nightly build: `build.yml` on the train signs it with the nightly key, which
+  then the job final when the release needs the full gate, which it works
+  out with `release_tier.py` (`--gate full` can raise it, never lower it).
+  The staged build is the train's nightly build: `build.yml` on the train
+  signs it with the nightly key, which
   no release trusts, and `stage.yml -f channel=nightly` publishes it as a
   `nightly-v…` pre-release that the website installer refuses
   ([nightly signing key](releasing.md#nightly-signing-key)). It writes a dated record naming the

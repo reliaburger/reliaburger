@@ -453,6 +453,16 @@ class Leaks(Evidence):
         self.assertEqual(sample(start + 3000 + 3600, "b2", 657000), [])
         self.assertEqual([item["check"] for item in sample(start + 3000 + 7000, "b2", 830000)], ["leak-rss"])
 
+    def test_anonymous_and_file_backed_rss_are_trended_apart(self):
+        # #1417: heap growth and mapped files look the same in VmRSS.
+        state = {}
+        for ts, anon, mapped in ((NOW, 200000, 30000), (NOW + 600, 260000, 31000)):
+            text = INVENTORY + f"bun_rss_anon_kb {anon}\nbun_rss_file_kb {mapped}\n"
+            checker.resource_trend_findings(state, "rb-a-1", checker.parse_inventory(text), ts)
+        trend = state["trends"]["rb-a-1"]
+        self.assertEqual(trend["rss_anon_kb"], {"first": 200000, "last": 260000, "max": 260000})
+        self.assertEqual(trend["rss_file_kb"], {"first": 30000, "last": 31000, "max": 31000})
+
     def test_inventories_without_an_image_line_still_track_the_pid(self):
         state = {}
         def sample(ts, pid, rss_kb):
@@ -823,6 +833,19 @@ class AgentLoopTurns(Evidence):
         failure = next(item for item in verdict["findings"] if item["check"] == "agent-loop-turn")
         self.assertIn("1 command turn(s) over the 1 s budget", failure["detail"])
 
+    def test_a_torn_scrape_is_not_a_slow_turn(self):
+        # #1419: the 0.2.3 day run's node 3 scraped le="1" one above +Inf
+        # once, from a Bun that read its turn count before its buckets. No
+        # turn was slow, and the scrape after it was honest again.
+        torn = [dict(sample, value=sample["value"] + (1 if json.loads(sample["labels"])["le"] != "+Inf" else 0))
+                for sample in turns(branch="follow_up", within=105875, ts=NOW + 10)]
+        code, verdict = self.evaluate(self.snapshot(ts=NOW + 30, **{
+            "inventory__rb-a-3_txt": INVENTORY,
+            "turns__rb-a-3_json": turns(branch="follow_up", within=105850, ts=NOW)
+            + torn + turns(branch="follow_up", within=105904, ts=NOW + 20)}))
+        self.assertNotIn("agent-loop-turn", self.failures(verdict))
+        self.assertNotIn("rb-a-3", checker.load_state(self.evidence).get("turns_over_budget", {}))
+
     def slow_fsync_window(self, node):
         with contextlib.redirect_stdout(io.StringIO()):
             checker.main(["window", str(self.evidence), "open", "node-slow-fsync", "--node", node])
@@ -882,7 +905,7 @@ class SoakPolicies(Evidence):
 
     def setUp(self):
         super().setUp()
-        (self.evidence / "workloads.toml").write_text(SOAK_WORKLOADS.read_text())
+        (self.evidence / "policies.toml").write_text(SOAK_WORKLOADS.read_text())
         self.declared = checker.expected_policies(self.evidence)
 
     def test_the_soak_workload_carries_a_deny_a_warn_and_a_default(self):
@@ -1155,7 +1178,8 @@ def passing_job_report(load, node_faults):
                 stop_requested_at=NOW + FINAL - 100,
                 progress={mode: {"succeeded": 20_000_000, "retried": 0} for mode in job_soak.MODES},
                 # p99 job start lag 32 ms, inside its SLO (#1400).
-                metrics=dict(start_lag_ms_counts=[980, 0, 0, 0, 0, 20] + [0] * 10))
+                metrics=dict(start_lag_ms_counts=[980, 0, 0, 0, 0, 20] + [0] * 10,
+                             quiet_start_lag_ms_counts=[980, 0, 0, 0, 0, 20] + [0] * 10))
 
 
 class ExecutionInventory(unittest.TestCase):

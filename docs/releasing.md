@@ -67,16 +67,27 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   portable Linux with the coverage floor, the demo app and the optimised
   contract boundaries, in 15–20 minutes. A `full-ci` label adds everything
   except the three macOS shards: privileged Linux, cluster, acceptance,
-  upgrades and benchmarks. macOS runs in the queue and on the push.
-- **The merge queue** on `release-*` runs every job, macOS shards and heavy
-  suites included, on the batch merged onto the train, before any of it
-  lands. The queue requires the single check `ignored-test evidence`, which
-  waits for every other job and demands every evidence owner.
-- **The push to the train**, and the gate PR into `main` (its head is a
-  train), run everything again on the result.
+  upgrades and benchmarks. The macOS shards run on the PR only when it
+  touches macOS-specific code or carries a `macos` label.
+- **The merge queue**, where a train has one, runs every job, macOS shards
+  and heavy suites included, on the batch merged onto the train, before any
+  of it lands. The queue requires the single check `ignored-test evidence`,
+  which waits for every other job and demands every evidence owner.
+- **The push to the train** runs everything on the result, macOS included.
+- **The gate PR** into `main` gets the light set on each push, because the
+  push to the train has just run everything on the same code
+  ([#1443](https://github.com/reliaburger/reliaburger/issues/1443)). At code
+  freeze, label it `release-gate`: from then on it runs everything, and the
+  evidence gate refuses it without every owner, macOS included. Merging it
+  pushes to `main`, which runs everything again, and that run is the one the
+  candidate build reuses.
 
 So nothing reaches a train, or `main`, without the full set having passed on
-that exact commit.
+that exact commit. macOS runs on every push and on the nightly, on the
+release gate PR and on the candidate build, but not on ordinary pull
+requests: the organisation's plan runs at most five macOS jobs at once, and
+each full run takes three. Dependabot's PRs never get macOS unless labelled;
+the nightly on `main` covers them.
 
 ## Refreshing dependencies
 
@@ -198,10 +209,10 @@ decision D31 in [#674](https://github.com/reliaburger/reliaburger/issues/674),
 10 October 2026). Every release from 0.1.0 to 0.2.2 bumped a format. 0.2.3
 is the first to keep its predecessor's pair, so a 0.2.2 cluster could roll
 onto it in place
-([upgrading from 0.2.2](#upgrading-from-022)), but no rolling upgrade between
-two published releases has been qualified yet. Qualifying that walk is a goal,
-not a release gate
-([#1444](https://github.com/reliaburger/reliaburger/issues/1444)). The pre-1.0 rule for known harness artefacts in
+([upgrading from 0.2.2](#upgrading-from-022)). That walk, the first between
+two published releases, ran on 29 October 2026
+([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md)). Qualifying a release's walk from its predecessor
+is a goal, not a release gate. The pre-1.0 rule for known harness artefacts in
 the V02 soak (step 4 of [staging a candidate](#staging-a-candidate))
 stays as it is.
 
@@ -463,11 +474,16 @@ same steps and the same losses.
 
 0.2.3 keeps 0.2.2's formats: protocol 53 and state format 70. It's the first
 release that doesn't bump one, so a 0.2.2 cluster's nodes accept 0.2.3's
-binary, and `relish upgrade start v0.2.3` can roll it in place. Nobody has
-qualified that published-to-published walk yet
-([#1444](https://github.com/reliaburger/reliaburger/issues/1444)). Until a
-record says it works, the path we've tested is the one from
-[0.2.1](#upgrading-from-021): a fresh cluster.
+binary, and `relish upgrade start v0.2.3` rolls it in place. We walked a
+three-node laptop cluster from the published 0.2.2 to the published 0.2.3 on
+29 October 2026 ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md)): every node moved, leader last, in
+2 min 20 s, with the council, cron jobs and `relish wtf` healthy throughout.
+One thing didn't hold: each node's app replicas were replaced rather than
+kept, because a restarting node reported itself not ready and the leader
+moved its replicas
+([#1449](https://github.com/reliaburger/reliaburger/issues/1449)). Both
+releases do it on any Bun restart; 0.2.4 fixes it. Expect your apps to
+restart, and sometimes move, once per node during this walk.
 
 The 0.3.0 appliance train carries everything up to 0.2.4 plus the appliance
 OS rollout and the cluster-wide council size, both new Raft requests and new
@@ -564,15 +580,18 @@ to `main`, so the build reuses that run instead of running the suite again
 [`ci_reuse.py`](../scripts/release/ci_reuse.py), which asks the GitHub API
 for a `ci.yml` run on exactly this commit, from a push, the merge queue or the
 nightly schedule (a pull request's run tests a merge commit and may skip
-jobs). The run counts only if it succeeded and every job in it succeeded,
-`ignored-test evidence` included; the script's list of required jobs is kept
+jobs). The run counts only if it succeeded on its first attempt and every
+job in it succeeded, `ignored-test evidence` included. A run that went green
+only when someone re-ran it doesn't count: a failure that passes on a re-run
+is a flake, retries are 0, and the candidate runs its own suite instead
+([#1436](https://github.com/reliaburger/reliaburger/issues/1436)); the script's list of required jobs is kept
 equal to `ci.yml`'s own by a test, so a new CI job can't be skipped silently.
-Anything else (no such run, a failed, cancelled or skipped job, another
-commit, an API error) runs the full suite in `validate-release`, as every
+Anything else (no such run, a re-run, a failed, cancelled or skipped job,
+another commit, an API error) runs the full suite in `validate-release`, as every
 build did before 0.2.4. Reusing the run takes the candidate from about 2 hours
 to about 50 minutes, the macOS `relish` build's time; most of the hour saved
 was spent waiting for hosted macOS runners. The job summary's *Source CI*
-line names the run the candidate rests on.
+line names the run and attempt the candidate rests on.
 
 Only after those checks pass does it collect the two built guest images, sign
 all six binaries and both images' digests, and upload `candidate-<commit>-<attempt>` as an Actions artefact.
@@ -671,12 +690,14 @@ job final. A failure then turns up mid-week, on the train, instead of after
 the freeze on a candidate.
 
 ```sh
-scripts/release/nightly-qualify.sh --train release-0-2-4 --gate patch \
+scripts/release/nightly-qualify.sh --train release-0-2-4 \
   --base-url https://github.com/reliaburger/reliaburger/releases/download/nightly-v0.2.4-RUN_ID-ATTEMPT \
   --qualified-digest ITS_DIGEST [--soak-bun /path/to/bun-v0.2.4-soak.1]
 ```
 
-It reads the tip with `git ls-remote`, fetches it, and runs every tier from a
+It reads the tip with `git ls-remote`, fetches it, works out the gate the
+release needs ([below](#a-gate-scaled-to-the-release)), and runs every tier
+from a
 detached checkout of that commit, so the tip's own harness runs. Power-cut
 and reboot runs build the commit inside their disposable VM; the soaks
 install a staged build through `curl | sh`, and the script refuses one whose
@@ -718,8 +739,21 @@ never marked latest. Nothing can mistake it for a release:
 - `docs/website/install.sh` refuses a mirror whose last path segment starts
   with `nightly-` unless `RELIABURGER_ACCEPT_NIGHTLY=1`, and
   `nightly-qualify.sh` sets that for its soaks and nothing else does;
-- even with that set by hand, a released `relish` or `bun` refuses the
-  nightly's signatures, because it doesn't trust the nightly key.
+- on a fresh install that variable is the only guard. Set by hand, it lets
+  the bootstrap run the nightly's own `install.sh`, which installs the
+  nightly's own `relish`, and that one trusts the nightly key. What the keys
+  guarantee is the other direction: a released `relish` or `bun` already on a
+  machine refuses the nightly's signatures, so nothing released installs or
+  upgrades to a nightly.
+
+The nightly's binaries aren't the candidate's bytes, either. They're built
+from the same commit, but with the `nightly-signing` feature, which changes
+the keys `src/upgrade/keys.rs` trusts and nothing else. A green night says
+the candidate's *code* passed the long tiers; the staged installs at freeze
+still run on the candidate's own signed build. The portable Linux CI job runs
+the nightly build's key test (`cargo test --features nightly-signing
+upgrade::keys::`), so the one difference is tested on every run
+([#1442](https://github.com/reliaburger/reliaburger/issues/1442)).
 
 Before any tier, `nightly-qualify.sh` checks the staged build's
 `candidate.json` against the digest and the tip, and checks its guest images'
@@ -768,8 +802,15 @@ a tag range and prints `patch` or `full` with its reasons:
 scripts/release/release_tier.py --previous v0.2.3 --release v0.2.4 --commit origin/release-0-2-4
 ```
 
-Run it when the train opens and again at freeze; a change that tips a patch
-release into the full gate moves its nightlies to `--gate full`.
+`nightly-qualify.sh` and `nightly.py freeze-check` apply the same rule
+themselves, so neither takes the gate on trust: the release is the version in
+the commit's `Cargo.toml`, the previous release the nearest `v*` tag behind
+it (`--previous` names another), and the run prints the reasons. `--gate`
+can only raise the gate: asking for the patch gate on a release that needs
+the full one is refused, so a change that tips a patch release into the full
+gate moves its nightlies and its freeze check with it
+([#1428](https://github.com/reliaburger/reliaburger/issues/1428)). 0.2.4
+needs the full gate: it moves `CURRENT` and the agent loop.
 
 ### Code freeze
 
@@ -779,7 +820,7 @@ the soaks and power-cut runs don't run again:
 
 ```sh
 git fetch origin main
-scripts/release/nightly.py freeze-check --commit CANDIDATE_SHA --gate patch
+scripts/release/nightly.py freeze-check --commit CANDIDATE_SHA
 ```
 
 Same code means the same commit, or a commit with the same tree: the gate
@@ -956,7 +997,17 @@ the real `curl … | sh` install against it on every host we advertise.
    unless both checkers were armed for at least 60 minutes on every node,
    with one unbroken window of at least 30 (maintainer decision, 20 October
    2026, [#1062](https://github.com/reliaburger/reliaburger/issues/1062)).
-   Fast and custom runs record their exposure without gating on it. A product fix
+   Fast and custom runs record their exposure without gating on it. Each
+   heavy check also reports Bun's anonymous and file-backed RSS
+   (`rss_anon_kb`, `rss_file_kb` in the record's resource trends), so heap
+   growth isn't mistaken for mapped files
+   ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)). The
+   nodes export logs and metrics to `soak-export` on their own disks; once a
+   metrics export's source has been gone for 30 minutes, and the checker has
+   seen it at the destination, the harness deletes it
+   (`soak_export_retention.py`). Without that the export grew by about
+   600 MiB a node in a day run
+   ([#1418](https://github.com/reliaburger/reliaburger/issues/1418)). A product fix
    found during the final run means a new candidate, a fresh fast run and
    then a fresh final run. `--resume --evidence DIR` continues an interrupted
    run with its original tier. The [0.1.0 release closure

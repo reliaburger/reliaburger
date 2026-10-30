@@ -1159,9 +1159,12 @@ impl RuncGrill {
         };
         let mut output = String::new();
         for extension in ["stdout", "stderr"] {
-            let bytes = tokio::fs::read(stem.with_extension(extension))
-                .await
-                .map_err(|error| failure(instance, error))?;
+            let path = stem.with_extension(extension);
+            let bytes =
+                tokio::task::spawn_blocking(move || crate::grill::capture::read_retained(&path))
+                    .await
+                    .map_err(|error| failure(instance, error))?
+                    .map_err(|error| failure(instance, error))?;
             output.push_str(&String::from_utf8_lossy(&bytes));
         }
         Ok(output)

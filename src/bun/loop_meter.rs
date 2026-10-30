@@ -230,31 +230,42 @@ impl std::fmt::Display for TurnRecord {
     }
 }
 
-/// Per-branch histogram: a count per bucket (not cumulative), plus the
-/// running sum and count Prometheus histograms carry.
+/// Per-branch histogram: a count per bucket (not cumulative), the last one
+/// for turns past every bound, plus the running sum Prometheus histograms
+/// carry.
+///
+/// There is no separate turn count. A scrape runs on another thread while
+/// turns finish, and reading a count apart from the buckets let one scrape
+/// see a turn in `le="1"` but not in `+Inf` (#1419). The count is the sum of
+/// the buckets one scrape read, so it can't disagree with them.
 struct BranchHistogram {
-    buckets: [AtomicU64; BUCKET_BOUNDS.len()],
+    buckets: [AtomicU64; BUCKET_BOUNDS.len() + 1],
     sum_nanos: AtomicU64,
-    count: AtomicU64,
 }
 
 impl BranchHistogram {
     const fn new() -> Self {
         Self {
-            buckets: [const { AtomicU64::new(0) }; BUCKET_BOUNDS.len()],
+            buckets: [const { AtomicU64::new(0) }; BUCKET_BOUNDS.len() + 1],
             sum_nanos: AtomicU64::new(0),
-            count: AtomicU64::new(0),
         }
     }
 
     fn observe(&self, took: Duration) {
         let seconds = took.as_secs_f64();
-        if let Some(bucket) = BUCKET_BOUNDS.iter().position(|bound| seconds <= *bound) {
-            self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
-        }
+        let bucket = BUCKET_BOUNDS
+            .iter()
+            .position(|bound| seconds <= *bound)
+            .unwrap_or(BUCKET_BOUNDS.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
         let nanos = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
         self.sum_nanos.fetch_add(nanos, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Each bucket's count, read once, so every number a scrape exports
+    /// comes from the same reading.
+    fn counts(&self) -> [u64; BUCKET_BOUNDS.len() + 1] {
+        std::array::from_fn(|bucket| self.buckets[bucket].load(Ordering::Relaxed))
     }
 }
 
@@ -374,7 +385,8 @@ impl LoopTurnMeter {
         let mut samples = Vec::new();
         for branch in LoopBranch::ALL {
             let histogram = &self.branches[branch.index()];
-            let count = histogram.count.load(Ordering::Relaxed);
+            let counts = histogram.counts();
+            let count: u64 = counts.iter().sum();
             if count == 0 {
                 continue;
             }
@@ -387,8 +399,8 @@ impl LoopTurnMeter {
                 labels
             };
             let mut cumulative = 0;
-            for (bound, bucket) in BUCKET_BOUNDS.iter().zip(&histogram.buckets) {
-                cumulative += bucket.load(Ordering::Relaxed);
+            for (bound, bucket) in BUCKET_BOUNDS.iter().zip(counts) {
+                cumulative += bucket;
                 samples.push(CollectedMetric {
                     key: MetricKey::with_labels(
                         format!("{TURN_METRIC}_bucket"),
@@ -631,5 +643,59 @@ mod tests {
         let last = meter.last_turn().unwrap();
         assert_eq!(last.branch, LoopBranch::HealthTick);
         assert_eq!(last.part(TurnPart::JournalWrite), None);
+    }
+
+    /// #1419: the 0.2.3 day run failed on "1 follow_up turn over the 1 s
+    /// budget" on node 3, and no slow-turn line named it. No turn was slow.
+    /// One scrape read the turn count, then a short turn finished, then the
+    /// scrape read the buckets, so `le="1"` (105,877) came out above `+Inf`
+    /// (105,876), and the soak checker counted the next, honest,
+    /// scrape as a new slow turn. Each scrape must be one consistent
+    /// histogram: buckets never shrink as `le` grows, and `+Inf` and `_count`
+    /// are the same number, however turns finish while it's read.
+    #[test]
+    fn a_scrape_racing_finished_turns_is_one_consistent_histogram() {
+        let meter = std::sync::Arc::new(LoopTurnMeter::new());
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let meter = meter.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    meter.branches[LoopBranch::FollowUp.index()].observe(Duration::from_millis(3));
+                }
+            })
+        };
+        let bounds: Vec<String> = BUCKET_BOUNDS
+            .iter()
+            .map(|bound| bound.to_string())
+            .chain(["+Inf".to_string()])
+            .collect();
+        let mut torn = 0;
+        for _ in 0..20_000 {
+            let samples = meter.samples();
+            let bucket = |le: &str| {
+                value(
+                    &samples,
+                    "bun_agent_loop_turn_seconds_bucket",
+                    &[("branch", "follow_up"), ("le", le)],
+                )
+            };
+            let Some(total) = bucket("+Inf") else {
+                continue;
+            };
+            let cumulative: Vec<f64> = bounds.iter().filter_map(|le| bucket(le)).collect();
+            let count = value(
+                &samples,
+                "bun_agent_loop_turn_seconds_count",
+                &[("branch", "follow_up")],
+            );
+            if cumulative.windows(2).any(|pair| pair[0] > pair[1]) || count != Some(total) {
+                torn += 1;
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert_eq!(torn, 0, "{torn} of 20,000 scrapes were torn");
     }
 }

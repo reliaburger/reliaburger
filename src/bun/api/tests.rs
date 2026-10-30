@@ -1943,6 +1943,38 @@ async fn follower_of_a_recording_leader(
     (follower, seen, nodes)
 }
 
+/// #1442: a follower forwards stop, delete and release as the caller, not
+/// as its own service identity, so the leader checks the app's owner
+/// against its own desired state and the caller's token. A follower's
+/// replica can lag a claim, and the leader used to wave the forwarded
+/// request through as the system principal.
+#[tokio::test]
+async fn a_follower_forwards_app_changes_to_the_leader_with_the_callers_token() {
+    let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+    let (follower, seen, nodes) = follower_of_a_recording_leader(deployer).await;
+    let calls = [
+        "/v1/stop/db/pg",
+        "/v1/delete/db/pg",
+        "/v1/delete/db/pg?force=true",
+        "/v1/release/db/pg",
+    ];
+    for path in calls {
+        let (status, reply) =
+            send_bounded(follower.clone(), "POST", path, &deployer_key, "", &[]).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}: {reply}");
+    }
+    let seen = seen.lock().await.clone();
+    assert_eq!(seen.len(), calls.len(), "{seen:?}");
+    assert!(
+        seen.iter().all(|(_, bearer, marked, _)| *marked
+            && bearer.as_deref() == Some(format!("Bearer {deployer_key}").as_str())),
+        "each forward carries the caller's token and the forwarded mark: {seen:?}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn a_follower_forwards_upgrade_control_calls_to_the_leader_with_the_callers_token() {
     let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
@@ -2470,6 +2502,161 @@ async fn a_settled_leader_accepts_job_submissions_after_its_quorum_misses_a_hear
             send_bounded(app.clone(), "POST", path, &admin_key, body, extra).await;
         healer.await.unwrap();
         assert_eq!(status, StatusCode::ACCEPTED, "{path}: {reply}");
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// Send `method path` to a leader whose followers miss its first heartbeat
+/// round: the links heal 300 ms after the request starts.
+async fn send_while_heartbeats_lag(
+    app: &Router,
+    network: &crate::council::network::InMemoryRaftRouter,
+    leader: &crate::council::CouncilNode,
+    request: (&str, &str, &str),
+    bearer: &str,
+) -> (StatusCode, String) {
+    let (method, path, body) = request;
+    network.partition(1, 2).await;
+    network.partition(1, 3).await;
+    // One confirmation round can't reach a quorum.
+    assert!(!leader.is_leader().await, "{method} {path}");
+    let healer = {
+        let network = network.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            network.heal().await;
+        })
+    };
+    let mut request = axum::http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {bearer}"));
+    if path != "/v1/apply" && !body.is_empty() {
+        request = request.header("content-type", "application/json");
+    }
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        app.clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{method} {path} didn't answer in 30 s"))
+    .unwrap();
+    healer.await.unwrap();
+    let status = response.status();
+    // A job apply streams its progress until the jobs finish, which these
+    // never do: the status is what this test is about.
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        response.into_body().collect(),
+    )
+    .await
+    .map(|body| String::from_utf8_lossy(&body.unwrap().to_bytes()).to_string())
+    .unwrap_or_else(|_| "(still streaming)".to_string());
+    (status, body)
+}
+
+// #1441: the batch, apply, replay, disable and stop routes confirm
+// leadership the same way as the submissions above (#1253), but nothing
+// tested them. A settled leader whose followers answer one round late must
+// serve each, not refuse it with "can't confirm it with a quorum".
+#[tokio::test]
+async fn a_settled_leader_serves_batch_apply_replay_disable_and_stop_after_a_missed_heartbeat_round()
+ {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let app = router_over(nodes[0].clone(), admin);
+    let leader = nodes[0].as_ref();
+
+    // A scheduled definition, for disable and stop. Its first occurrence is
+    // a year away, so it has no run yet; replay uses the batch below.
+    let (status, reply) = send_bounded(
+        app.clone(),
+        "POST",
+        "/v1/jobs/runs",
+        &admin_key,
+        r#"{"name":"nightly","namespace":"ops","definition":{"template":{"runtime":"process","exec":"/bin/true"},"cron":{"expression":"0 0 1 1 *"}}}"#,
+        &[(super::LEADER_FORWARDED_HEADER, "1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
+
+    let batch = r#"{"jobs":[{"name":"render","namespace":"default","spec":{"image":"x:1","command":["true"]}}]}"#;
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        leader,
+        ("POST", "/v1/batch", batch),
+        &admin_key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "POST /v1/batch: {reply}");
+    let batch: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    let batch = batch["batch_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{reply}"));
+    // The batch is a manifest; replay takes the run of its one cohort.
+    let (_, reply) = send_bounded(
+        app.clone(),
+        "GET",
+        &format!("/v1/batch/{batch}"),
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    let status: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    let cohort = status["cohorts"][0]["batch_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{reply}"));
+
+    let calls: Vec<(&str, String, &str, StatusCode)> = vec![
+        ("GET", format!("/v1/batch/{batch}"), "", StatusCode::OK),
+        (
+            "POST",
+            "/v1/apply".into(),
+            "[job.report]\nimage = \"test:v1\"\n",
+            StatusCode::OK,
+        ),
+        // The batch has no worker of unknown fate, so the leader's state
+        // machine refuses the replay: a 409 the leader decided itself, not
+        // a 503 for want of a quorum.
+        (
+            "POST",
+            format!("/v1/jobs/runs/{cohort}/replay"),
+            r#"{"acknowledged":true,"node":"n9","grant_digest":"none"}"#,
+            StatusCode::CONFLICT,
+        ),
+        (
+            "POST",
+            "/v1/jobs/definitions/nightly/ops/disable".into(),
+            "",
+            StatusCode::OK,
+        ),
+        (
+            "POST",
+            "/v1/stop/nightly/ops".into(),
+            "",
+            StatusCode::ACCEPTED,
+        ),
+    ];
+    for (method, path, body, expected) in calls {
+        let (status, reply) =
+            send_while_heartbeats_lag(&app, &network, leader, (method, &path, body), &admin_key)
+                .await;
+        assert_eq!(status, expected, "{method} {path}: {reply}");
     }
     for node in nodes {
         node.shutdown().await.unwrap();
@@ -5320,7 +5507,7 @@ async fn managed_volume_needs_only_deploy() {
 }
 
 const RUNTIME_KNOBS: &str = "[app.lb]\nimage = \"test:v1\"\n\
-    [app.lb.runtime]\ncapabilities = [\"NET_ADMIN\"]\n";
+    [app.lb.runtime]\ncapabilities = [\"IPC_OWNER\"]\n";
 
 /// #1122: the token gate on its own. A deployer whose permission block
 /// grants `deploy` but not `host-exec` can't apply an app with a runtime
@@ -5351,7 +5538,7 @@ async fn a_runtime_knob_needs_host_exec_and_the_refusal_names_the_token_gate() {
         .unwrap();
     let message = String::from_utf8_lossy(&body);
     assert!(
-        message.contains("runtime.capabilities CAP_NET_ADMIN"),
+        message.contains("runtime.capabilities CAP_IPC_OWNER"),
         "{message}"
     );
     assert!(message.contains("token gate"), "{message}");
@@ -5373,7 +5560,7 @@ fn apply_notes_each_runtime_knob_needs_a_node_allowlist_entry() {
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(notes[0].contains("app.lb"), "{notes:?}");
     assert!(
-        notes[0].contains("runtime.capabilities CAP_NET_ADMIN"),
+        notes[0].contains("runtime.capabilities CAP_IPC_OWNER"),
         "{notes:?}"
     );
     assert!(notes[0].contains("allowed_capabilities"), "{notes:?}");

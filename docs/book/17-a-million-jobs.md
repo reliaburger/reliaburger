@@ -254,6 +254,16 @@ That's the #1009 bug again, on different routes. The quorum was never lost. The 
 
 `a_settled_leader_accepts_job_submissions_after_its_quorum_misses_a_heartbeat_round`, also in `src/bun/api/tests.rs`, builds the slow followers with the in-memory Raft router. It holds elections on all three voters, cuts the leader off from both followers, checks that one `is_leader` round fails, and heals the links 300 ms later. Meanwhile it sends a task-array submission, a manifest and a cron definition to the leader. The cron definition carries the forwarded mark, as it does when a follower sends it on. Before the fix the first call got the same 503 as CI. Now all three get 202.
 
+That fix had a cost we only saw on review ([#1441](https://github.com/reliaburger/reliaburger/issues/1441)). `confirm_leadership` runs a proof every heartbeat interval until one succeeds or 3 seconds pass, and a dozen job and task-array handlers now call it, through `council_to_forward_to`. A leader admitting a burst of submissions had every one of them proving its leadership on its own, in parallel. Each proof is a heartbeat to every follower. So the overload that made the followers slow in the first place got answered with a heartbeat round per request in flight. Can you see the feedback loop?
+
+The proofs now take turns. `SharedProof` in `src/council/proof.rs` runs at most one at a time, and `CouncilNode::is_leader` goes through it, so every caller shares it, not just the job handlers. The interesting part is which answer a caller may take. Say request B arrives while request A's proof is running. A's heartbeats left before B arrived, so a quorum answering them proves this node led *then*, not when B asked. B waits for the next proof instead, and so does everyone else who arrived during A's round. Fifty requests in one round cost one more proof, not fifty, and none of them waits longer than the rest of one round plus one more.
+
+The state lives in a `watch` channel: how many proofs have started, whether one is running, and the latest one's generation and answer. `send_if_modified` runs its closure under the channel's write lock, so "is there an answer for me yet, and if not, may I start the next proof?" is one atomic step. Everyone else awaits `changed()`. The caller that runs a proof holds a small guard, `Round`, whose `Drop` publishes the answer and clears the "running" flag. That matters because `confirm_leadership` wraps each proof in a timeout: when it fires, Rust drops the future mid-proof, the guard's `Drop` still runs, and a waiter takes over the next round instead of waiting for an answer that will never come.
+
+We didn't cache a proof for the leader lease. Followers refuse to vote while the lease runs, so a proof stays good for most of an election timeout, and we could have skipped proofs altogether for a while after one succeeded. But openraft 0.9's `ensure_linearizable` doesn't tell us when its heartbeats left, only when the quorum answered, and a lease read is only safe if you measure from the send, with a margin for clock drift. Getting that wrong serves a stale read from a deposed leader, quietly. Sharing proofs fixes the traffic and keeps every answer exactly as fresh as before.
+
+`concurrent_confirmations_share_one_proof_at_a_time` in `src/council/node.rs` cuts a leader off from its followers and counts the proofs one `confirm_leadership` runs in 600 ms. Then it runs fifty at once. Before the change, fifty requests ran 600 proofs where one alone ran 12; now they run between about 25 and 50. Why not exactly 12? A failed proof ends at once, and each request sleeps its own heartbeat pause before it asks again, so a request that wakes just after a round ends starts the next one. The count depends on scheduling, so the test pins the property that matters instead: a test hook records the most proofs ever running at once, and it must be one. The count only has to stay under ten times one request's, far below the fifty times it was. Our first version asserted four times, and a coverage build on CI ran 51 proofs against 12. The hook counts a proof in a guard whose `Drop` runs even when a caller's timeout cancels it mid-flight; an earlier version decremented after the `.await`, leaked a count on every cancelled proof and reported overlaps that never happened. The same test first sends fifty confirmations to the healthy leader, and all fifty share the answer: yes. `src/council/proof.rs` tests the rules themselves: waiters share the next proof, not the running one; a proof that finished before a call doesn't answer it; and a cancelled proof lets the waiters run their own. The handlers that had no test got one too: `a_settled_leader_serves_batch_apply_replay_disable_and_stop_after_a_missed_heartbeat_round` sends `POST /v1/batch`, `GET /v1/batch/{id}`, a job apply, a replay, a schedule disable and a stop to a leader whose followers miss its first round, and expects each to be served.
+
 ### Definitions, runs and durable trigger identities
 
 A template and a count describe work, but not why it runs. A manually submitted
@@ -1117,6 +1127,18 @@ sketched, and decided against it: every one-off run would mint a new series,
 and a daily `render-$DATE` would grow the store for ever. A test checks that
 no other label ever appears, and that a node never keeps more than 1,024
 label sets however many definitions come and go.
+
+The cap bounded the map but not the samples. The collection loop exported
+every label set it kept, every 10 seconds, whether anything had run under it
+for hours or not. The 0.2.3 day run gave each of its arrays a new name, so
+each node exported one more idle set every few minutes: its metrics export
+grew from 6 MiB an hour at the start to 42 MiB an hour at the end, and Bun
+built, buffered and queried all those rows (#1417). Now a set records when it
+last saw activity, and `samples` leaves it out once it has been idle for
+`IDLE_SERIES_AFTER`, 15 minutes. Its totals stay in the map, so a definition
+that runs again carries on counting from where it was. A Prometheus target
+that stops answering looks the same: its series go stale, and `rate()` over
+a counter that comes back still works.
 
 The telemetry is shared by async tasks and synchronous code, so it sits behind
 a `std::sync::Mutex`, not a tokio one. That's allowed here because no critical
@@ -3554,6 +3576,15 @@ Now the tasks run within milliseconds, and the node's fence holds the store's
 revision *after* the tick's entry, which shows the follow-up carried the
 committed version. Waiting an hour for a test to fail isn't a plan, so the
 test waits twenty seconds and calls that never.
+
+The review of 0.2.4 spotted a loose end in it (#1442): the test cancelled
+its shutdown token and returned, without checking that the leader loop had
+stopped. The loop doesn't watch that token. It stops when the agent's
+command channel closes, and the test's stand-in agent drops its receiver on
+cancel. So the test now waits for the loop to go, and it can tell because the
+loop owns a clone of the `ApiState`, which holds an `Arc` of the task-array
+service. `Arc::strong_count` counts the owners. When the count gets back to
+one, the test's own, nothing else is running with the service.
 
 What does it cost? Every new control version is a fence write and an fsync
 on the node, and on macOS an fsync flushes the whole device (#809). A busy

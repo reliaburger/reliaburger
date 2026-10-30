@@ -13,10 +13,25 @@ use crate::config::{PolicySpec, PolicyTarget};
 
 /// The longest `match` or `deny` expression a policy may hold, in bytes.
 ///
-/// CEL has no loops of its own, so evaluation is bounded by the size of the
-/// expression times the size of the input. The `cel` crate tracks no cost,
-/// so this cap is the bound on the expression half (chapter 18).
+/// CEL has no loops of its own, but its macros (`all`, `exists`, `map`,
+/// `filter`) iterate, and a macro inside another multiplies: evaluation
+/// costs up to the expression's size times the input's size raised to the
+/// nesting depth. The `cel` crate tracks no cost, so three caps bound it
+/// instead: this one on the expression, [`MAX_COMPREHENSION_NESTING`] on the
+/// exponent, and [`MAX_COLLECTION_ENTRIES`] on the input (#1431, chapter 18).
 pub const MAX_EXPRESSION_BYTES: usize = 1024;
+
+/// How deeply a policy may nest `all`, `exists`, `exists_one`, `map` and
+/// `filter` (#1431). Two allows a rule that compares a list with itself
+/// (no argument given twice); a third level would make the deployer's input size
+/// cubed the cost.
+pub const MAX_COMPREHENSION_NESTING: usize = 2;
+
+/// The most entries any one list or map in a workload may have for a policy
+/// to judge it (#1431). A workload with a bigger one isn't judged: every
+/// policy that applies to it fails closed, naming the field, as a broken
+/// expression does.
+pub const MAX_COLLECTION_ENTRIES: usize = 1024;
 
 /// The longest `message` a policy may hold, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 512;
@@ -292,6 +307,18 @@ pub enum PolicyError {
         /// What serde said, naming the field.
         error: String,
     },
+    /// An expression nests macros deeper than [`MAX_COMPREHENSION_NESTING`].
+    #[error(
+        "{field} nests all/exists/map/filter {depth} deep, over the limit of {limit}: each level multiplies the cost by the size of the input"
+    )]
+    TooDeep {
+        /// The expression.
+        field: PolicyField,
+        /// How deep it nests.
+        depth: usize,
+        /// The cap.
+        limit: usize,
+    },
     /// An expression reads a field `app` or `caller` doesn't have.
     #[error("{field} reads {variable}.{name}, which doesn't exist")]
     UnknownField {
@@ -412,87 +439,106 @@ pub(super) fn compile_checked(
                 field,
                 error: error.to_string(),
             })?;
-    check_names(field, target, program.expression(), &mut Vec::new())?;
+    let mut walk = Walk {
+        field,
+        target,
+        bound: Vec::new(),
+        nesting: 0,
+    };
+    walk.check_names(program.expression())?;
     Ok(program)
 }
 
-/// Walk the expression, refusing a free variable a policy that applies to
-/// `target` can't see and a field `app`, `job`, `workload` or `caller`
-/// doesn't have. `bound` holds the variables the
-/// enclosing comprehensions (`all`, `exists`, `map`, `filter`) introduce.
-fn check_names(
+/// The state of a walk over one expression: which expression it is, the
+/// variables the enclosing comprehensions (`all`, `exists`, `map`,
+/// `filter`) introduce, and how many of them enclose the current node.
+struct Walk {
     field: PolicyField,
     target: PolicyTarget,
-    expression: &IdedExpr,
-    bound: &mut Vec<String>,
-) -> Result<(), PolicyError> {
-    match &expression.expr {
-        Expr::Unspecified | Expr::Literal(_) => Ok(()),
-        Expr::Ident(name) => check_variable(field, target, name, bound),
-        Expr::Select(select) => {
-            // The variable first: `job.image` in an apps policy is the wrong
-            // variable, not a missing field.
-            check_names(field, target, &select.operand, bound)?;
-            if let Expr::Ident(variable) = &select.operand.expr
-                && !bound.contains(variable)
-            {
-                check_field(field, variable, &select.field)?;
-            }
-            Ok(())
-        }
-        Expr::Call(call) => {
-            if let Some(call_target) = &call.target {
-                check_names(field, target, call_target, bound)?;
-            }
-            call.args
-                .iter()
-                .try_for_each(|argument| check_names(field, target, argument, bound))
-        }
-        Expr::List(list) => list
-            .elements
-            .iter()
-            .try_for_each(|element| check_names(field, target, element, bound)),
-        Expr::Map(map) => map
-            .entries
-            .iter()
-            .try_for_each(|entry| check_entry(field, target, &entry.expr, bound)),
-        Expr::Struct(structure) => structure
-            .entries
-            .iter()
-            .try_for_each(|entry| check_entry(field, target, &entry.expr, bound)),
-        Expr::Comprehension(comprehension) => {
-            // The range and the accumulator's start are outside the loop;
-            // everything else sees the loop's own variables.
-            check_names(field, target, &comprehension.iter_range, bound)?;
-            check_names(field, target, &comprehension.accu_init, bound)?;
-            let depth = bound.len();
-            bound.push(comprehension.iter_var.clone());
-            bound.extend(comprehension.iter_var2.iter().cloned());
-            bound.push(comprehension.accu_var.clone());
-            let inner = [
-                &comprehension.loop_cond,
-                &comprehension.loop_step,
-                &comprehension.result,
-            ]
-            .into_iter()
-            .try_for_each(|part| check_names(field, target, part, bound));
-            bound.truncate(depth);
-            inner
-        }
-    }
+    bound: Vec<String>,
+    nesting: usize,
 }
 
-fn check_entry(
-    field: PolicyField,
-    target: PolicyTarget,
-    entry: &EntryExpr,
-    bound: &mut Vec<String>,
-) -> Result<(), PolicyError> {
-    match entry {
-        EntryExpr::StructField(structure) => check_names(field, target, &structure.value, bound),
-        EntryExpr::MapEntry(map) => {
-            check_names(field, target, &map.key, bound)?;
-            check_names(field, target, &map.value, bound)
+impl Walk {
+    /// Walk the expression, refusing a free variable a policy that applies
+    /// to `target` can't see, a field `app`, `job`, `workload` or `caller`
+    /// doesn't have, and macros nested deeper than
+    /// [`MAX_COMPREHENSION_NESTING`].
+    fn check_names(&mut self, expression: &IdedExpr) -> Result<(), PolicyError> {
+        let field = self.field;
+        match &expression.expr {
+            Expr::Unspecified | Expr::Literal(_) => Ok(()),
+            Expr::Ident(name) => check_variable(field, self.target, name, &self.bound),
+            Expr::Select(select) => {
+                // The variable first: `job.image` in an apps policy is the
+                // wrong variable, not a missing field.
+                self.check_names(&select.operand)?;
+                if let Expr::Ident(variable) = &select.operand.expr
+                    && !self.bound.contains(variable)
+                {
+                    check_field(field, variable, &select.field)?;
+                }
+                Ok(())
+            }
+            Expr::Call(call) => {
+                if let Some(call_target) = &call.target {
+                    self.check_names(call_target)?;
+                }
+                call.args
+                    .iter()
+                    .try_for_each(|argument| self.check_names(argument))
+            }
+            Expr::List(list) => list
+                .elements
+                .iter()
+                .try_for_each(|element| self.check_names(element)),
+            Expr::Map(map) => map
+                .entries
+                .iter()
+                .try_for_each(|entry| self.check_entry(&entry.expr)),
+            Expr::Struct(structure) => structure
+                .entries
+                .iter()
+                .try_for_each(|entry| self.check_entry(&entry.expr)),
+            Expr::Comprehension(comprehension) => {
+                // The range and the accumulator's start are outside the
+                // loop; everything else sees the loop's own variables, and
+                // runs once per element.
+                self.check_names(&comprehension.iter_range)?;
+                self.check_names(&comprehension.accu_init)?;
+                if self.nesting + 1 > MAX_COMPREHENSION_NESTING {
+                    return Err(PolicyError::TooDeep {
+                        field,
+                        depth: self.nesting + 1,
+                        limit: MAX_COMPREHENSION_NESTING,
+                    });
+                }
+                let depth = self.bound.len();
+                self.bound.push(comprehension.iter_var.clone());
+                self.bound.extend(comprehension.iter_var2.iter().cloned());
+                self.bound.push(comprehension.accu_var.clone());
+                self.nesting += 1;
+                let inner = [
+                    &comprehension.loop_cond,
+                    &comprehension.loop_step,
+                    &comprehension.result,
+                ]
+                .into_iter()
+                .try_for_each(|part| self.check_names(part));
+                self.nesting -= 1;
+                self.bound.truncate(depth);
+                inner
+            }
+        }
+    }
+
+    fn check_entry(&mut self, entry: &EntryExpr) -> Result<(), PolicyError> {
+        match entry {
+            EntryExpr::StructField(structure) => self.check_names(&structure.value),
+            EntryExpr::MapEntry(map) => {
+                self.check_names(&map.key)?;
+                self.check_names(&map.value)
+            }
         }
     }
 }

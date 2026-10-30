@@ -314,12 +314,21 @@ permissions or namespaces. They judge a workload when it's applied: a new
 policy doesn't touch apps or jobs already running. `relish policy audit`
 shows which of them it would refuse.
 
+A job is judged however it arrives: `relish apply`, `relish run --batch`,
+`relish batch FILE`, `relish batch submit` (a task manifest) or `POST
+/v1/jobs/runs`. Each answers 422 when a deny policy refuses the job and
+prints a `warning:` line for each warn policy. `source` is `apply` on all of
+them.
+
 The cluster checks a policy when you apply it, and refuses one that:
 
 - has a name that isn't a lowercase DNS label;
 - has an empty `deny` or `match`, or one over 1024 bytes, or a `message` over
   512 bytes;
 - isn't valid CEL;
+- nests `all`, `exists`, `exists_one`, `map` or `filter` more than two deep
+  (`app.args.all(a, app.args.exists_one(b, a == b))` is as deep as it goes),
+  because each level multiplies what the policy costs to run;
 - names anything other than `app`, `caller` and `source`, such as `policy`,
   `permission` or `namespaces`;
 - reads a field `app` or `caller` doesn't have (`app.memroy`);
@@ -338,6 +347,9 @@ The cluster checks a policy when you apply it, and refuses one that:
 An expression that fails while it runs, such as `app.memory == '1Gi'` on an
 app with no memory set, or a `deny` that isn't true or false, counts as
 broken: a deny policy refuses the app and says why, and a warn policy warns.
+So does a workload with a list or map of more than 1,024 entries (`env`,
+`command`, …): it's too big for a policy to judge cheaply, so every policy
+that applies to it fails closed, naming the field.
 
 Only an unscoped Admin token can apply or delete a policy, and every policy
 write is audited. A refused apply answers with every policy it broke, writes
@@ -406,6 +418,11 @@ the definitions the cluster keeps, which are scheduled jobs and deployment
 hooks; a one-off job's definition goes once its runs are pruned. `relish wtf` shows the same
 denials and audit findings as warnings.
 
+Any token can run it, but a token limited to some apps or namespaces sees
+only those: the counts and findings leave out everything else, so a
+controller's token can't list another team's workloads or why they'd be
+refused.
+
 `action = "audit"` is the way to roll out a strict policy: commit it as
 `audit`, watch `relish policy audit` until nothing breaks it, then change it to
 `deny`.
@@ -463,18 +480,18 @@ reaches an app the next time the app itself is applied.
 ## Runtime knobs
 
 Some apps need a little more from the kernel than a container gets by
-default. A load balancer wants a bigger `net.core.somaxconn`, a VPN client
-wants `CAP_NET_ADMIN` and `/dev/net/tun`, a FUSE filesystem wants
-`/dev/fuse`. An app asks for these in its `[runtime]` table:
+default. A load balancer wants a bigger `net.core.somaxconn`, a FUSE
+filesystem wants `CAP_SYS_ADMIN` and `/dev/fuse`. An app asks for these in
+its `[runtime]` table:
 
 ```toml
-[app.vpn]
-image = "ghcr.io/example/vpn:2.0"
+[app.files]
+image = "ghcr.io/example/files:2.0"
 
-[app.vpn.runtime]
-capabilities = ["NET_ADMIN"]
-sysctls = { "net.ipv4.ip_forward" = "1", "net.core.somaxconn" = "4096" }
-devices = [{ path = "/dev/net/tun", permissions = "rw" }]
+[app.files.runtime]
+capabilities = ["SYS_ADMIN"]
+sysctls = { "net.core.somaxconn" = "4096" }
+devices = [{ path = "/dev/fuse", permissions = "rw" }]
 ```
 
 Each use needs two keys, the same two a host-path `source` needs:
@@ -485,16 +502,16 @@ Each use needs two keys, the same two a host-path `source` needs:
 
 ```toml
 [runtime]
-allowed_capabilities = ["NET_ADMIN"]
-allowed_sysctls = ["net.ipv4.ip_forward", "net.core.*"]
-allowed_devices = ["/dev/net/tun"]
+allowed_capabilities = ["SYS_ADMIN"]
+allowed_sysctls = ["net.core.*"]
+allowed_devices = ["/dev/fuse"]
 ```
 
 `apply` checks the token. A deploy-only token is refused before anything is
 written, with a reason that names the knob:
 
 ```text
-app.vpn: runtime.capabilities CAP_NET_ADMIN refused by the token gate: a runtime knob needs the host-exec permission, and this token's permission doesn't grant it
+app.files: runtime.capabilities CAP_SYS_ADMIN refused by the token gate: a runtime knob needs the host-exec permission, and this token's permission doesn't grant it
 ```
 
 The node checks its own list. Each node advertises what it allows, and the
@@ -504,7 +521,7 @@ it. A node that's asked anyway (on a standalone node, or after you've
 shortened its list) refuses the deploy and names the key it's missing:
 
 ```text
-runtime.devices /dev/net/tun refused by the node gate: this node's [runtime] allowed_devices in node.toml doesn't list it
+runtime.devices /dev/fuse refused by the node gate: this node's [runtime] allowed_devices in node.toml doesn't list it
 ```
 
 Only rootful runc applies knobs. A node on the process runtime, Apple
@@ -517,31 +534,69 @@ its network namespace and so see its `net.*` sysctls.
 What each kind accepts:
 
 - **`capabilities`**: Linux capability names, with or without `CAP_`
-  (`NET_ADMIN` and `CAP_NET_ADMIN` are the same). They're added to the
+  (`SYS_ADMIN` and `CAP_SYS_ADMIN` are the same). They're added to the
   container's default set; nothing is dropped. There's no wildcard: `ALL`
   is refused on both sides. The node names each capability, and the ones
   that amount to root inside the container (`CAP_SYS_ADMIN`,
-  `CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, `CAP_SYS_PTRACE`, `CAP_SYS_BOOT`,
-  `CAP_DAC_READ_SEARCH`, `CAP_MAC_ADMIN`, `CAP_MAC_OVERRIDE`, `CAP_BPF` and
-  `CAP_PERFMON`) are allowed only when listed by name. Bun warns at startup
-  for each one it finds. A container's root is still an unprivileged user on
-  the host (see `images-and-volumes`), so these act on the container's own
-  namespaces. As in Docker and Kubernetes, a capability reaches a process
-  that runs as root in the container; a non-root user needs file
-  capabilities on its binary.
+  `CAP_SYS_PTRACE` and `CAP_SYS_BOOT`) are allowed only when listed by name.
+  Bun warns at startup for each one it finds. A container's root is still
+  an unprivileged user on the host (see `images-and-volumes`), so these act
+  on the container's own namespaces. As in Docker and Kubernetes, a
+  capability reaches a process that runs as root in the container; a
+  non-root user needs file capabilities on its binary.
+
+  That's also the limit of what a capability can do here. A container runs
+  in a user namespace of its own, and the kernel checks each capability
+  against a user namespace: for most, the one that owns the thing being
+  changed; for the rest, the host's own. The container's processes, files,
+  mounts and IPC belong to its namespace, so `CAP_SYS_ADMIN` (mounts,
+  hostname), `CAP_SYS_PTRACE`, `CAP_SYS_BOOT` (which can only end the
+  container), `CAP_CHECKPOINT_RESTORE` and `CAP_IPC_OWNER` work on them,
+  as do the defaults (`CAP_CHOWN`, `CAP_SETUID` and the rest of Docker's
+  set). Nothing else does, so everything else is refused on both sides:
+
+  - The network capabilities, `CAP_NET_ADMIN`, `CAP_NET_RAW`,
+    `CAP_NET_BIND_SERVICE` and `CAP_NET_BROADCAST`. Bun creates the
+    container's network namespace before the container exists, so the
+    node's user namespace owns it, and `ip link`, a TUN device or a raw
+    socket would still fail with "operation not permitted". Ask for `net.*`
+    sysctls instead, which the node writes into the namespace for the app,
+    and note that every port, low ones included, is already bindable.
+  - The ones the kernel checks against the host whatever namespace asks:
+    `CAP_SYS_TIME` (the clock), `CAP_SYS_NICE` (negative nice values and
+    realtime scheduling), `CAP_IPC_LOCK` (locking memory beyond
+    `RLIMIT_MEMLOCK`), `CAP_SYS_RESOURCE` (raising hard limits),
+    `CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, `CAP_SYS_PACCT`, `CAP_SYS_TTY_CONFIG`,
+    `CAP_SYSLOG`, `CAP_LINUX_IMMUTABLE`, `CAP_LEASE`, `CAP_WAKE_ALARM`,
+    `CAP_BLOCK_SUSPEND`, `CAP_BPF`, `CAP_PERFMON`, `CAP_MAC_ADMIN`,
+    `CAP_MAC_OVERRIDE`, the three `CAP_AUDIT_*` and `CAP_MKNOD`.
+    `CAP_DAC_READ_SEARCH` is refused too: its one call of its own,
+    opening a file by handle, is checked against the host, and reading
+    past file permissions is `CAP_DAC_OVERRIDE`, which every container
+    already has.
+
+  The error names the capability and what the kernel checks it for:
+
+  ```text
+  CAP_SYS_TIME can't be granted: the kernel checks it against the node's own user namespace, not the container's, for setting the clock, so the container would still get "operation not permitted"
+  ```
+
 - **`sysctls`**: only the ones the kernel keeps per container: `net.*`,
   `kernel.shm*`, `kernel.msg*`, `kernel.sem` and `fs.mqueue.*`. Anything
   else, `kernel.panic` or `vm.overcommit_memory` say, would change the whole
   node, so it's refused at `lint` and `apply`, and a node can't list it
   either. A node may list exact names or a `net.` or `fs.mqueue.` prefix
   ending in `.*`.
-- **`devices`**: an absolute path under `/dev` and its `permissions`, some
-  of `r`, `w` and `m` (default `rwm`). The device appears at the same path
-  in the container, and the cgroup lets the container use it with those
-  permissions. The file's own mode still applies to the container's mapped
+- **`devices`**: an absolute path under `/dev` and its `permissions`, `r`,
+  `w` or `rw` (the default). The device appears at the same path in the
+  container, and the cgroup lets the container use it with those
+  permissions. A node that lists a device lets an app read and write it.
+  There's no `m` (mknod): the kernel lets only the host's own user namespace
+  make device nodes, so the permission would grant nothing, and it's
+  refused. The file's own mode still applies to the container's mapped
   user, so a device that only root or a group can open needs a mode or a
-  udev rule that lets the container in. `/dev/fuse` and `/dev/net/tun` are
-  `0666` on most distributions.
+  udev rule that lets the container in. `/dev/fuse` is `0666` on most
+  distributions.
 
 ## Audit log
 
@@ -661,6 +716,13 @@ rootless runc, the user running Bun) alone can read, and the container spec
 that carries it is deleted when the instance stops. The runtime's record of a
 stopped instance keeps the names of its environment variables, never their
 values.
+
+A sidecar inherits its app's whole `env`, so every sidecar sees the app's
+decrypted secrets, and each `PROVIDER[...]` reference in it is fetched again
+for each sidecar as it starts. A third-party proxy image you run as a
+sidecar can read the app's database password. Sidecars get the app's
+mounts too, so a file is no hiding place either. If a sidecar shouldn't
+hold a secret, run it as an app of its own.
 
 To rotate the key: `relish secret rotate` makes a new keypair and prints its
 public key, while the old one keeps decrypting. Re-encrypt your values with the

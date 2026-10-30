@@ -4901,6 +4901,71 @@ mod tests {
         ));
     }
 
+    /// #1440: once an execution's fence has committed, a repeated
+    /// retirement can be answered from committed state, and the answer is
+    /// the one the write would give. Anything the write would still change
+    /// or refuse is left to the write.
+    #[test]
+    fn a_fenced_retirement_reads_the_answer_its_write_would_give() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_consumers.insert("reader".into());
+        let catalog = withdrawal_fixture_catalogue();
+        let execution = catalog.services["default__api"].backends[0]
+            .execution
+            .clone()
+            .unwrap();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 0,
+                    catalog: Box::new(catalog),
+                })
+                .is_none()
+        );
+        let read = |inner: &StateMachineInner| {
+            inner
+                .state
+                .committed_producer_release("producer", &execution)
+        };
+        assert_eq!(read(&inner), None, "not fenced yet: only the write answers");
+
+        let request = retire_endpoint("producer", &execution);
+        released(inner.apply_request(&request), false);
+        assert_eq!(read(&inner), Some(false));
+        let before = serde_json::to_value(&inner.state).unwrap();
+        released(inner.apply_request(&request), false);
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+
+        inner.apply_request(&endpoint_receipt("reader", 1));
+        assert_eq!(read(&inner), Some(true));
+        released(inner.apply_request(&request), true);
+
+        let mut successor = execution.clone();
+        successor.generation = "b".repeat(64).try_into().unwrap();
+        assert_eq!(
+            inner
+                .state
+                .committed_producer_release("producer", &successor),
+            None
+        );
+        assert_eq!(
+            inner.state.committed_producer_release("other", &execution),
+            None
+        );
+
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::DecommissionNode {
+                node_id: "producer".into(),
+                retired_by: "operator".into(),
+                reason: "fenced".into(),
+                retired_at_unix_ms: 1,
+                membership_log_id: None,
+            }),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+        assert_eq!(read(&inner), None, "a retired node is refused by the write");
+    }
+
     #[test]
     fn producer_retirement_checks_all_historical_exposures_and_refuses_atomically_at_capacity() {
         let mut inner = StateMachineInner::default();

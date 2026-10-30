@@ -137,10 +137,11 @@ pub(super) enum DeployOp {
         reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Reserve an instance's sidecar identities before the first is
-    /// created, so its retirement finds every one (#1120).
+    /// created, so its retirement finds every one (#1120), with the
+    /// definitions a restart relaunches them from (#1434).
     RegisterSidecars {
         instance_id: InstanceId,
-        names: Vec<String>,
+        sidecars: Vec<crate::config::app::SidecarSpec>,
         reply: oneshot::Sender<Result<Vec<InstanceId>, BunError>>,
     },
     /// Program source and egress policy before create → program → start. On
@@ -777,12 +778,12 @@ impl DeployOps {
     pub(super) async fn register_sidecars(
         &self,
         instance_id: &InstanceId,
-        names: Vec<String>,
+        sidecars: Vec<crate::config::app::SidecarSpec>,
     ) -> Result<Vec<InstanceId>, BunError> {
         self.call(
             |reply| DeployOp::RegisterSidecars {
                 instance_id: instance_id.clone(),
-                names,
+                sidecars,
                 reply,
             },
             Err(BunError::InstanceNotFound {
@@ -1513,10 +1514,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             DeployOp::RegisterSidecars {
                 instance_id,
-                names,
+                sidecars,
                 reply,
             } => {
-                let _ = reply.send(self.register_sidecars(&instance_id, &names));
+                let _ = reply.send(self.register_sidecars(&instance_id, &sidecars));
             }
             DeployOp::ApplyNetworkPreStart {
                 instance_id,
