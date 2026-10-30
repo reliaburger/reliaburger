@@ -39,8 +39,11 @@ sudo dnsmasq --interface=rbbr0 --bind-interfaces --port=0 \
 
 export RELIABURGER_HOME="$work/home"
 mkdir -p "$RELIABURGER_HOME"
+# A throwaway key, so a failure can read each node's journal over SSH.
+ssh-keygen -q -t ed25519 -N "" -f "$work/ssh-key"
 "$relish" cluster create --bare-metal "$work/cluster" --name pair --operator 10.42.0.1 --yes \
-    --network 10.42.0.0/24 "${macs[0]}@${ips[0]}" "${macs[1]}@${ips[1]}"
+    --network 10.42.0.0/24 --ssh-key "$work/ssh-key.pub" \
+    "${macs[0]}@${ips[0]}" "${macs[1]}@${ips[1]}"
 
 pids=()
 for i in 0 1; do
@@ -81,6 +84,20 @@ for i in 0 1; do
     echo "--- node $((i + 1)) console ---"
     cat "$work/node$i.log" || true
 done
+if [ "$result" != pass ]; then
+    # The cluster's own view, from node 1, which answers when node 2 won't.
+    for command in nodes council events; do
+        echo "--- relish $command ---"
+        "$relish" "$command" 2>&1 || true
+    done
+    for i in 0 1; do
+        echo "--- node $((i + 1)) bun journal ---"
+        timeout 30 ssh -i "$work/ssh-key" -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${ips[$i]}" \
+            journalctl -b -o short-monotonic --no-pager -u reliaburger.service 2>&1 \
+            | grep -v "snapshot collection failed" | tail -n 150 || true
+    done
+fi
 {
     echo "### Seeded pair: $result after ${elapsed} s"
     echo '```'
