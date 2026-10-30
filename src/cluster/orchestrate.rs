@@ -481,7 +481,7 @@ pub fn spawn_leader_scheduler(
             let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
 
             let pass_members = PassMembers {
-                unheard: unheard_nodes(&alive, &reports),
+                unheard: unheard_nodes(&alive, &reports, stale_node_grace),
                 suspect: nodes_in_state(&members, NodeState::Suspect),
                 lapsed: lapsed_nodes(&alive, &reports, stale_node_grace),
                 alive: alive.clone(),
@@ -652,7 +652,8 @@ pub struct PassMembers {
     /// Members gossip suspects: they missed a probe but may refute it.
     pub suspect: HashSet<NodeId>,
     /// Alive members whose state report arrived but whose readiness or
-    /// capability report hasn't yet (see [`unheard_nodes`]).
+    /// capability report hasn't yet, or that are still starting (see
+    /// [`unheard_nodes`]).
     pub unheard: HashSet<NodeId>,
     /// Alive members whose reports went stale longer than the stale-node
     /// grace ago (see [`lapsed_nodes`]). Their placements move.
@@ -1343,7 +1344,8 @@ impl VolumeHome<'_> {
 ///
 /// A live node that hasn't reported to this leader yet keeps its placements,
 /// and so does one in `unheard`, whose state report has arrived but whose
-/// readiness or capability evidence hasn't. A new leader hears from nodes
+/// readiness or capability evidence hasn't, or whose readiness says it is
+/// still in its first start (a Bun that just restarted, #1449). A new leader hears from nodes
 /// over several seconds, one report at a time, and a node whose report went
 /// to a council member that just died can take longer still; "not heard from
 /// yet" is not evidence of trouble, and moving its replicas would restart
@@ -1575,20 +1577,63 @@ fn nodes_in_state(members: &[MembershipSnapshot], state: NodeState) -> HashSet<N
 }
 
 /// Live nodes whose state report is fresh but whose readiness or capability
-/// report this leader hasn't received yet. The three travel separately, and a
-/// new leader starts with none of them, so for a moment a healthy node looks
-/// unready. That's reason enough not to place anything new there, but not to
-/// move what it already runs.
-fn unheard_nodes(alive: &HashSet<NodeId>, reports: &AggregatedState) -> HashSet<NodeId> {
+/// report this leader hasn't received yet, or whose readiness says they are
+/// still starting (see [`still_starting`]). The three reports travel
+/// separately, and a new leader starts with none of them, so for a moment a
+/// healthy node looks unready; a Bun that has just restarted reports before
+/// its API, DNS, ingress and registry are up (#1449). That's reason enough
+/// not to place anything new there, but not to move what it already runs.
+fn unheard_nodes(
+    alive: &HashSet<NodeId>,
+    reports: &AggregatedState,
+    grace: Duration,
+) -> HashSet<NodeId> {
     alive
         .iter()
         .filter(|node| reports.reports.contains_key(*node))
         .filter(|node| !reports.stale_nodes.contains(*node))
         .filter(|node| {
-            !reports.readiness.contains_key(*node) || !reports.capabilities.contains_key(*node)
+            match (
+                reports.readiness.get(*node),
+                reports.capabilities.get(*node),
+            ) {
+                (Some(readiness), Some(_)) => still_starting(&readiness.evidence, grace),
+                _ => true,
+            }
         })
         .cloned()
         .collect()
+}
+
+/// Whether a node that isn't ready is only coming up: every critical
+/// subsystem it is waiting on is in its first start (`Starting`, never
+/// rebuilt) and has been for less than `grace`. Both timestamps are the
+/// node's own, so clock skew between nodes doesn't enter. A degraded or
+/// stopped subsystem, one being rebuilt after a failure, or a start that
+/// outlasts the grace is evidence the node can't run its work.
+fn still_starting(
+    evidence: &crate::bun::readiness::NodeReadinessEvidence,
+    grace: Duration,
+) -> bool {
+    use crate::bun::readiness::SubsystemState;
+    if evidence.ready {
+        return false;
+    }
+    let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+    let mut waiting = evidence
+        .subsystems
+        .iter()
+        .filter(|subsystem| subsystem.critical && subsystem.state != SubsystemState::Ready)
+        .peekable();
+    waiting.peek().is_some()
+        && waiting.all(|subsystem| {
+            subsystem.state == SubsystemState::Starting
+                && subsystem.restart_count == 0
+                && evidence
+                    .observed_at_unix_ms
+                    .saturating_sub(subsystem.state_since_unix_ms)
+                    < grace_ms
+        })
 }
 
 /// The per-replica resources an app requests, for quota accounting. Mirrors
@@ -2086,14 +2131,10 @@ async fn poll_consumer(
     io_timeout: Duration,
 ) -> Option<ConsumerPoll> {
     let client = cluster_http.client();
-    let leader_url = {
-        let metrics = metrics_rx.borrow();
-        let directory = directory_rx.borrow();
-        crate::cluster::directory::resolve_leader(&metrics, &directory, raft_to_api_offset, 0)
+    let leader_url =
+        crate::cluster::directory::resolve_leader(metrics_rx, directory_rx, raft_to_api_offset, 0)
             .and_then(|view| view.api_address)
-            .map(|address| cluster_http.url(&address.to_string(), ""))
-    };
-    let leader_url = leader_url?;
+            .map(|address| cluster_http.url(&address.to_string(), ""))?;
 
     let url = format!("{leader_url}/v1/placements/{node_name}");
     let mut request = client.get(&url);
@@ -6173,7 +6214,7 @@ image = "busybox:latest"
             })
             .collect();
         let mut cache = build_cluster_cache(&members, &reports);
-        let unheard = unheard_nodes(&alive, &reports);
+        let unheard = unheard_nodes(&alive, &reports, Duration::from_secs(300));
 
         let decisions = plan_scheduling_pass_with_dns(
             &mut cache,
@@ -6838,13 +6879,148 @@ image = "busybox:latest"
         }
         reports.stale_nodes.push(NodeId::new("stale"));
 
-        let unheard = unheard_nodes(&alive, &reports);
+        let unheard = unheard_nodes(&alive, &reports, Duration::from_secs(300));
 
         assert_eq!(
             unheard,
             HashSet::from([NodeId::new("no-readiness"), NodeId::new("no-capability")]),
             "a stale node lost its evidence; a silent one isn't in the cache at all"
         );
+    }
+
+    /// Readiness evidence from a Bun that is still coming up: `agent` is
+    /// running, `api` has been in its first start for `starting_for_ms`,
+    /// after `restarts` earlier attempts.
+    fn starting_readiness(
+        name: &str,
+        starting_for_ms: u64,
+        restarts: u32,
+    ) -> crate::reporting::types::NodeReadinessReport {
+        use crate::bun::readiness::{SubsystemEvidence, SubsystemState};
+        let observed_at_unix_ms = 1_800_000_000_000;
+        let subsystem = |name: &str, state| SubsystemEvidence {
+            name: name.to_string(),
+            critical: true,
+            state,
+            state_since_unix_ms: observed_at_unix_ms - starting_for_ms,
+            last_error: None,
+            last_error_unix_ms: None,
+            restart_count: 0,
+        };
+        let mut api = subsystem("api", SubsystemState::Starting);
+        api.restart_count = restarts;
+        crate::reporting::types::NodeReadinessReport {
+            node_id: NodeId::new(name),
+            evidence: crate::bun::readiness::NodeReadinessEvidence {
+                ready: false,
+                observed_at_unix_ms,
+                subsystems: vec![subsystem("agent", SubsystemState::Ready), api],
+            },
+        }
+    }
+
+    /// Fresh reports from `n1`, `n2` and `n3`, each with a capability
+    /// report; `n3`'s readiness is `n3_readiness`, the others are ready.
+    fn reports_with_n3_readiness(
+        n3_readiness: crate::reporting::types::NodeReadinessReport,
+    ) -> (Vec<MembershipSnapshot>, AggregatedState) {
+        let members = vec![member("n1", 1), member("n2", 2), member("n3", 3)];
+        let mut reports = AggregatedState::default();
+        for name in ["n1", "n2", "n3"] {
+            reports.reports.insert(NodeId::new(name), report(4000, 0));
+            reports.capabilities.insert(
+                NodeId::new(name),
+                crate::reporting::types::NodeCapabilityReport {
+                    node_id: NodeId::new(name),
+                    capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
+                    egress_enforcement: Vec::new(),
+                    egress_degraded: false,
+                    egress_affected_workloads: Vec::new(),
+                },
+            );
+            reports.receive_deadlines.insert(
+                NodeId::new(name),
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            );
+        }
+        for name in ["n1", "n2"] {
+            reports
+                .readiness
+                .insert(NodeId::new(name), readiness(name, true));
+        }
+        reports.readiness.insert(NodeId::new("n3"), n3_readiness);
+        (members, reports)
+    }
+
+    /// #1449: a Bun that restarts (a crash, `systemctl restart`, an upgrade
+    /// exec) adopts its running replicas, and its first report goes out
+    /// while its API, DNS, ingress and registry are still starting, so it
+    /// says "not ready". The leader took that as evidence and moved the
+    /// node's replica, and the node then retired the replica it had just
+    /// adopted. A node still in its first start hasn't failed anything: it
+    /// keeps what it runs, and gets nothing new until it is ready.
+    #[test]
+    fn a_restarting_node_keeps_its_replicas_while_its_subsystems_start() {
+        let app = AppId::new("hello", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 3));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n3"]));
+        let (members, reports) = reports_with_n3_readiness(starting_readiness("n3", 500, 0));
+        let alive: HashSet<NodeId> = members.iter().map(|m| m.node_id.clone()).collect();
+        let mut cache = build_cluster_cache(&members, &reports);
+        let unheard = unheard_nodes(&alive, &reports, Duration::from_secs(300));
+
+        let decisions = plan_scheduling_pass_with_dns(
+            &mut cache,
+            &desired,
+            &alive,
+            &HashSet::new(),
+            &mut QuotaLedger::default(),
+            false,
+            &unheard,
+        );
+
+        assert!(decisions.is_empty(), "{decisions:?}");
+        assert!(
+            !cache.get_node(&NodeId::new("n3")).unwrap().ready,
+            "nothing new lands on a node that is still starting"
+        );
+    }
+
+    /// Starting is only a reprieve while it is a first start, and only for
+    /// the stale-node grace. A subsystem being rebuilt after a failure, one
+    /// that hasn't come up within the grace, or a degraded one is evidence:
+    /// those nodes' replicas move.
+    #[test]
+    fn only_a_first_start_within_the_grace_counts_as_unheard() {
+        let grace = Duration::from_secs(300);
+        let cases = [
+            (
+                "first start, just begun",
+                starting_readiness("n3", 500, 0),
+                true,
+            ),
+            (
+                "first start, past the grace",
+                starting_readiness("n3", 300_000, 0),
+                false,
+            ),
+            (
+                "rebuilt after a failure",
+                starting_readiness("n3", 500, 1),
+                false,
+            ),
+            ("degraded", readiness("n3", false), false),
+        ];
+        for (case, evidence, kept) in cases {
+            let (members, reports) = reports_with_n3_readiness(evidence);
+            let alive: HashSet<NodeId> = members.iter().map(|m| m.node_id.clone()).collect();
+            let unheard = unheard_nodes(&alive, &reports, grace);
+            assert_eq!(unheard.contains(&NodeId::new("n3")), kept, "{case}");
+            assert!(!unheard.contains(&NodeId::new("n1")), "{case}");
+        }
     }
 
     #[test]

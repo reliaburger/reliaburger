@@ -93,6 +93,7 @@ checker=$repository/scripts/release/sustained_check.py
 slo_tool=$repository/scripts/release/soak_slo.py
 job_controller=$repository/scripts/release/job_soak.py
 job_inventory=$repository/scripts/release/job_soak_inventory.py
+export_retention=$repository/scripts/release/soak_export_retention.py
 guest_memory=$repository/scripts/release/sustained/guest-memory.sh
 history_client=$repository/scripts/release/council_history.py
 linearizability=$repository/scripts/release/linearizability.py
@@ -668,7 +669,7 @@ configure_nodes() {
     done
     probe_leaf_lifetime
     meta deviations+ 'node.toml `[testing] allowed_operations` adds `provision_isolated_workloads` (quickstart allows only inject_workload_faults and alter_node_state), so the catalogue pulse can lease test namespaces'
-    meta deviations+ 'node.toml `[logs]`/`[metrics]` export to file:///var/lib/reliaburger/soak-export every 60 s with max_storage_mb = 8, `[storage.snapshots]` every 900 s (compressed: 120 s), retain 4, uploaded to the same directory'
+    meta deviations+ 'node.toml `[logs]`/`[metrics]` export to file:///var/lib/reliaburger/soak-export every 60 s with max_storage_mb = 8 (the harness deletes a metrics export 30 minutes after its source has gone), `[storage.snapshots]` every 900 s (compressed: 120 s), retain 4, uploaded to the same directory'
     meta deviations+ 'node.toml `[ingress] tls_cert/tls_key` point at an operator pair from a soak CA, 45-minute leaves rotated by the harness'
     meta deviations+ 'Bun runs with auto/mixed; host jobs opt in to a single pinned BusyBox copy under /var/lib/reliaburger/soak-jobs, mount_isolation=false. The independent verifier listens on each private VM address, TCP 8189, with a separate run token'
     meta deviations+ 'node.toml `[node.labels] soak-volume` = "writer" on node 2 and "redis" on node 3, to pin the volume apps'
@@ -854,15 +855,28 @@ soak_workloads() {
         -e "s/SOAK_SLO_GENERATION = \"[0-9]*\"/SOAK_SLO_GENERATION = \"$slo_generation\"/" "$workloads_template"
 }
 
+# The policies go in their own manifest: the API refuses policies in a
+# manifest that has jobs, and the job hooks must be applied with the apps
+# they hook, so the jobs stay with the apps (#1311). A table is a policy's
+# from its `[policy.` header to the next header that isn't one.
 write_workloads() {
-    soak_workloads > "$evidence/workloads.toml"
+    soak_workloads | awk -v policies="$evidence/policies.toml" -v rest="$evidence/workloads.toml" \
+        '/^\[/ { policy = ($0 ~ /^\[policy\./) } { print > (policy ? policies : rest) }'
     ! jobs_applied || cat "$repository/scripts/release/sustained/soak-jobs.toml" >> "$evidence/workloads.toml"
+}
+
+# Apply the policies, then the workloads (and the job fixtures with them),
+# with both outputs in LOG.
+apply_soak_manifests() {
+    local log=$1
+    rel apply -f "$evidence/policies.toml" > "$log" 2>&1 || return 1
+    rel apply -f "$evidence/workloads.toml" >> "$log" 2>&1
 }
 
 apply_workloads() {
     write_workloads
     rel apply -f "$podinfo" > "$evidence/config/apply-podinfo.log" 2>&1 || fail "applying $podinfo failed"
-    rel apply -f "$evidence/workloads.toml" > "$evidence/config/apply-workloads.log" 2>&1 || fail 'applying the soak workloads failed'
+    apply_soak_manifests "$evidence/config/apply-workloads.log" || fail 'applying the soak workloads failed'
     # The workload file carries a deny, a warn and a default policy (#1311);
     # every later check makes sure they stay in force.
     rel --output json policy list > "$evidence/config/policies.json" 2>&1 || fail 'listing the soak policies failed'
@@ -992,7 +1006,13 @@ check_council_history() {
         > /dev/null || result=$?
     case $result in
         0) event --phase council-history --verdict ok ;;
-        3) event --phase council-history --verdict inconclusive --detail 'search over budget; see council-history-check.json' ;;
+        # A fast or final tier with no linearizability coverage isn't green (#1437).
+        3) if [ "$tier" = fast ] || [ "$tier" = final ]; then
+               event --phase council-history --verdict fail --detail 'search over budget; see council-history-check.json'
+               record_failure linearizability 'the council history check was inconclusive (search over budget); see council-history-check.json'
+           else
+               event --phase council-history --verdict inconclusive --detail 'search over budget; see council-history-check.json'
+           fi ;;
         *) event --phase council-history --verdict fail
            record_failure linearizability 'the council history is not linearizable; see council-history-check.json' ;;
     esac
@@ -1024,6 +1044,9 @@ echo "bun_pid $pid"
 if [ "${pid:-0}" -gt 0 ]; then
     echo "bun_fd $(ls /proc/"$pid"/fd | wc -l)"
     echo "bun_rss_kb $(awk '/^VmRSS/ {print $2}' /proc/"$pid"/status)"
+    # Heap and other private memory against mapped files (#1417).
+    echo "bun_rss_anon_kb $(awk '/^RssAnon/ {print $2}' /proc/"$pid"/status)"
+    echo "bun_rss_file_kb $(awk '/^RssFile/ {print $2}' /proc/"$pid"/status)"
     # utime + stime: fields 14 and 15, counted after comm's closing parenthesis.
     echo "bun_cpu_ticks $(sed 's/.*) //' /proc/"$pid"/stat | awk '{print $12 + $13}')"
     echo "clk_tck $(getconf CLK_TCK)"
@@ -1082,6 +1105,13 @@ for kind in logs metrics; do
         fi
     done
 done
+GUEST
+    # Once listed, metrics exports whose source left 30 minutes ago go
+    # (#1418): the destination used to keep about 600 MiB a node a day.
+    printf "python3 - /var/lib/reliaburger/metrics /var/lib/reliaburger/soak-export/metrics <<'RETENTION' || true\n"
+    cat "$export_retention"
+    printf 'RETENTION\n'
+    cat <<'GUEST'
 find /var/lib/reliaburger/soak-export/snapshots -name '*.tar.gz' -type f 2>/dev/null | while read -r file; do
     if gzip -t "$file" 2>/dev/null; then state=ok; else state=bad; fi
     echo "snap ${file#/var/lib/reliaburger/soak-export/snapshots/} $state"
@@ -1353,7 +1383,7 @@ slot_deploy_kill() {
     offset=$(random_between deploy-kill-offset 0 "$kill_offset")
     say "fault: rolling deploy (generation $generation), SIGKILL bun on ${vm[node]} after $offset s"
     open_window deploy-kill
-    rel apply -f "$evidence/workloads.toml" > "$evidence/snapshots/apply-$generation.log" 2>&1 || true
+    apply_soak_manifests "$evidence/snapshots/apply-$generation.log" || true
     sleep "$offset"
     avoid=$node
     before=$(main_pid "$node")

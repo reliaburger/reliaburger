@@ -602,7 +602,7 @@ class DrainedCampaignApply(unittest.TestCase):
             (evidence/"jobs/installed").write_text("")
             if stop_file: (evidence/"jobs/stop").write_text("")
             (evidence/"metadata.json").write_text(json.dumps(metadata))
-            (root/"apps.toml").write_text('[app.soak-identity]\nenv = { SOAK_GENERATION = "0" }\n')
+            (root/"apps.toml").write_text('[policy.soak-team]\nmatch = "true"\n\n[app.soak-identity]\nenv = { SOAK_GENERATION = "0" }\n')
             (root/"scripts/release/sustained").mkdir(parents=True)
             (root/"scripts/release/sustained/soak-jobs.toml").write_text('[job.soak-job-cron-runc]\nschedule = "* * * * *"\n')
             # The clock is the only thing faked: a shell function shadows date(1).
@@ -610,7 +610,23 @@ class DrainedCampaignApply(unittest.TestCase):
             subprocess.run(["bash","-c",clock+functions+"write_workloads"],check=True,
                            env=dict(PATH=os.environ["PATH"],HOME=directory,evidence=str(evidence),generation="7",
                                     workloads_template=str(root/"apps.toml"),repository=str(root)))
-            return (evidence/"workloads.toml").read_text()
+            self.workloads=(evidence/"workloads.toml").read_text()
+            self.policies=(evidence/"policies.toml").read_text()
+            return self.workloads
+
+    def test_the_policies_go_in_their_own_manifest_and_the_jobs_stay_with_the_apps(self):
+        # The API refuses policies in a manifest that has jobs ("policies
+        # apply only to a cluster, in a manifest without jobs"), and a job's
+        # run_before hook must be applied with the app it hooks: 0.2.4's
+        # first V02 fast tiers stopped at each in turn.
+        self.write(dict(job_stop_at=10**10))
+        self.assertIn("[policy.soak-team]",self.policies)
+        self.assertIn('match = "true"',self.policies)
+        self.assertNotIn("[app.",self.policies)
+        self.assertNotIn("[job.",self.policies)
+        self.assertNotIn("[policy.",self.workloads)
+        self.assertIn("[app.soak-identity]",self.workloads)
+        self.assertIn("[job.soak-job-cron-runc]",self.workloads)
 
     def test_the_job_fixtures_are_applied_while_the_campaign_runs(self):
         text=self.write(dict(job_stop_at=10**10))

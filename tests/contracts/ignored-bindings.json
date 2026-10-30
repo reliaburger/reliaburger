@@ -96,6 +96,18 @@
     "test": "grill::runc::tests::runc_sidecar_reaches_its_app_on_localhost"
   },
   {
+    "source": "src/grill/runc.rs",
+    "function": "runc_a_container_cannot_use_a_network_capability_or_make_device_nodes",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_a_container_cannot_use_a_network_capability_or_make_device_nodes"
+  },
+  {
+    "source": "src/grill/runc.rs",
+    "function": "runc_capability_knobs_work_only_where_the_container_owns_the_check",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_capability_knobs_work_only_where_the_container_owns_the_check"
+  },
+  {
     "source": "src/grill/snapshot.rs",
     "function": "btrfs_snapshot_restore_recovers_corrupted_data",
     "binary": "reliaburger",
@@ -562,6 +574,12 @@
     "function": "exec_workload_is_held_to_its_namespace",
     "binary": "reliaburger::ebpf",
     "test": "exec_workload_is_held_to_its_namespace"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "a_sidecar_is_held_to_its_apps_namespace",
+    "binary": "reliaburger::ebpf",
+    "test": "a_sidecar_is_held_to_its_apps_namespace"
   },
   {
     "source": "tests/ebpf.rs",

@@ -499,9 +499,11 @@ existing expressions mostly carry over. The other candidates were weaker fits:
   ([CUE spec](https://cuelang.org/docs/reference/spec/)), and only has a Go
   implementation.
 
-CEL's guarantee bounds evaluation by the size of the input times the size of
-the expression. The input is one spec, and we cap the expression's size when a
-policy is committed. Kubernetes goes further, with a cost model that refuses
+CEL's "linear time" is linear in the size of the program and the data it's
+handed, but its macros iterate, and a macro inside another multiplies. So the
+real bound is the expression's size times the input's size raised to how
+deeply the macros nest. We cap all three when a policy is committed or a
+workload is judged; the next section has the numbers. Kubernetes goes further, with a cost model that refuses
 expensive expressions at write time and halts them at run time
 ([CEL in Kubernetes](https://kubernetes.io/docs/reference/using-api/cel/)).
 
@@ -565,10 +567,27 @@ Here's what the check found, in `cel` 0.15:
   map, `startsWith` and `endsWith`, the `exists` and `all` macros, `size()`,
   `type()`, and int comparisons. Every row passed on the first run.
 - **Cost.** There's no cost model and no step limit. The parser caps nesting
-  at 96 levels, and that's all. So our own cap does the bounding: an
-  expression of at most 1,024 bytes, over one app's spec. CEL has no loops of
-  its own, and a macro like `exists` iterates over a list that came from the
-  spec, so the work is bounded by expression size times input size.
+  at 96 levels, and that's all. So our own caps do the bounding. The first
+  draft of this section said an expression of at most 1,024 bytes was enough,
+  because "the work is bounded by expression size times input size". The
+  review of the train proved it wrong
+  ([#1431](https://github.com/reliaburger/reliaburger/issues/1431)): a macro
+  like `all` runs its body once per element, so
+  `app.env.all(a, app.env.all(b, …))` costs the number of env entries
+  squared, and 1,024 bytes fit 96 levels of that. Worse, the deployer
+  chooses the input. An admin's perfectly plausible quadratic rule, "no
+  argument given twice", became a CPU amplifier for anyone with a deploy token
+  and a long list. Now three caps hold. The expression is still at most
+  1,024 bytes. `check_names`, which already walked every expression to
+  check its variables, counts comprehensions on the way down and refuses
+  nesting deeper than two (`MAX_COMPREHENSION_NESTING`), which still allows
+  comparing a list with itself. And the input: `workload_value` refuses a
+  workload with any list or map of more than 1,024 entries
+  (`MAX_COLLECTION_ENTRIES`), and every policy that applies to it fails
+  closed, naming the field, the same as an expression that can't be
+  evaluated. We could have truncated the list instead, but then padding
+  `env` with a thousand dummies would push the entry a deny looks for past
+  the end. Refusing is the only answer an attacker can't use.
 - **The calls.** `Env::stdlib()` plus the strings extension, `env.compile` to
   get a `Program`, `Context::with_env` and `add_variable_from_value` to bind
   `app`, `caller` and `source`, then `program.execute`. A spec becomes a CEL
@@ -615,6 +634,25 @@ to whatever the workload was, but then an expression that reads `app.port`
 would be fine on apps and broken on jobs, and you'd find out from a refused
 cron job at three in the morning. Making the variable name carry the kind
 keeps the commit check honest.
+
+A job also has more than one way in. `relish apply` posts a manifest to
+`/v1/apply`, but `relish run --batch` posts to `/v1/batch/array`, `relish
+batch FILE` to `/v1/batch`, `relish batch submit` to `/v1/batch/manifest`, and a cron
+job can be registered straight through `/v1/jobs/runs`. The first cut judged
+jobs only on `/v1/apply`, so the same `:latest` job a policy refused there
+went through untouched on the other four
+([#1424](https://github.com/reliaburger/reliaburger/issues/1424)). The fix
+puts the check where every route already meets: `admit_definition` in
+`src/bun/job_api.rs`, which each of them calls to authorise and bind a job
+before it's written. It takes a `PolicyCheck`, `Judge` or `Judged`, because
+`/v1/apply` has already judged the job together with the rest of its
+manifest and shouldn't record its audit findings twice. An enum with two
+named variants reads better at the call site than a bare `true`, and the
+compiler won't let a new caller forget to choose. A job definition keeps
+its schedule and retry policy outside its template, so
+`JobDefinition::to_spec` puts them back before judging: `job.schedule` reads
+the same whichever route the job came in by. Warnings come back in the
+answer as `policy_warnings`, and `relish` prints each as a `warning:` line.
 
 The second addition is a third action. `action = "audit"` lets the apply go
 ahead without telling the caller and records the finding in the audit log.
@@ -805,7 +843,21 @@ repository, a template in `templates.toml` can serve a `use` in
 `payments/db.toml`, and the app it makes lands in the `payments` namespace
 with `payments/_defaults.toml` filled in, exactly as if you'd written it
 there. Policies judge it like any other app, and they can tell where it came
-from: `app.provenance.template == 'postgres'` is a fine `match`.
+from: `app.provenance.template == 'postgres'` is a fine `match` for a rule
+that only makes sense for databases.
+
+It's a fine `match` for adding a rule, and a terrible one for lifting one
+([#1430](https://github.com/reliaburger/reliaburger/issues/1430)).
+Templates aren't an admin thing: any manifest can declare `[template.approved]`
+and use it, and `provenance` is an ordinary field, so a hand-written app can
+set it too. We looked at refusing a hand-written `provenance`, but it wouldn't
+close the hole, because the self-declared template still would, and the
+cluster can't tell one apart from `relish`'s own expansion anyway: `relish
+apply` expands on your laptop and sends the apps with their provenance. So
+the manual says what it is, a label. A policy that wants "only blessed
+templates" needs the blessing to live somewhere a deployer can't write, and
+today that's the policy itself: match the fields the template sets, not the
+name it claims.
 
 **Provenance is two strings.** The template's name and the `use`'s name, and
 nothing else. No template version, no parameter values, no copy of the
@@ -914,23 +966,27 @@ refused at apply, with a reason. That's the Swarm `--privileged` and
 without them:
 
 ```toml
-[app.vpn]
-image = "ghcr.io/example/vpn:2.0"
+[app.files]
+image = "ghcr.io/example/files:2.0"
 
-[app.vpn.runtime]
-capabilities = ["NET_ADMIN"]
-sysctls = { "net.ipv4.ip_forward" = "1" }
-devices = [{ path = "/dev/net/tun", permissions = "rw" }]
+[app.files.runtime]
+capabilities = ["SYS_ADMIN"]
+sysctls = { "net.core.somaxconn" = "4096" }
+devices = [{ path = "/dev/fuse", permissions = "rw" }]
 ```
 
 The node's half lives in its own `node.toml`:
 
 ```toml
 [runtime]
-allowed_capabilities = ["NET_ADMIN"]
-allowed_sysctls = ["net.ipv4.ip_forward"]
-allowed_devices = ["/dev/net/tun"]
+allowed_capabilities = ["SYS_ADMIN"]
+allowed_sysctls = ["net.core.somaxconn"]
+allowed_devices = ["/dev/fuse"]
 ```
+
+(The first version of this example was a VPN client with `CAP_NET_ADMIN`
+and `/dev/net/tun`. It couldn't have worked, and the walkthrough below says
+why.)
 
 ### The exec secret provider
 
@@ -1362,11 +1418,42 @@ and jobs without building a cluster. The route runs it on a copy of
 desired state inside `tokio::task::spawn_blocking`, because judging every
 workload is CPU work that would otherwise hold up an async thread.
 
+At first only the audit did that. The apply path judged inline, on whichever
+tokio worker took the request, and so did the GitOps runner and the job
+routes ([#1431](https://github.com/reliaburger/reliaburger/issues/1431)).
+One judgement is microseconds, which is why nobody noticed, but its cost is
+partly the caller's to choose, and a worker busy judging is a worker not
+serving heartbeats and API calls. Now they all go through `spawn_blocking`.
+`policy::admit_blocking` wraps `admit`, taking every argument by value:
+`spawn_blocking` wants a `'static` closure, because the thread may outlive
+the function that started it, so nothing it holds can borrow from the
+caller's stack. In Go you'd capture what you like in a goroutine and the
+garbage collector keeps it alive; Rust makes you hand ownership over, and a
+clone of the config is the price. The GitOps runner's cached `PolicySet`
+moved into an `Arc` for the same reason: the blocking thread gets a second
+handle to the compiled set rather than a borrow of the cache.
+
 Who is the caller, when nobody is applying? The audit asks what the next
 write would get, so it judges each app as its next writer: GitOps for an app
 GitOps owns, the controller's token for an app a controller owns
 ([#1125](https://github.com/reliaburger/reliaburger/issues/1125)), with the
 role read from that token, and the cluster's own `audit` caller for the rest.
+
+And who may read it? Any token can read the policies themselves, so the
+first cut let any token read the audit too. That was a leak
+([#1432](https://github.com/reliaburger/reliaburger/issues/1432)): a policy
+is a rule, but a finding names a workload, its namespace and why it's
+broken, and a controller's token scoped to `team-a` could list every other
+team's apps that way. Everywhere else a scoped token reads only its own
+namespaces, events included (#1125). So `audit` became a thin wrapper round
+`audit_visible`, which takes a predicate, `impl Fn(&AppId) -> bool`, and
+judges only the workloads it keeps. `impl Trait` in argument position is
+Rust's way of saying "any type that implements this", much like a Go
+parameter of interface type, except that the compiler generates a copy of
+the function for each closure it's called with, so there's no indirect call.
+The handler builds the predicate from the caller's scope and moves it into
+`spawn_blocking`. The counts come from the filtered lists, so a scoped
+caller can't even tell how many other workloads there are.
 
 ### The exec secret provider
 
@@ -1703,7 +1790,13 @@ pub struct StopPolicy {
 Every runtime already keeps that spec. The process runtime signals the
 workload's process group with `entry.spec.stop_signal()`, the process owner
 reads the spec it was launched with, runc passes the name to `runc kill`, and
-Apple Container gets `container stop --signal`. Because the spec is in the
+Apple Container gets `container kill --signal`. Why not `container stop
+--signal`, which looks made for this? Because it waits for the exit itself
+and kills the workload after its own `--time`, 5 s unless told otherwise, so
+`stop_grace = "2m"` bought two minutes on Linux and five seconds on a Mac
+(#1435). `Grill::stop` only signals, on every runtime, and Bun owns the
+grace. `container kill` refuses a workload that's already gone, so Apple's
+`stop` checks the state before it calls that a failure. Because the spec is in the
 instance record too, a Bun that restarts and adopts its instances still
 knows how to stop them. And a deploy retires an old instance with *its own*
 policy, not the new spec's. That matters when the new image has dropped the
@@ -1878,9 +1971,43 @@ That has a consequence. Egress allowlists are keyed by cgroup in the eBPF
 programs, so a sidecar in its own cgroup isn't held to its app's allowlist.
 A proxy could reach what the app can't. Programming the sidecar's cgroup
 too means another set of egress bindings to own and retire, so for now
-validation refuses the combination with a reason that says why. Namespace
-isolation still applies, because the kernel falls back to the cgroup's
-`/reliaburger/<namespace>` ancestor.
+validation refuses the combination with a reason that says why.
+
+Namespace isolation has the same shape, and the first version got it wrong.
+The connect hook looks up the caller's cgroup in `cgroup_namespace_map`,
+and when that misses, its `/reliaburger/<namespace>` ancestor. We wrote
+here that the fallback held sidecars to their namespace. It doesn't: that
+ancestor is bound only while a delegated job of the namespace runs on the
+node. The rest of the time a sidecar's cgroup had no namespace at all, and
+a caller with no namespace is a host daemon as far as the hook can tell, so
+it went anywhere. The review of the 0.2.4 train caught it (#1426), and a
+`make test-linux` case showed a sidecar in `tenant-a` connecting to a
+`tenant-b` address nothing had granted.
+
+The fix is the one the egress note above put off, and it's cheap here,
+because namespace bindings have no owner to retire: the reconcile rebuilds
+both maps from scratch every time. So `reconcile_namespace_firewall` asks
+the runtime for each sidecar's cgroup as it does for each instance's, and
+files it under the app's `(namespace, app)` key:
+
+```rust
+for instance in self.supervisor.list_instances() {
+    let key = (instance.namespace.clone(), instance.app_name.clone());
+    if sidecars::runs_beside(instance.state) {
+        for sidecar in self.sidecars.running_beside(&instance.id) {
+            sidecar_ids.push((key.clone(), sidecar));
+        }
+    }
+    pairs.push((key, instance.id.clone(), instance.is_being_created()));
+}
+```
+
+Everything downstream works off that key, so the sidecar gets its app's
+namespace and its app's `allow_from` grants in the same pass, no more and no
+less. A sidecar whose cgroup isn't there yet, because it's still being
+created or has just been restarted, keeps the sync stale, so the next tick
+tries again; and a finished sidecar restart marks it stale too, because its
+new cgroup has a new id.
 
 The requests, meanwhile, are simple arithmetic in `app_requests`, the one
 function placement, quotas and a node's own admission all call:
@@ -1956,6 +2083,42 @@ plain `<<` panics in a debug build and wraps in a release one, and
 `checked_shl` returns `None` instead, which turns into "a very long time"
 and then the one-minute cap.
 
+The first version never counted back down. A sidecar that crashed seven
+times over a few days waited a full minute after every crash from then on,
+as if it were in a crash loop. A kubelet forgets a container's back-off
+once it has run for ten minutes, and the registry now does the same: each
+restart alone records when it succeeded, and a crash at least
+`SIDECAR_STABLE_RUN` later starts the count from zero, so it's restarted at
+once again.
+
+Restarting it from *what* turned out to matter too (#1434). The first
+version rebuilt a crashed sidecar from the app's current spec, the one
+`deployed_specs` holds. That's right until a rollout begins: the deploy
+worker stores the new spec as it starts, while the old instances still run.
+An old instance's proxy that crashed then came back with the new proxy
+image, next to the old app. A sidecar the new spec added was created but
+never registered, so nothing would ever retire it. And one the new spec
+dropped was never relaunched and stayed due on every tick. The fix is to
+remember what each instance was launched with. `RegisterSidecars` now
+carries the `SidecarSpec`s, not just their names, and every registered
+sidecar keeps its own:
+
+```rust
+struct SidecarRun {
+    id: InstanceId,
+    spec: SidecarSpec,
+    restarts: u32,
+    restarted_at: Option<Instant>,
+    due: Option<Instant>,
+    relaunching: Option<CancellationToken>,
+}
+```
+
+A restart alone, and a whole-instance restart's Start step, build their
+launches from those and the instance's own stored OCI spec, never from the
+app's current one. An adopted instance registers the sidecars of the app
+spec in its own record, for the same reason.
+
 An app that crashes is different. On runc the network namespace belongs to
 the app's launch. The restart's Clear step tears it down with the app and
 the Create step makes a new one, so a sidecar left running would sit in a
@@ -2005,7 +2168,7 @@ question for each app with a knob, and refuse with a message that names the
 knob and the gate:
 
 ```text
-app.vpn: runtime.capabilities CAP_NET_ADMIN refused by the token gate: a runtime knob needs the host-exec permission, and this token's permission doesn't grant it
+app.files: runtime.capabilities CAP_SYS_ADMIN refused by the token gate: a runtime knob needs the host-exec permission, and this token's permission doesn't grant it
 ```
 
 The node half is `WorkloadSupervisor::admit_runtime_knobs`, which `admit_app`
@@ -2112,8 +2275,8 @@ Six lines, and the borrow question goes away: the `String` is dropped once
 #### What about CAP_SYS_ADMIN?
 
 We had to decide what to do with the capabilities that amount to root
-inside the container: `CAP_SYS_ADMIN`, `CAP_SYS_MODULE`, `CAP_SYS_PTRACE` and
-friends. Refusing them outright was tempting. But a FUSE filesystem needs
+inside the container: `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE` and
+`CAP_SYS_BOOT`. Refusing them outright was tempting. But a FUSE filesystem needs
 `CAP_SYS_ADMIN`, and "use a different orchestrator" is exactly the Swarm
 answer this issue exists to avoid. So we allow them, on three conditions.
 There's no wildcard anywhere: `ALL` is a parse error on both sides, so no
@@ -2148,8 +2311,12 @@ where
 
 The `where F: Fn(...)` clause says `lookup` can be any function or closure
 that takes a path and returns a device, the way a Go function might take a
-`func(string) (Device, error)`. runc passes `host_device`, which `stat`s the
-real node. The tests pass a closure over a table, so they can describe a
+`func(string) (Device, error)`. runc reads the real devices first, with
+`host_devices`, and passes a closure that looks them up there. (The first
+version passed `host_device` itself, which called the blocking
+`std::fs::metadata` from the async `create`; reading them up front with
+`tokio::fs` keeps the `stat` off the runtime's worker threads, and keeps
+`apply_to_spec` synchronous and easy to test.) The tests pass a closure over a table, so they can describe a
 block device with major 8 on a Mac that has no such thing. Because the
 compiler generates a copy of `apply_to_spec` for each `F` it's called with,
 there's no indirect call, as with the `Grill` generics in chapter 1.
@@ -2176,6 +2343,184 @@ netns::write_sysctls_with_commands(commands, instance, &network_sysctls)
     .await
     .map_err(|e| failed(e.to_string()))?;
 ```
+
+We fixed the sysctls and didn't follow the thought to its end. If container
+root can't write the namespace's sysctls, it can't configure the namespace
+either. The kernel checks `CAP_NET_ADMIN`, `CAP_NET_RAW` and the other
+network capabilities against the user namespace that owns the network
+namespace, which is the node's. So the manual's own example, a VPN client
+with `CAP_NET_ADMIN` and `/dev/net/tun`, passed both gates, started, and then
+got "operation not permitted" from `TUNSETIFF`, `ip route` and every raw
+socket. The review of the 0.2.4 train spotted it from the code (#1427), and
+nothing had caught it because no test ran runc with a knob.
+
+So the first thing we wrote was one.
+`runc_net_admin_knob_changes_the_containers_network` started Alpine with
+`capabilities = ["NET_ADMIN"]` and ran `ip link set dev lo mtu 1400` inside
+it. It failed with exit code 2 and `ip: ioctl 0x8922 failed: Operation not
+permitted` (0x8922 is `SIOCSIFMTU`), exactly as predicted.
+
+There were two ways out. One was to make it work: create the network
+namespace *inside* the container's user namespace, so container root owns
+it. But Bun wires up the veth pair and the address before runc runs, and
+adoption, rootless networking and the eBPF bindings all assume that order.
+Moving that setup into a runc hook is a redesign of chapter 3's networking
+for a feature with no user yet. The other was to say no, clearly, at parse
+time, the way `kernel.panic` is refused: a value no node could make work
+shouldn't be one a node can allow. We chose that.
+
+```rust
+pub const NETWORK_CAPABILITIES: [&str; 4] = [
+    "CAP_NET_ADMIN",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_NET_BROADCAST",
+    "CAP_NET_RAW",
+];
+```
+
+`Capability::from_str` checks this table before the list of known ones,
+and the error explains the namespace and points at `sysctls`, which do
+work. `CAP_NET_BIND_SERVICE` goes too, though it's harmless: every port is
+already bindable, thanks to the node's `ip_unprivileged_port_start=0`. The
+runc test turned into its mirror image,
+`runc_a_container_cannot_use_a_network_capability_or_make_device_nodes`.
+It can't ask for `CAP_NET_ADMIN` any more, and forcing it into the spec
+doesn't work either: the runtime's intent is stored and read back through
+the same parser, which refuses it, so the refusal goes deeper than we'd
+planned. Instead, the test runs `ip link` through `nsenter` from the host
+into the container's user and network namespaces. Joining a user namespace
+grants every capability in it, `CAP_NET_ADMIN` included, and the kernel
+still says no. If a future kernel or a redesign changes that, the
+test fails and tells us the refusal can go.
+
+The same reasoning took `m` out of device permissions. A device cgroup rule
+with `m` lets a process `mknod` that device, but the kernel only lets a
+process holding `CAP_MKNOD` in the *initial* user namespace make a device
+node at all. No container has that, so `m` granted nothing, and it was the
+default. Permissions are now `r`, `w` or `rw` (the default), `m` is a parse
+error, and the same runc test checks `mknod` fails inside the container.
+
+#### Every other capability gets the same question
+
+Fixing the network capabilities left an awkward thought. If the kernel
+checks `CAP_NET_ADMIN` against whoever owns the network namespace, what does
+it check `CAP_SYS_TIME` against? The clock isn't in any namespace the
+container owns. Neither is the module loader, the kernel log or the
+realtime scheduler. The manual now said "anything checked against the host
+itself fails", and the parser still accepted every one of them, so an app
+could pass both gates and fail at run time: #1427 all over again. That was
+#1474.
+
+The kernel has two ways to check a capability. `ns_capable(ns, cap)` asks
+whether the caller holds `cap` in user namespace `ns`, or in one of its
+ancestors. Most checks pass the namespace that owns the object: the
+process's for `kill` and `ptrace`, the mount namespace's for `mount`, the
+IPC namespace's for shared memory. Those work in a container, because the
+container's user namespace owns all of them. The other way is plain
+`capable(cap)`, which is `ns_capable(&init_user_ns, cap)`: the host's own
+namespace, which no container is in. Reading kernel source told us which
+capability went where, mostly. It didn't tell us which ones have *both*
+kinds of check, or whether a distribution patched one. So we asked the
+kernel instead.
+
+The trick is the one #1427's test used. A process that joins a user
+namespace from outside, as `nsenter --user` does, gets every capability in
+it, which is the most any knob could ever grant. So
+`tests/fixtures/capability_probe.py` (Python with `ctypes`, because it has
+to make a dozen raw system calls and the Linux test hosts all have Python)
+runs the operation each capability guards and prints one line: `allowed:`
+or `denied:`. `runc_capability_knobs_work_only_where_the_container_owns_the_check`
+starts an Alpine container and runs every probe twice:
+
+- For the capabilities we expected to be refused, once as root on the host,
+  where the operation has to work (otherwise the probe is wrong, not the
+  container), and once through `nsenter` in the container's user, pid, IPC,
+  UTS and network namespaces, where it has to fail.
+- For the ones we expected to work, once through `nsenter` and once through
+  `nsenter` with the capability cleared from the effective set first
+  (`--drop`, which calls `capset`), to show the probe really needs it.
+
+Here's part of what it printed in the Lima VM (Ubuntu, Linux 6.8):
+
+```text
+CAP_SYS_TIME: host root allowed: set the clock; container, every capability denied: EPERM
+CAP_SYS_NICE: host root allowed: lowered its nice value below zero; container, every capability denied: EACCES
+CAP_IPC_LOCK: host root allowed: locked 1 MiB beyond a 64 KiB RLIMIT_MEMLOCK; container, every capability denied: ENOMEM: locked memory is limited to RLIMIT_MEMLOCK
+CAP_SYS_MODULE: host root allowed: passed init_module's capability check (ENOEXEC); container, every capability denied: EPERM
+CAP_AUDIT_WRITE: host root allowed: audit answered AUDIT_GET; container, every capability denied: ECONNREFUSED
+CAP_BLOCK_SUSPEND: host root allowed: EPOLLWAKEUP kept; container, every capability denied: the kernel dropped EPOLLWAKEUP
+CAP_SYS_ADMIN: container allowed: set the hostname; container without it denied: EPERM
+CAP_SYS_PTRACE: container allowed: attached to another user's process; container without it denied: EPERM
+```
+
+All 21 probed host capabilities came out the way the issue guessed, and a
+few it didn't name joined them. Some probes stop short on purpose. Loading a
+real module or rebooting the test host would prove the point rather too
+well, so `init_module` gets an empty buffer: `ENOEXEC` means the capability
+check passed and the ELF parser said no, while `EPERM` means it never got
+that far. `CAP_BLOCK_SUSPEND` doesn't fail at all: the kernel quietly drops
+the `EPOLLWAKEUP` flag, so the probe reads it back from
+`/proc/self/fdinfo`. And the audit system refuses every user namespace but
+the host's with `ECONNREFUSED` before it looks at a capability.
+
+Two results needed thought. `CAP_SYS_NICE` isn't entirely dead in a
+container: it lets container root lower the priority of processes that
+belong to the container's other users, and change their CPU affinity. But nobody adds `SYS_NICE`
+for that. They add it for a negative nice value or realtime scheduling, and
+both are checked against the host. `CAP_DAC_READ_SEARCH` is the other
+way round: reading past file permissions works in the container, but every
+container already has `CAP_DAC_OVERRIDE`, which covers it, and the one call
+that's only `CAP_DAC_READ_SEARCH`'s, `open_by_handle_at`, is checked against
+the host. Adding either changes nothing an app would notice, so both are
+refused. `CAP_MAC_OVERRIDE` has no probe: only Smack checks it (against the
+host), and the test hosts run AppArmor. We refuse it on the source alone and
+say so in the test.
+
+The result is a second table beside `NETWORK_CAPABILITIES`, this time of
+pairs:
+
+```rust
+pub const HOST_CAPABILITIES: [(&str, &str); 22] = [
+    ("CAP_AUDIT_CONTROL", "controlling the audit system"),
+    // ...
+    ("CAP_SYS_TIME", "setting the clock"),
+    ("CAP_SYS_TTY_CONFIG", "configuring terminals"),
+    ("CAP_WAKE_ALARM", "alarms that wake the system"),
+];
+```
+
+`[(&str, &str); 22]` is a fixed-size array of 22 tuples, each a name and
+what the kernel checks it for. `from_str` looks the canonical name up with
+`.find(|(host, _)| *host == canonical)`. The closure's parameter is a
+pattern, like a `match` arm: it takes the pair apart, binds the name to
+`host` and throws the description away with `_`. The error is a struct-like
+enum variant, `KnobError::HostCapability { capability, guards }`, whose
+message reads:
+
+```text
+CAP_SYS_TIME can't be granted: the kernel checks it against the node's own user namespace, not the container's, for setting the clock, so the container would still get "operation not permitted"
+```
+
+That leaves 15 capabilities a container can be given: Docker's defaults
+plus `CAP_CHECKPOINT_RESTORE`, `CAP_IPC_OWNER`, `CAP_SYS_ADMIN`,
+`CAP_SYS_BOOT` and `CAP_SYS_PTRACE`. The same test starts its container
+with the last five as a knob, reads `CapEff` from `/proc/self/status` inside
+it to check each one arrived, and runs `hostname` there, which needs
+`CAP_SYS_ADMIN` in the container's UTS namespace. Seven of the ten escape
+hatches turned out to be host capabilities, so `ESCAPE_CAPABILITIES` is
+down to `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE` and `CAP_SYS_BOOT`. (`CAP_SYS_BOOT`
+in a container can only end the container: `reboot` in a child pid
+namespace kills its init. It still needs naming.)
+
+`CAP_MKNOD` and `CAP_AUDIT_WRITE` are refused as knobs but stay in the
+default set every container gets, as do `CAP_NET_RAW` and
+`CAP_NET_BIND_SERVICE`. They do nothing there either, but the default set
+is Docker's, and changing what every container starts with is its own
+decision.
+
+The test fixtures had used `SYS_NICE` and `IPC_LOCK` as the ordinary,
+harmless capability. They now use `IPC_OWNER` and `CHECKPOINT_RESTORE`,
+which work.
 
 The knobs are new fields in Raft desired state, OCI specs and the capability
 report, so they get a line under the 0.2.4 heading in `src/compatibility.rs`.
@@ -2344,6 +2689,38 @@ config itself? Uses expand in name order, because a `BTreeMap` iterates in
 key order, so the same files always give the same apps and the same first
 error.
 
+#### Substitution multiplies
+
+The injection argument above was about what a value can *say*. The review
+of the train found a problem with how much it can *weigh*
+([#1425](https://github.com/reliaburger/reliaburger/issues/1425)). A body
+of 250,000 `${v}` placeholders fits in a 2 MB request, and so does a
+megabyte-long value for `v`. Substitution writes the value once per
+placeholder: 250 gigabytes, asked for by one apply, before any namespace or
+permission check, on the leader. That's a denial of service anyone with a
+deploy token, or a commit to a GitOps repository, could send.
+
+So `substitute` now takes a `limit` and checks the running length before it
+appends each piece, text or value, rather than after the loop, by which time
+the memory is gone. A use may expand to at most 4 MiB
+(`MAX_EXPANDED_BYTES`), and all the uses in one expansion (one manifest, or
+one file of a GitOps tree) to 16 MiB together (`MAX_TOTAL_EXPANDED_BYTES`),
+because ten thousand uses that each stay under the first cap would add up to
+the same problem. `expand` keeps the remaining budget and hands each use the
+smaller of the two; a use that would pass it is refused with
+`TemplateError::TooLarge`, naming the use and the template.
+
+`substitute` used to return `Err((parameter, reason))`, a tuple, because
+the only failure was a value in the wrong place. A second failure that has
+no parameter at all made that tuple a lie, so the error is now a small
+private enum, `Unfillable`, with `Placement { parameter, reason }` and
+`TooLarge`, and `expand_one` maps each to its `TemplateError`. A tuple is
+fine for one kind of failure; as soon as there are two, an enum makes the
+compiler check every caller handles both. Each rendered value is a
+`Cow<str>`, "clone on write": a borrowed slice for a piece of the body, an
+owned `String` for a rendered value, so the length check reads the same
+for both without copying the body.
+
 #### Three callers, one function
 
 `expand` has three callers, all before validation and policy. The compiler
@@ -2500,13 +2877,20 @@ fingerprint. Without that, a controller claiming an app would roll every
 replica of it, which is the kind of surprise that makes people distrust a
 contract.
 
-**Check before you forward.** A follower can't write to Raft, so a `relish
-delete` that lands on one is forwarded to the leader, under the node's
-service token. By then the caller's identity is gone. So `stop`, `delete`,
-`release` and `rollback` check the owner on whichever node receives them,
-before forwarding, and the leader lets the service principal through.
-`relish apply` doesn't have this problem: its forward carries the caller's
-own token.
+**Check where you write.** A follower can't write to Raft, so a `relish
+delete` that lands on one is forwarded to the leader. The first cut
+forwarded it under the node's service token, which loses the caller, so
+`stop`, `delete` and `release` checked the owner on the follower before
+forwarding, and the leader let the service principal through. The review
+found the hole in that ([#1442](https://github.com/reliaburger/reliaburger/issues/1442)):
+a follower's replica can lag. A controller claims the app, the claim commits
+on the leader, and a follower that hasn't applied it yet sees an unowned app
+and waves a human's `delete` through, with the leader none the wiser. Now
+the forward carries the caller's own credentials, as `relish apply`'s
+always did, and the owner check runs on the leader, against the state the
+write will land on. `rollback` checks where it's asked and re-applies
+through the apply path, whose forward now carries the caller too, so the
+leader's owner rules judge it again.
 
 **The JSON is pinned.** `src/bun/api/contract_tests.rs` builds one example of
 every shape a controller reads or writes, and checks its JSON against a
@@ -2792,11 +3176,22 @@ Jobs and the audit action
   GitOps-owned app is judged as a GitOps sync. Its report is an `insta`
   snapshot. Another test covers the three quiet answers: every workload
   passes, there are no policies, and a policy no longer compiles.
+- **Every job route** (`a_jobs_policy_refuses_a_job_on_every_submission_route`,
+  `a_jobs_warn_policy_warns_on_every_submission_route`, #1424) posts the same
+  `:latest` job to `/v1/jobs/runs` (with a cron), `/v1/batch`,
+  `/v1/batch/array` and `/v1/batch/manifest`. A deny policy refuses it with
+  422 and a `policy.denied` record on each, and writes no definition; a warn
+  policy lets it through with the finding in `policy_warnings`.
 - **Through the router**: a jobs policy refuses a job manifest with 422 and a
   `policy.denied` record, and writes no job definition; an audit policy lets
   an apply through, says nothing to the caller, and leaves one
   `policy.audited` record; and the audit route lists an app committed before
   a policy that would now refuse it, without changing the app.
+- **A scoped audit** (`the_audit_shows_a_scoped_token_only_its_own_namespaces`,
+  #1432): with an app in `team-a`, and an app and a cron job in `team-b`, all
+  on `:latest`, a token scoped to `team-a` reads one app, no jobs and one
+  denial, and the body never mentions `team-b`; the admin still reads all
+  three.
 - **`relish wtf`** (`warns_about_committed_workloads_the_policies_would_now_refuse`):
   denials and audit findings become warnings named by workload, warnings are
   left to the audit report, a clean audit is an OK, and no policies says
@@ -2903,6 +3298,20 @@ signals it, even though the new spec has none. The parsing tests in
 SIGTERM back in both runtimes and skipped the pre-stop: eight of them failed,
 each saying what it saw instead.
 
+Two more came out of the review of the 0.2.4 train. On Apple silicon,
+`make test-apple` runs
+`a_stop_only_signals_so_a_slow_workload_finishes_within_bun_s_grace`: a
+workload traps SIGTERM, sleeps 10 s and prints `finished-cleanly`. The stop
+must return within 3 s, the workload must print its line, and a second stop
+of the exited workload must succeed. Against `container stop` it failed
+before it got that far: the CLI held the call for its own 5 s, then gave up
+with an XPC timeout. And `the_wait_for_remote_withdrawal_gives_up_at_its_patience`
+covers the wait before a rollout stops an old instance, the one that holds
+it serving until every node has dropped its backend (#1355). A node that
+never confirms mustn't hold the stop for ever, so the test answers
+"pending" to every ask, on tokio's paused clock, and checks the wait gives
+up at its 5 s patience, not before and not after.
+
 ### Testing sidecars
 
 The ordering is the feature, so the agent tests in
@@ -2927,6 +3336,13 @@ two sidecars, `proxy` and `logs`:
   is still Running.
 - `a_sidecar_that_keeps_crashing_waits_out_its_backoff`: the first restart
   is immediate and the second isn't.
+- `a_sidecar_that_crashes_mid_rollout_comes_back_from_its_own_instances_spec`
+  swaps the stored spec for one with a newer proxy image, a new `metrics`
+  sidecar and no `logs`, the way a rollout's start does, then crashes both
+  of the old instance's sidecars. `proxy` must come back on its old image,
+  `logs` must come back at all, nothing called `metrics` may appear, and
+  nothing may stay due. Before the fix it failed on the first: the proxy
+  came back on the new image.
 - `an_app_that_crashes_restarts_with_its_sidecars_stopped_after_and_started_before_it`:
   the restart's Clear kills the app before `proxy` and `proxy` before
   `logs`, and its Start starts both sidecars before the app.
@@ -2952,7 +3368,10 @@ that only a node reporting `shared_network` is a candidate.
 CLI runs, `pickle::binding` pins a sidecar's image, and the Kubernetes
 importer turns a native sidecar and a pod's second container into sidecars
 and survives a round trip through `relish export`. The registry's backoff
-and cancellation have their own tests in `bun::agent::sidecars`.
+and cancellation have their own tests in `bun::agent::sidecars`, and
+`a_sidecar_that_ran_stably_restarts_at_once_again` crashes a sidecar seven
+times, checks a crash a minute later still waits the longest backoff, and
+one ten quiet minutes later doesn't wait at all.
 
 To check that the agent tests check something, we started the sidecars
 after the app and stopped them before it. Four tests failed: the start
@@ -2965,15 +3384,23 @@ the app, a sidecar in the same image running `sleep`, and `redis-cli -h
 127.0.0.1 ping` executed inside the sidecar. `PONG` means they share a
 namespace, and the sidecar must have no address of its own.
 
+`a_sidecar_is_held_to_its_apps_namespace`, in `tests/ebpf.rs`, runs the
+agent with the real eBPF programs loaded. It deploys `web` in `tenant-a`
+with a `proxy` sidecar, and `db` in `tenant-b` with `allow_from =
+["tenant-a/web"]`. The mock runtime runs nothing, so the test makes the
+sidecar's cgroup where runc would and connects from a process inside it: to
+an address of `db`'s, which must work, and to one of a third namespace's,
+which must get `EPERM`. Before the fix, the second connect went through.
+
 ### Testing runtime knobs
 
 Each gate is tested alone first, then both together, because a double gate
 whose halves are never tested apart can quietly become a single gate.
 
 - **The token gate alone**: `a_runtime_knob_needs_host_exec_and_the_refusal_names_the_token_gate`
-  applies an app with `CAP_NET_ADMIN` as a deployer whose permission block
+  applies an app with `CAP_IPC_OWNER` as a deployer whose permission block
   grants only `deploy`. It must get a 403 whose body names
-  `runtime.capabilities CAP_NET_ADMIN` and "token gate", and the council
+  `runtime.capabilities CAP_IPC_OWNER` and "token gate", and the council
   must hold no app. The same manifest under `deploy` and `host-exec` goes
   through.
 - **The node gate alone**: `runtime_knobs_pass_only_the_node_gate_of_a_runtime_that_applies_them`
@@ -2994,7 +3421,7 @@ whose halves are never tested apart can quietly become a single gate.
   `a_host_wide_sysctl_fails_the_whole_config_at_parse` shows the error at
   `relish lint`, before any gate is asked.
 - **Escape hatches**: `an_escape_hatch_capability_needs_the_node_to_name_it`
-  shows that a node allowing `CAP_NET_ADMIN` doesn't admit `CAP_SYS_ADMIN`,
+  shows that a node allowing `CAP_IPC_OWNER` doesn't admit `CAP_SYS_ADMIN`,
   and that naming it does, and appears in the startup warning's list.
   `a_capability_wildcard_is_refused_with_its_reason` covers `ALL`, `all` and
   `CAP_*`.
@@ -3015,9 +3442,19 @@ whose halves are never tested apart can quietly become a single gate.
   unmapped, and a round trip sends an app's knobs through `relish export`
   and back in.
 
-None of these run runc. The runc half is two calls and a `stat`, and it's
-Linux-only, so it's exercised by `make test-linux` rather than by the
-portable suite.
+- **What no container can use**: `a_network_capability_is_refused_in_an_app_and_in_a_node`
+  tries all four network capabilities, spelt three ways, in an app and in
+  `node.toml`, and `the_mknod_device_permission_is_refused` tries `m`,
+  `rwm` and `mr`. `a_capability_checked_against_the_node_is_refused_in_an_app_and_in_a_node`
+  does the same for all 22 host capabilities, and pins the 15 that are
+  left, so a capability can't drift from one list to the other unnoticed.
+
+None of those run runc. The first version said the runc half was
+"exercised by `make test-linux`", and it wasn't: no Linux test ran a knob.
+`runc_a_container_cannot_use_a_network_capability_or_make_device_nodes`
+is the first, and it's the one that proved #1427 before we touched the
+code. `runc_capability_knobs_work_only_where_the_container_owns_the_check`
+is the second, and it ends by checking the parser agrees with the kernel.
 
 ### Testing templates
 
@@ -3044,6 +3481,13 @@ unit tests in `src/config/template/tests.rs`, with no node in sight:
   one name, a nested template or `use`, a body with a policy in it, a
   placeholder no parameter resolves, bad names, and a body that isn't valid
   TOML. The ones whose wording matters compare the whole message.
+- **Size** (#1425): `a_use_that_expands_past_the_limit_is_refused` turns
+  about 20 KiB of input (2,048 placeholders and a 4 KiB value) into a
+  refusal instead of 8 MiB; `uses_that_together_expand_past_the_total_are_refused`
+  has five uses of about 3.5 MiB each, every one under the per-use cap, and
+  checks the fifth is refused with the budget the first four left; and
+  `a_use_under_the_limit_expands` checks the cap doesn't bite ordinary
+  templates.
 - **A property test**, `expansion_is_deterministic_and_leaves_no_placeholders`,
   generates names, counts, flags and strings full of quotes, backslashes,
   newlines and Unicode, puts them in a basic string, a multi-line string, a
@@ -3064,7 +3508,9 @@ Around it:
   fills a field on an expanded app and keeps its provenance; and a default
   that tries to set `provenance` is refused at commit. A job policy matching
   `job.provenance.template` refuses a templated migration job pinned to
-  `:latest`. `app_fields_match_the_app_spec`
+  `:latest`. `provenance_is_a_label_anyone_can_write` (#1430) pins down the
+  limit: a policy that exempts template `approved` exempts a hand-written
+  app claiming it and an app from a template the manifest declared itself. `app_fields_match_the_app_spec`
   failed the moment `provenance` joined `AppSpec`, which is the job it was
   written for.
 - **Owners** (`bun::api::owner_tests`): a template whose body declares
@@ -3119,6 +3565,15 @@ the owner table has a test at the level where it lives.
   release hands the app back; the controller's token can't touch another
   namespace; and the desired-apps listing names the owner within the token's
   scope.
+- **Job manifests** (`a_job_manifest_cant_take_an_owned_app`,
+  `a_job_manifest_skips_an_owned_app`, #1429). A manifest with a `[job.*]`
+  goes down a different path, `job_apply`, and the first cut forgot the
+  owner check there: a deployer who added any job to a file could replace
+  a controller's app, because the state machine's backstop only checks that
+  a write keeps the stored owner, not who's asking. Now the same
+  `skip_owned_apps` runs first. Declaring someone else's owner is a 403, a
+  rival's is a 409, and a manifest that doesn't declare the owner deploys
+  its jobs without the owned app.
 - **GitOps** (`lettuce::diff::tests::diff_leaves_controller_owned_apps_alone`):
   git declaring a newer image doesn't update an owned app, and git dropping
   one GitOps wrote before the claim doesn't prune it.

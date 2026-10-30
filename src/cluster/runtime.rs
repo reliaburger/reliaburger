@@ -945,16 +945,12 @@ fn spawn_leader_target_maintainer(
     let shutdown = supervision.shutdown.clone();
     spawn_supervised("cluster:leader-target", supervision, async move {
         loop {
-            let view = {
-                let metrics = metrics_rx.borrow();
-                let directory = directory_rx.borrow();
-                crate::cluster::directory::resolve_leader(
-                    &metrics,
-                    &directory,
-                    api_offset,
-                    reporting_offset,
-                )
-            };
+            let view = crate::cluster::directory::resolve_leader(
+                &metrics_rx,
+                &directory_rx,
+                api_offset,
+                reporting_offset,
+            );
             if let Some(view) = view {
                 if let Some(reporting) = view.reporting_address {
                     let target = vec![(view.node_id.clone(), reporting)];

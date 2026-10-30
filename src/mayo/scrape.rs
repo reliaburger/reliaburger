@@ -503,11 +503,16 @@ instance{instance=\"self-reported\"} 1
 
     #[tokio::test]
     async fn a_failing_scrape_records_up_zero_and_no_samples() {
-        // Bind then drop, so the port is (almost certainly) closed.
-        let closed = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        };
+        // Keep the listener bound and drop every connection unanswered. A port
+        // freed by dropping its listener can be bound again by another test in
+        // the same process, which then serves metrics on it (#1470).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
         let (_dir, store) = store();
         let summary = scrape_app_targets(
             &store,

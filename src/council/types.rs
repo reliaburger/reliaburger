@@ -818,6 +818,45 @@ impl DesiredState {
     /// the dead council's log position and membership so the recovered node
     /// starts a fresh term line, and lifts the catalogue generation above
     /// anything the old epoch published (#478).
+    /// What a repeated [`RaftRequest::RetireEndpointExecution`] for
+    /// `execution` would answer, read from committed state without writing
+    /// it (#1440).
+    ///
+    /// `Some(released)` once the execution's fence has committed: a repeat
+    /// write would change nothing and answer `released`. `None` when only
+    /// the write can answer: the execution isn't fenced yet, or the write
+    /// would refuse it.
+    pub fn committed_producer_release(
+        &self,
+        node_id: &str,
+        execution: &crate::grill::RuntimeExecution,
+    ) -> Option<bool> {
+        // The write refuses a retired node; leave that answer to it.
+        if self.security_state.crl.retired_nodes.contains_key(node_id)
+            || !self.producer_retirements.fences(node_id, execution)
+        {
+            return None;
+        }
+        // With the fence committed, the write withdraws nothing more: a
+        // publication that names a fenced execution is refused. Check it
+        // anyway, so the read never answers for a write that would change
+        // the catalogue.
+        let withdraws = self.endpoint_catalog.services.values().any(|service| {
+            service.backends.iter().any(|backend| {
+                self.producer_retirements
+                    .blocks(&backend.node_id, backend.execution.as_ref())
+            })
+        });
+        if withdraws {
+            return None;
+        }
+        Some(self.producer_retirements.release_confirmed(
+            node_id,
+            execution,
+            &self.endpoint_withdrawals,
+        ))
+    }
+
     pub fn enter_recovery_epoch(&mut self, floor: u64) {
         self.recovery_epoch = self.recovery_epoch.max(floor).saturating_add(1);
         self.recovery_id = Some(RecoveryId::random());

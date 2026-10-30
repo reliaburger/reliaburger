@@ -57,11 +57,20 @@ pub struct CommittedApp {
 /// An app is judged as an apply would judge it: its declared spec (#1118)
 /// where the cluster kept one, filled in by the defaults, validated, then
 /// every `deny`. A job is judged from its stored definition, its schedule
-/// put back, with its image read back as the tag it was bound from.
+/// and run policy put back, with its image read back as the tag it was bound from.
 pub fn audit(desired: &DesiredState) -> PolicyAudit {
+    audit_visible(desired, |_| true)
+}
+
+/// [`audit`], judging only the apps and jobs `visible` keeps: what a token
+/// limited to some apps or namespaces may see (#1432). The counts are of
+/// those workloads too, so a scoped caller doesn't learn how many others
+/// there are.
+pub fn audit_visible(desired: &DesiredState, visible: impl Fn(&AppId) -> bool) -> PolicyAudit {
     let mut apps: Vec<CommittedApp> = desired
         .apps
         .iter()
+        .filter(|(id, _)| visible(id))
         .map(|(id, stored)| {
             // Without a declared spec (a rollback wrote this one), the
             // stored image is read back as the tag it was bound from.
@@ -85,14 +94,13 @@ pub fn audit(desired: &DesiredState) -> PolicyAudit {
         .definitions()
         .filter_map(|(key, record)| {
             let (namespace, name) = key.split_once('/')?;
-            let mut spec = record.definition.template.clone();
-            spec.schedule = record
-                .definition
-                .cron
-                .as_ref()
-                .map(|cron| cron.expression.clone());
+            let id = AppId::new(name, namespace);
+            if !visible(&id) {
+                return None;
+            }
+            let mut spec = record.definition.to_spec();
             spec.image = spec.image.as_deref().map(unbound);
-            Some((AppId::new(name, namespace), spec))
+            Some((id, spec))
         })
         .collect();
     audit_workloads(&desired.policies, desired.policy_generation, &apps, &jobs)

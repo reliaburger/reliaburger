@@ -3,6 +3,12 @@
 
 use super::*;
 
+/// How many instances of one batch retire at once (#1440). Each one's
+/// wait for other nodes to drop it asks the leader every 500 ms through
+/// the agent loop, and each stop drives the runtime, so the batch is
+/// bounded rather than all at once.
+const RETIREMENT_CONCURRENCY: usize = 16;
+
 /// Runs one deploy on its own spawned task so the command loop keeps
 /// servicing health checks, restarts and other commands while an image pulls
 /// or a rolling deploy waits on health (DEP4/codex-M3).
@@ -654,13 +660,11 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         if spec.sidecar.is_empty() {
             return Ok(());
         }
-        let names = spec
-            .sidecar
-            .iter()
-            .map(|sidecar| sidecar.name.clone())
-            .collect();
-        let registered = self.ops.register_sidecars(instance_id, names).await?;
-        let launches = super::sidecars::sidecar_launches(spec, instance_id, app_oci);
+        let registered = self
+            .ops
+            .register_sidecars(instance_id, spec.sidecar.clone())
+            .await?;
+        let launches = super::sidecars::sidecar_launches(&spec.sidecar, instance_id, app_oci);
         let Err(failure) = super::sidecars::launch_sidecars(
             &self.grill,
             &self.secrets,
@@ -846,14 +850,21 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         };
         let _ = events.send(ApplyEvent::Progress { message }).await;
         let drain_timeout = crate::meat::deploy_types::DeployConfig::for_app(spec).drain_timeout;
-        let mut retired: Vec<InstanceId> = Vec::new();
         for old_id in &retire {
             let _ = events
                 .send(ApplyEvent::Progress {
                     message: format!("stopping instance {}: its replica left this node", old_id.0),
                 })
                 .await;
-            let outcome = match self.retire_old_instance(old_id, drain_timeout).await {
+        }
+        // The leaving replicas retire as one batch, so their waits for other
+        // nodes overlap (#1440). Every one that stopped is finished, even
+        // when another failed, so none is left stopped but unaccounted.
+        let outcomes = self.retire_old_instances(&retire, drain_timeout).await;
+        let mut retired: Vec<InstanceId> = Vec::new();
+        let mut failure = None;
+        for (old_id, outcome) in retire.iter().zip(outcomes) {
+            let outcome = match outcome {
                 Ok(()) => match self.ops.finish_retire(old_id).await {
                     // Only other nodes' confirmations are outstanding; the
                     // agent loop finishes the release when they arrive.
@@ -865,17 +876,22 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 },
                 Err(error) => Err(error),
             };
-            if let Err(error) = outcome {
-                self.record_share_left(app_name, namespace, previous, &retired)
-                    .await;
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: format!("could not retire {}: {error}", old_id.0),
-                    })
-                    .await;
-                return std::ops::ControlFlow::Break(());
+            match outcome {
+                Ok(()) => retired.push(old_id.clone()),
+                Err(error) => {
+                    failure.get_or_insert((old_id, error));
+                }
             }
-            retired.push(old_id.clone());
+        }
+        if let Some((old_id, error)) = failure {
+            self.record_share_left(app_name, namespace, previous, &retired)
+                .await;
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: format!("could not retire {}: {error}", old_id.0),
+                })
+                .await;
+            return std::ops::ControlFlow::Break(());
         }
         let ids = match self
             .ops
@@ -1196,9 +1212,12 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     message: format!("stopping old instance {}", old_id.0),
                 })
                 .await;
-            if let Err(error) = self
-                .retire_old_instance(old_id, deploy_config.drain_timeout)
-                .await
+        }
+        // The surplus retires as one batch, so their waits overlap (#1440).
+        let outcomes = self
+            .retire_old_instances(&outstanding, deploy_config.drain_timeout)
+            .await;
+        if let Some(error) = outcomes.into_iter().find_map(Result::err) {
             {
                 let retention = self
                     .retain_started_replacements(
@@ -1749,6 +1768,33 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         stop_runtime_instance(&self.grill, id, &stop, self.stop_confirmation_timeout).await
     }
 
+    /// Retire a batch of old instances, each as [`Self::retire_old_instance`]
+    /// does, up to [`RETIREMENT_CONCURRENCY`] at a time. Returns one outcome
+    /// per instance, in the order given; one failure doesn't stop the rest.
+    ///
+    /// Retiring them one after another stacked their waits for other nodes
+    /// to drop them: with one node slow to confirm, each cost the whole
+    /// patience, and scaling 100 replicas to none took minutes (#1440).
+    /// Together, a batch costs about one wait per [`RETIREMENT_CONCURRENCY`]
+    /// instances.
+    pub(super) async fn retire_old_instances(
+        &self,
+        ids: &[InstanceId],
+        drain_timeout: std::time::Duration,
+    ) -> Vec<Result<(), BunError>> {
+        let mut outcomes = Vec::with_capacity(ids.len());
+        // Whole chunks, joined: a stream's `buffered` would keep the slots
+        // fuller, but its future isn't `Send` for every lifetime, which
+        // `tokio::spawn` needs of the deploy task.
+        for chunk in ids.chunks(RETIREMENT_CONCURRENCY) {
+            let retiring = chunk
+                .iter()
+                .map(|id| self.retire_old_instance(id, drain_timeout));
+            outcomes.extend(futures_util::future::join_all(retiring).await);
+        }
+        outcomes
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn retain_started_replacements(
         &self,
@@ -2054,10 +2100,11 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 return std::ops::ControlFlow::Break(());
             }
         }
-        for old_id in &existing {
-            if let Err(error) = self
-                .retire_old_instance(old_id, deploy_config.drain_timeout)
-                .await
+        // All of blue retires at once, so its waits overlap (#1440).
+        let outcomes = self
+            .retire_old_instances(&existing, deploy_config.drain_timeout)
+            .await;
+        if let Some(error) = outcomes.into_iter().find_map(Result::err) {
             {
                 let retention = self
                     .retain_started_replacements(

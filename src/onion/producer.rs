@@ -80,6 +80,15 @@ impl ProducerRetirements {
         Ok(next)
     }
 
+    /// Whether `execution` itself is fenced on `node_id`: its generation
+    /// is retired, for this instance.
+    pub fn fences(&self, node_id: &str, execution: &RuntimeExecution) -> bool {
+        self.executions
+            .get(node_id)
+            .and_then(|entries| entries.get(execution.generation.as_str()))
+            == Some(&execution.instance_id)
+    }
+
     /// Missing generation evidence from a previously fenced producer cannot reintroduce an endpoint.
     pub fn blocks(&self, node_id: &str, execution: Option<&RuntimeExecution>) -> bool {
         let Some(entries) = self.executions.get(node_id) else {
@@ -106,10 +115,7 @@ impl ProducerRetirements {
         execution: &RuntimeExecution,
         withdrawals: &EndpointWithdrawals,
     ) -> bool {
-        self.executions
-            .get(node_id)
-            .and_then(|entries| entries.get(execution.generation.as_str()))
-            == Some(&execution.instance_id)
+        self.fences(node_id, execution)
             && !withdrawals.pending.values().any(|withdrawal| {
                 !withdrawal.consumers.is_empty()
                     && withdrawal.services.values().any(|service| {

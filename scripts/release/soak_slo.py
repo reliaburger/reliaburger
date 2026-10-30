@@ -12,7 +12,9 @@ docs/plans/2026-10-28-research-kubernetes-release-testing.md.
 Every sample is taken outside fault windows. Samples go into a bucketed
 histogram in EVIDENCE/slo.json, so a day-long run stays a few kilobytes,
 and each p99 is the upper bound of the bucket holding it. A job's start
-lag comes from the job campaign's own buckets (job_soak.BUCKETS).
+lag comes from the job campaign's own buckets (job_soak.BUCKETS), summed
+over only the runs no fault window overlapped (#1438); the campaign's M8
+start lag counts every run.
 
 `measure_api` is the reusable part: give it endpoints, a token and a CA
 and it times the API reads `relish status` and `relish nodes` make. The
@@ -52,6 +54,10 @@ READ_TIMEOUT = 5
 # six times the fast tier's rate, which no record has measured yet; a custom
 # run says nothing about any gate.
 GATED_TIERS = ("fast", "final")
+# Quiet job starts a p99 needs before it can be judged (#1485). A fast tier's
+# faults leave only a handful of runs outside every window, and the p99 of 20
+# is their largest; a final's quiet tail gives millions.
+MIN_JOB_START_SAMPLES = 1000
 FAILURES_KEPT = 20
 RECORD_ONLY_NOTE = ("Record only from 28 October 2026 (#1400): no soak before 0.2.4 measured it. The threshold is "
                     "provisional; the first 0.2.4 fast and final records set the gate.")
@@ -79,7 +85,8 @@ SLOS = (
     Slo("deploy-ready", "Rolling update p99", "rolling update", 30000, False, "rollout",
         "from `relish apply` returning to every node's `soak-identity` running the new spec"),
     Slo("job-start", "Job task start p99", "job task start", 256, True, "job",
-        "a job task's start lag on a pooled executor, from the job campaign's buckets"),
+        "a job task's start lag on a pooled executor, from the job campaign's buckets, in runs no fault "
+        "window overlapped"),
 )
 
 
@@ -275,15 +282,17 @@ def rows(data, job_report, tier, job_campaign=True):
     """Each SLO's p99, sample count and verdict for one run. A gated SLO in
     a gated tier fails when it is over its threshold or has no samples. A
     run without a job campaign (`job_campaign` false) has no job starts to
-    judge, so that row is recorded as not measured."""
+    judge, so that row is recorded as not measured. Job starts need
+    MIN_JOB_START_SAMPLES: a final short of them fails, and any other tier
+    records them as too few to judge."""
     gated_tier = tier in GATED_TIERS
     result = []
     for slo in SLOS:
         over_every_bucket = False
         if slo.source == "job":
             m8 = (job_report or {}).get("m8") or {}
-            samples = m8.get("start_lag_samples") or 0
-            value = m8.get("p99_start_lag_ms") if samples else None
+            samples = m8.get("quiet_start_lag_samples") or 0
+            value = m8.get("quiet_p99_start_lag_ms") if samples else None
             over_every_bucket = bool(samples) and value is None
             failed = 0
         else:
@@ -291,11 +300,16 @@ def rows(data, job_report, tier, job_campaign=True):
             samples = histogram.get("count", 0)
             value = p99(histogram)
             failed = histogram.get("failed", 0)
-        gated = slo.gated and gated_tier and (job_campaign or slo.source != "job")
+        too_few = slo.source == "job" and 0 < samples < MIN_JOB_START_SAMPLES
+        gated = (slo.gated and gated_tier and (job_campaign or slo.source != "job")
+                 and not (too_few and tier != "final"))
         reason = None
         if not samples:
             verdict = "FAIL" if gated else "not measured"
             reason = f"no {slo.noun} samples"
+        elif too_few:
+            verdict = "FAIL" if gated else "too few samples"
+            reason = f"only {samples:,} {slo.noun} samples, fewer than the {MIN_JOB_START_SAMPLES:,} a p99 needs"
         elif over_every_bucket or value > slo.threshold_ms:
             verdict = "FAIL" if gated else "over (record only)"
             reason = (f"{slo.noun} p99 is over every start-lag bucket (> {JOB_BOUNDS_MS[-1]:,} ms)"
@@ -336,6 +350,8 @@ def table_lines(slo_rows, data=None):
     for row in slo_rows:
         if row["verdict"] == "FAIL":
             lines.append(f"- **SLO breached: {row['name']}: {row['reason']}**")
+        elif row["verdict"] == "too few samples":
+            lines.append(f"- {row['label']} not judged: {row['reason']}")
     for name, histogram in sorted((data or {}).items()):
         for reason in histogram.get("failures", [])[-3:]:
             lines.append(f"- {name} failed call: {reason}")

@@ -296,6 +296,8 @@ A clustered consumer sets `enforced` when it recovers its consumer ownership (ex
 
 Maps a cgroup ID to its namespace ID, used by the eBPF program to enforce default namespace isolation without requiring an explicit firewall_map entry for every possible pair.
 
+Bun binds every running instance's cgroup here, and each running sidecar's cgroup (`<instance cgroup>-sidecar-<name>`, a sibling of its app's) under its app's identity, so a sidecar gets its app's namespace and the same `firewall_map` grants (#1426). A cgroup with no entry falls back to its `/reliaburger/<namespace>` ancestor, which is bound only while a delegated job of that namespace runs on the node; a caller with neither is treated as a host process and isn't held to namespace policy, which is why every workload cgroup must be bound. A sidecar whose cgroup the runtime can't name yet (still being created, or just restarted) leaves the sync stale, so the next tick retries it.
+
 ```
 Type:        BPF_MAP_TYPE_HASH
 Max entries: 65536

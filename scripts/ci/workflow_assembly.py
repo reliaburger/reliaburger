@@ -87,10 +87,10 @@ def selected_workflow(expected, *, code, heavy, macos):
     """Compute required jobs from trusted changes-job outputs, never artifacts.
 
     `full` runs every owner, `portable` both portable hosts and the optimized
-    boundaries, and `light` (pull requests into a merge train) only portable
-    Linux and the optimized boundaries. `train-full` (a merge-train pull
-    request labelled full-ci) runs every owner except the macOS shards, which
-    the merge queue and the push to the train still run.
+    boundaries, and `light` only portable Linux and the optimized boundaries.
+    `train-full` runs every owner except the macOS shards: a code pull
+    request into main, or one into a train labelled full-ci, that doesn't
+    touch macOS code (#1443). Pushes and the nightly still run them.
     """
     c.fields(expected, ('commit', 'run_id', 'attempt'))
     c.require(re.fullmatch('[0-9a-f]{40}', expected['commit']) is not None,

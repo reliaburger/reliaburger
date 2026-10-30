@@ -39,9 +39,9 @@ use crate::meat::types::AppId;
 use crate::sesame::types::ApiRole;
 
 pub use check::{
-    APP_FIELDS, CALLER_FIELDS, JOB_FIELDS, MAX_DEFAULT_BYTES, MAX_EXPRESSION_BYTES,
-    MAX_MESSAGE_BYTES, POLICY_VARIABLES, PolicyError, PolicyField, UNFILLABLE_FIELDS,
-    WORKLOAD_FIELDS, app_fields, check_policy, workload_variables,
+    APP_FIELDS, CALLER_FIELDS, JOB_FIELDS, MAX_COLLECTION_ENTRIES, MAX_COMPREHENSION_NESTING,
+    MAX_DEFAULT_BYTES, MAX_EXPRESSION_BYTES, MAX_MESSAGE_BYTES, POLICY_VARIABLES, PolicyError,
+    PolicyField, UNFILLABLE_FIELDS, WORKLOAD_FIELDS, app_fields, check_policy, workload_variables,
 };
 pub use defaults::Filled;
 
@@ -62,7 +62,8 @@ pub struct PolicyListing {
 /// Where a change came from, as a policy sees it in `source`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// `relish apply`, or anything else that posts to `/v1/apply`.
+    /// `relish apply`, or anything else that posts to `/v1/apply`, and every
+    /// other route that submits a job (#1424).
     Apply,
     /// A GitOps sync.
     GitOps,
@@ -261,6 +262,13 @@ pub enum AdmitError {
         name: String,
         /// Why it doesn't compile.
         error: PolicyError,
+    },
+    /// The thread judging the apply stopped before it gave an answer. The
+    /// apply fails closed.
+    #[error("the policies couldn't be evaluated: {reason}")]
+    Interrupted {
+        /// What stopped it.
+        reason: String,
     },
 }
 
@@ -464,11 +472,15 @@ pub fn judge_job(
 
 /// Evaluate every `deny` in `set` that applies to `kind` against one
 /// workload, seen as `value`.
+///
+/// A workload too big to judge (see [`workload_value`]) gets a finding
+/// from every such policy, saying why: it fails closed, as a broken
+/// expression does.
 fn evaluate_workload(
     set: &PolicySet,
     kind: WorkloadKind,
     id: &AppId,
-    value: Value,
+    value: Result<Value, String>,
     caller: &Caller,
     source: Source,
 ) -> Verdict {
@@ -476,7 +488,7 @@ fn evaluate_workload(
     if set.is_empty() {
         return verdict;
     }
-    let context = policy_context(set, kind, value, caller, source);
+    let context = value.map(|value| policy_context(set, kind, value, caller, source));
     for policy in &set.policies {
         if !kind.judged_by(policy.target) {
             continue;
@@ -484,7 +496,11 @@ fn evaluate_workload(
         let Some(deny_program) = &policy.deny_program else {
             continue;
         };
-        let broken = match decide(policy, deny_program, &context) {
+        let decided = match &context {
+            Ok(context) => decide(policy, deny_program, context),
+            Err(reason) => Err(reason.clone()),
+        };
+        let broken = match decided {
             Ok(false) => continue,
             Ok(true) => None,
             Err(reason) => Some(reason),
@@ -572,9 +588,13 @@ pub fn judge_app(
         let Some(default) = &policy.default else {
             continue;
         };
-        let value = workload_value(app_id, &spec);
-        let context = policy_context(set, WorkloadKind::App, value, caller, source);
-        let outcome = match matches(policy, &context) {
+        let context = workload_value(app_id, &spec)
+            .map(|value| policy_context(set, WorkloadKind::App, value, caller, source));
+        let matched = match &context {
+            Ok(context) => matches(policy, context),
+            Err(reason) => Err(reason.clone()),
+        };
+        let outcome = match matched {
             Ok(true) => defaults::apply_default(&spec, default)
                 .map(Some)
                 .map_err(|reason| format!("its default couldn't be filled in: {reason}")),
@@ -640,14 +660,50 @@ fn run(field: PolicyField, program: &Program, context: &Context) -> Result<bool,
 }
 
 /// A workload as a policy sees it: its spec as JSON, with `name` and the
-/// resolved `namespace` added.
-fn workload_value(id: &AppId, spec: &impl serde::Serialize) -> Value {
+/// resolved `namespace` added. Refused, naming the field, when any list or
+/// map in it holds more than [`MAX_COLLECTION_ENTRIES`] entries: the
+/// deployer chooses the input's size, and a policy's macros iterate over
+/// it, so an unbounded input makes an ordinary rule a CPU amplifier (#1431).
+fn workload_value(id: &AppId, spec: &impl serde::Serialize) -> Result<Value, String> {
     let mut json = serde_json::to_value(spec).unwrap_or(serde_json::Value::Null);
+    if let Some(path) = oversized(&json, "") {
+        return Err(format!(
+            "{path} has more than {MAX_COLLECTION_ENTRIES} entries, too many for a policy to judge"
+        ));
+    }
     if let serde_json::Value::Object(map) = &mut json {
         map.insert("name".into(), id.name.clone().into());
         map.insert("namespace".into(), id.namespace.clone().into());
     }
-    json_to_cel(json)
+    Ok(json_to_cel(json))
+}
+
+/// The path of the first list or map in `json` with more than
+/// [`MAX_COLLECTION_ENTRIES`] entries, below `path`.
+fn oversized(json: &serde_json::Value, path: &str) -> Option<String> {
+    let at = |key: &str| {
+        if path.is_empty() {
+            key.to_string()
+        } else {
+            format!("{path}.{key}")
+        }
+    };
+    match json {
+        serde_json::Value::Array(items) if items.len() > MAX_COLLECTION_ENTRIES => {
+            Some(path.to_string())
+        }
+        serde_json::Value::Object(map) if map.len() > MAX_COLLECTION_ENTRIES => {
+            Some(path.to_string())
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| oversized(item, &at(&index.to_string()))),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .find_map(|(key, value)| oversized(value, &at(key))),
+        _ => None,
+    }
 }
 
 /// Turn JSON into a CEL value. Whole numbers become `int`, so
@@ -761,6 +817,28 @@ pub fn admit(
         generation,
         filled: evaluation.filled,
         defaulted,
+    })
+}
+
+/// [`admit`] on one of tokio's blocking threads (#1431). Judging is CPU
+/// work whose cost the caller's input partly decides, so the API and the
+/// GitOps runner never run it on an async worker. Takes its arguments by
+/// value, because the thread outlives the caller's borrows.
+pub async fn admit_blocking(
+    committed: BTreeMap<String, PolicySpec>,
+    generation: u64,
+    config: Config,
+    caller: Caller,
+    source: Source,
+) -> Result<Admitted, AdmitError> {
+    tokio::task::spawn_blocking(move || {
+        admit(&committed, generation, &config, &caller, source, Vec::new())
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(AdmitError::Interrupted {
+            reason: error.to_string(),
+        })
     })
 }
 

@@ -437,20 +437,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.note_adopted_instance(&key, &instance_id, record.app_spec.as_ref(), &record.image);
             // Its sidecars have no records of their own, so startup retired
             // them with the other unrecorded launches. They start again on
-            // the next tick, beside the adopted instance (#1120).
+            // the next tick, beside the adopted instance, from the spec it
+            // was launched with (#1120, #1434).
             if let Some(spec) = record
                 .app_spec
                 .as_ref()
                 .filter(|spec| !spec.sidecar.is_empty())
             {
-                let ids = spec
-                    .sidecar
-                    .iter()
-                    .map(|sidecar| {
-                        crate::grill::oci::sidecar_instance_id(&instance_id, &sidecar.name)
-                    })
-                    .collect();
-                self.sidecars.register_down(&instance_id, ids, now)?;
+                self.sidecars
+                    .register_down(&instance_id, &spec.sidecar, now)?;
             }
             if let Some(spec) = record.app_spec {
                 self.deployed_specs.insert(key, spec);

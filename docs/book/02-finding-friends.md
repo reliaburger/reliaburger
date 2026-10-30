@@ -3282,6 +3282,35 @@ The `*node` is worth a second look. `alive.iter()` yields `&NodeId`, borrowed re
 
 What still moves a replica is evidence: a node that's dead in gossip, one whose reports have been stale for a while, or one that reported itself not ready or unable to enforce what the app needs. Silence while the post is still arriving isn't evidence.
 
+Nor, it turned out in 0.2.4, is a node that is still booting. Walking a three-node cluster from 0.2.2 to 0.2.3 (#1449), every node adopted its running `hello` replica after the upgrade exec, and fifteen seconds later retired it while a fresh one started on another node. A plain `SIGKILL` of Bun, with systemd starting it again on the same build, did the same. The cause was the report worker's eagerness. When the new process joins the council, the worker re-points at the leader and reports at once, so its first report leaves while the API, DNS, ingress and registry are still starting. That report says `ready: false`, honestly, and the next one is five seconds away. The leader, planning every two seconds, took "not ready" as evidence and moved the replica. Sometimes the Raft write lost a race and was refused, which is why a restart sometimes kept its replicas.
+
+The readiness report already says *why* a node isn't ready: each subsystem carries its state, when it entered it, and how many times it has been rebuilt. A node whose only missing pieces are critical subsystems in their *first* start (`Starting`, no restarts) hasn't failed anything; it's coming up. So `unheard_nodes` now counts it as unheard too, the same reprieve a node whose readiness hasn't arrived gets: it keeps what it runs, and the cache still marks it not ready, so nothing new lands there.
+
+```rust
+fn still_starting(evidence: &NodeReadinessEvidence, grace: Duration) -> bool {
+    if evidence.ready {
+        return false;
+    }
+    let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+    let mut waiting = evidence
+        .subsystems
+        .iter()
+        .filter(|subsystem| subsystem.critical && subsystem.state != SubsystemState::Ready)
+        .peekable();
+    waiting.peek().is_some()
+        && waiting.all(|subsystem| {
+            subsystem.state == SubsystemState::Starting
+                && subsystem.restart_count == 0
+                && evidence
+                    .observed_at_unix_ms
+                    .saturating_sub(subsystem.state_since_unix_ms)
+                    < grace_ms
+        })
+}
+```
+
+`peekable()` wraps an iterator so you can look at the next item without consuming it. Here it answers "is anything waiting at all?" before `all`, which returns `true` for an empty iterator: a node that isn't ready but names no critical subsystem waiting is broken in a way we can't explain, and that stays evidence. The bound is the same stale-node grace, and both timestamps come from the node's own clock, so clock skew between machines never enters the subtraction. A subsystem being rebuilt after a failure (`restart_count` above zero), one that went `Degraded`, or a first start that outlasts the grace all still move the replica. `a_restarting_node_keeps_its_replicas_while_its_subsystems_start` replays the walk's report, and `only_a_first_start_within_the_grace_counts_as_unheard` pins each of those edges.
+
 "For a while" is new in 0.2.1, and it fixed two bugs pointing in opposite directions. A node can be alive in gossip while its reports have stopped: the soak has caught report workers stalling for over a minute while the node and its workloads carried on. The scheduler's cache only holds nodes with a fresh report, so the stale node simply wasn't in it, and `placement_holds` ended in `cache.get_node(..).is_none_or(..)`: no entry, so the placement holds. Forever. Its daemon copies, meanwhile, were dropped at once, because a daemon set was re-planned over the eligible nodes, and a node missing from the cache isn't eligible.
 
 Which is right? Both have a case. Moving at once duplicates a replica just because its reporter wedged, the lesson of #423. Holding forever means a node whose agent died quietly keeps its replicas off the cluster for good. We split the difference (D28): a stale node's placements hold for a grace period, `[reporting_tree] stale_node_grace_secs`, five minutes by default, and then move. Daemon sets get the same rule. The aggregator already knew when it last heard from each node; it now publishes when each stale node went stale, and the leader turns that into the set of *lapsed* nodes:

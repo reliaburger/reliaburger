@@ -42,8 +42,20 @@ pub(crate) fn write_error(error: TaskArrayWriteError) -> Response {
     self::error(status, error.to_string())
 }
 
-/// Authorise and bind the encrypted template before recording runnable work.
-#[allow(clippy::result_large_err)]
+/// Whether [`admit_definition`] judges the job by the policies in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PolicyCheck {
+    /// Judge it: every route that admits a job on its own.
+    Judge,
+    /// The caller already judged it, with the rest of its manifest
+    /// (`/v1/apply`, through `job_apply`).
+    Judged,
+}
+
+/// Authorise, judge and bind the encrypted template before recording
+/// runnable work. Returns the lines the `warn` policies said about the job,
+/// for the caller's answer.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub(crate) async fn admit_definition(
     state: &ApiState,
     auth: Option<&crate::sesame::auth::AuthContext>,
@@ -52,7 +64,8 @@ pub(crate) async fn admit_definition(
     namespace: &str,
     definition: &mut JobDefinition,
     lease: Option<&crate::testkit::lease::TestLease>,
-) -> Result<(), Response> {
+    policy: PolicyCheck,
+) -> Result<Vec<String>, Response> {
     if !crate::config::valid_workload_label(name) || !crate::config::valid_workload_label(namespace)
     {
         return Err(error(
@@ -98,6 +111,12 @@ pub(crate) async fn admit_definition(
         definition.template.is_host(),
         &permissions,
     )?;
+    // Judge the job as declared, before its image is bound, as `/v1/apply`
+    // judges a job manifest (#1424).
+    let warnings = match policy {
+        PolicyCheck::Judge => judge_definition(state, auth, name, namespace, definition).await?,
+        PolicyCheck::Judged => Vec::new(),
+    };
     if state.council.is_none() {
         let resources = super::api::ask_agent_bounded(&state.cmd_tx, |response| {
             super::agent::AgentCommand::CurrentResources { response }
@@ -122,7 +141,71 @@ pub(crate) async fn admit_definition(
             format!("no node can run job {namespace}/{name}: {reason}"),
         ));
     }
-    Ok(())
+    Ok(warnings)
+}
+
+/// Judge one job by the policies in force (#1119, #1424). A denial, or a
+/// policy that no longer compiles, answers 422 and is audited, as on
+/// `/v1/apply`; audit findings are recorded. Returns the warnings.
+///
+/// Nothing fences a job write on the policy generation, here or on
+/// `/v1/apply`: a policy committed between this check and the write
+/// judges the job's next submission, not this one.
+#[allow(clippy::result_large_err)]
+async fn judge_definition(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    name: &str,
+    namespace: &str,
+    definition: &JobDefinition,
+) -> Result<Vec<String>, Response> {
+    // Policies live in the council's desired state; a standalone node has none.
+    let Some(council) = &state.council else {
+        return Ok(Vec::new());
+    };
+    let policies = council
+        .read_desired(|desired| desired.policies.clone())
+        .await;
+    if policies.is_empty() {
+        return Ok(Vec::new());
+    }
+    let refuse = |error: crate::policy::AdmitError| async move {
+        super::api::apply::policy_refusal(state, auth, &error).await
+    };
+    // Judging is CPU work the caller's input partly sizes, so it runs off
+    // the async threads (#1431).
+    let job_id = crate::meat::AppId::new(name, namespace);
+    let spec = definition.to_spec();
+    let caller = super::api::apply::policy_caller(auth);
+    let judged = tokio::task::spawn_blocking(move || {
+        let set = crate::policy::PolicySet::compile(&policies)?;
+        Ok(crate::policy::judge_job(
+            &set,
+            &job_id,
+            &spec,
+            &caller,
+            crate::policy::Source::Apply,
+        ))
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(crate::policy::AdmitError::Interrupted {
+            reason: error.to_string(),
+        })
+    });
+    let verdict = match judged {
+        Ok(verdict) => verdict,
+        Err(error) => return Err(refuse(error).await),
+    };
+    if !verdict.is_allowed() {
+        let denied = crate::policy::Denied {
+            denials: verdict.denials,
+            warnings: verdict.warnings,
+        };
+        return Err(refuse(crate::policy::AdmitError::Denied(denied)).await);
+    }
+    super::api::apply::record_policy_audits(state, auth, &verdict.audits).await;
+    Ok(verdict.warnings.iter().map(ToString::to_string).collect())
 }
 
 /// Why this node would refuse the definition's host tasks, when it is the
@@ -256,7 +339,7 @@ pub async fn submit_handler(
     ) {
         return response;
     }
-    if let Err(response) = admit_definition(
+    let warnings = match admit_definition(
         &state,
         auth,
         binder.as_deref(),
@@ -264,11 +347,13 @@ pub async fn submit_handler(
         &namespace,
         &mut request.definition,
         None,
+        PolicyCheck::Judge,
     )
     .await
     {
-        return response;
-    }
+        Ok(warnings) => warnings,
+        Err(response) => return response,
+    };
     let trigger = match request.request_id {
         Some(request_id) => Some(RunTrigger::Manual { request_id }),
         None if request.definition.cron.is_some() => None,
@@ -276,8 +361,25 @@ pub async fn submit_handler(
     };
     let count = request.definition.tasks.count;
     let chunks = request.definition.tasks.chunk_count();
-    match write_task_array(&state, TaskArrayWrite::Job(Box::new(JobWrite::Put { name: request.name.clone(), namespace: namespace.clone(), definition: Box::new(request.definition), trigger, now_epoch_secs: crate::meat::batch_ids::epoch_now_secs() }))).await {
-        Ok(id) => (StatusCode::ACCEPTED, Json(serde_json::json!({"batch_id":id,"name":request.name,"namespace":namespace,"count":count,"chunks":chunks}))).into_response(),
+    match write_task_array(
+        &state,
+        TaskArrayWrite::Job(Box::new(JobWrite::Put {
+            name: request.name.clone(),
+            namespace: namespace.clone(),
+            definition: Box::new(request.definition),
+            trigger,
+            now_epoch_secs: crate::meat::batch_ids::epoch_now_secs(),
+        })),
+    )
+    .await
+    {
+        Ok(id) => {
+            let mut answer = serde_json::json!({"batch_id":id,"name":request.name,"namespace":namespace,"count":count,"chunks":chunks});
+            if !warnings.is_empty() {
+                answer["policy_warnings"] = serde_json::json!(warnings);
+            }
+            (StatusCode::ACCEPTED, Json(answer)).into_response()
+        }
         Err(e) => write_error(e),
     }
 }

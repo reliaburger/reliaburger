@@ -23,8 +23,11 @@ council's lease reaper may clean up a lease once its expiry has passed, so
 the model allows that, with a margin for clock skew between the host and
 the nodes.
 
-The search is bounded. A namespace whose search runs over its budget is
-reported as inconclusive rather than hanging the soak.
+The search is bounded. A namespace whose search runs over its budget or its
+deadline is reported as inconclusive rather than hanging the soak. Each
+namespace gets its own deadline, so one slow namespace can't leave the rest
+unchecked (#1437); a soak's fast and final tiers fail on an inconclusive
+result (sustained_check.py).
 
 Subcommands:
   check HISTORY [--out RESULT] [--budget N] [--deadline S]
@@ -48,6 +51,7 @@ GRANT_RETIREMENT_MS = 900_000
 # States the search may visit per namespace: a base plus a share per operation.
 DEFAULT_BUDGET = 400_000
 BUDGET_PER_OPERATION = 20
+# Seconds each namespace's search may take.
 DEFAULT_DEADLINE_SECONDS = 600
 
 FREE = ("free",)
@@ -411,8 +415,11 @@ def smallest_failing_slice(operations, budget, deadline):
 
 
 def check(operations, budget=None, deadline_seconds=DEFAULT_DEADLINE_SECONDS):
-    """Check every namespace; the result says how many operations were checked and the verdict."""
-    deadline = time.monotonic() + deadline_seconds
+    """Check every namespace; the result says how many operations were checked and the verdict.
+
+    Each namespace's search, and the failing slice it may need, gets
+    `deadline_seconds` of its own.
+    """
     by_namespace = {}
     for operation in operations:
         by_namespace.setdefault(operation.namespace, []).append(operation)
@@ -424,6 +431,7 @@ def check(operations, budget=None, deadline_seconds=DEFAULT_DEADLINE_SECONDS):
               sum(1 for op in operations if op.ret == INF and op.kind in KINDS)}
     for namespace, ops in sorted(by_namespace.items()):
         allowed = budget if budget is not None else DEFAULT_BUDGET + BUDGET_PER_OPERATION * len(ops)
+        deadline = time.monotonic() + deadline_seconds
         verdict = search(ops, FREE, allowed, deadline)
         if verdict == "ok":
             result["checked"] += counted(ops)
@@ -451,7 +459,8 @@ def main(argv=None):
     checking.add_argument("history")
     checking.add_argument("--out")
     checking.add_argument("--budget", type=int, help="states to visit per namespace (default: scales with its size)")
-    checking.add_argument("--deadline", type=float, default=DEFAULT_DEADLINE_SECONDS)
+    checking.add_argument("--deadline", type=float, default=DEFAULT_DEADLINE_SECONDS,
+                          help="seconds each namespace's search may take")
     args = parser.parse_args(argv)
     result = check(load_history(args.history), budget=args.budget, deadline_seconds=args.deadline)
     text = json.dumps(result, indent=1, sort_keys=True) + "\n"
