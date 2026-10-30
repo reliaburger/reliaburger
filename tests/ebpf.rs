@@ -127,6 +127,50 @@ fn tests_load_the_object_this_build_compiled() {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 0: what the compiler produced
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "reads the build's eBPF objects; run with make test-linux"]
+fn onion_objects_use_only_the_original_bpf_instruction_set() {
+    use object::{Object, ObjectSection, SectionKind};
+    // Instruction classes: the low three bits of each 8-byte instruction's
+    // opcode. 32-bit ALU and 32-bit jumps came with BPF v3, which newer
+    // clang emits by default. Kernel 7.0's verifier refused clang 21's v3
+    // build of Onion's backend selection: after a 32-bit modulo it no
+    // longer knew the index was in bounds.
+    const BPF_ALU: u8 = 0x04;
+    const BPF_JMP32: u8 = 0x06;
+    // This build's own objects, embedded and aligned (ELF parsing needs
+    // it) like the library's: never a search of a shared target directory,
+    // which can find another worktree's (#878), and still there when the
+    // test archive runs on another machine.
+    for (name, bytes) in [
+        (
+            "onion_connect.bpf.o",
+            aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/onion_connect.bpf.o")),
+        ),
+        (
+            "onion_connect_owned.bpf.o",
+            aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/onion_connect_owned.bpf.o")),
+        ),
+    ] {
+        let file = object::File::parse(bytes).unwrap();
+        for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
+            let data = section.data().unwrap();
+            for (index, instruction) in data.as_chunks::<8>().0.iter().enumerate() {
+                let class = instruction[0] & 0x07;
+                assert!(
+                    class != BPF_ALU && class != BPF_JMP32,
+                    "{name} {}: instruction {index} has 32-bit class {class:#x}",
+                    section.name().unwrap_or("?"),
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tier 1: Load and map verification
 // ---------------------------------------------------------------------------
 

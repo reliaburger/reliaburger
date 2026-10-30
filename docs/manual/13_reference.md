@@ -227,7 +227,7 @@ startup instead of being ignored.
 | Section | For |
 |---------|-----|
 | `[node]` | `name`, `labels` (matched by `placement`) |
-| `[cluster]` | `name`, `join`, ports, `[cluster.backup]` (see `operations`) |
+| `[cluster]` | `name`, `join`, ports, `council_size` (how many voters the council grows to, odd, 1 to 7; read when the node creates the cluster), `[cluster.backup]` (see `operations`) |
 | `[storage]` | data directories, `allowed_host_paths`, `audit_max_bytes` (see `security`), `[storage.snapshots]` (see `images-and-volumes`) |
 | `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
 | `[network]` | `advertise_address`, host `port_range` (default `{ start = 10000, end = 32767 }`, end exclusive: below Linux's ephemeral range; ports something on the host already listens on are skipped) |

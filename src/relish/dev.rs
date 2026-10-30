@@ -1556,8 +1556,7 @@ mod tests {
         // member, so the perimeter must already know every dev node.
         let text = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None, PEERS);
         let config = crate::config::node::NodeConfig::parse(&text).unwrap();
-        let expected: Vec<std::net::IpAddr> =
-            PEERS.iter().map(|peer| peer.parse().unwrap()).collect();
+        let expected: Vec<String> = PEERS.iter().map(|peer| peer.to_string()).collect();
         assert_eq!(config.security.bootstrap_peers, expected);
     }
 

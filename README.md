@@ -95,9 +95,27 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish setup`: Guided setup: detect or install bun, then write a starter config
 - `relish local <status|start|stop|destroy> [NODE]`: Manage a laptop cluster created by setup --quickstart
 - `relish init [DIR]`: Initialise a new cluster (generates CAs, age keypair, node identity)
+- `relish cluster`: Create a cluster of bare-metal appliances (docs/manual/15_appliance.md) *(0.3.0, not in 0.2.3)*
+  - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick *(0.3.0, not in 0.2.3)*
+- `relish image`: Appliance OS images: download, write to a disk, and seed machines *(0.3.0, not in 0.2.3)*
+  - `relish image download`: Download the newest OS build for every architecture and check it against the release key *(0.3.0, not in 0.2.3)*
+  - `relish image write <IMAGE> <DEVICE>`: Write a disk image (.raw or .raw.zst) onto a device, erasing it *(0.3.0, not in 0.2.3)*
+  - `relish image seed <DIRECTORY> <MACHINES>...`: Write seeds for machines joining a running bare-metal cluster *(0.3.0, not in 0.2.3)*
+  - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete` *(0.3.0, not in 0.2.3)*
+- `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network *(0.3.0, not in 0.2.3)*
+  - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them) *(0.3.0, not in 0.2.3)*
+- `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved *(0.3.0, not in 0.2.3)*
+- `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node *(0.3.0, not in 0.2.3)*
+  - `relish os list`: Each node's OS version, and the newest release *(0.3.0, not in 0.2.3)*
+  - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots *(0.3.0, not in 0.2.3)*
+  - `relish os status`: The rollout in progress, or the last one *(0.3.0, not in 0.2.3)*
+  - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it *(0.3.0, not in 0.2.3)*
+  - `relish os abort`: Stop the rollout; nodes keep the version they're on *(0.3.0, not in 0.2.3)*
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node
+  - `relish join-token list`: List join tokens: node id, expiry and whether each has been used *(0.3.0, not in 0.2.3)*
+  - `relish join-token revoke <NODE_ID>`: Revoke every unused join token for a node id *(0.3.0, not in 0.2.3)*
 - `relish nodes`: List cluster nodes and their gossip state
 - `relish council`: Show the council (Raft) on every node, or recover from full loss
   - `relish council status`: Show every node's view of the council (the default)
@@ -119,7 +137,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish rollback <APP>`: Rollback an app to the previous version
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
 - `relish delete <APP>`: Remove an app from the cluster and stop all its instances
-- `relish release <APP>`: Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin) *(0.2.4, not in 0.2.3)*
+- `relish release <APP>`: Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin) *(0.3.0, not in 0.2.3)*
 - `relish batch [PATH]`: Submit a batch of jobs, or manage a task array
   - `relish batch submit <PATH>`: Submit a compact TOML manifest containing mixed resource profiles
   - `relish batch replay --node <NODE> --grant-digest <GRANT_DIGEST> --acknowledge-side-effects <ID>`: Acknowledge repeating side effects for the exact unknown owner grants
@@ -202,11 +220,11 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
 - `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster
-- `relish policy`: List, audit or delete the cluster's policies, or test policies offline *(0.2.4, not in 0.2.3)*
-  - `relish policy list`: List the cluster's policies, with their action and rule *(0.2.4, not in 0.2.3)*
-  - `relish policy delete <NAME>`: Delete a policy (admin only; audited). Policies never judge policies, so this works even when one refuses every app *(0.2.4, not in 0.2.3)*
-  - `relish policy audit`: List the committed apps and jobs the cluster's policies would now refuse, warn about or record. Changes nothing: a new policy never touches running work *(0.2.4, not in 0.2.3)*
-  - `relish policy test --file <FILES>...`: Judge the apps and jobs in some files by the policies in them, offline, the way the cluster would. Exits non-zero when an apply would be refused *(0.2.4, not in 0.2.3)*
+- `relish policy`: List, audit or delete the cluster's policies, or test policies offline *(0.3.0, not in 0.2.3)*
+  - `relish policy list`: List the cluster's policies, with their action and rule *(0.3.0, not in 0.2.3)*
+  - `relish policy delete <NAME>`: Delete a policy (admin only; audited). Policies never judge policies, so this works even when one refuses every app *(0.3.0, not in 0.2.3)*
+  - `relish policy audit`: List the committed apps and jobs the cluster's policies would now refuse, warn about or record. Changes nothing: a new policy never touches running work *(0.3.0, not in 0.2.3)*
+  - `relish policy test --file <FILES>...`: Judge the apps and jobs in some files by the policies in them, offline, the way the cluster would. Exits non-zero when an apply would be refused *(0.3.0, not in 0.2.3)*
 
 **Images and volumes** ([images and volumes](docs/manual/11_images-and-volumes.md))
 
@@ -340,11 +358,11 @@ memory and CPU as they go.
 **Policies.** `[policy.*]` rules in CEL, such as "apps in `prod` need a memory
 limit", are kept in the council and checked on the leader before an app is
 written, for `relish apply` and GitOps alike. A rule refuses the apply or only
-warns, every denial names its policy, and `relish policy test` *(0.2.4, not in 0.2.3)* runs the same
+warns, every denial names its policy, and `relish policy test` *(0.3.0, not in 0.2.3)* runs the same
 check offline in CI. A policy can also fill in fields an app leaves out, such
 as a team label, without ever overwriting one you wrote, and GitOps doesn't
 mistake a filled-in field for a change. Policies can judge jobs too, an
-`audit` policy only records what it finds, and `relish policy audit` *(0.2.4, not in 0.2.3)* and
+`audit` policy only records what it finds, and `relish policy audit` *(0.3.0, not in 0.2.3)* and
 `relish wtf` list the running apps and jobs a new policy would refuse. See [security and access](docs/manual/10_security.md#policies).
 
 **Your own controllers, without an operator SDK.** A controller is an ordinary
@@ -432,7 +450,7 @@ binary was built from. Neither needs a network.
 | Prometheus, Alertmanager | Built-in scraping, alert rules and webhooks |
 | A log shipper and store | Built-in capture, streaming and Parquet export |
 | Argo CD or Flux | Built-in GitOps |
-| Kyverno or Gatekeeper (validation, defaults, audit) | `[policy.*]` deny, warn and audit rules for apps and jobs, fill-only defaults, `relish policy audit` *(0.2.4, not in 0.2.3)* |
+| Kyverno or Gatekeeper (validation, defaults, audit) | `[policy.*]` deny, warn and audit rules for apps and jobs, fill-only defaults, `relish policy audit` *(0.3.0, not in 0.2.3)* |
 | Helm charts or a CRD and its operator (the expansion half) | `[template.*]` and `[use.*]` |
 | Argo Workflows, Kueue or a Celery-style queue | Built-in jobs, cron, hooks and task arrays |
 | Chaos Mesh or Litmus | `relish fault` |

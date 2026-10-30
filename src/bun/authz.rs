@@ -145,6 +145,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/ui/static/{*path}", Public),
     route(Post, "/v1/cluster/join", Public),
     route(Get, "/v1/cluster/ca", Public),
+    // No bearer token: the handler requires a member's TLS client certificate.
+    route(Get, "/v1/cluster/master-key", Public),
     route(Get, "/ui/login", Public),
     route(Post, "/ui/session", Public),
     route(Post, "/ui/logout", Public),
@@ -239,6 +241,13 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/upgrade/resume", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/upgrade/abort", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/upgrade/cluster-rollback", Admin, Cluster(ADMIN)),
+    // Appliance OS updates: the leader stages on each node as the system
+    // principal; operators start and steer the rollout.
+    gated(Post, "/v1/os/stage", Admin, Cluster(ADMIN)),
+    route(Get, "/v1/os/rollout", AnyToken),
+    gated(Post, "/v1/os/rollout/start", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/os/rollout/resume", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/os/rollout/abort", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/cluster/elect", Admin, Cluster(ADMIN)),
     // GitOps: anyone may read the status (it never carries credentials);
     // changing the cluster's configuration is an Admin operation (#693).
@@ -372,6 +381,9 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/token/revoke", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/token/rotate", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/join-token/create", Admin, Cluster(ADMIN)),
+    gated(Get, "/v1/join-token/list", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/join-token/revoke", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/perimeter/admit", Admin, Cluster(ADMIN)),
     route(Get, "/v1/secret/public-key", AnyToken),
     gated(Post, "/v1/secret/rotate", Admin, Cluster(SECRET_WRITE)),
     // Rotating an intermediate CA (F04 R4): the operator's root signs, so
@@ -657,6 +669,7 @@ mod tests {
         include_str!("api/metrics.rs"),
         include_str!("api/node_info.rs"),
         include_str!("api/nodes.rs"),
+        include_str!("api/os.rs"),
         include_str!("api/policies.rs"),
         include_str!("api/registry.rs"),
         include_str!("api/secrets.rs"),
@@ -1072,6 +1085,10 @@ mod tests {
             "upgrade_abort_handler",
             "upgrade_cluster_rollback_handler",
             "cluster_elect_handler",
+            "os_stage_handler",
+            "os_rollout_start_handler",
+            "os_rollout_resume_handler",
+            "os_rollout_abort_handler",
         ] {
             let body = mounted_handler_body(source, handler).expect(handler);
             assert!(

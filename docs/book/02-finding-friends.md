@@ -2632,7 +2632,9 @@ if voters.len() + 2 <= target
 
 `[first, second, ..]` is a *slice pattern*. It matches any slice with at least two elements, binds the first two, and `..` ignores the rest. A slice with fewer than two doesn't match, so the condition is false and we fall through. In C you'd check the length and then index; in Python you'd unpack and catch the error. Rust folds the length check and the binding into one pattern, and there's no index to get wrong. The `&& let` part is a let chain (stable since Rust 1.88): every condition in the `if` must hold, and the bindings from the pattern are in scope inside the block.
 
-A two-node cluster ends up with one voter and one plain worker, and the gated `two_node_cluster_survives_losing_the_non_voter` test checks the half Raft can promise: kill the worker and the voter keeps committing alone. The upgrade planner's refusal of a two-voter council (chapter 14) stays, as a guard for councils an older release left behind.
+A two-node cluster ends up with one voter and one learner, and the gated `two_node_cluster_survives_losing_the_non_voter` test checks the half Raft can promise: kill the learner and the voter keeps committing alone.
+
+For a while it ended up with one voter and one plain worker, and that broke something a long way from the planner (#1477). When we made the council odd, the learner step brought in only enough learners to reach the odd target, which for two nodes is the voter it already had. So the second node never joined Raft at all. On an mTLS cluster, a joining node keeps its API closed until the cluster's API tokens arrive in its replicated state, so it can't be opened wide to the network before it knows who may call it. A node outside Raft never gets that state. Its bun waited 30 seconds, gave up, was restarted by systemd and waited again, forever. The same went for the fourth node of four and the sixth of six. None of the cluster tests caught it, because the process-level harness runs without mTLS and the mTLS tests drive the cluster runtime without bun's start-up. The appliance's two-VM boot test did. Now spares join as learners up to the cap, and the voter count stays odd because only promotion decides it. The upgrade planner's refusal of a two-voter council (chapter 14) stays, as a guard for councils an older release left behind.
 
 ### Hysteresis, or why flapping must not churn
 
@@ -2661,6 +2663,45 @@ The same slow disk raised a second question: what else was inside that five-seco
 The wait was redundant anyway. The planner already refuses to promote a learner until it's within `max_promotion_lag` (64) entries of the leader. So `add_learner` now passes `false` and returns once the membership entry commits. The catch-up runs between ticks, where it can take as long as the log gap needs without holding anything up, and the next ticks plan nothing until the learner is ready. The bound stays at five seconds: it now covers a known number of commits, with plenty of room for a leader whose apply queue is busy. The regression test gives two learners a log store that takes half a millisecond per entry and an 8,000-entry gap, sets the bound to one second, and asserts that no reconciler tick reaches it while the council grows to three voters. Before the change, the first `add_learner` ran into it.
 
 The test needed a slow store, and `MemLogStore` already had one test hook, `fail_appends`, for the full-disk case. We added a second beside it, `slow_entry_writes`, which sleeps in `append` for each entry it writes. Both hooks are fields marked `#[cfg(test)]`, so they exist only when the crate is compiled for its own unit tests. A production build has neither the fields nor the code that reads them, unlike Go, where a test hook usually stays in the binary behind a flag. The delay is per entry rather than per call because catch-up time has to grow with the log gap, which is the thing we were testing.
+
+### Five voters, not seven
+
+For a long time the cap was a constant: `max_council_size`, seven. Then the appliance lab arrived, ten Dell Wyse thin clients with 2 GB of RAM each, and seven voters on ten small machines looked like the wrong trade. Every voter keeps the whole council log on disk and has to acknowledge writes for a majority to form. Five voters ride out two failures at once; seven ride out three. On a ten-node lab that third failure isn't worth two more machines doing council work. So a cluster can now choose its size.
+
+The first question was where the setting lives. The obvious place is each node's `node.toml`, next to the ports. But the reconciler only runs on the leader, and leadership moves. If node 1 said five and node 4 said seven, the council would grow or shrink depending on who won the last election. A setting every leader must agree on is cluster state, so it goes where cluster state goes: into the Raft log. A new request, `RaftRequest::CouncilSize`, sets `DesiredState::council_size`, and each reconciler tick reads it before it plans:
+
+```rust
+let selection = config.selection.sized(council.council_size().await);
+```
+
+`sized` returns a copy of the selection config with `max_council_size` capped at the cluster's size, and `min_council_size` lowered to match when the size is smaller than three, so a one-voter council isn't held to a floor it can never reach. Everything else, the planner and its invariants and the proptest that guards them, is unchanged: the planner already stops adding learners when the open seats run out, it just runs out sooner. `council_size()` reads the field through the state machine's lock without cloning the whole desired state, because the reconciler asks every two seconds.
+
+Getting the size into the log uses the path the security state already took. `relish cluster create --bare-metal` writes it into node 1's seed, the seed becomes `[cluster] council_size = 5` in node 1's `node.toml`, and when node 1 bootstraps a fresh council it commits the security state and then the size. Joining nodes never read it; they get it from the log like everything else. `RaftRequest` is encoded with bincode, which writes a variant's position rather than its name, so the new variant goes at the end of the enum, and the change bumps both the protocol and the state generation in `src/compatibility.rs`.
+
+The size itself is a newtype that refuses to exist with a bad value:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct CouncilSize(u8);
+
+impl CouncilSize {
+    pub fn new(voters: u8) -> Result<Self, CouncilSizeError> {
+        match voters {
+            0 => Err(CouncilSizeError::Zero),
+            v if v > Self::MAX => Err(CouncilSizeError::TooLarge(v)),
+            v if v % 2 == 0 => Err(CouncilSizeError::Even(v)),
+            v => Ok(Self(v)),
+        }
+    }
+}
+```
+
+The field is private (no `pub` inside the parentheses), so code outside the module can't write `CouncilSize(4)`; it has to go through `new`. The serde attribute closes the other door. `try_from = "u8"` tells serde to decode a plain number and then call `TryFrom<u8>`, which calls `new`, so an even size can't arrive through TOML, JSON or a Raft entry either. `into = "u8"` writes it back out as a plain number. `v if v > Self::MAX` is a *match guard*: the arm matches any value, binds it to `v`, and only fires when the condition holds. Arms are tried in order, so by the time the even check runs, zero and anything over seven are already gone. In Go you'd validate in a constructor and hope nobody builds the struct literal; in Python you'd validate in `__init__` and hope nobody unpickles one. Here the type can only hold 1, 3, 5 or 7.
+
+Why refuse even sizes rather than quietly round them? A council of four needs three votes, so it survives one failure, the same as a council of three, while making every commit wait for one more machine. An operator who types `--council-size 4` almost certainly expects it to survive two, and a clear refusal teaches that better than a silent rounding would. The message says so: `a council of 4 voters survives no more failures than one of 3; pick an odd size from 1 to 7`.
+
+The tests come at it from three sides. Unit tests check the type (1, 3, 5 and 7 accepted; 0, even numbers and anything over seven refused, also when decoding) and the planner (five healthy voters and five spares: `Nothing`; four voters: add the fifth). An in-memory council of five nodes, with the size committed at three, ticks the real reconciler until it has three voters and then keeps ticking, asserting that no fourth node ever joins, even as a learner. And the claimed-pair appliance test in CI checks the size end to end: `relish machines claim --create` records five in `fleet.json`, and `relish council --output json` reports five from council state once node 1 has bootstrapped.
 
 ## When the whole council dies
 

@@ -1,0 +1,740 @@
+name: Appliance image
+
+# The Reliaburger appliance: Ubuntu 26.04 built with mkosi, one native build
+# per architecture (docs/plans/2026-10-01-plan-appliance-product.md, W1).
+#
+# Pull requests build the `lab` profile, boot-test it and sign it with a
+# throwaway key, for the QEMU lab. On x86-64 they also build a next version
+# and a lab os-channel.json naming it, signed with the same key, so the OS
+# update runs end to end in CI and in the Wyse lab; and a broken version
+# whose bun never starts, so CI proves a bad update falls back by itself
+# and times it, and the Wyse lab can stage the same. A dispatched lab build's
+# artefacts are kept a week, for the lab; a pull request's for a day. Every
+# QEMU test uses a 7.25 GiB disk, a Wyse 3040's eMMC (image/tests/disk.sh).
+# A dispatch on main with `publish` builds the production image with the
+# release public key inside;
+# then a job that runs no third-party actions signs it with the release key
+# (RELIABURGER_RELEASE_KEY), the netboot install test re-runs on the signed
+# artefacts, and the build is published as GitHub releases
+# os-<version>-<arch> with a signed os-channel.json. A build whose packages
+# match the last release publishes nothing.
+#
+# The weekly scheduled publish (Monday 04:00 UTC, `cron: "0 4 * * 1"`) is off
+# until v0.3.0 is promoted (maintainer, 7 October 2026), so the 0.3.0 train
+# landing on main publishes nothing by itself. Turn it back on by restoring
+# the `schedule` trigger once v0.3.0 is out; the plan job already treats a
+# scheduled run on main as a publishing one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bun_release:
+        description: Release tag to take bun and relish from (default is the newest published v* release, else the newest staging candidate)
+        required: false
+      broken_bun:
+        description: "Spike S4: build an image whose bun refuses to start, to test the A/B fallback (never published)"
+        type: boolean
+        default: false
+      publish:
+        description: Sign with the release key and publish (main only)
+        type: boolean
+        default: false
+  pull_request:
+    # release-* is each release's merge train (the appliance's is
+    # release-1-3-0): PRs into it build and test the image too.
+    branches: [main, "feat/appliance-*", "release-*"]
+    paths:
+      - "image/**"
+      - ".github/workflows/appliance.yml"
+
+concurrency:
+  group: appliance-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Whether this run publishes, and the version it builds.
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
+          BROKEN: ${{ inputs.broken_bun }}
+        run: |
+          set -euo pipefail
+          publish=false
+          if [ "$GITHUB_REF" = refs/heads/main ] && [ "$BROKEN" != true ] \
+              && { [ "$EVENT" = schedule ] || [ "$PUBLISH_INPUT" = true ]; }; then
+            publish=true
+          fi
+          week=$(date -u +%G.%V)
+          if [ "$publish" = true ]; then
+            tags=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 300 --json tagName --jq '.[].tagName')
+            # shellcheck disable=SC2086
+            version=$(python3 scripts/release/os_release.py next-version --week "$week" $tags)
+          else
+            # Lab builds: the run number, so they never collide with each other.
+            version="$week.$GITHUB_RUN_NUMBER"
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "### Appliance $version, publish: $publish" >> "$GITHUB_STEP_SUMMARY"
+
+  # Lab builds carry the bun and relish of the commit under test, so a PR's
+  # bun changes run in its own appliance image. Published builds and a
+  # dispatch naming bun_release take a release instead.
+  bun:
+    name: bun from source (${{ matrix.arch }})
+    needs: plan
+    if: needs.plan.outputs.publish != 'true' && inputs.bun_release == ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      RELIABURGER_GIT_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: appliance-${{ matrix.target }}
+      - name: Build bun and relish
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm libbpf-dev
+          cargo build --locked --release --target ${{ matrix.target }} --features ebpf --bin bun --bin relish
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/bun dist/bun-linux-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/relish dist/relish-linux-${{ matrix.arch }}
+          dist/bun-linux-${{ matrix.arch }} --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bun-source-${{ matrix.arch }}
+          path: dist/*
+          retention-days: 1
+
+  # The image's shell scripts that have unit tests (image/tests): quick, and
+  # Linux-only, since the scripts use GNU coreutils as the appliance does.
+  scripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dnsmasq
+        # For test_mac_router.py: it parses the lab Mac's dnsmasq.conf with
+        # the real tool (image/lab/mac/). dnsmasq-base is the binary
+        # without a service.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dnsmasq-base
+      - name: Script tests
+        env:
+          MAC_ROUTER_TOOLS: required
+        run: python3 -m unittest discover -s image/tests -v
+
+  image:
+    name: image (${{ matrix.arch }})
+    needs: [plan, bun]
+    # bun is skipped for published builds; the image still runs.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.bun.result != 'failure' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    env:
+      ARCH: ${{ matrix.arch }}
+      PUBLISH: ${{ needs.plan.outputs.publish }}
+      IMAGE_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        # The tools tree, the package downloads and the image all land on the
+        # runner's root disk; drop toolchains this job never uses.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up mkosi v27
+        uses: systemd/mkosi@f2b04fcd671110e3a7372027162752f71de0c9b0 # v27
+
+      - uses: actions/download-artifact@v4
+        if: needs.bun.result == 'success'
+        with:
+          name: bun-source-${{ matrix.arch }}
+          path: source-bin
+
+      - name: Fetch bun and relish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.bun_release }}
+        run: |
+          set -euo pipefail
+          if [ -d source-bin ]; then
+            install -D -m 0755 "source-bin/bun-linux-$ARCH" image/bin-tree/usr/lib/reliaburger/bin/bun
+            install -D -m 0755 "source-bin/relish-linux-$ARCH" image/bin-tree/usr/lib/reliaburger/bin/relish
+            echo "BUN_RELEASE=source-$GITHUB_SHA" >> "$GITHUB_ENV"
+            echo "### bun and relish built from \`$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          tag="$REQUESTED"
+          if [ -z "$tag" ]; then
+            # Published releases only: old v0.0.x pre-releases lack SHA256SUMS.
+            tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 \
+              --exclude-pre-releases --exclude-drafts --json tagName \
+              --jq '[.[].tagName | select(startswith("v"))][0] // empty')
+          fi
+          if [ -z "$tag" ]; then
+            tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --json tagName \
+              --jq '[.[].tagName | select(startswith("staging-v"))][0]')
+          fi
+          echo "BUN_RELEASE=$tag" >> "$GITHUB_ENV"
+          mkdir -p dl
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir dl \
+            -p "bun-linux-$ARCH" -p "relish-linux-$ARCH" -p SHA256SUMS
+          (cd dl && sha256sum --check --ignore-missing SHA256SUMS)
+          install -D -m 0755 "dl/bun-linux-$ARCH" image/bin-tree/usr/lib/reliaburger/bin/bun
+          install -D -m 0755 "dl/relish-linux-$ARCH" image/bin-tree/usr/lib/reliaburger/bin/relish
+          echo "### bun and relish from \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Break bun on purpose (spike S4)
+        # workflow_dispatch's broken_bun, or a commit adding image/spike-broken-bun
+        # (dispatch needs the workflow on main): the whole build is broken,
+        # for the Mac lab's arm64 fallback. x86-64 lab builds make a broken
+        # version of their own anyway (below).
+        if: (inputs.broken_bun || hashFiles('image/spike-broken-bun') != '') && env.PUBLISH != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p image/bin-tree
+          cp -R image/tests/broken-bun/. image/bin-tree/
+          echo "### Broken on purpose: bun won't start in this image" >> "$GITHUB_STEP_SUMMARY"
+          # Its boot tests would fail by design; skip them so it still uploads.
+          echo "BROKEN_BUN=1" >> "$GITHUB_ENV"
+
+      - name: Throwaway signing key
+        # Lab builds only: a fresh Ed25519 key per run, whose public half
+        # replaces the release key in the image and the installer, so the lab
+        # can check its signatures. A published build keeps the committed
+        # release public key (image/**/os-signing-key.pub.pem), and the sign
+        # job signs it with the release key.
+        if: env.PUBLISH != 'true'
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm ed25519 -out "$RUNNER_TEMP/spike.key"
+          openssl pkey -in "$RUNNER_TEMP/spike.key" -pubout -out "$RUNNER_TEMP/spike.pub.pem"
+          install -D -m 0644 "$RUNNER_TEMP/spike.pub.pem" \
+            image/mkosi.images/installer/mkosi.extra/usr/lib/reliaburger/os-signing-key.pub.pem
+          install -D -m 0644 "$RUNNER_TEMP/spike.pub.pem" \
+            image/bin-tree/usr/lib/reliaburger/os-signing-key.pub.pem
+
+      - name: Build the image
+        run: |
+          set -euo pipefail
+          profile=()
+          # The lab's image has sshd (mkosi.conf.d/30-lab.conf); published ones don't.
+          [ "$PUBLISH" = true ] || profile=(--profile lab)
+          start=$(date +%s)
+          mkosi -C image --image-version "$IMAGE_VERSION" "${profile[@]}" \
+            --extra-tree "$GITHUB_WORKSPACE/image/bin-tree" build
+          echo "BUILD_SECONDS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+          # What the quiet-week check compares besides the packages.
+          printf 'bun %s\nimage %s\n' "$BUN_RELEASE" "$(git rev-parse HEAD:image)" \
+            > "image/mkosi.output/reliaburger-os_$IMAGE_VERSION.build"
+
+      - name: Build the next version (x86-64 lab builds)
+        # A second build, one version on, for the OS update test: same
+        # sources, but a different version makes it a different /usr.
+        # Every x86-64 lab build, so the Wyse lab can update to it too
+        # (appliance-x86_64-next).
+        if: matrix.arch == 'x86_64' && env.PUBLISH != 'true' && env.BROKEN_BUN != '1'
+        run: |
+          set -euo pipefail
+          next="${IMAGE_VERSION%.*}.$(( ${IMAGE_VERSION##*.} + 1 ))"
+          echo "NEXT_VERSION=$next" >> "$GITHUB_ENV"
+          mkosi -C image --image-version "$next" --profile lab \
+            --extra-tree "$GITHUB_WORKSPACE/image/bin-tree" \
+            --output-dir "$RUNNER_TEMP/next" build
+          ls -l "$RUNNER_TEMP/next"
+
+      - name: Build a broken version (x86-64 lab builds)
+        # A third build, two versions on, whose bun never starts
+        # (image/tests/broken-bun), for the fallback test. Signed with the
+        # run's key like the next version and uploaded beside it, so the Wyse
+        # lab stages it from the same run (S5 runbook, step 7). Two on, not
+        # one, so it also sorts above the next version once a node has it.
+        if: env.NEXT_VERSION != ''
+        run: |
+          set -euo pipefail
+          broken="${IMAGE_VERSION%.*}.$(( ${IMAGE_VERSION##*.} + 2 ))"
+          echo "BROKEN_VERSION=$broken" >> "$GITHUB_ENV"
+          mkosi -C image --image-version "$broken" --profile lab \
+            --extra-tree "$GITHUB_WORKSPACE/image/bin-tree" \
+            --extra-tree "$GITHUB_WORKSPACE/image/tests/broken-bun" \
+            --output-dir "$RUNNER_TEMP/broken" build
+          ls -l "$RUNNER_TEMP/broken"
+          echo "### Broken version for the fallback test: $broken" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record sizes
+        run: |
+          set -euo pipefail
+          cd image/mkosi.output
+          ls -l
+          {
+            echo "### Appliance $IMAGE_VERSION ($ARCH), built in ${BUILD_SECONDS} s"
+            echo '```'
+            ls -l
+            echo '```'
+            echo "Packages: $(jq '.packages | length' *.manifest 2>/dev/null || echo '?')"
+            echo "Kernel: $(jq -r '.packages[] | select(.name | startswith("linux-image-")) | "\(.name) \(.version)"' *.manifest 2>/dev/null | tr '\n' ' ')"
+            echo "Firmware: $(jq -r '.packages[] | select(.name | startswith("linux-firmware")) | .name' *.manifest 2>/dev/null | tr '\n' ' ')"
+            du -sh ../mkosi.tools 2>/dev/null | sed 's/^/Tools tree: /' || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build iPXE
+        # Pinned and built here rather than downloaded (research §4.7), with
+        # image/netboot/embed.ipxe built in.
+        env:
+          IPXE_COMMIT: 12798ec29aa8a64d8675c4378b99f5fe28447afb # v2.0.0
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential liblzma-dev
+          git init -q "$RUNNER_TEMP/ipxe"
+          git -C "$RUNNER_TEMP/ipxe" fetch -q --depth 1 https://github.com/ipxe/ipxe "$IPXE_COMMIT"
+          git -C "$RUNNER_TEMP/ipxe" checkout -q FETCH_HEAD
+          case "$ARCH" in
+            x86_64) dir=bin-x86_64-efi name=x86_64 ;;
+            aarch64) dir=bin-arm64-efi name=arm64 ;;
+          esac
+          # snp.efi drives the NICs through the firmware's own drivers, which
+          # is what odd NICs (the Wyse's Realtek) need; it's the default, as
+          # in Sidero's Omni. ipxe.efi brings iPXE's drivers, for firmware
+          # whose network stack is broken but whose NIC iPXE knows.
+          make -s -C "$RUNNER_TEMP/ipxe/src" -j"$(nproc)" "$dir/snp.efi" "$dir/ipxe.efi" \
+            EMBED="$GITHUB_WORKSPACE/image/netboot/embed.ipxe"
+          mkdir -p image/mkosi.output/netboot
+          cp "$RUNNER_TEMP/ipxe/src/$dir/snp.efi" "image/mkosi.output/netboot/ipxe-snp-$name.efi"
+          cp "$RUNNER_TEMP/ipxe/src/$dir/ipxe.efi" "image/mkosi.output/netboot/ipxe-$name.efi"
+          cp image/netboot/boot.ipxe image/mkosi.output/netboot/
+          ls -l image/mkosi.output/netboot
+
+      - name: List the netboot files in SHA256SUMS
+        # One signature then covers everything a release publishes: the image,
+        # the installer and iPXE (relish image download checks them all).
+        run: |
+          set -euo pipefail
+          cd image/mkosi.output
+          sums="reliaburger-os_$IMAGE_VERSION.SHA256SUMS"
+          for f in "reliaburger-os-installer_$IMAGE_VERSION.efi" netboot/*; do
+            printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")" >> "$sums"
+          done
+          cat "$sums"
+
+      - name: Sign (throwaway key)
+        if: env.PUBLISH != 'true'
+        run: |
+          set -euo pipefail
+          cd image/mkosi.output
+          cp "$RUNNER_TEMP/spike.pub.pem" spike-signing-key.pub.pem
+          for sums in *.SHA256SUMS "$RUNNER_TEMP"/next/*.SHA256SUMS "$RUNNER_TEMP"/broken/*.SHA256SUMS; do
+            [ -f "$sums" ] || continue
+            openssl pkeyutl -sign -inkey "$RUNNER_TEMP/spike.key" -rawin -in "$sums" -out "$sums.sig"
+            openssl pkeyutl -verify -pubin -inkey spike-signing-key.pub.pem -rawin -in "$sums" -sigfile "$sums.sig"
+          done
+          if [ -n "${NEXT_VERSION:-}" ]; then
+            # The lab channel: the published channel's format and signing
+            # (os_release.py), naming the next version, with this run's key.
+            next="$RUNNER_TEMP/next"
+            (umask 077 && openssl pkey -in "$RUNNER_TEMP/spike.key" -outform DER -out "$RUNNER_TEMP/spike.der")
+            python3 "$GITHUB_WORKSPACE/scripts/release/os_release.py" lab-channel \
+              --key "$RUNNER_TEMP/spike.der" --version "$NEXT_VERSION" --out "$next" \
+              "x86_64=$next/reliaburger-os_$NEXT_VERSION.SHA256SUMS"
+            openssl pkeyutl -verify -pubin -inkey spike-signing-key.pub.pem -rawin \
+              -in "$next/os-channel.json" -sigfile "$next/os-channel.json.sig"
+            cp spike-signing-key.pub.pem "$next/"
+          fi
+          rm -f "$RUNNER_TEMP/spike.key" "$RUNNER_TEMP/spike.der"
+
+      - name: Lay out the next version as a release
+        # As GitHub would: the next version's release beside the lab channel,
+        # and the broken version's beside it, for the OS update and fallback
+        # tests and for appliance-x86_64-next.
+        if: env.NEXT_VERSION != ''
+        run: |
+          image/tests/lab-release.sh "$RUNNER_TEMP/next" "$NEXT_VERSION" "$RUNNER_TEMP/lab-release" \
+            "$RUNNER_TEMP/broken" "$BROKEN_VERSION"
+
+      - name: Boot test
+        if: env.BROKEN_BUN != '1'
+        # x86-64 runs under KVM. Hosted arm64 runners have no /dev/kvm, so
+        # aarch64 falls back to TCG: slower, but it catches an image that
+        # doesn't boot (like the 26.04 stubble kernel did) before the Mac lab.
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          if [ "$ARCH" = x86_64 ]; then
+            sudo apt-get install -y -qq qemu-system-x86 ovmf zstd
+            qemu_bin=qemu-system-x86_64 machine=q35
+            code=/usr/share/OVMF/OVMF_CODE_4M.fd vars=/usr/share/OVMF/OVMF_VARS_4M.fd
+          else
+            sudo apt-get install -y -qq qemu-system-arm qemu-efi-aarch64 zstd
+            qemu_bin=qemu-system-aarch64 machine=virt
+            code=/usr/share/AAVMF/AAVMF_CODE.fd vars=/usr/share/AAVMF/AAVMF_VARS.fd
+          fi
+          if [ -w /dev/kvm ] || sudo chmod 666 /dev/kvm 2>/dev/null; then
+            accel=kvm cpu=host deadline=600
+          else
+            # pauth-impdef: QEMU's own pointer-auth algorithm is much faster
+            # to emulate than the architected one.
+            accel=tcg cpu=max,pauth-impdef=on deadline=1200
+          fi
+          echo "Booting with $qemu_bin, accel=$accel"
+          zstd -q -d "image/mkosi.output/reliaburger-os_${IMAGE_VERSION}.raw.zst" -o "$RUNNER_TEMP/disk.raw"
+          # A 7.25 GiB disk, like the Wyse 3040's eMMC: first boot adds slot B
+          # and grows the data partition into the free space. It fails here,
+          # saying so, if the image doesn't leave room for slot B.
+          . image/tests/disk.sh
+          disk_from_image "$RUNNER_TEMP/disk.raw"
+          cp "$vars" "$RUNNER_TEMP/vars.fd"
+          log="$RUNNER_TEMP/serial.log"
+          # 2 GiB, like the Wyse 3040.
+          "$qemu_bin" -machine "$machine,accel=$accel" -cpu "$cpu" -smp 2 -m 2048 \
+            -drive if=pflash,format=raw,readonly=on,file="$code" \
+            -drive if=pflash,format=raw,file="$RUNNER_TEMP/vars.fd" \
+            -drive if=virtio,format=raw,file="$RUNNER_TEMP/disk.raw" \
+            -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+            -display none -serial "file:$log" -no-reboot &
+          qemu=$!
+          start=$(date +%s)
+          result=timeout
+          while [ $(( $(date +%s) - start )) -lt "$deadline" ]; do
+            if grep -q -e "reliaburger: bun healthy" -e "reliaburger: unclaimed" "$log" 2>/dev/null; then result=pass; break; fi
+            if grep -q "reliaburger: bun not healthy" "$log" 2>/dev/null; then result=fail; break; fi
+            if ! kill -0 "$qemu" 2>/dev/null; then result=exited; break; fi
+            sleep 5
+          done
+          elapsed=$(( $(date +%s) - start ))
+          kill "$qemu" 2>/dev/null || true
+          echo "--- serial console ---"
+          cat "$log" || true
+          # systemd breaks an ordering cycle by dropping jobs (once, /boot's
+          # automount), and the boot can still look healthy: refuse it.
+          # boot-check copies them from the journal onto the console.
+          if grep -q "reliaburger: ordering cycle:" "$log"; then
+            result="$result, with ordering cycles"
+          fi
+          echo "### Boot test: $result after ${elapsed} s" >> "$GITHUB_STEP_SUMMARY"
+          grep "reliaburger:" "$log" >> "$GITHUB_STEP_SUMMARY" || true
+          [ "$result" = pass ]
+
+      - name: Netboot install test (x86-64, KVM)
+        # A published build runs it after signing, in the verify job.
+        if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && env.PUBLISH != 'true'
+        timeout-minutes: 20
+        run: image/tests/netboot-install.sh image/mkosi.output "$IMAGE_VERSION"
+
+      - name: relish netboot install (x86-64, KVM)
+        # The same install, served by the commit's relish as a ProxyDHCP
+        # beside an ordinary DHCP server (lab builds only).
+        if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq dnsmasq-base
+          chmod +x source-bin/relish-linux-x86_64
+          image/tests/relish-netboot-install.sh image/mkosi.output "$IMAGE_VERSION" source-bin/relish-linux-x86_64
+
+      - name: relish netboot install, DHCP on the same machine (x86-64, KVM)
+        # The isolated lab's split: the lab Mac's dnsmasq.conf on the runner
+        # owns UDP 67 and sends option 60 PXEClient, and
+        # `relish netboot --mode-dhcp-proxy` answers on UDP 4011 only.
+        if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq dnsmasq-base
+          chmod +x source-bin/relish-linux-x86_64
+          image/tests/relish-netboot-install.sh image/mkosi.output "$IMAGE_VERSION" source-bin/relish-linux-x86_64 dhcp-proxy
+
+      - name: Seeded pair (x86-64, KVM)
+        # Two appliances form a cluster from their seeds alone, with the
+        # bun and relish of the commit under test (lab builds only).
+        if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq dnsmasq-base
+          chmod +x source-bin/relish-linux-x86_64
+          image/tests/seeded-pair.sh image/mkosi.output "$IMAGE_VERSION" source-bin/relish-linux-x86_64
+
+      - name: Claimed pair (x86-64, KVM)
+        # Two unseeded appliances claimed over the LAN: mDNS discovery, the
+        # pinned claim, and a join through the firewall's join window.
+        if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        timeout-minutes: 25
+        run: image/tests/claimed-pair.sh image/mkosi.output "$IMAGE_VERSION" source-bin/relish-linux-x86_64
+
+      - name: Record the netboot demo (x86-64, KVM)
+        # The homepage's netboot recording (scripts/demo/netboot.sh): three
+        # blank VMs netboot from the commit's relish and are claimed into a
+        # cluster. Only on a pull request labelled record-netboot-demo.
+        id: netboot_demo
+        if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != '' && contains(github.event.pull_request.labels.*.name, 'record-netboot-demo')
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq dnsmasq-base
+          sudo install -m 755 source-bin/relish-linux-x86_64 /usr/local/bin/relish
+          curl -fsSL -o "$RUNNER_TEMP/asciinema" \
+            https://github.com/asciinema/asciinema/releases/download/v3.2.1/asciinema-x86_64-unknown-linux-musl
+          echo "bec9781bc8f297a9d3d74ff60205599507f2abba1183578b8b2f22be4c999214  $RUNNER_TEMP/asciinema" | sha256sum -c -
+          sudo install -m 755 "$RUNNER_TEMP/asciinema" /usr/local/bin/asciinema
+          scripts/demo/netboot.sh --record "$RUNNER_TEMP/netboot.cast" image/mkosi.output "$IMAGE_VERSION"
+
+      - name: Upload the netboot demo
+        if: ${{ !cancelled() && steps.netboot_demo.outcome != 'skipped' && steps.netboot_demo.outcome != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: netboot-demo-cast
+          path: ${{ runner.temp }}/netboot.cast
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: OS update (x86-64, KVM)
+        # bun rolls the next version onto a one-node cluster: staging,
+        # sysupdate, the reboot and the boot checks, end to end.
+        # It needs the commit's relish (lab builds of bun from source).
+        if: env.NEXT_VERSION != '' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq dnsmasq-base
+          chmod +x source-bin/relish-linux-x86_64
+          image/tests/os-update.sh image/mkosi.output "$IMAGE_VERSION" \
+            "$RUNNER_TEMP/lab-release" "$NEXT_VERSION" source-bin/relish-linux-x86_64
+
+      - name: OS fallback (x86-64, KVM)
+        # bun rolls the broken version onto a one-node cluster: three counted
+        # boots fail their boot checks, systemd-boot falls back on its own,
+        # and bun reports it, which pauses the rollout. The summary records
+        # how long the fallback took (#406; the Wyse exit test needs 10 min).
+        if: env.BROKEN_VERSION != '' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          image/tests/os-update.sh image/mkosi.output "$IMAGE_VERSION" \
+            "$RUNNER_TEMP/lab-release" "$BROKEN_VERSION" source-bin/relish-linux-x86_64 --fallback
+
+      - name: Upload the image
+        uses: actions/upload-artifact@v4
+        with:
+          name: appliance-${{ matrix.arch }}
+          path: |
+            image/mkosi.output/*.raw*
+            !image/mkosi.output/*.esp.raw*
+            !image/mkosi.output/*.root-*.raw*
+            image/mkosi.output/*.efi
+            image/mkosi.output/*.manifest
+            image/mkosi.output/*.build
+            image/mkosi.output/*.SHA256SUMS*
+            image/mkosi.output/spike-signing-key.pub.pem
+            image/mkosi.output/netboot/
+          if-no-files-found: error
+          # zstd-compressed already. A published build's go into its releases
+          # within the run; a dispatched lab build's are for the Wyse lab, so
+          # they last a week; a pull request's are for the next day.
+          compression-level: 0
+          retention-days: ${{ env.PUBLISH == 'true' && 3 || github.event_name == 'workflow_dispatch' && 7 || 1 }}
+
+      - name: Upload the next version
+        # Ready to serve: `gh run download <run> -n appliance-x86_64-next -D
+        # next`, then any web server on next/, and `relish os upgrade --channel
+        # http://<server>/releases/download/os-channel/os-channel.json --key
+        # next/lab-signing-key.pub.pem`. The broken version's release sits
+        # beside it, for os-stage and the fallback test.
+        if: env.NEXT_VERSION != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: appliance-x86_64-next
+          path: ${{ runner.temp }}/lab-release/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ github.event_name == 'workflow_dispatch' && 7 || 1 }}
+
+  # Sign a published build with the release key. Only first-party actions
+  # run here: this job holds the key that every bun trusts.
+  sign:
+    needs: [plan, image]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.changed.outputs.changed }}
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: appliance-*
+          path: art
+      - name: Did anything change since the last release?
+        id: changed
+        run: |
+          set -euo pipefail
+          changed=true
+          last=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 300 --json tagName \
+            --jq '[.[].tagName | select(test("^os-[0-9]{4}\\.[0-9]{2}\\.[0-9]+-x86_64$"))] | .[0] // empty')
+          if [ -n "$last" ]; then
+            same=true
+            for arch in x86_64 aarch64; do
+              tag="${last%-x86_64}-$arch"
+              mkdir -p "prev/$arch"
+              if ! gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "prev/$arch" \
+                  -p 'reliaburger-os_*.manifest' -p 'reliaburger-os_*.build'; then
+                same=false
+                continue
+              fi
+              previous='' previous_record=''
+              for f in prev/"$arch"/reliaburger-os_*.manifest; do previous=$f; done
+              for f in prev/"$arch"/reliaburger-os_*.build; do previous_record=$f; done
+              python3 scripts/release/os_release.py unchanged --previous "$previous" \
+                --current "art/appliance-$arch/reliaburger-os_$VERSION.manifest" \
+                --previous-record "$previous_record" \
+                --current-record "art/appliance-$arch/reliaburger-os_$VERSION.build" || same=false
+            done
+            [ "$same" = true ] && changed=false
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "### Changed since ${last:-the first release}: $changed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Sign with the release key and write the channel
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          RELIABURGER_RELEASE_KEY: ${{ secrets.RELIABURGER_RELEASE_KEY }}
+        run: |
+          set -euo pipefail
+          # Each subcommand reads the key from the environment and drops it.
+          key="$RELIABURGER_RELEASE_KEY"
+          python3 scripts/release/os_release.py sign art/appliance-x86_64 art/appliance-aarch64
+          RELIABURGER_RELEASE_KEY="$key" python3 scripts/release/os_release.py channel \
+            --version "$VERSION" --out art/channel \
+            "x86_64=art/appliance-x86_64/reliaburger-os_$VERSION.SHA256SUMS" \
+            "aarch64=art/appliance-aarch64/reliaburger-os_$VERSION.SHA256SUMS"
+          unset key
+          # Check with the public key the image ships, as the installer will.
+          pem=image/mkosi.extra/usr/lib/reliaburger/os-signing-key.pub.pem
+          for f in art/appliance-*/reliaburger-os*.SHA256SUMS art/channel/os-channel.json; do
+            openssl pkeyutl -verify -pubin -inkey "$pem" -rawin -in "$f" -sigfile "$f.sig"
+          done
+          for arch in x86_64 aarch64; do
+            mkdir -p "signed/$arch"
+            cp art/appliance-$arch/*.sig "signed/$arch/"
+          done
+          cp art/channel/os-channel.json art/channel/os-channel.json.sig signed/
+      - uses: actions/upload-artifact@v4
+        if: steps.changed.outputs.changed == 'true'
+        with:
+          name: appliance-signed
+          path: signed/
+          retention-days: 3
+
+  # The netboot install test again, on the signed artefacts: a published
+  # image's installer trusts only the release key.
+  verify:
+    needs: [plan, sign]
+    if: needs.sign.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: appliance-x86_64
+          path: art
+      - uses: actions/download-artifact@v4
+        with:
+          name: appliance-signed
+          path: signed
+      - name: Netboot install test (x86-64, KVM)
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          cp signed/x86_64/*.sig art/
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 ovmf zstd
+          sudo chmod 666 /dev/kvm
+          image/tests/netboot-install.sh art "$VERSION"
+
+  publish:
+    needs: [plan, sign, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: appliance-*
+          path: art
+      - name: Release each architecture
+        run: |
+          set -euo pipefail
+          for arch in x86_64 aarch64; do
+            dir="art/appliance-$arch"
+            cp art/appliance-signed/$arch/*.sig "$dir/"
+            mv "$dir"/netboot/* "$dir/"
+            rmdir "$dir/netboot"
+            kernel=$(jq -r '[.packages[] | select(.name | startswith("linux-image-")) | .version][0] // "?"' \
+              "$dir/reliaburger-os_$VERSION.manifest")
+            gh release create "os-$VERSION-$arch" --repo "$GITHUB_REPOSITORY" --prerelease \
+              --latest=false --target "$GITHUB_SHA" --title "Reliaburger OS $VERSION ($arch)" \
+              --notes "The appliance OS for $arch: Ubuntu 26.04, kernel $kernel. Every file is listed in reliaburger-os_$VERSION.SHA256SUMS, signed with the release key; os-channel.json (release os-channel) names the newest version." \
+              "$dir"/*
+          done
+      - name: Point the channel at it
+        run: |
+          set -euo pipefail
+          if ! gh release view os-channel --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create os-channel --repo "$GITHUB_REPOSITORY" --prerelease --latest=false \
+              --target "$GITHUB_SHA" --title "Reliaburger OS channel" \
+              --notes "os-channel.json names the newest appliance OS release, and os-channel.json.sig is its signature by the release key."
+          fi
+          gh release upload os-channel --repo "$GITHUB_REPOSITORY" --clobber \
+            art/appliance-signed/os-channel.json art/appliance-signed/os-channel.json.sig
+          echo "### Published os-$VERSION-x86_64 and os-$VERSION-aarch64" >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the last 8 versions
+        run: |
+          set -euo pipefail
+          tags=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 300 --json tagName --jq '.[].tagName')
+          # shellcheck disable=SC2086
+          for tag in $(python3 scripts/release/os_release.py prune --keep 8 $tags); do
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done

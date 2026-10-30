@@ -49,6 +49,23 @@ Rootless Bun and macOS don't run the perimeter, so the setting has no effect
 there. The laptop quickstart doesn't need it either: it reaches each node's API
 through a port forward that arrives on the node's loopback.
 
+### Letting new nodes in
+
+A node that hasn't joined yet isn't a member, so the perimeter drops it unless
+it's in `bootstrap_peers`. List the nodes you know about, or the network that
+nodes you add later will join from:
+
+```toml
+[security]
+bootstrap_peers = ["192.168.0.101", "192.168.0.102", "192.168.0.0/24"]
+```
+
+- It opens the API and cluster ports (9117, 9443-9445) to them, not container
+  host ports. Joining still needs a join token, and every cluster port is mTLS.
+- Entries follow the `operator_cidrs` rules: bare addresses or CIDRs, IPv4 or
+  IPv6, no `/0` and no host bits set.
+- Releases up to 0.1.2 take bare addresses only.
+
 ## API tokens
 
 ```sh
@@ -606,9 +623,9 @@ What's recorded:
 |------|---------|
 | Workloads | `app.applied`, `app.stopped`, `app.deleted`, `app.exec`, `deploy.rolled_back`, `deploy.cancelled`, `snapshot.created`, `snapshot.restored`, `snapshot.deleted` |
 | Jobs and builds | `job.submitted`, `job.replayed`, `job.schedule_disabled`, `batch.submitted`, `array.submitted`, `batch.cancelled`, `build.submitted` |
-| The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
+| The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `os.staged`, `os.rollout_started` (and `rollout_resumed`, `rollout_aborted`), `perimeter.admitted`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
 | Policies | `policy.denied`, `policy.deleted`; an apply that writes a policy is `app.applied` with the policy names under `policies` |
-| Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
+| Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `join_token.revoked`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
 | Chaos | `fault.injected`, `fault.cleared`, `fault.cleared-by-service`, `fault.cleared-all-workload`, `fault.expired` |
 
 The cluster's own actions (a fault expiring, an expired token being swept)

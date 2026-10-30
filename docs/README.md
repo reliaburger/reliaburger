@@ -686,6 +686,9 @@ does not commit or disclose a usable token.
 For the whole walkthrough on three Linux VMs or bare-metal servers you
 already run, from packages and firewall rules to systemd units, see
 [Running Reliaburger on your own Linux servers](linux-servers.md).
+To turn spare mini PCs or thin clients into appliance nodes over the network
+instead, with no distro to install, see
+[Bare metal: the appliance and netboot](manual/15_appliance.md).
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
@@ -1461,7 +1464,7 @@ crashloops, stalled deploys, missing service backends, active faults and alerts,
 disk pressure, actual cgroup throttling, certificate lifecycle, Pickle
 redundancy and version skew (each node's bun version, commit and binary
 SHA-256; a warning names nodes on a different build), and the committed apps
-and jobs the cluster's policies would now refuse (`relish policy audit` *(0.2.4, not in 0.2.3)* lists
+and jobs the cluster's policies would now refuse (`relish policy audit` *(0.3.0, not in 0.2.3)* lists
 the same). Use `--app <name>` for application scope or `--watch` for a
 human refresh every 30 seconds (`--interval <secs>` changes the period). JSON and YAML use schema version 1. Exit status 0 means
 all selected evidence was observed and healthy, 1 means a critical finding,

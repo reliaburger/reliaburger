@@ -1,0 +1,183 @@
+#!/bin/bash
+# Reliaburger OS netboot installer (spike S2, research §4.7).
+#
+# Fetches the signed SHA256SUMS for this installer's own version, checks its
+# Ed25519 signature, then streams the compressed disk image straight onto the
+# disk: curl | zstd | dd, hashing the download on the way. Nothing is staged
+# in RAM, so a 2 GB machine can install a 1.7 GB image.
+#
+# Kernel command line (iPXE passes it; see image/netboot/):
+#   reliaburger.url=<base URL>   where the image files are (required unless
+#                                booted by UEFI HTTP Boot, whose URL
+#                                systemd-stub records)
+#   reliaburger.disk=/dev/<name> install here instead of the largest fixed disk
+#   reliaburger.wipe=1           overwrite a disk that already has partitions
+#   reliaburger.ask=<URL>        relish netboot passes this: report a disk
+#                                that isn't empty there and wipe it only if
+#                                the operator says so (ask-to-wipe)
+#
+# After writing, it puts a boot entry for the disk first in the firmware's
+# boot order, so the machine boots its disk from now on even where network
+# boot came first. A machine that network-boots onto a disk that already
+# holds Reliaburger OS (and no reliaburger.wipe=1) is sent back to that disk
+# instead of being reinstalled.
+set -euo pipefail
+
+say() { echo "reliaburger-install: $*"; }
+fail() {
+    say "FAILED: $*"
+    exit 1
+}
+
+arg() {
+    local word
+    for word in $(cat /proc/cmdline); do
+        case $word in "$1="*) echo "${word#*=}" ;; esac
+    done
+}
+
+started=$(date +%s)
+url=$(arg reliaburger.url)
+if [ -z "$url" ]; then
+    # UEFI HTTP Boot: systemd-stub (258+) records the URL it was loaded from.
+    var=/sys/firmware/efi/efivars/LoaderDeviceURL-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+    if [ -r "$var" ]; then
+        url=$(tail -c +5 "$var" | tr -d '\0')
+        url=${url%/*}
+    fi
+fi
+[ -n "$url" ] || fail "no image URL; boot with reliaburger.url=http://<server>/<path>"
+url=${url%/}
+
+. /usr/lib/os-release
+version=${IMAGE_VERSION:?}
+image="reliaburger-os_${version}.raw.zst"
+sums="reliaburger-os_${version}.SHA256SUMS"
+say "installer ${version}, fetching from ${url}"
+
+key=/usr/lib/reliaburger/os-signing-key.pub.pem
+[ -r "$key" ] || fail "no signing key in the installer"
+curl -fsS --retry 5 --retry-connrefused -o "/run/$sums" "$url/$sums" || fail "can't fetch $url/$sums"
+curl -fsS --retry 5 --retry-connrefused -o "/run/$sums.sig" "$url/$sums.sig" || fail "can't fetch $url/$sums.sig"
+openssl pkeyutl -verify -pubin -inkey "$key" -rawin -in "/run/$sums" -sigfile "/run/$sums.sig" >/dev/null \
+    || fail "bad signature on $sums"
+expected=$(awk -v f="$image" '{ n = $2; sub(/^\*/, "", n); if (n == f) print $1 }' "/run/$sums")
+[ -n "$expected" ] || fail "$image isn't listed in $sums"
+say "signature good; $image should hash to ${expected:0:16}…"
+
+# Put a firmware boot entry for $1's systemd-boot first in BootOrder,
+# replacing any earlier Reliaburger entry. The removable-media path
+# (\EFI\BOOT\BOOT*.EFI) stays as the fallback for firmware that drops
+# entries the OS created.
+boot_disk_first() {
+    local disk=$1 loader old new order
+    case $(uname -m) in
+        x86_64) loader='\EFI\systemd\systemd-bootx64.efi' ;;
+        aarch64) loader='\EFI\systemd\systemd-bootaa64.efi' ;;
+    esac
+    for old in $(efibootmgr | sed -n 's/^Boot\([0-9A-F]\{4\}\)\*\{0,1\} Reliaburger OS.*/\1/p'); do
+        efibootmgr -q -b "$old" -B || true
+    done
+    efibootmgr -q -c -d "$disk" -p 1 -L "Reliaburger OS" -l "$loader" || return 1
+    new=$(efibootmgr | sed -n 's/^Boot\([0-9A-F]\{4\}\)\*\{0,1\} Reliaburger OS.*/\1/p' | head -n 1)
+    order=$(efibootmgr | sed -n 's/^BootOrder: //p' | tr ',' '\n' | grep -vx "$new" | paste -sd, -)
+    efibootmgr -q -o "$new${order:+,$order}"
+    echo "$new"
+}
+
+disk=$(arg reliaburger.disk)
+if [ -z "$disk" ]; then
+    # The largest fixed, writable disk. eMMC boot partitions are read-only.
+    disk=$(lsblk -dnbpo NAME,TYPE,RM,RO,SIZE \
+        | awk '$2 == "disk" && $3 == 0 && $4 == 0 && $1 !~ /\/(zram|loop|ram)/ { print $5, $1 }' \
+        | sort -n | tail -n 1 | cut -d' ' -f2)
+fi
+[ -b "$disk" ] || fail "no disk to install to"
+size=$(blockdev --getsize64 "$disk")
+say "target $disk, $((size / 1000000)) MB"
+if [ -n "$(lsblk -nlo NAME "$disk" | tail -n +2)" ] || blkid -p "$disk" >/dev/null 2>&1; then
+    if [ "$(arg reliaburger.wipe)" != 1 ] && lsblk -nlo PARTLABEL "$disk" | grep -qx reliaburger-data; then
+        # Already installed, and this boot came from the network first:
+        # go back to the disk, this time and from now on.
+        entry=$(boot_disk_first "$disk") || fail "$disk holds Reliaburger OS, but no boot entry could be made for it"
+        efibootmgr -q -n "$entry"
+        say "$disk already holds Reliaburger OS; booting it (boot entry $entry, now first)"
+        systemctl reboot
+        exit 0
+    fi
+    ask=$(arg reliaburger.ask)
+    if [ "$(arg reliaburger.wipe)" = 1 ]; then
+        say "reliaburger.wipe=1 is set"
+    elif [ -n "$ask" ]; then
+        # relish netboot: the operator decides, never this machine.
+        if ! /usr/lib/reliaburger/ask-to-wipe "$ask" "$disk"; then
+            say "$disk is untouched; powering off in 60 s"
+            sleep 60
+            systemctl poweroff
+            exit 0
+        fi
+    else
+        fail "$disk isn't empty; boot with reliaburger.wipe=1 to overwrite it"
+    fi
+    say "wiping $disk"
+    wipefs -a -q "$disk"
+fi
+
+# Hash the compressed stream as it passes; dd writes with O_DIRECT so the
+# page cache doesn't fill with the image either.
+fifo=/run/image.fifo
+rm -f "$fifo"
+mkfifo "$fifo"
+sha256sum <"$fifo" | cut -d' ' -f1 >/run/image.sha256 &
+hasher=$!
+# Sample memory while streaming: the most anonymous memory and page cache
+# the installer's cgroup held, and the least memory the system had left.
+cgroup=/sys/fs/cgroup/system.slice/reliaburger-install.service
+(
+    anon=0 file=0 low=
+    while :; do
+        read -r a f < <(awk '$1 == "anon" { a = $2 } $1 == "file" { f = $2 } END { print a + 0, f + 0 }' "$cgroup/memory.stat")
+        m=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)
+        [ "$a" -gt "$anon" ] && anon=$a
+        [ "$f" -gt "$file" ] && file=$f
+        [ -z "$low" ] || [ "$m" -lt "$low" ] && low=$m
+        echo "$anon $file $low" >/run/memory.max
+        sleep 0.5
+    done
+) &
+sampler=$!
+say "streaming $image to $disk"
+curl -fsS --retry 5 --retry-connrefused "$url/$image" \
+    | tee "$fifo" \
+    | zstd -dc \
+    | dd of="$disk" bs=4M iflag=fullblock oflag=direct conv=fsync status=none \
+    || { wipefs -a -q "$disk" || true; fail "writing $image failed"; }
+wait "$hasher"
+kill "$sampler" 2>/dev/null || true
+actual=$(cat /run/image.sha256)
+if [ "$actual" != "$expected" ]; then
+    wipefs -a -q "$disk" || true
+    fail "$image hashed to $actual, not $expected; wiped $disk"
+fi
+
+# Move the backup GPT to the end of this disk. First boot's systemd-repart
+# then grows the data partition and adds slot B.
+sgdisk -e "$disk" >/dev/null
+sync
+if entry=$(boot_disk_first "$disk"); then
+    say "boot entry $entry for $disk is now first in the boot order"
+else
+    say "couldn't add a boot entry; relying on the firmware finding \\EFI\\BOOT on $disk"
+fi
+
+peak=$(cat "$cgroup/memory.peak" 2>/dev/null || echo 0)
+read -r anon file low </run/memory.max || anon=0 file=0 low=0
+say "installed ${version} to ${disk} in $(($(date +%s) - started)) s"
+say "memory: cgroup peak $((peak / 1048576)) MiB (at most $((anon / 1048576)) MiB anonymous, $((file / 1048576)) MiB page cache); MemAvailable never below $((low / 1024)) MiB"
+# The MACs are what a seed stick's seeds/<mac>.seed files are named after.
+for link in /sys/class/net/*; do
+    [ "$(cat "$link/type" 2>/dev/null)" = 1 ] || continue
+    say "this machine: $(basename "$link") $(cat "$link/address") $(ip -4 -br addr show dev "$(basename "$link")" | awk '{ print $3 }')"
+done
+say "rebooting into the installed system"
+systemctl reboot

@@ -32,6 +32,11 @@ owner check. `make ci-bench` is `make ci` followed by `make bench`. Neither
 runs a privileged, cluster or upgrade suite; those have their own targets
 below, because they need root, a provisioned host or a lot of wall time.
 
+Test threads get an 8 MiB stack (`RUST_MIN_STACK` in
+[`.cargo/config.toml`](../.cargo/config.toml)), not std's 2 MiB. An
+unoptimised build of clap's derived `relish` parser needs more than 2 MiB, so
+without it every test that parses the CLI overflows its stack.
+
 `make test` first runs `make warm-executables`: it builds the suite with
 `cargo test --no-run`, which builds the `[[bin]]` targets (`bun`, `relish`,
 `testapp`) as the tests use them, and, on macOS, runs each binary once with

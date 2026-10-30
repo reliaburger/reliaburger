@@ -1,0 +1,7 @@
+# DHCP on every wired link. Static addressing comes from the seed or the
+# claim later (research §4.5).
+[Match]
+Type=ether
+
+[Network]
+DHCP=yes

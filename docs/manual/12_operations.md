@@ -212,6 +212,8 @@ published release a cluster can roll onto in place. The walk works, but
 each node's app replicas restart, and may move, as that node upgrades
 ([#1449](https://github.com/reliaburger/reliaburger/issues/1449), fixed in
 0.2.4; [upgrading from 0.2.2](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-022)).
+Development builds of 0.3.0, the appliance release, are at protocol 56 and
+state format 73, so a 0.2.x cluster's leader refuses them too.
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it

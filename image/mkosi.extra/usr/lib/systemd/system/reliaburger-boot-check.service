@@ -1,0 +1,21 @@
+# Reports on the console once bun answers its health endpoint. The CI boot
+# test waits for this line. It also gates boot-complete.target, so
+# systemd-bless-boot only marks an updated UKI good once bun is healthy
+# (spike S4).
+# Not ordered after reliaburger.service: a machine waiting for a claim
+# never starts bun, and the script tells the two apart itself.
+[Unit]
+Description=Reliaburger boot check
+After=network-online.target
+Wants=reliaburger.service
+Before=boot-complete.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardOutput=journal+console
+ExecStart=/usr/lib/reliaburger/boot-check
+
+[Install]
+WantedBy=multi-user.target
+RequiredBy=boot-complete.target

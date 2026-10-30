@@ -1,0 +1,9 @@
+# Test threads get 8 MiB of stack, like a process's main thread, instead of
+# std's 2 MiB. In an unoptimised build, clap's derived parser builds every
+# `relish` subcommand and its arguments in one stack frame, and with the
+# 0.2.0 jobs commands and the 0.3.0 appliance commands together that frame
+# outgrew 2 MiB: every test that parses the CLI overflowed. `relish` itself
+# always parses on its main thread, and release builds need far less. A
+# value already set in the environment wins.
+[env]
+RUST_MIN_STACK = "8388608"
