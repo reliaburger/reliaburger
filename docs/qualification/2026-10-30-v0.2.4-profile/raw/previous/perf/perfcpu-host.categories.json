@@ -1,0 +1,43 @@
+{
+  "bun_categories": {
+    "Bun: uncategorised (extend the map)": 5609.0
+  },
+  "bun_total": 5609.0,
+  "categories": {
+    "Bun: uncategorised (extend the map)": 5609.0,
+    "busybox task: user space and other kernel": 4558.0,
+    "helper/child: clone3 (process creation)": 1671.0,
+    "helper/child: execve": 3732.0,
+    "helper/child: exit and address-space teardown": 3521.0,
+    "helper/child: page faults": 3508.0,
+    "helper: user space and other kernel": 882.0,
+    "helper: wait, poll, pipes and socket syscalls": 5130.0,
+    "idle (no runnable work)": 10098.0,
+    "other processes and kernel threads": 1200.0,
+    "relish (raw scenario spawner and bench client)": 7.0
+  },
+  "other_by_command": {
+    "containerd": 7.0,
+    "exe": 267.0,
+    "gmain": 1.0,
+    "jbd2/vda1": 10.0,
+    "ksoftirqd/": 499.0,
+    "kworker/0:0-eve": 23.0,
+    "kworker/0:1H-kb": 6.0,
+    "kworker/1:0-eve": 36.0,
+    "kworker/2:1H-kb": 1.0,
+    "kworker/2:2-eve": 26.0,
+    "kworker/3:0-eve": 34.0,
+    "kworker/u8:0-ev": 4.0,
+    "kworker/u8:2-ev": 4.0,
+    "lima-guestagent": 30.0,
+    "migration/": 193.0,
+    "perf": 44.0,
+    "rb-bun": 3.0,
+    "rcu_preempt": 11.0,
+    "systemd": 1.0
+  },
+  "rate": 0.0,
+  "total": 39916.0,
+  "uncategorised_share": 1.0
+}
