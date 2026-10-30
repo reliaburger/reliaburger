@@ -57,6 +57,15 @@ class Recording:
         self.file.write(json.dumps([elapsed, 'o', value.replace('\n', '\r\n') + '\r\n']) + '\n')
         self.file.flush()
 
+    def marker(self, label, now):
+        """A chapter marker, which asciinema-player shows on its progress bar."""
+        elapsed = now - self.started
+        if elapsed < self.last:
+            raise ValueError('recording clock went backwards')
+        self.last = elapsed
+        self.file.write(json.dumps([elapsed, 'm', label]) + '\n')
+        self.file.flush()
+
     def close(self):
         self.file.close()
 

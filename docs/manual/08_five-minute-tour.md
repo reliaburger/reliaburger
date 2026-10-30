@@ -3,11 +3,11 @@
 The same tour as the homepage's "Try it in five minutes": install, build a
 burger on a three-node laptop cluster and watch it, layer by layer, while you
 cook a batch of patties beside it, cut a layer off, roll one forward, roll a
-bad one back, scale one up, kill one, slow it down and lose a whole node. Open it any time with
+bad one back, scale one up, set a house rule, kill one, slow it down and lose a whole node. Open it any time with
 `relish manual tour`.
 
 It needs a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB
-of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.3 release.
+of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.4 release.
 
 ## Install and build the cluster
 
@@ -190,6 +190,37 @@ The patty at `v1` with three replicas. Any change to the spec clears the
 times over fresh connections, and the cluster balances connections
 round-robin, so it finds all three patties and stacks one line per instance: a
 triple patty.
+
+## Set a house rule
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.4/examples/policies/platform.toml
+relish policy test -f platform.toml -f burger/burger.toml
+```
+
+New in 0.2.4: policies, rules every apply has to pass, written in CEL and
+judged by the council's leader before anything is written. `platform.toml` is
+the release's example of the four rules platform teams ask for most: memory
+limits in `prod`, no `:latest`, images only from trusted registries, and a
+team named on every app. One of them looks like this:
+
+```toml
+[policy.trusted-registries]
+applies_to = "both"
+match = "has(workload.image)"
+deny = "!['registry.example.com/', 'ghcr.io/example/'].exists(prefix, workload.image.startsWith(prefix))"
+message = "images come from registry.example.com or ghcr.io/example only"
+```
+
+`relish policy test` judges the burger against them without sending
+anything to the cluster. The burger's layers come from the cluster's own
+registry, not `registry.example.com`, so the test lists every app that
+`trusted-registries` would refuse, with its message. It also shows the default
+that `team-env` would fill in. Apply `platform.toml` with `relish apply` and
+the next deploy of a layer would be refused; `relish policy audit` lists the
+apps already running that the rules would now refuse. The `security` chapter
+covers policies, and `deploy-an-app` covers templates, 0.2.4's other way to
+stop copying the same app around.
 
 ## Kill a patty
 

@@ -382,25 +382,55 @@ migration and no feature gate
   [#1419](https://github.com/reliaburger/reliaburger/issues/1419)). It ships
   with the `zstd` 0.13 advisories under a reviewed exception
   ([#1367](https://github.com/reliaburger/reliaburger/pull/1367)). 0.2.3 keeps
-  0.2.2's formats, the first release to do so, so a 0.2.2 cluster can roll to
-  it; that walk isn't qualified yet
-  ([#1444](https://github.com/reliaburger/reliaburger/issues/1444)).
-- [ ] **0.2.4: extension points**
+  0.2.2's formats, the first release to do so, and a 0.2.2 cluster rolled onto
+  it in place on 29 October
+  ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md),
+  [#1444](https://github.com/reliaburger/reliaburger/issues/1444)).
+- [x] **0.2.4: extension points.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.4)
+  on 30 October 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/19),
   [research](plans/2026-10-19-research-extension-points.md),
-  [plan](plans/2026-10-23-plan-0.2.4.md)). One missing
+  [plan](plans/archive/2026-10-23-plan-0.2.4.md)). One missing
   feature shouldn't rule Reliaburger out, and the answer isn't CRDs or
-  webhooks. Policies stored in the council (CEL deny and warn, fill-only
-  defaults) on the one apply path that `relish apply` and GitOps share;
-  sidecars, stop hooks and gated runtime knobs; an exec secret provider;
-  templates that expand to ordinary apps, and a contract for running your own
-  controller. A new book chapter,
-  [Chapter 18](book/18-bending-without-forking.md), comes first. Exit test: four common policies,
-  a template and a controller on a real cluster
-  ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)). Every
-  issue has landed on the train, and the exit test passes on the
-  `make test-cluster` fixture, with a stand-in for Postgres. Qualification
-  waits for 0.2.3.
+  webhooks. Policies stored in the council (CEL deny, warn and audit,
+  fill-only defaults, `relish policy audit`) on the one apply path that
+  `relish apply` and GitOps share; sidecars, stop hooks and gated runtime
+  knobs; an exec secret provider; templates that expand to ordinary apps, and
+  a contract for running your own controller, with
+  [Chapter 18](book/18-bending-without-forking.md) to explain them. The exit
+  test, four common policies, a template and a controller on a real cluster,
+  passes ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)).
+  Also a restarting node keeps its replicas
+  ([#1449](https://github.com/reliaburger/reliaburger/issues/1449)), and the
+  soak gates on a job-start SLO
+  ([#1400](https://github.com/reliaburger/reliaburger/issues/1400)) and checks
+  the council's history for linearizability. Candidate 1 passed the full gate
+  ([closure](qualification/2026-10-30-v0.2.4-release-closure.md),
+  [release log](release-log.md#024-extension-points)): the 8-hour jobs final
+  ran 6,899.6 accepted jobs a second against the 1,390 target, with a
+  job-start p99 of 32 ms over 137 million quiet tasks
+  ([record](qualification/2026-10-30-v0.2.4-job-qualification.md)). Both fast
+  tiers first failed on a harness bug, a p99 judged on 20 samples
+  ([#1485](https://github.com/reliaburger/reliaburger/issues/1485)), and pass
+  with the fixed checker. It ships with the `zstd` 0.13 advisories under the
+  exception 0.2.3 took, which expires on 18 November 2026
+  ([#1366](https://github.com/reliaburger/reliaburger/issues/1366), in 0.3.0).
+  The profile after the tag found 0.2.4 4.5% faster on host jobs than 0.2.3
+  ([record](qualification/2026-10-30-v0.2.4-profile/README.md)). Still open
+  in its milestone: the 24-hour memory run after the tag, for Bun's memory growth, the day run's slowdown and the job
+  storage that filled a disk
+  ([#1417](https://github.com/reliaburger/reliaburger/issues/1417),
+  [#1403](https://github.com/reliaburger/reliaburger/issues/1403),
+  [#1418](https://github.com/reliaburger/reliaburger/issues/1418)); the
+  harness's Python 3.11 requirement
+  ([#1483](https://github.com/reliaburger/reliaburger/issues/1483)); signing
+  keys in GitHub Environments
+  ([#1439](https://github.com/reliaburger/reliaburger/issues/1439)); and a
+  merge queue for every train
+  ([#1053](https://github.com/reliaburger/reliaburger/issues/1053)). 0.2.4
+  changes the cluster's formats, so a 0.2.3 cluster can't roll to it:
+  recreate the cluster
+  ([upgrading from 0.2.3](releasing.md#upgrading-from-023)).
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
@@ -414,8 +444,8 @@ migration and no feature gate
   pre-checks that read the leader's gossip view
   ([#334](https://github.com/reliaburger/reliaburger/issues/334)). Exit test:
   ten Dell Wyse 3040s from power-on to a cluster.
-  Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
-  which waits for the 0.2.x patch releases.
+  Next. Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
+  which waited for the 0.2.x patch releases.
 - [ ] **0.4.0 and 0.4.1: "Full container migration"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [plan](plans/2026-10-09-plan-container-migration.md),

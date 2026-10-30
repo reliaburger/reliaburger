@@ -8,6 +8,70 @@ release contains is in the [roadmap](roadmap.md#releases-after-010). A new
 paragraph goes at the top when a release is promoted
 ([release gate, step 9](releasing.md#staging-a-candidate)).
 
+## 0.2.4: extension points
+
+Promoted on 30 October 2026 as tag `v0.2.4` at `964b56a2`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/41018110348)).
+Its headline is a way to bend Reliaburger without forking it: `[policy.*]`
+rules in CEL that deny, warn or audit on the leader, fill-only defaults and
+`relish policy audit`; `[template.*]` and `[use.*]` in place of CRDs;
+sidecars, stop hooks and gated runtime knobs; an exec secret provider; and a
+contract for your own controllers
+([#1302](https://github.com/reliaburger/reliaburger/pull/1302), [Chapter
+18](book/18-bending-without-forking.md)). Qualification ran on 29 and 30
+October 2026 (UTC) and took one candidate
+([closure record](qualification/2026-10-30-v0.2.4-release-closure.md)), on
+the full gate, because 0.2.4 moves the formats (protocol 53 to 55, state
+format 70 to 72) and changes the agent loop. Its first build failed when
+GitHub's hosted runner lost contact with it, and the second made the
+candidate. It passed both staged installs, in 166 s and 165 s
+([first](qualification/2026-10-29-v0.2.4-staged-install-apple-silicon.md),
+[second](qualification/2026-10-29-v0.2.4-staged-install-apple-silicon-2.md)),
+and the power-cut and reboot lanes, 25 of 25 in every lane
+([record](qualification/2026-10-29-power-cut-reboot.md)). Before any soak
+reached a fault, the harness stopped three times on itself: it needed Python
+3.11 for `tomllib` and the qualification Mac has 3.9
+([#1483](https://github.com/reliaburger/reliaburger/issues/1483)), its
+manifest put policies beside jobs, which the API refuses
+([#1484](https://github.com/reliaburger/reliaburger/pull/1484)), and a
+stopped run left its VMs holding the cluster's ports. 0.2.4 is the first
+release whose soaks gate on a latency SLO, a job task's start lag at p99 no
+more than 256 ms ([#1400](https://github.com/reliaburger/reliaburger/issues/1400)),
+and both fast tiers first failed on it: counting only the tasks no fault
+overlapped left each of them 20 samples, and the p99 of 20 is their largest
+([#1485](https://github.com/reliaburger/reliaburger/issues/1485)). The
+checker now wants 1,000 quiet samples before it judges
+([#1486](https://github.com/reliaburger/reliaburger/pull/1486)); replayed
+on the same evidence, the V02 fast tier passed, 1 h 09 min and 6 cycles
+([record](qualification/2026-10-29-v0.2.4-sustained-v02-fast.md)), and so
+did the jobs fast tier, at 6,467.0 accepted jobs a second
+([record](qualification/2026-10-29-v0.2.4-job-qualification-fast.md)). The
+8-hour jobs final passed clean with the original checker: 10 h 16 min, 8
+cycles and a 2¼-hour quiet tail with every leak checker armed, 6,899.6
+accepted jobs a second against the 1,390 target, and a job-start p99 of
+32 ms over 137,306,923 quiet tasks
+([record](qualification/2026-10-30-v0.2.4-job-qualification.md)). It ships
+with the `zstd` 0.13 advisories 0.2.3 shipped with, under the same exception,
+which expires on 18 November 2026
+([#1366](https://github.com/reliaburger/reliaburger/issues/1366), in 0.3.0).
+The first release profile
+([#1358](https://github.com/reliaburger/reliaburger/issues/1358)) ran on the
+published binaries after the tag: in the same VM, 0.2.4 ran host jobs 4.5% and
+shared containers 5.7% faster than 0.2.3, with the same start lag and 15 MiB
+less idle memory ([record](qualification/2026-10-30-v0.2.4-profile/README.md)).
+A 24-hour memory run for
+[#1417](https://github.com/reliaburger/reliaburger/issues/1417),
+[#1403](https://github.com/reliaburger/reliaburger/issues/1403) and
+[#1418](https://github.com/reliaburger/reliaburger/issues/1418) follows it.
+On 29 October the first rolling walk between two published releases, 0.2.2
+to 0.2.3, moved every node, leader last, in 2 min 20 s, and
+found that a restarting Bun's replicas moved to other nodes
+([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md)); 0.2.4
+fixes that ([#1449](https://github.com/reliaburger/reliaburger/issues/1449)).
+0.2.4 itself changes the cluster's formats, so a 0.2.3 cluster can't roll to
+it: start a fresh cluster
+([upgrading from 0.2.3](releasing.md#upgrading-from-023)).
+
 ## 0.2.3: two billion a day
 
 Promoted on 28 October 2026 as tag `v0.2.3` at `d387d569`

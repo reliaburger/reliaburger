@@ -765,7 +765,8 @@ why we copied the idea and not the tooling.
 earlier records already kept. Across the ten 0.2.0 to 0.2.2 soak records its
 p99 was 2 to 8 ms at the V02 calibration load and 32 to 64 ms at the job
 qualification's target load (64 ms once, in the 0.2.1 fast tier; 32 ms in
-every final). There are no 0.2.3 soak records yet. The gate sits at 256 ms:
+every final). 0.2.3's records measured 2 ms in the V02 fast tier and 32 ms in
+both job tiers. The gate sits at 256 ms:
 four times the worst value seen, still a quarter of the September plan's
 1-second target, and a bucket bound, so the record's number is exact. A day
 tier records it without gating, since nothing has measured start lag at the
@@ -784,15 +785,19 @@ A p99 needs at least 1,000 quiet samples before the gate judges it
 tier's faults come back to back, so only about 20 runs a tier miss every
 window, and the p99 of 20 samples is their largest. A fast tier short of
 1,000 records the value as too few samples to judge. A final's 2¼-hour quiet
-tail gives it millions, so a final short of 1,000 fails.
+tail gives it millions, so a final short of 1,000 fails. 0.2.4's 8-hour
+final, the first to gate on it, measured 32 ms over 137,306,923 quiet tasks
+([record](qualification/2026-10-30-v0.2.4-job-qualification.md)).
 
 **Record only, from 28 October 2026.** No soak before 0.2.4 timed the API,
 an app start or a rolling update, so those four start in record-only mode:
 the record shows the value and whether it's over the provisional threshold,
 and never fails on it. The provisional thresholds are Kubernetes's for reads
 and app start, and a guess with room to spare for writes and rolling updates.
-Once the first 0.2.4 fast and final records exist, the maintainer sets each
-gate from them, with margin, the same way as the job start.
+The first 0.2.4 fast and final records exist now
+([release closure](qualification/2026-10-30-v0.2.4-release-closure.md)),
+and the maintainer sets each gate from them, with margin, the same way as
+the job start.
 
 **How it's measured.** At every light, settle and heavy check outside a fault
 window, the harness times the two API reads on each node that is up
