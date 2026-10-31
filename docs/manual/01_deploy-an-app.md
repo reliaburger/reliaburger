@@ -107,6 +107,25 @@ migration can read `DATABASE_URL` and a config generator can write a volume.
 The volume stays the app's: an init container doesn't take it over, so run it
 as root (most images do) or as the app's user.
 
+Give an init container variables of its own with `env`. They go on top of the
+app's, and only that init container sees them:
+
+```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+env = { LOG_LEVEL = "info" }
+
+[[app.api.init]]
+image = "ghcr.io/example/migrate:2.1"
+command = ["migrate", "up"]
+env = { LOG_LEVEL = "debug", LOCK_TIMEOUT = "30s" }
+```
+
+A value is plain text or a provider reference (`PROVIDER[name:path]`, see
+`security`), resolved when the init container launches. If the provider fails,
+the instance fails. An encrypted value (`ENC[AGE:...]`) is refused here: put it
+in the app's `env`, which every init container inherits.
+
 An `exec` or `script` app's init container that names no image runs its
 command on the host, like the app. The node's `[process_workloads]
 allowed_binaries` must name the command's first word by its full path, or the

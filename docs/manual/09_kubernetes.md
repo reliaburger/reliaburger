@@ -46,7 +46,14 @@ and isn't applied.
 From the pod template it takes the first container's image, `command`, `args`,
 `workingDir`, plain `env` values, CPU and memory requests and limits,
 `nodeSelector` (as `placement.required`), init containers, `runAsUser` and
-`runAsGroup`, and an `httpGet` readiness probe as the health check. The
+`runAsGroup`, and an `httpGet` readiness probe as the health check. An init
+container brings its image, `command`, `args` (added to the end of `command`)
+and environment, read the way the app's is: plain `env` values come across, a
+ConfigMap in the input is flattened, and a `valueFrom` or a Secret in `envFrom`
+is named in a warning under the init container's name. A value the app's `env`
+already holds is left out, because an init container inherits the app's `env`.
+That goes the other way too, so an imported init container also sees variables
+Kubernetes gave only the main container. The
 `prometheus.io/scrape`, `port` and `path` annotations turn on metrics scraping.
 Its stop hooks come across too: `terminationGracePeriodSeconds` becomes
 `stop_grace`, `lifecycle.stopSignal` becomes `stop_signal`, and an `exec`
@@ -150,7 +157,10 @@ and `runAsUser`/`runAsGroup`; a job's `max_attempts` becomes `backoffLimit` and
 that's Reliaburger's default and Kubernetes' is `Allow`. It reports what it
 can't express: firewall and egress rules on apps and jobs, process workloads,
 `run_before`, a job's `pids` and `replay_unknown`, and for now health checks,
-metrics, volumes, init containers, config files and placement. An encrypted env
+metrics, volumes, config files and placement. Init containers export as
+ordinary ones named `init-0`, `init-1` and so on, before any native sidecars,
+with the app's image when they name none and the app's `env` under their own,
+because Kubernetes doesn't pass either on. An encrypted env
 value exports as the placeholder `ENCRYPTED_VALUE`, and each one is listed as
 needing a Kubernetes Secret. A `runtime = "process"` job produces no Job at
 all, since Kubernetes needs an image. A `runtime = "shared-runc"` job becomes

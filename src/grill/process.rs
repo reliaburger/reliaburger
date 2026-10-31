@@ -3400,6 +3400,36 @@ mod tests {
         grill.create(&id, &spec).await.unwrap();
     }
 
+    /// #1498: a host app's init container runs with the app's environment
+    /// and its own `env` on top, where the one it sets wins.
+    #[tokio::test]
+    async fn a_host_apps_init_container_sees_its_own_env_over_the_apps() {
+        let grill = ProcessGrill::new();
+        let app = app_spec(
+            "loadgen",
+            "exec = \"/bin/sleep\"\ncommand = [\"60\"]\n\
+             env = { MODE = \"app\", SHARED = \"from-app\" }",
+        );
+        let init: crate::config::app::InitContainerSpec = toml::from_str(
+            "command = [\"/usr/bin/env\"]\n\
+             env = { FRONTEND_ADDR = \"frontend:80\", SHARED = \"from-init\" }",
+        )
+        .unwrap();
+        let id = InstanceId("default__loadgen-0__init-0".to_string());
+        let spec = crate::grill::oci::generate_init_oci_spec(&init, &app);
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        wait_for_state(&grill, &id, ContainerState::Stopped).await;
+        let logs = grill.logs(&id).await.unwrap();
+        for expected in ["FRONTEND_ADDR=frontend:80", "MODE=app", "SHARED=from-init"] {
+            assert!(
+                logs.lines().any(|line| line == expected),
+                "{expected}: {logs}"
+            );
+        }
+        assert!(!logs.contains("SHARED=from-app"), "{logs}");
+    }
+
     #[tokio::test]
     async fn owned_create_refuses_an_image_app_before_preparing_a_generation() {
         let root = tempfile::tempdir().unwrap();

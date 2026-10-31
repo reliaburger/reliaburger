@@ -95,6 +95,91 @@ async fn a_provider_value_reaches_the_runtime_but_never_the_supervisor() {
     );
 }
 
+/// #1498: an init container's own env reaches the runtime, a provider
+/// reference in it resolved like the app's, on top of the app's env.
+#[tokio::test]
+async fn an_init_containers_own_env_reaches_the_runtime_with_its_provider_resolved() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    agent.set_secret_providers(vault(&answering(dir.path()), PATIENT));
+    let init = InstanceId("default__loadgen-0__init-0".to_string());
+    grill.set_state(&init, ContainerState::Stopped);
+    grill.set_exit_code(&init, Some(0));
+    let handle = tokio::spawn(async move { agent.run().await });
+
+    let config = Config::parse(
+        r#"
+        [app.loadgen]
+        image = "loadgen:v1"
+        env = { MODE = "app" }
+
+        [[app.loadgen.init]]
+        command = ["wait-for-frontend"]
+        env = { FRONTEND_ADDR = "frontend:80", TOKEN = "PROVIDER[vault:loadgen/token]" }
+        "#,
+    )
+    .unwrap();
+    let events = send_deploy(&tx, config).await;
+    shutdown.cancel();
+    handle.await.unwrap();
+    expect_complete(&events);
+
+    let created = grill.created_spec(&init).expect("the init was created");
+    assert_eq!(
+        env_value(&created, "FRONTEND_ADDR").as_deref(),
+        Some("frontend:80")
+    );
+    assert_eq!(env_value(&created, "TOKEN").as_deref(), Some(SECRET));
+    assert_eq!(env_value(&created, "MODE").as_deref(), Some("app"));
+}
+
+/// #1498: an init container whose provider doesn't answer fails its
+/// instance closed, as the app's own reference would, and is never created
+/// with the reference as its value.
+#[tokio::test]
+async fn an_init_containers_slow_provider_fails_the_instance_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    agent.set_secret_providers(vault(&provider_script(dir.path(), "sleep 30"), 1));
+    let handle = tokio::spawn(async move { agent.run().await });
+
+    let config = Config::parse(
+        r#"
+        [app.loadgen]
+        image = "loadgen:v1"
+
+        [[app.loadgen.init]]
+        command = ["wait-for-frontend"]
+        env = { TOKEN = "PROVIDER[vault:loadgen/token]" }
+        "#,
+    )
+    .unwrap();
+    let events = send_deploy(&tx, config).await;
+    let Some(ApplyEvent::Error { message }) = events.last() else {
+        panic!("the deploy must fail: {events:?}");
+    };
+    let reason = "cannot resolve secret TOKEN: secret provider \"vault\" did not answer within 1s and was killed";
+    assert!(message.contains(reason), "{message}");
+
+    let instances = statuses(&tx).await;
+    shutdown.cancel();
+    handle.await.unwrap();
+    let loadgen = instances
+        .iter()
+        .find(|instance| instance.app_name == "loadgen")
+        .expect("the failed instance stays listed");
+    assert_eq!(loadgen.state, "failed");
+    assert_eq!(loadgen.reason.as_deref(), Some(reason));
+    // The app's own container is created before its inits run, and stopped
+    // here without ever starting.
+    let init = InstanceId("default__loadgen-0__init-0".to_string());
+    assert!(
+        grill.created_spec(&init).is_none(),
+        "an init without its secret must never be created: {:?}",
+        grill.calls()
+    );
+}
+
 #[tokio::test]
 async fn a_slow_provider_fails_the_instance_closed_with_its_reason() {
     let dir = tempfile::tempdir().unwrap();

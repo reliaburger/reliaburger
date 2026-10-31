@@ -1529,7 +1529,7 @@ Each correlated group becomes one `[app.*]` block. Two apps or jobs with the sam
 | CronJob | `[job.*]` with `schedule` | As Job, plus `suspend`, `concurrencyPolicy`, `timeZone` (schedules run in UTC) and `startingDeadlineSeconds` **warned** |
 | Namespace | `[namespace.*]` | Name only |
 | Anything else (PersistentVolumeClaim, NetworkPolicy, ServiceAccount, RBAC, ResourceQuota, PodDisruptionBudget, CRDs) | **Dropped** | Listed in the report's Dropped section |
-| initContainers | `[[app.*.init]]` | `command` + `args` as one argv; **warned** on a job |
+| initContainers | `[[app.*.init]]` | `command` + `args` as one argv; `env` read like the app's, with values the app holds left out and drops warned under the init's name; **warned** on a job |
 | Multiple containers/pod | **Warning** | First container imported |
 
 **Field-level mapping (pod template → App):**
@@ -1599,7 +1599,7 @@ Converts Reliaburger TOML to Kubernetes YAML (also `kubernetes`-feature only). I
 | `[job.*]` with `schedule` | CronJob; `overlap` → `concurrencyPolicy` (omitted → `Forbid`, Reliaburger's default) |
 | `[namespace.*]` | Namespace + ResourceQuota |
 
-The export report lists features with no Kubernetes equivalent (firewall and egress rules on apps and jobs, process workloads, `run_before`, a job's `pids` and `replay_unknown`, `max_apps`/`max_replicas`) separately from fields that have one but aren't exported yet (health checks, metrics, volumes, init containers, config files, placement, encrypted env values).
+The export report lists features with no Kubernetes equivalent (firewall and egress rules on apps and jobs, process workloads, `run_before`, a job's `pids` and `replay_unknown`, `max_apps`/`max_replicas`) separately from fields that have one but aren't exported yet (health checks, metrics, volumes, config files, placement, encrypted env values).
 
 Exits 0 on success, 1 on error. With `--strict`, exits 1 if the report lists anything unsupported or not exported yet, and the error counts both.
 
