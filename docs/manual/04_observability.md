@@ -229,9 +229,10 @@ relish events --app web --severity warning --limit 20
 `relish events` asks every live node for its events and merges them by time,
 oldest first, with each event's node; a node that doesn't answer is named on
 stderr. `--severity` keeps events at least that severe (`info`, `warning`,
-`critical`) and `-o json` prints the API's answer. A token scoped to some
-apps or namespaces sees only the events about them, and none that name no
-namespace (see `writing-a-controller`).
+`critical`) and `-o json` prints the API's answer. `--app` also finds an apply
+that named the app alongside others, and the `TARGET` column lists them. A
+token scoped to some apps or namespaces sees only the events about them, and
+none that name no namespace (see `writing-a-controller`).
 
 The TUI shows apps, nodes, jobs, routes, live logs and events; press `?`
 inside for keys. It needs a terminal of at least 80×24.

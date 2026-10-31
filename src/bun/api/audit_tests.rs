@@ -177,6 +177,79 @@ async fn apply_records_an_audit_entry_with_namespace_and_principal() {
 }
 
 #[tokio::test]
+async fn a_multi_app_apply_records_every_app_it_touched() {
+    let (token, plaintext) = named_user_token("alice", ApiRole::Deployer);
+    let (admin, admin_key) = named_user_token("root", ApiRole::Admin);
+    let audit = audited();
+    let (app, shutdown) = setup_with_auth_readiness_leases_and_events(
+        vec![token, admin],
+        None,
+        crate::bun::readiness::ReadinessTracker::new(),
+        crate::bun::capabilities::StaticCapabilities::default(),
+        None,
+        Some(Arc::clone(&audit.events)),
+    )
+    .await;
+    let manifest = "[app.frontend]\nimage = \"test:v1\"\n\n[app.backend]\nimage = \"test:v1\"\n";
+    let (status, body) = call(&app, "POST", "/v1/apply", &plaintext, manifest).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let records = audit.records("app.applied").await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    // One record for the one request: no single app, every name in details.
+    assert_eq!(record.app, None);
+    assert_eq!(record.namespace.as_deref(), Some("default"));
+    assert_eq!(
+        record.details.get("workloads").map(String::as_str),
+        Some("backend@default,frontend@default")
+    );
+
+    // Each app finds the record; an app the apply didn't touch doesn't.
+    let (admin_status, listing) = call(&app, "GET", "/v1/audit?app=backend", &admin_key, "").await;
+    assert_eq!(admin_status, StatusCode::OK, "{listing}");
+    let listing: AuditListing = serde_json::from_str(&listing).unwrap();
+    assert_eq!(listing.records.len(), 1, "{:?}", listing.records);
+    let (_, listing) = call(&app, "GET", "/v1/audit?app=worker", &admin_key, "").await;
+    let listing: AuditListing = serde_json::from_str(&listing).unwrap();
+    assert!(listing.records.is_empty(), "{:?}", listing.records);
+    shutdown.cancel();
+}
+
+#[test]
+fn the_peer_query_carries_the_app_filter() {
+    let filter = AuditFilter {
+        app: Some("web&co".to_string()),
+        ..AuditFilter::default()
+    };
+    assert!(
+        super::audit::peer_audit_path(&filter).contains("app=web%26co"),
+        "a peer that isn't told the app answers with records it should drop"
+    );
+}
+
+#[test]
+fn the_manifest_note_lists_every_workload_and_namespace() {
+    let config = crate::config::Config::parse(
+        "[app.web]\nimage = \"test:v1\"\nnamespace = \"team-a\"\n\n\
+         [app.api]\nimage = \"test:v1\"\nnamespace = \"payments\"\n\n\
+         [job.migrate]\nimage = \"test:v1\"\nnamespace = \"payments\"\n",
+    )
+    .unwrap();
+    let note = super::audit::manifest_audit_note(&config);
+    assert_eq!(note.app, None);
+    assert_eq!(note.namespace, None);
+    assert_eq!(
+        note.details.get("workloads").map(String::as_str),
+        Some("api@payments,migrate@payments,web@team-a")
+    );
+    assert_eq!(
+        note.details.get("namespaces").map(String::as_str),
+        Some("payments,team-a")
+    );
+}
+
+#[tokio::test]
 async fn delete_exec_upgrade_and_decommission_are_audited() {
     // Exec and delete on a standalone node whose agent answers both.
     let (token, plaintext) = named_user_token("alice", ApiRole::Deployer);

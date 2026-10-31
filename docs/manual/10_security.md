@@ -590,6 +590,7 @@ that after an incident:
 relish audit                                   # the newest 100 records on this node
 relish audit --cluster --since 2h              # every node, the last two hours
 relish audit --cluster --action 'fault.*'      # every fault injected, cleared or expired
+relish audit --app web --since 7d              # everything that touched one app or job
 relish audit --principal ci-deploy --namespace payments --output json
 ```
 
@@ -599,6 +600,24 @@ app and namespace it touched, the address the request came from, and the
 action's own facts (a fault's id and override flags, the node being
 decommissioned, the version an upgrade targets). A record never carries a
 secret: the log scrubs anything shaped like a token before writing it.
+
+An apply makes one record, however many apps and jobs its manifest declares.
+With more than one there's no single `app`, so the record lists them under
+`workloads` and its namespaces under `namespaces`. The table's `TARGET` column
+reads the list, and `--app` and `--namespace` search it, so
+`relish audit --app frontend` finds the apply below:
+
+```text
+TIME (UTC)            NODE          WHO               ACTION                      TARGET                    SOURCE
+2026-10-31 09:12:04   node-2        alice             app.applied                 backend, frontend @default  10.0.0.9:51000
+```
+
+When the apps span namespaces, each name keeps its own: `api@payments,
+web@team-a`. The table shows eight names and then a count (`+17 more`), and
+`--output json` shows up to twenty. A record never holds more than twenty, so a
+manifest that big shows up under every `--app` search: it might have touched
+the one you're after, and a search that hides a possible match is no use after
+an incident.
 
 What's recorded:
 

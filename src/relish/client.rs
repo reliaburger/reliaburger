@@ -3029,6 +3029,9 @@ fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String 
     if let Some(principal) = &filter.principal {
         params.append_pair("principal", principal);
     }
+    if let Some(app) = &filter.app {
+        params.append_pair("app", app);
+    }
     if let Some(namespace) = &filter.namespace {
         params.append_pair("namespace", namespace);
     }
@@ -3045,6 +3048,15 @@ fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String 
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn the_audit_query_carries_the_app_filter() {
+        let filter = crate::bun::audit::AuditFilter {
+            app: Some("web&co".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(audit_path(&filter, false), "/v1/audit?app=web%26co");
+    }
 
     #[test]
     fn the_public_key_path_names_an_encoded_namespace() {

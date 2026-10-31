@@ -538,6 +538,10 @@ struct AuditOptions {
     /// A token name or principal id.
     #[arg(long)]
     principal: Option<String>,
+    /// Only actions on this app or job, including an apply that listed it
+    /// with others.
+    #[arg(long)]
+    app: Option<String>,
     /// Only actions on this namespace.
     #[arg(long)]
     namespace: Option<String>,
@@ -2046,6 +2050,7 @@ async fn main() -> ExitCode {
                 until,
                 action,
                 principal,
+                app,
                 namespace,
                 limit,
                 cluster,
@@ -2056,6 +2061,7 @@ async fn main() -> ExitCode {
                     until,
                     action,
                     principal,
+                    app,
                     namespace,
                     limit,
                     cluster,
