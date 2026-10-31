@@ -416,18 +416,11 @@ migration and no feature gate
   exception 0.2.3 took, which expires on 18 November 2026
   ([#1366](https://github.com/reliaburger/reliaburger/issues/1366), in 0.3.0).
   The profile after the tag found 0.2.4 4.5% faster on host jobs than 0.2.3
-  ([record](qualification/2026-10-30-v0.2.4-profile/README.md)). Still open
-  in its milestone: the 24-hour memory run after the tag, for Bun's memory growth, the day run's slowdown and the job
-  storage that filled a disk
-  ([#1417](https://github.com/reliaburger/reliaburger/issues/1417),
-  [#1403](https://github.com/reliaburger/reliaburger/issues/1403),
-  [#1418](https://github.com/reliaburger/reliaburger/issues/1418)); the
-  harness's Python 3.11 requirement
-  ([#1483](https://github.com/reliaburger/reliaburger/issues/1483)); signing
-  keys in GitHub Environments
-  ([#1439](https://github.com/reliaburger/reliaburger/issues/1439)); and a
-  merge queue for every train
-  ([#1053](https://github.com/reliaburger/reliaburger/issues/1053)). 0.2.4
+  ([record](qualification/2026-10-30-v0.2.4-profile/README.md)). The 24-hour
+  memory run failed at hour 21 when the Mac lost its forwards to the VMs; up
+  to hour 20 it found no slowdown and Bun's memory levelling off
+  ([record](qualification/2026-10-30-v0.2.4-day-run.md)). What's still open
+  moved to 0.2.5 and 0.3.0. 0.2.4
   changes the cluster's formats, so a 0.2.3 cluster can't roll to it:
   recreate the cluster
   ([upgrading from 0.2.3](releasing.md#upgrading-from-023)).

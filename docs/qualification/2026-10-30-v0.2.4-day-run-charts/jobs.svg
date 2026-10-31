@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 272" width="720" height="272" role="img" aria-labelledby="t">
+<title id="t">Accepted jobs a second</title>
+<style>svg{--surface:#fcfcfb;--ink:#0b0b0b;--ink-2:#52514e;--muted:#8a8984;--grid:#e6e5e0;--series-1:#2a78d6;--series-2:#eb6834;--series-3:#1baf7a;--series-other:#8a8984}
+@media (prefers-color-scheme: dark){svg{--surface:#1a1a19;--ink:#f0efec;--ink-2:#c3c2b7;--muted:#8f8e86;--grid:#33332f;--series-1:#3987e5;--series-2:#d95926;--series-3:#199e70;--series-other:#8f8e86}}
+text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;font-size:11px;fill:var(--ink-2,#52514e)}
+.title{font-size:13px;font-weight:600;fill:var(--ink,#0b0b0b)}
+.surface{fill:var(--surface,#fcfcfb)}
+.grid{stroke:var(--grid,#e6e5e0);stroke-width:1}
+.axis{stroke:var(--muted,#8a8984);stroke-width:1}
+.line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.s1{stroke:var(--series-1,#2a78d6)}.f1{fill:var(--series-1,#2a78d6)}.s2{stroke:var(--series-2,#eb6834)}.f2{fill:var(--series-2,#eb6834)}.s3{stroke:var(--series-3,#1baf7a)}.f3{fill:var(--series-3,#1baf7a)}.s0{stroke:var(--series-other,#8a8984)}.f0{fill:var(--series-other,#8a8984)}
+.target{stroke:var(--ink-2,#52514e);stroke-width:1;stroke-dasharray:4 3}
+.mark{stroke:var(--ink-2,#52514e);fill:none;stroke-width:1.5}
+.mark.failure{stroke:var(--ink,#0b0b0b);stroke-width:2}
+.mark.special,.mark.upgrade{fill:var(--surface,#fcfcfb)}</style>
+<rect class="surface" x="0" y="0" width="720" height="272" rx="6"/>
+<text class="title" x="56" y="20">Accepted jobs a second</text>
+<line class="grid" x1="56" y1="210.0" x2="624" y2="210.0"/><text x="50" y="214.0" text-anchor="end">0</text>
+<line class="grid" x1="56" y1="154.7" x2="624" y2="154.7"/><text x="50" y="158.7" text-anchor="end">10,000</text>
+<line class="grid" x1="56" y1="99.3" x2="624" y2="99.3"/><text x="50" y="103.3" text-anchor="end">20,000</text>
+<line class="grid" x1="56" y1="44.0" x2="624" y2="44.0"/><text x="50" y="48.0" text-anchor="end">30,000</text>
+<text x="56" y="36">accepted a second, 10-minute windows</text>
+<line class="axis" x1="56.0" y1="210" x2="56.0" y2="214"/><text x="56.0" y="226" text-anchor="middle">0 h</text>
+<line class="axis" x1="103.3" y1="210" x2="103.3" y2="214"/><text x="103.3" y="226" text-anchor="middle">2 h</text>
+<line class="axis" x1="150.5" y1="210" x2="150.5" y2="214"/><text x="150.5" y="226" text-anchor="middle">4 h</text>
+<line class="axis" x1="197.8" y1="210" x2="197.8" y2="214"/><text x="197.8" y="226" text-anchor="middle">6 h</text>
+<line class="axis" x1="245.1" y1="210" x2="245.1" y2="214"/><text x="245.1" y="226" text-anchor="middle">8 h</text>
+<line class="axis" x1="292.3" y1="210" x2="292.3" y2="214"/><text x="292.3" y="226" text-anchor="middle">10 h</text>
+<line class="axis" x1="339.6" y1="210" x2="339.6" y2="214"/><text x="339.6" y="226" text-anchor="middle">12 h</text>
+<line class="axis" x1="386.9" y1="210" x2="386.9" y2="214"/><text x="386.9" y="226" text-anchor="middle">14 h</text>
+<line class="axis" x1="434.1" y1="210" x2="434.1" y2="214"/><text x="434.1" y="226" text-anchor="middle">16 h</text>
+<line class="axis" x1="481.4" y1="210" x2="481.4" y2="214"/><text x="481.4" y="226" text-anchor="middle">18 h</text>
+<line class="axis" x1="528.7" y1="210" x2="528.7" y2="214"/><text x="528.7" y="226" text-anchor="middle">20 h</text>
+<line class="axis" x1="575.9" y1="210" x2="575.9" y2="214"/><text x="575.9" y="226" text-anchor="middle">22 h</text>
+<line class="axis" x1="623.2" y1="210" x2="623.2" y2="214"/><text x="623.2" y="226" text-anchor="middle">24 h</text>
+<line class="target" x1="56" y1="81.9" x2="624" y2="81.9"/><text x="620" y="77.9" text-anchor="end">target 23,149/s</text>
+<polyline class="line s1" points="59.9,92.5 63.9,88.7 67.8,88.8 71.8,88.2 75.8,86.8 79.8,86.1 83.7,80.4 87.7,80.4 91.8,83.4 95.7,84.4 99.7,75.4 103.7,84.9 107.7,85.5 111.7,80.2 115.7,78.8 119.7,84.5 123.7,81.7 127.7,79.9 131.7,79.6 135.7,81.7 139.6,83.0 143.6,83.5 147.6,82.6 151.6,84.6 155.6,83.8 159.5,82.0 163.5,83.5 167.5,88.2 171.4,100.3 175.4,84.1 179.4,85.0 183.4,80.7 187.4,82.0 191.3,84.4 195.3,79.4 199.3,83.4 203.3,79.5 207.2,79.9 211.2,79.8 215.2,79.7 219.2,79.1 223.1,81.1 227.1,84.5 231.0,84.7 235.0,83.1 239.0,82.3 243.0,84.7 247.0,84.1 250.9,87.9 254.9,86.2 258.9,84.1 262.8,87.1 266.8,84.9 270.8,86.4 274.8,86.6 278.8,88.2 282.7,85.0 286.7,87.8 290.7,84.8 294.7,85.5 298.6,85.3 302.6,87.3 306.6,86.5 310.6,85.4 314.5,88.5 318.5,86.0 322.5,86.3 326.5,87.3 330.4,87.1 334.4,85.1 338.4,87.5 342.4,87.0 346.5,89.8 350.5,87.1 354.4,84.9 358.4,85.0 362.4,85.6 366.3,87.1 370.4,91.7 374.4,87.5 378.3,90.0 382.2,95.6 386.2,92.2 390.2,95.4 394.2,86.1 398.2,92.1 402.1,90.1 406.0,90.1 410.0,90.7 414.0,89.7 417.9,92.3 421.9,91.5 425.9,91.3 429.8,89.9 433.8,89.1 437.8,90.0 441.8,93.8 445.7,89.4 449.7,90.8 453.7,89.8 457.6,90.4 461.7,91.9 465.6,89.9 469.6,91.0 473.6,88.5 477.5,93.6 481.5,86.5 485.5,89.0 489.5,92.9 493.5,91.1 497.4,93.0 501.4,87.5 505.4,89.8 509.4,86.2 513.3,88.6 517.3,87.5 521.3,90.2 525.2,88.2 529.2,90.3 533.2,90.3 537.2,89.6 541.2,92.1 545.2,91.6 549.1,90.7 553.1,160.8 557.2,160.2 561.1,186.0 565.1,210.0 569.1,210.0 573.0,210.0 577.0,210.0 581.0,210.0 584.9,209.8 588.9,210.0 592.9,210.0 596.8,210.0 600.8,210.0 604.8,210.0 608.8,209.8 612.8,210.0 616.7,210.0 620.7,210.0"><title>accepted jobs</title></polyline>
+<path class="mark failure" d="M548.3,236.0 L556.3,244.0 M556.3,236.0 L548.3,244.0"><title>failure: light-check at 1259 min</title></path>
+<path class="mark failure" d="M551.5,236.0 L559.5,244.0 M559.5,236.0 L551.5,244.0"><title>failure: light-check at 1268 min</title></path>
+<path class="mark failure" d="M560.1,236.0 L568.1,244.0 M568.1,236.0 L560.1,244.0"><title>failure: light-check at 1289 min</title></path>
+<path class="mark failure" d="M572.0,236.0 L580.0,244.0 M580.0,236.0 L572.0,244.0"><title>failure: light-check at 1320 min</title></path>
+<path class="mark failure" d="M583.9,236.0 L591.9,244.0 M591.9,236.0 L583.9,244.0"><title>failure: light-check at 1350 min</title></path>
+<path class="mark failure" d="M595.8,236.0 L603.8,244.0 M603.8,236.0 L595.8,244.0"><title>failure: light-check at 1380 min</title></path>
+<path class="mark failure" d="M607.8,236.0 L615.8,244.0 M615.8,236.0 L607.8,244.0"><title>failure: light-check at 1410 min</title></path>
+<path class="mark failure" d="M620.0,236.0 L628.0,244.0 M628.0,236.0 L620.0,244.0"><title>failure: heavy-check at 1442 min</title></path>
+<line class="mark fault" x1="61.0" y1="255.0" x2="61.0" y2="263.0"/><text x="70.0" y="263">fault</text>
+<path class="mark upgrade" d="M117.5,254.0 L122.5,263.0 L112.5,263.0 Z"/><text x="126.5" y="263">upgrade walk</text>
+<path class="mark special" d="M219.5,254.0 L224.5,259.0 L219.5,264.0 L214.5,259.0 Z"/><text x="228.5" y="263">special</text>
+<path class="mark failure" d="M285.0,255.0 L293.0,263.0 M293.0,255.0 L285.0,263.0"/><text x="298.0" y="263">failure</text>
+</svg>
