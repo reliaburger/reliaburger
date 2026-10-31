@@ -505,10 +505,14 @@ roll from it, and it won't move a restarting node's replicas
 
 ## Signing identity
 
-Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
-of the existing Ed25519 PKCS#8 DER private key whose public key is listed in
-`src/upgrade/keys.rs`, for example
-`base64 < release-key.der | gh secret set RELIABURGER_RELEASE_KEY`. The packaging
+Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub
+Environment, whose deployment branch rule allows only `main`. It holds the
+base64 encoding of the existing Ed25519 PKCS#8 DER private key whose public key
+is listed in `src/upgrade/keys.rs`, for example
+`base64 < release-key.der | gh secret set RELIABURGER_RELEASE_KEY --env release`.
+Never make it a repository secret: every branch can read those, because the
+`if:` lines that guard the signing steps live in the dispatched branch's own
+copy of `build.yml`. The packaging
 script also accepts the base64 of a PEM private key or of the bare 32-byte seed,
 and converts either to DER; anything else fails with a message saying what it
 found, never the key itself. It then checks the derived public key against
@@ -541,10 +545,13 @@ is unreleased code, so the release key never signs it. It has a key of its
 own (maintainer decision, 27 October 2026,
 [#1363](https://github.com/reliaburger/reliaburger/issues/1363)):
 
-- The private key is the Actions secret `RELIABURGER_NIGHTLY_KEY`, in the same
+- The private key is `RELIABURGER_NIGHTLY_KEY`, a secret of the `nightly`
+  GitHub Environment, whose branch rule allows only `release-*`, in the same
   format as the release key's secret. `build.yml` uses it in one step, which
   runs only on a `release-*` branch; the release key's step runs only on
-  `main`. A test in `test_build_workflow.py` holds both conditions.
+  `main`, and the candidate job picks its environment the same way. A test in
+  `test_build_workflow.py` holds all three. Anyone who can push a `release-*`
+  branch can reach this key, which is why only nightly builds trust it.
 - The public key is `NIGHTLY_SIGNING_KEYS` in `src/upgrade/keys.rs`, next to
   the release keys. Only a binary built with the `nightly-signing` Cargo
   feature trusts it, and that binary trusts no release key. `build.yml`
@@ -562,7 +569,7 @@ The maintainer sets it up once, on a machine with `gh` signed in and a
 
 ```sh
 relish dev keygen --out ~/reliaburger-nightly-key
-base64 < ~/reliaburger-nightly-key/release.key | gh secret set RELIABURGER_NIGHTLY_KEY
+base64 < ~/reliaburger-nightly-key/release.key | gh secret set RELIABURGER_NIGHTLY_KEY --env nightly
 cat ~/reliaburger-nightly-key/release.pub
 ```
 
