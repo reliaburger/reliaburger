@@ -283,6 +283,9 @@ jobs:
     # that run, and every build job must have succeeded either way. Main's
     # candidate is signed with the release key; a release train's nightly
     # build (#1363) with the nightly key, and it's uploaded as `nightly-*`.
+    # Each key is a secret of its environment, whose branch rule in the
+    # repository's settings is what keeps it from any other branch (#1439).
+    environment: ${{ github.ref == 'refs/heads/main' && 'release' || 'nightly' }}
     if: >-
       ${{ !cancelled() && github.event_name == 'workflow_dispatch'
       && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release-'))
