@@ -595,9 +595,63 @@ let previous_valid_until = now
 
 The node that took the request also installs the rotation in its own token store straight away, so the new secret works on the very next request there. The other nodes catch up on their five-second refresh from Raft, and since the old secret keeps working meanwhile, nobody notices the gap.
 
+### A create that works on any node
+
+`token create` didn't get that treatment at first, and a claims evaluation of 0.2.0 caught it twice over (#1496). On a follower the handler went straight to `council.write`, which refuses anywhere but the leader, so a script creating tokens on a three-node cluster failed about two times in three with `503`, depending on which node it reached. And a token that *was* created got a `401` for up to five seconds on the node that made it, because that node was waiting for its own refresh. Unlike a rotation, a new token has no old secret to fall back on, so here people really do notice the gap.
+
+The first half is the same fix as every other leader-only write: ask `council_to_forward_to` whether this node can prove it leads and, if it can't, hand the raw body to `forward_to_leader` with the caller's own `Authorization` header. The follower forwards before it looks at `[permission]` specs or picks a default lifetime, because those answers belong to the leader. Its replica might be a moment behind, and a spec it hasn't seen yet shouldn't change what a token inherits. The leader repeats the role checks against the caller's credential, so forwarding grants nothing.
+
+The second half is more interesting on a follower. On the leader, `council.write` returns once the entry is applied, so the token is right there to copy into the store. But the follower only sees the leader's answer, and that holds the plaintext, not the stored record. What should it install?
+
+We could have rebuilt an `ApiToken` from the answer, but that's a second copy of the record that can disagree with the first, and the next refresh would delete it if the replica was still behind. We could have had the leader send the record back, but that puts a hash in a response meant for a client. Instead the follower hashes the secret from the answer and waits for its own replica to apply a token with that hash:
+
+```rust
+pub async fn applied_api_token(
+    &self,
+    token_hash: &[u8],
+    within: std::time::Duration,
+) -> Option<crate::sesame::types::ApiToken> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let token = self
+            .state_machine
+            .read_desired(|state| {
+                state
+                    .security_state
+                    .api_tokens
+                    .iter()
+                    .find(|token| token.token_hash == token_hash)
+                    .cloned()
+            })
+            .await;
+        if token.is_some() || tokio::time::Instant::now() >= deadline {
+            return token;
+        }
+        tokio::time::sleep(API_TOKEN_POLL).await;
+    }
+}
+```
+
+`read_desired` takes a closure and runs it under the state machine's read lock, so we borrow the list and clone the one token we want, not the whole desired state. `.cloned()` turns the `Option<&ApiToken>` from `find` into an `Option<ApiToken>`, which is what lets the value outlive the lock. In Go you'd copy the struct by hand before unlocking, and nothing would stop you forgetting. Here the borrow checker refuses to let a reference escape the closure.
+
+Replication takes a few heartbeats, so the loop gives up after two seconds. A node lagging further than that still answers, since the token *is* committed, and it picks the token up on its next refresh. The only thing the caller loses in that case is the "at once".
+
+To read the leader's answer without losing it, the handler takes the `Response` apart:
+
+```rust
+let (mut parts, body) = answer.into_parts();
+let bytes = match axum::body::to_bytes(body, limit).await { /* ... */ };
+// ...parse the secret, install the token...
+Response::from_parts(parts, axum::body::Body::from(bytes))
+```
+
+`into_parts` consumes the response and hands back its status and headers separately from its body, and `to_bytes` reads the body into memory, up to a limit. A response body is a stream you can read once, so reading it means building a new response. The ownership rules make that obvious: after `into_parts` the original `answer` is gone, and using it again is a compile error.
+
+The other nodes still catch up on their five-second refresh, so a client behind a load balancer can land on a third node and get a `401` for a moment. The issue asked for the node you spoke to, and that's what the fix promises.
+
 ### A default lifetime, except for Admins
 
-Until now a token without `--ttl-days` lived forever, and forever is the default people actually get. Deployer and ReadOnly tokens now get 90 days unless you pass `--ttl-days` or, deliberately, `--no-expiry`. The node that answers reads the default from `[security.tokens] default_ttl`.
+Until now a token without `--ttl-days` lived forever, and forever is the default people actually get. Deployer and ReadOnly tokens now get 90 days unless you pass `--ttl-days` or, deliberately, `--no-expiry`. The leader reads the default from its own `[security.tokens] default_ttl`, whichever node you asked.
 
 Admin tokens are exempt, and the reason is the same trap the sweep avoids. If every Admin token expires, nobody can create the next one, and the bootstrap window doesn't reopen (the store isn't empty). A default lifetime on Admins would arm that trap for every cluster that forgot a calendar reminder. So Admins don't expire unless you say so, and `relish wtf` nags instead: it warns about an Admin token whose secret is more than 90 days old, and about any token that expires within 14 days. `relish token list` gives the 14-day warning too, on stderr so `-o json` stays parseable.
 
@@ -1911,7 +1965,7 @@ Image signing (`src/pickle/signing.rs`) is the clearest example of testing a sec
 
 The per-instance lifecycle has its own regression suite spread across the layers it touches: `identity_mount_source_is_per_instance_not_per_app` (OCI spec), `two_replicas_of_one_app_get_distinct_identity_dirs_and_keys` (the overwrite bug), `deploy_prepares_and_stop_removes_per_instance_identity_dirs` and `rolling_redeploy_leaves_only_live_instances_identity_dirs` (agent lifecycle), and `adoption_restores_identity_and_rotation_schedule_from_disk` plus `adoption_sweeps_orphaned_identity_dirs` (restart safety). The tmpfs backing itself only shows up under Linux as root, so `identity_dir_is_tmpfs_backed_under_root` self-skips elsewhere and runs in the Lima rig. On the rotation side, the state machine's verify-before-retire behaviour is pinned by `finalize_refused_while_a_secret_is_sealed_under_an_old_generation`, `finalize_succeeds_after_secrets_re_encrypted_under_the_new_generation`, `concurrent_second_rotation_refused_until_finalised`, `same_generation_rotation_retry_is_idempotent`, and the compatibility fixture `legacy_secret_without_generation_metadata_blocks_finalize`; the API tests assert the refusals surface as `409`s.
 
-Token rotation is tested at three layers, and the tests came first. In `sesame/token.rs`, `the_old_secret_works_inside_the_grace_period_and_stops_after_it` drives `validate_token_at` with an injected `now` either side of the grace end, so no test sleeps for a day; `a_second_rotation_ends_the_first_old_secret` and `the_old_secret_never_outlives_the_old_expiry` pin the edges, and `admin_tokens_are_exempt_from_the_default_lifetime` pins decision 6. In `sesame/auth.rs`, `a_session_opened_with_the_old_secret_ends_with_its_grace_period` shows the principal doing the session work. And `bun/api/token_tests.rs` goes through the real router and a one-node council: the old secret works and the new one works at once, a zero-grace rotation ends the old secret *and* its dashboard session, the `[permission]` spec still binds the rotated token, the last Admin can rotate itself, a `token.rotated` event names the caller without ever containing the new secret, a token created without a lifetime gets 90 days, and a name with a spec needs `--inherit-permissions`. On the `wtf` side, `a_token_expiring_within_fourteen_days_is_a_warning` and `an_admin_token_older_than_ninety_days_without_an_expiry_is_a_warning` feed the pure diagnosis engine a fixed snapshot.
+Token rotation is tested at three layers, and the tests came first. In `sesame/token.rs`, `the_old_secret_works_inside_the_grace_period_and_stops_after_it` drives `validate_token_at` with an injected `now` either side of the grace end, so no test sleeps for a day; `a_second_rotation_ends_the_first_old_secret` and `the_old_secret_never_outlives_the_old_expiry` pin the edges, and `admin_tokens_are_exempt_from_the_default_lifetime` pins decision 6. In `sesame/auth.rs`, `a_session_opened_with_the_old_secret_ends_with_its_grace_period` shows the principal doing the session work. And `bun/api/token_tests.rs` goes through the real router and a one-node council: the old secret works and the new one works at once, a zero-grace rotation ends the old secret *and* its dashboard session, the `[permission]` spec still binds the rotated token, the last Admin can rotate itself, a `token.rotated` event names the caller without ever containing the new secret, a token created without a lifetime gets 90 days, a name with a spec needs `--inherit-permissions`, and a created token works at once on a node that runs no refresh at all. In `tests/suite/api_tokens.rs`, `a_token_created_through_a_follower_works_on_both_nodes_at_once` runs two real API servers on an in-memory council, each with its own token store and neither refreshing, so the only way the secret can work on the follower is the install we just wrote; its neighbours cover a leased create, a refusal coming back unchanged and a request that was already forwarded. On the `wtf` side, `a_token_expiring_within_fourteen_days_is_a_warning` and `an_admin_token_older_than_ninety_days_without_an_expiry_is_a_warning` feed the pure diagnosis engine a fixed snapshot.
 
 ### Integration tests — the lifecycles
 

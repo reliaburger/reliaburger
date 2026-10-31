@@ -466,7 +466,8 @@ fn node_capacity(config: &NodeConfig) -> (u32, u32) {
 /// Overwrite the auth token store with the current API tokens from Raft.
 ///
 /// Called on startup and every few seconds after, so a token created via
-/// `relish token create` starts being enforced without restarting the agent.
+/// `relish token create` reaches this node without restarting the agent. The
+/// node that answered the create already has it.
 async fn refresh_token_store(
     store: &reliaburger::sesame::auth::TokenStore,
     council: &reliaburger::council::CouncilNode,

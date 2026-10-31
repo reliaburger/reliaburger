@@ -421,3 +421,22 @@ async fn creating_a_token_under_a_name_with_a_permission_spec_needs_inherit_perm
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+/// #1496: the node that answered a create installs the token itself, so
+/// the secret works on it as soon as the command returns, not after the
+/// next periodic refresh from Raft. The fixture runs no refresh at all.
+#[tokio::test]
+async fn a_created_token_works_on_the_node_that_answered_at_once() {
+    let root = token("root", ApiRole::Admin);
+    let fx = fixture("create-at-once", std::slice::from_ref(&root.token)).await;
+    let (status, body) = create(
+        &fx.app,
+        &root.plaintext,
+        serde_json::json!({"name": "ci", "role": "deployer"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let secret = answer["token"].as_str().unwrap();
+    assert_eq!(read_with(&fx.app, secret).await, StatusCode::OK);
+}

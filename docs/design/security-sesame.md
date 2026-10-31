@@ -398,7 +398,7 @@ pub struct ApiToken {
     pub scope: TokenScope,
 
     /// When the token expires; `None` means never. A Deployer or ReadOnly
-    /// token created without `--ttl-days` or `--no-expiry` gets the node's
+    /// token created without `--ttl-days` or `--no-expiry` gets the leader's
     /// `[security.tokens] default_ttl` (90 days); Admin tokens get none (§5.4).
     pub expires_at: Option<SystemTime>,
 
@@ -912,6 +912,16 @@ $ relish token create --name ci-deploy --role deployer \
 4. Return the plaintext token to the user, with its expiry. It is never stored
    in plaintext.
 
+Only the leader mints. A follower forwards the request with the caller's own
+credential (#1496), and the leader repeats every check, so the `[permission]`
+check and the default lifetime are always the leader's. Once the write commits,
+the node the client spoke to copies the stored record from its own replica into
+its token store, so the secret works there on the next request. A follower
+finds the record by hashing the secret in the leader's answer and waits up to
+two seconds for its replica to apply it. A follower lagging further answers
+anyway and gets the token from the five-second refresh, as every other node
+does.
+
 **Verification.** `sesame::auth::authenticate` turns away a bearer that
 doesn't have the token shape with a string check. Otherwise it hashes the
 bearer once and compares the digest with every stored secret (each token's
@@ -944,7 +954,7 @@ The change alters the stored format, so 0.2.1 starts a fresh cluster (state
 `69`, see `src/compatibility.rs`) and tokens must be reissued.
 
 **Default lifetime (shipped, F05 I3).** Without `--ttl-days`, a Deployer or
-ReadOnly token expires after the answering node's `[security.tokens]
+ReadOnly token expires after the leader's `[security.tokens]
 default_ttl` (`"90d"` by default; `"12h"`-style hours and `"none"` are
 accepted, and a bad value fails config load). `--no-expiry` opts out
 explicitly and conflicts with `--ttl-days`. Admin tokens get no default

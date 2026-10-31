@@ -22,6 +22,9 @@ use super::types::{
 };
 use crate::sesame::types::{CaRole, SerialNumber, SpiffeUri};
 
+/// How often [`CouncilNode::applied_api_token`] looks at the replica again.
+const API_TOKEN_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Result of signing a workload CSR.
 #[derive(Debug, Clone)]
 pub struct CsrSignResult {
@@ -669,6 +672,34 @@ impl CouncilNode {
         self.state_machine.desired_state().await.security_state
     }
 
+    /// The API token stored under `token_hash` in this node's replica,
+    /// waiting up to `within` for the replica to apply it. `None` when it
+    /// hasn't by then, which on a follower only means it's still lagging.
+    pub async fn applied_api_token(
+        &self,
+        token_hash: &[u8],
+        within: std::time::Duration,
+    ) -> Option<crate::sesame::types::ApiToken> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let token = self
+                .state_machine
+                .read_desired(|state| {
+                    state
+                        .security_state
+                        .api_tokens
+                        .iter()
+                        .find(|token| token.token_hash == token_hash)
+                        .cloned()
+                })
+                .await;
+            if token.is_some() || tokio::time::Instant::now() >= deadline {
+                return token;
+            }
+            tokio::time::sleep(API_TOKEN_POLL).await;
+        }
+    }
+
     /// Whether an operator has permanently retired this node identity.
     /// Cheap enough to call on every request: it borrows, never clones.
     pub async fn is_node_retired(&self, node_id: &str) -> bool {
@@ -1126,6 +1157,37 @@ mod tests {
         // Can write immediately.
         let resp = nodes[0].write(RaftRequest::Noop).await.unwrap();
         assert!(matches!(resp, CouncilResponse::Applied { .. }));
+    }
+
+    #[tokio::test]
+    async fn applied_api_token_finds_a_committed_token_and_gives_up_on_a_missing_one() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5)).await;
+        let created = crate::sesame::token::create_token(
+            "ci",
+            crate::sesame::types::ApiRole::Deployer,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let missing = nodes[0]
+            .applied_api_token(&created.token.token_hash, Duration::from_millis(60))
+            .await;
+        assert!(missing.is_none());
+        assert!(started.elapsed() >= Duration::from_millis(60));
+
+        nodes[0]
+            .write(RaftRequest::CreateApiToken(created.token.clone()))
+            .await
+            .unwrap();
+        let found = nodes[0]
+            .applied_api_token(&created.token.token_hash, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(found.name, "ci");
     }
 
     #[tokio::test]
