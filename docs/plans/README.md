@@ -10,6 +10,7 @@ the detail is in the GitHub milestones and issues.
 
 | Plan | What it is | Still open |
 |---|---|---|
+| [0.2.5: Bugs an outside evaluation found](2026-10-31-plan-0.2.5.md) | The 0.2.5 patch release: token create forwarding, the Authority Key Identifier, init container `env` on import, where `logs-export` writes, delete then re-apply, app names in the audit table, and the stale `logs --tail`, all on `main`. | [0.2.5](https://github.com/reliaburger/reliaburger/milestone/27): #1493, #1496–#1501 |
 | [Research: how Kubernetes tests its releases](2026-10-28-research-kubernetes-release-testing.md) | What the Kubernetes project runs before a release (blocking-job thresholds, e2e and conformance, scale tests and SLOs, etcd's history checks, OSS-Fuzz) against our gate, what we should copy and what we shouldn't. The source of the testing section on the Kubernetes comparison page. | None: #1398–#1401 shipped in 0.2.4 |
 | [CI and test efficiency](2026-10-11-ci-and-test-efficiency.md) | Faster CI and stronger test and soak evidence: one archive extraction per job (#1050), integration policy, test consolidation and compilation costs, with an 18 October status of what's done, tracked and proposed. | Merge queue on the current train; the proposed test, fixture and soak-evidence issues |
 | [Competitive review and comparison pages](2026-10-15-competitor-comparisons.md) | Source-linked comparisons and a wider review, matching the static homepage. | Review and merge into the 0.2.1 train |
