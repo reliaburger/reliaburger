@@ -1,0 +1,251 @@
+{
+ "accepted_successes": {
+  "process": 1677744622,
+  "runc": 196286,
+  "shared-runc": 8902030
+ },
+ "accepted_successes_per_second": 19520.93387492478,
+ "api_fallbacks": {
+  "answered": {
+   "rb-7d210f99063e-2": 51,
+   "rb-7d210f99063e-3": 38
+  },
+  "missed": {
+   "rb-7d210f99063e-1": 89,
+   "rb-7d210f99063e-2": 38
+  }
+ },
+ "audited_attempts": 24,
+ "complete": false,
+ "day": {
+  "day_equivalent": 1677511634,
+  "elapsed_seconds": 86412,
+  "first_hour": 21801.649444444443,
+  "floor_met": true,
+  "floor_rate": 11575,
+  "host_successes": 1677744622,
+  "host_successes_per_second": 19415.643915196964,
+  "hourly": [
+   21801.649444444443,
+   23125.84059983338,
+   23013.655459849957,
+   22980.886174347586,
+   22082.00777993887,
+   22925.063038044987,
+   23436.550708530147,
+   22596.31731036399,
+   22391.37111111111,
+   22237.7539572341,
+   22185.873888888887,
+   22141.70611111111,
+   22220.815555555557,
+   21360.140594609613,
+   21490.047751249305,
+   21441.49208113365,
+   21434.764444444445,
+   21534.980555555554,
+   21483.097777777777,
+   21821.429444444446,
+   19849.425,
+   2478.8316666666665,
+   0.0,
+   0.0
+  ],
+  "last_hour": 0.0,
+  "per_node": {
+   "balanced": true,
+   "nodes": [
+    {
+     "fair_share_percent": 33.333333333333336,
+     "node": "rb-7d210f99063e-1",
+     "over_fair_share": false,
+     "restarted": true,
+     "share_percent": 32.185742936278466,
+     "slots": 27,
+     "successes": 539994716
+    },
+    {
+     "fair_share_percent": 33.333333333333336,
+     "node": "rb-7d210f99063e-2",
+     "over_fair_share": false,
+     "restarted": true,
+     "share_percent": 33.57096876038388,
+     "slots": 27,
+     "successes": 563235274
+    },
+    {
+     "fair_share_percent": 33.333333333333336,
+     "node": "rb-7d210f99063e-3",
+     "over_fair_share": false,
+     "restarted": true,
+     "share_percent": 34.24328830333766,
+     "slots": 27,
+     "successes": 574515082
+    }
+   ],
+   "tolerance_percent": 20
+  },
+  "slowdown_ok": false,
+  "slowdown_percent": 10,
+  "target_met": false,
+  "target_rate": 23149.0
+ },
+ "elapsed_seconds": 86412,
+ "errors": [
+  "shared-runc short work (3930): the candidate no longer has this run (candidate API refused GET /v1/batch/3930 (HTTP 404)); last seen 229824/262144 succeeded, not drained, so its outcome is unknown",
+  "process long work (4017): the candidate no longer has this run (candidate API refused GET /v1/batch/4017 (HTTP 404)); last seen 486/512 succeeded, not drained, so its outcome is unknown",
+  "process short work (4060): the candidate no longer has this run (candidate API refused GET /v1/batch/4060 (HTTP 404)); never observed, so its outcome is unknown",
+  "shared-runc long work (4010): the candidate no longer has this run (candidate API refused GET /v1/batch/4010 (HTTP 404)); last seen 192/512 succeeded, not drained, so its outcome is unknown",
+  "job campaign drain deadline exceeded"
+ ],
+ "fault_markers": 0,
+ "gate": {
+  "decision": "D18-C",
+  "fault_kinds": [],
+  "node_faults": false,
+  "nodes": 3,
+  "schedule": "none",
+  "soak_seconds": 86520,
+  "tier": "day"
+ },
+ "load": "day",
+ "m8": {
+  "api_node": "rb-7d210f99063e-1",
+  "bun_rss_worst": {
+   "node": "rb-7d210f99063e-2",
+   "peak_rss_mib": 229.42578125,
+   "steady_rss_mib": 228.81640625,
+   "target_mib": 384
+  },
+  "executor_overhead_cores_per_node": 0.3918112858414237,
+  "leader_cpu_cores": 0.6297209893666198,
+  "million_task_array_wall_seconds": {
+   "max": null,
+   "median": null,
+   "runs": 0
+  },
+  "node_ledger_mib_per_million_tasks": 0.46617920141537206,
+  "p99_start_lag_ms": 16,
+  "per_node": {
+   "rb-7d210f99063e-1": {
+    "bun_cpu_cores": 0.6297209893666198,
+    "bun_peak_rss_mib": 268.87109375,
+    "bun_processes": [
+     {
+      "boot": "3e5d4d2e-3eb8-4d1e-ba64-4b07bde45687",
+      "first_seen": 1793379186,
+      "image": "3734447156",
+      "peak_rss_mib": 268.87109375,
+      "pid": 3686,
+      "steady_rss_mib": 261.46484375,
+      "steady_samples": 285
+     }
+    ],
+    "bun_rss_target_mib": 512,
+    "bun_steady_rss_mib": 261.46484375,
+    "executor_helper_cpu_cores": 0.3812545977115118,
+    "peak_task_array_storage_mib": 257.57421875,
+    "retained_log_mb": 8.896512
+   },
+   "rb-7d210f99063e-2": {
+    "bun_cpu_cores": 0.581935390661119,
+    "bun_peak_rss_mib": 229.42578125,
+    "bun_processes": [
+     {
+      "boot": "f29a16e0-4c72-49cc-9f87-285518aaf01b",
+      "first_seen": 1793379186,
+      "image": "1463172332",
+      "peak_rss_mib": 229.42578125,
+      "pid": 1821,
+      "steady_rss_mib": 228.81640625,
+      "steady_samples": 285
+     }
+    ],
+    "bun_rss_target_mib": 384,
+    "bun_steady_rss_mib": 228.81640625,
+    "executor_helper_cpu_cores": 0.3879383048196946,
+    "peak_task_array_storage_mib": 261.3671875,
+    "retained_log_mb": 1.007616
+   },
+   "rb-7d210f99063e-3": {
+    "bun_cpu_cores": 0.5840008090614883,
+    "bun_peak_rss_mib": 227.5078125,
+    "bun_processes": [
+     {
+      "boot": "564efac1-6f4b-4ed7-8627-2f0d9c2c299b",
+      "first_seen": 1793379186,
+      "image": "1376861240",
+      "peak_rss_mib": 227.5078125,
+      "pid": 1673,
+      "steady_rss_mib": 220.90625,
+      "steady_samples": 285
+     }
+    ],
+    "bun_rss_target_mib": 384,
+    "bun_steady_rss_mib": 220.90625,
+    "executor_helper_cpu_cores": 0.3918112858414237,
+    "peak_task_array_storage_mib": 267.4296875,
+    "retained_log_mb": 0.131072
+   }
+  },
+  "quiet_p99_start_lag_ms": 16,
+  "quiet_start_lag_samples": 1686415382,
+  "raft_entries_per_second": 3.315133965950321,
+  "raft_leaders": [
+   "rb-7d210f99063e-1",
+   "rb-7d210f99063e-3"
+  ],
+  "raft_state_bytes_max": 45473,
+  "retained_log_mb": 10.0352,
+  "start_lag_samples": 1686415382,
+  "targets": {
+   "bun_steady_rss_mib": {
+    "api_node": 512,
+    "other_nodes": 384
+   },
+   "executor_overhead_cores_per_node": 0.5,
+   "leader_cpu_cores": 1,
+   "million_task_array_wall_seconds": 600,
+   "node_ledger_mib_per_million_tasks": 64,
+   "p99_start_lag_ms": 1000,
+   "raft_entries_per_second": "recorded only; the batch target counts only task-array writes",
+   "raft_state_bytes_per_million_tasks": 262144,
+   "retained_log_mb": 50
+  }
+ },
+ "operator_replay_decisions": 9,
+ "retries": {
+  "process": 1,
+  "runc": 251,
+  "shared-runc": 1
+ },
+ "retry_causes": {
+  "process": {
+   "exit_code": 1,
+   "launch": 0,
+   "signal": 0,
+   "timeout": 0,
+   "unknown": 0,
+   "unrecorded": 0
+  },
+  "runc": {
+   "exit_code": 1,
+   "launch": 2,
+   "signal": 0,
+   "timeout": 246,
+   "unknown": 2,
+   "unrecorded": 0
+  },
+  "shared-runc": {
+   "exit_code": 1,
+   "launch": 0,
+   "signal": 0,
+   "timeout": 0,
+   "unknown": 0,
+   "unrecorded": 0
+  }
+ },
+ "schema": 1,
+ "target_met": false,
+ "target_rate": 23149.0
+}
