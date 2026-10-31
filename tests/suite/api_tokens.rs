@@ -845,6 +845,299 @@ fn shared_authority_router(
     )
 }
 
+/// Two real API servers on one in-memory council, each with its own token
+/// store and neither running the five-second refresh, so a token reaches a
+/// store only through the create that made it.
+struct TokenCluster {
+    leader: Arc<CouncilNode>,
+    leader_url: String,
+    follower_url: String,
+    admin: String,
+    admin_principal: String,
+    client: reqwest::Client,
+    shutdown: tokio_util::sync::CancellationToken,
+    _tasks: crate::task_harness::TestTasks,
+}
+
+impl TokenCluster {
+    async fn start() -> Self {
+        use crate::cluster_support;
+        use crate::task_harness::TestTasks;
+
+        let (nodes, _network) = cluster_support::build_council().await;
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let cleanup_nodes = nodes.clone();
+        let cleanup_signal = shutdown.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_signal.cancelled().await;
+            for node in cleanup_nodes {
+                node.shutdown().await.unwrap();
+            }
+        });
+        let leader_index = cluster_support::initial_voter_leader_index(&nodes)
+            .await
+            .unwrap();
+        let follower_index = (0..3).find(|index| *index != leader_index).unwrap();
+        let leader = nodes[leader_index].clone();
+        let follower = nodes[follower_index].clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !leader.is_leader().await
+                || follower.current_leader().await != Some(cluster_support::rid(leader_index))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("no elected leader and follower");
+
+        let admin = reliaburger::sesame::token::create_token(
+            "operator",
+            reliaburger::sesame::types::ApiRole::Admin,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        leader
+            .write(reliaburger::council::RaftRequest::CreateApiToken(
+                admin.token.clone(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while follower.security_state().await.api_tokens.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the follower never applied the admin token");
+
+        let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let follower_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let leader_address = leader_listener.local_addr().unwrap();
+        let follower_address = follower_listener.local_addr().unwrap();
+        let leader_name = cluster_support::NAMES[leader_index];
+        let follower_name = cluster_support::NAMES[follower_index];
+        let membership = Arc::new(tokio::sync::RwLock::new(vec![
+            reliaburger::bun::api::NodeMembershipInfo {
+                node_id: reliaburger::meat::NodeId::new(leader_name),
+                address: leader_address,
+                api_advertised: true,
+                jobs: None,
+            },
+            reliaburger::bun::api::NodeMembershipInfo {
+                node_id: reliaburger::meat::NodeId::new(follower_name),
+                address: follower_address,
+                api_advertised: true,
+                jobs: None,
+            },
+        ]));
+        let (commands, mut incoming) = tokio::sync::mpsc::channel(16);
+        let agent_stop = shutdown.clone();
+        let agent = tokio::spawn(async move {
+            tokio::select! {
+                () = agent_stop.cancelled() => {}
+                () = async {
+                    while let Some(command) = incoming.recv().await {
+                        if let reliaburger::bun::agent::AgentCommand::Status { response } = command {
+                            let _ = response.send(Vec::new());
+                        }
+                    }
+                } => {}
+            }
+        });
+        let mut tasks = vec![cleanup, agent];
+        for (listener, council, name) in [
+            (leader_listener, leader.clone(), leader_name),
+            (follower_listener, follower, follower_name),
+        ] {
+            let tokens = reliaburger::sesame::auth::new_token_store();
+            tokens.write().await.push(admin.token.clone());
+            let router = shared_authority_router(
+                council,
+                tokens,
+                commands.clone(),
+                membership.clone(),
+                None,
+                name,
+            );
+            let stop = shutdown.clone();
+            tasks.push(tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(stop.cancelled_owned())
+                    .await
+                    .unwrap();
+            }));
+        }
+        Self {
+            leader,
+            leader_url: format!("http://{leader_address}"),
+            follower_url: format!("http://{follower_address}"),
+            admin_principal: reliaburger::sesame::auth::authenticate(
+                &admin.plaintext,
+                std::slice::from_ref(&admin.token),
+            )
+            .unwrap()
+            .principal_id,
+            admin: admin.plaintext,
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
+            _tasks: TestTasks::new(shutdown.clone(), tasks),
+            shutdown,
+        }
+    }
+
+    async fn create(&self, url: &str, body: serde_json::Value) -> reqwest::Response {
+        self.client
+            .post(format!("{url}/v1/token/create"))
+            .bearer_auth(&self.admin)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// What a read any valid token may make answers on `url` with `secret`.
+    async fn read_status(&self, url: &str, secret: &str) -> reqwest::StatusCode {
+        self.client
+            .get(format!("{url}/v1/status"))
+            .bearer_auth(secret)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn stored_named(&self, name: &str) -> usize {
+        self.leader
+            .security_state()
+            .await
+            .api_tokens
+            .iter()
+            .filter(|token| token.name == name)
+            .count()
+    }
+}
+
+impl Drop for TokenCluster {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+/// #1496: a follower forwards the create with the caller's own credential,
+/// and the new secret works on it, and on the leader, the moment the command
+/// returns. Nothing in this fixture runs the periodic refresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_created_through_a_follower_works_on_both_nodes_at_once() {
+    let cluster = TokenCluster::start().await;
+    let response = cluster
+        .create(
+            &cluster.follower_url,
+            serde_json::json!({"name": "ci", "role": "deployer"}),
+        )
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "application/json"
+    );
+    let answer: serde_json::Value = response.json().await.unwrap();
+    let secret = answer["token"].as_str().unwrap();
+
+    assert_eq!(
+        cluster.read_status(&cluster.follower_url, secret).await,
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        cluster.read_status(&cluster.leader_url, secret).await,
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(cluster.stored_named("ci").await, 1);
+}
+
+/// `relish test` mints its tokens through the same route: a leased create
+/// forwarded from a follower has to work at once as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leased_token_created_through_a_follower_works_there_at_once() {
+    use reliaburger::testkit::lease::{TestLease, now_unix_millis};
+    let cluster = TokenCluster::start().await;
+    let now = now_unix_millis();
+    let lease = TestLease::new(
+        "token-lease".into(),
+        cluster.admin_principal.clone(),
+        "ci".into(),
+        "rbtest-token".into(),
+        now,
+        now + 60_000,
+    )
+    .unwrap();
+    cluster
+        .leader
+        .write(reliaburger::council::RaftRequest::TestLeaseCreate(
+            lease.clone(),
+        ))
+        .await
+        .unwrap();
+
+    let response = cluster
+        .create(
+            &cluster.follower_url,
+            serde_json::json!({
+                "name": "rbtest-token-ci", "role": "deployer",
+                "namespaces": ["rbtest-token"], "lease_id": lease.lease_id,
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let answer: serde_json::Value = response.json().await.unwrap();
+    let secret = answer["token"].as_str().unwrap();
+    assert_eq!(
+        cluster.read_status(&cluster.follower_url, secret).await,
+        reqwest::StatusCode::OK
+    );
+}
+
+/// A refusal comes back as the leader gave it, with no secret, and a repeat
+/// of a create can't leave a second token behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_the_leader_refuses_comes_back_through_the_follower_unchanged() {
+    let cluster = TokenCluster::start().await;
+    let body = serde_json::json!({"name": "ci", "role": "deployer"});
+    assert_eq!(
+        cluster
+            .create(&cluster.follower_url, body.clone())
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    let refused = cluster.create(&cluster.follower_url, body).await;
+    assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
+    let text = refused.text().await.unwrap();
+    assert!(!text.contains("rbrg_"), "{text}");
+    assert_eq!(cluster.stored_named("ci").await, 1);
+}
+
+/// The forwarded mark stops a request bouncing between two nodes that each
+/// think the other leads: the follower answers 503 and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_follower_refuses_a_create_another_node_already_forwarded() {
+    let cluster = TokenCluster::start().await;
+    let response = cluster
+        .client
+        .post(format!("{}/v1/token/create", cluster.follower_url))
+        .bearer_auth(&cluster.admin)
+        .header("x-reliaburger-forwarded", "1")
+        .json(&serde_json::json!({"name": "ci", "role": "deployer"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(cluster.stored_named("ci").await, 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authority() {
     use crate::cluster_support;

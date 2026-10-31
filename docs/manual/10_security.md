@@ -80,6 +80,10 @@ goes to stderr. `revoke` refuses to remove the last admin token; create its
 replacement first. Revoking a token, or letting it expire, also ends every
 dashboard session that was logged in with it.
 
+`create` works against any node: a follower forwards it to the leader. The
+new token works at once on the node you asked and on the leader, and on the
+others within about five seconds, so point a script at one node until then.
+
 ### Lifetimes
 
 Deployer and read-only tokens live **90 days** unless you say otherwise:
@@ -89,7 +93,7 @@ Deployer and read-only tokens live **90 days** unless you say otherwise:
 - admin tokens get no default expiry, because a cluster whose every admin
   token had expired would have nobody left to create the next one.
 
-The default comes from the node that answers the `create`, in its config:
+The default comes from the leader's config, whichever node you asked:
 
 ```toml
 [security.tokens]

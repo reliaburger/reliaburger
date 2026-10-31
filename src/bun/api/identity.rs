@@ -375,7 +375,7 @@ pub(super) async fn token_create_handler(
             return response;
         }
         if !council.is_leader().await {
-            return forward_test_lease_request(
+            let answer = forward_test_lease_request(
                 &state,
                 council,
                 reqwest::Method::POST,
@@ -384,9 +384,38 @@ pub(super) async fn token_create_handler(
                 Some(&req),
             )
             .await;
+            return install_forwarded_token(&state, council, answer).await;
         }
         Some(user.principal_id.clone())
     } else {
+        // The leader decides everything from here on, from its own state and
+        // config: a follower's replica could miss a `[permission]` spec or
+        // an existing name. It repeats the checks above with the caller's
+        // credential, so forwarding grants nothing.
+        if let Some(council) = crate::bun::task_array_api::council_to_forward_to(&state).await {
+            let answer = match tokio::time::timeout(
+                LEADER_FORWARD_TIMEOUT,
+                crate::bun::batch::forward_to_leader(
+                    &state,
+                    council,
+                    "/v1/token/create",
+                    body,
+                    &headers,
+                ),
+            )
+            .await
+            {
+                Ok(answer) => answer,
+                Err(_) => {
+                    return (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        Json(serde_json::json!({ "error": "leader request timed out" })),
+                    )
+                        .into_response();
+                }
+            };
+            return install_forwarded_token(&state, council, answer).await;
+        }
         None
     };
     let lease = if let Some(lease_id) = &req.lease_id {
@@ -493,6 +522,7 @@ pub(super) async fn token_create_handler(
         }
     };
 
+    let token_hash = created.token.token_hash.clone();
     let request = match (lease, lease_owner) {
         (Some(lease), Some(owner_id)) => crate::council::RaftRequest::TestLeaseApiToken {
             lease_id: lease.lease_id,
@@ -505,6 +535,7 @@ pub(super) async fn token_create_handler(
     if let Err(response) = write_lease_request(council, request).await {
         return response;
     }
+    install_committed_token(&state, council, &token_hash).await;
     let mut details = std::collections::BTreeMap::from([
         ("token".to_string(), req.name.clone()),
         ("role".to_string(), req.role.clone()),
@@ -534,6 +565,93 @@ pub(super) async fn token_create_handler(
         "expires_at": expires_unix,
     }))
     .into_response()
+}
+
+/// How long a follower waits for the leader to answer a forwarded create.
+/// Longer than the 5 s the apply path allows, because the leader may spend 3 s
+/// proving it leads before it even writes. Timing out here costs the caller
+/// the secret of a token that may have committed, so it's only a backstop.
+const LEADER_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a follower waits for its own replica to apply a token the leader
+/// committed. Replication takes a few heartbeats; a node lagging further than
+/// this answers anyway and gets the token from its next periodic refresh.
+const TOKEN_REPLICATION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Install a committed token in this node's auth store now, so its secret
+/// works on the next request here instead of after the next periodic refresh
+/// from Raft (every 5 seconds). Other nodes pick it up on theirs.
+///
+/// The record comes from this node's own replica, not from the request, so
+/// a refresh that reads the replica after this finds the same token.
+async fn install_committed_token(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    token_hash: &[u8],
+) {
+    let Some(store) = &state.token_store else {
+        return;
+    };
+    let Some(token) = council
+        .applied_api_token(token_hash, TOKEN_REPLICATION_WAIT)
+        .await
+    else {
+        return;
+    };
+    // The write lock covers one in-memory update; it's never held across I/O.
+    let mut tokens = store.write().await;
+    // A name can already be here: a token revoked since the last refresh, or
+    // this one if the refresh got there first.
+    match tokens.iter_mut().find(|known| known.name == token.name) {
+        Some(known) => *known = token,
+        None => tokens.push(token),
+    }
+}
+
+/// Hand the leader's answer to a forwarded create back to the caller, first
+/// installing the new token here, on the node the caller will talk to next.
+///
+/// The leader's answer holds the plaintext and no stored record, so the
+/// secret's hash is what finds the record in this node's replica. A refusal
+/// passes through as the leader gave it.
+async fn install_forwarded_token(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    answer: Response,
+) -> Response {
+    #[derive(serde::Deserialize)]
+    struct IssuedSecret {
+        token: String,
+    }
+
+    if answer.status() != StatusCode::OK {
+        return answer;
+    }
+    let (mut parts, body) = answer.into_parts();
+    let limit = super::test_leases::MAX_LEASE_FORWARD_RESPONSE_BYTES;
+    let bytes = match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("failed to read the leader's answer: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
+    let token_hash = serde_json::from_slice::<IssuedSecret>(&bytes)
+        .ok()
+        .and_then(|issued| crate::sesame::token::hash_secret(&issued.token).ok());
+    if let Some(token_hash) = token_hash {
+        install_committed_token(state, council, &token_hash).await;
+    }
+    parts.headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    Response::from_parts(parts, axum::body::Body::from(bytes))
 }
 
 /// Seconds since the Unix epoch; zero for a time before it.
