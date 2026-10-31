@@ -458,6 +458,45 @@ One more thing changed while we were in here. The old code hard-coded the issuer
 
 That helper used to be one call to rcgen's `CertificateParams::from_ca_cert_der`. rcgen 0.14 removed it in favour of `Issuer::from_ca_cert_der`, which is fine for signing but keeps the CA's name and validity private, and we need the validity to clamp each leaf. So we read what an issuer needs off the certificate ourselves with `x509-parser`: the subject name, the validity window and the subject key identifier. The name is the fiddly one. A verifier compares the leaf's issuer with the CA's subject byte for byte, so each attribute keeps its original ASN.1 string type (a `UTF8String` stays a `UTF8String`, a `PrintableString` stays printable). Re-encode one as the wrong type and the names look identical when printed but don't match. The test `a_leaf_signed_with_issuer_params_rebuilt_from_the_ca_der_chains_to_that_ca` compares the raw bytes and runs the chain through rustls's own verifier, because that's the kind of break that would otherwise only show up as a failed handshake.
 
+### Naming the issuer by key
+
+Our own clients never noticed the next bug. rustls chains certificates by name and signature, so every TLS test we had was green. Then a claims evaluation pointed a Python 3.13 client at the API and got this:
+
+```text
+certificate verify failed: Missing Authority Key Identifier
+```
+
+Python 3.13 turned on OpenSSL's strict X.509 mode by default, and strict mode holds you to RFC 5280: every certificate a CA issues must carry an authority key identifier (AKI), which is the issuer's subject key identifier (SKI) copied into the child. It's how a verifier picks the right parent when two CAs share a name, which is exactly what a CA rotation produces. We had the SKI on every CA. We just never asked for the AKI, because rcgen leaves `use_authority_key_identifier_extension` off unless you turn it on. Six functions signed certificates, and not one of them did.
+
+We could have set the flag in six places, and the seventh signer would have forgotten it. So there's now one way to issue:
+
+```rust
+pub(crate) fn sign_as_issuer(
+    mut params: CertificateParams,
+    subject_key: &impl rcgen::PublicKeyData,
+    issuer_params: &CertificateParams,
+    issuer_keypair: &KeyPair,
+) -> Result<rcgen::Certificate, rcgen::Error> {
+    params.use_authority_key_identifier_extension = true;
+    params.signed_by(
+        subject_key,
+        &Issuer::from_params(issuer_params, issuer_keypair),
+    )
+}
+```
+
+`mut params` takes the params by value and lets this function change its own copy; the caller gave them up, so nothing it holds changes underneath it. `&impl rcgen::PublicKeyData` means "a reference to any type that implements this trait", and the compiler generates one version of the function per type, much like a C++ template and unlike a Go interface, which dispatches at runtime. We need that because the subject key is a `KeyPair` when we made the key ourselves and a CSR's public key when a joining node did.
+
+Why not set the flag in the shared `node_cert_params`? Because it's also tempting to reuse params for a CSR, and rcgen refuses to serialise a CSR with the flag set. An AKI names the signer, and a CSR doesn't have one yet.
+
+The byte-for-byte promise holds after a restart because of the helper in the last section. `issuer_params_from_der` reads the SKI off the stored CA certificate and pre-specifies it as the key identifier, so rcgen copies those bytes instead of hashing the key again. That matters for a rotated intermediate too: its leaves name the new key, not the old one, and `leaves_from_a_rotated_intermediate_name_the_new_key_not_the_old_one` checks both directions.
+
+The unit tests parse every kind of issued certificate and compare the two identifiers. `tests/suite/strict_tls_verifier.rs` goes further and runs the real thing: `openssl verify -x509_strict` over the node, ingress and workload chains, and `openssl s_client -x509_strict` against a live API listener, trusting only the root. It first checks that the same `openssl` refuses a leaf with no AKI, because not every `openssl` on a developer's `PATH` is OpenSSL (macOS ships LibreSSL). An `openssl` that can't refuse the bad chain proves nothing when it accepts the good one, so the test says so and leans on the unit tests. (That control earned its keep immediately. The first draft read the error from the wrong stream, decided no strict `openssl` existed, and passed without checking anything.)
+
+There's a catch for clusters that already exist. A leaf picks up the extension at its next renewal, but the Node, Workload and Ingress CAs were signed at `relish init`, and they're in the chain too. Strict verification checks every certificate below the trust anchor, so a client that trusts only the root keeps refusing until `relish ca rotate` replaces the intermediate, or you start a fresh cluster.
+
+One thing the AKI doesn't change: a node certificate names the node, not its address. Python's default context also checks the hostname, so connect with `server_hostname` set to the node's id. Give it `127.0.0.1` and it now fails for an honest reason, `IP address mismatch`. `relish` doesn't hit this because it verifies the chain and never the name.
+
 ### Binding a connection to a node
 
 Chapter 10 pins the client verifier to the Node CA: a peer must present a valid, unrevoked certificate that the Node CA issued. That stops outsiders cold. It does *not* stop one cluster node from impersonating another. Node B holds a perfectly valid Node-CA certificate. If B connects to A pretending to be C, the CA-pin check is happy — B's cert is genuine. We just never asked "genuine as *whom*?"
@@ -1160,6 +1199,7 @@ Cryptography is a dream to unit-test and a nightmare to test any other way. The 
 The roster maps directly onto the primitives in this chapter:
 
 - **CA hierarchy** — generation and chain validation: a node cert verifies against the Node CA, which verifies against the Root, and a Workload-CA-signed cert does *not* validate as a node cert.
+- **Key identifiers** — every intermediate and leaf carries an authority key identifier equal to its issuer's subject key identifier, including issuers rebuilt from stored DER and rotated intermediates.
 - **HKDF** — determinism (same `ikm`/salt/info gives the same key) and separation (different `info` gives unrelated keys).
 - **AES-256-GCM** — encrypt/decrypt round-trips, and the one that matters most: flip a byte of ciphertext and decryption returns an error, never plaintext.
 - **Key wrapping** — wrap an intermediate CA key, unwrap it, get the original back; unwrap with the wrong purpose string and it fails.

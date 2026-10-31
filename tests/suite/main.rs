@@ -94,6 +94,7 @@ mod server_idle_connections;
 mod service_endpoints;
 mod stop_confirmation;
 mod stop_hooks;
+mod strict_tls_verifier;
 mod task_array_million;
 mod task_array_recovery;
 mod task_arrays;

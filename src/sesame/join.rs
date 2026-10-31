@@ -841,6 +841,20 @@ mod tests {
     }
 
     #[test]
+    fn issued_leaf_names_the_stored_node_ca_by_key_identifier() {
+        // Join and renewal both sign here, with issuer params rebuilt from
+        // the Node CA in replicated state (#1497).
+        let (state, token, master_secret) = setup_with_known_key();
+        let (result, _key) =
+            issue(&state, &token, "node-02", SerialNumber(6), &master_secret).unwrap();
+
+        ca::key_identifier_checks::assert_names_issuer_by_key(
+            &result.certificate_der,
+            &result.node_ca_der,
+        );
+    }
+
+    #[test]
     fn issued_leaf_issuer_matches_the_stored_node_ca_subject() {
         // PKI5: the issuer DN is derived from the stored Node CA, so the leaf's
         // issuer field equals the CA's subject and the chain path-builds.
