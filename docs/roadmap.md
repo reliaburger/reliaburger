@@ -431,6 +431,13 @@ migration and no feature gate
   changes the cluster's formats, so a 0.2.3 cluster can't roll to it:
   recreate the cluster
   ([upgrading from 0.2.3](releasing.md#upgrading-from-023)).
+- [ ] **0.2.5: bugs an outside evaluation found**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/27),
+  [plan](plans/2026-10-31-plan-0.2.5.md)). A patch release for the
+  product bugs that an external evaluation of 0.2.0
+  ([#1080](https://github.com/reliaburger/reliaburger/pull/1080)) found and
+  that are still on `main`, and the stale `relish logs --tail` that 0.2.4's
+  day run found ([#1493](https://github.com/reliaburger/reliaburger/issues/1493)).
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
