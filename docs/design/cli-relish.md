@@ -651,7 +651,7 @@ relish logs <app> --since <time>    # 30s, 5m, 2h, 1d, or epoch seconds
 relish logs <app> --grep <substr>   # Substring filter
 relish logs <app> --json-field <k=v> # Structured JSON field match
 relish logs <app> --namespace <ns>  # App namespace (default "default")
-relish logs-export --dest <dir>     # Export Parquet log files
+relish logs-export --dest <dest>    # Copy a node's Parquet logs here, or ship them to s3:// or gs://
 relish logs-search <dir> <sql>      # SQL over an exported Parquet archive
 relish path <src> --to <dst>       # DNS / service-map / firewall / TCP evidence probe
 relish inspect <app>                # Per-instance detail for an app

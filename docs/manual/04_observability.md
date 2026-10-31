@@ -93,10 +93,26 @@ relish logs-export --dest ./archive
 relish logs-search ./archive "SELECT count(*) FROM logs WHERE line LIKE '%error%'"
 ```
 
+`--dest` is a directory on the machine running `relish`, however far away the
+node is. Relish fetches the Parquet files of the node it's talking to over the
+API and writes them to `./archive/<node>/`, so this works from a laptop. To
+archive another node, point `--endpoint` at it. It needs an unscoped Admin
+token, because a node's log store holds every tenant's logs. Files you already
+have are skipped, so running it again only fetches what's new. The copy stays
+yours: it isn't the node's own export, so it doesn't let the node prune
+anything.
+
+Give `--dest` an `s3://` or `gs://` URL and the node writes the files itself,
+with its own credentials, to `<url>/<node>/`. That counts as an export, and
+the output says which node shipped what to where. For an archive that keeps up
+by itself, and that lets a node prune under disk pressure, set
+`[logs] export_path` instead.
+
 To export a local store directly, including a custom store while its agent is
-stopped, use `relish logs-export --source /path/to/parquet --dest ./archive`.
-If files copy but the checkpoint cannot be saved, the command exits non-zero
-and explains that a later export may repeat them.
+stopped, run `relish logs-export --source /path/to/parquet --dest ./archive` on
+the node. This one uses the store's checkpoint and never contacts an agent. If
+files copy but the checkpoint cannot be saved, the command exits non-zero and
+explains that a later export may repeat them.
 
 ## Metrics
 

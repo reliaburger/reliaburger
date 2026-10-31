@@ -313,6 +313,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Get, "/v1/alerts", AnyToken, Cluster(METRICS)),
     gated(Get, "/v1/logs/sql", AnyToken, Cluster(LOGS)),
     gated(Post, "/v1/logs/export", Admin, Cluster(ADMIN)),
+    gated(Get, "/v1/logs/archive", Admin, Cluster(ADMIN)),
+    gated(Get, "/v1/logs/archive/{name}", Admin, Cluster(ADMIN)),
     route(Get, "/v1/deploys/active", AnyToken),
     route(Get, "/v1/deploys/operations", AnyToken),
     gated(

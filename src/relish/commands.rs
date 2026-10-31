@@ -419,14 +419,70 @@ async fn logs_with_client(
     Ok(())
 }
 
-/// Export Parquet log files to a destination.
+/// Where `relish logs-export --dest` puts the files.
+#[derive(Debug, PartialEq, Eq)]
+enum ExportLanding {
+    /// A directory on the machine running relish: a bare path or `file://`.
+    ThisMachine { directory: PathBuf },
+    /// An object store, written with the exporter's own credentials.
+    ObjectStore { url: String },
+}
+
+impl ExportLanding {
+    fn parse(destination: &str) -> Result<Self, RelishError> {
+        if !destination.contains("://") {
+            return Ok(Self::ThisMachine {
+                directory: PathBuf::from(destination),
+            });
+        }
+        let invalid = |reason: String| RelishError::InvalidFlag {
+            flag: "dest".into(),
+            reason,
+        };
+        let url = url::Url::parse(destination).map_err(|error| invalid(error.to_string()))?;
+        if url.scheme() != "file" {
+            return Ok(Self::ObjectStore {
+                url: destination.trim_end_matches('/').to_string(),
+            });
+        }
+        let directory = url
+            .to_file_path()
+            .map_err(|()| invalid("a file:// URL must name a path on this machine".into()))?;
+        Ok(Self::ThisMachine { directory })
+    }
+
+    /// Where `node_id`'s files land, in words that can't be taken for the
+    /// wrong machine.
+    fn place_for(&self, node_id: &str) -> String {
+        match self {
+            Self::ThisMachine { directory } => {
+                format!("{} on this machine", directory.join(node_id).display())
+            }
+            Self::ObjectStore { url } => format!("{url}/{node_id}"),
+        }
+    }
+}
+
+/// The one line `relish logs-export` prints when it succeeds.
+fn render_export_summary(landing: &ExportLanding, node_id: &str, files: u64, bytes: u64) -> String {
+    let place = landing.place_for(node_id);
+    if files == 0 {
+        format!("no new files to export from {node_id} to {place}")
+    } else {
+        format!("exported {files} file(s) ({bytes} bytes) of {node_id}'s logs to {place}")
+    }
+}
+
+/// Export a node's Parquet log files.
 ///
-/// Asks the running Bun agent to export its LogStore (`POST
-/// /v1/logs/export`): the destination is resolved agent-side (a path on the
-/// agent host, `file://`, `s3://` or `gs://`) and the agent files the export
-/// under its own node name — `--node-id` only affects the local fallback.
-/// When no agent answers the health probe, falls back to reading the local
-/// Parquet store directly, preferring the agent's default
+/// A directory (a bare path or `file://`) is on the machine running relish:
+/// relish copies the files of the node it's talking to over the API. An
+/// `s3://` or `gs://` URL is asked of the agent (`POST /v1/logs/export`),
+/// which writes with its own credentials. Either way the node's name comes
+/// from the agent; `--node-id` only affects a local store.
+///
+/// With `source`, or when no agent answers the health probe, relish reads a
+/// local Parquet store directly, preferring the agent's default
 /// `/var/lib/reliaburger/logs/parquet` and then the per-user data dir (the
 /// same order bun itself uses); a custom `[storage] logs` path is only
 /// reachable through the agent or an explicit `source` directory.
@@ -436,27 +492,40 @@ pub async fn logs_export(
     source: Option<&Path>,
 ) -> Result<(), RelishError> {
     let dest_str = dest.to_str().ok_or_else(|| RelishError::InvalidFlag {
-        flag: "--dest".into(),
+        flag: "dest".into(),
         reason: "destination must be valid UTF-8".into(),
     })?;
+    let landing = ExportLanding::parse(dest_str)?;
     if let Some(source) = source {
-        return logs_export_from(source, dest_str, node_id).await;
+        return logs_export_from(source, dest_str, &landing, node_id).await;
     }
     let client = BunClient::default_local();
     if client.health().await.is_ok() {
-        let outcome = client.logs_export(dest_str).await?;
-        if outcome.files_exported == 0 {
-            println!("no new files to export");
-        } else {
-            println!(
-                "agent exported {} file(s) ({} bytes) to {}/{}",
-                outcome.files_exported, outcome.bytes_written, dest_str, outcome.node_id,
-            );
-            if !outcome.checkpoint_saved {
-                eprintln!(
-                    "warning: the agent could not persist its export checkpoint; \
-                     a later export may re-ship these files"
+        match &landing {
+            ExportLanding::ThisMachine { directory } => {
+                let copied = copy_node_archive(&client, directory).await?;
+                println!(
+                    "{}",
+                    render_export_summary(&landing, &copied.node_id, copied.files, copied.bytes)
                 );
+            }
+            ExportLanding::ObjectStore { .. } => {
+                let outcome = client.logs_export(dest_str).await?;
+                println!(
+                    "{}",
+                    render_export_summary(
+                        &landing,
+                        &outcome.node_id,
+                        outcome.files_exported,
+                        outcome.bytes_written,
+                    )
+                );
+                if !outcome.checkpoint_saved {
+                    eprintln!(
+                        "warning: the agent could not persist its export checkpoint; \
+                         a later export may re-ship these files"
+                    );
+                }
             }
         }
         return Ok(());
@@ -485,10 +554,158 @@ pub async fn logs_export(
             ),
         });
     };
-    logs_export_from(&source, dest_str, node_id).await
+    logs_export_from(&source, dest_str, &landing, node_id).await
 }
 
-async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Result<(), RelishError> {
+/// What a copy of a node's archive brought over.
+#[derive(Debug, PartialEq, Eq)]
+struct CopiedArchive {
+    node_id: String,
+    files: u64,
+    bytes: u64,
+}
+
+fn archive_error(body: String) -> RelishError {
+    RelishError::ApiError { status: 0, body }
+}
+
+/// Copy the node's flushed log files to `directory/<node>/` on this machine.
+///
+/// Files land under the same `{sha256}-{filename}` names an export gives
+/// them, so one already there is complete and the right bytes: that's all
+/// the memory a repeat run needs. The node's export checkpoint isn't involved,
+/// because a copy on someone's laptop must not let the node prune its logs.
+async fn copy_node_archive(
+    client: &BunClient,
+    directory: &Path,
+) -> Result<CopiedArchive, RelishError> {
+    use crate::ketchup::export::{archive_object_name, is_archive_file_name};
+    use std::path::Component;
+
+    let listing = client.logs_archive().await?;
+    // The agent's answer becomes local paths, so a wrong one must not be able
+    // to write anywhere but under `directory`.
+    let mut components = Path::new(&listing.node_id).components();
+    let one_name = matches!(components.next(), Some(Component::Normal(_)));
+    if !one_name || components.next().is_some() {
+        return Err(archive_error(format!(
+            "the agent gave an unusable node name: {:?}",
+            listing.node_id
+        )));
+    }
+    let target = directory.join(&listing.node_id);
+    tokio::fs::create_dir_all(&target)
+        .await
+        .map_err(|error| archive_error(format!("cannot create {}: {error}", target.display())))?;
+
+    let mut copied = CopiedArchive {
+        node_id: listing.node_id.clone(),
+        files: 0,
+        bytes: 0,
+    };
+    for file in &listing.files {
+        let is_sha256 =
+            file.sha256.len() == 64 && file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit());
+        if !is_archive_file_name(&file.name) || !is_sha256 {
+            return Err(archive_error(format!(
+                "the agent listed an unusable log file: {:?}",
+                file.name
+            )));
+        }
+        let path = target.join(archive_object_name(&file.sha256, &file.name));
+        let exists = tokio::fs::try_exists(&path).await.map_err(|error| {
+            archive_error(format!("cannot inspect {}: {error}", path.display()))
+        })?;
+        if exists {
+            continue;
+        }
+        // Retention may remove a file between the listing and its fetch.
+        let Some(response) = client.logs_archive_file(&file.name).await? else {
+            continue;
+        };
+        receive_archive_file(response, file, &path).await?;
+        copied.files += 1;
+        copied.bytes += file.size;
+    }
+    Ok(copied)
+}
+
+/// Stream one file to `path`. The name appears only once the bytes are
+/// verified and on disk, so a file an interrupted run leaves behind is a
+/// hidden `.partial` that neither a repeat run nor `logs-search` mistakes for
+/// a finished one.
+async fn receive_archive_file(
+    response: reqwest::Response,
+    file: &crate::ketchup::export::ArchiveFile,
+    path: &Path,
+) -> Result<(), RelishError> {
+    let partial = path.with_file_name(format!(".{}.{}.partial", file.name, std::process::id()));
+    let written = write_archive_file(response, file, &partial).await;
+    let renamed = match written {
+        Ok(()) => tokio::fs::rename(&partial, path)
+            .await
+            .map_err(|error| archive_error(format!("cannot write {}: {error}", path.display()))),
+        Err(error) => Err(error),
+    };
+    if renamed.is_err() {
+        let _ = tokio::fs::remove_file(&partial).await;
+    }
+    renamed
+}
+
+async fn write_archive_file(
+    mut response: reqwest::Response,
+    file: &crate::ketchup::export::ArchiveFile,
+    partial: &Path,
+) -> Result<(), RelishError> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
+
+    let write_error = |error: std::io::Error| {
+        archive_error(format!("cannot write {}: {error}", partial.display()))
+    };
+    let changed = || {
+        archive_error(format!(
+            "{} changed on the node during the copy; run the export again",
+            file.name
+        ))
+    };
+    // Logs can hold anything a workload printed, so only their owner reads them.
+    let mut out = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(partial)
+        .await
+        .map_err(write_error)?;
+    let mut hash = Sha256::new();
+    let mut size = 0_u64;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| archive_error(format!("fetching {}: {error}", file.name)))?
+    {
+        size += chunk.len() as u64;
+        if size > file.size {
+            return Err(changed());
+        }
+        hash.update(&chunk);
+        out.write_all(&chunk).await.map_err(write_error)?;
+    }
+    if size != file.size || hex::encode(hash.finalize()) != file.sha256 {
+        return Err(changed());
+    }
+    out.flush().await.map_err(write_error)?;
+    out.sync_all().await.map_err(write_error)
+}
+
+async fn logs_export_from(
+    source: &Path,
+    dest_str: &str,
+    landing: &ExportLanding,
+    node_id: &str,
+) -> Result<(), RelishError> {
     use crate::ketchup::export::{ExportCheckpoint, export_logs};
 
     // The exporter owns cross-process locking, reload and durable persistence.
@@ -505,14 +722,15 @@ async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Resul
 
     match export_logs(source, dest_str, node_id, &mut checkpoint).await {
         Ok(result) => {
-            if result.files_exported == 0 {
-                println!("no new files to export");
-            } else {
-                println!(
-                    "exported {} file(s) ({} bytes) to {}/{}",
-                    result.files_exported, result.bytes_written, dest_str, node_id,
-                );
-            }
+            println!(
+                "{}",
+                render_export_summary(
+                    landing,
+                    node_id,
+                    result.files_exported as u64,
+                    result.bytes_written,
+                )
+            );
             Ok(())
         }
         Err(e) => Err(RelishError::ApiError {
@@ -3780,6 +3998,189 @@ pub async fn snapshot_delete(
 
 #[cfg(test)]
 mod tests {
+    /// #1499: the summary names the node the logs came from and where they
+    /// landed, so nobody looks for an archive on the wrong machine.
+    #[test]
+    fn log_export_summary_names_the_node_and_where_the_files_landed() {
+        use super::{ExportLanding, render_export_summary};
+        let here = ExportLanding::parse("./archive").unwrap();
+        let bucket = ExportLanding::parse("s3://bucket/logs/").unwrap();
+        let lines = [
+            render_export_summary(&here, "node-1", 2, 4096),
+            render_export_summary(&here, "node-1", 0, 0),
+            render_export_summary(&bucket, "node-1", 2, 4096),
+            render_export_summary(&bucket, "node-1", 0, 0),
+        ];
+        insta::assert_snapshot!(lines.join("\n"), @r"
+        exported 2 file(s) (4096 bytes) of node-1's logs to ./archive/node-1 on this machine
+        no new files to export from node-1 to ./archive/node-1 on this machine
+        exported 2 file(s) (4096 bytes) of node-1's logs to s3://bucket/logs/node-1
+        no new files to export from node-1 to s3://bucket/logs/node-1
+        ");
+    }
+
+    /// A bare path and `file://` are this machine's disk; every other scheme
+    /// is an object store the node writes to.
+    #[test]
+    fn export_destination_is_this_machine_unless_it_names_an_object_store() {
+        use super::ExportLanding;
+        let here = |directory: &str| ExportLanding::ThisMachine {
+            directory: directory.into(),
+        };
+        assert_eq!(
+            ExportLanding::parse("./archive").unwrap(),
+            here("./archive")
+        );
+        assert_eq!(
+            ExportLanding::parse("/srv/logs").unwrap(),
+            here("/srv/logs")
+        );
+        assert_eq!(
+            ExportLanding::parse("file:///srv/logs").unwrap(),
+            here("/srv/logs")
+        );
+        assert_eq!(
+            ExportLanding::parse("gs://bucket/logs").unwrap(),
+            ExportLanding::ObjectStore {
+                url: "gs://bucket/logs".into()
+            }
+        );
+        assert!(ExportLanding::parse("file://other-host/srv/logs").is_err());
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// An agent that lists `listing` and serves `body` for `logs_1.parquet`,
+    /// or nothing for any other name.
+    async fn canned_archive_agent(
+        listing: serde_json::Value,
+        body: &'static [u8],
+    ) -> (super::BunClient, tokio::task::JoinHandle<()>) {
+        use axum::routing::get;
+        let router = axum::Router::new()
+            .route(
+                "/v1/logs/archive",
+                get(move || {
+                    let listing = listing.clone();
+                    async move { axum::Json(listing) }
+                }),
+            )
+            .route(
+                "/v1/logs/archive/logs_1.parquet",
+                get(move || async move { body }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = super::BunClient::new_with_token(&format!("http://{address}"), None);
+        (client, server)
+    }
+
+    fn listing_of(node_id: &str, name: &str, size: usize, sha256: &str) -> serde_json::Value {
+        serde_json::json!({
+            "node_id": node_id,
+            "files": [{"name": name, "size": size, "sha256": sha256}],
+        })
+    }
+
+    fn names_under(directory: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(directory)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn archive_copy_files_each_log_under_its_hash_and_skips_it_next_time() {
+        let sha256 = sha256_hex(b"parquet");
+        let listing = listing_of("node-1", "logs_1.parquet", 7, &sha256);
+        let (client, server) = canned_archive_agent(listing, b"parquet").await;
+        let dest = tempfile::tempdir().unwrap();
+
+        let first = super::copy_node_archive(&client, dest.path())
+            .await
+            .unwrap();
+        let second = super::copy_node_archive(&client, dest.path())
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!((first.files, first.bytes), (1, 7));
+        assert_eq!((second.files, second.bytes), (0, 0));
+        let path = dest
+            .path()
+            .join("node-1")
+            .join(format!("{sha256}-logs_1.parquet"));
+        assert_eq!(std::fs::read(path).unwrap(), b"parquet");
+        assert_eq!(names_under(&dest.path().join("node-1")).len(), 1);
+    }
+
+    /// A node name or file name from the agent never climbs out of `--dest`.
+    #[tokio::test]
+    async fn archive_copy_refuses_names_that_leave_the_destination() {
+        let sha256 = sha256_hex(b"parquet");
+        let hostile = [
+            listing_of("../outside", "logs_1.parquet", 7, &sha256),
+            listing_of("/tmp/outside", "logs_1.parquet", 7, &sha256),
+            listing_of("..", "logs_1.parquet", 7, &sha256),
+            listing_of("node-1", "../logs_1.parquet", 7, &sha256),
+            listing_of("node-1", "logs_1.parquet", 7, "../../outside"),
+        ];
+        for listing in hostile {
+            let (client, server) = canned_archive_agent(listing.clone(), b"parquet").await;
+            let parent = tempfile::tempdir().unwrap();
+            let dest = parent.path().join("archive");
+            let outcome = super::copy_node_archive(&client, &dest).await;
+            server.abort();
+            assert!(outcome.is_err(), "{listing}");
+            assert!(names_under(&dest.join("node-1")).is_empty(), "{listing}");
+            assert_eq!(names_under(parent.path()).len(), usize::from(dest.exists()));
+        }
+    }
+
+    /// Bytes that don't match the listing never take the archive name, and
+    /// no partial file stays behind.
+    #[tokio::test]
+    async fn archive_copy_refuses_bytes_that_do_not_match_the_listing() {
+        for (size, body) in [
+            (7, b"tampers".as_slice()),
+            (7, b"short".as_slice()),
+            (3, b"too long".as_slice()),
+        ] {
+            let listing = listing_of("node-1", "logs_1.parquet", size, &sha256_hex(b"parquet"));
+            let (client, server) = canned_archive_agent(listing, body).await;
+            let dest = tempfile::tempdir().unwrap();
+            let error = super::copy_node_archive(&client, dest.path())
+                .await
+                .unwrap_err();
+            server.abort();
+            assert!(
+                error.to_string().contains("run the export again"),
+                "{error}"
+            );
+            assert!(names_under(&dest.path().join("node-1")).is_empty());
+        }
+    }
+
+    /// Retention can remove a file after the listing: that's not a failure.
+    #[tokio::test]
+    async fn archive_copy_skips_a_file_retention_removed() {
+        let listing = listing_of("node-1", "logs_2.parquet", 7, &sha256_hex(b"parquet"));
+        let (client, server) = canned_archive_agent(listing, b"parquet").await;
+        let dest = tempfile::tempdir().unwrap();
+        let copied = super::copy_node_archive(&client, dest.path())
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!((copied.files, copied.bytes), (0, 0));
+    }
+
     #[test]
     fn history_table_names_the_node_of_every_entry() {
         let at = std::time::SystemTime::UNIX_EPOCH;

@@ -598,6 +598,37 @@ fn every_mutating_route_is_audited_or_exempt() {
     }
 }
 
+/// Copying a node's logs reads the API rather than writing to it, but it
+/// hands someone every tenant's logs, so it leaves the same record an export
+/// does.
+#[tokio::test]
+async fn a_log_archive_listing_is_audited_as_an_export() {
+    let audit = audited();
+    let (token, key) = named_user_token("operator", ApiRole::Admin);
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+    let (commands, _receiver) = mpsc::channel(1);
+    let app = router(
+        commands,
+        None,
+        Some(Arc::new(RwLock::new(store))),
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::new(RwLock::new(vec![token]))),
+        None,
+        None,
+        None,
+        None,
+        0,
+        Some(Arc::clone(&audit.events)),
+    );
+    let (status, body) = call(&app, "GET", "/v1/logs/archive", &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(audit.records("logs.exported").await.len(), 1);
+}
+
 /// A Deployer token confined to namespace `a`.
 fn scoped_token(name: &str) -> (crate::sesame::types::ApiToken, String) {
     let created = crate::sesame::token::create_token(
