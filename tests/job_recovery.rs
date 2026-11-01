@@ -300,10 +300,12 @@ registry_port = 0
             command: vec!["/bin/sh".into(), "-c".into(),
                 "printf 'init\\n' >> \"$1\"; printf '%s\\n' \"$$\" > \"$2\"; n=0; while [ ! -f \"$3\" ] && [ $n -lt 600 ]; do sleep 0.05; n=$((n+1)); done; [ -f \"$3\" ]".into(),
                 "init".into(), runs.display().to_string(), pid_file.display().to_string(), release.display().to_string()],
+            env: Default::default(),
         },
         InitContainerSpec {
             image: None,
             command: vec!["/bin/sh".into(), "-c".into(), "printf 'next\\n' >> \"$1\"".into(), "next".into(), successor.display().to_string()],
+            env: Default::default(),
         },
     ];
     app.command = vec![

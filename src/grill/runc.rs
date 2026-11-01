@@ -2062,8 +2062,14 @@ mod tests {
                 command: vec![
                     "/bin/sh".to_string(),
                     "-c".to_string(),
-                    "echo \"$GREETING|$(. /etc/os-release; echo $ID)\" > /data/marker".to_string(),
+                    "echo \"$GREETING|$FRONTEND_ADDR|$(. /etc/os-release; echo $ID)\" > /data/marker"
+                        .to_string(),
                 ],
+                // #1498: its own env, on top of the app's.
+                env: std::collections::BTreeMap::from([(
+                    "FRONTEND_ADDR".to_string(),
+                    crate::config::types::EnvValue::Plain("frontend:80".to_string()),
+                )]),
             },
             &app,
         );
@@ -2085,8 +2091,8 @@ mod tests {
         assert_eq!(exit, Some(0), "init failed: {logs}");
         assert_eq!(
             std::fs::read_to_string(volume.join("marker")).unwrap(),
-            "hello|alpine\n",
-            "the init ran in its own image (alpine) with the app's env"
+            "hello|frontend:80|alpine\n",
+            "the init ran in its own image (alpine) with the app's env and its own"
         );
         let redis_host_uid = crate::grill::userns::host_id(999).unwrap();
         assert_eq!(

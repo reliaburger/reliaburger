@@ -2466,6 +2466,24 @@ pub fn generate_init_oci_spec(init: &InitContainerSpec, app: &OciSpec) -> OciSpe
 
 By the time the app's spec exists, its secrets are decrypted, its host paths have passed the node's allowlist, and its image is pinned to the digest the trust policy verified. Borrowing from the finished spec means the init container gets all of that for free, rather than a second copy of the logic that could drift. The deploy worker verifies and pins each init container's own image the same way it does the app's.
 
+An init container can also set variables of its own, on top of the app's. That came late, and from a migration. The Kubernetes importer was keeping an init container's image and command and quietly dropping its `env`, because `InitContainerSpec` had nowhere to put it (chapter 9 has the rest of that story). So `process.env` above is now `layered_env(&app.process.env, &init.env)`, the same helper a sidecar uses (chapter 18):
+
+```rust
+fn layered_env(app: &[String], own: &BTreeMap<String, EnvValue>) -> Vec<String> {
+    let inherited = app.iter().filter(|entry| {
+        let name = entry
+            .split_once('=')
+            .map_or(entry.as_str(), |(name, _)| name);
+        !own.contains_key(name)
+    });
+    // ...
+}
+```
+
+`split_once` returns an `Option<(&str, &str)>`, and `map_or` unwraps it with a default for `None`, so an entry with no `=` counts as all name. The `filter` closure borrows `own`, and nothing gets copied until the entries are collected at the end: iterators in Rust are lazy, a bit like a Python generator.
+
+The field is a `BTreeMap<String, EnvValue>`, so a value can be a `PROVIDER[name:path]` reference. That one line of type had two consequences. The scheduler's filter has to read init containers too, or an app lands on a node without the provider. And the deploy worker has to resolve the reference before the runtime sees it, so the init now goes through `create_with_secrets` like everything else, and a provider that doesn't answer fails the instance closed. What it can't be is an encrypted value. Rotating a key walks each app's `env` to re-seal it, and validation refuses `ENC[AGE:...]` in an init's own `env` rather than teaching rotation about a second place. Put it in the app's `env`, and the init inherits it.
+
 `initialiser: true` stops runc handing the app's volumes to the init container's user. Runc gives each managed volume to whichever user a container runs as. If an `alpine` init (root) took the volume over from a `redis` app (uid 999), the app would start and find it couldn't write its own data. Root inside the container's user namespace can write files any mapped user owns, so the init doesn't need the volume to be its own.
 
 The state transition path for apps with init containers is: Pending → Preparing → Initialising → Starting → HealthWait → Running. Without init containers, it's: Pending → Preparing → Starting → HealthWait → Running. The state machine validates both paths because we added Preparing → Initialising and Initialising → Starting as valid transitions.

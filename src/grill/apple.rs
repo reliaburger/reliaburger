@@ -775,6 +775,31 @@ mod tests {
         assert!(error.to_string().contains("VM of its own"), "{error}");
     }
 
+    /// #1498: an init container's own env reaches the `container` CLI, on
+    /// top of the app's.
+    #[test]
+    fn create_passes_an_init_containers_own_env() {
+        let app: crate::config::app::AppSpec =
+            toml::from_str("image = \"web:1\"\nenv = { MODE = \"app\" }\n").unwrap();
+        let parent = InstanceId("default__web-0".into());
+        let app_spec = crate::grill::oci::generate_oci_spec(
+            "web", "default", &app, &parent.0, None, "/cg", None, None,
+        );
+        let init: crate::config::app::InitContainerSpec =
+            toml::from_str("command = [\"wait\"]\nenv = { ADDR = \"frontend:80\" }\n").unwrap();
+        let args = AppleContainerGrill::create_command_args(
+            &InstanceId("default__web-0__init-0".into()),
+            &crate::grill::oci::generate_init_oci_spec(&init, &app_spec),
+        )
+        .unwrap();
+        for pair in [["-e", "ADDR=frontend:80"], ["-e", "MODE=app"]] {
+            assert!(
+                args.windows(2).any(|args| args == pair),
+                "missing {pair:?}: {args:?}"
+            );
+        }
+    }
+
     #[test]
     fn create_preserves_mounts_identity_ports_and_process_settings() {
         let spec: OciSpec = serde_json::from_value(serde_json::json!({
