@@ -1510,8 +1510,8 @@ mod tests {
         );
     }
 
-    /// Spares past the cap stay outside Raft: a cluster of five voters
-    /// (its `council_size`) adds no learners.
+    /// Spares past the cap stay outside Raft: three voters at a
+    /// `max_council_size` of 3 add no learners.
     #[test]
     fn no_learners_join_past_the_council_cap() {
         let now = Instant::now();
