@@ -850,8 +850,18 @@ fn shared_authority_router(
 /// store only through the create that made it.
 struct TokenCluster {
     leader: Arc<CouncilNode>,
+    follower: Arc<CouncilNode>,
     leader_url: String,
     follower_url: String,
+    /// The follower's own auth store, for a credential only it has seen.
+    follower_tokens: reliaburger::sesame::auth::TokenStore,
+    /// Raft id of the node behind `follower_url`.
+    follower_id: u64,
+    /// Every Raft node but the one behind `follower_url`.
+    other_ids: Vec<u64>,
+    router: InMemoryRaftRouter,
+    membership: Arc<tokio::sync::RwLock<Vec<reliaburger::bun::api::NodeMembershipInfo>>>,
+    leader_name: String,
     admin: String,
     admin_principal: String,
     client: reqwest::Client,
@@ -861,10 +871,21 @@ struct TokenCluster {
 
 impl TokenCluster {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// The same cluster with a learner behind `follower_url`. A learner
+    /// never campaigns, so a test can cut it off from replication and it
+    /// keeps naming the leader, which is what a lagging follower looks like.
+    async fn start_with_learner() -> Self {
+        Self::start_with(true).await
+    }
+
+    async fn start_with(learner: bool) -> Self {
         use crate::cluster_support;
         use crate::task_harness::TestTasks;
 
-        let (nodes, _network) = cluster_support::build_council().await;
+        let (nodes, router) = cluster_support::build_council().await;
         let shutdown = tokio_util::sync::CancellationToken::new();
         let cleanup_nodes = nodes.clone();
         let cleanup_signal = shutdown.clone();
@@ -877,9 +898,29 @@ impl TokenCluster {
         let leader_index = cluster_support::initial_voter_leader_index(&nodes)
             .await
             .unwrap();
-        let follower_index = (0..3).find(|index| *index != leader_index).unwrap();
+        let follower_index = if learner {
+            3
+        } else {
+            (0..3).find(|index| *index != leader_index).unwrap()
+        };
         let leader = nodes[leader_index].clone();
         let follower = nodes[follower_index].clone();
+        if learner {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !leader.is_leader().await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("no elected leader");
+            leader
+                .add_learner(
+                    cluster_support::rid(follower_index),
+                    cluster_support::node_info(follower_index),
+                )
+                .await
+                .unwrap();
+        }
         tokio::time::timeout(Duration::from_secs(5), async {
             while !leader.is_leader().await
                 || follower.current_leader().await != Some(cluster_support::rid(leader_index))
@@ -946,11 +987,21 @@ impl TokenCluster {
             }
         });
         let mut tasks = vec![cleanup, agent];
-        for (listener, council, name) in [
-            (leader_listener, leader.clone(), leader_name),
-            (follower_listener, follower, follower_name),
+        let follower_tokens = reliaburger::sesame::auth::new_token_store();
+        for (listener, council, name, tokens) in [
+            (
+                leader_listener,
+                leader.clone(),
+                leader_name,
+                reliaburger::sesame::auth::new_token_store(),
+            ),
+            (
+                follower_listener,
+                follower.clone(),
+                follower_name,
+                follower_tokens.clone(),
+            ),
         ] {
-            let tokens = reliaburger::sesame::auth::new_token_store();
             tokens.write().await.push(admin.token.clone());
             let router = shared_authority_router(
                 council,
@@ -970,8 +1021,18 @@ impl TokenCluster {
         }
         Self {
             leader,
+            follower,
             leader_url: format!("http://{leader_address}"),
             follower_url: format!("http://{follower_address}"),
+            follower_tokens,
+            follower_id: cluster_support::rid(follower_index),
+            other_ids: (0..cluster_support::NAMES.len())
+                .filter(|index| *index != follower_index)
+                .map(cluster_support::rid)
+                .collect(),
+            router,
+            membership,
+            leader_name: leader_name.to_string(),
             admin_principal: reliaburger::sesame::auth::authenticate(
                 &admin.plaintext,
                 std::slice::from_ref(&admin.token),
@@ -1009,8 +1070,96 @@ impl TokenCluster {
             .status()
     }
 
+    /// POST `body` to `path` on `url` with the admin credential.
+    async fn post(&self, url: &str, path: &str, body: serde_json::Value) -> reqwest::Response {
+        self.post_as(url, path, &self.admin, body).await
+    }
+
+    async fn post_as(
+        &self,
+        url: &str,
+        path: &str,
+        bearer: &str,
+        body: serde_json::Value,
+    ) -> reqwest::Response {
+        self.client
+            .post(format!("{url}{path}"))
+            .bearer_auth(bearer)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Create a deployer token called `name` on the leader; its secret works
+    /// on the leader and, through the fixture's store, on the follower.
+    async fn deployer_on_both(&self, name: &str) -> String {
+        let response = self
+            .post(
+                &self.leader_url,
+                "/v1/token/create",
+                serde_json::json!({"name": name, "role": "deployer"}),
+            )
+            .await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let answer: serde_json::Value = response.json().await.unwrap();
+        let secret = answer["token"].as_str().unwrap().to_string();
+        let stored = self
+            .leader
+            .security_state()
+            .await
+            .api_tokens
+            .into_iter()
+            .find(|token| token.name == name)
+            .unwrap();
+        self.follower_tokens.write().await.push(stored);
+        assert_eq!(
+            self.read_status(&self.follower_url, &secret).await,
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            self.read_status(&self.leader_url, &secret).await,
+            reqwest::StatusCode::OK
+        );
+        secret
+    }
+
+    /// Cut the node behind `follower_url` off from replication. Its API can
+    /// still reach the leader's, as a lagging node's can.
+    async fn stop_replicating_to_the_follower(&self) {
+        for other in &self.other_ids {
+            self.router.partition(self.follower_id, *other).await;
+        }
+    }
+
+    /// Make the follower forward to a port that accepts and never answers.
+    /// Returns the listener, which has to outlive the request.
+    async fn point_the_follower_at_a_silent_leader(&self) -> tokio::net::TcpListener {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = silent.local_addr().unwrap();
+        let leader = reliaburger::meat::NodeId::new(&self.leader_name);
+        let mut members = self.membership.write().await;
+        members
+            .iter_mut()
+            .find(|member| member.node_id == leader)
+            .unwrap()
+            .address = address;
+        silent
+    }
+
     async fn stored_named(&self, name: &str) -> usize {
         self.leader
+            .security_state()
+            .await
+            .api_tokens
+            .iter()
+            .filter(|token| token.name == name)
+            .count()
+    }
+
+    /// How many tokens called `name` the follower's own replica holds.
+    async fn follower_replica_named(&self, name: &str) -> usize {
+        self.follower
             .security_state()
             .await
             .api_tokens
@@ -1136,6 +1285,411 @@ async fn a_follower_refuses_a_create_another_node_already_forwarded() {
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(cluster.stored_named("ci").await, 0);
+}
+
+/// #1506: a rotation through a follower reaches the leader, the new secret
+/// works on both nodes the moment the command returns, and the old one keeps
+/// its grace period on both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_rotated_through_a_follower_works_on_both_nodes_at_once() {
+    let cluster = TokenCluster::start().await;
+    let old = cluster.deployer_on_both("ci").await;
+
+    let response = cluster
+        .post(
+            &cluster.follower_url,
+            "/v1/token/rotate",
+            serde_json::json!({"name": "ci"}),
+        )
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "application/json"
+    );
+    let answer: serde_json::Value = response.json().await.unwrap();
+    let new = answer["token"].as_str().unwrap();
+    assert!(answer["previous_valid_until"].is_u64(), "{answer}");
+
+    for url in [&cluster.follower_url, &cluster.leader_url] {
+        assert_eq!(
+            cluster.read_status(url, new).await,
+            reqwest::StatusCode::OK,
+            "new secret on {url}"
+        );
+        assert_eq!(
+            cluster.read_status(url, &old).await,
+            reqwest::StatusCode::OK,
+            "old secret on {url}"
+        );
+    }
+    assert_eq!(cluster.stored_named("ci").await, 1);
+}
+
+/// `--grace-hours 0` is what you run on a leaked secret, so it's a revoke of
+/// the old secret: it has to stop on the node you asked before you hear back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_without_grace_through_a_follower_ends_the_old_secret_there_at_once() {
+    let cluster = TokenCluster::start().await;
+    let old = cluster.deployer_on_both("ci").await;
+
+    let response = cluster
+        .post(
+            &cluster.follower_url,
+            "/v1/token/rotate",
+            serde_json::json!({"name": "ci", "grace_hours": 0}),
+        )
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let answer: serde_json::Value = response.json().await.unwrap();
+    let new = answer["token"].as_str().unwrap();
+
+    for url in [&cluster.follower_url, &cluster.leader_url] {
+        assert_eq!(
+            cluster.read_status(url, &old).await,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "old secret on {url}"
+        );
+        assert_eq!(
+            cluster.read_status(url, new).await,
+            reqwest::StatusCode::OK,
+            "new secret on {url}"
+        );
+    }
+}
+
+/// #1506: the failure this guards against is a revoked token working on the
+/// node you asked for up to five seconds. Nothing in this fixture refreshes,
+/// so the token could only stop here because the revoke took it out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_revoked_through_a_follower_stops_working_on_both_nodes_at_once() {
+    let cluster = TokenCluster::start().await;
+    let secret = cluster.deployer_on_both("ci").await;
+
+    let response = cluster
+        .post(
+            &cluster.follower_url,
+            "/v1/token/revoke",
+            serde_json::json!({"name": "ci"}),
+        )
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "application/json"
+    );
+    let answer: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(answer["message"], "token ci revoked");
+
+    assert_eq!(
+        cluster.read_status(&cluster.follower_url, &secret).await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        cluster.read_status(&cluster.leader_url, &secret).await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(cluster.stored_named("ci").await, 0);
+}
+
+/// A revoke the leader answered directly ends the token on the leader too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_revoked_on_the_leader_stops_working_there_at_once() {
+    let cluster = TokenCluster::start().await;
+    let secret = cluster.deployer_on_both("ci").await;
+
+    let response = cluster
+        .post(
+            &cluster.leader_url,
+            "/v1/token/revoke",
+            serde_json::json!({"name": "ci"}),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        cluster.read_status(&cluster.leader_url, &secret).await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A node whose replica is behind can't wait for ever. It answers after two
+/// seconds with the token already gone from its store, and says it's behind,
+/// because a refresh from that replica could bring the token back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoke_through_a_lagging_node_drops_the_token_there_and_says_it_is_behind() {
+    let cluster = TokenCluster::start_with_learner().await;
+    let secret = cluster.deployer_on_both("ci").await;
+    // The learner has to have the token before the cut, or its replica would
+    // look as if the removal had already applied.
+    let follower_has_it = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if cluster.follower_replica_named("ci").await == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    follower_has_it.await.expect("the learner never applied it");
+    cluster.stop_replicating_to_the_follower().await;
+
+    let started = tokio::time::Instant::now();
+    let response = cluster
+        .post(
+            &cluster.follower_url,
+            "/v1/token/revoke",
+            serde_json::json!({"name": "ci"}),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    let answer: serde_json::Value = response.json().await.unwrap();
+    let message = answer["message"].as_str().unwrap();
+    assert!(message.contains("token ci revoked"), "{message}");
+    assert!(message.contains("behind"), "{message}");
+    assert_eq!(cluster.follower_replica_named("ci").await, 1);
+    assert_eq!(
+        cluster.read_status(&cluster.follower_url, &secret).await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(cluster.stored_named("ci").await, 0);
+}
+
+/// A rotation has committed by the time a lagging node gives up on its
+/// replica, so the caller still gets the secret, the only copy there is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_through_a_lagging_node_still_hands_back_the_new_secret() {
+    let cluster = TokenCluster::start_with_learner().await;
+    cluster.deployer_on_both("ci").await;
+    cluster.stop_replicating_to_the_follower().await;
+
+    let response = cluster
+        .post(
+            &cluster.follower_url,
+            "/v1/token/rotate",
+            serde_json::json!({"name": "ci"}),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let answer: serde_json::Value = response.json().await.unwrap();
+    let new = answer["token"].as_str().unwrap();
+    assert_eq!(
+        cluster.read_status(&cluster.leader_url, new).await,
+        reqwest::StatusCode::OK
+    );
+}
+
+/// #1506: a join token through a follower commits on the leader, and its
+/// plaintext comes back once. Only the hash is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_token_created_through_a_follower_commits_on_the_leader() {
+    let cluster = TokenCluster::start().await;
+
+    let response = cluster
+        .post(
+            &cluster.follower_url,
+            "/v1/join-token/create",
+            serde_json::json!({"node_id": "node-7", "ttl_seconds": 900}),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "application/json"
+    );
+    let answer: serde_json::Value = response.json().await.unwrap();
+    assert!(answer["token"].is_string(), "{answer}");
+    assert_eq!(answer["ttl_seconds"], 900);
+    let stored = cluster.leader.security_state().await.join_tokens;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].node_id, "node-7");
+}
+
+/// Refusals are the leader's to give, and they come back as it gave them,
+/// with no secret and nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writes_the_leader_refuses_come_back_through_the_follower_unchanged() {
+    let cluster = TokenCluster::start().await;
+
+    let unknown = cluster
+        .post(
+            &cluster.follower_url,
+            "/v1/token/rotate",
+            serde_json::json!({"name": "ghost"}),
+        )
+        .await;
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let last_admin = cluster
+        .post(
+            &cluster.follower_url,
+            "/v1/token/revoke",
+            serde_json::json!({"name": "operator"}),
+        )
+        .await;
+    assert_eq!(last_admin.status(), reqwest::StatusCode::CONFLICT);
+    assert!(
+        last_admin
+            .text()
+            .await
+            .unwrap()
+            .contains("last Admin token")
+    );
+    assert_eq!(
+        cluster
+            .read_status(&cluster.follower_url, &cluster.admin)
+            .await,
+        reqwest::StatusCode::OK,
+        "a refused revoke leaves the token in the follower's store"
+    );
+
+    let no_node = cluster
+        .post(
+            &cluster.follower_url,
+            "/v1/join-token/create",
+            serde_json::json!({"ttl_seconds": 900}),
+        )
+        .await;
+    assert_eq!(no_node.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(cluster.leader.security_state().await.join_tokens.is_empty());
+}
+
+/// The follower forwards the caller's own credential, so the leader judges
+/// it. An Admin secret only the follower knows, as a token the leader has
+/// just lost would be, gets nothing done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_leader_repeats_the_checks_on_a_forwarded_write() {
+    let cluster = TokenCluster::start().await;
+    let secret = cluster.deployer_on_both("ci").await;
+    let unknown_to_the_leader = reliaburger::sesame::token::create_token(
+        "follower-only",
+        reliaburger::sesame::types::ApiRole::Admin,
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    cluster
+        .follower_tokens
+        .write()
+        .await
+        .push(unknown_to_the_leader.token);
+
+    for (path, body) in [
+        ("/v1/token/rotate", serde_json::json!({"name": "ci"})),
+        ("/v1/token/revoke", serde_json::json!({"name": "ci"})),
+        (
+            "/v1/join-token/create",
+            serde_json::json!({"node_id": "node-7"}),
+        ),
+    ] {
+        let response = cluster
+            .post_as(
+                &cluster.follower_url,
+                path,
+                &unknown_to_the_leader.plaintext,
+                body,
+            )
+            .await;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
+    }
+
+    assert_eq!(cluster.stored_named("ci").await, 1);
+    assert!(cluster.leader.security_state().await.join_tokens.is_empty());
+    assert_eq!(
+        cluster.read_status(&cluster.follower_url, &secret).await,
+        reqwest::StatusCode::OK,
+        "a revoke the leader refused must not touch the follower's store"
+    );
+}
+
+/// The forwarded mark stops any of these bouncing between two nodes that each
+/// think the other leads: the follower answers 503 and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_follower_refuses_token_writes_another_node_already_forwarded() {
+    let cluster = TokenCluster::start().await;
+    let secret = cluster.deployer_on_both("ci").await;
+    for (path, body) in [
+        ("/v1/token/rotate", serde_json::json!({"name": "ci"})),
+        ("/v1/token/revoke", serde_json::json!({"name": "ci"})),
+        (
+            "/v1/join-token/create",
+            serde_json::json!({"node_id": "node-7"}),
+        ),
+    ] {
+        let response = cluster
+            .client
+            .post(format!("{}{path}", cluster.follower_url))
+            .bearer_auth(&cluster.admin)
+            .header("x-reliaburger-forwarded", "1")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "{path}"
+        );
+    }
+    assert_eq!(cluster.stored_named("ci").await, 1);
+    assert!(cluster.leader.security_state().await.join_tokens.is_empty());
+    assert_eq!(
+        cluster.read_status(&cluster.leader_url, &secret).await,
+        reqwest::StatusCode::OK
+    );
+}
+
+/// A forwarded write the leader doesn't answer may still have committed. The
+/// caller gets a 504 that says what that costs, for each route, because the
+/// cost differs: a lost secret, nothing, or an orphan that expires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_write_that_times_out_says_what_it_may_have_cost() {
+    let cluster = TokenCluster::start().await;
+    let _silent = cluster.point_the_follower_at_a_silent_leader().await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap();
+    let ask = |path: &'static str, body: serde_json::Value| {
+        let request = client
+            .post(format!("{}{path}", cluster.follower_url))
+            .bearer_auth(&cluster.admin)
+            .json(&body)
+            .send();
+        async move {
+            let response = request.await.unwrap();
+            (response.status(), response.text().await.unwrap())
+        }
+    };
+
+    let (create, rotate, revoke, join) = tokio::join!(
+        ask(
+            "/v1/token/create",
+            serde_json::json!({"name": "ci", "role": "deployer"})
+        ),
+        ask("/v1/token/rotate", serde_json::json!({"name": "ci"})),
+        ask("/v1/token/revoke", serde_json::json!({"name": "ci"})),
+        ask(
+            "/v1/join-token/create",
+            serde_json::json!({"node_id": "node-7"})
+        ),
+    );
+
+    for (status, _) in [&create, &rotate, &revoke, &join] {
+        assert_eq!(*status, reqwest::StatusCode::GATEWAY_TIMEOUT);
+    }
+    assert!(create.1.contains("relish token list"), "{}", create.1);
+    assert!(rotate.1.contains("new secret"), "{}", rotate.1);
+    assert!(rotate.1.contains("relish token list"), "{}", rotate.1);
+    assert!(revoke.1.contains("safe"), "{}", revoke.1);
+    assert!(join.1.contains("expires"), "{}", join.1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

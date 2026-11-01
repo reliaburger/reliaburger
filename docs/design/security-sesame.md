@@ -852,8 +852,11 @@ $ relish --endpoint https://leader.example:9117 \
 `1..=3600`, requires the Admin role, generates the secret on the leader and
 commits only its SHA-256 hash, expiry and attestation mode through
 `RaftRequest::CreateJoinToken`. The response carries the plaintext once. A
-follower returns `503` without the plaintext; retrying against the elected
-leader cannot create an orphan credential.
+follower forwards the request with the caller's own credential (#1506) and
+generates nothing itself; the leader repeats every check. If the leader doesn't
+answer within 10 seconds the caller gets a `504`, and a token may have
+committed: only its hash, which nobody holds the plaintext for, so it can't be
+used and it expires by itself. A retired node id gets a `409`.
 
 1. The joining node connects to the current leader over TLS (server-authenticated only at this stage, using the root CA certificate that was provided alongside the join token or downloaded via a trust-on-first-use pinning step).
 2. The joining node presents the join token.
@@ -920,7 +923,8 @@ its token store, so the secret works there on the next request. A follower
 finds the record by hashing the secret in the leader's answer and waits up to
 two seconds for its replica to apply it. A follower lagging further answers
 anyway and gets the token from the five-second refresh, as every other node
-does.
+does. A leader that doesn't answer a forwarded create within 10 seconds gets
+the caller a `504`; the token may have committed with its secret lost.
 
 **Verification.** `sesame::auth::authenticate` turns away a bearer that
 doesn't have the token shape with a string check. Otherwise it hashes the
@@ -1056,8 +1060,10 @@ runtime, storage or observability startup in standalone mode.
 $ relish token rotate ci-deploy [--grace-hours 24]
 ```
 
-1. The node that takes `POST /v1/token/rotate {name, grace_hours}` generates a
-   new secret and hash, and reads the clock once.
+1. Only the leader mints. A follower forwards
+   `POST /v1/token/rotate {name, grace_hours}` with the caller's own credential
+   (#1506), and the leader repeats every check. The leader generates a new
+   secret and hash, and reads the clock once.
 2. It proposes `RaftRequest::RotateApiToken(TokenRotation)`, carrying the new
    SHA-256 digest, `rotated_at`, the new expiry (the token's previous lifetime
    length from now, or none) and `previous_valid_until` (now plus the grace,
@@ -1071,10 +1077,39 @@ $ relish token rotate ci-deploy [--grace-hours 24]
    authenticates as its own principal (the digest of its hash), so last use,
    audit events and browser sessions opened with it stay separate, and those
    sessions end when it does.
-5. The answering node installs the rotation in its own token store at once;
-   the others pick it up on their five-second refresh. The handler records a
-   `token.rotated` audit event with the caller and the grace end, never the
-   secret. Role, scope and the `[permission]` spec stay with the name.
+5. The node the client spoke to installs the rotation in its own token store
+   at once, by copying the stored record from its replica, so the record also
+   says what became of the old secret. A follower finds the record by hashing
+   the secret in the leader's answer and waits up to two seconds for its
+   replica. A follower lagging further answers anyway: the new secret gets a
+   `401` there, and the old one keeps working there even after a zero grace,
+   until its replica catches up. The others pick the rotation up on their
+   five-second refresh. The leader records a `token.rotated` audit event with
+   the caller and the grace end, never the secret. Role, scope and the
+   `[permission]` spec stay with the name.
+
+If the leader doesn't answer a forwarded rotation within 10 seconds the caller
+gets a `504`, and the rotation may have committed with its new secret lost.
+Rotating again isn't a clean retry: the lost secret becomes the previous one,
+so the secret clients still hold stops at once whatever the grace. The error
+says to check the token's created time in `relish token list` first.
+
+**Revocation (forwarded by #1506):** `POST /v1/token/revoke {name}` commits
+`RaftRequest::RevokeApiToken` on the leader; a follower forwards it with the
+caller's own credential. Authentication reads each node's token store, so the
+node the client spoke to also drops the token from its store before it answers
+(`drop_revoked_token`), by name, as the state machine does. It first waits up
+to two seconds for its replica to apply the removal, because the five-second
+refresh copies the replica over the store and would otherwise put the token
+back. The refresh leaves the store alone if the store changed after it read the
+replica (`replace_tokens_unless_changed`), which covers a refresh already in
+flight; it doesn't hold the store's lock across that read, because every
+authenticated request would then wait on the state machine's. A follower
+lagging past the two seconds still drops the token, but a refresh can restore
+it until its replica catches up, so the answer says the node is behind. The
+other nodes drop the token on their refresh, within five seconds. A forwarded
+revoke the leader doesn't answer within 10 seconds is a `504`, and repeating it
+is safe.
 
 **Expiry:** A token with a set `expires_at` is rejected at authentication time once that time has passed (a `401 token expired`). A token with no expiry is never rejected on age grounds. Revocation is explicit via `relish token revoke`.
 
