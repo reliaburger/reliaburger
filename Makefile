@@ -155,6 +155,7 @@ toml-demo: build ## Demo config tooling (lint, fmt, compile, diff)
 	./scripts/relish-toml-demo.sh
 
 test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping
+	python3 scripts/release/require_python.py
 	python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 	python3 -m unittest discover -s scripts/release -p 'test_*.py'
 
