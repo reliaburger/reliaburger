@@ -80,9 +80,20 @@ goes to stderr. `revoke` refuses to remove the last admin token; create its
 replacement first. Revoking a token, or letting it expire, also ends every
 dashboard session that was logged in with it.
 
-`create` works against any node: a follower forwards it to the leader. The
-new token works at once on the node you asked and on the leader, and on the
-others within about five seconds, so point a script at one node until then.
+`create`, `rotate`, `revoke` and `join-token create` work against any node: a
+follower forwards them to the leader, with your credential. A new token works
+at once on the node you asked and on the leader, and on the others within about
+five seconds, so point a script at one node until then.
+
+`revoke` is the same the other way round: the token stops at once on the node
+you asked and on the leader, and on the others within about five seconds. If
+the node you asked is more than two seconds behind the leader, the message says
+so, and that node may accept the token until it catches up.
+
+If the leader doesn't answer within 10 seconds you get a `504`, and the write
+may have happened anyway. Repeating a `revoke` is safe, and a lost join token
+expires by itself. Check `relish token list` before repeating a `create` or a
+`rotate`, because a secret may be lost (see Rotation below).
 
 ### Lifetimes
 
@@ -118,7 +129,13 @@ on stdout. The new secret works at once on the node you asked, and on the
 others within five seconds. The old one keeps working until the end of the
 grace period (stderr says when), so you can roll the new secret out to every
 client before the old one stops. After that, the old secret gets
-`401 token rotated`.
+`401 token rotated`. With `--grace-hours 0` the old secret stops at once on the
+node you asked and on the leader, and on the others within five seconds.
+
+If `rotate` answers `504`, the rotation may have happened with its new secret
+lost. Look at the token's `CREATED` time in `relish token list` before you run
+it again: a rotation moves that time, and a second rotation ends the old secret
+at once, whatever the grace, because only one previous secret is kept.
 
 What stays with the name: the role, the scope, any `[permission]` spec, and
 the lifetime (a 90-day token gets a fresh 90 days). What doesn't: dashboard
