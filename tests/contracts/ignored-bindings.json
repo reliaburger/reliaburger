@@ -1093,12 +1093,6 @@
   },
   {
     "source": "tests/oci_crash.rs",
-    "function": "three_enrolled_oci_nodes_converge_when_deleted_apps_are_reapplied_at_once",
-    "binary": "reliaburger::oci_crash",
-    "test": "three_enrolled_oci_nodes_converge_when_deleted_apps_are_reapplied_at_once"
-  },
-  {
-    "source": "tests/oci_crash.rs",
     "function": "managed_guest_startup_establishes_bpffs_before_bun",
     "binary": "reliaburger::oci_crash",
     "test": "managed_guest_startup_establishes_bpffs_before_bun"

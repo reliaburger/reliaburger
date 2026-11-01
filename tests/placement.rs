@@ -607,9 +607,7 @@ async fn app_instances(nodes: &[&Node], apps: &[&str]) -> Result<Vec<String>, St
 ///
 /// This guards the lifecycle only. Process nodes have no discovery journal,
 /// so the wedge itself can't happen here: its reproduction is the agent test
-/// `a_reapplied_app_under_a_new_vip_converges_without_a_restart`, and the
-/// same loop on real runc nodes is
-/// `three_enrolled_oci_nodes_converge_when_deleted_apps_are_reapplied_at_once`.
+/// `a_reapplied_app_under_a_new_vip_converges_without_a_restart`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn deleted_apps_reapplied_at_once_converge_every_cycle() {
