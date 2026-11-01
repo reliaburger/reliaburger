@@ -499,7 +499,19 @@ format from 70 to 72, and a 0.2.3 leader refuses `relish upgrade start v0.2.4`
 before it records a run.
 
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
-same steps and the same losses. The next release that keeps 0.2.4's pair can
+same steps and the same losses.
+
+### Upgrading from 0.2.4
+
+0.2.5 can't roll onto a 0.2.4 cluster. An init container's `env` is a new
+field in Raft desired state and node syncs, and `InitContainerSpec` refuses
+unknown fields, so a 0.2.4 node couldn't decode an app that sets it
+([#1498](https://github.com/reliaburger/reliaburger/issues/1498)). So the
+protocol moved from 55 to 56 and the state format from 72 to 73, and a 0.2.4
+leader refuses `relish upgrade start v0.2.5` before it records a run.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses. The next release that keeps 0.2.5's pair can
 roll from it, and it won't move a restarting node's replicas
 ([#1449](https://github.com/reliaburger/reliaburger/issues/1449)).
 

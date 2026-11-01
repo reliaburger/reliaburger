@@ -199,9 +199,16 @@ pub struct Compatibility {
 /// `CAP_SYS_ADMIN`, `CAP_SYS_BOOT` and `CAP_SYS_PTRACE` are escape hatches
 /// (#1474), in desired state, OCI specs, instance records and the node's
 /// knob allowlist.
+///
+/// 0.2.5, bugs an outside evaluation found (56/73): one bump for the whole
+/// release, made by its first wire or state change. Each later 0.2.5 change
+/// adds its line below this one, not another bump.
+/// An init container's `env` in Raft desired state and node syncs (#1498).
+/// `InitContainerSpec` refuses unknown fields, so a 0.2.4 node can't decode
+/// an app that sets it.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 55,
-    state: 72,
+    protocol: 56,
+    state: 73,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

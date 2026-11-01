@@ -332,6 +332,9 @@ pub struct InitContainer {
     /// Image to use. If None, inherits the parent app's image.
     pub image: Option<String>,
     pub command: Vec<String>,
+    /// Variables on top of the app's. A provider reference here narrows
+    /// placement to nodes that run the provider, as one in the app's does.
+    pub env: BTreeMap<String, EnvValue>,
 }
 
 /// Full specification for an App as consumed by the scheduler.

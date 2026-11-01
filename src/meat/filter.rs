@@ -68,10 +68,12 @@ impl WorkloadRequirements {
                 .collect(),
             requires_containers: (spec.exec.is_none() && spec.script.is_none())
                 || spec.init.iter().any(|init| init.image.is_some()),
-            // A sidecar's own env can name a provider too.
+            // A sidecar's or an init container's own env can name a
+            // provider too.
             secret_providers: spec
                 .env
                 .values()
+                .chain(spec.init.iter().flat_map(|init| init.env.values()))
                 .chain(spec.sidecar.iter().flat_map(|sidecar| sidecar.env.values()))
                 .filter_map(|value| value.provider_reference())
                 .map(|reference| reference.provider().clone())
@@ -526,6 +528,17 @@ mod tests {
         let plain: AppSpec = toml::from_str("image = \"api:1\"\n").unwrap();
         let anywhere = filter_nodes(&WorkloadRequirements::for_app(&plain, false), &cluster);
         assert_eq!(anywhere.len(), 3);
+
+        // #1498: an init container's own env names a provider the same way.
+        let init: AppSpec = toml::from_str(
+            "image = \"api:1\"\n[[init]]\ncommand = [\"migrate\"]\n\
+             env = { DB_PASSWORD = \"PROVIDER[aws:secret/db]\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            filter_nodes(&WorkloadRequirements::for_app(&init, false), &cluster),
+            vec![NodeId::new("aws")]
+        );
     }
 
     /// #1122: an app that asks for runtime knobs lands only on a node whose

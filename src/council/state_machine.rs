@@ -9256,6 +9256,7 @@ mod tests {
                 spec.init = vec![crate::config::app::InitContainerSpec {
                     image: Some("rbtest-run1/web:latest".into()),
                     command: vec![],
+                    env: Default::default(),
                 }];
             } else {
                 spec.image = Some("registry.example:5050/rbtest-run1/web:latest".into());
@@ -9298,6 +9299,7 @@ mod tests {
                     spec.init = vec![crate::config::app::InitContainerSpec {
                         image: Some(image.into()),
                         command: vec![],
+                        env: Default::default(),
                     }];
                 } else {
                     spec.image = Some(image.into());

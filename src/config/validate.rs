@@ -481,6 +481,7 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
     }
 
     validate_app_stop(name, app)?;
+    validate_app_inits(name, app)?;
     validate_app_sidecars(name, app)?;
 
     // Runtime knobs change a container's own kernel settings (#1122). A
@@ -546,6 +547,30 @@ fn validate_app_stop(name: &str, app: &super::app::AppSpec) -> Result<(), Config
             "an exec or script app's pre_stop runs on the host, where allowed_binaries \
              names programs by full path; start it with an absolute path",
         ));
+    }
+    Ok(())
+}
+
+/// Refuse an encrypted value in an init container's own `env` (#1498). The
+/// init's environment is built from the app's finished one, whose secrets
+/// are already decrypted, so its own values have no decryption step. One
+/// belongs in the app's `env`, which every init container inherits.
+fn validate_app_inits(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    for (index, init) in app.init.iter().enumerate() {
+        if let Some(variable) = init
+            .env
+            .iter()
+            .find_map(|(variable, value)| value.is_encrypted().then_some(variable))
+        {
+            return Err(ConfigError::Validation {
+                field: "init".to_string(),
+                context: format!("app {name:?}"),
+                reason: format!(
+                    "init container {index} env {variable:?} is encrypted; put it in the \
+                     app's env, which every init container inherits"
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -1633,6 +1658,29 @@ mod tests {
         )
         .unwrap();
         assert!(reason.contains("app's env"), "{reason}");
+    }
+
+    /// #1498: an init container's own env takes plain values and provider
+    /// references. An encrypted value belongs in the app's env, which the
+    /// init inherits, as with a sidecar.
+    #[test]
+    fn an_init_containers_env_validates_but_an_encrypted_value_is_refused() {
+        assert_eq!(
+            stop_refusal(
+                "image = \"web:v1\"\n[[init]]\ncommand = [\"wait\"]\n\
+                 env = { ADDR = \"frontend:80\", TOKEN = \"PROVIDER[vault:web/token]\" }\n"
+            ),
+            None
+        );
+        let (field, reason) = stop_refusal(
+            "image = \"web:v1\"\n[[init]]\ncommand = [\"wait\"]\nenv = { K = \"ENC[AGE:abc]\" }\n",
+        )
+        .unwrap();
+        assert_eq!(field, "init");
+        assert!(
+            reason.contains("init container 0") && reason.contains("app's env"),
+            "{reason}"
+        );
     }
 
     #[test]
