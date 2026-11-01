@@ -51,6 +51,15 @@ jobs:
           mkdir -p docs/website/demo
           cp examples/kubernetes/podinfo.yaml docs/website/demo/podinfo.yaml
           tar -czf docs/website/demo/burger.tar.gz -C examples/demo burger
+      - name: Stamp the released version into the feedback page
+        # "early in development at 0.2" follows the release install.sh
+        # installs, shown as major.minor.
+        run: |
+          tag=$(sed -n 's/.*RELIABURGER_VERSION:-\(v[0-9][0-9.]*\)}.*/\1/p' docs/website/install.sh)
+          minor=$(echo "${tag#v}" | cut -d. -f1,2)
+          test -n "$minor"
+          sed -i "s|<span data-release-minor>[^<]*</span>|<span data-release-minor>$minor</span>|" docs/website/feedback/index.html
+          grep -q "<span data-release-minor>$minor</span>" docs/website/feedback/index.html
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
