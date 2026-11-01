@@ -467,13 +467,35 @@ fn node_capacity(config: &NodeConfig) -> (u32, u32) {
 ///
 /// Called on startup and every few seconds after, so a token created via
 /// `relish token create` reaches this node without restarting the agent. The
-/// node that answered the create already has it.
+/// node that answered a create, rotate or revoke has already changed its
+/// store itself.
 async fn refresh_token_store(
     store: &reliaburger::sesame::auth::TokenStore,
     council: &reliaburger::council::CouncilNode,
 ) {
-    let tokens = council.security_state().await.api_tokens;
-    *store.write().await = tokens;
+    let seen = store.read().await.clone();
+    let tokens = council.api_tokens().await;
+    replace_tokens_unless_changed(store, &seen, tokens).await;
+}
+
+/// Replace the store's tokens, unless the store no longer holds `seen`, what
+/// it held before `tokens` was read from the replica.
+///
+/// A handler that changed the store in between has newer news than `tokens`,
+/// and writing them over it could put a revoked token back for five seconds,
+/// so this tick does nothing and the next one catches up. Comparing here
+/// avoids holding the store's write lock across the replica read, which waits
+/// for Raft's apply and snapshot builds, with every authenticated request
+/// queued behind it.
+async fn replace_tokens_unless_changed(
+    store: &reliaburger::sesame::auth::TokenStore,
+    seen: &[reliaburger::sesame::types::ApiToken],
+    tokens: Vec<reliaburger::sesame::types::ApiToken>,
+) {
+    let mut current = store.write().await;
+    if current.as_slice() == seen {
+        *current = tokens;
+    }
 }
 
 /// Reserve a port without accepting connections during cluster bootstrap.
@@ -4622,6 +4644,40 @@ mod tests {
         let tokens = store.read().await;
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].name, "ci");
+    }
+
+    /// #1506: a refresh reads the replica first and writes the store second.
+    /// A revoke that lands between the two must not be undone, or the revoked
+    /// token works here for another five seconds.
+    #[tokio::test]
+    async fn a_refresh_that_read_before_a_revoke_leaves_the_store_alone() {
+        let revoked = create_token("ci", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        let root = create_token("root", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        let store = reliaburger::sesame::auth::new_token_store();
+        *store.write().await = vec![root.token.clone(), revoked.token.clone()];
+
+        // What the refresh saw and read before the revoke, then the revoke.
+        let seen = store.read().await.clone();
+        let replica_before_the_revoke = seen.clone();
+        store.write().await.retain(|token| token.name != "ci");
+
+        replace_tokens_unless_changed(&store, &seen, replica_before_the_revoke).await;
+
+        let tokens = store.read().await;
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].name, "root");
+    }
+
+    /// The ordinary tick: nothing touched the store, so the replica wins.
+    #[tokio::test]
+    async fn a_refresh_replaces_a_store_nothing_changed() {
+        let created = create_token("ci", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        let store = reliaburger::sesame::auth::new_token_store();
+        let seen = store.read().await.clone();
+
+        replace_tokens_unless_changed(&store, &seen, vec![created.token.clone()]).await;
+
+        assert_eq!(*store.read().await, vec![created.token]);
     }
 
     /// A config with require_mtls but no identity on disk.

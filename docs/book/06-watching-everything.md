@@ -1270,6 +1270,120 @@ make an app block when Bun is slow. The issue also asked about the soak's own
 export directory, which grows about 600 MiB a day on each node. That's the
 harness's to bound, and it stays open in #1418.
 
+### The tail that stopped
+
+`relish logs soak-redis-client --tail 20` answered `INCR 1628` on 30 October
+2026, 27 minutes into a day-long run. It gave the same answer for the next
+21 hours, while the app counted past seven thousand and beyond.
+`soak-writer` froze at `ACK 61022` an hour and a half later. No warning, no
+error, twenty tidy lines.
+
+Which part of the path would you blame? We blamed the query. A tail is a
+`SELECT ... ORDER BY sequence DESC LIMIT n` across a Parquet directory, and
+DataFusion's top-k plan shares a filter between partitions and prunes files
+with it. Picking the wrong file after a rotation sounded right, and the freeze
+times differing by app sounded like a size threshold. So we wrote the test: a
+chatty app and a quiet one, forty flushes, row groups splitting every file, a
+tail after each flush. It passed. At the soak's real rates for 150 simulated
+minutes on four partitions, it passed. It passes today, along with
+`tail_crosses_parquet_a_flush_in_flight_and_the_buffer` and
+`tail_survives_the_oldest_files_being_pruned`. The query was never wrong.
+
+The run's evidence directory settled it. Every check lists each node's files,
+and after 18:49 on the first evening no node wrote another log file:
+
+| Node | Runs | Last Parquet file | Written by |
+|---|---|---|---|
+| 1 | `soak-redis-client`, `soak-spammer` | `logs_000120` | 18:49 |
+| 2 | `soak-writer` | `logs_000120` | 18:49 |
+| 3 | `soak-redis` | `logs_000025` | 18:24 |
+
+A flush with an empty buffer writes nothing, so the store wasn't failing to
+write. It had nothing to write. And the same run's other mystery fell out: node 1
+ended with 858 MiB of instance storage against 9 MiB on node 2. That's the
+spammer's capture, which [Giving the disk back](#giving-the-disk-back) can only
+reclaim once a flush has stored it. The lines were reaching the capture files
+and stopping there.
+
+Here's what stopped them, in the Runc follower:
+
+```rust
+terminal = match &context {
+    Some(context) => !matches!(
+        context.role_state(RuntimeRole::Launcher).await,
+        Ok(Some(CommandState::Running { .. }))
+    ),
+    None => true,
+};
+```
+
+"Not `Ok(Running)`" lumps two very different answers together. `Ok(Retired)`
+is the owner saying the workload is gone. `Err(..)` is us failing to find out.
+`role_state` asks the instance's owner process over a Unix socket, the owner
+serves one client at a time, and each request gets two seconds. The follower
+asks five times a second. On a four-vCPU VM running 23,000 host jobs a second,
+it only takes one answer in several hours to miss that deadline. The follower
+reads the error as the end of the workload, finishes, and returns. Nothing
+starts it again until the instance or Bun restarts. That fits the eight-hour soak never
+seeing this: its faults restart Bun all the time, at a sixteenth of the job
+rate. Only a
+quiet cluster with no faults could keep a dead forwarder dead for a day.
+
+The process runtime had the same mistake in a shorter form, `Err(_) => return`,
+which let us reproduce it on any machine.
+`a_failed_state_check_keeps_a_running_instance_in_the_log_store` follows a real
+capture through four flushes and makes one state check fail. It failed on the
+first one, with "the follower ended while its instance ran", and passes now.
+
+The fix is to stop treating "I don't know" as "no". The Runc loop moved into
+`capture::follow_capture`, which the compiler lets every platform build and
+test, and it takes its check as a closure:
+
+```rust
+pub async fn follow_capture<Checked>(
+    mut readers: [CaptureReader; 2],
+    sender: mpsc::Sender<CapturedLine>,
+    limit: Duration,
+    mut running: impl FnMut() -> Checked,
+) where
+    Checked: Future<Output = io::Result<bool>>,
+```
+
+If you're coming from Go, the closure is a `func() (bool, error)`. The generic
+`Checked` exists because every `async` block has its own anonymous type, so a
+function can't spell it out; it can only say "some future that produces an
+`io::Result<bool>`". `Ok(false)` ends the follow, `Ok(true)` carries on, and an
+`Err` is news of nothing.
+
+Could a follower now run forever? It could, for an instance whose records have
+been deleted, because no check will ever answer for it. So a failed check has
+two ways out. If the capture files have gone, the instance was cleaned up and
+the follower stops at once. Otherwise `SourceWatch` starts a ten-minute clock,
+and any answer or any new output stops it. A workload that keeps writing is
+never dropped, however broken its owner is. Only one that's silent *and*
+unaccountable for ten minutes is let go, and that one leaves a line in Bun's
+log, because the old exit said nothing at all and that silence cost us two
+releases. The same patience covers the follower's first step, which could
+fail the same way and leave an instance out of the store from birth.
+
+Why not restart a dead forwarder from a supervisor? That'd need a second loop
+to notice that a task has gone, and still a rule for when not to restart it.
+The rule is the hard part, and the follower already has what it needs to apply
+it.
+
+One thing still looks odd. `--since 3m` returned current lines, which is what
+pointed us at the query. It only looked healthy. The store had
+nothing that recent, so `relish logs` fell back to the agent's plain-text
+endpoint, which reads the capture file directly and ignores `start`. So on
+the node holding the instance, a window of three minutes printed everything
+the capture had kept, and the newest line was indeed new.
+
+We never saw the failed check itself: the journal the run kept starts about
+19 hours later, and the old exit logged nothing anyway. So the chain is strong
+rather than proven. The stores stopped, the captures didn't, and this is the
+one way out of the loop while an instance runs. The next long run's `--tail`
+is the check that closes it.
+
 ## When nothing looks like success
 
 Both hardening passes share a pattern, and later reviews kept finding more of it: a failure that comes back dressed as an empty, successful answer. A directory called `blocked.parquet` made the exporter and both retention loops report success. A peer that sent `200 OK` and then went quiet hung a log query. A node that answered `{}` convinced the diagnostic collector there were no alerts. None of these crash. They lie quietly, which is worse.
@@ -1359,6 +1473,44 @@ The `if` after the pattern is a *match guard*: the arm only matches when the pat
 
 `ExportBusy` also turned up where nobody was exporting. `checkpoint_retains_only_live_source_generations_across_restart` exports twice in a row, and in a full `cargo test --test suite` run the second export was refused as busy in four runs out of six (#519). It was the same `flock` quirk that Chapter 9 describes for quickstart operations. The lock belongs to the open file description, and a child process that another thread is halfway through spawning holds a copy of it until its `exec`. Closing our descriptor didn't release the lock, so the export straight after found it held. The lock became an `ExportLock` whose `Drop` calls `unlock()` before the file closes, which releases it for every copy at once. Today it's the shared `file_lock::FileLock` that Chapter 9 describes, which every file lock in the codebase uses. In production that was a spurious skip or a 100 ms wait, since Bun spawns workloads while it exports. In a test it was a failure.
 
+### Whose disk is `./archive`?
+
+The manual had two lines that read like one thought:
+
+```sh
+relish logs-export --dest ./archive
+relish logs-search ./archive "SELECT count(*) FROM logs WHERE line LIKE '%error%'"
+```
+
+Run them on a laptop, against a node somewhere else, and see what happens. The first line prints `agent exported 1 file(s) (2399 bytes) to ./archive/local`, and the files are real. They're just on the node, in `./archive` relative to wherever Bun happened to start. The second line runs on your laptop, where there's no such directory. Our own test caught it in the act: the first failing run left an `archive/` folder in the repository root, because that was the working directory of the agent under test.
+
+Remember the endpoint from earlier in this chapter, `POST /v1/logs/export`? We'd moved the work to the agent so that it could use the store's real path and its credentials. That was right for `s3://`. For a bare path it quietly changed whose disk the path meant, and every word the CLI printed still looked local.
+
+There were two ways out. We could keep the files on the node and make the output say so, or make `--dest` mean what it looks like. A flag that takes `./archive` from a shell on your machine has only one sensible reading, and the second option turned out to cost two small read-only routes, so that's what we did. `GET /v1/logs/archive` lists the node's flushed Parquet files with each one's size and SHA-256, and `GET /v1/logs/archive/{name}` streams one. Relish writes them under `./archive/<node>/`. `s3://` and `gs://` still go to the agent, because it's the one holding the credentials.
+
+Three decisions in there are worth a look.
+
+**A copy isn't an export.** The checkpoint is what licenses pruning, so `relish logs-export` must not touch it: a file on someone's laptop is no reason for a node to delete its only copy. So how does a repeat run skip what it already has, with no checkpoint? We gave the files the names an export gives them, `{sha256}-{filename}`. A name with its hash in it answers the question by itself: if the file exists, those are the bytes. That only holds if a half-written file can never take the name, so Relish writes to a hidden `.partial` file, checks the size and hash, syncs, and only then renames.
+
+**Neither side trusts the other's paths.** The API refuses any name that isn't a single `.parquet` path component, so `_export_checkpoint.json` and `../escape.parquet` get a 400. Relish does the same in the other direction, because the node's name and the file names in the listing are about to become local paths:
+
+```rust
+let mut components = Path::new(&listing.node_id).components();
+let one_name = matches!(components.next(), Some(Component::Normal(_)));
+if !one_name || components.next().is_some() {
+    return Err(archive_error(format!(
+        "the agent gave an unusable node name: {:?}",
+        listing.node_id
+    )));
+}
+```
+
+`Path::components` splits a path the way the operating system would, into an enum with variants like `Normal`, `ParentDir` and `RootDir`, so `..` and `/tmp/x` can't be mistaken for names. `matches!` is a macro that turns a pattern into a `bool`. In Go you'd compare strings against `".."` and hope you'd thought of every spelling; here the type did the thinking.
+
+**The archive's routes refuse a scoped token, even an Admin one.** `/v1/logs/query/{app}/{namespace}` can filter by tenant. A Parquet file can't: it's every tenant's lines in one blob. So these routes call `require_unscoped`, as `/v1/logs/sql` does. We also audit the listing as `logs.exported`, the same action the `POST` records, so moving the work to a `GET` didn't take it off the trail. The audit layer mostly records writes, so this is the one read it records; the files that follow each listing would only add noise. An Admin who already knows a file's name can fetch it without a listing, so this is a record of the normal path, not a wall.
+
+Getting the files to the right machine wasn't the end of it. The end-to-end test copied them, ran the manual's second line, and got back `{"errors":0}`. No error at all. DataFusion's `listing_table_ignore_subdirectory` defaults to `true`, and an export files everything one level down in `<node>/`, so the search looked in `./archive`, found no Parquet directly in it and reported, accurately, zero rows. Chapter 11's example got away with this by pointing at `/tmp/backup/node-1/`; the manual never did. Both query paths now set it to `false`, so a search of an archive's root sees every node in it. A test that stopped at "the files arrived" would have shipped a manual that printed the wrong answer, which is worse than the error we started with.
+
 ### Errors that used to vanish
 
 Retention in the metrics and rollup stores ignored `remove_file` errors and counted the file as deleted anyway; now only successful removals count. The exporter forgives exactly one read failure, `NotFound`, because retention can delete a file between listing the directory and opening it.
@@ -1441,7 +1593,7 @@ Almost everything in this chapter is a pure data transform: a sample becomes a `
 The three subsystems carry their own tests at the bottom of each source file:
 
 - **Mayo (metrics):** Arrow schema validation, DataFusion SQL over the metrics table, Parquet round-trips, Prometheus text parsing, and the alert state machine. The alert tests read like the transition table itself — `inactive_to_pending_on_breach`, `pending_to_firing_after_duration`, `firing_to_inactive_on_recovery`, `pending_to_inactive_on_recovery`, `missing_metric_does_not_fire`. Each builds an evaluator, feeds it a metric value, and asserts the resulting state. The hardening work added a matching set of failure-path tests, one per edge from the previous section: `query_metric_name_injection_is_neutralised` and `app_metrics_name_injection_cannot_bypass_predicate` (the SQL escape), `resent_window_does_not_double_count` and `restart_resumes_flush_counter_without_clobbering` (idempotent, durable rollups), `stale_telemetry_does_not_resolve_a_firing_alert` (the value-not-boolean state machine), `slack_payload_matches_provider_shape` and `pagerduty_payload_matches_events_v2_shape` (the provider webhook contracts), and `query_proceeds_during_flush` plus `corrupt_parquet_file_does_not_fail_query` (the off-lock flush and corrupt-file skip). Each names the failure it prevents. The streaming work added `every_read_matches_the_eager_golden_answers` and `every_rollup_read_matches_the_eager_golden_answers` (the answers recorded before the change), `streamed_reads_match_the_eager_reader` (the property test), and `a_disjunction_narrows_to_the_hull_of_its_sides` with its neighbours in `scan.rs`, which plan real SQL and check the bounds the scan receives. The memory tests live in their own binary, `tests/mayo_memory.rs`, because they replace the global allocator, and they need a process each (nextest's default) because the counters are process-wide.
-- **Ketchup (logs):** `append_and_query`, grep/tail/time-range filters, and the SQL path (`app` filter, time range, `LIKE` grep, `LIMIT`). The log-path hardening added a matching set of failure tests, one per edge above: `bounded_sql_rejects_non_select`, `bounded_sql_rejects_other_tables` and `bounded_sql_caps_returned_rows` (the seatbelt on `/v1/logs/sql`); `unreachable_node_is_a_partial_failure` and `grep_value_with_ampersand_and_question_mark_transmitted_intact` (honest, correctly-encoded fan-out); `identical_lines_from_two_replicas_both_survive` and `repeated_identical_lines_from_one_node_both_survive` (the `(node, sequence)` dedup identity); `tail_returns_the_newest_lines_in_emission_order`, `lines_within_one_second_keep_emission_order_across_flushes` and `lines_sharing_a_second_come_back_in_sequence_order` (the V02 ordering bugs); `restart_does_not_reingest_lines_already_flushed`, `lines_lost_with_the_buffer_are_ingested_again_after_a_crash` and `refollowing_a_capture_file_replays_the_same_positions_and_the_store_keeps_one_copy` (exactly-once ingestion across restarts); `logs_from_several_instances_name_each_line_s_instance` (labelled tails); `reused_filename_with_new_contents_is_not_skipped` (durable checkpoint ids); and `flush_shared_persists_the_buffer_on_shutdown` (the final flush on stop).
+- **Ketchup (logs):** `append_and_query`, grep/tail/time-range filters, and the SQL path (`app` filter, time range, `LIKE` grep, `LIMIT`). The log-path hardening added a matching set of failure tests, one per edge above: `bounded_sql_rejects_non_select`, `bounded_sql_rejects_other_tables` and `bounded_sql_caps_returned_rows` (the seatbelt on `/v1/logs/sql`); `unreachable_node_is_a_partial_failure` and `grep_value_with_ampersand_and_question_mark_transmitted_intact` (honest, correctly-encoded fan-out); `identical_lines_from_two_replicas_both_survive` and `repeated_identical_lines_from_one_node_both_survive` (the `(node, sequence)` dedup identity); `tail_returns_the_newest_lines_in_emission_order`, `lines_within_one_second_keep_emission_order_across_flushes` and `lines_sharing_a_second_come_back_in_sequence_order` (the V02 ordering bugs); `a_failed_check_does_not_end_the_follow` and `a_failed_state_check_keeps_a_running_instance_in_the_log_store` (a follower that only stops on evidence); `restart_does_not_reingest_lines_already_flushed`, `lines_lost_with_the_buffer_are_ingested_again_after_a_crash` and `refollowing_a_capture_file_replays_the_same_positions_and_the_store_keeps_one_copy` (exactly-once ingestion across restarts); `logs_from_several_instances_name_each_line_s_instance` (labelled tails); `reused_filename_with_new_contents_is_not_skipped` (durable checkpoint ids); and `flush_shared_persists_the_buffer_on_shutdown` (the final flush on stop).
 - **Brioche (dashboard):** HTML rendering, and two security-flavoured tests worth calling out — `render_app_detail_escapes_html` (no stored-XSS through an app name) and `render_app_detail_masks_encrypted_env` (a secret never reaches the page). These are unit tests because the renderer is a pure function from data to a string; you assert on the string.
 
 ### End-to-end: the demo script

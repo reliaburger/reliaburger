@@ -316,9 +316,9 @@ async fn export_logs_locked(
 
         // Include the generation in the object key, not only the checkpoint.
         // Keep the Parquet extension so archive queries discover every generation.
-        let key = node_prefix.clone().join(format!(
-            "{}-{filename}",
-            hex::encode(Sha256::digest(&contents))
+        let key = node_prefix.clone().join(archive_object_name(
+            &hex::encode(Sha256::digest(&contents)),
+            &filename,
         ));
         let len = contents.len() as u64;
         store
@@ -337,6 +337,103 @@ async fn export_logs_locked(
     Ok(result)
 }
 
+/// One Parquet file in a node's log store, as `GET /v1/logs/archive` lists it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveFile {
+    /// The file's name in the store, `logs_NNNNNN.parquet`.
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// The hex SHA-256 of its contents.
+    pub sha256: String,
+}
+
+/// A node's flushed log files, for `relish logs-export` to copy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveListing {
+    /// The node that holds these files. An archive is filed under this name.
+    pub node_id: String,
+    /// Every flushed Parquet file, sorted by name.
+    pub files: Vec<ArchiveFile>,
+}
+
+/// Whether `name` could be a flushed file in a log store: one path component
+/// ending in `.parquet`. The API checks this before it opens a file, and
+/// Relish checks it before it writes one, since neither trusts the other's
+/// idea of a path.
+pub fn is_archive_file_name(name: &str) -> bool {
+    name.len() > ".parquet".len()
+        && name.ends_with(".parquet")
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\'])
+}
+
+/// The name a file takes in an archive: its hash, then its name in the store.
+///
+/// A store reuses names once retention empties it, so the hash keeps two
+/// generations apart, and it means a file already in an archive is the right
+/// one. It keeps the Parquet extension so archive queries discover it.
+pub fn archive_object_name(sha256: &str, filename: &str) -> String {
+    format!("{sha256}-{filename}")
+}
+
+/// List the flushed Parquet files in `source_dir`, hashing each one.
+///
+/// This reads every file, so it runs off the runtime. It takes no checkpoint
+/// lock and writes nothing: copying a file out of a store is not exporting it,
+/// and only an export may license pruning. Anything that isn't a regular file
+/// is left out, and so is a file retention removes while we're looking.
+pub async fn list_archive(
+    source_dir: &Path,
+    node_id: &str,
+) -> Result<ArchiveListing, KetchupError> {
+    let directory = source_dir.to_path_buf();
+    let files = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !is_archive_file_name(&name) || !entry.file_type()?.is_file() {
+                continue;
+            }
+            match hash_archive_file(&entry.path()) {
+                Ok((size, sha256)) => files.push(ArchiveFile { name, size, sha256 }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        files.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok::<_, std::io::Error>(files)
+    })
+    .await
+    .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))??;
+    Ok(ArchiveListing {
+        node_id: node_id.to_string(),
+        files,
+    })
+}
+
+/// The size and hex SHA-256 of a file, read in pieces: a store can hold more
+/// than we'd want in memory at once.
+fn hash_archive_file(path: &Path) -> std::io::Result<(u64, String)> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0_u8; 256 * 1024];
+    let mut size = 0_u64;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            return Ok((size, hex::encode(hash.finalize())));
+        }
+        size += count as u64;
+        hash.update(&buffer[..count]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -344,6 +441,58 @@ async fn export_logs_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_file_names_are_one_parquet_path_component() {
+        assert!(is_archive_file_name("logs_000000.parquet"));
+        for name in [
+            "",
+            ".parquet",
+            ".hidden.parquet",
+            "..",
+            "_export_checkpoint.json",
+            "logs_000000.parquet.tmp",
+            "../logs_000000.parquet",
+            "nested/logs_000000.parquet",
+            "nested\\logs_000000.parquet",
+        ] {
+            assert!(!is_archive_file_name(name), "{name:?}");
+        }
+    }
+
+    /// The listing is what a copy trusts, so it holds only finished log
+    /// files: no flush in progress, no checkpoint, no symlink out of the
+    /// store. And it's a read: the checkpoint and its lock stay absent.
+    #[tokio::test]
+    async fn archive_listing_holds_only_flushed_files_and_writes_nothing() {
+        let store = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(store.path().join("logs_000001.parquet"), b"second").unwrap();
+        std::fs::write(store.path().join("logs_000000.parquet"), b"abc").unwrap();
+        std::fs::write(store.path().join("logs_000002.parquet.tmp"), b"half").unwrap();
+        std::fs::create_dir(store.path().join("nested.parquet")).unwrap();
+        let secret = outside.path().join("secret.parquet");
+        std::fs::write(&secret, b"secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret, store.path().join("link.parquet")).unwrap();
+
+        let listing = list_archive(store.path(), "node-1").await.unwrap();
+
+        assert_eq!(listing.node_id, "node-1");
+        let names: Vec<&str> = listing
+            .files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect();
+        assert_eq!(names, ["logs_000000.parquet", "logs_000001.parquet"]);
+        assert_eq!(listing.files[0].size, 3);
+        assert_eq!(
+            listing.files[0].sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(!store.path().join(CHECKPOINT_FILENAME).exists());
+        assert!(!store.path().join("_export_checkpoint.lock").exists());
+    }
 
     // The durable id and export scope are stored in the checkpoint, so a
     // changed digest would re-export every file. Pin both to known answers.

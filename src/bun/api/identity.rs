@@ -188,9 +188,15 @@ pub(super) async fn token_list_handler(
 }
 
 /// Revoke an API token by name via Raft.
+///
+/// Only the leader writes, so a follower forwards the request with the
+/// caller's own credential and the leader repeats every check. Either way the
+/// token stops working on the node that answered before the caller hears
+/// back; see [`drop_revoked_token`].
 pub(super) async fn token_revoke_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     if let Err(resp) =
@@ -234,6 +240,24 @@ pub(super) async fn token_revoke_handler(
             .into_response();
     };
 
+    if let Some(council) = crate::bun::task_array_api::council_to_forward_to(&state).await {
+        let answer = forward_token_write(
+            &state,
+            council,
+            "/v1/token/revoke",
+            body,
+            &headers,
+            "the leader didn't answer in time, so the revoke may or may not have committed; \
+             revoking again is safe",
+        )
+        .await;
+        if answer.status() != StatusCode::OK {
+            return answer;
+        }
+        let message = drop_revoked_token(&state, council, &req.name).await;
+        return Json(serde_json::json!({ "message": message })).into_response();
+    }
+
     match council
         .write(crate::council::RaftRequest::RevokeApiToken {
             name: req.name.clone(),
@@ -246,6 +270,7 @@ pub(super) async fn token_revoke_handler(
         )
             .into_response(),
         Ok(_) => {
+            let message = drop_revoked_token(&state, council, &req.name).await;
             record_caller_audit(
                 &state,
                 auth.as_deref(),
@@ -255,8 +280,7 @@ pub(super) async fn token_revoke_handler(
                 format!("API token {} revoked", req.name),
             )
             .await;
-            Json(serde_json::json!({ "message": format!("token {} revoked", req.name) }))
-                .into_response()
+            Json(serde_json::json!({ "message": message })).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -393,27 +417,16 @@ pub(super) async fn token_create_handler(
         // an existing name. It repeats the checks above with the caller's
         // credential, so forwarding grants nothing.
         if let Some(council) = crate::bun::task_array_api::council_to_forward_to(&state).await {
-            let answer = match tokio::time::timeout(
-                LEADER_FORWARD_TIMEOUT,
-                crate::bun::batch::forward_to_leader(
-                    &state,
-                    council,
-                    "/v1/token/create",
-                    body,
-                    &headers,
-                ),
+            let answer = forward_token_write(
+                &state,
+                council,
+                "/v1/token/create",
+                body,
+                &headers,
+                "the leader didn't answer in time; the token may have committed with its \
+                 secret lost, so check `relish token list` before creating it again",
             )
-            .await
-            {
-                Ok(answer) => answer,
-                Err(_) => {
-                    return (
-                        StatusCode::GATEWAY_TIMEOUT,
-                        Json(serde_json::json!({ "error": "leader request timed out" })),
-                    )
-                        .into_response();
-                }
-            };
+            .await;
             return install_forwarded_token(&state, council, answer).await;
         }
         None
@@ -567,23 +580,94 @@ pub(super) async fn token_create_handler(
     .into_response()
 }
 
-/// How long a follower waits for the leader to answer a forwarded create.
-/// Longer than the 5 s the apply path allows, because the leader may spend 3 s
-/// proving it leads before it even writes. Timing out here costs the caller
-/// the secret of a token that may have committed, so it's only a backstop.
+/// How long a follower waits for the leader to answer a forwarded token or
+/// join-token write. Longer than the 5 s the apply path allows, because the
+/// leader may spend 3 s proving it leads before it even writes.
+///
+/// It's only a backstop, because the write may have committed anyway and
+/// what that costs depends on the route, which is why each caller of
+/// [`forward_token_write`] says so in its own error:
+///
+/// - a create or a rotation loses the only copy of the new secret;
+/// - a revoke loses nothing: it's safe to repeat;
+/// - a join token leaves a hash nobody has the plaintext for, which expires.
 const LEADER_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long a follower waits for its own replica to apply a token the leader
-/// committed. Replication takes a few heartbeats; a node lagging further than
-/// this answers anyway and gets the token from its next periodic refresh.
+/// How long the answering node waits for its own replica to apply a write the
+/// leader committed. Replication takes a few heartbeats. The write has
+/// committed either way, so a node lagging further than this still answers,
+/// and until its replica catches up and the next periodic refresh runs:
+///
+/// - a created or rotated secret gets a `401` here, and the caller still has it;
+/// - the old secret of a rotation without grace keeps working here;
+/// - a revoked token is out of the store, but a refresh from the lagging
+///   replica can bring it back, so the answer says the node is behind.
 const TOKEN_REPLICATION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Install a committed token in this node's auth store now, so its secret
-/// works on the next request here instead of after the next periodic refresh
-/// from Raft (every 5 seconds). Other nodes pick it up on theirs.
+/// Forward a token or join-token write to the leader with the caller's own
+/// credential, so the leader repeats every check and forwarding grants
+/// nothing. `timed_out` is the error for a leader that doesn't answer within
+/// [`LEADER_FORWARD_TIMEOUT`]: it has to say what the caller may have lost.
+async fn forward_token_write(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    path: &str,
+    body: String,
+    headers: &HeaderMap,
+    timed_out: &str,
+) -> Response {
+    let forward = crate::bun::batch::forward_to_leader(state, council, path, body, headers);
+    match tokio::time::timeout(LEADER_FORWARD_TIMEOUT, forward).await {
+        Ok(answer) => answer,
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({ "error": timed_out })),
+        )
+            .into_response(),
+    }
+}
+
+/// Take a committed revoke's token out of this node's auth store now, instead
+/// of leaving it working until the next periodic refresh from Raft (every 5
+/// seconds), and return the message for the caller. Other nodes drop it on
+/// their refresh.
+///
+/// The order matters. A refresh copies the replica over the store, so taking
+/// the token out while the replica still holds it could be undone a moment
+/// later. Waiting for the replica first means a refresh that starts after
+/// this finds the token gone, and the refresh leaves the store alone when
+/// this runs in the middle of one. Like the state machine, this goes by name.
+async fn drop_revoked_token(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    name: &str,
+) -> String {
+    let applied = council
+        .api_token_removal_applied(name, TOKEN_REPLICATION_WAIT)
+        .await;
+    if let Some(store) = &state.token_store {
+        // The write lock covers one in-memory update; it's never held across I/O.
+        store.write().await.retain(|token| token.name != name);
+    }
+    if applied {
+        format!("token {name} revoked")
+    } else {
+        format!(
+            "token {name} revoked, but this node's replica is behind: it may accept the \
+             token again until it catches up"
+        )
+    }
+}
+
+/// Install a committed token, new or rotated, in this node's auth store now,
+/// so its secret works on the next request here instead of after the next
+/// periodic refresh from Raft (every 5 seconds). Other nodes pick it up on
+/// theirs.
 ///
 /// The record comes from this node's own replica, not from the request, so
-/// a refresh that reads the replica after this finds the same token.
+/// a refresh that reads the replica after this finds the same token. For a
+/// rotation that record also says what became of the old secret: it keeps
+/// its grace period, or stops here at once when there is none.
 async fn install_committed_token(
     state: &ApiState,
     council: &crate::council::CouncilNode,
@@ -600,16 +684,17 @@ async fn install_committed_token(
     };
     // The write lock covers one in-memory update; it's never held across I/O.
     let mut tokens = store.write().await;
-    // A name can already be here: a token revoked since the last refresh, or
-    // this one if the refresh got there first.
+    // A name can already be here: a token revoked since the last refresh, the
+    // one a rotation replaces, or this one if the refresh got there first.
     match tokens.iter_mut().find(|known| known.name == token.name) {
         Some(known) => *known = token,
         None => tokens.push(token),
     }
 }
 
-/// Hand the leader's answer to a forwarded create back to the caller, first
-/// installing the new token here, on the node the caller will talk to next.
+/// Hand the leader's answer to a forwarded create or rotation back to the
+/// caller, first installing the token here, on the node the caller will talk
+/// to next.
 ///
 /// The leader's answer holds the plaintext and no stored record, so the
 /// secret's hash is what finds the record in this node's replica. A refusal
@@ -661,25 +746,6 @@ fn unix_seconds(at: std::time::SystemTime) -> u64 {
         .as_secs()
 }
 
-/// Install a committed rotation in this node's auth store now, so the new
-/// secret works on the next request here instead of after the next periodic
-/// refresh from Raft (every 5 seconds). Other nodes pick it up on theirs.
-async fn apply_rotation_locally(state: &ApiState, rotation: &crate::sesame::types::TokenRotation) {
-    let Some(store) = &state.token_store else {
-        return;
-    };
-    // The write lock covers one in-memory update; it's never held across I/O.
-    let mut tokens = store.write().await;
-    // Skip a token the periodic refresh already brought up to date, or the
-    // new secret would be installed over itself and the old one lost.
-    if let Some(token) = tokens
-        .iter_mut()
-        .find(|token| token.name == rotation.name && token.token_hash != rotation.token_hash)
-    {
-        crate::sesame::token::apply_rotation(token, rotation);
-    }
-}
-
 /// Give an API token a new secret under the same name (F05 I3).
 ///
 /// The new secret works at once. The old one keeps working for the grace
@@ -688,9 +754,14 @@ async fn apply_rotation_locally(state: &ApiState, rotation: &crate::sesame::type
 /// secret is its own principal, so browser sessions opened with it end with
 /// it. The token's role, scope and `[permission]` spec stay with the name.
 /// Rotating the last Admin is fine: the store keeps the same Admin.
+///
+/// Only the leader mints, so a follower forwards the request with the
+/// caller's own credential before it reads its replica, and installs the
+/// result from that replica once the leader answers.
 pub(super) async fn token_rotate_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     if let Err(resp) =
@@ -748,6 +819,23 @@ pub(super) async fn token_rotate_handler(
         )
             .into_response();
     };
+    if let Some(council) = crate::bun::task_array_api::council_to_forward_to(&state).await {
+        // Rotating again after a lost answer isn't a clean retry: the first
+        // rotation made its secret the previous one, so the second ends the
+        // secret clients still hold at once, grace or no grace.
+        let answer = forward_token_write(
+            &state,
+            council,
+            "/v1/token/rotate",
+            body,
+            &headers,
+            "the leader didn't answer in time; the rotation may have committed with its \
+             new secret lost, so check the token's created time in `relish token list` \
+             first: rotating it again would end the old secret at once",
+        )
+        .await;
+        return install_forwarded_token(&state, council, answer).await;
+    }
     let Some(stored) = council
         .security_state()
         .await
@@ -799,7 +887,7 @@ pub(super) async fn token_rotate_handler(
                 .into_response();
         }
     }
-    apply_rotation_locally(&state, &rotated.rotation).await;
+    install_committed_token(&state, council, &rotated.rotation.token_hash).await;
 
     let mut details = std::collections::BTreeMap::from([("token".to_string(), req.name.clone())]);
     let summary = match previous_valid_until {
@@ -841,9 +929,14 @@ pub(super) async fn token_rotate_handler(
 /// This is deliberately separate from API bearer-token management. The
 /// plaintext exists only in this request and response; Raft receives the
 /// SHA-256 hash, expiry and attestation policy.
+///
+/// Only the leader mints. A follower forwards the request with the caller's
+/// own credential and generates nothing itself. Join tokens live in Raft
+/// alone, not in the auth store, so there's nothing to install afterwards.
 pub(super) async fn join_token_create_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     if let Err(resp) =
@@ -897,6 +990,26 @@ pub(super) async fn join_token_create_handler(
             .into_response();
     };
 
+    if let Some(council) = crate::bun::task_array_api::council_to_forward_to(&state).await {
+        let mut answer = forward_token_write(
+            &state,
+            council,
+            "/v1/join-token/create",
+            body,
+            &headers,
+            "the leader didn't answer in time; a join token may have committed, but its \
+             secret is lost, so nobody can use it and it expires by itself: create another",
+        )
+        .await;
+        if answer.status() == StatusCode::OK {
+            answer.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+        }
+        return answer;
+    }
+
     let ttl = std::time::Duration::from_secs(req.ttl_seconds);
     let (plaintext, join_token) = match crate::sesame::join::create_join_token(ttl, &req.node_id) {
         Ok(created) => created,
@@ -938,6 +1051,11 @@ pub(super) async fn join_token_create_handler(
         .write(crate::council::RaftRequest::CreateJoinToken(join_token))
         .await
     {
+        Ok(crate::council::CouncilResponse::Refused { reason }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response(),
         Ok(_) => {
             record_caller_audit(
                 &state,
@@ -961,7 +1079,7 @@ pub(super) async fn join_token_create_handler(
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": format!("failed to commit join token (try the cluster leader): {e}")
+                "error": format!("failed to commit join token: {e}")
             })),
         )
             .into_response(),

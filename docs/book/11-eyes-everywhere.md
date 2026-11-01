@@ -497,9 +497,9 @@ The `ListingTableUrl` abstraction is what makes this work with both local paths 
 
 ### Two CLI commands
 
-`relish logs-export --dest /tmp/backup/` copies local Parquet files to a destination. It finds the LogStore directory, loads (or creates) a checkpoint, exports new files, and reports results.
+`relish logs-export --dest /tmp/backup/` copies a node's Parquet files to a directory on your machine, over the API, into `/tmp/backup/<node>/`. It skips what you already have and tells you what it copied and where. Give it an `s3://` or `gs://` URL and the node ships them itself. Chapter 6 tells the story of how `--dest` came to mean "here".
 
-`relish logs-search /tmp/backup/node-1/ "SELECT app, COUNT(*) FROM logs GROUP BY app"` runs SQL directly against the exported files. No running agent needed. DataFusion reads Parquet, executes the query, and prints JSON results. Aggregations, joins, window functions, LIKE patterns -- the full SQL dialect.
+`relish logs-search /tmp/backup/ "SELECT app, COUNT(*) FROM logs GROUP BY app"` runs SQL directly against the exported files, every node's under that directory (or point it at `/tmp/backup/node-1/` for one node). No running agent needed. DataFusion reads Parquet, executes the query, and prints JSON results. Aggregations, joins, window functions, LIKE patterns -- the full SQL dialect.
 
 ## Disk pressure: export before you delete
 

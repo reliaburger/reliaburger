@@ -700,6 +700,37 @@ impl CouncilNode {
         }
     }
 
+    /// Every API token this node's replica has applied. Copies only the
+    /// tokens, where [`Self::security_state`] copies the whole desired state.
+    pub async fn api_tokens(&self) -> Vec<crate::sesame::types::ApiToken> {
+        self.state_machine
+            .read_desired(|state| state.security_state.api_tokens.clone())
+            .await
+    }
+
+    /// Whether this node's replica holds no token called `name`, waiting up
+    /// to `within` for it to apply the removal. `false` means it still held
+    /// one at the deadline, which on a follower only means it's lagging.
+    pub async fn api_token_removal_applied(&self, name: &str, within: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let removed = self
+                .state_machine
+                .read_desired(|state| {
+                    !state
+                        .security_state
+                        .api_tokens
+                        .iter()
+                        .any(|token| token.name == name)
+                })
+                .await;
+            if removed || tokio::time::Instant::now() >= deadline {
+                return removed;
+            }
+            tokio::time::sleep(API_TOKEN_POLL).await;
+        }
+    }
+
     /// Whether an operator has permanently retired this node identity.
     /// Cheap enough to call on every request: it borrows, never clones.
     pub async fn is_node_retired(&self, node_id: &str) -> bool {
@@ -1188,6 +1219,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found.name, "ci");
+    }
+
+    #[tokio::test]
+    async fn api_tokens_reads_the_applied_tokens() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5)).await;
+        assert!(nodes[0].api_tokens().await.is_empty());
+        let created = crate::sesame::token::create_token(
+            "ci",
+            crate::sesame::types::ApiRole::Deployer,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        nodes[0]
+            .write(RaftRequest::CreateApiToken(created.token.clone()))
+            .await
+            .unwrap();
+        assert_eq!(nodes[0].api_tokens().await, vec![created.token]);
+    }
+
+    #[tokio::test]
+    async fn api_token_removal_gives_up_on_a_token_still_there_and_sees_one_gone() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5)).await;
+        let created = crate::sesame::token::create_token(
+            "ci",
+            crate::sesame::types::ApiRole::Deployer,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        nodes[0]
+            .write(RaftRequest::CreateApiToken(created.token))
+            .await
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        assert!(
+            !nodes[0]
+                .api_token_removal_applied("ci", Duration::from_millis(60))
+                .await
+        );
+        assert!(started.elapsed() >= Duration::from_millis(60));
+
+        nodes[0]
+            .write(RaftRequest::RevokeApiToken { name: "ci".into() })
+            .await
+            .unwrap();
+        assert!(
+            nodes[0]
+                .api_token_removal_applied("ci", Duration::ZERO)
+                .await
+        );
     }
 
     #[tokio::test]

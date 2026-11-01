@@ -861,6 +861,8 @@ regression they find goes into the next patch release.
 
 ## Staging a candidate
 
+The qualification scripts and `make test-ci-scripts` need Python 3.11 or later for `tomllib`, and macOS's `/usr/bin/python3` is 3.9. Each checks first and says what to install; put a newer `python3` first on `PATH` ([`require_python.py`](../scripts/release/require_python.py)).
+
 Before promoting a release, publish the exact signed candidate to HTTPS and run
 the real `curl … | sh` install against it on every host we advertise.
 

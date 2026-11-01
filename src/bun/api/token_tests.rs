@@ -440,3 +440,92 @@ async fn a_created_token_works_on_the_node_that_answered_at_once() {
     let secret = answer["token"].as_str().unwrap();
     assert_eq!(read_with(&fx.app, secret).await, StatusCode::OK);
 }
+
+/// #1506: a revoke takes the token out of the answering node's store itself.
+/// The fixture runs no refresh, so nothing else could end it here.
+#[tokio::test]
+async fn a_revoked_token_stops_working_on_the_node_that_answered_at_once() {
+    let root = token("root", ApiRole::Admin);
+    let ci = token("ci", ApiRole::Deployer);
+    let fx = fixture("revoke-at-once", &[root.token.clone(), ci.token.clone()]).await;
+    assert_eq!(read_with(&fx.app, &ci.plaintext).await, StatusCode::OK);
+
+    let (status, body) = post(
+        &fx.app,
+        "/v1/token/revoke",
+        &root.plaintext,
+        serde_json::json!({"name": "ci"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(answer["message"], "token ci revoked");
+    assert_eq!(
+        read_with(&fx.app, &ci.plaintext).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(read_with(&fx.app, &root.plaintext).await, StatusCode::OK);
+}
+
+/// A refused revoke commits nothing, so the token has to stay usable here.
+#[tokio::test]
+async fn revoking_the_last_admin_is_refused_and_leaves_it_working() {
+    let root = token("root", ApiRole::Admin);
+    let fx = fixture("revoke-last-admin", std::slice::from_ref(&root.token)).await;
+    let (status, body) = post(
+        &fx.app,
+        "/v1/token/revoke",
+        &root.plaintext,
+        serde_json::json!({"name": "root"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(read_with(&fx.app, &root.plaintext).await, StatusCode::OK);
+}
+
+/// The council refuses a join token for a retired node, and an answer with a
+/// plaintext would hand out a credential nothing stored.
+#[tokio::test]
+async fn a_join_token_for_a_retired_node_is_refused_without_a_secret() {
+    let root = token("root", ApiRole::Admin);
+    let fx = fixture("join-retired", std::slice::from_ref(&root.token)).await;
+    let membership_log_id = *fx.council.metrics().borrow().membership_config.log_id();
+    let retired = fx
+        .council
+        .write(crate::council::RaftRequest::DecommissionNode {
+            node_id: "node-7".into(),
+            retired_by: "operator".into(),
+            reason: "disk died".into(),
+            retired_at_unix_ms: 1,
+            membership_log_id,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            retired,
+            crate::council::CouncilResponse::NodeDecommissioned { .. }
+        ),
+        "{retired:?}"
+    );
+
+    let (status, body) = post(
+        &fx.app,
+        "/v1/join-token/create",
+        &root.plaintext,
+        serde_json::json!({"node_id": "node-7"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(!body.contains("token\""), "{body}");
+    assert!(
+        fx.council
+            .security_state()
+            .await
+            .join_tokens
+            .iter()
+            .all(|token| token.node_id != "node-7")
+    );
+}

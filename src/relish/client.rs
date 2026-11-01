@@ -1261,11 +1261,46 @@ impl BunClient {
             .collect())
     }
 
+    /// List the agent's flushed log files (`GET /v1/logs/archive`).
+    pub async fn logs_archive(
+        &self,
+    ) -> Result<crate::ketchup::export::ArchiveListing, RelishError> {
+        self.get_typed_json("/v1/logs/archive").await
+    }
+
+    /// Start fetching one flushed log file (`GET /v1/logs/archive/{name}`).
+    /// The caller reads the body as it arrives. `None` means the file is gone.
+    pub async fn logs_archive_file(
+        &self,
+        name: &str,
+    ) -> Result<Option<reqwest::Response>, RelishError> {
+        let segment: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();
+        let response = self
+            .http()?
+            .get(format!("{}/v1/logs/archive/{segment}", self.base_url))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(Some(response))
+    }
+
     /// Trigger an immediate log export on the agent (`POST /v1/logs/export`).
     ///
-    /// The destination is resolved agent-side — a path on the agent host,
-    /// `file://`, `s3://` or `gs://` — and the agent names the subdirectory
-    /// after its own node name.
+    /// The destination is resolved on the agent, with its credentials: a path
+    /// on the agent host, `file://`, `s3://` or `gs://`. `relish logs-export`
+    /// only sends object-store URLs here; a directory it copies to itself. The
+    /// agent names the subdirectory after its own node name.
     pub async fn logs_export(&self, destination: &str) -> Result<LogsExportOutcome, RelishError> {
         let response = self
             .http()?
@@ -3029,6 +3064,9 @@ fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String 
     if let Some(principal) = &filter.principal {
         params.append_pair("principal", principal);
     }
+    if let Some(app) = &filter.app {
+        params.append_pair("app", app);
+    }
     if let Some(namespace) = &filter.namespace {
         params.append_pair("namespace", namespace);
     }
@@ -3045,6 +3083,15 @@ fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String 
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn the_audit_query_carries_the_app_filter() {
+        let filter = crate::bun::audit::AuditFilter {
+            app: Some("web&co".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(audit_path(&filter, false), "/v1/audit?app=web%26co");
+    }
 
     #[test]
     fn the_public_key_path_names_an_encoded_namespace() {

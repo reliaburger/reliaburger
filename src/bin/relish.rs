@@ -538,6 +538,10 @@ struct AuditOptions {
     /// A token name or principal id.
     #[arg(long)]
     principal: Option<String>,
+    /// Only actions on this app or job, including an apply that listed it
+    /// with others.
+    #[arg(long)]
+    app: Option<String>,
     /// Only actions on this namespace.
     #[arg(long)]
     namespace: Option<String>,
@@ -590,16 +594,18 @@ enum Command {
     Status,
     /// Stream logs from an app or job.
     Logs(Box<LogsOptions>),
-    /// Export Parquet log files to a destination directory.
+    /// Copy a node's Parquet log files here, or have it ship them to object storage.
     #[command(name = "logs-export")]
     LogsExport {
         /// Export this local Parquet directory without contacting an agent.
         #[arg(long)]
         source: Option<PathBuf>,
-        /// Destination directory path.
+        /// A directory on the machine running relish, or an s3:// or gs:// URL
+        /// the node writes to with its own credentials. Files land under
+        /// <DEST>/<node>/.
         #[arg(long)]
         dest: PathBuf,
-        /// Node ID to use in export path. Default: "local".
+        /// Node name for a local store's files. A running agent uses its own.
         #[arg(long, default_value = "local")]
         node_id: String,
     },
@@ -2046,6 +2052,7 @@ async fn main() -> ExitCode {
                 until,
                 action,
                 principal,
+                app,
                 namespace,
                 limit,
                 cluster,
@@ -2056,6 +2063,7 @@ async fn main() -> ExitCode {
                     until,
                     action,
                     principal,
+                    app,
                     namespace,
                     limit,
                     cluster,
