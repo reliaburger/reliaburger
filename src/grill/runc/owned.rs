@@ -10,7 +10,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::*;
-use crate::grill::capture::{CAPTURE_CHUNK_BYTES, CaptureReader};
+use crate::grill::capture::{
+    CaptureReader, FOLLOW_POLL, SourceWatch, UNKNOWN_SOURCE_LIMIT, follow_capture,
+};
 use crate::grill::command::{
     ClaimedCommandExecutor, CommandOutput, CommandState, RuntimeCommandExecutor,
 };
@@ -1213,62 +1215,49 @@ impl RuncGrill {
         sender: tokio::sync::mpsc::Sender<CapturedLine>,
         resume: &crate::ketchup::types::CaptureOffsets,
     ) {
-        let source = self
-            .owned_operation(instance, |_runtime, _id, context| async move {
-                let stem = context.role_log_stem(RuntimeRole::Launcher).await?;
-                let retired = matches!(context.intent().await?.phase, IntentPhase::Retired { .. });
-                // Immutable retired logs need no lifecycle claim. A slow reader
-                // must not retain the lock required to prepare the next generation.
-                Ok((stem, if retired { None } else { Some(context) }))
-            })
-            .await;
-        let Ok((Some(stem), context)) = source else {
-            return;
+        // One failed start would leave this instance out of the log store
+        // until Bun restarted, as a failed check later on would (#1493).
+        let mut watch = SourceWatch::new(UNKNOWN_SOURCE_LIMIT);
+        let (stem, context) = loop {
+            let source = self
+                .owned_operation(instance, |_runtime, _id, context| async move {
+                    let stem = context.role_log_stem(RuntimeRole::Launcher).await?;
+                    let retired =
+                        matches!(context.intent().await?.phase, IntentPhase::Retired { .. });
+                    // Immutable retired logs need no lifecycle claim. A slow reader
+                    // must not retain the lock required to prepare the next generation.
+                    Ok((stem, if retired { None } else { Some(context) }))
+                })
+                .await;
+            match source {
+                Ok((Some(stem), context)) => break (stem, context),
+                Ok((None, _)) | Err(GrillError::NotFound { .. }) => return,
+                Err(error) => {
+                    if sender.is_closed() || watch.check_failed(tokio::time::Instant::now()) {
+                        eprintln!("ketchup: not following {instance}: {error}");
+                        return;
+                    }
+                    tokio::time::sleep(FOLLOW_POLL).await;
+                }
+            }
         };
-        let mut terminal = context.is_none();
-        let mut readers = [
+        let readers = [
             CaptureReader::resume(LogStream::Stdout, stem.with_extension("stdout"), resume).await,
             CaptureReader::resume(LogStream::Stderr, stem.with_extension("stderr"), resume).await,
         ];
-        loop {
-            // A capture with no checkpoint replays from byte 0. Bounded
-            // chunks, each read behind an `.await`, keep that replay from
-            // holding a runtime worker (it once starved startup adoption).
-            let mut backlog = false;
-            for reader in &mut readers {
-                let Ok(bytes) = reader.read_chunk().await else {
-                    continue;
+        // Follow the captured generation, never a successor using its name.
+        follow_capture(readers, sender, UNKNOWN_SOURCE_LIMIT, || {
+            let context = context.as_ref();
+            async move {
+                let Some(context) = context else {
+                    return Ok(false);
                 };
-                backlog |= bytes.len() == CAPTURE_CHUNK_BYTES;
-                for line in reader.push(&bytes) {
-                    if sender.send(line).await.is_err() {
-                        return;
-                    }
-                }
+                Ok(matches!(
+                    context.role_state(RuntimeRole::Launcher).await?,
+                    Some(CommandState::Running { .. })
+                ))
             }
-            if backlog {
-                continue;
-            }
-            if terminal || sender.is_closed() {
-                for reader in &mut readers {
-                    if let Some(line) = reader.finish() {
-                        let _ = sender.send(line).await;
-                    }
-                }
-                return;
-            }
-            // Follow the captured generation, never a successor using its name.
-            // A lost source ends this log stream without asserting runtime absence.
-            terminal = match &context {
-                Some(context) => !matches!(
-                    context.role_state(RuntimeRole::Launcher).await,
-                    Ok(Some(CommandState::Running { .. }))
-                ),
-                None => true,
-            };
-            if !terminal {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
+        })
+        .await;
     }
 }
