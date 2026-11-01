@@ -767,6 +767,8 @@ pub(super) struct AuditQuery {
     #[serde(default)]
     principal: Option<String>,
     #[serde(default)]
+    app: Option<String>,
+    #[serde(default)]
     namespace: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
@@ -782,6 +784,7 @@ impl AuditQuery {
             until: self.until,
             action: self.action.clone(),
             principal: self.principal.clone(),
+            app: self.app.clone(),
             namespace: self.namespace.clone(),
             limit: self.limit,
         }
@@ -868,7 +871,7 @@ const PEER_AUDIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 //
 // A plain function: the URL serialiser holds a non-`Send` reference, which
 // must not live across an `.await` in the handler.
-fn peer_audit_path(filter: &AuditFilter) -> String {
+pub(super) fn peer_audit_path(filter: &AuditFilter) -> String {
     let mut params = url::form_urlencoded::Serializer::new(String::new());
     if let Some(since) = filter.since {
         params.append_pair("since", &since.to_string());
@@ -881,6 +884,9 @@ fn peer_audit_path(filter: &AuditFilter) -> String {
     }
     if let Some(principal) = &filter.principal {
         params.append_pair("principal", principal);
+    }
+    if let Some(app) = &filter.app {
+        params.append_pair("app", app);
     }
     if let Some(namespace) = &filter.namespace {
         params.append_pair("namespace", namespace);

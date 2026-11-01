@@ -1103,7 +1103,32 @@ A layer driven by a table has the same weakness as the handlers it replaced: som
 
 ### Reading it back
 
-`GET /v1/audit` takes `since`, `until`, `action` (exact, or a family like `fault.*`), `principal` and `namespace`, and returns the newest matching records, oldest first. With `?cluster=true` the node asks every live member for its records and merges them by `(timestamp, node, sequence)`, naming any member that didn't answer. It forwards the *caller's* token rather than the cluster service token, so each node repeats the authorisation itself, and the service token never needs to be able to read the log. That matters: the log lists every principal and the addresses they work from, which is exactly the map an attacker holding a stolen node credential would want. Reading needs an unscoped Admin with `admin` across the cluster. `relish audit` wraps it, with `--since 2h` style times.
+`GET /v1/audit` takes `since`, `until`, `action` (exact, or a family like `fault.*`), `principal`, `app` and `namespace`, and returns the newest matching records, oldest first. With `?cluster=true` the node asks every live member for its records and merges them by `(timestamp, node, sequence)`, naming any member that didn't answer. It forwards the *caller's* token rather than the cluster service token, so each node repeats the authorisation itself, and the service token never needs to be able to read the log. That matters: the log lists every principal and the addresses they work from, which is exactly the map an attacker holding a stolen node credential would want. Reading needs an unscoped Admin with `admin` across the cluster. `relish audit` wraps it, with `--since 2h` style times.
+
+### The apply with no name
+
+Apply two apps in one manifest and what does the table say? For a long time, this:
+
+```text
+ACTION       TARGET
+app.applied  @default
+```
+
+The manual promised that each record names the app it touched, and for a one-app apply it did. With two, `manifest_audit_note` had no single name to put in `app`, so it left it empty and wrote `backend@default,frontend@default` under `details.workloads`. The table only knew about `app` and `namespace`. So the names were on disk and in `-o json`, and nowhere a person would look. Worse, the filters had the same blind spot. An apply across two namespaces has no `namespace` either, so `--namespace payments` skipped it, and `relish events --app backend` skipped every multi-app apply there was. `relish audit` had no `--app` at all.
+
+We could have written one record per app, and for a moment that looks tidier: `app` is always set, and every filter just works. But a record is one request. One person ran one command from one address, and it succeeded or failed as one. Ten records for that lie about how many things happened, make `--limit` count apps rather than actions, and let a 500-app manifest write 500 synced lines before answering. So a record stays one request, its JSON stays as it was, and the readers learn to read the list. `WorkloadList` parses it in one place:
+
+```rust
+pub fn from_details(details: &'a BTreeMap<String, String>) -> Option<Self> {
+    let mut listed: Vec<&str> = details.get("workloads")?.split(',').collect();
+    let unlisted = listed
+        .last()
+        .and_then(|last| last.strip_prefix('+')?.strip_suffix(" more")?.parse().ok());
+```
+
+The `'a` is a lifetime. It says the `&str`s in the list borrow from `details`, so the compiler won't let a `WorkloadList` outlive the map it points into, and we parse a list without copying a single name. In C you'd keep that rule in your head. Go's garbage collector would quietly keep the string alive for you, and Python's would too. Here it's written in the signature. The `?` inside the closure works too: the closure returns an `Option`, so a last entry that isn't shaped like `+5 more` just gives `None`.
+
+That `+5 more` is the awkward bit. `summarise_names` keeps twenty names so that one huge manifest can't make a huge record, which means `--app` can't know what the other five were. It has two choices: say no and maybe hide the apply you're hunting, or say yes and maybe show one line too many. After an incident, a false negative is the expensive one, so `may_name` says yes. The table has less room than the record, so it shows eight names and counts the rest.
 
 ### Recording the refusals
 
