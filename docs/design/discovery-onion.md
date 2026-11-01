@@ -900,6 +900,20 @@ Two things the argument doesn't cover, neither of them new. A process that isn't
 
 **Rollouts:** a rolling deploy no longer fails when the old instance's release is still waiting. After a short patience the worker hands the stopped, withdrawn instance to the agent loop (`deferred_retirements`), which keeps asking the leader each tick, and the rollout finishes. The retained instance no longer counts as one of the app's existing instances, so a later rollout can't retire it twice or mistake the replacements for surplus.
 
+### 7.7 Delete, Then Apply Straight Back (Two Incarnations of One Service)
+
+**Scenario:** `relish delete` withdraws a service, and its VIP stays reserved in the withdrawal ledger until every consumer confirms. `relish apply` before then gets the same service a *different* VIP (`reconcile_reserving`, § 5.4). A node whose old replica is stopped but still waiting for its producer release now holds a local reservation and a journal entry for the old VIP, and receives a deploy for the same service under the new one.
+
+**Property:** an address is released, and an allocation retired, only on proof about that exact allocation: the live entry keeps the original VIP and port and no longer names the backend (`authorise_local_discovery_release`), and for the allocation itself names no backend at all (`retire_discovery_service`). An entry under another VIP proves nothing about the original, which may still route to the address. The journal enforces the matching rule: one allocation per service, and it can't change VIP or port until the original has reached `Withdrawn` and been removed (`validate_transition`). That's what keeps the journal a superset of everything that might be exposed after a crash.
+
+**Failure before 0.2.5 (#1500):** the deploy ran as a rollout over the stopped replicas, and the rollout's final registration under the new VIP broke that rule. On 0.2.0 the agent's `service_map` had already moved to the new VIP when the journal refused, so every retirement failed with "original service withdrawal is unproven" until Bun restarted. From 0.2.4 (#1336) the map stays put, and the rollout fails with "original service allocation has not retired" on every retry instead.
+
+**Resolution:** the two incarnations never overlap on a node. `begin_deploy` calls `superseded_target`, which compares the node's reservation with the latest committed catalogue. If the VIP or port differs and instances of the app remain, the deploy is refused and a `StopPurpose::Retire` stop starts. The reconciler retries the deploy under its backoff, each attempt restarting a retirement that's still waiting, and once it has finished the deploy is a fresh one under the new allocation. Neither check changed, nor did the journal's format.
+
+**Cost:** the new incarnation starts here only after the old one's release is confirmed, normally a few seconds, or a lapsed consumer's lease plus margin (§ 7.6) if a node is gone. Replicas on other nodes aren't held up. A changed `port` takes the same path, so it restarts the app's replicas on an enrolled cluster, where the journal would otherwise refuse the rollout outright.
+
+**Not covered:** a node that never sees the delete, because its assignment comes back unchanged between two polls, gets no deploy. Its replica keeps running under the old reservation until the next change to the app, which then goes through this path. Standalone nodes and clusters without durable discovery have no catalogue to compare with, and no journal to refuse.
+
 ---
 
 ## 8. Security Considerations

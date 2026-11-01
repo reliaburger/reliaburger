@@ -1333,6 +1333,12 @@
   },
   {
     "source": "tests/placement.rs",
+    "function": "deleted_apps_reapplied_at_once_converge_every_cycle",
+    "binary": "reliaburger::placement",
+    "test": "deleted_apps_reapplied_at_once_converge_every_cycle"
+  },
+  {
+    "source": "tests/placement.rs",
     "function": "an_image_app_is_never_placed_on_a_process_only_node",
     "binary": "reliaburger::placement",
     "test": "an_image_app_is_never_placed_on_a_process_only_node"
