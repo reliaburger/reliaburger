@@ -490,3 +490,140 @@ async fn checkpoint_retains_only_live_source_generations_across_restart() {
     assert_eq!(entries[0].line, "generation 0");
     assert_eq!(entries[31].line, "generation 31");
 }
+
+/// Run `relish` in `workdir` against the agent at `endpoint`.
+async fn relish_in(
+    workdir: &std::path::Path,
+    endpoint: &str,
+    args: &[&str],
+) -> std::process::Output {
+    // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+    crate::bun_process::first_launch_binaries();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+            .args(args)
+            .current_dir(workdir)
+            .env("RELIABURGER_ENDPOINT", endpoint)
+            .env("RELIABURGER_HOME", workdir.join("home"))
+            .env_remove("RELIABURGER_TOKEN")
+            .env_remove("RELIABURGER_CA_CERT")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+/// #1499: `relish logs-export --dest ./archive` writes the archive on the
+/// machine running relish, relative to where it ran, not on the agent's
+/// host. The manual's next step, `relish logs-search ./archive`, then finds
+/// it. The copy leaves the node's own export checkpoint alone, and a repeat
+/// copies nothing new.
+#[tokio::test]
+async fn logs_export_writes_the_archive_where_relish_runs() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let mut store = LogStore::new(store_dir.path().to_path_buf());
+    store.append_at(1, "web", "default", LogStream::Stdout, "INFO ok");
+    store.append_at(2, "web", "default", LogStream::Stderr, "ERROR fail");
+    store.flush().await.unwrap();
+    let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(1);
+    let router = reliaburger::bun::api::router(
+        cmd_tx,
+        None,
+        Some(std::sync::Arc::new(tokio::sync::RwLock::new(store))),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let workdir = tempfile::tempdir().unwrap();
+    let export = ["logs-export", "--dest", "./archive"];
+    let first = relish_in(workdir.path(), &endpoint, &export).await;
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(
+        first.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        stdout.contains("exported 1 file(s)")
+            && stdout.contains("of local's logs to ./archive/local on this machine"),
+        "{stdout}"
+    );
+
+    let copied: Vec<_> = std::fs::read_dir(workdir.path().join("archive").join("local"))
+        .expect("the archive must land under relish's working directory")
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(copied.len(), 1, "{copied:?}");
+    let source = std::fs::read_dir(store_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&copied[0]).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+    assert!(
+        !store_dir
+            .path()
+            .join(reliaburger::ketchup::export::CHECKPOINT_FILENAME)
+            .exists(),
+        "a copy to this machine must not advance the node's export checkpoint"
+    );
+
+    let repeat = relish_in(workdir.path(), &endpoint, &export).await;
+    assert!(repeat.status.success());
+    assert!(
+        String::from_utf8_lossy(&repeat.stdout).starts_with("no new files to export"),
+        "{}",
+        String::from_utf8_lossy(&repeat.stdout)
+    );
+
+    let search = relish_in(
+        workdir.path(),
+        &endpoint,
+        &[
+            "logs-search",
+            "./archive",
+            "SELECT count(*) AS errors FROM logs WHERE line LIKE '%ERROR%'",
+        ],
+    )
+    .await;
+    server.abort();
+    let _ = server.await;
+    let found = String::from_utf8_lossy(&search.stdout);
+    assert!(
+        search.status.success(),
+        "{found}{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let row: serde_json::Value = serde_json::from_str(found.trim()).unwrap();
+    assert_eq!(row["errors"], 1, "{found}");
+}
+
+/// The flag's `--help` tells the same story as the manual and the output.
+#[test]
+fn logs_export_help_says_where_the_destination_is() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(["logs-export", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("on the machine running relish"), "{help}");
+    assert!(help.contains("with its own credentials"), "{help}");
+}

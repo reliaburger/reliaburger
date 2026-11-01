@@ -152,7 +152,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish top`: Show every workload on every node, with its latest CPU and memory
 - `relish metrics <APP>`: Show an app's own Prometheus metrics, scraped by the nodes running it
 - `relish logs <NAME>`: Stream logs from an app or job
-- `relish logs-export --dest <DEST>`: Export Parquet log files to a destination directory
+- `relish logs-export --dest <DEST>`: Copy a node's Parquet log files here, or have it ship them to object storage
 - `relish logs-search <SOURCE> <SQL>`: Search exported Parquet log archives with SQL
 - `relish events`: Show the cluster's recent events: deploys, restarts, health, faults, tokens, secrets and audited operations, newest last
 

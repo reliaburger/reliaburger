@@ -1359,6 +1359,44 @@ The `if` after the pattern is a *match guard*: the arm only matches when the pat
 
 `ExportBusy` also turned up where nobody was exporting. `checkpoint_retains_only_live_source_generations_across_restart` exports twice in a row, and in a full `cargo test --test suite` run the second export was refused as busy in four runs out of six (#519). It was the same `flock` quirk that Chapter 9 describes for quickstart operations. The lock belongs to the open file description, and a child process that another thread is halfway through spawning holds a copy of it until its `exec`. Closing our descriptor didn't release the lock, so the export straight after found it held. The lock became an `ExportLock` whose `Drop` calls `unlock()` before the file closes, which releases it for every copy at once. Today it's the shared `file_lock::FileLock` that Chapter 9 describes, which every file lock in the codebase uses. In production that was a spurious skip or a 100 ms wait, since Bun spawns workloads while it exports. In a test it was a failure.
 
+### Whose disk is `./archive`?
+
+The manual had two lines that read like one thought:
+
+```sh
+relish logs-export --dest ./archive
+relish logs-search ./archive "SELECT count(*) FROM logs WHERE line LIKE '%error%'"
+```
+
+Run them on a laptop, against a node somewhere else, and see what happens. The first line prints `agent exported 1 file(s) (2399 bytes) to ./archive/local`, and the files are real. They're just on the node, in `./archive` relative to wherever Bun happened to start. The second line runs on your laptop, where there's no such directory. Our own test caught it in the act: the first failing run left an `archive/` folder in the repository root, because that was the working directory of the agent under test.
+
+Remember the endpoint from earlier in this chapter, `POST /v1/logs/export`? We'd moved the work to the agent so that it could use the store's real path and its credentials. That was right for `s3://`. For a bare path it quietly changed whose disk the path meant, and every word the CLI printed still looked local.
+
+There were two ways out. We could keep the files on the node and make the output say so, or make `--dest` mean what it looks like. A flag that takes `./archive` from a shell on your machine has only one sensible reading, and the second option turned out to cost two small read-only routes, so that's what we did. `GET /v1/logs/archive` lists the node's flushed Parquet files with each one's size and SHA-256, and `GET /v1/logs/archive/{name}` streams one. Relish writes them under `./archive/<node>/`. `s3://` and `gs://` still go to the agent, because it's the one holding the credentials.
+
+Three decisions in there are worth a look.
+
+**A copy isn't an export.** The checkpoint is what licenses pruning, so `relish logs-export` must not touch it: a file on someone's laptop is no reason for a node to delete its only copy. So how does a repeat run skip what it already has, with no checkpoint? We gave the files the names an export gives them, `{sha256}-{filename}`. A name with its hash in it answers the question by itself: if the file exists, those are the bytes. That only holds if a half-written file can never take the name, so Relish writes to a hidden `.partial` file, checks the size and hash, syncs, and only then renames.
+
+**Neither side trusts the other's paths.** The API refuses any name that isn't a single `.parquet` path component, so `_export_checkpoint.json` and `../escape.parquet` get a 400. Relish does the same in the other direction, because the node's name and the file names in the listing are about to become local paths:
+
+```rust
+let mut components = Path::new(&listing.node_id).components();
+let one_name = matches!(components.next(), Some(Component::Normal(_)));
+if !one_name || components.next().is_some() {
+    return Err(archive_error(format!(
+        "the agent gave an unusable node name: {:?}",
+        listing.node_id
+    )));
+}
+```
+
+`Path::components` splits a path the way the operating system would, into an enum with variants like `Normal`, `ParentDir` and `RootDir`, so `..` and `/tmp/x` can't be mistaken for names. `matches!` is a macro that turns a pattern into a `bool`. In Go you'd compare strings against `".."` and hope you'd thought of every spelling; here the type did the thinking.
+
+**The archive's routes refuse a scoped token, even an Admin one.** `/v1/logs/query/{app}/{namespace}` can filter by tenant. A Parquet file can't: it's every tenant's lines in one blob. So these routes call `require_unscoped`, as `/v1/logs/sql` does. We also audit the listing as `logs.exported`, the same action the `POST` records, so moving the work to a `GET` didn't take it off the trail. The audit layer mostly records writes, so this is the one read it records; the files that follow each listing would only add noise. An Admin who already knows a file's name can fetch it without a listing, so this is a record of the normal path, not a wall.
+
+Getting the files to the right machine wasn't the end of it. The end-to-end test copied them, ran the manual's second line, and got back `{"errors":0}`. No error at all. DataFusion's `listing_table_ignore_subdirectory` defaults to `true`, and an export files everything one level down in `<node>/`, so the search looked in `./archive`, found no Parquet directly in it and reported, accurately, zero rows. Chapter 11's example got away with this by pointing at `/tmp/backup/node-1/`; the manual never did. Both query paths now set it to `false`, so a search of an archive's root sees every node in it. A test that stopped at "the files arrived" would have shipped a manual that printed the wrong answer, which is worse than the error we started with.
+
 ### Errors that used to vanish
 
 Retention in the metrics and rollup stores ignored `remove_file` errors and counted the file as deleted anyway; now only successful removals count. The exporter forgives exactly one read failure, `NotFound`, because retention can delete a file between listing the directory and opening it.

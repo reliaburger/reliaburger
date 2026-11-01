@@ -24,6 +24,20 @@ use super::types::{KetchupError, LogEntry};
 /// query *error* instead. Generous (512 MiB) since it's local and interactive.
 const QUERY_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 
+/// Session settings for reading an archive. An export files each node's logs
+/// in its own subdirectory, so searching an archive means searching those too;
+/// left to its default, DataFusion looks only at files directly in the
+/// directory and a search of the archive's root finds nothing, without an
+/// error (#1499).
+fn archive_session_config() -> SessionConfig {
+    let mut config = SessionConfig::new();
+    config
+        .options_mut()
+        .execution
+        .listing_table_ignore_subdirectory = false;
+    config
+}
+
 /// A DataFusion session with the working-memory limit applied (O13).
 fn bounded_session(config: SessionConfig) -> Result<SessionContext, KetchupError> {
     let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
@@ -48,7 +62,7 @@ pub async fn query_remote(source_path: &str, sql: &str) -> Result<Vec<LogEntry>,
     // an equality filter like `WHERE app = 'web'` can skip whole row groups
     // that hold no matching rows. (It's on by default in DataFusion, but we
     // set it explicitly so the behaviour can't silently regress.)
-    let mut config = SessionConfig::new();
+    let mut config = archive_session_config();
     config.options_mut().execution.parquet.bloom_filter_on_read = true;
     let ctx = bounded_session(config)?;
 
@@ -101,7 +115,7 @@ pub async fn query_remote_json(
     source_path: &str,
     sql: &str,
 ) -> Result<Vec<serde_json::Value>, KetchupError> {
-    let ctx = bounded_session(SessionConfig::new())?;
+    let ctx = bounded_session(archive_session_config())?;
 
     let table_url = ListingTableUrl::parse(source_path).map_err(|e| {
         KetchupError::Io(std::io::Error::other(format!("invalid source path: {e}")))

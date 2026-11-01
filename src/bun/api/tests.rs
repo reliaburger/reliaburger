@@ -6134,6 +6134,151 @@ async fn logs_export_ships_parquet_and_persists_the_checkpoint() {
     assert_eq!(outcome["files_exported"], 0, "{outcome}");
 }
 
+/// The log archive hands every tenant's logs to whoever asks, so like the
+/// export it is Admin-only.
+#[tokio::test]
+async fn logs_archive_requires_admin() {
+    let (app, shutdown, tok) = setup_with_role(
+        "logs-archive-deployer",
+        crate::sesame::types::ApiRole::Deployer,
+    )
+    .await;
+    for uri in ["/v1/logs/archive", "/v1/logs/archive/logs_000000.parquet"] {
+        let status = get_status(app.clone(), uri, Some(&tok)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    shutdown.cancel();
+}
+
+/// A token scoped to one namespace can't have a store that holds everyone's
+/// logs, whatever its role: there's no filtering a Parquet file.
+#[tokio::test]
+async fn logs_archive_refuses_a_scoped_admin_token() {
+    let created = crate::sesame::token::create_token(
+        "logs-archive-scoped-admin",
+        crate::sesame::types::ApiRole::Admin,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["a".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (app, shutdown) = setup_with_auth(vec![created.token], None).await;
+    for uri in ["/v1/logs/archive", "/v1/logs/archive/logs_000000.parquet"] {
+        let status = get_status(app.clone(), uri, Some(&created.plaintext)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    shutdown.cancel();
+}
+
+/// A router over a log store holding one flushed Parquet file.
+async fn router_with_one_parquet_file() -> (Router, tempfile::TempDir) {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let store_dir = tempfile::tempdir().unwrap();
+    let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+    store.append(
+        "web",
+        "default",
+        crate::ketchup::types::LogStream::Stdout,
+        "hello",
+    );
+    store.flush().await.unwrap();
+    let app = router(
+        cmd_tx,
+        None,
+        Some(Arc::new(RwLock::new(store))),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    (app, store_dir)
+}
+
+async fn get_bytes(app: Router, uri: &str) -> (StatusCode, Vec<u8>) {
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+/// #1499: `relish logs-export` copies a node's archive to the operator's
+/// machine through these two routes. The listing names each Parquet file
+/// with its size and SHA-256, the file route serves those exact bytes, and
+/// neither touches the node's own export checkpoint.
+#[tokio::test]
+async fn logs_archive_lists_each_parquet_file_and_serves_its_bytes() {
+    let (app, store_dir) = router_with_one_parquet_file().await;
+    let (status, body) = get_bytes(app.clone(), "/v1/logs/archive").await;
+    assert_eq!(status, StatusCode::OK);
+    let listing: crate::ketchup::export::ArchiveListing = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listing.node_id, "local");
+    assert_eq!(listing.files.len(), 1, "{listing:?}");
+    let file = &listing.files[0];
+    let on_disk = std::fs::read(store_dir.path().join(&file.name)).unwrap();
+    assert_eq!(file.size, on_disk.len() as u64);
+    assert_eq!(
+        file.sha256,
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&on_disk))
+    );
+
+    let (status, served) = get_bytes(app, &format!("/v1/logs/archive/{}", file.name)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(served, on_disk);
+    assert!(
+        !store_dir
+            .path()
+            .join(crate::ketchup::export::CHECKPOINT_FILENAME)
+            .exists()
+    );
+}
+
+/// The file route serves only a Parquet file in the store itself: not the
+/// checkpoint, not a path that climbs out, not a file that isn't there.
+#[tokio::test]
+async fn logs_archive_serves_nothing_but_the_stores_parquet_files() {
+    let (app, store_dir) = router_with_one_parquet_file().await;
+    std::fs::write(store_dir.path().join("_export_checkpoint.json"), b"{}").unwrap();
+    for (uri, expected) in [
+        (
+            "/v1/logs/archive/_export_checkpoint.json",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/logs/archive/..%2Fescape.parquet",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/v1/logs/archive/..", StatusCode::BAD_REQUEST),
+        ("/v1/logs/archive/missing.parquet", StatusCode::NOT_FOUND),
+    ] {
+        let (status, body) = get_bytes(app.clone(), uri).await;
+        assert_eq!(
+            status,
+            expected,
+            "{uri}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
 /// AUTH1 for faults: a Deployer scoped to one namespace clears the role
 /// gate but is refused injecting a fault into another tenant's same-named
 /// service, before the safety policy is even consulted. `/v1/fault` carries

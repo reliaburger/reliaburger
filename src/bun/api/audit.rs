@@ -154,6 +154,10 @@ pub(crate) const AUDITED_ROUTES: &[AuditedRoute] = &[
         Operation,
     ),
     audited(Post, "/v1/logs/export", "logs.exported", Operation),
+    // A copy starts with this listing. It's the one read we record, because
+    // it hands someone every tenant's logs. The files that follow would only
+    // add a record each.
+    audited(Get, "/v1/logs/archive", "logs.exported", Operation),
     audited(Post, "/v1/identity/sign", "identity.signed", Identity),
 ];
 
