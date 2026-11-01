@@ -1478,6 +1478,49 @@ The producer's side mirrors this. Before a node frees the host port or container
 
 To make a growing backlog visible before the ledger fills, the leader degrades a `discovery:withdrawal-backlog` readiness subsystem at 75% occupancy and exports `discovery_withdrawal_ledger_occupancy_ratio` for alerting.
 
+### Deleted, then applied straight back
+
+An outside evaluation of 0.2.0 ran a simple loop on three nodes: `relish delete` two apps, `relish apply` them again at once. Three cycles converged. The fourth stuck, with every retry refused: "original service withdrawal is unproven". It stayed stuck until someone restarted Bun. Wait for the delete to settle first, and it never happened.
+
+That refusal is the check from [Writing it down before doing it](#writing-it-down-before-doing-it), and it's guarding something real. A retiring instance's address can go back in the pool only once we've shown that the *exact allocation that published it*, that VIP on that port, no longer routes to it. Any other evidence is worthless. An entry under a different VIP tells you nothing about the old one, which may still be sending traffic to an address that's about to be handed to a stranger. Relax the check to get past the wedge, and a client can end up talking to the wrong workload, with no error at all.
+
+So the check was right, and we had to work out how the truth had changed underneath it. Here's the sequence on one node:
+
+1. `relish delete` withdraws the service. Its VIP, say `127.128.3.7`, stays reserved in the ledger until every consumer sends its receipt.
+2. The node stops its replica, but the replica's address has to wait for those receipts, so the retirement answers "not yet". The node's own record of the service stays, along with the journal's.
+3. `relish apply` arrives before the receipts do. The old VIP is still reserved, so the council gives the *same service* a new one.
+4. The node gets a deploy for an app it still holds stopped replicas of, so it treats it as a rollout. It starts a replacement, then registers the service again under the new VIP.
+
+Step 4 breaks a rule the journal enforces. It holds one allocation per service, and it refuses to swap the VIP until the old allocation has retired, because that's the only way a crash leaves a complete list of what might be exposed. On 0.2.0 the node had already changed its in-memory map by the time the journal said no, so every retirement after that compared the journal's VIP with a map that had moved on. Hence "unproven", forever. A restart threw the map away and rebuilt it from the journal, which is why that fixed it. 0.2.4 stopped changing the map before the journal agreed, for reasons of its own (#1336), so main didn't print that message any more. It wedged all the same, this time with "original service allocation has not retired" on every attempt. The bug had changed its clothes, not its behaviour.
+
+We could have taught the journal to hold two allocations per service. That's a change to durable state, plus a second answer to "which VIP does this backend belong to?" everywhere that question gets asked. There's something simpler: never let the two incarnations overlap on a node. The app was deleted, so nothing is lost by finishing that first. Before a deploy starts, the loop compares the node's reservation with the council's committed allocation:
+
+```rust
+let replaced = self
+    .service_map
+    .resolve(&id)
+    .zip(catalog.resolve(&id))
+    .is_some_and(|(local, committed)| {
+        local.vip != committed.vip || local.port != committed.port
+    });
+```
+
+`Option::zip` turns two options into one option of a pair: `Some((a, b))` if both are there, `None` otherwise. `is_some_and` then asks its question only of a value that exists. If the node has no reservation, or the council has no allocation yet, nothing has been replaced.
+
+When something has, the deploy is refused and the old incarnation's retirement is started on the spot:
+
+```rust
+let (response, _) = oneshot::channel();
+self.request_app_stop(target.name, target.namespace, StopPurpose::Retire, response)
+    .await;
+```
+
+Binding the receiver to `_` drops it straight away, because nobody here cares how the stop ends. A send into a dropped receiver returns an error, and `request_app_stop` ignores that, so this is a cheap way of saying "do it, and don't tell me". The reconciler retries the deploy under its usual backoff of 5 s, 10 s, 20 s. Each attempt starts the retirement again if it's still waiting on the other nodes, and once it's finished the next attempt is an ordinary fresh deploy under the new VIP.
+
+The check itself didn't change by a single character. Nobody weakened it. The old incarnation is now judged against the old allocation because the new allocation doesn't exist on this node until the old one has gone. A changed port goes the same way: the journal refuses that too, so an app whose port changes on an enrolled cluster now stops and starts rather than failing its rollout for ever.
+
+One more thing this taught us: the regression test almost couldn't see the bug. The discovery journal only runs on enrolled runc nodes with eBPF, so a process-runtime cluster loops through delete and apply happily and proves nothing about it. The test that does reproduce it, `a_reapplied_app_under_a_new_vip_converges_without_a_restart`, drives one agent with a real journal through exactly the four steps above. `a_new_allocation_waits_here_until_the_old_incarnation_has_retired` checks the safety half: until the other nodes confirm, no new replica starts and the old address stays held. And `three_enrolled_oci_nodes_converge_when_deleted_apps_are_reapplied_at_once` runs the evaluation's loop on real runc nodes in the OCI qualification.
+
 ### When a node goes quiet
 
 What happens when a consumer never sends its receipt? For a long time the answer was: we wait. A partitioned node that's still alive may still be routing to old addresses, and handing those addresses to someone else is worse than asking an operator to confirm the node is really gone. Decommissioning it discharges what it owed.

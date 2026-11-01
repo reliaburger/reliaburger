@@ -48,6 +48,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let _ = events.send(ApplyEvent::Error { message }).await;
             return;
         }
+        // Its old incarnation retires first, whatever it was waiting on, and
+        // the reconciler's next attempt deploys under the new allocation.
+        // Nobody needs this stop's answer: that attempt asks again.
+        if let Some(target) = self.superseded_target(&config) {
+            let message = format!(
+                "workload {}/{} has a new service allocation; retry once its previous one has retired",
+                target.namespace, target.name
+            );
+            let (response, _) = oneshot::channel();
+            self.request_app_stop(target.name, target.namespace, StopPurpose::Retire, response)
+                .await;
+            // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
+            let _ = events.send(ApplyEvent::Error { message }).await;
+            return;
+        }
         if let Some((namespace, app)) = self.restoring_target(&config) {
             let message = format!(
                 "volumes of {namespace}/{app} are being restored from a snapshot; retry once the restore finishes"

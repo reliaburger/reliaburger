@@ -577,6 +577,150 @@ async fn cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app() {
     }
 }
 
+/// Every instance of `apps` on `nodes`, as `node/id:state`, or why a node
+/// didn't answer.
+async fn app_instances(nodes: &[&Node], apps: &[&str]) -> Result<Vec<String>, String> {
+    let mut found = Vec::new();
+    for node in nodes {
+        let statuses = node
+            .client
+            .status()
+            .await
+            .map_err(|error| format!("{}: {error}", node.name))?;
+        found.extend(
+            statuses
+                .iter()
+                .filter(|s| apps.contains(&s.app_name.as_str()))
+                .map(|s| format!("{}/{}:{}", node.name, s.id, s.state)),
+        );
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// #1500: deleting two services and re-applying them straight away, before
+/// the deleted incarnation has retired, converges every cycle: each app is
+/// back at its replica count, every instance running, every node resolves
+/// the full set of backends, and nothing of the deleted incarnation is left
+/// stopped or stopping. The evaluation's fourth cycle wedged until Bun
+/// restarted.
+///
+/// This guards the lifecycle only. Process nodes have no discovery journal,
+/// so the wedge itself can't happen here: its reproduction is the agent test
+/// `a_reapplied_app_under_a_new_vip_converges_without_a_restart`, and the
+/// same loop on real runc nodes is
+/// `three_enrolled_oci_nodes_converge_when_deleted_apps_are_reapplied_at_once`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn deleted_apps_reapplied_at_once_converge_every_cycle() {
+    const CYCLES: usize = 6;
+    let shutdown = CancellationToken::new();
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("reapply1", base, vec![], &shutdown).await;
+    let n2 = start_node("reapply2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("reapply3", base + 8, vec![local(base)], &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
+    let ready = wait_until(Duration::from_secs(30), || {
+        nodes.iter().any(|n| *n.thinks_leader.borrow())
+    })
+    .await;
+    assert!(ready, "no leader elected");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let config = reliaburger::config::Config::parse(
+        r#"
+        [app.backend]
+        script = "exec sleep 600"
+        replicas = 2
+        port = 9898
+
+        [app.frontend]
+        script = "exec sleep 600"
+        replicas = 3
+        port = 9898
+        [app.frontend.ingress]
+        host = "fixture.reapply.test"
+    "#,
+    )
+    .unwrap();
+    let apps = [("backend", 2), ("frontend", 3)];
+    let names = ["backend", "frontend"];
+    let converged = async |cycle: usize| {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let mut why = None;
+            match app_instances(&nodes, &names).await {
+                Ok(instances) => {
+                    for (app, replicas) in apps {
+                        let mine: Vec<_> = instances
+                            .iter()
+                            .filter(|i| i.contains(&format!("/default__{app}-")))
+                            .collect();
+                        if mine.len() != replicas || mine.iter().any(|i| !i.ends_with(":running")) {
+                            why = Some(format!("{instances:?}"));
+                        }
+                    }
+                }
+                Err(error) => why = Some(error),
+            }
+            if why.is_none() {
+                for node in nodes {
+                    for (app, replicas) in apps {
+                        let healthy = node
+                            .client
+                            .resolve(app)
+                            .await
+                            .map(|r| r.healthy_backends)
+                            .unwrap_or(0);
+                        if healthy != replicas {
+                            why = Some(format!(
+                                "{} resolves {app} to {healthy} healthy backends",
+                                node.name
+                            ));
+                        }
+                    }
+                }
+            }
+            let Some(why) = why else {
+                return;
+            };
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cycle {cycle} never converged: {why}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+
+    tokio::time::timeout(Duration::from_secs(15), n1.client.apply(&config))
+        .await
+        .expect("apply did not hang")
+        .expect("apply succeeded");
+    converged(0).await;
+    for cycle in 1..=CYCLES {
+        for app in names {
+            tokio::time::timeout(Duration::from_secs(15), n1.client.delete(app, "default"))
+                .await
+                .expect("delete did not hang")
+                .expect("delete succeeded");
+        }
+        // Straight back, while the deleted incarnation is still retiring.
+        tokio::time::timeout(Duration::from_secs(15), n1.client.apply(&config))
+            .await
+            .expect("apply did not hang")
+            .expect("apply succeeded");
+        converged(cycle).await;
+    }
+
+    shutdown.cancel();
+    for n in nodes {
+        if let Some(council) = &n.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}
+
 /// The nodes with a live instance of `app`.
 async fn nodes_with_live(nodes: &[&Node], app: &str) -> Vec<String> {
     let mut found = Vec::new();

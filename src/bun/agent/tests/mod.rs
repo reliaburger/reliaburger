@@ -12695,6 +12695,330 @@ async fn failed_rollout_finalisation_keeps_the_reservation_retirement_needs() {
     agent.retire_discovery_service(&service).await.unwrap();
 }
 
+/// Run `config` through the loop's own deploy admission, as the reconciler
+/// does, pumping what the loop would: the deploy's ops and any stop it set
+/// off. Returns the deploy's events.
+async fn deploy_through_admission(
+    agent: &mut BunAgent<MockGrill>,
+    config: Config,
+) -> Vec<ApplyEvent> {
+    let (sender, mut receiver) = mpsc::channel(256);
+    agent.begin_deploy(config, sender).await;
+    let mut events = Vec::new();
+    loop {
+        tokio::select! {
+            Some(op) = agent.deploy_ops_rx.recv() => agent.handle_deploy_op(op).await,
+            Some(outcome) = agent.stop_waits.join_next_with_id(),
+                if !agent.stop_waits.is_empty() => agent.complete_app_stop(outcome).await,
+            event = receiver.recv() => match event {
+                Some(event) => events.push(event),
+                None => break,
+            },
+        }
+    }
+    // A stop the refused deploy set off finishes after the deploy's answer.
+    while let Some(outcome) = agent.stop_waits.join_next_with_id().await {
+        agent.complete_app_stop(outcome).await;
+    }
+    events
+}
+
+/// What #1500's evaluation hit. `web` runs here at its committed VIP, and
+/// `relish delete` retires it: the replica stops, but its address waits for
+/// the other nodes' withdrawal receipts. An immediate `relish apply` comes
+/// back before they arrive, so the council can't reuse the old VIP, which
+/// it reserves until every consumer has confirmed, and commits another one.
+/// Returns the agent ready to deploy `web` again, the fixture's directory,
+/// the old and new VIPs and the original network reference.
+async fn reapplied_under_a_new_vip() -> (
+    BunAgent<MockGrill>,
+    tempfile::TempDir,
+    crate::onion::vip::VirtualIP,
+    crate::onion::vip::VirtualIP,
+    crate::grill::runc_intent::NetworkReference,
+) {
+    use crate::onion::service_id::ServiceId;
+    let (mut agent, root, catalog) = clustered_allocation_fixture().await;
+    let grill = agent.supervisor.grill().clone();
+    grill.set_pid(std::process::id());
+    grill.set_container_ip("10.0.2.5".parse().unwrap());
+    let web = ServiceId::new("default", "web");
+    let remote_id = ServiceId::new("default", "remote");
+    let remote = catalog.services["default__remote"].clone();
+    let remote_entry = || (remote_id.clone(), remote.port, remote.backends.clone());
+    let (_, ingress) = cluster_publication_fixture();
+
+    let placed = catalog
+        .reconcile([remote_entry(), (web.clone(), 8080, vec![])])
+        .unwrap();
+    let old_vip = placed.resolve(&web).unwrap().vip;
+    agent
+        .synchronise_consumer(2, placed.clone(), ingress.clone(), vec![])
+        .await
+        .unwrap();
+    agent
+        .renew_view_lease(crate::onion::lease::boot_clock_ns())
+        .await;
+    let reference = original_test_network_reference();
+    grill.set_network_reference(reference.clone()).await;
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let spec = agent
+        .supervisor
+        .get_instance(&reference.instance_id)
+        .unwrap()
+        .oci_spec
+        .clone()
+        .unwrap();
+    grill
+        .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+            generation: crate::grill::RuntimeGeneration::runc(reference.generation.as_str()),
+            instance_id: reference.instance_id.clone(),
+            spec,
+            network_reference: Some(crate::grill::runc_intent::NetworkReferenceState::Held(
+                reference.clone(),
+            )),
+        }])
+        .await;
+
+    // `relish delete`: the allocation leaves the catalogue, and the retiring
+    // replica waits on the other nodes' receipts.
+    let deleted = placed.reconcile([remote_entry()]).unwrap();
+    agent
+        .synchronise_consumer(3, deleted.clone(), ingress.clone(), vec![])
+        .await
+        .unwrap();
+    agent
+        .renew_view_lease(crate::onion::lease::boot_clock_ns())
+        .await;
+    let (client, pending) =
+        crate::cluster::producer::test_fixture(axum::http::StatusCode::ACCEPTED, String::new())
+            .await;
+    agent.set_producer_release_client(client);
+    let (reply, retired) = oneshot::channel();
+    agent
+        .request_app_stop("web".into(), "default".into(), StopPurpose::Retire, reply)
+        .await;
+    while let Some(outcome) = agent.stop_waits.join_next_with_id().await {
+        agent.complete_app_stop(outcome).await;
+    }
+    assert!(
+        matches!(
+            retired.await.unwrap(),
+            Err(BunError::ProducerReleasePending { .. })
+        ),
+        "the retirement should wait for the other nodes"
+    );
+    pending.abort();
+    let _ = pending.await;
+
+    // `relish apply`, straight back: the old VIP is still reserved.
+    let reapplied = deleted
+        .reconcile_reserving(
+            [remote_entry(), (web.clone(), 8080, vec![])],
+            [old_vip, remote.vip],
+        )
+        .unwrap();
+    let new_vip = reapplied.resolve(&web).unwrap().vip;
+    assert_ne!(old_vip, new_vip);
+    agent
+        .synchronise_consumer(4, reapplied, ingress, vec![])
+        .await
+        .unwrap();
+    agent
+        .renew_view_lease(crate::onion::lease::boot_clock_ns())
+        .await;
+    (agent, root, old_vip, new_vip, reference)
+}
+
+/// #1500: once every node has confirmed, the deleted incarnation retires
+/// and the re-applied app comes up under its new VIP, with nothing wedged
+/// in between and no restart of Bun.
+#[tokio::test]
+async fn a_reapplied_app_under_a_new_vip_converges_without_a_restart() {
+    let (mut agent, root, _old_vip, new_vip, reference) = reapplied_under_a_new_vip().await;
+    let grill = agent.supervisor.grill().clone();
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    let execution = serde_json::json!({
+        "node_id": "test",
+        "execution": {
+            "instance_id": reference.instance_id,
+            "generation": crate::grill::RuntimeGeneration::runc(reference.generation.as_str()),
+        },
+    })
+    .to_string();
+    let (client, leader) =
+        crate::cluster::producer::test_fixture(axum::http::StatusCode::OK, execution).await;
+    agent.set_producer_release_client(client);
+
+    // The reconciler sends the deploy again each tick until it completes.
+    let mut last = Vec::new();
+    for _ in 0..4 {
+        last = deploy_through_admission(&mut agent, basic_config()).await;
+        if matches!(last.last(), Some(ApplyEvent::Complete { .. })) {
+            break;
+        }
+    }
+    leader.abort();
+    let _ = leader.await;
+    assert!(
+        matches!(last.last(), Some(ApplyEvent::Complete { .. })),
+        "the re-apply never converged: {last:?}"
+    );
+    assert_eq!(agent.service_map.resolve(&service).unwrap().vip, new_vip);
+    assert_eq!(
+        grill
+            .network_reference(&reference.instance_id)
+            .await
+            .unwrap(),
+        None,
+        "the runtime still holds the old incarnation's address"
+    );
+    drop(agent);
+    let journal =
+        crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+            .unwrap();
+    let owner = journal
+        .inventory()
+        .services
+        .iter()
+        .find(|owner| owner.entry.app_name == "web")
+        .unwrap();
+    assert_eq!(owner.entry.vip, new_vip);
+}
+
+/// #1500's safety half: while the other nodes haven't confirmed, nothing of
+/// the new incarnation starts here. The old replica keeps its address, the
+/// journal keeps the old VIP, and the deploy says why and leaves the retry
+/// to the reconciler.
+#[tokio::test]
+async fn a_new_allocation_waits_here_until_the_old_incarnation_has_retired() {
+    let (mut agent, root, old_vip, _new_vip, reference) = reapplied_under_a_new_vip().await;
+    let grill = agent.supervisor.grill().clone();
+    let (client, pending) =
+        crate::cluster::producer::test_fixture(axum::http::StatusCode::ACCEPTED, String::new())
+            .await;
+    agent.set_producer_release_client(client);
+
+    let events = deploy_through_admission(&mut agent, basic_config()).await;
+    pending.abort();
+    let _ = pending.await;
+
+    match events.as_slice() {
+        [ApplyEvent::Error { message }] => assert!(
+            message.contains("new service allocation"),
+            "unexpected refusal: {message}"
+        ),
+        other => panic!("the deploy went ahead: {other:?}"),
+    }
+    assert_eq!(
+        grill
+            .calls()
+            .iter()
+            .filter(|(operation, _)| operation == "create")
+            .count(),
+        1,
+        "started a replica before the old incarnation retired"
+    );
+    assert_eq!(
+        grill
+            .network_reference(&reference.instance_id)
+            .await
+            .unwrap(),
+        Some(reference.clone()),
+        "released the address before the other nodes confirmed"
+    );
+    assert!(
+        agent
+            .supervisor
+            .get_instance(&reference.instance_id)
+            .is_some()
+    );
+    drop(agent);
+    let journal =
+        crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+            .unwrap();
+    let owner = journal
+        .inventory()
+        .services
+        .iter()
+        .find(|owner| owner.entry.app_name == "web")
+        .unwrap();
+    assert_eq!(owner.entry.vip, old_vip);
+}
+
+/// Only a replaced allocation sends a deploy through retirement. A rollout
+/// under the allocation the node already has stays a rollout, or every
+/// ordinary `apply` would stop the app.
+#[tokio::test]
+async fn a_deploy_under_the_same_allocation_supersedes_nothing() {
+    let (agent, _root, _vip) = consumer_web_fixture().await;
+    assert_eq!(agent.superseded_target(&basic_config()), None);
+}
+
+/// A changed port replaces the allocation as much as a changed VIP does:
+/// the journal refuses either until the old one has retired.
+#[tokio::test]
+async fn a_changed_port_supersedes_the_old_allocation() {
+    use crate::onion::service_id::ServiceId;
+    let (mut agent, _root, _vip) = consumer_web_fixture().await;
+    let web = ServiceId::new("default", "web");
+    let mut moved = agent
+        .consumer_owner()
+        .unwrap()
+        .publications
+        .last()
+        .unwrap()
+        .catalog
+        .clone();
+    moved.services.get_mut("default__web").unwrap().port = 9090;
+    let (_, ingress) = cluster_publication_fixture();
+    agent
+        .synchronise_consumer(4, moved, ingress, vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .superseded_target(&basic_config())
+            .map(|target| target.name),
+        Some(web.name)
+    );
+}
+
+/// A reservation with nothing of the app left here has no stop to run, so
+/// it can't hold a deploy up.
+#[tokio::test]
+async fn a_reservation_without_instances_supersedes_nothing() {
+    let (mut agent, _root, _catalog) = clustered_allocation_fixture().await;
+    let (reply, result) = oneshot::channel();
+    agent
+        .handle_deploy_op(DeployOp::RegisterServiceApp {
+            app_name: "remote".into(),
+            namespace: "default".into(),
+            port: 8080,
+            firewall: None,
+            reply,
+        })
+        .await;
+    result.await.unwrap().unwrap();
+    let mut moved = agent
+        .consumer_owner()
+        .unwrap()
+        .publications
+        .last()
+        .unwrap()
+        .catalog
+        .clone();
+    moved.services.get_mut("default__remote").unwrap().vip =
+        crate::onion::vip::VirtualIP("127.128.43.43".parse().unwrap());
+    let (_, ingress) = cluster_publication_fixture();
+    agent
+        .synchronise_consumer(2, moved, ingress, vec![])
+        .await
+        .unwrap();
+    let config = Config::parse("[app.remote]\nimage = 'test:v1'\nport = 8080\n").unwrap();
+    assert_eq!(agent.superseded_target(&config), None);
+}
+
 #[tokio::test]
 async fn clustered_local_allocation_retires_without_cancelling_remote_replica_requests() {
     let (mut agent, root, catalog) = clustered_allocation_fixture().await;

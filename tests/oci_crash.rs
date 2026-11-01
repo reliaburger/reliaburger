@@ -1814,6 +1814,202 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
     }
 }
 
+/// Two services shaped like the evaluation's fixture (#1500): a backend of
+/// two replicas and a frontend of three, both with a port, so every node
+/// owns discovery allocations and the frontend's replicas consume the
+/// backend's VIP.
+#[cfg(feature = "ebpf")]
+fn reapply_fixture(backend: &str, frontend: &str) -> Config {
+    let command = r#"["/bin/busybox", "sh", "-c", "trap 'exit 0' TERM; while :; do /bin/busybox sleep 1; done"]"#;
+    Config::parse(&format!(
+        r#"
+[app.{backend}]
+image = "/empty-fixture"
+command = {command}
+replicas = 2
+port = 8080
+
+[app.{frontend}]
+image = "/empty-fixture"
+command = {command}
+replicas = 3
+port = 8080
+"#
+    ))
+    .unwrap()
+}
+
+/// Whether every node runs exactly `apps`' replicas, all of them running,
+/// and resolves each app to that many healthy backends. A leftover stopped
+/// or stopping instance of an earlier incarnation fails the count.
+#[cfg(feature = "ebpf")]
+async fn reapply_converged(nodes: &[Node], apps: &[(&str, usize)]) -> Result<(), String> {
+    let mut instances: Vec<reliaburger::bun::agent::InstanceStatus> = Vec::new();
+    for node in nodes {
+        let statuses = node
+            .client
+            .status()
+            .await
+            .map_err(|error| error.to_string())?;
+        instances.extend(statuses);
+    }
+    for (app, replicas) in apps {
+        let mine: Vec<_> = instances.iter().filter(|i| i.app_name == *app).collect();
+        if mine.len() != *replicas || mine.iter().any(|i| i.state != "running") {
+            let states: Vec<_> = mine
+                .iter()
+                .map(|i| format!("{}:{}", i.id, i.state))
+                .collect();
+            return Err(format!("{app}: {states:?}"));
+        }
+        for node in nodes {
+            let resolved = node
+                .client
+                .resolve(app)
+                .await
+                .map_err(|error| error.to_string())?;
+            if resolved.healthy_backends != *replicas {
+                return Err(format!(
+                    "{app} resolves to {} healthy backends",
+                    resolved.healthy_backends
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// #1500: `relish delete` followed at once by `relish apply` of the same
+/// apps must converge every time, with no instance of the deleted
+/// incarnation left retiring. The evaluation saw the fourth such cycle on a
+/// three-node runc cluster wedge with "original service withdrawal is
+/// unproven" until Bun restarted. Discovery ownership is journalled only
+/// on runc with eBPF, so only an enrolled OCI cluster runs the check.
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox; run through scripts/release/qualify-oci-interruptions.sh"]
+async fn three_enrolled_oci_nodes_converge_when_deleted_apps_are_reapplied_at_once() {
+    const CYCLES: usize = 6;
+    let root = tempfile::tempdir().unwrap().keep();
+    let _cleanup = RootCleanup(root.clone());
+    let roots: Vec<_> = (0..3)
+        .map(|i| {
+            let path = root.join(format!("node{i}"));
+            std::fs::create_dir(&path).unwrap();
+            path
+        })
+        .collect();
+    let mut nodes = Vec::new();
+    let mut fixtures = Vec::new();
+    let (node, fixture) = enrolled_upgrade_fixture(&roots[0], "reapply-0", None).await;
+    nodes.push(node);
+    fixtures.push(fixture);
+    for (i, node_root) in roots.iter().enumerate().skip(1) {
+        let (node, fixture) = enrolled_upgrade_fixture(
+            node_root,
+            &format!("reapply-{i}"),
+            Some((&roots[0], &nodes[0])),
+        )
+        .await;
+        nodes.push(node);
+        fixtures.push(fixture);
+    }
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let mut ready = true;
+            for node in &nodes {
+                ready &= node
+                    .client
+                    .council()
+                    .await
+                    .is_ok_and(|c| c.members.len() == 3 && c.leader.is_some());
+            }
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("three enrolled voters did not converge"));
+    let backend = root_app_name("backend", &root);
+    let frontend = root_app_name("frontend", &root);
+    let apps = [(backend.as_str(), 2), (frontend.as_str(), 3)];
+    let config = reapply_fixture(&backend, &frontend);
+    let converge = async |cycle: usize| {
+        let mut last = String::new();
+        let converged = tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                match reapply_converged(&nodes, &apps).await {
+                    Ok(()) => break,
+                    Err(why) => last = why,
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await;
+        if converged.is_err() {
+            panic!(
+                "cycle {cycle} never converged: {last}\n{}",
+                node_log_tails(&roots)
+            );
+        }
+    };
+    nodes[0].client.apply(&config).await.unwrap();
+    converge(0).await;
+    for cycle in 1..=CYCLES {
+        for (app, _) in &apps {
+            nodes[0].client.delete(app, "default").await.unwrap();
+        }
+        // No wait for the deleted incarnation to retire: that is the case.
+        nodes[0].client.apply(&config).await.unwrap();
+        converge(cycle).await;
+    }
+    for root in &roots {
+        let log = std::fs::read_to_string(root.join("bun.log")).unwrap_or_default();
+        assert!(
+            !log.contains("withdrawal is unproven"),
+            "{} refused a retirement on the way:\n{}",
+            root.display(),
+            node_log_tails(&roots)
+        );
+    }
+    for (app, _) in &apps {
+        nodes[0].client.delete(app, "default").await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let mut cleared = true;
+            for root in &roots {
+                let saved: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(root.join("data/discovery/discovery.json")).unwrap(),
+                )
+                .unwrap();
+                let inventory = &saved["inventory"];
+                cleared &= inventory["services"].as_array().unwrap().is_empty()
+                    && inventory["references"].as_array().unwrap().is_empty();
+            }
+            if cleared {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the last delete left discovery obligations behind\n{}",
+            node_log_tails(&roots)
+        )
+    });
+    for node in &mut nodes {
+        node.crash().await;
+    }
+    for root in &roots {
+        retire_kernel(root);
+    }
+}
+
 #[cfg(feature = "ebpf")]
 #[tokio::test]
 #[ignore = "requires Linux root and private mount namespaces; run through scripts/release/qualify-oci-interruptions.sh"]

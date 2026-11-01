@@ -293,6 +293,38 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .contains_key(&(target.name.clone(), target.namespace.clone()))
             })
     }
+
+    /// The first workload in `config` whose instances here still belong to
+    /// an allocation the council has replaced (#1500).
+    ///
+    /// `relish delete` withdraws a service's VIP, and the council reserves
+    /// it until every consumer confirms. An `apply` before then gets another
+    /// VIP. The discovery journal holds one allocation per service and won't
+    /// let go of the old one until it has retired, and that retirement has
+    /// to be proved against the old allocation. So the new one has to wait
+    /// here until the old one has gone.
+    pub(super) fn superseded_target(
+        &self,
+        config: &crate::config::Config,
+    ) -> Option<crate::bun::deploy_operations::DeployTarget> {
+        let catalog = &self.consumer_owner()?.publications.last()?.catalog;
+        crate::bun::deploy_operations::targets(config)
+            .into_iter()
+            .find(|target| {
+                let id = crate::onion::service_id::ServiceId::new(&target.namespace, &target.name);
+                let replaced = self
+                    .service_map
+                    .resolve(&id)
+                    .zip(catalog.resolve(&id))
+                    .is_some_and(|(local, committed)| {
+                        local.vip != committed.vip || local.port != committed.port
+                    });
+                replaced
+                    && self.supervisor.list_instances().iter().any(|instance| {
+                        instance.app_name == target.name && instance.namespace == target.namespace
+                    })
+            })
+    }
 }
 
 fn stop_incomplete(reason: String) -> BunError {
