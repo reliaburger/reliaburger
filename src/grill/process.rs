@@ -483,6 +483,10 @@ pub struct ProcessGrill {
     capture_gate: Option<Arc<CaptureGate>>,
     #[cfg(test)]
     file_eof_gate: Option<Arc<CaptureGate>>,
+    /// State checks that fail before answering, as an owner too busy to
+    /// reply within its timeout fails.
+    #[cfg(test)]
+    state_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ProcessGrill {
@@ -496,6 +500,8 @@ impl ProcessGrill {
             capture_gate: None,
             #[cfg(test)]
             file_eof_gate: None,
+            #[cfg(test)]
+            state_failures: Arc::default(),
         }
     }
 
@@ -510,6 +516,8 @@ impl ProcessGrill {
             capture_gate: None,
             #[cfg(test)]
             file_eof_gate: None,
+            #[cfg(test)]
+            state_failures: Arc::default(),
         }
     }
 
@@ -525,6 +533,8 @@ impl ProcessGrill {
             capture_gate: None,
             #[cfg(test)]
             file_eof_gate: None,
+            #[cfg(test)]
+            state_failures: Arc::default(),
         }
     }
 
@@ -1020,6 +1030,16 @@ impl super::Grill for ProcessGrill {
     }
 
     async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
+        #[cfg(test)]
+        if self
+            .state_failures
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.state_failures
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(owner_error(instance, "process owner request timed out"));
+        }
         if let Some(control) = &self.control {
             let record = control
                 .status_if_present(instance)
@@ -1384,6 +1404,8 @@ impl super::Grill for ProcessGrill {
         }
 
         let mut drained = false;
+        let mut watch =
+            crate::grill::capture::SourceWatch::new(crate::grill::capture::UNKNOWN_SOURCE_LIMIT);
         #[cfg(test)]
         let mut eof_gated = false;
         loop {
@@ -1429,11 +1451,26 @@ impl super::Grill for ProcessGrill {
                 gate.release.acquire().await.unwrap().forget();
             }
 
-            // Check if the process has exited and no more data is coming
+            if !no_new_data {
+                watch.confirm();
+            }
+
+            // Check if the process has exited and no more data is coming. A
+            // state that can't be read is a busy owner, not an ended process:
+            // leaving now would freeze this instance's logs for good (#1493).
             let exited = match self.state(instance).await {
-                Ok(ContainerState::Stopped) => true,
-                Err(_) => return,
-                _ => false,
+                Ok(state) => {
+                    watch.confirm();
+                    state == ContainerState::Stopped
+                }
+                Err(GrillError::NotFound { .. }) => return,
+                Err(error) => {
+                    if watch.check_failed(tokio::time::Instant::now()) {
+                        eprintln!("ketchup: no longer following {instance}: {error}");
+                        return;
+                    }
+                    false
+                }
             };
             if exited && no_new_data {
                 if !drained {
@@ -1456,7 +1493,7 @@ impl super::Grill for ProcessGrill {
 
             tokio::select! {
                 _ = lines_tx.closed() => return,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                _ = tokio::time::sleep(crate::grill::capture::FOLLOW_POLL) => {}
             }
         }
     }
@@ -2207,6 +2244,79 @@ mod tests {
         }
         task.abort();
         lines
+    }
+
+    /// #1493: one owner request timing out on a loaded node ended the
+    /// forwarder for good. The instance kept running, but its lines stopped
+    /// reaching the store, and `relish logs --tail` froze on the last ones
+    /// stored. A failed check says nothing about the workload.
+    #[tokio::test]
+    async fn a_failed_state_check_keeps_a_running_instance_in_the_log_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let id = InstanceId("client-0".to_string());
+        grill.create(&id, &sleep_spec("60")).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let capture = dir.path().join("client-0.stdout");
+        let mut capture_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&capture)
+            .unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let follower = grill.clone();
+        let follow_id = id.clone();
+        let task = tokio::spawn(async move {
+            follower
+                .follow_logs(&follow_id, sender, &Default::default())
+                .await
+        });
+
+        // Each round is one flush, so the tail has to cross Parquet files.
+        let mut written = 0;
+        for round in 0..4 {
+            if round > 0 {
+                grill
+                    .state_failures
+                    .store(1, std::sync::atomic::Ordering::SeqCst);
+                while grill
+                    .state_failures
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+            for _ in 0..10 {
+                written += 1;
+                std::io::Write::write_all(&mut capture_file, format!("ACK {written}\n").as_bytes())
+                    .unwrap();
+            }
+            for _ in 0..10 {
+                let line = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+                    .await
+                    .expect("the follower went quiet with lines still unread")
+                    .expect("the follower ended while its instance ran");
+                assert!(store.ingest(&client_record(&id, line)));
+            }
+            store.flush().await.unwrap();
+        }
+
+        let tail: Vec<String> = store
+            .query("client", "default", None, None, None, Some(15))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.line)
+            .collect();
+        let newest: Vec<String> = (26..=40).map(|n| format!("ACK {n}")).collect();
+        assert_eq!(tail, newest);
+
+        task.abort();
+        grill.kill(&id).await.unwrap();
     }
 
     /// #308: after a Bun restart, a forwarder resumes the capture file at the

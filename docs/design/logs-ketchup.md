@@ -334,7 +334,7 @@ The emergency per-app line-dropping, the `log.storage_exhausted` alert, and the 
 
 ### 7.2 Container Restart During Capture
 
-When a workload stops, its forwarder task ends; a new one is spawned when a new instance starts. **Partial-line flushing with an `is_truncated` marker is planned -- not yet implemented** -- there is no truncation flag on a stored line (the record has no `flags` field).
+When a workload stops, its forwarder task ends; a new one is spawned when a new instance starts. The forwarder is the only path from a capture file into the `LogStore` and nothing respawns it, so it ends only on evidence ([#1493](https://github.com/reliaburger/reliaburger/issues/1493)): the runtime reports the source stopped or absent, or `capture::follow_capture` finds the capture files gone. A check that merely fails, such as an owner request timing out on a busy node, keeps it reading. After `UNKNOWN_SOURCE_LIMIT` (10 minutes) of failed checks with no output in between, it logs why and stops, so it can't outlive an instance whose records have gone. **Partial-line flushing with an `is_truncated` marker is planned -- not yet implemented** -- there is no truncation flag on a stored line (the record has no `flags` field).
 
 ### 7.3 Corrupt Parquet File
 
