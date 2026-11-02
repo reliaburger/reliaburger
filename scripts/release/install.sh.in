@@ -242,7 +242,7 @@ main() {
       -h|--help) explain_choices; exit 0 ;;
       *)
         # The rest belongs to `relish setup`.
-        [ "$mode" != laptop ] && [ "$mode" != ssh ] || break
+        case $mode in laptop|ssh) break ;; esac
         refuse_usage "unknown option: $1" ;;
     esac
   done
