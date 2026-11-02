@@ -29,7 +29,7 @@
     <main id="main">
       <section id="intro" class="intro" aria-labelledby="title">
         <div class="intro-copy">
-          <div class="eyebrow">RUST · APACHE 2.0 · 0.2.4 PROTOTYPE</div>
+          <div class="eyebrow">RUST · APACHE 2.0 · 0.2.4</div>
           <h1 id="title">The container platform,<br>served ready.</h1>
           <p class="lede">Kubernetes hands you the ingredients. Reliaburger hands you the burger:
             scheduling, mTLS, ingress, a registry, metrics, logs, GitOps, jobs and chaos testing,
@@ -75,7 +75,6 @@
               anything.</p>
             <p>You’ll need a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB of
               free memory and 15 GiB of disk. No Rust, no checkout.</p>
-            <p>Until 1.0.0, Reliaburger is for trying out, not for production.</p>
             <p class="install-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a>
               · <a href="install.sh">Read the bootstrap script</a>
               · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.4">Release notes <span aria-hidden="true">↗</span></a></p>
@@ -85,6 +84,13 @@
 
       <!-- Release cards, here and in #next, use the roadmap's release names (docs/roadmap.md);
            a date appears only where the roadmap states one. tests/suite/website.rs checks both. -->
+      <aside class="status status-note" aria-label="Project status">
+        <strong>Where it stands</strong>
+        <p>Good enough for home labs and dev clusters. Not for production until 1.0.0,
+          expected in January 2027. Until then, an upgrade can mean starting a fresh cluster.</p>
+        <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">Roadmap <span aria-hidden="true">↗</span></a>
+      </aside>
+
       <aside class="status" aria-label="Release status: what the installer fetches">
         <strong>0.2.4: Extension points</strong>
         <p>What that line installs, released on 30 October 2026. Bend it to your own rules

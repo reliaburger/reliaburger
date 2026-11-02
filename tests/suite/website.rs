@@ -609,6 +609,25 @@ fn every_section_can_be_linked_to() {
     );
 }
 
+/// The page sets expectations before anyone installs, and the date it gives
+/// for 1.0.0 is the one the roadmap gives.
+#[test]
+fn the_status_box_says_who_it_is_for_and_when_1_0_0_is_due() {
+    let page = read("docs/website/index.html");
+    let start = page
+        .find("<aside class=\"status status-note\"")
+        .expect("the page has no status box");
+    let install = page.find("<section id=\"tour\"").unwrap();
+    assert!(start < install, "the status box should sit by the install");
+    let text = strip_tags(&page[start..start + page[start..].find("</aside>").unwrap()]);
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for phrase in ["home labs", "dev clusters", "production until 1.0.0"] {
+        assert!(text.contains(phrase), "the status box lacks {phrase:?}");
+    }
+    assert!(text.contains("January 2027"));
+    assert!(read("docs/roadmap.md").contains("January 2027"));
+}
+
 /// The day run is the page's headline claim, so its memory chart stays beside
 /// it through later releases, in its own directory because a promotion empties
 /// `assets/soak/`. It's a copy of the record's chart, shown lazily like the rest.
@@ -688,7 +707,7 @@ fn the_site_and_docs_announce_the_version_the_installer_installs() {
 
     let page = read("docs/website/index.html");
     for expected in [
-        format!("{version} PROTOTYPE"),
+        format!("APACHE 2.0 · {version}<"),
         format!("<strong>{version}: "),
         format!("href=\"{notes}\""),
     ] {
