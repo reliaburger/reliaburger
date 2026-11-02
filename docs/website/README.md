@@ -182,10 +182,11 @@ fails while a chart differs from its record's copy, comes from another
 release, lacks alt text, a size or lazy loading, or sits in `assets/soak/`
 without being shown, and while the section misses any of the seven charts.
 A release with a headline record of its own can show its charts while it's
-the installed release, copied the same way: 0.2.3 showed the day run's job
-rate and memory. The test wants every chart from the installed release's
-records, so the next promotion removes them; the headline paragraph in the
-jobs section keeps its links to the record.
+the installed release, copied the same way. The test wants every chart from
+the installed release's records, so the next promotion removes them. The one
+exception is the day run's memory chart, which stays beside its headline
+paragraph in the jobs section: it lives in `assets/day-run/`, out of a
+promotion's way, and `tests/suite/website.rs` checks it against its record.
 
 ### Commands the installed release doesn't have
 

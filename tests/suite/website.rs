@@ -609,6 +609,31 @@ fn every_section_can_be_linked_to() {
     );
 }
 
+/// The day run is the page's headline claim, so its memory chart stays beside
+/// it through later releases, in its own directory because a promotion empties
+/// `assets/soak/`. It's a copy of the record's chart, shown lazily like the rest.
+#[test]
+fn the_jobs_section_shows_the_day_run_s_memory_chart_from_its_record() {
+    let page = read("docs/website/index.html");
+    let start = page.find("<section id=\"job-throughput\"").unwrap();
+    let section = &page[start..start + page[start..].find("</section>").unwrap()];
+    let source = "assets/day-run/rss.svg";
+    let tag = img_tags(section)
+        .into_iter()
+        .find(|tag| attribute(tag, "src") == Some(source))
+        .expect("the jobs section doesn't show the day run's memory chart");
+    assert!(attribute(tag, "alt").is_some_and(|alt| !alt.trim().is_empty()));
+    assert_eq!(attribute(tag, "loading"), Some("lazy"));
+    for size in ["width", "height"] {
+        assert!(attribute(tag, size).is_some(), "the chart has no {size}");
+    }
+    assert_eq!(
+        read("docs/website/assets/day-run/rss.svg"),
+        read("docs/qualification/2026-10-28-v0.2.3-day-run-charts/rss.svg"),
+        "the day run's chart differs from its record; copy it again"
+    );
+}
+
 /// The page a new cluster serves tells people what to type next, so every
 /// command on it has to parse.
 #[test]
