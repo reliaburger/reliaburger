@@ -44,6 +44,7 @@
     var speed = 1;
     var started = false;
     var hasPlayed = false;
+    var trimmedGaps = [];
 
     // The player takes its speed when it's created, so a new speed means a new
     // player that picks up where the old one was.
@@ -65,6 +66,15 @@
       player.isPlaying = function () { return playing; };
     }
 
+    // The player reports its own trimmed time but starts from the recording's.
+    function recordingTime(playerTime) {
+      var time = playerTime;
+      trimmedGaps.forEach(function (gap) {
+        if (gap.trimmed <= playerTime) time = gap.at + playerTime - gap.trimmed;
+      });
+      return time;
+    }
+
     function setSpeed(button) {
       speed = Number(button.getAttribute("data-speed"));
       speeds.querySelectorAll("button").forEach(function (other) {
@@ -73,23 +83,35 @@
       if (!player) return;
       var observed = player;
       Promise.resolve(hasPlayed ? observed.getCurrentTime() : 0).then(function (at) {
-        if (player === observed) create(at > 0 ? at : 0, observed.isPlaying());
+        if (player === observed) create(at > 0 ? recordingTime(at) : 0, observed.isPlaying());
       });
     }
 
-    // A recording marks its own steps with "m" events, so these buttons follow
-    // every re-recording.
+    // A recording marks its own steps with "m" events, so the buttons and the
+    // poster follow every re-recording. A button starts on the recording's own
+    // time, while a poster is on the player's, which trims idle time.
     function chaptersFromMarkers() {
       return fetch(cast).then(function (response) {
         if (!response.ok) throw new Error(response.statusText);
         return response.text();
       }).then(function (text) {
+        var lines = text.split("\n");
+        var idleLimit = JSON.parse(lines[0]).idle_time_limit || Infinity;
+        var posterChapter = figure.getAttribute("data-poster-chapter");
+        var inPosterChapter = false;
         var at = 0;
-        text.split("\n").slice(1).forEach(function (line) {
+        var trimmed = 0;
+        lines.slice(1).forEach(function (line) {
           if (!line || line.charAt(0) === "#") return;
           var event = JSON.parse(line);
+          var before = trimmed;
           at += event[0];
+          trimmed += Math.min(event[0], idleLimit);
+          if (event[0] > idleLimit) trimmedGaps.push({ trimmed: trimmed, at: at });
           if (event[1] !== "m") return;
+          // The chapter's last frame, once its commands have finished.
+          if (inPosterChapter) poster = "npt:" + before;
+          inPosterChapter = event[2] === posterChapter;
           var button = document.createElement("button");
           button.type = "button";
           button.textContent = event[2];
@@ -105,14 +127,15 @@
       playerAssets().then(function () {
         figure.classList.add("has-player");
         speeds.hidden = false;
-        create(0, false);
-        if (!chapters) return;
         if (figure.getAttribute("data-chapters") !== "markers") {
-          chapters.hidden = false;
+          if (chapters) chapters.hidden = false;
+          create(0, false);
           return;
         }
         // Without its chapters the recording still plays, with its marks.
-        chaptersFromMarkers().then(function () { chapters.hidden = false; }).catch(function () {});
+        return chaptersFromMarkers().then(function () {
+          chapters.hidden = false;
+        }).catch(function () {}).then(function () { create(0, false); });
       }).catch(function () {
         started = false;
       });

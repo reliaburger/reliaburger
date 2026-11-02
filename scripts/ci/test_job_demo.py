@@ -195,22 +195,27 @@ setImmediate(async()=>{
     def test_marker_chapters_follow_the_recording(self):
         program = r"""
 const fs = require('fs'), vm = require('vm'), assert = require('assert');
-const calls = [], speedButton = {getAttribute: () => '1', setAttribute: () => {}};
-const speeds = {hidden:true,querySelectorAll:()=>[speedButton],addEventListener:()=>{}};
+const calls = [], speedButton = {getAttribute: () => '2', setAttribute: () => {}};
+const speeds = {hidden:true,querySelectorAll:()=>[speedButton],addEventListener:(_,callback)=>speeds.click=callback};
 const buttons = [], chapters = {hidden:true,addEventListener:()=>{},appendChild:b=>buttons.push(b)};
-const screen = {addEventListener:()=>{}};
-const figure = {classList:{add:()=>{}},getAttribute:key=>({'data-cast':'tour.cast','data-chapters':'markers'})[key]||null,
+const screen = {addEventListener:(event,callback)=>screen[event]=callback};
+const figure = {classList:{add:()=>{}},getAttribute:key=>({'data-cast':'tour.cast','data-chapters':'markers','data-poster-chapter':'One'})[key]||null,
  querySelector:selector=>selector==='.recording-speed'?speeds:selector==='.recording-chapters'?chapters:screen};
 const document = {querySelectorAll:()=>[figure],
  createElement:()=>({attributes:{},setAttribute(name,value){this.attributes[name]=value;}}),
  head:{appendChild:element=>queueMicrotask(()=>element.onload())}};
-const window = {AsciinemaPlayer:{create:()=>{calls.push(1);return {dispose:()=>{},addEventListener:()=>{}};}}};
-const cast = ['{"version":3}','[1,"m","One"]','[10,"o","x"]','','#note','[0.5,"m","Two"]'].join('\n');
+const window = {AsciinemaPlayer:{create:(cast,screen,options)=>{calls.push(options);return {dispose:()=>{},addEventListener:()=>{},getCurrentTime:()=>3.25};}}};
+const cast = ['{"version":3,"idle_time_limit":2}','[1,"m","One"]','[10,"o","x"]','','#note','[0.5,"m","Two"]'].join('\n');
 const fetch = async url => {assert.strictEqual(url,'tour.cast');return {ok:true,text:async()=>cast};};
-vm.runInNewContext(fs.readFileSync(process.argv[1],'utf8'),{document,window,Promise,Number,Object,String,JSON,Error,fetch});
-setTimeout(()=>{
+vm.runInNewContext(fs.readFileSync(process.argv[1],'utf8'),{document,window,Promise,Number,Object,String,Math,JSON,Error,Infinity,fetch});
+setTimeout(async()=>{
  assert.strictEqual(chapters.hidden,false);
  assert.deepStrictEqual(buttons.map(b=>[b.textContent,b.attributes['data-start']]),[['One','1'],['Two','11.5']]);
+ assert.strictEqual(calls.length,1);
+ assert.strictEqual(calls[0].poster,'npt:3');
+ screen.pointerdown();
+ speeds.click({target:{closest:()=>speedButton}});await new Promise(r=>setTimeout(r));
+ assert.strictEqual(calls[1].startAt,11.25);
 },20);
 """
         subprocess.run(['node', '-e', program, str(ROOT / 'docs/website/assets/tour-player.js')], check=True)

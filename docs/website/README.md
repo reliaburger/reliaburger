@@ -94,8 +94,9 @@ opens with a bold `» Title` line, and the post-processing puts an asciicast
 marker (`"m"` event) on it with the same title. The vendored player shows
 markers as chapters on its progress bar without any option, and `[` and `]`
 jump between them. `assets/tour-player.js` also reads those markers from the
-recording and draws them as jump buttons under the player, so a re-record needs
-no change to the page. The script applies
+recording and draws them as jump buttons under the player, and shows the last
+frame of the chapter named by `data-poster-chapter` before anyone presses play,
+so a re-record needs no change to the page. The script applies
 the demo URL when it answers, and `examples/kubernetes/podinfo.yaml` (with a
 note) when it doesn't; likewise it copies `examples/demo/burger` unless the
 published tarball holds exactly that directory. Until a promotion's site
