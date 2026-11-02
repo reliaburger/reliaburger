@@ -444,7 +444,7 @@ async fn build_cluster(
     quorum.record(wait_for_quorum(&client, &names).await)?;
     let demo_step = progress.step(Stage::Verify, "run hello through ingress");
     let result = async {
-        let demo = demo_config();
+        let demo = demo_config(spec.ingress_port);
         tokio::fs::write(operation.directory.join("hello.toml"), &demo).await?;
         client.apply(&crate::config::Config::parse(&demo)?).await?;
         probe_demo(spec.ingress_port).await
@@ -829,11 +829,17 @@ pub(super) async fn wait_for_quorum(client: &BunClient, names: &[String]) -> Res
     Ok(())
 }
 
-fn demo_config() -> String {
+/// The page `hello` serves: what a first visitor sees in the browser.
+const WELCOME_PAGE: &str = include_str!("welcome.html");
+/// The heading `probe_demo` looks for, so a page some other app served
+/// doesn't count as `hello` answering.
+const WELCOME_HEADING: &str = "<h1>Reliaburger is running</h1>";
+
+fn demo_config(ingress_port: u16) -> String {
     format!(
         r#"[app.hello]
 image = "{}"
-command = ["/bin/sh", "-c", "echo hello-started; mkdir -p /tmp/www; printf 'Reliaburger is running\\n' > /tmp/www/index.html; exec httpd -f -p 8080 -h /tmp/www"]
+command = ["/bin/sh", "-c", "echo hello-started; exec httpd -f -p 8080 -h /www"]
 port = 8080
 replicas = 1
 [app.hello.health]
@@ -845,12 +851,17 @@ threshold_healthy = 1
 host = "localhost"
 [app.hello.env]
 PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+[[app.hello.config_file]]
+path = "/www/index.html"
+content = '''
+{}'''
 "#,
         crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.replacen(
             "docker.io/library/",
             "public.ecr.aws/docker/library/",
             1
-        )
+        ),
+        WELCOME_PAGE.replace("{{INGRESS_PORT}}", &ingress_port.to_string())
     )
 }
 
@@ -869,7 +880,7 @@ async fn probe_demo(port: u16) -> Result<()> {
                 && response
                     .text()
                     .await
-                    .is_ok_and(|body| body.trim() == "Reliaburger is running")
+                    .is_ok_and(|body| body.contains(WELCOME_HEADING))
             {
                 return;
             }
@@ -1116,7 +1127,7 @@ esac
 
     #[test]
     fn demo_is_a_pinned_container_with_health_and_browser_ingress() {
-        let config = crate::config::Config::parse(&demo_config()).unwrap();
+        let config = crate::config::Config::parse(&demo_config(18080)).unwrap();
         let app = &config.app["hello"];
         assert!(
             app.image
@@ -1134,7 +1145,38 @@ esac
     /// parses can still stop the quickstart at its last step.
     #[test]
     fn demo_passes_the_validation_the_api_applies() {
-        let config = crate::config::Config::parse(&demo_config()).unwrap();
+        let config = crate::config::Config::parse(&demo_config(18080)).unwrap();
         config.validate_intrinsic().unwrap();
+    }
+
+    #[test]
+    fn hello_serves_the_welcome_page_from_a_config_file() {
+        let config = crate::config::Config::parse(&demo_config(18080)).unwrap();
+        let app = &config.app["hello"];
+        assert!(app.command[2].contains("-h /www"));
+        let [page] = app.config_file.as_slice() else {
+            panic!("hello needs exactly one config file");
+        };
+        assert_eq!(page.path, std::path::Path::new("/www/index.html"));
+        assert!(page.content.as_ref().unwrap().contains(WELCOME_HEADING));
+    }
+
+    #[test]
+    fn the_welcome_page_links_the_burger_on_this_clusters_ingress_port() {
+        let demo = demo_config(28080);
+        assert!(demo.contains("http://burger.localhost:28080"));
+        assert!(!demo.contains("INGRESS_PORT"));
+    }
+
+    /// The page may link out, but it has to render whole on a laptop with no
+    /// network, so nothing on it loads from anywhere else.
+    #[test]
+    fn the_welcome_page_loads_nothing_from_elsewhere() {
+        for external in ["src=", "<link", "<script", "url(", "@import"] {
+            assert!(
+                !WELCOME_PAGE.contains(external),
+                "the welcome page has {external:?}"
+            );
+        }
     }
 }

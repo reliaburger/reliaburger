@@ -609,6 +609,67 @@ fn every_section_can_be_linked_to() {
     );
 }
 
+/// The page sets expectations before anyone installs, and the date it gives
+/// for 1.0.0 is the one the roadmap gives.
+#[test]
+fn the_status_box_says_who_it_is_for_and_when_1_0_0_is_due() {
+    let page = read("docs/website/index.html");
+    let start = page
+        .find("<aside class=\"status status-note\"")
+        .expect("the page has no status box");
+    let install = page.find("<section id=\"tour\"").unwrap();
+    assert!(start < install, "the status box should sit by the install");
+    let text = strip_tags(&page[start..start + page[start..].find("</aside>").unwrap()]);
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for phrase in ["home labs", "dev clusters", "production until 1.0.0"] {
+        assert!(text.contains(phrase), "the status box lacks {phrase:?}");
+    }
+    assert!(text.contains("January 2027"));
+    assert!(read("docs/roadmap.md").contains("January 2027"));
+}
+
+/// The day run is the page's headline claim, so its memory chart stays beside
+/// it through later releases, in its own directory because a promotion empties
+/// `assets/soak/`. It's a copy of the record's chart, shown lazily like the rest.
+#[test]
+fn the_jobs_section_shows_the_day_run_s_memory_chart_from_its_record() {
+    let page = read("docs/website/index.html");
+    let start = page.find("<section id=\"job-throughput\"").unwrap();
+    let section = &page[start..start + page[start..].find("</section>").unwrap()];
+    let source = "assets/day-run/rss.svg";
+    let tag = img_tags(section)
+        .into_iter()
+        .find(|tag| attribute(tag, "src") == Some(source))
+        .expect("the jobs section doesn't show the day run's memory chart");
+    assert!(attribute(tag, "alt").is_some_and(|alt| !alt.trim().is_empty()));
+    assert_eq!(attribute(tag, "loading"), Some("lazy"));
+    for size in ["width", "height"] {
+        assert!(attribute(tag, size).is_some(), "the chart has no {size}");
+    }
+    assert_eq!(
+        read("docs/website/assets/day-run/rss.svg"),
+        read("docs/qualification/2026-10-28-v0.2.3-day-run-charts/rss.svg"),
+        "the day run's chart differs from its record; copy it again"
+    );
+}
+
+/// The page a new cluster serves tells people what to type next, so every
+/// command on it has to parse.
+#[test]
+fn every_command_on_the_welcome_page_parses_with_the_real_cli() {
+    let page = read("src/relish/quickstart/welcome.html");
+    let mut commands = Vec::new();
+    for block in page.split("<code>").skip(1) {
+        let block = decode(&strip_tags(&block[..block.find("</code>").unwrap()]));
+        commands.extend(block.lines().map(str::to_string));
+    }
+    let relish = relish_lines(&commands);
+    assert!(relish.len() >= 6, "too few commands found: {relish:?}");
+    for command in relish {
+        parses(&command).unwrap_or_else(|error| panic!("{command:?}: {error}"));
+    }
+}
+
 /// A release is published, so the page leads with the one-line install and keeps
 /// building from source as the second path (#280).
 #[test]
@@ -646,8 +707,7 @@ fn the_site_and_docs_announce_the_version_the_installer_installs() {
 
     let page = read("docs/website/index.html");
     for expected in [
-        format!("{version} PROTOTYPE"),
-        format!("Install {version} "),
+        format!("APACHE 2.0 · {version}<"),
         format!("<strong>{version}: "),
         format!("href=\"{notes}\""),
     ] {

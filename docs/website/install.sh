@@ -88,8 +88,8 @@ Reliaburger installs in one of two ways. Pick one and run the installer again:
 
 Netbooting a set of machines into a cluster is planned, but not built yet.
 
-Until 1.0.0, Reliaburger is for developers and enthusiasts trying it out:
-every mode builds a cluster to learn on, not for production.
+Until 1.0.0, Reliaburger is good enough for home labs and dev clusters,
+not for production.
 CHOICES
 }
 

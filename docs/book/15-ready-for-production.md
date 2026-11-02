@@ -8255,6 +8255,16 @@ applies, and `tests/suite/documented_manifests.rs` runs them on every manifest
 we tell people to apply as written: everything in `examples/`, and the TOML in
 the README, the quickstart, the Linux servers guide and the website.
 
+`hello` is also the first thing anyone sees of a new cluster in a browser, so
+it now serves a small page with a burger and what to try next, instead of one
+line of plain text. The page is `src/relish/quickstart/welcome.html`, which
+`include_str!` compiles into `relish`, and it reaches the container as an
+inline `config_file`, the same feature a user's own app would use. That's why
+the setup probe can no longer compare the whole body: it looks for the page's
+heading. A test also runs every command on the page through the real CLI,
+because a welcome page that tells you to type something broken is worse than
+none.
+
 That guard only reads manifests we wrote by hand. `relish test` writes its own,
 in code, and two of its generators still set `interval = 1` with `timeout = 2`.
 Three 0.2.1 soaks (candidates 3 and 4, and the run that reproduced them) each

@@ -18,7 +18,7 @@ with it.
 
 Patch releases (0.1.x) fix and harden without a headline. Each minor release
 after that ships one headline feature, with a single exit test that proves it.
-Until 1.0.0 every release is a development release: an incompatible format
+1.0.0 is expected in January 2027. Until then every release is a development release: an incompatible format
 change bumps the compatibility generation and needs a fresh cluster, with no
 migration and no feature gate
 ([compatibility before 1.0.0](releasing.md#compatibility-before-100)).

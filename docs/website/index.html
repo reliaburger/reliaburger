@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Reliaburger is a container orchestrator written in Rust. One node agent, one CLI, and the source, design decisions and book on GitHub.">
+  <meta name="description" content="The container platform, served ready: scheduling, mTLS, ingress, a registry, metrics, logs, GitOps, jobs and chaos testing in one Rust agent and one CLI.">
   <meta name="theme-color" content="#181b19">
   <title>Reliaburger — a container orchestrator in Rust</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23181b19'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-family='monospace' font-weight='bold' font-size='23' fill='%23f49463'%3Er%3C/text%3E%3C/svg%3E">
@@ -17,10 +17,11 @@
       <nav aria-label="Main navigation">
         <a href="#install">Install</a>
         <a href="#tour">Try it</a>
-        <a href="#job-throughput">Jobs</a>
-        <a href="#start">Build it</a>
+        <a href="#job-throughput">Batch jobs</a>
+        <a href="#release-testing">Testing</a>
         <a href="#docs">Read the docs</a>
         <a href="#compare">Compare</a>
+        <a href="#start">Build it</a>
         <a href="https://github.com/reliaburger/reliaburger">GitHub <span aria-hidden="true">↗</span></a>
       </nav>
     </header>
@@ -28,16 +29,15 @@
     <main id="main">
       <section id="intro" class="intro" aria-labelledby="title">
         <div class="intro-copy">
-          <div class="eyebrow">RUST · APACHE 2.0 · 0.2.4 PROTOTYPE</div>
-          <h1 id="title">One agent, one CLI.<br>A container platform with nothing to assemble.</h1>
-          <p class="lede">Kubernetes gave us container orchestration, and gave every team an accidental
-            platform engineering department. Reliaburger compiles the platform into one Rust agent:
+          <div class="eyebrow">RUST · APACHE 2.0 · 0.2.4</div>
+          <h1 id="title">The container platform,<br>served ready.</h1>
+          <p class="lede">Kubernetes hands you the ingredients. Reliaburger hands you the burger:
             scheduling, mTLS, ingress, a registry, metrics, logs, GitOps, jobs and chaos testing,
-            with policies and templates to bend it to your own rules without forking it.
-            It’s a prototype. Try it on a laptop cluster, on an Apple silicon Mac or on Linux with KVM; five
-            minutes from install to cluster is the target.</p>
+            in one Rust agent and one CLI.</p>
           <div class="intro-links">
-            <a class="primary-link" href="#install">Install 0.2.4 <span aria-hidden="true">↓</span></a>
+            <a class="primary-link" href="#install">Get a working cluster in under 5 minutes <span aria-hidden="true">↓</span></a>
+          </div>
+          <div class="intro-reading">
             <a href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
             <span class="link-pair"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">Read the whitepaper</a>
               <a class="pdf-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf" aria-label="The whitepaper as a PDF">PDF</a></span>
@@ -68,14 +68,14 @@
             <pre><code>curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop</code></pre>
           </div>
           <div class="install-copy">
-            <p>One line installs <code>relish</code>, then builds a three-node cluster in Linux
-              VMs on your laptop, running real containers. It checks every download against a
-              pinned digest or the release’s signing key. Without <code>--laptop</code> it only
-              explains the choices, such as Linux machines you already have, and installs nothing.</p>
-            <p>Until 1.0.0, Reliaburger is for developers and enthusiasts trying it out, not for
-              production.</p>
-            <p>You’ll need a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB of free memory
-              and 15 GiB of disk. No Rust, no checkout.</p>
+            <p>One line installs <code>relish</code>, then builds a three-node cluster of Linux
+              VMs on your laptop, running real containers. Every download is checked against a
+              pinned digest or the release’s signing key. Got Linux machines already? Swap
+              <code>--laptop</code> for <code>--install-only</code> to install just
+              <code>relish</code>, then follow the
+              <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md">Linux servers guide</a>.</p>
+            <p>You’ll need a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB of
+              free memory and 15 GiB of disk. No Rust, no checkout.</p>
             <p class="install-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a>
               · <a href="install.sh">Read the bootstrap script</a>
               · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.4">Release notes <span aria-hidden="true">↗</span></a></p>
@@ -83,33 +83,22 @@
         </div>
       </section>
 
-      <!-- Release cards use the roadmap's release names (docs/roadmap.md); a date
-           appears only where the roadmap states one. tests/suite/website.rs checks both. -->
+      <!-- Release cards, here and in #next, use the roadmap's release names (docs/roadmap.md);
+           a date appears only where the roadmap states one. tests/suite/website.rs checks both. -->
+      <aside class="status status-note" aria-label="Project status">
+        <strong>Where it stands</strong>
+        <p>Good enough for home labs and dev clusters. Not for production until 1.0.0,
+          expected in January 2027. Until then, an upgrade can mean starting a fresh cluster.</p>
+        <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">Roadmap <span aria-hidden="true">↗</span></a>
+      </aside>
+
       <aside class="status" aria-label="Release status: what the installer fetches">
         <strong>0.2.4: Extension points</strong>
-        <p>The prototype you install today, released on 30 October 2026. Bend it to
-          your own rules without forking it: policies in CEL that refuse, warn about or
-          fill in an app before it’s stored, templates that expand to ordinary apps
-          instead of CRDs, sidecars, stop hooks, a secret provider and a contract for
-          your own controllers. Signed binaries for Linux and Apple silicon Macs, and a
-          one-line installer that builds a laptop cluster from them. The documentation
-          lists what 0.2.4 doesn’t do yet.</p>
+        <p>What that line installs, released on 30 October 2026. Bend it to your own rules
+          without forking it: policies in CEL that refuse, warn about or fill in an app before
+          it’s stored, templates that expand to ordinary apps instead of CRDs, sidecars, stop
+          hooks, a secret provider and a contract for your own controllers.</p>
         <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.4">Release notes <span aria-hidden="true">↗</span></a>
-      </aside>
-
-      <aside class="status" aria-label="Release status: next">
-        <strong>0.3.0: Bare metal in an hour</strong>
-        <p>Next. An appliance OS, netbooting and claiming machines over
-          the LAN, and signed A/B OS updates. The exit test: Dell Wyse
-          thin clients from power-on to a cluster.</p>
-        <a href="https://github.com/reliaburger/reliaburger/milestone/6">Milestone <span aria-hidden="true">↗</span></a>
-      </aside>
-
-      <aside class="status" aria-label="Release status: planned">
-        <strong>0.4.0: Full container migration</strong>
-        <p>Planned. Cordon, drain and uncordon, cold moves that carry volumes, and
-          checkpoint moves that keep memory while connections reconnect.</p>
-        <a href="https://github.com/reliaburger/reliaburger/milestone/7">Milestone <span aria-hidden="true">↗</span></a>
       </aside>
 
       <section id="tour" class="section" aria-labelledby="tour-title">
@@ -120,24 +109,24 @@
           <h2 id="tour-title">Try it in five minutes <a class="permalink" href="#tour" aria-label="Link to the tour">#</a></h2>
         </div>
         <div class="tour">
-          <p class="tour-note">Install, then put the cluster through its paces with a burger
-            built from six apps: watch a layer cut off, a rolling deploy, a rollback, a
-            scale-up, a house rule, a killed patty, a batch of jobs, a network fault and a lost
-            node. Same prerequisites as the install line.</p>
+          <p class="tour-note">Put the cluster through its paces with a burger built from eight
+            apps: a batch of jobs, a layer cut off, a rolling deploy, a rollback, a scale-up, a
+            house rule, a killed patty, a slow network and a lost node.</p>
           <!-- The recording is always on show. assets/tour-player.js loads the vendored
                asciinema player (assets/asciinema/) and the recording from this site as the
                figure nears the viewport. -->
-          <figure id="tour-recording" class="recording" data-cast="./assets/tour.cast" data-poster="npt:3:53">
+          <figure id="tour-recording" class="recording" data-cast="./assets/tour.cast" data-chapters="markers" data-poster-chapter="Cook a batch">
             <div class="recording-screen"></div>
             <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
               <a href="./assets/tour.cast">download the recording</a> and play it in a terminal with
               <code>asciinema play tour.cast</code>, or follow the steps below.</p></noscript>
             <figcaption>
+              <span class="recording-chapters" role="group" aria-label="Tour recording chapters" hidden></span>
               <span>The whole tour on a real laptop cluster, run by
                 <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>
                 against the published 0.2.4 install.
                 Setup plays four times faster and idle time is cut to two seconds; every wait
-                says how long it really took. The marks on the progress bar are the steps.</span>
+                says how long it really took. Jump to a step with the buttons above, or the marks on the progress bar.</span>
               <span class="recording-speed" role="group" aria-label="Playback speed" hidden>speed
                 <button type="button" data-speed="1" aria-pressed="true">1×</button>
                 <button type="button" data-speed="2" aria-pressed="false">2×</button>
@@ -151,9 +140,7 @@
             <ol class="tour-steps">
               <li>
                 <pre><code data-tour>curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop</code></pre>
-                <p>Installs <code>relish</code>, then builds a three-node cluster in Linux VMs on your
-                  laptop. It checks every download against a pinned digest, and it’s the only step
-                  that takes minutes.</p>
+                <p>The install line from above. It’s the only step that takes minutes.</p>
               </li>
               <li>
                 <pre><code data-tour>curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz</code>
@@ -302,8 +289,7 @@
           </details>
           <p class="tour-links">Also in the CLI: <code data-tour>relish manual tour</code>
             · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/08_five-minute-tour.md">Read it on GitHub</a>
-            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">Prerequisites, retries and cleanup</a>
-            · <a href="install.sh">Read the bootstrap script</a></p>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">Prerequisites, retries and cleanup</a></p>
         </div>
       </section>
 
@@ -314,20 +300,31 @@
             <a class="permalink" href="#job-throughput" aria-label="Link to the job demonstration">#</a></h2>
         </div>
         <div class="tour">
-        <p class="tour-note">The same command, run four ways on the same VM with the same
-          concurrency, so you can see what each kind of isolation costs.</p>
+        <p class="tour-note">Jobs run on the same cluster as your apps, in the room the apps
+          leave free, so there’s no second system to install. Run one task or an array of a
+          million, on a schedule or on demand. Give each task a fresh container for full
+          isolation, share a container across short tasks to start them faster, or run them
+          straight on the host when speed matters more than the boundary.</p>
         <p><strong>1,807,742,226 host jobs in one real day.</strong> 0.2.3 ran host jobs
           for 24 hours on three 4-vCPU VMs on one laptop: 20,920 a second, counted as the
           council accepted them, not extrapolated from a minute. That’s 1.81 billion
           against the two billion we aimed for, with no failed tasks and every node
-          within a point of its share. The same release ran 14,917 a second on one node
-          and 29,350 on three in a short benchmark; a whole day on a laptop whose cores
-          the VMs fill runs slower. Bun’s memory grew through the day, inside its budget;
-          0.2.4 bounds the idle job series and the ingest checkpoint behind part of that,
-          and a day-long memory run on 0.2.4 is checking the rest.
+          within a point of its share. Short benchmarks of the same release ran 14,917 a
+          second on one node and 29,350 on three; a whole day on a laptop whose cores the
+          VMs fill runs slower. Bun’s memory grew all day, inside its budget, and that
+          growth isn’t fully fixed yet
+          (<a href="https://github.com/reliaburger/reliaburger/issues/1417">#1417</a>).
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-28-v0.2.3-day-run.md">Day-run record</a> ·
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-27-v0.2.3-candidate-throughput/README.md">Benchmark record</a></p>
-        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:258.78089525790324">
+        <figure class="soak-chart">
+          <a href="assets/day-run/rss.svg"><img src="assets/day-run/rss.svg" width="720" height="272" loading="lazy"
+            alt="Bun resident memory per node over the 24-hour day run, growing from about 200 to about 345 MiB, against the 512 MiB target for node 1 and 384 MiB for the others"></a>
+          <figcaption>Bun memory per node over the day run, with the 512 and 384 MiB targets. The ✕ marks
+            are failed health checks, nearly all the leak check flagging this growth, not failed job tasks.</figcaption>
+        </figure>
+        <p class="tour-note">What does each kind of isolation cost? Here’s the same command, run
+          four ways on the same VM with the same concurrency.</p>
+        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:257.7">
           <div class="recording-screen"></div>
           <noscript><p class="recording-fallback">The demonstration plays with JavaScript.
             <a href="./assets/job-throughput.cast">Download the recording</a> and play it
@@ -394,11 +391,8 @@
         </details>
         <details class="tour-commands" id="job-throughput-details">
           <summary>Show the results and setup <span class="tour-commands-note">use cases, rates and testing rig</span></summary>
-        <p>Run independent jobs in fresh, fully isolated containers. Use a shared
-          container for repeatable tasks when starting a container for every command
-          would dominate the work. Choose host jobs for maximum speed with no isolation,
-          using an explicit allowlisted binary. All three use built-in resource
-          admission, durable ownership, retries and accepted outcomes.</p>
+        <p>All three job types get the same resource admission, durable ownership, retries
+          and accepted outcomes. Host jobs also need an explicitly allowlisted binary.</p>
         <div class="throughput-comparison" role="region" aria-label="Measured job runtimes" tabindex="0">
         <table><caption>Released v0.2.0: the median of five rounds of the four
           scenarios, 60 seconds each. Same VM, BusyBox command and concurrency cap of 27.
@@ -430,18 +424,15 @@
               controls reporting, not resource admission. Counts conservatively exclude
               results after the last sample. Preparation, cancellation and verified
               cleanup remain visible outside the 60-second windows. All windows have
-              zero failures; one fresh-container window accepted one retry. In the
-              recording, real pauses are preserved; chapter jumps and playback speed
-              change only your view.</p>
+              zero failures; one fresh-container window accepted one retry.</p>
 
         <p><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-17-v0.2.0-job-throughput">v0.2.0 measurements</a> ·
           <a href="./assets/job-throughput-report.json">Recording's report</a> ·
           <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-09-timed-job-scenarios">The recording's raw results</a> ·
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/14_batch-jobs.md">Job manual</a></p>
-        <p>Use indexed work for data preparation, offline evaluation and independent
-          inference commands. Fresh containers keep dependencies and jobs separate;
-          shared containers reuse their environment. Each job still starts a process;
-          keeping an AI model resident is a separate planned executor.</p>
+        <p>Arrays suit data preparation, offline evaluation and independent inference
+          commands. Each job still starts a process; keeping an AI model resident is a
+          separate planned executor.</p>
         </details>
         </div>
       </section>
@@ -497,6 +488,12 @@
           drains, a council history that isn't linearizable, or job tasks slower than
           256 ms to start at the 99th percentile. A failure gets a root cause before anything else happens. A product fix
           means a new candidate, and every soak starts again.</p>
+        <p><strong>The latest: 0.2.4, 30 October 2026.</strong> One candidate over two days,
+          on the full gate because it changes the cluster’s formats. Both one-hour soaks failed
+          on a check with too few samples to judge, which we fixed in the harness and replayed
+          on the same evidence. The 8-hour soak then passed clean.
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/release-log.md">The release log</a>
+          has every release’s story.</p>
         <details class="tour-commands" id="release-testing-results">
           <summary>Show 0.2.4's results <span class="tour-commands-note">headline numbers and charts, each with its record</span></summary>
           <ul>
@@ -564,14 +561,6 @@
             </figure>
           </div>
         </details>
-        <p><strong>The latest: 0.2.4, 30 October 2026.</strong> One candidate over two
-          days, on the full gate because it changes the cluster’s formats. Before any soak
-          reached a fault, the harness tripped over itself three times: an old Python, a
-          manifest the new policy checks refuse, and ports a stopped run left behind. Then
-          both one-hour soaks failed on a check with too few samples to judge, fixed in the
-          harness and replayed on the same evidence, and the 8-hour soak passed clean.
-          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/release-log.md">The release log</a>
-          has every release's story.</p>
         <p>What the soaks don't prove: they run three small VMs on one laptop, so they say
           nothing about large clusters, real networks between machines or hardware failing.
           A VM forced off isn't a real power loss, the fault rates are a schedule, not
@@ -582,46 +571,31 @@
         </div>
       </section>
 
-      <section id="start" class="section start" aria-labelledby="start-title">
+      <section id="next" class="section" aria-labelledby="next-title">
         <div class="section-heading">
           <span class="section-number" aria-hidden="true">05 /</span>
-          <h2 id="start-title">Or build it from source <a class="permalink" href="#start" aria-label="Link to the build-from-source section">#</a></h2>
+          <h2 id="next-title">What’s next <a class="permalink" href="#next" aria-label="Link to what's next">#</a></h2>
         </div>
-        <div class="start-grid">
-          <div class="start-copy">
-            <p>Hacking on Reliaburger itself? Start with a local process. No container
-              runtime required.</p>
-            <p>You’ll need Rust and the build tools for your platform. This example runs
-              <code>hello</code> as a host process under the built-in process runtime, which
-              runs the binaries the node config allows and no images; it doesn’t create
-              an isolated container or a multi-node cluster.</p>
-            <p>For real OCI containers, use runc on Linux. On macOS, the managed laptop
-              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.4.</p>
-            <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/README.md">Build requirements &amp; runtime setup <span aria-hidden="true">↗</span></a>
-          </div>
-          <div class="terminal">
-            <div class="terminal-heading">LOCAL DEVELOPMENT <span>sh</span></div>
-            <pre><code><span class="comment"># Terminal 1 · build and start the agent</span>
-git clone https://github.com/reliaburger/reliaburger
-cd reliaburger
-cargo build --bins
-target/debug/bun --runtime process \
-  --config examples/node/process-runtime.toml
+      <aside class="status" aria-label="Release status: next">
+        <strong>0.3.0: Bare metal in an hour</strong>
+        <p>Next. An appliance OS, netbooting and claiming machines over
+          the LAN, and signed A/B OS updates. The exit test: Dell Wyse
+          thin clients from power-on to a cluster.</p>
+        <a href="https://github.com/reliaburger/reliaburger/milestone/6">Milestone <span aria-hidden="true">↗</span></a>
+      </aside>
 
-<span class="comment"># Terminal 2 · from the same checkout</span>
-target/debug/relish apply \
-  examples/phase-1/proc-first-run.toml
-target/debug/relish status
-target/debug/relish</code></pre>
-            <div class="terminal-footer">Web dashboard: <code>http://127.0.0.1:9117/</code></div>
-          </div>
-        </div>
+      <aside class="status" aria-label="Release status: planned">
+        <strong>0.4.0: Full container migration</strong>
+        <p>Planned. Cordon, drain and uncordon, cold moves that carry volumes, and
+          checkpoint moves that keep memory while connections reconnect.</p>
+        <a href="https://github.com/reliaburger/reliaburger/milestone/7">Milestone <span aria-hidden="true">↗</span></a>
+      </aside>
       </section>
 
       <section id="docs" class="section" aria-labelledby="docs-title">
         <div class="section-heading">
           <span class="section-number" aria-hidden="true">06 /</span>
-          <h2 id="docs-title">Read before you deploy <a class="permalink" href="#docs" aria-label="Link to the documentation section">#</a></h2>
+          <h2 id="docs-title">Read the docs <a class="permalink" href="#docs" aria-label="Link to the documentation section">#</a></h2>
           <span class="section-note">Documentation lives with the code.</span>
         </div>
         <div class="reading-list">
@@ -634,19 +608,16 @@ target/debug/relish</code></pre>
             <span class="filetype">DESIGN &amp; INTENT</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">The whitepaper <span aria-hidden="true">↗</span></a></h3>
             <p>The architecture, its trade-offs and the longer-term vision. Includes features still planned.</p>
-            <a class="secondary-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf">PDF from the latest release</a>
           </article>
           <article class="reading-item">
             <span class="filetype">IMPLEMENTATION</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/design">Component design docs <span aria-hidden="true">↗</span></a></h3>
             <p>Protocols, data structures, failure modes and decisions for each subsystem.</p>
-            <a class="secondary-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-design-docs.pdf">PDF from the latest release</a>
           </article>
           <article class="reading-item">
             <span class="filetype">WALKTHROUGH</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/book">Building Reliaburger <span aria-hidden="true">↗</span></a></h3>
             <p>The companion book: build the orchestrator while learning Rust and distributed systems. For programmers coming from C, Python or Go.</p>
-            <a class="secondary-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/building-reliaburger.pdf">PDF from the latest release</a>
           </article>
           <article class="reading-item">
             <span class="filetype">REFERENCE</span>
@@ -656,7 +627,7 @@ target/debug/relish</code></pre>
           <article class="reading-item">
             <span class="filetype">CURRENT STATE</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">Roadmap &amp; backlog <span aria-hidden="true">↗</span></a></h3>
-            <p>What’s implemented, what 0.2.4 leaves out and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
+            <p>What’s implemented, what 0.2.4 leaves out and what’s next.</p>
           </article>
         </div>
         <p class="pdf-note">Every release carries PDFs, and these links always fetch the latest:
@@ -668,8 +639,8 @@ target/debug/relish</code></pre>
       </section>
 
       <section id="compare" class="section" aria-labelledby="compare-title">
-        <div class="section-heading"><span class="section-number" aria-hidden="true">06 /</span><h2 id="compare-title">Compare the alternatives <a class="permalink" href="#compare" aria-label="Link to the comparisons">#</a></h2></div>
-        <p class="section-intro">See how Reliaburger’s integrated deployment and diagnosis compare, with practical commands and sources beside the claims.
+        <div class="section-heading"><span class="section-number" aria-hidden="true">07 /</span><h2 id="compare-title">Compare the alternatives <a class="permalink" href="#compare" aria-label="Link to the comparisons">#</a></h2></div>
+        <p class="section-intro">How Reliaburger compares, with commands and sources beside the claims.
           These pages were last re-checked on 21 October 2026, against 0.2.2; the policies, templates and sidecars 0.2.4 adds aren’t in them yet.</p>
         <div class="reading-list">
           <article class="reading-item">
@@ -708,7 +679,7 @@ target/debug/relish</code></pre>
 
       <section id="internals" class="section" aria-labelledby="internals-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">07 /</span>
+          <span class="section-number" aria-hidden="true">08 /</span>
           <h2 id="internals-title">Follow a subsystem <a class="permalink" href="#internals" aria-label="Link to the subsystems section">#</a></h2>
         </div>
         <p class="section-intro"><code>bun</code> runs on each node. <code>relish</code> talks to its API.
@@ -727,6 +698,41 @@ target/debug/relish</code></pre>
           <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/chaos-smoker.md">Smoker</a></dt><dd>Fault injection, recovery testing</dd></div>
           <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/cli-relish.md">Relish</a> / <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/ui-brioche.md">Brioche</a></dt><dd>CLI, terminal UI, web dashboard</dd></div>
         </dl>
+      </section>
+
+      <section id="start" class="section start" aria-labelledby="start-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">09 /</span>
+          <h2 id="start-title">Build it from source <a class="permalink" href="#start" aria-label="Link to the build-from-source section">#</a></h2>
+        </div>
+        <div class="start-grid">
+          <div class="start-copy">
+            <p>Hacking on Reliaburger itself? Start with a local process. No container
+              runtime required.</p>
+            <p>You’ll need Rust and your platform’s build tools. This runs <code>hello</code> as
+              a host process on one node: no images, no isolated container, only the binaries
+              the node config allows.</p>
+            <p>For real OCI containers, use runc on Linux. On macOS, the managed laptop
+              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.4.</p>
+            <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/README.md">Build requirements &amp; runtime setup <span aria-hidden="true">↗</span></a>
+          </div>
+          <div class="terminal">
+            <div class="terminal-heading">LOCAL DEVELOPMENT <span>sh</span></div>
+            <pre><code><span class="comment"># Terminal 1 · build and start the agent</span>
+git clone https://github.com/reliaburger/reliaburger
+cd reliaburger
+cargo build --bins
+target/debug/bun --runtime process \
+  --config examples/node/process-runtime.toml
+
+<span class="comment"># Terminal 2 · from the same checkout</span>
+target/debug/relish apply \
+  examples/phase-1/proc-first-run.toml
+target/debug/relish status
+target/debug/relish</code></pre>
+            <div class="terminal-footer">Web dashboard: <code>http://127.0.0.1:9117/</code></div>
+          </div>
+        </div>
       </section>
 
       <section id="contributing" class="section contributing" aria-labelledby="contribute-title">

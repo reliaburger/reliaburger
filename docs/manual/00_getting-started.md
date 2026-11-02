@@ -23,8 +23,8 @@ no Intel Mac build: the installer refuses one and suggests a Linux host, or
 cluster instead. `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop`
 installs the released `relish` and runs this for you. Without `--laptop` the
 installer only explains the choices and installs nothing. A laptop cluster is
-for development: until 1.0.0, Reliaburger is for developers and enthusiasts,
-not production.
+for development: until 1.0.0, Reliaburger is good enough for home labs and dev
+clusters, not production.
 
 Setup saves an admin credential for the cluster in `~/.reliaburger/context.json`
 (readable only by you), so every `relish` command on this machine reaches the

@@ -53,7 +53,7 @@ installs Lima in your user directory, downloads the release's guest image (Ubunt
 Linux binaries, creates the cluster's credentials, then enrols each
 node. It checks the authenticated APIs, the three-member council and a sample
 container through the host ingress port. Open `http://localhost:18080/` to see
-the sample app. Your first application config is saved under
+the sample app, a small page with what to try next. Your first application config is saved under
 `~/.reliaburger/clusters/laptop/hello.toml`.
 
 `relish dashboard` opens a temporary, read-only browser session on a loopback
