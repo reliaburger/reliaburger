@@ -14,9 +14,6 @@ use anyhow::{Context, Result, bail};
 
 use super::lima::{GuestFile, install_script, write_bundle};
 
-/// The port Bun's API listens on, which setup reaches through a tunnel.
-const API_PORT: u16 = 9117;
-
 /// One machine to build a cluster on: `[user@]host[:port]`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -239,13 +236,19 @@ impl Ssh {
         Ok(())
     }
 
-    /// Forward a loopback port here to `target`'s API until the result drops.
+    /// Forward a loopback port here to `remote_port` on `target` until the
+    /// result drops.
     ///
-    /// A machine's firewall may not let this one reach the API, but Bun's
+    /// A machine's firewall may not let this one reach its API, but Bun's
     /// perimeter always admits loopback, so setup can work before the
     /// operator's own address is admitted.
-    pub async fn api_tunnel(&self, target: &SshTarget, local_port: u16) -> Result<Tunnel> {
-        let forward = format!("127.0.0.1:{local_port}:127.0.0.1:{API_PORT}");
+    pub async fn tunnel(
+        &self,
+        target: &SshTarget,
+        local_port: u16,
+        remote_port: u16,
+    ) -> Result<Tunnel> {
+        let forward = format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}");
         let mut command = self.command(
             target,
             &["-N", "-o", "ExitOnForwardFailure=yes", "-L", &forward],
@@ -260,7 +263,7 @@ impl Ssh {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(status) = child.try_wait()? {
-                bail!("{target}: the API tunnel closed ({status})");
+                bail!("{target}: the tunnel to port {remote_port} closed ({status})");
             }
             if tokio::net::TcpStream::connect(("127.0.0.1", local_port))
                 .await
@@ -269,7 +272,7 @@ impl Ssh {
                 return Ok(Tunnel { _child: child });
             }
             if tokio::time::Instant::now() >= deadline {
-                bail!("{target}: the API tunnel didn't open within 15 s");
+                bail!("{target}: the tunnel to port {remote_port} didn't open within 15 s");
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

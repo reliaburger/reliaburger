@@ -8255,6 +8255,17 @@ applies, and `tests/suite/documented_manifests.rs` runs them on every manifest
 we tell people to apply as written: everything in `examples/`, and the TOML in
 the README, the quickstart, the Linux servers guide and the website.
 
+The same steps work on real machines. `relish setup --ssh` drives the system
+`ssh` binary rather than an SSH library, so a person's keys, agent and known hosts
+all behave as they do at a prompt. It's a separate flow from the laptop's rather
+than a mode of it, which meant one trait we didn't write: a qualified path stays
+exactly as it was. Real machines also change what a failure costs. Nothing moves
+until every machine has passed its checks, and the report lists every problem on
+every machine, because finding them one at a time over four machines is miserable.
+Reaching those machines from a shell needs care too. The remote side re-parses
+what `ssh` sends, so each argument is quoted, and a host that starts with a dash
+is refused, because `ssh -oProxyCommand=...` would run it.
+
 `hello` is also the first thing anyone sees of a new cluster in a browser, so
 it now serves a small page with a burger and what to try next, instead of one
 line of plain text. The page is `src/relish/quickstart/welcome.html`, which

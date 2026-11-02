@@ -254,6 +254,7 @@ mod tests {
                 api_port: 19117,
                 ingress_port: 18080,
                 registry_port: 15050,
+                ssh: Vec::new(),
             },
         )
         .unwrap()

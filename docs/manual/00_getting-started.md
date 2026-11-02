@@ -26,6 +26,22 @@ installer only explains the choices and installs nothing. A laptop cluster is
 for development: until 1.0.0, Reliaburger is good enough for home labs and dev
 clusters, not production.
 
+On Linux machines you already have, 0.2.6 (not in 0.2.4) builds the cluster over
+SSH instead:
+
+```sh
+relish setup --ssh ubuntu@10.0.0.1,ubuntu@10.0.0.2,ubuntu@10.0.0.3
+```
+
+The machines need Ubuntu or Debian, and passwordless `sudo` for that user. Every
+machine is checked first, and if any fails nothing changes on any of them. Rerun
+the same command to resume. Credentials stay on the machine you ran it from, so
+back up the directory setup names when it finishes. `relish local` doesn't
+manage these clusters. If a machine has several private addresses, give each
+machine's address in the same order with `--advertise`. The
+[Linux servers guide](https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md)
+covers doing all this by hand.
+
 Setup saves an admin credential for the cluster in `~/.reliaburger/context.json`
 (readable only by you), so every `relish` command on this machine reaches the
 cluster without flags. Then take the tour: `relish manual tour`.

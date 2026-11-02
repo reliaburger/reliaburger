@@ -9,6 +9,9 @@
 #   --laptop           install the CLI, then build a laptop cluster with
 #                      `relish setup --quickstart`; any option after it that
 #                      isn't the installer's own goes to setup
+#   --ssh MACHINES     install the CLI, then build a cluster on existing
+#                      machines with `relish setup --ssh`; any option after
+#                      it that isn't the installer's own goes to setup
 #   --install-only     install the CLI and stop
 #   --no-modify-path   touch nothing outside ~/.reliaburger (also
 #                      RELIABURGER_NO_MODIFY_PATH=1)
@@ -107,15 +110,20 @@ refuse_intel_mac() {
 # so `curl | sh` with no flag explains the choices before downloading anything.
 explain_choices() {
   cat <<'CHOICES'
-Reliaburger installs in one of two ways. Pick one and run the installer again:
+Reliaburger installs in one of three ways. Pick one and run the installer again:
 
   --laptop        a development cluster on this computer: relish, then three
                   Linux VMs in Lima, running real containers with runc.
                     curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
 
+  --ssh MACHINES  a cluster on Linux machines you already have, from 0.2.6:
+                  relish here, then a node on each machine over SSH. They need
+                  Ubuntu or Debian, and passwordless sudo.
+                    curl -fsSL https://reliaburger.com/install.sh | sh -s -- --ssh ubuntu@10.0.0.1,ubuntu@10.0.0.2,ubuntu@10.0.0.3
+
   --install-only  just the relish CLI, for a cluster on Linux machines you
-                  already have: install bun on each, run `relish init` on the
-                  first and `relish join` on the rest. The walkthrough is
+                  set up by hand: install bun on each, run `relish init` on
+                  the first and `relish join` on the rest. The walkthrough is
                   https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md
                     curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
 
@@ -129,6 +137,7 @@ CHOICES
 usage() {
   printf '%s\n' \
     'usage: install.sh --laptop [--no-modify-path] [relish setup options...]' \
+    '       install.sh --ssh user@host,user@host,... [--no-modify-path] [relish setup options...]' \
     '       install.sh --install-only [--no-modify-path]' \
     '       install.sh --help' \
     'From curl, put the options after "sh -s --":' \
@@ -142,7 +151,7 @@ refuse_usage() {
 }
 
 choose_mode() {
-  [ -z "$mode" ] || [ "$mode" = "$1" ] || refuse_usage 'choose either --laptop or --install-only'
+  [ -z "$mode" ] || [ "$mode" = "$1" ] || refuse_usage 'choose one of --laptop, --ssh or --install-only'
   mode=$1
 }
 
@@ -223,12 +232,17 @@ main() {
   while [ "$#" -gt 0 ]; do
     case $1 in
       --laptop) choose_mode laptop; shift ;;
+      --ssh)
+        choose_mode ssh
+        [ "$#" -ge 2 ] || refuse_usage '--ssh needs the machines: user@host,user@host,...'
+        machines=$2
+        shift 2 ;;
       --install-only) choose_mode install-only; shift ;;
       --no-modify-path) modify_path=false; shift ;;
       -h|--help) explain_choices; exit 0 ;;
       *)
-        # The rest belongs to `relish setup --quickstart`.
-        [ "$mode" != laptop ] || break
+        # The rest belongs to `relish setup`.
+        [ "$mode" != laptop ] && [ "$mode" != ssh ] || break
         refuse_usage "unknown option: $1" ;;
     esac
   done
@@ -317,10 +331,14 @@ main() {
     exit 0
   fi
   if [ -n "${RELIABURGER_RELEASE_BASE_URL:-}" ]; then
-    "$bin_dir/relish" setup --quickstart --release-mirror "$release_base" "$@"
-  else
-    "$bin_dir/relish" setup --quickstart "$@"
+    set -- --release-mirror "$release_base" "$@"
   fi
+  if [ "$mode" = ssh ]; then
+    set -- --ssh "$machines" "$@"
+  else
+    set -- --quickstart "$@"
+  fi
+  "$bin_dir/relish" setup "$@"
 }
 
 main "$@"
