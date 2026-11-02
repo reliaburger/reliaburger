@@ -9,7 +9,7 @@ see the [whitepaper](whitepaper.md); for status and what's next, see the
 installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.4),
 and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs it
 and builds a laptop cluster; without a flag the installer explains the choices.
-Until 1.0.0 Reliaburger is for developers and enthusiasts, not production. Every
+Until 1.0.0 Reliaburger is good enough for home labs and dev clusters, not production. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
 The limits below are the ones 0.2.4 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.

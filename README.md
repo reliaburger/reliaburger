@@ -30,8 +30,8 @@ and KVM, plus about 8 GiB of free memory and 15 GiB of disk.
 `--laptop` asks for a development cluster on this computer. Without a flag the
 installer only explains the choices, including clusters on Linux machines you
 already have (`--install-only`, then the [Linux servers guide](docs/linux-servers.md)).
-Until 1.0.0, every Reliaburger cluster is for developers and enthusiasts
-trying it out, not for production.
+Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not
+for production.
 
 ```sh
 # Install relish and build a three-node cluster in Linux VMs on this laptop
