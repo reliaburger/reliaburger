@@ -27,7 +27,7 @@ note links the `.cast` file, and the written tour works as before. Don't add oth
 so change the two together.
 
 Every `<section>` has a stable `id` (`install`, `tour`, `start`, `docs`,
-`internals`, `contributing`) and every section heading a `#` permalink, shown on
+`internals`, `next`, `contributing`) and every section heading a `#` permalink, shown on
 hover or focus, so a section can be shared as `reliaburger.com/#install`.
 Renaming an `id` breaks links people have already shared; add a new section
 instead. `tests/suite/website.rs` checks the ids, the permalinks and that the
@@ -93,7 +93,9 @@ narration says both, and every wait prints how long it really took. Each step
 opens with a bold `» Title` line, and the post-processing puts an asciicast
 marker (`"m"` event) on it with the same title. The vendored player shows
 markers as chapters on its progress bar without any option, and `[` and `]`
-jump between them. The script applies
+jump between them. `assets/tour-player.js` also reads those markers from the
+recording and draws them as jump buttons under the player, so a re-record needs
+no change to the page. The script applies
 the demo URL when it answers, and `examples/kubernetes/podinfo.yaml` (with a
 note) when it doesn't; likewise it copies `examples/demo/burger` unless the
 published tarball holds exactly that directory. Until a promotion's site

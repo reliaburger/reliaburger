@@ -192,6 +192,30 @@ setImmediate(async()=>{
         subprocess.run(['node', '-e', program, str(ROOT / 'docs/website/assets/tour-player.js')], check=True)
 
     @unittest.skipUnless(shutil.which('node'), 'requires Node for the browser script contract')
+    def test_marker_chapters_follow_the_recording(self):
+        program = r"""
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+const calls = [], speedButton = {getAttribute: () => '1', setAttribute: () => {}};
+const speeds = {hidden:true,querySelectorAll:()=>[speedButton],addEventListener:()=>{}};
+const buttons = [], chapters = {hidden:true,addEventListener:()=>{},appendChild:b=>buttons.push(b)};
+const screen = {addEventListener:()=>{}};
+const figure = {classList:{add:()=>{}},getAttribute:key=>({'data-cast':'tour.cast','data-chapters':'markers'})[key]||null,
+ querySelector:selector=>selector==='.recording-speed'?speeds:selector==='.recording-chapters'?chapters:screen};
+const document = {querySelectorAll:()=>[figure],
+ createElement:()=>({attributes:{},setAttribute(name,value){this.attributes[name]=value;}}),
+ head:{appendChild:element=>queueMicrotask(()=>element.onload())}};
+const window = {AsciinemaPlayer:{create:()=>{calls.push(1);return {dispose:()=>{},addEventListener:()=>{}};}}};
+const cast = ['{"version":3}','[1,"m","One"]','[10,"o","x"]','','#note','[0.5,"m","Two"]'].join('\n');
+const fetch = async url => {assert.strictEqual(url,'tour.cast');return {ok:true,text:async()=>cast};};
+vm.runInNewContext(fs.readFileSync(process.argv[1],'utf8'),{document,window,Promise,Number,Object,String,JSON,Error,fetch});
+setTimeout(()=>{
+ assert.strictEqual(chapters.hidden,false);
+ assert.deepStrictEqual(buttons.map(b=>[b.textContent,b.attributes['data-start']]),[['One','1'],['Two','11.5']]);
+},20);
+"""
+        subprocess.run(['node', '-e', program, str(ROOT / 'docs/website/assets/tour-player.js')], check=True)
+
+    @unittest.skipUnless(shutil.which('node'), 'requires Node for the browser script contract')
     def test_all_recordings_load_once_and_keep_independent_speed_controls(self):
         program = r"""
 const fs = require('fs'), vm = require('vm'), assert = require('assert');

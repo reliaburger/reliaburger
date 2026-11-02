@@ -38,6 +38,7 @@ nav a:hover { text-decoration: underline; }
 h1 { font-size: clamp(2.4rem, 5.1vw, 3.7rem); line-height: 1.12; letter-spacing: -.055em; font-weight: 650; margin: 0 0 26px; }
 .lede { max-width: 720px; font-size: 1.2rem; line-height: 1.6; color: var(--muted); }
 .intro-links { display: flex; align-items: center; flex-wrap: wrap; gap: 28px; margin-top: 28px; font-size: .9375rem; }
+.intro-reading { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 28px; margin-top: 20px; font-size: .9375rem; }
 .link-pair { display: inline-flex; align-items: center; gap: 10px; }
 .pdf-link { font: 500 .75rem/1 var(--mono); letter-spacing: .07em; text-decoration: none; border: 1px solid var(--ink); border-radius: 2px; padding: 5px 7px; }
 .pdf-link:hover { border-color: var(--accent); }
@@ -156,7 +157,6 @@ h3 a { text-decoration: none; }
 h3 a:hover { text-decoration: underline; }
 h3 span { color: var(--accent); font-weight: 400; }
 .reading-item p { color: var(--muted); margin-bottom: 0; }
-.secondary-link { display: inline-block; margin-top: 10px; font-size: .875rem; color: var(--accent); }
 .pdf-note { border-top: 1px solid var(--line); padding-top: 17px; font-size: .875rem; color: var(--muted); }
 .section-intro { max-width: 760px; color: var(--muted); }
 .subsystems { display: grid; grid-template-columns: 1fr 1fr; column-gap: 56px; margin: 26px 0 0; }

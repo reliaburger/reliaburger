@@ -77,14 +77,42 @@
       });
     }
 
+    // A recording marks its own steps with "m" events, so these buttons follow
+    // every re-recording.
+    function chaptersFromMarkers() {
+      return fetch(cast).then(function (response) {
+        if (!response.ok) throw new Error(response.statusText);
+        return response.text();
+      }).then(function (text) {
+        var at = 0;
+        text.split("\n").slice(1).forEach(function (line) {
+          if (!line || line.charAt(0) === "#") return;
+          var event = JSON.parse(line);
+          at += event[0];
+          if (event[1] !== "m") return;
+          var button = document.createElement("button");
+          button.type = "button";
+          button.textContent = event[2];
+          button.setAttribute("data-start", String(at));
+          chapters.appendChild(button);
+        });
+      });
+    }
+
     function start() {
       if (started) return;
       started = true;
       playerAssets().then(function () {
         figure.classList.add("has-player");
         speeds.hidden = false;
-        if (chapters) chapters.hidden = false;
         create(0, false);
+        if (!chapters) return;
+        if (figure.getAttribute("data-chapters") !== "markers") {
+          chapters.hidden = false;
+          return;
+        }
+        // Without its chapters the recording still plays, with its marks.
+        chaptersFromMarkers().then(function () { chapters.hidden = false; }).catch(function () {});
       }).catch(function () {
         started = false;
       });
