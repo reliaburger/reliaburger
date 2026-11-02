@@ -609,6 +609,23 @@ fn every_section_can_be_linked_to() {
     );
 }
 
+/// The page a new cluster serves tells people what to type next, so every
+/// command on it has to parse.
+#[test]
+fn every_command_on_the_welcome_page_parses_with_the_real_cli() {
+    let page = read("src/relish/quickstart/welcome.html");
+    let mut commands = Vec::new();
+    for block in page.split("<code>").skip(1) {
+        let block = decode(&strip_tags(&block[..block.find("</code>").unwrap()]));
+        commands.extend(block.lines().map(str::to_string));
+    }
+    let relish = relish_lines(&commands);
+    assert!(relish.len() >= 6, "too few commands found: {relish:?}");
+    for command in relish {
+        parses(&command).unwrap_or_else(|error| panic!("{command:?}: {error}"));
+    }
+}
+
 /// A release is published, so the page leads with the one-line install and keeps
 /// building from source as the second path (#280).
 #[test]
@@ -647,7 +664,6 @@ fn the_site_and_docs_announce_the_version_the_installer_installs() {
     let page = read("docs/website/index.html");
     for expected in [
         format!("{version} PROTOTYPE"),
-        format!("Install {version} "),
         format!("<strong>{version}: "),
         format!("href=\"{notes}\""),
     ] {

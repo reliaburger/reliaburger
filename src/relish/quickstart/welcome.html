@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reliaburger is running</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --paper: #fafbf9;
+  --card: #fff;
+  --ink: #181b19;
+  --muted: #555e57;
+  --line: #d6ddd6;
+  --accent: #a83b15;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #181b19;
+    --card: #202421;
+    --ink: #eef1ec;
+    --muted: #a7b0a8;
+    --line: #363d38;
+    --accent: #f49463;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 1rem/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 680px; margin: auto; padding: 56px 20px; }
+header { display: flex; align-items: center; gap: 20px; margin-bottom: 20px; }
+svg { flex: none; width: 88px; height: auto; }
+.eyebrow { margin: 0 0 2px; font: 500 .75rem var(--mono); letter-spacing: .07em; color: var(--accent); }
+h1 { margin: 0; font-size: clamp(1.75rem, 6vw, 2.25rem); line-height: 1.15; letter-spacing: -.02em; }
+h2 { margin: 0 0 4px; font-size: 1rem; }
+p { margin: 0 0 10px; color: var(--muted); }
+a { color: inherit; text-underline-offset: .2em; }
+a:hover { color: var(--accent); }
+code { font-family: var(--mono); font-size: .875em; }
+section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; margin-top: 14px; }
+pre { margin: 0; padding: 10px 14px; overflow-x: auto; background: #181b19; color: #e4e9e3; border: 1px solid var(--line); border-radius: 6px; line-height: 1.7; }
+pre code { display: block; }
+nav { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 24px; font-size: .9375rem; font-weight: 550; }
+footer { margin-top: 20px; font-size: .875rem; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <svg viewBox="0 0 120 92" aria-hidden="true">
+      <path d="M12 38C12 14 34 4 60 4s48 10 48 34c0 3-2 5-5 5H17c-3 0-5-2-5-5Z" fill="#ee9a4d"/>
+      <path d="M85 8c14 5 23 15 23 30 0 3-2 5-5 5H78c10-9 13-22 7-35Z" fill="#dc7f33"/>
+      <g fill="#fbe7c4"><ellipse cx="38" cy="19" rx="4" ry="2.2" transform="rotate(-20 38 19)"/><ellipse cx="58" cy="13" rx="4" ry="2.2"/><ellipse cx="78" cy="19" rx="4" ry="2.2" transform="rotate(20 78 19)"/><ellipse cx="48" cy="29" rx="4" ry="2.2" transform="rotate(-10 48 29)"/><ellipse cx="68" cy="29" rx="4" ry="2.2" transform="rotate(10 68 29)"/></g>
+      <rect x="9" y="58" width="102" height="14" rx="7" fill="#7b2b2d"/>
+      <path d="M14 56h92L72 64l-12 6-12-6Z" fill="#f4bf3a"/>
+      <path d="M6 46h108v3c0 5-8 6-13 3-4 5-11 5-15 0-4 5-11 5-15 0-4 5-11 5-15 0-4 5-11 5-15 0-4 5-11 5-15 0-5 3-20 2-20-3Z" fill="#7fbf4a"/>
+      <path d="M12 75h96v2c0 7-6 12-13 12H25c-7 0-13-5-13-12Z" fill="#ee9a4d"/>
+    </svg>
+    <div>
+      <p class="eyebrow">YOUR CLUSTER IS UP</p>
+      <h1>Reliaburger is running</h1>
+    </div>
+  </header>
+  <p>This page is <code>hello</code>, your first app: one container, reached through the
+    cluster’s own ingress. Here’s where to go next.</p>
+
+  <section>
+    <h2>See what’s running</h2>
+    <p>Nodes, the council and apps in your terminal, or live charts in your browser.</p>
+    <pre><code>relish status
+relish dashboard</code></pre>
+  </section>
+
+  <section>
+    <h2>Run an example</h2>
+    <p>Build a burger out of eight apps, then open
+      <a href="http://burger.localhost:{{INGRESS_PORT}}">burger.localhost:{{INGRESS_PORT}}</a>.</p>
+    <pre><code>curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz
+relish build burger/burger.toml
+relish apply burger/burger.toml</code></pre>
+  </section>
+
+  <section>
+    <h2>Take the tour</h2>
+    <p>Roll a deploy, roll one back, cut a layer off and lose a node.</p>
+    <pre><code>relish manual tour</code></pre>
+  </section>
+
+  <nav aria-label="Further reading">
+    <a href="https://reliaburger.com/">Website</a>
+    <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/manual">Manual</a>
+    <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/book">The book</a>
+    <a href="https://github.com/reliaburger/reliaburger">GitHub</a>
+  </nav>
+  <footer><p>Finished? <code>relish local destroy --yes</code> removes this cluster.</p></footer>
+</main>
+</body>
+</html>
