@@ -76,7 +76,9 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .tour-commands-note { color: var(--muted); font-weight: 400; font-size: .875rem; }
 .tour-commands > :not(summary) { margin-left: 16px; margin-right: 16px; }
 .tour-commands .tour-steps { margin-top: 0; }
-.tour-note { max-width: 760px; color: var(--muted); }
+/* One measure for running text in these boxes; recordings and tables stay wide. */
+.tour > p, .tour-commands > p, .tour-commands > ul { max-width: 760px; }
+.tour-note { color: var(--muted); }
 .tour-steps { list-style: none; counter-reset: step; margin: 22px 0; padding: 0; }
 .tour-steps li { counter-increment: step; display: grid; grid-template-columns: 2.5rem minmax(0, 1.2fr) minmax(0, 1fr); gap: 8px 24px; align-items: start; border-top: 1px solid var(--line); padding: 14px 0; }
 .tour-steps li::before { content: counter(step, decimal-leading-zero); font: .75rem/2.9 var(--mono); color: var(--accent); }
@@ -85,7 +87,7 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .tour-cleanup { margin-bottom: 1rem; }
 .tour var { font-style: normal; color: #f49463; }
 .tour-links { font-size: .875rem; color: var(--muted); margin: 0; }
-.release-pipeline { list-style: none; counter-reset: stage; margin: 22px 0; padding: 0; max-width: 860px; }
+.release-pipeline { list-style: none; counter-reset: stage; margin: 22px 0; padding: 0; max-width: 760px; }
 .release-pipeline li { counter-increment: stage; position: relative; border-top: 1px solid var(--line); padding: 12px 0 12px calc(2.5rem + 16px); color: var(--muted); font-size: .9375rem; }
 .release-pipeline li::before { content: counter(stage, decimal-leading-zero); position: absolute; left: 0; font: .75rem/2.2 var(--mono); color: var(--accent); }
 .release-pipeline strong { color: var(--ink); }
