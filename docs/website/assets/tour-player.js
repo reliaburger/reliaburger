@@ -109,8 +109,9 @@
           trimmed += Math.min(event[0], idleLimit);
           if (event[0] > idleLimit) trimmedGaps.push({ trimmed: trimmed, at: at });
           if (event[1] !== "m") return;
-          // The chapter's last frame, once its commands have finished.
-          if (inPosterChapter) poster = "npt:" + before;
+          // The chapter's last frame: between its last output and the next
+          // chapter, because a poster at an output's own time leaves it out.
+          if (inPosterChapter) poster = "npt:" + (before + trimmed) / 2;
           inPosterChapter = event[2] === posterChapter;
           var button = document.createElement("button");
           button.type = "button";

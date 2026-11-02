@@ -212,7 +212,7 @@ setTimeout(async()=>{
  assert.strictEqual(chapters.hidden,false);
  assert.deepStrictEqual(buttons.map(b=>[b.textContent,b.attributes['data-start']]),[['One','1'],['Two','11.5']]);
  assert.strictEqual(calls.length,1);
- assert.strictEqual(calls[0].poster,'npt:3');
+ assert.strictEqual(calls[0].poster,'npt:3.25');
  screen.pointerdown();
  speeds.click({target:{closest:()=>speedButton}});await new Promise(r=>setTimeout(r));
  assert.strictEqual(calls[1].startAt,11.25);
