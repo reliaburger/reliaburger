@@ -120,6 +120,101 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .recording-chapters button { font: inherit; color: var(--ink); background: none; border: 1px solid var(--line); border-radius: 3px; padding: 4px 8px; cursor: pointer; }
 .recording-chapters button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 
+/* Built differently: five slides. Without script they're a stacked list;
+   assets/why-carousel.js adds .is-enhanced, stacks them in one grid cell (so
+   the box is as tall as the tallest and nothing jumps) and fades between them.
+   The drawings animate with CSS only, so reduced motion stops them all. */
+.why-carousel { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); border-left: 3px solid var(--accent); padding: 20px 20px 16px; }
+.why-slides { list-style: none; margin: 0; padding: 0; }
+.why-slide { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 12px 32px; align-items: center; }
+.why-slide + .why-slide { border-top: 1px solid var(--line); margin-top: 18px; padding-top: 18px; }
+.why-art { display: block; width: 100%; max-width: 240px; height: auto; overflow: visible; }
+.why-punchline { font-size: clamp(1.3rem, 2.4vw, 1.65rem); line-height: 1.25; letter-spacing: -.03em; font-weight: 650; margin: 0 0 10px; }
+.why-copy p { margin: 0; color: var(--muted); }
+.why-carousel.is-enhanced .why-slides { display: grid; }
+.why-carousel.is-enhanced .why-slide { grid-area: 1 / 1; border-top: 0; margin-top: 0; padding-top: 0; visibility: hidden; opacity: 0; transition: opacity .6s ease, visibility 0s linear .6s; }
+.why-carousel.is-enhanced .why-slide.is-active { visibility: visible; opacity: 1; transition: opacity .6s ease; }
+.why-carousel.is-enhanced .why-slide:not(.is-active) .why-art * { animation: none; }
+.why-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 16px; font: 500 .8125rem var(--mono); }
+.why-controls button { font: inherit; color: var(--ink); background: none; border: 1px solid var(--line); border-radius: 3px; min-width: 32px; min-height: 32px; padding: 2px 10px; cursor: pointer; }
+.why-controls button:hover { border-color: var(--accent); color: var(--accent); }
+.why-controls button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.why-controls .why-step { font-size: 1.125rem; line-height: 1; padding: 0 10px; }
+.why-controls .why-toggle { margin-left: auto; }
+.why-controls .why-toggle[hidden] { display: none; }
+.why-dots { display: inline-flex; }
+.why-controls .why-dot { display: inline-grid; place-items: center; min-width: 28px; padding: 0; border: 0; }
+.why-dot::before { content: ""; width: 10px; height: 10px; border: 2px solid var(--muted); border-radius: 50%; }
+.why-dot:hover::before { border-color: var(--accent); }
+.why-dot[aria-current="true"]::before { background: var(--accent); border-color: var(--accent); }
+/* Only the animated shapes scale about their own centre: transform-origin also
+   moves the rotate() in a transform attribute, which the seeds and timer use. */
+.why-layer, .why-addon, .why-sparkle, .why-ripple, .why-council, .why-onion, .why-task, .why-victim { transform-box: fill-box; transform-origin: center; }
+.why-addon { opacity: 0; animation: why-addon 9s ease-in-out infinite; }
+.why-layer { animation: why-assemble 9s ease-in-out infinite; }
+.why-sparkle { animation: why-twinkle 3s ease-in-out infinite; }
+.why-sparkle-late { animation-delay: 1.5s; }
+.why-ripple { opacity: .4; animation: why-ripple 3s ease-out infinite; }
+.why-ripple-2 { animation-delay: 1s; }
+.why-ripple-3 { animation-delay: 2s; }
+.why-chatter { stroke-dasharray: 2 6; animation: why-march 1.2s linear infinite; }
+.why-council { animation: why-beat 1.5s ease-in-out infinite; }
+.why-onion { animation: why-beat 1.5s ease-in-out infinite; }
+.why-packet { opacity: 0; }
+.why-packet-up { animation: why-route-up 3s ease-in-out infinite; }
+.why-packet-down { animation: why-route-down 3s ease-in-out 1.5s infinite; }
+.why-task { animation: why-pop 6s ease-out infinite; }
+.why-victim { animation: why-kill 9s ease-in-out infinite; }
+.why-bolt { animation: why-flash 9s linear infinite; }
+.why-smoke { opacity: 0; animation: why-smoke 9s ease-out infinite; }
+.why-timer { animation: why-countdown 9s linear infinite; }
+@keyframes why-assemble {
+  0%, 12% { transform: translate(var(--dx), var(--dy)) scale(.45); }
+  40%, 86% { transform: none; }
+  100% { transform: translate(var(--dx), var(--dy)) scale(.45); }
+}
+@keyframes why-addon { 0%, 12% { opacity: 1; } 32%, 88% { opacity: 0; } 100% { opacity: 1; } }
+@keyframes why-twinkle { 0%, 100% { transform: scale(.4); opacity: .3; } 50% { transform: scale(1.15); opacity: 1; } }
+@keyframes why-ripple { 0% { transform: scale(.2); opacity: .9; } 100% { transform: scale(1.3); opacity: 0; } }
+@keyframes why-march { to { stroke-dashoffset: -16; } }
+@keyframes why-beat { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.06); } }
+@keyframes why-route-up {
+  0% { transform: none; opacity: 0; }
+  8% { opacity: 1; }
+  35% { transform: translate(50px, 0); }
+  75% { transform: translate(110px, -44px); opacity: 1; }
+  88%, 100% { transform: translate(114px, -44px); opacity: 0; }
+}
+@keyframes why-route-down {
+  0% { transform: none; opacity: 0; }
+  8% { opacity: 1; }
+  35% { transform: translate(50px, 0); }
+  75% { transform: translate(110px, 44px); opacity: 1; }
+  88%, 100% { transform: translate(114px, 44px); opacity: 0; }
+}
+@keyframes why-pop {
+  0% { transform: scale(0); opacity: 0; }
+  6% { transform: scale(1.25); opacity: 1; }
+  10%, 65% { transform: scale(1); opacity: 1; }
+  75%, 100% { transform: scale(.4); opacity: 0; }
+}
+@keyframes why-kill {
+  0%, 28% { transform: none; opacity: 1; }
+  30% { transform: translate(4px, 0); }
+  32% { transform: translate(-4px, 0); }
+  34% { transform: translate(3px, 0); }
+  46% { transform: translate(70px, 14px) rotate(14deg); opacity: 0; }
+  60% { transform: translate(0, -40px); opacity: 0; }
+  72%, 100% { transform: none; opacity: 1; }
+}
+@keyframes why-flash { 0%, 24% { opacity: .35; } 27%, 33% { opacity: 1; } 40%, 100% { opacity: .35; } }
+@keyframes why-smoke { 0%, 34% { opacity: 0; transform: none; } 42% { opacity: 1; } 66%, 100% { opacity: 0; transform: translate(0, -14px); } }
+@keyframes why-countdown { 0%, 34% { stroke-dashoffset: 0; } 60% { stroke-dashoffset: 88; } 72%, 100% { stroke-dashoffset: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .why-art * { animation: none !important; }
+  .why-carousel.is-enhanced .why-slide { transition: none; }
+}
+
 /* The command gets the section's full width so it shows in full; the text goes
    below it at every width (#1369). */
 .install-grid { display: grid; grid-template-columns: 1fr; gap: 24px; }
@@ -206,6 +301,9 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
   .tour-steps li p { grid-column: 1; }
   .tour-steps li::before { line-height: 1.4; }
   .recording-speed { margin-left: 0; }
+  .why-carousel { padding: 16px 14px; }
+  .why-slide { grid-template-columns: minmax(0, 1fr); }
+  .why-art { max-width: 200px; }
 }
 @media print {
   .page { max-width: none; padding: 0; }
@@ -213,6 +311,8 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
   .terminal { background: white; color: black; border: 1px solid; }
   .comment, .terminal-heading, .terminal-footer { color: #444; }
   .section { break-inside: avoid; }
+  .why-carousel.is-enhanced .why-slide { grid-area: auto; visibility: visible; opacity: 1; }
+  .why-controls { display: none; }
 }
 
 .throughput-comparison { max-width: 100%; overflow-x: auto; margin: 20px 0; }

@@ -585,6 +585,7 @@ fn every_section_can_be_linked_to() {
     unique.dedup();
     assert_eq!(unique.len(), ids.len(), "duplicate section ids: {ids:?}");
     for id in [
+        "why",
         "install",
         "tour",
         "start",
@@ -1476,4 +1477,78 @@ fn release_pipeline_steps_flow_as_one_paragraph() {
             "a grid splits a step's title and text into separate cells: {rule}"
         );
     }
+}
+
+/// The "Built differently" section: the `<section id="why">` element.
+fn why_section(page: &str) -> &str {
+    let start = page
+        .find("<section id=\"why\"")
+        .expect("the page has no #why section");
+    &page[start..start + page[start..].find("</section>").unwrap()]
+}
+
+/// The five differences sit between the hero and the install, each a short
+/// punchline, two sentences and a drawing. The list works without script;
+/// `assets/why-carousel.js` turns it into a slideshow.
+#[test]
+fn five_differences_come_just_before_the_install() {
+    let page = read("docs/website/index.html");
+    let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
+    let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
+    assert_eq!(position("why") + 1, position("install"), "{ids:?}");
+
+    let section = why_section(&page);
+    assert!(section.contains("data-carousel"));
+    let slides: Vec<&str> = section.split("<li class=\"why-slide\"").skip(1).collect();
+    assert_eq!(slides.len(), 5, "the section should show five differences");
+    for slide in slides {
+        assert_eq!(slide.matches("<h3 class=\"why-punchline\">").count(), 1);
+        assert_eq!(slide.matches("<p>").count(), 1);
+        assert_eq!(slide.matches("<svg").count(), 1);
+        let svg = &slide[slide.find("<svg").unwrap()..];
+        let svg = &svg[..svg.find('>').unwrap()];
+        assert!(
+            svg.contains("aria-hidden=\"true\"") && svg.contains("viewBox="),
+            "the drawing is decorative and scales: {svg}"
+        );
+        let text = &slide[slide.find("<p>").unwrap()..slide.find("</p>").unwrap()];
+        let text = decode(&strip_tags(text));
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let sentences = text.matches(". ").count() + usize::from(text.ends_with('.'));
+        assert_eq!(sentences, 2, "each difference is two sentences: {text:?}");
+    }
+}
+
+/// The drawings are inline and animated by the site's own CSS, so nothing in
+/// the section loads from anywhere else, and reduced motion stills them.
+#[test]
+fn the_differences_load_nothing_and_respect_reduced_motion() {
+    let page = read("docs/website/index.html");
+    let section = why_section(&page);
+    for external in ["http:", "https:", "//", "<img", "<script", "<link", "<use"] {
+        assert!(
+            !section.contains(external),
+            "the #why section contains {external:?}"
+        );
+    }
+    assert!(page.contains("<script src=\"./assets/why-carousel.js\" defer></script>"));
+    let script = read("docs/website/assets/why-carousel.js");
+    for needle in [
+        "aria-live",
+        "prefers-reduced-motion",
+        "aria-roledescription",
+    ] {
+        assert!(script.contains(needle), "why-carousel.js lacks {needle:?}");
+    }
+    let style = read("docs/website/style.css");
+    let reduced = style
+        .split("@media (prefers-reduced-motion: reduce)")
+        .skip(1)
+        .any(|block| {
+            block[..block.find('}').unwrap()].contains(".why-art * { animation: none !important;")
+        });
+    assert!(
+        reduced,
+        "style.css should stop the drawings' animation for reduced motion"
+    );
 }

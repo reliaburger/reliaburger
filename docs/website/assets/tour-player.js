@@ -1,4 +1,4 @@
-// One of the site's two scripts: it plays the tour recordings with the
+// One of the site's three scripts: it plays the tour recordings with the
 // vendored asciinema player (assets/asciinema/). The recording is always on
 // show; the player and the recording load from this site as the figure nears
 // the viewport, so a visitor who never scrolls that far doesn't fetch them.
