@@ -252,8 +252,9 @@ impl TaskArrayService {
         self.write_timeout
     }
 
-    /// Hold the durable store's next publication before it writes, until
-    /// `pause` is released. Nothing happens without durable storage.
+    /// Hold the durable store's next publication that creates a run before
+    /// it writes, until `pause` is released; the leader loop's own writes
+    /// pass. Nothing happens without durable storage.
     #[cfg(test)]
     pub(crate) fn pause_next_publication(&self, pause: Arc<std::sync::Barrier>) {
         if let Some(store) = &self.standalone {
