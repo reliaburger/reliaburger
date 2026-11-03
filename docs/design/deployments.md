@@ -1083,7 +1083,7 @@ functions, one per kind of change:
   claim (#1442). `rollback_handler` checks on the node that's asked, then
   re-applies through `cluster_apply`, forwarding the caller's credentials too,
   so the leader's `skip_owned_apps` judges the re-apply (it declares today's
-  owner) as the caller. The bootstrap window and the service
+  owner) as the caller, and audits it under the caller's token (#1310). The bootstrap window and the service
   principal count as admins.
 - **Defaults.** The checks run on the declared spec, before policy defaults
   (#1118) fill it, so `owner` is in `policy::check::UNFILLABLE_FIELDS`: a

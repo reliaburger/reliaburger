@@ -1874,6 +1874,19 @@ async fn follower_of_a_recording_leader(
     Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>>,
     Vec<Arc<crate::council::CouncilNode>>,
 ) {
+    follower_with_history_of_a_recording_leader(token, None).await
+}
+
+/// [`follower_of_a_recording_leader`], with `history` as the follower's
+/// own deploy records.
+async fn follower_with_history_of_a_recording_leader(
+    token: crate::sesame::types::ApiToken,
+    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+) -> (
+    Router,
+    Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>>,
+    Vec<Arc<crate::council::CouncilNode>>,
+) {
     use crate::council::CouncilNode;
     use crate::council::log_store::MemLogStore;
     use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
@@ -1928,7 +1941,7 @@ async fn follower_of_a_recording_leader(
         commands,
         None,
         None,
-        None,
+        history,
         None,
         None,
         Some(nodes[1].clone()),
@@ -1969,6 +1982,65 @@ async fn a_follower_forwards_app_changes_to_the_leader_with_the_callers_token() 
         seen.iter().all(|(_, bearer, marked, _)| *marked
             && bearer.as_deref() == Some(format!("Bearer {deployer_key}").as_str())),
         "each forward carries the caller's token and the forwarded mark: {seen:?}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// #1310: a rollback re-applies the previous spec through `cluster_apply`,
+/// so a follower forwards it as an apply. It goes as the caller, bearer and
+/// all, so the leader audits it under the caller's token name and a policy
+/// sees the caller's role, not the follower's service identity.
+#[tokio::test]
+async fn a_follower_forwards_a_rollback_to_the_leader_with_the_callers_token() {
+    let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+    // No spec in Raft and no gossip peers, so the follower's own records
+    // choose the target: the newest is the current version, the one before
+    // it is what the rollback re-applies.
+    let deployed = |id: u64, image: &str| DeployHistoryEntry {
+        id: crate::meat::deploy_types::DeployId(id),
+        created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id),
+        spec: Some(Box::new(
+            toml::from_str(&format!("image = \"{image}\"")).unwrap(),
+        )),
+        ..sample_history_entry(image)
+    };
+    let history = Arc::new(RwLock::new(vec![
+        deployed(1, "nginx:1.26"),
+        deployed(2, "nginx:1.27"),
+    ]));
+    let (follower, seen, nodes) =
+        follower_with_history_of_a_recording_leader(deployer, Some(history)).await;
+
+    let (status, reply) = send_bounded(
+        follower,
+        "POST",
+        "/v1/rollback/web/default",
+        &deployer_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
+    assert!(reply.contains("recorded by the leader"), "{reply}");
+
+    let seen = seen.lock().await.clone();
+    let [(path, bearer, marked, body)] = seen.as_slice() else {
+        panic!("one forward to the leader: {seen:?}");
+    };
+    assert_eq!(path, "/v1/apply");
+    assert_eq!(
+        bearer.as_deref(),
+        Some(format!("Bearer {deployer_key}").as_str()),
+        "the leader must see the caller's token"
+    );
+    assert!(marked, "a forwarded rollback carries the forwarded mark");
+    let config: Config = toml::from_str(body).unwrap();
+    assert_eq!(
+        config.app.get("web").and_then(|spec| spec.image.as_deref()),
+        Some("nginx:1.26"),
+        "the forward re-applies the previous version: {body}"
     );
     for node in nodes {
         node.shutdown().await.unwrap();
