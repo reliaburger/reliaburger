@@ -27,6 +27,8 @@ use cluster_support::task_harness;
 mod hollow;
 // Seeds whole-pass admission entries the way a planner commits them.
 mod admission_fixture;
+// Judges what requests wrote, apart from the leader loop's cron clock (#1331).
+mod raft_writes;
 
 mod agent_cluster;
 mod api_tls;

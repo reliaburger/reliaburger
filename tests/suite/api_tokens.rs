@@ -6,7 +6,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use reliaburger::council::{
-    CouncilConfig, CouncilNode, CouncilNodeInfo, DesiredState,
+    CouncilConfig, CouncilNode, CouncilNodeInfo,
     log_store::MemLogStore,
     network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter},
     state_machine::CouncilStateMachine,
@@ -17,6 +17,11 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tower::ServiceExt;
+
+// The router's task-array leader loop records each new wall-clock minute
+// (`CronObserve`) on its own timer, so denied cases judge every desired
+// field except the two that entry moves (#849, #1331).
+use crate::raft_writes::changed_desired_fields;
 
 async fn api() -> (Arc<CouncilNode>, Router) {
     api_with_capacity(false).await
@@ -760,32 +765,6 @@ async fn scoped_admin_cannot_inspect_another_credentials_lease() {
 #[tokio::test]
 async fn scoped_admin_cannot_release_another_credentials_lease() {
     check_lease_admin_override("DELETE", StatusCode::NO_CONTENT).await;
-}
-
-/// The top-level desired-state fields that differ between two reads,
-/// ignoring what the leader writes on its own (#849). The router's
-/// task-array leader loop records each new wall-clock minute it observes
-/// (`CronObserve`): its first tick lands late under load, and later ones
-/// whenever a request straddles a minute boundary. That entry moves the log
-/// position and `cron_observed_minute`, so neither can show whether a
-/// request wrote.
-fn changed_desired_fields(before: &DesiredState, after: &DesiredState) -> Vec<String> {
-    let fields = |state: &DesiredState| {
-        let serde_json::Value::Object(mut fields) = serde_json::to_value(state).unwrap() else {
-            panic!("desired state serialises as an object");
-        };
-        fields.remove("last_applied_log");
-        if let Some(serde_json::Value::Object(arrays)) = fields.get_mut("task_arrays") {
-            arrays.remove("cron_observed_minute");
-        }
-        fields
-    };
-    let (before, after) = (fields(before), fields(after));
-    before
-        .keys()
-        .filter(|key| before.get(*key) != after.get(*key))
-        .cloned()
-        .collect()
 }
 
 /// Router configuration from the existing api_tokens fixture, with its command
@@ -2055,6 +2034,10 @@ async fn common_run_cancellation_and_output_obey_current_permissions() {
             .await
             .unwrap();
         let before = council.desired_state().await;
+        // The router's leader loop may record a new cron minute meanwhile;
+        // only a write the refused request made counts. Record one here so
+        // that race is met on every run (#1331).
+        crate::raft_writes::observe_a_later_minute(&council).await;
         let mut request = Request::builder()
             .method(method)
             .uri(path)
@@ -2063,8 +2046,6 @@ async fn common_run_cancellation_and_output_obey_current_permissions() {
         request.extensions_mut().insert(owner());
         let response = router.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
-        // The router's leader loop may record a new cron minute meanwhile;
-        // only a write the refused request made counts.
         assert_eq!(
             changed_desired_fields(&before, &council.desired_state().await),
             Vec::<String>::new(),
