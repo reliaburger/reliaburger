@@ -163,26 +163,35 @@ struct RunOptions {
 // `relish setup`, boxed to keep the generated `Command` parser
 // small (see `AuditOptions`).
 #[derive(clap::Args)]
+#[command(group(clap::ArgGroup::new("managed").args(["quickstart", "ssh"]).multiple(false)))]
 struct SetupOptions {
     /// Boot a secure managed Linux cluster and verify a sample container.
     #[arg(long, conflicts_with_all = ["dir", "release_url", "binary_dir"])]
     quickstart: bool,
-    #[arg(long, requires = "quickstart")]
+    /// Build a cluster on Linux machines you already have: user@host,user@host,...
+    #[arg(long, value_name = "MACHINES", conflicts_with_all = ["dir", "release_url", "binary_dir"])]
+    ssh: Option<String>,
+    /// The address peers should use for each machine, comma separated, in the same order.
+    #[arg(long, value_name = "ADDRESSES", requires = "ssh")]
+    advertise: Option<String>,
+    /// The cluster's name: `laptop` for a laptop cluster, `servers` for one
+    /// built over SSH.
+    #[arg(long, requires = "managed")]
     name: Option<String>,
-    #[arg(long, requires = "quickstart")]
+    #[arg(long, requires = "quickstart", conflicts_with = "ssh")]
     nodes: Option<usize>,
-    #[arg(long, requires = "quickstart")]
+    #[arg(long, requires = "managed")]
     api_port: Option<u16>,
-    #[arg(long, requires = "quickstart")]
+    #[arg(long, requires = "managed")]
     ingress_port: Option<u16>,
     /// Host port forwarded to the managed Pickle registry (default: 15050).
     #[arg(long, requires = "quickstart")]
     registry_port: Option<u16>,
     /// Use explicitly supplied Linux binaries for development before a release exists.
-    #[arg(long, requires = "quickstart")]
+    #[arg(long, requires = "managed")]
     development_binaries: Option<PathBuf>,
     /// HTTPS directory containing unchanged signed release candidate assets.
-    #[arg(long, requires = "quickstart", conflicts_with = "development_binaries")]
+    #[arg(long, requires = "managed", conflicts_with = "development_binaries")]
     release_mirror: Option<String>,
     /// Also print every setup step's timing (always saved as timings.json).
     #[arg(long, requires = "quickstart")]
@@ -2691,6 +2700,8 @@ async fn main() -> ExitCode {
         Command::Setup(options) => {
             let SetupOptions {
                 quickstart,
+                ssh,
+                advertise,
                 name,
                 nodes,
                 api_port,
@@ -2704,7 +2715,31 @@ async fn main() -> ExitCode {
                 ref release_url,
                 ref binary_dir,
             } = *options;
-            if quickstart {
+            if let Some(machines) = ssh {
+                let run = async {
+                    let targets = reliaburger::relish::quickstart::ssh::parse_targets(&machines)?;
+                    let advertise = advertise
+                        .iter()
+                        .flat_map(|list| list.split(','))
+                        .map(str::parse)
+                        .collect::<Result<Vec<std::net::Ipv4Addr>, _>>()?;
+                    reliaburger::relish::quickstart::server_runner::run(
+                        reliaburger::relish::quickstart::server_runner::Options {
+                            name: name.unwrap_or_else(|| "servers".into()),
+                            targets,
+                            advertise,
+                            api_port: api_port.unwrap_or(19117),
+                            ingress_port: ingress_port.unwrap_or(18080),
+                            development_binaries,
+                            release_mirror,
+                        },
+                    )
+                    .await
+                };
+                run.await.map_err(|error: anyhow::Error| {
+                    reliaburger::relish::RelishError::InitFailed(format!("{error:#}"))
+                })
+            } else if quickstart {
                 reliaburger::relish::quickstart::runner::run(
                     reliaburger::relish::quickstart::runner::Options {
                         name: name.unwrap_or_else(|| "laptop".into()),
@@ -4110,6 +4145,11 @@ mod tests {
         assert!(parse(&["relish", "local", "stop", "1", "--yes"]).is_ok());
         assert!(parse(&["relish", "local", "destroy", "--name", "laptop", "--yes"]).is_ok());
         assert!(parse(&["relish", "setup", "--nodes", "3"]).is_err());
+        assert!(parse(&["relish", "setup", "--ssh", "u@a,u@b,u@c"]).is_ok());
+        assert!(parse(&["relish", "setup", "--ssh", "u@a", "--name", "lab"]).is_ok());
+        assert!(parse(&["relish", "setup", "--advertise", "10.0.0.1"]).is_err());
+        assert!(parse(&["relish", "setup", "--ssh", "u@a", "--quickstart"]).is_err());
+        assert!(parse(&["relish", "setup", "--ssh", "u@a", "--nodes", "3"]).is_err());
     }
 
     #[test]
