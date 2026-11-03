@@ -3027,18 +3027,20 @@ async fn a_restart_waits_for_its_slow_network_reference_write_instead_of_refusin
         agent.run().await;
         agent
     });
-    // Hold the create, so the successor's hold is in place before the
-    // restart retains it.
-    grill.set_call_delay(
-        MockCall::Create,
-        Some(std::time::Duration::from_millis(500)),
-    );
-    let released = calls_of(&grill, "release_network_reference");
+    // Hold the successor's create. The restart only creates once the
+    // predecessor has retired: its reference released and the journal's
+    // record of it forgotten. Planting the successor's hold any earlier lets
+    // a retirement retry find it and refuse to release the predecessor's,
+    // which never happens on a real runtime (#1520). Stalling the journal
+    // any earlier slows the predecessor's forget instead of the successor's
+    // record.
+    grill.block_creates();
     let started = calls_of(&grill, "start");
     crash(&grill);
-    wait_for_calls(&grill, "release_network_reference", released, 1).await;
+    grill.wait_for_creates(1).await;
     grill.set_network_reference(successor.clone()).await;
     stalls.set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    grill.release_creates(1);
     wait_for_calls(&grill, "start", started, 1).await;
     stalls.set(LoopStall::Persist, std::time::Duration::ZERO);
     shutdown.cancel();

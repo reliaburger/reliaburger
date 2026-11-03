@@ -200,14 +200,17 @@ fn every_shown_install_line_names_a_mode() {
                 continue;
             };
             let rest = &line[at..];
-            if !rest.contains("sh -s -- --laptop") && !rest.contains("sh -s -- --install-only") {
+            if !["--laptop", "--install-only", "--ssh"]
+                .iter()
+                .any(|mode| rest.contains(&format!("sh -s -- {mode}")))
+            {
                 failures.push(format!("{page}:{}: {}", number + 1, line.trim()));
             }
         }
     }
     assert!(
         failures.is_empty(),
-        "these install lines name no mode; add `sh -s -- --laptop` or `--install-only`:\n{}",
+        "these install lines name no mode; add `sh -s -- --laptop`, `--ssh` or `--install-only`:\n{}",
         failures.join("\n")
     );
 }

@@ -363,7 +363,7 @@ impl GuestFile {
 }
 
 /// Write `files` as a tar stream owned by root, with each file's final mode.
-fn write_bundle(files: &[GuestFile], output: &mut std::fs::File) -> Result<()> {
+pub(super) fn write_bundle(files: &[GuestFile], output: &mut std::fs::File) -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
@@ -386,7 +386,7 @@ fn write_bundle(files: &[GuestFile], output: &mut std::fs::File) -> Result<()> {
 
 /// The guest-side script that unpacks a bundle from standard input under
 /// `root` (empty in production; a temporary directory in tests).
-fn install_script(root: &str, files: &[GuestFile]) -> Result<String> {
+pub(super) fn install_script(root: &str, files: &[GuestFile]) -> Result<String> {
     let mut script = format!(
         "set -eu\numask 077\nstage=$(mktemp -d '{root}/var/tmp/rb-install.XXXXXXXXXX')\n\
          trap 'rm -rf -- \"$stage\"' EXIT\ntar -x -p -f - -C \"$stage\"\n"

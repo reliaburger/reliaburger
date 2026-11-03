@@ -10,6 +10,9 @@ use crate::file_lock::FileLock;
 use crate::relish::RelishError;
 use crate::upgrade::BinaryVersion;
 
+/// Keeps the loopback ports setup tunnels through clear of its other ports.
+const MAX_SSH_NODES: usize = 64;
+
 /// Immutable choices for a managed cluster; resuming must preserve them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,13 +29,22 @@ pub struct ClusterSpec {
     pub ingress_port: u16,
     /// Host port forwarded to the first node's Pickle registry.
     pub registry_port: u16,
+    /// Existing machines to build on over SSH; empty for managed VMs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh: Vec<super::ssh::SshTarget>,
 }
 
 impl ClusterSpec {
     fn validate(&self) -> Result<(), RelishError> {
         validate_name(&self.name)?;
-        if !matches!(self.nodes, 1 | 3) {
-            return Err(failed("quickstart supports one or three nodes"));
+        if self.ssh.is_empty() {
+            if !matches!(self.nodes, 1 | 3) {
+                return Err(failed("quickstart supports one or three nodes"));
+            }
+        } else if self.ssh.len() != self.nodes || self.nodes > MAX_SSH_NODES {
+            return Err(failed(&format!(
+                "setup over SSH supports up to {MAX_SSH_NODES} machines"
+            )));
         }
         let last = self
             .api_port
@@ -104,7 +116,7 @@ impl ClusterState {
             return Err(failed("invalid managed cluster state"));
         }
         for (index, node) in self.nodes.iter().enumerate() {
-            if node.name != vm_name(&self.id, index) {
+            if node.name != node_name(&self.spec, &self.id, index) {
                 return Err(failed(
                     "managed state contains a VM not owned by this operation",
                 ));
@@ -141,7 +153,7 @@ impl Operation {
             let id = format!("{:032x}", rand::random::<u128>());
             let nodes = (0..spec.nodes)
                 .map(|index| NodeState {
-                    name: vm_name(&id, index),
+                    name: node_name(spec, &id, index),
                     address: None,
                     phase: NodePhase::Planned,
                 })
@@ -254,14 +266,24 @@ fn spec_mismatch(saved: &ClusterSpec, requested: &ClusterSpec) -> String {
         saved.registry_port.to_string(),
         requested.registry_port.to_string(),
     );
+    let machines = |spec: &ClusterSpec| {
+        let names: Vec<_> = spec.ssh.iter().map(ToString::to_string).collect();
+        names.join(",")
+    };
+    compare("machines", machines(saved), machines(requested));
     format!(
         "existing cluster parameters differ ({}); resume with the original parameters",
         changes.join("; ")
     )
 }
 
-fn vm_name(id: &str, index: usize) -> String {
-    format!("rb-{}-{}", &id[..12], index + 1)
+fn node_name(spec: &ClusterSpec, id: &str, index: usize) -> String {
+    if spec.ssh.is_empty() {
+        format!("rb-{}-{}", &id[..12], index + 1)
+    } else {
+        // A real machine outlives this operation, and people read its name.
+        format!("node-{}", index + 1)
+    }
 }
 
 fn validate_name(name: &str) -> Result<(), RelishError> {
@@ -339,6 +361,61 @@ fn failed(message: &str) -> RelishError {
 mod tests {
     use super::*;
 
+    fn ssh_spec(machines: &str) -> ClusterSpec {
+        let ssh = crate::relish::quickstart::ssh::parse_targets(machines).unwrap();
+        ClusterSpec {
+            nodes: ssh.len(),
+            ssh,
+            ..spec()
+        }
+    }
+
+    #[test]
+    fn machines_get_names_people_can_read() {
+        let root = tempfile::tempdir().unwrap();
+        let operation = Operation::open(root.path(), &ssh_spec("u@a,u@b")).unwrap();
+        let names: Vec<_> = operation
+            .state
+            .nodes
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(names, ["node-1", "node-2"]);
+    }
+
+    #[test]
+    fn any_number_of_machines_works_but_not_a_mismatched_count() {
+        for count in [1, 2, 4, 5] {
+            let machines: Vec<_> = (0..count).map(|i| format!("m{i}")).collect();
+            ssh_spec(&machines.join(",")).validate().unwrap();
+        }
+        let mismatched = ClusterSpec {
+            nodes: 3,
+            ..ssh_spec("a,b")
+        };
+        assert!(mismatched.validate().is_err());
+    }
+
+    #[test]
+    fn a_resume_must_name_the_same_machines() {
+        let root = tempfile::tempdir().unwrap();
+        drop(Operation::open(root.path(), &ssh_spec("u@a,u@b")).unwrap());
+        let error = Operation::open(root.path(), &ssh_spec("u@a,u@c"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("machines: saved u@a,u@b, requested u@a,u@c"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_vm_clusters_saved_state_has_no_machines_in_it() {
+        let saved = serde_json::to_string(&spec()).unwrap();
+        assert!(!saved.contains("ssh"), "{saved}");
+    }
+
     #[test]
     fn long_cluster_names_do_not_expand_vm_socket_paths() {
         let root = tempfile::tempdir().unwrap();
@@ -362,6 +439,7 @@ mod tests {
             api_port: 19117,
             ingress_port: 18080,
             registry_port: 15050,
+            ssh: Vec::new(),
         }
     }
 

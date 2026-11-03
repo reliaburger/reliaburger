@@ -303,6 +303,9 @@ exit 1
             ["--install-only", "--nodes", "1"],
             ["--laptop", "--install-only"],
             ["--install-only", "--laptop"],
+            ["--ssh"],
+            ["--ssh", "u@a", "--laptop"],
+            ["--laptop", "--ssh", "u@a"],
         ]
         for shell in POSIX_SHELLS:
             for number, given in enumerate(cases):
@@ -317,6 +320,43 @@ exit 1
                     self.assertIn("--laptop", stderr)
                     self.assertFalse(calls.exists(), "a refused option reached a download")
                     self.assertFalse((home / ".reliaburger").exists())
+
+    def test_ssh_installs_relish_and_builds_on_the_machines(self):
+        tools = self.arguments_tools("ssh-mode-tools")
+        arguments = self.root / "ssh-mode-arguments"
+        mirror = "https://example.com/r"
+        for shell in POSIX_SHELLS:
+            with self.subTest(shell=shell):
+                home = self.root / f"ssh-mode-home-{shell}"
+                home.mkdir()
+                arguments.unlink(missing_ok=True)
+                _, env = self.download_env(tools, home)
+                env = dict(env, ARGUMENTS=str(arguments))
+                result = subprocess.run([shell, str(self.assets / "install.sh"), "--ssh", "u@a,u@b", "--name", "lab"],
+                                        env=env, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(arguments.read_text().splitlines(),
+                                 ["setup", "--ssh", "u@a,u@b", "--release-mirror", mirror, "--name", "lab"])
+
+    def test_bootstrap_refuses_ssh_for_releases_from_before_it(self):
+        """The site's bootstrap goes live before 0.2.6 does, so --ssh has to
+        fail by name rather than as an unknown option, and before a download."""
+        import os
+        calls = self.root / "ssh-urls"
+        tools = self.root / "ssh-tools"
+        tools.mkdir()
+        (tools / "curl").write_text(f"#!/bin/sh\ntouch {calls}\n")
+        (tools / "curl").chmod(0o755)
+        env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"])
+        env.pop("RELIABURGER_RELEASE_BASE_URL", None)
+        for shell in POSIX_SHELLS:
+            for version in ("v0.2.4", "v0.2.5"):
+                with self.subTest(shell=shell, version=version):
+                    result = subprocess.run([shell, str(BOOTSTRAP), "--ssh", "u@a"], capture_output=True,
+                                            env=dict(env, RELIABURGER_VERSION=version))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"--ssh arrived in 0.2.6, and this installs {version}", result.stderr.decode())
+                    self.assertFalse(calls.exists())
 
     def test_bootstrap_drops_laptop_for_releases_from_before_it(self):
         """0.2.1 and older build the laptop cluster without a flag and would
