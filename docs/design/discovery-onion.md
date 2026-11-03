@@ -912,6 +912,8 @@ Two things the argument doesn't cover, neither of them new. A process that isn't
 
 **Cost:** the new incarnation starts here only after the old one's release is confirmed, normally a few seconds, or a lapsed consumer's lease plus margin (§ 7.6) if a node is gone. Replicas on other nodes aren't held up. A changed `port` takes the same path, so it restarts the app's replicas on an enrolled cluster, where the journal would otherwise refuse the rollout outright.
 
+**Diagnosis:** from 0.2.6 each refusal names which part of the proof failed: the service map no longer holds the service, holds it under another VIP or port, still lists this instance as a backend, or (for the allocation) still lists backends. The evaluation's output couldn't tell those apart. On three real runc nodes running 0.2.5, 30 delete-and-reapply cycles all converged ([#1500](https://github.com/reliaburger/reliaburger/issues/1500#issuecomment-6607021587)).
+
 **Not covered:** a node that never sees the delete, because its assignment comes back unchanged between two polls, gets no deploy. Its replica keeps running under the old reservation until the next change to the app, which then goes through this path. Standalone nodes and clusters without durable discovery have no catalogue to compare with, and no journal to refuse.
 
 ---

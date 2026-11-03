@@ -3695,7 +3695,7 @@ async fn a_release_is_refused_while_the_live_entry_names_its_backend() {
         .await;
     assert!(
         matches!(&released, Err(BunError::RetirementState { reason, .. })
-            if reason == "original service withdrawal is unproven"),
+            if reason == "original service withdrawal is unproven: the service map still lists this instance as a backend"),
         "{released:?}"
     );
     assert_eq!(
@@ -3724,7 +3724,7 @@ async fn a_release_is_refused_against_another_allocation() {
         .await;
     assert!(
         matches!(&released, Err(BunError::RetirementState { reason, .. })
-            if reason == "original service withdrawal is unproven"),
+            if reason == "original service withdrawal is unproven: the service map holds the service under another VIP or port"),
         "{released:?}"
     );
     assert_eq!(
@@ -3751,7 +3751,7 @@ async fn an_allocation_stays_while_a_new_incarnation_publishes_into_it() {
     let retired = agent.retire_discovery_service(&service).await;
     assert!(
         matches!(&retired, Err(BunError::BackendPublication { reason, .. })
-            if reason == "original service withdrawal is unproven"),
+            if reason == "original service withdrawal is unproven: the service map still lists backends"),
         "{retired:?}"
     );
 }
