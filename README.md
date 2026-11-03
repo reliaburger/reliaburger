@@ -118,7 +118,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish history <APP>`: Show deploy history for an app, from every node
 - `relish rollback <APP>`: Rollback an app to the previous version
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
-- `relish delete <APP>`: Remove an app from the cluster and stop all its instances
+- `relish delete <APP>`: Remove an app from the cluster; each node then stops its instances
 - `relish release <APP>`: Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin)
 - `relish batch [PATH]`: Submit a batch of jobs, or manage a task array
   - `relish batch submit <PATH>`: Submit a compact TOML manifest containing mixed resource profiles

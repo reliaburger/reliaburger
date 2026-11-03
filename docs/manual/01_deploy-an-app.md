@@ -430,6 +430,26 @@ has recorded the change. Each node then retires its instances on its own, and
 a node that's unreachable does so when it comes back. Run `relish status` (or
 `relish inspect web`) to watch the instances go.
 
+A delete followed straight away by an apply of the same file may not restart
+anything. A node that hasn't acted on the delete yet sees the app come back
+with the spec it's already running, and keeps the instances it has, with
+the same process IDs. That's deliberate: the app ends up as the file says,
+without a pointless restart. Images bind to a digest at apply ([Tags bind to
+digests at apply](11_images-and-volumes.md#tags-bind-to-digests-at-apply)),
+so a tag that has moved gives a new spec and new instances. What a kept
+instance won't pick up is anything outside the spec:
+
+- **A mutable image the apply didn't re-resolve.** If the registry doesn't
+  answer, the apply binds the pull-through cache's copy of the tag, which may
+  be the one already running. Push under a new tag, or pin `name@sha256:…`,
+  when you need new bytes.
+- **A host binary or script** that an `exec` or `script` app runs, replaced on
+  disk. The kept process still runs the old one.
+- **State the process holds in memory**, such as a cache or a connection pool.
+
+When you need fresh processes, wait until `relish status` shows none of the
+app's instances before you apply again.
+
 Commands that take an app name also take `--namespace` (default `default`).
 
 ## Instance names
