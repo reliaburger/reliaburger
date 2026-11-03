@@ -84,6 +84,10 @@ pub struct CouncilNode {
     /// The leadership proof callers share, so a burst of requests doesn't
     /// send a burst of heartbeat rounds (#1441).
     leadership_proof: super::proof::SharedProof,
+    /// The leader's [`node_view`](crate::sesame::types::SecurityState::node_view)
+    /// of the security state, for a node whose own replica holds none
+    /// because it has no Raft seat (#1477). `None` until it has fetched one.
+    leader_security_view: tokio::sync::RwLock<Option<crate::sesame::types::SecurityState>>,
     /// Test hook: writes and linearizable reads never return, as they don't
     /// on a leader that has lost its quorum and not yet stepped down.
     #[cfg(test)]
@@ -168,6 +172,7 @@ impl CouncilNode {
             raft_id,
             election_hold,
             leadership_proof: super::proof::SharedProof::new(),
+            leader_security_view: tokio::sync::RwLock::new(None),
             state_machine,
             node_fault_membership: tokio::sync::Mutex::new(()),
             consumer_contacts: tokio::sync::Mutex::new(crate::onion::lease::ConsumerContacts::new(
@@ -668,8 +673,33 @@ impl CouncilNode {
     /// ticker, fast-fail pre-checks whose authoritative decision goes through
     /// Raft anyway). For a read that *is* the security decision, use
     /// [`Self::security_state_linearizable`].
+    ///
+    /// A node with no Raft seat has nothing applied; it gets the leader's view
+    /// instead, once it has fetched one (#1477).
     pub async fn security_state(&self) -> crate::sesame::types::SecurityState {
-        self.state_machine.desired_state().await.security_state
+        let local = self.state_machine.desired_state().await.security_state;
+        if local.is_initialised() {
+            return local;
+        }
+        self.leader_security_view
+            .read()
+            .await
+            .clone()
+            .unwrap_or(local)
+    }
+
+    /// Whether this node's own replica holds the security state. A node with
+    /// no Raft seat doesn't, and fetches the leader's view (#1477).
+    pub async fn holds_security_state(&self) -> bool {
+        self.state_machine
+            .read_desired(|state| state.security_state.is_initialised())
+            .await
+    }
+
+    /// Keep the leader's view of the security state, for a node whose replica
+    /// holds none (#1477). Ignored once the replica holds its own.
+    pub async fn adopt_leader_security_view(&self, view: crate::sesame::types::SecurityState) {
+        *self.leader_security_view.write().await = Some(view);
     }
 
     /// The API token stored under `token_hash` in this node's replica,
@@ -702,10 +732,28 @@ impl CouncilNode {
 
     /// Every API token this node's replica has applied. Copies only the
     /// tokens, where [`Self::security_state`] copies the whole desired state.
+    ///
+    /// A node with no Raft seat gets the tokens in the leader's view (#1477).
     pub async fn api_tokens(&self) -> Vec<crate::sesame::types::ApiToken> {
-        self.state_machine
-            .read_desired(|state| state.security_state.api_tokens.clone())
-            .await
+        let local = self
+            .state_machine
+            .read_desired(|state| {
+                state
+                    .security_state
+                    .is_initialised()
+                    .then(|| state.security_state.api_tokens.clone())
+            })
+            .await;
+        match local {
+            Some(tokens) => tokens,
+            None => self
+                .leader_security_view
+                .read()
+                .await
+                .as_ref()
+                .map(|view| view.api_tokens.clone())
+                .unwrap_or_default(),
+        }
     }
 
     /// Whether this node's replica holds no token called `name`, waiting up

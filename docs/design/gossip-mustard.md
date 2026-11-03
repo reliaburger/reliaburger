@@ -206,6 +206,8 @@ The leader selects council members from the general node pool. Selection criteri
 
 **Odd voter counts (D12, #694).** The planner (`plan_council_action`) targets the largest odd number of voters not above the live nodes (live voters, live learners and live spare candidates) nor `max_council_size`. An even council tolerates no more failures than the odd one below it and adds a write acknowledgement, so no planner action ever lands on an even count:
 
+**Nodes past the cap (#1477).** A node the planner never seats has an empty replica, so it reads the leader's view of the security state instead (`/v1/cluster/security-view`, refreshed every five seconds). Its API tokens, CRL, trust set and age keys come from there. `docs/design/security-sesame.md` lists what the view holds.
+
 | Live nodes | Voters |
 |---|---|
 | 1-2 | 1 |

@@ -97,7 +97,10 @@ use internal::{
     producer_retirement_handler, refuse_retired_tls_peer, rollout_failed_handler,
     workload_csr_handler,
 };
-use join::{cluster_ca_handler, join_handler, node_renewal_handler, node_trust_ack_handler};
+use join::{
+    cluster_ca_handler, join_handler, node_renewal_handler, node_security_view_handler,
+    node_trust_ack_handler,
+};
 use logs::{
     logs_archive_file_handler, logs_archive_handler, logs_cross_node_handler, logs_entries_handler,
     logs_export_handler, logs_handler, logs_sql_handler, ws_logs_handler,
@@ -693,6 +696,7 @@ pub fn router_with_upgrade(
             "/v1/cluster/renew",
             post(node_renewal_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
+        .route("/v1/cluster/security-view", get(node_security_view_handler))
         .route(
             "/v1/cluster/trust-ack",
             post(node_trust_ack_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),

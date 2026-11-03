@@ -198,6 +198,15 @@ Admin                  New Node                  Cluster (any existing node)
   |                       |                              |
 ```
 
+A node with no Raft seat replicates no security state, so it fetches the
+leader's `SecurityState::node_view()` from `/v1/cluster/security-view` over
+mTLS on every security refresh (#1477). The leader reads its state
+linearizably and checks the caller's node certificate as renewal does. The
+view keeps the CA certificates, API token hashes, the CRL, node leaf records,
+the wrapped age keys and the wrapped Ingress CA key. It drops the root, Node
+and Workload CA keys, the OIDC signing key, join tokens, secret seals,
+pending intermediates and the serial counter.
+
 ---
 
 ## 4. Data Structures

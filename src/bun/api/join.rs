@@ -149,6 +149,52 @@ pub(super) async fn node_trust_ack_handler(
     }
 }
 
+/// Serve a node's view of the security state (#1477): the API tokens, CRL,
+/// trust set and keys a node needs when it has no Raft seat to replicate
+/// them. Only the leader answers, from a linearizable read, and only to a
+/// caller presenting a current node certificate, as renewal requires.
+pub(super) async fn node_security_view_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+) -> Response {
+    use crate::sesame::renewal::RenewalError;
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "the security view requires a TLS node certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no council available").into_response();
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        crate::sesame::security_view::issue_view(council, &peer),
+    )
+    .await
+    {
+        Ok(Ok(view)) => Json(view).into_response(),
+        Ok(Err(error)) => {
+            let status = match &error {
+                RenewalError::Identity(_) => StatusCode::FORBIDDEN,
+                RenewalError::Request(_) => StatusCode::BAD_REQUEST,
+                RenewalError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "security view timed out").into_response(),
+    }
+}
+
 pub(super) async fn join_handler(
     State(state): State<ApiState>,
     Json(body): Json<crate::sesame::join::JoinRequest>,

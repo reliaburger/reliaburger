@@ -791,6 +791,26 @@ paths as well as refusals, unchanged Raft state and an acknowledged empty
 mutation queue. Its finite command actor records dispatch; actual child
 execution belongs to the ProcessGrill and owned-runc suites.
 
+### Tokens for a node with no seat
+
+Every node reads its tokens from its own Raft replica, and that's the trouble with a node that has no seat. A node outside the council isn't a voter or a learner, so nothing replicates to it, and its replica stays empty. With `require_mtls` on, a joining node keeps its API listener closed until tokens arrive, so it waited 30 seconds, gave up, and systemd started it again, forever ([#1477](https://github.com/reliaburger/reliaburger/issues/1477)). 0.2.5 brought spare nodes in as learners up to the council cap, which fixed two, four and six nodes, but `max_council_size` is seven by default, so the eighth node of any secure cluster still hit it. And tokens were only the visible part: the same empty replica meant no revocation list and no rotated CA ever reached that node either.
+
+We could have made every node a learner. That's a one-line change in the planner, but then every node replicates the whole log, which is the cost the council exists to avoid. Instead a node with no seat asks the leader for what it needs. The leader serves `/v1/cluster/security-view` from a linearizable read, so a deposed leader can't hand out a stale revocation list, and only to a caller presenting a current node certificate. What it sends is `SecurityState::node_view()`: the CA certificates, token hashes, the CRL and node leaf records, the wrapped age keys that decrypt the secrets of apps the node runs, and the wrapped Ingress CA key for its ingress leaves. It never sends the keys that issue identity (the root, Node and Workload CA keys, the OIDC signing key) or join tokens. The wrapped keys open only with the master key, which every node holds already.
+
+The receiving end is the part we liked. Nothing that reads tokens, the CRL or the trust set had to change, because the council handle answers for the node:
+
+```rust
+pub async fn security_state(&self) -> SecurityState {
+    let local = self.state_machine.desired_state().await.security_state;
+    if local.is_initialised() {
+        return local;
+    }
+    self.leader_security_view.read().await.clone().unwrap_or(local)
+}
+```
+
+`unwrap_or(local)` returns the empty local state when no view has arrived yet, so a reader never waits here. Bun's five-second security refresh fetches the view whenever its replica holds nothing, and keeps the last one if the leader can't be reached, the way a follower that can't reach quorum keeps its replica. A token revoked on the leader stops working on the node within one refresh.
+
 ### Evaluating a policy isn't enforcing it
 
 Roles and scopes are blunt. A `[permission]` block sharpens them: it names a token and lists what that token may do, and to which apps.
