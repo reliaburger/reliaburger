@@ -29,6 +29,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::raft_writes;
 use crate::task_harness::TestTasks;
 
 /// The live members the leader's API sees, as `bun` builds them from gossip.
@@ -43,6 +44,8 @@ struct Harness {
     base_url: String,
     http: reqwest::Client,
     council: Option<Arc<CouncilNode>>,
+    /// The council's Raft log, so a test can read what was written.
+    council_log: Option<MemLogStore>,
     /// The job capabilities this harness's node advertises (#788).
     job_capabilities: JobCapabilities,
     _data: tempfile::TempDir,
@@ -73,7 +76,8 @@ impl Options {
     }
 }
 
-async fn single_node_leader() -> Arc<CouncilNode> {
+async fn single_node_leader() -> (Arc<CouncilNode>, MemLogStore) {
+    let log = MemLogStore::new();
     let router = InMemoryRaftRouter::new();
     let network = InMemoryRaftNetworkFactory::new(1, router.clone());
     let config = CouncilConfig {
@@ -87,7 +91,7 @@ async fn single_node_leader() -> Arc<CouncilNode> {
         1,
         config,
         network,
-        MemLogStore::new(),
+        log.clone(),
         CouncilStateMachine::new(),
         None,
     )
@@ -107,7 +111,7 @@ async fn single_node_leader() -> Arc<CouncilNode> {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    node
+    (node, log)
 }
 
 impl Harness {
@@ -216,10 +220,11 @@ impl Harness {
             .await
             .unwrap(),
         );
-        let council = if options.council {
-            Some(single_node_leader().await)
+        let (council, council_log) = if options.council {
+            let (council, log) = single_node_leader().await;
+            (Some(council), Some(log))
         } else {
-            None
+            (None, None)
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -268,6 +273,7 @@ impl Harness {
             base_url: format!("http://127.0.0.1:{port}"),
             http: reqwest::Client::new(),
             council,
+            council_log,
             job_capabilities,
             _data: data,
             _tasks: TestTasks::new(shutdown, vec![agent, server]),
@@ -484,13 +490,8 @@ async fn twenty_thousand_tasks_cost_a_few_dozen_raft_entries() {
         mount_isolation: false,
     })
     .await;
-    let council = harness.council.clone().unwrap();
-    let before = council
-        .raft()
-        .metrics()
-        .borrow()
-        .last_log_index
-        .unwrap_or(0);
+    let log = harness.council_log.clone().unwrap();
+    let before = raft_writes::last_index(&log).await;
 
     let batch_id = harness
         .submit_ok(json!({
@@ -507,14 +508,10 @@ async fn twenty_thousand_tasks_cost_a_few_dozen_raft_entries() {
 
     // Registration plus at most one entry per sync that changed
     // something: never anywhere near one per task. Three entries per
-    // thousand tasks is the budget 300 was for 100,000.
-    let entries = council
-        .raft()
-        .metrics()
-        .borrow()
-        .last_log_index
-        .unwrap_or(0)
-        - before;
+    // thousand tasks is the budget 300 was for 100,000. The leader loop's
+    // cron clock records each new minute on its own timer, so it isn't
+    // counted against the array (#1331).
+    let entries = raft_writes::writes_after(&log, before).await.len() as u64;
     let budget = RAFT_ENTRY_TASKS / 1000 * 3;
     assert!(
         entries <= budget,
