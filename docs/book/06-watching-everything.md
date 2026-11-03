@@ -1384,6 +1384,43 @@ rather than proven. The stores stopped, the captures didn't, and this is the
 one way out of the loop while an instance runs. The next long run's `--tail`
 is the check that closes it.
 
+The fallback itself was the next fix (#1515). Could the capture endpoint learn
+to honour `start`? Not cheaply. A capture file is the raw bytes the workload
+wrote, with no time on any line, so the endpoint would have to start stamping
+lines it currently copies verbatim. It doesn't need to, though. The store's
+query unions its unflushed buffer with the Parquet files, so a line is in the
+store within a moment of being written, and the store is the only place that
+knows when each line arrived. `relish logs` already refused to fall back for
+`--until`, `--stream` and a named instance, for the same reason: an empty
+answer from the store is the answer. `--since` now joins them.
+
+Without a window the fallback stays, and it had a second rough edge. The
+cross-node query fans out to every node, but the capture endpoint only reads
+the node you asked. Ask a node that doesn't run the app, get nothing from the
+store, and the fallback's `404 no local capture for this workload` came back
+as an error. When the store has already answered for the cluster, that 404
+just means "not here", so `relish logs` now prints nothing instead. If the
+store didn't answer, the 404 is still the most honest thing to show, and it
+still surfaces. The match is a single arm with a guard:
+
+```rust
+match self.logs_local(app, namespace, options).await {
+    Err(RelishError::ApiError { status: 404, .. }) if store_answered => Ok(String::new()),
+    other => other,
+}
+```
+
+The `..` in the pattern ignores the variant's other fields (the body here),
+and the `if` after the pattern is a match guard: the arm only matches when
+both the shape and the condition hold. Everything else, success included,
+falls through to `other` and is returned unchanged.
+
+`since_on_a_quiet_app_prints_nothing_from_the_old_capture` serves an empty
+store answer beside a capture holding old lines and asks with a window. It
+printed the old lines before the fix. Its neighbours pin the rest: lines
+inside the window still print, an unwindowed query still reads the capture,
+and a 404 is only forgiven once the store has spoken.
+
 ## When nothing looks like success
 
 Both hardening passes share a pattern, and later reviews kept finding more of it: a failure that comes back dressed as an empty, successful answer. A directory called `blocked.parquet` made the exporter and both retention loops report success. A peer that sent `200 OK` and then went quiet hung a log query. A node that answered `{}` convinced the diagnostic collector there were no alerts. None of these crash. They lie quietly, which is worse.
