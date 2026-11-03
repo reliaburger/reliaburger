@@ -553,6 +553,11 @@ pub fn issue_node_cert(
 /// `[security] leaf_lifetime_override_secs`. The issuer's CA validity still
 /// clamps it.
 ///
+/// `address` is where the issuer saw the node: the source of its join or
+/// renewal request. A routable one becomes an IP SAN, so a strict client can
+/// connect by address (#1508); it never comes from the CSR, which could claim
+/// another node's.
+///
 /// Returns `(certificate_der, serial)`.
 pub fn sign_node_csr(
     csr_der: &[u8],
@@ -561,6 +566,7 @@ pub fn sign_node_csr(
     lifetime: Duration,
     ca_keypair: &KeyPair,
     ca_params: &CertificateParams,
+    address: Option<std::net::IpAddr>,
 ) -> Result<(Vec<u8>, SerialNumber), CaError> {
     let csr_der_owned: Vec<u8> = csr_der.to_vec();
     let csr_der_ref = rustls::pki_types::CertificateSigningRequestDer::from(csr_der_owned);
@@ -568,11 +574,48 @@ pub fn sign_node_csr(
         .map_err(|e| CaError::SignFailed(format!("failed to parse node CSR: {e}")))?;
 
     let mut params = node_cert_params(node_id, serial, lifetime)?;
+    if let Some(address) = address.filter(|address| names_a_machine(*address)) {
+        params.subject_alt_names.push(SanType::IpAddress(address));
+    }
     bound_leaf_validity(&mut params, ca_params)?;
     let certificate = sign_as_issuer(params, &csr_params.public_key, ca_params, ca_keypair)
         .map_err(|e| CaError::SignFailed(e.to_string()))?;
 
     Ok((certificate.der().to_vec(), serial))
+}
+
+/// Whether `address` can name a node to a client elsewhere: not loopback,
+/// which would name the client's own machine, and not unspecified.
+pub fn names_a_machine(address: std::net::IpAddr) -> bool {
+    !address.is_loopback() && !address.is_unspecified()
+}
+
+/// The IP SANs a DER certificate names, in order. An unparsable
+/// certificate names none.
+pub fn ip_sans(cert_der: &[u8]) -> Vec<std::net::IpAddr> {
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert_der) else {
+        return Vec::new();
+    };
+    let Ok(Some(extension)) = cert.subject_alternative_name() else {
+        return Vec::new();
+    };
+    extension
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            x509_parser::extensions::GeneralName::IPAddress(bytes) => {
+                if let Ok(octets) = <[u8; 4]>::try_from(*bytes) {
+                    Some(std::net::IpAddr::from(octets))
+                } else {
+                    <[u8; 16]>::try_from(*bytes)
+                        .ok()
+                        .map(std::net::IpAddr::from)
+                }
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn bound_leaf_validity(
@@ -1125,6 +1168,7 @@ mod tests {
             NODE_LEAF_LIFETIME,
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
+            None,
         )
         .unwrap();
         let (leaf_der, _, _) = issue_end_entity_cert(
@@ -1263,6 +1307,7 @@ mod tests {
             NODE_LEAF_LIFETIME,
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
+            None,
         )
         .unwrap();
 
@@ -1277,6 +1322,43 @@ mod tests {
         // Chains to the Node CA that signed it.
         crate::sesame::cert::verify_signature(&cert_der, &hierarchy.node.ca.certificate_der)
             .unwrap();
+    }
+
+    /// #1508: a strict client that connects by address checks an IP SAN.
+    /// The issuer names the address it saw the node at, and leaves out one
+    /// that names no machine on the network.
+    #[test]
+    fn a_node_certificate_names_the_address_the_issuer_saw() {
+        let hierarchy = generate_ca_hierarchy("test", b"ikm").unwrap();
+        let (csr_der, _) = create_node_csr("node-2").unwrap();
+        let sign = |address: Option<&str>| {
+            sign_node_csr(
+                &csr_der,
+                "node-2",
+                SerialNumber(12),
+                NODE_LEAF_LIFETIME,
+                &hierarchy.node.signing_keypair,
+                &hierarchy.node.certificate_params,
+                address.map(|address| address.parse().unwrap()),
+            )
+            .unwrap()
+            .0
+        };
+        assert_eq!(
+            ip_sans(&sign(Some("10.0.0.5"))),
+            ["10.0.0.5".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            ip_sans(&sign(Some("fd00::5"))),
+            ["fd00::5".parse::<std::net::IpAddr>().unwrap()]
+        );
+        for nowhere in [None, Some("127.0.0.1"), Some("::1"), Some("0.0.0.0")] {
+            assert!(ip_sans(&sign(nowhere)).is_empty(), "{nowhere:?}");
+        }
+        // The node id stays bound whatever the address.
+        let signed = sign(Some("10.0.0.5"));
+        let (_, cert) = x509_parser::parse_x509_certificate(&signed).unwrap();
+        assert!(cert.subject().to_string().contains("node-2"));
     }
 
     #[test]
@@ -1315,6 +1397,7 @@ mod tests {
             NODE_LEAF_LIFETIME,
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
+            None,
         )
         .unwrap();
         // The backdated start may be clamped to the Node CA's own start; the
@@ -1340,6 +1423,7 @@ mod tests {
             Duration::from_secs(3600),
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
+            None,
         )
         .unwrap();
         let (_, cert) = x509_parser::parse_x509_certificate(&signed).unwrap();
@@ -1472,6 +1556,7 @@ mod tests {
                 NODE_LEAF_LIFETIME,
                 &hierarchy.node.signing_keypair,
                 params,
+                None,
             )
             .unwrap();
             webpki_accepts(&signed, node_ca, root, "node-b");
@@ -1545,6 +1630,7 @@ mod tests {
                 NODE_LEAF_LIFETIME,
                 keypair,
                 params,
+                None,
             )
             .unwrap();
             assert_names_issuer_by_key(&signed, node_ca);

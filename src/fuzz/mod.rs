@@ -303,6 +303,7 @@ pub fn join_csr(data: &[u8]) -> Outcome {
         NODE_LEAF_LIFETIME,
         &hierarchy.node.signing_keypair,
         &hierarchy.node.certificate_params,
+        None,
     ) else {
         return Outcome::Refused;
     };
