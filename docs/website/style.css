@@ -132,8 +132,10 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .why-punchline { font-size: clamp(1.3rem, 2.4vw, 1.65rem); line-height: 1.25; letter-spacing: -.03em; font-weight: 650; margin: 0 0 10px; }
 .why-copy p { margin: 0; color: var(--muted); }
 .why-carousel.is-enhanced .why-slides { display: grid; }
-.why-carousel.is-enhanced .why-slide { grid-area: 1 / 1; border-top: 0; margin-top: 0; padding-top: 0; visibility: hidden; opacity: 0; transition: opacity .6s ease, visibility 0s linear .6s; }
-.why-carousel.is-enhanced .why-slide.is-active { visibility: visible; opacity: 1; transition: opacity .6s ease; }
+/* The outgoing slide fades out before the next fades in: the slides share one
+   grid cell, so a crossfade showed both texts on top of each other. */
+.why-carousel.is-enhanced .why-slide { grid-area: 1 / 1; border-top: 0; margin-top: 0; padding-top: 0; visibility: hidden; opacity: 0; transition: opacity .3s ease, visibility 0s linear .3s; }
+.why-carousel.is-enhanced .why-slide.is-active { visibility: visible; opacity: 1; transition: opacity .3s ease .3s, visibility 0s linear .3s; }
 .why-carousel.is-enhanced .why-slide:not(.is-active) .why-art * { animation: none; }
 .why-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 16px; font: 500 .8125rem var(--mono); }
 .why-controls button { font: inherit; color: var(--ink); background: none; border: 1px solid var(--line); border-radius: 3px; min-width: 32px; min-height: 32px; padding: 2px 10px; cursor: pointer; }
