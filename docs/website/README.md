@@ -28,8 +28,9 @@ note links the `.cast` file, and the written tour works as before.
 `assets/why-carousel.js` turns the "Built differently" section (`#why`), a
 plain list of five architectural differences, into a slideshow: one at a
 time, a new one every nine seconds, with previous, next, five dots and a Pause
-button. It stops while the pointer or keyboard focus is inside, and doesn't
-rotate at all for visitors who prefer reduced motion. It follows the WAI-ARIA
+and Play button. Pause and Play always take effect; it also stops while a
+mouse rests on it and when keyboard focus comes in (until Play), never because
+of a tap, and doesn't rotate at all for visitors who prefer reduced motion. It follows the WAI-ARIA
 carousel pattern, so the slide text is a polite live region only while it
 isn't rotating by itself. The drawings are inline SVG animated by CSS in
 `style.css`, so reduced motion stills them and nothing loads from elsewhere.
