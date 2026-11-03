@@ -1,11 +1,14 @@
 // One of the site's three scripts: it turns the "Built differently" list into
 // a slideshow that shows one difference at a time. Without JavaScript the list
-// stays as it is, all five stacked. It moves on every nine seconds, and stops
-// while the pointer or keyboard focus is in it, while the tab is hidden, after
-// the visitor presses Pause, and for anyone who prefers reduced motion. It
-// follows the WAI-ARIA carousel pattern: the slide text is a polite live region
-// only while it isn't rotating by itself, so a screen reader isn't interrupted
-// every nine seconds.
+// stays as it is, all five stacked. It moves on every nine seconds. Pause and
+// Play always do what they say. Rotation also stops when keyboard focus comes
+// in from outside (it stays stopped until Play), while a mouse rests on it,
+// while the tab is hidden, and for anyone who prefers reduced motion. Touch
+// doesn't count as hovering: a phone fires a mouse-enter on every tap and no
+// mouse-leave, which used to freeze the slideshow behind a Play that did
+// nothing. It follows the WAI-ARIA carousel pattern: the slide text is a polite
+// live region only while it isn't rotating by itself, so a screen reader isn't
+// interrupted every nine seconds.
 (function () {
   "use strict";
 
@@ -21,7 +24,6 @@
   var timer = null;
   var stopped = false;
   var hovered = false;
-  var focused = false;
 
   function title(slide) {
     return slide.querySelector(".why-punchline").textContent.trim();
@@ -94,7 +96,7 @@
   }
 
   function rotating() {
-    return !stopped && !hovered && !focused && !reduced() && !document.hidden;
+    return !stopped && !hovered && !reduced() && !document.hidden;
   }
 
   // Every change of state comes through here, so the timer restarts from a
@@ -122,6 +124,8 @@
   });
   toggle.addEventListener("click", function () {
     stopped = !stopped;
+    // Play means play, even with the mouse still over the button.
+    if (!stopped) hovered = false;
     schedule();
   });
   root.addEventListener("keydown", function (event) {
@@ -130,21 +134,23 @@
     show(current + (event.key === "ArrowLeft" ? -1 : 1));
     if (dots.contains(document.activeElement)) dotButtons[current].focus();
   });
-  root.addEventListener("mouseenter", function () {
+  root.addEventListener("pointerenter", function (event) {
+    if (event.pointerType !== "mouse") return;
     hovered = true;
     schedule();
   });
-  root.addEventListener("mouseleave", function () {
+  root.addEventListener("pointerleave", function (event) {
+    if (event.pointerType !== "mouse") return;
     hovered = false;
     schedule();
   });
-  root.addEventListener("focusin", function () {
-    focused = true;
-    schedule();
-  });
-  root.addEventListener("focusout", function (event) {
+  // Keyboard focus arriving from outside stops the slideshow until the visitor
+  // presses Play. A click focuses too, so only keyboard focus (:focus-visible)
+  // counts, or pressing Play with the mouse would stop it again.
+  root.addEventListener("focusin", function (event) {
     if (root.contains(event.relatedTarget)) return;
-    focused = false;
+    if (!event.target.matches(":focus-visible")) return;
+    stopped = true;
     schedule();
   });
   document.addEventListener("visibilitychange", schedule);
