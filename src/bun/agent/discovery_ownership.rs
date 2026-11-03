@@ -450,18 +450,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 owner.entry.namespace == service.namespace && owner.entry.app_name == service.name
             })
             .ok_or_else(|| refuse("original service allocation is missing"))?;
-        let live = self
-            .service_map
-            .resolve(&service)
-            .ok_or_else(|| refuse("original service withdrawal is unproven"))?;
-        if live.vip != original.entry.vip
-            || live.port != original.entry.port
-            || live
-                .backends
-                .iter()
-                .any(|backend| backend.instance_id == reference.instance_id.0)
+        // Each way the withdrawal can be unproven has its own reason, so a
+        // refusal that repeats says which one held (#1500).
+        let live = self.service_map.resolve(&service).ok_or_else(|| {
+            refuse("original service withdrawal is unproven: the service map no longer holds the service")
+        })?;
+        if live.vip != original.entry.vip || live.port != original.entry.port {
+            return Err(refuse(
+                "original service withdrawal is unproven: the service map holds the service under another VIP or port",
+            ));
+        }
+        if live
+            .backends
+            .iter()
+            .any(|backend| backend.instance_id == reference.instance_id.0)
         {
-            return Err(refuse("original service withdrawal is unproven"));
+            return Err(refuse(
+                "original service withdrawal is unproven: the service map still lists this instance as a backend",
+            ));
         }
         let deadline = self.turn_deadline();
         let landing = self
@@ -544,13 +550,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return Err(refuse("original consumer ownership is missing"));
         }
         let Some(live) = live else {
-            return Err(refuse("original service withdrawal is unproven"));
+            return Err(refuse(
+                "original service withdrawal is unproven: the service map no longer holds the service",
+            ));
         };
-        if live.vip != original.entry.vip
-            || live.port != original.entry.port
-            || !live.backends.is_empty()
-        {
-            return Err(refuse("original service withdrawal is unproven"));
+        if live.vip != original.entry.vip || live.port != original.entry.port {
+            return Err(refuse(
+                "original service withdrawal is unproven: the service map holds the service under another VIP or port",
+            ));
+        }
+        if !live.backends.is_empty() {
+            return Err(refuse(
+                "original service withdrawal is unproven: the service map still lists backends",
+            ));
         }
         if journal
             .inventory()

@@ -198,6 +198,15 @@ Admin                  New Node                  Cluster (any existing node)
   |                       |                              |
 ```
 
+A node certificate names the node id as a SPIFFE URI SAN and a DNS SAN, and,
+from 0.2.6, the address the issuer saw the join or renewal request come from
+as an IP SAN, so a strict client can connect by address
+([#1508](https://github.com/reliaburger/reliaburger/issues/1508)). Loopback and
+unspecified addresses are left out, and nothing in the CSR is used. A node
+whose certificate doesn't name its advertised address renews once to get it,
+which covers the first node and a node that moved; Bun reaches its own API at
+that address, so the leader's own renewal arrives from it too.
+
 ---
 
 ## 4. Data Structures
@@ -794,7 +803,9 @@ start with the command that fixes it, `relish init` on a bootstrap node or
 the setting. `relish dev create` builds an mTLS cluster the way
 `relish setup --quickstart` does, from the same bootstrap code: it generates the
 CA, master key and first identity on the host, then enrols every other Lima VM
-with a join token and `relish join`.
+with a join token and `relish join`. The bootstrap's administrator token is
+named by the caller: `laptop-admin` for the quickstart, `dev-<cluster>-admin`
+for a dev cluster (#930).
 
 Plaintext is an explicit opt-in, and there are only two: `relish init
 --development-plaintext`, and test fixtures that write `require_mtls = false`.

@@ -114,6 +114,19 @@ gets the first identity, and every other VM enrols with a join token and
 `relish join`, exactly as you would by hand. One less special case, and the dev
 cluster finally has a registry, which needs mTLS.
 
+Sharing the code at first meant sharing a name, too: every dev cluster's
+administrator token was called `laptop-admin`, which is right for the
+quickstart and puzzling in `relish token list` on a dev cluster (#930). The
+name is what the audit log records for every change made with the token, so
+it should say where the token came from. `prepare_in` now takes the name as
+a parameter. The quickstart passes its `QUICKSTART_ADMINISTRATOR` constant,
+`"laptop-admin"`, and `relish dev create` passes
+`format!("dev-{cluster_name}-admin")`. The parameter is a `&str`, a borrowed
+string, so the dev caller lends `prepare_in` a reference to a `String` it
+builds on the spot and still owns, and the quickstart lends one to a constant
+baked into the binary (its type is `&'static str`, a borrow that lasts the
+whole program). Neither copies anything into the function.
+
 The first mTLS dev cluster formed a healthy council and then failed every
 linearizable read on the leader. Pulls failed, and `relish wtf` said the leader
 wasn't the leader. The cause was a timing budget. Our Raft transport opens a
@@ -513,6 +526,23 @@ if let Some(expected) = &self.expected_node_id {
 ```
 
 Now a valid certificate for node C, presented when we dialled node A, is rejected: the SAN says C, we expected A. A certificate with no node-id SAN at all is rejected too — under binding, absence is mismatch. The property jumps from "some valid node" to "the specific node I meant to reach". (The reporting transport dials by address without a target id to hand the verifier, so it keeps the CA-pin-plus-CRL guarantee; binding lives where the id is known.)
+
+### Naming the address, but only one we saw
+
+Fixing the authority key identifier got the same Python 3.13 client one error further. Strict mode also checks the server's name, and someone who connects with `https://10.0.0.5:9117` is asking for an address, so the certificate has to carry that address as an IP SAN. Ours carried the node-id URI and DNS names, and no address at all, so the client refused with "IP address mismatch" ([#1508](https://github.com/reliaburger/reliaburger/issues/1508)). `relish` never noticed because it binds to the node id, not the address.
+
+The tempting fix is to let the joiner say which address it has. That's the mistake from the workload signer again: a node that can choose its own SANs can claim another node's address, and a client that connects by address would then trust it. So the address comes from where the issuer saw the request come from, the TCP source the API server already records for the audit log, and never from the CSR:
+
+```rust
+let mut params = node_cert_params(node_id, serial, lifetime)?;
+if let Some(address) = address.filter(|address| names_a_machine(*address)) {
+    params.subject_alt_names.push(SanType::IpAddress(address));
+}
+```
+
+`address` is an `Option<IpAddr>`, and `filter` keeps it only when the closure says yes, so loopback and `0.0.0.0` never make it into a certificate: they'd name the client's own machine. A node behind NAT gets no IP SAN, and clients go on using the node id as the server name.
+
+Two cases needed more than that. The first node's certificate comes from `relish setup` before any peer has seen it, and it lasts a year, so waiting for a renewal would mean waiting a year. And the leader renews its own certificate through its own API, which it used to reach on loopback. Now Bun dials itself at the address it advertises, and its renewal worker renews once, early, whenever its certificate doesn't name that address. That catches the first node, and a node whose address has changed, with the same check. Once per address, because the issuer may still leave the address out (that NAT case), and a node that asked every second would never stop.
 
 ### Installing the bundle without half-doing it
 

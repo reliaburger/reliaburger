@@ -77,7 +77,7 @@ so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.2.4
+  --record docs/website/assets/tour.cast --install v0.2.5
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -114,11 +114,11 @@ published tarball holds exactly that directory. Until a promotion's site
 change deploys, the live tarball is the previous release's, so a re-record
 always shows the repository copy, and says so on screen. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.2.4` on the default ports.
+`--install v0.2.5` on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
 `--record` writes the installed version into the cast's title (`Reliaburger
-0.2.4: the five-minute tour`), and the caption under the player names it too.
+0.2.5: the five-minute tour`), and the caption under the player names it too.
 `tests/suite/website.rs` checks that both match `install.sh`'s default, so a
 promotion that forgets the re-record fails CI.
 
@@ -224,7 +224,7 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.2.4` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.2.5` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. Every line the site shows names a
 mode (`sh -s -- --laptop`): with no arguments both scripts only explain the
 choices and exit 2, and the bootstrap does it before downloading anything.

@@ -8,6 +8,58 @@ release contains is in the [roadmap](roadmap.md#releases-after-010). A new
 paragraph goes at the top when a release is promoted
 ([release gate, step 9](releasing.md#staging-a-candidate)).
 
+## 0.2.5: bugs an outside evaluation found
+
+Promoted on 3 November 2026 as tag `v0.2.5` at `954bb7b1`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/41605919475)).
+A patch release for the product bugs that an external evaluation of 0.2.0
+([#1080](https://github.com/reliaburger/reliaburger/pull/1080)) found and
+that were still on `main`: `relish token create` and the other token
+commands work on any node, issued certificates name their issuer's key, the
+Kubernetes importer keeps an init container's `env`, `relish logs-export
+--dest DIR` writes where relish runs, an app can be deleted and applied
+straight back, the audit table names every app an apply touched, and
+`relish logs --tail` stays current
+([plan](plans/archive/2026-10-31-plan-0.2.5.md)). Spare nodes also join as
+Raft learners up to the council cap
+([#1494](https://github.com/reliaburger/reliaburger/pull/1494)).
+Qualification ran from 1 to 3 November 2026 (UTC) and took one candidate
+([closure record](qualification/2026-11-03-v0.2.5-release-closure.md)), on
+the full gate, because 0.2.5 moves the formats (protocol 55 to 56, state
+format 72 to 73) and changes the agent loop. A first build came out as 0.2.4
+because the version bump hadn't merged
+([#1522](https://github.com/reliaburger/reliaburger/pull/1522)). The gate was
+split around a workshop: overnight on 1 to 2 November the candidate passed
+both staged installs, in 134 s and 132 s
+([first](qualification/2026-11-02-v0.2.5-staged-install-apple-silicon.md),
+[second](qualification/2026-11-02-v0.2.5-staged-install-apple-silicon-2.md)),
+the power-cut and reboot lanes, 25 of 25 in every lane
+([record](qualification/2026-11-02-power-cut-reboot.md)), the V02 fast tier
+([record](qualification/2026-11-02-v0.2.5-sustained-v02-fast.md)) and the
+jobs fast tier at 6,307.0 accepted jobs a second
+([record](qualification/2026-11-02-v0.2.5-job-qualification-fast.md)), all
+clean. The 8-hour jobs final ran the next night and completed its schedule,
+10 h 20 min with every leak checker armed in the quiet tail, but it wasn't
+clean: one `health_tick` turn on node 3 took 1,077 ms against the 1 s
+budget, four minutes after the soak killed that node's Bun
+([record](qualification/2026-11-03-v0.2.5-job-qualification.md)). The Mac
+had been plugged in at 10% charge two minutes before the final started and
+logged three thermal emergencies in the night; the job rate fell to 1,552.4
+a second with the first, a quarter of the fast tier's, though still above
+the 1,390 target, and the slow turn came just after the second. The
+maintainer accepted the turn as a host stall rather than run the final
+again. It ships with the `zstd` 0.13 advisories under the exception that
+expires on 18 November 2026
+([#1366](https://github.com/reliaburger/reliaburger/issues/1366)), and with
+[RUSTSEC-2026-0433](https://rustsec.org/advisories/RUSTSEC-2026-0433.html)
+in `pulldown-cmark` 0.13.5, which it doesn't expose. `make test-s3` wasn't
+run and `make test-apple` failed on the host's container networking; neither
+change reached what they cover, and both get fixed in 0.2.6
+([#1534](https://github.com/reliaburger/reliaburger/issues/1534),
+[#1535](https://github.com/reliaburger/reliaburger/issues/1535)). 0.2.5
+changes the cluster's formats, so a 0.2.4 cluster can't roll to it: start a
+fresh cluster ([upgrading from 0.2.4](releasing.md#upgrading-from-024)).
+
 ## 0.2.4: extension points
 
 Promoted on 30 October 2026 as tag `v0.2.4` at `964b56a2`

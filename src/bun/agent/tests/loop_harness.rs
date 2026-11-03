@@ -458,6 +458,7 @@ async fn status_answers_while_a_join_waits_on_a_council_without_quorum() {
         token,
         node_id: "node-99".into(),
         csr_der: vec![],
+        address: None,
         response,
     })
     .await
@@ -3027,18 +3028,20 @@ async fn a_restart_waits_for_its_slow_network_reference_write_instead_of_refusin
         agent.run().await;
         agent
     });
-    // Hold the create, so the successor's hold is in place before the
-    // restart retains it.
-    grill.set_call_delay(
-        MockCall::Create,
-        Some(std::time::Duration::from_millis(500)),
-    );
-    let released = calls_of(&grill, "release_network_reference");
+    // Hold the successor's create. The restart only creates once the
+    // predecessor has retired: its reference released and the journal's
+    // record of it forgotten. Planting the successor's hold any earlier lets
+    // a retirement retry find it and refuse to release the predecessor's,
+    // which never happens on a real runtime (#1520). Stalling the journal
+    // any earlier slows the predecessor's forget instead of the successor's
+    // record.
+    grill.block_creates();
     let started = calls_of(&grill, "start");
     crash(&grill);
-    wait_for_calls(&grill, "release_network_reference", released, 1).await;
+    grill.wait_for_creates(1).await;
     grill.set_network_reference(successor.clone()).await;
     stalls.set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    grill.release_creates(1);
     wait_for_calls(&grill, "start", started, 1).await;
     stalls.set(LoopStall::Persist, std::time::Duration::ZERO);
     shutdown.cancel();
@@ -3692,7 +3695,7 @@ async fn a_release_is_refused_while_the_live_entry_names_its_backend() {
         .await;
     assert!(
         matches!(&released, Err(BunError::RetirementState { reason, .. })
-            if reason == "original service withdrawal is unproven"),
+            if reason == "original service withdrawal is unproven: the service map still lists this instance as a backend"),
         "{released:?}"
     );
     assert_eq!(
@@ -3721,7 +3724,7 @@ async fn a_release_is_refused_against_another_allocation() {
         .await;
     assert!(
         matches!(&released, Err(BunError::RetirementState { reason, .. })
-            if reason == "original service withdrawal is unproven"),
+            if reason == "original service withdrawal is unproven: the service map holds the service under another VIP or port"),
         "{released:?}"
     );
     assert_eq!(
@@ -3748,7 +3751,7 @@ async fn an_allocation_stays_while_a_new_incarnation_publishes_into_it() {
     let retired = agent.retire_discovery_service(&service).await;
     assert!(
         matches!(&retired, Err(BunError::BackendPublication { reason, .. })
-            if reason == "original service withdrawal is unproven"),
+            if reason == "original service withdrawal is unproven: the service map still lists backends"),
         "{retired:?}"
     );
 }
