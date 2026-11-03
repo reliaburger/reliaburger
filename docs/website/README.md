@@ -5,7 +5,7 @@ fonts, analytics or third-party requests. Publish the contents of this directory
 with the GitHub Pages workflow (`.github/workflows/static.yml`); workflow and
 custom-domain configuration are managed separately.
 
-JavaScript: two small scripts, each for one thing. `assets/copy.js` adds a
+JavaScript: three small scripts, each for one thing. `assets/copy.js` adds a
 copy button beside every command snippet (`<pre>`) with a short "Copied"
 confirmation announced through a live region, and makes each heading's `#`
 permalink copy the section's address as well as navigate to it. It adds the
@@ -23,10 +23,21 @@ the recording (about 1 MB) from this site when the figure comes within a screen
 or so of the viewport (an `IntersectionObserver`; browsers without one load them
 straight away), so a visitor who never scrolls down doesn't pay for them.
 Nothing is fetched from anywhere else. With scripts disabled a `<noscript>`
-note links the `.cast` file, and the written tour works as before. Don't add other scripts. The footer names both,
-so change the two together.
+note links the `.cast` file, and the written tour works as before.
 
-Every `<section>` has a stable `id` (`install`, `tour`, `start`, `docs`,
+`assets/why-carousel.js` turns the "Built differently" section (`#why`), a
+plain list of five architectural differences, into a slideshow: one at a
+time, a new one every nine seconds, with previous, next, five dots and a Pause
+button. It stops while the pointer or keyboard focus is inside, and doesn't
+rotate at all for visitors who prefer reduced motion. It follows the WAI-ARIA
+carousel pattern, so the slide text is a polite live region only while it
+isn't rotating by itself. The drawings are inline SVG animated by CSS in
+`style.css`, so reduced motion stills them and nothing loads from elsewhere.
+Without JavaScript all five stay stacked.
+
+Don't add other scripts. The footer names all three, so change them together.
+
+Every `<section>` has a stable `id` (`why`, `install`, `tour`, `start`, `docs`,
 `internals`, `next`, `contributing`) and every section heading a `#` permalink, shown on
 hover or focus, so a section can be shared as `reliaburger.com/#install`.
 Renaming an `id` breaks links people have already shared; add a new section
