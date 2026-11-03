@@ -532,6 +532,8 @@ fn security_directory(state_root: &std::path::Path, cluster_name: &str) -> PathB
 
 /// Generate the dev cluster's credentials once, with the same bootstrap code
 /// `relish setup --quickstart` uses, or reuse them on a resumed `create`.
+/// The administrator token is named `dev-<cluster>-admin`, so
+/// `relish token list` says which cluster it belongs to.
 fn prepare_security(
     directory: &std::path::Path,
     cluster_name: &str,
@@ -540,7 +542,12 @@ fn prepare_security(
     if let Some(parent) = directory.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    crate::relish::quickstart::security::prepare_in(directory, cluster_name, first_node)
+    crate::relish::quickstart::security::prepare_in(
+        directory,
+        cluster_name,
+        first_node,
+        &format!("dev-{cluster_name}-admin"),
+    )
 }
 
 /// Forget a destroyed dev cluster's credentials.
@@ -1573,6 +1580,21 @@ mod tests {
         let second = prepare_security(&directory, "dev", "reliaburger-dev-1").unwrap();
         assert_eq!(first.root_fingerprint, second.root_fingerprint);
         assert_eq!(std::fs::read(directory.join("admin.token")).unwrap(), token);
+    }
+
+    #[test]
+    fn a_dev_cluster_names_its_administrator_token_after_the_cluster() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = security_directory(root.path(), "lab");
+        prepare_security(&directory, "lab", "reliaburger-lab-1").unwrap();
+        let bytes = std::fs::read(directory.join("security-bootstrap.json")).unwrap();
+        let state: crate::sesame::types::SecurityState = serde_json::from_slice(&bytes).unwrap();
+        let names: Vec<&str> = state
+            .api_tokens
+            .iter()
+            .map(|token| token.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["dev-lab-admin"]);
     }
 
     #[test]

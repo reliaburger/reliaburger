@@ -114,6 +114,19 @@ gets the first identity, and every other VM enrols with a join token and
 `relish join`, exactly as you would by hand. One less special case, and the dev
 cluster finally has a registry, which needs mTLS.
 
+Sharing the code at first meant sharing a name, too: every dev cluster's
+administrator token was called `laptop-admin`, which is right for the
+quickstart and puzzling in `relish token list` on a dev cluster (#930). The
+name is what the audit log records for every change made with the token, so
+it should say where the token came from. `prepare_in` now takes the name as
+a parameter. The quickstart passes its `QUICKSTART_ADMINISTRATOR` constant,
+`"laptop-admin"`, and `relish dev create` passes
+`format!("dev-{cluster_name}-admin")`. The parameter is a `&str`, a borrowed
+string, so the dev caller lends `prepare_in` a reference to a `String` it
+builds on the spot and still owns, and the quickstart lends one to a constant
+baked into the binary (its type is `&'static str`, a borrow that lasts the
+whole program). Neither copies anything into the function.
+
 The first mTLS dev cluster formed a healthy council and then failed every
 linearizable read on the leader. Pulls failed, and `relish wtf` said the leader
 wasn't the leader. The cause was a timing budget. Our Raft transport opens a

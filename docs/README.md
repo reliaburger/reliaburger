@@ -856,7 +856,7 @@ relish dev destroy mycluster
 
 Notes:
 
-- **mTLS, like any other cluster.** `dev create` generates the cluster's CA, master key and an administrator token on the host (kept in `~/.reliaburger/dev/clusters/<name>.security/` until `dev destroy`), gives the first node its identity, then enrols every other node with a join token and `relish join`. Each VM's `relish` gets a context file holding the administrator token and the root CA, so it reaches its local agent over HTTPS with no flags.
+- **mTLS, like any other cluster.** `dev create` generates the cluster's CA, master key and an administrator token (named `dev-<name>-admin`) on the host (kept in `~/.reliaburger/dev/clusters/<name>.security/` until `dev destroy`), gives the first node its identity, then enrols every other node with a join token and `relish join`. Each VM's `relish` gets a context file holding the administrator token and the root CA, so it reaches its local agent over HTTPS with no flags.
 - **Lima required** (`brew install lima`). VMs use Lima's `user-v2` network so they can reach each other with no `socket_vmnet`/sudo setup; each node advertises its inter-VM IP. That network isn't routable from the host, so run `relish nodes`/`council` *inside* a node (`limactl shell reliaburger-mycluster-1 …`), where the CLI reaches the local agent on `127.0.0.1:9117`.
 - **Binaries are built from your current tree, not downloaded.** `dev create` builds `bun`/`relish` for Linux inside the persistent build VM (the same one `relish dev test` uses), so the **first `create` is slow** (a full build); later runs are incremental.
 - `--bun <path>` / `--relish <path>` install a pre-built Linux binary instead, skipping the build.

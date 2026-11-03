@@ -794,7 +794,9 @@ start with the command that fixes it, `relish init` on a bootstrap node or
 the setting. `relish dev create` builds an mTLS cluster the way
 `relish setup --quickstart` does, from the same bootstrap code: it generates the
 CA, master key and first identity on the host, then enrols every other Lima VM
-with a join token and `relish join`.
+with a join token and `relish join`. The bootstrap's administrator token is
+named by the caller: `laptop-admin` for the quickstart, `dev-<cluster>-admin`
+for a dev cluster (#930).
 
 Plaintext is an explicit opt-in, and there are only two: `relish init
 --development-plaintext`, and test fixtures that write `require_mtls = false`.
