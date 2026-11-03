@@ -10,7 +10,7 @@ the detail is in the GitHub milestones and issues.
 
 | Plan | What it is | Still open |
 |---|---|---|
-| [0.2.5: Bugs an outside evaluation found](2026-10-31-plan-0.2.5.md) | The 0.2.5 patch release: token create forwarding, the Authority Key Identifier, init container `env` on import, where `logs-export` writes, delete then re-apply, app names in the audit table, and the stale `logs --tail`, all on `main`. | [0.2.5](https://github.com/reliaburger/reliaburger/milestone/27): #1493, #1496–#1501 |
+| [0.2.6: The rest of the evaluation's bugs, and setup over SSH](2026-11-03-plan-0.2.6.md) | The 0.2.6 patch release: the rest of #1477 and #1500, `relish setup --ssh`, an IP SAN on node certificates, smaller fixes, `test-s3` and `test-apple` runnable by CI, and the known flakes. | [0.2.6](https://github.com/reliaburger/reliaburger/milestone/28) |
 | [Research: how Kubernetes tests its releases](2026-10-28-research-kubernetes-release-testing.md) | What the Kubernetes project runs before a release (blocking-job thresholds, e2e and conformance, scale tests and SLOs, etcd's history checks, OSS-Fuzz) against our gate, what we should copy and what we shouldn't. The source of the testing section on the Kubernetes comparison page. | None: #1398–#1401 shipped in 0.2.4 |
 | [CI and test efficiency](2026-10-11-ci-and-test-efficiency.md) | Faster CI and stronger test and soak evidence: one archive extraction per job (#1050), integration policy, test consolidation and compilation costs, with an 18 October status of what's done, tracked and proposed. | Merge queue on the current train; the proposed test, fixture and soak-evidence issues |
 | [Competitive review and comparison pages](2026-10-15-competitor-comparisons.md) | Source-linked comparisons and a wider review, matching the static homepage. | Review and merge into the 0.2.1 train |
@@ -37,6 +37,7 @@ finished plans since. The
 [0.1.0 release closure record](../qualification/2026-09-27-v0.1.0-release-closure.md)
 is the summary of how 0.1.0 ended.
 
+- [0.2.5: Bugs an outside evaluation found](archive/2026-10-31-plan-0.2.5.md): token commands on any node, the Authority Key Identifier, init container `env` on import, where `logs-export` writes, delete then re-apply, app names in the audit table and the stale `logs --tail`, shipped in 0.2.5
 - [0.2.4: Extension points](archive/2026-10-23-plan-0.2.4.md): the 0.2.4 merge train, policies, templates, sidecars, stop hooks, the exec secret provider, gated runtime knobs and the controller contract, plus the 0.2.3 hand-over and the review's fixes, shipped in 0.2.4
 - [0.2.3: Two billion a day](archive/2026-10-20-plan-0.2.3.md): the 0.2.3 merge train, 1.81 billion host-job tasks in one real day on three nodes, plus the CI, soak and test follow-ups, shipped in 0.2.3
 - [0.2.2: UX patch](archive/2026-10-16-plan-0.2.2-ux-patch.md): the 0.2.2 merge train, the CLI review, Kubernetes fidelity, chaos for jobs, demos and doc fixes, shipped in 0.2.2

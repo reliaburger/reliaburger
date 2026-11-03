@@ -29,7 +29,7 @@
     <main id="main">
       <section id="intro" class="intro" aria-labelledby="title">
         <div class="intro-copy">
-          <div class="eyebrow">RUST · APACHE 2.0 · 0.2.4</div>
+          <div class="eyebrow">RUST · APACHE 2.0 · 0.2.5</div>
           <h1 id="title">The container platform,<br>served ready.</h1>
           <p class="lede">Kubernetes hands you the ingredients. Reliaburger hands you the burger:
             scheduling, mTLS, ingress, a registry, metrics, logs, GitOps, jobs and chaos testing,
@@ -78,7 +78,7 @@
               free memory and 15 GiB of disk. No Rust, no checkout.</p>
             <p class="install-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a>
               · <a href="install.sh">Read the bootstrap script</a>
-              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.4">Release notes <span aria-hidden="true">↗</span></a></p>
+              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.5">Release notes <span aria-hidden="true">↗</span></a></p>
           </div>
         </div>
       </section>
@@ -93,12 +93,13 @@
       </aside>
 
       <aside class="status" aria-label="Release status: what the installer fetches">
-        <strong>0.2.4: Extension points</strong>
-        <p>What that line installs, released on 30 October 2026. Bend it to your own rules
-          without forking it: policies in CEL that refuse, warn about or fill in an app before
-          it’s stored, templates that expand to ordinary apps instead of CRDs, sidecars, stop
-          hooks, a secret provider and a contract for your own controllers.</p>
-        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.4">Release notes <span aria-hidden="true">↗</span></a>
+        <strong>0.2.5: Bugs an outside evaluation found</strong>
+        <p>What that line installs, released on 3 November 2026. Fixes for what an outside
+          evaluation hit in ordinary use: token commands work on any node, certificates pass
+          strict verifiers, <code>logs-export</code> writes where you run it, an app can be
+          deleted and applied straight back, and <code>logs --tail</code> stays current.
+          Extension points arrived in 0.2.4.</p>
+        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.5">Release notes <span aria-hidden="true">↗</span></a>
       </aside>
 
       <section id="tour" class="section" aria-labelledby="tour-title">
@@ -124,7 +125,7 @@
               <span class="recording-chapters" role="group" aria-label="Tour recording chapters" hidden></span>
               <span>The whole tour on a real laptop cluster, run by
                 <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>
-                against the published 0.2.4 install.
+                against the published 0.2.5 install.
                 Setup plays four times faster and idle time is cut to two seconds; every wait
                 says how long it really took. Jump to a step with the buttons above, or the marks on the progress bar.</span>
               <span class="recording-speed" role="group" aria-label="Playback speed" hidden>speed
@@ -218,10 +219,10 @@
                   mark, so this one goes out.</p>
               </li>
               <li>
-                <pre><code data-tour>curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.4/examples/policies/platform.toml</code>
+                <pre><code data-tour>curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.5/examples/policies/platform.toml</code>
 <code data-tour>relish policy test -f platform.toml -f burger/burger.toml</code></pre>
                 <p>House rules, without forking anything. <code>platform.toml</code> is
-                  0.2.4’s example of the four policies platform teams ask for most, each a line or
+                  the release’s example of the four policies platform teams ask for most, each a line or
                   two of CEL that the leader judges every apply by. <code>policy test</code> tries
                   the burger against them offline: none of its apps comes from a trusted registry,
                   so each one is listed with the rule’s own message. Applied, the rules would refuse
@@ -488,74 +489,75 @@
           drains, a council history that isn't linearizable, or job tasks slower than
           256 ms to start at the 99th percentile. A failure gets a root cause before anything else happens. A product fix
           means a new candidate, and every soak starts again.</p>
-        <p><strong>The latest: 0.2.4, 30 October 2026.</strong> One candidate over two days,
-          on the full gate because it changes the cluster’s formats. Both one-hour soaks failed
-          on a check with too few samples to judge, which we fixed in the harness and replayed
-          on the same evidence. The 8-hour soak then passed clean.
+        <p><strong>The latest: 0.2.5, 3 November 2026.</strong> One candidate over three days,
+          on the full gate because it changes the cluster’s formats. Everything passed clean
+          but one slow agent turn in the 8-hour soak, on a night the laptop running it logged
+          thermal emergencies. We accepted that turn as the host’s, not the release’s.
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/release-log.md">The release log</a>
           has every release’s story.</p>
         <details class="tour-commands" id="release-testing-results">
-          <summary>Show 0.2.4's results <span class="tour-commands-note">headline numbers and charts, each with its record</span></summary>
+          <summary>Show 0.2.5's results <span class="tour-commands-note">headline numbers and charts, each with its record</span></summary>
           <ul>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-30-v0.2.4-job-qualification.md">8-hour job soak</a>:
-              6,900 accepted jobs a second against a target of 1,390, every fault and upgrade
-              walk settled, no data lost, every job drained, agent memory within target, a
-              linearizable council history, and a 2¼-hour quiet tail with every leak check
-              armed. Job tasks started within 32 ms at the 99th percentile, over 137 million
-              of them, against the 256 ms that 0.2.4 is the first release to gate on. A clean
-              pass.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-29-v0.2.4-sustained-v02-fast.md">One-hour app soak</a>:
-              6 cycles and 3 upgrade round trips. It failed as run, and so did the one-hour job
-              soak, on the new job-start check alone: with the faults back to back, each had
-              only 20 tasks that no fault overlapped, and the slowest of 20 isn’t a 99th percentile.
-              The check now waits for 1,000, and replayed on the same evidence both pass.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-29-power-cut-reboot.md">Power cuts and reboots</a>:
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-03-v0.2.5-job-qualification.md">8-hour job soak</a>:
+              every fault and upgrade walk settled, no data lost, every job drained, agent
+              memory within target, a linearizable council history, and a 2¼-hour quiet tail
+              with every leak check armed. Job tasks started within 128 ms at the 99th
+              percentile, over 14.7 million of them. It failed as run on one agent turn of
+              1,077 ms against the 1 s budget. The laptop overheated the same night, and the job
+              rate fell with it to 1,552 a second: still above the 1,390 target, but a quarter
+              of the one-hour soak’s.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-02-v0.2.5-job-qualification-fast.md">One-hour job soak</a>:
+              6,307 accepted jobs a second, and job tasks started within 32 ms at the 99th
+              percentile. Clean.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-02-v0.2.5-sustained-v02-fast.md">One-hour app soak</a>:
+              every fault kind, special and upgrade walk on the compressed schedule. Clean.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-02-power-cut-reboot.md">Power cuts and reboots</a>:
               25 of 25 in each of five lanes.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-30-v0.2.4-release-closure.md">Every gate and every candidate</a>:
-              one candidate, which passed every gate.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-03-v0.2.5-release-closure.md">Every gate and every candidate</a>:
+              one candidate, and why we shipped it with that one turn.</li>
           </ul>
           <p class="soak-charts-note">Time runs from the start of each soak. The marks under a
             chart are its faults and upgrade walks, and the dashed lines its targets. Open a
             chart to see it full size, with every mark named when you point at it.</p>
           <div class="soak-charts" role="group" aria-labelledby="soak-charts-jobs">
-            <h3 id="soak-charts-jobs"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-30-v0.2.4-job-qualification.md">The 8-hour job soak</a></h3>
+            <h3 id="soak-charts-jobs"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-03-v0.2.5-job-qualification.md">The 8-hour job soak</a></h3>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-30-v0.2.4-job-qualification-charts/jobs.svg"><img src="assets/soak/2026-10-30-v0.2.4-job-qualification-charts/jobs.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-03-v0.2.5-job-qualification-charts/jobs.svg"><img src="assets/soak/2026-11-03-v0.2.5-job-qualification-charts/jobs.svg" width="720" height="272" loading="lazy"
                 alt="Accepted jobs a second in 10-minute windows over the 8-hour job soak, against the target rate, with the faults marked along the time axis"></a>
               <figcaption>Accepted jobs a second, in 10-minute windows, against the target.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-30-v0.2.4-job-qualification-charts/rss.svg"><img src="assets/soak/2026-10-30-v0.2.4-job-qualification-charts/rss.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-03-v0.2.5-job-qualification-charts/rss.svg"><img src="assets/soak/2026-11-03-v0.2.5-job-qualification-charts/rss.svg" width="720" height="272" loading="lazy"
                 alt="Bun resident memory per node over the 8-hour job soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
               <figcaption>Bun memory per node, with the 512 and 384 MiB targets.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-30-v0.2.4-job-qualification-charts/fds.svg"><img src="assets/soak/2026-10-30-v0.2.4-job-qualification-charts/fds.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-03-v0.2.5-job-qualification-charts/fds.svg"><img src="assets/soak/2026-11-03-v0.2.5-job-qualification-charts/fds.svg" width="720" height="272" loading="lazy"
                 alt="Open file descriptors per node over the 8-hour job soak, with the faults marked along the time axis"></a>
               <figcaption>Open file descriptors per node.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-30-v0.2.4-job-qualification-charts/cpu.svg"><img src="assets/soak/2026-10-30-v0.2.4-job-qualification-charts/cpu.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-03-v0.2.5-job-qualification-charts/cpu.svg"><img src="assets/soak/2026-11-03-v0.2.5-job-qualification-charts/cpu.svg" width="720" height="272" loading="lazy"
                 alt="Bun CPU per node over the 8-hour job soak, as a percentage of one core, with the faults marked along the time axis"></a>
               <figcaption>Bun CPU per node, as a percentage of one core.</figcaption>
             </figure>
           </div>
           <div class="soak-charts" role="group" aria-labelledby="soak-charts-v02">
-            <h3 id="soak-charts-v02"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-29-v0.2.4-sustained-v02-fast.md">The one-hour app soak</a></h3>
+            <h3 id="soak-charts-v02"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-02-v0.2.5-sustained-v02-fast.md">The one-hour app soak</a></h3>
             <p class="soak-charts-note">The gate has no separate 8-hour app soak: the job soak
               above runs the same apps and faults. These are from the compressed one.</p>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-29-v0.2.4-sustained-v02-fast-charts/rss.svg"><img src="assets/soak/2026-10-29-v0.2.4-sustained-v02-fast-charts/rss.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-02-v0.2.5-sustained-v02-fast-charts/rss.svg"><img src="assets/soak/2026-11-02-v0.2.5-sustained-v02-fast-charts/rss.svg" width="720" height="272" loading="lazy"
                 alt="Bun resident memory per node over the one-hour app soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
               <figcaption>Bun memory per node, with the 512 and 384 MiB targets.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-29-v0.2.4-sustained-v02-fast-charts/fds.svg"><img src="assets/soak/2026-10-29-v0.2.4-sustained-v02-fast-charts/fds.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-02-v0.2.5-sustained-v02-fast-charts/fds.svg"><img src="assets/soak/2026-11-02-v0.2.5-sustained-v02-fast-charts/fds.svg" width="720" height="272" loading="lazy"
                 alt="Open file descriptors per node over the one-hour app soak, with the faults marked along the time axis"></a>
               <figcaption>Open file descriptors per node.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-29-v0.2.4-sustained-v02-fast-charts/cpu.svg"><img src="assets/soak/2026-10-29-v0.2.4-sustained-v02-fast-charts/cpu.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-02-v0.2.5-sustained-v02-fast-charts/cpu.svg"><img src="assets/soak/2026-11-02-v0.2.5-sustained-v02-fast-charts/cpu.svg" width="720" height="272" loading="lazy"
                 alt="Bun CPU per node over the one-hour app soak, as a percentage of one core, with the faults marked along the time axis"></a>
               <figcaption>Bun CPU per node, as a percentage of one core.</figcaption>
             </figure>
@@ -627,7 +629,7 @@
           <article class="reading-item">
             <span class="filetype">CURRENT STATE</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">Roadmap &amp; backlog <span aria-hidden="true">↗</span></a></h3>
-            <p>What’s implemented, what 0.2.4 leaves out and what’s next.</p>
+            <p>What’s implemented, what 0.2.5 leaves out and what’s next.</p>
           </article>
         </div>
         <p class="pdf-note">Every release carries PDFs, and these links always fetch the latest:
@@ -641,7 +643,7 @@
       <section id="compare" class="section" aria-labelledby="compare-title">
         <div class="section-heading"><span class="section-number" aria-hidden="true">07 /</span><h2 id="compare-title">Compare the alternatives <a class="permalink" href="#compare" aria-label="Link to the comparisons">#</a></h2></div>
         <p class="section-intro">How Reliaburger compares, with commands and sources beside the claims.
-          These pages were last re-checked on 21 October 2026, against 0.2.2; the policies, templates and sidecars 0.2.4 adds aren’t in them yet.</p>
+          These pages were last re-checked on 21 October 2026, against 0.2.2; the policies, templates and sidecars 0.2.4 added aren’t in them yet.</p>
         <div class="reading-list">
           <article class="reading-item">
             <span class="filetype">THE PLATFORM API</span>
@@ -713,7 +715,7 @@
               a host process on one node: no images, no isolated container, only the binaries
               the node config allows.</p>
             <p>For real OCI containers, use runc on Linux. On macOS, the managed laptop
-              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.4.</p>
+              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.5.</p>
             <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/README.md">Build requirements &amp; runtime setup <span aria-hidden="true">↗</span></a>
           </div>
           <div class="terminal">
