@@ -42,6 +42,19 @@ machine's address in the same order with `--advertise`. The
 [Linux servers guide](https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md)
 covers doing all this by hand.
 
+There's no command to remove such a cluster yet. On each machine, stop Bun,
+unmount what it left mounted for its workloads, delete its files, then
+reboot: the firewall tables and eBPF programs it loaded stay in the kernel
+until the machine restarts.
+
+```sh
+sudo systemctl disable --now reliaburger.service
+findmnt -rn -o TARGET | grep '^/var/lib/reliaburger' | sort -r | xargs -r sudo umount
+sudo rm -rf /etc/reliaburger /var/lib/reliaburger /etc/systemd/system/reliaburger.service \
+  /usr/local/bin/bun /usr/local/bin/bun-* /usr/local/bin/relish
+sudo reboot
+```
+
 Setup saves an admin credential for the cluster in `~/.reliaburger/context.json`
 (readable only by you), so every `relish` command on this machine reaches the
 cluster without flags. Then take the tour: `relish manual tour`.

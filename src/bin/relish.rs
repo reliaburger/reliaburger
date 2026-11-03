@@ -174,6 +174,8 @@ struct SetupOptions {
     /// The address peers should use for each machine, comma separated, in the same order.
     #[arg(long, value_name = "ADDRESSES", requires = "ssh")]
     advertise: Option<String>,
+    /// The cluster's name: `laptop` for a laptop cluster, `servers` for one
+    /// built over SSH.
     #[arg(long, requires = "managed")]
     name: Option<String>,
     #[arg(long, requires = "quickstart", conflicts_with = "ssh")]
@@ -2723,7 +2725,7 @@ async fn main() -> ExitCode {
                         .collect::<Result<Vec<std::net::Ipv4Addr>, _>>()?;
                     reliaburger::relish::quickstart::server_runner::run(
                         reliaburger::relish::quickstart::server_runner::Options {
-                            name: name.unwrap_or_else(|| "cluster".into()),
+                            name: name.unwrap_or_else(|| "servers".into()),
                             targets,
                             advertise,
                             api_port: api_port.unwrap_or(19117),
