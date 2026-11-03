@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="The container platform, served ready: scheduling, mTLS, ingress, a registry, metrics, logs, GitOps, jobs and chaos testing in one Rust agent and one CLI.">
+  <meta name="description" content="The container platform, served ready: app scheduling, batch jobs, metrics, logs, service discovery, ingress, mTLS, a Docker registry, GitOps and chaos testing in one Rust agent and one CLI.">
   <meta name="theme-color" content="#181b19">
   <title>Reliaburger — a container orchestrator in Rust</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23181b19'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-family='monospace' font-weight='bold' font-size='23' fill='%23f49463'%3Er%3C/text%3E%3C/svg%3E">
@@ -32,8 +32,8 @@
           <div class="eyebrow">RUST · APACHE 2.0 · 0.2.4</div>
           <h1 id="title">The container platform,<br>served ready.</h1>
           <p class="lede">Kubernetes hands you the ingredients. Reliaburger hands you the burger:
-            scheduling, mTLS, ingress, a registry, metrics, logs, GitOps, jobs and chaos testing,
-            in one Rust agent and one CLI.</p>
+            app scheduling, batch jobs, metrics, logs, service discovery, ingress, mTLS,
+            a Docker registry, GitOps and chaos testing, in one Rust agent and one CLI.</p>
           <div class="intro-links">
             <a class="primary-link" href="#install">Get a working cluster in under 5 minutes <span aria-hidden="true">↓</span></a>
           </div>
@@ -116,10 +116,11 @@
               </svg>
               <div class="why-copy">
                 <h3 class="why-punchline">One agent instead of a dozen add-ons.</h3>
-                <p>Scheduling, consensus, service discovery, ingress, PKI, a registry, metrics,
-                  logs, GitOps, jobs and fault injection are compiled into <code>bun</code>, the
-                  one agent every node runs. There’s no etcd, CoreDNS, ingress controller,
-                  Prometheus or Argo CD to install, upgrade and keep in step with each other.</p>
+                <p>App scheduling, batch jobs, metrics, logs, service discovery, ingress, PKI,
+                  a Docker registry, consensus, GitOps and fault injection are compiled into
+                  <code>bun</code>, the one agent every node runs. There’s no Prometheus, CoreDNS,
+                  ingress controller, etcd or Argo CD to install, upgrade and keep in step with
+                  each other.</p>
               </div>
             </li>
             <li class="why-slide" id="why-council">
