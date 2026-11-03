@@ -458,6 +458,7 @@ async fn status_answers_while_a_join_waits_on_a_council_without_quorum() {
         token,
         node_id: "node-99".into(),
         csr_der: vec![],
+        address: None,
         response,
     })
     .await

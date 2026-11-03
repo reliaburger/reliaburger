@@ -199,6 +199,9 @@ pub enum AgentCommand {
         /// DER PKCS#10 CSR the joiner generated (PKI4). The joiner keeps its
         /// private key; the issuer only signs this request.
         csr_der: Vec<u8>,
+        /// Where the request came from, which the certificate names as an
+        /// IP SAN when it's routable (#1508).
+        address: Option<std::net::IpAddr>,
         response: oneshot::Sender<Result<crate::sesame::join::JoinBundle, BunError>>,
     },
     /// Snapshot an app's managed volumes (one volume, or all of them).
@@ -711,9 +714,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 token,
                 node_id,
                 csr_der,
+                address,
                 response,
             } => {
-                self.spawn_join_issue(token, node_id, csr_der, response);
+                self.spawn_join_issue(token, node_id, csr_der, address, response);
             }
             AgentCommand::SnapshotCreate {
                 namespace,

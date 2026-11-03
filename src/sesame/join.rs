@@ -438,7 +438,9 @@ pub fn check_join_token(
 /// The `wrapping_ikm` is needed to unwrap the Node CA private key from Raft
 /// storage. `lifetime` is the signing member's node leaf lifetime
 /// ([`ca::NODE_LEAF_LIFETIME`] unless that member's node config shortens it),
-/// so the member that signs decides how long the leaf lives.
+/// so the member that signs decides how long the leaf lives. `address` is
+/// where the signing member saw the node, named as an IP SAN when it's
+/// routable ([`ca::sign_node_csr`]).
 pub fn sign_join_csr(
     csr_der: &[u8],
     node_id: &str,
@@ -446,6 +448,7 @@ pub fn sign_join_csr(
     lifetime: Duration,
     state: &SecurityState,
     wrapping_ikm: &[u8],
+    address: Option<std::net::IpAddr>,
 ) -> Result<JoinResult, JoinError> {
     if state.crl.retired_nodes.contains_key(node_id) {
         return Err(JoinError::NodeRetired);
@@ -477,8 +480,15 @@ pub fn sign_join_csr(
     let ca_params = ca::issuer_params_from_der(&node_ca_der)
         .map_err(|e| JoinError::CertIssueFailed(format!("invalid Node CA cert: {e}")))?;
 
-    let (cert_der, serial) =
-        ca::sign_node_csr(csr_der, node_id, serial, lifetime, &ca_keypair, &ca_params)?;
+    let (cert_der, serial) = ca::sign_node_csr(
+        csr_der,
+        node_id,
+        serial,
+        lifetime,
+        &ca_keypair,
+        &ca_params,
+        address,
+    )?;
 
     Ok(JoinResult {
         node_id: node_id.to_string(),
@@ -602,6 +612,7 @@ mod tests {
             ca::NODE_LEAF_LIFETIME,
             state,
             master_secret,
+            None,
         )?;
         Ok((result, key_der))
     }
@@ -618,6 +629,7 @@ mod tests {
             Duration::from_secs(3600),
             &state,
             &master_secret,
+            None,
         )
         .unwrap();
         let (_, leaf) = x509_parser::parse_x509_certificate(&result.certificate_der).unwrap();
