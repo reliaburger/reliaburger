@@ -26,7 +26,7 @@ installer only explains the choices and installs nothing. A laptop cluster is
 for development: until 1.0.0, Reliaburger is good enough for home labs and dev
 clusters, not production.
 
-On Linux machines you already have, 0.2.6 (not in 0.2.4) builds the cluster over
+On Linux machines you already have, 0.2.6 (not in 0.2.5) builds the cluster over
 SSH instead:
 
 ```sh

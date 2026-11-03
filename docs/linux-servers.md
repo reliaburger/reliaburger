@@ -8,7 +8,7 @@ workload.
 Often the VMs already exist, and you want to use the configuration and
 runtimes you've already got on them.
 
-From 0.2.6 (not in 0.2.4), `relish setup --ssh user@host,user@host,...` does
+From 0.2.6 (not in 0.2.5), `relish setup --ssh user@host,user@host,...` does
 everything in this guide from your laptop, so read this one when you want to
 choose each step yourself, or need to know what that command does.
 

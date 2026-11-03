@@ -880,7 +880,26 @@ content = '''
             1
         ),
         host,
-        WELCOME_PAGE.replace("{{INGRESS_PORT}}", &ingress_port.to_string())
+        WELCOME_PAGE.replace("{{SEE_THE_BURGER}}", &see_the_burger(ingress_port, host))
+    )
+}
+
+/// The welcome page's pointer to the burger example. `burger.localhost`
+/// resolves only on the machine running the browser, which is the cluster
+/// on a laptop; on servers, `host` is a machine's address, and the burger is
+/// reached through its ingress with the burger's host name.
+fn see_the_burger(ingress_port: u16, host: &str) -> String {
+    if host == "localhost" {
+        return format!(
+            "open\n      <a href=\"http://burger.localhost:{ingress_port}\">burger.localhost:{ingress_port}</a>"
+        );
+    }
+    let address = match ingress_port {
+        80 => format!("http://{host}"),
+        port => format!("http://{host}:{port}"),
+    };
+    format!(
+        "ask any machine's ingress for it:\n      <code>curl -H 'Host: burger.localhost' {address}</code>"
     )
 }
 
@@ -1185,6 +1204,22 @@ esac
         let demo = demo_config(28080, "localhost");
         assert!(demo.contains("http://burger.localhost:28080"));
         assert!(!demo.contains("INGRESS_PORT"));
+        assert!(!demo.contains("{{"));
+    }
+
+    /// `burger.localhost` only resolves on the machine running the browser,
+    /// so on a cluster of servers the page shows how to reach the burger
+    /// through a machine's address instead of a link that can't work.
+    #[test]
+    fn the_welcome_page_on_servers_reaches_the_burger_through_a_machine() {
+        let demo = demo_config(80, "10.0.0.1");
+        assert!(
+            demo.contains("curl -H 'Host: burger.localhost' http://10.0.0.1"),
+            "{demo}"
+        );
+        assert!(!demo.contains("href=\"http://burger.localhost"));
+        assert!(!demo.contains("{{"));
+        crate::config::Config::parse(&demo).unwrap();
     }
 
     /// The page may link out, but it has to render whole on a laptop with no
