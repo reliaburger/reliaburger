@@ -92,6 +92,7 @@ mod rollout_failed;
 mod root_teardown;
 mod runtime_executor;
 mod security_integration;
+mod security_view;
 mod server_idle_connections;
 mod service_endpoints;
 mod stop_confirmation;

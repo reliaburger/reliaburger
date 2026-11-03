@@ -206,8 +206,15 @@ pub struct Compatibility {
 /// An init container's `env` in Raft desired state and node syncs (#1498).
 /// `InitContainerSpec` refuses unknown fields, so a 0.2.4 node can't decode
 /// an app that sets it.
+///
+/// 0.2.6, the rest of the evaluation's bugs (57/73): one protocol bump for
+/// the whole release; the durable state doesn't change. Each later 0.2.6
+/// change adds its line below this one.
+/// A node with no Raft seat fetches the leader's view of the security state
+/// from `/v1/cluster/security-view` (#1477), which a 0.2.5 leader doesn't
+/// serve, so such a node would wait for API tokens that never come.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 56,
+    protocol: 57,
     state: 73,
 };
 

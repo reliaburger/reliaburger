@@ -209,6 +209,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/cluster/renew", System),
     // As does a trust acknowledgement (F04 R4).
     route(Post, "/v1/cluster/trust-ack", System),
+    // And the security view a node with no Raft seat reads (#1477).
+    route(Get, "/v1/cluster/security-view", System),
     route(Post, "/v1/cluster/workload-csr", System),
     route(Post, "/v1/registry/propose", System),
     route(Post, "/v1/registry/query", System),
@@ -444,6 +446,11 @@ mod tests {
                 "{path} must be a node-to-node route"
             );
         }
+        assert_eq!(
+            required_principal(Method::Get, "/v1/cluster/security-view"),
+            Some(RoutePrincipal::System),
+            "the security view must be a node-to-node route"
+        );
     }
 
     /// Every `System` row's handler must call `require_system`, or the

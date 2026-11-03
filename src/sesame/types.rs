@@ -620,6 +620,38 @@ impl SecurityState {
         cas
     }
 
+    /// What a node outside the council needs from this state to do its own
+    /// job (#1477), for the leader to serve it. It keeps what verifies (CA
+    /// certificates, token hashes, the CRL, node leaf records), the wrapped
+    /// age keys that decrypt the secrets of apps the node runs, and the
+    /// wrapped Ingress CA key that signs its ingress leaves. Every wrapped key
+    /// opens only with the master key, which every node already holds.
+    ///
+    /// It drops what issues identity: the root, Node and Workload CA keys, the
+    /// OIDC signing key, join tokens, secret seals, pending intermediates and
+    /// the serial counter.
+    pub fn node_view(&self) -> SecurityState {
+        let certificate_authorities = self
+            .certificate_authorities
+            .iter()
+            .map(|ca| CertificateAuthority {
+                private_key_wrapped: ca
+                    .private_key_wrapped
+                    .clone()
+                    .filter(|_| ca.role == CaRole::Ingress),
+                ..ca.clone()
+            })
+            .collect();
+        SecurityState {
+            certificate_authorities,
+            age_keypairs: self.age_keypairs.clone(),
+            api_tokens: self.api_tokens.clone(),
+            crl: self.crl.clone(),
+            node_leaves: self.node_leaves.clone(),
+            ..SecurityState::default()
+        }
+    }
+
     /// The CA a role is rotating away from, if a rotation is in progress.
     pub fn retiring_ca(&self, role: CaRole) -> Option<&CertificateAuthority> {
         self.certificate_authorities
@@ -703,6 +735,66 @@ impl SecurityState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1477: the view a node outside the council gets holds nothing that
+    /// issues identity: no CA key but the Ingress CA's, no OIDC signing key,
+    /// no join tokens, seals or pending intermediates.
+    #[test]
+    fn a_node_view_keeps_what_verifies_and_drops_what_issues() {
+        let init = crate::sesame::init::initialize_cluster(
+            "view",
+            "node-1",
+            tempfile::tempdir().unwrap().path(),
+        )
+        .unwrap();
+        let mut state = init.security_state;
+        state.join_tokens.push(JoinToken {
+            token_hash: [7; 32],
+            expires_at: std::time::SystemTime::now(),
+            consumed: false,
+            attestation_mode: AttestationMode::None,
+            node_id: "node-2".into(),
+        });
+        assert!(state.oidc_signing_config.is_some());
+        assert!(
+            state
+                .certificate_authorities
+                .iter()
+                .any(|ca| ca.role != CaRole::Ingress && ca.private_key_wrapped.is_some()),
+            "the fixture should hold an issuing key to drop"
+        );
+
+        let view = state.node_view();
+
+        for (kept, original) in view
+            .certificate_authorities
+            .iter()
+            .zip(&state.certificate_authorities)
+        {
+            let expected =
+                original.role == CaRole::Ingress && original.private_key_wrapped.is_some();
+            assert_eq!(
+                kept.private_key_wrapped.is_some(),
+                expected,
+                "{:?}",
+                original.role
+            );
+            assert_eq!(kept.certificate_der, original.certificate_der);
+        }
+        assert_eq!(
+            view.certificate_authorities.len(),
+            state.certificate_authorities.len()
+        );
+        assert!(view.oidc_signing_config.is_none());
+        assert!(view.join_tokens.is_empty());
+        assert!(view.secret_seals.is_empty());
+        assert!(view.pending_intermediates.is_empty());
+        assert_eq!(view.next_serial, 0);
+        assert_eq!(view.api_tokens, state.api_tokens);
+        assert_eq!(view.age_keypairs, state.age_keypairs);
+        assert_eq!(view.crl, state.crl);
+        assert!(view.is_initialised());
+    }
 
     #[test]
     fn serial_number_display_hex() {
