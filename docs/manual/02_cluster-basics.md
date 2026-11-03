@@ -179,8 +179,11 @@ still be sending traffic to addresses the cluster would then hand out again.
 
 `relish dev create` builds `bun` and `relish` from your source tree inside a
 Lima build VM and starts a cluster from them. Like any cluster it runs mTLS:
-it creates the CA on your machine and enrols each VM with `relish join`. It's
-for working on Reliaburger itself; everyone else wants the quickstart.
+it creates the CA on your machine and enrols each VM with `relish join`. Its
+administrator token is named after the cluster, so `relish token list` on the
+`default` dev cluster shows `dev-default-admin` where a quickstart cluster
+shows `laptop-admin`. It's for working on Reliaburger itself; everyone else
+wants the quickstart.
 
 ```sh
 relish dev create --nodes 3

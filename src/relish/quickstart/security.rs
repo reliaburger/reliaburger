@@ -36,6 +36,10 @@ pub fn existing(operation: &Operation) -> Result<Bootstrap, RelishError> {
     )
 }
 
+/// The name of a laptop quickstart cluster's administrator token, as
+/// `relish token list` shows it.
+pub const QUICKSTART_ADMINISTRATOR: &str = "laptop-admin";
+
 /// Generate credentials once, or validate and reuse the complete existing bundle.
 /// Call this on the blocking pool before creating any VM.
 pub fn prepare(operation: &Operation) -> Result<Bootstrap, RelishError> {
@@ -43,6 +47,7 @@ pub fn prepare(operation: &Operation) -> Result<Bootstrap, RelishError> {
         &operation.directory.join("security"),
         &operation.state.spec.name,
         first_node(operation)?,
+        QUICKSTART_ADMINISTRATOR,
     )
 }
 
@@ -59,8 +64,9 @@ fn first_node(operation: &Operation) -> Result<&str, RelishError> {
 /// reuse the complete bundle already there.
 ///
 /// The bundle holds the master key, the security bootstrap (with one
-/// administrator token), that token's plaintext and the first node's
-/// identity, all owner-only. `relish setup --quickstart` and
+/// administrator token, named `administrator`), that token's plaintext and
+/// the first node's identity, all owner-only. The name only matters to
+/// people: it's what `relish token list` and the audit log show. `relish setup --quickstart` and
 /// `relish dev create` both build their clusters from it. `directory` must
 /// not exist yet or must hold a complete bundle for `first_node`; its parent
 /// must exist.
@@ -68,6 +74,7 @@ pub fn prepare_in(
     directory: &Path,
     cluster: &str,
     first_node: &str,
+    administrator: &str,
 ) -> Result<Bootstrap, RelishError> {
     if directory.exists() {
         return load(directory, first_node);
@@ -86,7 +93,7 @@ pub fn prepare_in(
     let mut init = crate::sesame::init::initialize_cluster(cluster, first_node, staging.path())
         .map_err(|error| failed(&format!("failed to generate bootstrap identity: {error}")))?;
     let administrator = crate::sesame::token::create_token(
-        "laptop-admin",
+        administrator,
         ApiRole::Admin,
         TokenScope::default(),
         None,
@@ -323,5 +330,30 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    fn token_names(bootstrap: &Bootstrap) -> Vec<String> {
+        let bytes = std::fs::read(bootstrap.directory.join("security-bootstrap.json")).unwrap();
+        let state: SecurityState = serde_json::from_slice(&bytes).unwrap();
+        state
+            .api_tokens
+            .into_iter()
+            .map(|token| token.name)
+            .collect()
+    }
+
+    #[test]
+    fn the_quickstart_administrator_token_is_named_laptop_admin() {
+        let root = tempfile::tempdir().unwrap();
+        let bootstrap = prepare(&operation(root.path())).unwrap();
+        assert_eq!(token_names(&bootstrap), vec!["laptop-admin"]);
+    }
+
+    #[test]
+    fn the_caller_names_the_administrator_token() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("security");
+        let bootstrap = prepare_in(&directory, "lab", "lab-1", "dev-lab-admin").unwrap();
+        assert_eq!(token_names(&bootstrap), vec!["dev-lab-admin"]);
     }
 }
