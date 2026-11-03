@@ -661,7 +661,7 @@ enum Command {
         #[arg(long, default_value = "default")]
         namespace: String,
     },
-    /// Remove an app from the cluster and stop all its instances.
+    /// Remove an app from the cluster; each node then stops its instances.
     Delete {
         /// App name.
         app: String,
