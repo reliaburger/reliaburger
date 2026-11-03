@@ -23,7 +23,7 @@ batch of jobs on it, breaks it and watches it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-0.2.4 was released on 30 October 2026, and the one-line installer fetches
+0.2.5 was released on 3 November 2026, and the one-line installer fetches
 its signed binaries. You'll need a Mac with Apple silicon, or Linux with QEMU
 and KVM, plus about 8 GiB of free memory and 15 GiB of disk.
 
@@ -261,7 +261,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 ## What's in the binary
 
-This is what 0.2.4, the release the installer fetches, does.
+This is what 0.2.5, the release the installer fetches, does.
 
 **Runs Kubernetes YAML.** `relish apply -f` converts Deployments, StatefulSets,
 DaemonSets, Services, Ingresses, Jobs, CronJobs, HPAs and Namespaces on the
@@ -396,7 +396,7 @@ and your own, which `--external-key` adds as relish downloads the build for
 each node's platform. Until 1.0 it works only between builds with the same
 cluster formats. 0.2.3 kept 0.2.2's, and a 0.2.2 cluster rolled onto it in
 place ([record](docs/qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md));
-0.2.4 changes them again, so a 0.2.3 cluster moves to it as a fresh cluster. A release with other cluster formats, or a
+0.2.4 and 0.2.5 each change them again, so a 0.2.4 cluster moves to 0.2.5 as a fresh cluster. A release with other cluster formats, or a
 rollback to a version some node doesn't hold, is refused before anything is
 recorded.
 
@@ -442,7 +442,7 @@ binary was built from. Neither needs a network.
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
-## Limits in 0.2.4
+## Limits in 0.2.5
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
   managed Linux VMs; native macOS `bun` runs plain processes only.

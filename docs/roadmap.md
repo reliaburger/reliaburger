@@ -424,13 +424,36 @@ migration and no feature gate
   changes the cluster's formats, so a 0.2.3 cluster can't roll to it:
   recreate the cluster
   ([upgrading from 0.2.3](releasing.md#upgrading-from-023)).
-- [ ] **0.2.5: bugs an outside evaluation found**
+- [x] **0.2.5: bugs an outside evaluation found.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.5)
+  on 3 November 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/27),
-  [plan](plans/2026-10-31-plan-0.2.5.md)). A patch release for the
+  [plan](plans/archive/2026-10-31-plan-0.2.5.md)). A patch release for the
   product bugs that an external evaluation of 0.2.0
   ([#1080](https://github.com/reliaburger/reliaburger/pull/1080)) found and
-  that are still on `main`, and the stale `relish logs --tail` that 0.2.4's
+  that were still on `main`, and the stale `relish logs --tail` that 0.2.4's
   day run found ([#1493](https://github.com/reliaburger/reliaburger/issues/1493)).
+  Spare nodes also join as Raft learners up to the council cap
+  ([#1494](https://github.com/reliaburger/reliaburger/pull/1494)). Candidate 1
+  passed the full gate but for one 1,077 ms `health_tick` turn in the 8-hour
+  final, on a Mac that logged thermal emergencies that night, which the
+  maintainer accepted as a host stall
+  ([closure](qualification/2026-11-03-v0.2.5-release-closure.md),
+  [release log](release-log.md#025-bugs-an-outside-evaluation-found)).
+  0.2.5 changes the cluster's formats, so a 0.2.4 cluster can't roll to it:
+  recreate the cluster
+  ([upgrading from 0.2.4](releasing.md#upgrading-from-024)).
+- [ ] **0.2.6: the rest of the evaluation's bugs, and setup over SSH**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/28),
+  [plan](plans/2026-11-03-plan-0.2.6.md)). What 0.2.5 left of [#1477](https://github.com/reliaburger/reliaburger/issues/1477)
+  (secure clusters past the council cap) and
+  [#1500](https://github.com/reliaburger/reliaburger/issues/1500) (delete then
+  re-apply on real multi-node runc), `relish setup --ssh` for clusters on
+  Linux machines you already have
+  ([#1529](https://github.com/reliaburger/reliaburger/issues/1529)), the S3
+  and Apple Container tests in CI
+  ([#1534](https://github.com/reliaburger/reliaburger/issues/1534),
+  [#1535](https://github.com/reliaburger/reliaburger/issues/1535)), and the
+  known flakes.
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
