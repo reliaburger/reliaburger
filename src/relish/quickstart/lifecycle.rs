@@ -235,6 +235,19 @@ pub async fn boot(lima: &Lima, operation: &Operation, selection: NodeSelection) 
 /// Operate only on saved resource names, holding the same lock as setup.
 ///
 /// `node` narrows `start` and `stop` to one VM; see [`select_node`].
+/// `relish local` drives VMs. Applying it to someone's real machines, least of
+/// all `destroy`, would be a much bigger thing than it says.
+fn refuse_ssh_cluster(spec: &super::state::ClusterSpec) -> Result<()> {
+    if spec.ssh.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "cluster {} runs on machines reached over SSH, and `relish local` only manages VMs; \
+         use `relish status`, and systemctl on the machines themselves",
+        spec.name
+    )
+}
+
 pub async fn run(action: Action, name: &str, node: Option<&str>, confirmed: bool) -> Result<()> {
     if action == Action::Destroy && !confirmed {
         bail!("destroy removes this cluster's VMs and data permanently; pass --yes to confirm");
@@ -247,6 +260,7 @@ pub async fn run(action: Action, name: &str, node: Option<&str>, confirmed: bool
     let name = name.to_owned();
     let (operation, bootstrap) = tokio::task::spawn_blocking(move || -> Result<_> {
         let operation = Operation::load(&operation_root, &name)?;
+        refuse_ssh_cluster(&operation.state.spec)?;
         let bootstrap = if matches!(action, Action::Status | Action::Start) {
             Some(security::existing(&operation)?)
         } else {
@@ -377,6 +391,27 @@ pub async fn run(action: Action, name: &str, node: Option<&str>, confirmed: bool
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_commands_leave_machines_reached_over_ssh_alone() {
+        let spec = super::super::state::ClusterSpec {
+            name: "lab".to_string(),
+            nodes: 1,
+            version: "v0.1.0".parse().unwrap(),
+            api_port: 19117,
+            ingress_port: 18080,
+            registry_port: 15050,
+            ssh: vec!["u@a".parse().unwrap()],
+        };
+        let error = refuse_ssh_cluster(&spec).unwrap_err().to_string();
+        assert!(error.contains("only manages VMs"), "{error}");
+        let vms = super::super::state::ClusterSpec {
+            ssh: Vec::new(),
+            ..spec
+        };
+        assert!(refuse_ssh_cluster(&vms).is_ok());
+    }
+
     use crate::relish::quickstart::state::ClusterSpec;
 
     /// A stand-in `limactl`: it appends each argument list to `calls.log`
@@ -448,6 +483,7 @@ fi
                 api_port: 19117,
                 ingress_port: 18080,
                 registry_port: 15050,
+                ssh: Vec::new(),
             },
         )
         .unwrap()

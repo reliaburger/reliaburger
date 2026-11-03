@@ -145,6 +145,18 @@ enum Command {
     },
 }
 
+/// The address `[network] advertise_address` names, as an address or the
+/// address part of `address:port`.
+fn advertised_ip(config: &NodeConfig) -> Option<std::net::IpAddr> {
+    let configured = config.network.advertise_address.as_deref()?;
+    configured.parse::<std::net::IpAddr>().ok().or_else(|| {
+        configured
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|address| address.ip())
+    })
+}
+
 /// Build cluster startup parameters from node config.
 ///
 /// Gossip binds/advertises on `advertise_address` (falling back to
@@ -159,16 +171,7 @@ fn cluster_params_from_config(
     use anyhow::Context;
     use reliaburger::sesame::bootstrap;
 
-    let ip = config
-        .network
-        .advertise_address
-        .as_deref()
-        .and_then(|s| {
-            s.parse::<IpAddr>()
-                .ok()
-                .or_else(|| s.parse::<SocketAddr>().ok().map(|sa| sa.ip()))
-        })
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let ip = advertised_ip(config).unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let gossip_addr = SocketAddr::new(ip, config.cluster.gossip_port);
 
     let seeds = resolve_join_seeds(&config.cluster.join)?;
@@ -3158,13 +3161,23 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 }
                 None => worker,
             };
+            // The leaf names the address the issuer sees a renewal come from
+            // (#1508). A leader renews its own leaf through this API, so it
+            // reaches it at its advertised address rather than loopback,
+            // which no certificate names.
+            let advertised = advertised_ip(&config)
+                .filter(|address| reliaburger::sesame::ca::names_a_machine(*address));
+            let worker = match advertised {
+                Some(address) => worker.with_address(address),
+                None => worker,
+            };
             let mut local_api = listener.local_addr()?;
             if local_api.ip().is_unspecified() {
-                local_api.set_ip(if local_api.is_ipv6() {
+                local_api.set_ip(advertised.unwrap_or(if local_api.is_ipv6() {
                     std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
                 } else {
                     std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                });
+                }));
             }
             let council = council.clone();
             let membership = membership.clone();

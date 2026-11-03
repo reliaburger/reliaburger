@@ -28,9 +28,21 @@ use std::{
 };
 use tower::ServiceExt;
 
+use crate::raft_writes;
+
 const IKM: [u8; 32] = [42; 32];
 
 async fn council(hierarchy: &ca::CaHierarchy, initialise: bool) -> Arc<CouncilNode> {
+    council_with_log(hierarchy, initialise).await.0
+}
+
+/// [`council`], with a handle on its Raft log so a test can read what was
+/// written.
+async fn council_with_log(
+    hierarchy: &ca::CaHierarchy,
+    initialise: bool,
+) -> (Arc<CouncilNode>, MemLogStore) {
+    let log = MemLogStore::new();
     let network = InMemoryRaftRouter::new();
     let node = Arc::new(
         CouncilNode::new(
@@ -42,7 +54,7 @@ async fn council(hierarchy: &ca::CaHierarchy, initialise: bool) -> Arc<CouncilNo
                 ..Default::default()
             },
             InMemoryRaftNetworkFactory::new(1, network.clone()),
-            MemLogStore::new(),
+            log.clone(),
             CouncilStateMachine::new(),
             Some(IKM),
         )
@@ -72,7 +84,7 @@ async fn council(hierarchy: &ca::CaHierarchy, initialise: bool) -> Arc<CouncilNo
         .await
         .unwrap();
     }
-    node
+    (node, log)
 }
 
 fn peer(hierarchy: &ca::CaHierarchy, name: &str, serial: u64) -> TlsPeerCertificate {
@@ -511,7 +523,7 @@ async fn producer_release_requires_authenticated_identity_and_every_consumer_rec
 #[tokio::test]
 async fn a_repeated_producer_release_commits_no_new_log_entry() {
     let hierarchy = ca::generate_ca_hierarchy("producer-repeat", &IKM).unwrap();
-    let council = council(&hierarchy, true).await;
+    let (council, log) = council_with_log(&hierarchy, true).await;
     council
         .write(RaftRequest::RegisterEndpointConsumer {
             node_id: "offline".into(),
@@ -538,20 +550,27 @@ async fn a_repeated_producer_release_commits_no_new_log_entry() {
         .await
         .unwrap();
     let app = router(council.clone(), Some(peer(&hierarchy, "producer", 10)));
-    let last_log = || council.raft().metrics().borrow().last_log_index;
 
     assert_eq!(
         retire_producer(app.clone(), producer_request(), "internal-token").await,
         StatusCode::ACCEPTED
     );
-    let fenced = last_log();
+    let fenced = raft_writes::last_index(&log).await;
+    // The router's task-array loop records the cron minute on its own
+    // timer, so judge what was written rather than count entries, and
+    // record a minute here so that race is met on every run (#1331).
+    raft_writes::observe_a_later_minute(&council).await;
     for _ in 0..3 {
         assert_eq!(
             retire_producer(app.clone(), producer_request(), "internal-token").await,
             StatusCode::ACCEPTED
         );
     }
-    assert_eq!(last_log(), fenced, "a repeated ask committed an entry");
+    assert_eq!(
+        raft_writes::writes_after(&log, fenced).await,
+        Vec::<String>::new(),
+        "a repeated ask committed an entry"
+    );
 
     assert_eq!(
         acknowledge(
@@ -562,12 +581,16 @@ async fn a_repeated_producer_release_commits_no_new_log_entry() {
         .await,
         StatusCode::NO_CONTENT
     );
-    let acknowledged = last_log();
+    let acknowledged = raft_writes::last_index(&log).await;
     assert_eq!(
         retire_producer(app, producer_request(), "internal-token").await,
         StatusCode::OK
     );
-    assert_eq!(last_log(), acknowledged);
+    assert_eq!(
+        raft_writes::writes_after(&log, acknowledged).await,
+        Vec::<String>::new(),
+        "a confirmed release committed an entry"
+    );
 }
 
 #[tokio::test]
@@ -575,7 +598,10 @@ async fn producer_release_refuses_missing_forged_retired_and_incompatible_author
     let hierarchy = ca::generate_ca_hierarchy("producer-authority", &IKM).unwrap();
     let council = council(&hierarchy, true).await;
     let app = router(council.clone(), Some(peer(&hierarchy, "producer", 10)));
-    let before = serde_json::to_value(council.desired_state().await).unwrap();
+    let before = council.desired_state().await;
+    // The router's task-array loop may record a cron minute meanwhile; only
+    // a write a refused release made counts (#1331).
+    raft_writes::observe_a_later_minute(&council).await;
     assert_eq!(
         retire_producer(
             router(council.clone(), None),
@@ -613,8 +639,9 @@ async fn producer_release_refuses_missing_forged_retired_and_incompatible_author
         StatusCode::CONFLICT
     );
     assert_eq!(
-        serde_json::to_value(council.desired_state().await).unwrap(),
-        before
+        raft_writes::changed_desired_fields(&before, &council.desired_state().await),
+        Vec::<String>::new(),
+        "a refused release changed desired state"
     );
     let retired = council
         .write(RaftRequest::DecommissionNode {

@@ -49,6 +49,7 @@ fn issue_all(hierarchy: &ca::CaHierarchy) -> Vec<Result<Vec<u8>, String>> {
             ca::NODE_LEAF_LIFETIME,
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
+            None,
         )
         .map(|(cert, _)| cert)
         .map_err(|error| error.to_string()),
@@ -59,6 +60,7 @@ fn issue_all(hierarchy: &ca::CaHierarchy) -> Vec<Result<Vec<u8>, String>> {
             ca::NODE_LEAF_LIFETIME,
             &state,
             b"test-ikm",
+            None,
         )
         .map(|result| result.certificate_der)
         .map_err(|error| error.to_string()),

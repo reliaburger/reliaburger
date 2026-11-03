@@ -8,6 +8,10 @@ workload.
 Often the VMs already exist, and you want to use the configuration and
 runtimes you've already got on them.
 
+From 0.2.6 (not in 0.2.5), `relish setup --ssh user@host,user@host,...` does
+everything in this guide from your laptop, so read this one when you want to
+choose each step yourself, or need to know what that command does.
+
 If you want an automated, disposable local cluster on macOS or Linux using
 managed Lima VMs instead, see the [quickstart guide](quickstart.md).
 

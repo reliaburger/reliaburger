@@ -198,6 +198,15 @@ Admin                  New Node                  Cluster (any existing node)
   |                       |                              |
 ```
 
+A node certificate names the node id as a SPIFFE URI SAN and a DNS SAN, and,
+from 0.2.6, the address the issuer saw the join or renewal request come from
+as an IP SAN, so a strict client can connect by address
+([#1508](https://github.com/reliaburger/reliaburger/issues/1508)). Loopback and
+unspecified addresses are left out, and nothing in the CSR is used. A node
+whose certificate doesn't name its advertised address renews once to get it,
+which covers the first node and a node that moved; Bun reaches its own API at
+that address, so the leader's own renewal arrives from it too.
+
 A node with no Raft seat replicates no security state, so it fetches the
 leader's `SecurityState::node_view()` from `/v1/cluster/security-view` over
 mTLS on every security refresh (#1477). The leader reads its state
