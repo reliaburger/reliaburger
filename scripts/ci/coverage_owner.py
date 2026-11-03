@@ -480,9 +480,15 @@ def execute(root, directory, context, source_files, run=subprocess.run, commands
         (directory / 'owner-runtime.json').write_text(json.dumps(runtime, sort_keys=True, indent=2) + '\n')
         owner['runtime_sha256'] = c.digest(directory / 'owner-runtime.json')
         (directory / 'owner.json').write_text(json.dumps(owner, sort_keys=True, indent=2) + '\n')
+    reasons = list(controller.errors)
+    if status != 0:
+        reasons.append(f'make coverage exited {status}')
+        failing = failing_tests(directory / 'junit.xml')
+        if failing:
+            reasons.append('failing tests: ' + ', '.join(failing))
     c.require(
         status == 0 and (not controller.errors),
-        'coverage owner failed: ' + '; '.join(controller.errors),
+        'coverage owner failed: ' + '; '.join(reasons),
     )
     c.require(
         controller.active is None and controller.index == 5 and (controller.count == 1),
@@ -490,6 +496,23 @@ def execute(root, directory, context, source_files, run=subprocess.run, commands
     )
     k.owner_completion(owner, controller.expected, directory / 'child.json')
     return controller.expected
+
+def failing_tests(junit):
+    """Name each test the run's JUnit records as failed, so a refusal says which.
+
+    The step's own log can come back empty (#1531); the copied JUnit stays in
+    the run's evidence. A missing or unreadable file names nothing.
+    """
+    import xml.etree.ElementTree as ElementTree
+    try:
+        tree = ElementTree.parse(junit)
+    except (OSError, ElementTree.ParseError):
+        return []
+    return [
+        f"{case.get('classname')} {case.get('name')}"
+        for case in tree.getroot().iter('testcase')
+        if case.find('failure') is not None or case.find('error') is not None
+    ]
 
 def adapter_main():
     """Run the narrow generated nextest overlay without reconstructing compiler flags."""
