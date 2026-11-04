@@ -437,8 +437,15 @@ no_fault:
             break;
 
         __u32 idx = (rr + i) % val->count;
+        if (idx >= MAX_BACKENDS)
+            continue;
+        /* Already below MAX_BACKENDS, but the verifier must see the bound
+         * on the register that indexes the map value. Linux 7.0's verifier
+         * (or newer clang) lost it through the comparison above and refused
+         * the program (#1557); a mask is a bound it always tracks. */
+        idx &= MAX_BACKENDS - 1;
 
-        if (idx < MAX_BACKENDS && val->backends[idx].healthy == 1 &&
+        if (val->backends[idx].healthy == 1 &&
             (!local_only || val->backends[idx].local == 1)) {
             selected_idx = idx;
             found = 1;
@@ -451,7 +458,7 @@ no_fault:
         return 0;  /* deny -> EPERM: no healthy (or, lapsed, local) backends */
 
     /* Rewrite destination to the selected backend */
-    struct backend_endpoint *be = &val->backends[selected_idx];
+    struct backend_endpoint *be = &val->backends[selected_idx & (MAX_BACKENDS - 1)];
     ctx->user_ip4  = be->host_ip;
     ctx->user_port = be->host_port;
 
