@@ -68,6 +68,7 @@ REQUIRED_JOBS = (
     "portable macOS (3/3)",
     "benchmarks",
     "task-array benchmarks",
+    "S3 round trip",
 )
 
 
