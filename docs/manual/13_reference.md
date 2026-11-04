@@ -282,6 +282,12 @@ JSON) exits `2`.
 and `path` exit `3` for warnings, degraded paths or incomplete evidence. Before
 0.2.2 that was `2`, which a script couldn't tell from a usage error.
 
+`relish agent` commands use their own codes, which say only whether the
+command answered: `0` answered, `2` usage, `3` couldn't reach or authenticate
+to the cluster, `4` refused, `5` anything else. A usage error there is a JSON
+envelope on stdout, not text on stderr. See
+[Working with an AI agent](16_working-with-an-ai-agent.md#exit-codes).
+
 `relish exec` exits with the remote command's own exit code, so
 `relish exec web ls /ready` works in a shell `if`. It exits `1` when it
 can't run the command at all, with an `error:` line on stderr.

@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod audit_cmd;
 pub mod bench_cmd;
 pub mod bench_jobs;

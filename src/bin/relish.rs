@@ -992,6 +992,8 @@ enum Command {
     /// Checks DNS, the service VIP, the eBPF service map, the firewall, active
     /// faults and a real TCP connect from inside the source workload.
     Path(Box<PathOptions>),
+    /// Commands for LLM agents: one JSON envelope, bounded, never interactive.
+    Agent(Box<reliaburger::relish::agent::AgentOptions>),
 }
 
 #[derive(Subcommand)]
@@ -1834,7 +1836,10 @@ enum FaultAction {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => return parse_failure(error),
+    };
     // Parse, then stop: tests/suite/website.rs checks the documented tour
     // commands against this exact parser without running any of them.
     if std::env::var_os("RELISH_PARSE_ONLY").is_some() {
@@ -1844,7 +1849,11 @@ async fn main() -> ExitCode {
     // Record the global connection overrides before any client is built.
     reliaburger::relish::client::set_cli_token(cli.token.clone());
     reliaburger::relish::client::set_cli_ca_cert(cli.ca_cert.clone());
-    if let Err(reason) = reliaburger::relish::client::set_cli_endpoint(cli.endpoint.clone()) {
+    let endpoint = reliaburger::relish::client::set_cli_endpoint(cli.endpoint.clone());
+    if let Some(Command::Agent(options)) = &cli.command {
+        return run_agent(options, endpoint.err());
+    }
+    if let Err(reason) = endpoint {
         eprintln!("error: {reason}");
         return ExitCode::FAILURE;
     }
@@ -2877,6 +2886,9 @@ async fn main() -> ExitCode {
                 .await,
             );
         }
+        // Handled before the endpoint check above, so an invalid endpoint
+        // still answers with an envelope; this arm only keeps the match whole.
+        Command::Agent(options) => return run_agent(&options, None),
     };
 
     finish(result)
@@ -2951,6 +2963,10 @@ fn honours_output(command: &Command) -> bool {
         | Command::Bench(_)
         | Command::Wtf(_)
         | Command::Path(_) => true,
+        // Agent commands print only JSON, so `-o` is accepted and ignored:
+        // refusing it would fail an agent over a flag that can't change
+        // anything.
+        Command::Agent(_) => true,
         Command::Tui
         | Command::Dashboard { .. }
         | Command::Logs(_)
@@ -2987,6 +3003,57 @@ fn honours_output(command: &Command) -> bool {
         #[cfg(feature = "kubernetes")]
         Command::Import { .. } | Command::Export { .. } => false,
     }
+}
+
+/// What `relish` does when clap rejects the command line.
+///
+/// For `relish agent` the answer is still an envelope on stdout, with the
+/// `usage` code and exit 2, because an agent parses stdout and nothing else.
+/// Help (`--help`) and `--version` print as usual. Everything else gets
+/// clap's own message on stderr and clap's exit code.
+fn parse_failure(error: clap::Error) -> ExitCode {
+    use clap::error::ErrorKind;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let is_help = matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    );
+    if is_help || !reliaburger::relish::agent::invoked(&args) {
+        error.exit();
+    }
+    let rendered = reliaburger::relish::agent::usage_failure(&args, &error.render().to_string());
+    print_agent(rendered)
+}
+
+/// Run a `relish agent` command. `endpoint_error` is why `--endpoint` or
+/// `RELIABURGER_ENDPOINT` was refused, when it was.
+fn run_agent(
+    options: &reliaburger::relish::agent::AgentOptions,
+    endpoint_error: Option<reliaburger::relish::client::EndpointError>,
+) -> ExitCode {
+    use reliaburger::relish::agent;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let rerun = agent::rerun_command(&args);
+    let rendered = match endpoint_error {
+        Some(reason) => agent::failure(
+            options.command.name(),
+            agent::AgentError::new(agent::ErrorCode::Usage, reason.to_string())
+                .with_hint("pass an https:// endpoint, or http:// to a loopback address"),
+            options.max_bytes,
+            &rerun,
+        ),
+        None => agent::run(options, &rerun),
+    };
+    print_agent(rendered)
+}
+
+/// Print an agent command's envelope and end with its exit code.
+fn print_agent(rendered: reliaburger::relish::agent::Rendered) -> ExitCode {
+    use std::io::Write;
+    // A reader that hung up (a closed pipe) can't be told anything more;
+    // the exit code still says how the command went.
+    let _ = std::io::stdout().lock().write_all(rendered.json.as_bytes());
+    ExitCode::from(rendered.exit.code())
 }
 
 fn finish(result: Result<(), reliaburger::relish::RelishError>) -> ExitCode {
