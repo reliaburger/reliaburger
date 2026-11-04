@@ -155,6 +155,7 @@ ignored by default and run by their own targets and CI jobs
 | Feature demos | [`scripts/demo/rollout.sh`](../scripts/demo/rollout.sh) (roll forward, roll back, a bad version rolled back and marked `RolloutFailed`) and [`scripts/demo/gitops.sh`](../scripts/demo/gitops.sh) (a `file://` repository synced, an app deleted from it, a hand-applied app left alone) run to completion on a one-node cluster each starts through [`lib.sh`](../scripts/demo/lib.sh); a step that doesn't do what it says fails the demo, and each must print the resource readout and summary [`resources.py`](../scripts/demo/resources.py) samples ([`test_demo_resources.py`](../scripts/ci/test_demo_resources.py) covers its parsing and arithmetic). [`test_demo_scripts.py`](../scripts/ci/test_demo_scripts.py) checks on every run that they stop on the first error and swallow nothing | [`tests/demos.rs`](../tests/demos.rs) | `make test-cluster`; by hand `make rollout-demo`, `make gitops-demo` |
 | Self-upgrade | Rolling binary upgrades and rollbacks with real signed binaries, workloads kept running | [`tests/self_upgrade.rs`](../tests/self_upgrade.rs), [`tests/self_upgrade_cluster.rs`](../tests/self_upgrade_cluster.rs) | `make test-upgrade` |
 | Wall-clock acceptance | Timeouts, back-offs and leases that can't be tested with a paused clock | ignored tests in [`tests/integration.rs`](../tests/integration.rs) | `make test-slow` |
+| S3 object storage | Logs export to an S3 bucket, and a council backup goes up, lists, prunes and restores, with every request signed and checked | [`src/ketchup/export.rs`](../src/ketchup/export.rs), [`src/council/backup.rs`](../src/council/backup.rs) | `make test-s3` ([where it runs](#s3-in-ci)) |
 | Standard registry clients | docker, podman, skopeo and crane log in with an API token, verify the cluster CA, push and pull layers back through Pickle's TLS listener; a wrong token, another cluster's CA and an out-of-namespace push are refused | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (Linux, with the four clients and `sudo scripts/standard-clients-host.sh --provision`) |
 | Benchmarks | Gossip convergence from 5 to 1,000 nodes, one scheduling pass (`plan_pass`) over 1,000 and 10,000 nodes, policy evaluation per app for 10 to 1,000 policies, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` ([which job](#benchmarks-in-ci)) |
 
@@ -226,7 +227,6 @@ record goes in [`qualification/`](qualification):
 |---|---|---|
 | `make test-apple` | Apple silicon with Apple Container | The maintainer, before any release that touches the Apple Container runtime (`src/grill/apple.rs`) |
 | `make test-gpu` | An NVIDIA GPU and `nvidia-smi` | The maintainer, before any release that touches GPU detection (`src/bun/gpu.rs`) |
-| `make test-s3` | AWS credentials and `RELIABURGER_TEST_S3_URL=s3://bucket/prefix` | The maintainer, before any release that touches log export, council backups or the S3 object-store client (`src/ketchup/export.rs`, `src/council/backup.rs`, `src/object_storage.rs`). It exports logs to the bucket and round-trips a council backup through it (put, list, prune, restore), with credentials and region from the standard `AWS_*` variables |
 | `qualify-power-cut-reboot.sh`, which runs `qualify-oci-reboot.sh`, `qualify-discovery-reboot.sh` and `qualify-storage-power-cut.sh` | A disposable VM, which it creates and deletes that can be rebooted or powered off ([below](#pulling-the-plug)) | The maintainer, on every release candidate ([release gate](releasing.md#staging-a-candidate)) |
 | `qualify-ssh-setup.sh` (`relish setup --ssh` end to end) | Lima on the host. It creates three disposable VMs from `ssh-setup-vm.yaml`, builds a cluster on them over SSH, checks `status` and `wtf`, runs setup again to show it resumes without restarting a node, shows a second operator refused, and deletes the VMs | The maintainer, before any release that touches SSH setup (`src/relish/quickstart/ssh.rs`, `server.rs`, `server_runner.rs`), from 0.2.6 ([#1529](https://github.com/reliaburger/reliaburger/issues/1529)) |
 | `nightly-qualify.sh` (the power-cut runs and the soak tiers, one after another on a train's tip) | The quiet host with Lima, a staged build of the tip for the soaks, and the signed soak bun for the job final | The quiet host every night, from 0.2.4 ([nightly qualification](releasing.md#nightly-qualification-on-the-train-tip)); `nightly.py freeze-check` compares the candidate with the latest green night. `make test-ci-scripts` tests its plan, record and freeze rule ([`test_nightly.py`](../scripts/release/test_nightly.py)) |
@@ -306,6 +306,66 @@ fresh. The job's Criterion output and baseline are kept as the
 `criterion-task-arrays` artefact for 90 days, the cost trend #668 reads.
 `test_every_benchmark_target_is_run_by_a_workflow` fails if a `bench` target
 in the `Makefile` isn't run by any workflow.
+
+### S3 in CI
+
+`make test-s3` exports logs to an S3 bucket and round-trips a council backup
+through it: put, list, prune and restore by key. Until 0.2.6 it needed AWS
+credentials and a real bucket, which the qualification Mac didn't have, so
+0.2.5 shipped without it (#1534). Now
+[`scripts/test-s3.sh`](../scripts/test-s3.sh) finds a bucket one of three ways:
+
+- **With nothing set**, it downloads SeaweedFS 4.48's `weed` binary for the
+  host into `target/test-s3/` (once, checked against the release's SHA-256),
+  starts `weed mini` on free loopback ports with a random bucket and random
+  credentials, and points the client at it with `AWS_ENDPOINT` and
+  `AWS_ALLOW_HTTP`. It stops the server and deletes its data when the tests
+  end, pass or fail. It needs `curl` and `python3`, on macOS or Linux, x86_64
+  or arm64.
+- **With `RELIABURGER_TEST_S3_ENDPOINT`**, it uses a server that's already
+  running, with the bucket in `RELIABURGER_TEST_S3_BUCKET` and the
+  credentials in `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. That's
+  how CI runs it.
+- **With `RELIABURGER_TEST_S3_URL=s3://bucket/prefix`**, it uses that bucket,
+  with credentials and region from the standard `AWS_*` variables.
+
+The `S3 round trip` job in [`ci.yml`](../.github/workflows/ci.yml) starts
+the same SeaweedFS release as a service container, pinned by digest, and runs
+`make test-s3` against it. It runs nightly on `main`, on pushes, and on pull
+requests that touch what the tests send: `src/ketchup/export.rs`,
+`src/council/backup.rs`, `src/object_storage.rs` or the script itself
+([`select-jobs.sh`](../scripts/ci/select-jobs.sh)). A pull request into a
+merge train runs it only with `full-ci`, like the benchmarks. The final gate
+waits for the job and fails when it fails, but the two tests aren't bound
+evidence cases: each evidence mode is a fixed set of owners, and this job is
+chosen by path.
+
+Why SeaweedFS? MinIO was the obvious server, but its community edition is
+now [source only](https://github.com/minio/minio), with no binaries, and the
+repository was archived in April 2026. [Garage](https://garagehq.deuxfleurs.fr/documentation/quick-start/)
+needs a configuration file and command-line flags before one node serves a
+bucket, and a GitHub Actions service container can pass neither.
+[moto](https://pypi.org/project/moto/) in server mode would start, but it's
+a mock that [checks no signatures by default](https://docs.getmoto.org/en/latest/docs/iam.html),
+and it needs Python 3.10 or later where macOS ships 3.9.
+[SeaweedFS](https://github.com/seaweedfs/seaweedfs/releases/tag/4.48)
+publishes one static binary for macOS and Linux every week or two, its image
+[starts `weed mini` with no arguments](https://github.com/seaweedfs/seaweedfs/blob/4.48/docker/Dockerfile.go_build)
+(master, volume server, filer and S3 gateway in one process), and it checks
+each request's SigV4 signature against the credentials it was started with.
+A request signed wrongly fails here as it would on AWS.
+
+A local server proves our requests round-trip; it doesn't prove AWS accepts
+them. Signing quirks, checksums, regions and virtual-hosted addressing are
+AWS's own, and the local runs only use path-style addressing. So run it by hand against a real
+bucket before a release that changes how the client builds, signs or
+addresses requests: `src/object_storage.rs`, the `object_store` crate's
+version, or an S3 setting users can pass. Put the record in
+[`qualification/`](qualification).
+
+```sh
+RELIABURGER_TEST_S3_URL=s3://bucket/prefix AWS_REGION=eu-west-2 make test-s3
+```
 
 ### Which jobs a pull request runs
 

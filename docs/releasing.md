@@ -833,6 +833,14 @@ a tag range and prints `patch` or `full` with its reasons:
 scripts/release/release_tier.py --previous v0.2.3 --release v0.2.4 --commit origin/release-0-2-4
 ```
 
+Neither gate runs `make test-s3` by hand any more: CI runs it against a local
+SeaweedFS on every change to log export, council backups or the S3 client,
+and nightly ([S3 in CI](testing.md#s3-in-ci)). What CI can't show is that AWS
+itself accepts our requests, so a release that changes how the client builds,
+signs or addresses them (`src/object_storage.rs`, or the `object_store`
+crate's version) also runs it once against a real bucket, with
+`RELIABURGER_TEST_S3_URL`, and records the run in `qualification/`.
+
 `nightly-qualify.sh` and `nightly.py freeze-check` apply the same rule
 themselves, so neither takes the gate on trust: the release is the version in
 the commit's `Cargo.toml`, the previous release the nearest `v*` tag behind

@@ -898,13 +898,15 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    // Real S3/GCS export lives in a named, ignored manual suite so it never
-    // silently passes without credentials (test-harness honesty rule).
+    // S3 export lives in a named, ignored suite so it never silently passes
+    // without a server (test-harness honesty rule). `make test-s3` starts a
+    // throwaway SeaweedFS for it, or uses the real bucket in
+    // RELIABURGER_TEST_S3_URL.
     #[tokio::test]
-    #[ignore = "requires AWS credentials and RELIABURGER_TEST_S3_URL; run with make test-s3"]
+    #[ignore = "needs an S3 server, which make test-s3 starts (or a real bucket in RELIABURGER_TEST_S3_URL); run with make test-s3"]
     async fn export_to_real_s3_manual() {
         let Ok(dest) = std::env::var("RELIABURGER_TEST_S3_URL") else {
-            panic!("set RELIABURGER_TEST_S3_URL=s3://bucket/prefix to run this suite");
+            panic!("run this suite with make test-s3, which sets RELIABURGER_TEST_S3_URL");
         };
         let source = tempfile::tempdir().unwrap();
         std::fs::write(source.path().join("logs_000000.parquet"), b"real-s3").unwrap();

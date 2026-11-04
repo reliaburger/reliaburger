@@ -14,6 +14,11 @@ WORKFLOWS = REPO / ".github" / "workflows"
 # Make targets that run nextest and so write a JUnit report under the ci profile.
 NEXTEST_TARGETS = re.compile(r"\bmake (coverage|test(?:-[a-z-]+)?)(?![\w-])")
 NOT_NEXTEST = {"test-doc", "test-images", "test-ci-scripts"}
+# Nextest targets CI runs directly rather than through an evidence owner.
+# `make test-s3` runs only when select-jobs.sh picks it by path (#1534), and
+# every evidence mode is a fixed set of owners, so the final gate checks its
+# job's result instead of binding its two tests.
+UNBOUND_SUITES = {"test-s3"}
 
 # The no-op job a closed pull request's run starts instead of CI.
 CLOSED_JOB = "closed-pull-request"
@@ -129,7 +134,7 @@ class EvidenceTests(unittest.TestCase):
         # Original test owners must be intercepted rather than executed again.
         for job in workflow_jobs.values():
             for step in steps(job):
-                self.assertEqual(set(NEXTEST_TARGETS.findall(step)) - NOT_NEXTEST, set())
+                self.assertEqual(set(NEXTEST_TARGETS.findall(step)) - NOT_NEXTEST - UNBOUND_SUITES, set())
 
     def assert_cached_owners_clear_restored_envelopes(self, workflow_jobs):
         """Clear cached generated directories once before any fresh producer."""
@@ -586,6 +591,39 @@ class BenchmarkTests(unittest.TestCase):
         for target in targets:
             with self.subTest(target=target):
                 self.assertRegex(workflows, rf"(?m)run: make {re.escape(target)}$")
+
+
+class S3Tests(unittest.TestCase):
+    """`make test-s3` runs in CI against the server the script pins (#1534)."""
+
+    def setUp(self):
+        self.jobs = jobs((WORKFLOWS / "ci.yml").read_text())
+        self.job = self.jobs["s3"]
+
+    def test_the_s3_round_trip_runs_when_select_jobs_picks_it(self):
+        # select-jobs.sh sets s3 on pushes and schedules, so it runs nightly.
+        self.assertIn("    if: needs.changes.outputs.s3 == 'true'\n", self.job)
+        self.assertIn("s3: ${{ steps.select.outputs.s3 }}", self.jobs["changes"])
+        self.assertRegex(self.job, r"(?m)^        run: make test-s3$")
+
+    def test_ci_and_the_script_run_the_same_pinned_seaweedfs(self):
+        script = (REPO / "scripts" / "test-s3.sh").read_text()
+        version = re.search(r"(?m)^SEAWEEDFS_VERSION=(\S+)$", script).group(1)
+        image = re.search(r"(?m)^        image: (\S+)$", self.job).group(1)
+        self.assertRegex(image, rf"^chrislusf/seaweedfs:{re.escape(version)}@sha256:[0-9a-f]{{64}}$")
+        # Every binary the script may download is checked against a digest.
+        self.assertEqual(len(re.findall(r"digest=[0-9a-f]{64} ;;", script)), 4)
+
+    def test_the_job_talks_to_its_service_container_with_its_credentials(self):
+        service = dict(re.findall(r"(?m)^          (AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|S3_BUCKET): (\S+)$",
+                                  self.job.split("    steps:")[0]))
+        step = next(step for step in steps(self.job) if "run: make test-s3" in step)
+        self.assertIn("RELIABURGER_TEST_S3_ENDPOINT: http://127.0.0.1:8333", step)
+        self.assertIn("- 8333:8333", self.job)
+        self.assertIn(f"RELIABURGER_TEST_S3_BUCKET: {service['S3_BUCKET']}", step)
+        for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+            self.assertIn(f"{name}: {service[name]}", step)
+        self.assertNotIn("RELIABURGER_TEST_S3_URL", self.job)
 
 
 class ArtifactDownloadTests(unittest.TestCase):
