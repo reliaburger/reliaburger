@@ -2892,7 +2892,7 @@ fn finish_outcome(
     match result {
         Ok(outcome) => ExitCode::from(outcome.exit_code()),
         Err(e) => {
-            eprintln!("error: {e}");
+            report(&e);
             ExitCode::FAILURE
         }
     }
@@ -2993,9 +2993,22 @@ fn finish(result: Result<(), reliaburger::relish::RelishError>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e}");
+            report(&e);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Print a command's error, with what to do when the agent it needed was out
+/// of reach on a cluster `relish setup --ssh` built: there, the usual cause is
+/// a firewall between this machine and port 9117, not a stopped Bun.
+fn report(error: &reliaburger::relish::RelishError) {
+    eprintln!("error: {error}");
+    if matches!(error, reliaburger::relish::RelishError::AgentUnreachable)
+        && !reliaburger::relish::client::endpoint_overridden()
+        && let Some(hint) = reliaburger::relish::quickstart::server_runner::unreachable_hint()
+    {
+        eprintln!("{hint}");
     }
 }
 

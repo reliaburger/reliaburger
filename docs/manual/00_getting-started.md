@@ -38,7 +38,10 @@ machine is checked first, and if any fails nothing changes on any of them. Rerun
 the same command to resume. Credentials stay on the machine you ran it from, so
 back up the directory setup names when it finishes. `relish local` doesn't
 manage these clusters. If a machine has several private addresses, give each
-machine's address in the same order with `--advertise`. The
+machine's address in the same order with `--advertise`. Afterwards `relish`
+talks to port 9117 on the first machine, so a firewall in between has to let
+you through; if it doesn't, setup and commands such as `relish status` print
+the `ufw` rule to add, or the SSH tunnel to use instead. The
 [Linux servers guide](https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md)
 covers doing all this by hand.
 

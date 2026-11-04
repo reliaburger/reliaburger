@@ -210,6 +210,20 @@ impl Operation {
     }
 }
 
+/// The saved cluster whose operation identifier is `owner`, and its directory,
+/// read without taking the operation lock: for messages about the cluster
+/// behind the active context, never for changing it.
+pub fn find_owned(root: &Path, owner: &str) -> Option<(PathBuf, ClusterState)> {
+    std::fs::read_dir(root.join("clusters"))
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find_map(|directory| {
+            let state = read_state(&directory.join("state.json")).ok()?;
+            (state.id == owner).then_some((directory, state))
+        })
+}
+
 fn save_state(directory: &Path, state: &ClusterState) -> Result<(), RelishError> {
     state.validate()?;
     let bytes = serde_json::to_vec_pretty(state).map_err(RelishError::SerialiseJson)?;
