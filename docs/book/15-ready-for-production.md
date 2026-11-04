@@ -7586,9 +7586,33 @@ returns an iterator, a `Vec<(String, String)>` can become one, and the
 compiler generates a copy of `open_with_env` for each. It's the closest thing
 Rust has to Python's duck typing, checked at compile time.
 
-The unit tests never talk to a cloud. `make test-s3` does: with real
-credentials and `RELIABURGER_TEST_S3_URL`, it exports logs to the bucket and
-round-trips a council backup through it, put, list, prune and restore.
+The unit tests never talk to a cloud. `make test-s3` does: it exports logs to
+a bucket and round-trips a council backup through it, put, list, prune and
+restore. Until 0.2.6 it needed real AWS credentials, and the
+qualification Mac had none, so 0.2.5 shipped without it. A test nobody can
+run doesn't gate anything.
+
+So now `make test-s3` brings its own bucket. With no `RELIABURGER_TEST_S3_URL`
+it downloads a pinned [SeaweedFS](https://github.com/seaweedfs/seaweedfs)
+binary, starts `weed mini` on free loopback ports with a random bucket and
+random credentials, runs the two tests and deletes the lot afterwards. CI
+runs the same script, the same way, on every change to the S3 client, log
+export or council backups. We picked SeaweedFS because MinIO's
+community edition stopped shipping binaries, and because SeaweedFS checks
+every request's signature: a mock that accepts anything would pass a client
+that AWS would refuse. The [testing guide](../testing.md#s3-in-ci) has the
+rest, including when a real bucket is still worth the trouble.
+
+Nothing in Reliaburger changed to make this work, and that's the point of
+`open_with_env`. The script exports `AWS_ENDPOINT=http://127.0.0.1:<port>`
+and `AWS_ALLOW_HTTP=true`, and `s3_builder` hands them to `object_store`
+like any other `AWS_*` variable. One new unit test pins down what the local
+server depends on. An endpoint without `AWS_VIRTUAL_HOSTED_STYLE_REQUEST`
+means path-style requests, `http://127.0.0.1:18333/council-backups/...`,
+because a loopback address has no `council-backups.127.0.0.1` subdomain to
+resolve. The test checks the builder's config values and then the built
+store's `Debug` output, which shows the bucket in the path after the
+endpoint.
 
 The regression tests are less satisfying than we'd like. Nothing a unit test
 can observe changes when an `fsync` is missing, so each caller's test checks

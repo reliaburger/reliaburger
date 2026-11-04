@@ -86,6 +86,7 @@ jobs:
       heavy: ${{ steps.select.outputs.heavy }}
       task_arrays: ${{ steps.select.outputs.task_arrays }}
       macos: ${{ steps.select.outputs.macos }}
+      s3: ${{ steps.select.outputs.s3 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -639,6 +640,37 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  s3:
+    # make test-s3 (#1534): log export and a council backup round trip
+    # through the throwaway SeaweedFS that scripts/test-s3.sh starts, exactly
+    # as on a laptop: the pinned binary, checked against its digest, with
+    # telemetry off. Nightly on main, on pushes, and on pull requests that
+    # touch what the tests send (select-jobs.sh). Its two tests aren't bound
+    # evidence cases: every evidence mode is a fixed set of owners, and this
+    # job is chosen by path. The final gate checks this job's own result.
+    name: S3 round trip
+    needs: changes
+    if: needs.changes.outputs.s3 == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: s3
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Prepare portable build host
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang libbpf-dev llvm
+      - name: Export logs and round-trip a council backup through SeaweedFS
+        run: make test-s3
+
   ignored-evidence:
     # The final gate, and the one check the merge queue requires: it waits
     # for every other job, fails if any of them failed, and then checks that
@@ -646,7 +678,7 @@ jobs:
     # always reports, so a skipped owner can never stand in for a pass. A
     # closed PR's run has nothing to report.
     name: ignored-test evidence
-    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, portable, linux, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks]
+    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, portable, linux, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
     if: ${{ always() && github.event.action != 'closed' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
