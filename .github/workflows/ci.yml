@@ -642,30 +642,17 @@ jobs:
 
   s3:
     # make test-s3 (#1534): log export and a council backup round trip
-    # through SeaweedFS, the server scripts/test-s3.sh starts on a laptop,
-    # here as a service container. Its image starts `weed mini` with no
-    # arguments, which is all a service container can do, so unlike the
-    # script it can't be told -master.telemetry=false. Nightly on main, on
-    # pushes, and on pull requests that touch what the tests send
-    # (select-jobs.sh). Its two tests aren't bound evidence cases: every
-    # evidence mode is a fixed set of owners, and this job is chosen by path.
-    # The final gate checks this job's own result instead.
+    # through the throwaway SeaweedFS that scripts/test-s3.sh starts, exactly
+    # as on a laptop: the pinned binary, checked against its digest, with
+    # telemetry off. Nightly on main, on pushes, and on pull requests that
+    # touch what the tests send (select-jobs.sh). Its two tests aren't bound
+    # evidence cases: every evidence mode is a fixed set of owners, and this
+    # job is chosen by path. The final gate checks this job's own result.
     name: S3 round trip
     needs: changes
     if: needs.changes.outputs.s3 == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
-    services:
-      seaweedfs:
-        # The same release as the binary scripts/test-s3.sh pins.
-        image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
-        env:
-          # Throwaway credentials: the server lives for this job alone.
-          AWS_ACCESS_KEY_ID: reliaburger-ci
-          AWS_SECRET_ACCESS_KEY: reliaburger-ci-secret
-          S3_BUCKET: reliaburger-test
-        ports:
-          - 8333:8333
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -682,11 +669,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang libbpf-dev llvm
       - name: Export logs and round-trip a council backup through SeaweedFS
-        env:
-          RELIABURGER_TEST_S3_ENDPOINT: http://127.0.0.1:8333
-          RELIABURGER_TEST_S3_BUCKET: reliaburger-test
-          AWS_ACCESS_KEY_ID: reliaburger-ci
-          AWS_SECRET_ACCESS_KEY: reliaburger-ci-secret
         run: make test-s3
 
   ignored-evidence:

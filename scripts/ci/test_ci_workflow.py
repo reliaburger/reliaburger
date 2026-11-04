@@ -606,24 +606,17 @@ class S3Tests(unittest.TestCase):
         self.assertIn("s3: ${{ steps.select.outputs.s3 }}", self.jobs["changes"])
         self.assertRegex(self.job, r"(?m)^        run: make test-s3$")
 
-    def test_ci_and_the_script_run_the_same_pinned_seaweedfs(self):
+    def test_every_seaweedfs_build_the_script_downloads_is_pinned(self):
         script = (REPO / "scripts" / "test-s3.sh").read_text()
-        version = re.search(r"(?m)^SEAWEEDFS_VERSION=(\S+)$", script).group(1)
-        image = re.search(r"(?m)^        image: (\S+)$", self.job).group(1)
-        self.assertRegex(image, rf"^chrislusf/seaweedfs:{re.escape(version)}@sha256:[0-9a-f]{{64}}$")
-        # Every binary the script may download is checked against a digest.
+        self.assertRegex(script, r"(?m)^SEAWEEDFS_VERSION=\S+$")
         self.assertEqual(len(re.findall(r"digest=[0-9a-f]{64} ;;", script)), 4)
 
-    def test_the_job_talks_to_its_service_container_with_its_credentials(self):
-        service = dict(re.findall(r"(?m)^          (AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|S3_BUCKET): (\S+)$",
-                                  self.job.split("    steps:")[0]))
-        step = next(step for step in steps(self.job) if "run: make test-s3" in step)
-        self.assertIn("RELIABURGER_TEST_S3_ENDPOINT: http://127.0.0.1:8333", step)
-        self.assertIn("- 8333:8333", self.job)
-        self.assertIn(f"RELIABURGER_TEST_S3_BUCKET: {service['S3_BUCKET']}", step)
-        for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
-            self.assertIn(f"{name}: {service[name]}", step)
-        self.assertNotIn("RELIABURGER_TEST_S3_URL", self.job)
+    def test_ci_runs_the_script_s_own_throwaway_server_as_a_laptop_does(self):
+        # One way in: the pinned binary with telemetry off, not a service
+        # container that can't be given flags.
+        self.assertNotIn("services:", self.job)
+        for name in ("RELIABURGER_TEST_S3_URL", "RELIABURGER_TEST_S3_ENDPOINT", "AWS_"):
+            self.assertNotIn(name, self.job)
 
 
 class ArtifactDownloadTests(unittest.TestCase):

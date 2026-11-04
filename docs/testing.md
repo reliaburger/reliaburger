@@ -324,14 +324,13 @@ credentials and a real bucket, which the qualification Mac didn't have, so
   or arm64.
 - **With `RELIABURGER_TEST_S3_ENDPOINT`**, it uses a server that's already
   running, with the bucket in `RELIABURGER_TEST_S3_BUCKET` and the
-  credentials in `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. That's
-  how CI runs it.
+  credentials in `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
 - **With `RELIABURGER_TEST_S3_URL=s3://bucket/prefix`**, it uses that bucket,
   with credentials and region from the standard `AWS_*` variables.
 
-The `S3 round trip` job in [`ci.yml`](../.github/workflows/ci.yml) starts
-the same SeaweedFS release as a service container, pinned by digest, and runs
-`make test-s3` against it. It runs nightly on `main`, on pushes, and on pull
+The `S3 round trip` job in [`ci.yml`](../.github/workflows/ci.yml) runs
+`make test-s3` with nothing set, so it starts the same pinned binary a laptop
+does, with telemetry off. It runs nightly on `main`, on pushes, and on pull
 requests that touch what the tests send: `src/ketchup/export.rs`,
 `src/council/backup.rs`, `src/object_storage.rs` or the script itself
 ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)). A pull request into a
@@ -343,15 +342,15 @@ chosen by path.
 Why SeaweedFS? MinIO was the obvious server, but its community edition is
 now [source only](https://github.com/minio/minio), with no binaries, and the
 repository was archived in April 2026. [Garage](https://garagehq.deuxfleurs.fr/documentation/quick-start/)
-needs a configuration file and command-line flags before one node serves a
-bucket, and a GitHub Actions service container can pass neither.
+needs a configuration file and command-line steps before one node serves a
+bucket.
 [moto](https://pypi.org/project/moto/) in server mode would start, but it's
 a mock that [checks no signatures by default](https://docs.getmoto.org/en/latest/docs/iam.html),
 and it needs Python 3.10 or later where macOS ships 3.9.
 [SeaweedFS](https://github.com/seaweedfs/seaweedfs/releases/tag/4.48)
-publishes one static binary for macOS and Linux every week or two, its image
-[starts `weed mini` with no arguments](https://github.com/seaweedfs/seaweedfs/blob/4.48/docker/Dockerfile.go_build)
-(master, volume server, filer and S3 gateway in one process), and it checks
+publishes one static binary for macOS and Linux every week or two,
+`weed mini` runs the master, volume server, filer and S3 gateway in one
+process, and it checks
 each request's SigV4 signature against the credentials it was started with.
 A request signed wrongly fails here as it would on AWS.
 

@@ -7596,8 +7596,8 @@ So now `make test-s3` brings its own bucket. With no `RELIABURGER_TEST_S3_URL`
 it downloads a pinned [SeaweedFS](https://github.com/seaweedfs/seaweedfs)
 binary, starts `weed mini` on free loopback ports with a random bucket and
 random credentials, runs the two tests and deletes the lot afterwards. CI
-runs the same release as a service container on every change to the S3
-client, log export or council backups. We picked SeaweedFS because MinIO's
+runs the same script, the same way, on every change to the S3 client, log
+export or council backups. We picked SeaweedFS because MinIO's
 community edition stopped shipping binaries, and because SeaweedFS checks
 every request's signature: a mock that accepts anything would pass a client
 that AWS would refuse. The [testing guide](../testing.md#s3-in-ci) has the

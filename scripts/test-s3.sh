@@ -9,11 +9,11 @@
 #   1. RELIABURGER_TEST_S3_URL is set: a real bucket. COMMAND runs as is,
 #      with whatever AWS_* credentials and region the caller exported.
 #   2. RELIABURGER_TEST_S3_ENDPOINT is set: an S3 server someone else
-#      started, such as CI's SeaweedFS service container. The bucket is
+#      started. The bucket is
 #      RELIABURGER_TEST_S3_BUCKET (default reliaburger-test), and the
 #      credentials are the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY the
 #      server was started with.
-#   3. Neither: start a throwaway SeaweedFS server (`weed mini`) on free
+#   3. Neither (as CI runs it): start a throwaway SeaweedFS server (`weed mini`) on free
 #      loopback ports, with a random bucket and random credentials, and
 #      remove it and its data when COMMAND ends, pass or fail. The pinned
 #      `weed` binary is downloaded once into target/test-s3 and checked
@@ -23,7 +23,7 @@
 
 set -euo pipefail
 
-# The same release as CI's service container (.github/workflows/ci.yml).
+# Bump with the four digests below.
 SEAWEEDFS_VERSION=4.48
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 
