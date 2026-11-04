@@ -70,7 +70,7 @@ jobs:
     # guard; the rest are skipped with select jobs.
     name: closed pull request
     if: github.event.action == 'closed'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
       - run: echo "The pull request was closed; its older CI run is cancelled."
@@ -79,7 +79,7 @@ jobs:
     # Which job groups this run needs; see scripts/ci/select-jobs.sh.
     name: select jobs
     if: github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       code: ${{ steps.select.outputs.code }}
       gossip: ${{ steps.select.outputs.gossip }}
@@ -113,7 +113,7 @@ jobs:
     # so it runs on every change, documentation included.
     name: CI policy
     if: github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -130,7 +130,7 @@ jobs:
   dependency-audit:
     name: dependency advisory audit
     if: github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@cargo-audit
@@ -142,7 +142,7 @@ jobs:
     name: lint
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -169,7 +169,7 @@ jobs:
     name: demo app
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -190,7 +190,7 @@ jobs:
     name: minimum Rust 1.97.0
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -218,7 +218,7 @@ jobs:
     name: portable Linux
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # About 25 minutes, but 35 to 41 on a slow runner (#1421). nextest's
     # per-test timeouts catch a hung test, so this only catches a stuck runner.
     timeout-minutes: 62
@@ -281,7 +281,7 @@ jobs:
     name: privileged Linux
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
@@ -401,7 +401,7 @@ jobs:
     name: build tests
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -436,7 +436,7 @@ jobs:
     name: multi-node cluster
     needs: [changes, build-tests]
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     # actions: read lets the archive fetch list this run's artefacts.
     permissions:
@@ -499,7 +499,7 @@ jobs:
     name: acceptance
     needs: [changes, build-tests]
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     # actions: read lets the archive fetch list this run's artefacts.
     permissions:
@@ -618,7 +618,7 @@ jobs:
     name: optimized contract boundaries
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       optimized_cron_sha256: ${{ steps.optimized_cron.outputs.optimized_cron_sha256 }}
     steps:
@@ -680,7 +680,7 @@ jobs:
     name: ignored-test evidence
     needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, portable, linux, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
     if: ${{ always() && github.event.action != 'closed' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -780,7 +780,7 @@ jobs:
     name: benchmarks
     needs: changes
     if: needs.changes.outputs.gossip == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -815,7 +815,7 @@ jobs:
     name: task-array benchmarks
     needs: changes
     if: needs.changes.outputs.task_arrays == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
