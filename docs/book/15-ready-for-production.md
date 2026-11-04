@@ -8266,6 +8266,40 @@ Reaching those machines from a shell needs care too. The remote side re-parses
 what `ssh` sends, so each argument is quoted, and a host that starts with a dash
 is refused, because `ssh -oProxyCommand=...` would run it.
 
+How do you test a flow whose whole job is changing other people's machines? The
+same way we tested the laptop path: a fake. `Ssh::shell_script` swaps the `ssh`
+binary for a shell script, as `fake_lima` does for `limactl`, and the script in
+`server_runner.rs` plays three machines. It names each call from the script it
+was sent (pre-flight, packages, files, the `bun` link, start), writes
+`<host> <user|root> <step>` to a log, and answers the way a machine would: a
+pre-flight report, `used=yes` once files have landed, a list of the files in
+the bundle. A file called `fail/b-preflight` makes that step fail. The tests
+then read the log. One machine failing its checks leaves three `user
+preflight` lines and nothing run as root, anywhere. A failure at the `bun`
+link, then a rerun, shows the packages installed once and the files twice,
+and a third run only starts the service. Moving `run`'s body into
+`provision_cluster` meant the tests call exactly what the command calls,
+with no test hook in the product.
+
+The fake can't be Bun, so every tunnel to a node's API closes, and that's
+where the tests stop. Readiness, the council and the demo need a real cluster,
+which `scripts/release/qualify-ssh-setup.sh` builds on VMs.
+
+Setup reaches each machine's API through SSH tunnels, which close when it
+finishes. After that `relish` talks to port 9117 on the first machine directly,
+and a firewall in between used to get you `bun agent not reachable at
+localhost:9117 (is it running?)`, about a host you never named and a Bun that
+was running fine. Worse, a firewall that drops packets makes the connection time
+out, and a timeout read as "the operation may still be running". Now a
+connection that never opened is always "unreachable", it gives up after ten
+seconds instead of the operating system's minute or more, and on a cluster
+`relish setup --ssh` built, the error carries the fix. Setup admitted the
+address it saw you connect from, so the message names it, with the `ufw`
+command for the first machine, and then the tunnel: an explicit endpoint skips
+the saved context's credentials, so it prints the CA and token exports as well.
+Setup prints the same advice as its last line when its own check finds the API
+out of reach.
+
 `hello` is also the first thing anyone sees of a new cluster in a browser, so
 it now serves a small page with a burger and what to try next, instead of one
 line of plain text. The page is `src/relish/quickstart/welcome.html`, which
