@@ -454,6 +454,17 @@ migration and no feature gate
   ([#1534](https://github.com/reliaburger/reliaburger/issues/1534),
   [#1535](https://github.com/reliaburger/reliaburger/issues/1535)), and the
   known flakes.
+- [ ] **0.2.7: "Built for humans and their agents"**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/29),
+  [plan](plans/2026-11-04-plan-0.2.7.md)). The read-only half of the AI SRE
+  work, brought forward from 0.4.2: a JSON-only `relish agent` command family
+  over the exact source the binary was built from, a patch-and-try loop on a
+  throwaway cluster, redacted reports a human posts, `relish mcp`, an agent
+  page and "With your agent" getting started on the website, and the loop
+  that turns agent sessions into fixes released in days. No LLM inside `bun`.
+  Exit test: Claude Code with a read-only token diagnoses three Smoker
+  scenarios and finds a planted Reliaburger bug in the source
+  ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)).
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
@@ -481,17 +492,12 @@ migration and no feature gate
   Managed-volume retirement and the Apple runtime (F10,
   [#367](https://github.com/reliaburger/reliaburger/issues/367)) ship in 0.4.3,
   outside the migration plan.
-- [ ] **0.4.2: "Plug in an AI SRE"**
+- [ ] **0.4.2: "Let the AI SRE help"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/18),
-  [research](plans/2026-10-18-research-ai-sre.md)). Make Reliaburger the
-  easiest orchestrator for an AI agent to operate, safely. Part 1 is
-  read-only: `relish mcp`, agent tokens, untrusted-content envelopes, a merged
-  incident timeline, `relish explain`, agent-ready webhooks, `llms.txt` and an
-  eval gym on Smoker faults. Part 2 adds human-approved mutations through
-  proposals, and log patterns in Ketchup. No LLM inside `bun`. Exit test: an
-  off-the-shelf agent with a read-only token diagnoses at least 4 of 5 runs of
-  each eval scenario and never attempts a mutation
-  ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)).
+  [research](plans/2026-10-18-research-ai-sre.md)). The read-only half moved
+  to 0.2.7. What stays: human-approved mutations through proposals, agent
+  tokens labelled in audit, a merged incident timeline, log patterns in
+  Ketchup, agent-ready webhooks and a larger eval. No LLM inside `bun`.
 - [ ] **0.4.3, 0.4.4 and 0.4.5: "Stronger walls"**
   ([0.4.3](https://github.com/reliaburger/reliaburger/milestone/20),
   [0.4.4](https://github.com/reliaburger/reliaburger/milestone/21),
