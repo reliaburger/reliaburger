@@ -49,6 +49,7 @@ pub mod recover_guard;
 pub mod released_cli;
 pub mod setup;
 pub mod source;
+pub mod source_bundle;
 pub mod test_cmd;
 mod tls;
 pub mod tui;
@@ -103,6 +104,10 @@ pub enum RelishError {
     /// Configuration parse or validation failure.
     #[error("{0}")]
     Config(#[from] ConfigError),
+
+    /// The embedded source bundle couldn't be read or extracted.
+    #[error("{0}")]
+    SourceBundle(#[from] source_bundle::SourceBundleError),
 
     /// JSON serialisation failure.
     #[error("failed to serialise JSON: {0}")]

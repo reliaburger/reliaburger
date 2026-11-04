@@ -64,8 +64,9 @@ version (`release-0-2-1`), and one gate PR takes the train into `main`. CI
 treats the three kinds of run differently ([which jobs run](testing.md#which-jobs-a-pull-request-runs)):
 
 - **A PR into the train** gets the light set: lint and format, minimum Rust,
-  portable Linux with the coverage floor, the demo app and the optimised
-  contract boundaries, in 15–20 minutes. A `full-ci` label adds everything
+  portable Linux with the coverage floor, the demo app, the source bundle
+  build and the optimised contract boundaries, in 15–20 minutes. A
+  `full-ci` label adds everything
   except the three macOS shards: privileged Linux, cluster, acceptance,
   upgrades and benchmarks. The macOS shards run on the PR only when it
   touches macOS-specific code or carries a `macos` label.
@@ -165,6 +166,17 @@ reports; for function names, build from source with
 `CARGO_PROFILE_RELEASE_STRIP=none`. Nothing reads symbols at runtime. The
 measurements, including build times and the backtrace check, are in
 [qualification/2026-09-24-binary-size.md](qualification/2026-09-24-binary-size.md).
+
+### The source bundle
+
+From 0.2.7 every release `relish` carries the build, test and read set it was
+built from, as one zstd tarball of about 4.7 MB
+([#1570](https://github.com/reliaburger/reliaburger/issues/1570)). `build.rs`
+packs it at level 19, which adds about 10 seconds to the release build. The
+build job sets `RELIABURGER_REQUIRE_CLEAN_SOURCE=1`, so `build.rs` fails the
+build when git lists any change in the embedded paths: a release bundle is
+exactly its commit. Recording the bundle's digest in `candidate.json` is still
+to do (#1570).
 
 ## Cluster compatibility
 

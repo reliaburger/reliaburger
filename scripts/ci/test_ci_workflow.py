@@ -502,8 +502,30 @@ class TrainAndQueueTests(unittest.TestCase):
     def test_the_heavy_jobs_wait_for_their_own_selection(self):
         for name in ["linux", "build-tests", "cluster", "acceptance"]:
             self.assertIn("if: needs.changes.outputs.heavy == 'true'", self.jobs[name])
-        for name in ["lint", "minimum-rust", "portable", "contract-boundaries", "demo-app"]:
+        for name in ["lint", "minimum-rust", "portable", "contract-boundaries", "demo-app", "source-bundle"]:
             self.assertIn("if: needs.changes.outputs.code == 'true'", self.jobs[name])
+
+    def test_the_embedded_source_builds_on_its_own(self):
+        # relish carries its source (#1570); the job proves the bundle alone
+        # builds every binary, from an empty directory, with the locked graph.
+        job = self.jobs["source-bundle"]
+        blocks = steps(job)
+        build = next(index for index, step in enumerate(blocks) if "cargo build --locked --bin relish --features embed-source" in step)
+        extract = next(index for index, step in enumerate(blocks) if "relish source --extract" in step)
+        rebuild = next(index for index, step in enumerate(blocks) if "cargo build --locked --bins" in step)
+        self.assertLess(build, extract)
+        self.assertLess(extract, rebuild)
+        self.assertIn('"$RUNNER_TEMP/source-bundle"', blocks[extract])
+        self.assertIn("working-directory: ${{ runner.temp }}/source-bundle", blocks[rebuild])
+        # The extracted tree packs its own bundle, and nothing of the
+        # checkout's build of the crate stands in for it.
+        self.assertIn("--features embed-source", blocks[rebuild])
+        self.assertIn("cargo clean --package reliaburger", blocks[rebuild])
+        compare = next(index for index, step in enumerate(blocks) if "source-again" in step)
+        self.assertLess(rebuild, compare)
+        self.assertIn('test "$first" = "$second"', blocks[compare])
+        # It restores a cache without competing to save one.
+        self.assertIn("save-if: false", job)
 
     def test_the_portable_suite_finishes_on_a_slow_runner_with_headroom(self):
         # About 25 minutes normally and 35 to 41 on a slow runner (#1421).
