@@ -958,6 +958,11 @@ enum Command {
     Source {
         /// Open with this search query pre-seeded (e.g. "ebpf").
         query: Option<String>,
+        /// Write the embedded source tree into this new or empty directory
+        /// instead. CI builds the result (#1570); `relish agent source
+        /// extract` (#1571) is the documented way.
+        #[arg(long, hide = true, value_name = "DIR", conflicts_with = "query")]
+        extract: Option<PathBuf>,
     },
     /// Remove the CLI, its PATH link, the managed Lima tools and the image cache.
     Uninstall {
@@ -2687,7 +2692,11 @@ async fn main() -> ExitCode {
             None if web => reliaburger::relish::manual::web::serve(port).await,
             None => reliaburger::relish::manual::run(chapter.as_deref()).await,
         },
-        Command::Source { query } => reliaburger::relish::source::run(query).await,
+        Command::Source {
+            extract: Some(ref dir),
+            ..
+        } => reliaburger::relish::source::extract(dir),
+        Command::Source { query, .. } => reliaburger::relish::source::run(query).await,
         Command::Uninstall { yes } => reliaburger::relish::uninstall::run(yes).map_err(Into::into),
         Command::Local {
             action,
@@ -5317,7 +5326,23 @@ mod tests {
     #[test]
     fn parse_source_without_query() {
         let cli = parse(&["relish", "source"]).unwrap();
-        assert!(matches!(cli.command, Command::Source { query: None }));
+        assert!(matches!(
+            cli.command,
+            Command::Source {
+                query: None,
+                extract: None
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_source_extract_takes_a_directory_and_no_query() {
+        let cli = parse(&["relish", "source", "--extract", "/tmp/source"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Source { query: None, extract: Some(ref dir) } if dir.to_str() == Some("/tmp/source")
+        ));
+        assert!(parse(&["relish", "source", "ebpf", "--extract", "/tmp/source"]).is_err());
     }
 
     #[test]
@@ -5325,7 +5350,7 @@ mod tests {
         let cli = parse(&["relish", "source", "ebpf"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Source { query: Some(ref q) } if q == "ebpf"
+            Command::Source { query: Some(ref q), .. } if q == "ebpf"
         ));
     }
 

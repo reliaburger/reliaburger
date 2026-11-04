@@ -155,6 +155,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       RELIABURGER_GIT_SHA: ${{ github.sha }}
+      # relish embeds its source (#1570); build.rs fails the build when git
+      # lists a change in what it embeds, so a release carries its commit.
+      # TODO(#1570): record the bundle digest in candidate.json.
+      RELIABURGER_REQUIRE_CLEAN_SOURCE: "1"
       # A train's nightly build trusts the nightly key instead of the release
       # keys (src/upgrade/keys.rs), so the bun it signs can never reach a
       # released cluster. Main's build never has the feature.

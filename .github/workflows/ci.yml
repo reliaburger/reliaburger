@@ -210,6 +210,52 @@ jobs:
       - name: Check every target without default features
         run: cargo check --locked --all-targets --no-default-features
 
+  source-bundle:
+    # relish embeds the source it was built from (pack::ALLOWLIST in
+    # src/relish/source_bundle/pack.rs, #1570). This makes the claim honest:
+    # extract the bundle from a built relish into an empty directory and
+    # build every binary there, packing the bundle again from the extracted
+    # tree. A new include_str! of a file the allowlist leaves out fails here,
+    # not on a user's machine, and so does a pack that isn't reproducible.
+    # The extracted build shares this checkout's target directory, so only
+    # the crate itself compiles twice; it restores the build-tests cache and
+    # never saves one.
+    name: source bundle builds
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-debug
+          save-if: false
+      # Debug builds read the checkout instead of embedding the bundle, so
+      # a book or test edit doesn't rebuild the crate; the feature embeds it.
+      - name: Build relish with the source embedded
+        run: cargo build --locked --bin relish --features embed-source
+      - name: Test the source bundle as relish embeds it
+        run: cargo test --locked --lib --features embed-source relish::source
+      - name: Extract the embedded source into an empty directory
+        run: target/debug/relish source --extract "$RUNNER_TEMP/source-bundle" | tee "$RUNNER_TEMP/first-extract.txt"
+      # Both builds have the same package id, so drop the crate's own
+      # artefacts: nothing of the checkout's build can stand in for it.
+      - name: Build every binary from the extracted source alone
+        working-directory: ${{ runner.temp }}/source-bundle
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo clean --package reliaburger
+          cargo build --locked --bins --features embed-source
+      - name: The rebuilt relish carries the same source, digest for digest
+        run: |
+          target/debug/relish source --extract "$RUNNER_TEMP/source-again" | tee "$RUNNER_TEMP/second-extract.txt"
+          first=$(grep -o 'sha256 [0-9a-f]*' "$RUNNER_TEMP/first-extract.txt")
+          second=$(grep -o 'sha256 [0-9a-f]*' "$RUNNER_TEMP/second-extract.txt")
+          test -n "$first" && test "$first" = "$second"
+
   portable:
     outputs:
       portable_linux_sha256: ${{ steps.portable_linux.outputs.portable_linux_sha256 }}
@@ -678,7 +724,7 @@ jobs:
     # always reports, so a skipped owner can never stand in for a pass. A
     # closed PR's run has nothing to report.
     name: ignored-test evidence
-    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, portable, linux, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
+    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, source-bundle, portable, linux, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
     if: ${{ always() && github.event.action != 'closed' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10

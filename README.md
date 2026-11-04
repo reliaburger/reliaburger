@@ -424,8 +424,10 @@ failure. See [how Reliaburger is tested](docs/testing.md).
 TUI; `relish dashboard` opens the web UI through your authenticated CLI session.
 
 **The manual ships in the binary.** `relish manual` is a searchable reader with
-runnable examples, and `relish source` fuzzy-searches the exact source tree the
-binary was built from. Neither needs a network.
+runnable examples, and `relish source` fuzzy-searches the exact source the
+binary was built from: everything it takes to build it again, its tests and
+its design docs, which CI proves by building from the copy inside the binary.
+Neither needs a network.
 
 ## What you don't install
 

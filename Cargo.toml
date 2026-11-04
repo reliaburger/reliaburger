@@ -83,9 +83,12 @@ url = "2"
 # multithread was on by default up to 0.33; keep the process scan parallel
 sysinfo = { version = "0.39", features = ["multithread"] }
 prometheus-parse = "0.2"
-# The compression feature shrinks the release-embedded src/ tree
-# (`relish source`); debug builds read embeds from disk as before.
+# The manual, the examples and the dashboard's assets; the compression
+# feature shrinks them in release builds.
 rust-embed = { version = "8", features = ["compression", "debug-embed"] }
+# Reads the source bundle build.rs packs (src/relish/source_bundle.rs). The
+# same version arrow-ipc already pulls in, so no new crate.
+zstd = { version = "0.13", default-features = false }
 mime_guess = "2"
 k8s-openapi = { version = "0.28", default-features = false, features = ["std", "v1_36"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
@@ -113,6 +116,17 @@ nightly-signing = []
 # The fuzz target bodies in `src/fuzz/`, for the `fuzz/` crate (#1398).
 # Nothing else turns it on, so no binary carries them.
 fuzzing = []
+# Embed the source bundle in a debug build too (#1570). Release builds always
+# embed it; other builds read the checkout at run time, so a book or test
+# edit doesn't rebuild the crate. CI's `source bundle builds` job uses it.
+embed-source = []
+
+# build.rs packs the source bundle with the same tar, zstd and SHA-256
+# crates the library reads it with (src/relish/source_bundle/pack.rs).
+[build-dependencies]
+sha2 = "0.11"
+tar = "0.4"
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
@@ -171,6 +185,19 @@ opt-level = 3
 opt-level = 3
 
 [profile.test.package.block-buffer]
+opt-level = 3
+
+# build.rs compresses the source bundle with zstd (#1570), level 19 in a
+# release build, and the size test compresses it again. Build scripts and
+# their dependencies compile unoptimised by default, even in release; naming
+# the package here overrides that too.
+[profile.dev.package.zstd-sys]
+opt-level = 3
+
+[profile.test.package.zstd-sys]
+opt-level = 3
+
+[profile.release.package.zstd-sys]
 opt-level = 3
 
 # Every Raft RPC opens a fresh mTLS connection, and openraft gives each
