@@ -8266,6 +8266,15 @@ Reaching those machines from a shell needs care too. The remote side re-parses
 what `ssh` sends, so each argument is quoted, and a host that starts with a dash
 is refused, because `ssh -oProxyCommand=...` would run it.
 
+Setup ends by waiting for a healthy council, and its first version spelled
+that "every machine is a member". It is on three machines, and on seven. On
+eight it never is: the council stops at seven members, so the eighth runs
+without a seat, and setup waited for a seat that never comes, gave up after
+45 seconds, and called a healthy cluster broken. The release check built
+three machines, so it couldn't see it. Now `quorum_ready` wants one member
+per machine up to the cap, every member a machine setup owns, and an owned
+leader, and the check takes `--machines N`.
+
 How do you test a flow whose whole job is changing other people's machines? The
 same way we tested the laptop path: a fake. `Ssh::shell_script` swaps the `ssh`
 binary for a shell script, as `fake_lima` does for `limactl`, and the script in
