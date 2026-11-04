@@ -57,7 +57,7 @@ env:
 jobs:
   fuzz:
     name: fuzz every decoder
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Uncached: a 33-minute sanitizer build (run 40697356210), nine targets
     # at five minutes each and about 3 minutes of set-up, 81 in all, with
     # half that again to spare. Cached, only reliaburger itself rebuilds
