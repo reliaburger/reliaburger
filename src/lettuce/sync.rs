@@ -941,29 +941,55 @@ mod tests {
     const BASIC_NEW: &str = "[app.web]\nreplicas = 1\nscript = \"echo new\"\n";
     const NO_SCRIPT: &str = "[app.web]\nimage = \"web:v1\"\n";
 
-    /// B13: every way of changing a script, relative to an applied commit,
-    /// is refused unsigned and admitted with a trusted signature. The old
-    /// check only saw an added diff line containing `script`, so editing a
-    /// multiline body or deleting the script slipped through unsigned.
+    /// B13: a change from `before` to `after`, relative to an applied
+    /// commit, is refused unsigned and admitted with a trusted signature.
+    /// The old check only saw an added diff line containing `script`, so
+    /// editing a multiline body or deleting the script slipped through
+    /// unsigned. Each case is its own test: one case makes a key, a
+    /// repository and three signed or unsigned commits, and five in a row
+    /// passed the 60 s timeout on a loaded host (#1555).
+    fn assert_script_change_needs_a_trusted_signature(case: &str, before: &str, after: &str) {
+        let mut repo = SigningRepo::new();
+        let applied = repo.commit_apps(before, true);
+
+        repo.commit_apps(after, false);
+        assert_refused(&repo.sync(Some(&applied)), case);
+
+        repo.commit_apps(after, true);
+        assert_admitted(&repo.sync(Some(&applied)), case);
+    }
+
     #[test]
-    fn every_script_change_needs_a_trusted_signature() {
-        let cases = [
-            ("multiline body edit", MULTILINE_OLD, MULTILINE_NEW),
-            ("literal string body edit", LITERAL_OLD, LITERAL_NEW),
-            ("basic string edit", BASIC_OLD, BASIC_NEW),
-            ("script deleted", MULTILINE_OLD, NO_SCRIPT),
-            ("script added", NO_SCRIPT, BASIC_NEW),
-        ];
-        for (case, before, after) in cases {
-            let mut repo = SigningRepo::new();
-            let applied = repo.commit_apps(before, true);
+    fn a_multiline_script_body_edit_needs_a_trusted_signature() {
+        assert_script_change_needs_a_trusted_signature(
+            "multiline body edit",
+            MULTILINE_OLD,
+            MULTILINE_NEW,
+        );
+    }
 
-            repo.commit_apps(after, false);
-            assert_refused(&repo.sync(Some(&applied)), case);
+    #[test]
+    fn a_literal_string_script_edit_needs_a_trusted_signature() {
+        assert_script_change_needs_a_trusted_signature(
+            "literal string body edit",
+            LITERAL_OLD,
+            LITERAL_NEW,
+        );
+    }
 
-            repo.commit_apps(after, true);
-            assert_admitted(&repo.sync(Some(&applied)), case);
-        }
+    #[test]
+    fn a_basic_string_script_edit_needs_a_trusted_signature() {
+        assert_script_change_needs_a_trusted_signature("basic string edit", BASIC_OLD, BASIC_NEW);
+    }
+
+    #[test]
+    fn deleting_a_script_needs_a_trusted_signature() {
+        assert_script_change_needs_a_trusted_signature("script deleted", MULTILINE_OLD, NO_SCRIPT);
+    }
+
+    #[test]
+    fn adding_a_script_needs_a_trusted_signature() {
+        assert_script_change_needs_a_trusted_signature("script added", NO_SCRIPT, BASIC_NEW);
     }
 
     /// B13 negative control: an unsigned commit that leaves every script

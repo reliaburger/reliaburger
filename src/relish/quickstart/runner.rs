@@ -815,15 +815,22 @@ async fn record_boot(
     Ok(())
 }
 
+/// A full council of owned nodes: one member per machine, up to the council's
+/// cap of seven, every one of them a machine this setup owns, and an owned
+/// leader. Machines past the cap run without a seat.
 fn quorum_ready(names: &[String], council: &CouncilStatus) -> bool {
+    let seats = names
+        .len()
+        .min(crate::council::selection::CouncilSelectionConfig::default().max_council_size);
     council
         .leader
         .as_ref()
         .is_some_and(|leader| names.contains(leader))
-        && council.members.len() == names.len()
-        && names
+        && council.members.len() == seats
+        && council
+            .members
             .iter()
-            .all(|name| council.members.iter().any(|member| &member.name == name))
+            .all(|member| names.contains(&member.name))
 }
 
 pub(super) async fn wait_for_quorum(client: &BunClient, names: &[String]) -> Result<()> {
@@ -972,6 +979,38 @@ mod tests {
         assert!(quorum_ready(&names, &council));
         council.leader = Some("foreign".into());
         assert!(!quorum_ready(&names, &council));
+    }
+
+    /// The council caps at seven members, so an eight-machine setup waited
+    /// for an eighth seat that never comes and gave up after 45 s, with the
+    /// cluster healthy. Seven owned members are a full council; a foreign
+    /// one, or fewer than seven, still aren't.
+    #[test]
+    fn readiness_of_more_machines_than_the_council_cap_wants_a_full_council() {
+        let names: Vec<String> = (1..=8).map(|index| format!("node-{index}")).collect();
+        let member = |name: &str| CouncilMemberInfo {
+            raft_id: 0,
+            name: name.into(),
+            address: "192.168.104.1:9444".into(),
+            voter: true,
+        };
+        let mut council = CouncilStatus {
+            leader: Some("node-1".into()),
+            members: names
+                .iter()
+                .filter(|name| *name != "node-3")
+                .map(|name| member(name))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(quorum_ready(&names, &council));
+        council.members.pop();
+        assert!(!quorum_ready(&names, &council), "six of seven seats");
+        council.members.push(member("foreign"));
+        assert!(
+            !quorum_ready(&names, &council),
+            "a member setup doesn't own"
+        );
     }
 
     #[test]

@@ -82,8 +82,8 @@ test-standard-clients: ## Push and pull through Pickle's TLS listener with docke
 test-gpu: ## Detect a real NVIDIA GPU (needs the GPU and nvidia-smi)
 	RELIABURGER_GPU_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(=bun::gpu::tests::nvidia_detector_finds_hardware)'
 
-test-s3: ## Export logs and round-trip a council backup through a real bucket (needs AWS credentials and RELIABURGER_TEST_S3_URL=s3://bucket/prefix)
-	$(NEXTEST) --run-ignored=only -E 'test(=ketchup::export::tests::export_to_real_s3_manual) | test(=council::backup::tests::council_backup_round_trips_through_real_s3)'
+test-s3: ## Export logs and round-trip a council backup through a throwaway local S3 server, or a real bucket with RELIABURGER_TEST_S3_URL=s3://bucket/prefix and AWS credentials
+	scripts/test-s3.sh $(NEXTEST) --lib --run-ignored=only -E 'test(=ketchup::export::tests::export_to_real_s3_manual) | test(=council::backup::tests::council_backup_round_trips_through_real_s3)'
 
 check: ## Type-check without producing binaries (fast)
 	$(CARGO) check

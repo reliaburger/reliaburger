@@ -349,7 +349,12 @@ async fn json_or_api_error<T: serde::de::DeserializeOwned>(
 }
 
 fn classify_error(e: reqwest::Error) -> RelishError {
-    if e.is_timeout() {
+    // A connection that never opened reached no agent, even when it gave up
+    // by timing out, which is how a firewall that drops packets looks. Only
+    // a request that got through may still be running.
+    if e.is_connect() {
+        RelishError::AgentUnreachable
+    } else if e.is_timeout() {
         RelishError::RequestTimeout
     } else {
         RelishError::AgentUnreachable
@@ -380,6 +385,9 @@ static CLI_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new
 /// `main`. When present, the CLI reaches the agent API over HTTPS trusting
 /// this CA.
 static CLI_CA_CERT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// How long a command waits for the agent to accept a connection.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The `--endpoint` CLI override, set once from `main` before dispatch.
 static CLI_ENDPOINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -447,6 +455,12 @@ fn resolve_token() -> Option<String> {
 /// `RELIABURGER_ENDPOINT`, then the ordinary local default.
 fn resolve_endpoint() -> Option<String> {
     CLI_ENDPOINT.get().cloned().flatten()
+}
+
+/// Whether `--endpoint` or `RELIABURGER_ENDPOINT` chose the node, rather than
+/// the saved context or the local default.
+pub fn endpoint_overridden() -> bool {
+    resolve_endpoint().is_some()
 }
 
 /// Precedence rule for [`resolve_token`], split out to be testable without the
@@ -560,6 +574,9 @@ impl BunClient {
         let client = (|| -> Result<reqwest::Client, String> {
             let mut builder = crate::http_client::builder()
                 .timeout(std::time::Duration::from_secs(300))
+                // A firewall that drops packets would otherwise hold every
+                // command for the operating system's own connect timeout.
+                .connect_timeout(CONNECT_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none());
             if let Some(token) = token {
                 let mut headers = reqwest::header::HeaderMap::new();
@@ -4143,6 +4160,27 @@ mod tests {
             Some("https://env.example:9117".to_string())
         );
         assert_eq!(pick_endpoint(None, None), None);
+    }
+
+    /// A firewall that drops packets makes the connection time out. Nothing
+    /// was sent, so "the operation may still be running" would be wrong.
+    #[tokio::test]
+    async fn a_connection_that_never_opens_is_unreachable_even_when_it_times_out() {
+        let client = crate::http_client::builder()
+            .connect_timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap();
+        // TEST-NET-1 (RFC 5737) is never routed: the connect times out or fails.
+        let error = client
+            .get("http://192.0.2.1:9117/v1/health")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_connect(), "{error:?}");
+        assert!(matches!(
+            classify_error(error),
+            RelishError::AgentUnreachable
+        ));
     }
 
     #[tokio::test]

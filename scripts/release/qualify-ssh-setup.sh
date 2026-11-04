@@ -2,13 +2,15 @@
 # The Markdown record quotes values in backticks, inside single-quoted formats.
 # shellcheck disable=SC2016
 #
-# relish setup --ssh, end to end (#1529): create three disposable Lima VMs
-# from ssh-setup-vm.yaml, build a cluster on them over SSH exactly as an
+# relish setup --ssh, end to end (#1529): create disposable Lima VMs (three,
+# or --machines N) from ssh-setup-vm.yaml, build a cluster on them over SSH exactly as an
 # operator would, and check it:
 #
 #   1. setup --ssh finishes, with hello answering through the ingress;
 #   2. relish status shows every node and a full council, and relish wtf
-#      finds nothing critical;
+#      finds nothing critical; past seven machines the rest run without a
+#      council seat, so every node's Bun must also have kept its pid, with
+#      no restarts and its API listening, three minutes on (#1477);
 #   3. the same command again resumes and finishes without changing a node;
 #   4. a second operator, with a fresh RELIABURGER_HOME, is refused on the
 #      same machines before anything is written, and Bun keeps its pid.
@@ -25,7 +27,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 --relish PATH --record FILE [--keep] [-- SETUP_OPTIONS...]" >&2
+    echo "usage: $0 --relish PATH --record FILE [--machines N] [--keep] [-- SETUP_OPTIONS...]" >&2
     exit 2
 }
 
@@ -37,10 +39,12 @@ refuse() {
 relish=
 record=
 keep=no
+machines=3
 setup_options=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --keep) keep=yes; shift ;;
+        --machines) [[ $# -ge 2 ]] || usage; machines=$2; shift 2 ;;
         --relish) [[ $# -ge 2 ]] || usage; relish=$2; shift 2 ;;
         --record) [[ $# -ge 2 ]] || usage; record=$2; shift 2 ;;
         --) shift; setup_options=("$@"); break ;;
@@ -49,6 +53,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n $relish && -n $record ]] || usage
 [[ -x $relish ]] || refuse "$relish isn't an executable relish"
+[[ $machines =~ ^[1-9][0-9]*$ ]] || refuse "--machines needs a whole number of machines, not $machines"
 [[ ! -e $record ]] || refuse "$record already exists; records are never overwritten"
 [[ -d $(dirname "$record") ]] || refuse "no directory $(dirname "$record") for the record"
 command -v limactl >/dev/null || refuse "limactl isn't installed"
@@ -56,7 +61,12 @@ command -v limactl >/dev/null || refuse "limactl isn't installed"
 here=$(cd "$(dirname "$0")" && pwd)
 template=$here/ssh-setup-vm.yaml
 run=$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')
-vms=("rb-sshq-$run-1" "rb-sshq-$run-2" "rb-sshq-$run-3")
+vms=()
+for index in $(seq 1 "$machines"); do vms+=("rb-sshq-$run-$index"); done
+# The council: one seat per machine up to seven, the largest odd number of
+# them voting.
+seats=$((machines < 7 ? machines : 7))
+voters=$((seats % 2 == 1 ? seats : seats - 1))
 work=$(mktemp -d "${TMPDIR:-/tmp}/rb-sshq.XXXXXX")
 home=$work/home
 mkdir -p "$home" "$work/bin"
@@ -121,7 +131,7 @@ fi
 # 2. Status and diagnosis.
 if [[ $failed == no ]]; then
     status=$(RELIABURGER_HOME=$home "$relish" status 2>&1 || true)
-    if grep -q "3/3 voters" <<<"$status"; then
+    if grep -q "$voters/$voters voters" <<<"$status"; then
         pass "relish status" "$(head -1 <<<"$status")"
     else
         fail "relish status" "$(head -1 <<<"$status")"
@@ -132,6 +142,29 @@ if [[ $failed == no ]]; then
         pass "relish wtf" "$summary"
     else
         fail "relish wtf" "$summary"
+    fi
+fi
+
+# 2b. Every node keeps running. Past seven machines a node has no council
+# seat and reads the leader's security view; before #1477 its API never
+# opened and its Bun restarted every 30 s.
+if [[ $failed == no ]]; then
+    pids=()
+    for target in "${targets[@]}"; do pids+=("$(bun_pid "$target")"); done
+    sleep 180
+    unsettled=()
+    for index in "${!targets[@]}"; do
+        port=${targets[$index]##*:}
+        restarts=$(ssh -p "$port" "$USER@127.0.0.1" 'systemctl show -p NRestarts --value reliaburger')
+        listening=$(ssh -p "$port" "$USER@127.0.0.1" 'sudo ss -ltnH "sport = :9117" | wc -l')
+        if [[ $(bun_pid "${targets[$index]}") != "${pids[$index]}" || $restarts != 0 || $listening -lt 1 ]]; then
+            unsettled+=("node $((index + 1)): restarts $restarts, listeners $listening")
+        fi
+    done
+    if [[ ${#unsettled[@]} -eq 0 ]]; then
+        pass "every node settled" "$machines Buns kept their pids for 3 minutes, with no restarts and the API listening"
+    else
+        fail "every node settled" "${unsettled[*]}"
     fi
 fi
 
@@ -169,7 +202,7 @@ verdict=PASS
 [[ $failed == no ]] || verdict=FAIL
 {
     printf '# relish setup --ssh: %s\n\n' "$verdict"
-    printf '%s to %s. Three disposable Lima VMs from `scripts/release/ssh-setup-vm.yaml`, built into a cluster by `scripts/release/qualify-ssh-setup.sh`.\n\n' "$started" "$finished"
+    printf '%s to %s. %s disposable Lima VMs from `scripts/release/ssh-setup-vm.yaml`, built into a cluster by `scripts/release/qualify-ssh-setup.sh`.\n\n' "$started" "$finished" "$machines"
     printf '| | |\n|---|---|\n'
     printf '| relish | `%s` |\n' "$("$relish" --version)"
     printf '| Host | %s |\n' "$(sw_vers -productName 2>/dev/null || uname -s) $(sw_vers -productVersion 2>/dev/null || uname -r), $(uname -m)"
