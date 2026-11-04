@@ -25,7 +25,7 @@ jobs:
     # build runs on pushes and manual runs, and on a pull request only when
     # this workflow changes.
     name: select builds
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       pdf: ${{ steps.select.outputs.pdf }}
       binaries: ${{ steps.select.outputs.binaries }}
@@ -102,7 +102,7 @@ jobs:
   build-pdf:
     needs: changes
     if: needs.changes.outputs.pdf == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
