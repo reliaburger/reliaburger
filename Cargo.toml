@@ -32,6 +32,9 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "que
 webpki-root-certs = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# JSON Schema for `relish agent schema` (#1565), derived from the same serde
+# types the commands print, so the schema can't drift from the output.
+schemars = "1"
 yaml_serde = "0.10"
 semver = "1"
 thiserror = "2"

@@ -163,6 +163,12 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish test`: Run the built-in integration test suite against the cluster
 - `relish bench`: Run reproducible performance benchmarks against the real data plane
 
+**Work with an AI agent** ([working with an AI agent](docs/manual/16_working-with-an-ai-agent.md))
+
+- `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive *(0.2.7, not in 0.2.5)*
+  - `relish agent version`: This binary's version, commit, target and cluster formats *(0.2.7, not in 0.2.5)*
+  - `relish agent schema [version|schema]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.5)*
+
 **Break things on purpose** ([chaos](docs/manual/05_chaos.md))
 
 - `relish fault`: Inject faults for chaos testing (Smoker)

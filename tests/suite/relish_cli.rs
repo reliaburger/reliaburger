@@ -753,3 +753,107 @@ async fn hung_toml_job_times_out() {
     }
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
 }
+
+/// Run `relish agent ...` the way an agent's tool runner does: no terminal,
+/// nothing on stdin, no connection settings in the environment.
+fn run_agent(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .env_remove("RELIABURGER_TOKEN")
+        .env_remove("RELIABURGER_CA_CERT")
+        .env_remove("RELIABURGER_ENDPOINT")
+        .env_remove("TERM")
+        .output()
+        .unwrap()
+}
+
+/// stdout as the one JSON document an agent command prints.
+fn agent_envelope(output: &Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches('\n').count(), 1, "one line: {stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    assert_eq!(value["schema"], "relish.agent/v1");
+    value
+}
+
+#[test]
+fn agent_version_answers_without_a_terminal_or_stdin() {
+    let output = run_agent(&["agent", "version"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let value = agent_envelope(&output);
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["command"], "version");
+    assert_eq!(value["data"]["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn agent_ignores_the_output_flag() {
+    let output = run_agent(&["-o", "yaml", "agent", "version"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(agent_envelope(&output)["ok"], true);
+}
+
+#[test]
+fn agent_usage_errors_are_envelopes_on_stdout_with_exit_2() {
+    for args in [
+        &["agent", "version", "--bogus"][..],
+        &["agent", "nonsense"],
+        &["agent"],
+        &["agent", "version", "--max-bytes", "10"],
+        &["--endpoint", "http://192.0.2.10:9117", "agent", "version"],
+    ] {
+        let output = run_agent(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        let value = agent_envelope(&output);
+        assert_eq!(value["ok"], false, "{args:?}");
+        assert_eq!(value["error"]["code"], "usage", "{args:?}");
+    }
+}
+
+#[test]
+fn agent_refuses_a_plaintext_remote_endpoint_from_the_environment_with_an_envelope() {
+    let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(["agent", "version"])
+        .stdin(std::process::Stdio::null())
+        .env("RELIABURGER_ENDPOINT", "http://192.0.2.10:9117")
+        .env_remove("RELIABURGER_TOKEN")
+        .env_remove("RELIABURGER_CA_CERT")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let value = agent_envelope(&output);
+    assert_eq!(value["error"]["code"], "usage");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must use HTTPS"),
+        "{value}"
+    );
+}
+
+#[test]
+fn agent_help_is_ordinary_help() {
+    let output = run_agent(&["agent", "--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--max-bytes"));
+}
+
+#[test]
+fn agent_schema_stays_within_a_small_budget() {
+    let output = run_agent(&["agent", "schema", "--max-bytes", "1024"]);
+    assert!(output.stdout.len() <= 1024, "{} bytes", output.stdout.len());
+    let value = agent_envelope(&output);
+    // The whole schema is far over 1 KiB and mostly objects, which the
+    // budget never trims, so this either trims the command list or says the
+    // budget is too small. Both are answers inside the budget.
+    if value["ok"] == true {
+        assert_eq!(value["truncated"], true);
+    } else {
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(value["error"]["code"], "usage");
+    }
+}
