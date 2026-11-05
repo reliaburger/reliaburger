@@ -740,6 +740,17 @@ drops a `Gone` caller, treats an `Attempt` without its namespace or `eth0` as
 match on `tc`'s stderr is the only signal we have, but it's contained in one
 function, and only an attempt's failure can be softened by it.
 
+The first soak on the Mac Studio found the same race one step earlier
+(#1587). `run_in_instance_netns` checks that the namespace exists, then runs
+`ip netns exec`. An attempt that finished in between left `ip` saying
+`Cannot open network namespace ... No such file or directory`, which came
+back as a `Failed` and refused the delay again. That isn't `tc` failing: the
+namespace has gone. So `failed_command_error` turns that one message into
+`NoNamespace`, the same variant the existence check gives, and every caller
+of `run_in_instance_netns` handles it the way it already handled a missing
+namespace. Mapping the text to a variant where it's produced, not where it's
+read, keeps the stderr matching in the module that runs `ip`.
+
 On the podinfo demo, `relish fault delay redis 300ms --from frontend` took a
 cache read from 43 ms to 945 ms: about three redis round trips (podinfo's
 read runs `EXISTS` and then `GET`, and its pool talks to redis too), each
