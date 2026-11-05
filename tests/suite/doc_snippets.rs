@@ -49,7 +49,6 @@ const OPEN_ISSUES: &[(u32, &str)] = &[
     (1221, "model shorthand and relish model"),
     (1223, "group type"),
     (1238, "pipelines and fair share, after 0.8.0"),
-    (1571, "relish agent source"),
     (1573, "relish agent logs and manual"),
 ];
 
@@ -70,7 +69,6 @@ const INLINE_PENDING: &[(&str, u32)] = &[
     ("relish usage", 1238),
     ("relish agent guide", 1090),
     ("relish agent manual", 1573),
-    ("relish agent source", 1571),
 ];
 
 /// Chapters of the manual, which ships inside `relish`.

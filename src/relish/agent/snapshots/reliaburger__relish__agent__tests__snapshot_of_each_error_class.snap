@@ -1,0 +1,111 @@
+---
+source: src/relish/agent/mod.rs
+expression: rendered
+---
+[
+  {
+    "exit": 2,
+    "stdout": {
+      "command": "version",
+      "error": {
+        "code": "usage",
+        "endpoint": null,
+        "hint": "relish agent --help lists the commands; relish agent schema their output",
+        "message": "error: unexpected argument '--bogus' found",
+        "status": null
+      },
+      "ok": false,
+      "relish": {
+        "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+        "dirty": null,
+        "source_digest": null,
+        "version": "0.2.7"
+      },
+      "schema": "relish.agent/v1"
+    }
+  },
+  {
+    "exit": 3,
+    "stdout": {
+      "command": "version",
+      "error": {
+        "code": "unreachable",
+        "endpoint": null,
+        "hint": "start a cluster (relish setup --quickstart) or point at one with --endpoint",
+        "message": "cannot reach the bun agent at https://10.0.0.5:9117: connection refused; check that bun runs there and listens on that port",
+        "status": null
+      },
+      "ok": false,
+      "relish": {
+        "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+        "dirty": null,
+        "source_digest": null,
+        "version": "0.2.7"
+      },
+      "schema": "relish.agent/v1"
+    }
+  },
+  {
+    "exit": 3,
+    "stdout": {
+      "command": "version",
+      "error": {
+        "code": "unauthenticated",
+        "endpoint": null,
+        "hint": "pass a token with --token or RELIABURGER_TOKEN; a read-only one is enough",
+        "message": "API error (status 401): missing bearer token",
+        "status": 401
+      },
+      "ok": false,
+      "relish": {
+        "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+        "dirty": null,
+        "source_digest": null,
+        "version": "0.2.7"
+      },
+      "schema": "relish.agent/v1"
+    }
+  },
+  {
+    "exit": 4,
+    "stdout": {
+      "command": "version",
+      "error": {
+        "code": "forbidden",
+        "endpoint": null,
+        "hint": null,
+        "message": "API error (status 403): token role read-only can't do this",
+        "status": 403
+      },
+      "ok": false,
+      "relish": {
+        "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+        "dirty": null,
+        "source_digest": null,
+        "version": "0.2.7"
+      },
+      "schema": "relish.agent/v1"
+    }
+  },
+  {
+    "exit": 5,
+    "stdout": {
+      "command": "version",
+      "error": {
+        "code": "internal",
+        "endpoint": null,
+        "hint": null,
+        "message": "disk on fire",
+        "status": null
+      },
+      "ok": false,
+      "relish": {
+        "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+        "dirty": null,
+        "source_digest": null,
+        "version": "0.2.7"
+      },
+      "schema": "relish.agent/v1"
+    }
+  }
+]

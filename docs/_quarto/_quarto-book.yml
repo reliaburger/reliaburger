@@ -29,6 +29,7 @@ book:
     - book/15-ready-for-production.md
     - book/17-a-million-jobs.md
     - book/18-bending-without-forking.md
+    - book/19-built-for-agents.md
     - book/16-appendix-rust.md
 
 format:

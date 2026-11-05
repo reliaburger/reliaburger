@@ -1,0 +1,74 @@
+---
+source: src/relish/agent/source/tree.rs
+expression: value
+---
+{
+  "command": "source tree",
+  "data": {
+    "bytes": 857,
+    "depth": null,
+    "entries": [
+      {
+        "bytes": 26,
+        "files": null,
+        "kind": "file",
+        "lines": 2,
+        "path": "Cargo.toml"
+      },
+      {
+        "bytes": 11,
+        "files": null,
+        "kind": "file",
+        "lines": null,
+        "path": "brioche/dist/logo.png"
+      },
+      {
+        "bytes": 31,
+        "files": null,
+        "kind": "file",
+        "lines": 3,
+        "path": "docs/book/01-hello.md"
+      },
+      {
+        "bytes": 34,
+        "files": null,
+        "kind": "file",
+        "lines": 3,
+        "path": "src/bin/tool.rs"
+      },
+      {
+        "bytes": 739,
+        "files": null,
+        "kind": "file",
+        "lines": 42,
+        "path": "src/client.rs"
+      },
+      {
+        "bytes": 16,
+        "files": null,
+        "kind": "file",
+        "lines": 1,
+        "path": "src/lib.rs"
+      }
+    ],
+    "files": 6,
+    "prefix": null
+  },
+  "next": [
+    {
+      "read_only": true,
+      "run": "relish agent source show Cargo.toml",
+      "why": "the first file"
+    }
+  ],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": false,
+    "source_digest": "sha256:1639b607afe38bc2d97354cd49b82921653880e34c8d918491816b50df78c953",
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": []
+}

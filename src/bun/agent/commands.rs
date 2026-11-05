@@ -1003,6 +1003,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                     Err(reason) => {
                         self.fault_registry.remove(rule.id);
+                        self.network_faults.unproven_sources.remove(&rule.id);
                         // Take back anything a partial network install wrote.
                         self.reconcile_network_faults().await;
                         let _ = response.send(Err(BunError::FaultRejected { reason }));

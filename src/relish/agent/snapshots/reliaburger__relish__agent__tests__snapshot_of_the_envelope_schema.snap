@@ -1,0 +1,324 @@
+---
+source: src/relish/agent/mod.rs
+expression: "schema_of::<Envelope<Value>>()"
+---
+{
+  "$defs": {
+    "AgentError": {
+      "description": "What went wrong, for a command that couldn't answer.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode",
+          "description": "What kind of failure, from a closed list."
+        },
+        "endpoint": {
+          "description": "The cluster endpoint the command tried, when it tried one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hint": {
+          "description": "What to do about it, when we know.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "One line saying what happened.",
+          "type": "string"
+        },
+        "status": {
+          "description": "The HTTP status the API answered with, for `api` and the codes that\ncome from a status.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "endpoint",
+        "status",
+        "hint"
+      ],
+      "type": "object"
+    },
+    "BuildInfo": {
+      "description": "Which `relish` produced the answer.\n\nEvery field is always present; a value the build doesn't know is `null`.",
+      "properties": {
+        "commit": {
+          "description": "The full git commit the binary was built from, when the build knew it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "description": "Whether the checkout had uncommitted changes in the bundled paths,\nwhen git could say.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "source_digest": {
+          "description": "`sha256:` digest of the source bundle, as `relish agent source\nversion` reports it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "description": "The Cargo package version, e.g. `0.2.7`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "commit",
+        "dirty",
+        "source_digest"
+      ],
+      "type": "object"
+    },
+    "CommandName": {
+      "description": "Every `relish agent` command, by the name the envelope's `command` field\ncarries.",
+      "oneOf": [
+        {
+          "const": "agent",
+          "description": "`relish agent` itself, when the arguments named no command it knows.",
+          "type": "string"
+        },
+        {
+          "const": "version",
+          "description": "`relish agent version`.",
+          "type": "string"
+        },
+        {
+          "const": "schema",
+          "description": "`relish agent schema`.",
+          "type": "string"
+        },
+        {
+          "const": "source version",
+          "description": "`relish agent source version`.",
+          "type": "string"
+        },
+        {
+          "const": "source tree",
+          "description": "`relish agent source tree`.",
+          "type": "string"
+        },
+        {
+          "const": "source grep",
+          "description": "`relish agent source grep`.",
+          "type": "string"
+        },
+        {
+          "const": "source show",
+          "description": "`relish agent source show`.",
+          "type": "string"
+        },
+        {
+          "const": "source extract",
+          "description": "`relish agent source extract`.",
+          "type": "string"
+        }
+      ]
+    },
+    "ErrorCode": {
+      "description": "Why a command couldn't answer. A closed list: a new code is a deliberate\nchange to the contract, with a snapshot to prove it.",
+      "oneOf": [
+        {
+          "const": "usage",
+          "description": "The arguments were wrong: an unknown command or flag, a bad value.",
+          "type": "string"
+        },
+        {
+          "const": "no_endpoint",
+          "description": "No cluster endpoint is configured, or the command needs a running\nagent where there is none.",
+          "type": "string"
+        },
+        {
+          "const": "unreachable",
+          "description": "The endpoint refused or never answered the connection.",
+          "type": "string"
+        },
+        {
+          "const": "dns",
+          "description": "The endpoint's host name didn't resolve.",
+          "type": "string"
+        },
+        {
+          "const": "tls_untrusted",
+          "description": "The endpoint's certificate isn't one this CLI trusts.",
+          "type": "string"
+        },
+        {
+          "const": "timeout",
+          "description": "The request was sent but no answer came in time.",
+          "type": "string"
+        },
+        {
+          "const": "unauthenticated",
+          "description": "The API wanted a token, or rejected the one given (401).",
+          "type": "string"
+        },
+        {
+          "const": "forbidden",
+          "description": "The token isn't allowed to do this, or a policy refused it (403).",
+          "type": "string"
+        },
+        {
+          "const": "not_found",
+          "description": "The thing asked about doesn't exist (404).",
+          "type": "string"
+        },
+        {
+          "const": "conflict",
+          "description": "The request conflicts with the cluster's current state (409).",
+          "type": "string"
+        },
+        {
+          "const": "api",
+          "description": "Any other answer from the API that wasn't a success.",
+          "type": "string"
+        },
+        {
+          "const": "source_mismatch",
+          "description": "This binary's source doesn't match what the question needs.",
+          "type": "string"
+        },
+        {
+          "const": "build_failed",
+          "description": "Building a patched binary failed.",
+          "type": "string"
+        },
+        {
+          "const": "unsupported_platform",
+          "description": "This command can't run on this operating system.",
+          "type": "string"
+        },
+        {
+          "const": "internal",
+          "description": "Something went wrong inside `relish` itself.",
+          "type": "string"
+        }
+      ]
+    },
+    "NextStep": {
+      "description": "A command the agent could run next, and why.",
+      "properties": {
+        "read_only": {
+          "description": "`true` when running it changes nothing anywhere; `false` means a human\nshould say yes first.",
+          "type": "boolean"
+        },
+        "run": {
+          "description": "The full command line, ready to run.",
+          "type": "string"
+        },
+        "why": {
+          "description": "Why it's worth running, in one line.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run",
+        "why",
+        "read_only"
+      ],
+      "type": "object"
+    },
+    "SchemaVersion": {
+      "description": "The envelope's version tag. One variant, so the schema says exactly which\nstring to expect; a `v2` would be a new variant and a deliberate change.",
+      "oneOf": [
+        {
+          "const": "relish.agent/v1",
+          "description": "The first version, `relish.agent/v1`.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "anyOf": [
+    {
+      "description": "The command answered.",
+      "properties": {
+        "data": {
+          "description": "The answer; its shape depends on the command."
+        },
+        "next": {
+          "description": "Commands worth running next.",
+          "items": {
+            "$ref": "#/$defs/NextStep"
+          },
+          "type": "array"
+        },
+        "truncated": {
+          "description": "Whether the byte budget cut something out of `data`.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "description": "Things the agent should know that aren't the answer.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "data",
+        "truncated",
+        "next",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "The command couldn't answer.",
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/AgentError",
+          "description": "What went wrong."
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "type": "object"
+    }
+  ],
+  "description": "The `relish.agent/v1` envelope every `relish agent` command prints:\n`data` when `ok` is `true`, `error` when it's `false`.",
+  "properties": {
+    "command": {
+      "$ref": "#/$defs/CommandName",
+      "description": "The command that answered."
+    },
+    "ok": {
+      "description": "`true` when the command answered and `data` is present; `false` when\nit couldn't and `error` is present.",
+      "type": "boolean"
+    },
+    "relish": {
+      "$ref": "#/$defs/BuildInfo",
+      "description": "The build of `relish` that answered."
+    },
+    "schema": {
+      "$ref": "#/$defs/SchemaVersion",
+      "description": "Always `relish.agent/v1`."
+    }
+  },
+  "required": [
+    "schema",
+    "command",
+    "ok",
+    "relish"
+  ],
+  "title": "Envelope",
+  "type": "object"
+}
