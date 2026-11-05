@@ -8,7 +8,8 @@ another sends it chasing the wrong problem. `relish agent` is the family of
 commands built for it.
 
 This chapter grows through 0.2.7 as the commands arrive (#1090). Today it has
-the contract every one of them follows, and the first two commands.
+the contract every one of them follows, `version`, `schema`, and the commands
+that read the source this binary was built from.
 
 ## The contract
 
@@ -41,8 +42,9 @@ An answer looks like this (one line on stdout, spread out here):
 }
 ```
 
-- `relish` says which build answered. `dirty` and `source_digest` are `null`
-  until the binary carries its own source bundle, later in 0.2.7.
+- `relish` says which build answered: its version, commit, whether the
+  source it carries had uncommitted changes (`dirty`), and that source's
+  `sha256:` digest. A value the build doesn't know is `null`.
 - `data` is the answer. Its shape depends on the command; `relish agent
   schema` prints it.
 - `next` lists commands worth running next. Each has `run` (the command line),
@@ -126,5 +128,90 @@ command's `data`; name a command to get only its schema:
 relish agent schema version
 ```
 
-The commands that read the cluster (`context`, `diagnose`, `logs`) and the
-source this binary was built from (`source`) come next.
+The commands that read the cluster (`context`, `diagnose`, `logs`) come next.
+
+## Reading the source
+
+`relish` carries the source it was built from: the code, the build files, the
+tests and the book, about 950 files. `relish agent source` lets an agent read
+it without a checkout, and without guessing which version of the code it
+should be reading. Paths are always repository-relative, such as
+`src/relish/client.rs`, the same in the bundle, on GitHub and in an extracted
+copy.
+
+`version` says what the bundle is and whether the cluster runs it:
+
+```sh
+relish agent source version
+```
+
+`data` has the version, commit, `dirty`, digest, target and file count, plus
+`cluster`: each node that's up, the version and commit its `bun` reports, and
+whether that commit is this binary's. When a node runs another commit, every
+`source` command carries a warning that starts with `source_mismatch:`, names
+the node and links to GitHub's tree at the node's commit. That's the code the
+node actually runs. When no cluster answers, `cluster.state` is `unreachable`
+and the command still answers: the source is still this binary's.
+
+Asking the nodes costs at most two seconds per request. `--offline` skips it,
+which is what you want in CI or on a laptop with no cluster:
+
+```sh
+relish agent source version --offline
+```
+
+`tree` lists files with their size and line count. Give it a path to list only
+what's under it, and `--depth` to roll deeper levels up into one entry per
+directory:
+
+```sh
+relish agent source tree src/relish --depth 1
+```
+
+`grep` searches with a regular expression (the
+[regex crate's syntax](https://docs.rs/regex/1/regex/#syntax)), line by line:
+
+```sh
+relish agent source grep 'fn classify_error' --path 'src/relish/**' --context 3
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--path` | every file | A glob the path must match: `*` within a segment, `**` across them, e.g. `'src/bun/**'`. A glob without `/` matches file names |
+| `--context` | `2` | Lines before and after each match, at most 20 |
+| `--max-matches` | `50` | Matches to return, at most 1000; `total_matches` says how many there were |
+| `-i`, `--ignore-case` | off | Ignore case |
+
+A line longer than 400 bytes is cut. A pattern that doesn't parse is a `usage`
+failure whose hint links the syntax.
+
+`show` prints up to 400 numbered lines of one file, with the `fn`, `impl`,
+`trait` or `mod` the first line sits inside:
+
+```sh
+relish agent source show src/relish/client.rs:340-400
+```
+
+Leave the range off for the start of the file. A path that isn't in the bundle
+is a `not_found` failure whose hint names the closest paths.
+
+When the build is clean and knows its commit, `grep` matches and `show` ranges
+carry a `url`: a GitHub permalink to those lines at that commit. A `dirty`
+build has no `url`, because GitHub doesn't have its changes.
+
+`extract` writes the whole bundle into a new or empty directory:
+
+```sh
+relish agent source extract ./reliaburger-src --offline
+```
+
+The directory gets a `.reliaburger-source.json` stamp (version, commit,
+`dirty`, digest) and, when git is installed, becomes a git repository with
+everything in one commit, so `git diff` shows exactly what the agent changed.
+`data.git.state` is `committed`, or `skipped` with a reason. A directory with
+anything in it is a `conflict` failure; `extract` never overwrites. The tree
+builds on its own with `cargo build --locked --bins`, and its tests run with
+`make test`.
+
+On a development build, the source is the checkout the binary was built in, as
+it is now, and `data.origin` in `version` says so. Release builds embed it.

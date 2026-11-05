@@ -7,8 +7,6 @@
 //! file content on the right, `/` for fuzzy search across paths and text.
 //! `relish source ebpf` opens with the query pre-seeded.
 
-use std::path::Path;
-
 use super::RelishError;
 use super::reader::{self, Document};
 use super::source_bundle::{self, SourceFile};
@@ -46,18 +44,6 @@ fn document(file: SourceFile) -> Option<Document> {
 /// `relish source [query]` — open the reader, optionally mid-search.
 pub async fn run(query: Option<String>) -> Result<(), RelishError> {
     reader::run("files", documents()?, query).await
-}
-
-/// `relish source --extract <dir>` — write the embedded tree into a new or
-/// empty directory. CI builds the result to prove the bundle is complete.
-pub fn extract(dir: &Path) -> Result<(), RelishError> {
-    let written = source_bundle::extract(dir)?;
-    println!(
-        "wrote {written} files (sha256 {}) to {}",
-        source_bundle::digest()?,
-        dir.display()
-    );
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

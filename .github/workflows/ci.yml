@@ -239,7 +239,7 @@ jobs:
       - name: Test the source bundle as relish embeds it
         run: cargo test --locked --lib --features embed-source relish::source
       - name: Extract the embedded source into an empty directory
-        run: target/debug/relish source --extract "$RUNNER_TEMP/source-bundle" | tee "$RUNNER_TEMP/first-extract.txt"
+        run: target/debug/relish agent source extract "$RUNNER_TEMP/source-bundle" --offline | tee "$RUNNER_TEMP/first-extract.json"
       # Both builds have the same package id, so drop the crate's own
       # artefacts: nothing of the checkout's build can stand in for it.
       - name: Build every binary from the extracted source alone
@@ -251,10 +251,10 @@ jobs:
           cargo build --locked --bins --features embed-source
       - name: The rebuilt relish carries the same source, digest for digest
         run: |
-          target/debug/relish source --extract "$RUNNER_TEMP/source-again" | tee "$RUNNER_TEMP/second-extract.txt"
-          first=$(grep -o 'sha256 [0-9a-f]*' "$RUNNER_TEMP/first-extract.txt")
-          second=$(grep -o 'sha256 [0-9a-f]*' "$RUNNER_TEMP/second-extract.txt")
-          test -n "$first" && test "$first" = "$second"
+          target/debug/relish agent source extract "$RUNNER_TEMP/source-again" --offline | tee "$RUNNER_TEMP/second-extract.json"
+          first=$(jq -r .data.digest "$RUNNER_TEMP/first-extract.json")
+          second=$(jq -r .data.digest "$RUNNER_TEMP/second-extract.json")
+          test "$first" != null && test -n "$first" && test "$first" = "$second"
 
   portable:
     outputs:

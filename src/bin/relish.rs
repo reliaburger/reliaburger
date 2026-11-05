@@ -958,11 +958,6 @@ enum Command {
     Source {
         /// Open with this search query pre-seeded (e.g. "ebpf").
         query: Option<String>,
-        /// Write the embedded source tree into this new or empty directory
-        /// instead. CI builds the result (#1570); `relish agent source
-        /// extract` (#1571) is the documented way.
-        #[arg(long, hide = true, value_name = "DIR", conflicts_with = "query")]
-        extract: Option<PathBuf>,
     },
     /// Remove the CLI, its PATH link, the managed Lima tools and the image cache.
     Uninstall {
@@ -1856,7 +1851,7 @@ async fn main() -> ExitCode {
     reliaburger::relish::client::set_cli_ca_cert(cli.ca_cert.clone());
     let endpoint = reliaburger::relish::client::set_cli_endpoint(cli.endpoint.clone());
     if let Some(Command::Agent(options)) = &cli.command {
-        return run_agent(options, endpoint.err());
+        return run_agent(options, endpoint.err()).await;
     }
     if let Err(reason) = endpoint {
         eprintln!("error: {reason}");
@@ -2692,11 +2687,7 @@ async fn main() -> ExitCode {
             None if web => reliaburger::relish::manual::web::serve(port).await,
             None => reliaburger::relish::manual::run(chapter.as_deref()).await,
         },
-        Command::Source {
-            extract: Some(ref dir),
-            ..
-        } => reliaburger::relish::source::extract(dir),
-        Command::Source { query, .. } => reliaburger::relish::source::run(query).await,
+        Command::Source { query } => reliaburger::relish::source::run(query).await,
         Command::Uninstall { yes } => reliaburger::relish::uninstall::run(yes).map_err(Into::into),
         Command::Local {
             action,
@@ -2897,7 +2888,7 @@ async fn main() -> ExitCode {
         }
         // Handled before the endpoint check above, so an invalid endpoint
         // still answers with an envelope; this arm only keeps the match whole.
-        Command::Agent(options) => return run_agent(&options, None),
+        Command::Agent(options) => return run_agent(&options, None).await,
     };
 
     finish(result)
@@ -3036,7 +3027,7 @@ fn parse_failure(error: clap::Error) -> ExitCode {
 
 /// Run a `relish agent` command. `endpoint_error` is why `--endpoint` or
 /// `RELIABURGER_ENDPOINT` was refused, when it was.
-fn run_agent(
+async fn run_agent(
     options: &reliaburger::relish::agent::AgentOptions,
     endpoint_error: Option<reliaburger::relish::client::EndpointError>,
 ) -> ExitCode {
@@ -3051,7 +3042,7 @@ fn run_agent(
             options.max_bytes,
             &rerun,
         ),
-        None => agent::run(options, &rerun),
+        None => agent::run(options, &rerun).await,
     };
     print_agent(rendered)
 }
@@ -5326,23 +5317,13 @@ mod tests {
     #[test]
     fn parse_source_without_query() {
         let cli = parse(&["relish", "source"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Source {
-                query: None,
-                extract: None
-            }
-        ));
+        assert!(matches!(cli.command, Command::Source { query: None }));
     }
 
     #[test]
-    fn parse_source_extract_takes_a_directory_and_no_query() {
-        let cli = parse(&["relish", "source", "--extract", "/tmp/source"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Source { query: None, extract: Some(ref dir) } if dir.to_str() == Some("/tmp/source")
-        ));
-        assert!(parse(&["relish", "source", "ebpf", "--extract", "/tmp/source"]).is_err());
+    fn source_has_no_hidden_extract_flag() {
+        // Extraction moved to `relish agent source extract` (#1571).
+        assert!(parse(&["relish", "source", "--extract", "/tmp/source"]).is_err());
     }
 
     #[test]

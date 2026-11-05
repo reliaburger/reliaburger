@@ -511,11 +511,13 @@ class TrainAndQueueTests(unittest.TestCase):
         job = self.jobs["source-bundle"]
         blocks = steps(job)
         build = next(index for index, step in enumerate(blocks) if "cargo build --locked --bin relish --features embed-source" in step)
-        extract = next(index for index, step in enumerate(blocks) if "relish source --extract" in step)
+        extract = next(index for index, step in enumerate(blocks) if "relish agent source extract" in step)
         rebuild = next(index for index, step in enumerate(blocks) if "cargo build --locked --bins" in step)
         self.assertLess(build, extract)
         self.assertLess(extract, rebuild)
         self.assertIn('"$RUNNER_TEMP/source-bundle"', blocks[extract])
+        # Extraction never asks a cluster: the runner has none (#1571).
+        self.assertIn("--offline", blocks[extract])
         self.assertIn("working-directory: ${{ runner.temp }}/source-bundle", blocks[rebuild])
         # The extracted tree packs its own bundle, and nothing of the
         # checkout's build of the crate stands in for it.
@@ -523,6 +525,9 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertIn("cargo clean --package reliaburger", blocks[rebuild])
         compare = next(index for index, step in enumerate(blocks) if "source-again" in step)
         self.assertLess(rebuild, compare)
+        # The digest comes from the agent envelope, not from scraping text.
+        self.assertIn("jq -r .data.digest", blocks[compare])
+        self.assertIn("--offline", blocks[compare])
         self.assertIn('test "$first" = "$second"', blocks[compare])
         # It restores a cache without competing to save one.
         self.assertIn("save-if: false", job)
