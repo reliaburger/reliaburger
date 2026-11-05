@@ -102,6 +102,24 @@ done
 for vm in "${vms[@]}"; do limactl start "$vm" >"$work/lima-$vm.log" 2>&1 & done
 wait
 
+# On the Mac Studio (macOS 27.2, Ubuntu 24.04 guests) some VMs boot with
+# systemd-logind spinning on epoll without reading, so every later ssh login
+# hangs in pam_systemd and drops (5 November 2026, 2 of 8 VMs). That's the
+# guest, not relish: replace a spinning logind and say so in the record.
+# limactl shell rides Lima's existing control connection, so it still gets in.
+guest_notes=()
+for vm in "${vms[@]}"; do
+    # CPU ticks logind used over two seconds; 100 a second is one whole core.
+    used=$(limactl shell "$vm" bash -c 'p=$(pidof systemd-logind) || exit 0
+        a=$(awk "{print \$14+\$15}" /proc/$p/stat); sleep 2
+        b=$(awk "{print \$14+\$15}" /proc/$p/stat); echo $((b - a))' 2>/dev/null || echo 0)
+    if [[ ${used:-0} -gt 150 ]]; then
+        limactl shell "$vm" bash -c 'sudo kill -9 "$(pidof systemd-logind)"; sleep 2
+            sudo systemctl start systemd-logind' >/dev/null 2>&1 || true
+        guest_notes+=("$vm: systemd-logind was spinning ($used of 200 ticks in 2 s); the harness replaced it before setup")
+    fi
+done
+
 targets=()
 addresses=()
 for vm in "${vms[@]}"; do
@@ -210,6 +228,10 @@ verdict=PASS
     printf '| Setup options | `%s` |\n\n' "${setup_options[*]:-none}"
     printf '| Step | Result | Detail |\n|---|---|---|\n'
     printf '%s\n' "${results[@]}"
+    if [[ ${#guest_notes[@]} -gt 0 ]]; then
+        printf '\n## Guest repairs\n\n'
+        printf -- '- %s\n' "${guest_notes[@]}"
+    fi
     printf '\n## Setup\n\n```\n'
     sed 's/[[:cntrl:]]\[[0-9;]*m//g' "$work/setup.log"
     printf '```\n'
