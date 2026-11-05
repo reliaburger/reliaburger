@@ -159,7 +159,11 @@ pub fn format_change(running: Option<Compatibility>, release: &Release) -> Optio
 }
 
 /// `relish upgrade check`: compare what the nodes run with the latest release.
-pub async fn check(client: &BunClient, url: &str) -> Result<(), RelishError> {
+pub async fn check(
+    client: &BunClient,
+    url: &str,
+    output: super::OutputFormat,
+) -> Result<(), RelishError> {
     let metadata = metadata::fetch(url).await?;
     let running = client.version().await?;
     let topology = topology(client.upgrade_cluster().await)?;
@@ -168,48 +172,114 @@ pub async fn check(client: &BunClient, url: &str) -> Result<(), RelishError> {
         .version
         .parse()
         .map_err(|e: crate::upgrade::UpgradeError| RelishError::FormatFailed(e.to_string()))?;
-    print!(
-        "{}",
-        render_check(
+    super::output::print_output(
+        &assess_check(
             &running_version,
             running.compatibility,
             &metadata,
-            &platforms
-        )
-    );
-    Ok(())
+            &platforms,
+        ),
+        output,
+    )
 }
 
+/// What `relish upgrade check` found.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UpgradeCheck {
+    /// The version the connected node runs.
+    pub running: String,
+    /// The newest release the metadata names.
+    pub latest: String,
+    /// What can be done about it.
+    pub verdict: CheckVerdict,
+    /// Why the verdict isn't `available`, in a sentence; `null` otherwise.
+    pub detail: Option<String>,
+    /// The command that starts the upgrade, when one is available.
+    pub command: Option<String>,
+}
+
+/// The answer of `relish upgrade check`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckVerdict {
+    /// The nodes already run the latest release, or a newer build.
+    UpToDate,
+    /// `relish upgrade start` can roll the latest release out.
+    Available,
+    /// The latest release changes the cluster formats: start a fresh cluster.
+    NeedsFreshCluster,
+    /// A newer release exists but can't be rolled out here: the metadata
+    /// lists no artefacts for it, or none for a node's platform.
+    Unavailable,
+}
+
+impl std::fmt::Display for UpgradeCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "running: {}\nlatest:  {}", self.running, self.latest)?;
+        match (self.verdict, &self.detail, &self.command) {
+            (CheckVerdict::UpToDate, _, _) => writeln!(f, "up to date"),
+            (CheckVerdict::Available, _, Some(command)) => {
+                writeln!(f, "upgrade available: {command}")
+            }
+            (_, Some(detail), _) => writeln!(f, "{detail}"),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn assess_check(
+    running: &BinaryVersion,
+    running_formats: Option<Compatibility>,
+    metadata: &ReleaseMetadata,
+    nodes: &[NodePlatform],
+) -> UpgradeCheck {
+    let latest = &metadata.latest;
+    let answer = |verdict, detail: Option<String>, command: Option<String>| UpgradeCheck {
+        running: running.to_string(),
+        latest: latest.to_string(),
+        verdict,
+        detail,
+        command,
+    };
+    if running >= latest {
+        return answer(CheckVerdict::UpToDate, None, None);
+    }
+    let Some(release) = metadata.release(latest) else {
+        return answer(
+            CheckVerdict::Unavailable,
+            Some(format!(
+                "the release metadata names {latest} but lists no artefacts for it"
+            )),
+            None,
+        );
+    };
+    if let Some(change) = format_change(running_formats, release) {
+        return answer(CheckVerdict::NeedsFreshCluster, Some(change), None);
+    }
+    match artefacts_for_nodes(release, nodes) {
+        Ok(_) => answer(
+            CheckVerdict::Available,
+            None,
+            Some(format!(
+                "relish upgrade start {latest} --external-key <your key>"
+            )),
+        ),
+        Err(e) => answer(
+            CheckVerdict::Unavailable,
+            Some(format!("a newer version exists, but {e}")),
+            None,
+        ),
+    }
+}
+
+#[cfg(test)]
 fn render_check(
     running: &BinaryVersion,
     running_formats: Option<Compatibility>,
     metadata: &ReleaseMetadata,
     nodes: &[NodePlatform],
 ) -> String {
-    let latest = &metadata.latest;
-    let mut out = format!("running: {running}\nlatest:  {latest}\n");
-    if running >= latest {
-        out.push_str("up to date\n");
-        return out;
-    }
-    let Some(release) = metadata.release(latest) else {
-        out.push_str(&format!(
-            "the release metadata names {latest} but lists no artefacts for it\n"
-        ));
-        return out;
-    };
-    if let Some(change) = format_change(running_formats, release) {
-        out.push_str(&change);
-        out.push('\n');
-        return out;
-    }
-    match artefacts_for_nodes(release, nodes) {
-        Ok(_) => out.push_str(&format!(
-            "upgrade available: relish upgrade start {latest} --external-key <your key>\n"
-        )),
-        Err(e) => out.push_str(&format!("a newer version exists, but {e}\n")),
-    }
-    out
+    assess_check(running, running_formats, metadata, nodes).to_string()
 }
 
 /// Arguments for `relish upgrade start`.
@@ -641,6 +711,7 @@ pub async fn plan(
     version: &str,
     cluster_size: Option<usize>,
     parallel: u32,
+    output: super::OutputFormat,
 ) -> Result<(), RelishError> {
     let (workers, council, leader) = match cluster_size {
         Some(size) => hypothetical_roles(size),
@@ -658,10 +729,10 @@ pub async fn plan(
             Err(_) => (0, 0, 1),
         },
     };
-    print!(
-        "{}",
-        render_plan(version, workers, council, leader, parallel)
-    );
+    super::output::print_output(
+        &UpgradePlan::new(version, workers, council, leader, parallel),
+        output,
+    )?;
     Ok(())
 }
 
@@ -717,6 +788,121 @@ pub async fn abort(client: &BunClient) -> Result<(), RelishError> {
 // Rendering (pure, snapshot-tested)
 // ---------------------------------------------------------------------------
 
+/// `relish upgrade plan`: the rolling order and an estimate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UpgradePlan {
+    /// The target version, as typed.
+    pub version: String,
+    /// Nodes the plan covers.
+    pub nodes: usize,
+    /// Workers upgraded at once.
+    pub parallel: usize,
+    /// The stages, in order: workers, then council members, then the leader.
+    pub stages: Vec<PlanStage>,
+    /// Estimated seconds for the whole roll, at `seconds_per_node`.
+    pub estimated_secs: u64,
+    /// The assumed time for one node to swap and verify.
+    pub seconds_per_node: u64,
+}
+
+/// One stage of an [`UpgradePlan`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlanStage {
+    /// Which nodes move in this stage.
+    pub role: PlanRole,
+    /// How many of them.
+    pub nodes: usize,
+    /// In how many batches: workers go up to `parallel` at a time, council
+    /// members and the leader one at a time.
+    pub batches: usize,
+}
+
+/// The nodes a [`PlanStage`] moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanRole {
+    Workers,
+    Council,
+    Leader,
+}
+
+impl UpgradePlan {
+    fn new(version: &str, workers: usize, council: usize, leader: usize, parallel: u32) -> Self {
+        let parallel = parallel.max(1) as usize;
+        let mut stages = Vec::new();
+        if workers > 0 {
+            stages.push(PlanStage {
+                role: PlanRole::Workers,
+                nodes: workers,
+                batches: workers.div_ceil(parallel),
+            });
+        }
+        if council > 0 {
+            stages.push(PlanStage {
+                role: PlanRole::Council,
+                nodes: council,
+                batches: council,
+            });
+        }
+        if leader > 0 {
+            // The leader always upgrades last, in place (openraft 0.9 can't
+            // gracefully hand off; a >=3-node council keeps quorum through
+            // the sub-second exec bounce).
+            stages.push(PlanStage {
+                role: PlanRole::Leader,
+                nodes: 1,
+                batches: 1,
+            });
+        }
+        let batches: usize = stages.iter().map(|stage| stage.batches).sum();
+        Self {
+            version: version.to_string(),
+            nodes: workers + council + leader,
+            parallel,
+            stages,
+            estimated_secs: batches as u64 * SECONDS_PER_NODE,
+            seconds_per_node: SECONDS_PER_NODE,
+        }
+    }
+}
+
+impl std::fmt::Display for UpgradePlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "upgrade plan to {} ({} node(s))",
+            self.version, self.nodes
+        )?;
+        for (index, stage) in self.stages.iter().enumerate() {
+            let step = index + 1;
+            match stage.role {
+                PlanRole::Workers => writeln!(
+                    f,
+                    "  {step}. workers: {} node(s) in {} batch(es) of up to {}",
+                    stage.nodes, stage.batches, self.parallel
+                )?,
+                PlanRole::Council => writeln!(
+                    f,
+                    "  {step}. council members: {} node(s), strictly one at a time",
+                    stage.nodes
+                )?,
+                PlanRole::Leader => writeln!(f, "  {step}. the leader, in place (last)")?,
+            }
+        }
+        writeln!(
+            f,
+            "estimated duration: ~{} min (assuming {}s per node)",
+            self.estimated_secs.div_ceil(60),
+            self.seconds_per_node
+        )?;
+        writeln!(
+            f,
+            "workloads keep running throughout (adoption across exec)"
+        )
+    }
+}
+
+#[cfg(test)]
 fn render_plan(
     version: &str,
     workers: usize,
@@ -724,47 +910,7 @@ fn render_plan(
     leader: usize,
     parallel: u32,
 ) -> String {
-    // Writing to a String never fails.
-    use std::fmt::Write as _;
-
-    let parallel = parallel.max(1) as usize;
-    let mut out = String::new();
-    let total = workers + council + leader;
-    let _ = writeln!(out, "upgrade plan to {version} ({total} node(s))");
-
-    let mut step = 1;
-    let mut estimate = 0u64;
-    if workers > 0 {
-        let batches = workers.div_ceil(parallel);
-        let _ = writeln!(
-            out,
-            "  {step}. workers: {workers} node(s) in {batches} batch(es) of up to {parallel}"
-        );
-        estimate += batches as u64 * SECONDS_PER_NODE;
-        step += 1;
-    }
-    if council > 0 {
-        let _ = writeln!(
-            out,
-            "  {step}. council members: {council} node(s), strictly one at a time"
-        );
-        estimate += council as u64 * SECONDS_PER_NODE;
-        step += 1;
-    }
-    if leader > 0 {
-        // The leader always upgrades last, in place (openraft 0.9 can't
-        // gracefully hand off; a >=3-node council keeps quorum through the
-        // sub-second exec bounce).
-        let _ = writeln!(out, "  {step}. the leader, in place (last)");
-        estimate += SECONDS_PER_NODE;
-    }
-    let _ = writeln!(
-        out,
-        "estimated duration: ~{} min (assuming {SECONDS_PER_NODE}s per node)",
-        estimate.div_ceil(60)
-    );
-    out.push_str("workloads keep running throughout (adoption across exec)\n");
-    out
+    UpgradePlan::new(version, workers, council, leader, parallel).to_string()
 }
 
 fn render_cluster_status(cluster: &serde_json::Value) -> String {
@@ -1504,6 +1650,64 @@ mod tests {
         assert!(
             same.contains("upgrade available: relish upgrade start v0.2.0"),
             "{same}"
+        );
+    }
+
+    /// #1566: `relish upgrade check -o json` gives a verdict a script can
+    /// branch on, not a sentence to parse.
+    #[test]
+    fn check_as_json_gives_a_verdict_and_the_command() {
+        let running: BinaryVersion = "v0.1.6".parse().unwrap();
+        let formats = Compatibility {
+            protocol: 51,
+            state: 68,
+        };
+        let available = assess_check(
+            &running,
+            Some(formats),
+            &release_fixture(Some(formats)),
+            &[on("a", "linux-x86_64")],
+        );
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(&available, crate::relish::OutputFormat::Json)
+                .unwrap()
+        );
+
+        let missing = assess_check(
+            &running,
+            Some(formats),
+            &release_fixture(Some(formats)),
+            &[on("m", "macos-aarch64")],
+        );
+        assert_eq!(missing.verdict, CheckVerdict::Unavailable);
+        assert!(
+            missing.detail.as_deref().unwrap_or("").contains("node m"),
+            "{missing:?}"
+        );
+        assert_eq!(missing.command, None);
+
+        let current: BinaryVersion = "v0.2.0".parse().unwrap();
+        let up_to_date = assess_check(
+            &current,
+            Some(formats),
+            &release_fixture(Some(formats)),
+            &[on("a", "linux-x86_64")],
+        );
+        assert_eq!(up_to_date.verdict, CheckVerdict::UpToDate);
+        assert_eq!(
+            up_to_date.to_string(),
+            "running: v0.2.0\nlatest:  v0.2.0\nup to date\n"
+        );
+    }
+
+    #[test]
+    fn plan_as_json_lists_the_stages_in_order() {
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(
+                &UpgradePlan::new("v0.2.0", 5, 2, 1, 2),
+                crate::relish::OutputFormat::Json
+            )
+            .unwrap()
         );
     }
 

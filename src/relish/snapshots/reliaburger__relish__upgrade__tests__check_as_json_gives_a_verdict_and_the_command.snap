@@ -1,0 +1,11 @@
+---
+source: src/relish/upgrade.rs
+expression: "crate::relish::output::format_output(&available,\ncrate::relish::OutputFormat::Json).unwrap()"
+---
+{
+  "running": "v0.1.6",
+  "latest": "v0.2.0",
+  "verdict": "available",
+  "detail": null,
+  "command": "relish upgrade start v0.2.0 --external-key <your key>"
+}

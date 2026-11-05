@@ -10,7 +10,7 @@ use crate::config::Config;
 
 use super::RelishError;
 use super::client::BunClient;
-use super::output::{OutputFormat, format_output};
+use super::output::{OutputFormat, format_output, print_output};
 use super::plan::generate_plan;
 
 use crate::bun::agent::CouncilStatus;
@@ -265,9 +265,113 @@ pub struct LogFlags {
 }
 
 /// Stream logs from an app or job.
-pub async fn logs(name: &str, namespace: &str, flags: LogFlags) -> Result<(), RelishError> {
+///
+/// With `-o json`, each line is one JSON object on its own line (`at`,
+/// `node`, `instance`, `stream`, `text`); with `-o yaml`, one list of them.
+pub async fn logs(
+    name: &str,
+    namespace: &str,
+    flags: LogFlags,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    if flags.follow && output != OutputFormat::Human {
+        return Err(RelishError::InvalidFlag {
+            flag: "follow".to_string(),
+            reason: "can't be combined with --output json or yaml yet: a followed stream \
+                     doesn't say when, or on which stream, each line was written"
+                .to_string(),
+        });
+    }
     let options = build_log_options(flags, unix_now())?;
-    logs_with_client(name, namespace, &options, &BunClient::default_local()).await
+    logs_with_client(
+        name,
+        namespace,
+        &options,
+        output,
+        &BunClient::default_local(),
+    )
+    .await
+}
+
+/// One log line as `relish logs -o json` prints it. A field the source
+/// didn't record is `null`: the agent's own capture, the fallback when the
+/// log store has nothing, records only the text.
+#[derive(Debug, serde::Serialize)]
+pub struct LogRecord<'a> {
+    /// When the line was stored, RFC 3339 in UTC, to the second.
+    pub at: Option<String>,
+    /// The node that stored the line.
+    pub node: Option<&'a str>,
+    /// The instance that wrote it.
+    pub instance: Option<&'a str>,
+    /// `stdout` or `stderr`.
+    pub stream: Option<&'static str>,
+    /// The line itself, without its newline.
+    pub text: &'a str,
+}
+
+/// The records behind `lines`, oldest first.
+pub fn log_records(lines: &super::client::LogLines) -> Vec<LogRecord<'_>> {
+    match lines {
+        super::client::LogLines::Stored(entries) => entries
+            .iter()
+            .map(|entry| LogRecord {
+                at: rfc3339(entry.timestamp),
+                node: entry.node.as_deref(),
+                instance: entry.instance.as_deref(),
+                stream: Some(entry.stream.as_str()),
+                text: &entry.line,
+            })
+            .collect(),
+        super::client::LogLines::Captured(lines) => lines
+            .iter()
+            .map(|line| LogRecord {
+                at: None,
+                node: None,
+                instance: None,
+                stream: None,
+                text: line,
+            })
+            .collect(),
+    }
+}
+
+/// `seconds` since the Unix epoch as RFC 3339 in UTC, if it's a real time.
+fn rfc3339(seconds: u64) -> Option<String> {
+    let seconds = i64::try_from(seconds).ok()?;
+    time::OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()?
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
+}
+
+/// `lines` as `relish logs` prints them in `output`: the plain lines for
+/// people, JSON Lines for `json`, one YAML list for `yaml`. Empty when there
+/// are no lines.
+pub fn render_logs(
+    lines: &super::client::LogLines,
+    output: OutputFormat,
+) -> Result<String, RelishError> {
+    match output {
+        OutputFormat::Human => Ok(lines.render()),
+        OutputFormat::Json => {
+            let mut out = Vec::new();
+            for record in log_records(lines) {
+                out.push(serde_json::to_string(&record).map_err(RelishError::SerialiseJson)?);
+            }
+            Ok(out.join("\n"))
+        }
+        OutputFormat::Yaml => {
+            let records = log_records(lines);
+            if records.is_empty() {
+                return Ok(String::new());
+            }
+            Ok(yaml_serde::to_string(&records)
+                .map_err(RelishError::SerialiseYaml)?
+                .trim_end()
+                .to_string())
+        }
+    }
 }
 
 /// Translate the CLI flags into [`LogOptions`], validating as we go.
@@ -410,9 +514,14 @@ async fn logs_with_client(
     name: &str,
     namespace: &str,
     options: &super::client::LogOptions,
+    output: OutputFormat,
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    let log_output = client.logs(name, namespace, options).await?;
+    let log_output = if output == OutputFormat::Human {
+        client.logs(name, namespace, options).await?
+    } else {
+        render_logs(&client.log_lines(name, namespace, options).await?, output)?
+    };
     if !log_output.is_empty() {
         println!("{log_output}");
     }
@@ -847,14 +956,17 @@ pub async fn release(app: &str, namespace: &str) -> Result<(), RelishError> {
 }
 
 /// Show every instance of an app across the cluster, with its node.
-pub async fn inspect(name: &str) -> Result<(), RelishError> {
-    inspect_with_client(name, &BunClient::default_local()).await
+pub async fn inspect(name: &str, output: OutputFormat) -> Result<(), RelishError> {
+    inspect_with_client(name, output, &BunClient::default_local()).await
 }
 
-async fn inspect_with_client(name: &str, client: &BunClient) -> Result<(), RelishError> {
+async fn inspect_with_client(
+    name: &str,
+    output: OutputFormat,
+    client: &BunClient,
+) -> Result<(), RelishError> {
     let inspection = super::inspect::collect(client, name).await?;
-    print!("{}", super::inspect::render(&inspection));
-    Ok(())
+    print_output(&inspection, output)
 }
 
 /// Security mode written by [`init_with_security`] into the generated node
@@ -1644,31 +1756,40 @@ impl std::fmt::Display for ResolvedService {
 }
 
 /// Show ingress routing table.
-pub async fn routes() -> Result<(), RelishError> {
-    routes_with_client(&BunClient::default_local()).await
+pub async fn routes(output: OutputFormat) -> Result<(), RelishError> {
+    routes_with_client(output, &BunClient::default_local()).await
 }
 
-async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
-    let routes = client.routes().await?;
+async fn routes_with_client(output: OutputFormat, client: &BunClient) -> Result<(), RelishError> {
+    print_output(&RouteTable(client.routes().await?), output)
+}
 
-    if routes.is_empty() {
-        println!("no ingress routes configured");
-    } else {
-        println!(
+/// The ingress routing table; as JSON, the list of routes.
+#[derive(Debug, serde::Serialize)]
+#[serde(transparent)]
+struct RouteTable(Vec<crate::wrapper::types::RouteInfo>);
+
+impl std::fmt::Display for RouteTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return writeln!(f, "no ingress routes configured");
+        }
+        writeln!(
+            f,
             "{:<30} {:<10} {:<15} {:<12} {:<6}",
             "HOST", "PATH", "APP", "BACKENDS", "WS"
-        );
-        for r in &routes {
+        )?;
+        for r in &self.0 {
             let backends = format!("{}/{}", r.healthy_backends, r.total_backends);
             let ws = if r.websocket { "yes" } else { "no" };
-            println!(
+            writeln!(
+                f,
                 "{:<30} {:<10} {:<15} {:<12} {:<6}",
                 r.host, r.path, r.app_name, backends, ws
-            );
+            )?;
         }
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// Trigger a rolling deploy from a config file.
@@ -1852,27 +1973,86 @@ fn render_history_table(
 
 /// Rollback an app to the previous version. A GitOps-managed app needs
 /// `force`.
-pub async fn rollback(app: &str, namespace: &str, force: bool) -> Result<(), RelishError> {
+pub async fn rollback(
+    app: &str,
+    namespace: &str,
+    force: bool,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     client.health().await?;
     // X3: rollback used to only print advice. It now calls the server,
     // which redeploys the previous successful spec.
     client.rollback_with_force(app, namespace, force).await?;
-    println!("rolled {app} back to its previous version");
-    Ok(())
+    print_output(
+        &Rollback {
+            app,
+            namespace,
+            forced: force,
+        },
+        output,
+    )
+}
+
+/// A rollback the cluster accepted: it redeploys the app's previous
+/// successful version.
+#[derive(Debug, serde::Serialize)]
+struct Rollback<'a> {
+    app: &'a str,
+    namespace: &'a str,
+    /// `--force` took the app back from GitOps for this rollback.
+    forced: bool,
+}
+
+impl std::fmt::Display for Rollback<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "rolled {} back to its previous version", self.app)
+    }
 }
 
 /// Validate a config file without deploying.
-pub fn lint(path: &Path) -> Result<(), RelishError> {
-    let config = load_config_file(path)?;
-    config.validate()?;
-    for warning in config.warnings() {
+///
+/// Warnings go to stderr whatever the format, and also into the JSON and
+/// YAML report.
+pub fn lint(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
+    let report = lint_report(path)?;
+    for warning in &report.warnings {
         eprintln!("warning: {warning}");
     }
+    print_output(&report, output)
+}
 
-    // Count resources
-    let app_count = config.app.len();
-    let job_count = config.job.len();
+/// What `relish lint` found in a config that passed validation.
+#[derive(Debug, serde::Serialize)]
+pub struct LintReport {
+    /// Apps the config declares.
+    pub apps: usize,
+    /// Jobs the config declares.
+    pub jobs: usize,
+    /// Things that are allowed but probably not meant.
+    pub warnings: Vec<String>,
+}
+
+impl std::fmt::Display for LintReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "config valid: {} app(s), {} job(s)",
+            self.apps, self.jobs
+        )
+    }
+}
+
+/// Validate the config at `path` and collect its warnings. An invalid
+/// config is an error, not a report.
+fn lint_report(path: &Path) -> Result<LintReport, RelishError> {
+    let config = load_config_file(path)?;
+    config.validate()?;
+    let mut warnings: Vec<String> = config
+        .warnings()
+        .into_iter()
+        .map(|warning| warning.to_string())
+        .collect();
 
     // Validate run_before references
     for (name, job) in &config.job {
@@ -1882,15 +2062,18 @@ pub fn lint(path: &Path) -> Result<(), RelishError> {
                 .keys()
                 .any(|app_name| format!("app.{app_name}") == *target);
             if !target_exists {
-                eprintln!(
-                    "warning: job {name} has run_before target {target:?} which doesn't exist in this config"
-                );
+                warnings.push(format!(
+                    "job {name} has run_before target {target:?} which doesn't exist in this config"
+                ));
             }
         }
     }
 
-    println!("config valid: {app_count} app(s), {job_count} job(s)");
-    Ok(())
+    Ok(LintReport {
+        apps: config.app.len(),
+        jobs: config.job.len(),
+        warnings,
+    })
 }
 
 /// Compile a config file or directory into a single resolved config.
@@ -4458,7 +4641,7 @@ mod tests {
     #[test]
     fn local_config_commands_accept_kubernetes_yaml() {
         let file = write_temp_config(K8S_DEPLOYMENT);
-        lint(file.path()).unwrap();
+        lint(file.path(), OutputFormat::Human).unwrap();
         diff(file.path(), None).unwrap();
         compile(file.path()).unwrap();
         let config = load_config_file(file.path()).unwrap();
@@ -5114,9 +5297,15 @@ spec:
     #[tokio::test]
     async fn logs_returns_agent_unreachable() {
         let options = super::super::client::LogOptions::default();
-        let err = logs_with_client("web", "default", &options, &bogus_client())
-            .await
-            .unwrap_err();
+        let err = logs_with_client(
+            "web",
+            "default",
+            &options,
+            OutputFormat::Human,
+            &bogus_client(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));
     }
 
@@ -5321,7 +5510,7 @@ spec:
 
     #[tokio::test]
     async fn inspect_returns_agent_unreachable() {
-        let err = inspect_with_client("web", &bogus_client())
+        let err = inspect_with_client("web", OutputFormat::Human, &bogus_client())
             .await
             .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));
@@ -5352,7 +5541,7 @@ spec:
             port = 8080
         "#,
         );
-        lint(f.path()).unwrap();
+        lint(f.path(), OutputFormat::Human).unwrap();
     }
 
     #[test]
@@ -5363,14 +5552,163 @@ spec:
             replicas = 3
         "#,
         );
-        let result = lint(f.path());
+        let result = lint(f.path(), OutputFormat::Human);
         assert!(result.is_err());
     }
 
     #[test]
     fn lint_missing_file() {
-        let result = lint(Path::new("/nonexistent/config.toml"));
+        let result = lint(Path::new("/nonexistent/config.toml"), OutputFormat::Human);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn lint_as_json_counts_the_resources_and_carries_the_warnings() {
+        let f = write_temp_config(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+            port = 8080
+
+            [app.worker]
+            exec = "/usr/bin/python3"
+            command = ["worker.py"]
+            [[app.worker.init]]
+            command = ["echo", "hi"]
+
+            [job.migrate]
+            image = "myapp:v1"
+        "#,
+        );
+        let report = lint_report(f.path()).unwrap();
+        insta::assert_snapshot!(format_output(&report, OutputFormat::Json).unwrap());
+        assert_eq!(report.to_string(), "config valid: 2 app(s), 1 job(s)\n");
+    }
+
+    #[test]
+    fn a_rollback_as_json_names_the_app() {
+        let rollback = Rollback {
+            app: "web",
+            namespace: "default",
+            forced: false,
+        };
+        insta::assert_snapshot!(
+            format_output(&rollback, OutputFormat::Json).unwrap(),
+            @r#"
+        {
+          "app": "web",
+          "namespace": "default",
+          "forced": false
+        }
+        "#
+        );
+        assert_eq!(
+            rollback.to_string(),
+            "rolled web back to its previous version\n"
+        );
+    }
+
+    #[test]
+    fn routes_as_json_are_the_list_of_routes() {
+        let routes = RouteTable(vec![crate::wrapper::types::RouteInfo {
+            host: "shop.example.com".to_string(),
+            path: "/".to_string(),
+            app_name: "web".to_string(),
+            namespace: "default".to_string(),
+            healthy_backends: 2,
+            total_backends: 3,
+            websocket: true,
+        }]);
+        insta::assert_snapshot!(format_output(&routes, OutputFormat::Json).unwrap());
+        assert_eq!(
+            RouteTable(Vec::new()).to_string(),
+            "no ingress routes configured\n"
+        );
+    }
+
+    fn stored_line(
+        timestamp: u64,
+        node: &str,
+        instance: &str,
+        stream: crate::ketchup::types::LogStream,
+        line: &str,
+    ) -> crate::ketchup::types::LogEntry {
+        crate::ketchup::types::LogEntry {
+            timestamp,
+            sequence: timestamp * 1_000_000_000,
+            instance: Some(instance.to_string()),
+            node: Some(node.to_string()),
+            stream,
+            line: line.to_string(),
+        }
+    }
+
+    /// #1566: `relish logs -o json` is JSON Lines, one object per log line,
+    /// each saying when, where and on which stream it was written.
+    #[test]
+    fn logs_as_json_are_one_object_per_line() {
+        use crate::ketchup::types::LogStream;
+        let lines = super::super::client::LogLines::Stored(vec![
+            stored_line(
+                1_790_000_000,
+                "node-1",
+                "default__web-0",
+                LogStream::Stdout,
+                "listening on :8080",
+            ),
+            stored_line(
+                1_790_000_001,
+                "node-2",
+                "default__web-1",
+                LogStream::Stderr,
+                r#"{"level":"error","msg":"no \"db\""}"#,
+            ),
+        ]);
+        insta::assert_snapshot!(render_logs(&lines, OutputFormat::Json).unwrap());
+        for line in render_logs(&lines, OutputFormat::Json).unwrap().lines() {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(record["text"].is_string(), "{line}");
+        }
+    }
+
+    /// The agent's own capture records only the text, so the other fields
+    /// are `null` rather than guessed.
+    #[test]
+    fn captured_logs_as_json_leave_what_the_capture_lacks_null() {
+        let lines = super::super::client::LogLines::Captured(vec!["hello".to_string()]);
+        assert_eq!(
+            render_logs(&lines, OutputFormat::Json).unwrap(),
+            r#"{"at":null,"node":null,"instance":null,"stream":null,"text":"hello"}"#
+        );
+        let empty = super::super::client::LogLines::Captured(Vec::new());
+        assert_eq!(render_logs(&empty, OutputFormat::Json).unwrap(), "");
+        assert_eq!(render_logs(&empty, OutputFormat::Yaml).unwrap(), "");
+    }
+
+    #[test]
+    fn logs_as_yaml_are_one_list() {
+        use crate::ketchup::types::LogStream;
+        let lines = super::super::client::LogLines::Stored(vec![stored_line(
+            1_790_000_000,
+            "node-1",
+            "default__web-0",
+            LogStream::Stdout,
+            "ready",
+        )]);
+        insta::assert_snapshot!(render_logs(&lines, OutputFormat::Yaml).unwrap());
+    }
+
+    #[tokio::test]
+    async fn following_logs_as_json_is_refused_until_the_stream_says_where_lines_came_from() {
+        let flags = LogFlags {
+            follow: true,
+            ..LogFlags::default()
+        };
+        let error = logs("web", "default", flags, OutputFormat::Json)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--output json or yaml"), "{error}");
     }
 
     // --- relish sign ---
@@ -5741,7 +6079,7 @@ mod task_array_tests {
                 format!("[job.cleanup]\nimage = 'cleanup:v1'\n{policy}\n"),
             )
             .unwrap();
-            assert!(lint(file.path()).is_err(), "{policy}");
+            assert!(lint(file.path(), OutputFormat::Human).is_err(), "{policy}");
         }
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
@@ -5749,7 +6087,7 @@ mod task_array_tests {
             "[job.cleanup]\nimage = 'cleanup:v1'\nschedule = '@daily'\nmax_attempts = 2\ntask_timeout_secs = 300\noverlap = 'allow'\nreplay_unknown = true\n",
         )
         .unwrap();
-        lint(file.path()).unwrap();
+        lint(file.path(), OutputFormat::Human).unwrap();
     }
 
     fn run() -> TaskArrayRun {

@@ -2160,18 +2160,91 @@ first parse. So `main` now asks before dispatching:
 
 ```rust
 fn output_refusal(command: &Command, output: OutputFormat) -> Option<String> {
-    if output == OutputFormat::Human || honours_output(command) {
-        return None;
+    let format = match output {
+        OutputFormat::Human => return None,
+        OutputFormat::Json => "json",
+        OutputFormat::Yaml => "yaml",
+    };
+    match output_support(command) {
+        OutputSupport::Structured => None,
+        OutputSupport::Interactive => Some(format!(
+            "this command is interactive, so it has no {format} output; drop --output (or -o)"
+        )),
+        OutputSupport::HumanOnly => Some(format!(
+            "this command has no {format} output yet; drop --output (or -o)"
+        )),
     }
-    // ... "this command has no json output; drop --output (or -o)"
 }
 ```
 
-`honours_output` is one `match` over every `Command` variant, with no `_`
+`output_support` is one `match` over every `Command` variant, with no `_`
 arm. That's deliberate: add a command and the compiler refuses to build until
 you've said whether it prints JSON. A refusal exits 2, the usage-error code,
 since asking a command for output it doesn't have is a usage error. The flag
 also gained the short form the manual had been documenting all along, `-o`.
+
+The first version of that `match` returned a `bool`, and `false` covered two
+different things: `relish tui`, which takes over the terminal and has nothing
+to print as data, and `relish inspect`, which just hadn't been given a shape.
+For 0.2.7, the release that makes `relish` friendly to LLM agents, that
+difference matters, so the answer became a three-way enum and `inspect`,
+`logs`, `routes`, `rollback`, `lint`, `fault`, `upgrade check`, `upgrade plan`
+and `local` moved to `Structured` (#1566).
+
+Each one follows the pattern `status` and `events` already used: a small
+struct that derives `Serialize` for the data and implements `Display` for the
+table, handed to the one shared `format_output`. Where the data already
+existed, the struct is a *newtype*, a one-field tuple struct like
+`struct RouteTable(Vec<RouteInfo>)`. In Rust you can't implement a trait you
+didn't define (`Display`) for a type you didn't define (`Vec`): that's the
+*orphan rule*, which stops two crates giving the same type two conflicting
+implementations. Wrapping the `Vec` in a local type gets round it at no
+runtime cost, and `#[serde(transparent)]` makes the wrapper serialise as
+whatever it wraps, so the JSON is a plain list.
+
+`relish inspect` needed more thought. Its `Inspection` holds
+`desired: Result<Vec<DesiredAppEvidence>, String>`, and serde's default
+encoding of a `Result` is `{"Ok": [...]}` or `{"Err": "..."}`, which is
+Rust leaking into a wire format. So `Inspection` implements `Serialize` by
+hand, building a borrowed view on the fly:
+
+```rust
+#[derive(serde::Serialize)]
+#[serde(tag = "answer", rename_all = "snake_case")]
+enum NodeJson<'a> {
+    Answered { node: &'a str, instances: Vec<&'a InstanceStatus> },
+    Silent { node: &'a str, reason: &'a str },
+    Down { node: &'a str, state: &'a str },
+}
+```
+
+The `'a` is a *lifetime parameter*: it says every `&str` in a `NodeJson`
+borrows from something that lives at least as long as the view does, here the
+`Inspection` being serialised. Nothing is copied, and the compiler checks
+that the view can't outlive the data it points into. `tag = "answer"` makes
+serde write the variant's name as a field, `{"answer": "silent", "node":
+"node-2", "reason": "..."}`, which is the shape a reader in any language
+expects.
+
+`relish logs -o json` is JSON Lines, one object per log line with `at`,
+`node`, `instance`, `stream` and `text`, so an agent can filter on fields
+instead of on the `[instance]` labels people see. The client used to turn the
+store's entries into text before anyone could ask for anything else; it now
+returns a `LogLines` enum, `Stored` entries with their metadata or `Captured`
+plain lines from the agent's own fallback, and rendering happens last. A
+captured line's `at`, `node` and `stream` are `null`, because the capture
+never recorded them, and making them up would be worse than saying so. A
+followed stream (`-f`) refuses `-o json` for the same reason: each line
+arrives as text prefixed with `[node instance]` and nothing else.
+
+A `match` that the compiler checks stops a new command forgetting to decide,
+but not from deciding "human only" without anyone noticing. So a test walks
+clap's own command tree, every subcommand down to the leaves, invents values
+for the arguments each one requires, parses the line, and asks
+`output_support`. Every command that answers anything but `Structured` has to
+appear in a written list, `NO_JSON`, with the reason it's there. Adding a
+human-only command means editing that list in the same change, where a
+reviewer sees it.
 
 Adding `relish events` and one flag broke every parser test on Linux CI with
 a stack overflow, while macOS passed. Clap's derive writes one function,

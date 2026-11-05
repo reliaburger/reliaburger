@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use super::RelishError;
 use super::client::BunClient;
+use super::output::{OutputFormat, print_output};
 use crate::smoker::types::{FaultRequest, FaultSummary, FaultType};
 
 /// Default fault duration when --duration is omitted.
@@ -188,6 +189,7 @@ pub async fn delay(
     from: Option<&str>,
     duration: &Option<String>,
     targeting: &FaultTargeting,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let delay_ns = parse_delay_ns(delay_str)?;
     let jitter_ns = match jitter {
@@ -204,7 +206,7 @@ pub async fn delay(
         get_duration(duration)?,
         targeting,
     );
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
 /// Inject a drop fault.
@@ -213,6 +215,7 @@ pub async fn drop_fault(
     percentage_str: &str,
     duration: &Option<String>,
     targeting: &FaultTargeting,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let probability = parse_percentage(percentage_str)?;
     let request = make_request(
@@ -221,7 +224,7 @@ pub async fn drop_fault(
         get_duration(duration)?,
         targeting,
     );
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
 /// Inject a DNS fault. Only `nxdomain` is supported; an unknown type is
@@ -231,6 +234,7 @@ pub async fn dns(
     fault_type: &str,
     duration: &Option<String>,
     targeting: &FaultTargeting,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     if !fault_type.eq_ignore_ascii_case("nxdomain") {
         return Err(RelishError::ApiError {
@@ -244,7 +248,7 @@ pub async fn dns(
         get_duration(duration)?,
         targeting,
     );
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
 /// Inject a partition fault.
@@ -253,6 +257,7 @@ pub async fn partition(
     from: Option<&str>,
     duration: &Option<String>,
     targeting: &FaultTargeting,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let request = make_request(
         FaultType::Partition {
@@ -262,7 +267,7 @@ pub async fn partition(
         get_duration(duration)?,
         targeting,
     );
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
 /// Inject a bandwidth fault.
@@ -271,6 +276,7 @@ pub async fn bandwidth(
     limit_str: &str,
     duration: &Option<String>,
     targeting: &FaultTargeting,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let bytes_per_sec = parse_bandwidth(limit_str)?;
     let request = make_request(
@@ -279,7 +285,7 @@ pub async fn bandwidth(
         get_duration(duration)?,
         targeting,
     );
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
 /// Inject a CPU stress fault.
@@ -289,6 +295,7 @@ pub async fn cpu(
     cores: Option<u32>,
     duration: &Option<String>,
     targeting: &FaultTargeting,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let percentage = parse_percentage(percentage_str)?;
     let request = make_request(
@@ -297,7 +304,7 @@ pub async fn cpu(
         get_duration(duration)?,
         targeting,
     );
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
 /// Inject a memory pressure fault.
@@ -306,6 +313,7 @@ pub async fn memory(
     value: &str,
     duration: &Option<String>,
     targeting: &FaultTargeting,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let request = make_request(
         FaultType::MemoryPressure {
@@ -315,7 +323,7 @@ pub async fn memory(
         get_duration(duration)?,
         targeting,
     );
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
 /// Inject a disk I/O throttle fault.
@@ -325,6 +333,7 @@ pub async fn disk_io(
     write_only: bool,
     duration: &Option<String>,
     targeting: &FaultTargeting,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let bytes_per_sec = parse_bandwidth(limit_str)?;
     let request = make_request(
@@ -336,11 +345,16 @@ pub async fn disk_io(
         get_duration(duration)?,
         targeting,
     );
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
 /// Kill instances of a service.
-pub async fn kill(target: &str, count: u32, targeting: &FaultTargeting) -> Result<(), RelishError> {
+pub async fn kill(
+    target: &str,
+    count: u32,
+    targeting: &FaultTargeting,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     // Kill is instantaneous.
     let request = make_request(
         FaultType::Kill { count },
@@ -348,7 +362,7 @@ pub async fn kill(target: &str, count: u32, targeting: &FaultTargeting) -> Resul
         Duration::from_secs(0),
         targeting,
     );
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
 /// Pause (freeze) instances of a service.
@@ -356,6 +370,7 @@ pub async fn pause(
     target: &str,
     duration: &Option<String>,
     targeting: &FaultTargeting,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let request = make_request(
         FaultType::Pause,
@@ -363,18 +378,22 @@ pub async fn pause(
         get_duration(duration)?,
         targeting,
     );
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
 /// Resume (unfreeze) previously paused instances of a service.
-pub async fn resume(target: &str, targeting: &FaultTargeting) -> Result<(), RelishError> {
+pub async fn resume(
+    target: &str,
+    targeting: &FaultTargeting,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let request = make_request(
         FaultType::Resume,
         target.into(),
         Duration::from_secs(0),
         targeting,
     );
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
 /// Simulate graceful node departure.
@@ -385,6 +404,7 @@ pub async fn node_drain(
     reason: Option<&str>,
     override_safety: bool,
     acknowledged: bool,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let targeting = FaultTargeting {
         node: Some(target.into()),
@@ -400,10 +420,11 @@ pub async fn node_drain(
     );
     request.include_leader = include_leader;
     request.acknowledged = acknowledged;
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
 /// Simulate abrupt node failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn node_kill(
     target: &str,
     duration: &Option<String>,
@@ -412,6 +433,7 @@ pub async fn node_kill(
     reason: Option<&str>,
     override_safety: bool,
     acknowledged: bool,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let targeting = FaultTargeting {
         node: Some(target.into()),
@@ -427,7 +449,7 @@ pub async fn node_kill(
     );
     request.include_leader = include_leader;
     request.acknowledged = acknowledged;
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
 /// Consume bounded CPU and memory capacity on one node.
@@ -441,6 +463,7 @@ pub async fn node_pressure(
     reason: Option<&str>,
     override_safety: bool,
     acknowledged: bool,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let cpu_percentage = parse_percentage(cpu)?;
     let memory_percentage = parse_percentage(memory)?;
@@ -461,18 +484,29 @@ pub async fn node_pressure(
     );
     request.include_leader = include_leader;
     request.acknowledged = acknowledged;
-    inject_and_print(&request).await
+    inject_and_print(&request, output).await
 }
 
-/// List every node's active faults.
-pub async fn list() -> Result<(), RelishError> {
+/// List every node's active faults. Warnings name the nodes whose faults
+/// couldn't be read: on stderr, and in the JSON and YAML too.
+pub async fn list(output: OutputFormat) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let listing = client.list_cluster_faults().await?;
     for warning in &listing.warnings {
         eprintln!("warning: {warning}");
     }
-    print!("{}", render_fault_list(&listing.faults));
-    Ok(())
+    print_output(&FaultList(listing), output)
+}
+
+/// `relish fault list`: the table for people, `{faults, warnings}` as data.
+#[derive(Debug, serde::Serialize)]
+#[serde(transparent)]
+struct FaultList(crate::bun::api::ClusterFaultList);
+
+impl std::fmt::Display for FaultList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&render_fault_list(&self.0.faults))
+    }
 }
 
 /// The `relish fault list` table.
@@ -545,6 +579,7 @@ pub async fn clear(
     namespace: Option<&str>,
     node: Option<&str>,
     acknowledged: bool,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let msg = match target {
@@ -570,16 +605,32 @@ pub async fn clear(
             Err(_) => client.clear_faults_by_service(&arg, namespace).await?,
         },
     };
-    println!("{msg}");
-    Ok(())
+    print_output(&Cleared { message: msg }, output)
+}
+
+/// What the node said it cleared.
+#[derive(Debug, serde::Serialize)]
+struct Cleared {
+    message: String,
+}
+
+impl std::fmt::Display for Cleared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.message)
+    }
 }
 
 /// Run a scripted chaos scenario from a TOML file.
+///
+/// For people it narrates each step as it goes. As JSON or YAML it stays
+/// quiet until the end, then prints one report of every step (or, with
+/// `--dry-run`, the timeline it would run).
 pub async fn scenario(
     path: &std::path::Path,
     dry_run: bool,
     speed: f64,
     acknowledged: bool,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     use crate::smoker::scenario;
 
@@ -587,91 +638,258 @@ pub async fn scenario(
     let timeline = scenario::build_timeline(&s, speed)?;
 
     if dry_run {
-        scenario::print_dry_run(&s, &timeline);
-        return Ok(());
+        if output == OutputFormat::Human {
+            scenario::print_dry_run(&s, &timeline);
+            return Ok(());
+        }
+        return print_output(&ScenarioPlan::new(&s.name, &timeline), output);
     }
 
-    println!("Executing scenario: {}", s.name);
+    let narrate = output == OutputFormat::Human;
+    if narrate {
+        println!("Executing scenario: {}", s.name);
+    }
     let client = BunClient::default_local();
-    run_scenario(timeline, acknowledged, |request| {
+    let run = run_scenario(timeline, acknowledged, narrate, |request| {
         let client = &client;
         async move { client.inject_fault(&request).await }
     })
-    .await
+    .await;
+    if !narrate {
+        print_output(
+            &ScenarioReport {
+                name: &s.name,
+                run: &run,
+                complete: run.verdict().is_ok(),
+            },
+            output,
+        )?;
+    }
+    run.verdict()
 }
 
-/// Inject each step of a validated timeline at its activation time.
+/// A scenario's timeline as `relish fault scenario --dry-run -o json`
+/// prints it.
+#[derive(Debug, serde::Serialize)]
+struct ScenarioPlan<'a> {
+    name: &'a str,
+    steps: Vec<PlannedStep<'a>>,
+}
+
+/// One step of a [`ScenarioPlan`].
+#[derive(Debug, serde::Serialize)]
+struct PlannedStep<'a> {
+    /// Seconds after the start, at the chosen speed.
+    at_secs: f64,
+    description: &'a str,
+    fault: &'a str,
+    target: &'a str,
+    value: &'a str,
+    /// How long the fault lasts; `null` means until the scenario ends.
+    duration: Option<&'a str>,
+}
+
+impl<'a> ScenarioPlan<'a> {
+    fn new(name: &'a str, timeline: &'a [crate::smoker::scenario::TimelineEntry]) -> Self {
+        Self {
+            name,
+            steps: timeline
+                .iter()
+                .map(|entry| PlannedStep {
+                    at_secs: entry.activation.as_secs_f64(),
+                    description: &entry.step.description,
+                    fault: &entry.step.fault,
+                    target: &entry.step.target,
+                    value: &entry.step.value,
+                    duration: entry.step.duration.as_deref(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl std::fmt::Display for ScenarioPlan<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // People get `print_dry_run`; this keeps the type printable.
+        writeln!(f, "Scenario: {} ({} steps)", self.name, self.steps.len())
+    }
+}
+
+/// What happened to each step of a scenario run.
+#[derive(Debug, serde::Serialize)]
+struct ScenarioRun {
+    steps: Vec<StepResult>,
+    /// Seconds from the first step to the last answer.
+    elapsed_secs: f64,
+}
+
+/// One step of a [`ScenarioRun`].
+#[derive(Debug, serde::Serialize)]
+struct StepResult {
+    /// From 1, in timeline order.
+    step: usize,
+    /// Seconds after the start when it was sent.
+    at_secs: f64,
+    description: String,
+    fault: String,
+    target: String,
+    value: String,
+    #[serde(flatten)]
+    outcome: StepOutcome,
+}
+
+/// Whether a step's fault went in.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum StepOutcome {
+    /// The node activated it, as `relish fault list` would show it.
+    Injected { summary: FaultSummary },
+    /// The node refused it, or couldn't be asked.
+    Failed { error: String },
+}
+
+impl ScenarioRun {
+    /// An error naming every failed step, so a script or CI job sees a
+    /// non-zero exit instead of "complete".
+    fn verdict(&self) -> Result<(), RelishError> {
+        let failed: Vec<String> = self
+            .steps
+            .iter()
+            .filter(|step| matches!(step.outcome, StepOutcome::Failed { .. }))
+            .map(|step| format!("step {} ({:?})", step.step, step.description))
+            .collect();
+        if failed.is_empty() {
+            return Ok(());
+        }
+        Err(RelishError::Scenario(format!(
+            "{} of {} steps failed: {}",
+            failed.len(),
+            self.steps.len(),
+            failed.join(", ")
+        )))
+    }
+}
+
+/// `relish fault scenario -o json`: the scenario's name and its run.
+#[derive(Debug, serde::Serialize)]
+struct ScenarioReport<'a> {
+    name: &'a str,
+    #[serde(flatten)]
+    run: &'a ScenarioRun,
+    /// Every step's fault went in.
+    complete: bool,
+}
+
+impl std::fmt::Display for ScenarioReport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // People get the narration as the run goes; this keeps the type
+        // printable.
+        writeln!(f, "Scenario {}: {} steps", self.name, self.run.steps.len())
+    }
+}
+
+/// Inject each step of a validated timeline at its activation time,
+/// narrating on stdout when `narrate` is set.
 ///
 /// A refused or failed step doesn't stop the steps after it, since the
-/// scenario's timeline still matters, but the run then ends in an error,
-/// so a script or CI job sees a non-zero exit instead of "complete".
+/// scenario's timeline still matters; [`ScenarioRun::verdict`] then fails.
 async fn run_scenario<F, Fut>(
     timeline: Vec<crate::smoker::scenario::TimelineEntry>,
     acknowledged: bool,
+    narrate: bool,
     mut inject: F,
-) -> Result<(), RelishError>
+) -> ScenarioRun
 where
     F: FnMut(FaultRequest) -> Fut,
     Fut: std::future::Future<Output = Result<FaultSummary, RelishError>>,
 {
     let start = std::time::Instant::now();
     let total = timeline.len();
-    let mut failed = Vec::new();
+    let mut steps = Vec::with_capacity(total);
 
     for (index, entry) in timeline.into_iter().enumerate() {
         let elapsed = start.elapsed();
         if entry.activation > elapsed {
             let wait = entry.activation - elapsed;
-            println!("  Waiting {:?} for next step...", wait);
+            if narrate {
+                println!("  Waiting {:?} for next step...", wait);
+            }
             tokio::time::sleep(wait).await;
         }
 
-        println!(
-            "  T+{:.0}s: {} -- {} {} {}",
-            start.elapsed().as_secs_f64(),
-            entry.step.description,
-            entry.step.fault,
-            entry.step.target,
-            entry.step.value,
-        );
+        let at_secs = start.elapsed().as_secs_f64();
+        if narrate {
+            println!(
+                "  T+{at_secs:.0}s: {} -- {} {} {}",
+                entry.step.description, entry.step.fault, entry.step.target, entry.step.value,
+            );
+        }
 
         let mut request = entry.request;
         request.acknowledged = acknowledged;
-        match inject(request).await {
+        let outcome = match inject(request).await {
             Ok(summary) => {
-                println!(
-                    "    -> injected (id: {}, expires in {}s)",
-                    summary.id, summary.remaining_secs
-                );
+                if narrate {
+                    println!(
+                        "    -> injected (id: {}, expires in {}s)",
+                        summary.id, summary.remaining_secs
+                    );
+                }
+                StepOutcome::Injected { summary }
             }
             Err(e) => {
-                println!("    -> FAILED: {e}");
-                failed.push(format!("step {} ({:?})", index + 1, entry.step.description));
+                if narrate {
+                    println!("    -> FAILED: {e}");
+                }
+                StepOutcome::Failed {
+                    error: e.to_string(),
+                }
             }
+        };
+        steps.push(StepResult {
+            step: index + 1,
+            at_secs,
+            description: entry.step.description,
+            fault: entry.step.fault,
+            target: entry.step.target,
+            value: entry.step.value,
+            outcome,
+        });
+    }
+
+    let run = ScenarioRun {
+        steps,
+        elapsed_secs: start.elapsed().as_secs_f64(),
+    };
+    if narrate {
+        println!();
+        if run.verdict().is_ok() {
+            println!(
+                "Scenario complete: {total} steps in {:.1}s",
+                run.elapsed_secs
+            );
         }
     }
-
-    println!();
-    if !failed.is_empty() {
-        return Err(RelishError::Scenario(format!(
-            "{} of {total} steps failed: {}",
-            failed.len(),
-            failed.join(", ")
-        )));
-    }
-    println!(
-        "Scenario complete: {total} steps in {:.1}s",
-        start.elapsed().as_secs_f64()
-    );
-    Ok(())
+    run
 }
 
-/// Submit a fault request and print the result.
-async fn inject_and_print(request: &FaultRequest) -> Result<(), RelishError> {
+/// Submit a fault request and print the faults it created.
+async fn inject_and_print(request: &FaultRequest, output: OutputFormat) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let summary = client.inject_fault(request).await?;
-    print!("{}", render_injection(&summary));
-    Ok(())
+    print_output(&Injection(summary), output)
+}
+
+/// `relish fault <type>`: a line per fault for people; as data, the fault
+/// with any it created on other nodes under `routed`.
+#[derive(Debug, serde::Serialize)]
+#[serde(transparent)]
+struct Injection(FaultSummary);
+
+impl std::fmt::Display for Injection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&render_injection(&self.0))
+    }
 }
 
 /// One line per fault a request created; a routed workload fault can create
@@ -744,7 +962,7 @@ mod tests {
     #[tokio::test]
     async fn scenario_exits_non_zero_when_a_step_is_refused() {
         let mut sent = Vec::new();
-        let result = run_scenario(two_step_timeline(), true, |request: FaultRequest| {
+        let run = run_scenario(two_step_timeline(), true, true, |request: FaultRequest| {
             sent.push(request.acknowledged);
             let refused = matches!(request.fault_type, FaultType::Kill { .. });
             async move {
@@ -760,7 +978,7 @@ mod tests {
         })
         .await;
 
-        let error = result.unwrap_err().to_string();
+        let error = run.verdict().unwrap_err().to_string();
         assert!(error.contains("1 of 2 steps failed"), "{error}");
         assert!(error.contains("kill a replica"), "{error}");
         assert_eq!(sent, [true, true], "a refusal still runs the later steps");
@@ -768,11 +986,93 @@ mod tests {
 
     #[tokio::test]
     async fn scenario_succeeds_when_every_step_is_injected() {
-        let result = run_scenario(two_step_timeline(), false, |_request| async {
+        let run = run_scenario(two_step_timeline(), false, true, |_request| async {
             Ok(summary(7, "node-1", "web"))
         })
         .await;
-        assert!(result.is_ok());
+        assert!(run.verdict().is_ok());
+    }
+
+    /// `-o json` reports every step, the refused one with its error, once
+    /// the run ends. Times vary, so the snapshot zeroes them.
+    #[tokio::test]
+    async fn a_scenario_run_as_json_reports_each_step_and_its_outcome() {
+        let mut run = run_scenario(two_step_timeline(), true, false, |request: FaultRequest| {
+            let refused = matches!(request.fault_type, FaultType::Kill { .. });
+            async move {
+                if refused {
+                    Err(RelishError::ApiError {
+                        status: 400,
+                        body: "replica minimum".to_string(),
+                    })
+                } else {
+                    Ok(summary(7, "node-1", "web"))
+                }
+            }
+        })
+        .await;
+        run.elapsed_secs = 0.0;
+        for step in &mut run.steps {
+            step.at_secs = 0.0;
+        }
+        let report = ScenarioReport {
+            name: "refusal",
+            run: &run,
+            complete: run.verdict().is_ok(),
+        };
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(&report, OutputFormat::Json).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_scenario_dry_run_as_json_lists_the_timeline() {
+        let timeline = two_step_timeline();
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(
+                &ScenarioPlan::new("refusal", &timeline),
+                OutputFormat::Json
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_routed_injection_as_json_nests_the_other_nodes_faults() {
+        let mut first = summary(1, "node-1", "web");
+        first.routed = vec![summary(3, "node-2", "web")];
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(&Injection(first), OutputFormat::Json).unwrap()
+        );
+    }
+
+    #[test]
+    fn fault_list_as_json_carries_the_faults_and_the_warnings() {
+        let listing = crate::bun::api::ClusterFaultList {
+            faults: vec![summary(1, "node-1", "web")],
+            warnings: vec!["node-3 did not answer".to_string()],
+        };
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(&FaultList(listing), OutputFormat::Json).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_cleared_fault_as_json_carries_the_nodes_message() {
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(
+                &Cleared {
+                    message: "cleared 2 fault(s)".to_string()
+                },
+                OutputFormat::Json
+            )
+            .unwrap(),
+            @r#"
+        {
+          "message": "cleared 2 fault(s)"
+        }
+        "#
+        );
     }
 
     #[test]
@@ -973,9 +1273,15 @@ mod tests {
     /// is validated before any request is built.
     #[tokio::test]
     async fn dns_rejects_an_unknown_fault_type() {
-        let error = dns("redis", "banana", &None, &FaultTargeting::default())
-            .await
-            .unwrap_err();
+        let error = dns(
+            "redis",
+            "banana",
+            &None,
+            &FaultTargeting::default(),
+            OutputFormat::Human,
+        )
+        .await
+        .unwrap_err();
         match error {
             RelishError::ApiError { body, .. } => {
                 assert!(body.contains("banana"), "{body}");

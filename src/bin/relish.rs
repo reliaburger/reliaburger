@@ -1904,6 +1904,7 @@ async fn main() -> ExitCode {
                     stream: stream.clone(),
                     json_field: json_field.clone(),
                 },
+                cli.output,
             )
             .await
         }
@@ -1938,7 +1939,7 @@ async fn main() -> ExitCode {
             ref command,
             ref namespace,
         } => return finish_outcome(commands::exec(app, command, namespace).await),
-        Command::Inspect { ref name } => commands::inspect(name).await,
+        Command::Inspect { ref name } => commands::inspect(name, cli.output).await,
         Command::Stop {
             ref app,
             ref namespace,
@@ -2029,7 +2030,7 @@ async fn main() -> ExitCode {
             ref name,
             ref namespace,
         } => commands::resolve(name, namespace.as_deref(), cli.output).await,
-        Command::Routes => commands::routes().await,
+        Command::Routes => commands::routes(cli.output).await,
         Command::Snapshot { ref action } => match action {
             SnapshotAction::Create {
                 app,
@@ -2114,6 +2115,7 @@ async fn main() -> ExitCode {
                     from.as_deref(),
                     duration,
                     targeting,
+                    cli.output,
                 )
                 .await
             }
@@ -2123,30 +2125,46 @@ async fn main() -> ExitCode {
                 duration,
                 targeting,
             } => {
-                reliaburger::relish::fault::drop_fault(target, percentage, duration, targeting)
-                    .await
+                reliaburger::relish::fault::drop_fault(
+                    target, percentage, duration, targeting, cli.output,
+                )
+                .await
             }
             FaultAction::Dns {
                 target,
                 fault_type,
                 duration,
                 targeting,
-            } => reliaburger::relish::fault::dns(target, fault_type, duration, targeting).await,
+            } => {
+                reliaburger::relish::fault::dns(target, fault_type, duration, targeting, cli.output)
+                    .await
+            }
             FaultAction::Partition {
                 target,
                 from,
                 duration,
                 targeting,
             } => {
-                reliaburger::relish::fault::partition(target, from.as_deref(), duration, targeting)
-                    .await
+                reliaburger::relish::fault::partition(
+                    target,
+                    from.as_deref(),
+                    duration,
+                    targeting,
+                    cli.output,
+                )
+                .await
             }
             FaultAction::Bandwidth {
                 target,
                 limit,
                 duration,
                 targeting,
-            } => reliaburger::relish::fault::bandwidth(target, limit, duration, targeting).await,
+            } => {
+                reliaburger::relish::fault::bandwidth(
+                    target, limit, duration, targeting, cli.output,
+                )
+                .await
+            }
             FaultAction::Cpu(options) => {
                 let FaultCpuArgs {
                     target,
@@ -2155,15 +2173,20 @@ async fn main() -> ExitCode {
                     duration,
                     targeting,
                 } = &**options;
-                reliaburger::relish::fault::cpu(target, percentage, *cores, duration, targeting)
-                    .await
+                reliaburger::relish::fault::cpu(
+                    target, percentage, *cores, duration, targeting, cli.output,
+                )
+                .await
             }
             FaultAction::Memory {
                 target,
                 value,
                 duration,
                 targeting,
-            } => reliaburger::relish::fault::memory(target, value, duration, targeting).await,
+            } => {
+                reliaburger::relish::fault::memory(target, value, duration, targeting, cli.output)
+                    .await
+            }
             FaultAction::DiskIo(options) => {
                 let FaultDiskIoArgs {
                     target,
@@ -2172,21 +2195,28 @@ async fn main() -> ExitCode {
                     duration,
                     targeting,
                 } = &**options;
-                reliaburger::relish::fault::disk_io(target, limit, *write_only, duration, targeting)
-                    .await
+                reliaburger::relish::fault::disk_io(
+                    target,
+                    limit,
+                    *write_only,
+                    duration,
+                    targeting,
+                    cli.output,
+                )
+                .await
             }
             FaultAction::Kill {
                 target,
                 count,
                 targeting,
-            } => reliaburger::relish::fault::kill(target, *count, targeting).await,
+            } => reliaburger::relish::fault::kill(target, *count, targeting, cli.output).await,
             FaultAction::Pause {
                 target,
                 duration,
                 targeting,
-            } => reliaburger::relish::fault::pause(target, duration, targeting).await,
+            } => reliaburger::relish::fault::pause(target, duration, targeting, cli.output).await,
             FaultAction::Resume { target, targeting } => {
-                reliaburger::relish::fault::resume(target, targeting).await
+                reliaburger::relish::fault::resume(target, targeting, cli.output).await
             }
             FaultAction::NodeDrain(options) => {
                 let FaultNodeDrainArgs {
@@ -2204,6 +2234,7 @@ async fn main() -> ExitCode {
                     reason.as_deref(),
                     *override_safety,
                     *acknowledge,
+                    cli.output,
                 )
                 .await
             }
@@ -2225,6 +2256,7 @@ async fn main() -> ExitCode {
                     reason.as_deref(),
                     *override_safety,
                     *acknowledge,
+                    cli.output,
                 )
                 .await
             }
@@ -2248,10 +2280,11 @@ async fn main() -> ExitCode {
                     reason.as_deref(),
                     *override_safety,
                     *acknowledge,
+                    cli.output,
                 )
                 .await
             }
-            FaultAction::List => reliaburger::relish::fault::list().await,
+            FaultAction::List => reliaburger::relish::fault::list(cli.output).await,
             FaultAction::Clear {
                 target,
                 namespace,
@@ -2263,6 +2296,7 @@ async fn main() -> ExitCode {
                     namespace.as_deref(),
                     node.as_deref(),
                     *acknowledge,
+                    cli.output,
                 )
                 .await
             }
@@ -2271,7 +2305,16 @@ async fn main() -> ExitCode {
                 dry_run,
                 speed,
                 acknowledge,
-            } => reliaburger::relish::fault::scenario(path, *dry_run, *speed, *acknowledge).await,
+            } => {
+                reliaburger::relish::fault::scenario(
+                    path,
+                    *dry_run,
+                    *speed,
+                    *acknowledge,
+                    cli.output,
+                )
+                .await
+            }
         },
         Command::Deploy { ref path, dry_run } => commands::deploy(path, cli.output, dry_run).await,
         Command::CancelDeploy { ref operation_id } => {
@@ -2285,8 +2328,8 @@ async fn main() -> ExitCode {
             ref app,
             ref namespace,
             force,
-        } => commands::rollback(app, namespace, force).await,
-        Command::Lint { ref path } => commands::lint(path),
+        } => commands::rollback(app, namespace, force, cli.output).await,
+        Command::Lint { ref path } => commands::lint(path, cli.output),
         Command::Compile { ref path } => commands::compile(path),
         Command::Diff {
             ref path_a,
@@ -2622,7 +2665,7 @@ async fn main() -> ExitCode {
             let client = reliaburger::relish::client::BunClient::default_local();
             match action {
                 UpgradeAction::Check { url } => {
-                    reliaburger::relish::upgrade::check(&client, &url).await
+                    reliaburger::relish::upgrade::check(&client, &url, cli.output).await
                 }
                 UpgradeAction::Start {
                     version,
@@ -2656,8 +2699,14 @@ async fn main() -> ExitCode {
                     cluster_size,
                     parallel,
                 } => {
-                    reliaburger::relish::upgrade::plan(&client, &version, cluster_size, parallel)
-                        .await
+                    reliaburger::relish::upgrade::plan(
+                        &client,
+                        &version,
+                        cluster_size,
+                        parallel,
+                        cli.output,
+                    )
+                    .await
                 }
                 UpgradeAction::Status => reliaburger::relish::upgrade::status(&client).await,
                 UpgradeAction::Rollback {
@@ -2693,7 +2742,7 @@ async fn main() -> ExitCode {
                 LocalAction::Stop => Action::Stop,
                 LocalAction::Destroy => Action::Destroy,
             };
-            lifecycle::run(action, &name, node.as_deref(), yes)
+            lifecycle::run(action, &name, node.as_deref(), yes, cli.output)
                 .await
                 .map_err(|error| reliaburger::relish::RelishError::InitFailed(format!("{error:#}")))
         }
@@ -2904,36 +2953,61 @@ fn finish_outcome(
 /// prints for people would silently ignore `-o json` and hand a script text
 /// it can't parse, so it refuses instead.
 fn output_refusal(command: &Command, output: OutputFormat) -> Option<String> {
-    if output == OutputFormat::Human || honours_output(command) {
-        return None;
-    }
     let format = match output {
+        OutputFormat::Human => return None,
         OutputFormat::Json => "json",
         OutputFormat::Yaml => "yaml",
-        OutputFormat::Human => "human",
     };
-    Some(format!(
-        "this command has no {format} output; drop --output (or -o)"
-    ))
+    match output_support(command) {
+        OutputSupport::Structured => None,
+        OutputSupport::Interactive => Some(format!(
+            "this command is interactive, so it has no {format} output; drop --output (or -o)"
+        )),
+        OutputSupport::HumanOnly => Some(format!(
+            "this command has no {format} output yet; drop --output (or -o)"
+        )),
+    }
+}
+
+/// What a command can print when asked for `--output json` or `yaml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputSupport {
+    /// It prints JSON and YAML when asked.
+    Structured,
+    /// It takes over the terminal, a browser or a prompt, so there's no
+    /// result to print as data.
+    Interactive,
+    /// It prints only for people so far.
+    HumanOnly,
 }
 
 /// Whether `command` prints JSON and YAML when asked. Every command is
-/// listed, so a new one has to decide.
-fn honours_output(command: &Command) -> bool {
+/// listed, so a new one has to decide, and
+/// `every_command_prints_json_unless_listed_as_an_exception` holds the
+/// exceptions to a written list.
+fn output_support(command: &Command) -> OutputSupport {
+    use OutputSupport::{HumanOnly, Interactive, Structured};
+    let structured_when = |honours: bool| if honours { Structured } else { HumanOnly };
     match command {
-        Command::Apply { rerun_jobs, .. } => !rerun_jobs,
-        Command::Council { action } => matches!(
+        Command::Apply { rerun_jobs, .. } => structured_when(!rerun_jobs),
+        Command::Council { action } => structured_when(matches!(
             action,
             None | Some(CouncilCommand::Status) | Some(CouncilCommand::Backups { .. })
-        ),
-        Command::Images { action } => action.is_none(),
-        Command::Batch { action, .. } => matches!(
+        )),
+        Command::Images { action } => structured_when(action.is_none()),
+        Command::Batch { action, .. } => structured_when(matches!(
             action,
             Some(BatchAction::Submit { .. }) | Some(BatchAction::Results { .. })
-        ),
-        Command::Gitops { action } => matches!(action, GitopsAction::Status),
-        Command::Policy { action } => !matches!(action, PolicyAction::Delete { .. }),
-        Command::Token { action } => matches!(action, TokenAction::List),
+        )),
+        Command::Gitops { action } => structured_when(matches!(action, GitopsAction::Status)),
+        Command::Policy { action } => {
+            structured_when(!matches!(action, PolicyAction::Delete { .. }))
+        }
+        Command::Token { action } => structured_when(matches!(action, TokenAction::List)),
+        Command::Upgrade { action } => structured_when(matches!(
+            action,
+            UpgradeAction::Check { .. } | UpgradeAction::Plan { .. }
+        )),
         Command::Status
         | Command::Top
         | Command::Metrics(_)
@@ -2950,24 +3024,37 @@ fn honours_output(command: &Command) -> bool {
         | Command::Test(_)
         | Command::Bench(_)
         | Command::Wtf(_)
-        | Command::Path(_) => true,
+        | Command::Path(_)
+        | Command::Logs(_)
+        | Command::Inspect { .. }
+        | Command::Routes
+        | Command::Fault { .. }
+        | Command::Rollback { .. }
+        | Command::Lint { .. }
+        | Command::Local { .. } => Structured,
+        // `manual examples` writes files; the rest is the reader, or the
+        // browser with `--web`.
+        Command::Manual {
+            action: Some(ManualAction::Examples { .. }),
+            ..
+        } => HumanOnly,
+        Command::Dev {
+            action: DevAction::Shell { .. },
+        } => Interactive,
         Command::Tui
         | Command::Dashboard { .. }
-        | Command::Logs(_)
-        | Command::LogsExport { .. }
+        | Command::Manual { .. }
+        | Command::Source { .. }
+        | Command::Setup(_) => Interactive,
+        Command::LogsExport { .. }
         | Command::LogsSearch { .. }
         | Command::Exec { .. }
-        | Command::Inspect { .. }
         | Command::Stop { .. }
         | Command::Delete { .. }
         | Command::Release { .. }
         | Command::Init(_)
         | Command::Join(_)
-        | Command::Routes
-        | Command::Fault { .. }
         | Command::Snapshot { .. }
-        | Command::Rollback { .. }
-        | Command::Lint { .. }
         | Command::Compile { .. }
         | Command::Diff { .. }
         | Command::Fmt { .. }
@@ -2978,14 +3065,9 @@ fn honours_output(command: &Command) -> bool {
         | Command::JoinToken { .. }
         | Command::Sign { .. }
         | Command::Dev { .. }
-        | Command::Upgrade { .. }
-        | Command::Manual { .. }
-        | Command::Source { .. }
-        | Command::Uninstall { .. }
-        | Command::Local { .. }
-        | Command::Setup(_) => false,
+        | Command::Uninstall { .. } => HumanOnly,
         #[cfg(feature = "kubernetes")]
-        Command::Import { .. } | Command::Export { .. } => false,
+        Command::Import { .. } | Command::Export { .. } => HumanOnly,
     }
 }
 
@@ -4312,20 +4394,16 @@ mod tests {
     #[test]
     fn machine_output_is_refused_where_a_command_ignores_it() {
         for args in [
-            &["relish", "-o", "json", "inspect", "web"][..],
-            &["relish", "-o", "json", "routes"],
-            &["relish", "-o", "yaml", "logs", "web"],
-            &["relish", "-o", "json", "lint", "app.toml"],
-            &["relish", "-o", "json", "snapshot", "list", "db"],
+            &["relish", "-o", "json", "snapshot", "list", "db"][..],
+            &["relish", "-o", "yaml", "upgrade", "status"],
             &[
                 "relish", "-o", "json", "token", "create", "--name", "ci", "--role", "deployer",
             ],
         ] {
             let cli = parse(args).unwrap();
-            assert!(
-                output_refusal(&cli.command, cli.output).is_some(),
-                "{args:?} accepted an output format it ignores"
-            );
+            let refusal = output_refusal(&cli.command, cli.output)
+                .unwrap_or_else(|| panic!("{args:?} accepted an output format it ignores"));
+            assert!(refusal.contains("output yet"), "{refusal}");
         }
         for args in [
             &["relish", "-o", "json", "status"][..],
@@ -4333,11 +4411,272 @@ mod tests {
             &["relish", "-o", "json", "events"],
             &["relish", "-o", "json", "resolve", "redis"],
             &["relish", "-o", "json", "wtf"],
+            &["relish", "-o", "json", "inspect", "web"],
+            &["relish", "-o", "json", "routes"],
+            &["relish", "-o", "yaml", "logs", "web"],
+            &["relish", "-o", "json", "lint", "app.toml"],
+            &["relish", "-o", "json", "rollback", "web"],
+            &["relish", "-o", "json", "fault", "list"],
+            &["relish", "-o", "json", "fault", "kill", "web"],
+            &["relish", "-o", "json", "upgrade", "check"],
+            &["relish", "-o", "json", "upgrade", "plan", "v0.2.7"],
+            &["relish", "-o", "json", "local", "status"],
             &["relish", "inspect", "web"],
         ] {
             let cli = parse(args).unwrap();
             assert_eq!(output_refusal(&cli.command, cli.output), None, "{args:?}");
         }
+    }
+
+    #[test]
+    fn an_interactive_command_says_so_when_refusing_json() {
+        let cli = parse(&["relish", "-o", "json", "tui"]).unwrap();
+        assert_eq!(
+            output_refusal(&cli.command, cli.output).as_deref(),
+            Some("this command is interactive, so it has no json output; drop --output (or -o)")
+        );
+    }
+
+    /// Every command line relish accepts, one per runnable command (a leaf,
+    /// or a parent whose subcommand is optional), with made-up values for
+    /// the arguments it requires.
+    fn every_command_line() -> Vec<Vec<String>> {
+        use clap::CommandFactory;
+        let mut lines = Vec::new();
+        let mut root = Cli::command();
+        // Building fills in the argument groups that `#[arg(group)]` joins.
+        root.build();
+        for command in root.get_subcommands() {
+            collect_command_lines(command, Vec::new(), &mut lines);
+        }
+        lines
+    }
+
+    fn collect_command_lines(
+        command: &clap::Command,
+        mut line: Vec<String>,
+        lines: &mut Vec<Vec<String>>,
+    ) {
+        if command.get_name() == "help" {
+            return;
+        }
+        line.push(command.get_name().to_string());
+        let subcommands: Vec<_> = command
+            .get_subcommands()
+            .filter(|sub| sub.get_name() != "help")
+            .collect();
+        if subcommands.is_empty() || !command.is_subcommand_required_set() {
+            let mut runnable = line.clone();
+            runnable.extend(required_values(command));
+            lines.push(runnable);
+        }
+        for sub in subcommands {
+            collect_command_lines(sub, line.clone(), lines);
+        }
+    }
+
+    /// Made-up values for `command`'s required arguments and argument groups.
+    fn required_values(command: &clap::Command) -> Vec<String> {
+        let value = |arg: &clap::Arg| {
+            arg.get_possible_values()
+                .first()
+                .map(|possible| possible.get_name().to_string())
+                .unwrap_or_else(|| "1".to_string())
+        };
+        let mut wanted: Vec<&clap::Arg> = command
+            .get_arguments()
+            .filter(|arg| arg.is_required_set())
+            .collect();
+        for group in command.get_groups().filter(|group| group.is_required_set()) {
+            let members: Vec<_> = group.get_args().collect();
+            if wanted.iter().any(|arg| members.contains(&arg.get_id())) {
+                continue;
+            }
+            if let Some(arg) = command
+                .get_arguments()
+                .find(|arg| members.first() == Some(&arg.get_id()))
+            {
+                wanted.push(arg);
+            }
+        }
+        let mut values = Vec::new();
+        for arg in wanted {
+            match arg.get_long() {
+                Some(long) if !arg.is_positional() => {
+                    values.push(format!("--{long}"));
+                    if arg.get_action().takes_values() {
+                        values.push(value(arg));
+                    }
+                }
+                _ => values.push(value(arg)),
+            }
+        }
+        values
+    }
+
+    /// The commands that refuse `-o json`, and why. An interactive one takes
+    /// over the terminal, a browser or a prompt, so it has no result to
+    /// print as data; a human-only one prints for people until someone gives
+    /// it a shape. Adding a command here is a decision, never a default.
+    const NO_JSON: &[(&str, OutputSupport)] = &[
+        ("tui", OutputSupport::Interactive),
+        ("dashboard", OutputSupport::Interactive),
+        ("manual", OutputSupport::Interactive),
+        ("source", OutputSupport::Interactive),
+        ("setup", OutputSupport::Interactive),
+        ("dev shell", OutputSupport::Interactive),
+        ("logs-export", OutputSupport::HumanOnly),
+        ("logs-search", OutputSupport::HumanOnly),
+        ("exec", OutputSupport::HumanOnly),
+        ("stop", OutputSupport::HumanOnly),
+        ("delete", OutputSupport::HumanOnly),
+        ("release", OutputSupport::HumanOnly),
+        ("init", OutputSupport::HumanOnly),
+        ("council recover", OutputSupport::HumanOnly),
+        ("council re-enrol", OutputSupport::HumanOnly),
+        ("join", OutputSupport::HumanOnly),
+        ("snapshot create", OutputSupport::HumanOnly),
+        ("snapshot list", OutputSupport::HumanOnly),
+        ("snapshot restore", OutputSupport::HumanOnly),
+        ("snapshot delete", OutputSupport::HumanOnly),
+        ("compile", OutputSupport::HumanOnly),
+        ("diff", OutputSupport::HumanOnly),
+        ("fmt", OutputSupport::HumanOnly),
+        ("import", OutputSupport::HumanOnly),
+        ("export", OutputSupport::HumanOnly),
+        ("images delete", OutputSupport::HumanOnly),
+        ("build", OutputSupport::HumanOnly),
+        ("batch", OutputSupport::HumanOnly),
+        ("batch replay", OutputSupport::HumanOnly),
+        ("batch watch", OutputSupport::HumanOnly),
+        ("batch cancel", OutputSupport::HumanOnly),
+        ("batch logs", OutputSupport::HumanOnly),
+        ("run", OutputSupport::HumanOnly),
+        ("secret pubkey", OutputSupport::HumanOnly),
+        ("secret encrypt", OutputSupport::HumanOnly),
+        ("secret rotate", OutputSupport::HumanOnly),
+        ("gitops set", OutputSupport::HumanOnly),
+        ("gitops disable", OutputSupport::HumanOnly),
+        ("policy delete", OutputSupport::HumanOnly),
+        ("ca backup", OutputSupport::HumanOnly),
+        ("ca verify", OutputSupport::HumanOnly),
+        ("ca rotate", OutputSupport::HumanOnly),
+        ("token create", OutputSupport::HumanOnly),
+        ("token revoke", OutputSupport::HumanOnly),
+        ("token rotate", OutputSupport::HumanOnly),
+        ("join-token create", OutputSupport::HumanOnly),
+        ("sign", OutputSupport::HumanOnly),
+        ("sign keygen", OutputSupport::HumanOnly),
+        ("dev create", OutputSupport::HumanOnly),
+        ("dev status", OutputSupport::HumanOnly),
+        ("dev stop", OutputSupport::HumanOnly),
+        ("dev start", OutputSupport::HumanOnly),
+        ("dev destroy", OutputSupport::HumanOnly),
+        ("dev test", OutputSupport::HumanOnly),
+        ("dev disk", OutputSupport::HumanOnly),
+        ("dev clean", OutputSupport::HumanOnly),
+        ("dev keygen", OutputSupport::HumanOnly),
+        ("dev sign-binary", OutputSupport::HumanOnly),
+        ("dev countersign-binary", OutputSupport::HumanOnly),
+        ("upgrade start", OutputSupport::HumanOnly),
+        ("upgrade status", OutputSupport::HumanOnly),
+        ("upgrade rollback", OutputSupport::HumanOnly),
+        ("upgrade resume", OutputSupport::HumanOnly),
+        ("upgrade abort", OutputSupport::HumanOnly),
+        ("manual examples", OutputSupport::HumanOnly),
+        ("uninstall", OutputSupport::HumanOnly),
+    ];
+
+    /// The rule behind `output_support`: every command prints JSON unless
+    /// [`NO_JSON`] lists it, so a new command can't quietly skip it.
+    #[test]
+    fn every_command_prints_json_unless_listed_as_an_exception() {
+        use clap::CommandFactory;
+        let root = Cli::command();
+        let lines = every_command_line();
+        assert!(lines.len() > 50, "found only {} commands", lines.len());
+        let mut unlisted = Vec::new();
+        let mut refusing = Vec::new();
+        for line in &lines {
+            let mut args = vec!["relish".to_string(), "-o".into(), "json".into()];
+            args.extend(line.iter().cloned());
+            let cli = parse_filling_in(args);
+            let support = output_support(&cli.command.expect("a subcommand"));
+            if support == OutputSupport::Structured {
+                continue;
+            }
+            let name = command_name(&root, line);
+            match NO_JSON.iter().find(|(listed, _)| *listed == name) {
+                Some((_, listed)) if *listed == support => {}
+                _ => unlisted.push(format!("(\"{name}\", OutputSupport::{support:?}),")),
+            }
+            refusing.push(name);
+        }
+        assert!(
+            unlisted.is_empty(),
+            "these commands refuse -o json without being listed in NO_JSON:\n{}",
+            unlisted.join("\n")
+        );
+        for (listed, _) in NO_JSON {
+            assert!(
+                refusing.iter().any(|name| name == listed),
+                "{listed} is in NO_JSON but prints JSON, or no longer exists"
+            );
+        }
+    }
+
+    /// Parse `args`, adding a made-up value for each argument clap says is
+    /// missing: one required only unless another is present, say.
+    fn parse_filling_in(mut args: Vec<String>) -> Cli {
+        for _ in 0..4 {
+            let error = match Cli::try_parse_from(&args) {
+                Ok(cli) => return cli,
+                Err(error) => error,
+            };
+            let missing = match (
+                error.kind(),
+                error.get(clap::error::ContextKind::InvalidArg),
+            ) {
+                (
+                    clap::error::ErrorKind::MissingRequiredArgument,
+                    Some(clap::error::ContextValue::Strings(missing)),
+                ) => missing.clone(),
+                // A bare parent such as `relish batch PATH` shows its help
+                // without its positional argument.
+                (clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand, _) => {
+                    vec!["<VALUE>".to_string()]
+                }
+                _ => panic!("{args:?} doesn't parse: {error}"),
+            };
+            // One at a time: two arguments that each stand in for the other
+            // are both reported missing.
+            if let Some(usage) = missing.first() {
+                let mut words = usage.split_whitespace();
+                match words.next() {
+                    Some(flag) if flag.starts_with("--") => {
+                        args.push(flag.to_string());
+                        if words.next().is_some() {
+                            args.push("1".to_string());
+                        }
+                    }
+                    _ => args.push("1".to_string()),
+                }
+            }
+        }
+        panic!("{args:?} still doesn't parse")
+    }
+
+    /// A command line's command words, without its made-up values.
+    fn command_name(root: &clap::Command, line: &[String]) -> String {
+        let mut command = root;
+        let mut words = Vec::new();
+        for word in line {
+            if let Some(sub) = command.find_subcommand(word) {
+                words.push(word.as_str());
+                command = sub;
+            }
+        }
+        words.join(" ")
     }
 
     #[test]

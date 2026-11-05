@@ -52,6 +52,21 @@ pub fn format_output<T: Serialize + fmt::Display>(
     }
 }
 
+/// Print `value` to stdout in `format`, for a value whose `Display` already
+/// ends each of its lines (a table, a report). JSON and YAML end with one
+/// newline.
+pub fn print_output<T: Serialize + fmt::Display>(
+    value: &T,
+    format: OutputFormat,
+) -> Result<(), super::RelishError> {
+    let text = format_output(value, format)?;
+    match format {
+        OutputFormat::Human => print!("{text}"),
+        OutputFormat::Json | OutputFormat::Yaml => println!("{}", text.trim_end()),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

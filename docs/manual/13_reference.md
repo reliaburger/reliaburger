@@ -15,6 +15,38 @@ The flags, variables, files and ports you'll reach for. `relish help COMMAND`
 A flag beats its variable. With neither, `relish` uses the laptop cluster's
 saved context, then `http://127.0.0.1:9117`.
 
+## Machine output
+
+`-o json` and `-o yaml` print the same facts the table does, as data, so a
+script or an agent never parses prose. Warnings still go to stderr, so stdout
+stays parseable; where a command has warnings worth keeping (`lint`,
+`fault list`), they're in the data too.
+
+| Command | What `-o json` prints |
+|---|---|
+| `logs` | one object per line (JSON Lines): `at`, `node`, `instance`, `stream`, `text` |
+| `inspect` | `desired` (or `desired_error`), then each node's `answer`: its `instances`, or the `reason` it's missing |
+| `routes` | the list of routes |
+| `rollback` | the `app`, its `namespace`, and whether it was `forced` |
+| `lint` | `apps`, `jobs` and `warnings` |
+| `fault <type>` | the fault, with any it created on other nodes under `routed` |
+| `fault list`, `fault clear` | `faults` and `warnings`; the node's `message` |
+| `fault scenario` | each step's `outcome` once the run ends; with `--dry-run`, the timeline |
+| `upgrade check` | `running`, `latest`, a `verdict` (`up_to_date`, `available`, `needs_fresh_cluster`, `unavailable`) and the `command` to run |
+| `upgrade plan` | the `stages` in order, with `estimated_secs` |
+| `local` | `status`: each node's `condition` and `ready`; `start`, `stop`, `destroy`: each node's `result` |
+
+`status`, `top`, `nodes`, `history`, `events`, `audit`, `wtf`, `path`, `test`
+and the other read commands had JSON already.
+
+A few commands refuse it, exit `2` and say why. `tui`, `dashboard`, `manual`,
+`source`, `setup` and `dev shell` are interactive, so they have nothing to
+print as data. The rest, mostly commands that change something and print one
+line (`stop`, `delete`, `secret encrypt`, `token create`, `upgrade start`), or
+write files (`init`, `compile`, `fmt`), say they have no JSON output *yet*.
+`-f` on `logs` is refused with `-o json` too, until a followed line carries
+its time and stream.
+
 ## Environment variables
 
 | Variable | Read by | Meaning |
