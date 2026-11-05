@@ -87,6 +87,9 @@ pub struct MockGrill {
     /// Time each workload cgroup read takes, as runc's owner lock does on a
     /// loaded host.
     workload_cgroup_delay: Arc<Mutex<Option<std::time::Duration>>>,
+    /// Cgroup ids a workload cgroup read names, for a test on a host that
+    /// can't resolve a real cgroup path.
+    workload_cgroups: Arc<Mutex<HashMap<InstanceId, u64>>>,
     /// Per-instance pid delays, on top of `pid_delay`.
     instance_pid_delays: Arc<Mutex<HashMap<InstanceId, std::time::Duration>>>,
     /// Make pid reads fail, as an owner that doesn't answer does.
@@ -171,6 +174,7 @@ impl Default for MockGrill {
             kill_delay: Arc::default(),
             pid_delay: Arc::default(),
             workload_cgroup_delay: Arc::default(),
+            workload_cgroups: Arc::default(),
             instance_pid_delays: Arc::default(),
             fail_pid: Arc::default(),
             fail_create: Arc::default(),
@@ -534,6 +538,15 @@ impl MockGrill {
     /// Delay every workload cgroup read, as runc's owner does on a loaded host.
     pub fn set_workload_cgroup_delay(&self, delay: Option<std::time::Duration>) {
         *self.workload_cgroup_delay.lock().unwrap() = delay;
+    }
+
+    /// Make a workload cgroup read of `instance` name `cgroup_id`, as a
+    /// runtime that has proved the instance's cgroup does.
+    pub fn set_workload_cgroup(&self, instance: &InstanceId, cgroup_id: u64) {
+        self.workload_cgroups
+            .lock()
+            .unwrap()
+            .insert(instance.clone(), cgroup_id);
     }
 
     /// Make every pid read fail, as a runtime that can't say does.
@@ -960,6 +973,9 @@ impl super::Grill for MockGrill {
         let delay = *self.workload_cgroup_delay.lock().unwrap();
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
+        }
+        if let Some(cgroup_id) = self.workload_cgroups.lock().unwrap().get(instance) {
+            return Ok(Some(*cgroup_id));
         }
         if !*self.honours_cgroup_path.lock().unwrap()
             || self.state_overrides.lock().unwrap().get(instance) == Some(&ContainerState::Stopped)

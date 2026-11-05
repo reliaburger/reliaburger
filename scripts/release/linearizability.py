@@ -295,10 +295,51 @@ class Unanswered:
         return kept if len(kept) != len(applied) else applied
 
 
+def needs_holder(operation):
+    """Whether the operation can only take effect while its lease holds the namespace."""
+    return operation.lease is not None and (operation.kind, operation.outcome) in (
+        ("read", "ok"), ("renew", "ok"), ("renew", "not_active"), ("release", "pending"))
+
+
+class Stranded:
+    """Spots a step that leaves an answered operation no way to happen.
+
+    Once lease L stops holding the namespace it never holds it again, since
+    lease ids are never reused, unless its own grant is still to come. So a
+    step that moves the namespace off L, while an answered operation that
+    needs L to hold has not been placed yet, is a dead end. Cutting it there
+    changes no verdict, but without the cut the search walks every order in
+    which timed-out grants could have taken and lost the namespace before it
+    finds out, which is exponential in the reads still to place (a Studio
+    soak went inconclusive this way).
+    """
+
+    def __init__(self, completed):
+        self.needs, self.grants = {}, {}
+        for index, op in enumerate(completed):
+            if needs_holder(op):
+                self.needs.setdefault(op.lease, []).append(index)
+            elif op.kind == "grant" and op.outcome == "ok":
+                self.grants.setdefault(op.lease, []).append(index)
+
+    def __call__(self, state, successor, frontier, done):
+        lease = state[1] if state[0] == "held" else None
+        if lease is None or holder_of(successor) == lease:
+            return False
+
+        def pending(index):
+            return index >= frontier and index not in done
+
+        if any(pending(index) for index in self.grants.get(lease, ())):
+            return False
+        return any(pending(index) for index in self.needs.get(lease, ()))
+
+
 def search(operations, initial, budget, deadline):
     """'ok', 'fail' or 'budget': can these operations be put in an order the model accepts?"""
     completed = [op for op in operations if op.ret != INF]
     optional = Unanswered([op for op in operations if op.ret == INF])
+    stranded = Stranded(completed)
     total = len(completed)
     stack = [(initial, 0, frozenset(), frozenset())]
     seen = set()
@@ -328,7 +369,7 @@ def search(operations, initial, budget, deadline):
             if operation.call > earliest_return or index in applied:
                 continue
             for successor in step(state, operation):
-                if successor != state:
+                if successor != state and not stranded(state, successor, frontier, done):
                     stack.append((successor, frontier, done,
                                   optional.canonical(applied | {index}, successor, now_wall)))
         for index in reversed(candidates):
@@ -337,6 +378,8 @@ def search(operations, initial, budget, deadline):
                 while now_frontier in now_done:
                     now_done = now_done - {now_frontier}
                     now_frontier += 1
+                if stranded(state, successor, now_frontier, now_done):
+                    continue
                 later_wall = completed[now_frontier].call_wall if now_frontier < total else now_wall
                 stack.append((successor, now_frontier, now_done, optional.canonical(applied, successor, later_wall)))
     return "fail"

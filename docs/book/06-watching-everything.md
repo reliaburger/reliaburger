@@ -1615,6 +1615,8 @@ parquet = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214
 
 A fork is a debt: every arrow-rs fix after 59.3.0 passes you by until you redo the patch. So we also asked upstream to backport the fix to the 59 line (apache/arrow-rs#11186), and they released Parquet 59.3.1 with it. In 0.2.1 we deleted the whole `[patch.crates-io]` block, and `Cargo.lock` now takes every arrow-rs crate from crates.io at 59.3.1 (#975). The regression tests didn't change, and they still run on Linux in CI, where the abort happened. The lesson: a test only proves something on the platform where it ran.
 
+Leaving the fork paid off in 0.2.6. On 2 November, RUSTSEC-2026-0442 reported that arrow-data 59.3.1 can read past the end of a RunEndEncoded array's values. The 0.2.6 candidate's release audit refused it. Upstream had already released 59.3.2 on the same line, so the fix was `cargo update` on the fifteen arrow and parquet crates: a `Cargo.lock` change, with no code and no fork. Our own files never build RunEndEncoded arrays, but the advisory is in a crate that reads files from disk, so we took the patch rather than adding an exception to `.cargo/audit.toml`.
+
 ### Server-rendered HTML with meta refresh beats React
 
 The Brioche dashboard is a single server-rendered HTML page. No JavaScript framework, no API calls, no state management. The browser refreshes every 5 seconds. Total payload: 10KB. Time to first meaningful paint: zero seconds (it's all in the HTML response).

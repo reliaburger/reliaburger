@@ -589,6 +589,45 @@ really running first), so the agent caches the id per instance and restart
 count. A restart bumps the count, the next tick looks the cgroup up again, and
 the new cgroup gets its key.
 
+The cache has a cold start, though. Before the injection there's no rule that
+names `frontend` as a source, so nothing has looked its cgroup up. The turn
+that injects the partition asks the runtime, under the agent loop's 500 ms
+turn budget. On an idle node that takes a few milliseconds. Under the 0.2.6
+jobs soak, with thousands of job attempts queueing on runc's lifecycle lock,
+it took longer than the turn, and the operator got this:
+
+```text
+fault rejected: no running instance of source app soak-redis-client on this node has a verified workload cgroup
+```
+
+The frontend was running. The check that refused it, `check_fault_sources`,
+had read "the runtime didn't answer in time" as "the runtime said no" (#1601).
+Those are different answers, and `local_callers` already kept them apart: a
+caller whose lookup times out goes into `pending_callers`, and one the runtime
+answered for gets either `Some(cgroup)` or `None`. So the check now has three
+outcomes. A proven source passes, as before. A source that's only pending
+passes too, and the rule's id goes into `unproven_sources`. No running
+instance, or a runtime that answered and couldn't prove a cgroup, is still
+refused, with the same message.
+
+Passing a pending source doesn't mean the operator hears "applied" straight
+away. The injection's answer already waits for pending callers, because a
+partition that reaches two frontends out of three isn't in place (#625). It
+sends a task to read their cgroups with ten seconds' patience, off the loop,
+and keys each one the task proves. Waiting longer inside the turn would have
+been the obvious fix and the wrong one: every other command and health check
+queues behind a turn that waits. The one new step is at the end. If the rule
+went in with no proven source and the reads find none after all, the agent
+refuses the fault then, takes the rule back out of the registry and
+reconverges, so no key it wrote survives. Otherwise you'd get a partition
+that reports itself in place and keys nothing, which is a quieter version of
+the bug. A source the runtime still can't name after the follow-up reads is
+refused too, and the reason says it timed out. Meanwhile the health tick keeps
+asking every second, and it writes a key only for a cgroup the runtime proved.
+`desired_connect_faults` takes the cgroup from `filter_map(|caller|
+caller.cgroup_id)`, which drops every `None`, so an unverified caller never
+gets a key.
+
 ### The pool that didn't notice
 
 With the partition landing on the right node, we ran the demo again. `relish
@@ -739,6 +778,17 @@ drops a `Gone` caller, treats an `Attempt` without its namespace or `eth0` as
 `Pending`, and leaves an app instance's failures as they were. Here the text
 match on `tc`'s stderr is the only signal we have, but it's contained in one
 function, and only an attempt's failure can be softened by it.
+
+The first soak on the Mac Studio found the same race one step earlier
+(#1587). `run_in_instance_netns` checks that the namespace exists, then runs
+`ip netns exec`. An attempt that finished in between left `ip` saying
+`Cannot open network namespace ... No such file or directory`, which came
+back as a `Failed` and refused the delay again. That isn't `tc` failing: the
+namespace has gone. So `failed_command_error` turns that one message into
+`NoNamespace`, the same variant the existence check gives, and every caller
+of `run_in_instance_netns` handles it the way it already handled a missing
+namespace. Mapping the text to a variant where it's produced, not where it's
+read, keeps the stderr matching in the module that runs `ip`.
 
 On the podinfo demo, `relish fault delay redis 300ms --from frontend` took a
 cache read from 43 ms to 945 ms: about three redis round trips (podinfo's
