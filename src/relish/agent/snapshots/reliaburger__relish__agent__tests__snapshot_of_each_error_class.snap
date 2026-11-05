@@ -32,7 +32,7 @@ expression: rendered
         "code": "unreachable",
         "endpoint": null,
         "hint": "start a cluster (relish setup --quickstart) or point at one with --endpoint",
-        "message": "bun agent not reachable at localhost:9117 (is it running?)",
+        "message": "cannot reach the bun agent at https://10.0.0.5:9117: connection refused; check that bun runs there and listens on that port",
         "status": null
       },
       "ok": false,
