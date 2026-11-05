@@ -17,8 +17,8 @@
 # judged by the files they change against their base:
 #
 #   - into a release's merge train (`release-*`): the light set. Lint, MSRV,
-#     portable Linux, the demo app and the optimized contract boundaries
-#     answer in about 15 minutes; the heavy suites and the benchmarks wait
+#     portable Linux, the demo app, the source bundle build and the optimized
+#     contract boundaries answer in about 15 minutes; the heavy suites and the benchmarks wait
 #     for the push to the train, which runs everything on the merged result.
 #     A `full-ci` label adds the heavy suites and the benchmarks.
 #   - from a train (the gate PR into main): the light set too, since the

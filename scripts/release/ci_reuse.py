@@ -56,6 +56,7 @@ REQUIRED_JOBS = (
     "lint",
     "demo app",
     "minimum Rust 1.97.0",
+    "source bundle builds",
     "portable Linux",
     "privileged Linux",
     "privileged Linux (Ubuntu 26.04)",

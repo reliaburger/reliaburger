@@ -278,5 +278,15 @@ class NightlySigningTests(unittest.TestCase):
         self.assertIn('--channel "$CHANNEL"', record)
 
 
+class SourceBundleTests(unittest.TestCase):
+    def test_every_shipped_binary_is_built_from_a_clean_tree(self):
+        # relish embeds its source; build.rs refuses to build with changes
+        # in the embedded paths when this is set, so a release's bundle is
+        # exactly its commit (#1570).
+        text = WORKFLOW.read_text()
+        job = text.split("\n  build-binaries:\n", 1)[1].split("\n  build-profiling:\n", 1)[0]
+        self.assertIn('RELIABURGER_REQUIRE_CLEAN_SOURCE: "1"', job)
+
+
 if __name__ == "__main__":
     unittest.main()
