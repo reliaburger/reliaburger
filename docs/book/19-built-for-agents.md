@@ -701,7 +701,7 @@ its own commit. Does the *cluster* run that commit?
 
 ### Is this the code the nodes run?
 
-An agent reading `src/bun/scheduler.rs` to explain why a node placed an app
+An agent reading `src/meat/scheduler.rs` to explain why a node placed an app
 where it did is only right if the node runs that file. So every `source`
 command asks first. There's no cluster-wide versions endpoint, but `relish
 wtf` already shows a builds row, and it gets it the way we do now: list the
