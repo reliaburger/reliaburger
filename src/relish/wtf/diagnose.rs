@@ -539,6 +539,13 @@ fn check_crashloops(inputs: &WtfInputs, report: &mut WtfReport) {
                 message: format!("deploy {} entered {}", deploy.operation_id, deploy.phase),
             });
         }
+        // The app's own log line lands in `correlated_events[].message` and
+        // inside the finding's `details` sentence, where an agent can't tell
+        // it from our words.
+        // TODO(#1572): `relish agent diagnose` carries this line as a
+        // `relish::agent::untrusted::Untrusted` (origin `workload_log`)
+        // instead; `wtf`'s own schema stays as it is.
+        // TODO(#1573): `relish agent logs` wraps every line it returns the same way.
         let log = first_error_log(inputs, app, namespace);
         if let Some(log) = log {
             correlated_events.push(CorrelatedEvent {

@@ -177,9 +177,25 @@ impl Ssh {
             .with_context(|| format!("{target}: ssh exceeded its deadline"))?
             .context("failed to execute ssh; is OpenSSH installed?")?;
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.trim().is_empty() {
+                bail!("{target}: {}", stderr.trim());
+            }
+            // A machine whose login hangs can drop the session without a
+            // word; an empty reason gives the operator nothing to fix.
+            let status = output
+                .status
+                .code()
+                .map_or_else(|| "a signal".to_string(), |code| format!("status {code}"));
+            let port = if target.port == 22 {
+                String::new()
+            } else {
+                format!("-p {} ", target.port)
+            };
             bail!(
-                "{target}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                "{target}: ssh exited with {status} and said nothing; check that the machine \
+                 accepts a login (`ssh {port}{} true`)",
+                target.destination()
             );
         }
         String::from_utf8(output.stdout).context("ssh returned invalid UTF-8")
@@ -414,6 +430,25 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(error, "u@a: refused");
+    }
+
+    /// A machine whose login service hung dropped the session without a word
+    /// (an 8-machine run on the Mac Studio, 5 November 2026), and the operator
+    /// was told to fix `u@a: ` and nothing else.
+    #[tokio::test]
+    async fn a_silent_failure_says_how_ssh_exited() {
+        let directory = tempfile::tempdir().unwrap();
+        let ssh = fake_ssh(directory.path(), "");
+        let error = ssh
+            .user_script(&target("u@a"), "exit 255", &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "u@a: ssh exited with status 255 and said nothing; check that the machine \
+             accepts a login (`ssh u@a true`)"
+        );
     }
 
     #[tokio::test]
