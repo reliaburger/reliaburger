@@ -27,7 +27,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 --relish PATH --record FILE [--machines N] [--keep] [-- SETUP_OPTIONS...]" >&2
+    echo "usage: $0 --relish PATH --record FILE [--machines N] [--ubuntu 24.04|26.04] [--keep] [-- SETUP_OPTIONS...]" >&2
     exit 2
 }
 
@@ -40,11 +40,13 @@ relish=
 record=
 keep=no
 machines=3
+ubuntu=24.04
 setup_options=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --keep) keep=yes; shift ;;
         --machines) [[ $# -ge 2 ]] || usage; machines=$2; shift 2 ;;
+        --ubuntu) [[ $# -ge 2 ]] || usage; ubuntu=$2; shift 2 ;;
         --relish) [[ $# -ge 2 ]] || usage; relish=$2; shift 2 ;;
         --record) [[ $# -ge 2 ]] || usage; record=$2; shift 2 ;;
         --) shift; setup_options=("$@"); break ;;
@@ -52,6 +54,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ -n $relish && -n $record ]] || usage
+# The template names 24.04's cloud images; 26.04's (#1559) differ only in
+# the release's code name.
+case $ubuntu in
+    24.04) codename=noble ;;
+    26.04) codename=resolute ;;
+    *) refuse "--ubuntu takes 24.04 or 26.04, not $ubuntu" ;;
+esac
 [[ -x $relish ]] || refuse "$relish isn't an executable relish"
 [[ $machines =~ ^[1-9][0-9]*$ ]] || refuse "--machines needs a whole number of machines, not $machines"
 [[ ! -e $record ]] || refuse "$record already exists; records are never overwritten"
@@ -68,6 +77,10 @@ for index in $(seq 1 "$machines"); do vms+=("rb-sshq-$run-$index"); done
 seats=$((machines < 7 ? machines : 7))
 voters=$((seats % 2 == 1 ? seats : seats - 1))
 work=$(mktemp -d "${TMPDIR:-/tmp}/rb-sshq.XXXXXX")
+if [[ $codename != noble ]]; then
+    sed "s/noble/$codename/g" "$template" >"$work/ssh-setup-vm.yaml"
+    template=$work/ssh-setup-vm.yaml
+fi
 home=$work/home
 mkdir -p "$home" "$work/bin"
 
@@ -225,6 +238,7 @@ verdict=PASS
     printf '| relish | `%s` |\n' "$("$relish" --version)"
     printf '| Host | %s |\n' "$(sw_vers -productName 2>/dev/null || uname -s) $(sw_vers -productVersion 2>/dev/null || uname -r), $(uname -m)"
     printf '| Lima | %s |\n' "$(limactl --version)"
+    printf '| Guests | Ubuntu %s |\n' "$ubuntu"
     printf '| Setup options | `%s` |\n\n' "${setup_options[*]:-none}"
     printf '| Step | Result | Detail |\n|---|---|---|\n'
     printf '%s\n' "${results[@]}"
