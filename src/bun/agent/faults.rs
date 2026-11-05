@@ -52,6 +52,17 @@ pub(super) struct InstalledNetworkFaults {
     /// turn's deadline. A fault keyed by caller cgroup doesn't reach them
     /// yet, so an injection waits for them before it answers (#625).
     pub(super) pending_callers: Vec<super::fault_coverage::PendingCaller>,
+    /// Source-scoped faults accepted while every local source was pending
+    /// (#1601). Their injection is answered only once a source is proven,
+    /// and refused if none is.
+    pub(super) unproven_sources: std::collections::HashSet<crate::smoker::types::FaultId>,
+}
+
+/// Why a source-scoped fault can't act on this node.
+pub(super) fn no_proven_source(source: &str) -> String {
+    format!(
+        "no running instance of source app {source} on this node has a verified workload cgroup"
+    )
 }
 
 /// Run the cuts a reconcile left in [`InstalledNetworkFaults::late_cuts`].
@@ -1748,21 +1759,57 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 rule.target_service
             ));
         }
+        self.check_fault_sources(rule).await
+    }
+
+    /// Check that a source-scoped fault (in the registry already) has a local
+    /// source instance it can act on.
+    ///
+    /// A source the runtime proved a cgroup for passes. So does one still
+    /// pending because the runtime didn't answer before the turn's deadline:
+    /// that is "not yet", not "no" (#1601). The rule is installed for the
+    /// callers proven so far, and [`Self::answer_fault_injection`] reads the
+    /// pending ones from a task and refuses the fault then if none of them
+    /// has a cgroup after all. A source with no running instance, or whose
+    /// runtime answered that it has no provable cgroup, is refused here.
+    #[cfg_attr(not(all(feature = "ebpf", target_os = "linux")), allow(dead_code))]
+    pub(super) async fn check_fault_sources(
+        &mut self,
+        rule: &crate::smoker::types::FaultRule,
+    ) -> Result<(), String> {
+        use crate::smoker::network::applies_to_caller;
         let Some(source) = rule.fault_type.source_app() else {
             return Ok(());
         };
         let callers = self.local_callers().await;
         let proven = callers.iter().any(|caller| {
-            caller.cgroup_id.is_some()
-                && crate::smoker::network::applies_to_caller(rule, &caller.app, &caller.namespace)
+            caller.cgroup_id.is_some() && applies_to_caller(rule, &caller.app, &caller.namespace)
         });
         if proven {
-            Ok(())
-        } else {
-            Err(format!(
-                "no running instance of source app {source} on this node has a verified workload cgroup"
-            ))
+            return Ok(());
         }
+        let pending = self
+            .network_faults
+            .pending_callers
+            .iter()
+            .any(|caller| applies_to_caller(rule, &caller.app, &caller.namespace));
+        if pending {
+            self.network_faults.unproven_sources.insert(rule.id);
+            return Ok(());
+        }
+        Err(no_proven_source(source))
+    }
+
+    /// Whether a local instance `rule` acts on as its source has a cgroup
+    /// the runtime proved, at the instance's current restart count.
+    pub(super) fn source_proven(&self, rule: &crate::smoker::types::FaultRule) -> bool {
+        self.supervisor.list_instances().iter().any(|instance| {
+            crate::smoker::network::applies_to_caller(rule, &instance.app_name, &instance.namespace)
+                && matches!(
+                    self.network_faults.caller_cgroups.get(&instance.id),
+                    Some((restarts, _)) if *restarts == instance.restart_count
+                )
+        })
     }
 
     /// Converge the eBPF `fault_connect_map` on what the active drop and
