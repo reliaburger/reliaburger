@@ -235,7 +235,7 @@ jobs:
           FILTER: ${{ matrix.filter }}
           RELIABURGER_BTRFS_TESTS: "1"
         run: >-
-          sudo -E env PATH="$PATH"
+          scripts/ci/as-root
           cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite
           --workspace-remap . --profile ci --no-tests=fail --run-ignored=only -E "$FILTER"
           --stress-count "$LOOP_COUNT"
