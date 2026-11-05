@@ -35,7 +35,7 @@ pub struct ImportResult {
 }
 
 /// Migration report detailing what happened during import.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct MigrationReport {
     /// Successfully converted resources.
     pub converted: Vec<String>,
@@ -46,7 +46,7 @@ pub struct MigrationReport {
 }
 
 /// A warning about an approximated conversion.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct MigrationWarning {
     pub resource: String,
     pub message: String,

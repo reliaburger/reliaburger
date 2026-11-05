@@ -1,0 +1,8 @@
+---
+source: src/relish/commands.rs
+expression: "json(&PublicKey\n{ namespace: Some(\"shop\"), public_key: \"age1xyz\".to_string(), })"
+---
+{
+  "namespace": "shop",
+  "public_key": "age1xyz"
+}

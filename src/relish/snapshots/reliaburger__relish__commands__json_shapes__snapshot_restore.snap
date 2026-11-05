@@ -1,0 +1,11 @@
+---
+source: src/relish/commands.rs
+expression: "json(&SnapshotChange\n{\n    change: SnapshotChangeKind::Restored, app: \"db\", namespace: \"default\",\n    snapshot: \"nightly\", volume: None,\n})"
+---
+{
+  "change": "restored",
+  "app": "db",
+  "namespace": "default",
+  "snapshot": "nightly",
+  "volume": null
+}

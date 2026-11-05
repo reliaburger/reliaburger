@@ -2170,9 +2170,6 @@ fn output_refusal(command: &Command, output: OutputFormat) -> Option<String> {
         OutputSupport::Interactive => Some(format!(
             "this command is interactive, so it has no {format} output; drop --output (or -o)"
         )),
-        OutputSupport::HumanOnly => Some(format!(
-            "this command has no {format} output yet; drop --output (or -o)"
-        )),
     }
 }
 ```
@@ -2185,15 +2182,32 @@ also gained the short form the manual had been documenting all along, `-o`.
 
 The first version of that `match` returned a `bool`, and `false` covered two
 different things: `relish tui`, which takes over the terminal and has nothing
-to print as data, and `relish inspect`, which just hadn't been given a shape.
-For 0.2.7, the release that makes `relish` friendly to LLM agents, that
-difference matters, so the answer became a three-way enum and `inspect`,
-`logs`, `routes`, `rollback`, `lint`, `fault`, `upgrade check`, `upgrade plan`
-and `local` moved to `Structured` (#1566).
+to print as data, and some sixty commands, `inspect`, `logs`, `stop`, `token
+create` and the rest, that just hadn't been given a shape. For 0.2.7, the
+release that makes `relish` friendly to LLM agents, the maintainer's call was
+`-o json` for every command (#1566). So the answer became an enum with two
+honest answers, `Structured` and `Interactive`, and only six commands give the
+second: `tui`, `dashboard`, `manual`'s reader, `source`, `setup` and `dev
+shell`.
 
-Each one follows the pattern `status` and `events` already used: a small
-struct that derives `Serialize` for the data and implements `Display` for the
-table, handed to the one shared `format_output`. Where the data already
+Every other command follows the pattern `status` and `events` already used: a
+small struct that derives `Serialize` for the data and implements `Display`
+for the table, handed to the one shared `format_output`. A helper,
+`print_output`, prints either and ends JSON with one newline, so a command's
+last line is usually `print_output(&report, output)`. A command that changes
+something reports what it did: `relish stop` prints `{"action":
+"stop_requested", "app": "web", ...}`, not `{"ok": true}`. One that narrates
+as it goes, `build`, `dev create`, `upgrade start`, sends the narration to
+stderr when stdout carries JSON, through a second helper, `progress`, and
+prints one report at the end.
+
+Two commands hand over a secret by design. `token create` prints the new
+token on stdout and nothing else, so `TOKEN=$(relish token create ...)` works,
+and the cluster keeps only its hash. The JSON carries the same token, once, in
+a `token` field beside its name, role and expiry. Leaving it out would make
+`-o json` useless for the one thing the command is for. Everything else that
+touches a secret names where it is (`init`'s `master_key` path) and never the
+secret itself. Where the data already
 existed, the struct is a *newtype*, a one-field tuple struct like
 `struct RouteTable(Vec<RouteInfo>)`. In Rust you can't implement a trait you
 didn't define (`Display`) for a type you didn't define (`Vec`): that's the
@@ -2238,13 +2252,23 @@ followed stream (`-f`) refuses `-o json` for the same reason: each line
 arrives as text prefixed with `[node instance]` and nothing else.
 
 A `match` that the compiler checks stops a new command forgetting to decide,
-but not from deciding "human only" without anyone noticing. So a test walks
+but not from deciding "interactive" without anyone noticing. So a test walks
 clap's own command tree, every subcommand down to the leaves, invents values
 for the arguments each one requires, parses the line, and asks
 `output_support`. Every command that answers anything but `Structured` has to
-appear in a written list, `NO_JSON`, with the reason it's there. Adding a
-human-only command means editing that list in the same change, where a
-reviewer sees it.
+appear in a written list, `NO_JSON`, with a comment saying why. Adding a
+command that refuses JSON means editing that list in the same change, where a
+reviewer sees it. Each shape has an `insta` snapshot beside it, so changing
+what a script parses shows up as a diff in review.
+
+`exec` was the borderline case. It sounds interactive, but it runs a command
+once with no stdin and no terminal, so it has a result: the exit code and what
+the command printed. It got JSON. `dev test` streams `cargo test` to the
+terminal; with `-o json` the stream goes to stderr and stdout gets
+`{"passed": true}`. Bare `relish` is `relish tui`, and the TUI fails fast
+without a terminal (#1569); `main` now treats a missing subcommand as `tui`
+before checking `--output`, so `relish -o json` gets the interactive refusal
+rather than the less useful no-terminal one.
 
 Adding `relish events` and one flag broke every parser test on Linux CI with
 a stack overflow, while macOS passed. Clap's derive writes one function,

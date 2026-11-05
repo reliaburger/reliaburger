@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::RelishError;
 use super::client::BunClient;
-use super::output::{OutputFormat, print_output};
+use super::output::{Message, OutputFormat, print_output};
 use crate::smoker::types::{FaultRequest, FaultSummary, FaultType};
 
 /// Default fault duration when --duration is omitted.
@@ -605,19 +605,7 @@ pub async fn clear(
             Err(_) => client.clear_faults_by_service(&arg, namespace).await?,
         },
     };
-    print_output(&Cleared { message: msg }, output)
-}
-
-/// What the node said it cleared.
-#[derive(Debug, serde::Serialize)]
-struct Cleared {
-    message: String,
-}
-
-impl std::fmt::Display for Cleared {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{}", self.message)
-    }
+    print_output(&Message { message: msg }, output)
 }
 
 /// Run a scripted chaos scenario from a TOML file.
@@ -1061,7 +1049,7 @@ mod tests {
     fn a_cleared_fault_as_json_carries_the_nodes_message() {
         insta::assert_snapshot!(
             crate::relish::output::format_output(
-                &Cleared {
+                &Message {
                     message: "cleared 2 fault(s)".to_string()
                 },
                 OutputFormat::Json

@@ -1,0 +1,10 @@
+---
+source: src/relish/upgrade.rs
+expression: "json(&UpgradeChange\n{\n    change: UpgradeChangeKind::RollbackStarted, scope:\n    Some(UpgradeScope::Cluster), version: Some(\"v0.2.6\".to_string()),\n    upgrade_id: None,\n})"
+---
+{
+  "change": "rollback_started",
+  "scope": "cluster",
+  "version": "v0.2.6",
+  "upgrade_id": null
+}

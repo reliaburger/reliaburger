@@ -1488,10 +1488,10 @@ that gossip reports dead is named rather than silently left out.
 (`--app`, `--severity`, `--limit`). `relish exec <app> <cmd>` runs a command
 once, without stdin or a terminal, and exits with its exit code. `relish
 resolve <name> --namespace <ns>` picks a service whose name exists in several
-namespaces. `-o json` works on most commands, including `logs` (one
-object per line), `inspect`, `routes`, `lint`, `fault`, `upgrade check`,
-`upgrade plan` and `local`; a command without it refuses `-o json` (exit 2)
-and says whether it's interactive or just has no JSON yet (manual chapter
+namespaces. `-o json` works on every command except the six interactive
+ones (`tui`, `dashboard`, `manual`, `source`, `setup`, `dev shell`), which
+refuse it with exit 2; `logs` and `batch watch` print one object per line,
+and a command that changes something reports what it did (manual chapter
 13). `relish fmt` keeps comments.
 
 External probes are denied by default. They require an Admin credential,

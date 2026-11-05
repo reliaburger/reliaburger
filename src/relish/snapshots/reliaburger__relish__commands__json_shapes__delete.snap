@@ -1,0 +1,10 @@
+---
+source: src/relish/commands.rs
+expression: json(&delete)
+---
+{
+  "action": "delete_requested",
+  "app": "web",
+  "namespace": "shop",
+  "forced": true
+}

@@ -1,0 +1,10 @@
+---
+source: src/relish/commands.rs
+expression: "json(&ExportReport::new(&here, \"node-1\", 2, 4096))"
+---
+{
+  "node": "node-1",
+  "files": 2,
+  "bytes": 4096,
+  "destination": "/tmp/archive/node-1 on this machine"
+}
