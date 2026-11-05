@@ -43,6 +43,7 @@ fn document(file: SourceFile) -> Option<Document> {
 
 /// `relish source [query]` — open the reader, optionally mid-search.
 pub async fn run(query: Option<String>) -> Result<(), RelishError> {
+    super::FullScreen::Source.require_terminal()?;
     reader::run("files", documents()?, query).await
 }
 

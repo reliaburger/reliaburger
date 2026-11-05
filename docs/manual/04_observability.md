@@ -252,7 +252,11 @@ token scoped to some apps or namespaces sees only the events about them, and
 none that name no namespace (see `writing-a-controller`).
 
 The TUI shows apps, nodes, jobs, routes, live logs and events; press `?`
-inside for keys. It needs a terminal of at least 80×24.
+inside for keys. It needs a terminal of at least 80×24. With no terminal on
+stdin or stdout (a pipe, a cron job, an AI agent's shell), `relish`, `relish
+manual` and `relish source` exit at once with an error that names the plain
+output command to use instead: `relish agent guide`, `relish agent manual` or
+`relish agent source`.
 
 Every view covers the whole cluster, whichever node the TUI talks to. Live
 logs follow every node that runs the app, like `relish logs -f`, and a node

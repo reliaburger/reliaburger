@@ -2631,7 +2631,7 @@ async fn main() -> ExitCode {
             let client = reliaburger::relish::client::BunClient::default_local();
             match action {
                 UpgradeAction::Check { url } => {
-                    reliaburger::relish::upgrade::check(&client, &url).await
+                    reliaburger::relish::upgrade::check(&client, &url, cli.output).await
                 }
                 UpgradeAction::Start {
                     version,
@@ -2944,6 +2944,7 @@ fn honours_output(command: &Command) -> bool {
             Some(BatchAction::Submit { .. }) | Some(BatchAction::Results { .. })
         ),
         Command::Gitops { action } => matches!(action, GitopsAction::Status),
+        Command::Upgrade { action } => matches!(action, UpgradeAction::Check { .. }),
         Command::Policy { action } => !matches!(action, PolicyAction::Delete { .. }),
         Command::Token { action } => matches!(action, TokenAction::List),
         Command::Status
@@ -2994,7 +2995,6 @@ fn honours_output(command: &Command) -> bool {
         | Command::JoinToken { .. }
         | Command::Sign { .. }
         | Command::Dev { .. }
-        | Command::Upgrade { .. }
         | Command::Manual { .. }
         | Command::Source { .. }
         | Command::Uninstall { .. }
@@ -3068,11 +3068,19 @@ fn finish(result: Result<(), reliaburger::relish::RelishError>) -> ExitCode {
 
 /// Print a command's error, with what to do when the agent it needed was out
 /// of reach on a cluster `relish setup --ssh` built: there, the usual cause is
-/// a firewall between this machine and port 9117, not a stopped Bun.
+/// a firewall between this machine and port 9117, not a stopped Bun. A name
+/// that doesn't resolve or a certificate relish doesn't trust has its own fix
+/// in the error, and the firewall advice would only mislead.
 fn report(error: &reliaburger::relish::RelishError) {
+    use reliaburger::relish::{RelishError, UnreachableCause};
     eprintln!("error: {error}");
-    if matches!(error, reliaburger::relish::RelishError::AgentUnreachable)
-        && !reliaburger::relish::client::endpoint_overridden()
+    if matches!(
+        error,
+        RelishError::AgentUnreachable {
+            cause: UnreachableCause::Refused | UnreachableCause::TimedOut,
+            ..
+        }
+    ) && !reliaburger::relish::client::endpoint_overridden()
         && let Some(hint) = reliaburger::relish::quickstart::server_runner::unreachable_hint()
     {
         eprintln!("{hint}");
@@ -4384,6 +4392,7 @@ mod tests {
             &["relish", "-o", "yaml", "logs", "web"],
             &["relish", "-o", "json", "lint", "app.toml"],
             &["relish", "-o", "json", "snapshot", "list", "db"],
+            &["relish", "-o", "json", "upgrade", "plan", "v0.2.0"],
             &[
                 "relish", "-o", "json", "token", "create", "--name", "ci", "--role", "deployer",
             ],
@@ -4400,6 +4409,7 @@ mod tests {
             &["relish", "-o", "json", "events"],
             &["relish", "-o", "json", "resolve", "redis"],
             &["relish", "-o", "json", "wtf"],
+            &["relish", "-o", "json", "upgrade", "check"],
             &["relish", "inspect", "web"],
         ] {
             let cli = parse(args).unwrap();

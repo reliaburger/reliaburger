@@ -112,14 +112,29 @@ impl<T> EvidenceBuilder<T> {
     }
 }
 
+/// Check the entry agent answers, keeping the endpoint and the cause when it
+/// doesn't.
+async fn entry_health(client: &BunClient) -> Result<(), RelishError> {
+    let unreachable = |cause| RelishError::AgentUnreachable {
+        endpoint: client.base_url().to_string(),
+        cause,
+    };
+    match tokio::time::timeout(REQUEST_TIMEOUT, client.health()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error @ RelishError::AgentUnreachable { .. })) => Err(error),
+        Ok(Err(error)) => Err(unreachable(crate::relish::UnreachableCause::Other(
+            error.to_string(),
+        ))),
+        Err(_) => Err(unreachable(crate::relish::UnreachableCause::TimedOut)),
+    }
+}
+
 /// Collect an authenticated, bounded cluster evidence snapshot.
 ///
 /// Failure of one node or subsystem becomes typed evidence. The function only
 /// returns an error when the entry Bun agent itself cannot be reached.
 pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs, RelishError> {
-    bounded("entry health", client.health())
-        .await
-        .map_err(|_| RelishError::AgentUnreachable)?;
+    entry_health(client).await?;
 
     let (nodes_result, capabilities_result) = tokio::join!(
         bounded("cluster nodes", client.nodes()),

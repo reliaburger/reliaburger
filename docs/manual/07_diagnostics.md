@@ -275,6 +275,16 @@ semantics. Daily rates are explicitly extrapolated from the measured window.
 
 ## When the CLI can't reach anything
 
+The error names the endpoint `relish` dialled and why the connection failed,
+and each cause has its own fix:
+
+| The error says | What to do |
+|---|---|
+| the host name doesn't resolve | check the host in `--endpoint`, `RELIABURGER_ENDPOINT` or the current context |
+| connection refused | nothing listens on that port: check Bun runs on that machine and the port is right |
+| TLS handshake failed | pass the cluster CA with `--ca-cert` or `RELIABURGER_CA_CERT`, and check the endpoint starts with `https://` |
+| no answer before the connect timeout | the host is down, or a firewall drops packets to the port; `relish` gives up after 10 seconds |
+
 - `relish` talks to `--endpoint`, then `RELIABURGER_ENDPOINT`, then the
   laptop cluster's `~/.reliaburger/context.json`, then
   `http://127.0.0.1:9117`. An explicit endpoint doesn't borrow the saved

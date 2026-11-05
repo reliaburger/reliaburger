@@ -89,6 +89,7 @@ pub fn find_chapter(chapters: &[assets::Chapter], query: &str) -> Result<usize, 
 
 /// `relish manual [CHAPTER]` — open the reader, on `chapter` if given.
 pub async fn run(chapter: Option<&str>) -> Result<(), RelishError> {
+    crate::relish::FullScreen::Manual.require_terminal()?;
     let Some(query) = chapter else {
         return reader::run("chapters", documents(), None).await;
     };
