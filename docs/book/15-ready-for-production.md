@@ -8345,6 +8345,17 @@ the saved context's credentials, so it prints the CA and token exports as well.
 Setup prints the same advice as its last line when its own check finds the API
 out of reach.
 
+The first eight-machine run on the Mac Studio stopped at the machine checks
+with this, and nothing else: `Fix these and run the same command again:
+miko@127.0.0.1:50812:`. Two of the disposable VMs had booted with
+`systemd-logind` spinning, so `sshd` accepted the key and then dropped the
+session when `pam_systemd` timed out, and `ssh` exited without a word. Our
+error was `{target}: {stderr}`, so an empty stderr told the operator to fix
+nothing in particular. Now a silent failure says how `ssh` exited and what to
+try by hand (`ssh -p 50812 miko@127.0.0.1 true`). The spinning logind is the
+guest's problem, not ours, so `qualify-ssh-setup.sh` checks each new VM's
+logind for a busy loop, replaces it, and lists the repair in its record.
+
 `hello` is also the first thing anyone sees of a new cluster in a browser, so
 it now serves a small page with a burger and what to try next, instead of one
 line of plain text. The page is `src/relish/quickstart/welcome.html`, which
