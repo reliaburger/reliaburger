@@ -418,7 +418,7 @@ jobs:
       - name: Run only provisioned Linux tests
         id: linux_root_storage
         run: |
-          sudo -E env PATH="$PATH" python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate linux-root-storage --host linux --directory target/contracts/linux/linux-root-storage --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          scripts/ci/as-root python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate linux-root-storage --host linux --directory target/contracts/linux/linux-root-storage --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Restore root-storage evidence ownership
         if: always()
         run: |
@@ -433,6 +433,47 @@ jobs:
           path: target/contracts/linux/linux-root-storage
           if-no-files-found: error
           retention-days: 14
+  linux-next:
+    # The privileged suite on the newest Ubuntu LTS too (#1559): Linux 7.0's
+    # verifier and sudo-rs both broke things 24.04 never showed (#1557). The
+    # `linux` job owns the evidence envelopes; this one only has to pass.
+    name: privileged Linux (Ubuntu 26.04)
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-privileged-2604
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Install runtime and kernel test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq btrfs-progs buildah busybox-static gcc clang iproute2 libbpf-dev linux-headers-$(uname -r) llvm nftables runc slirp4netns uidmap
+      - name: Mount persistent BPF storage for kernel recovery tests
+        run: mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
+      - name: Permit rootless runc on Ubuntu AppArmor hosts
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Restore the pinned test images
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/test-images
+          key: test-images-${{ runner.arch }}-${{ hashFiles('tests/fixtures/pinned-images.txt') }}
+      - name: Warm the pinned test images
+        run: make test-images TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images"
+      - name: Run the provisioned Linux tests as root
+        run: scripts/ci/as-root make test-linux TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images"
+
   build-tests:
     outputs:
       archive_sha256: ${{ steps.archive.outputs.archive_sha256 }}
@@ -724,7 +765,7 @@ jobs:
     # always reports, so a skipped owner can never stand in for a pass. A
     # closed PR's run has nothing to report.
     name: ignored-test evidence
-    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, source-bundle, portable, linux, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
+    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, source-bundle, portable, linux, linux-next, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
     if: ${{ always() && github.event.action != 'closed' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10

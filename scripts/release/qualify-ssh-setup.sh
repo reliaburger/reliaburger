@@ -27,7 +27,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 --relish PATH --record FILE [--machines N] [--keep] [-- SETUP_OPTIONS...]" >&2
+    echo "usage: $0 --relish PATH --record FILE [--machines N] [--ubuntu 24.04|26.04] [--keep] [-- SETUP_OPTIONS...]" >&2
     exit 2
 }
 
@@ -40,11 +40,13 @@ relish=
 record=
 keep=no
 machines=3
+ubuntu=24.04
 setup_options=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --keep) keep=yes; shift ;;
         --machines) [[ $# -ge 2 ]] || usage; machines=$2; shift 2 ;;
+        --ubuntu) [[ $# -ge 2 ]] || usage; ubuntu=$2; shift 2 ;;
         --relish) [[ $# -ge 2 ]] || usage; relish=$2; shift 2 ;;
         --record) [[ $# -ge 2 ]] || usage; record=$2; shift 2 ;;
         --) shift; setup_options=("$@"); break ;;
@@ -52,6 +54,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ -n $relish && -n $record ]] || usage
+# The template names 24.04's cloud images; 26.04's (#1559) differ only in
+# the release's code name.
+case $ubuntu in
+    24.04) codename=noble ;;
+    26.04) codename=resolute ;;
+    *) refuse "--ubuntu takes 24.04 or 26.04, not $ubuntu" ;;
+esac
 [[ -x $relish ]] || refuse "$relish isn't an executable relish"
 [[ $machines =~ ^[1-9][0-9]*$ ]] || refuse "--machines needs a whole number of machines, not $machines"
 [[ ! -e $record ]] || refuse "$record already exists; records are never overwritten"
@@ -68,6 +77,10 @@ for index in $(seq 1 "$machines"); do vms+=("rb-sshq-$run-$index"); done
 seats=$((machines < 7 ? machines : 7))
 voters=$((seats % 2 == 1 ? seats : seats - 1))
 work=$(mktemp -d "${TMPDIR:-/tmp}/rb-sshq.XXXXXX")
+if [[ $codename != noble ]]; then
+    sed "s/noble/$codename/g" "$template" >"$work/ssh-setup-vm.yaml"
+    template=$work/ssh-setup-vm.yaml
+fi
 home=$work/home
 mkdir -p "$home" "$work/bin"
 
@@ -101,6 +114,24 @@ for vm in "${vms[@]}"; do
 done
 for vm in "${vms[@]}"; do limactl start "$vm" >"$work/lima-$vm.log" 2>&1 & done
 wait
+
+# On the Mac Studio (macOS 27.2, Ubuntu 24.04 guests) some VMs boot with
+# systemd-logind spinning on epoll without reading, so every later ssh login
+# hangs in pam_systemd and drops (5 November 2026, 2 of 8 VMs). That's the
+# guest, not relish: replace a spinning logind and say so in the record.
+# limactl shell rides Lima's existing control connection, so it still gets in.
+guest_notes=()
+for vm in "${vms[@]}"; do
+    # CPU ticks logind used over two seconds; 100 a second is one whole core.
+    used=$(limactl shell "$vm" bash -c 'p=$(pidof systemd-logind) || exit 0
+        a=$(awk "{print \$14+\$15}" /proc/$p/stat); sleep 2
+        b=$(awk "{print \$14+\$15}" /proc/$p/stat); echo $((b - a))' 2>/dev/null || echo 0)
+    if [[ ${used:-0} -gt 150 ]]; then
+        limactl shell "$vm" bash -c 'sudo kill -9 "$(pidof systemd-logind)"; sleep 2
+            sudo systemctl start systemd-logind' >/dev/null 2>&1 || true
+        guest_notes+=("$vm: systemd-logind was spinning ($used of 200 ticks in 2 s); the harness replaced it before setup")
+    fi
+done
 
 targets=()
 addresses=()
@@ -207,9 +238,14 @@ verdict=PASS
     printf '| relish | `%s` |\n' "$("$relish" --version)"
     printf '| Host | %s |\n' "$(sw_vers -productName 2>/dev/null || uname -s) $(sw_vers -productVersion 2>/dev/null || uname -r), $(uname -m)"
     printf '| Lima | %s |\n' "$(limactl --version)"
+    printf '| Guests | Ubuntu %s |\n' "$ubuntu"
     printf '| Setup options | `%s` |\n\n' "${setup_options[*]:-none}"
     printf '| Step | Result | Detail |\n|---|---|---|\n'
     printf '%s\n' "${results[@]}"
+    if [[ ${#guest_notes[@]} -gt 0 ]]; then
+        printf '\n## Guest repairs\n\n'
+        printf -- '- %s\n' "${guest_notes[@]}"
+    fi
     printf '\n## Setup\n\n```\n'
     sed 's/[[:cntrl:]]\[[0-9;]*m//g' "$work/setup.log"
     printf '```\n'

@@ -787,6 +787,12 @@ That list is generated from relish's own command definitions, so it matches
 the binary. `relish help COMMAND` (or `--help` on any command) shows every
 flag.
 
+`relish agent` is the family for LLM agents: every command prints one
+`relish.agent/v1` JSON envelope within a byte budget, never prompts, and exits
+`0` whenever it answered. So far it has `version` and `schema`; the commands
+that read the cluster and the source arrive through 0.2.7. See
+[Working with an AI agent](manual/16_working-with-an-ai-agent.md).
+
 Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select
 an exact supported chaos scenario. Omitting the filter runs all five, including
 rootful Linux node pressure; selecting a subset does not qualify the full suite.

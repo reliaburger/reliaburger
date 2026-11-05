@@ -59,6 +59,7 @@ REQUIRED_JOBS = (
     "source bundle builds",
     "portable Linux",
     "privileged Linux",
+    "privileged Linux (Ubuntu 26.04)",
     "build tests",
     "multi-node cluster",
     "acceptance",

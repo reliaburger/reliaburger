@@ -17,8 +17,10 @@ NOT_NEXTEST = {"test-doc", "test-images", "test-ci-scripts"}
 # Nextest targets CI runs directly rather than through an evidence owner.
 # `make test-s3` runs only when select-jobs.sh picks it by path (#1534), and
 # every evidence mode is a fixed set of owners, so the final gate checks its
-# job's result instead of binding its two tests.
-UNBOUND_SUITES = {"test-s3"}
+# job's result instead of binding its two tests. `make test-linux` runs
+# directly only in `linux-next`, the Ubuntu 26.04 parity leg (#1559); the
+# `linux` job still owns its evidence.
+UNBOUND_SUITES = {"test-s3", "test-linux"}
 
 # The no-op job a closed pull request's run starts instead of CI.
 CLOSED_JOB = "closed-pull-request"
@@ -212,7 +214,7 @@ class EvidenceTests(unittest.TestCase):
                      if 'workflow_adapter.py produce' in step
                      and '--gate linux-root-storage ' in step]
         self.assertEqual(len(producers), 1)
-        self.assertIn('sudo -E env PATH=', blocks[producers[0]])
+        self.assertIn('scripts/ci/as-root python3', blocks[producers[0]])
         restores = [index for index, step in enumerate(blocks)
                     if 'name: Restore root-storage evidence ownership' in step]
         self.assertEqual(len(restores), 1)
@@ -500,7 +502,7 @@ class TrainAndQueueTests(unittest.TestCase):
             self.assertRegex(block, r"if: matrix\.shard == \d\n")
 
     def test_the_heavy_jobs_wait_for_their_own_selection(self):
-        for name in ["linux", "build-tests", "cluster", "acceptance"]:
+        for name in ["linux", "linux-next", "build-tests", "cluster", "acceptance"]:
             self.assertIn("if: needs.changes.outputs.heavy == 'true'", self.jobs[name])
         for name in ["lint", "minimum-rust", "portable", "contract-boundaries", "demo-app", "source-bundle"]:
             self.assertIn("if: needs.changes.outputs.code == 'true'", self.jobs[name])
