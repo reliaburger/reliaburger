@@ -207,7 +207,9 @@ Once documents-in-the-binary machinery exists, a stranger idea becomes a small d
 
 The whole feature is one new module because the reader from the previous section doesn't care what it's showing. Each file becomes a document whose first line is its styled path, so one fuzzy query matches paths and contents alike. No new key bindings, no new search code, no markdown involved.
 
-The cost is binary size, and rust-embed softens it twice. Its `compression` feature compresses each embedded file in release builds (source code deflates well), and in debug builds it doesn't embed at all — assets load from disk at runtime, so `cargo test` iterations don't pay for a 5 MB copy of `src/` on every link. That split, incidentally, is why an embed-backed test can pass in debug and still deserve a release-build check in CI.
+The cost is binary size, and rust-embed's `compression` feature softened it by compressing each embedded file in release builds (source code deflates well): 3.9 MB for `src/`.
+
+That version had a hole, though: `src/` alone can't be built. No `Cargo.toml`, no `Cargo.lock`, no `build.rs`, none of the eBPF programs or the files the code pulls in with `include_str!`. In 0.2.7 `relish source` moved onto a single zstd tarball of the build, test and read set, only 0.8 MB bigger than the per-file embed despite carrying 60% more, and which CI proves can rebuild every binary. [Chapter 19](19-built-for-agents.md#carrying-the-source) tells that story.
 
 ## The command list writes itself
 

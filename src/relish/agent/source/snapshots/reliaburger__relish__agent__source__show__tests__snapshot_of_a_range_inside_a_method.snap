@@ -1,0 +1,61 @@
+---
+source: src/relish/agent/source/show.rs
+expression: value
+---
+{
+  "command": "source show",
+  "data": {
+    "enclosing": [
+      {
+        "kind": "impl",
+        "line": 9,
+        "name": "impl Client"
+      },
+      {
+        "kind": "fn",
+        "line": 16,
+        "name": "fetch"
+      }
+    ],
+    "from": 20,
+    "lines": [
+      {
+        "number": 20,
+        "text": "        let url = format!(\"http://localhost{path}\");"
+      },
+      {
+        "number": 21,
+        "text": "        let body = get(&url, self.timeout).await?;"
+      },
+      {
+        "number": 22,
+        "text": "        Ok(body)"
+      },
+      {
+        "number": 23,
+        "text": "    }"
+      }
+    ],
+    "path": "src/client.rs",
+    "to": 23,
+    "total_lines": 42,
+    "url": "https://github.com/reliaburger/reliaburger/blob/a1b2c3d4e5f60718293a4b5c6d7e8f9012345678/src/client.rs#L20-L23"
+  },
+  "next": [
+    {
+      "read_only": true,
+      "run": "relish agent source show src/client.rs:24-42",
+      "why": "the lines after these"
+    }
+  ],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": false,
+    "source_digest": "sha256:1639b607afe38bc2d97354cd49b82921653880e34c8d918491816b50df78c953",
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": []
+}

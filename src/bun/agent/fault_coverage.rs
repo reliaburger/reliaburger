@@ -91,6 +91,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// it acts on, sending a task for the callers this turn couldn't name.
     pub(super) async fn answer_fault_injection(&mut self, mut injection: Injection) {
         let Some(rule) = self.fault_registry.get(injection.rule_id) else {
+            self.network_faults
+                .unproven_sources
+                .remove(&injection.rule_id);
             self.spawn_cuts(std::mem::take(&mut injection.late_cuts));
             let _ = injection.response.send(Err(BunError::FaultRejected {
                 reason: "the fault was cleared while it was being applied".into(),
@@ -115,6 +118,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
 
         if unreached.is_empty() {
+            // Accepted while every source was pending (#1601): the reads
+            // are in, so a source is proven now or there is none to act on.
+            if self
+                .network_faults
+                .unproven_sources
+                .remove(&injection.rule_id)
+                && !self.source_proven(rule)
+            {
+                let source = rule.fault_type.source_app().unwrap_or_default();
+                let reason = super::faults::no_proven_source(source);
+                self.refuse_injection(injection, reason).await;
+                return;
+            }
             let Injection {
                 summary,
                 late_cuts,
@@ -258,6 +274,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Take an injection back and tell its caller why.
     async fn refuse_injection(&mut self, mut injection: Injection, reason: String) {
         self.fault_registry.remove(injection.rule_id);
+        self.network_faults
+            .unproven_sources
+            .remove(&injection.rule_id);
         // Converging without the rule takes back every key it wrote.
         self.reconcile_network_faults().await;
         self.spawn_cuts(std::mem::take(&mut injection.late_cuts));

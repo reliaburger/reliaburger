@@ -59,8 +59,9 @@ docs/
 examples/              # Ready-to-apply workload configs
 ```
 
-You're reading an embedded copy of `docs/manual/`. The full source tree the
-binary was built from is in there too: try `relish source meat` to read the
+You're reading an embedded copy of `docs/manual/`. The source the binary was
+built from is in there too, with everything it takes to build it again, its
+tests, the design docs and the book: try `relish source meat` to read the
 scheduler.
 
 ## Test suites

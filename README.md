@@ -163,6 +163,18 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish test`: Run the built-in integration test suite against the cluster
 - `relish bench`: Run reproducible performance benchmarks against the real data plane
 
+**Work with an AI agent** ([working with an AI agent](docs/manual/16_working-with-an-ai-agent.md))
+
+- `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive *(0.2.7, not in 0.2.5)*
+  - `relish agent version`: This binary's version, commit, target and cluster formats *(0.2.7, not in 0.2.5)*
+  - `relish agent schema [version|schema|source-version|source-tree|source-grep|source-show|source-extract]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.5)*
+  - `relish agent source`: The source this binary was built from: search it, read it, extract it *(0.2.7, not in 0.2.5)*
+    - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs *(0.2.7, not in 0.2.5)*
+    - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count *(0.2.7, not in 0.2.5)*
+    - `relish agent source grep <PATTERN>`: Search the source with a regular expression, line by line *(0.2.7, not in 0.2.5)*
+    - `relish agent source show <TARGET>`: Print up to 400 numbered lines of one file: `path` or `path:from-to` *(0.2.7, not in 0.2.5)*
+    - `relish agent source extract <DIR>`: Write the source into a new or empty directory, as a git repository when git is installed *(0.2.7, not in 0.2.5)*
+
 **Break things on purpose** ([chaos](docs/manual/05_chaos.md))
 
 - `relish fault`: Inject faults for chaos testing (Smoker)
@@ -418,8 +430,10 @@ failure. See [how Reliaburger is tested](docs/testing.md).
 TUI; `relish dashboard` opens the web UI through your authenticated CLI session.
 
 **The manual ships in the binary.** `relish manual` is a searchable reader with
-runnable examples, and `relish source` fuzzy-searches the exact source tree the
-binary was built from. Neither needs a network.
+runnable examples, and `relish source` fuzzy-searches the exact source the
+binary was built from: everything it takes to build it again, its tests and
+its design docs, which CI proves by building from the copy inside the binary.
+Neither needs a network.
 
 ## What you don't install
 
