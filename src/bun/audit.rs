@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use super::events::{AuditEvent, EventKind, EventSeverity};
+use crate::redact::redact_secrets;
 
 pub mod refusals;
 
@@ -271,26 +272,6 @@ pub fn newest(mut records: Vec<AuditRecord>, limit: usize) -> Vec<AuditRecord> {
     let excess = records.len().saturating_sub(limit);
     records.drain(..excess);
     records
-}
-
-/// Replace anything shaped like a Reliaburger secret (API tokens and join
-/// tokens both start `rbrg_`) with a marker. Handlers never put secrets in a
-/// record; this is the second line of defence should one ever slip through.
-pub fn redact_secrets(text: &str) -> String {
-    const MARKER: &str = "rbrg_";
-    let mut redacted = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find(MARKER) {
-        redacted.push_str(&rest[..start]);
-        let after = &rest[start + MARKER.len()..];
-        let end = after
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(after.len());
-        redacted.push_str("rbrg_[redacted]");
-        rest = &after[end..];
-    }
-    redacted.push_str(rest);
-    redacted
 }
 
 /// Facts a handler adds to the record its route's audit makes: the
@@ -647,7 +628,9 @@ impl SegmentWriter {
 }
 
 /// Turn an audit event into the record the log stores, scrubbing anything
-/// shaped like a secret.
+/// shaped like a secret. Handlers never put secrets in a record; the shared
+/// redaction rules in [`crate::redact`] are the second line of defence
+/// should one ever slip through.
 fn to_record(sequence: u64, event: AuditEvent) -> AuditRecord {
     AuditRecord {
         sequence,
@@ -1115,5 +1098,21 @@ mod tests {
             redact_secrets("token rbrg_0123abcd, then more"),
             "token rbrg_[redacted], then more"
         );
+    }
+
+    #[test]
+    fn a_record_is_scrubbed_of_every_secret_shape_the_shared_rules_know() {
+        let mut leaky = event("app.applied", None);
+        leaky.message = "applied with ENC[AGE:c2VjcmV0] from https://u:pw@git.example".to_string();
+        leaky
+            .details
+            .insert("identity".to_string(), "AGE-SECRET-KEY-1QYQSZQ".to_string());
+        let record = to_record(1, leaky);
+        assert_eq!(
+            record.message,
+            "applied with ENC[AGE:[redacted]] from https://[redacted]@git.example"
+        );
+        assert_eq!(record.details["identity"], "AGE-SECRET-KEY-1[redacted]");
+        assert_eq!(record.details["token_name"], "alice");
     }
 }
