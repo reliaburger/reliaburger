@@ -6,12 +6,14 @@
 //! prompt, no TUI, no stdin. `-o` is accepted and ignored, because there is
 //! only one format.
 //!
-//! This module holds the contract ([`envelope`], [`budget`]) and the first
-//! two commands, `version` and `schema`, which exercise it end to end. The
-//! commands that read the cluster and the source come later and reuse it.
+//! This module holds the contract ([`envelope`], [`budget`], and
+//! [`untrusted`] for text a workload wrote) and the first two commands,
+//! `version` and `schema`, which exercise it end to end. The commands
+//! that read the cluster and the source come later and reuse it.
 
 pub mod budget;
 pub mod envelope;
+pub mod untrusted;
 
 use schemars::JsonSchema;
 use serde::Serialize;

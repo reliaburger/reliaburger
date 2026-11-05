@@ -34,6 +34,7 @@ pub mod onion;
 pub mod pickle;
 pub mod policy;
 pub mod reconstruction;
+pub mod redact;
 pub mod relish;
 pub mod reporting;
 pub mod sesame;
