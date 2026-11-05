@@ -600,13 +600,32 @@ pub async fn run_in_instance_netns(
         source,
     })?;
     if !output.status.success() {
-        return Err(NetnsCommandError::Failed {
-            instance: instance_id.to_string(),
-            program: program.to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
+        return Err(failed_command_error(
+            instance_id,
+            program,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The error for a command that ran in an instance's namespace and failed.
+///
+/// A short-lived job attempt's namespace can go between the existence check
+/// and `ip netns exec` opening it (#1587). `ip` then says it can't open the
+/// namespace, which is the namespace missing, so it's `NoNamespace`.
+#[cfg(any(target_os = "linux", test))]
+fn failed_command_error(instance_id: &str, program: &str, stderr: &str) -> NetnsCommandError {
+    if stderr.contains("Cannot open network namespace") {
+        return NetnsCommandError::NoNamespace {
+            instance: instance_id.to_string(),
+        };
+    }
+    NetnsCommandError::Failed {
+        instance: instance_id.to_string(),
+        program: program.to_string(),
+        stderr: stderr.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -615,6 +634,32 @@ mod tests {
 
     use super::*;
     use crate::smoker::types::FaultId;
+
+    /// A job attempt's namespace can go between the existence check and
+    /// `ip netns exec` opening it (#1587). That's the namespace missing, not
+    /// the program failing, so callers treat it like the check's answer.
+    #[test]
+    fn a_namespace_gone_before_ip_netns_exec_opens_it_is_no_namespace() {
+        let gone = failed_command_error(
+            "default__executor-fb-165",
+            "tc",
+            "Cannot open network namespace \"rb-default__executor-fb-165\": No such file or directory",
+        );
+        assert!(matches!(
+            gone,
+            NetnsCommandError::NoNamespace { ref instance } if instance == "default__executor-fb-165"
+        ));
+
+        let other = failed_command_error(
+            "default__executor-fb-165",
+            "tc",
+            "RTNETLINK answers: File exists",
+        );
+        assert!(matches!(
+            other,
+            NetnsCommandError::Failed { ref stderr, .. } if stderr == "RTNETLINK answers: File exists"
+        ));
+    }
 
     fn rule(id: u64, fault_type: FaultType) -> FaultRule {
         let mut rule = FaultRule::new(

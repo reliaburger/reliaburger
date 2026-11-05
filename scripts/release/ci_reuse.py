@@ -58,6 +58,7 @@ REQUIRED_JOBS = (
     "minimum Rust 1.97.0",
     "portable Linux",
     "privileged Linux",
+    "privileged Linux (Ubuntu 26.04)",
     "build tests",
     "multi-node cluster",
     "acceptance",

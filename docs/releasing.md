@@ -66,7 +66,7 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
 - **A PR into the train** gets the light set: lint and format, minimum Rust,
   portable Linux with the coverage floor, the demo app and the optimised
   contract boundaries, in 15–20 minutes. A `full-ci` label adds everything
-  except the three macOS shards: privileged Linux, cluster, acceptance,
+  except the three macOS shards: privileged Linux (on Ubuntu 24.04 and 26.04), cluster, acceptance,
   upgrades and benchmarks. The macOS shards run on the PR only when it
   touches macOS-specific code or carries a `macos` label.
 - **The merge queue**, where a train has one, runs every job, macOS shards
