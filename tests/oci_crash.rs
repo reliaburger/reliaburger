@@ -1586,6 +1586,7 @@ async fn enrolled_upgrade_fixture(
             name,
             Some(&root.join("identity")),
             Some(&fingerprint),
+            reliaburger::relish::OutputFormat::Human,
         )
         .await
         .unwrap();
