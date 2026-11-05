@@ -567,6 +567,18 @@ declined to adopt it. No fixture could have caught this, because the fixture *wa
 Only `make test-apple`, run on Apple silicon, exercised the real CLI -- so that's where it
 surfaced, and where we captured the true schema and pinned the fixtures to it.
 
+It happened again a few weeks later, the other way round (#1535). Apple's
+`container` 1.x moved the state into an object, `status.state`, and the
+addresses under `status.networks`, and an absent name became a failed command
+saying `Error: container not found: <id>` where 0.x had printed `[]`. The
+fixtures still pinned the 0.x shape, so they stayed green while the real CLI
+gave "unknown container state" again. The parser now probes both shapes,
+newest first. The absence rule took more care: Chapter 14's adoption treats a
+failed inspection as "we don't know", never as "gone". So we accept exactly
+one failure as absence, the line that names our own container, and a test
+checks that the same message naming any other container, or any other error,
+still refuses.
+
 Neither bug was subtle once you saw it. Both were invisible from inside the test suite,
 because both suites tested a model of the world rather than the world. That's the whole reason
 the acceptance gate exists: run the portable suite, then the cluster and upgrade suites
