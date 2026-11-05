@@ -2622,7 +2622,7 @@ async fn main() -> ExitCode {
             let client = reliaburger::relish::client::BunClient::default_local();
             match action {
                 UpgradeAction::Check { url } => {
-                    reliaburger::relish::upgrade::check(&client, &url).await
+                    reliaburger::relish::upgrade::check(&client, &url, cli.output).await
                 }
                 UpgradeAction::Start {
                     version,
@@ -2932,6 +2932,7 @@ fn honours_output(command: &Command) -> bool {
             Some(BatchAction::Submit { .. }) | Some(BatchAction::Results { .. })
         ),
         Command::Gitops { action } => matches!(action, GitopsAction::Status),
+        Command::Upgrade { action } => matches!(action, UpgradeAction::Check { .. }),
         Command::Policy { action } => !matches!(action, PolicyAction::Delete { .. }),
         Command::Token { action } => matches!(action, TokenAction::List),
         Command::Status
@@ -2978,7 +2979,6 @@ fn honours_output(command: &Command) -> bool {
         | Command::JoinToken { .. }
         | Command::Sign { .. }
         | Command::Dev { .. }
-        | Command::Upgrade { .. }
         | Command::Manual { .. }
         | Command::Source { .. }
         | Command::Uninstall { .. }
@@ -4325,6 +4325,7 @@ mod tests {
             &["relish", "-o", "yaml", "logs", "web"],
             &["relish", "-o", "json", "lint", "app.toml"],
             &["relish", "-o", "json", "snapshot", "list", "db"],
+            &["relish", "-o", "json", "upgrade", "plan", "v0.2.0"],
             &[
                 "relish", "-o", "json", "token", "create", "--name", "ci", "--role", "deployer",
             ],
@@ -4341,6 +4342,7 @@ mod tests {
             &["relish", "-o", "json", "events"],
             &["relish", "-o", "json", "resolve", "redis"],
             &["relish", "-o", "json", "wtf"],
+            &["relish", "-o", "json", "upgrade", "check"],
             &["relish", "inspect", "web"],
         ] {
             let cli = parse(args).unwrap();

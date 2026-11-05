@@ -162,6 +162,13 @@ pub enum RelishError {
     #[error("invalid --{flag} value: {reason}")]
     InvalidFlag { flag: String, reason: String },
 
+    /// `relish upgrade plan` couldn't see the live cluster, so it won't
+    /// guess its shape (#1568).
+    #[error(
+        "can't plan an upgrade for a cluster relish couldn't see ({0}); fix that, or pass --cluster-size N to plan for a cluster of N nodes"
+    )]
+    UnseenCluster(Box<RelishError>),
+
     /// A request to the agent timed out. The operation may still be running.
     #[error("request timed out (the operation may still be running on the agent)")]
     RequestTimeout,
