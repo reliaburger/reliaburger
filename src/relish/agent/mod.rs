@@ -7,12 +7,14 @@
 //! only one format.
 //!
 //! This module holds the contract ([`envelope`], [`budget`], and
-//! [`untrusted`] for text a workload wrote) and the first two commands,
-//! `version` and `schema`, which exercise it end to end. The commands
-//! that read the cluster and the source come later and reuse it.
+//! [`untrusted`] for text a workload wrote), the first two commands,
+//! `version` and `schema`, which exercise it end to end, and [`source`],
+//! which reads the source this binary was built from. The commands that
+//! read the cluster come later and reuse it.
 
 pub mod budget;
 pub mod envelope;
+pub mod source;
 pub mod untrusted;
 
 use schemars::JsonSchema;
@@ -50,6 +52,8 @@ pub enum AgentCommand {
         #[arg(value_enum)]
         command: Option<CommandName>,
     },
+    /// The source this binary was built from: search it, read it, extract it.
+    Source(source::SourceOptions),
 }
 
 impl AgentCommand {
@@ -58,6 +62,7 @@ impl AgentCommand {
         match self {
             AgentCommand::Version => CommandName::Version,
             AgentCommand::Schema { .. } => CommandName::Schema,
+            AgentCommand::Source(options) => options.command.name(),
         }
     }
 }
@@ -81,19 +86,23 @@ pub fn render<T: Serialize>(envelope: &Envelope<T>, max_bytes: usize, rerun: &st
 ///
 /// `rerun` is the command line as [`rerun_command`] rebuilds it, for the
 /// hint a trimmed answer carries.
-pub fn run(options: &AgentOptions, rerun: &str) -> Rendered {
-    let relish = BuildInfo::current();
+pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
     match &options.command {
         AgentCommand::Version => render(
-            &Envelope::answered(CommandName::Version, relish, version_data()),
+            &Envelope::answered(CommandName::Version, BuildInfo::current(), version_data()),
             options.max_bytes,
             rerun,
         ),
         AgentCommand::Schema { command } => render(
-            &Envelope::answered(CommandName::Schema, relish, schema_data(*command)),
+            &Envelope::answered(
+                CommandName::Schema,
+                BuildInfo::current(),
+                schema_data(*command),
+            ),
             options.max_bytes,
             rerun,
         ),
+        AgentCommand::Source(source) => source::run(source, options.max_bytes, rerun).await,
     }
 }
 
@@ -176,6 +185,11 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::Agent => None,
         CommandName::Version => Some(schema_of::<VersionData>()),
         CommandName::Schema => Some(schema_of::<SchemaData>()),
+        CommandName::SourceVersion => Some(schema_of::<source::VersionData>()),
+        CommandName::SourceTree => Some(schema_of::<source::TreeData>()),
+        CommandName::SourceGrep => Some(schema_of::<source::GrepData>()),
+        CommandName::SourceShow => Some(schema_of::<source::ShowData>()),
+        CommandName::SourceExtract => Some(schema_of::<source::ExtractData>()),
     }
 }
 
@@ -217,16 +231,23 @@ pub fn invoked(args: &[String]) -> bool {
 }
 
 /// The command `args` named after `agent`, or [`CommandName::Agent`] when
-/// they named none it knows.
+/// they named none it knows. `source` takes the word after it too, as in
+/// `source grep`.
 pub fn command_named(args: &[String]) -> CommandName {
     let mut words = args
         .iter()
         .skip_while(|arg| arg.as_str() != "agent")
-        .skip(1);
-    words
-        .find(|arg| !arg.starts_with('-'))
-        .and_then(|word| <CommandName as clap::ValueEnum>::from_str(word, false).ok())
-        .unwrap_or(CommandName::Agent)
+        .skip(1)
+        .filter(|arg| !arg.starts_with('-'));
+    let name = match words.next().map(String::as_str) {
+        Some("source") => match words.next() {
+            Some(word) => format!("source-{word}"),
+            None => return CommandName::Agent,
+        },
+        Some(word) => word.to_string(),
+        None => return CommandName::Agent,
+    };
+    <CommandName as clap::ValueEnum>::from_str(&name, false).unwrap_or(CommandName::Agent)
 }
 
 /// The `--max-bytes` in `args`, when there is a valid one.
@@ -352,9 +373,9 @@ mod tests {
         assert!(parse("agent version --max-bytes lots").is_err());
     }
 
-    #[test]
-    fn version_answers_with_this_build() {
-        let rendered = run(&parse("agent version").unwrap(), "relish agent version");
+    #[tokio::test]
+    async fn version_answers_with_this_build() {
+        let rendered = run(&parse("agent version").unwrap(), "relish agent version").await;
         assert_eq!(rendered.exit, ExitStatus::Answered);
         let value = json_of(&rendered);
         assert_eq!(value["schema"], "relish.agent/v1");
@@ -366,11 +387,17 @@ mod tests {
             crate::compatibility::CURRENT.protocol
         );
         assert_eq!(value["relish"]["version"], env!("CARGO_PKG_VERSION"));
+        let digest = crate::relish::source_bundle::digest().unwrap();
+        assert_eq!(value["relish"]["source_digest"], format!("sha256:{digest}"));
+        assert_eq!(
+            value["relish"]["dirty"],
+            serde_json::json!(crate::relish::source_bundle::dirty())
+        );
     }
 
-    #[test]
-    fn schema_lists_the_envelope_and_every_answering_command() {
-        let rendered = run(&parse("agent schema").unwrap(), "relish agent schema");
+    #[tokio::test]
+    async fn schema_lists_the_envelope_and_every_answering_command() {
+        let rendered = run(&parse("agent schema").unwrap(), "relish agent schema").await;
         assert_eq!(rendered.exit, ExitStatus::Answered);
         let value = json_of(&rendered);
         assert_eq!(
@@ -383,7 +410,18 @@ mod tests {
             .iter()
             .map(|command| command["command"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["version", "schema"]);
+        assert_eq!(
+            names,
+            [
+                "version",
+                "schema",
+                "source version",
+                "source tree",
+                "source grep",
+                "source show",
+                "source extract"
+            ]
+        );
         let envelope = &value["data"]["envelope"];
         let error_codes = &envelope["$defs"]["ErrorCode"];
         assert!(
@@ -392,12 +430,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn schema_for_one_command_lists_only_that_one() {
+    #[tokio::test]
+    async fn schema_for_one_command_lists_only_that_one() {
         let rendered = run(
             &parse("agent schema version").unwrap(),
             "relish agent schema version",
-        );
+        )
+        .await;
         let value = json_of(&rendered);
         let commands = value["data"]["commands"].as_array().unwrap();
         assert_eq!(commands.len(), 1);
@@ -406,6 +445,48 @@ mod tests {
             commands[0]["data"]["properties"]["formats"].is_object(),
             "{}",
             commands[0]["data"]
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_names_a_source_command_with_a_hyphen() {
+        let rendered = run(
+            &parse("agent schema source-grep").unwrap(),
+            "relish agent schema source-grep",
+        )
+        .await;
+        let value = json_of(&rendered);
+        let commands = value["data"]["commands"].as_array().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["command"], "source grep");
+        let properties = &commands[0]["data"]["properties"];
+        for key in ["files_searched", "total_matches", "matches"] {
+            assert!(properties[key].is_object(), "{key}: {properties}");
+        }
+    }
+
+    #[test]
+    fn source_commands_parse_with_their_flags() {
+        let options =
+            parse("agent source grep fn.main --path src/** --context 4 -i --offline").unwrap();
+        let AgentCommand::Source(source) = &options.command else {
+            panic!("{options:?}");
+        };
+        assert!(source.offline);
+        let source::SourceCommand::Grep(grep) = &source.command else {
+            panic!("{source:?}");
+        };
+        assert_eq!(grep.pattern, "fn.main");
+        assert_eq!(grep.path.as_deref(), Some("src/**"));
+        assert_eq!(grep.context, 4);
+        assert_eq!(grep.max_matches, 50);
+        assert!(grep.ignore_case);
+        assert_eq!(options.command.name(), CommandName::SourceGrep);
+        assert!(parse("agent source tree src --depth 0").is_err());
+        assert!(parse("agent source grep x --context 99").is_err());
+        assert!(
+            parse("agent --offline source version").is_err(),
+            "--offline belongs to source"
         );
     }
 
@@ -437,6 +518,15 @@ mod tests {
             "a flag's value isn't skipped, so this one falls back to agent"
         );
         assert_eq!(command_named(&args("agent nonsense")), CommandName::Agent);
+        assert_eq!(
+            command_named(&args("agent source grep --bogus")),
+            CommandName::SourceGrep
+        );
+        assert_eq!(command_named(&args("agent source")), CommandName::Agent);
+        assert_eq!(
+            command_named(&args("agent source nope")),
+            CommandName::Agent
+        );
         assert_eq!(command_named(&args("agent")), CommandName::Agent);
     }
 

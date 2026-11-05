@@ -864,7 +864,8 @@ Extraction goes through the same reader. `extract_from` refuses a directory
 that isn't empty, and leans on `tar::Entry::unpack_in`, which refuses any entry
 whose path would land outside the target directory, an absolute path or one
 climbing out with `..`. We wrote the archive ourselves, but checking costs
-nothing, and #1571's `relish agent source extract` will build on this function.
+nothing, and `relish agent source extract` (next section) builds on this
+function.
 
 ### What it cost the inner loop
 
@@ -985,3 +986,223 @@ out. The only check that means anything is the one the claim makes: take the
 bundle out of the binary, put it somewhere empty, and build it. Everything else
 in this section is in service of making that check cheap and that build
 reproducible.
+
+## Reading the source
+
+A bundle nobody can read is just weight. [#1571](https://github.com/reliaburger/reliaburger/issues/1571)
+gives it five commands, all under `relish agent source`, all speaking the
+envelope from the start of this chapter:
+
+| Command | Answers |
+|---|---|
+| `version` | What the bundle is (commit, `dirty`, digest, file count) and which commit each node runs |
+| `tree [prefix] [--depth N]` | Files with their size and line count, optionally rolled up per directory |
+| `grep PATTERN [--path GLOB]` | Matching lines with context and a permalink each |
+| `show PATH[:FROM-TO]` | Up to 400 numbered lines, plus the `fn` or `impl` they sit inside |
+| `extract DIR` | The whole tree, written out as a git repository |
+
+Why not just tell the agent to `git clone` the repository? Because the agent
+then has to guess which commit to check out, and it'll guess `main`. The
+bug it's chasing is in whatever the cluster runs, which is rarely `main`.
+`relish` knows exactly which code it was built from; asking it removes the
+guess.
+
+That shifts the question rather than answering it, though. The binary knows
+its own commit. Does the *cluster* run that commit?
+
+### Is this the code the nodes run?
+
+An agent reading `src/meat/scheduler.rs` to explain why a node placed an app
+where it did is only right if the node runs that file. So every `source`
+command asks first. There's no cluster-wide versions endpoint, but `relish
+wtf` already shows a builds row, and it gets it the way we do now: list the
+nodes through the entry node, then ask each one for `/v1/version` through the
+same entry node, all at once.
+
+```rust
+let answers = futures_util::future::join_all(up.iter().map(|node| async move {
+    match client.via_node(&node.node_id) {
+        Ok(node_client) => ask(&node_client).await,
+        Err(error) => Err(error.to_string()),
+    }
+}))
+.await;
+```
+
+`async move { ... }` is an *async block*: an expression whose value is a
+future, a computation that hasn't run yet, rather than the result. (`move`
+copies the `node` reference into the block, so the future doesn't borrow a
+loop variable that's about to change.) `map` turns the list of nodes into a
+list of those futures and `join_all` runs them concurrently, finishing when
+the last one does. Nothing runs before the final `.await`: a Rust future is
+inert until something polls it, unlike a JavaScript promise or a goroutine,
+which start the moment you create them. Each request also sits inside a
+two-second `tokio::time::timeout`, because the check is a courtesy on top of
+the answer and mustn't hold the answer up.
+
+What comes back is an enum, serialised with `#[serde(tag = "state")]` as in
+[Chapter 1](01-hello-container.md):
+
+```rust
+pub enum ClusterSource {
+    Offline,
+    Unreachable { reason: String },
+    Checked { nodes: Vec<NodeSource> },
+}
+```
+
+`Unreachable` isn't an error. With no cluster up, the source is still this
+binary's and `grep` still works; the envelope says `ok: true` and
+`cluster.state` says why there's no comparison. A node on a different commit
+isn't an error either. It becomes a warning on *every* `source` answer, not
+just `version`'s, because an agent that went straight to `grep` needs to see
+it too:
+
+```
+source_mismatch: this relish was built from a1b2c3d, but node-2 runs 3fcb1fd
+(https://github.com/reliaburger/reliaburger/tree/3fcb1fd); this source may not
+be the code those nodes run
+```
+
+The link is the useful bit: GitHub's tree at the node's commit is the code the
+node actually runs. Carrying the bundle in `bun` too would avoid the
+round trip to GitHub, and we decided against it in the previous section.
+
+Two choices here were about trust. The comparison treats an unknown commit,
+on either side, as a mismatch: nothing proves they match, so we don't say
+they do. And nothing is cached. A node upgraded a minute ago must not be
+reported as the old build, and two seconds is cheap next to an agent spending
+twenty minutes reasoning about the wrong code. `--offline` skips the question
+entirely, which is what CI wants.
+
+### Permalinks, and `?` on an `Option`
+
+Each `grep` match and each `show` range carries a GitHub permalink, so a human
+reading the agent's explanation can click through to the same lines. Only
+when that's honest, though:
+
+```rust
+fn permalink(&self, path: &str, anchor: &str) -> Option<String> {
+    let commit = self.build.commit.as_deref()?;
+    (self.build.dirty == Some(false))
+        .then(|| format!("{REPOSITORY_URL}/blob/{commit}/{path}#{anchor}"))
+}
+```
+
+You've seen `?` return early on an `Err`. It works on `Option` too, in a
+function that returns `Option`: if the build doesn't know its commit,
+`as_deref()?` returns `None` from `permalink` on the spot. `bool::then` turns
+`true` into `Some(closure())` and `false` into `None`. So a build with
+uncommitted changes, or one that couldn't ask git, gets no link at all,
+because GitHub doesn't have its changes and a link to the committed version
+of a line someone edited is worse than none.
+
+### Finding the enclosing function without a parser
+
+`show src/relish/client.rs:340-400` answers with those lines, and also with
+the items they sit inside:
+
+```json
+"enclosing": [{"kind": "impl", "line": 9, "name": "impl Client"},
+              {"kind": "fn", "line": 16, "name": "fetch"}]
+```
+
+That saves an agent a second call to find out whose body it's looking at. The
+obvious tool is a Rust parser, the `syn` crate. We didn't use one. The bundle
+holds Markdown, C, TOML and shell as well as Rust, a parser would have to
+handle half-edited files in a development checkout, and the tree has a
+property that makes something much simpler work: rustfmt formats every Rust
+file, and CI enforces it.
+
+So `enclosing_items` walks upwards from the first line shown, tracking an
+indentation limit. A line indented less than the limit that starts an item
+(`fn`, `impl`, `trait`, `mod`, past any `pub(crate)`, `async` or `unsafe`) is an
+enclosing item, and the limit drops to its indentation. Any other
+less-indented line, such as the closing brace of a sibling, also lowers the
+limit, so a function that ended above can't be mistaken for the one we're in.
+The one wrinkle is a signature rustfmt split across lines:
+
+```rust
+    pub async fn fetch(
+        &self,
+        path: &str,
+    ) -> Result<String, Error> {
+        let url = format!("http://localhost{path}");
+```
+
+Walking up from the `let`, the first less-indented line is `) -> Result...`,
+which isn't an item. Lines starting with `)`, `>` or `where` continue a
+signature, so they leave the limit just above their own indentation and the
+walk carries on to `pub async fn fetch(`. It's a heuristic and it says so in
+its tests, but on rustfmt'd code it's right, and it's thirty lines.
+
+### Extract, and what `read_only` means
+
+`extract` writes the tree with the same `extract_from` the CI job relied on,
+adds a `.reliaburger-source.json` stamp (version, commit, `dirty`, digest),
+and then makes the directory a git repository with one commit, authored as
+`relish`. That last step is for the agent's next move. After it patches a
+function, `git diff` shows exactly the patch, against exactly the source the
+binary was built from, with no noise from a different `main`. If git isn't
+installed, the tree is still written and `data.git` says `skipped` with the
+reason.
+
+The answer's `next` suggests the build:
+
+```json
+{"run": "cargo build --locked --bins --manifest-path ./src-copy/Cargo.toml",
+ "why": "build every binary from this source", "read_only": false}
+```
+
+`read_only: false` for a build may look odd. Nothing in the cluster changes.
+But the contract's wording is "changes nothing anywhere", and a build writes a
+`target/` directory, downloads crates and runs a build script. Agents ask a
+human before a step with `read_only: false`; for a multi-gigabyte build, that
+seems right. `git diff`, which only reads, is `true`.
+
+The CI job from the previous section now uses the real command. It extracts
+with `relish agent source extract "$RUNNER_TEMP/source-bundle" --offline`,
+builds there, extracts again from the rebuilt binary, and compares the two
+digests with `jq -r .data.digest`. Reading a field from the envelope replaced a
+`grep` over the hidden `relish source --extract` flag's text output, and the
+flag is gone.
+
+### The tests
+
+The commands are plain functions over a `Bundle`, a tarball unpacked in memory
+plus the build it claims, so the tests never touch the real 950-file bundle.
+A fixture packs six files from a temporary directory with the same
+`pack::write_tar` the build script uses, and claims a fixed commit. The
+snapshots then can't drift every time the real source changes, and the digest
+in them is stable.
+
+There's a snapshot of each command's envelope: `version` with one matching
+node and one on an older commit (the mismatch warning included), `tree` flat
+and rolled up, a `grep` match with context, a `show` range inside a method of
+an `impl`, a missing path with its close matches, and an `extract`. Unit tests
+cover the rest: commits matching when one side is abbreviated and not
+matching when either is unknown; no permalinks for a dirty build; a bad regex
+being `usage` with a hint; a long line cut at 400 bytes; the enclosing scan
+over a multi-line signature, a sibling function that ended above and a test
+inside `mod tests`; `extract` refusing a directory with anything in it and
+leaving a repository whose `git status` is clean.
+
+### What we didn't do
+
+- **A `source diff` against a node's commit.** GitHub's compare view does it,
+  and the warning links the tree.
+- **Search across the cluster's version.** Only this binary's source is here.
+  When they differ, the warning says so instead of guessing.
+- **An index.** `grep` scans 27 MB in memory in about 0.3 seconds, even in a
+  debug build; an index
+  would be one more thing to keep in step with the bundle.
+- **Overwrite on extract.** An agent that extracts into the wrong directory
+  shouldn't lose anything. `conflict` and a fresh path is cheap.
+
+### Lessons
+
+The interesting part of "show the agent the source" turned out not to be
+showing it. It was making every answer say whether that source is the one that
+matters: the commit, the `dirty` flag, the digest, the mismatch warning, a
+permalink only when it's true. An agent will reason confidently about whatever
+it's given. The tool's job is to make sure what it's given is labelled.

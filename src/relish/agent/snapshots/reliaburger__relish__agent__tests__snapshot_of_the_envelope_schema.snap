@@ -60,14 +60,14 @@ expression: "schema_of::<Envelope<Value>>()"
           ]
         },
         "dirty": {
-          "description": "Whether the checkout had uncommitted changes.",
+          "description": "Whether the checkout had uncommitted changes in the bundled paths,\nwhen git could say.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "source_digest": {
-          "description": "`sha256:` digest of the embedded source bundle.",
+          "description": "`sha256:` digest of the source bundle, as `relish agent source\nversion` reports it.",
           "type": [
             "string",
             "null"
@@ -102,6 +102,31 @@ expression: "schema_of::<Envelope<Value>>()"
         {
           "const": "schema",
           "description": "`relish agent schema`.",
+          "type": "string"
+        },
+        {
+          "const": "source version",
+          "description": "`relish agent source version`.",
+          "type": "string"
+        },
+        {
+          "const": "source tree",
+          "description": "`relish agent source tree`.",
+          "type": "string"
+        },
+        {
+          "const": "source grep",
+          "description": "`relish agent source grep`.",
+          "type": "string"
+        },
+        {
+          "const": "source show",
+          "description": "`relish agent source show`.",
+          "type": "string"
+        },
+        {
+          "const": "source extract",
+          "description": "`relish agent source extract`.",
           "type": "string"
         }
       ]

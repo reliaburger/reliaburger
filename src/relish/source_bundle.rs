@@ -106,8 +106,18 @@ pub fn digest() -> Result<String, SourceBundleError> {
     }
     #[cfg(not(source_bundle_embedded))]
     {
-        Ok(pack::digest(&tarball()?))
+        Ok(digest_of(&tarball()?))
     }
+}
+
+/// The SHA-256 of an uncompressed tarball, in lower-case hex: what
+/// [`digest`] reports for the bundle that tarball came from.
+pub fn digest_of(tar: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(tar)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Whether the tree had uncommitted changes in the allowlisted paths: when
@@ -154,7 +164,7 @@ fn parse_dirty(value: &str) -> Option<bool> {
 }
 
 /// The files in an uncompressed tarball, sorted by path.
-fn files_in(tar: &[u8]) -> Result<Vec<SourceFile>, SourceBundleError> {
+pub fn files_in(tar: &[u8]) -> Result<Vec<SourceFile>, SourceBundleError> {
     let mut archive = tar::Archive::new(tar);
     let mut files = Vec::new();
     for entry in archive.entries().map_err(SourceBundleError::Read)? {
@@ -177,8 +187,9 @@ fn files_in(tar: &[u8]) -> Result<Vec<SourceFile>, SourceBundleError> {
     Ok(files)
 }
 
-/// Unpack an uncompressed tarball into `dir`, which must be new or empty.
-fn extract_from(tar: &[u8], dir: &Path) -> Result<usize, SourceBundleError> {
+/// Unpack an uncompressed tarball into `dir`, which must be new or empty,
+/// and return the number of files written.
+pub fn extract_from(tar: &[u8], dir: &Path) -> Result<usize, SourceBundleError> {
     let write_error = |source| SourceBundleError::Write {
         path: dir.to_path_buf(),
         source,
@@ -335,6 +346,7 @@ mod tests {
         let digest = digest().unwrap();
         assert_eq!(digest.len(), 64);
         assert_eq!(pack::digest(&tarball().unwrap()), digest);
+        assert_eq!(digest_of(&tarball().unwrap()), digest);
     }
 
     #[test]

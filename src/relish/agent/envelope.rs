@@ -32,6 +32,26 @@ pub enum CommandName {
     Version,
     /// `relish agent schema`.
     Schema,
+    /// `relish agent source version`.
+    #[serde(rename = "source version")]
+    #[value(name = "source-version")]
+    SourceVersion,
+    /// `relish agent source tree`.
+    #[serde(rename = "source tree")]
+    #[value(name = "source-tree")]
+    SourceTree,
+    /// `relish agent source grep`.
+    #[serde(rename = "source grep")]
+    #[value(name = "source-grep")]
+    SourceGrep,
+    /// `relish agent source show`.
+    #[serde(rename = "source show")]
+    #[value(name = "source-show")]
+    SourceShow,
+    /// `relish agent source extract`.
+    #[serde(rename = "source extract")]
+    #[value(name = "source-extract")]
+    SourceExtract,
 }
 
 impl CommandName {
@@ -41,12 +61,25 @@ impl CommandName {
             CommandName::Agent => "agent",
             CommandName::Version => "version",
             CommandName::Schema => "schema",
+            CommandName::SourceVersion => "source version",
+            CommandName::SourceTree => "source tree",
+            CommandName::SourceGrep => "source grep",
+            CommandName::SourceShow => "source show",
+            CommandName::SourceExtract => "source extract",
         }
     }
 
     /// The commands that answer with `data`, in the order `relish agent
     /// schema` lists them.
-    pub const ANSWERING: &'static [CommandName] = &[CommandName::Version, CommandName::Schema];
+    pub const ANSWERING: &'static [CommandName] = &[
+        CommandName::Version,
+        CommandName::Schema,
+        CommandName::SourceVersion,
+        CommandName::SourceTree,
+        CommandName::SourceGrep,
+        CommandName::SourceShow,
+        CommandName::SourceExtract,
+    ];
 }
 
 /// Which `relish` produced the answer.
@@ -58,26 +91,29 @@ pub struct BuildInfo {
     pub version: String,
     /// The full git commit the binary was built from, when the build knew it.
     pub commit: Option<String>,
-    /// Whether the checkout had uncommitted changes.
-    // TODO(#1570): filled in once the build embeds its source bundle.
+    /// Whether the checkout had uncommitted changes in the bundled paths,
+    /// when git could say.
     pub dirty: Option<bool>,
-    /// `sha256:` digest of the embedded source bundle.
-    // TODO(#1570): filled in once the build embeds its source bundle.
+    /// `sha256:` digest of the source bundle, as `relish agent source
+    /// version` reports it.
     pub source_digest: Option<String>,
 }
 
 impl BuildInfo {
     /// This binary's build information.
     ///
-    /// `dirty` and `source_digest` are `null` until the source bundle lands
-    /// (#1570): nothing in the build records them yet, and a guess would be
-    /// worse than saying so.
+    /// A release build reads `dirty` and `source_digest` from what it
+    /// embedded, for free. A dev build packs its checkout to work them out,
+    /// and says `null` when the checkout has gone.
     pub fn current() -> Self {
+        use crate::relish::source_bundle;
         BuildInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
             commit: crate::upgrade::version::build_commit().map(str::to_string),
-            dirty: None,
-            source_digest: None,
+            dirty: source_bundle::dirty(),
+            source_digest: source_bundle::digest()
+                .ok()
+                .map(|digest| format!("sha256:{digest}")),
         }
     }
 }
