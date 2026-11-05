@@ -97,6 +97,34 @@ impl CommandOutcome {
     }
 }
 
+/// Why a connection to a Bun agent never carried a request. Each cause's
+/// message ends with what to try, because "is it running?" was wrong for
+/// most of them (#1567).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UnreachableCause {
+    /// The host name didn't resolve to an address.
+    #[error(
+        "the host name doesn't resolve; check the address in --endpoint, RELIABURGER_ENDPOINT or the current context"
+    )]
+    NameResolution,
+    /// The host answered, and nothing listened on the port.
+    #[error("connection refused; check that bun runs there and listens on that port")]
+    Refused,
+    /// The TCP connection opened, and the TLS handshake failed.
+    #[error(
+        "TLS handshake failed ({0}); pass the cluster CA with --ca-cert or RELIABURGER_CA_CERT, and check the endpoint is https"
+    )]
+    Tls(String),
+    /// Nothing answered before relish gave up.
+    #[error(
+        "no answer before the connect timeout; the host may be down, or a firewall may drop packets to that port"
+    )]
+    TimedOut,
+    /// Anything else, as the network stack described it.
+    #[error("{0}")]
+    Other(String),
+}
+
 /// Errors from Relish CLI operations.
 #[derive(Debug, thiserror::Error)]
 pub enum RelishError {
@@ -116,9 +144,15 @@ pub enum RelishError {
     #[error("{command} requires a running Bun agent (not available in single-node mode yet)")]
     AgentRequired { command: String },
 
-    /// The Bun agent is not reachable.
-    #[error("bun agent not reachable at localhost:9117 (is it running?)")]
-    AgentUnreachable,
+    /// No connection to the Bun agent carried the request: it names the
+    /// endpoint relish dialled and why that failed (#1567).
+    #[error("cannot reach the bun agent at {endpoint}: {cause}")]
+    AgentUnreachable {
+        /// The scheme, host and port relish dialled (`https://10.0.0.5:9117`).
+        endpoint: String,
+        /// What went wrong, with what to do about it.
+        cause: UnreachableCause,
+    },
 
     /// A WebSocket connection or frame failed.
     #[error("websocket: {0}")]

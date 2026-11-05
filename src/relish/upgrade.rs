@@ -1401,7 +1401,10 @@ mod tests {
     fn a_cluster_timeout_does_not_fall_back_to_single_node() {
         for failure in [
             RelishError::RequestTimeout,
-            RelishError::AgentUnreachable,
+            RelishError::AgentUnreachable {
+                endpoint: "https://10.0.0.5:9117".to_string(),
+                cause: crate::relish::UnreachableCause::Refused,
+            },
             api_error(500, "internal error"),
             api_error(503, "agent unavailable"),
         ] {
