@@ -8418,6 +8418,30 @@ the saved context's credentials, so it prints the CA and token exports as well.
 Setup prints the same advice as its last line when its own check finds the API
 out of reach.
 
+That still left one message for four different problems. A typo in the host
+name, a stopped Bun, an `https://` endpoint without `--ca-cert` and a firewall
+all printed the same `localhost:9117 (is it running?)`, and only the firewall
+got the setup hint. An agent reading that from a shell does what it says: it
+checks whether Bun runs, finds it does, and is stuck. So `AgentUnreachable`
+grew two fields (#1567), the endpoint relish actually dialled and an
+`UnreachableCause`: `NameResolution`, `Refused`, `Tls`, `TimedOut`, or `Other`
+with the network stack's own words. Each cause's message ends with its fix, and
+the setup hint now shows only for a refusal or a timeout, where a firewall is
+the likely story.
+
+Getting the cause out of a `reqwest::Error` means walking its chain.
+`std::error::Error` has a `source()` method that returns the error underneath,
+so a loop follows it down, and `downcast_ref::<T>()` asks each link "are you a
+`T`?", the way a type switch does in Go. The catch is `std::io::Error`. When it
+wraps another error, its `source()` skips the wrapped error and returns *that*
+error's source, and hyper wraps rustls's certificate error in one `io::Error`
+inside another. The first version walked `source()` and called a perfectly
+diagnosable `UnknownIssuer` "other". The test that served a certificate from a
+private CA caught it, and `io_cause` now looks inside each `io::Error` with
+`get_ref()` itself. DNS failures have no public type to match, so for those we
+fall back to the text hyper uses, `dns error`, and a test that dials a
+`.invalid` name (reserved by RFC 6761, so it never resolves) keeps that honest.
+
 The first eight-machine run on the Mac Studio stopped at the machine checks
 with this, and nothing else: `Fix these and run the same command again:
 miko@127.0.0.1:50812:`. Two of the disposable VMs had booted with

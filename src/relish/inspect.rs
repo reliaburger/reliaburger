@@ -66,7 +66,7 @@ pub struct Inspection {
 pub async fn collect(client: &BunClient, name: &str) -> Result<Inspection, RelishError> {
     let members = match bounded(client.nodes()).await {
         Ok(members) => members,
-        Err(RelishError::AgentUnreachable) => return Err(RelishError::AgentUnreachable),
+        Err(error @ RelishError::AgentUnreachable { .. }) => return Err(error),
         // An agent without cluster membership (or one too old to list it)
         // can still describe its own instances.
         Err(_) => Vec::new(),
@@ -78,7 +78,7 @@ pub async fn collect(client: &BunClient, name: &str) -> Result<Inspection, Relis
         });
         let answer = match local {
             Ok(instances) => NodeAnswer::Answered(instances),
-            Err(RelishError::AgentUnreachable) => return Err(RelishError::AgentUnreachable),
+            Err(error @ RelishError::AgentUnreachable { .. }) => return Err(error),
             Err(error) => NodeAnswer::Silent {
                 reason: describe_failure(&error),
             },

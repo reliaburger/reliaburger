@@ -32,7 +32,7 @@ stays parseable; where a command has warnings worth keeping (`lint`,
 | `fault <type>` | the fault, with any it created on other nodes under `routed` |
 | `fault list`, `fault clear` | `faults` and `warnings`; the node's `message` |
 | `fault scenario` | each step's `outcome` once the run ends; with `--dry-run`, the timeline |
-| `upgrade check` | `running`, `latest`, a `verdict` (`up_to_date`, `available`, `needs_fresh_cluster`, `unavailable`) and the `command` to run |
+| `upgrade check` | `running`, `latest`, each node's `platform`, a `verdict` (`up_to_date`, `available`, `needs_fresh_cluster`, `no_artefact_for_node`, `no_artefacts`), the `reason` behind a verdict that blocks, and the `command` to run when one is available |
 | `upgrade plan` | the `stages` in order, with `estimated_secs` |
 | `local` | `status`: each node's `condition` and `ready`; `start`, `stop`, `destroy`: each node's `result` |
 

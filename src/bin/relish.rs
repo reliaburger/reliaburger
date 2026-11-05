@@ -1849,10 +1849,10 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let command = match cli.command {
-        Some(command) => command,
-        None => return finish(reliaburger::relish::tui::run().await),
-    };
+    // Bare `relish` is `relish tui`, so `relish -o json` is refused the same
+    // way: before the TUI's own no-terminal check (#1569) can say something
+    // less to the point.
+    let command = cli.command.unwrap_or(Command::Tui);
     if let Some(reason) = output_refusal(&command, cli.output) {
         eprintln!("error: {reason}");
         // A usage error, like clap's own.
@@ -3083,11 +3083,19 @@ fn finish(result: Result<(), reliaburger::relish::RelishError>) -> ExitCode {
 
 /// Print a command's error, with what to do when the agent it needed was out
 /// of reach on a cluster `relish setup --ssh` built: there, the usual cause is
-/// a firewall between this machine and port 9117, not a stopped Bun.
+/// a firewall between this machine and port 9117, not a stopped Bun. A name
+/// that doesn't resolve or a certificate relish doesn't trust has its own fix
+/// in the error, and the firewall advice would only mislead.
 fn report(error: &reliaburger::relish::RelishError) {
+    use reliaburger::relish::{RelishError, UnreachableCause};
     eprintln!("error: {error}");
-    if matches!(error, reliaburger::relish::RelishError::AgentUnreachable)
-        && !reliaburger::relish::client::endpoint_overridden()
+    if matches!(
+        error,
+        RelishError::AgentUnreachable {
+            cause: UnreachableCause::Refused | UnreachableCause::TimedOut,
+            ..
+        }
+    ) && !reliaburger::relish::client::endpoint_overridden()
         && let Some(hint) = reliaburger::relish::quickstart::server_runner::unreachable_hint()
     {
         eprintln!("{hint}");

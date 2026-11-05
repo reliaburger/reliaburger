@@ -76,7 +76,7 @@ async fn stopped_instance_leaves_the_backend_list(
             Ok(resolved) if resolved.healthy_backends == 0 => return Ok(()),
             Err(crate::relish::RelishError::ApiError { status: 404, .. }) => return Ok(()),
             Err(
-                error @ (crate::relish::RelishError::AgentUnreachable
+                error @ (crate::relish::RelishError::AgentUnreachable { .. }
                 | crate::relish::RelishError::RequestTimeout),
             ) => Some(error.to_string()),
             Err(error) => return Err((format!("resolve failed: {error}")).into()),

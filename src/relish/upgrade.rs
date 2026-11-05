@@ -60,10 +60,11 @@ fn says_no_council(body: &str) -> bool {
 }
 
 /// One node and the platform (`linux-x86_64`) it reports.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct NodePlatform {
     /// How to name the node in a message: `node n1`, or `this node`.
     pub node: String,
+    /// The `{os}-{arch}` it runs on.
     pub platform: String,
 }
 
@@ -172,81 +173,90 @@ pub async fn check(
         .version
         .parse()
         .map_err(|e: crate::upgrade::UpgradeError| RelishError::FormatFailed(e.to_string()))?;
-    super::output::print_output(
-        &assess_check(
-            &running_version,
-            running.compatibility,
-            &metadata,
-            &platforms,
-        ),
-        output,
-    )
+    let report = check_report(
+        &running_version,
+        running.compatibility,
+        &metadata,
+        &platforms,
+    );
+    super::output::print_output(&report, output)
 }
 
-/// What `relish upgrade check` found.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct UpgradeCheck {
+/// What `relish upgrade check` found: the versions, the verdict, and what
+/// to run next when there's something to run.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CheckReport {
     /// The version the connected node runs.
     pub running: String,
-    /// The newest release the metadata names.
+    /// The newest version the release metadata names.
     pub latest: String,
-    /// What can be done about it.
+    /// Whether an upgrade is possible, and if not, why not.
     pub verdict: CheckVerdict,
-    /// Why the verdict isn't `available`, in a sentence; `null` otherwise.
-    pub detail: Option<String>,
+    /// The detail behind a verdict that isn't `up_to_date` or `available`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// The command that starts the upgrade, when one is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Each live node and the platform it runs on.
+    pub nodes: Vec<NodePlatform>,
 }
 
-/// The answer of `relish upgrade check`.
+/// The answer `relish upgrade check` gives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckVerdict {
-    /// The nodes already run the latest release, or a newer build.
+    /// The nodes run the latest release or newer.
     UpToDate,
-    /// `relish upgrade start` can roll the latest release out.
-    Available,
-    /// The latest release changes the cluster formats: start a fresh cluster.
+    /// The metadata names a latest release it has no entry for.
+    NoArtefacts,
+    /// The latest release changes a cluster format: start a fresh cluster.
     NeedsFreshCluster,
-    /// A newer release exists but can't be rolled out here: the metadata
-    /// lists no artefacts for it, or none for a node's platform.
-    Unavailable,
+    /// A node runs on a platform the release has no build for.
+    NoArtefactForNode,
+    /// `relish upgrade start` can roll the cluster forward.
+    Available,
 }
 
-impl std::fmt::Display for UpgradeCheck {
+impl std::fmt::Display for CheckReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "running: {}\nlatest:  {}", self.running, self.latest)?;
-        match (self.verdict, &self.detail, &self.command) {
-            (CheckVerdict::UpToDate, _, _) => writeln!(f, "up to date"),
-            (CheckVerdict::Available, _, Some(command)) => {
-                writeln!(f, "upgrade available: {command}")
-            }
-            (_, Some(detail), _) => writeln!(f, "{detail}"),
-            _ => Ok(()),
+        writeln!(f, "running: {}", self.running)?;
+        writeln!(f, "latest:  {}", self.latest)?;
+        let reason = self.reason.as_deref().unwrap_or_default();
+        match self.verdict {
+            CheckVerdict::UpToDate => writeln!(f, "up to date"),
+            CheckVerdict::NoArtefacts | CheckVerdict::NeedsFreshCluster => writeln!(f, "{reason}"),
+            CheckVerdict::NoArtefactForNode => writeln!(f, "a newer version exists, but {reason}"),
+            CheckVerdict::Available => writeln!(
+                f,
+                "upgrade available: {}",
+                self.command.as_deref().unwrap_or_default()
+            ),
         }
     }
 }
 
-fn assess_check(
+fn check_report(
     running: &BinaryVersion,
     running_formats: Option<Compatibility>,
     metadata: &ReleaseMetadata,
     nodes: &[NodePlatform],
-) -> UpgradeCheck {
+) -> CheckReport {
     let latest = &metadata.latest;
-    let answer = |verdict, detail: Option<String>, command: Option<String>| UpgradeCheck {
+    let report = |verdict, reason: Option<String>, command: Option<String>| CheckReport {
         running: running.to_string(),
         latest: latest.to_string(),
         verdict,
-        detail,
+        reason,
         command,
+        nodes: nodes.to_vec(),
     };
     if running >= latest {
-        return answer(CheckVerdict::UpToDate, None, None);
+        return report(CheckVerdict::UpToDate, None, None);
     }
     let Some(release) = metadata.release(latest) else {
-        return answer(
-            CheckVerdict::Unavailable,
+        return report(
+            CheckVerdict::NoArtefacts,
             Some(format!(
                 "the release metadata names {latest} but lists no artefacts for it"
             )),
@@ -254,32 +264,18 @@ fn assess_check(
         );
     };
     if let Some(change) = format_change(running_formats, release) {
-        return answer(CheckVerdict::NeedsFreshCluster, Some(change), None);
+        return report(CheckVerdict::NeedsFreshCluster, Some(change), None);
     }
     match artefacts_for_nodes(release, nodes) {
-        Ok(_) => answer(
+        Ok(_) => report(
             CheckVerdict::Available,
             None,
             Some(format!(
                 "relish upgrade start {latest} --external-key <your key>"
             )),
         ),
-        Err(e) => answer(
-            CheckVerdict::Unavailable,
-            Some(format!("a newer version exists, but {e}")),
-            None,
-        ),
+        Err(e) => report(CheckVerdict::NoArtefactForNode, Some(e.to_string()), None),
     }
-}
-
-#[cfg(test)]
-fn render_check(
-    running: &BinaryVersion,
-    running_formats: Option<Compatibility>,
-    metadata: &ReleaseMetadata,
-    nodes: &[NodePlatform],
-) -> String {
-    assess_check(running, running_formats, metadata, nodes).to_string()
 }
 
 /// Arguments for `relish upgrade start`.
@@ -713,27 +709,40 @@ pub async fn plan(
     parallel: u32,
     output: super::OutputFormat,
 ) -> Result<(), RelishError> {
-    let (workers, council, leader) = match cluster_size {
-        Some(size) => hypothetical_roles(size),
-        None => match client.nodes().await {
-            Ok(mut nodes) => {
-                nodes.retain(|node| !node.is_down());
-                let leader = nodes.iter().filter(|n| n.is_leader).count();
-                let council = nodes
-                    .iter()
-                    .filter(|n| n.is_council && !n.is_leader)
-                    .count();
-                (nodes.len() - council - leader, council, leader)
-            }
-            // No cluster reachable: plan for a single node.
-            Err(_) => (0, 0, 1),
-        },
-    };
+    let (workers, council, leader) = plan_roles(client, cluster_size).await?;
     super::output::print_output(
         &UpgradePlan::new(version, workers, council, leader, parallel),
         output,
-    )?;
-    Ok(())
+    )
+}
+
+/// How many workers, followers and leaders the plan covers: the hypothetical
+/// cluster `--cluster-size` describes, or the live one.
+///
+/// Only a node that says it has no council is planned as a single node. A
+/// cluster relish couldn't see is refused: planning one node for it printed
+/// a confident rolling order for a cluster nobody looked at (#1568).
+async fn plan_roles(
+    client: &BunClient,
+    cluster_size: Option<usize>,
+) -> Result<(usize, usize, usize), RelishError> {
+    if let Some(size) = cluster_size {
+        return Ok(hypothetical_roles(size));
+    }
+    let unseen = |error| RelishError::UnseenCluster(Box::new(error));
+    match topology(client.upgrade_cluster().await).map_err(unseen)? {
+        Topology::SingleNode => Ok((0, 0, 1)),
+        Topology::Cluster(_) => {
+            let mut nodes = client.nodes().await.map_err(unseen)?;
+            nodes.retain(|node| !node.is_down());
+            let leader = nodes.iter().filter(|n| n.is_leader).count();
+            let council = nodes
+                .iter()
+                .filter(|n| n.is_council && !n.is_leader)
+                .count();
+            Ok((nodes.len() - council - leader, council, leader))
+        }
+    }
 }
 
 /// `relish upgrade rollback [version]`.
@@ -1547,7 +1556,10 @@ mod tests {
     fn a_cluster_timeout_does_not_fall_back_to_single_node() {
         for failure in [
             RelishError::RequestTimeout,
-            RelishError::AgentUnreachable,
+            RelishError::AgentUnreachable {
+                endpoint: "https://10.0.0.5:9117".to_string(),
+                cause: crate::relish::UnreachableCause::Refused,
+            },
             api_error(500, "internal error"),
             api_error(503, "agent unavailable"),
         ] {
@@ -1641,12 +1653,14 @@ mod tests {
         };
         let nodes = [on("a", "linux-x86_64")];
 
-        let changed = render_check(&running, Some(old), &release_fixture(Some(new)), &nodes);
+        let changed =
+            check_report(&running, Some(old), &release_fixture(Some(new)), &nodes).to_string();
         assert!(changed.contains("needs a fresh cluster"), "{changed}");
         assert!(changed.contains("protocol 46 -> 51"), "{changed}");
         assert!(!changed.contains("upgrade available"), "{changed}");
 
-        let same = render_check(&running, Some(new), &release_fixture(Some(new)), &nodes);
+        let same =
+            check_report(&running, Some(new), &release_fixture(Some(new)), &nodes).to_string();
         assert!(
             same.contains("upgrade available: relish upgrade start v0.2.0"),
             "{same}"
@@ -1654,7 +1668,7 @@ mod tests {
     }
 
     /// #1566: `relish upgrade check -o json` gives a verdict a script can
-    /// branch on, not a sentence to parse.
+    /// branch on, not a sentence to parse. The one snapshot of its shape.
     #[test]
     fn check_as_json_gives_a_verdict_and_the_command() {
         let running: BinaryVersion = "v0.1.6".parse().unwrap();
@@ -1662,7 +1676,7 @@ mod tests {
             protocol: 51,
             state: 68,
         };
-        let available = assess_check(
+        let available = check_report(
             &running,
             Some(formats),
             &release_fixture(Some(formats)),
@@ -1673,21 +1687,8 @@ mod tests {
                 .unwrap()
         );
 
-        let missing = assess_check(
-            &running,
-            Some(formats),
-            &release_fixture(Some(formats)),
-            &[on("m", "macos-aarch64")],
-        );
-        assert_eq!(missing.verdict, CheckVerdict::Unavailable);
-        assert!(
-            missing.detail.as_deref().unwrap_or("").contains("node m"),
-            "{missing:?}"
-        );
-        assert_eq!(missing.command, None);
-
         let current: BinaryVersion = "v0.2.0".parse().unwrap();
-        let up_to_date = assess_check(
+        let up_to_date = check_report(
             &current,
             Some(formats),
             &release_fixture(Some(formats)),
@@ -1788,6 +1789,131 @@ mod tests {
         drop(staged);
         assert!(!path.exists(), "the staged binary is removed");
         assert!(!directory.exists(), "and so is its directory");
+    }
+
+    /// Serve `/v1/upgrade/cluster` and `/v1/cluster/nodes` with the given
+    /// statuses and bodies; returns the client pointed at it.
+    async fn fake_node(
+        cluster: (axum::http::StatusCode, serde_json::Value),
+        nodes: (axum::http::StatusCode, serde_json::Value),
+    ) -> BunClient {
+        let app = axum::Router::new()
+            .route(
+                "/v1/upgrade/cluster",
+                axum::routing::get(move || async move { (cluster.0, axum::Json(cluster.1)) }),
+            )
+            .route(
+                "/v1/cluster/nodes",
+                axum::routing::get(move || async move { (nodes.0, axum::Json(nodes.1)) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        BunClient::new_with_token(&origin, None)
+    }
+
+    /// #1568: it used to print a confident one-node rolling order for a
+    /// cluster it never saw.
+    #[tokio::test]
+    async fn plan_refuses_a_cluster_it_could_not_reach() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+
+        let error = plan_roles(&client, None).await.unwrap_err();
+
+        assert!(matches!(error, RelishError::UnseenCluster(_)), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains(&address.to_string()), "{message}");
+        assert!(message.contains("--cluster-size"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn plan_refuses_when_the_node_list_fails() {
+        use axum::http::StatusCode;
+        let client = fake_node(
+            (StatusCode::OK, serde_json::json!({ "active": null })),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "boom" }),
+            ),
+        )
+        .await;
+
+        let error = plan_roles(&client, None).await.unwrap_err();
+
+        assert!(matches!(error, RelishError::UnseenCluster(_)), "{error:?}");
+        assert!(error.to_string().contains("boom"), "{error}");
+    }
+
+    /// A node that says it has no council really is a single node.
+    #[tokio::test]
+    async fn plan_for_a_node_without_a_council_is_one_node() {
+        use axum::http::StatusCode;
+        let client = fake_node(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "error": crate::upgrade::NO_COUNCIL }),
+            ),
+            (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({})),
+        )
+        .await;
+
+        assert_eq!(plan_roles(&client, None).await.unwrap(), (0, 0, 1));
+    }
+
+    /// `--cluster-size` is the offline form: it needs no cluster at all.
+    #[tokio::test]
+    async fn plan_with_a_cluster_size_needs_no_cluster() {
+        let client = BunClient::new_with_token("http://127.0.0.1:1", None);
+        assert_eq!(plan_roles(&client, Some(5)).await.unwrap(), (2, 2, 1));
+    }
+
+    /// `relish upgrade check -o json` gives a script the verdict as a
+    /// field instead of a sentence to grep.
+    #[test]
+    fn check_report_serialises_its_verdict() {
+        let running: BinaryVersion = "v0.1.6".parse().unwrap();
+        let formats = Compatibility {
+            protocol: 51,
+            state: 68,
+        };
+        let nodes = [on("a", "linux-x86_64")];
+
+        let fresh = check_report(
+            &running,
+            Some(Compatibility {
+                protocol: 46,
+                state: 63,
+            }),
+            &release_fixture(Some(formats)),
+            &nodes,
+        );
+        assert_eq!(
+            serde_json::to_value(&fresh).unwrap()["verdict"],
+            "needs_fresh_cluster"
+        );
+
+        let current: BinaryVersion = "v0.2.0".parse().unwrap();
+        let up_to_date = check_report(&current, None, &release_fixture(None), &nodes);
+        assert_eq!(
+            serde_json::to_value(&up_to_date).unwrap()["verdict"],
+            "up_to_date"
+        );
+
+        let missing = check_report(
+            &running,
+            None,
+            &release_fixture(None),
+            &[on("m", "macos-aarch64")],
+        );
+        let json = serde_json::to_value(&missing).unwrap();
+        assert_eq!(json["verdict"], "no_artefact_for_node");
+        assert!(
+            json["reason"].as_str().unwrap().contains("node m"),
+            "{json}"
+        );
     }
 
     #[test]

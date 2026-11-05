@@ -6,6 +6,11 @@ expression: "crate::relish::output::format_output(&available,\ncrate::relish::Ou
   "running": "v0.1.6",
   "latest": "v0.2.0",
   "verdict": "available",
-  "detail": null,
-  "command": "relish upgrade start v0.2.0 --external-key <your key>"
+  "command": "relish upgrade start v0.2.0 --external-key <your key>",
+  "nodes": [
+    {
+      "node": "node a",
+      "platform": "linux-x86_64"
+    }
+  ]
 }

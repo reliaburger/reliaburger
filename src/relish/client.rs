@@ -337,8 +337,6 @@ pub const FAULT_CLEAR_RETRY_BUDGET: std::time::Duration = std::time::Duration::f
 /// Pause between those attempts.
 const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Classify a reqwest send error as either a timeout or a connection failure.
-/// A successful response's JSON body, or the API error it carried.
 /// Attach an `Idempotency-Key` header when the caller has one.
 fn with_idempotency_key(
     request: reqwest::RequestBuilder,
@@ -364,16 +362,82 @@ async fn json_or_api_error<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Classify a reqwest error: a connection that never carried the request, a
+/// request that timed out after it was sent, or a body that didn't parse.
 fn classify_error(e: reqwest::Error) -> RelishError {
     // A connection that never opened reached no agent, even when it gave up
     // by timing out, which is how a firewall that drops packets looks. Only
     // a request that got through may still be running.
     if e.is_connect() {
-        RelishError::AgentUnreachable
+        unreachable(&e)
     } else if e.is_timeout() {
         RelishError::RequestTimeout
+    } else if e.is_decode() {
+        RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        }
     } else {
-        RelishError::AgentUnreachable
+        unreachable(&e)
+    }
+}
+
+/// The agent couldn't be reached: the endpoint the request dialled, and why.
+fn unreachable(error: &reqwest::Error) -> RelishError {
+    let endpoint = error
+        .url()
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| "the configured endpoint".to_string());
+    RelishError::AgentUnreachable {
+        endpoint,
+        cause: unreachable_cause(error),
+    }
+}
+
+/// Walk the error's sources for the reason the connection failed. reqwest
+/// wraps hyper, which wraps the resolver, the socket and rustls, so the
+/// useful part is several layers down.
+fn unreachable_cause(error: &reqwest::Error) -> super::UnreachableCause {
+    use super::UnreachableCause;
+    let mut deepest = error.to_string();
+    let mut said_dns = false;
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if let Some(cause) = io_cause(current) {
+            return cause;
+        }
+        let text = current.to_string();
+        // hyper-util's resolver error has no type of its own to match on.
+        said_dns |= text.contains("dns error") || text.contains("failed to lookup address");
+        deepest = text;
+        source = current.source();
+    }
+    if error.is_timeout() {
+        UnreachableCause::TimedOut
+    } else if said_dns {
+        UnreachableCause::NameResolution
+    } else {
+        UnreachableCause::Other(deepest)
+    }
+}
+
+/// The cause one link of the chain names, if it's a rustls error or an
+/// `io::Error` that says what happened. hyper wraps rustls's error in one
+/// `io::Error` inside another, and `io::Error::source` skips the error it
+/// wraps, so this looks inside each wrapper itself.
+fn io_cause(error: &(dyn std::error::Error + 'static)) -> Option<super::UnreachableCause> {
+    use super::UnreachableCause;
+    if let Some(tls) = error.downcast_ref::<rustls::Error>() {
+        return Some(UnreachableCause::Tls(tls.to_string()));
+    }
+    let io = error.downcast_ref::<std::io::Error>()?;
+    match io.kind() {
+        std::io::ErrorKind::ConnectionRefused => Some(UnreachableCause::Refused),
+        std::io::ErrorKind::TimedOut => Some(UnreachableCause::TimedOut),
+        _ => {
+            let inner: &(dyn std::error::Error + 'static) = io.get_ref()?;
+            io_cause(inner)
+        }
     }
 }
 
@@ -841,7 +905,7 @@ impl BunClient {
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-            .map_err(|_| RelishError::AgentUnreachable)?;
+            .map_err(|error| unreachable(&error))?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
             return Err(RelishError::ApiError {
@@ -4214,10 +4278,104 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.is_connect(), "{error:?}");
-        assert!(matches!(
-            classify_error(error),
-            RelishError::AgentUnreachable
-        ));
+        let RelishError::AgentUnreachable { endpoint, .. } = classify_error(error) else {
+            panic!("a connection that never opened must read as unreachable");
+        };
+        assert_eq!(endpoint, "http://192.0.2.1:9117");
+    }
+
+    /// The error names the endpoint relish actually dialled, not the
+    /// localhost:9117 default, and says the port refused the connection.
+    #[tokio::test]
+    async fn a_refused_connection_names_the_endpoint_and_says_refused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = BunClient::build(&format!("http://{address}"), None, None);
+
+        let error = client.health().await.unwrap_err();
+
+        let RelishError::AgentUnreachable { endpoint, cause } = &error else {
+            panic!("expected unreachable, got {error:?}");
+        };
+        assert_eq!(endpoint, &format!("http://{address}"));
+        assert_eq!(cause, &crate::relish::UnreachableCause::Refused);
+        let message = error.to_string();
+        assert!(!message.contains("localhost:9117"), "{message}");
+        assert!(message.contains("connection refused"), "{message}");
+    }
+
+    /// A host name that doesn't resolve is a typo in the address, not a
+    /// stopped agent.
+    #[tokio::test]
+    async fn a_name_that_does_not_resolve_says_so() {
+        // `.invalid` is reserved (RFC 6761): it never resolves.
+        let client = BunClient::build("https://no-such-node.invalid:9117", None, None);
+
+        let error = client.health().await.unwrap_err();
+
+        let RelishError::AgentUnreachable { endpoint, cause } = &error else {
+            panic!("expected unreachable, got {error:?}");
+        };
+        assert_eq!(endpoint, "https://no-such-node.invalid:9117");
+        assert_eq!(cause, &crate::relish::UnreachableCause::NameResolution);
+        assert!(error.to_string().contains("doesn't resolve"), "{error}");
+    }
+
+    /// The commonest remote mistake: an https endpoint and no `--ca-cert`.
+    /// The agent is up and listening; the fix is the CA, not restarting it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_certificate_relish_does_not_trust_names_tls_and_the_ca_flag() {
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("unreachable-tls", b"ikm").unwrap();
+        let server = test_identity(&hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let address = spawn_tls_health(&server, shutdown.clone()).await;
+        let client = BunClient::build(&format!("https://{address}"), None, None);
+
+        let error = client.health().await.unwrap_err();
+        shutdown.cancel();
+
+        let RelishError::AgentUnreachable { endpoint, cause } = &error else {
+            panic!("expected unreachable, got {error:?}");
+        };
+        assert_eq!(endpoint, &format!("https://{address}"));
+        assert!(
+            matches!(cause, crate::relish::UnreachableCause::Tls(_)),
+            "{cause:?}"
+        );
+        assert!(error.to_string().contains("--ca-cert"), "{error}");
+    }
+
+    /// Every cause says what to do; none falls back to "is it running?".
+    #[test]
+    fn each_unreachable_cause_names_its_fix() {
+        use crate::relish::UnreachableCause;
+        let message = |cause| {
+            RelishError::AgentUnreachable {
+                endpoint: "https://10.0.0.5:9117".to_string(),
+                cause,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            message(UnreachableCause::NameResolution),
+            "cannot reach the bun agent at https://10.0.0.5:9117: the host name doesn't resolve; check the address in --endpoint, RELIABURGER_ENDPOINT or the current context"
+        );
+        assert_eq!(
+            message(UnreachableCause::Refused),
+            "cannot reach the bun agent at https://10.0.0.5:9117: connection refused; check that bun runs there and listens on that port"
+        );
+        assert_eq!(
+            message(UnreachableCause::Tls(
+                "invalid peer certificate: UnknownIssuer".to_string()
+            )),
+            "cannot reach the bun agent at https://10.0.0.5:9117: TLS handshake failed (invalid peer certificate: UnknownIssuer); pass the cluster CA with --ca-cert or RELIABURGER_CA_CERT, and check the endpoint is https"
+        );
+        assert_eq!(
+            message(UnreachableCause::TimedOut),
+            "cannot reach the bun agent at https://10.0.0.5:9117: no answer before the connect timeout; the host may be down, or a firewall may drop packets to that port"
+        );
     }
 
     #[tokio::test]

@@ -152,15 +152,14 @@ async fn apply_with_client(
             println!("{}", apply_summary(result.created, &result.instances));
             Ok(())
         }
-        Err(_) => {
+        Err(error) => {
             // X5: show the plan for reference, but fail — a dead agent
             // must not make a deploy look successful.
             let plan = generate_plan(&config, None);
             let formatted = format_output(&plan, output)?;
             println!("{formatted}");
-            eprintln!("\nerror: bun agent not reachable — nothing was deployed");
-            eprintln!("(use --dry-run to preview a plan without an agent)");
-            Err(RelishError::AgentUnreachable)
+            eprintln!("\nnothing was deployed (use --dry-run to preview a plan without an agent)");
+            Err(error)
         }
     }
 }
@@ -1842,13 +1841,12 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
             }
             Ok(())
         }
-        Err(_) => {
+        Err(error) => {
             let plan = generate_plan(&config, None);
             let formatted = format_output(&plan, super::OutputFormat::Human)?;
             println!("{formatted}");
-            eprintln!("\nerror: bun agent not reachable — nothing was deployed");
-            eprintln!("(use --dry-run to preview a plan without an agent)");
-            Err(RelishError::AgentUnreachable)
+            eprintln!("\nnothing was deployed (use --dry-run to preview a plan without an agent)");
+            Err(error)
         }
     }
 }
@@ -4951,7 +4949,10 @@ spec:
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
+        assert!(
+            matches!(err, RelishError::AgentUnreachable { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -5291,7 +5292,10 @@ spec:
         let err = status_with_client(OutputFormat::Human, &bogus_client())
             .await
             .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
+        assert!(
+            matches!(err, RelishError::AgentUnreachable { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -5306,7 +5310,7 @@ spec:
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable));
+        assert!(matches!(err, RelishError::AgentUnreachable { .. }));
     }
 
     #[tokio::test]
@@ -5314,7 +5318,7 @@ spec:
         let err = exec_with_client("web", "default", &["sh".to_string()], &bogus_client())
             .await
             .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable));
+        assert!(matches!(err, RelishError::AgentUnreachable { .. }));
     }
 
     #[tokio::test]
@@ -5322,7 +5326,7 @@ spec:
         let err = stop_with_client("web", "default", &bogus_client())
             .await
             .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable));
+        assert!(matches!(err, RelishError::AgentUnreachable { .. }));
     }
 
     #[test]
@@ -5513,7 +5517,7 @@ spec:
         let err = inspect_with_client("web", OutputFormat::Human, &bogus_client())
             .await
             .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable));
+        assert!(matches!(err, RelishError::AgentUnreachable { .. }));
     }
 
     #[tokio::test]
@@ -5521,7 +5525,10 @@ spec:
         let err = nodes_with_client(OutputFormat::Human, &bogus_client())
             .await
             .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
+        assert!(
+            matches!(err, RelishError::AgentUnreachable { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -5529,7 +5536,10 @@ spec:
         let err = council_with_client(OutputFormat::Human, &bogus_client())
             .await
             .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
+        assert!(
+            matches!(err, RelishError::AgentUnreachable { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]

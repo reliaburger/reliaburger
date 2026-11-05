@@ -27,6 +27,56 @@ fn version_reports_the_compiled_binary() {
     assert!(output.stderr.is_empty());
 }
 
+/// Run `relish` the way an agent's shell does: no terminal on stdin or
+/// stdout. Gives up after 20 s, so a reader that hangs fails the test
+/// instead of the run.
+fn run_without_a_terminal(args: &[&str]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(args)
+        .env_remove("RELIABURGER_TOKEN")
+        .env_remove("RELIABURGER_CA_CERT")
+        .env_remove("RELIABURGER_ENDPOINT")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("relish {args:?} hung without a terminal");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// #1569: the TUI and the two readers are full-screen. From an agent's shell
+/// they used to error obscurely or hang; now they stop at once and say what
+/// to run instead.
+#[test]
+fn full_screen_commands_fail_fast_without_a_terminal() {
+    for (args, hint) in [
+        (&[][..], "relish agent guide"),
+        (&["tui"], "relish agent guide"),
+        (&["manual"], "relish agent manual"),
+        (&["manual", "tour"], "relish agent manual"),
+        (&["source"], "relish agent source"),
+        (&["source", "ebpf"], "relish agent source"),
+    ] {
+        let output = run_without_a_terminal(args);
+        assert_eq!(output.status.code(), Some(1), "relish {args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("needs a terminal"),
+            "relish {args:?}: {stderr}"
+        );
+        assert!(stderr.contains(hint), "relish {args:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "relish {args:?}");
+    }
+}
+
 #[test]
 fn invalid_output_format_exits_with_clap_error() {
     let output = run(&["--output", "xml", "status"]);
