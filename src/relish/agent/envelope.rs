@@ -266,10 +266,11 @@ impl From<&RelishError> for AgentError {
     fn from(error: &RelishError) -> Self {
         let message = error.to_string();
         match error {
-            RelishError::AgentUnreachable => AgentError::new(ErrorCode::Unreachable, message)
-                .with_hint(
+            RelishError::AgentUnreachable { .. } => {
+                AgentError::new(ErrorCode::Unreachable, message).with_hint(
                     "start a cluster (relish setup --quickstart) or point at one with --endpoint",
-                ),
+                )
+            }
             RelishError::AgentRequired { .. } => AgentError::new(ErrorCode::NoEndpoint, message),
             RelishError::RequestTimeout => AgentError::new(ErrorCode::Timeout, message),
             RelishError::ApiError { status, .. } => {
@@ -521,7 +522,13 @@ mod tests {
     #[test]
     fn relish_errors_map_to_their_codes() {
         let cases = [
-            (RelishError::AgentUnreachable, ErrorCode::Unreachable),
+            (
+                RelishError::AgentUnreachable {
+                    endpoint: "https://10.0.0.5:9117".to_string(),
+                    cause: crate::relish::UnreachableCause::Refused,
+                },
+                ErrorCode::Unreachable,
+            ),
             (RelishError::RequestTimeout, ErrorCode::Timeout),
             (
                 RelishError::AgentRequired {

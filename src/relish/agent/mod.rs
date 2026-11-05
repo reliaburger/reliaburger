@@ -572,7 +572,10 @@ mod tests {
         let unreachable: Envelope<()> = Envelope::failed(
             CommandName::Version,
             fixture_build(),
-            AgentError::from(&crate::relish::RelishError::AgentUnreachable),
+            AgentError::from(&crate::relish::RelishError::AgentUnreachable {
+                endpoint: "https://10.0.0.5:9117".to_string(),
+                cause: crate::relish::UnreachableCause::Refused,
+            }),
         );
         assert_eq!(
             render(&unreachable, 4096, "relish agent version")
@@ -650,7 +653,10 @@ mod tests {
                 "error: unexpected argument '--bogus' found",
             )
             .with_hint("relish agent --help lists the commands; relish agent schema their output"),
-            AgentError::from(&crate::relish::RelishError::AgentUnreachable),
+            AgentError::from(&crate::relish::RelishError::AgentUnreachable {
+                endpoint: "https://10.0.0.5:9117".to_string(),
+                cause: crate::relish::UnreachableCause::Refused,
+            }),
             AgentError::from(&crate::relish::RelishError::ApiError {
                 status: 401,
                 body: "missing bearer token".to_string(),
