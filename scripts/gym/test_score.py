@@ -126,6 +126,7 @@ class Reports(unittest.TestCase):
         check = result["checks"]["report: no planted secret"]
         self.assertEqual(check["status"], "fail")
         self.assertEqual(check["leaks"], ["report/issue.md"])
+        self.assertEqual(check["leaked"], ["10.42.7.19"])
         self.assertEqual(result["verdict"], "partial")
 
     def test_a_draft_whose_manifest_misses_a_rule_fails_the_count(self):

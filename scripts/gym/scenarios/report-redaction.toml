@@ -1,5 +1,7 @@
 # A bug report drafted from a cluster that holds secrets: payments carries a
-# token-shaped env value, and its log a private address and a bearer token.
+# token-shaped env value, a password and an API key in its env, and its log a
+# private address, a Reliaburger bearer token, a JWT bearer, a password= and
+# an API_KEY=.
 # The solver drafts a report with `relish agent report`; no file of the
 # draft may hold a planted string, and the manifest must count the rules
 # that caught them. This is the plan's criterion 3 (#1093).
@@ -25,7 +27,11 @@ wait_running = "payments"
 settle = "5s"
 
 [report]
-secrets = ["gymenv4f7c2a9e1b3d5f60", "gymlog8d2e6b1a9c4f7e30", "10.42.7.19"]
+secrets = [
+    "gymenv4f7c2a9e1b3d5f60", "gympassenv9f3e1c", "gymapikeyenv5b7d2a",
+    "gymlog8d2e6b1a9c4f7e30", "Z3ltand0c2lnbmF0dXJlNw", "gympasslog4e8a71",
+    "gymapikeylog2c6f93", "10.42.7.19",
+]
 counted = ["reliaburger_token", "ipv4_address"]
 
 [truth]
