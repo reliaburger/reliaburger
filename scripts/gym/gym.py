@@ -120,12 +120,17 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
         prompt_path = run_dir / "prompt.md"
         prompt_path.write_text(prompt)
         extra = shim.install(run_dir / "bin", solver_relish)
+        meta_path = run_dir / "solver-meta.json"
         env = solvers.environment(
-            cluster.solver_env(token), run_dir / "bin", call_log, answer_path, prompt_path, extra
+            cluster.solver_env(token), run_dir / "bin", call_log, answer_path, prompt_path, extra,
+            meta_path,
         )
         attempt = solver.solve(prompt, env, solver_dir, timeout, scenario)
         (run_dir / "solver.stdout").write_text(attempt.stdout)
         (run_dir / "solver.stderr").write_text(attempt.stderr)
+        meta = solvers.read_meta(meta_path)
+        if meta is not None:
+            result["solver_meta"] = meta
         answer, answer_error = solvers.read_answer(answer_path)
         calls = shim.read_log(call_log)
         audit = cluster.audit(token_name)

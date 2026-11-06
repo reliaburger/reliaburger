@@ -42,7 +42,7 @@ variable GYM_ANSWER, with these fields (null for any you can't name):
       "node": "the node at fault",
       "fault_kind": "one of: {kinds}",
       "location": {{"file": "repository-relative path", "function": "function name"}},
-      "patch": "a unified diff against the source, for a bug in Reliaburger",
+      "patch": "a unified diff against the source that `git apply` takes at its root, for a bug in Reliaburger",
       "summary": "what you found, in a few sentences"
     }}
 """
@@ -230,12 +230,27 @@ def solver_from_spec(spec):
     raise ValueError(f"unknown solver {spec!r}: use scripted or command:PROGRAM")
 
 
-def environment(base_env, shim_bin, call_log, answer_path, prompt_path, extra):
-    """The solver's environment: the shim first on PATH, and the gym's files."""
+def environment(base_env, shim_bin, call_log, answer_path, prompt_path, extra, meta_path=None):
+    """The solver's environment: the shim first on PATH, and the gym's files.
+
+    `GYM_SOLVER_META` names a file the solver may write a JSON object to
+    (its model, client version, cost); the runner keeps it in the result.
+    """
     env = dict(base_env)
     env.update(extra)
     env["PATH"] = f"{shim_bin}{os.pathsep}{base_env.get('PATH', '')}"
     env["GYM_CALL_LOG"] = str(call_log)
     env["GYM_ANSWER"] = str(answer_path)
     env["GYM_PROMPT"] = str(prompt_path)
+    if meta_path is not None:
+        env["GYM_SOLVER_META"] = str(meta_path)
     return env
+
+
+def read_meta(path):
+    """What the solver said about itself, or None when it said nothing usable."""
+    try:
+        meta = json.loads(Path(path).read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return meta if isinstance(meta, dict) else None

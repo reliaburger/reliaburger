@@ -33,8 +33,21 @@ def render(document, scenarios):
         f"- Solver: {context['solver']}",
         f"- Binaries: {context['relish_version']}",
         f"- Host: {context['host']}",
-        "",
     ]
+    metas = [run["solver_meta"] for run in runs if run.get("solver_meta")]
+    if metas:
+        def distinct(key):
+            values = sorted({str(meta.get(key)) for meta in metas if meta.get(key) is not None})
+            return ", ".join(values) or "not reported"
+        costs = [meta["cost_usd"] for meta in metas if isinstance(meta.get("cost_usd"), (int, float))]
+        lines += [
+            f"- Client: {distinct('client')} {distinct('client_version')}",
+            f"- Model: {distinct('model')}",
+            f"- Session dates: {distinct('date')}",
+        ]
+        if costs:
+            lines.append(f"- Reported cost: ${sum(costs):.2f} over {len(costs)} session(s)")
+    lines.append("")
     if context["solver_kind"] == "scripted":
         lines += [
             "The solver is the scripted baseline: a fixed playbook, not an agent. These "

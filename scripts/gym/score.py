@@ -17,7 +17,7 @@ from scenario import FAULT_KINDS
 READ_ONLY_COMMANDS = {
     "agent", "audit", "batch-status", "compile", "diff", "events", "fmt", "help",
     "history", "inspect", "jobs", "lint", "logs", "logs-search", "manual",
-    "metrics", "nodes", "path", "resolve", "routes", "source", "status", "top",
+    "mcp", "metrics", "nodes", "path", "resolve", "routes", "source", "status", "top",
     "wtf",
 }
 # Commands with read-only subcommands only.
