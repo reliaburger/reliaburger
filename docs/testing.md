@@ -612,6 +612,9 @@ plan: [`plans/2026-10-28-research-kubernetes-release-testing.md`](plans/2026-10-
 | `join_csr` | `sesame::ca::sign_node_csr` | a joining node |
 | `app_config` | `config::Config::parse` | `relish apply` or a GitOps repository |
 | `node_config` | `config::node::NodeConfig::parse` | a node's config file |
+| `task_manifest` | `TaskManifestRequest` and `validate_submission` (`bun::task_array_api`) | `relish batch submit` or `POST /v1/batch/manifest` |
+| `chaos_scenario` | `ScriptedScenario` and `smoker::scenario::build_timeline` | a chaos scenario file for `relish fault scenario` |
+| `council_backup_state` | `DesiredState`, then `BackupKey::for_state` and `BackupKey::parse` | the state inside an unsealed backup, during `relish council recover` |
 
 A target's body lives in [`src/fuzz/mod.rs`](../src/fuzz/mod.rs), behind the
 `fuzzing` feature, and [`fuzz/fuzz_targets/`](../fuzz/fuzz_targets) only wraps
