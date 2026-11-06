@@ -745,7 +745,8 @@ deploy, an unschedulable deploy, a council follower partitioned by Smoker, the
 crash loop again beside an app whose log carries a prompt injection, and a
 `relish` built with the fix for
 [#1515](https://github.com/reliaburger/reliaburger/issues/1515) reverted, to be
-found through `relish agent source`.
+found through `relish agent source`, and an app carrying secrets that a bug
+report drafted with `relish agent report` must not leak.
 
 | Command | What it does |
 |---|---|
