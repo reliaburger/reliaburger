@@ -19,8 +19,9 @@ pub(super) struct JobStore {
     path: PathBuf,
     checkpoint: Checkpoint,
     fenced: bool,
-    /// Test hook: the next publication waits here, after its checkpoint is
-    /// built and before it reaches the disk, until the test also waits.
+    /// Test hook: the next publication that creates a run waits here, after
+    /// its checkpoint is built and before it reaches the disk, until the
+    /// test also waits.
     #[cfg(test)]
     publication_pause: Option<std::sync::Arc<std::sync::Barrier>>,
 }
@@ -79,7 +80,8 @@ impl JobStore {
         })
     }
 
-    /// Hold the next publication before it writes, until `pause` is released.
+    /// Hold the next publication that creates a run before it writes, until
+    /// `pause` is released. Writes that create no run pass straight through.
     #[cfg(test)]
     pub(super) fn pause_next_publication(&mut self, pause: std::sync::Arc<std::sync::Barrier>) {
         self.publication_pause = Some(pause);
@@ -126,8 +128,13 @@ impl JobStore {
         if bytes.len() as u64 > MAX_STORE_BYTES {
             return Err("job store exceeds 64 MiB".into());
         }
+        // Only a write that creates a run waits: the leader loop's own
+        // writes (cron observations, ticks) would otherwise take the pause
+        // and fence the store before the test's admission arrives (#1521).
         #[cfg(test)]
-        if let Some(pause) = self.publication_pause.take() {
+        if ids > 0
+            && let Some(pause) = self.publication_pause.take()
+        {
             pause.wait();
         }
         if let Err(error) =
@@ -215,6 +222,44 @@ mod tests {
                 .is_some()
         );
     }
+
+    /// The leader loop's own writes (a cron observation here) publish past
+    /// the test pause; only a write that creates a run waits at it (#1521).
+    #[test]
+    fn a_paused_publication_holds_the_next_run_and_not_a_control_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = JobStore::open(dir.path()).unwrap();
+        let pause = std::sync::Arc::new(std::sync::Barrier::new(2));
+        store.pause_next_publication(std::sync::Arc::clone(&pause));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            store
+                .apply(&TaskArrayWrite::CronObserve { minute: 1 })
+                .unwrap();
+            done_tx.send("control").unwrap();
+            let applied = store.apply(&registration()).unwrap();
+            done_tx.send("run").unwrap();
+            applied
+        });
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok("control"),
+            "a control write waited at the pause"
+        );
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "the run's publication went past the pause"
+        );
+        pause.wait();
+        assert_eq!(done_rx.recv(), Ok("run"));
+        assert_eq!(
+            writer.join().unwrap(),
+            TaskArrayApplied::Registered { batch_id: 1 }
+        );
+    }
+
     #[test]
     fn reopening_refuses_impossible_execution_partition_or_specification() {
         let dir = tempfile::tempdir().unwrap();

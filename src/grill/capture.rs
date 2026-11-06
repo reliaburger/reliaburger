@@ -9,6 +9,10 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::ketchup::types::{
     CaptureFileIdentity, CaptureOffsets, CapturePosition, CapturedLine, LogStream,
@@ -22,6 +26,138 @@ use crate::ketchup::types::{
 /// holding a runtime worker: on a two-vCPU node one long synchronous split
 /// starved startup adoption for eleven minutes.
 pub const CAPTURE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// How often a follower looks for new output.
+pub const FOLLOW_POLL: Duration = Duration::from_millis(200);
+
+/// How long a follower carries on when it can't tell whether its source still
+/// runs and the source has written nothing either (#1493).
+///
+/// A failed check says nothing about the workload, so a follower never stops
+/// on one: an owner that's slow to answer on a busy node is the usual reason.
+/// This limit only stops a follower outliving an instance whose records have
+/// gone, which no check can answer for again. It's far longer than any stall
+/// a loaded node has shown, and output resets it, so a workload that keeps
+/// writing is never dropped.
+pub const UNKNOWN_SOURCE_LIMIT: Duration = Duration::from_secs(600);
+
+/// Tells a follower when it has gone [`UNKNOWN_SOURCE_LIMIT`] without news of
+/// its source.
+#[derive(Debug)]
+pub struct SourceWatch {
+    limit: Duration,
+    unknown_since: Option<Instant>,
+}
+
+impl SourceWatch {
+    /// A watch that gives up after `limit` without news.
+    pub fn new(limit: Duration) -> Self {
+        Self {
+            limit,
+            unknown_since: None,
+        }
+    }
+
+    /// The source answered or wrote something, so it's still accounted for.
+    pub fn confirm(&mut self) {
+        self.unknown_since = None;
+    }
+
+    /// A check failed at `now`. True once checks have failed, with no news
+    /// between them, for the whole limit.
+    pub fn check_failed(&mut self, now: Instant) -> bool {
+        let since = *self.unknown_since.get_or_insert(now);
+        now.duration_since(since) >= self.limit
+    }
+}
+
+/// Follow two capture files into `sender` until their source ends.
+///
+/// `running` says whether the source still runs. `Ok(false)` is positive
+/// evidence that it has stopped: the follower reads what's left, hands on any
+/// unfinished last line and returns. An error is only a failed check, so the
+/// follower keeps reading. It stops on errors alone when the capture files
+/// have gone, or after `limit` with no answer and no output.
+///
+/// This is the only thing that moves a running instance's lines into the log
+/// store, and nothing starts another until the instance or Bun restarts, so
+/// returning early silently freezes the instance's logs.
+pub async fn follow_capture<Checked>(
+    mut readers: [CaptureReader; 2],
+    sender: mpsc::Sender<CapturedLine>,
+    limit: Duration,
+    mut running: impl FnMut() -> Checked,
+) where
+    Checked: Future<Output = io::Result<bool>>,
+{
+    let mut watch = SourceWatch::new(limit);
+    let mut terminal = false;
+    loop {
+        // A capture with no checkpoint replays from byte 0. Bounded chunks,
+        // each read behind an `.await`, keep that replay from holding a
+        // runtime worker (it once starved startup adoption).
+        let mut backlog = false;
+        for reader in &mut readers {
+            let Ok(bytes) = reader.read_chunk().await else {
+                continue;
+            };
+            backlog |= bytes.len() == CAPTURE_CHUNK_BYTES;
+            if !bytes.is_empty() {
+                watch.confirm();
+            }
+            for line in reader.push(&bytes) {
+                if sender.send(line).await.is_err() {
+                    return;
+                }
+            }
+        }
+        if backlog {
+            continue;
+        }
+        if terminal || sender.is_closed() {
+            for reader in &mut readers {
+                if let Some(line) = reader.finish() {
+                    let _ = sender.send(line).await;
+                }
+            }
+            return;
+        }
+        terminal = match running().await {
+            Ok(still_running) => {
+                watch.confirm();
+                !still_running
+            }
+            Err(error) => {
+                let lost = capture_gone(&readers).await || watch.check_failed(Instant::now());
+                if lost {
+                    let file = readers[0].file().map(Path::display);
+                    eprintln!(
+                        "ketchup: no longer following {}: {error}",
+                        file.map_or_else(|| "a capture".to_string(), |file| file.to_string())
+                    );
+                }
+                lost
+            }
+        };
+        if !terminal {
+            tokio::time::sleep(FOLLOW_POLL).await;
+        }
+    }
+}
+
+/// Whether every file these readers follow has gone: the instance was cleaned
+/// up, so no check will ever answer for it.
+async fn capture_gone(readers: &[CaptureReader]) -> bool {
+    for reader in readers {
+        let Some(file) = reader.file() else {
+            return false;
+        };
+        if tokio::fs::try_exists(file).await.unwrap_or(true) {
+            return false;
+        }
+    }
+    true
+}
 
 /// Read at most [`CAPTURE_CHUNK_BYTES`] of `path`, starting at `offset`.
 ///
@@ -444,6 +580,182 @@ struct CaptureReadGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stdout_and_stderr(dir: &Path) -> [CaptureReader; 2] {
+        [
+            CaptureReader::new(LogStream::Stdout, Some(dir.join("web.stdout"))),
+            CaptureReader::new(LogStream::Stderr, Some(dir.join("web.stderr"))),
+        ]
+    }
+
+    fn append(path: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    async fn next_line(lines: &mut mpsc::Receiver<CapturedLine>) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(5), lines.recv())
+            .await
+            .expect("the follower went quiet")
+            .map(|captured| captured.line)
+    }
+
+    fn timed_out() -> io::Error {
+        io::Error::new(io::ErrorKind::TimedOut, "process owner request timed out")
+    }
+
+    /// #1493: a check that fails says nothing about the workload, so lines
+    /// written after it must still arrive.
+    #[tokio::test]
+    async fn a_failed_check_does_not_end_the_follow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stdout = tmp.path().join("web.stdout");
+        append(&stdout, b"before\n");
+        let (sender, mut lines) = mpsc::channel(8);
+        let mut checks = 0;
+        let follow = follow_capture(
+            stdout_and_stderr(tmp.path()),
+            sender,
+            UNKNOWN_SOURCE_LIMIT,
+            || {
+                checks += 1;
+                let check = checks;
+                let stdout = stdout.clone();
+                async move {
+                    match check {
+                        1 => Err(timed_out()),
+                        2 => {
+                            append(&stdout, b"after\n");
+                            Ok(true)
+                        }
+                        _ => Ok(false),
+                    }
+                }
+            },
+        );
+        let reader = async {
+            assert_eq!(next_line(&mut lines).await.as_deref(), Some("before"));
+            assert_eq!(next_line(&mut lines).await.as_deref(), Some("after"));
+            assert_eq!(next_line(&mut lines).await, None);
+        };
+        tokio::join!(follow, reader);
+    }
+
+    /// Positive evidence ends the follow, after what's left is read, the
+    /// unfinished last line included.
+    #[tokio::test]
+    async fn a_stopped_source_ends_the_follow_with_its_last_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stdout = tmp.path().join("web.stdout");
+        append(&stdout, b"one\n");
+        let (sender, mut lines) = mpsc::channel(8);
+        let follow = follow_capture(
+            stdout_and_stderr(tmp.path()),
+            sender,
+            UNKNOWN_SOURCE_LIMIT,
+            || {
+                let stdout = stdout.clone();
+                async move {
+                    append(&stdout, b"two\nunfinished");
+                    Ok(false)
+                }
+            },
+        );
+        let reader = async {
+            assert_eq!(next_line(&mut lines).await.as_deref(), Some("one"));
+            assert_eq!(next_line(&mut lines).await.as_deref(), Some("two"));
+            assert_eq!(next_line(&mut lines).await.as_deref(), Some("unfinished"));
+            assert_eq!(next_line(&mut lines).await, None);
+        };
+        tokio::join!(follow, reader);
+    }
+
+    /// An instance cleaned up under the follower takes its records and its
+    /// capture files with it. Nothing will ever answer, so waiting out the
+    /// limit would keep a dead task polling for ten minutes.
+    #[tokio::test]
+    async fn checks_failing_with_the_capture_files_gone_end_the_follow_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sender, _lines) = mpsc::channel(8);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            follow_capture(
+                stdout_and_stderr(tmp.path()),
+                sender,
+                UNKNOWN_SOURCE_LIMIT,
+                || async { Err(timed_out()) },
+            ),
+        )
+        .await
+        .expect("the follower outlived its capture files");
+    }
+
+    #[tokio::test]
+    async fn checks_that_keep_failing_with_no_output_end_the_follow_at_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        append(&tmp.path().join("web.stdout"), b"");
+        let (sender, _lines) = mpsc::channel(8);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            follow_capture(
+                stdout_and_stderr(tmp.path()),
+                sender,
+                Duration::from_millis(300),
+                || async { Err(timed_out()) },
+            ),
+        )
+        .await
+        .expect("the follower outlived the limit");
+    }
+
+    /// An owner that stays broken must not cost a workload still writing its
+    /// logs: output is news of the source, whatever the checks say.
+    #[tokio::test]
+    async fn output_keeps_a_follow_going_past_the_limit_while_checks_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stdout = tmp.path().join("web.stdout");
+        append(&stdout, b"");
+        let (sender, mut lines) = mpsc::channel(8);
+        let limit = FOLLOW_POLL / 2;
+        let mut checks = 0;
+        let follow = follow_capture(stdout_and_stderr(tmp.path()), sender, limit, || {
+            checks += 1;
+            let check = checks;
+            let stdout = stdout.clone();
+            async move {
+                if check <= 4 {
+                    append(&stdout, format!("line {check}\n").as_bytes());
+                }
+                Err(timed_out())
+            }
+        });
+        let reader = async {
+            for check in 1..=4 {
+                let expected = format!("line {check}");
+                assert_eq!(next_line(&mut lines).await, Some(expected));
+            }
+            assert_eq!(next_line(&mut lines).await, None);
+        };
+        tokio::join!(follow, reader);
+    }
+
+    #[test]
+    fn a_watch_gives_up_only_after_the_limit_without_news() {
+        let start = Instant::now();
+        let limit = Duration::from_secs(600);
+        let mut watch = SourceWatch::new(limit);
+        assert!(!watch.check_failed(start));
+        assert!(!watch.check_failed(start + limit - Duration::from_secs(1)));
+        watch.confirm();
+        assert!(!watch.check_failed(start + limit));
+        assert!(watch.check_failed(start + limit + limit));
+    }
 
     fn file_reader() -> CaptureReader {
         CaptureReader::new(LogStream::Stdout, Some(PathBuf::from("/logs/web.stdout")))

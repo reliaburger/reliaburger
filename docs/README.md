@@ -5,13 +5,13 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.2.3 was released on 28 October 2026. Its signed binaries, guest images and
-installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.3),
+0.2.5 was released on 3 November 2026. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.5),
 and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs it
 and builds a laptop cluster; without a flag the installer explains the choices.
-Until 1.0.0 Reliaburger is for developers and enthusiasts, not production. Every
+Until 1.0.0 Reliaburger is good enough for home labs and dev clusters, not production. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
-The limits below are the ones 0.2.3 ships with; the [roadmap](roadmap.md) tracks
+The limits below are the ones 0.2.5 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.
 
 The [platform comparisons](website/compare/index.html) and
@@ -141,10 +141,9 @@ lists which work.
 
 ### Jobs and cron
 
-Jobs arrived in 0.2.0. 0.2.3 keeps 0.2.2's formats, so a 0.2.2 cluster can
-roll to it, though that walk hasn't been qualified yet; from 0.2.1 or older,
-start a fresh cluster
-([upgrading from 0.2.2](releasing.md#upgrading-from-022)). The
+Jobs arrived in 0.2.0. 0.2.5 changes the cluster's formats again, so a 0.2.4
+cluster can't roll to it: start a fresh cluster
+([upgrading from 0.2.4](releasing.md#upgrading-from-024)). The
 [job manual](manual/14_batch-jobs.md) covers jobs in full.
 
 Every job, cron occurrence, hook and task array runs on one lifecycle: a durable
@@ -319,7 +318,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-For 0.2.3, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.2.5, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -358,7 +357,7 @@ or operator firewall rules when diagnosing direct-host connectivity.
 
 ### macOS containers: managed Linux VMs
 
-For 0.2.3, run containers through the [managed laptop quickstart](quickstart.md):
+For 0.2.5, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
 relish setup --quickstart --nodes 3
@@ -369,7 +368,7 @@ foreground process workloads. Direct Apple Container selection is disabled,
 even when its CLI is installed: interrupted CLI requests can outlive Bun and
 mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
-work; they are outside the 0.2.3 runtime profile.
+work; they are outside the 0.2.5 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -389,7 +388,7 @@ sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
 limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
 environment and run without container isolation.
 
-**0.2.3 contract: foreground workloads only.** The main process stays under Bun's
+**0.2.5 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
 Use the application's foreground/no-daemon option. A shell wrapper should `exec`
@@ -457,9 +456,10 @@ make coverage              # portable suite under line coverage (HTML and LCOV)
 make audit                 # fail on new RustSec dependency findings
 ```
 
-Tests that need hardware, credentials or a reboot (Apple Container, NVIDIA GPU,
-S3, host reboot) aren't run by CI. The [test harness design](design/test-harness.md#tests-no-ci-job-runs)
-lists them and how to run each.
+Tests that need hardware or a reboot (Apple Container, NVIDIA GPU, host
+reboot) aren't run by CI. The [test harness design](design/test-harness.md#tests-no-ci-job-runs)
+lists them and how to run each. `make test-s3` starts its own throwaway S3
+server, and CI runs it too ([S3 in CI](testing.md#s3-in-ci)).
 
 `make test` runs only tests that can execute truthfully on an ordinary developer machine.
 Provisioned tests use `#[ignore = "requires …"]`; their named target enables the prerequisite,
@@ -860,7 +860,7 @@ relish dev destroy mycluster
 
 Notes:
 
-- **mTLS, like any other cluster.** `dev create` generates the cluster's CA, master key and an administrator token on the host (kept in `~/.reliaburger/dev/clusters/<name>.security/` until `dev destroy`), gives the first node its identity, then enrols every other node with a join token and `relish join`. Each VM's `relish` gets a context file holding the administrator token and the root CA, so it reaches its local agent over HTTPS with no flags.
+- **mTLS, like any other cluster.** `dev create` generates the cluster's CA, master key and an administrator token (named `dev-<name>-admin`) on the host (kept in `~/.reliaburger/dev/clusters/<name>.security/` until `dev destroy`), gives the first node its identity, then enrols every other node with a join token and `relish join`. Each VM's `relish` gets a context file holding the administrator token and the root CA, so it reaches its local agent over HTTPS with no flags.
 - **Lima required** (`brew install lima`). VMs use Lima's `user-v2` network so they can reach each other with no `socket_vmnet`/sudo setup; each node advertises its inter-VM IP. That network isn't routable from the host, so run `relish nodes`/`council` *inside* a node (`limactl shell reliaburger-mycluster-1 …`), where the CLI reaches the local agent on `127.0.0.1:9117`.
 - **Binaries are built from your current tree, not downloaded.** `dev create` builds `bun`/`relish` for Linux inside the persistent build VM (the same one `relish dev test` uses), so the **first `create` is slow** (a full build); later runs are incremental.
 - `--bun <path>` / `--relish <path>` install a pre-built Linux binary instead, skipping the build.
@@ -1464,7 +1464,7 @@ crashloops, stalled deploys, missing service backends, active faults and alerts,
 disk pressure, actual cgroup throttling, certificate lifecycle, Pickle
 redundancy and version skew (each node's bun version, commit and binary
 SHA-256; a warning names nodes on a different build), and the committed apps
-and jobs the cluster's policies would now refuse (`relish policy audit` *(0.3.0, not in 0.2.3)* lists
+and jobs the cluster's policies would now refuse (`relish policy audit` lists
 the same). Use `--app <name>` for application scope or `--watch` for a
 human refresh every 30 seconds (`--interval <secs>` changes the period). JSON and YAML use schema version 1. Exit status 0 means
 all selected evidence was observed and healthy, 1 means a critical finding,
@@ -1583,7 +1583,7 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Direct Apple Container is disabled for 0.2.3 while interrupted daemon-command
+Direct Apple Container is disabled for 0.2.5 while interrupted daemon-command
 recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide

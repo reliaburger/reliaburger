@@ -18,7 +18,7 @@ with it.
 
 Patch releases (0.1.x) fix and harden without a headline. Each minor release
 after that ships one headline feature, with a single exit test that proves it.
-Until 1.0.0 every release is a development release: an incompatible format
+1.0.0 is expected in January 2027. Until then every release is a development release: an incompatible format
 change bumps the compatibility generation and needs a fresh cluster, with no
 migration and no feature gate
 ([compatibility before 1.0.0](releasing.md#compatibility-before-100)).
@@ -382,25 +382,89 @@ migration and no feature gate
   [#1419](https://github.com/reliaburger/reliaburger/issues/1419)). It ships
   with the `zstd` 0.13 advisories under a reviewed exception
   ([#1367](https://github.com/reliaburger/reliaburger/pull/1367)). 0.2.3 keeps
-  0.2.2's formats, the first release to do so, so a 0.2.2 cluster can roll to
-  it; that walk isn't qualified yet
-  ([#1444](https://github.com/reliaburger/reliaburger/issues/1444)).
-- [ ] **0.2.4: extension points**
+  0.2.2's formats, the first release to do so, and a 0.2.2 cluster rolled onto
+  it in place on 29 October
+  ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md),
+  [#1444](https://github.com/reliaburger/reliaburger/issues/1444)).
+- [x] **0.2.4: extension points.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.4)
+  on 30 October 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/19),
   [research](plans/2026-10-19-research-extension-points.md),
-  [plan](plans/2026-10-23-plan-0.2.4.md)). One missing
+  [plan](plans/archive/2026-10-23-plan-0.2.4.md)). One missing
   feature shouldn't rule Reliaburger out, and the answer isn't CRDs or
-  webhooks. Policies stored in the council (CEL deny and warn, fill-only
-  defaults) on the one apply path that `relish apply` and GitOps share;
-  sidecars, stop hooks and gated runtime knobs; an exec secret provider;
-  templates that expand to ordinary apps, and a contract for running your own
-  controller. A new book chapter,
-  [Chapter 18](book/18-bending-without-forking.md), comes first. Exit test: four common policies,
-  a template and a controller on a real cluster
-  ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)). Every
-  issue has landed on the train, and the exit test passes on the
-  `make test-cluster` fixture, with a stand-in for Postgres. Qualification
-  waits for 0.2.3.
+  webhooks. Policies stored in the council (CEL deny, warn and audit,
+  fill-only defaults, `relish policy audit`) on the one apply path that
+  `relish apply` and GitOps share; sidecars, stop hooks and gated runtime
+  knobs; an exec secret provider; templates that expand to ordinary apps, and
+  a contract for running your own controller, with
+  [Chapter 18](book/18-bending-without-forking.md) to explain them. The exit
+  test, four common policies, a template and a controller on a real cluster,
+  passes ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)).
+  Also a restarting node keeps its replicas
+  ([#1449](https://github.com/reliaburger/reliaburger/issues/1449)), and the
+  soak gates on a job-start SLO
+  ([#1400](https://github.com/reliaburger/reliaburger/issues/1400)) and checks
+  the council's history for linearizability. Candidate 1 passed the full gate
+  ([closure](qualification/2026-10-30-v0.2.4-release-closure.md),
+  [release log](release-log.md#024-extension-points)): the 8-hour jobs final
+  ran 6,899.6 accepted jobs a second against the 1,390 target, with a
+  job-start p99 of 32 ms over 137 million quiet tasks
+  ([record](qualification/2026-10-30-v0.2.4-job-qualification.md)). Both fast
+  tiers first failed on a harness bug, a p99 judged on 20 samples
+  ([#1485](https://github.com/reliaburger/reliaburger/issues/1485)), and pass
+  with the fixed checker. It ships with the `zstd` 0.13 advisories under the
+  exception 0.2.3 took, which expires on 18 November 2026
+  ([#1366](https://github.com/reliaburger/reliaburger/issues/1366), in 0.3.0).
+  The profile after the tag found 0.2.4 4.5% faster on host jobs than 0.2.3
+  ([record](qualification/2026-10-30-v0.2.4-profile/README.md)). The 24-hour
+  memory run failed at hour 21 when the Mac lost its forwards to the VMs; up
+  to hour 20 it found no slowdown and Bun's memory levelling off
+  ([record](qualification/2026-10-30-v0.2.4-day-run.md)). What's still open
+  moved to 0.2.5 and 0.3.0. 0.2.4
+  changes the cluster's formats, so a 0.2.3 cluster can't roll to it:
+  recreate the cluster
+  ([upgrading from 0.2.3](releasing.md#upgrading-from-023)).
+- [x] **0.2.5: bugs an outside evaluation found.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.5)
+  on 3 November 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/27),
+  [plan](plans/archive/2026-10-31-plan-0.2.5.md)). A patch release for the
+  product bugs that an external evaluation of 0.2.0
+  ([#1080](https://github.com/reliaburger/reliaburger/pull/1080)) found and
+  that were still on `main`, and the stale `relish logs --tail` that 0.2.4's
+  day run found ([#1493](https://github.com/reliaburger/reliaburger/issues/1493)).
+  Spare nodes also join as Raft learners up to the council cap
+  ([#1494](https://github.com/reliaburger/reliaburger/pull/1494)). Candidate 1
+  passed the full gate but for one 1,077 ms `health_tick` turn in the 8-hour
+  final, on a Mac that logged thermal emergencies that night, which the
+  maintainer accepted as a host stall
+  ([closure](qualification/2026-11-03-v0.2.5-release-closure.md),
+  [release log](release-log.md#025-bugs-an-outside-evaluation-found)).
+  0.2.5 changes the cluster's formats, so a 0.2.4 cluster can't roll to it:
+  recreate the cluster
+  ([upgrading from 0.2.4](releasing.md#upgrading-from-024)).
+- [ ] **0.2.6: the rest of the evaluation's bugs, and setup over SSH**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/28),
+  [plan](plans/2026-11-03-plan-0.2.6.md)). What 0.2.5 left of [#1477](https://github.com/reliaburger/reliaburger/issues/1477)
+  (secure clusters past the council cap) and
+  [#1500](https://github.com/reliaburger/reliaburger/issues/1500) (delete then
+  re-apply on real multi-node runc), `relish setup --ssh` for clusters on
+  Linux machines you already have
+  ([#1529](https://github.com/reliaburger/reliaburger/issues/1529)), the S3
+  and Apple Container tests in CI
+  ([#1534](https://github.com/reliaburger/reliaburger/issues/1534),
+  [#1535](https://github.com/reliaburger/reliaburger/issues/1535)), and the
+  known flakes.
+- [ ] **0.2.7: "Built for humans and their agents"**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/29),
+  [plan](plans/2026-11-04-plan-0.2.7.md)). The read-only half of the AI SRE
+  work, brought forward from 0.4.2: a JSON-only `relish agent` command family
+  over the exact source the binary was built from, a patch-and-try loop on a
+  throwaway cluster, redacted reports a human posts, `relish mcp`, an agent
+  page and "With your agent" getting started on the website, and the loop
+  that turns agent sessions into fixes released in days. No LLM inside `bun`.
+  Exit test: Claude Code with a read-only token diagnoses three Smoker
+  scenarios and finds a planted Reliaburger bug in the source
+  ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)).
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
@@ -429,17 +493,12 @@ migration and no feature gate
   Managed-volume retirement and the Apple runtime (F10,
   [#367](https://github.com/reliaburger/reliaburger/issues/367)) ship in 0.4.3,
   outside the migration plan.
-- [ ] **0.4.2: "Plug in an AI SRE"**
+- [ ] **0.4.2: "Let the AI SRE help"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/18),
-  [research](plans/2026-10-18-research-ai-sre.md)). Make Reliaburger the
-  easiest orchestrator for an AI agent to operate, safely. Part 1 is
-  read-only: `relish mcp`, agent tokens, untrusted-content envelopes, a merged
-  incident timeline, `relish explain`, agent-ready webhooks, `llms.txt` and an
-  eval gym on Smoker faults. Part 2 adds human-approved mutations through
-  proposals, and log patterns in Ketchup. No LLM inside `bun`. Exit test: an
-  off-the-shelf agent with a read-only token diagnoses at least 4 of 5 runs of
-  each eval scenario and never attempts a mutation
-  ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)).
+  [research](plans/2026-10-18-research-ai-sre.md)). The read-only half moved
+  to 0.2.7. What stays: human-approved mutations through proposals, agent
+  tokens labelled in audit, a merged incident timeline, log patterns in
+  Ketchup, agent-ready webhooks and a larger eval. No LLM inside `bun`.
 - [ ] **0.4.3, 0.4.4 and 0.4.5: "Stronger walls"**
   ([0.4.3](https://github.com/reliaburger/reliaburger/milestone/20),
   [0.4.4](https://github.com/reliaburger/reliaburger/milestone/21),

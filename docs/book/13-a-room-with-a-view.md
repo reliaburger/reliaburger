@@ -369,7 +369,8 @@ and only the TUI called them. The 0.2.2 CLI review (D36) added the command.
 It's thin on purpose. `EventsFilter` turns `--app`, `--severity` and
 `--limit` into the `/v1/events` query, the node does the filtering and the
 fan-out, and `EventsReport` renders the answer as a table with the same
-`TIME (UTC)` and `app@namespace` columns as `relish audit`. A `#[serde(transparent)]`
+`TIME (UTC)` and target columns as `relish audit`, through the same `target`
+function. A `#[serde(transparent)]`
 newtype is how one value gets two faces: `Serialize` passes straight through to
 the API's `ClusterEvents`, so `-o json` prints exactly what the API sent,
 while `Display` belongs to the wrapper and draws the table.

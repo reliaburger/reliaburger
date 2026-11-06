@@ -186,14 +186,21 @@ fn export_app(
 
     let knobs = export_runtime_knobs(name, app, &mut container, report);
 
-    let sidecars: Vec<Container> = app
-        .sidecar
+    // Kubernetes runs init containers in order and starts a native sidecar
+    // when its turn comes, so the ordinary inits go first: Reliaburger
+    // starts sidecars after every init has finished.
+    let mut init_containers: Vec<Container> = app
+        .init
         .iter()
-        .map(|sidecar| sidecar_container(name, app, sidecar, report))
+        .enumerate()
+        .map(|(index, init)| init_container(name, app, index, init, report))
         .collect();
+    for sidecar in &app.sidecar {
+        init_containers.push(sidecar_container(name, app, sidecar, report));
+    }
     let pod_spec = PodSpec {
         containers: vec![container],
-        init_containers: (!sidecars.is_empty()).then_some(sidecars),
+        init_containers: (!init_containers.is_empty()).then_some(init_containers),
         termination_grace_period_seconds: termination_grace(app),
         security_context: knobs.security_context,
         volumes: knobs.volumes,
@@ -440,7 +447,6 @@ fn export_app(
             "prometheus.io/* pod annotations",
         ),
         (!app.volumes.is_empty(), "volumes", "volumes + volumeMounts"),
-        (!app.init.is_empty(), "init", "initContainers"),
         (!app.config_file.is_empty(), "config_file", "ConfigMap"),
         (
             app.placement.is_some(),
@@ -811,13 +817,28 @@ fn to_yaml<T: serde::Serialize>(resource: &T) -> Result<String, RelishError> {
     yaml_serde::to_string(resource).map_err(|e| RelishError::FormatFailed(e.to_string()))
 }
 
-/// Map Reliaburger env vars to Kubernetes `EnvVar`s.
-///
-/// Encrypted values export as the placeholder `ENCRYPTED_VALUE` — the sealed
-/// ciphertext is useless outside the cluster that holds the key, and leaking
-/// it would be worse than a placeholder. A placeholder doesn't fail loudly,
-/// though: the pod starts with the wrong password. So each one is listed in
-/// the report, under `[table]`, as needing a Secret (#703).
+/// The init container at `index` as an ordinary Kubernetes init container
+/// named `init-{index}` (#1498). Like a sidecar, it gets the app's image
+/// when it names none, and the app's env with its own on top, which
+/// Reliaburger gives it implicitly and Kubernetes doesn't.
+fn init_container(
+    app_name: &str,
+    app: &crate::config::app::AppSpec,
+    index: usize,
+    init: &crate::config::app::InitContainerSpec,
+    report: &mut ExportReport,
+) -> Container {
+    let mut env = app.env.clone();
+    env.extend(init.env.clone());
+    Container {
+        name: format!("init-{index}"),
+        image: init.image.clone().or_else(|| app.image.clone()),
+        command: (!init.command.is_empty()).then(|| init.command.clone()),
+        env: env_vars(&format!("app.{app_name}.init.{index}"), &env, report),
+        ..Container::default()
+    }
+}
+
 /// A sidecar as a Kubernetes native sidecar (#1120): an init container
 /// with `restartPolicy: Always`, which starts before the app's container,
 /// keeps running beside it and stops after it, as Reliaburger's does. It
@@ -847,6 +868,13 @@ fn sidecar_container(
     }
 }
 
+/// Map Reliaburger env vars to Kubernetes `EnvVar`s.
+///
+/// Encrypted values export as the placeholder `ENCRYPTED_VALUE` — the sealed
+/// ciphertext is useless outside the cluster that holds the key, and leaking
+/// it would be worse than a placeholder. A placeholder doesn't fail loudly,
+/// though: the pod starts with the wrong password. So each one is listed in
+/// the report, under `[table]`, as needing a Secret (#703).
 fn env_vars(
     table: &str,
     env: &BTreeMap<String, crate::config::types::EnvValue>,

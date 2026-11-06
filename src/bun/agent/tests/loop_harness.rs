@@ -458,6 +458,7 @@ async fn status_answers_while_a_join_waits_on_a_council_without_quorum() {
         token,
         node_id: "node-99".into(),
         csr_der: vec![],
+        address: None,
         response,
     })
     .await
@@ -3027,18 +3028,20 @@ async fn a_restart_waits_for_its_slow_network_reference_write_instead_of_refusin
         agent.run().await;
         agent
     });
-    // Hold the create, so the successor's hold is in place before the
-    // restart retains it.
-    grill.set_call_delay(
-        MockCall::Create,
-        Some(std::time::Duration::from_millis(500)),
-    );
-    let released = calls_of(&grill, "release_network_reference");
+    // Hold the successor's create. The restart only creates once the
+    // predecessor has retired: its reference released and the journal's
+    // record of it forgotten. Planting the successor's hold any earlier lets
+    // a retirement retry find it and refuse to release the predecessor's,
+    // which never happens on a real runtime (#1520). Stalling the journal
+    // any earlier slows the predecessor's forget instead of the successor's
+    // record.
+    grill.block_creates();
     let started = calls_of(&grill, "start");
     crash(&grill);
-    wait_for_calls(&grill, "release_network_reference", released, 1).await;
+    grill.wait_for_creates(1).await;
     grill.set_network_reference(successor.clone()).await;
     stalls.set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    grill.release_creates(1);
     wait_for_calls(&grill, "start", started, 1).await;
     stalls.set(LoopStall::Persist, std::time::Duration::ZERO);
     shutdown.cancel();
@@ -3647,6 +3650,110 @@ async fn withdrawn_web_holding_its_reference() -> (
         .await
         .unwrap();
     (agent, grill, root, reference)
+}
+
+/// `web`'s service as a re-apply leaves it (#1500): the same allocation,
+/// naming only the new incarnation's replica.
+fn republished_by_a_new_incarnation(agent: &mut TestAgent) {
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    let successor = InstanceId("default__web-g1-0".into());
+    let backend = agent.local_backend(&successor, &service, None, 30002, true);
+    agent.service_map.add_backend(&service, backend).unwrap();
+}
+
+/// The release check judges an old incarnation by its own backend. A live
+/// entry under the original allocation that names a new incarnation's
+/// replica still proves the old one is gone.
+#[tokio::test]
+async fn a_release_is_judged_by_its_own_backend_not_a_new_incarnations() {
+    let (mut agent, grill, _root, reference) = withdrawn_web_holding_its_reference().await;
+    republished_by_a_new_incarnation(&mut agent);
+    agent
+        .release_network_reference(&reference.instance_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        grill
+            .network_reference(&reference.instance_id)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// The other side of the same check: while the live entry still names the
+/// old backend, the address stays held, new replicas or not.
+#[tokio::test]
+async fn a_release_is_refused_while_the_live_entry_names_its_backend() {
+    let (mut agent, grill, _root, reference) = withdrawn_web_holding_its_reference().await;
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    republished_by_a_new_incarnation(&mut agent);
+    let old = agent.local_backend(&reference.instance_id, &service, None, 30001, true);
+    agent.service_map.add_backend(&service, old).unwrap();
+    let released = agent
+        .release_network_reference(&reference.instance_id, None)
+        .await;
+    assert!(
+        matches!(&released, Err(BunError::RetirementState { reason, .. })
+            if reason == "original service withdrawal is unproven: the service map still lists this instance as a backend"),
+        "{released:?}"
+    );
+    assert_eq!(
+        grill
+            .network_reference(&reference.instance_id)
+            .await
+            .unwrap(),
+        Some(reference)
+    );
+}
+
+/// An entry under any other allocation proves nothing about the original
+/// VIP, which may still route to the address. Nothing should ever put one
+/// there (`superseded_target` keeps a new allocation out until the old one
+/// has retired); if something does, the address stays held.
+#[tokio::test]
+async fn a_release_is_refused_against_another_allocation() {
+    let (mut agent, grill, _root, reference) = withdrawn_web_holding_its_reference().await;
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    let mut moved = agent.service_map.resolve(&service).unwrap().clone();
+    moved.vip = crate::onion::vip::VirtualIP("127.128.9.9".parse().unwrap());
+    moved.app_id = u32::from(moved.vip.0);
+    agent.service_map = crate::onion::service_map::ServiceMap::from_snapshot(&[moved]).unwrap();
+    let released = agent
+        .release_network_reference(&reference.instance_id, None)
+        .await;
+    assert!(
+        matches!(&released, Err(BunError::RetirementState { reason, .. })
+            if reason == "original service withdrawal is unproven: the service map holds the service under another VIP or port"),
+        "{released:?}"
+    );
+    assert_eq!(
+        grill
+            .network_reference(&reference.instance_id)
+            .await
+            .unwrap(),
+        Some(reference)
+    );
+}
+
+/// Retiring the allocation itself asks for more than a release does: no
+/// backend at all. A new incarnation's replica keeps it, since the
+/// retirement would otherwise take that replica's route with it.
+#[tokio::test]
+async fn an_allocation_stays_while_a_new_incarnation_publishes_into_it() {
+    let (mut agent, _grill, _root, reference) = withdrawn_web_holding_its_reference().await;
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    agent
+        .release_network_reference(&reference.instance_id, None)
+        .await
+        .unwrap();
+    republished_by_a_new_incarnation(&mut agent);
+    let retired = agent.retire_discovery_service(&service).await;
+    assert!(
+        matches!(&retired, Err(BunError::BackendPublication { reason, .. })
+            if reason == "original service withdrawal is unproven: the service map still lists backends"),
+        "{retired:?}"
+    );
 }
 
 /// Release `id`'s network reference in a turn of its own.

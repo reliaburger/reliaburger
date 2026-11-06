@@ -493,6 +493,24 @@ class ScriptTests(unittest.TestCase):
         result = self.run_script("--plan", "--candidate", "https://example.invalid/x", "--scenarios", "raw,nope")
         self.assertNotEqual(result.returncode, 0)
 
+    def test_a_quiet_host_gets_past_the_preflight(self):
+        # pgrep exits 1 when nothing matches: on a quiet host the compiler
+        # count must be 0, not a pipefail that ends the script silently (#1488).
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        fake = Path(directory.name)
+        for name, body in {"uname": "echo Darwin", "pgrep": "exit 1", "limactl": "exit 0",
+                           "curl": "exit 22"}.items():
+            (fake / name).write_text(f"#!/bin/sh\n{body}\n")
+            (fake / name).chmod(0o755)
+        env = dict(os.environ, RELIABURGER_PROFILE_CAFFEINATED="1", TMPDIR=directory.name,
+                   PATH=f"{fake}{os.pathsep}{os.environ['PATH']}")
+        result = subprocess.run(["bash", str(self.SCRIPT), "--candidate", "https://example.invalid/v0.2.4",
+                                 "--previous", "v0.2.3", "--vm", "rb-profile-test"],
+                                capture_output=True, text=True, env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not download https://example.invalid/v0.2.4/candidate.json", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

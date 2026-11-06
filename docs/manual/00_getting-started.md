@@ -23,8 +23,40 @@ no Intel Mac build: the installer refuses one and suggests a Linux host, or
 cluster instead. `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop`
 installs the released `relish` and runs this for you. Without `--laptop` the
 installer only explains the choices and installs nothing. A laptop cluster is
-for development: until 1.0.0, Reliaburger is for developers and enthusiasts,
-not production.
+for development: until 1.0.0, Reliaburger is good enough for home labs and dev
+clusters, not production.
+
+On Linux machines you already have, 0.2.6 (not in 0.2.5) builds the cluster over
+SSH instead:
+
+```sh
+relish setup --ssh ubuntu@10.0.0.1,ubuntu@10.0.0.2,ubuntu@10.0.0.3
+```
+
+The machines need Ubuntu or Debian, and passwordless `sudo` for that user. Every
+machine is checked first, and if any fails nothing changes on any of them. Rerun
+the same command to resume. Credentials stay on the machine you ran it from, so
+back up the directory setup names when it finishes. `relish local` doesn't
+manage these clusters. If a machine has several private addresses, give each
+machine's address in the same order with `--advertise`. Afterwards `relish`
+talks to port 9117 on the first machine, so a firewall in between has to let
+you through; if it doesn't, setup and commands such as `relish status` print
+the `ufw` rule to add, or the SSH tunnel to use instead. The
+[Linux servers guide](https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md)
+covers doing all this by hand.
+
+There's no command to remove such a cluster yet. On each machine, stop Bun,
+unmount what it left mounted for its workloads, delete its files, then
+reboot: the firewall tables and eBPF programs it loaded stay in the kernel
+until the machine restarts.
+
+```sh
+sudo systemctl disable --now reliaburger.service
+findmnt -rn -o TARGET | grep '^/var/lib/reliaburger' | sort -r | xargs -r sudo umount
+sudo rm -rf /etc/reliaburger /var/lib/reliaburger /etc/systemd/system/reliaburger.service \
+  /usr/local/bin/bun /usr/local/bin/bun-* /usr/local/bin/relish
+sudo reboot
+```
 
 Setup saves an admin credential for the cluster in `~/.reliaburger/context.json`
 (readable only by you), so every `relish` command on this machine reaches the
@@ -47,7 +79,7 @@ It verifies `bun` against the release signatures, asks a few questions and
 writes a starter `reliaburger.toml`. Pass `--yes` to accept every default.
 Real containers need runc on Linux, and a cluster needs rootful runc with eBPF
 (see `cluster-basics`). On macOS, use the quickstart above: it runs the same
-runc path inside Linux VMs. Apple Container isn't supported in 0.2.3.
+runc path inside Linux VMs. Apple Container isn't supported in 0.2.5.
 
 ## From source, without containers
 

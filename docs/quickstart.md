@@ -1,7 +1,7 @@
 # A laptop cluster
 
-The command below installs the published, signed 0.2.3 release
-(28 October 2026) and builds a laptop cluster from it. A laptop cluster is a
+The command below installs the published, signed 0.2.5 release
+(3 November 2026) and builds a laptop cluster from it. A laptop cluster is a
 development cluster: until 1.0.0, Reliaburger is for developers and
 enthusiasts trying it out, not for production. The two cold installs of the
 0.1.0 release candidate on Apple silicon took 178 s and 282 s from the first `curl`
@@ -34,7 +34,7 @@ not built. An unknown option gets the usage and status 2. Options after
 `--laptop` that aren't the installer's own go to `relish setup --quickstart`.
 
 The installer says what it's fetching before each download (for example
-`Downloading relish v0.2.3 for macos-aarch64 (91.9 MiB)...`), draws curl's
+`Downloading relish v0.2.5 for macos-aarch64 (94.6 MiB)...`), draws curl's
 progress bar when you run it in a terminal, and finishes each download with
 the bytes and seconds it took. In a log or a pipe it prints only those lines.
 
@@ -54,7 +54,7 @@ other packages already installed) and signed
 Linux binaries, creates the cluster's credentials, then enrols each
 node. It checks the authenticated APIs, the three-member council and a sample
 container through the host ingress port. Open `http://localhost:18080/` to see
-the sample app. Your first application config is saved under
+the sample app, a small page with what to try next. Your first application config is saved under
 `~/.reliaburger/clusters/laptop/hello.toml`.
 
 `relish dashboard` opens a temporary, read-only browser session on a loopback

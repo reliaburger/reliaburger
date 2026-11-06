@@ -679,6 +679,14 @@ fn pod_spec_to_app(
     }
     app.env = import_env(resource, metadata_namespace, container, configmaps, report);
     import_pod_template(resource, pod_spec, container, &mut app, report);
+    app.init = import_init_containers(
+        resource,
+        metadata_namespace,
+        pod_spec,
+        &app.env,
+        configmaps,
+        report,
+    );
     app.sidecar = import_sidecars(resource, metadata_namespace, pod_spec, configmaps, report);
     app
 }
@@ -899,8 +907,8 @@ fn import_env(
 }
 
 /// The parts of a pod template only an app carries: argv, working
-/// directory and user, port, health check, resources, placement and init
-/// containers.
+/// directory and user, port, health check, resources and placement.
+/// [`import_init_containers`] reads the init containers.
 fn import_pod_template(
     resource: &str,
     pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
@@ -985,29 +993,54 @@ fn import_pod_template(
             });
         }
     }
+}
 
-    // Init containers carry a single argv: command followed by args.
-    if let Some(inits) = pod_spec.and_then(|ps| ps.init_containers.as_ref()) {
-        // A native sidecar keeps running: it imports as a sidecar instead.
-        for ic in inits.iter().filter(|ic| !is_native_sidecar(ic)) {
-            let command = ic.command.clone().unwrap_or_default();
-            let args = ic.args.clone().unwrap_or_default();
-            if command.is_empty() && !args.is_empty() {
-                report.warnings.push(MigrationWarning {
-                    resource: resource.to_string(),
-                    message: format!(
-                        "initContainer {} sets args without a command; its image \
-                         entrypoint is dropped, so add it to the command",
-                        ic.name
-                    ),
-                });
-            }
-            app.init.push(crate::config::app::InitContainerSpec {
-                image: ic.image.clone(),
-                command: command.into_iter().chain(args).collect(),
+/// A pod's ordinary init containers, in order. Each carries a single argv
+/// (command followed by args) and its environment (#1498), which
+/// [`import_env`] reads as it reads the app's, with what it can't carry
+/// reported under the init container's name. A value the app's env already
+/// holds is left out, because the init inherits the app's env. A native
+/// sidecar keeps running, so it imports as a sidecar instead.
+fn import_init_containers(
+    resource: &str,
+    metadata_namespace: Option<&String>,
+    pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    app_env: &BTreeMap<String, EnvValue>,
+    configmaps: &mut ConfigMaps,
+    report: &mut MigrationReport,
+) -> Vec<crate::config::app::InitContainerSpec> {
+    let inits = pod_spec
+        .and_then(|ps| ps.init_containers.as_ref())
+        .into_iter()
+        .flatten()
+        .filter(|ic| !is_native_sidecar(ic));
+    let mut imported = Vec::new();
+    for ic in inits {
+        let command = ic.command.clone().unwrap_or_default();
+        let args = ic.args.clone().unwrap_or_default();
+        if command.is_empty() && !args.is_empty() {
+            report.warnings.push(MigrationWarning {
+                resource: resource.to_string(),
+                message: format!(
+                    "initContainer {} sets args without a command; its image \
+                     entrypoint is dropped, so add it to the command",
+                    ic.name
+                ),
             });
         }
+        let reported = report.warnings.len();
+        let mut env = import_env(resource, metadata_namespace, Some(ic), configmaps, report);
+        env.retain(|name, value| app_env.get(name) != Some(&*value));
+        for warning in &mut report.warnings[reported..] {
+            warning.message = format!("initContainer {}: {}", ic.name, warning.message);
+        }
+        imported.push(crate::config::app::InitContainerSpec {
+            image: ic.image.clone(),
+            command: command.into_iter().chain(args).collect(),
+            env,
+        });
     }
+    imported
 }
 
 /// `terminationGracePeriodSeconds`, `lifecycle.stopSignal` and an exec
@@ -4616,6 +4649,163 @@ spec:
                 .any(|w| w.contains("imported as sidecar(s)") && w.contains("before the app")),
             "{warnings:?}"
         );
+    }
+
+    /// #1498: an init container's literal env values come over. Online
+    /// Boutique's loadgenerator waits for `FRONTEND_ADDR` in its init
+    /// container, and the import used to drop it without a word. A value
+    /// the app's env already holds is left out, because the init inherits
+    /// it.
+    #[test]
+    fn an_init_containers_literal_env_is_imported() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgenerator
+spec:
+  selector:
+    matchLabels: {app: loadgenerator}
+  template:
+    metadata:
+      labels: {app: loadgenerator}
+    spec:
+      initContainers:
+      - name: frontend-check
+        image: busybox:1.36
+        command: ["/bin/sh", "-c", "until wget -q -O- http://$FRONTEND_ADDR; do sleep 2; done"]
+        env:
+        - name: FRONTEND_ADDR
+          value: "frontend:80"
+        - name: USERS
+          value: "10"
+      containers:
+      - name: main
+        image: loadgenerator:v1
+        env:
+        - name: FRONTEND_ADDR
+          value: "frontend:80"
+        - name: USERS
+          value: "20"
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let app = &result.config.app["loadgenerator"];
+        assert_eq!(app.init.len(), 1);
+        assert_eq!(
+            app.init[0].env,
+            BTreeMap::from([("USERS".to_string(), EnvValue::Plain("10".into()))]),
+            "FRONTEND_ADDR is inherited from the app; USERS differs, so it's the init's own"
+        );
+        result.config.validate().unwrap();
+        let warnings = report_lines(&result.report);
+        assert!(
+            !warnings.iter().any(|w| w.contains("frontend-check")),
+            "nothing was dropped: {warnings:?}"
+        );
+    }
+
+    /// #1498: what an init container's env can't carry over (a `valueFrom`
+    /// reference, an `envFrom` Secret, a ConfigMap that isn't in the input)
+    /// is reported by init container and name, never dropped quietly.
+    #[test]
+    fn an_init_containers_unimportable_env_is_reported() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      initContainers:
+      - name: migrate
+        image: migrate:v1
+        command: ["migrate"]
+        envFrom:
+        - secretRef: {name: db-creds}
+        - configMapRef: {name: absent}
+        env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: db, key: password}
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef: {fieldPath: spec.nodeName}
+        - name: MODE
+          value: migrate
+      containers:
+      - name: web
+        image: web:v1
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let app = &result.config.app["web"];
+        assert_eq!(
+            app.init[0].env,
+            BTreeMap::from([("MODE".to_string(), EnvValue::Plain("migrate".into()))])
+        );
+        let warnings = report_lines(&result.report);
+        for expected in [
+            "initContainer migrate: env DB_PASSWORD uses valueFrom",
+            "initContainer migrate: env NODE_NAME uses valueFrom",
+            "initContainer migrate: envFrom Secret/db-creds is not imported",
+            "initContainer migrate: envFrom ConfigMap/absent is not in the input",
+        ] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.starts_with("Deployment/web") && w.contains(expected)),
+                "{expected}: {warnings:?}"
+            );
+        }
+    }
+
+    /// #1498: init containers leave as ordinary Kubernetes init containers,
+    /// ahead of the native sidecars, and come back as init containers with
+    /// their image, command and env.
+    #[test]
+    fn init_containers_survive_an_export_and_import_round_trip() {
+        let config = crate::config::Config::parse(
+            r#"
+            [app.loadgen]
+            image = "loadgen:v1"
+            env = { MODE = "load" }
+            [[app.loadgen.init]]
+            image = "busybox:1.36"
+            command = ["/bin/sh", "-c", "wait-for $FRONTEND_ADDR"]
+            env = { FRONTEND_ADDR = "frontend:80" }
+            [[app.loadgen.init]]
+            command = ["prepare"]
+            [[app.loadgen.sidecar]]
+            name = "proxy"
+            image = "envoy:1.31"
+            "#,
+        )
+        .unwrap();
+        let exported = crate::relish::k8s_export::export_kubernetes(&config).unwrap();
+        assert!(
+            !exported
+                .report
+                .dropped
+                .iter()
+                .any(|line| line.contains("init")),
+            "{:?}",
+            exported.report.dropped
+        );
+        let imported = import_from_yaml(&exported.yaml).unwrap();
+        let (original, back) = (&config.app["loadgen"], &imported.config.app["loadgen"]);
+        assert_eq!(back.init.len(), 2, "{}", exported.yaml);
+        assert_eq!(back.init[0], original.init[0]);
+        // Kubernetes has no "the app's image": it's written out.
+        assert_eq!(back.init[1].image.as_deref(), Some("loadgen:v1"));
+        assert_eq!(back.init[1].command, original.init[1].command);
+        assert!(back.init[1].env.is_empty());
+        assert_eq!(back.env, original.env);
+        assert_eq!(back.sidecar.len(), 1);
+        assert_eq!(back.sidecar[0].name, "proxy");
     }
 
     /// #1120: sidecars leave as native sidecars and come back as sidecars.

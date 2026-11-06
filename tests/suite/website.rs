@@ -268,14 +268,17 @@ fn every_shown_install_line_names_a_mode() {
                 continue;
             };
             let rest = &line[at..];
-            if !rest.contains("sh -s -- --laptop") && !rest.contains("sh -s -- --install-only") {
+            if !["--laptop", "--install-only", "--ssh"]
+                .iter()
+                .any(|mode| rest.contains(&format!("sh -s -- {mode}")))
+            {
                 failures.push(format!("{page}:{}: {}", number + 1, line.trim()));
             }
         }
     }
     assert!(
         failures.is_empty(),
-        "these install lines name no mode; add `sh -s -- --laptop` or `--install-only`:\n{}",
+        "these install lines name no mode; add `sh -s -- --laptop`, `--ssh` or `--install-only`:\n{}",
         failures.join("\n")
     );
 }
@@ -653,6 +656,7 @@ fn every_section_can_be_linked_to() {
     unique.dedup();
     assert_eq!(unique.len(), ids.len(), "duplicate section ids: {ids:?}");
     for id in [
+        "why",
         "install",
         "tour",
         "netboot",
@@ -676,6 +680,67 @@ fn every_section_can_be_linked_to() {
         css.contains("scroll-margin-top"),
         "linked headings need scroll-margin-top"
     );
+}
+
+/// The page sets expectations before anyone installs, and the date it gives
+/// for 1.0.0 is the one the roadmap gives.
+#[test]
+fn the_status_box_says_who_it_is_for_and_when_1_0_0_is_due() {
+    let page = read("docs/website/index.html");
+    let start = page
+        .find("<aside class=\"status status-note\"")
+        .expect("the page has no status box");
+    let install = page.find("<section id=\"tour\"").unwrap();
+    assert!(start < install, "the status box should sit by the install");
+    let text = strip_tags(&page[start..start + page[start..].find("</aside>").unwrap()]);
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for phrase in ["home labs", "dev clusters", "production until 1.0.0"] {
+        assert!(text.contains(phrase), "the status box lacks {phrase:?}");
+    }
+    assert!(text.contains("January 2027"));
+    assert!(read("docs/roadmap.md").contains("January 2027"));
+}
+
+/// The day run is the page's headline claim, so its memory chart stays beside
+/// it through later releases, in its own directory because a promotion empties
+/// `assets/soak/`. It's a copy of the record's chart, shown lazily like the rest.
+#[test]
+fn the_jobs_section_shows_the_day_run_s_memory_chart_from_its_record() {
+    let page = read("docs/website/index.html");
+    let start = page.find("<section id=\"job-throughput\"").unwrap();
+    let section = &page[start..start + page[start..].find("</section>").unwrap()];
+    let source = "assets/day-run/rss.svg";
+    let tag = img_tags(section)
+        .into_iter()
+        .find(|tag| attribute(tag, "src") == Some(source))
+        .expect("the jobs section doesn't show the day run's memory chart");
+    assert!(attribute(tag, "alt").is_some_and(|alt| !alt.trim().is_empty()));
+    assert_eq!(attribute(tag, "loading"), Some("lazy"));
+    for size in ["width", "height"] {
+        assert!(attribute(tag, size).is_some(), "the chart has no {size}");
+    }
+    assert_eq!(
+        read("docs/website/assets/day-run/rss.svg"),
+        read("docs/qualification/2026-10-28-v0.2.3-day-run-charts/rss.svg"),
+        "the day run's chart differs from its record; copy it again"
+    );
+}
+
+/// The page a new cluster serves tells people what to type next, so every
+/// command on it has to parse.
+#[test]
+fn every_command_on_the_welcome_page_parses_with_the_real_cli() {
+    let page = read("src/relish/quickstart/welcome.html");
+    let mut commands = Vec::new();
+    for block in page.split("<code>").skip(1) {
+        let block = decode(&strip_tags(&block[..block.find("</code>").unwrap()]));
+        commands.extend(block.lines().map(str::to_string));
+    }
+    let relish = relish_lines(&commands);
+    assert!(relish.len() >= 6, "too few commands found: {relish:?}");
+    for command in relish {
+        parses(&command).unwrap_or_else(|error| panic!("{command:?}: {error}"));
+    }
 }
 
 /// A release is published, so the page leads with the one-line install and keeps
@@ -715,8 +780,7 @@ fn the_site_and_docs_announce_the_version_the_installer_installs() {
 
     let page = read("docs/website/index.html");
     for expected in [
-        format!("{version} PROTOTYPE"),
-        format!("Install {version} "),
+        format!("APACHE 2.0 · {version}<"),
         format!("<strong>{version}: "),
         format!("href=\"{notes}\""),
     ] {
@@ -1485,4 +1549,78 @@ fn release_pipeline_steps_flow_as_one_paragraph() {
             "a grid splits a step's title and text into separate cells: {rule}"
         );
     }
+}
+
+/// The "Built differently" section: the `<section id="why">` element.
+fn why_section(page: &str) -> &str {
+    let start = page
+        .find("<section id=\"why\"")
+        .expect("the page has no #why section");
+    &page[start..start + page[start..].find("</section>").unwrap()]
+}
+
+/// The five differences sit between the hero and the install, each a short
+/// punchline, two sentences and a drawing. The list works without script;
+/// `assets/why-carousel.js` turns it into a slideshow.
+#[test]
+fn five_differences_come_just_before_the_install() {
+    let page = read("docs/website/index.html");
+    let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
+    let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
+    assert_eq!(position("why") + 1, position("install"), "{ids:?}");
+
+    let section = why_section(&page);
+    assert!(section.contains("data-carousel"));
+    let slides: Vec<&str> = section.split("<li class=\"why-slide\"").skip(1).collect();
+    assert_eq!(slides.len(), 5, "the section should show five differences");
+    for slide in slides {
+        assert_eq!(slide.matches("<h3 class=\"why-punchline\">").count(), 1);
+        assert_eq!(slide.matches("<p>").count(), 1);
+        assert_eq!(slide.matches("<svg").count(), 1);
+        let svg = &slide[slide.find("<svg").unwrap()..];
+        let svg = &svg[..svg.find('>').unwrap()];
+        assert!(
+            svg.contains("aria-hidden=\"true\"") && svg.contains("viewBox="),
+            "the drawing is decorative and scales: {svg}"
+        );
+        let text = &slide[slide.find("<p>").unwrap()..slide.find("</p>").unwrap()];
+        let text = decode(&strip_tags(text));
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let sentences = text.matches(". ").count() + usize::from(text.ends_with('.'));
+        assert_eq!(sentences, 2, "each difference is two sentences: {text:?}");
+    }
+}
+
+/// The drawings are inline and animated by the site's own CSS, so nothing in
+/// the section loads from anywhere else, and reduced motion stills them.
+#[test]
+fn the_differences_load_nothing_and_respect_reduced_motion() {
+    let page = read("docs/website/index.html");
+    let section = why_section(&page);
+    for external in ["http:", "https:", "//", "<img", "<script", "<link", "<use"] {
+        assert!(
+            !section.contains(external),
+            "the #why section contains {external:?}"
+        );
+    }
+    assert!(page.contains("<script src=\"./assets/why-carousel.js\" defer></script>"));
+    let script = read("docs/website/assets/why-carousel.js");
+    for needle in [
+        "aria-live",
+        "prefers-reduced-motion",
+        "aria-roledescription",
+    ] {
+        assert!(script.contains(needle), "why-carousel.js lacks {needle:?}");
+    }
+    let style = read("docs/website/style.css");
+    let reduced = style
+        .split("@media (prefers-reduced-motion: reduce)")
+        .skip(1)
+        .any(|block| {
+            block[..block.find('}').unwrap()].contains(".why-art * { animation: none !important;")
+        });
+    assert!(
+        reduced,
+        "style.css should stop the drawings' animation for reduced motion"
+    );
 }

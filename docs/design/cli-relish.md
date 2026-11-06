@@ -651,7 +651,7 @@ relish logs <app> --since <time>    # 30s, 5m, 2h, 1d, or epoch seconds
 relish logs <app> --grep <substr>   # Substring filter
 relish logs <app> --json-field <k=v> # Structured JSON field match
 relish logs <app> --namespace <ns>  # App namespace (default "default")
-relish logs-export --dest <dir>     # Export Parquet log files
+relish logs-export --dest <dest>    # Copy a node's Parquet logs here, or ship them to s3:// or gs://
 relish logs-search <dir> <sql>      # SQL over an exported Parquet archive
 relish path <src> --to <dst>       # DNS / service-map / firewall / TCP evidence probe
 relish inspect <app>                # Per-instance detail for an app
@@ -1529,7 +1529,7 @@ Each correlated group becomes one `[app.*]` block. Two apps or jobs with the sam
 | CronJob | `[job.*]` with `schedule` | As Job, plus `suspend`, `concurrencyPolicy`, `timeZone` (schedules run in UTC) and `startingDeadlineSeconds` **warned** |
 | Namespace | `[namespace.*]` | Name only |
 | Anything else (PersistentVolumeClaim, NetworkPolicy, ServiceAccount, RBAC, ResourceQuota, PodDisruptionBudget, CRDs) | **Dropped** | Listed in the report's Dropped section |
-| initContainers | `[[app.*.init]]` | `command` + `args` as one argv; **warned** on a job |
+| initContainers | `[[app.*.init]]` | `command` + `args` as one argv; `env` read like the app's, with values the app holds left out and drops warned under the init's name; **warned** on a job |
 | Multiple containers/pod | **Warning** | First container imported |
 
 **Field-level mapping (pod template → App):**
@@ -1599,7 +1599,7 @@ Converts Reliaburger TOML to Kubernetes YAML (also `kubernetes`-feature only). I
 | `[job.*]` with `schedule` | CronJob; `overlap` → `concurrencyPolicy` (omitted → `Forbid`, Reliaburger's default) |
 | `[namespace.*]` | Namespace + ResourceQuota |
 
-The export report lists features with no Kubernetes equivalent (firewall and egress rules on apps and jobs, process workloads, `run_before`, a job's `pids` and `replay_unknown`, `max_apps`/`max_replicas`) separately from fields that have one but aren't exported yet (health checks, metrics, volumes, init containers, config files, placement, encrypted env values).
+The export report lists features with no Kubernetes equivalent (firewall and egress rules on apps and jobs, process workloads, `run_before`, a job's `pids` and `replay_unknown`, `max_apps`/`max_replicas`) separately from fields that have one but aren't exported yet (health checks, metrics, volumes, config files, placement, encrypted env values).
 
 Exits 0 on success, 1 on error. With `--strict`, exits 1 if the report lists anything unsupported or not exported yet, and the error counts both.
 

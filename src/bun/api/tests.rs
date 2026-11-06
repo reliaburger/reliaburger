@@ -242,6 +242,17 @@ async fn test_setup_with_timed_metrics(
 /// real `SecurityState` (four CAs, an age keypair, an OIDC config). `tag`
 /// labels a private temp dir; repeated tags cannot collide across processes.
 pub(super) async fn seeded_council(tag: &str) -> Arc<crate::council::CouncilNode> {
+    seeded_council_with_log(tag).await.0
+}
+
+/// [`seeded_council`], with a handle on its Raft log so a test can read
+/// what was written.
+async fn seeded_council_with_log(
+    tag: &str,
+) -> (
+    Arc<crate::council::CouncilNode>,
+    crate::council::log_store::MemLogStore,
+) {
     use std::collections::BTreeMap;
 
     use crate::council::log_store::MemLogStore;
@@ -249,13 +260,14 @@ pub(super) async fn seeded_council(tag: &str) -> Arc<crate::council::CouncilNode
     use crate::council::state_machine::CouncilStateMachine;
     use crate::council::types::{CouncilConfig, CouncilNodeInfo, RaftRequest};
 
+    let log = MemLogStore::new();
     let raft_router = InMemoryRaftRouter::new();
     let network = InMemoryRaftNetworkFactory::new(1, raft_router.clone());
     let node = crate::council::CouncilNode::new(
         1,
         CouncilConfig::default(),
         network,
-        MemLogStore::new(),
+        log.clone(),
         CouncilStateMachine::new(),
         None,
     )
@@ -291,7 +303,7 @@ pub(super) async fn seeded_council(tag: &str) -> Arc<crate::council::CouncilNode
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    Arc::new(node)
+    (Arc::new(node), log)
 }
 
 /// Send a GET to `uri` against `app` and return (status, body bytes).
@@ -1874,6 +1886,19 @@ async fn follower_of_a_recording_leader(
     Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>>,
     Vec<Arc<crate::council::CouncilNode>>,
 ) {
+    follower_with_history_of_a_recording_leader(token, None).await
+}
+
+/// [`follower_of_a_recording_leader`], with `history` as the follower's
+/// own deploy records.
+async fn follower_with_history_of_a_recording_leader(
+    token: crate::sesame::types::ApiToken,
+    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+) -> (
+    Router,
+    Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>>,
+    Vec<Arc<crate::council::CouncilNode>>,
+) {
     use crate::council::CouncilNode;
     use crate::council::log_store::MemLogStore;
     use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
@@ -1928,7 +1953,7 @@ async fn follower_of_a_recording_leader(
         commands,
         None,
         None,
-        None,
+        history,
         None,
         None,
         Some(nodes[1].clone()),
@@ -1969,6 +1994,65 @@ async fn a_follower_forwards_app_changes_to_the_leader_with_the_callers_token() 
         seen.iter().all(|(_, bearer, marked, _)| *marked
             && bearer.as_deref() == Some(format!("Bearer {deployer_key}").as_str())),
         "each forward carries the caller's token and the forwarded mark: {seen:?}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// #1310: a rollback re-applies the previous spec through `cluster_apply`,
+/// so a follower forwards it as an apply. It goes as the caller, bearer and
+/// all, so the leader audits it under the caller's token name and a policy
+/// sees the caller's role, not the follower's service identity.
+#[tokio::test]
+async fn a_follower_forwards_a_rollback_to_the_leader_with_the_callers_token() {
+    let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+    // No spec in Raft and no gossip peers, so the follower's own records
+    // choose the target: the newest is the current version, the one before
+    // it is what the rollback re-applies.
+    let deployed = |id: u64, image: &str| DeployHistoryEntry {
+        id: crate::meat::deploy_types::DeployId(id),
+        created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id),
+        spec: Some(Box::new(
+            toml::from_str(&format!("image = \"{image}\"")).unwrap(),
+        )),
+        ..sample_history_entry(image)
+    };
+    let history = Arc::new(RwLock::new(vec![
+        deployed(1, "nginx:1.26"),
+        deployed(2, "nginx:1.27"),
+    ]));
+    let (follower, seen, nodes) =
+        follower_with_history_of_a_recording_leader(deployer, Some(history)).await;
+
+    let (status, reply) = send_bounded(
+        follower,
+        "POST",
+        "/v1/rollback/web/default",
+        &deployer_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
+    assert!(reply.contains("recorded by the leader"), "{reply}");
+
+    let seen = seen.lock().await.clone();
+    let [(path, bearer, marked, body)] = seen.as_slice() else {
+        panic!("one forward to the leader: {seen:?}");
+    };
+    assert_eq!(path, "/v1/apply");
+    assert_eq!(
+        bearer.as_deref(),
+        Some(format!("Bearer {deployer_key}").as_str()),
+        "the leader must see the caller's token"
+    );
+    assert!(marked, "a forwarded rollback carries the forwarded mark");
+    let config: Config = toml::from_str(body).unwrap();
+    assert_eq!(
+        config.app.get("web").and_then(|spec| spec.image.as_deref()),
+        Some("nginx:1.26"),
+        "the forward re-applies the previous version: {body}"
     );
     for node in nodes {
         node.shutdown().await.unwrap();
@@ -3049,7 +3133,7 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
     use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
     use crate::onion::service_id::ServiceId;
 
-    let council = seeded_council("withdrawal-instructions").await;
+    let (council, log) = seeded_council_with_log("withdrawal-instructions").await;
     let (app, shutdown) = setup_with_auth_leases_events_and_council(
         vec![],
         Some("internal".into()),
@@ -3125,6 +3209,10 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
         }
     }
     let before = council.desired_state().await;
+    let before_index = last_log_index(&log).await;
+    // The router's leader loop records the cron minute on its own timer, so
+    // judge what was written rather than compare log positions (#1331).
+    observe_a_later_minute(&council).await;
     for (consumer, expected) in [
         ("worker", vec![1, 2]),
         ("other-worker", vec![1, 2]),
@@ -3163,7 +3251,11 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
         assert_eq!(serde_json::to_value(decoded).unwrap(), body);
     }
     let after = council.desired_state().await;
-    assert_eq!(before.last_applied_log, after.last_applied_log);
+    assert_eq!(
+        writes_after(&log, before_index).await,
+        Vec::<String>::new(),
+        "serving instructions wrote to the council"
+    );
     assert_eq!(
         before.endpoint_withdrawals, after.endpoint_withdrawals,
         "serving instructions is not a cleanup acknowledgement"
@@ -3227,24 +3319,66 @@ async fn unparseable_peer_identity_is_refused_before_any_route() {
     council.shutdown().await.unwrap();
 }
 
-/// Wait until `council`'s applied log index has stopped moving for 200 ms,
-/// so a test can count the writes its own requests make.
-async fn wait_for_quiet_log(council: &crate::council::CouncilNode) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut last = council.desired_state().await.last_applied_log;
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let now = council.desired_state().await.last_applied_log;
-        if now == last || tokio::time::Instant::now() >= deadline {
-            return;
-        }
-        last = now;
-    }
+/// Every entry in `log` past `index`, except the task-array leader loop's
+/// cron clock, each named by its log id and payload.
+///
+/// The router spawns that loop, and it commits `CronObserve` on its first
+/// tick and again on each new wall-clock minute, on its own timer. Nothing
+/// orders that entry against a test's requests, so counting entries around
+/// a request sees it at random (#1331); this judges what was written.
+async fn writes_after(log: &crate::council::log_store::MemLogStore, index: u64) -> Vec<String> {
+    use openraft::storage::RaftLogReader;
+    log.clone()
+        .try_get_log_entries(..)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| {
+            entry.log_id.index > index
+                && !matches!(
+                    &entry.payload,
+                    openraft::EntryPayload::Normal(crate::council::RaftRequest::TaskArray(write))
+                        if matches!(**write, crate::meat::task_array_store::TaskArrayWrite::CronObserve { .. })
+                )
+        })
+        .map(|entry| match entry.payload {
+            openraft::EntryPayload::Normal(request) => format!("{}: {request:?}", entry.log_id),
+            other => format!("{}: {other:?}", entry.log_id),
+        })
+        .collect()
+}
+
+/// The index of the newest entry in `log`, or 0 when it holds none.
+async fn last_log_index(log: &crate::council::log_store::MemLogStore) -> u64 {
+    use openraft::storage::RaftLogReader;
+    log.clone()
+        .try_get_log_entries(..)
+        .await
+        .unwrap()
+        .last()
+        .map_or(0, |entry| entry.log_id.index)
+}
+
+/// Commit the cron clock's entry for the minute after the wall clock's, as
+/// the leader loop would on reaching it, so a test meets that stray entry
+/// on every run rather than once in a few hundred.
+async fn observe_a_later_minute(council: &crate::council::CouncilNode) {
+    let minute = i64::try_from(crate::meat::batch_ids::epoch_now_secs() / 60).unwrap() + 1;
+    let response = council
+        .write(crate::council::RaftRequest::TaskArray(Box::new(
+            crate::meat::task_array_store::TaskArrayWrite::CronObserve { minute },
+        )))
+        .await
+        .unwrap();
+    assert!(
+        !matches!(response, crate::council::CouncilResponse::Refused { .. }),
+        "the cron observation was refused: {response:?}"
+    );
 }
 
 #[tokio::test]
 async fn placements_serve_plaintext_discovery_without_registering_a_consumer() {
-    let council = seeded_council("endpoint-consumer").await;
+    let (council, log) = seeded_council_with_log("endpoint-consumer").await;
     let (token, user_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
     let (app, shutdown) = setup_with_auth_leases_events_and_council(
         vec![token],
@@ -3256,10 +3390,6 @@ async fn placements_serve_plaintext_discovery_without_registering_a_consumer() {
         Some(council.clone()),
     )
     .await;
-    // The router's leader loops write to Raft once as they start. Token
-    // checks used to take long enough (Argon2) to hide that; now they don't,
-    // so wait for the log to settle before counting writes.
-    wait_for_quiet_log(&council).await;
     let path = "/v1/placements/worker";
     assert_eq!(
         get_authenticated(app.clone(), path, &user_key).await.0,
@@ -3294,14 +3424,17 @@ async fn placements_serve_plaintext_discovery_without_registering_a_consumer() {
             .endpoint_consumers
             .contains("imposter")
     );
-    let applied = council.desired_state().await.last_applied_log;
+    let applied = last_log_index(&log).await;
+    // The router's leader loop records the cron minute on its own timer, so
+    // judge what was written rather than count entries (#1331).
+    observe_a_later_minute(&council).await;
     assert_eq!(
         get_authenticated(app, path, "internal").await.0,
         StatusCode::OK
     );
     assert_eq!(
-        council.desired_state().await.last_applied_log,
-        applied,
+        writes_after(&log, applied).await,
+        Vec::<String>::new(),
         "an unchanged placement poll must not write another registration"
     );
     shutdown.cancel();
@@ -6142,6 +6275,151 @@ async fn logs_export_ships_parquet_and_persists_the_checkpoint() {
         .unwrap();
     let outcome: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(outcome["files_exported"], 0, "{outcome}");
+}
+
+/// The log archive hands every tenant's logs to whoever asks, so like the
+/// export it is Admin-only.
+#[tokio::test]
+async fn logs_archive_requires_admin() {
+    let (app, shutdown, tok) = setup_with_role(
+        "logs-archive-deployer",
+        crate::sesame::types::ApiRole::Deployer,
+    )
+    .await;
+    for uri in ["/v1/logs/archive", "/v1/logs/archive/logs_000000.parquet"] {
+        let status = get_status(app.clone(), uri, Some(&tok)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    shutdown.cancel();
+}
+
+/// A token scoped to one namespace can't have a store that holds everyone's
+/// logs, whatever its role: there's no filtering a Parquet file.
+#[tokio::test]
+async fn logs_archive_refuses_a_scoped_admin_token() {
+    let created = crate::sesame::token::create_token(
+        "logs-archive-scoped-admin",
+        crate::sesame::types::ApiRole::Admin,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["a".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (app, shutdown) = setup_with_auth(vec![created.token], None).await;
+    for uri in ["/v1/logs/archive", "/v1/logs/archive/logs_000000.parquet"] {
+        let status = get_status(app.clone(), uri, Some(&created.plaintext)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    shutdown.cancel();
+}
+
+/// A router over a log store holding one flushed Parquet file.
+async fn router_with_one_parquet_file() -> (Router, tempfile::TempDir) {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let store_dir = tempfile::tempdir().unwrap();
+    let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+    store.append(
+        "web",
+        "default",
+        crate::ketchup::types::LogStream::Stdout,
+        "hello",
+    );
+    store.flush().await.unwrap();
+    let app = router(
+        cmd_tx,
+        None,
+        Some(Arc::new(RwLock::new(store))),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    (app, store_dir)
+}
+
+async fn get_bytes(app: Router, uri: &str) -> (StatusCode, Vec<u8>) {
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+/// #1499: `relish logs-export` copies a node's archive to the operator's
+/// machine through these two routes. The listing names each Parquet file
+/// with its size and SHA-256, the file route serves those exact bytes, and
+/// neither touches the node's own export checkpoint.
+#[tokio::test]
+async fn logs_archive_lists_each_parquet_file_and_serves_its_bytes() {
+    let (app, store_dir) = router_with_one_parquet_file().await;
+    let (status, body) = get_bytes(app.clone(), "/v1/logs/archive").await;
+    assert_eq!(status, StatusCode::OK);
+    let listing: crate::ketchup::export::ArchiveListing = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listing.node_id, "local");
+    assert_eq!(listing.files.len(), 1, "{listing:?}");
+    let file = &listing.files[0];
+    let on_disk = std::fs::read(store_dir.path().join(&file.name)).unwrap();
+    assert_eq!(file.size, on_disk.len() as u64);
+    assert_eq!(
+        file.sha256,
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&on_disk))
+    );
+
+    let (status, served) = get_bytes(app, &format!("/v1/logs/archive/{}", file.name)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(served, on_disk);
+    assert!(
+        !store_dir
+            .path()
+            .join(crate::ketchup::export::CHECKPOINT_FILENAME)
+            .exists()
+    );
+}
+
+/// The file route serves only a Parquet file in the store itself: not the
+/// checkpoint, not a path that climbs out, not a file that isn't there.
+#[tokio::test]
+async fn logs_archive_serves_nothing_but_the_stores_parquet_files() {
+    let (app, store_dir) = router_with_one_parquet_file().await;
+    std::fs::write(store_dir.path().join("_export_checkpoint.json"), b"{}").unwrap();
+    for (uri, expected) in [
+        (
+            "/v1/logs/archive/_export_checkpoint.json",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/logs/archive/..%2Fescape.parquet",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/v1/logs/archive/..", StatusCode::BAD_REQUEST),
+        ("/v1/logs/archive/missing.parquet", StatusCode::NOT_FOUND),
+    ] {
+        let (status, body) = get_bytes(app.clone(), uri).await;
+        assert_eq!(
+            status,
+            expected,
+            "{uri}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 }
 
 /// AUTH1 for faults: a Deployer scoped to one namespace clears the role
@@ -9616,18 +9894,40 @@ async fn hung_failed_hook_settlement_is_bounded_and_preserves_the_exact_failure_
     assert_stalled_settlement_is_bounded(StalledSettlement::FailedHook).await;
 }
 
+/// Commit `request` the way the planner does, against the log position read
+/// just before it. The router's task-array loop commits its cron clock on
+/// its own timer, and an entry landing in between makes the state machine
+/// refuse the plan with "admission revision changed" (#735, #1331), so the
+/// fixture plans again, as `tests/suite/admission_fixture.rs` does. Every
+/// other response is returned unchanged.
 async fn write_admission_fixture(
     council: &crate::council::CouncilNode,
-    mut request: crate::council::RaftRequest,
+    request: crate::council::RaftRequest,
 ) -> Result<crate::council::CouncilResponse, crate::council::CouncilError> {
-    let previous = council.desired_state().await.last_applied_log;
-    if let crate::council::RaftRequest::SchedulingDecision(decision) = &request {
-        request = crate::council::RaftRequest::SchedulingDecisions {
-            expected_log_id: previous,
-            decisions: vec![decision.clone()],
+    const MAX_PLANS: usize = 8;
+    let mut plans = 0;
+    loop {
+        plans += 1;
+        let previous = council.desired_state().await.last_applied_log;
+        let planned = match request.clone() {
+            crate::council::RaftRequest::SchedulingDecision(decision) => {
+                crate::council::RaftRequest::SchedulingDecisions {
+                    expected_log_id: previous,
+                    decisions: vec![decision],
+                }
+            }
+            other => other,
+        };
+        let response = council.write(planned).await?;
+        match &response {
+            crate::council::CouncilResponse::Refused { reason }
+                if reason == "admission revision changed" && plans < MAX_PLANS =>
+            {
+                continue;
+            }
+            _ => return Ok(response),
         }
     }
-    council.write(request).await
 }
 
 #[tokio::test]

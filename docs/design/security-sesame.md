@@ -198,6 +198,24 @@ Admin                  New Node                  Cluster (any existing node)
   |                       |                              |
 ```
 
+A node certificate names the node id as a SPIFFE URI SAN and a DNS SAN, and,
+from 0.2.6, the address the issuer saw the join or renewal request come from
+as an IP SAN, so a strict client can connect by address
+([#1508](https://github.com/reliaburger/reliaburger/issues/1508)). Loopback and
+unspecified addresses are left out, and nothing in the CSR is used. A node
+whose certificate doesn't name its advertised address renews once to get it,
+which covers the first node and a node that moved; Bun reaches its own API at
+that address, so the leader's own renewal arrives from it too.
+
+A node with no Raft seat replicates no security state, so it fetches the
+leader's `SecurityState::node_view()` from `/v1/cluster/security-view` over
+mTLS on every security refresh (#1477). The leader reads its state
+linearizably and checks the caller's node certificate as renewal does. The
+view keeps the CA certificates, API token hashes, the CRL, node leaf records,
+the wrapped age keys and the wrapped Ingress CA key. It drops the root, Node
+and Workload CA keys, the OIDC signing key, join tokens, secret seals,
+pending intermediates and the serial counter.
+
 ---
 
 ## 4. Data Structures
@@ -398,7 +416,7 @@ pub struct ApiToken {
     pub scope: TokenScope,
 
     /// When the token expires; `None` means never. A Deployer or ReadOnly
-    /// token created without `--ttl-days` or `--no-expiry` gets the node's
+    /// token created without `--ttl-days` or `--no-expiry` gets the leader's
     /// `[security.tokens] default_ttl` (90 days); Admin tokens get none (§5.4).
     pub expires_at: Option<SystemTime>,
 
@@ -794,7 +812,9 @@ start with the command that fixes it, `relish init` on a bootstrap node or
 the setting. `relish dev create` builds an mTLS cluster the way
 `relish setup --quickstart` does, from the same bootstrap code: it generates the
 CA, master key and first identity on the host, then enrols every other Lima VM
-with a join token and `relish join`.
+with a join token and `relish join`. The bootstrap's administrator token is
+named by the caller: `laptop-admin` for the quickstart, `dev-<cluster>-admin`
+for a dev cluster (#930).
 
 Plaintext is an explicit opt-in, and there are only two: `relish init
 --development-plaintext`, and test fixtures that write `require_mtls = false`.
@@ -852,8 +872,11 @@ $ relish --endpoint https://leader.example:9117 \
 `1..=3600`, requires the Admin role, generates the secret on the leader and
 commits only its SHA-256 hash, expiry and attestation mode through
 `RaftRequest::CreateJoinToken`. The response carries the plaintext once. A
-follower returns `503` without the plaintext; retrying against the elected
-leader cannot create an orphan credential.
+follower forwards the request with the caller's own credential (#1506) and
+generates nothing itself; the leader repeats every check. If the leader doesn't
+answer within 10 seconds the caller gets a `504`, and a token may have
+committed: only its hash, which nobody holds the plaintext for, so it can't be
+used and it expires by itself. A retired node id gets a `409`.
 
 1. The joining node connects to the current leader over TLS (server-authenticated only at this stage, using the root CA certificate that was provided alongside the join token or downloaded via a trust-on-first-use pinning step).
 2. The joining node presents the join token.
@@ -912,6 +935,17 @@ $ relish token create --name ci-deploy --role deployer \
 4. Return the plaintext token to the user, with its expiry. It is never stored
    in plaintext.
 
+Only the leader mints. A follower forwards the request with the caller's own
+credential (#1496), and the leader repeats every check, so the `[permission]`
+check and the default lifetime are always the leader's. Once the write commits,
+the node the client spoke to copies the stored record from its own replica into
+its token store, so the secret works there on the next request. A follower
+finds the record by hashing the secret in the leader's answer and waits up to
+two seconds for its replica to apply it. A follower lagging further answers
+anyway and gets the token from the five-second refresh, as every other node
+does. A leader that doesn't answer a forwarded create within 10 seconds gets
+the caller a `504`; the token may have committed with its secret lost.
+
 **Verification.** `sesame::auth::authenticate` turns away a bearer that
 doesn't have the token shape with a string check. Otherwise it hashes the
 bearer once and compares the digest with every stored secret (each token's
@@ -944,7 +978,7 @@ The change alters the stored format, so 0.2.1 starts a fresh cluster (state
 `69`, see `src/compatibility.rs`) and tokens must be reissued.
 
 **Default lifetime (shipped, F05 I3).** Without `--ttl-days`, a Deployer or
-ReadOnly token expires after the answering node's `[security.tokens]
+ReadOnly token expires after the leader's `[security.tokens]
 default_ttl` (`"90d"` by default; `"12h"`-style hours and `"none"` are
 accepted, and a bad value fails config load). `--no-expiry` opts out
 explicitly and conflicts with `--ttl-days`. Admin tokens get no default
@@ -1046,8 +1080,10 @@ runtime, storage or observability startup in standalone mode.
 $ relish token rotate ci-deploy [--grace-hours 24]
 ```
 
-1. The node that takes `POST /v1/token/rotate {name, grace_hours}` generates a
-   new secret and hash, and reads the clock once.
+1. Only the leader mints. A follower forwards
+   `POST /v1/token/rotate {name, grace_hours}` with the caller's own credential
+   (#1506), and the leader repeats every check. The leader generates a new
+   secret and hash, and reads the clock once.
 2. It proposes `RaftRequest::RotateApiToken(TokenRotation)`, carrying the new
    SHA-256 digest, `rotated_at`, the new expiry (the token's previous lifetime
    length from now, or none) and `previous_valid_until` (now plus the grace,
@@ -1061,10 +1097,39 @@ $ relish token rotate ci-deploy [--grace-hours 24]
    authenticates as its own principal (the digest of its hash), so last use,
    audit events and browser sessions opened with it stay separate, and those
    sessions end when it does.
-5. The answering node installs the rotation in its own token store at once;
-   the others pick it up on their five-second refresh. The handler records a
-   `token.rotated` audit event with the caller and the grace end, never the
-   secret. Role, scope and the `[permission]` spec stay with the name.
+5. The node the client spoke to installs the rotation in its own token store
+   at once, by copying the stored record from its replica, so the record also
+   says what became of the old secret. A follower finds the record by hashing
+   the secret in the leader's answer and waits up to two seconds for its
+   replica. A follower lagging further answers anyway: the new secret gets a
+   `401` there, and the old one keeps working there even after a zero grace,
+   until its replica catches up. The others pick the rotation up on their
+   five-second refresh. The leader records a `token.rotated` audit event with
+   the caller and the grace end, never the secret. Role, scope and the
+   `[permission]` spec stay with the name.
+
+If the leader doesn't answer a forwarded rotation within 10 seconds the caller
+gets a `504`, and the rotation may have committed with its new secret lost.
+Rotating again isn't a clean retry: the lost secret becomes the previous one,
+so the secret clients still hold stops at once whatever the grace. The error
+says to check the token's created time in `relish token list` first.
+
+**Revocation (forwarded by #1506):** `POST /v1/token/revoke {name}` commits
+`RaftRequest::RevokeApiToken` on the leader; a follower forwards it with the
+caller's own credential. Authentication reads each node's token store, so the
+node the client spoke to also drops the token from its store before it answers
+(`drop_revoked_token`), by name, as the state machine does. It first waits up
+to two seconds for its replica to apply the removal, because the five-second
+refresh copies the replica over the store and would otherwise put the token
+back. The refresh leaves the store alone if the store changed after it read the
+replica (`replace_tokens_unless_changed`), which covers a refresh already in
+flight; it doesn't hold the store's lock across that read, because every
+authenticated request would then wait on the state machine's. A follower
+lagging past the two seconds still drops the token, but a refresh can restore
+it until its replica catches up, so the answer says the node is behind. The
+other nodes drop the token on their refresh, within five seconds. A forwarded
+revoke the leader doesn't answer within 10 seconds is a `504`, and repeating it
+is safe.
 
 **Expiry:** A token with a set `expires_at` is rejected at authentication time once that time has passed (a `401 token expired`). A token with no expiry is never rejected on age grounds. Revocation is explicit via `relish token revoke`.
 
@@ -1116,7 +1181,7 @@ An app env value `PROVIDER[name:path]` names a secret kept outside the cluster. 
 
 **Placement.** `NodeCapabilities::secret_providers` lists the names a node runs, in its capability report. `WorkloadRequirements::secret_providers` collects the names an app's env uses, and `meat::filter::node_can_run` requires them to be a subset, so the scheduler only places a provider-backed app where its providers exist (`UnplacedReason::NoCapableNode` otherwise).
 
-**Resolution at launch.** `grill::oci::build_env_with_decryptor` passes a provider value through as `KEY=PROVIDER[...]`. Just before the runtime creates the instance, on the deploy worker or restart task (never the agent loop), `bun::agent::launch::create_with_secrets` resolves each such entry through `SecretProviders::resolve_env` and hands the runtime a resolved copy. The supervisor keeps the unresolved spec, so every restart calls the provider again. Init containers get the resolved environment of the app they precede.
+**Resolution at launch.** `grill::oci::build_env_with_decryptor` passes a provider value through as `KEY=PROVIDER[...]`. Just before the runtime creates the instance, on the deploy worker or restart task (never the agent loop), `bun::agent::launch::create_with_secrets` resolves each such entry through `SecretProviders::resolve_env` and hands the runtime a resolved copy. The supervisor keeps the unresolved spec, so every restart calls the provider again. Init containers get the resolved environment of the app they precede, and a reference in an init container's own `env` resolves the same way on the deploy worker.
 
 **Protocol, version 1.** Bun spawns the binary with `env_clear()`, a default `PATH` plus the configured `env`, cwd `/`, stderr discarded, `kill_on_drop` and its own process group. It writes one JSON object on one newline-terminated line to stdin and closes it: `{"version":1,"provider","path","namespace","app","instance","variable"}`. It reads at most `max_output_bytes + 1` bytes of stdout while waiting for exit, all inside `tokio::time::timeout(timeout_secs)`. Once the provider exits, reading gets 100 ms more rather than waiting for end-of-file, because a leftover child, or on macOS a process spawned concurrently that inherited the pipe before `FD_CLOEXEC` was set, can hold the write end open. The answer is `{"version":1,"value":"..."}` with exit 0, or `{"version":1,"error":"..."}`. Unknown fields are ignored.
 
@@ -1203,7 +1268,7 @@ On each council node (intended design; step 1 differs today, see the status note
 **Intermediate CA rotation (`relish ca rotate --role node|workload|ingress --root-backup <file>`, F04 R4):**
 
 1. **Prepare** (`POST /v1/ca/rotation/prepare {role}`). The leader generates the new P-256 key, wraps it with the master key and proposes `RaftRequest::CaRotationPrepare { role, generation, csr_der, private_key_wrapped }`. Applying it stores a `PendingIntermediate` (one per role; a second prepare replaces the first) and allocates the certificate's serial from `next_serial`, so it can't collide with a revoked serial. Refused for the root, for a role mid-rotation and for a generation other than the active one's plus one. The answer carries the CSR, generation, serial and the active root's fingerprint.
-2. **Sign** (on the operator's machine). `relish` opens the R3 backup, checks its fingerprint against the one the council sent, and signs the CSR with `ca::sign_intermediate_csr`: only the CSR's public key is used; name, path length 0, key usages and five-year lifetime are fixed per role and clamped to the root's validity. The root key never reaches the cluster.
+2. **Sign** (on the operator's machine). `relish` opens the R3 backup, checks its fingerprint against the one the council sent, and signs the CSR with `ca::sign_intermediate_csr`: only the CSR's public key is used; name, path length 0, key usages and five-year lifetime are fixed per role and clamped to the root's validity. Like every issued certificate, it carries an authority key identifier equal to its issuer's subject key identifier. The root key never reaches the cluster.
 3. **Begin** (`POST /v1/ca/rotation/begin {role, certificate_b64}`). The leader checks the certificate with `ca_rotation::intermediate_from_signed` (pending CSR for the role, same public key, allocated serial, CA certificate, signed by the active root), builds the `CertificateAuthority` with the pending wrapped key and proposes `CaRotationBegin`, which clears the pending CSR. Both CAs are trusted; new leaves come from the new one.
 4. **Re-issue.**
    - *Node:* each node's renewal worker checks its replica every 5 s. Once its live identity holds exactly the council's trust set it sends `POST /v1/cluster/trust-ack {node_ca_fingerprints}` (node-to-node, TLS-peer authenticated); the leader refuses unless every trusted Node CA is listed, then proposes `AcknowledgeNodeTrust { node_id, generation }`, which raises `NodeLeafRecord::trust_generation` (never lowers it; a join starts at the active generation). When every live node has acknowledged, nodes renew early (`ca_rotation::early_renewal_due`) one at a time in node-id order, each after every earlier node holds a new-CA leaf, or after its slot (`EARLY_RENEWAL_STAGGER`, 60 s per place from the new CA's issue time) if one is stuck.

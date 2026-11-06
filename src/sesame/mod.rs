@@ -25,6 +25,7 @@ pub mod renewal_worker;
 pub mod root_backup;
 pub mod secret;
 pub mod secret_provider;
+pub mod security_view;
 pub mod session;
 pub mod token;
 pub mod trust;

@@ -77,6 +77,9 @@ pub struct NodeRenewalWorker {
     /// This node's `leaf_lifetime_override_secs`, when set. A leaf signed for
     /// longer is renewed at the midpoint of this ceiling instead.
     lifetime_ceiling: Option<Duration>,
+    /// The address this node advertises, which its leaf should name as an
+    /// IP SAN (#1508); `None` when it advertises none a client could use.
+    address: Option<std::net::IpAddr>,
 }
 
 impl NodeRenewalWorker {
@@ -109,6 +112,7 @@ impl NodeRenewalWorker {
                 state,
                 retry_delay: RETRY_DELAY,
                 lifetime_ceiling: None,
+                address: None,
             },
             RenewalMonitor(monitor),
         ))
@@ -132,6 +136,16 @@ impl NodeRenewalWorker {
         self
     }
 
+    /// Renew early, once, when the installed leaf doesn't name `address`, the
+    /// address this node advertises: a first node's leaf, or one issued
+    /// before the node moved. The issuer names the address it sees the
+    /// request come from, so a node behind NAT may still get a leaf without
+    /// it; one attempt per address keeps that from renewing every tick.
+    pub fn with_address(mut self, address: std::net::IpAddr) -> Self {
+        self.address = Some(address).filter(|address| super::ca::names_a_machine(*address));
+        self
+    }
+
     /// Renew at the signed lifetime midpoint (or the ceiling's, when that is
     /// sooner), retrying failed attempts after five seconds. Resolve the
     /// current leader on every attempt; never proxy a CSR through another node
@@ -150,6 +164,7 @@ impl NodeRenewalWorker {
         let mut last_error = None;
         let mut rotation_checked_at: Option<tokio::time::Instant> = None;
         let mut rotation_due = false;
+        let mut address_asked = false;
         loop {
             tokio::select! { biased;
                 _ = shutdown.cancelled() => return,
@@ -191,7 +206,9 @@ impl NodeRenewalWorker {
                 .not_before
                 .checked_add(lifetime / 2)
                 .unwrap_or(current.not_before);
-            if now < due && !rotation_due {
+            let address_due =
+                !address_asked && address_renewal_due(&current.certificate_der, self.address);
+            if now < due && !rotation_due && !address_due {
                 self.state.send_replace(RenewalState::Valid);
                 continue;
             }
@@ -210,6 +227,7 @@ impl NodeRenewalWorker {
                     self.state.send_replace(RenewalState::Valid);
                     last_error = None;
                     rotation_due = false;
+                    address_asked |= address_due;
                 }
                 Err(error) => {
                     self.state.send_replace(RenewalState::Retrying);
@@ -373,5 +391,45 @@ impl NodeRenewalWorker {
             .replace(replacement, &council_trust)
             .await
             .map_err(|error| error.to_string())
+    }
+}
+
+/// Whether a leaf should be renewed to name `address`: the node advertises
+/// one a client could use, and the leaf in `certificate_der` doesn't name it.
+fn address_renewal_due(certificate_der: &[u8], address: Option<std::net::IpAddr>) -> bool {
+    address.is_some_and(|address| !super::ca::ip_sans(certificate_der).contains(&address))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sesame::{ca, types::SerialNumber};
+
+    fn leaf(address: Option<&str>) -> Vec<u8> {
+        let hierarchy = ca::generate_ca_hierarchy("address", b"ikm").unwrap();
+        let (csr, _) = ca::create_node_csr("node-1").unwrap();
+        ca::sign_node_csr(
+            &csr,
+            "node-1",
+            SerialNumber(9),
+            ca::NODE_LEAF_LIFETIME,
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+            address.map(|address| address.parse().unwrap()),
+        )
+        .unwrap()
+        .0
+    }
+
+    /// #1508: a first node's leaf, issued before any peer saw it, names no
+    /// address; the node renews once to get one. A leaf that names the
+    /// advertised address, or a node that advertises none, needs nothing.
+    #[test]
+    fn a_leaf_without_the_advertised_address_is_due_for_renewal() {
+        let advertised = Some("10.0.0.7".parse().unwrap());
+        assert!(address_renewal_due(&leaf(None), advertised));
+        assert!(address_renewal_due(&leaf(Some("10.0.0.8")), advertised));
+        assert!(!address_renewal_due(&leaf(Some("10.0.0.7")), advertised));
+        assert!(!address_renewal_due(&leaf(None), None));
     }
 }

@@ -47,6 +47,13 @@ def shared_tools():
     """
     digest = hashlib.sha256(repr(sorted(TOOLS.items())).encode()).hexdigest()[:16]
     directory = Path(tempfile.gettempdir()) / f"reliaburger-installer-tools-{os.getuid()}-{digest}"
+    # macOS's temporary-file sweep can empty an old copy and leave the
+    # directory, and every test then failed reading `uname`. Start again.
+    if directory.is_dir() and not all(
+        (directory / name).is_file() and (directory / name).read_text() == body
+        for name, body in TOOLS.items()
+    ):
+        shutil.rmtree(directory, ignore_errors=True)
     if not directory.exists():
         staging = Path(tempfile.mkdtemp(prefix="reliaburger-installer-tools-"))
         for name, body in TOOLS.items():

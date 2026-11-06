@@ -5,7 +5,7 @@ fonts, analytics or third-party requests. Publish the contents of this directory
 with the GitHub Pages workflow (`.github/workflows/static.yml`); workflow and
 custom-domain configuration are managed separately.
 
-JavaScript: two small scripts, each for one thing. `assets/copy.js` adds a
+JavaScript: three small scripts, each for one thing. `assets/copy.js` adds a
 copy button beside every command snippet (`<pre>`) with a short "Copied"
 confirmation announced through a live region, and makes each heading's `#`
 permalink copy the section's address as well as navigate to it. It adds the
@@ -23,11 +23,23 @@ the recording (about 1 MB) from this site when the figure comes within a screen
 or so of the viewport (an `IntersectionObserver`; browsers without one load them
 straight away), so a visitor who never scrolls down doesn't pay for them.
 Nothing is fetched from anywhere else. With scripts disabled a `<noscript>`
-note links the `.cast` file, and the written tour works as before. Don't add other scripts. The footer names both,
-so change the two together.
+note links the `.cast` file, and the written tour works as before.
 
-Every `<section>` has a stable `id` (`install`, `tour`, `netboot`, `start`,
-`docs`, `internals`, `contributing`) and every section heading a `#` permalink, shown on
+`assets/why-carousel.js` turns the "Built differently" section (`#why`), a
+plain list of five architectural differences, into a slideshow: one at a
+time, a new one every nine seconds, with previous, next, five dots and a Pause
+and Play button. Pause and Play always take effect; it also stops while a
+mouse rests on it and when keyboard focus comes in (until Play), never because
+of a tap, and doesn't rotate at all for visitors who prefer reduced motion. It follows the WAI-ARIA
+carousel pattern, so the slide text is a polite live region only while it
+isn't rotating by itself. The drawings are inline SVG animated by CSS in
+`style.css`, so reduced motion stills them and nothing loads from elsewhere.
+Without JavaScript all five stay stacked.
+
+Don't add other scripts. The footer names all three, so change them together.
+
+Every `<section>` has a stable `id` (`why`, `install`, `tour`, `netboot`, `start`,
+`docs`, `internals`, `next`, `contributing`) and every section heading a `#` permalink, shown on
 hover or focus, so a section can be shared as `reliaburger.com/#install`.
 Renaming an `id` breaks links people have already shared; add a new section
 instead. `tests/suite/website.rs` checks the ids, the permalinks and that the
@@ -88,7 +100,7 @@ so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.2.3
+  --record docs/website/assets/tour.cast --install v0.2.5
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -111,18 +123,25 @@ port. The recording says which ports it used and shows the commands with them.
 `--record` runs the tour inside `asciinema rec` (110x32, idle time cut to two
 seconds) and then plays the setup step four times faster, because setup redraws
 its timers several times a second and idle trimming can't shorten it. The
-narration says both, and every wait prints how long it really took. It applies
+narration says both, and every wait prints how long it really took. Each step
+opens with a bold `» Title` line, and the post-processing puts an asciicast
+marker (`"m"` event) on it with the same title. The vendored player shows
+markers as chapters on its progress bar without any option, and `[` and `]`
+jump between them. `assets/tour-player.js` also reads those markers from the
+recording and draws them as jump buttons under the player, and shows the last
+frame of the chapter named by `data-poster-chapter` before anyone presses play,
+so a re-record needs no change to the page. The script applies
 the demo URL when it answers, and `examples/kubernetes/podinfo.yaml` (with a
 note) when it doesn't; likewise it copies `examples/demo/burger` unless the
 published tarball holds exactly that directory. Until a promotion's site
 change deploys, the live tarball is the previous release's, so a re-record
 always shows the repository copy, and says so on screen. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.2.3` on the default ports.
+`--install v0.2.5` on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
 `--record` writes the installed version into the cast's title (`Reliaburger
-0.2.3: the five-minute tour`), and the caption under the player names it too.
+0.2.5: the five-minute tour`), and the caption under the player names it too.
 `tests/suite/website.rs` checks that both match `install.sh`'s default, so a
 promotion that forgets the re-record fails CI.
 
@@ -196,8 +215,12 @@ delete the `jobs.svg` an app soak record also draws. `tests/suite/website.rs`
 fails while a chart differs from its record's copy, comes from another
 release, lacks alt text, a size or lazy loading, or sits in `assets/soak/`
 without being shown, and while the section misses any of the seven charts.
-A release with a headline record of its own can show its charts too: 0.2.3
-adds the day run's job rate and memory, copied the same way.
+A release with a headline record of its own can show its charts while it's
+the installed release, copied the same way. The test wants every chart from
+the installed release's records, so the next promotion removes them. The one
+exception is the day run's memory chart, which stays beside its headline
+paragraph in the jobs section: it lives in `assets/day-run/`, out of a
+promotion's way, and `tests/suite/website.rs` checks it against its record.
 
 ### Commands the installed release doesn't have
 
@@ -224,7 +247,7 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.2.3` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.2.5` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. Every line the site shows names a
 mode (`sh -s -- --laptop`): with no arguments both scripts only explain the
 choices and exit 2, and the bootstrap does it before downloading anything.

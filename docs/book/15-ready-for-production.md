@@ -567,6 +567,18 @@ declined to adopt it. No fixture could have caught this, because the fixture *wa
 Only `make test-apple`, run on Apple silicon, exercised the real CLI -- so that's where it
 surfaced, and where we captured the true schema and pinned the fixtures to it.
 
+It happened again a few weeks later, the other way round (#1535). Apple's
+`container` 1.x moved the state into an object, `status.state`, and the
+addresses under `status.networks`, and an absent name became a failed command
+saying `Error: container not found: <id>` where 0.x had printed `[]`. The
+fixtures still pinned the 0.x shape, so they stayed green while the real CLI
+gave "unknown container state" again. The parser now probes both shapes,
+newest first. The absence rule took more care: Chapter 14's adoption treats a
+failed inspection as "we don't know", never as "gone". So we accept exactly
+one failure as absence, the line that names our own container, and a test
+checks that the same message naming any other container, or any other error,
+still refuses.
+
 Neither bug was subtle once you saw it. Both were invisible from inside the test suite,
 because both suites tested a model of the world rather than the world. That's the whole reason
 the acceptance gate exists: run the portable suite, then the cluster and upgrade suites
@@ -7586,9 +7598,33 @@ returns an iterator, a `Vec<(String, String)>` can become one, and the
 compiler generates a copy of `open_with_env` for each. It's the closest thing
 Rust has to Python's duck typing, checked at compile time.
 
-The unit tests never talk to a cloud. `make test-s3` does: with real
-credentials and `RELIABURGER_TEST_S3_URL`, it exports logs to the bucket and
-round-trips a council backup through it, put, list, prune and restore.
+The unit tests never talk to a cloud. `make test-s3` does: it exports logs to
+a bucket and round-trips a council backup through it, put, list, prune and
+restore. Until 0.2.6 it needed real AWS credentials, and the
+qualification Mac had none, so 0.2.5 shipped without it. A test nobody can
+run doesn't gate anything.
+
+So now `make test-s3` brings its own bucket. With no `RELIABURGER_TEST_S3_URL`
+it downloads a pinned [SeaweedFS](https://github.com/seaweedfs/seaweedfs)
+binary, starts `weed mini` on free loopback ports with a random bucket and
+random credentials, runs the two tests and deletes the lot afterwards. CI
+runs the same script, the same way, on every change to the S3 client, log
+export or council backups. We picked SeaweedFS because MinIO's
+community edition stopped shipping binaries, and because SeaweedFS checks
+every request's signature: a mock that accepts anything would pass a client
+that AWS would refuse. The [testing guide](../testing.md#s3-in-ci) has the
+rest, including when a real bucket is still worth the trouble.
+
+Nothing in Reliaburger changed to make this work, and that's the point of
+`open_with_env`. The script exports `AWS_ENDPOINT=http://127.0.0.1:<port>`
+and `AWS_ALLOW_HTTP=true`, and `s3_builder` hands them to `object_store`
+like any other `AWS_*` variable. One new unit test pins down what the local
+server depends on. An endpoint without `AWS_VIRTUAL_HOSTED_STYLE_REQUEST`
+means path-style requests, `http://127.0.0.1:18333/council-backups/...`,
+because a loopback address has no `council-backups.127.0.0.1` subdomain to
+resolve. The test checks the builder's config values and then the built
+store's `Debug` output, which shows the bucket in the path after the
+endpoint.
 
 The regression tests are less satisfying than we'd like. Nothing a unit test
 can observe changes when an `fsync` is missing, so each caller's test checks
@@ -8254,6 +8290,81 @@ it. Now the demo's test runs `validate_intrinsic`, the same checks the API
 applies, and `tests/suite/documented_manifests.rs` runs them on every manifest
 we tell people to apply as written: everything in `examples/`, and the TOML in
 the README, the quickstart, the Linux servers guide and the website.
+
+The same steps work on real machines. `relish setup --ssh` drives the system
+`ssh` binary rather than an SSH library, so a person's keys, agent and known hosts
+all behave as they do at a prompt. It's a separate flow from the laptop's rather
+than a mode of it, which meant one trait we didn't write: a qualified path stays
+exactly as it was. Real machines also change what a failure costs. Nothing moves
+until every machine has passed its checks, and the report lists every problem on
+every machine, because finding them one at a time over four machines is miserable.
+Reaching those machines from a shell needs care too. The remote side re-parses
+what `ssh` sends, so each argument is quoted, and a host that starts with a dash
+is refused, because `ssh -oProxyCommand=...` would run it.
+
+Setup ends by waiting for a healthy council, and its first version spelled
+that "every machine is a member". It is on three machines, and on seven. On
+eight it never is: the council stops at seven members, so the eighth runs
+without a seat, and setup waited for a seat that never comes, gave up after
+45 seconds, and called a healthy cluster broken. The release check built
+three machines, so it couldn't see it. Now `quorum_ready` wants one member
+per machine up to the cap, every member a machine setup owns, and an owned
+leader, and the check takes `--machines N`.
+
+How do you test a flow whose whole job is changing other people's machines? The
+same way we tested the laptop path: a fake. `Ssh::shell_script` swaps the `ssh`
+binary for a shell script, as `fake_lima` does for `limactl`, and the script in
+`server_runner.rs` plays three machines. It names each call from the script it
+was sent (pre-flight, packages, files, the `bun` link, start), writes
+`<host> <user|root> <step>` to a log, and answers the way a machine would: a
+pre-flight report, `used=yes` once files have landed, a list of the files in
+the bundle. A file called `fail/b-preflight` makes that step fail. The tests
+then read the log. One machine failing its checks leaves three `user
+preflight` lines and nothing run as root, anywhere. A failure at the `bun`
+link, then a rerun, shows the packages installed once and the files twice,
+and a third run only starts the service. Moving `run`'s body into
+`provision_cluster` meant the tests call exactly what the command calls,
+with no test hook in the product.
+
+The fake can't be Bun, so every tunnel to a node's API closes, and that's
+where the tests stop. Readiness, the council and the demo need a real cluster,
+which `scripts/release/qualify-ssh-setup.sh` builds on VMs.
+
+Setup reaches each machine's API through SSH tunnels, which close when it
+finishes. After that `relish` talks to port 9117 on the first machine directly,
+and a firewall in between used to get you `bun agent not reachable at
+localhost:9117 (is it running?)`, about a host you never named and a Bun that
+was running fine. Worse, a firewall that drops packets makes the connection time
+out, and a timeout read as "the operation may still be running". Now a
+connection that never opened is always "unreachable", it gives up after ten
+seconds instead of the operating system's minute or more, and on a cluster
+`relish setup --ssh` built, the error carries the fix. Setup admitted the
+address it saw you connect from, so the message names it, with the `ufw`
+command for the first machine, and then the tunnel: an explicit endpoint skips
+the saved context's credentials, so it prints the CA and token exports as well.
+Setup prints the same advice as its last line when its own check finds the API
+out of reach.
+
+The first eight-machine run on the Mac Studio stopped at the machine checks
+with this, and nothing else: `Fix these and run the same command again:
+miko@127.0.0.1:50812:`. Two of the disposable VMs had booted with
+`systemd-logind` spinning, so `sshd` accepted the key and then dropped the
+session when `pam_systemd` timed out, and `ssh` exited without a word. Our
+error was `{target}: {stderr}`, so an empty stderr told the operator to fix
+nothing in particular. Now a silent failure says how `ssh` exited and what to
+try by hand (`ssh -p 50812 miko@127.0.0.1 true`). The spinning logind is the
+guest's problem, not ours, so `qualify-ssh-setup.sh` checks each new VM's
+logind for a busy loop, replaces it, and lists the repair in its record.
+
+`hello` is also the first thing anyone sees of a new cluster in a browser, so
+it now serves a small page with a burger and what to try next, instead of one
+line of plain text. The page is `src/relish/quickstart/welcome.html`, which
+`include_str!` compiles into `relish`, and it reaches the container as an
+inline `config_file`, the same feature a user's own app would use. That's why
+the setup probe can no longer compare the whole body: it looks for the page's
+heading. A test also runs every command on the page through the real CLI,
+because a welcome page that tells you to type something broken is worse than
+none.
 
 That guard only reads manifests we wrote by hand. `relish test` writes its own,
 in code, and two of its generators still set `interval = 1` with `timeout = 2`.

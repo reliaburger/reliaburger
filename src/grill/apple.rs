@@ -77,15 +77,17 @@ impl AppleContainerGrill {
 
     /// Extract the container's IPv4 address from an inspect document.
     ///
-    /// The `container` CLI reports it at `networks[0].ipv4Address` as a CIDR
-    /// string (e.g. `192.168.64.3/24`), so we keep only the address part. The
+    /// The `container` CLI reports it at `status.networks[0].ipv4Address`
+    /// (1.x) or `networks[0].ipv4Address` (0.x) as a CIDR string (e.g.
+    /// `192.168.64.3/24`), so we keep only the address part. The
     /// older guessed paths stay as fallbacks in case the schema shifts again.
     /// Pulled out of `discover_container_ip` so it's testable against fixture
     /// JSON without a running Apple Container.
     fn parse_container_ip(inspect_json: &serde_json::Value) -> Option<Ipv4Addr> {
         let root = Self::inspect_root(inspect_json);
-        let ip_str = root["networks"][0]["ipv4Address"]
+        let ip_str = root["status"]["networks"][0]["ipv4Address"]
             .as_str()
+            .or_else(|| root["networks"][0]["ipv4Address"].as_str())
             .or_else(|| root["NetworkSettings"]["IPAddress"].as_str())
             .or_else(|| root["networkSettings"]["ipAddress"].as_str())
             .or_else(|| root["network"]["ip"].as_str())?;
@@ -96,8 +98,9 @@ impl AppleContainerGrill {
 
     /// Map an Apple `container inspect` JSON document to a [`ContainerState`].
     ///
-    /// Apple's CLI reports the status at the top level of each inspect entry
-    /// as a lowercase `status` (e.g. `running`, `stopped`). Older/other shapes
+    /// Apple's CLI reports the status as a lowercase string, at
+    /// `status.state` in 1.x and as a top-level `status` in 0.x (e.g.
+    /// `running`, `stopped`). Older/other shapes
     /// (`State.Status`, `state.status`, `Status`) stay as fallbacks. Pulled out
     /// of `state()` so the adoption and status logic can be tested against
     /// fixture JSON without a running Apple Container.
@@ -108,6 +111,7 @@ impl AppleContainerGrill {
         let root = Self::inspect_root(inspect_json);
         let status = root["status"]
             .as_str()
+            .or_else(|| root["status"]["state"].as_str())
             .or_else(|| root["State"]["Status"].as_str())
             .or_else(|| root["state"]["status"].as_str())
             .or_else(|| root["Status"].as_str())
@@ -142,9 +146,18 @@ impl AppleContainerGrill {
         .map_err(|_| unavailable("container inspection timed out".into()))?
         .map_err(|error| unavailable(error.to_string()))?;
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // `container` 1.x reports an absent name as a failure that names
+            // it; only that exact line counts as absence (#1535).
+            let not_found = format!("Error: container not found: {}", instance.0);
+            if stderr.lines().any(|line| line.trim() == not_found) {
+                return Err(GrillError::NotFound {
+                    instance: instance.clone(),
+                });
+            }
             return Err(unavailable(format!(
                 "container inspect failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                stderr.trim()
             )));
         }
         let document: serde_json::Value = serde_json::from_slice(&output.stdout)
@@ -721,6 +734,50 @@ mod tests {
         }
     }
 
+    /// `container` 1.x answers an inspect of an absent name with exit 1 and
+    /// `Error: container not found: <id>` (#1535), where 0.x printed `[]`.
+    /// That names our container, so it's explicit absence; the same failure
+    /// naming another container, or any other failure, still proves nothing.
+    #[tokio::test]
+    async fn container_1_x_not_found_for_our_id_is_absence() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("container-fixture");
+        crate::first_launch::install_script(
+            &program,
+            "#!/bin/sh\ndir=${0%/*}\ncat \"$dir/stderr\" >&2\nexit 1\n",
+        );
+        let id = InstanceId("apple-evidence".into());
+        let record = serde_json::from_value(serde_json::json!({
+            "schema": crate::grill::records::RECORD_SCHEMA, "instance_id": id.0, "namespace": "default",
+            "app_name": "apple-evidence", "replica_index": 0,
+            "image": "unused", "runtime": "Apple",
+            "pid": 0, "pid_started_at": 0,
+            "oci_spec": {
+                "root": {"path": "unused", "readonly": true},
+                "process": {"args": [], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+                "mounts": [], "linux": {"namespaces": []}
+            }
+        }))
+        .unwrap();
+        for (stderr, absent) in [
+            ("Error: container not found: apple-evidence\n", true),
+            ("Error: container not found: apple-evidence-2\n", false),
+            ("Error: container not found: someone-else\n", false),
+            ("Error: XPC connection error\n", false),
+        ] {
+            std::fs::write(directory.path().join("stderr"), stderr).unwrap();
+            let mut grill = AppleContainerGrill::new();
+            grill.container_program = program.clone();
+            let adopted = grill.adopt(&id, &record).await;
+            if absent {
+                assert!(!adopted.unwrap(), "{stderr}");
+            } else {
+                assert!(adopted.is_err(), "absence accepted from: {stderr}");
+            }
+            assert!(grill.entries.lock().await.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn stalled_inspection_times_out_and_reaps_the_cli() {
         let directory = tempfile::tempdir().unwrap();
@@ -773,6 +830,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("VM of its own"), "{error}");
+    }
+
+    /// #1498: an init container's own env reaches the `container` CLI, on
+    /// top of the app's.
+    #[test]
+    fn create_passes_an_init_containers_own_env() {
+        let app: crate::config::app::AppSpec =
+            toml::from_str("image = \"web:1\"\nenv = { MODE = \"app\" }\n").unwrap();
+        let parent = InstanceId("default__web-0".into());
+        let app_spec = crate::grill::oci::generate_oci_spec(
+            "web", "default", &app, &parent.0, None, "/cg", None, None,
+        );
+        let init: crate::config::app::InitContainerSpec =
+            toml::from_str("command = [\"wait\"]\nenv = { ADDR = \"frontend:80\" }\n").unwrap();
+        let args = AppleContainerGrill::create_command_args(
+            &InstanceId("default__web-0__init-0".into()),
+            &crate::grill::oci::generate_init_oci_spec(&init, &app_spec),
+        )
+        .unwrap();
+        for pair in [["-e", "ADDR=frontend:80"], ["-e", "MODE=app"]] {
+            assert!(
+                args.windows(2).any(|args| args == pair),
+                "missing {pair:?}: {args:?}"
+            );
+        }
     }
 
     #[test]
@@ -993,6 +1075,45 @@ mod tests {
         // No network information yields None rather than a bogus address.
         let empty = serde_json::json!([{ "id": "apple-0", "status": "running" }]);
         assert_eq!(AppleContainerGrill::parse_container_ip(&empty), None);
+    }
+
+    /// `container` 1.x moved the state and networks under a `status` object
+    /// (#1535): `{"status": {"state": "running", "networks": [...]}}`, captured
+    /// from `container inspect` 1.6.1 on 5 November 2026.
+    #[test]
+    fn parse_reads_the_status_object_of_container_1_x() {
+        let id = InstanceId("apple-adopt-0".to_string());
+        let running = serde_json::json!([{
+            "configuration": { "id": "apple-adopt-0" },
+            "id": "apple-adopt-0",
+            "status": {
+                "networks": [{
+                    "hostname": "apple-adopt-0",
+                    "ipv4Address": "192.168.64.6/24",
+                    "ipv4Gateway": "192.168.64.1",
+                    "network": "default"
+                }],
+                "startedDate": "2026-11-05T03:45:04Z",
+                "state": "running"
+            }
+        }]);
+        assert_eq!(
+            AppleContainerGrill::parse_state(&running, &id).unwrap(),
+            ContainerState::Running
+        );
+        assert_eq!(
+            AppleContainerGrill::parse_container_ip(&running),
+            Some("192.168.64.6".parse().unwrap())
+        );
+        let stopped = serde_json::json!([{
+            "configuration": { "id": "apple-adopt-0" },
+            "status": { "networks": [], "state": "stopped" }
+        }]);
+        assert_eq!(
+            AppleContainerGrill::parse_state(&stopped, &id).unwrap(),
+            ContainerState::Stopped
+        );
+        assert_eq!(AppleContainerGrill::parse_container_ip(&stopped), None);
     }
 
     #[test]

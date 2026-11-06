@@ -163,26 +163,35 @@ struct RunOptions {
 // `relish setup`, boxed to keep the generated `Command` parser
 // small (see `AuditOptions`).
 #[derive(clap::Args)]
+#[command(group(clap::ArgGroup::new("managed").args(["quickstart", "ssh"]).multiple(false)))]
 struct SetupOptions {
     /// Boot a secure managed Linux cluster and verify a sample container.
     #[arg(long, conflicts_with_all = ["dir", "release_url", "binary_dir"])]
     quickstart: bool,
-    #[arg(long, requires = "quickstart")]
+    /// Build a cluster on Linux machines you already have: user@host,user@host,...
+    #[arg(long, value_name = "MACHINES", conflicts_with_all = ["dir", "release_url", "binary_dir"])]
+    ssh: Option<String>,
+    /// The address peers should use for each machine, comma separated, in the same order.
+    #[arg(long, value_name = "ADDRESSES", requires = "ssh")]
+    advertise: Option<String>,
+    /// The cluster's name: `laptop` for a laptop cluster, `servers` for one
+    /// built over SSH.
+    #[arg(long, requires = "managed")]
     name: Option<String>,
-    #[arg(long, requires = "quickstart")]
+    #[arg(long, requires = "quickstart", conflicts_with = "ssh")]
     nodes: Option<usize>,
-    #[arg(long, requires = "quickstart")]
+    #[arg(long, requires = "managed")]
     api_port: Option<u16>,
-    #[arg(long, requires = "quickstart")]
+    #[arg(long, requires = "managed")]
     ingress_port: Option<u16>,
     /// Host port forwarded to the managed Pickle registry (default: 15050).
     #[arg(long, requires = "quickstart")]
     registry_port: Option<u16>,
     /// Use explicitly supplied Linux binaries for development before a release exists.
-    #[arg(long, requires = "quickstart")]
+    #[arg(long, requires = "managed")]
     development_binaries: Option<PathBuf>,
     /// HTTPS directory containing unchanged signed release candidate assets.
-    #[arg(long, requires = "quickstart", conflicts_with = "development_binaries")]
+    #[arg(long, requires = "managed", conflicts_with = "development_binaries")]
     release_mirror: Option<String>,
     /// Also print every setup step's timing (always saved as timings.json).
     #[arg(long, requires = "quickstart")]
@@ -538,6 +547,10 @@ struct AuditOptions {
     /// A token name or principal id.
     #[arg(long)]
     principal: Option<String>,
+    /// Only actions on this app or job, including an apply that listed it
+    /// with others.
+    #[arg(long)]
+    app: Option<String>,
     /// Only actions on this namespace.
     #[arg(long)]
     namespace: Option<String>,
@@ -590,16 +603,18 @@ enum Command {
     Status,
     /// Stream logs from an app or job.
     Logs(Box<LogsOptions>),
-    /// Export Parquet log files to a destination directory.
+    /// Copy a node's Parquet log files here, or have it ship them to object storage.
     #[command(name = "logs-export")]
     LogsExport {
         /// Export this local Parquet directory without contacting an agent.
         #[arg(long)]
         source: Option<PathBuf>,
-        /// Destination directory path.
+        /// A directory on the machine running relish, or an s3:// or gs:// URL
+        /// the node writes to with its own credentials. Files land under
+        /// <DEST>/<node>/.
         #[arg(long)]
         dest: PathBuf,
-        /// Node ID to use in export path. Default: "local".
+        /// Node name for a local store's files. A running agent uses its own.
         #[arg(long, default_value = "local")]
         node_id: String,
     },
@@ -646,7 +661,7 @@ enum Command {
         #[arg(long, default_value = "default")]
         namespace: String,
     },
-    /// Remove an app from the cluster and stop all its instances.
+    /// Remove an app from the cluster; each node then stops its instances.
     Delete {
         /// App name.
         app: String,
@@ -2393,6 +2408,7 @@ async fn main() -> ExitCode {
                 until,
                 action,
                 principal,
+                app,
                 namespace,
                 limit,
                 cluster,
@@ -2403,6 +2419,7 @@ async fn main() -> ExitCode {
                     until,
                     action,
                     principal,
+                    app,
                     namespace,
                     limit,
                     cluster,
@@ -3194,6 +3211,8 @@ async fn main() -> ExitCode {
         Command::Setup(options) => {
             let SetupOptions {
                 quickstart,
+                ssh,
+                advertise,
                 name,
                 nodes,
                 api_port,
@@ -3207,7 +3226,31 @@ async fn main() -> ExitCode {
                 ref release_url,
                 ref binary_dir,
             } = *options;
-            if quickstart {
+            if let Some(machines) = ssh {
+                let run = async {
+                    let targets = reliaburger::relish::quickstart::ssh::parse_targets(&machines)?;
+                    let advertise = advertise
+                        .iter()
+                        .flat_map(|list| list.split(','))
+                        .map(str::parse)
+                        .collect::<Result<Vec<std::net::Ipv4Addr>, _>>()?;
+                    reliaburger::relish::quickstart::server_runner::run(
+                        reliaburger::relish::quickstart::server_runner::Options {
+                            name: name.unwrap_or_else(|| "servers".into()),
+                            targets,
+                            advertise,
+                            api_port: api_port.unwrap_or(19117),
+                            ingress_port: ingress_port.unwrap_or(18080),
+                            development_binaries,
+                            release_mirror,
+                        },
+                    )
+                    .await
+                };
+                run.await.map_err(|error: anyhow::Error| {
+                    reliaburger::relish::RelishError::InitFailed(format!("{error:#}"))
+                })
+            } else if quickstart {
                 reliaburger::relish::quickstart::runner::run(
                     reliaburger::relish::quickstart::runner::Options {
                         name: name.unwrap_or_else(|| "laptop".into()),
@@ -3360,7 +3403,7 @@ fn finish_outcome(
     match result {
         Ok(outcome) => ExitCode::from(outcome.exit_code()),
         Err(e) => {
-            eprintln!("error: {e}");
+            report(&e);
             ExitCode::FAILURE
         }
     }
@@ -3466,9 +3509,22 @@ fn finish(result: Result<(), reliaburger::relish::RelishError>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e}");
+            report(&e);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Print a command's error, with what to do when the agent it needed was out
+/// of reach on a cluster `relish setup --ssh` built: there, the usual cause is
+/// a firewall between this machine and port 9117, not a stopped Bun.
+fn report(error: &reliaburger::relish::RelishError) {
+    eprintln!("error: {error}");
+    if matches!(error, reliaburger::relish::RelishError::AgentUnreachable)
+        && !reliaburger::relish::client::endpoint_overridden()
+        && let Some(hint) = reliaburger::relish::quickstart::server_runner::unreachable_hint()
+    {
+        eprintln!("{hint}");
     }
 }
 
@@ -4794,6 +4850,11 @@ mod tests {
         assert!(parse(&["relish", "local", "stop", "1", "--yes"]).is_ok());
         assert!(parse(&["relish", "local", "destroy", "--name", "laptop", "--yes"]).is_ok());
         assert!(parse(&["relish", "setup", "--nodes", "3"]).is_err());
+        assert!(parse(&["relish", "setup", "--ssh", "u@a,u@b,u@c"]).is_ok());
+        assert!(parse(&["relish", "setup", "--ssh", "u@a", "--name", "lab"]).is_ok());
+        assert!(parse(&["relish", "setup", "--advertise", "10.0.0.1"]).is_err());
+        assert!(parse(&["relish", "setup", "--ssh", "u@a", "--quickstart"]).is_err());
+        assert!(parse(&["relish", "setup", "--ssh", "u@a", "--nodes", "3"]).is_err());
     }
 
     #[test]

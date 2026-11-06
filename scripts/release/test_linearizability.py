@@ -234,6 +234,35 @@ class BoundedSearch(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(result["inconclusive"], [NS])
 
+    def test_a_timed_out_release_amid_timed_out_grants_is_decided_quickly(self):
+        # A Studio soak went inconclusive on this shape: a release with no
+        # answer, a read that saw its cleanup, reads that saw the lease gone,
+        # and many timed-out grants whose short leases may come and go. The
+        # search must not wander through every order of those grants once
+        # the lease has gone while a read still needs it.
+        history = History()
+        history.op(1, "grant", 0, 1, "ok", lease="L1", expires=1_000_000)
+        for index in range(60):
+            history.op(10 + index, "grant", 2 + index * 0.1, None, "unknown", ttl=1_000)
+        history.op(1, "release", 100, None, "unknown", lease="L1")
+        history.op(2, "read", 100.1, 100.5, "ok", lease="L1", expires=1_000_000, cleaning=True)
+        for client in range(3, 6):
+            history.op(client, "read", 100.2, 100.6, "not_found", lease="L1")
+        self.assertEqual(history.check(budget=10_000)["verdict"], "linearizable")
+
+    def test_a_read_of_a_lease_after_it_has_gone_still_fails_amid_timed_out_grants(self):
+        # The same shape, but every read that saw the lease gone returned
+        # before the read that saw it cleaning was called: a violation.
+        history = History()
+        history.op(1, "grant", 0, 1, "ok", lease="L1", expires=1_000_000)
+        for index in range(60):
+            history.op(10 + index, "grant", 2 + index * 0.1, None, "unknown", ttl=1_000)
+        history.op(1, "release", 100, None, "unknown", lease="L1")
+        for client in range(3, 6):
+            history.op(client, "read", 100.1, 100.2, "not_found", lease="L1")
+        history.op(2, "read", 100.3, 100.5, "ok", lease="L1", expires=1_000_000, cleaning=True)
+        self.assertEqual(history.check(budget=10_000)["verdict"], "violation")
+
 
     def test_each_namespace_gets_its_own_deadline(self):
         # One slow namespace must not leave the next with nothing (#1437).

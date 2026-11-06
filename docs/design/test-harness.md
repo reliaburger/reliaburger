@@ -64,7 +64,8 @@ be visible until we remove its race.
 | `make test-rootless-runc` | Rootless runc networking and port adoption as a non-root user | Privileged Linux; PRs into `main`, `main` and nightly |
 | `make test-standard-clients` | docker, podman, skopeo and crane against Pickle's TLS listener, verifying the cluster CA | Linux, the runner image's docker, podman and skopeo plus a pinned `crane`, on a host prepared by `scripts/standard-clients-host.sh`; PRs into `main`, `main` and nightly |
 | `make test-apple` | Deferred Apple adapter | Manual Apple-silicon development check, outside 0.1.0 |
-| `make test-gpu`, `make test-s3` | Real NVIDIA hardware; a real S3 bucket | Manual |
+| `make test-gpu` | Real NVIDIA hardware | Manual |
+| `make test-s3` | Log export and a council backup round trip through S3: a throwaway local SeaweedFS, or a real bucket with `RELIABURGER_TEST_S3_URL` | Linux, SeaweedFS as a service container; `main`, nightly, and PRs touching the S3 client, log export or council backups |
 | `make test-ci-scripts`, `make check-ignored` | The CI scripts' fixtures; every `#[ignore]` names its owner | Every pull request ("CI policy") and `make ci` |
 | `make ci` | `fmt-check`, `lint`, `test`, `test-doc`, `test-ci-scripts`, `check-ignored` | Local; CI runs the same pieces as separate jobs |
 | `make ci-bench` | `make ci`, then `make bench` | Local |
@@ -107,14 +108,13 @@ applicable exact identity; presence in a union of reports is insufficient. See
 
 ### Tests no CI job runs
 
-These need hardware, credentials or a reboot that hosted runners can't provide. They
+These need hardware or a reboot that hosted runners can't provide. They
 are `#[ignore]`d with a reason naming the target or script that runs them:
 
 | Test | Needs | How to run |
 |---|---|---|
 | `grill::apple::tests::*` | Apple silicon with Apple Container | `make test-apple` |
 | `bun::gpu::tests::nvidia_detector_finds_hardware` | An NVIDIA GPU and `nvidia-smi` | `make test-gpu` |
-| `ketchup::export::tests::export_to_real_s3_manual` | AWS credentials and a bucket | `RELIABURGER_TEST_S3_URL=s3://bucket/prefix make test-s3` |
 | `owned_runc::actual_host_reboot_*`, `oci_crash::actual_bun_kernel_discovery_host_reboot` | A Linux VM that can be rebooted mid-test | `scripts/release/qualify-oci-reboot.sh`, `scripts/release/qualify-discovery-reboot.sh` |
 | `power_cut::actual_power_cut_*` | A disposable Linux VM whose power can be cut while workers write | `scripts/release/qualify-storage-power-cut.sh --vm VM --fixture exporter\|leases\|backups --iterations N` |
 | All of the above, for a release candidate | Lima on the host; it creates and deletes the VM | `scripts/release/qualify-power-cut-reboot.sh --commit SHA --iterations N --record-dir DIR` |

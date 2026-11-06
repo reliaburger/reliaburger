@@ -9,6 +9,8 @@
 #                  benchmarks changed, the script that gates on them, or
 #                  criterion's version
 #   macos        - run the portable suite on macOS (three shards)
+#   s3           - log export, council backups or the S3 client changed, or
+#                  the script that gives `make test-s3` its server
 #
 # Pushes (to main and to every train), merge-queue groups, schedules and
 # manual runs get everything; so does build.yml's call. Pull requests are
@@ -50,12 +52,12 @@ set -euo pipefail
 output="${GITHUB_OUTPUT:-/dev/stdout}"
 
 emit() {
-    printf 'code=%s\ngossip=%s\nheavy=%s\ntask_arrays=%s\nmacos=%s\n' "$1" "$2" "$3" "$4" "$5" >>"$output"
-    printf 'code=%s gossip=%s heavy=%s task_arrays=%s macos=%s\n' "$1" "$2" "$3" "$4" "$5" >&2
+    printf 'code=%s\ngossip=%s\nheavy=%s\ntask_arrays=%s\nmacos=%s\ns3=%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >>"$output"
+    printf 'code=%s gossip=%s heavy=%s task_arrays=%s macos=%s s3=%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >&2
 }
 
 if [ "${EVENT}" != "pull_request" ]; then
-    emit true true true true true
+    emit true true true true true true
     exit 0
 fi
 
@@ -104,6 +106,7 @@ macos_code_file() {
 code=false
 gossip=false
 task_arrays=false
+s3=false
 macos_code=false
 while IFS= read -r file; do
     [ -z "$file" ] && continue
@@ -119,6 +122,11 @@ while IFS= read -r file; do
         src/bun/task_array* | src/bun/task_executor* | src/meat/task_array* | \
             src/meat/index_set* | benches/task_arrays.rs | \
             scripts/ci/bench_baseline.py) task_arrays=true ;;
+    esac
+    # What `make test-s3` sends to an S3 server (#1534).
+    case "$file" in
+        src/ketchup/export.rs | src/council/backup.rs | src/object_storage.rs | \
+            scripts/test-s3.sh) s3=true ;;
     esac
 done <<<"$changed"
 
@@ -155,7 +163,7 @@ case "${HEAD_REF:-}" in
 esac
 
 if [ "$code" = false ]; then
-    emit false "$gossip" false "$task_arrays" false
+    emit false "$gossip" false "$task_arrays" false "$s3"
     exit 0
 fi
 
@@ -167,7 +175,7 @@ elif [ "$macos_code" = true ] && [ "$from_a_train" = false ] && [ "$dependabot" 
 fi
 
 if [ "$from_a_train" = true ] && [ "${RELEASE_GATE:-false}" = true ]; then
-    emit true true true true true
+    emit true true true true true true
     exit 0
 fi
 
@@ -175,9 +183,9 @@ fi
 # and the benchmarks the change touches.
 if [ "$into_a_train" = true ] || [ "$from_a_train" = true ]; then
     if [ "${FULL_CI}" = true ]; then
-        emit true "$gossip" true "$task_arrays" "$macos"
+        emit true "$gossip" true "$task_arrays" "$macos" "$s3"
     else
-        emit true false false false "$macos"
+        emit true false false false "$macos" false
     fi
     exit 0
 fi
@@ -186,4 +194,4 @@ heavy=false
 if [ "${BASE_REF}" = main ] || [ "${FULL_CI}" = true ]; then
     heavy=true
 fi
-emit true "$gossip" "$heavy" "$task_arrays" "$macos"
+emit true "$gossip" "$heavy" "$task_arrays" "$macos" "$s3"

@@ -561,6 +561,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         &self,
         instance_id: &InstanceId,
         app_name: &str,
+        namespace: &str,
         spec: &AppSpec,
         app_oci: &crate::grill::oci::OciSpec,
         cgroup_path: &std::path::Path,
@@ -573,9 +574,19 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await?;
         for (i, init_spec) in spec.init.iter().enumerate() {
             let init_id = self.ops.register_initialiser(instance_id, i).await?;
-            // Its own image, the app's env and mounts (#701).
+            // Its own image, the app's env and mounts (#701), and its own
+            // env on top, whose provider references resolve here as a
+            // sidecar's do (#1498).
             let init_oci = crate::grill::oci::generate_init_oci_spec(init_spec, app_oci);
-            if let Err(error) = self.grill.create(&init_id, &init_oci).await {
+            let target = super::launch::LaunchTarget {
+                instance_id: &init_id,
+                app_name,
+                namespace,
+            };
+            if let Err(error) =
+                super::launch::create_with_secrets(&self.grill, &self.secrets, target, &init_oci)
+                    .await
+            {
                 // A missing init binary fails its parent the way its own would.
                 if let Some(problem) = error.launch_problem() {
                     self.ops
@@ -792,8 +803,15 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await?;
 
         if prepared.has_init {
-            self.drive_initialisers(instance_id, app_name, spec, &launch, &prepared.cgroup_path)
-                .await?;
+            self.drive_initialisers(
+                instance_id,
+                app_name,
+                namespace,
+                spec,
+                &launch,
+                &prepared.cgroup_path,
+            )
+            .await?;
         }
         // Sidecars after the inits and before the app (#1120).
         self.drive_sidecars(instance_id, app_name, namespace, spec, &prepared.oci_spec)
@@ -1345,7 +1363,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await
             .map_err(|error| format!("failed to program egress for {}: {error}", new_id.0))?;
         let initialised = async {
-            self.drive_initialisers(new_id, app_name, spec, &launch, &cgroup_path)
+            self.drive_initialisers(new_id, app_name, namespace, spec, &launch, &cgroup_path)
                 .await?;
             self.drive_sidecars(new_id, app_name, namespace, spec, &oci_spec)
                 .await?;

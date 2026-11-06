@@ -202,12 +202,26 @@ pub struct Compatibility {
 /// (#1474), in desired state, OCI specs, instance records and the node's
 /// knob allowlist.
 ///
-/// 0.3.0, Bare metal in an hour (56/73): the appliance OS rollout (a new Raft
+/// 0.2.5, bugs an outside evaluation found (56/73): one bump for the whole
+/// release, made by its first wire or state change. Each later 0.2.5 change
+/// adds its line below this one, not another bump.
+/// An init container's `env` in Raft desired state and node syncs (#1498).
+/// `InitContainerSpec` refuses unknown fields, so a 0.2.4 node can't decode
+/// an app that sets it.
+///
+/// 0.2.6, the rest of the evaluation's bugs (57/73): one protocol bump for
+/// the whole release; the durable state doesn't change. Each later 0.2.6
+/// change adds its line below this one.
+/// A node with no Raft seat fetches the leader's view of the security state
+/// from `/v1/cluster/security-view` (#1477), which a 0.2.5 leader doesn't
+/// serve, so such a node would wait for API tokens that never come.
+///
+/// 0.3.0, Bare metal in an hour (58/74): the appliance OS rollout (a new Raft
 /// request and a new field in council state) and the cluster-wide council
 /// size (`RaftRequest::CouncilSize` and `DesiredState::council_size`).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 56,
-    state: 73,
+    protocol: 58,
+    state: 74,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

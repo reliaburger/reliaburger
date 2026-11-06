@@ -1,0 +1,61 @@
+total 37804
+ 98.92% incl   0.00% self  swapper
+ 98.92% incl   0.00% self  cpu_startup_entry
+ 98.90% incl   0.00% self  do_idle
+ 98.81% incl  98.03% self  cpuidle_idle_call
+ 73.80% incl   0.00% self  secondary_start_kernel
+ 73.80% incl   0.00% self  __secondary_switched
+ 25.12% incl   0.00% self  __primary_switched
+ 25.12% incl   0.00% self  rest_init
+ 25.12% incl   0.00% self  start_kernel
+ 25.12% incl   0.00% self  arch_call_rest_init
+  0.88% incl   0.07% self  [libc.so.6]
+  0.67% incl   0.00% self  <std::sys::thread::unix::Thread>::new::thread_start
+  0.62% incl   0.00% self  std::sys::backtrace::__rust_begin_short_backtrace<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>
+  0.62% incl   0.00% self  tokio-rt-worker
+  0.62% incl   0.00% self  <std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>::{closure} as core::ops::function::FnOnce<()>>:
+  0.56% incl   0.00% self  el0t_64_sync
+  0.56% incl   0.00% self  el0t_64_sync_handler
+  0.55% incl   0.02% self  el0_svc
+  0.51% incl   0.01% self  do_el0_svc
+  0.50% incl   0.00% self  el0_svc_common.constprop.0
+  0.48% incl   0.00% self  invoke_syscall
+  0.48% incl   0.00% self  ____do_softirq
+  0.48% incl   0.00% self  __do_softirq
+  0.48% incl   0.00% self  do_softirq_own_stack
+  0.48% incl   0.00% self  call_on_irq_stack
+  0.47% incl   0.00% self  irq_exit_rcu
+  0.47% incl   0.00% self  __irq_exit_rcu
+  0.47% incl   0.00% self  el1_interrupt
+  0.47% incl   0.00% self  el1h_64_irq_handler
+  0.47% incl   0.00% self  el1h_64_irq
+  0.43% incl   0.29% self  handle_softirqs
+  0.36% incl   0.00% self  tokio::runtime::task::raw::poll<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::maybe_move_runtime::{closure}::{cl
+  0.36% incl   0.00% self  tokio::runtime::scheduler::multi_thread::worker::run
+  0.33% incl   0.33% self  default_idle_call
+  0.29% incl   0.00% self  <tokio::runtime::scheduler::multi_thread::worker::Context>::run_task
+  0.20% incl   0.00% self  __libc_start_main
+  0.19% incl   0.00% self  _start
+  0.19% incl   0.00% self  main
+  0.17% incl   0.00% self  std::rt::lang_start<core::result::Result<(), anyhow::Error>>::{closure}
+  0.17% incl   0.00% self  std::rt::lang_start_internal
+  0.17% incl   0.00% self  bun::main
+  0.17% incl   0.01% self  reliaburger::grill::process_owner::run_locked_owner
+  0.17% incl   0.00% self  exe
+  0.17% incl   0.00% self  reliaburger::grill::process_owner::run_owner_generation
+  0.17% incl   0.00% self  std::sys::backtrace::__rust_begin_short_backtrace<fn(..), core::result::Result<(), anyhow::Error>>
+  0.15% incl   0.00% self  tokio::runtime::task::raw::poll<tokio::runtime::blocking::task::BlockingTask<<reliaburger::grill::process_control::ProcessControl>::run<reliaburger::grill::proc
+  0.14% incl   0.00% self  <reliaburger::grill::process_control::ProcessControl>::inspect_status
+  0.11% incl   0.10% self  finish_task_switch.isra.0
+  0.11% incl   0.01% self  __schedule
+  0.09% incl   0.00% self  <reliaburger::grill::process_control::ProcessControl>::finish_retirement
+  0.09% incl   0.00% self  __sock_sendmsg
+  0.09% incl   0.01% self  [lima-guestagent]
+  0.09% incl   0.00% self  lima-guestagent
+  0.08% incl   0.00% self  <std::os::unix::net::listener::UnixListener>::accept
+  0.08% incl   0.00% self  <std::sys::net::connection::socket::unix::Socket>::accept
+  0.08% incl   0.00% self  <reliaburger::grill::process_control::ProcessControl>::load
+  0.07% incl   0.00% self  do_futex
+  0.07% incl   0.00% self  __arm64_sys_futex
+  0.07% incl   0.00% self  accept4
+  0.07% incl   0.00% self  __sys_sendmsg

@@ -163,6 +163,18 @@ enum ApplianceCommand {
     },
 }
 
+/// The address `[network] advertise_address` names, as an address or the
+/// address part of `address:port`.
+fn advertised_ip(config: &NodeConfig) -> Option<std::net::IpAddr> {
+    let configured = config.network.advertise_address.as_deref()?;
+    configured.parse::<std::net::IpAddr>().ok().or_else(|| {
+        configured
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|address| address.ip())
+    })
+}
+
 /// Build cluster startup parameters from node config.
 ///
 /// Gossip binds/advertises on `advertise_address` (falling back to
@@ -177,16 +189,7 @@ fn cluster_params_from_config(
     use anyhow::Context;
     use reliaburger::sesame::bootstrap;
 
-    let ip = config
-        .network
-        .advertise_address
-        .as_deref()
-        .and_then(|s| {
-            s.parse::<IpAddr>()
-                .ok()
-                .or_else(|| s.parse::<SocketAddr>().ok().map(|sa| sa.ip()))
-        })
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let ip = advertised_ip(config).unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let gossip_addr = SocketAddr::new(ip, config.cluster.gossip_port);
 
     let seeds = resolve_join_seeds(&config.cluster.join)?;
@@ -485,13 +488,80 @@ fn node_capacity(config: &NodeConfig) -> (u32, u32) {
 /// Overwrite the auth token store with the current API tokens from Raft.
 ///
 /// Called on startup and every few seconds after, so a token created via
-/// `relish token create` starts being enforced without restarting the agent.
+/// `relish token create` reaches this node without restarting the agent. The
+/// node that answered a create, rotate or revoke has already changed its
+/// store itself.
 async fn refresh_token_store(
     store: &reliaburger::sesame::auth::TokenStore,
     council: &reliaburger::council::CouncilNode,
 ) {
-    let tokens = council.security_state().await.api_tokens;
-    *store.write().await = tokens;
+    let seen = store.read().await.clone();
+    let tokens = council.api_tokens().await;
+    replace_tokens_unless_changed(store, &seen, tokens).await;
+}
+
+/// For a node with no Raft seat, fetch the leader's view of the security
+/// state, so the token, CRL and trust refreshes have something to read
+/// (#1477). A node whose replica holds the state does nothing. A failure
+/// keeps the last view, as a follower that can't reach quorum keeps its
+/// replica, and is logged once until it changes.
+async fn refresh_leader_security_view(
+    council: &reliaburger::council::CouncilNode,
+    client: Option<&reliaburger::sesame::security_view::SecurityViewClient>,
+    directory: Option<
+        &tokio::sync::watch::Receiver<reliaburger::mustard::directory::NodeDirectory>,
+    >,
+    last_error: &mut Option<String>,
+) {
+    let (Some(client), Some(directory)) = (client, directory) else {
+        return;
+    };
+    if council.holds_security_state().await {
+        return;
+    }
+    let metrics = council.metrics();
+    let leader = reliaburger::cluster::directory::leader_api_address(Some(&metrics), directory);
+    let result = match leader {
+        Some(leader) => client.fetch(leader).await,
+        None => Err("no council leader is known yet".to_string()),
+    };
+    match result {
+        Ok(view) => {
+            council.adopt_leader_security_view(view).await;
+            if last_error.take().is_some() {
+                println!("bun: fetched the leader's security view");
+            }
+        }
+        Err(error) => {
+            if last_error.as_ref() != Some(&error) {
+                eprintln!(
+                    "bun: no Raft seat, and the leader's security view is unavailable \
+                     (keeping the last one): {error}"
+                );
+                *last_error = Some(error);
+            }
+        }
+    }
+}
+
+/// Replace the store's tokens, unless the store no longer holds `seen`, what
+/// it held before `tokens` was read from the replica.
+///
+/// A handler that changed the store in between has newer news than `tokens`,
+/// and writing them over it could put a revoked token back for five seconds,
+/// so this tick does nothing and the next one catches up. Comparing here
+/// avoids holding the store's write lock across the replica read, which waits
+/// for Raft's apply and snapshot builds, with every authenticated request
+/// queued behind it.
+async fn replace_tokens_unless_changed(
+    store: &reliaburger::sesame::auth::TokenStore,
+    seen: &[reliaburger::sesame::types::ApiToken],
+    tokens: Vec<reliaburger::sesame::types::ApiToken>,
+) {
+    let mut current = store.write().await;
+    if current.as_slice() == seen {
+        *current = tokens;
+    }
 }
 
 /// Reserve a port without accepting connections during cluster bootstrap.
@@ -1872,6 +1942,32 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // silently replaced it with a fresh empty store. The listener guard then
     // saw `None` and skipped the check needed to contain that open router.
     if let Some(council) = &api_council {
+        // A node with no Raft seat reads the leader's view of the security
+        // state instead of its own empty replica (#1477).
+        let view_client = match (&api_identity, &crl_refresh, service_token.as_deref()) {
+            (Some(identity), Some(crl), Some(token)) => {
+                match reliaburger::sesame::security_view::SecurityViewClient::new(
+                    identity,
+                    crl.clone(),
+                    token,
+                ) {
+                    Ok(client) => Some(Arc::new(client)),
+                    Err(error) => {
+                        eprintln!("bun: WARNING: cannot fetch the leader's security view: {error}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let mut view_error = None;
+        refresh_leader_security_view(
+            council,
+            view_client.as_deref(),
+            registry_directory.as_ref(),
+            &mut view_error,
+        )
+        .await;
         refresh_token_store(&api_token_store, council).await;
         let mut trust_error = None;
         refresh_crl_and_trust(
@@ -1886,6 +1982,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let refresh_council = Arc::clone(council);
         let refresh_crl = crl_refresh.clone();
         let refresh_identity = api_identity.clone();
+        let refresh_view_client = view_client.clone();
+        let refresh_directory = registry_directory.clone();
         reliaburger::bun::readiness::spawn_reconstructible(
             "security-refresh",
             false,
@@ -1902,8 +2000,18 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 let refresh_council = Arc::clone(&refresh_council);
                 let refresh_crl = refresh_crl.clone();
                 let refresh_identity = refresh_identity.clone();
+                let refresh_view_client = refresh_view_client.clone();
+                let refresh_directory = refresh_directory.clone();
                 async move {
                     let mut trust_error = None;
+                    let mut view_error = None;
+                    refresh_leader_security_view(
+                        &refresh_council,
+                        refresh_view_client.as_deref(),
+                        refresh_directory.as_ref(),
+                        &mut view_error,
+                    )
+                    .await;
                     refresh_token_store(&refresh_store, &refresh_council).await;
                     refresh_crl_and_trust(
                         &refresh_council,
@@ -1918,6 +2026,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         tokio::select! {
                             _ = attempt_shutdown.cancelled() => break,
                             _ = ticker.tick() => {
+                                refresh_leader_security_view(
+                                    &refresh_council,
+                                    refresh_view_client.as_deref(),
+                                    refresh_directory.as_ref(),
+                                    &mut view_error,
+                                )
+                                .await;
                                 refresh_token_store(&refresh_store, &refresh_council).await;
                                 // Same tick refreshes the CRL so a revoked peer is
                                 // refused on its next handshake, and the trust set
@@ -3104,13 +3219,23 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 }
                 None => worker,
             };
+            // The leaf names the address the issuer sees a renewal come from
+            // (#1508). A leader renews its own leaf through this API, so it
+            // reaches it at its advertised address rather than loopback,
+            // which no certificate names.
+            let advertised = advertised_ip(&config)
+                .filter(|address| reliaburger::sesame::ca::names_a_machine(*address));
+            let worker = match advertised {
+                Some(address) => worker.with_address(address),
+                None => worker,
+            };
             let mut local_api = listener.local_addr()?;
             if local_api.ip().is_unspecified() {
-                local_api.set_ip(if local_api.is_ipv6() {
+                local_api.set_ip(advertised.unwrap_or(if local_api.is_ipv6() {
                     std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
                 } else {
                     std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                });
+                }));
             }
             let council = council.clone();
             let membership = membership.clone();
@@ -4679,6 +4804,40 @@ mod tests {
         let tokens = store.read().await;
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].name, "ci");
+    }
+
+    /// #1506: a refresh reads the replica first and writes the store second.
+    /// A revoke that lands between the two must not be undone, or the revoked
+    /// token works here for another five seconds.
+    #[tokio::test]
+    async fn a_refresh_that_read_before_a_revoke_leaves_the_store_alone() {
+        let revoked = create_token("ci", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        let root = create_token("root", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        let store = reliaburger::sesame::auth::new_token_store();
+        *store.write().await = vec![root.token.clone(), revoked.token.clone()];
+
+        // What the refresh saw and read before the revoke, then the revoke.
+        let seen = store.read().await.clone();
+        let replica_before_the_revoke = seen.clone();
+        store.write().await.retain(|token| token.name != "ci");
+
+        replace_tokens_unless_changed(&store, &seen, replica_before_the_revoke).await;
+
+        let tokens = store.read().await;
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].name, "root");
+    }
+
+    /// The ordinary tick: nothing touched the store, so the replica wins.
+    #[tokio::test]
+    async fn a_refresh_replaces_a_store_nothing_changed() {
+        let created = create_token("ci", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        let store = reliaburger::sesame::auth::new_token_store();
+        let seen = store.read().await.clone();
+
+        replace_tokens_unless_changed(&store, &seen, vec![created.token.clone()]).await;
+
+        assert_eq!(*store.read().await, vec![created.token]);
     }
 
     /// A config with require_mtls but no identity on disk.

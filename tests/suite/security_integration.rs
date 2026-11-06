@@ -83,6 +83,7 @@ fn issue_for(
         ca::NODE_LEAF_LIFETIME,
         state,
         ikm,
+        None,
     )
 }
 
@@ -316,6 +317,7 @@ async fn spawn_issuer(
                 ca::NODE_LEAF_LIFETIME,
                 &state,
                 &issuer.ikm,
+                None,
             )
         })();
 

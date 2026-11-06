@@ -14,6 +14,13 @@ WORKFLOWS = REPO / ".github" / "workflows"
 # Make targets that run nextest and so write a JUnit report under the ci profile.
 NEXTEST_TARGETS = re.compile(r"\bmake (coverage|test(?:-[a-z-]+)?)(?![\w-])")
 NOT_NEXTEST = {"test-doc", "test-images", "test-ci-scripts"}
+# Nextest targets CI runs directly rather than through an evidence owner.
+# `make test-s3` runs only when select-jobs.sh picks it by path (#1534), and
+# every evidence mode is a fixed set of owners, so the final gate checks its
+# job's result instead of binding its two tests. `make test-linux` runs
+# directly only in `linux-next`, the Ubuntu 26.04 parity leg (#1559); the
+# `linux` job still owns its evidence.
+UNBOUND_SUITES = {"test-s3", "test-linux"}
 
 # The no-op job a closed pull request's run starts instead of CI.
 CLOSED_JOB = "closed-pull-request"
@@ -129,7 +136,7 @@ class EvidenceTests(unittest.TestCase):
         # Original test owners must be intercepted rather than executed again.
         for job in workflow_jobs.values():
             for step in steps(job):
-                self.assertEqual(set(NEXTEST_TARGETS.findall(step)) - NOT_NEXTEST, set())
+                self.assertEqual(set(NEXTEST_TARGETS.findall(step)) - NOT_NEXTEST - UNBOUND_SUITES, set())
 
     def assert_cached_owners_clear_restored_envelopes(self, workflow_jobs):
         """Clear cached generated directories once before any fresh producer."""
@@ -207,7 +214,7 @@ class EvidenceTests(unittest.TestCase):
                      if 'workflow_adapter.py produce' in step
                      and '--gate linux-root-storage ' in step]
         self.assertEqual(len(producers), 1)
-        self.assertIn('sudo -E env PATH=', blocks[producers[0]])
+        self.assertIn('scripts/ci/as-root python3', blocks[producers[0]])
         restores = [index for index, step in enumerate(blocks)
                     if 'name: Restore root-storage evidence ownership' in step]
         self.assertEqual(len(restores), 1)
@@ -495,7 +502,7 @@ class TrainAndQueueTests(unittest.TestCase):
             self.assertRegex(block, r"if: matrix\.shard == \d\n")
 
     def test_the_heavy_jobs_wait_for_their_own_selection(self):
-        for name in ["linux", "build-tests", "cluster", "acceptance"]:
+        for name in ["linux", "linux-next", "build-tests", "cluster", "acceptance"]:
             self.assertIn("if: needs.changes.outputs.heavy == 'true'", self.jobs[name])
         for name in ["lint", "minimum-rust", "portable", "contract-boundaries", "demo-app"]:
             self.assertIn("if: needs.changes.outputs.code == 'true'", self.jobs[name])
@@ -586,6 +593,32 @@ class BenchmarkTests(unittest.TestCase):
         for target in targets:
             with self.subTest(target=target):
                 self.assertRegex(workflows, rf"(?m)run: make {re.escape(target)}$")
+
+
+class S3Tests(unittest.TestCase):
+    """`make test-s3` runs in CI against the server the script pins (#1534)."""
+
+    def setUp(self):
+        self.jobs = jobs((WORKFLOWS / "ci.yml").read_text())
+        self.job = self.jobs["s3"]
+
+    def test_the_s3_round_trip_runs_when_select_jobs_picks_it(self):
+        # select-jobs.sh sets s3 on pushes and schedules, so it runs nightly.
+        self.assertIn("    if: needs.changes.outputs.s3 == 'true'\n", self.job)
+        self.assertIn("s3: ${{ steps.select.outputs.s3 }}", self.jobs["changes"])
+        self.assertRegex(self.job, r"(?m)^        run: make test-s3$")
+
+    def test_every_seaweedfs_build_the_script_downloads_is_pinned(self):
+        script = (REPO / "scripts" / "test-s3.sh").read_text()
+        self.assertRegex(script, r"(?m)^SEAWEEDFS_VERSION=\S+$")
+        self.assertEqual(len(re.findall(r"digest=[0-9a-f]{64} ;;", script)), 4)
+
+    def test_ci_runs_the_script_s_own_throwaway_server_as_a_laptop_does(self):
+        # One way in: the pinned binary with telemetry off, not a service
+        # container that can't be given flags.
+        self.assertNotIn("services:", self.job)
+        for name in ("RELIABURGER_TEST_S3_URL", "RELIABURGER_TEST_S3_ENDPOINT", "AWS_"):
+            self.assertNotIn(name, self.job)
 
 
 class ArtifactDownloadTests(unittest.TestCase):

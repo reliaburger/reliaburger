@@ -168,6 +168,9 @@ pub struct AuditFilter {
     /// A principal id, or the token name it was recorded under.
     #[serde(default)]
     pub principal: Option<String>,
+    /// An app or job the action touched.
+    #[serde(default)]
+    pub app: Option<String>,
     /// The namespace the action touched.
     #[serde(default)]
     pub namespace: Option<String>,
@@ -200,10 +203,63 @@ impl AuditFilter {
                     || record.details.get("token_name").map(String::as_str) == Some(principal)
             })
             && self
-                .namespace
+                .app
                 .as_deref()
-                .is_none_or(|namespace| record.namespace.as_deref() == Some(namespace))
+                .is_none_or(|app| touched_app(record.app.as_deref(), &record.details, app))
+            && self.namespace.as_deref().is_none_or(|namespace| {
+                record.namespace.as_deref() == Some(namespace)
+                    || record
+                        .details
+                        .get("namespaces")
+                        .is_some_and(|listed| listed.split(',').any(|name| name == namespace))
+            })
     }
+}
+
+/// The workloads an apply lists under `details.workloads`, when it touched
+/// more than `app` can name.
+#[derive(Debug)]
+pub struct WorkloadList<'a> {
+    /// Each `name@namespace` the record kept, sorted.
+    pub listed: Vec<&'a str>,
+    /// How many more the apply touched, which the record only counted.
+    pub unlisted: usize,
+}
+
+impl<'a> WorkloadList<'a> {
+    /// The list in `details`, if there is one.
+    pub fn from_details(details: &'a BTreeMap<String, String>) -> Option<Self> {
+        let mut listed: Vec<&str> = details.get("workloads")?.split(',').collect();
+        let unlisted = listed
+            .last()
+            .and_then(|last| last.strip_prefix('+')?.strip_suffix(" more")?.parse().ok());
+        if unlisted.is_some() {
+            listed.pop();
+        }
+        Some(Self {
+            listed,
+            unlisted: unlisted.unwrap_or(0),
+        })
+    }
+
+    /// Whether `app` is in the list, or could be among those only counted.
+    fn may_name(&self, app: &str) -> bool {
+        self.unlisted > 0
+            || self.listed.iter().any(|workload| {
+                workload
+                    .split_once('@')
+                    .is_some_and(|(name, _)| name == app)
+            })
+    }
+}
+
+/// Whether the audited action with this `app` and `details` touched `wanted`.
+///
+/// A list that was cut short can't rule an app out, so it counts as a match:
+/// an audit search that hides a possible match is worse than one extra line.
+pub fn touched_app(app: Option<&str>, details: &BTreeMap<String, String>, wanted: &str) -> bool {
+    app == Some(wanted)
+        || WorkloadList::from_details(details).is_some_and(|list| list.may_name(wanted))
 }
 
 /// Keep the newest `limit` records of `records`, oldest first, ordered by
@@ -909,6 +965,82 @@ mod tests {
             ..AuditFilter::default()
         };
         assert_eq!(query(newest_one).await, ["app.deleted"]);
+    }
+
+    /// The record an apply across two namespaces makes: no single app or
+    /// namespace, the names under `workloads` and `namespaces` (#1501).
+    fn multi_app_apply(workloads: &str) -> AuditRecord {
+        AuditRecord {
+            sequence: 1,
+            timestamp: 10,
+            kind: EventKind::Operation,
+            severity: EventSeverity::Info,
+            action: "app.applied".to_string(),
+            principal: "token:alice".to_string(),
+            app: None,
+            namespace: None,
+            node: None,
+            source_address: None,
+            details: BTreeMap::from([
+                ("workloads".to_string(), workloads.to_string()),
+                ("namespaces".to_string(), "payments,team-a".to_string()),
+            ]),
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_namespace_filter_finds_an_apply_that_spanned_several_namespaces() {
+        let record = multi_app_apply("api@payments,web@team-a");
+        let filter = |namespace: &str| AuditFilter {
+            namespace: Some(namespace.to_string()),
+            ..AuditFilter::default()
+        };
+        assert!(filter("payments").matches(&record));
+        assert!(filter("team-a").matches(&record));
+        assert!(!filter("team").matches(&record));
+        assert!(!filter("team-b").matches(&record));
+    }
+
+    #[test]
+    fn an_app_filter_finds_every_app_a_multi_app_apply_listed() {
+        let record = multi_app_apply("api@payments,web@team-a");
+        let filter = |app: &str| AuditFilter {
+            app: Some(app.to_string()),
+            ..AuditFilter::default()
+        };
+        assert!(filter("api").matches(&record));
+        assert!(filter("web").matches(&record));
+        assert!(!filter("we").matches(&record));
+        assert!(!filter("payments").matches(&record));
+    }
+
+    #[test]
+    fn an_app_filter_matches_the_app_a_record_names_and_no_other() {
+        let record = AuditRecord {
+            app: Some("web".to_string()),
+            details: BTreeMap::new(),
+            ..multi_app_apply("")
+        };
+        let filter = |app: &str| AuditFilter {
+            app: Some(app.to_string()),
+            ..AuditFilter::default()
+        };
+        assert!(filter("web").matches(&record));
+        assert!(!filter("api").matches(&record));
+    }
+
+    #[test]
+    fn an_app_filter_keeps_a_record_whose_list_was_cut_short() {
+        // The app may be one of the five the record only counted, and an
+        // audit search that hides a possible match is worse than one extra
+        // line.
+        let record = multi_app_apply("api@payments,+5 more");
+        let filter = AuditFilter {
+            app: Some("zebra".to_string()),
+            ..AuditFilter::default()
+        };
+        assert!(filter.matches(&record));
     }
 
     #[test]

@@ -1,0 +1,479 @@
+{
+  "categories": {
+    "perfcpu-host": {
+      "rows": [
+        {
+          "candidate": 22.41733466933868,
+          "category": "idle (no runnable work)",
+          "points": -2.8807913953972673,
+          "previous": 25.298126064735946
+        },
+        {
+          "candidate": 0.07765531062124248,
+          "category": "Bun: task ledger (group commit, fsync)",
+          "points": 0.07765531062124248,
+          "previous": 0.0
+        },
+        {
+          "candidate": 13.146292585170341,
+          "category": "Bun: task-array leader tick and node sync",
+          "points": 13.146292585170341,
+          "previous": 0.0
+        },
+        {
+          "candidate": 0.03507014028056112,
+          "category": "Bun: Raft core and log",
+          "points": 0.03507014028056112,
+          "previous": 0.0
+        },
+        {
+          "candidate": 0.01753507014028056,
+          "category": "Bun: agent loop and supervisor",
+          "points": 0.01753507014028056,
+          "previous": 0.0
+        },
+        {
+          "candidate": 0.05260521042084168,
+          "category": "Bun: API server",
+          "points": 0.05260521042084168,
+          "previous": 0.0
+        },
+        {
+          "candidate": 0.01002004008016032,
+          "category": "Bun: metrics (Mayo)",
+          "points": 0.01002004008016032,
+          "previous": 0.0
+        },
+        {
+          "candidate": 0.05511022044088176,
+          "category": "Bun: containers (Grill)",
+          "points": 0.05511022044088176,
+          "previous": 0.0
+        },
+        {
+          "candidate": 0.01753507014028056,
+          "category": "Bun: other Reliaburger code",
+          "points": 0.01753507014028056,
+          "previous": 0.0
+        },
+        {
+          "candidate": 1.8261523046092185,
+          "category": "Bun: async runtime (scheduler, timers, parking)",
+          "points": 1.8261523046092185,
+          "previous": 0.0
+        },
+        {
+          "candidate": 0.025050100200400802,
+          "category": "Bun: uncategorised (extend the map)",
+          "points": -14.026959119160257,
+          "previous": 14.052009219360658
+        },
+        {
+          "candidate": 4.564128256513026,
+          "category": "helper/child: clone3 (process creation)",
+          "points": 0.3778370449687829,
+          "previous": 4.186291211544243
+        },
+        {
+          "candidate": 9.664328657314629,
+          "category": "helper/child: execve",
+          "points": 0.3146944254276658,
+          "previous": 9.349634231886963
+        },
+        {
+          "candidate": 8.860220440881763,
+          "category": "helper/child: exit and address-space teardown",
+          "points": 0.03919629016525761,
+          "previous": 8.821024150716505
+        },
+        {
+          "candidate": 8.399298597194388,
+          "category": "helper/child: page faults",
+          "points": -0.38915715989550037,
+          "previous": 8.788455757089888
+        },
+        {
+          "candidate": 13.43937875751503,
+          "category": "helper: wait, poll, pipes and socket syscalls",
+          "points": 0.5873895802427587,
+          "previous": 12.851989177272271
+        },
+        {
+          "candidate": 2.4198396793587174,
+          "category": "helper: user space and other kernel",
+          "points": 0.21019943484523917,
+          "previous": 2.209640244513478
+        },
+        {
+          "candidate": 11.26002004008016,
+          "category": "busybox task: user space and other kernel",
+          "points": -0.15895981762101208,
+          "previous": 11.418979857701173
+        },
+        {
+          "candidate": 0.01503006012024048,
+          "category": "relish (raw scenario spawner and bench client)",
+          "points": -0.002506767217168077,
+          "previous": 0.017536827337408557
+        },
+        {
+          "candidate": 3.697394789579158,
+          "category": "other processes and kernel threads",
+          "points": 0.6910815317376908,
+          "previous": 3.0063132578414673
+        }
+      ],
+      "title": "host jobs, share of the VM"
+    },
+    "perfcpu-idle": {
+      "rows": [
+        {
+          "candidate": 1.968503937007874,
+          "category": "Bun: task-array leader tick and node sync",
+          "points": 1.968503937007874,
+          "previous": 0.0
+        },
+        {
+          "candidate": 0.3937007874015748,
+          "category": "Bun: pool path, rest of ReusablePool::run (slots lock, timers, logs)",
+          "points": 0.3937007874015748,
+          "previous": 0.0
+        },
+        {
+          "candidate": 5.118110236220472,
+          "category": "Bun: Raft core and log",
+          "points": 5.118110236220472,
+          "previous": 0.0
+        },
+        {
+          "candidate": 11.417322834645669,
+          "category": "Bun: agent loop and supervisor",
+          "points": 11.417322834645669,
+          "previous": 0.0
+        },
+        {
+          "candidate": 11.417322834645669,
+          "category": "Bun: API server",
+          "points": 11.417322834645669,
+          "previous": 0.0
+        },
+        {
+          "candidate": 0.3937007874015748,
+          "category": "Bun: gossip (Mustard)",
+          "points": 0.3937007874015748,
+          "previous": 0.0
+        },
+        {
+          "candidate": 31.88976377952756,
+          "category": "Bun: containers (Grill)",
+          "points": 31.88976377952756,
+          "previous": 0.0
+        },
+        {
+          "candidate": 4.724409448818897,
+          "category": "Bun: other Reliaburger code",
+          "points": 4.724409448818897,
+          "previous": 0.0
+        },
+        {
+          "candidate": 24.409448818897637,
+          "category": "Bun: async runtime (scheduler, timers, parking)",
+          "points": 24.409448818897637,
+          "previous": 0.0
+        },
+        {
+          "candidate": 8.26771653543307,
+          "category": "Bun: uncategorised (extend the map)",
+          "points": -91.73228346456693,
+          "previous": 100.0
+        }
+      ],
+      "title": "idle cluster, share of Bun"
+    }
+  },
+  "control": [],
+  "findings": [
+    {
+      "detail": "Bun used 3.7% of one core with no work, over the 2% limit",
+      "rule": "idle-cpu",
+      "severity": "would fail",
+      "subject": "idle cluster"
+    },
+    {
+      "detail": "100.0% of Bun's samples are uncategorised, over the 5% limit: extend BUN_RULES in scripts/release/profiling/profile_categories.py",
+      "rule": "uncategorised",
+      "severity": "extend the map",
+      "subject": "previous, host jobs, share of the VM"
+    },
+    {
+      "detail": "0.0% to 13.1%, +13.1 points",
+      "rule": "category-move",
+      "severity": "explain",
+      "subject": "Bun: task-array leader tick and node sync (host jobs, share of the VM)"
+    },
+    {
+      "detail": "14.1% to 0.0%, -14.0 points",
+      "rule": "category-move",
+      "severity": "explain",
+      "subject": "Bun: uncategorised (extend the map) (host jobs, share of the VM)"
+    },
+    {
+      "detail": "12.0% of Bun's CPU, from 0.0% in the previous release",
+      "rule": "new-category",
+      "severity": "would fail",
+      "subject": "Bun: async runtime (scheduler, timers, parking) (host jobs, share of the VM)"
+    },
+    {
+      "detail": "86.1% of Bun's CPU, from 0.0% in the previous release",
+      "rule": "new-category",
+      "severity": "would fail",
+      "subject": "Bun: task-array leader tick and node sync (host jobs, share of the VM)"
+    },
+    {
+      "detail": "100.0% of Bun's samples are uncategorised, over the 5% limit: extend BUN_RULES in scripts/release/profiling/profile_categories.py",
+      "rule": "uncategorised",
+      "severity": "extend the map",
+      "subject": "previous, idle cluster, share of Bun"
+    },
+    {
+      "detail": "8.3% of Bun's samples are uncategorised, over the 5% limit: extend BUN_RULES in scripts/release/profiling/profile_categories.py",
+      "rule": "uncategorised",
+      "severity": "extend the map",
+      "subject": "candidate, idle cluster, share of Bun"
+    },
+    {
+      "detail": "0.0% to 5.1%, +5.1 points",
+      "rule": "category-move",
+      "severity": "explain",
+      "subject": "Bun: Raft core and log (idle cluster, share of Bun)"
+    },
+    {
+      "detail": "0.0% to 11.4%, +11.4 points",
+      "rule": "category-move",
+      "severity": "explain",
+      "subject": "Bun: agent loop and supervisor (idle cluster, share of Bun)"
+    },
+    {
+      "detail": "0.0% to 11.4%, +11.4 points",
+      "rule": "category-move",
+      "severity": "explain",
+      "subject": "Bun: API server (idle cluster, share of Bun)"
+    },
+    {
+      "detail": "0.0% to 31.9%, +31.9 points",
+      "rule": "category-move",
+      "severity": "explain",
+      "subject": "Bun: containers (Grill) (idle cluster, share of Bun)"
+    },
+    {
+      "detail": "0.0% to 24.4%, +24.4 points",
+      "rule": "category-move",
+      "severity": "explain",
+      "subject": "Bun: async runtime (scheduler, timers, parking) (idle cluster, share of Bun)"
+    },
+    {
+      "detail": "100.0% to 8.3%, -91.7 points",
+      "rule": "category-move",
+      "severity": "explain",
+      "subject": "Bun: uncategorised (extend the map) (idle cluster, share of Bun)"
+    },
+    {
+      "detail": "11.4% of Bun's CPU, from 0.0% in the previous release",
+      "rule": "new-category",
+      "severity": "would fail",
+      "subject": "Bun: API server (idle cluster, share of Bun)"
+    },
+    {
+      "detail": "5.1% of Bun's CPU, from 0.0% in the previous release",
+      "rule": "new-category",
+      "severity": "would fail",
+      "subject": "Bun: Raft core and log (idle cluster, share of Bun)"
+    },
+    {
+      "detail": "11.4% of Bun's CPU, from 0.0% in the previous release",
+      "rule": "new-category",
+      "severity": "would fail",
+      "subject": "Bun: agent loop and supervisor (idle cluster, share of Bun)"
+    },
+    {
+      "detail": "24.4% of Bun's CPU, from 0.0% in the previous release",
+      "rule": "new-category",
+      "severity": "would fail",
+      "subject": "Bun: async runtime (scheduler, timers, parking) (idle cluster, share of Bun)"
+    },
+    {
+      "detail": "31.9% of Bun's CPU, from 0.0% in the previous release",
+      "rule": "new-category",
+      "severity": "would fail",
+      "subject": "Bun: containers (Grill) (idle cluster, share of Bun)"
+    }
+  ],
+  "idle": [
+    {
+      "candidate": {
+        "high": 0.03779803624509235,
+        "low": 0.037455148017243416,
+        "median": 0.03745649904600907,
+        "n": 3
+      },
+      "field": "bun_cpu_cores",
+      "interval": [
+        0.9703792956318935,
+        1.008872041692174
+      ],
+      "previous": {
+        "high": 0.038951816485819545,
+        "low": 0.0371257666675153,
+        "median": 0.038125149261335256,
+        "n": 3
+      },
+      "ratio": 0.9824617023596993,
+      "title": "Bun's CPU, share of one core",
+      "verdict": "no clear change"
+    },
+    {
+      "candidate": {
+        "high": 321.2985830581401,
+        "low": 316.887413119098,
+        "median": 317.7975852392503,
+        "n": 3
+      },
+      "field": "bun_wakeups_per_second",
+      "interval": [
+        0.9577282400839863,
+        0.9904112031895823
+      ],
+      "previous": {
+        "high": 330.87404114898936,
+        "low": 321.5331911284576,
+        "median": 324.4092777054722,
+        "n": 3
+      },
+      "ratio": 0.9796192867448611,
+      "title": "Bun's context switches a second",
+      "verdict": "no clear change"
+    },
+    {
+      "candidate": {
+        "high": 172860,
+        "low": 161952,
+        "median": 162284,
+        "n": 3
+      },
+      "field": "bun_rss_kb",
+      "interval": [
+        0.8794355450545163,
+        1.0300567287982076
+      ],
+      "previous": {
+        "high": 184532,
+        "low": 167816,
+        "median": 177380,
+        "n": 3
+      },
+      "ratio": 0.9148945766151765,
+      "title": "Bun's RSS, KiB",
+      "verdict": "no clear change"
+    }
+  ],
+  "rates": [
+    {
+      "candidate": {
+        "high": 29418.466666666667,
+        "low": 29239.833333333332,
+        "median": 29393.116666666665,
+        "n": 3
+      },
+      "interval": [
+        0.9814527642396494,
+        1.0397826545411275
+      ],
+      "previous": {
+        "high": 29792.4,
+        "low": 28292.9,
+        "median": 29177.816666666666,
+        "n": 3
+      },
+      "ratio": 1.0073788934401648,
+      "relative_candidate": 1.0,
+      "relative_previous": 1.0,
+      "steady_candidate": null,
+      "steady_previous": null,
+      "title": "Raw VM processes (calibration)",
+      "verdict": "no clear change",
+      "window": "raw"
+    },
+    {
+      "candidate": {
+        "high": 15466.666666666666,
+        "low": 15466.666666666666,
+        "median": 15466.666666666666,
+        "n": 3
+      },
+      "interval": [
+        1.0368715083798883,
+        1.0581527936145951
+      ],
+      "previous": {
+        "high": 14916.666666666666,
+        "low": 14616.666666666666,
+        "median": 14800.0,
+        "n": 3
+      },
+      "ratio": 1.045045045045045,
+      "relative_candidate": 0.5262002951938294,
+      "relative_previous": 0.5072346628631683,
+      "steady_candidate": {
+        "high": 15831.265508684864,
+        "low": 15831.265508684864,
+        "median": 15831.265508684864,
+        "n": 3
+      },
+      "steady_previous": {
+        "high": 15831.265508684864,
+        "low": 15384.615384615387,
+        "median": 15657.5682382134,
+        "n": 3
+      },
+      "title": "Host jobs, default cap",
+      "verdict": "no clear change",
+      "window": "host"
+    },
+    {
+      "candidate": {
+        "high": 8416.666666666666,
+        "low": 8333.333333333334,
+        "median": 8366.666666666666,
+        "n": 3
+      },
+      "interval": [
+        1.0526315789473684,
+        1.0749464668094217
+      ],
+      "previous": {
+        "high": 7916.666666666667,
+        "low": 7783.333333333333,
+        "median": 7916.666666666667,
+        "n": 3
+      },
+      "ratio": 1.0568421052631578,
+      "relative_candidate": 0.28464714244321376,
+      "relative_previous": 0.2713248478153209,
+      "steady_candidate": {
+        "high": 9081.885856079405,
+        "low": 8957.816377171217,
+        "median": 8982.630272952854,
+        "n": 3
+      },
+      "steady_previous": {
+        "high": 8933.002481389578,
+        "low": 8706.467661691542,
+        "median": 8908.18858560794,
+        "n": 3
+      },
+      "title": "Shared containers",
+      "verdict": "no clear change",
+      "window": "shared"
+    }
+  ]
+}

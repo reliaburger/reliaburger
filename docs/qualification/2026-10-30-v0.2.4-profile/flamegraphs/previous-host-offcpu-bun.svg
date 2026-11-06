@@ -1,0 +1,219 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="556" viewBox="0 0 1400 556" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fbfbf6"/>
+<text x="700.0" y="20" text-anchor="middle" font-size="15">v0.2.3: host jobs, Bun off-CPU</text>
+<text x="10" y="40" font-size="11">total 271,778,165 us; frames under 0.2% hidden; hover for detail</text>
+<g><title>all (271,778,165 us, 100.00%)</title><rect x="10.0" y="530" width="1379.5" height="15" fill="rgb(254,101,73)" rx="1"/>
+<text x="12.0" y="542">all</text>
+</g>
+<g><title>tokio-rt-worker (271,777,043 us, 100.00%)</title><rect x="10.0" y="514" width="1379.5" height="15" fill="rgb(222,138,68)" rx="1"/>
+<text x="12.0" y="526">tokio-rt-worker</text>
+</g>
+<g><title>state=R (2,691,048 us, 0.99%)</title><rect x="10.9" y="498" width="13.2" height="15" fill="rgb(233,184,66)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (2,691,048 us, 0.99%)</title><rect x="10.9" y="482" width="13.2" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (2,691,048 us, 0.99%)</title><rect x="10.9" y="466" width="13.2" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>[rb-bun] (2,691,048 us, 0.99%)</title><rect x="10.9" y="450" width="13.2" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (2,691,048 us, 0.99%)</title><rect x="10.9" y="434" width="13.2" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (2,691,048 us, 0.99%)</title><rect x="10.9" y="418" width="13.2" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (2,691,048 us, 0.99%)</title><rect x="10.9" y="402" width="13.2" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (2,690,743 us, 0.99%)</title><rect x="10.9" y="386" width="13.2" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (2,689,640 us, 0.99%)</title><rect x="10.9" y="370" width="13.2" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (2,686,038 us, 0.99%)</title><rect x="10.9" y="354" width="13.1" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (1,152,817 us, 0.42%)</title><rect x="10.9" y="338" width="5.4" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (1,135,978 us, 0.42%)</title><rect x="11.0" y="322" width="5.3" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (1,060,839 us, 0.39%)</title><rect x="11.1" y="306" width="4.9" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (960,562 us, 0.35%)</title><rect x="11.2" y="290" width="4.4" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (900,045 us, 0.33%)</title><rect x="11.2" y="274" width="4.1" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (794,189 us, 0.29%)</title><rect x="11.2" y="258" width="3.5" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (557,089 us, 0.20%)</title><rect x="11.2" y="242" width="2.3" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>syscall (1,530,782 us, 0.56%)</title><rect x="16.8" y="338" width="7.3" height="15" fill="rgb(217,175,75)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (1,530,755 us, 0.56%)</title><rect x="16.8" y="322" width="7.3" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (1,530,755 us, 0.56%)</title><rect x="16.8" y="306" width="7.3" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (1,530,755 us, 0.56%)</title><rect x="16.8" y="290" width="7.3" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_notify_resume (1,528,290 us, 0.56%)</title><rect x="16.8" y="274" width="7.3" height="15" fill="rgb(231,197,74)" rx="1"/>
+</g>
+<g><title>schedule (1,528,290 us, 0.56%)</title><rect x="16.8" y="258" width="7.3" height="15" fill="rgb(208,127,57)" rx="1"/>
+</g>
+<g><title>__schedule (1,528,290 us, 0.56%)</title><rect x="16.8" y="242" width="7.3" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>__schedule (1,528,290 us, 0.56%)</title><rect x="16.8" y="226" width="7.3" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>state=S (268,908,361 us, 98.94%)</title><rect x="24.6" y="498" width="1364.9" height="15" fill="rgb(207,105,74)" rx="1"/>
+<text x="26.6" y="510">state=S</text>
+</g>
+<g><title>[libc.so.6] (268,908,361 us, 98.94%)</title><rect x="24.6" y="482" width="1364.9" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="26.6" y="494">[libc.so.6]</text>
+</g>
+<g><title>[libc.so.6] (268,908,361 us, 98.94%)</title><rect x="24.6" y="466" width="1364.9" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="26.6" y="478">[libc.so.6]</text>
+</g>
+<g><title>[rb-bun] (268,908,361 us, 98.94%)</title><rect x="24.6" y="450" width="1364.9" height="15" fill="rgb(225,188,74)" rx="1"/>
+<text x="26.6" y="462">[rb-bun]</text>
+</g>
+<g><title>[rb-bun] (268,908,361 us, 98.94%)</title><rect x="24.6" y="434" width="1364.9" height="15" fill="rgb(225,188,74)" rx="1"/>
+<text x="26.6" y="446">[rb-bun]</text>
+</g>
+<g><title>[rb-bun] (268,908,361 us, 98.94%)</title><rect x="24.6" y="418" width="1364.9" height="15" fill="rgb(225,188,74)" rx="1"/>
+<text x="26.6" y="430">[rb-bun]</text>
+</g>
+<g><title>[rb-bun] (268,908,361 us, 98.94%)</title><rect x="24.6" y="402" width="1364.9" height="15" fill="rgb(225,188,74)" rx="1"/>
+<text x="26.6" y="414">[rb-bun]</text>
+</g>
+<g><title>[rb-bun] (14,668,835 us, 5.40%)</title><rect x="24.6" y="386" width="74.0" height="15" fill="rgb(225,188,74)" rx="1"/>
+<text x="26.6" y="398">[rb-bun]</text>
+</g>
+<g><title>[rb-bun] (14,668,802 us, 5.40%)</title><rect x="24.6" y="370" width="74.0" height="15" fill="rgb(225,188,74)" rx="1"/>
+<text x="26.6" y="382">[rb-bun]</text>
+</g>
+<g><title>[rb-bun] (14,668,480 us, 5.40%)</title><rect x="24.6" y="354" width="74.0" height="15" fill="rgb(225,188,74)" rx="1"/>
+<text x="26.6" y="366">[rb-bun]</text>
+</g>
+<g><title>[rb-bun] (2,234,432 us, 0.82%)</title><rect x="24.6" y="338" width="10.8" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (2,233,989 us, 0.82%)</title><rect x="24.6" y="322" width="10.8" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>[rb-bun] (2,228,742 us, 0.82%)</title><rect x="24.6" y="306" width="10.8" height="15" fill="rgb(225,188,74)" rx="1"/>
+</g>
+<g><title>epoll_pwait (2,147,091 us, 0.79%)</title><rect x="25.0" y="290" width="10.4" height="15" fill="rgb(243,128,53)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (2,147,091 us, 0.79%)</title><rect x="25.0" y="274" width="10.4" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (2,147,091 us, 0.79%)</title><rect x="25.0" y="258" width="10.4" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (2,147,091 us, 0.79%)</title><rect x="25.0" y="242" width="10.4" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_el0_svc (2,147,091 us, 0.79%)</title><rect x="25.0" y="226" width="10.4" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (2,147,091 us, 0.79%)</title><rect x="25.0" y="210" width="10.4" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (2,147,091 us, 0.79%)</title><rect x="25.0" y="194" width="10.4" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_epoll_pwait (2,147,091 us, 0.79%)</title><rect x="25.0" y="178" width="10.4" height="15" fill="rgb(219,132,75)" rx="1"/>
+</g>
+<g><title>do_epoll_pwait.part.0 (2,147,091 us, 0.79%)</title><rect x="25.0" y="162" width="10.4" height="15" fill="rgb(229,140,76)" rx="1"/>
+</g>
+<g><title>do_epoll_wait (2,147,091 us, 0.79%)</title><rect x="25.0" y="146" width="10.4" height="15" fill="rgb(233,199,47)" rx="1"/>
+</g>
+<g><title>ep_poll (2,147,091 us, 0.79%)</title><rect x="25.0" y="130" width="10.4" height="15" fill="rgb(219,115,44)" rx="1"/>
+</g>
+<g><title>schedule_hrtimeout_range (2,147,091 us, 0.79%)</title><rect x="25.0" y="114" width="10.4" height="15" fill="rgb(209,134,70)" rx="1"/>
+</g>
+<g><title>schedule_hrtimeout_range_clock (2,147,091 us, 0.79%)</title><rect x="25.0" y="98" width="10.4" height="15" fill="rgb(238,118,42)" rx="1"/>
+</g>
+<g><title>schedule (2,147,091 us, 0.79%)</title><rect x="25.0" y="82" width="10.4" height="15" fill="rgb(208,127,57)" rx="1"/>
+</g>
+<g><title>__schedule (2,147,091 us, 0.79%)</title><rect x="25.0" y="66" width="10.4" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>__schedule (2,147,091 us, 0.79%)</title><rect x="25.0" y="50" width="10.4" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>syscall (11,963,533 us, 4.40%)</title><rect x="38.3" y="338" width="60.2" height="15" fill="rgb(217,175,75)" rx="1"/>
+<text x="40.3" y="350">syscall</text>
+</g>
+<g><title>el0t_64_sync (11,963,533 us, 4.40%)</title><rect x="38.3" y="322" width="60.2" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="40.3" y="334">el0t_64..</text>
+</g>
+<g><title>el0t_64_sync_handler (11,963,533 us, 4.40%)</title><rect x="38.3" y="306" width="60.2" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="40.3" y="318">el0t_64..</text>
+</g>
+<g><title>el0_svc (11,963,533 us, 4.40%)</title><rect x="38.3" y="290" width="60.2" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="40.3" y="302">el0_svc</text>
+</g>
+<g><title>do_el0_svc (11,963,533 us, 4.40%)</title><rect x="38.3" y="274" width="60.2" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="40.3" y="286">do_el0_..</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (11,963,533 us, 4.40%)</title><rect x="38.3" y="258" width="60.2" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="40.3" y="270">el0_svc..</text>
+</g>
+<g><title>invoke_syscall (11,963,533 us, 4.40%)</title><rect x="38.3" y="242" width="60.2" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="40.3" y="254">invoke_..</text>
+</g>
+<g><title>__arm64_sys_futex (11,963,533 us, 4.40%)</title><rect x="38.3" y="226" width="60.2" height="15" fill="rgb(210,125,77)" rx="1"/>
+<text x="40.3" y="238">__arm64..</text>
+</g>
+<g><title>do_futex (11,963,533 us, 4.40%)</title><rect x="38.3" y="210" width="60.2" height="15" fill="rgb(228,138,51)" rx="1"/>
+<text x="40.3" y="222">do_futex</text>
+</g>
+<g><title>futex_wait (11,963,533 us, 4.40%)</title><rect x="38.3" y="194" width="60.2" height="15" fill="rgb(215,163,77)" rx="1"/>
+<text x="40.3" y="206">futex_w..</text>
+</g>
+<g><title>__futex_wait (11,963,533 us, 4.40%)</title><rect x="38.3" y="178" width="60.2" height="15" fill="rgb(213,123,55)" rx="1"/>
+<text x="40.3" y="190">__futex..</text>
+</g>
+<g><title>futex_wait_queue (11,963,533 us, 4.40%)</title><rect x="38.3" y="162" width="60.2" height="15" fill="rgb(253,105,54)" rx="1"/>
+<text x="40.3" y="174">futex_w..</text>
+</g>
+<g><title>schedule (11,963,533 us, 4.40%)</title><rect x="38.3" y="146" width="60.2" height="15" fill="rgb(208,127,57)" rx="1"/>
+<text x="40.3" y="158">schedule</text>
+</g>
+<g><title>__schedule (11,963,533 us, 4.40%)</title><rect x="38.3" y="130" width="60.2" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="40.3" y="142">__sched..</text>
+</g>
+<g><title>__schedule (11,963,533 us, 4.40%)</title><rect x="38.3" y="114" width="60.2" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="40.3" y="126">__sched..</text>
+</g>
+<g><title>syscall (254,239,476 us, 93.55%)</title><rect x="99.1" y="386" width="1290.4" height="15" fill="rgb(217,175,75)" rx="1"/>
+<text x="101.1" y="398">syscall</text>
+</g>
+<g><title>el0t_64_sync (254,239,476 us, 93.55%)</title><rect x="99.1" y="370" width="1290.4" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="101.1" y="382">el0t_64_sync</text>
+</g>
+<g><title>el0t_64_sync_handler (254,239,476 us, 93.55%)</title><rect x="99.1" y="354" width="1290.4" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="101.1" y="366">el0t_64_sync_handler</text>
+</g>
+<g><title>el0_svc (254,239,476 us, 93.55%)</title><rect x="99.1" y="338" width="1290.4" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="101.1" y="350">el0_svc</text>
+</g>
+<g><title>do_el0_svc (254,239,476 us, 93.55%)</title><rect x="99.1" y="322" width="1290.4" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="101.1" y="334">do_el0_svc</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (254,239,476 us, 93.55%)</title><rect x="99.1" y="306" width="1290.4" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="101.1" y="318">el0_svc_common.constprop.0</text>
+</g>
+<g><title>invoke_syscall (254,239,476 us, 93.55%)</title><rect x="99.1" y="290" width="1290.4" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="101.1" y="302">invoke_syscall</text>
+</g>
+<g><title>__arm64_sys_futex (254,239,476 us, 93.55%)</title><rect x="99.1" y="274" width="1290.4" height="15" fill="rgb(210,125,77)" rx="1"/>
+<text x="101.1" y="286">__arm64_sys_futex</text>
+</g>
+<g><title>do_futex (254,239,476 us, 93.55%)</title><rect x="99.1" y="258" width="1290.4" height="15" fill="rgb(228,138,51)" rx="1"/>
+<text x="101.1" y="270">do_futex</text>
+</g>
+<g><title>futex_wait (254,239,476 us, 93.55%)</title><rect x="99.1" y="242" width="1290.4" height="15" fill="rgb(215,163,77)" rx="1"/>
+<text x="101.1" y="254">futex_wait</text>
+</g>
+<g><title>__futex_wait (254,239,476 us, 93.55%)</title><rect x="99.1" y="226" width="1290.4" height="15" fill="rgb(213,123,55)" rx="1"/>
+<text x="101.1" y="238">__futex_wait</text>
+</g>
+<g><title>futex_wait_queue (254,239,476 us, 93.55%)</title><rect x="99.1" y="210" width="1290.4" height="15" fill="rgb(253,105,54)" rx="1"/>
+<text x="101.1" y="222">futex_wait_queue</text>
+</g>
+<g><title>schedule (254,239,476 us, 93.55%)</title><rect x="99.1" y="194" width="1290.4" height="15" fill="rgb(208,127,57)" rx="1"/>
+<text x="101.1" y="206">schedule</text>
+</g>
+<g><title>__schedule (254,239,476 us, 93.55%)</title><rect x="99.1" y="178" width="1290.4" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="101.1" y="190">__schedule</text>
+</g>
+<g><title>__schedule (254,239,476 us, 93.55%)</title><rect x="99.1" y="162" width="1290.4" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="101.1" y="174">__schedule</text>
+</g>
+</svg>

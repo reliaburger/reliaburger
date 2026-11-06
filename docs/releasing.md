@@ -66,7 +66,7 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
 - **A PR into the train** gets the light set: lint and format, minimum Rust,
   portable Linux with the coverage floor, the demo app and the optimised
   contract boundaries, in 15–20 minutes. A `full-ci` label adds everything
-  except the three macOS shards: privileged Linux, cluster, acceptance,
+  except the three macOS shards: privileged Linux (on Ubuntu 24.04 and 26.04), cluster, acceptance,
   upgrades and benchmarks. The macOS shards run on the PR only when it
   touches macOS-specific code or carries a `macos` label.
 - **The merge queue**, where a train has one, runs every job, macOS shards
@@ -211,8 +211,11 @@ is the first to keep its predecessor's pair, so a 0.2.2 cluster could roll
 onto it in place
 ([upgrading from 0.2.2](#upgrading-from-022)). That walk, the first between
 two published releases, ran on 29 October 2026
-([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md)). Qualifying a release's walk from its predecessor
-is a goal, not a release gate. The pre-1.0 rule for known harness artefacts in
+([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md)). 0.2.4
+bumps both again (protocol 55, state format 72), so a 0.2.3 cluster moves to
+it as a fresh cluster ([upgrading from 0.2.3](#upgrading-from-023)).
+Qualifying a release's walk from its predecessor is a goal, not a release
+gate. The pre-1.0 rule for known harness artefacts in
 the V02 soak (step 4 of [staging a candidate](#staging-a-candidate))
 stays as it is.
 
@@ -485,18 +488,49 @@ moved its replicas
 releases do it on any Bun restart; 0.2.4 fixes it. Expect your apps to
 restart, and sometimes move, once per node during this walk.
 
-The 0.3.0 appliance train carries everything up to 0.2.4 plus the appliance
+### Upgrading from 0.2.3
+
+0.2.4 can't roll onto a 0.2.3 cluster. Policies, templates, sidecars, stop
+hooks, secret provider references, runtime knobs and resource owners all
+live in Raft desired state and node syncs, and nodes report the secret
+providers, runtime knobs and shared networks they support (the full list is
+in `src/compatibility.rs`). So the protocol moved from 53 to 55 and the state
+format from 70 to 72, and a 0.2.3 leader refuses `relish upgrade start v0.2.4`
+before it records a run.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses.
+
+### Upgrading from 0.2.4
+
+0.2.5 can't roll onto a 0.2.4 cluster. An init container's `env` is a new
+field in Raft desired state and node syncs, and `InitContainerSpec` refuses
+unknown fields, so a 0.2.4 node couldn't decode an app that sets it
+([#1498](https://github.com/reliaburger/reliaburger/issues/1498)). So the
+protocol moved from 55 to 56 and the state format from 72 to 73, and a 0.2.4
+leader refuses `relish upgrade start v0.2.5` before it records a run.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses. The next release that keeps 0.2.5's pair can
+roll from it, and it won't move a restarting node's replicas
+([#1449](https://github.com/reliaburger/reliaburger/issues/1449)).
+
+The 0.3.0 appliance train carries everything up to 0.2.6 plus the appliance
 OS rollout and the cluster-wide council size, both new Raft requests and new
-fields in council state, so its builds are at protocol 56 and state format
-73, one past 0.2.4's 55/72. A 0.2.x leader offered a 0.3.0 development build
+fields in council state, so its builds are at protocol 58 and state format
+74, one past 0.2.6's 57/73. A 0.2.x leader offered a 0.3.0 development build
 refuses it before it records a run, and the move is a fresh cluster.
 
 ## Signing identity
 
-Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
-of the existing Ed25519 PKCS#8 DER private key whose public key is listed in
-`src/upgrade/keys.rs`, for example
-`base64 < release-key.der | gh secret set RELIABURGER_RELEASE_KEY`. The packaging
+Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub
+Environment, whose deployment branch rule allows only `main`. It holds the
+base64 encoding of the existing Ed25519 PKCS#8 DER private key whose public key
+is listed in `src/upgrade/keys.rs`, for example
+`base64 < release-key.der | gh secret set RELIABURGER_RELEASE_KEY --env release`.
+Never make it a repository secret: every branch can read those, because the
+`if:` lines that guard the signing steps live in the dispatched branch's own
+copy of `build.yml`. The packaging
 script also accepts the base64 of a PEM private key or of the bare 32-byte seed,
 and converts either to DER; anything else fails with a message saying what it
 found, never the key itself. It then checks the derived public key against
@@ -529,10 +563,13 @@ is unreleased code, so the release key never signs it. It has a key of its
 own (maintainer decision, 27 October 2026,
 [#1363](https://github.com/reliaburger/reliaburger/issues/1363)):
 
-- The private key is the Actions secret `RELIABURGER_NIGHTLY_KEY`, in the same
+- The private key is `RELIABURGER_NIGHTLY_KEY`, a secret of the `nightly`
+  GitHub Environment, whose branch rule allows only `release-*`, in the same
   format as the release key's secret. `build.yml` uses it in one step, which
   runs only on a `release-*` branch; the release key's step runs only on
-  `main`. A test in `test_build_workflow.py` holds both conditions.
+  `main`, and the candidate job picks its environment the same way. A test in
+  `test_build_workflow.py` holds all three. Anyone who can push a `release-*`
+  branch can reach this key, which is why only nightly builds trust it.
 - The public key is `NIGHTLY_SIGNING_KEYS` in `src/upgrade/keys.rs`, next to
   the release keys. Only a binary built with the `nightly-signing` Cargo
   feature trusts it, and that binary trusts no release key. `build.yml`
@@ -550,7 +587,7 @@ The maintainer sets it up once, on a machine with `gh` signed in and a
 
 ```sh
 relish dev keygen --out ~/reliaburger-nightly-key
-base64 < ~/reliaburger-nightly-key/release.key | gh secret set RELIABURGER_NIGHTLY_KEY
+base64 < ~/reliaburger-nightly-key/release.key | gh secret set RELIABURGER_NIGHTLY_KEY --env nightly
 cat ~/reliaburger-nightly-key/release.pub
 ```
 
@@ -659,7 +696,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.2.3` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.5` today), so
 bump that default in the same change that announces a newer release. Both
 scripts need a mode, `--laptop` or `--install-only`; with none they explain the
 choices and exit 2. For a release from before 0.2.2 the bootstrap drops
@@ -802,6 +839,14 @@ a tag range and prints `patch` or `full` with its reasons:
 scripts/release/release_tier.py --previous v0.2.3 --release v0.2.4 --commit origin/release-0-2-4
 ```
 
+Neither gate runs `make test-s3` by hand any more: CI runs it against a local
+SeaweedFS on every change to log export, council backups or the S3 client,
+and nightly ([S3 in CI](testing.md#s3-in-ci)). What CI can't show is that AWS
+itself accepts our requests, so a release that changes how the client builds,
+signs or addresses them (`src/object_storage.rs`, or the `object_store`
+crate's version) also runs it once against a real bucket, with
+`RELIABURGER_TEST_S3_URL`, and records the run in `qualification/`.
+
 `nightly-qualify.sh` and `nightly.py freeze-check` apply the same rule
 themselves, so neither takes the gate on trust: the release is the version in
 the commit's `Cargo.toml`, the previous release the nearest `v*` tag behind
@@ -841,6 +886,8 @@ after the tag ([step 9](#staging-a-candidate)) instead of blocking it, and a
 regression they find goes into the next patch release.
 
 ## Staging a candidate
+
+The qualification scripts and `make test-ci-scripts` need Python 3.11 or later for `tomllib`, and macOS's `/usr/bin/python3` is 3.9. Each checks first and says what to install; put a newer `python3` first on `PATH` ([`require_python.py`](../scripts/release/require_python.py)).
 
 Before promoting a release, publish the exact signed candidate to HTTPS and run
 the real `curl … | sh` install against it on every host we advertise.

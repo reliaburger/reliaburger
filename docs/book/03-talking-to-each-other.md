@@ -787,6 +787,8 @@ Every health tick checks that both hooks are still attached and the enforcement 
 
 One wrinkle worth knowing about: a dual-stack socket reaching an IPv4 server goes through *connect6* with a "v4-mapped" address, `::ffff:a.b.c.d`. The connect6 hook has to spot that pattern and judge the connection against the IPv4 policy, or the mapped form becomes yet another bypass. The kernel also insists that `user_ip6` is read in 32-bit chunks — the verifier rejects byte-wise loads from that context field.
 
+The verifier's rules can also tighten under you. The connect hook picks a backend with `idx = (rr + i) % val->count`, then checks `idx < MAX_BACKENDS` before reading `val->backends[idx]`. That satisfied every kernel we'd run, until GitHub's runners moved to Ubuntu 26.04 and Linux 7.0, which refused to load the program: "math between map_value pointer and register with unbounded min value is not allowed". The newer clang there computes the modulo in a 32-bit register, and the 7.0 verifier treats that result's upper half as unknown, so the 32-bit comparison no longer bounds the 64-bit register that does the indexing. Bun couldn't start at all, because a node with Onion enabled won't run without its hook (#1557). The fix masks the index in 64 bits, `slot &= MAX_BACKENDS - 1`, kept honest by a `_Static_assert` that `MAX_BACKENDS` is a power of two. Our first try masked the 32-bit `idx`, and CI on 26.04 refused it again: clang knew `idx` was already below 32 and dropped the mask as redundant. An empty `asm volatile("" : "+r"(slot))` hides the value from the compiler, so the mask stays in the object code. The lessons for eBPF code: a bound the verifier has to infer through a comparison is a bound a newer kernel or compiler may stop inferring, and a bound you add for the verifier's sake is one the optimiser may delete, so check the disassembly. CI then pinned its Linux runners to `ubuntu-24.04` until the rest of 26.04 worked, and the rest was `sudo` itself: 26.04's default is sudo-rs, which ignores `-E`, so every privileged step ran as root without the runner's `CARGO_HOME` or the job's variables. `scripts/ci/as-root` now hands root the environment as arguments to `env`, which both sudos honour, and a `privileged Linux (Ubuntu 26.04)` job runs `make test-linux` on Linux 7.0 beside the 24.04 one, so the next verifier change shows up on a pull request rather than on the day GitHub moves `ubuntu-latest` (#1559).
+
 While we were in there, we fixed how a defective object file fails. The map handles used to be fetched lazily, deep inside the agent, with `.unwrap()` — a `.bpf.o` missing a map would panic Bun at the first write, minutes or hours after startup. Now the loader validates every required map and program against a single list the moment the object loads, and refuses with the full roster of what's missing. One clear error at load time beats nine scattered panics at use time.
 
 ### Isolation on real addresses
@@ -1493,6 +1495,49 @@ The return type says "some iterator yielding `VirtualIP`s" without naming the co
 The producer's side mirrors this. Before a node frees the host port or container address of a stopped instance, it asks the leader to *retire* that exact execution at `/v1/discovery/retire`. The leader records a permanent retirement (the code calls it a *fence*: any late report from that execution is ignored from then on, rather than put back in the catalogue) and answers "confirmed" only once every consumer has sent its receipt. Executions are identified by a runtime generation, an opaque SHA-256 fingerprint of the original launch record. A restart gets a new fingerprint even if it reuses the same name and port, so a delayed receipt for the old execution can't free the new one. The request runs as its own task with a one-second wait, so an unreachable leader makes retirement slow, not the whole agent.
 
 To make a growing backlog visible before the ledger fills, the leader degrades a `discovery:withdrawal-backlog` readiness subsystem at 75% occupancy and exports `discovery_withdrawal_ledger_occupancy_ratio` for alerting.
+
+### Deleted, then applied straight back
+
+An outside evaluation of 0.2.0 ran a simple loop on three nodes: `relish delete` two apps, `relish apply` them again at once. Three cycles converged. The fourth stuck, with every retry refused: "original service withdrawal is unproven". It stayed stuck until someone restarted Bun. Wait for the delete to settle first, and it never happened.
+
+That refusal is the check from [Writing it down before doing it](#writing-it-down-before-doing-it), and it's guarding something real. A retiring instance's address can go back in the pool only once we've shown that the *exact allocation that published it*, that VIP on that port, no longer routes to it. Any other evidence is worthless. An entry under a different VIP tells you nothing about the old one, which may still be sending traffic to an address that's about to be handed to a stranger. Relax the check to get past the wedge, and a client can end up talking to the wrong workload, with no error at all.
+
+So the check was right, and we had to work out how the truth had changed underneath it. Here's the sequence on one node:
+
+1. `relish delete` withdraws the service. Its VIP, say `127.128.3.7`, stays reserved in the ledger until every consumer sends its receipt.
+2. The node stops its replica, but the replica's address has to wait for those receipts, so the retirement answers "not yet". The node's own record of the service stays, along with the journal's.
+3. `relish apply` arrives before the receipts do. The old VIP is still reserved, so the council gives the *same service* a new one.
+4. The node gets a deploy for an app it still holds stopped replicas of, so it treats it as a rollout. It starts a replacement, then registers the service again under the new VIP.
+
+Step 4 breaks a rule the journal enforces. It holds one allocation per service, and it refuses to swap the VIP until the old allocation has retired, because that's the only way a crash leaves a complete list of what might be exposed. On 0.2.0 the node had already changed its in-memory map by the time the journal said no, so every retirement after that compared the journal's VIP with a map that had moved on. Hence "unproven", forever. A restart threw the map away and rebuilt it from the journal, which is why that fixed it. 0.2.4 stopped changing the map before the journal agreed, for reasons of its own (#1336), so main didn't print that message any more. It wedged all the same, this time with "original service allocation has not retired" on every attempt. The bug had changed its clothes, not its behaviour.
+
+We could have taught the journal to hold two allocations per service. That's a change to durable state, plus a second answer to "which VIP does this backend belong to?" everywhere that question gets asked. There's something simpler: never let the two incarnations overlap on a node. The app was deleted, so nothing is lost by finishing that first. Before a deploy starts, the loop compares the node's reservation with the council's committed allocation:
+
+```rust
+let replaced = self
+    .service_map
+    .resolve(&id)
+    .zip(catalog.resolve(&id))
+    .is_some_and(|(local, committed)| {
+        local.vip != committed.vip || local.port != committed.port
+    });
+```
+
+`Option::zip` turns two options into one option of a pair: `Some((a, b))` if both are there, `None` otherwise. `is_some_and` then asks its question only of a value that exists. If the node has no reservation, or the council has no allocation yet, nothing has been replaced.
+
+When something has, the deploy is refused and the old incarnation's retirement is started on the spot:
+
+```rust
+let (response, _) = oneshot::channel();
+self.request_app_stop(target.name, target.namespace, StopPurpose::Retire, response)
+    .await;
+```
+
+Binding the receiver to `_` drops it straight away, because nobody here cares how the stop ends. A send into a dropped receiver returns an error, and `request_app_stop` ignores that, so this is a cheap way of saying "do it, and don't tell me". The reconciler retries the deploy under its usual backoff of 5 s, 10 s, 20 s. Each attempt starts the retirement again if it's still waiting on the other nodes, and once it's finished the next attempt is an ordinary fresh deploy under the new VIP.
+
+The check itself didn't change by a single character. Nobody weakened it. The old incarnation is now judged against the old allocation because the new allocation doesn't exist on this node until the old one has gone. A changed port goes the same way: the journal refuses that too, so an app whose port changes on an enrolled cluster now stops and starts rather than failing its rollout for ever.
+
+One more thing this taught us: the regression test almost couldn't see the bug. The discovery journal only runs on enrolled runc nodes with eBPF, so a process-runtime cluster loops through delete and apply happily and proves nothing about it. The test that does reproduce it, `a_reapplied_app_under_a_new_vip_converges_without_a_restart`, drives one agent with a real journal through exactly the four steps above. `a_new_allocation_waits_here_until_the_old_incarnation_has_retired` checks the safety half: until the other nodes confirm, no new replica starts and the old address stays held. What we don't have is the evaluation's own loop on real runc nodes. We tried: our enrolled OCI fixture runs three nodes on one host, and their replicas collide on the same container routes (`RTNETLINK answers: File exists`), so it can't hold five replicas of two apps. Repeating that loop still needs real machines.
 
 ### When a node goes quiet
 

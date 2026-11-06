@@ -543,6 +543,11 @@ pub(super) mod tests_support {
         }))
     }
 
+    /// A progress display that draws nowhere, for driving a whole flow.
+    pub fn silent() -> Progress {
+        Progress::new(std::io::sink(), false)
+    }
+
     /// Bytes on disk according to the step.
     pub fn bytes(step: &Step) -> u64 {
         step.0.transfer.bytes.load(Ordering::Relaxed)
