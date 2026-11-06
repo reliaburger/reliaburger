@@ -9,7 +9,10 @@ its exit code, so you can wire them straight into CI or an alert.
 `wtf` fans authenticated requests across the expected nodes, correlates the
 evidence, and prints a categorised report: CRITICAL, WARNING, UNKNOWN and OK.
 It doesn't just list problems. It links a crashloop to the recent deploy and
-the error log line behind it.
+the error log line behind it. A crashloop is three `restart` events for one
+app inside 15 minutes; Bun records one for every restart, so `relish events`
+shows the same history `wtf` read. A high lifetime `restart_count` in
+`relish status` on its own isn't one.
 
 You only need to reach one node. `wtf`, `inspect` and `path` send every
 per-node request through the node you're connected to (`/v1/nodes/<node>/relay/...`), carrying
