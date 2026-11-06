@@ -268,6 +268,12 @@ exit 1
                     result = subprocess.run([shell, str(self.assets / "install.sh"), flag], env=env, capture_output=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("--laptop", result.stdout.decode())
+                    # How a stranger checks the files (#1583), with this
+                    # release's repository filled in.
+                    self.assertIn("gh attestation verify ~/.reliaburger/bin/relish --repo reliaburger/reliaburger",
+                                  result.stdout.decode())
+                    self.assertIn("--signer-workflow reliaburger/reliaburger/.github/workflows/build.yml",
+                                  result.stdout.decode())
                     self.assertFalse(calls.exists())
                     self.assertFalse((home / ".reliaburger").exists())
 
