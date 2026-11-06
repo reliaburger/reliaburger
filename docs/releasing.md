@@ -67,15 +67,15 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
 
 - **A PR into the train** gets the light set: lint and format, minimum Rust,
   portable Linux with the coverage floor, the demo app, the source bundle
-  build and the optimised contract boundaries, in 15–20 minutes. A
-  `full-ci` label adds everything except the three macOS shards: privileged
+  build and the optimised contract boundaries, in about 25 minutes. A
+  `full-ci` label adds everything except portable macOS: privileged
   Linux (on Ubuntu 24.04 and 26.04), cluster, acceptance,
-  upgrades and benchmarks. The macOS shards run on the PR only when it
+  upgrades and benchmarks. Portable macOS runs on the PR only when it
   touches macOS-specific code or carries a `macos` label.
-- **The merge queue**, where a train has one, runs every job, macOS shards
-  and heavy suites included, on the batch merged onto the train, before any
-  of it lands. The queue requires the single check `ignored-test evidence`,
-  which waits for every other job and demands every evidence owner.
+- **The merge queue** runs every job, portable macOS and the heavy suites
+  included, on the batch merged onto the train, before any of it lands. The
+  queue requires the single check `ignored-test evidence`, which waits for
+  every other job and demands every evidence owner.
 - **The push to the train** runs everything on the result, macOS included.
 - **The gate PR** into `main` gets the light set on each push, because the
   push to the train has just run everything on the same code
@@ -89,8 +89,37 @@ So nothing reaches a train, or `main`, without the full set having passed on
 that exact commit. macOS runs on every push and on the nightly, on the
 release gate PR and on the candidate build, but not on ordinary pull
 requests: the organisation's plan runs at most five macOS jobs at once, and
-each full run takes three. Dependabot's PRs never get macOS unless labelled;
-the nightly on `main` covers them.
+each full run takes one ([portable macOS in one job](testing.md#portable-macos-in-one-job)).
+Dependabot's PRs never get macOS unless labelled; the nightly on `main`
+covers them.
+
+### Merging through the queue
+
+Every train merges through GitHub's merge queue (maintainer decision of 6
+November 2026). The repository ruleset "release trains merge queue" holds the
+queue and its one required check, `ignored-test evidence`, and it names each
+train branch exactly: GitHub doesn't allow a wildcard such as `release-*` in a
+ruleset with a merge-queue rule. So when a train opens, the maintainer adds
+its branch (`refs/heads/release-0-2-8`, say) to that ruleset by name, in the
+same sitting as creating the branch. A train missing from the ruleset has
+no queue, and its PRs merge on the light set alone; that's how 0.2.2 to 0.2.6
+merged, because the ruleset still named only `release-0-2-1`.
+
+Merge a PR into a train with `gh pr merge --merge --auto`, or the "Merge when
+ready" button, which adds it to the queue. Don't merge it directly. The queue
+builds a temporary branch with the train plus the PR (and up to three more
+waiting behind it), and `ci.yml`'s `merge_group` trigger runs every job on it.
+The PR lands only if `ignored-test evidence` passes on that exact commit. A
+batch that fails drops the PR that broke it, and the rest go round again.
+
+Why bother, when the push to the train runs everything anyway? Because the
+push runs after the merge. Without the queue, a PR that passed the light set
+could break the macOS or heavy suites, and the train would carry the break
+until someone noticed the push run. Merges also landed faster than the push
+runs finished: each merge cancelled the previous push run, so in early
+November four of six pushes to `release-0-2-7` were cancelled 31 to 52
+minutes in, and those commits never had a finished full run. With the queue,
+every commit on a train has passed every job before it got there.
 
 ## Refreshing dependencies
 

@@ -108,16 +108,17 @@ class EvidenceTests(unittest.TestCase):
             producer = blocks[index]
             identity = gate.replace('-', '_')
             self.assertIn('id: ' + identity, producer)
-            # A split owner is one matrix job; each shard sets only its own output.
+            # A partitioned owner (portable macOS) runs its one, whole
+            # partition in one job, with no matrix (plan 2026-11-06, F1).
             count = SHARDS.get(gate)
-            suffixes = [''] if count is None else ['_' + str(shard) for shard in range(1, count + 1)]
-            for suffix in suffixes:
-                self.assertIn(identity + suffix + '_sha256: ${{ steps.' + identity
-                              + '.outputs.' + identity + suffix + '_sha256 }}', job)
-            label = gate if count is None else gate + '-${{ matrix.shard }}'
+            self.assertIn(count, (None, 1), gate)
+            self.assertNotIn('matrix', job, gate)
+            suffix = '' if count is None else '_1'
+            self.assertIn(identity + suffix + '_sha256: ${{ steps.' + identity
+                          + '.outputs.' + identity + suffix + '_sha256 }}', job)
+            label = gate if count is None else gate + '-1'
             if count is not None:
-                self.assertIn('        shard: [' + ', '.join(map(str, range(1, count + 1))) + ']\n', job)
-                self.assertIn('--shard "${{ matrix.shard }}/' + str(count) + '"', producer)
+                self.assertIn('--shard "1/1"', producer)
                 self.assertIn('--directory "target/contracts/' + host + '/' + label + '"', producer)
             if gate != 'oci-interruptions':
                 for argument in ('--host ' + host, '--commit "$EXPECTED_CHECKOUT_COMMIT"',
@@ -411,6 +412,22 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertRegex(self.triggers, r"\n  merge_group:\n(?:\s+#.*\n)*\s+types: \[checks_requested\]\n")
         self.assertRegex(self.triggers, r"\n  push:\n(?:\s+#.*\n)*\s+branches: \[main, \"release-\*\"\]\n")
 
+    def test_a_merge_group_runs_every_job_and_the_check_the_queue_requires(self):
+        # The train ruleset's queue requires one check, "ignored-test
+        # evidence". A merge group has no pull request and no label, so no
+        # job may hang its condition on the event: each follows select jobs
+        # (which picks everything for merge_group, see test_select_jobs.py)
+        # or the closed-PR guard, and the gate always reports.
+        allowed = {"github.event.action == 'closed'", "github.event.action != 'closed'",
+                   "${{ always() && github.event.action != 'closed' }}"}
+        for name, job in self.jobs.items():
+            condition = re.search(r"^    if: (.+)$", job, re.M)
+            self.assertIsNotNone(condition, name)
+            value = condition.group(1)
+            self.assertTrue(value in allowed or re.fullmatch(r"needs\.changes\.outputs\.[a-z_0-9]+ == 'true'", value),
+                            (name, value))
+        self.assertIn("    name: ignored-test evidence\n", self.jobs["ignored-evidence"])
+
     def test_selection_sees_the_head_branch_and_the_full_ci_label(self):
         changes = self.jobs["changes"]
         self.assertIn("HEAD_REF: ${{ github.event.pull_request.head.ref }}", changes)
@@ -492,14 +509,30 @@ class TrainAndQueueTests(unittest.TestCase):
         # job doesn't hide whether the evidence was complete.
         self.assertIn("if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}", blocks[aggregate])
 
-    def test_macos_runs_when_selected_and_splits_the_once_only_steps(self):
+    def test_macos_is_one_job_that_lints_and_runs_every_portable_test(self):
+        # One job, not three shards that each compiled the whole suite to
+        # run a third of it (plan 2026-11-06, F1).
         macos = self.jobs["macos"]
+        portable = [name for name, job in self.jobs.items() if "--gate portable-darwin " in job]
+        self.assertEqual(portable, ["macos"])
         self.assertIn("    if: needs.changes.outputs.macos == 'true'\n", macos)
-        self.assertIn("      fail-fast: false\n", macos)
-        self.assertIn("    name: portable macOS (${{ matrix.shard }}/" + str(SHARDS["portable-darwin"]) + ")\n", macos)
-        for name in ["Lint every target, with all features", "Doctests"]:
+        self.assertIn("    name: portable macOS\n", macos)
+        self.assertNotIn("strategy:", macos)
+        self.assertNotIn("matrix", macos)
+        self.assertEqual(SHARDS["portable-darwin"], 1)
+        self.assertIn('--shard "1/1"', macos)
+        # The same profile and features as before: the ci nextest profile
+        # from the workflow env, the all-features lint, and the doctests,
+        # each unconditional.
+        self.assertIn("  NEXTEST_PROFILE: ci\n", self.ci)
+        for name, command in [("Lint every target, with all features", "run: make lint-macos"),
+                              ("Portable tests", "workflow_adapter.py produce"),
+                              ("Doctests", "run: make test-doc")]:
             block = next(step for step in steps(macos) if "name: " + name in step)
-            self.assertRegex(block, r"if: matrix\.shard == \d\n")
+            self.assertIn(command, block)
+            self.assertNotIn("if:", block)
+        cache = next(step for step in steps(macos) if "Swatinem/rust-cache@" in step)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", cache)
 
     def test_the_heavy_jobs_wait_for_their_own_selection(self):
         for name in ["linux", "linux-next", "build-tests", "cluster", "acceptance"]:

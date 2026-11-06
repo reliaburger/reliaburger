@@ -65,7 +65,7 @@ class WorkflowAssembly(unittest.TestCase):
 
     def test_train_full_plan_waits_for_every_heavy_owner_but_not_macos(self):
         # A full-ci pull request into a merge train: everything except the
-        # three portable macOS shards, which the queue and the train push run.
+        # portable macOS job, which the queue and the train push run.
         plan = self.w.selected_workflow(self.expected, code='true', heavy='true', macos='false')
         self.assertEqual(plan['mode'], 'train-full')
         self.assertEqual(set(plan['jobs']), {'changes', 'portable', 'contract-boundaries', 'linux',
@@ -78,12 +78,13 @@ class WorkflowAssembly(unittest.TestCase):
                 with self.subTest(heavy=heavy, macos=value), self.assertRaises(c.Invalid):
                     self.w.selected_workflow(self.expected, code='true', heavy=heavy, macos=value)
 
-    def test_the_portable_macos_owner_is_split_into_three_hash_partitions(self):
-        self.assertEqual(self.w.SHARDS, {'portable-darwin': 3})
-        self.assertEqual([self.w.partition('portable-darwin', shard) for shard in (1, 2, 3)],
-                         ['hash:1/3', 'hash:2/3', 'hash:3/3'])
+    def test_the_portable_macos_owner_runs_its_whole_suite_in_one_partition(self):
+        # One macOS job, not three shards (plan 2026-11-06, F1): each shard
+        # compiled the whole suite to run a third of it.
+        self.assertEqual(self.w.SHARDS, {'portable-darwin': 1})
+        self.assertEqual(self.w.partition('portable-darwin', 1), 'hash:1/1')
         self.assertIsNone(self.w.partition('portable-linux', None))
-        for gate, shard in [('portable-darwin', None), ('portable-darwin', 0), ('portable-darwin', 4),
+        for gate, shard in [('portable-darwin', None), ('portable-darwin', 0), ('portable-darwin', 2),
                             ('portable-darwin', '1'), ('portable-linux', 1)]:
             with self.subTest(gate=gate, shard=shard), self.assertRaises(c.Invalid):
                 self.w.partition(gate, shard)
@@ -93,12 +94,12 @@ class WorkflowAssembly(unittest.TestCase):
         self.root.joinpath('.config/nextest.toml').write_text('synthetic expected config')
         manifest = {'gates': {'portable-darwin': {'command': ['make', 'test'], 'hosts': ['darwin']}},
                     'contracts': [{'cases': [{'requires': ['portable-darwin'], 'sources': ['src/contract.rs']}]}]}
-        entry = self.w.entry_from_make(self.root, manifest, 'portable-darwin', 'darwin', shard=2)
-        self.assertEqual(entry['partition'], 'hash:2/3')
-        self.assertEqual(entry['selectors'], ['--profile', 'ci', '--partition', 'hash:2/3'])
+        entry = self.w.entry_from_make(self.root, manifest, 'portable-darwin', 'darwin', shard=1)
+        self.assertEqual(entry['partition'], 'hash:1/1')
+        self.assertEqual(entry['selectors'], ['--profile', 'ci', '--partition', 'hash:1/1'])
         run, listed = self.w.gates.commands(entry)
-        self.assertIn('hash:2/3', run)
-        self.assertIn('hash:2/3', listed)
+        self.assertIn('hash:1/1', run)
+        self.assertIn('hash:1/1', listed)
         unsharded = self.w.entry_from_make(self.root, manifest, 'portable-darwin', 'darwin')
         self.assertNotIn('partition', unsharded)
         self.assertNotIn('--partition', unsharded['selectors'])
