@@ -51,6 +51,7 @@ const OPEN_ISSUES: &[(u32, &str)] = &[
     (1238, "pipelines and fair share, after 0.8.0"),
     (1573, "relish agent logs and manual"),
     (1575, "relish agent report"),
+    (1581, "relish agent setup"),
 ];
 
 /// Inline `relish …` spans in prose for commands an open issue is adding.
@@ -71,6 +72,7 @@ const INLINE_PENDING: &[(&str, u32)] = &[
     ("relish agent manual", 1573),
     ("relish mcp", 1094),
     ("relish agent report", 1575),
+    ("relish agent setup", 1581),
 ];
 
 /// Chapters of the manual, which ships inside `relish`.

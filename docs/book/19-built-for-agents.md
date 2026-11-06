@@ -1400,8 +1400,10 @@ command lands. There's an insta snapshot of each generated file and of the
 deterministic, that regenerating from its own output changes nothing, that a
 missing or doubled marker is an error, that an edited chapter makes every
 file quoting it stale, and that a skill description over the format's 1,024
-characters is refused. One reads the embedded chapter and checks that it fits
-the default 24 KiB budget untrimmed. Today it does.
+characters is refused. One reads the embedded chapter and checks how it fits
+the default 24 KiB budget: when this landed it fitted untrimmed, and since
+the playbook joined it (see "Getting started with your agent" below) only
+that last section is trimmed.
 
 `tests/suite/agent_docs.rs` holds the agreement test, plus checks that
 `llms.txt` links every manual chapter, that `SKILL.md`'s front matter follows
@@ -1439,3 +1441,188 @@ skill is loaded into a model and never read by a person, so nobody would
 notice when it went stale. The manual chapter is read by people, compiled
 into the binary, and its snippets are tested. Make the file people read the
 source, and the files only machines read follow it.
+
+## Getting started with your agent
+
+Everything so far helps an agent that already has a cluster. The pitch of
+0.2.7 is earlier than that: you shouldn't have to build the cluster either.
+Paste one sentence into your agent, "Set up a Reliaburger cluster for me.
+Start at https://reliaburger.com/agents.", and it does the rest, stopping only
+for the decisions that are yours. That took three pieces: a playbook for the
+agent to follow, a setup that tells the agent what it built, and a way to
+make cloud machines ready without a single secret in them (#1579).
+
+### A playbook, not a script
+
+The playbook is the last section of the agent chapter, "Setting up a cluster
+for your human", so `/agents`, `llms.txt`'s brief and `relish agent guide` all
+carry it and the drift test keeps them in step. It's five steps: ask where
+(this computer, machines over SSH, or a cloud), check the cloud and ask before
+spending, install and build, show them around, and leave a summary with the
+way out.
+
+Why prose for a model rather than a shell script it runs? Because the hard
+parts are judgement. Which cloud has your human already logged in to? Is the
+free machine big enough? (Google's `e2-micro` has 1 GB of memory, so no.) Is
+it worth three nodes, or is one fine for a look? A script would either ask
+all of that up front or guess. A model can ask the one question that matters
+and use the provider's own CLI, which your human has already set up, for the
+rest.
+
+The playbook dates the numbers it quotes ("as of November 2026") and links
+each to the provider's page, and it tells the agent to look again before
+suggesting anything. Free allowances move: AWS swapped twelve months of free
+micro instances for six months of credits in July 2025, and Oracle's Arm
+allowance in its docs is now 2 OCPUs and 12 GB, half the figure that's still
+in blog posts everywhere. The one rule it doesn't hedge: nothing that costs
+money without an explicit yes.
+
+### `relish setup -o json`
+
+Until now `setup` was on the list of commands that refuse `-o json`, because
+the guided setup asks its questions as it goes. But `--quickstart` and `--ssh`
+never ask anything. They were refusing JSON for no reason, and an agent that
+ran one was left scraping progress lines to tell its human what it had built.
+
+So the two now print a `SetupReport` when they finish. People see the same
+few lines as before; `-o json` gets the facts as one document: the nodes, the
+API endpoint, the app's address, the file holding the admin credential (never
+the credential itself), where the time went, what to run next, how to tear it
+down, and any warning that will stop the next commands working. The progress
+lines move to stderr, as they do for every other command with `-o json`, so
+stdout stays parseable.
+
+The change to the refusal list is a match guard:
+
+```rust
+match command {
+    Command::Setup(options) if options.quickstart || options.ssh.is_some() => Structured,
+    Command::Tui
+    | Command::Dashboard { .. }
+    | Command::Manual { .. }
+    | Command::Source { .. }
+    | Command::Setup(_) => Interactive,
+    // ...
+}
+```
+
+Arms are tried top to bottom, so a `setup` with either flag stops at the
+first arm and every other `setup` falls through to `Interactive`. The guard
+doesn't weaken the exhaustiveness check: `Command::Setup(_)` still has to be
+covered by an arm without one.
+
+Teardown differs by kind of cluster. A laptop cluster has a command, `relish
+local destroy`; one built over SSH doesn't yet, and the honest thing is to say
+so rather than print `null`. That's an internally tagged enum:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Teardown {
+    Command { run: String },
+    Manual { chapter: String, reason: String },
+}
+```
+
+which serialises as `{"kind": "command", "run": "relish local destroy --name
+laptop --yes"}` or `{"kind": "manual", "chapter": "getting-started",
+"reason": "..."}`. An agent reads `kind` and knows whether it has a command to
+quote or steps to walk through. Here, unlike the envelope earlier in this
+chapter, internal tagging is exactly right: the tag is a real field with a
+fixed set of values, not a `bool` serde can't use as one.
+
+The human lines come from the same struct, through its `Display`, which
+`print_output` uses for `-o human`. One type, two renderings, so they can't
+disagree about what was built.
+
+### Cloud-init with nothing secret in it
+
+The research note suggested a cloud-init file that installs a node and joins
+it to the cluster on first boot. We didn't build that one. A joining node
+needs the cluster's master key as well as a join token, and user data is the
+wrong place for a key: the provider stores it, and anything on the machine
+can read it back from the metadata service for as long as the machine lives.
+
+The snippet in the playbook does the boring half instead. It creates a user
+that logs in with your human's public key and runs `sudo` without a password,
+and installs the packages a node needs. Then the agent runs `relish setup
+--ssh` against those machines, and setup mints each node's join token itself,
+over SSH, good for one use in five minutes. The only key anywhere in the user
+data is a public one.
+
+One trap the playbook warns about: cloud-init's own `apt` run can still be
+going when the machine first answers SSH, and setup's `apt-get` would then
+fail on the package lock. So the agent waits with `cloud-init status --wait`
+first.
+
+### The install tabs
+
+The homepage's install section gets two tabs: "Kick the tyres", the one-line
+laptop install as before, and "With your agent", the one prompt. The site has
+three small scripts and a rule against a fourth, so the tabs are two radio
+buttons and their labels, and a CSS rule shows the panel whose button is
+checked:
+
+```css
+#install-tyres:checked ~ .install-panel-tyres,
+#install-agent:checked ~ .install-panel-agent { display: grid; }
+```
+
+Radio buttons give keyboard users arrow keys between the tabs for free, and
+the page still leads with the one-line install, which a test has always
+checked.
+
+### The tests
+
+- `src/relish/quickstart/report.rs` snapshots the JSON for a laptop cluster
+  and for one over SSH with insta, checks that no token appears in it, and
+  that the human lines still lead with "ready in" (two release scripts grep
+  for it) and end with any warning.
+- `src/bin/relish.rs`'s refusal test now has the guided `setup` refusing JSON
+  and `setup --quickstart` and `setup --ssh` taking it.
+- `tests/suite/cloud_init.rs` holds the snippet to the code it serves, since
+  nothing in CI boots it: the packages are exactly `server::PACKAGES`, the
+  user it makes is the one the playbook's `setup --ssh` line logs in as, with
+  passwordless `sudo` and no password login, it mentions no token or key
+  file, and the install and setup lines beside it use flags the installer and
+  `relish` really have.
+- `tests/suite/website.rs` checks the two tabs, the exact prompt, and that the
+  page it names carries the playbook.
+
+The playbook made the agent chapter bigger than `relish agent guide`'s default
+24 KiB budget. That's what the budget is for: the guide drops sections from
+the end, says so, and its `next` step asks for a budget that fits. The
+playbook is the last section on purpose, since an agent already driving a
+cluster needs it least. The guide test now checks exactly that: at the
+default budget only the playbook goes, and at 48 KiB nothing does.
+
+### What we didn't do
+
+- **The recording.** The issue asks for a second recording, "Your agent sets
+  it up", of a real session. Recordings on the site are real runs with real
+  timings, and the build machine was too busy to make an honest one when
+  this landed, so it waits.
+- **Booting cloud-init in CI.** A test parses it and checks it against the
+  code; booting it needs a VM, which the portable suite doesn't have. We
+  tried it once by hand on 6 November 2026, in a throwaway Lima VM running
+  Ubuntu 24.04 and cloud-init 26.1: `cloud-init schema` called it valid,
+  `cloud-init single` applied its `users_groups` and package modules, and
+  `ssh -o BatchMode=yes` with the generated key logged in as `reliaburger`
+  and ran `sudo -n true`. That's the real cloud-init code applying the real
+  file, but on a running machine rather than at first boot, since Lima
+  writes its own user data. It also showed why the playbook mentions exit
+  code `2`: `cloud-init status --wait` printed `status: done` and exited `2`,
+  because of deprecation warnings in Lima's part of the config, not ours.
+- **Per-provider commands.** The playbook names each provider's CLI and
+  leaves the flags to the agent, which can read `--help`. Five sets of
+  `create` flags in the chapter would be five things to go stale.
+- **`relish agent setup`.** Wiring Reliaburger into your agent clients is
+  #1581; the playbook mentions it with a `pending` marker until it lands.
+
+### Lessons
+
+Writing for an agent turned out to be writing for a careful newcomer who
+reads every word and takes it literally. "Check the free tier" isn't enough;
+"say when it's too small, and here's one that is" is. And the most useful
+thing in the whole playbook is a sentence any person would also want: create
+nothing that costs money until I say yes.

@@ -875,23 +875,46 @@ Intro paragraph.\n\n## In brief\n\n\
         }
     }
 
-    #[test]
-    fn guide_answers_from_the_embedded_chapter_within_the_default_budget() {
-        let rendered = run(super::super::DEFAULT_MAX_BYTES, "relish agent guide");
+    /// The headings `relish agent guide` answers with at `max_bytes`, and
+    /// whether it said it trimmed any.
+    fn guide_headings(max_bytes: usize) -> (Vec<String>, serde_json::Value) {
+        let rendered = run(max_bytes, "relish agent guide");
         assert_eq!(rendered.exit, super::super::ExitStatus::Answered);
         let value: serde_json::Value = serde_json::from_str(&rendered.json).unwrap();
         assert_eq!(value["command"], "guide");
         assert_eq!(value["data"]["title"], "Working with an AI agent");
-        assert_eq!(
-            value["truncated"], false,
-            "the chapter fits the default budget"
-        );
+        let headings = value["data"]["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|section| section["heading"].as_str().unwrap().to_string())
+            .collect();
+        (headings, value)
+    }
+
+    /// The setup playbook (#1579) is the chapter's last section because an
+    /// agent driving a cluster needs it least: the default budget drops only
+    /// it, and says how to get it.
+    #[test]
+    fn guide_answers_from_the_embedded_chapter_within_the_default_budget() {
+        const PLAYBOOK: &str = "Setting up a cluster for your human";
+        let (headings, value) = guide_headings(super::super::DEFAULT_MAX_BYTES);
         assert!(
             value["data"]["commands"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|command| command["command"] == "relish agent guide")
+        );
+        let (whole, untrimmed) = guide_headings(48 * 1024);
+        assert_eq!(untrimmed["truncated"], false, "48 KiB fits the chapter");
+        assert_eq!(whole.last().map(String::as_str), Some(PLAYBOOK));
+        assert_eq!(value["truncated"], true);
+        assert_eq!(headings, whole[..whole.len() - 1], "only the playbook goes");
+        let rerun = value["next"][0]["run"].as_str().unwrap();
+        assert!(
+            rerun.starts_with("relish agent guide --max-bytes "),
+            "{rerun}"
         );
     }
 

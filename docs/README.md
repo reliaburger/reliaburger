@@ -809,6 +809,11 @@ generates [`llms.txt`](website/llms.txt), the website's
 plugin in [`plugins/`](../plugins/reliaburger) (install it with `/plugin
 marketplace add reliaburger/reliaburger`) and a block of
 [`AGENTS.md`](../AGENTS.md), and a test fails when any of them is stale.
+The chapter ends with the playbook an agent follows to set a cluster up for
+you, on this computer, on machines over SSH or in a cloud, with a cloud-init
+file that readies machines for `relish setup --ssh` and the rule that nothing
+paid is created without your yes. The homepage's install section has a "With
+your agent" tab with the one prompt that sends an agent there.
 
 Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select
 an exact supported chaos scenario. Omitting the filter runs all five, including
@@ -1512,8 +1517,9 @@ that gossip reports dead is named rather than silently left out.
 once, without stdin or a terminal, and exits with its exit code. `relish
 resolve <name> --namespace <ns>` picks a service whose name exists in several
 namespaces. `-o json` works on every command except the six interactive
-ones (`tui`, `dashboard`, `manual`, `source`, `setup`, `dev shell`), which
-refuse it with exit 2; `logs` and `batch watch` print one object per line,
+ones (`tui`, `dashboard`, `manual`, `source`, the guided `setup`, `dev
+shell`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
+print what they built, for an agent to quote; `logs` and `batch watch` print one object per line,
 and a command that changes something reports what it did (manual chapter
 13). `relish fmt` keeps comments.
 

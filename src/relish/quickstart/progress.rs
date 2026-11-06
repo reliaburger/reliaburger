@@ -13,6 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::relish::output::OutputFormat;
+
 /// Broad phase of setup, used to group the final summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -190,6 +192,23 @@ impl Progress {
         let interactive = std::io::stdout().is_terminal()
             && std::env::var_os("TERM").is_some_and(|term| term != "dumb");
         Self::new(std::io::stdout(), interactive)
+    }
+
+    /// Draw on standard error, updating in place only on a real terminal.
+    pub fn stderr() -> Self {
+        use std::io::IsTerminal;
+        let interactive = std::io::stderr().is_terminal()
+            && std::env::var_os("TERM").is_some_and(|term| term != "dumb");
+        Self::new(std::io::stderr(), interactive)
+    }
+
+    /// Draw where people look: standard output, unless it carries `-o json`
+    /// or `-o yaml` data, which keeps it to itself.
+    pub fn for_output(format: OutputFormat) -> Self {
+        match format {
+            OutputFormat::Human => Self::stdout(),
+            OutputFormat::Json | OutputFormat::Yaml => Self::stderr(),
+        }
     }
 
     fn new<W: Write + Send + 'static>(output: W, interactive: bool) -> Self {
@@ -424,6 +443,18 @@ pub struct StepTiming {
     pub note: Option<String>,
 }
 
+/// How long one stage of setup took, from its first step's start to its last
+/// step's finish.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct StageTiming {
+    /// The stage.
+    pub stage: Stage,
+    /// Wall-clock seconds.
+    pub seconds: f64,
+    /// Bytes downloaded during this run; 0 for a stage without downloads.
+    pub bytes: u64,
+}
+
 /// Every step's timing for one setup run.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Timings {
@@ -465,14 +496,12 @@ impl Timings {
         }
     }
 
-    /// Wall-clock time per stage. Steps in a stage overlap (three VMs boot
-    /// at once), so a stage's time is its first start to its last finish,
-    /// not the sum of its steps.
-    pub fn summary(&self) -> String {
-        let mut text = format!(
-            "where the time went ({:.1}s in total):\n",
-            self.total_seconds
-        );
+    /// Wall-clock time per stage, in setup's order, leaving out stages no
+    /// step ran in. Steps in a stage overlap (three VMs boot at once), so a
+    /// stage's time is its first start to its last finish, not the sum of
+    /// its steps.
+    pub fn stages(&self) -> Vec<StageTiming> {
+        let mut stages = Vec::new();
         for stage in Stage::ALL {
             let steps: Vec<_> = self
                 .steps
@@ -490,14 +519,29 @@ impl Timings {
                 .iter()
                 .map(|step| step.start_seconds + step.seconds)
                 .fold(0.0, f64::max);
-            let span = end - start;
-            let transferred: u64 = steps.iter().filter_map(|step| step.bytes).sum();
-            let mut row = format!("  {:<16} {:>7.1}s", stage.label(), span);
-            if transferred > 0 && span > 0.0 {
+            stages.push(StageTiming {
+                stage,
+                seconds: end - start,
+                bytes: steps.iter().filter_map(|step| step.bytes).sum(),
+            });
+        }
+        stages
+    }
+
+    /// [`Timings::stages`] as the lines setup prints when it ends.
+    pub fn summary(&self) -> String {
+        let mut text = format!(
+            "where the time went ({:.1}s in total):\n",
+            self.total_seconds
+        );
+        for timing in self.stages() {
+            let span = timing.seconds;
+            let mut row = format!("  {:<16} {:>7.1}s", timing.stage.label(), span);
+            if timing.bytes > 0 && span > 0.0 {
                 row.push_str(&format!(
                     "  {} at {}/s",
-                    bytes(transferred),
-                    bytes((transferred as f64 / span) as u64)
+                    bytes(timing.bytes),
+                    bytes((timing.bytes as f64 / span) as u64)
                 ));
             }
             text.push_str(&row);
@@ -752,5 +796,21 @@ mod tests {
         let json = serde_json::to_value(&timings).unwrap();
         assert_eq!(json["steps"][2]["stage"], "boot");
         assert!(json["steps"][2].get("bytes").is_none());
+        // The same spans, as `relish setup -o json` reports them.
+        assert_eq!(
+            timings.stages(),
+            [
+                StageTiming {
+                    stage: Stage::Download,
+                    seconds: 20.0,
+                    bytes: 200 * 1024 * 1024,
+                },
+                StageTiming {
+                    stage: Stage::Boot,
+                    seconds: 54.0,
+                    bytes: 0,
+                },
+            ]
+        );
     }
 }

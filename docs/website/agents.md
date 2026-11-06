@@ -18,7 +18,8 @@ This chapter is also where every agent-facing file comes from. `relish agent
 guide` prints it, and `make agent-docs` builds `llms.txt`, the website's
 `/agents` page, the `reliaburger` skill, the Claude Code plugin and part of
 the repository's `AGENTS.md` from it, so they can't disagree. It grows through
-0.2.7 as the commands arrive.
+0.2.7 as the commands arrive. It ends with the playbook an agent follows to
+set a cluster up for you, which is where `reliaburger.com/agents` sends one.
 
 ## In brief
 
@@ -44,9 +45,13 @@ If you're an agent operating or debugging a Reliaburger cluster:
   links that commit's code.
 - **Use `-o json` for everything else.** Every `relish` command takes it
   except the six interactive ones: `tui`, `dashboard`, `manual`, `source`,
-  `setup` and `dev shell`.
+  `dev shell` and the guided `setup`. `setup --quickstart` and `setup --ssh`
+  take it.
 - **Never post, change or file anything without your human.** Draft it, show
   it, and let them send it.
+- **Asked to set up a cluster?** Follow the playbook "Setting up a cluster for
+  your human" at <https://reliaburger.com/agents>, the last section of
+  `relish agent guide`, and spend nothing without an explicit yes.
 
 ## A read-only token
 
@@ -334,7 +339,8 @@ it is now, and `data.origin` in `version` says so. Release builds embed it.
 The rest of `relish` was written for people first, but every command takes
 `-o json` (or `-o yaml`) and prints the same facts its table shows. Six
 refuse it, exit `2` and say they're interactive: `tui`, `dashboard`,
-`manual`, `source`, `setup` and `dev shell`. Without a terminal, as in an
+`manual`, `source`, `dev shell` and `setup` without `--quickstart` or
+`--ssh`, which asks its questions as it goes. Without a terminal, as in an
 agent's shell, `relish`, `relish manual` and `relish source` exit at once and
 name the command to use instead. The `reference` chapter lists what each
 command's JSON holds.
@@ -422,3 +428,125 @@ ci`, or a gated target such as `make test-cluster`. And if it finds behaviour
 no test covers, tell us with the test request form. A missing test is a bug
 too. [How Reliaburger is tested](https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md)
 has every layer.
+
+## Setting up a cluster for your human
+
+Asked to "set up a Reliaburger cluster"? This is the playbook. Your human
+should only have to make the decisions that are theirs: where it runs, and
+whether to pay for it. You do the rest, and say what you're doing as you go.
+
+### 1. Ask where
+
+Offer three places and wait for the answer:
+
+- **This computer**: three Linux VMs in Lima. It needs a Mac with Apple
+  silicon, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
+  15 GiB of disk.
+- **Machines they already have**, over SSH. Each needs Ubuntu 24.04 or Debian
+  12 or later on x86_64 or aarch64, 2 CPU cores, 2 GiB of memory, 10 GiB free
+  under `/var/lib`, an SSH key that logs in without a prompt and passwordless
+  `sudo`. TCP port 9117 on the first one must be reachable from this computer.
+- **A cloud**: new machines that meet the same bar, made with the provider's
+  own CLI.
+
+One machine is enough to try it. Three form a council that survives losing one.
+
+### 2. A cloud: check first, and ask before anything costs money
+
+Use the provider's own CLI, logged in by your human: `gcloud`, `oci`,
+`hcloud`, `doctl` or `aws`. Look up today's sizes, prices and free allowances
+on the provider's own pages before you suggest anything, because they change.
+Then say what you'd create and what it costs per month, and create nothing
+paid without an explicit yes. Be honest when a free machine is too small. As
+of November 2026:
+
+- Google Cloud's always-free machine is one `e2-micro`, with 1 GB of memory:
+  too small for a node ([free features](https://docs.cloud.google.com/free/docs/free-cloud-features)).
+- Oracle Cloud's Always Free Arm allowance comes to 2 OCPUs and 12 GB a month,
+  in the home region: enough for one or two nodes
+  ([Always Free resources](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm)).
+- AWS's free plan is credits for six months, and `t3.small`, `t4g.small` and
+  the `-flex.large` types are among the eligible machines
+  ([EC2 free tier](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-free-tier-usage.html)).
+  It ends, so say when.
+- Hetzner and DigitalOcean have no free machines: pick the smallest with
+  2 vCPUs and 2 GiB, and quote its price.
+
+Open TCP 9117 to your human's address only, and the cluster ports between the
+machines (the `reference` chapter lists them), in the provider's firewall.
+Every one of these CLIs takes a user-data file when it creates a machine. Give
+each machine this one, with your human's public key:
+
+```yaml
+#cloud-config
+# Ready for `relish setup --ssh`: a user that logs in with your key and runs
+# sudo without a password, and the packages a node needs. No secrets.
+users:
+  - default
+  - name: reliaburger
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA...replace-with-your-public-key
+package_update: true
+packages:
+  - runc
+  - uidmap
+  - iptables
+  - iproute2
+  - btrfs-progs
+  - nftables
+  - curl
+```
+
+It carries nothing secret, so it doesn't matter that the provider keeps it
+and anything on the machine can read it back. Setup makes each node's join
+token itself, over SSH, good for one use in five minutes. Wait for cloud-init
+to finish before setup, or the two fight over `apt`:
+`ssh reliaburger@<address> cloud-init status --wait`. Wait for `status:
+done`; it exits `2` when cloud-init finished with only warnings, often about
+the provider's own part of the config.
+
+### 3. Install and build
+
+Install `relish` on this computer, then build with `-o json`:
+
+```sh
+curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
+relish setup --quickstart -o json
+relish setup --ssh reliaburger@203.0.113.10,reliaburger@203.0.113.11,reliaburger@203.0.113.12 -o json
+```
+
+Neither asks anything. SSH runs with `BatchMode`, so a key that wants a
+passphrase fails at once instead of waiting. Progress goes to stderr and, when
+the cluster is up, one JSON document to stdout: `nodes`, the `api` endpoint,
+the `app` address, the `context` file holding the admin credential (never the
+credential itself), `back_up` for a cluster over SSH, `next`, `teardown` and
+`warnings`. Quote it rather than paraphrase it. A warning means the `next`
+commands will fail until it's dealt with, and it says how, usually a firewall
+rule. If setup stops, run the same command again: it resumes.
+
+### 4. Show them around
+
+Run `relish status`, then take your human through the five-minute tour, one
+command at a time, saying what each shows before you run the next. Read it as
+`08_five-minute-tour.md` from `llms.txt`: `relish manual tour` opens the same
+chapter, but only in a terminal. The tour
+changes only its own demo app. Its fault commands take `--acknowledge`, so say
+what they'll break first. Its addresses are a laptop cluster's; on machines
+over SSH, use the `app` address from the report.
+
+### 5. Leave a summary and the way out
+
+Finish with a short summary: where the cluster runs, its nodes, the API and
+the app, where the admin credential lives, what to back up, what it costs per
+month, and how to remove it: the report's `teardown`, plus the provider's
+delete command for every machine you made. Then suggest a read-only token for
+your next session (see "A read-only token"). `relish agent setup` (#1581) will
+wire Reliaburger into your human's agent clients; until it ships, this doesn't
+parse:
+
+```sh
+relish agent setup
+```

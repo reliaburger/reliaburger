@@ -1,0 +1,80 @@
+---
+source: src/relish/quickstart/report.rs
+expression: "format_output(&servers_report(None), OutputFormat::Json).unwrap()"
+---
+{
+  "cluster": "servers",
+  "kind": "servers",
+  "version": "0.2.7",
+  "seconds": 187.25,
+  "stages": [
+    {
+      "stage": "host",
+      "seconds": 0.5,
+      "bytes": 0
+    },
+    {
+      "stage": "download",
+      "seconds": 60.0,
+      "bytes": 629145600
+    },
+    {
+      "stage": "boot",
+      "seconds": 50.0,
+      "bytes": 0
+    },
+    {
+      "stage": "configure",
+      "seconds": 40.0,
+      "bytes": 0
+    },
+    {
+      "stage": "verify",
+      "seconds": 36.25,
+      "bytes": 0
+    }
+  ],
+  "nodes": [
+    {
+      "name": "rb-servers-1",
+      "address": "10.0.0.1",
+      "ssh": "ubuntu@10.0.0.1"
+    },
+    {
+      "name": "rb-servers-2",
+      "address": "10.0.0.2",
+      "ssh": "ubuntu@10.0.0.2"
+    },
+    {
+      "name": "rb-servers-3",
+      "address": "10.0.0.3",
+      "ssh": "ubuntu@10.0.0.3:2222"
+    }
+  ],
+  "api": "https://10.0.0.1:9117",
+  "context": "/home/me/.reliaburger/context.json",
+  "app": "http://10.0.0.1",
+  "state_directory": "/home/me/.reliaburger/clusters/servers",
+  "timings_file": null,
+  "back_up": "/home/me/.reliaburger/clusters/servers/security",
+  "next": [
+    {
+      "run": "relish status",
+      "why": "every app and node"
+    },
+    {
+      "run": "relish logs hello",
+      "why": "the demo app's logs"
+    },
+    {
+      "run": "relish wtf",
+      "why": "anything that needs attention"
+    }
+  ],
+  "teardown": {
+    "kind": "manual",
+    "chapter": "getting-started",
+    "reason": "no command removes a cluster built over SSH yet"
+  },
+  "warnings": []
+}
