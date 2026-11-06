@@ -51,7 +51,7 @@ pub(super) async fn deploy_cancel_handler(
     let arrays = crate::bun::task_array_leader::read_task_arrays(&state).await;
     if arrays.deployments().any(|(operation, _)| operation == id) {
         if let Some(council) = &state.council
-            && !council.is_leader().await
+            && !crate::bun::leadership::leads(council).await
         {
             return crate::bun::batch::forward_to_leader(
                 &state,
