@@ -830,6 +830,8 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
   `compatibility`, the `protocol` and `state` pair `package.py` reads from
   `CURRENT` in `src/compatibility.rs`, so `relish upgrade check` and `start`
   can tell a release that needs a fresh cluster from one that can roll.
+  From 0.2.7 it also carries `notes`, one line pointing at the release page,
+  which `relish agent upgrade-check` passes on inside an untrusted envelope.
   `external_signature` is always `null` in published metadata: only the
   operator holds that key, so `relish upgrade start <version>` takes
   `--external-key` (or a countersigned `--sig`) and adds it.

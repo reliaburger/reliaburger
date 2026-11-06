@@ -1874,3 +1874,158 @@ The budget is a safety net, not a design. It keeps any answer valid and
 bounded, but it doesn't know which half of a log matters. A command that
 knows its data should fit itself, and then say, in fields an agent can't
 miss, exactly what it left out.
+
+## Can it roll?
+
+Ask `relish upgrade check` whether to upgrade and it compares two version
+numbers, checks the release has a build for each node's platform, and says
+`available`. That's a fine answer for a person, who knows the payments app
+has been crash looping since lunch and that one of the three council members
+died on Tuesday. An agent doesn't know either of those things unless
+something tells it. Hand it `available` and it'll suggest `relish upgrade
+start` on a cluster where restarting the next council member loses quorum.
+
+`relish agent upgrade-check` (#1576) answers the question an agent actually
+needs answered: can this cluster take the latest release now? It reads the
+release metadata, each node's build through the entry node's relay, the
+upgrade state and a full `relish wtf` diagnosis, and turns them into one of
+five verdicts:
+
+```json
+{"verdict": "blocked",
+ "reasons": [
+   {"code": "node_down", "kind": "blocker", "node": "node-3",
+    "message": "node-3 is dead; it would miss the roll and come back on its old version"},
+   {"code": "quorum_risk", "kind": "blocker", "node": null,
+    "message": "2 of 3 council members are up; restarting one at a time leaves 1, and quorum needs 2"},
+   {"code": "wtf_critical", "kind": "blocker", "node": null,
+    "message": "relish wtf: payments is crash looping (crash-loop, app/default/payments)"}],
+ "latest": {"version": "v0.2.7", "formats": {"protocol": 57, "state": 74},
+            "platforms": ["linux-aarch64", "linux-x86_64"]},
+ "nodes": ["…"], "metadata": "https://github.com/…/metadata.json", "release_notes": null}
+```
+
+`ready`, `up_to_date`, `needs_fresh_cluster` and `blocked` are the four the
+issue asked for, plus `unknown`. We added `up_to_date` because `ready` for a
+cluster with nothing to upgrade would send an agent off to run `relish
+upgrade start` for no reason.
+
+### Never `ready` on missing evidence
+
+The rule that shaped the code is that silence is never good news. A node
+that didn't answer, a node that didn't say its platform, a release whose
+metadata doesn't name its cluster formats, a `wtf` that timed out: each is a
+`missing_evidence` reason, and any one of them stops the verdict being
+`ready`. The verdict is the worst thing found, in a fixed order:
+
+1. the metadata or the cluster didn't answer at all: `unknown`;
+2. every live node runs the latest or newer: `up_to_date`;
+3. a node speaks other formats than the release: `needs_fresh_cluster`;
+4. any blocker: `blocked`;
+5. any missing evidence: `unknown`;
+6. otherwise `ready`.
+
+A format change outranks a blocker on purpose. A quorum risk matters to a
+rolling upgrade; a fresh cluster doesn't roll, so telling the agent to fix
+the quorum first would be advice for a path it can't take. The reasons are
+still all there, sorted blockers first, so nothing is hidden.
+
+The quorum rule needed a moment's thought. The orchestrator restarts council
+members one at a time, so at each step one live voter is briefly gone. That's
+safe only if the rest are still a majority of the whole council: with `total`
+members and `live` of them up, the check is `live - 1 >= total / 2 + 1`. Three
+up of three passes. Two up of three doesn't. Two of two doesn't either, which
+is right: a two-member council loses quorum every time one restarts. A
+one-member council is skipped, because it has no quorum to keep, and its
+restart is the sub-second bounce every one-node cluster takes.
+
+### Evidence, then a verdict
+
+The code splits the same way `relish wtf` does. `collect_cluster` asks the
+questions and records the answers, failures included, in plain structs:
+
+```rust
+pub struct NodeEvidence {
+    pub node: String,
+    pub role: NodeRole,
+    pub state: String,
+    pub build: Result<AgentVersion, String>,
+}
+```
+
+`build` is a `Result` stored as data, not one returned with `?`. In Go you'd
+keep a `(value, err)` pair in a struct; in Python, `None` and a separate
+reason. Rust's `Result<T, E>` is an ordinary enum, so it can sit in a field
+like any other value, and `assess`, a pure function from `&Evidence` to the
+answer, has to `match` on it before it can touch the version. There's no way
+to read a node's platform and forget that the node never answered.
+
+`assess` builds its reasons in a `Vec`, then sorts them by kind with
+`sort_by_key`. Rust's `sort_by_key` is stable, like Python's `sorted`: two
+blockers keep the order the checks found them in, so the snapshots don't
+shuffle.
+
+One more Rust detail from the tests. The "missing evidence is never ready"
+test runs the same assertion over five ways to lose a piece of evidence, each
+a closure that breaks a healthy cluster:
+
+```rust
+type Breakage = fn(&mut ClusterEvidence);
+
+let gaps: [(&str, Breakage); 5] = [
+    ("no platform", |c| c.nodes[3].build = Ok(build("v0.2.6", None))),
+    ("no wtf", |c| c.wtf = Err("timed out".to_string())),
+    // …
+];
+```
+
+Each closure has its own anonymous type, so they can't share an array as
+they are. But a closure that captures nothing coerces to a plain function
+pointer, `fn(&mut ClusterEvidence)`, which is one type, the same as a C
+function pointer. Write the type on the array and the compiler does the
+coercion. The `type` alias is only a name, like C's `typedef`; clippy asks
+for one when a type gets long.
+
+### Release notes are someone else's words
+
+The release metadata gained an optional `notes` field, and `package.py`
+fills it with a line pointing at the release page. Text fetched from a
+metadata host is text someone else controls, so it travels the way an app's
+log lines do: inside an `untrusted` envelope with origin `release_metadata`,
+stripped of escapes and redacted. The rest of the metadata is parsed into
+types (a `BinaryVersion`, a pair of numbers, a map of platforms) before
+anything reaches the output, so there's no free text left to smuggle in.
+
+The metadata is also the only network call. `--metadata ./metadata.json`
+reads a file instead, which is how an air-gapped cluster checks, and how the
+tests run the whole command with no network: the metadata from a temporary
+file, the cluster on a port nobody listens on, and the answer `unknown` with
+`cluster_unreachable` and exit 0.
+
+### The tests
+
+`assess` gets most of them, because it's pure. Each verdict has a test and a
+snapshot of its envelope: a healthy three-member council and a worker
+(`ready`, with `relish upgrade plan` as a read-only next step and `relish
+upgrade start` as one that isn't), a single node on the latest
+(`up_to_date`, even with a `wtf` critical, since there's nothing to roll), a
+protocol bump (`needs_fresh_cluster`, linking the compatibility policy), a dead
+council member plus a RISC-V worker plus a crash loop (`blocked`, four
+reasons) and an unreachable cluster (`unknown`). Unit tests cover each
+blocker on its own, the quorum arithmetic for one, two and three members, a
+blocker outranking a gap, and release notes arriving cleaned. One test points
+`collect_cluster` at a fake node built with axum: four listed nodes, one dead,
+each live one answering `/v1/version` through the relay path, and no
+`/v1/health`, so `wtf` can't run and the verdict can't be `ready`.
+
+### What we didn't do
+
+- **Fetch the release notes themselves.** They live on the GitHub release
+  page, written after the binaries are packaged. Fetching them would be a
+  second network call to a second host; the metadata's pointer is enough for
+  an agent to show a human.
+- **Check disk space or the image registry.** `wtf` already reports a node
+  short of disk, and that's a critical.
+- **Start the upgrade.** No `relish agent` command mutates the cluster. The
+  `ready` answer's `next` has the start command with `read_only: false`, for a
+  human to say yes to.

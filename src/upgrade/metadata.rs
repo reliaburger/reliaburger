@@ -35,6 +35,11 @@ pub struct Release {
     /// until 1.0. Absent in metadata published before 0.2.0.
     #[serde(default)]
     pub compatibility: Option<crate::compatibility::Compatibility>,
+    /// Notes the metadata host publishes with the release. Free text from
+    /// the network: `relish agent upgrade-check` passes it on only inside an
+    /// untrusted envelope. Absent in metadata published before 0.2.7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
     /// Keyed by `{os}-{arch}` (`linux-x86_64`, `macos-aarch64`, ...).
     pub platforms: BTreeMap<String, PlatformArtifact>,
 }

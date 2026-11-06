@@ -245,10 +245,14 @@ cluster and the release share a pair.
    same thing locally. With `-o json` the answer is a `verdict` field
    (`up_to_date`, `available`, `needs_fresh_cluster`, `no_artefact_for_node`
    or `no_artefacts`), with the `command` to run when one is available.
+   `relish agent upgrade-check` asks the same question for an agent, and
+   adds `relish wtf`'s critical findings, the council's quorum and version
+   skew ([Working with an AI agent](16_working-with-an-ai-agent.md#before-an-upgrade)).
 
    ```sh
    relish upgrade check
    relish -o json upgrade check
+   relish agent upgrade-check
    ```
 
 2. Make your countersigning key, once. Put the `ed25519:…` public key it

@@ -23,6 +23,7 @@ pub mod logs;
 pub mod manual;
 pub mod source;
 pub mod untrusted;
+pub mod upgrade_check;
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -80,6 +81,9 @@ pub enum AgentCommand {
         /// A finding id, e.g. `crashloop`.
         id: Option<String>,
     },
+    /// Whether the cluster can take the latest release: `ready`,
+    /// `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`.
+    UpgradeCheck(upgrade_check::UpgradeCheckArgs),
 }
 
 impl AgentCommand {
@@ -94,6 +98,7 @@ impl AgentCommand {
             AgentCommand::Context(_) => CommandName::Context,
             AgentCommand::Diagnose(_) => CommandName::Diagnose,
             AgentCommand::Explain { .. } => CommandName::Explain,
+            AgentCommand::UpgradeCheck(_) => CommandName::UpgradeCheck,
         }
     }
 }
@@ -142,6 +147,9 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
         }
         AgentCommand::Explain { id } => {
             diagnose::run_explain(id.as_deref(), options.max_bytes, rerun)
+        }
+        AgentCommand::UpgradeCheck(args) => {
+            upgrade_check::run(args, options.max_bytes, rerun).await
         }
     }
 }
@@ -236,6 +244,7 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::Context => Some(schema_of::<context::ContextData>()),
         CommandName::Diagnose => Some(schema_of::<diagnose::DiagnoseData>()),
         CommandName::Explain => Some(schema_of::<diagnose::ExplainData>()),
+        CommandName::UpgradeCheck => Some(schema_of::<upgrade_check::UpgradeCheckData>()),
     }
 }
 
@@ -475,7 +484,8 @@ mod tests {
                 "manual show",
                 "context",
                 "diagnose",
-                "explain"
+                "explain",
+                "upgrade-check"
             ]
         );
         let envelope = &value["data"]["envelope"];
