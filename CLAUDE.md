@@ -1,5 +1,7 @@
 # Reliaburger — Project Guide
 
+@AGENTS.md
+
 ## What This Is
 
 Reliaburger is a batteries-included container orchestrator written in Rust. It is a single binary that replaces Kubernetes + its ecosystem of add-ons with something dramatically simpler.
