@@ -2350,6 +2350,29 @@ impl StateMachineInner {
                     },
                 );
             }
+            RaftRequest::RotateOidcSigningKey {
+                signing_key,
+                retire_after_unix_secs,
+                now_unix_secs,
+            } => {
+                return crate::sesame::oidc::rotate_signing_key(
+                    &mut self.state.security_state,
+                    signing_key.clone(),
+                    *retire_after_unix_secs,
+                    *now_unix_secs,
+                )
+                .err()
+                .map(|error| CouncilResponse::Refused {
+                    reason: error.to_string(),
+                });
+            }
+            RaftRequest::RetireOidcSigningKeys { now_unix_secs } => {
+                crate::sesame::oidc::retire_signing_keys(
+                    &mut self.state.security_state,
+                    *now_unix_secs,
+                );
+                return None;
+            }
             RaftRequest::AcknowledgeNodeTrust {
                 node_id,
                 generation,
@@ -6731,6 +6754,43 @@ mod tests {
             inner.state.security_state.trusted_cas(CaRole::Node).len(),
             1
         );
+    }
+
+    /// #709: a signing-key rotation through the log moves the old key to
+    /// retiring with the window the proposer chose, refuses a cluster with
+    /// no key, and a later retire drops the old key once its window ends.
+    #[test]
+    fn oidc_signing_key_rotation_and_retirement_through_the_log() {
+        let ikm = [6u8; 32];
+        let old = crate::sesame::oidc::generate_oidc_keypair("https://rotate", &ikm).unwrap();
+        let new = crate::sesame::oidc::generate_oidc_keypair("https://rotate", &ikm).unwrap();
+        let mut inner = StateMachineInner::default();
+        let rotate = RaftRequest::RotateOidcSigningKey {
+            signing_key: new.clone(),
+            retire_after_unix_secs: 2_000,
+            now_unix_secs: 1_000,
+        };
+        assert!(matches!(
+            inner.apply_request(&rotate),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.state.security_state.oidc_signing_config = Some(old.clone());
+        assert_eq!(inner.apply_request(&rotate), None);
+        let security = &inner.state.security_state;
+        assert_eq!(security.oidc_signing_config.as_ref(), Some(&new));
+        assert_eq!(security.retiring_oidc_keys.len(), 1);
+        assert_eq!(security.retiring_oidc_keys[0].key_id, old.key_id);
+
+        let early = RaftRequest::RetireOidcSigningKeys {
+            now_unix_secs: 1_999,
+        };
+        assert_eq!(inner.apply_request(&early), None);
+        assert_eq!(inner.state.security_state.retiring_oidc_keys.len(), 1);
+        let due = RaftRequest::RetireOidcSigningKeys {
+            now_unix_secs: 2_000,
+        };
+        assert_eq!(inner.apply_request(&due), None);
+        assert!(inner.state.security_state.retiring_oidc_keys.is_empty());
     }
 
     /// F04 R4 through the log: prepare allocates the serial the operator's

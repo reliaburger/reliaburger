@@ -75,7 +75,10 @@ pub(crate) use apply::{
 use apply::{apply_handler, cluster_apply};
 use apps::{delete_handler, exec_handler, release_handler, stop_handler};
 use audit::audit_handler;
-use ca::{ca_rotation_begin_handler, ca_rotation_finalize_handler, ca_rotation_prepare_handler};
+use ca::{
+    ca_rotation_begin_handler, ca_rotation_finalize_handler, ca_rotation_prepare_handler,
+    signing_key_rotate_handler,
+};
 use deploys::{
     cluster_deploy_history, deploy_cancel_handler, deploys_active_handler, deploys_history_handler,
     deploys_operations_handler, rollback_handler,
@@ -904,6 +907,10 @@ pub fn router_with_upgrade(
         .route(
             "/v1/ca/rotation/finalize",
             post(ca_rotation_finalize_handler),
+        )
+        .route(
+            "/v1/identity/signing-key/rotate",
+            post(signing_key_rotate_handler),
         )
         // Inside the auth layer, so it sees who the caller is (#685).
         .route_layer(axum::middleware::from_fn_with_state(

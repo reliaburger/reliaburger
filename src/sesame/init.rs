@@ -125,6 +125,7 @@ pub fn initialize_cluster(
         join_tokens: vec![],
         next_serial: 6, // Next available serial after root(1), node(2), workload(3), ingress(4), first-node(5)
         oidc_signing_config: Some(oidc_config),
+        retiring_oidc_keys: Vec::new(),
         crl: super::types::Crl::default(),
         secret_seals: std::collections::BTreeMap::new(),
         // The first node's leaf is signed here rather than through the

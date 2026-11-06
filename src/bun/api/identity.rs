@@ -3,7 +3,8 @@
 
 use super::*;
 
-/// JWKS endpoint — publishes the OIDC Ed25519 public key for JWT verification.
+/// JWKS endpoint: publishes the OIDC Ed25519 public keys for JWT
+/// verification, the active one and any a rotation is retiring (#709).
 pub(super) async fn identity_jwks_handler(State(state): State<ApiState>) -> Response {
     let Some(ref council) = state.council else {
         return (
@@ -14,15 +15,21 @@ pub(super) async fn identity_jwks_handler(State(state): State<ApiState>) -> Resp
     };
 
     let security_state = council.security_state().await;
-    let Some(ref oidc_config) = security_state.oidc_signing_config else {
-        return (
+    match crate::sesame::oidc::jwks_for_state(&security_state, unix_now_secs()) {
+        Some(jwks) => Json(jwks).into_response(),
+        None => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "error": "no OIDC signing config" })),
         )
-            .into_response();
-    };
+            .into_response(),
+    }
+}
 
-    Json(crate::sesame::oidc::jwks_response(oidc_config)).into_response()
+/// Seconds since the Unix epoch, zero for a clock before it.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Attach an operator's detached image signature (from `relish sign`) to a

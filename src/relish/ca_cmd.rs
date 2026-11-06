@@ -242,6 +242,26 @@ pub async fn ca_rotate_finalize(role: CaRole) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// `relish identity rotate-signing-key`: sign workload JWTs with a new key,
+/// and say which key keeps verifying until when (#709).
+pub async fn identity_rotate_signing_key() -> Result<(), RelishError> {
+    let client = super::client::BunClient::default_local();
+    let rotated = client.identity_rotate_signing_key().await?;
+    println!("{}", rotation_message(&rotated));
+    Ok(())
+}
+
+/// What `relish identity rotate-signing-key` prints for `rotated`.
+fn rotation_message(rotated: &crate::sesame::oidc::RotatedSigningKey) -> String {
+    format!(
+        "Workload identity tokens are now signed with key {}.\n\
+         Key {} keeps verifying until {} UTC; workloads pick up new tokens on their next refresh.",
+        rotated.key_id,
+        rotated.retiring_key_id,
+        super::audit_cmd::format_time(rotated.retire_after)
+    )
+}
+
 /// Sign the council's CSR with the backup's root. Split from [`ca_rotate`]
 /// so tests can run it without a cluster.
 fn sign_prepared_rotation(
@@ -399,6 +419,21 @@ fn prompt_secret(_prompt: &str) -> Result<SecretString, RelishError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rotation_says_which_key_signs_and_until_when_the_old_one_verifies() {
+        let message = rotation_message(&crate::sesame::oidc::RotatedSigningKey {
+            key_id: "new0123456789abc".into(),
+            retiring_key_id: "old0123456789abc".into(),
+            retire_after: 1_793_966_400,
+        });
+        assert_eq!(
+            message,
+            "Workload identity tokens are now signed with key new0123456789abc.\n\
+             Key old0123456789abc keeps verifying until 2026-11-06 12:00:00 UTC; \
+             workloads pick up new tokens on their next refresh."
+        );
+    }
     use crate::sesame::root_backup::RootBackupError;
 
     const PASSPHRASE: &str = "correct horse battery staple";
