@@ -27,6 +27,8 @@ cargo build --bins
 
 The repository's `Makefile` contains the supported development commands. Run `make help` to see them all.
 
+Or skip the set-up: [`.devcontainer/`](.devcontainer) builds an Ubuntu 24.04 environment with the Rust and nextest versions CI pins, the C compiler, static libc, clang, LLVM and libbpf the build needs, Python 3.12 and cargo-mutants. Open the repository in VS Code's Dev Containers, a GitHub Codespace or any tool that reads the [Dev Container spec](https://containers.dev/) and run `make ci`; give it 4 CPUs and 16 GB of memory. GitHub's Copilot coding agent gets the same toolchain from [`copilot-setup-steps.yml`](.github/workflows/copilot-setup-steps.yml). Only the portable suite runs in either: the gated targets need root, runc, eBPF or a Mac, so when you say tests passed there, say it was the portable set ([docs/testing.md](docs/testing.md#the-development-container)).
+
 ## Tests First
 
 Tests are part of the design, not a final inspection step. Start with a failing test that describes the behaviour you want, then implement the smallest change that makes it pass.
@@ -41,6 +43,8 @@ make lint                 # Clippy, all features and none, warnings as errors
 ```
 
 `make ci` runs the standard portable CI checks together, including `make check-ignored`, which fails when an `#[ignore]` reason doesn't name the target or script that runs it (see [who runs an ignored test](docs/testing.md#who-runs-an-ignored-test)). Use the specialised targets for ignored acceptance suites when your environment supports them: `make test-linux`, `make test-cluster`, `make test-upgrade`, `make test-standard-clients` and `make test-apple`.
+
+Looking for a first contribution? Take an issue labelled [`missed-mutant`](https://github.com/reliaburger/reliaburger/labels/missed-mutant). Each one is a small change to the code (cargo-mutants' *mutant*) that no test noticed, with the line, the change and the command that checks it, such as `cargo mutants --file src/onion/dns.rs --re '...'`. Write a test that fails with the mutant, run the command again, and it's done when cargo-mutants reports the mutant `caught`. A pull request that touches `src/` gets the same check on the lines it changes, as a non-blocking job whose summary lists what it missed ([mutation testing](docs/testing.md#mutation-testing)).
 
 Tests should describe behaviour in their names, cover failure and boundary cases, and avoid relying on timing or external services unless the test is an explicit integration or acceptance test. Unit tests belong beside the code; cross-subsystem tests belong in `tests/suite/` as a module of the single portable integration binary. Add a separate `tests/*.rs` binary only for gated, heavy or process-isolated suites (see `docs/design/test-harness.md`).
 

@@ -518,7 +518,9 @@ in [docs/book/](docs/book/).
 
 Bug reports and pull requests are welcome. Read the
 [contributing guide](CONTRIBUTING.md) first: changes come with tests and a
-matching update to the book.
+matching update to the book. [`.devcontainer/`](.devcontainer) gives you CI's
+toolchain in one step for `make ci` (the portable suite only), and issues
+labelled `missed-mutant` are self-checking first tasks.
 
 ## Licence
 

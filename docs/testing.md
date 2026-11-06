@@ -73,6 +73,35 @@ nothing before nextest: in CI the cluster and acceptance suites run from the
 `build tests` job's nextest archive, and the `qualify-*.sh` scripts already
 build with `cargo test --no-run`.
 
+### The development container
+
+[`.devcontainer/`](../.devcontainer) is a ready environment for the portable
+set ([#1584](https://github.com/reliaburger/reliaburger/issues/1584)): open the
+repository in VS Code's Dev Containers, a Codespace or anything else that
+reads the [Dev Container spec](https://containers.dev/), and `make ci` runs
+with nothing else to install. It's Ubuntu 24.04, as CI's runners are, with
+the Rust CI pins (`RUST_VERSION` in the
+[Dockerfile](../.devcontainer/Dockerfile)), the nextest
+`.config/nextest.toml` pins, the C compiler and static libc `build.rs` needs,
+clang, LLVM and libbpf for `make lint`'s all-features build, Python 3.12 and
+cargo-mutants. It works as the image's own user, `ubuntu`, not root: some
+portable tests check file permissions, which root ignores. Give it 4 CPUs and
+16 GB; the target directory alone grows past 30 GB.
+
+[`copilot-setup-steps.yml`](../.github/workflows/copilot-setup-steps.yml) does
+the same for GitHub's Copilot coding agent, which runs the job of that name
+before it starts work, and builds the suite so the agent's first test run is
+warm.
+
+Only the portable suite runs in either. The gated targets (`make
+test-linux`, `make test-cluster`, `make test-upgrade`, `make test-apple` and
+the rest) need root, runc, network namespaces, a kernel that loads eBPF or a
+Mac, so "`make ci` passed in the devcontainer" means the portable set passed,
+nothing more. Say so in a pull request.
+[`toolchain_pins.rs`](../tests/suite/toolchain_pins.rs) fails when the
+Dockerfile's Rust, nextest or packages, the mutants job's or the Copilot
+job's drift from what `ci.yml` installs.
+
 ### Doc snippets
 
 The manual ships inside `relish`, so a wrong snippet ships in the binary.
@@ -658,6 +687,76 @@ through the same cargo-fuzz targets
 Applying needs a `projects/reliaburger/` directory in the OSS-Fuzz repository
 (a `project.yaml`, a Dockerfile and a `build.sh` that runs `cargo fuzz build -O`),
 once the targets have run clean nightly for a while.
+
+## Mutation testing
+
+Coverage says a line ran. It doesn't say a test would notice if the line were
+wrong. [cargo-mutants](https://mutants.rs/) checks that: it makes one small
+change at a time (a `>` becomes `>=`, a function returns
+`Default::default()`, a match guard becomes `true`), runs the tests, and
+reports each change that no test fails on as *missed*
+([#1584](https://github.com/reliaburger/reliaburger/issues/1584)). A missed
+mutant is a missing test, with the exact line and the exact wrong behaviour
+already written down, which makes it the most self-checking first
+contribution there is: the new test is right when the mutant stops being
+missed.
+
+[`mutants.yml`](../.github/workflows/mutants.yml) runs it, on Linux only and
+in its own workflow, so it's never on a pull request's critical path: the
+evidence gate doesn't wait for it, and a missed mutant doesn't turn the check
+red. Only a broken run (the unmutated tree failing its tests, say) does.
+
+| Run | What it mutates | At most | Wall time |
+|---|---|---|---|
+| A pull request that touches `src/` | The lines it changes ([`--in-diff`](https://mutants.rs/in-diff.html)) | 20 mutants | an estimated 10 minutes plus about 3 a mutant, so at most about 70 |
+| A pull request that changes only the mutants set-up | `src/file_lock.rs`, as a check that the job still works | 20 | the same |
+| Sundays at 04:23 UTC | What landed on `main` in the last seven days | 90 | up to six hours |
+| By hand (`workflow_dispatch`) | A glob of files, or the last seven days | as asked | |
+
+Each mutant rebuilds the crate, so the budget is a count. In the first local
+trial (6 November 2026, the Mac Studio at a load average of about 40),
+`src/file_lock.rs`'s first shard built its baseline cold in 37 minutes, then
+took 194 s to rebuild for its one buildable mutant and 5 s to test it; the
+other two failed to compile (*unviable*) within 75 s. The estimate above is
+from CI's own crate rebuilds (the nightly-signing step, 2.5 minutes), until
+the job has a record of its own. Over it, the job
+tests one round-robin shard (`--shard 0/K --sharding round-robin`), which
+spreads the sample over every file the change touches, and the summary says
+"Tested 20 of 47". The sizing is in
+[`mutants_plan.py`](../scripts/ci/mutants_plan.py) and its tests in
+[`test_mutants_plan.py`](../scripts/ci/test_mutants_plan.py).
+
+To keep each mutant's test short, the job runs only the library's unit tests
+(`--lib`) of the top-level modules the mutants are in: a mutant in
+`src/council/network.rs` runs `council::`'s tests, not the whole suite. That's
+where a unit test for that line belongs, but it means a mutant only an
+integration test in `tests/` would catch shows as missed. Check `tests/`
+before filing one. [`.cargo/mutants.toml`](../.cargo/mutants.toml) holds the
+settings every run shares: nextest as the test tool, and `src/testkit/`,
+`src/fuzz/` and `src/bin/` left alone, since the first two exist only for
+tests and only process-level suites reach the third.
+
+There's no whole-crate run. `cargo mutants --list` finds about 27,000
+mutants, which at a few minutes each is over a thousand runner-hours. The
+weekly run covers the new code instead, which is where a missing test is most
+likely and cheapest to add.
+
+**Missed mutants become issues by hand.** The job summary lists each missed
+mutant with a link that opens a new issue, labelled `missed-mutant`, with
+the mutant, a permalink to its line and the command that checks a fix. A
+person reads it and files it; the job never posts to GitHub, so a noisy run
+can't bury the tracker. To work one:
+
+```sh
+cargo mutants --file src/onion/dns.rs --re 'replace > with >= in decode_query'
+```
+
+reproduces it locally (the devcontainer has cargo-mutants), running the
+whole portable suite against it. Write the test and run the command again:
+the mutant should now be `caught`. Without `--in-place`, cargo-mutants works
+on a copy of the tree, so a local run never leaves your checkout mutated. CI
+passes `--in-place` because its checkout is thrown away anyway, and it reuses
+the cached target directory.
 
 ## Inside a live cluster
 
