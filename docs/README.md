@@ -14,6 +14,15 @@ release follows the same [build, staging and promotion procedure](releasing.md#m
 The limits below are the ones 0.2.6 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.
 
+Found a bug? Open an issue with one of the
+[issue forms](https://github.com/reliaburger/reliaburger/issues/new/choose): each asks
+for the version, a reproducer and what you didn't test, and an agent's draft
+from `relish agent report` has a form of its own. The
+[contributing guide](../CONTRIBUTING.md) explains the forms, the triage labels and
+the AI-assistance policy. Report a vulnerability privately as
+[SECURITY.md](../SECURITY.md) describes, and point a coding agent at
+[AGENTS.md](../AGENTS.md).
+
 The [platform comparisons](website/compare/index.html) and
 [competitive research writeup](research/2026-10-15-competitor-review.md) compare installation, operations
 and trade-offs against other projects, with dated evidence and explicit release boundaries.

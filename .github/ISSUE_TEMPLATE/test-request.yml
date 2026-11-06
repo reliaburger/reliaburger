@@ -1,0 +1,67 @@
+name: Test request
+description: Behaviour no test covers, such as a surviving mutant, a flake or an uncovered line.
+title: "test: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A test request comes with the failing test attached, or a plain statement that you couldn't write one and why. A surviving mutant gets the `missed-mutant` label.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release or commit you looked at.
+    validations:
+      required: true
+  - type: dropdown
+    id: gap_source
+    attributes:
+      label: How you found the gap
+      options:
+        - A surviving mutant
+        - A flake
+        - A proptest regression seed
+        - Uncovered lines
+        - Reading the code
+    validations:
+      required: true
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: Untested behaviour
+      description: What the code does that no test checks, and where (file and function).
+    validations:
+      required: true
+  - type: input
+    id: test_name
+    attributes:
+      label: Test name
+      description: The test you'd add, named as a behaviour sentence, such as `unhealthy_after_three_consecutive_failures`.
+    validations:
+      required: true
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Reproducer
+      description: The failing test, or the mutant and the command that shows it surviving. If you couldn't write one, say why.
+      render: rust
+    validations:
+      required: true
+  - type: textarea
+    id: not_tested
+    attributes:
+      label: What was not tested
+      description: What you didn't run, such as the gated suites.
+    validations:
+      required: true
+  - type: dropdown
+    id: ai_disclosure
+    attributes:
+      label: AI assistance
+      description: Did an AI tool help write this report? See the AI-assistance policy in CONTRIBUTING.md.
+      options:
+        - No AI assistance
+        - An AI tool helped, and a human checked every line
+        - An AI agent drafted it, and a human checked every line
+    validations:
+      required: true
