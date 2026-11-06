@@ -518,9 +518,15 @@ in [docs/book/](docs/book/).
 
 Bug reports and pull requests are welcome. Read the
 [contributing guide](CONTRIBUTING.md) first: changes come with tests and a
-matching update to the book. [`.devcontainer/`](.devcontainer) gives you CI's
-toolchain in one step for `make ci` (the portable suite only), and issues
-labelled `missed-mutant` are self-checking first tasks.
+matching update to the book. Report a bug through an
+[issue form](https://github.com/reliaburger/reliaburger/issues/new/choose), which
+asks for the version, a reproducer and what you didn't test. You're welcome to
+use AI tools if you say so and a human answers for every line; agents start
+with [AGENTS.md](AGENTS.md). Vulnerabilities go privately, as
+[SECURITY.md](SECURITY.md) describes, and there's no bounty.
+[`.devcontainer/`](.devcontainer) gives you CI's toolchain in one step for
+`make ci` (the portable suite only), and issues labelled `missed-mutant` are
+self-checking first tasks.
 
 ## Licence
 
