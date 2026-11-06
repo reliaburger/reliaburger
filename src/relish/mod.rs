@@ -143,7 +143,7 @@ impl FullScreen {
             FullScreen::Tui => {
                 "`relish agent guide` lists the commands that print plain output, such as `relish status`"
             }
-            FullScreen::Manual => "`relish agent manual` prints a chapter as text",
+            FullScreen::Manual => "`relish agent manual search` and `show` print it as Markdown",
             FullScreen::Source => "`relish agent source` searches and prints the source",
         }
     }
@@ -366,7 +366,7 @@ mod tests {
         );
         assert_eq!(
             refusal(FullScreen::Manual),
-            "relish manual needs a terminal, and stdin or stdout isn't one; `relish agent manual` prints a chapter as text"
+            "relish manual needs a terminal, and stdin or stdout isn't one; `relish agent manual search` and `show` print it as Markdown"
         );
         assert_eq!(
             refusal(FullScreen::Source),

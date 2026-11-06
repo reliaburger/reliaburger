@@ -52,6 +52,16 @@ pub enum CommandName {
     #[serde(rename = "source extract")]
     #[value(name = "source-extract")]
     SourceExtract,
+    /// `relish agent logs`.
+    Logs,
+    /// `relish agent manual search`.
+    #[serde(rename = "manual search")]
+    #[value(name = "manual-search")]
+    ManualSearch,
+    /// `relish agent manual show`.
+    #[serde(rename = "manual show")]
+    #[value(name = "manual-show")]
+    ManualShow,
 }
 
 impl CommandName {
@@ -66,6 +76,9 @@ impl CommandName {
             CommandName::SourceGrep => "source grep",
             CommandName::SourceShow => "source show",
             CommandName::SourceExtract => "source extract",
+            CommandName::Logs => "logs",
+            CommandName::ManualSearch => "manual search",
+            CommandName::ManualShow => "manual show",
         }
     }
 
@@ -79,6 +92,9 @@ impl CommandName {
         CommandName::SourceGrep,
         CommandName::SourceShow,
         CommandName::SourceExtract,
+        CommandName::Logs,
+        CommandName::ManualSearch,
+        CommandName::ManualShow,
     ];
 }
 
@@ -397,6 +413,16 @@ impl<T> Envelope<T> {
     pub fn with_warning(mut self, warning: impl Into<String>) -> Self {
         if let Outcome::Answered { warnings, .. } = &mut self.outcome {
             warnings.push(warning.into());
+        }
+        self
+    }
+
+    /// The same answer, marked `truncated`: the command left part of `data`
+    /// out to fit the byte budget, and says what in `data`. A failure
+    /// ignores it.
+    pub fn mark_truncated(mut self) -> Self {
+        if let Outcome::Answered { truncated, .. } = &mut self.outcome {
+            *truncated = true;
         }
         self
     }
