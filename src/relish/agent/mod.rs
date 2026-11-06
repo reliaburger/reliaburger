@@ -14,6 +14,7 @@
 
 pub mod budget;
 pub mod envelope;
+pub mod report;
 pub mod source;
 pub mod untrusted;
 
@@ -54,6 +55,8 @@ pub enum AgentCommand {
     },
     /// The source this binary was built from: search it, read it, extract it.
     Source(source::SourceOptions),
+    /// Draft a redacted bug report for a human to post. Never posts.
+    Report(Box<report::ReportArgs>),
 }
 
 impl AgentCommand {
@@ -63,6 +66,7 @@ impl AgentCommand {
             AgentCommand::Version => CommandName::Version,
             AgentCommand::Schema { .. } => CommandName::Schema,
             AgentCommand::Source(options) => options.command.name(),
+            AgentCommand::Report(_) => CommandName::Report,
         }
     }
 }
@@ -103,6 +107,7 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
             rerun,
         ),
         AgentCommand::Source(source) => source::run(source, options.max_bytes, rerun).await,
+        AgentCommand::Report(args) => report::run(args, options.max_bytes, rerun),
     }
 }
 
@@ -190,6 +195,7 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::SourceGrep => Some(schema_of::<source::GrepData>()),
         CommandName::SourceShow => Some(schema_of::<source::ShowData>()),
         CommandName::SourceExtract => Some(schema_of::<source::ExtractData>()),
+        CommandName::Report => Some(schema_of::<report::ReportData>()),
     }
 }
 
@@ -419,7 +425,8 @@ mod tests {
                 "source tree",
                 "source grep",
                 "source show",
-                "source extract"
+                "source extract",
+                "report"
             ]
         );
         let envelope = &value["data"]["envelope"];

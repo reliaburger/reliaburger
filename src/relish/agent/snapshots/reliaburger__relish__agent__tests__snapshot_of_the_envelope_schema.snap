@@ -128,6 +128,11 @@ expression: "schema_of::<Envelope<Value>>()"
           "const": "source extract",
           "description": "`relish agent source extract`.",
           "type": "string"
+        },
+        {
+          "const": "report",
+          "description": "`relish agent report`.",
+          "type": "string"
         }
       ]
     },

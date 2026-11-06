@@ -791,8 +791,10 @@ flag.
 `relish.agent/v1` JSON envelope within a byte budget, never prompts, and exits
 `0` whenever it answered. So far it has `version`, `schema`, and `source`
 (`version`, `tree`, `grep`, `show` and `extract` over the code this binary was
-built from, with a warning when a node runs another commit); the commands that
-read the cluster arrive through 0.2.7. See
+built from, with a warning when a node runs another commit), and `report`,
+which drafts a redacted bug report, with a fingerprint for finding duplicates,
+for a human to read and post (it never posts, and makes no network call); the
+commands that read the cluster arrive through 0.2.7. See
 [Working with an AI agent](manual/16_working-with-an-ai-agent.md).
 
 Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select
