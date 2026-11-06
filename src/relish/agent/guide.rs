@@ -19,12 +19,12 @@
 
 use std::fmt::Write as _;
 
-use clap::{Args, Command};
+use clap::Command;
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::json;
 
-use super::{AgentError, AgentOptions, BuildInfo, CommandName, Envelope, ErrorCode, NextStep};
+use super::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, NextStep, agent_command};
 use super::{Rendered, render};
 
 /// The chapter's file name inside `docs/manual/`.
@@ -170,11 +170,6 @@ pub fn replace_region(
     }
     out.push_str(&text[close..]);
     Ok(out)
-}
-
-/// `relish agent` as clap defines it, without the rest of `relish`.
-pub fn agent_command() -> Command {
-    AgentOptions::augment_args(Command::new("agent"))
 }
 
 /// One `relish agent` command and what it does.

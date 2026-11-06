@@ -8860,7 +8860,9 @@ got the setup hint. An agent reading that from a shell does what it says: it
 checks whether Bun runs, finds it does, and is stuck. So `AgentUnreachable`
 grew two fields (#1567), the endpoint relish actually dialled and an
 `UnreachableCause`: `NameResolution`, `Refused`, `Tls`, `TimedOut`, or `Other`
-with the network stack's own words. Each cause's message ends with its fix, and
+with the network stack's own words. (0.2.7 splits a certificate relish doesn't
+trust out of `Tls` as `UntrustedCertificate`, so `relish agent` can report it
+as `tls_untrusted`; see chapter 19.) Each cause's message ends with its fix, and
 the setup hint now shows only for a refusal or a timeout, where a firewall is
 the likely story.
 

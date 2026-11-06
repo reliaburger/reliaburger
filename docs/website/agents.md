@@ -132,8 +132,9 @@ A failure carries `error` instead of `data`:
   "command": "version",
   "ok": false,
   "relish": {"version": "0.2.7", "commit": "a1b2c3d4…", "dirty": null, "source_digest": null},
-  "error": {"code": "unreachable", "message": "bun agent not reachable at localhost:9117 (is it running?)",
-            "endpoint": null, "status": null,
+  "error": {"code": "unreachable",
+            "message": "cannot reach the bun agent at https://localhost:9117: connection refused; check that bun runs there and listens on that port",
+            "endpoint": "https://localhost:9117", "status": null,
             "hint": "start a cluster (relish setup --quickstart) or point at one with --endpoint"}
 }
 ```
@@ -141,7 +142,11 @@ A failure carries `error` instead of `data`:
 `code` is one of a fixed list: `usage`, `no_endpoint`, `unreachable`, `dns`,
 `tls_untrusted`, `timeout`, `unauthenticated`, `forbidden`, `not_found`,
 `conflict`, `api`, `source_mismatch`, `build_failed`, `unsupported_platform`
-and `internal`. `status` is the HTTP status when the API answered with one.
+and `internal`. `status` is the HTTP status when the API answered with one,
+and `endpoint` the address `relish` dialled when the connection failed. A
+connection failure splits by its cause: `dns` when the host name doesn't
+resolve, `tls_untrusted` when the server's certificate isn't one `relish`
+trusts (pass the cluster CA with `--ca-cert`), and `unreachable` for the rest.
 
 A usage error is an envelope too. Give `relish agent version` a flag it
 doesn't have and it prints a failure with the `usage` code on stdout, not

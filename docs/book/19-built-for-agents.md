@@ -201,9 +201,37 @@ RelishError::ApiError { status, .. } => {
 }
 ```
 
-The `..` in the pattern means "and other fields I don't care about". Two codes,
-`dns` and `tls_untrusted`, have no source yet: the HTTP client folds both into
-"unreachable", and #1567 splits them.
+The `..` in the pattern means "and other fields I don't care about". A
+connection that never carried a request splits by its cause, which the HTTP
+client names since #1567:
+
+```rust
+RelishError::AgentUnreachable { endpoint, cause } => {
+    let (code, hint) = match cause {
+        UnreachableCause::NameResolution => (ErrorCode::Dns, /* ... */),
+        UnreachableCause::UntrustedCertificate(_) => (ErrorCode::TlsUntrusted, /* ... */),
+        UnreachableCause::Refused
+        | UnreachableCause::Tls(_)
+        | UnreachableCause::TimedOut
+        | UnreachableCause::Other(_) => (ErrorCode::Unreachable, /* ... */),
+    };
+    // ...
+}
+```
+
+A name that doesn't resolve is `dns`, and the fix is the address. A
+certificate relish doesn't trust is `tls_untrusted`, and the fix is
+`--ca-cert`. Everything else is `unreachable`, including a TLS handshake that
+failed before it reached the certificate, which usually means an `https`
+endpoint on a port that doesn't speak TLS. The match lists every cause rather
+than ending in `_`, so a new cause added later doesn't compile until someone
+decides its code. To tell the certificate case apart, the client looks at the
+`rustls::Error` at the bottom of the error chain: `InvalidCertificate` (an
+unknown issuer, the wrong name, an expired certificate) becomes
+`UntrustedCertificate`, and any other handshake failure stays `Tls`. Two tests
+in `client.rs` dial a `.invalid` name and a local server whose certificate
+comes from a CA relish wasn't given, and check that the envelope says `dns`
+and `tls_untrusted`, both exiting 3.
 
 ## Why a byte budget
 
@@ -2692,20 +2720,22 @@ Other 0.2.7 issues are adding `relish agent` commands in parallel with this
 one, so the chapter can't hand-write a list of them. The command table
 between the `commands` markers comes from clap. The CLI's `Cli` struct lives
 in the `relish` binary, which the library can't see, but `relish agent`'s
-options are a library type, and that's enough:
+options are a library type, and that's enough. `src/relish/agent/mod.rs`
+builds the tree next to `AgentOptions`:
 
 ```rust
-pub fn agent_command() -> Command {
-    AgentOptions::augment_args(Command::new("agent"))
+pub fn agent_command() -> clap::Command {
+    <AgentOptions as clap::Args>::augment_args(clap::Command::new("agent"))
 }
 ```
 
 `#[derive(clap::Args)]` implements the `Args` trait for `AgentOptions`, and
 `augment_args` is one of the trait's functions: it takes a `Command` and
 returns it with this type's flags and subcommands added. It has no `self`, so
-you call it on the type, like a static method in Go or Python. The `use
-clap::Args` at the top of the file is what makes it callable: Rust only lets
-you call a trait's functions when the trait is in scope. A walk over
+you call it on the type, like a static method in Go or Python. Rust only lets
+you call a trait's function when the trait is in scope, and the angle-bracket
+form names the trait on the spot, so no `use clap::Args` is needed; the next
+part of the chapter, on `relish mcp`, comes back to that syntax. A walk over
 `get_subcommands()` then lists every visible leaf. `source` has no answer of
 its own, so its five commands are listed instead.
 
@@ -2862,9 +2892,13 @@ and subcommands to a `clap::Command`, a plain value you can walk:
 
 ```rust
 pub fn agent_command() -> clap::Command {
-    <agent::AgentOptions as clap::Args>::augment_args(clap::Command::new("agent"))
+    <AgentOptions as clap::Args>::augment_args(clap::Command::new("agent"))
 }
 ```
+
+It's the same function the guide's command list uses. For a while `relish mcp`
+had its own copy in `tools.rs`; the two said the same thing in different
+words, so one went, and both callers now use `agent::agent_command()`.
 
 `<AgentOptions as clap::Args>::augment_args` is the fully qualified way to
 call a trait's function on a type: "the `augment_args` that the `Args` trait

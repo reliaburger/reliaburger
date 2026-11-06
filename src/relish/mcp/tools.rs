@@ -33,8 +33,8 @@ pub struct Exclusion {
     pub why: &'static str,
 }
 
-/// The commands `relish mcp` never offers. Some don't exist yet; naming them
-/// now means they can't slip in as tools when they land.
+/// The commands `relish mcp` never offers. Naming them here means none
+/// becomes a tool by accident, whatever its `data` schema.
 pub const EXCLUDED: &[Exclusion] = &[
     Exclusion {
         command: "source extract",
@@ -122,14 +122,6 @@ pub fn tool_name(command: &str) -> String {
     command.replace([' ', '-'], "_")
 }
 
-/// The `relish agent` command tree, as clap builds it.
-pub fn agent_command() -> clap::Command {
-    // `Args` is the trait `#[derive(clap::Args)]` implemented for
-    // `AgentOptions`; `augment_args` adds its flags and subcommands to a
-    // command we name ourselves.
-    <agent::AgentOptions as clap::Args>::augment_args(clap::Command::new("agent"))
-}
-
 /// The `data` schema of the `relish agent` command `command`, or `None` for
 /// a command that doesn't answer with data.
 pub fn data_schema(command: &str) -> Option<Value> {
@@ -145,7 +137,7 @@ pub fn command_name(command: &str) -> Option<CommandName> {
 /// Every tool `tree` offers: each leaf command with a `data` schema that
 /// [`EXCLUDED`] doesn't name.
 ///
-/// `tree` is `relish agent`'s clap command ([`agent_command`]) and `schema`
+/// `tree` is `relish agent`'s clap command ([`agent::agent_command`]) and `schema`
 /// gives a command's `data` schema ([`data_schema`]); the tests pass
 /// stand-ins for both.
 pub fn derive(tree: clap::Command, schema: &dyn Fn(&str) -> Option<Value>) -> Vec<ToolSpec> {
