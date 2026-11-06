@@ -453,7 +453,7 @@ async fn proxy_handler(
 /// A 128-bit random value, hex-encoded — unique enough to correlate a request
 /// across the proxy hop without pulling in a UUID dependency. Only used when
 /// the client didn't already supply an `X-Request-ID`.
-fn generate_request_id() -> String {
+pub(super) fn generate_request_id() -> String {
     format!("{:032x}", rand::random::<u128>())
 }
 
@@ -2210,12 +2210,17 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), drains.wait_drained("default__ws-0"))
                 .await
                 .expect("WebSocket did not release its captured backend after cancellation");
-            let closed = tokio::time::timeout(Duration::from_secs(2), ws.read(&mut buf))
+            // F08: the client hears why before the connection goes: a Close
+            // frame with 1001 Going Away, then end of stream.
+            let mut received = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), ws.read_to_end(&mut received))
                 .await
-                .unwrap();
-            assert!(
-                matches!(closed, Ok(0) | Err(_)),
-                "WebSocket stayed open after drain completion"
+                .expect("WebSocket stayed open after drain completion")
+                .ok();
+            assert_eq!(
+                received,
+                super::super::websocket::build_close_frame(1001),
+                "the client got no Close 1001 before the connection closed"
             );
         }
 
