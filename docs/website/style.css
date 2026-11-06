@@ -120,7 +120,7 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .recording-chapters button { font: inherit; color: var(--ink); background: none; border: 1px solid var(--line); border-radius: 3px; padding: 4px 8px; cursor: pointer; }
 .recording-chapters button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 
-/* Built differently: five slides. Without script they're a stacked list;
+/* Built differently: six slides. Without script they're a stacked list;
    assets/why-carousel.js adds .is-enhanced, stacks them in one grid cell (so
    the box is as tall as the tallest and nothing jumps) and fades between them.
    The drawings animate with CSS only, so reduced motion stops them all. */
@@ -170,6 +170,9 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .why-bolt { animation: why-flash 9s linear infinite; }
 .why-smoke { opacity: 0; animation: why-smoke 9s ease-out infinite; }
 .why-timer { animation: why-countdown 9s linear infinite; }
+.why-line { stroke: #e8c08f; animation: why-read 6s linear infinite; }
+.why-lens { animation: why-scan 6s ease-in-out infinite; }
+.why-reply { transform-box: fill-box; transform-origin: 20% 100%; animation: why-answer 6s ease-out infinite; }
 @keyframes why-assemble {
   0%, 12% { transform: translate(var(--dx), var(--dy)) scale(.45); }
   40%, 86% { transform: none; }
@@ -211,6 +214,9 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 }
 @keyframes why-flash { 0%, 24% { opacity: .35; } 27%, 33% { opacity: 1; } 40%, 100% { opacity: .35; } }
 @keyframes why-smoke { 0%, 34% { opacity: 0; transform: none; } 42% { opacity: 1; } 66%, 100% { opacity: 0; transform: translate(0, -14px); } }
+@keyframes why-read { 0% { stroke: #e8c08f; } 4%, 12% { stroke: #a83b15; } 20%, 100% { stroke: #e8c08f; } }
+@keyframes why-scan { 0%, 4% { transform: none; } 50%, 58% { transform: translate(-8px, 70px); } 96%, 100% { transform: none; } }
+@keyframes why-answer { 0%, 52% { transform: scale(.4); opacity: 0; } 60% { transform: scale(1.08); opacity: 1; } 64%, 92% { transform: scale(1); opacity: 1; } 100% { transform: scale(.4); opacity: 0; } }
 @keyframes why-countdown { 0%, 34% { stroke-dashoffset: 0; } 60% { stroke-dashoffset: 88; } 72%, 100% { stroke-dashoffset: 0; } }
 @media (prefers-reduced-motion: reduce) {
   .why-art * { animation: none !important; }
@@ -277,6 +283,53 @@ dd { margin: 0; color: var(--muted); }
 .contributing > a { flex-shrink: 0; font-size: .875rem; }
 footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; padding: 24px 0 36px; border-top: 1px solid var(--line); color: var(--muted); font-size: .8125rem; }
 .footer-note { margin-left: auto; }
+/* The agent banner: the first thing on the homepage, one line that sends an
+   agent to /agents, its Markdown and llms.txt. */
+.agent-banner { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: .875rem; color: var(--muted); }
+.agent-banner strong { color: var(--ink); font-family: var(--mono); font-size: .8125rem; font-weight: 600; letter-spacing: .02em; }
+.agent-banner a { color: var(--ink); }
+.agent-banner a:first-of-type { color: var(--accent); font-weight: 600; }
+.headline-agents { font-size: clamp(1.35rem, 2.6vw, 1.75rem); line-height: 1.25; letter-spacing: -.03em; font-weight: 600; color: var(--accent); margin: -12px 0 22px; }
+/* A recording that isn't made yet: the slot says so and points at the steps. */
+.recording-pending { background: var(--ink); color: #e4e9e3; border-radius: 4px; padding: 16px; margin: 0; font-size: .9375rem; }
+.recording-pending a { color: #f49463; }
+.agent-steps code { overflow-wrap: anywhere; }
+/* /agents, generated from the manual chapter by src/relish/agent/guide.rs.
+   The chapter's prose keeps a readable measure; its tables scroll on their
+   own on a phone instead of widening the page. */
+.agents-page { max-width: 46rem; padding: 40px 0 20px; }
+.agents-page h1 { font-size: clamp(2rem, 4.4vw, 2.8rem); margin-bottom: 18px; }
+.agents-page > p:first-of-type { font-size: 1.125rem; color: var(--ink); }
+.agents-page p, .agents-page li { color: var(--muted); }
+.agents-page strong { color: var(--ink); }
+.agents-page h2 { margin: 0 0 14px; }
+.agents-page h3 { margin-top: 24px; }
+.agents-page section { scroll-margin-top: 1.5rem; margin-top: 44px; padding-top: 22px; border-top: 1px solid var(--line); }
+.agents-page section:hover .permalink { opacity: 1; }
+.agents-page ul, .agents-page ol { padding-left: 1.4rem; }
+.agents-page li { margin: 6px 0; }
+.agents-page pre { background: var(--ink); color: #e4e9e3; border-radius: 4px; padding: 12px 16px; margin: 0 0 1rem; line-height: 1.7; }
+.agents-page .copyable { background: var(--ink); border-radius: 4px; margin: 0 0 1rem; }
+.agents-page .copyable pre { background: none; margin: 0; }
+.agents-page table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 0 0 1rem; font-size: .875rem; }
+.agents-page th, .agents-page td { text-align: left; vertical-align: top; padding: 8px 12px 8px 0; border-bottom: 1px solid var(--line); }
+.agents-page td { color: var(--muted); }
+.agents-page td code, .agents-page li code, .agents-page p code { overflow-wrap: anywhere; }
+.agents-install { margin: 28px 0 8px; padding: 18px 20px 6px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); border-left: 3px solid var(--accent); }
+.agents-install h2 { font-size: 1.25rem; }
+.agents-install h2:hover .permalink { opacity: 1; }
+.agents-install-buttons { display: flex; flex-wrap: wrap; gap: 10px; }
+.install-button { display: inline-block; background: var(--ink); color: #fff; padding: 9px 16px; text-decoration: none; border: 1px solid var(--ink); border-radius: 3px; font-size: .875rem; font-weight: 600; }
+.install-button:hover { background: #303c32; color: #fff; }
+/* Not the masthead's flex nav: a heading over a two-column list. */
+.agents-contents { display: block; margin: 28px 0 0; font-size: .875rem; font-weight: 400; }
+.agents-contents h2 { font: 500 .75rem var(--mono); letter-spacing: .07em; text-transform: uppercase; color: var(--muted); }
+.agents-contents ol { columns: 2; column-gap: 32px; margin: 0; }
+.agents-contents li { margin: 3px 0; break-inside: avoid; }
+.agents-contents a { color: var(--ink); }
+/* "How Reliaburger is tested" carries the same accent rule as the homepage's
+   release-testing section: it says what runs, and what doesn't. */
+.agents-page #how-reliaburger-is-tested { border: 1px solid var(--line); border-left: 3px solid var(--accent); padding: 18px 20px 4px; }
 @media (max-width: 900px) {
   .status { grid-template-columns: 1fr auto; gap: 10px 22px; }
   .status p { grid-column: 1; }
@@ -317,6 +370,9 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
   .why-carousel { padding: 16px 14px; }
   .why-slide { grid-template-columns: minmax(0, 1fr); }
   .why-art { max-width: 200px; }
+  .agents-page { padding-top: 24px; }
+  .agents-contents ol { columns: 1; }
+  .agents-install, .agents-page #how-reliaburger-is-tested { padding-left: 14px; padding-right: 14px; }
 }
 @media print {
   .page { max-width: none; padding: 0; }

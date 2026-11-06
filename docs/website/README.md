@@ -26,19 +26,19 @@ Nothing is fetched from anywhere else. With scripts disabled a `<noscript>`
 note links the `.cast` file, and the written tour works as before.
 
 `assets/why-carousel.js` turns the "Built differently" section (`#why`), a
-plain list of five architectural differences, into a slideshow: one at a
-time, a new one every nine seconds, with previous, next, five dots and a Pause
+plain list of six architectural differences, into a slideshow: one at a
+time, a new one every nine seconds, with previous, next, six dots and a Pause
 and Play button. Pause and Play always take effect; it also stops while a
 mouse rests on it and when keyboard focus comes in (until Play), never because
 of a tap, and doesn't rotate at all for visitors who prefer reduced motion. It follows the WAI-ARIA
 carousel pattern, so the slide text is a polite live region only while it
 isn't rotating by itself. The drawings are inline SVG animated by CSS in
 `style.css`, so reduced motion stills them and nothing loads from elsewhere.
-Without JavaScript all five stay stacked.
+Without JavaScript all six stay stacked.
 
 Don't add other scripts. The footer names all three, so change them together.
 
-Every `<section>` has a stable `id` (`why`, `install`, `tour`, `start`, `docs`,
+Every `<section>` has a stable `id` (`why`, `install`, `tour`, `debug`, `start`, `docs`,
 `internals`, `next`, `contributing`) and every section heading a `#` permalink, shown on
 hover or focus, so a section can be shared as `reliaburger.com/#install`.
 Renaming an `id` breaks links people have already shared; add a new section
@@ -53,6 +53,32 @@ the npm tarball
 The bundle is self-contained: no fonts, workers or other files to fetch. To
 upgrade, replace those three files from a newer tarball and check the
 recording still plays.
+
+### For agents
+
+The page opens with one line for AI agents, "Are you an AI agent? Start
+here", above the masthead: it links `/agents` (as `agents.html`, which also
+works from a local preview), `agents.md` and `llms.txt`. Those three files,
+the skill and the plugin are generated from the manual chapter
+`docs/manual/16_working-with-an-ai-agent.md` by `src/relish/agent/guide.rs`;
+`make agent-docs` rewrites them, and `tests/suite/agent_docs.rs` fails while
+one is stale, so never edit them by hand. `/agents` uses this directory's
+`style.css` (the `.agents-*` rules) and `assets/copy.js`, nothing else. The
+generator makes each `## ` heading a `<section>` with its slug as `id` (the
+same anchors GitHub makes), a contents list, and the "Add it to your agent"
+box: Cursor, VS Code and Goose install links and the `claude mcp add` line,
+all built from the server name and command line `relish agent setup` writes.
+The README carries the same links through cursor.com and vscode.dev, because
+GitHub drops links with other schemes.
+
+The "Debug the platform, not just your app" section (`#debug`) shows what an
+agent does from 0.2.7. Its commands carry `data-agent-command`, and
+`tests/suite/website.rs` parses each with the real CLI. Its recording slot
+(`#agent-recording`) has no `data-cast` until a real session is recorded
+([#1579](https://github.com/reliaburger/reliaburger/issues/1579)), so the
+player leaves it alone and it says there's no recording yet. When the cast
+lands, put it in `assets/`, add `data-cast` and a `.recording-screen` as the
+tour's figure has, and drop the pending note.
 
 ### Re-recording the tour
 

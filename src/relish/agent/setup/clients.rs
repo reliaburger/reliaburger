@@ -24,7 +24,7 @@ pub const MCP_SERVER_NAME: &str = "reliaburger";
 pub const MCP_COMMAND_LINE: &[&str] = &["relish", "mcp"];
 
 /// One line for the agents whose entries carry a description.
-const MCP_DESCRIPTION: &str = "Reliaburger: read-only cluster status, diagnosis and logs";
+pub const MCP_DESCRIPTION: &str = "Reliaburger: read-only cluster status, diagnosis and logs";
 
 /// An agent `relish agent setup` can wire up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, JsonSchema, clap::ValueEnum)]
