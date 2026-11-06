@@ -163,7 +163,11 @@ interface, or give it a fixed address and pass that with `--address`.
 It remembers each machine that downloaded the installer, by MAC address and
 SMBIOS UUID, in `netboot-installed.json` in the directory it serves. Next time that machine
 network-boots, it's told to boot its disk instead. Pass `--reinstall` to
-install over them again.
+install over them again. Their disks then hold Reliaburger OS, which counts
+as a used disk: each one waits for your yes, or for its `--wipe`. Each
+machine reinstalls once per run, so a machine whose firmware tries the
+network first boots its new install afterwards rather than installing
+again.
 
 ### Serving from a Mac
 
@@ -315,8 +319,10 @@ console and powers it off. For the rest of that `relish netboot` run, the
 machine is told to boot its own disk and isn't asked again. Start `relish
 netboot` again to be asked again.
 
-A blank disk installs without a question. So does a disk that already holds
-Reliaburger OS: the installer boots it instead of reinstalling.
+A blank disk installs without a question. A disk that already holds
+Reliaburger OS doesn't install at all: the installer boots it, unless
+`relish netboot` runs with `--reinstall`, and then it asks like any other
+used disk.
 
 For an unattended run, list the machines whose disks may be wiped up front:
 

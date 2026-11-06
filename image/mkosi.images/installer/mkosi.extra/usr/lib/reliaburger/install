@@ -15,12 +15,16 @@
 #   reliaburger.ask=<URL>        relish netboot passes this: report a disk
 #                                that isn't empty there and wipe it only if
 #                                the operator says so (ask-to-wipe)
+#   reliaburger.reinstall=1      relish netboot --reinstall passes this: treat
+#                                a disk that holds Reliaburger OS like any
+#                                other used disk (ask, or wipe=1), rather
+#                                than booting it
 #
 # After writing, it puts a boot entry for the disk first in the firmware's
 # boot order, so the machine boots its disk from now on even where network
 # boot came first. A machine that network-boots onto a disk that already
-# holds Reliaburger OS (and no reliaburger.wipe=1) is sent back to that disk
-# instead of being reinstalled.
+# holds Reliaburger OS (and no reliaburger.wipe=1 or reliaburger.reinstall=1)
+# is sent back to that disk instead of being reinstalled.
 set -euo pipefail
 
 # The console is the last console= on the command line, the serial port, and
@@ -99,7 +103,8 @@ fi
 size=$(blockdev --getsize64 "$disk")
 say "target $disk, $((size / 1000000)) MB"
 if [ -n "$(lsblk -nlo NAME "$disk" | tail -n +2)" ] || blkid -p "$disk" >/dev/null 2>&1; then
-    if [ "$(arg reliaburger.wipe)" != 1 ] && lsblk -nlo PARTLABEL "$disk" | grep -qx reliaburger-data; then
+    if [ "$(arg reliaburger.wipe)" != 1 ] && [ "$(arg reliaburger.reinstall)" != 1 ] \
+        && lsblk -nlo PARTLABEL "$disk" | grep -qx reliaburger-data; then
         # Already installed, and this boot came from the network first:
         # go back to the disk, this time and from now on.
         entry=$(boot_disk_first "$disk") || fail "$disk holds Reliaburger OS, but no boot entry could be made for it"

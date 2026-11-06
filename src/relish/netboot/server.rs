@@ -75,6 +75,7 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         installed: Mutex::new(record),
         allowed: options.allowed.clone(),
         reinstall: options.reinstall,
+        reinstalled: Mutex::new(Vec::new()),
         wipe: options.wipe.clone(),
         operator: operator(),
         question_timeout: wipe::QUESTION_TIMEOUT,

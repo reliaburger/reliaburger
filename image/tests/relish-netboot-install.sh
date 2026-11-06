@@ -22,6 +22,13 @@
 # passes once bun is healthy on it, relish has remembered the machine as
 # installed, relish's log shows it decided to wipe, and relish's start-up
 # probe saw the router's DHCP.
+#
+# In router mode it then reinstalls: a second `relish netboot --reinstall`
+# run, with the VM's network boot now first, so every boot asks relish. The
+# installer finds Reliaburger on the disk and, told reliaburger.reinstall=1,
+# reports it like any used disk instead of booting it; --wipe lets relish
+# wipe it. The next boot asks relish again and gets exit, since --reinstall
+# installs each machine once per run, so the VM boots the new install.
 # Needs root (the bridge, port 67, a loop device), qemu-system-x86, ovmf,
 # dnsmasq, sfdisk, e2fsprogs and /dev/kvm.
 set -euo pipefail
@@ -92,25 +99,35 @@ loop=$(sudo losetup -fP --show "$work/used.raw")
 sudo mkfs.ext4 -q -L ThinOS "${loop}p1"
 sudo losetup -d "$loop"
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$work/vars.fd"
+# boot_vm <serial log> <disk bootindex> <network bootindex>
+boot_vm() {
+    qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 2 -m 2048 \
+        -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+        -drive if=pflash,format=raw,file="$work/vars.fd" \
+        -drive if=none,id=d0,format=raw,file="$work/used.raw" \
+        -device "virtio-blk-pci,drive=d0,bootindex=$2" \
+        -netdev tap,id=n0,ifname=rbtap0,script=no,downscript=no \
+        -device "virtio-net-pci,netdev=n0,mac=$mac,bootindex=$3" \
+        -display none -serial "file:$1" &
+    qemu=$!
+}
+# wait_boot <serial log>: sets result to pass, fail, timeout or why it stopped.
+wait_boot() {
+    local started
+    started=$(date +%s)
+    result=timeout
+    while [ $(( $(date +%s) - started )) -lt 900 ]; do
+        if grep -q -e "reliaburger: bun healthy" -e "reliaburger: unclaimed" "$1" 2>/dev/null; then result=pass; return; fi
+        if grep -q -e "reliaburger-install: FAILED" -e "reliaburger: bun not healthy" "$1" 2>/dev/null; then result=fail; return; fi
+        if ! kill -0 "$qemu" 2>/dev/null; then result=exited; return; fi
+        if ! sudo kill -0 "$server" 2>/dev/null; then result="relish netboot stopped"; return; fi
+        sleep 5
+    done
+}
 log="$work/serial.log"
-qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 2 -m 2048 \
-    -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
-    -drive if=pflash,format=raw,file="$work/vars.fd" \
-    -drive if=none,id=d0,format=raw,file="$work/used.raw" \
-    -device virtio-blk-pci,drive=d0,bootindex=1 \
-    -netdev tap,id=n0,ifname=rbtap0,script=no,downscript=no \
-    -device "virtio-net-pci,netdev=n0,mac=$mac,bootindex=2" \
-    -display none -serial "file:$log" &
-qemu=$!
 start=$(date +%s)
-result=timeout
-while [ $(( $(date +%s) - start )) -lt 900 ]; do
-    if grep -q -e "reliaburger: bun healthy" -e "reliaburger: unclaimed" "$log" 2>/dev/null; then result=pass; break; fi
-    if grep -q -e "reliaburger-install: FAILED" -e "reliaburger: bun not healthy" "$log" 2>/dev/null; then result=fail; break; fi
-    if ! kill -0 "$qemu" 2>/dev/null; then result=exited; break; fi
-    if ! sudo kill -0 "$server" 2>/dev/null; then result="relish netboot stopped"; break; fi
-    sleep 5
-done
+boot_vm "$log" 1 2
+wait_boot "$log"
 elapsed=$(( $(date +%s) - start ))
 if [ "$result" = pass ] && ! sudo grep -qi "$mac" "$work/serve/netboot-installed.json" 2>/dev/null; then
     result="installed, but relish netboot didn't remember the machine"
@@ -136,14 +153,50 @@ if [ "$mode" = dhcp-proxy ] && [ "$result" = pass ]; then
         result="installed, but relish answered on UDP 67 beside the local DHCP server"
     fi
 fi
+# The reinstall pass (router mode): network first, so the firmware asks
+# relish on every boot, and relish must install once and then send it on.
+reinstall=skipped
+if [ "$mode" = router ] && [ "$result" = pass ]; then
+    kill "$qemu" 2>/dev/null || true
+    wait "$qemu" 2>/dev/null || true
+    sudo kill "$server" 2>/dev/null || true
+    while sudo kill -0 "$server" 2>/dev/null; do sleep 1; done
+    # shellcheck disable=SC2024
+    sudo "$relish" netboot "$work/serve" --key "$out/spike-signing-key.pub.pem" \
+        --interface rbbr0 --mac "$mac" --wipe "$mac" --reinstall --for 30m \
+        < /dev/null > "$work/netboot-reinstall.log" 2>&1 &
+    server=$!
+    log2="$work/serial-reinstall.log"
+    boot_vm "$log2" 2 1
+    wait_boot "$log2"
+    reinstall=$result
+    if [ "$reinstall" = pass ] && grep -q "already holds Reliaburger OS; booting it" "$log2"; then
+        reinstall="booted the old install instead of reinstalling"
+    elif [ "$reinstall" = pass ] && ! grep -q "reliaburger-install: installed .* to " "$log2"; then
+        reinstall="never reinstalled"
+    elif [ "$reinstall" = pass ] && ! grep -q "$mac.*: disk .*: wiping it and installing (--wipe lists it)" "$work/netboot-reinstall.log"; then
+        reinstall="reinstalled, but relish netboot's log doesn't show the disk being wiped"
+    elif [ "$reinstall" = pass ] && ! grep -q "being installed again; it gets exit for the rest of this run" "$work/netboot-reinstall.log"; then
+        reinstall="reinstalled, but relish netboot didn't say it would send the machine on"
+    elif [ "$reinstall" = pass ] && [ "$(grep -c "reliaburger-install: installed .* to " "$log2")" != 1 ]; then
+        reinstall="installed more than once in one --reinstall run"
+    fi
+    [ "$reinstall" = pass ] || result="first install passed; reinstall: $reinstall"
+fi
 echo "--- serial console ---"
 cat "$log" || true
 echo "--- relish netboot ---"
 cat "$work/netboot.log" || true
+if [ "$reinstall" != skipped ]; then
+    echo "--- serial console, reinstall ---"
+    cat "$log2" || true
+    echo "--- relish netboot --reinstall ---"
+    cat "$work/netboot-reinstall.log" || true
+fi
 echo "--- dnsmasq ($mode) ---"
 sudo cat "$work/dnsmasq.log" || true
 {
-    echo "### relish netboot install ($mode): $result after ${elapsed} s"
+    echo "### relish netboot install ($mode): $result after ${elapsed} s (reinstall: $reinstall)"
     echo '```'
     cat "$work/netboot.log" || true
     grep -a -e "reliaburger" "$log" | grep -v "reliaburger: journal:" || true
