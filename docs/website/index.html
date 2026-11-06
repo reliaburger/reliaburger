@@ -291,7 +291,15 @@
           <span class="section-number" aria-hidden="true">02 /</span>
           <h2 id="install-title">Install it <a class="permalink" href="#install" aria-label="Link to the install section">#</a></h2>
         </div>
-        <div class="install-grid">
+        <!-- Two ways in, as radio buttons styled as tabs so they work without
+             a script (#1579). The first panel stays first in the markup:
+             tests/suite/website.rs checks the page leads with its install line. -->
+        <div class="install-tabs" role="radiogroup" aria-label="How to install">
+        <input class="install-tab-input" type="radio" name="install-way" id="install-tyres" checked>
+        <label class="install-tab" for="install-tyres">Kick the tyres</label>
+        <input class="install-tab-input" type="radio" name="install-way" id="install-agent">
+        <label class="install-tab" for="install-agent">With your agent</label>
+        <div class="install-grid install-panel install-panel-tyres">
           <div class="terminal">
             <div class="terminal-heading">INSTALL <span>sh</span></div>
             <pre><code>curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop</code></pre>
@@ -313,6 +321,25 @@
               · <a href="install.sh">Read the bootstrap script</a>
               · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.6">Release notes <span aria-hidden="true">↗</span></a></p>
           </div>
+        </div>
+        <div class="install-grid install-panel install-panel-agent">
+          <div class="terminal">
+            <div class="terminal-heading">PROMPT <span>your agent</span></div>
+            <pre><code data-agent-prompt>Set up a Reliaburger cluster for me. Start at https://reliaburger.com/agents.</code></pre>
+          </div>
+          <div class="install-copy">
+            <p>Paste that into Claude Code, Codex or any agent with a shell. The page it reads is
+              a playbook: ask you where the cluster should run (this computer, machines you
+              already have, or a cloud), check the provider’s current prices and free allowances,
+              and create nothing that costs money until you say yes. Then it installs
+              <code>relish</code>, builds the cluster, shows you around, and leaves a summary
+              with the way to remove it.</p>
+            <p>You still make the decisions; it does the typing. Give it a read-only token
+              afterwards, and it can help you run the cluster too.</p>
+            <p class="install-links"><a href="agents.html">Read the playbook</a>
+              · <a href="agents.md">As Markdown</a></p>
+          </div>
+        </div>
         </div>
       </section>
 

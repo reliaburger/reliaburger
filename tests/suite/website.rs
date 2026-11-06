@@ -1555,3 +1555,32 @@ fn the_differences_load_nothing_and_respect_reduced_motion() {
         "style.css should stop the drawings' animation for reduced motion"
     );
 }
+
+/// The install section has two tabs (#1579): the one-line install, and one
+/// prompt for an agent that sends it to the playbook on `/agents`. They're
+/// radio buttons, so they switch without a script, and the one-line install
+/// is the one chosen when the page loads.
+#[test]
+fn the_install_section_offers_the_one_line_install_and_an_agent_prompt() {
+    let page = read("docs/website/index.html");
+    let section = &page[page.find("<section id=\"install\"").unwrap()..];
+    let section = &section[..section.find("</section>").unwrap()];
+    for tab in ["Kick the tyres", "With your agent"] {
+        assert!(
+            section.contains(&format!(">{tab}</label>")),
+            "no {tab:?} tab"
+        );
+    }
+    assert!(section.contains("id=\"install-tyres\" checked>"));
+    let prompt = &section[section.find("<code data-agent-prompt>").unwrap()..];
+    let prompt = &prompt["<code data-agent-prompt>".len()..prompt.find("</code>").unwrap()];
+    assert_eq!(
+        prompt,
+        "Set up a Reliaburger cluster for me. Start at https://reliaburger.com/agents."
+    );
+    // The page the prompt names is the one generated from the agent chapter,
+    // and it carries the playbook.
+    let agents = read("docs/website/agents.html");
+    assert!(agents.contains("Setting up a cluster for your human"));
+    assert!(!section.contains("<script"), "the tabs need no script");
+}

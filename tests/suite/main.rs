@@ -39,6 +39,7 @@ mod batch;
 mod bun_auth_startup;
 mod bun_startup_exit;
 mod ca_trust_rotation;
+mod cloud_init;
 mod cluster_fixtures;
 mod compatibility;
 mod container_runtime_required;

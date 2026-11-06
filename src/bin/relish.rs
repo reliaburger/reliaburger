@@ -2852,6 +2852,7 @@ async fn main() -> ExitCode {
                             ingress_port: ingress_port.unwrap_or(18080),
                             development_binaries,
                             release_mirror,
+                            output: cli.output,
                         },
                     )
                     .await
@@ -2870,6 +2871,7 @@ async fn main() -> ExitCode {
                         development_binaries,
                         release_mirror,
                         timings,
+                        output: cli.output,
                     },
                 )
                 .await
@@ -3067,6 +3069,9 @@ fn output_support(command: &Command) -> OutputSupport {
         Command::Dev {
             action: DevAction::Shell { .. },
         } => Interactive,
+        // `--quickstart` and `--ssh` never ask anything, so an agent can run
+        // them and quote what they built; the guided setup asks as it goes.
+        Command::Setup(options) if options.quickstart || options.ssh.is_some() => Structured,
         Command::Tui
         | Command::Dashboard { .. }
         | Command::Manual { .. }
@@ -4522,6 +4527,8 @@ mod tests {
             &["relish", "-o", "json", "manual", "chaos"],
             &["relish", "-o", "json", "source"],
             &["relish", "-o", "json", "dev", "shell", "reliaburger-1"],
+            &["relish", "-o", "json", "setup"],
+            &["relish", "-o", "json", "setup", "--yes"],
         ] {
             let cli = parse(args).unwrap();
             let refusal = output_refusal(&cli.command, cli.output)
@@ -4551,6 +4558,17 @@ mod tests {
             &["relish", "-o", "json", "upgrade", "check"],
             &["relish", "-o", "json", "upgrade", "plan", "v0.2.7"],
             &["relish", "-o", "json", "local", "status"],
+            &["relish", "-o", "json", "setup", "--quickstart"],
+            &[
+                "relish",
+                "-o",
+                "yaml",
+                "setup",
+                "--quickstart",
+                "--nodes",
+                "1",
+            ],
+            &["relish", "-o", "json", "setup", "--ssh", "ubuntu@10.0.0.1"],
             &["relish", "inspect", "web"],
         ] {
             let cli = parse(args).unwrap();

@@ -35,6 +35,12 @@ already have (`--install-only`, then the [Linux servers guide](docs/linux-server
 Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not
 for production.
 
+From 0.2.7 your agent can do it for you: tell it "Set up a Reliaburger cluster
+for me. Start at https://reliaburger.com/agents." The playbook there
+([working with an AI agent](docs/manual/16_working-with-an-ai-agent.md#setting-up-a-cluster-for-your-human))
+has it ask where the cluster should run and create nothing that costs money
+without your yes.
+
 ```sh
 # Install relish and build a three-node cluster in Linux VMs on this laptop
 curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop

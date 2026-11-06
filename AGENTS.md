@@ -40,7 +40,11 @@ If you're an agent operating or debugging a Reliaburger cluster:
   links that commit's code.
 - **Use `-o json` for everything else.** Every `relish` command takes it
   except the six interactive ones: `tui`, `dashboard`, `manual`, `source`,
-  `setup` and `dev shell`.
+  `dev shell` and the guided `setup`. `setup --quickstart` and `setup --ssh`
+  take it.
 - **Never post, change or file anything without your human.** Draft it, show
   it, and let them send it.
+- **Asked to set up a cluster?** Follow the playbook "Setting up a cluster for
+  your human" at <https://reliaburger.com/agents>, the last section of
+  `relish agent guide`, and spend nothing without an explicit yes.
 <!-- agent-generated:end -->
