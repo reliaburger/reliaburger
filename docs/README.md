@@ -11,6 +11,9 @@ and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs
 and builds a laptop cluster; without a flag the installer explains the choices.
 Until 1.0.0 Reliaburger is good enough for home labs and dev clusters, not production. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
+From 0.2.7 (0.2.7, not in 0.2.6) every release file also carries a build provenance
+attestation that anyone can check with `gh attestation verify`, and the macOS `relish` can be
+notarised ([checks a stranger can run](releasing.md#checks-a-stranger-can-run)).
 The limits below are the ones 0.2.6 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.
 
