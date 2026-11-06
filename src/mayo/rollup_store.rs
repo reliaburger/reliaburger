@@ -611,58 +611,14 @@ impl RollupStore {
     /// Keyed on the data's own newest timestamp (O12), read from row-group
     /// statistics, not the file's mtime — the rollup schema shares the
     /// leading `timestamp` column, so `store::file_max_timestamp` applies.
-    pub fn prune(&self, before: u64) -> Result<usize, MayoError> {
-        let mut deleted = 0;
-        let entries = match std::fs::read_dir(&self.data_dir) {
-            Ok(entries) => entries,
-            // A new store has no directory until its first flush.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => {
-                return Err(MayoError::Io(std::io::Error::new(
-                    error.kind(),
-                    format!("list metrics {}: {error}", self.data_dir.display()),
-                )));
-            }
-        };
-        for entry in entries {
-            let path = entry
-                .map_err(|error| {
-                    MayoError::Io(std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "read metrics directory {}: {error}",
-                            self.data_dir.display()
-                        ),
-                    ))
-                })?
-                .path();
-            if !path.extension().is_some_and(|e| e == "parquet") {
-                continue;
-            }
-            let newest = super::store::file_max_timestamp(&path).unwrap_or_else(|| {
-                std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .map(|t| {
-                        t.duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                    })
-                    .unwrap_or(u64::MAX)
-            });
-            if newest < before {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => deleted += 1,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(MayoError::Io(std::io::Error::new(
-                            error.kind(),
-                            format!("prune {}: {error}", path.display()),
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(deleted)
+    ///
+    /// Opening every file's footer is slow on a slow disk, so the scan runs
+    /// on a blocking thread (#1417).
+    pub async fn prune(&self, before: u64) -> Result<usize, MayoError> {
+        let data_dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || prune_directory(&data_dir, before))
+            .await
+            .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?
     }
 
     /// Prune rollups older than `retention`, measured back from `now`.
@@ -673,7 +629,11 @@ impl RollupStore {
     /// timestamp `prune` expects. A zero `retention` keeps everything —
     /// matching the "0 means unlimited" convention the other storage limits
     /// use — so an unconfigured council never deletes rollups by surprise.
-    pub fn prune_expired(&self, now: SystemTime, retention: Duration) -> Result<usize, MayoError> {
+    pub async fn prune_expired(
+        &self,
+        now: SystemTime,
+        retention: Duration,
+    ) -> Result<usize, MayoError> {
         if retention.is_zero() {
             return Ok(0);
         }
@@ -682,8 +642,61 @@ impl RollupStore {
             .unwrap_or_default()
             .as_secs();
         let before = now_secs.saturating_sub(retention.as_secs());
-        self.prune(before)
+        self.prune(before).await
     }
+}
+
+/// Delete the Parquet files under `data_dir` whose newest datapoint is older
+/// than `before`: how many went.
+fn prune_directory(data_dir: &std::path::Path, before: u64) -> Result<usize, MayoError> {
+    let mut deleted = 0;
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        // A new store has no directory until its first flush.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(MayoError::Io(std::io::Error::new(
+                error.kind(),
+                format!("list metrics {}: {error}", data_dir.display()),
+            )));
+        }
+    };
+    for entry in entries {
+        let path = entry
+            .map_err(|error| {
+                MayoError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("read metrics directory {}: {error}", data_dir.display()),
+                ))
+            })?
+            .path();
+        if !path.extension().is_some_and(|e| e == "parquet") {
+            continue;
+        }
+        let newest = super::store::file_max_timestamp(&path).unwrap_or_else(|| {
+            std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map(|t| {
+                    t.duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                })
+                .unwrap_or(u64::MAX)
+        });
+        if newest < before {
+            match std::fs::remove_file(&path) {
+                Ok(()) => deleted += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(MayoError::Io(std::io::Error::new(
+                        error.kind(),
+                        format!("prune {}: {error}", path.display()),
+                    )));
+                }
+            }
+        }
+    }
+    Ok(deleted)
 }
 
 /// A cluster-wide aggregate row with full statistics.
@@ -721,14 +734,15 @@ mod tests {
     use crate::mayo::rollup::{NodeRollup, RollupAggregate, RollupEntry};
     use crate::meat::NodeId;
 
-    #[test]
-    fn prune_reports_failed_deletions_and_preserves_survivors() {
+    #[tokio::test]
+    async fn prune_reports_failed_deletions_and_preserves_survivors() {
         let (store, dir) = test_store();
         let blocked = dir.path().join("blocked.parquet");
         std::fs::create_dir(&blocked).unwrap();
         std::fs::write(blocked.join("survivor"), b"preserve").unwrap();
         let error = store
             .prune(u64::MAX)
+            .await
             .expect_err("failed removal must not count as deletion");
         assert!(error.to_string().contains("blocked.parquet"), "{error}");
         assert_eq!(
@@ -1329,12 +1343,12 @@ mod tests {
             .unwrap()
             .as_secs()
             + 10_000;
-        assert_eq!(store.prune(future).unwrap(), 1);
+        assert_eq!(store.prune(future).await.unwrap(), 1);
 
         // Pruning to the epoch keeps everything.
         store.ingest(&make_rollup("n2", 1000, "cpu", 20.0));
         store.flush().await.unwrap();
-        assert_eq!(store.prune(0).unwrap(), 0);
+        assert_eq!(store.prune(0).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1354,6 +1368,7 @@ mod tests {
         // Retaining one hour must delete the two-hour-old file.
         let deleted = store
             .prune_expired(std::time::SystemTime::now(), Duration::from_secs(3600))
+            .await
             .unwrap();
         assert_eq!(deleted, 1);
 
@@ -1363,9 +1378,39 @@ mod tests {
         assert_eq!(
             store
                 .prune_expired(std::time::SystemTime::now(), Duration::ZERO)
+                .await
                 .unwrap(),
             0
         );
+    }
+
+    /// The disk-pressure tick prunes expired rollups, and pruning opens
+    /// every Parquet file's footer. It ran on a runtime worker, under the
+    /// store's read guard, on the disks where 0.2.6's soaks saw journal
+    /// writes take over a second (#1606). On a single-threaded runtime,
+    /// work done inline finishes inside the first poll, so a pending first
+    /// poll means the files are read on a blocking thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn expiry_reads_the_files_off_the_runtime() {
+        let (store, dir) = test_store();
+        for file in 0..500 {
+            std::fs::write(
+                dir.path().join(format!("rollup_{file:06}.parquet")),
+                [0u8; 10],
+            )
+            .unwrap();
+        }
+        let mut prune = std::pin::pin!(
+            store.prune_expired(std::time::SystemTime::now(), Duration::from_secs(3600))
+        );
+
+        let first = futures_util::poll!(prune.as_mut());
+        assert!(
+            first.is_pending(),
+            "the prune read every file inside one poll, on the runtime"
+        );
+        // Unreadable footers fall back to the files' mtimes, which are new.
+        assert_eq!(prune.await.unwrap(), 0);
     }
 
     #[test]

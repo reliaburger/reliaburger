@@ -471,7 +471,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.prepare_storage(app_name, namespace, spec).await?;
 
         // The per-instance identity dir must exist before create (PKI7).
-        if let Err(e) = self.prepare_instance_identity(instance_id) {
+        if let Err(e) = self.prepare_instance_identity(instance_id).await {
             eprintln!("bun: warning: {e}");
         }
 
@@ -676,7 +676,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             });
         }
         self.prepare_storage(app_name, namespace, spec).await?;
-        if let Err(e) = self.prepare_instance_identity(instance_id) {
+        if let Err(e) = self.prepare_instance_identity(instance_id).await {
             eprintln!("bun: warning: {e}");
         }
         let cgroup_path =

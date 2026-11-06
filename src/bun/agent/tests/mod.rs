@@ -3010,7 +3010,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 Some(outcome) = self.identity_signing_tasks.join_next_with_id(),
                     if !self.identity_signing_tasks.is_empty() => {
-                    self.finish_identity_provision(outcome);
+                    self.finish_identity_provision(outcome).await;
                 }
                 result = &mut task => {
                     let _ = result;
@@ -13694,7 +13694,7 @@ async fn concurrent_requests_for_one_identity_share_one_signing() {
     .await
     .unwrap()
     .unwrap();
-    agent.finish_identity_provision(outcome);
+    agent.finish_identity_provision(outcome).await;
     for answered in [first_answered, second_answered] {
         answered.await.expect("a waiter was dropped unanswered");
     }
@@ -13743,7 +13743,7 @@ async fn signed_identity_is_stored_only_for_a_live_instance() {
             .join_next_with_id()
             .await
             .unwrap();
-        agent.finish_identity_provision(outcome);
+        agent.finish_identity_provision(outcome).await;
     }
 
     let instance = agent.supervisor.get_instance(&live).unwrap();

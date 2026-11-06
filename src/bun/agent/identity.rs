@@ -51,14 +51,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Prepare an instance's identity directory before its container is
     /// created — the bind-mount source must exist, and on Linux root mode
     /// this is where the backing tmpfs gets mounted (PKI7).
-    pub(super) fn prepare_instance_identity(
+    /// The directory work runs on a blocking thread: it may fork `mount`.
+    pub(super) async fn prepare_instance_identity(
         &self,
         instance_id: &InstanceId,
     ) -> Result<(), BunError> {
         let dir = self.instance_identity_dir(instance_id);
-        crate::sesame::identity::prepare_identity_dir(&dir).map_err(|e| BunError::SecurityError {
-            reason: format!("failed to prepare identity dir for {instance_id}: {e}"),
-        })
+        // LOOP-INLINE: the mount source must exist before create; a blocking thread does the work, once per instance
+        crate::sesame::identity::prepare_identity_dir_off_runtime(&dir)
+            .await
+            .map_err(|e| BunError::SecurityError {
+                reason: format!("failed to prepare identity dir for {instance_id}: {e}"),
+            })
     }
 
     /// Remove identity directories that don't belong to any tracked

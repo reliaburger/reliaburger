@@ -2298,7 +2298,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let job_telemetry = Arc::new(reliaburger::mayo::job_metrics::JobTelemetry::default());
     let collection_jobs = Arc::clone(&job_telemetry);
     feeder_handles.push(tokio::spawn(async move {
-        let mut collector = SystemCollector::new();
+        // Off the runtime: the first refresh reads every process on the host.
+        let Ok(mut collector) = tokio::task::spawn_blocking(SystemCollector::new).await else {
+            eprintln!("bun: metrics collector failed to start");
+            return;
+        };
         let mut job_cgroups = reliaburger::mayo::job_metrics::CgroupCpu::default();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(collection_interval));
         let mut flush_counter = 0u64;
@@ -2306,7 +2310,17 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             tokio::select! {
                 _ = collection_shutdown.cancelled() => break,
                 _ = tick.tick() => {
-                    collector.refresh();
+                    collector = match collector.refreshed().await {
+                        Ok(collector) => collector,
+                        // A panic in sysinfo took the collector with it.
+                        Err(error) => {
+                            eprintln!("bun: metrics refresh failed: {error}");
+                            match tokio::task::spawn_blocking(SystemCollector::new).await {
+                                Ok(collector) => collector,
+                                Err(_) => break,
+                            }
+                        }
+                    };
                     let mut samples = collector.collect_node_metrics();
 
                     // Per-app metrics (OBS3): ask the agent for its running
@@ -2537,7 +2551,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             .as_secs();
                         let before = now_secs.saturating_sub(u64::from(retention_days) * 86_400);
                         let store = retention_mayo.read().await;
-                        match store.prune(before) {
+                        match store.prune(before).await {
                             Ok(n) if n > 0 => println!(
                                 "bun: metrics retention pruned {n} file(s) older than {retention_days}d"
                             ),
@@ -2698,6 +2712,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                                 .read()
                                 .await
                                 .prune_expired(std::time::SystemTime::now(), retention)
+                                .await
                             {
                                 Ok(pruned) if pruned > 0 => {
                                     println!("bun: pruned {pruned} expired rollup(s)");
@@ -2713,7 +2728,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         // `max_storage_mb` caps are retention limits that
                         // export-and-prune enforce above; a store over its cap
                         // on a mostly empty disk is no reason to resign (#510).
-                        let council_disk = match FilesystemUsage::of(&dp_raft_dir) {
+                        let council_disk = match FilesystemUsage::measure(&dp_raft_dir).await {
                             Ok(usage) => Some(usage),
                             Err(error) => {
                                 eprintln!(

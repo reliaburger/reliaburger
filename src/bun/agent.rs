@@ -1737,7 +1737,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Some(outcome) = self.identity_signing_tasks.join_next_with_id(),
                         if !self.identity_signing_tasks.is_empty() => {
                         let turn = self.begin_turn(LoopBranch::IdentitySigning, None);
-                        self.finish_identity_provision(outcome);
+                        self.finish_identity_provision(outcome).await;
                         turn
                     }
                     Some(outcome) = self.restart_steps.join_next_with_id(),
