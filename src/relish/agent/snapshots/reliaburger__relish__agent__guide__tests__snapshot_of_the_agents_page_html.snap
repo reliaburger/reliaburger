@@ -26,11 +26,30 @@ expression: "artefact(paths::AGENTS_PAGE_HTML)"
 <p>Reliaburger is an orchestrator.
 Its CLI is <code>relish</code>.</p>
 <p>Intro paragraph.</p>
-<h2>In brief</h2>
+<aside class="agents-install" id="add-to-your-agent" aria-labelledby="add-to-your-agent-title">
+<h2 id="add-to-your-agent-title">Add it to your agent <a class="permalink" href="#add-to-your-agent" aria-label="Link to the install buttons">#</a></h2>
+<p>Each button adds one MCP server, <code>reliaburger</code>, that runs <code>relish mcp</code>: read-only tools over stdio, with no port, no trust flag and no auto-approval. Your client shows the entry and asks before it adds it. Install <code>relish</code> 0.2.7 or later first (<code>relish agent version</code> says which you have); the server runs the <code>relish</code> on your <code>PATH</code>.</p>
+<p class="agents-install-buttons"><a class="install-button" href="cursor://anysphere.cursor-deeplink/mcp/install?name=reliaburger&amp;config=eyJhcmdzIjpbIm1jcCJdLCJjb21tYW5kIjoicmVsaXNoIn0%3D">Add to Cursor</a><a class="install-button" href="vscode:mcp/install?%7B%22args%22%3A%5B%22mcp%22%5D%2C%22command%22%3A%22relish%22%2C%22name%22%3A%22reliaburger%22%7D">Add to VS Code</a><a class="install-button" href="goose://extension?cmd=relish&amp;arg=mcp&amp;id=reliaburger&amp;name=Reliaburger&amp;description=Reliaburger%3A%20read-only%20cluster%20status%2C%20diagnosis%20and%20logs">Add to Goose</a></p>
+<p>Claude Code, from a shell:</p>
+<pre><code data-install-command>claude mcp add reliaburger -- relish mcp</code></pre>
+<p>Or let <code>relish agent setup</code> find every agent on this machine and show the change before it writes anything (see <a href="#wiring-up-your-agent">Wiring up your agent</a>). Give the server a read-only token: see <a href="#a-read-only-token">A read-only token</a>.</p>
+</aside>
+<nav class="agents-contents" aria-label="On this page">
+<h2>On this page</h2>
+<ol>
+<li><a href="#in-brief">In brief</a></li>
+<li><a href="#commands">Commands</a></li>
+<li><a href="#sending-us-a-fix">Sending us a fix</a></li>
+</ol>
+</nav>
+<section class="agents-section" id="in-brief">
+<h2>In brief <a class="permalink" href="#in-brief" aria-label="Link to this section">#</a></h2>
 <ul>
 <li><strong>Run <code>relish agent guide</code> first.</strong></li>
 </ul>
-<h2>Commands</h2>
+</section>
+<section class="agents-section" id="commands">
+<h2>Commands <a class="permalink" href="#commands" aria-label="Link to this section">#</a></h2>
 <table><thead><tr><th>Command</th><th>What it does</th></tr></thead><tbody>
 <tr><td><code>relish agent guide</code></td><td>This chapter, as Markdown sections.</td></tr>
 <tr><td><code>relish agent source grep</code></td><td>Search it | quickly.</td></tr>
@@ -38,12 +57,15 @@ Its CLI is <code>relish</code>.</p>
 <pre><code class="language-sh">## not a heading inside a fence
 relish agent guide
 </code></pre>
-<h2>Sending us a fix</h2>
+</section>
+<section class="agents-section" id="sending-us-a-fix">
+<h2>Sending us a fix <a class="permalink" href="#sending-us-a-fix" aria-label="Link to this section">#</a></h2>
 <ul>
 <li><strong>Disclose.</strong></li>
 </ul>
+</section>
     </main>
-    <footer><span>Reliaburger · by Miko Pawlikowski</span><a href="./agents.md">This page as Markdown</a><span class="footer-note">Generated from the manual chapter “Working with an AI agent”. Static HTML and CSS. The existing copy script adds command buttons. No tracking or third-party requests.</span></footer>
+    <footer><span>Reliaburger · by Miko Pawlikowski</span><a href="./agents.md">This page as Markdown</a><span class="footer-note">Generated from the manual chapter “Working with an AI agent”. Static HTML and CSS; the site’s copy script adds the copy buttons. No tracking or third-party requests.</span></footer>
   </div>
   <script src="assets/copy.js" defer></script>
 </body>

@@ -833,7 +833,12 @@ The chapter ends with the playbook an agent follows to set a cluster up for
 you, on this computer, on machines over SSH or in a cloud, with a cloud-init
 file that readies machines for `relish setup --ssh` and the rule that nothing
 paid is created without your yes. The homepage's install section has a "With
-your agent" tab with the one prompt that sends an agent there.
+your agent" tab with the one prompt that sends an agent there. The homepage
+opens with "Are you an AI agent? Start here", linking `/agents`, its Markdown
+and `llms.txt`; its "Debug the platform, not just your app" section shows the
+session an agent runs. `/agents` has a linkable section per heading and "Add
+to Cursor / VS Code / Goose" buttons that add `relish mcp`, built from the
+same server entry `relish agent setup` writes.
 
 Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select
 an exact supported chaos scenario. Omitting the filter runs all five, including

@@ -980,21 +980,34 @@ explains the policy behind them.
 runs the portable suite: unit, property and snapshot tests, the integration
 suite, doctests, the doc snippet checks (every `relish` command in this
 manual parses with the real CLI), lint and a coverage floor. `make ci` runs
-the same set on your machine, and nothing more.
+the same set on your machine, and nothing more. So does `relish agent patch test ./fix`.
 
-The suites that need root, Linux, eBPF, Apple hardware or a real multi-node
-cluster are gated. Each has its own `make` target, and CI runs them on pushes
-to a merge train and on pull requests labelled `full-ci`. Before a release,
-the exact signed binaries are installed the way you'd install them and soaked
-under faults for hours, and the [qualification records](https://github.com/reliaburger/reliaburger/tree/main/docs/qualification)
+The suites that need root, Linux, eBPF or a real multi-node cluster are
+gated. Each has its own `make` target, such as `make test-linux` or `make
+test-cluster`. CI runs them on every push to a merge train or to `main`, every
+night, and on pull requests labelled `full-ci`; any other pull request
+doesn't run them. The Apple Container and GPU suites (`make test-apple`,
+`make test-gpu`) need hardware CI doesn't have, so the maintainer runs them by
+hand before a release that touches those parts.
+
+Before a release, the exact signed binaries are installed the way you'd
+install them, soaked under faults for hours, and put through power cuts and
+reboots in a throwaway VM. The [qualification records](https://github.com/reliaburger/reliaburger/tree/main/docs/qualification)
 say what each candidate went through. A test that passes only on a re-run goes
 in the [flakes register](https://github.com/reliaburger/reliaburger/blob/main/docs/flakes.md)
 the same day.
 
+What none of that proves: the soaks run three small VMs on one machine, so
+they say nothing about large clusters, real networks between machines or
+hardware failing. A VM forced off isn't a real power loss, the faults follow a
+schedule rather than production traffic, and zero failures in 25 power cuts
+only rules out failure rates above about 12%.
+
 So when your agent reports a fix, it should say which of these it ran: `make
 ci`, or a gated target such as `make test-cluster`. And if it finds behaviour
-no test covers, tell us with the test request form. A missing test is a bug
-too. [How Reliaburger is tested](https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md)
+no test covers, ask your human to tell us with the
+[test request form](https://github.com/reliaburger/reliaburger/issues/new?template=test-request.yml).
+A missing test is a bug too. [How Reliaburger is tested](https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md)
 has every layer.
 
 ## Measuring an agent on your cluster

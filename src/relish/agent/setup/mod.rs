@@ -33,7 +33,7 @@ use super::envelope::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, N
 use clients::{Client, Home};
 use edit::Existing;
 
-pub use clients::{MCP_COMMAND_LINE, MCP_SERVER_NAME, mcp_command_line};
+pub use clients::{MCP_COMMAND_LINE, MCP_DESCRIPTION, MCP_SERVER_NAME, mcp_command_line};
 
 /// The Reliaburger skill for agents that read Agent Skills, as `make
 /// agent-docs` generates it from the manual's agent chapter. Setup installs

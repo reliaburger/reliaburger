@@ -444,7 +444,7 @@ pub fn generate(inputs: &Inputs<'_>, agent: &Command) -> Result<Vec<Artefact>, G
         },
         Artefact {
             path: paths::AGENTS_PAGE_HTML,
-            contents: agents_html(&title, &summary, &page),
+            contents: agents_html(&title, &summary, &page, inputs.version),
         },
         Artefact {
             path: paths::SKILL,
@@ -533,10 +533,170 @@ fn escape_html(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn agents_html(title: &str, summary: &str, page: &str) -> String {
+/// `text` percent-encoded for a URL query value: everything but the
+/// unreserved characters of RFC 3986 becomes `%XX`.
+fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 3);
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// One-click links that add `relish mcp` to an agent client, each made from
+/// the same name and command line `relish agent setup` writes. Each client
+/// shows the server and asks before it adds anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallLinks {
+    /// Cursor's `cursor://` deeplink.
+    pub cursor: String,
+    /// The same, through cursor.com, for pages that strip custom schemes.
+    pub cursor_web: String,
+    /// VS Code's `vscode:mcp/install` link.
+    pub vscode: String,
+    /// The same, through vscode.dev, for pages that strip custom schemes.
+    pub vscode_web: String,
+    /// Goose's `goose://extension` link.
+    pub goose: String,
+    /// The Claude Code command that adds the same server.
+    pub claude_code: String,
+}
+
+/// The install links for `relish mcp`.
+pub fn install_links() -> InstallLinks {
+    use base64::Engine as _;
+    let name = super::setup::MCP_SERVER_NAME;
+    let mut words = super::setup::MCP_COMMAND_LINE.iter().copied();
+    let command = words.next().unwrap_or("relish");
+    let args: Vec<&str> = words.collect();
+
+    let cursor_config = base64::engine::general_purpose::STANDARD
+        .encode(json!({"command": command, "args": args}).to_string());
+    let cursor_query = format!("name={name}&config={}", percent_encode(&cursor_config));
+    let vscode = format!(
+        "vscode:mcp/install?{}",
+        percent_encode(&json!({"name": name, "command": command, "args": args}).to_string())
+    );
+    let mut goose = format!("goose://extension?cmd={}", percent_encode(command));
+    for arg in &args {
+        let _ = write!(goose, "&arg={}", percent_encode(arg));
+    }
+    let _ = write!(
+        goose,
+        "&id={name}&name={}&description={}",
+        percent_encode("Reliaburger"),
+        percent_encode(super::setup::MCP_DESCRIPTION)
+    );
+    InstallLinks {
+        cursor: format!("cursor://anysphere.cursor-deeplink/mcp/install?{cursor_query}"),
+        cursor_web: format!("https://cursor.com/en/install-mcp?{cursor_query}"),
+        vscode_web: format!(
+            "https://insiders.vscode.dev/redirect?url={}",
+            percent_encode(&vscode)
+        ),
+        vscode,
+        goose,
+        claude_code: format!(
+            "claude mcp add {name} -- {}",
+            super::setup::MCP_COMMAND_LINE.join(" ")
+        ),
+    }
+}
+
+/// A heading's anchor, the way GitHub makes one: lower case, spaces to `-`,
+/// punctuation other than `-` and `_` dropped.
+fn slug(heading: &str) -> String {
+    heading
+        .trim()
+        .chars()
+        .filter_map(|c| match c {
+            ' ' => Some('-'),
+            c if c.is_alphanumeric() || c == '-' || c == '_' => Some(c.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn markdown_to_html(markdown: &str) -> String {
     use pulldown_cmark::{Options, Parser, html};
-    let mut body = String::new();
-    html::push_html(&mut body, Parser::new_ext(page, Options::ENABLE_TABLES));
+    let mut out = String::new();
+    html::push_html(&mut out, Parser::new_ext(markdown, Options::ENABLE_TABLES));
+    out
+}
+
+/// The box near the top of `/agents` with the install buttons, the Claude
+/// Code line and what they need.
+fn install_box(version: &str) -> String {
+    let links = install_links();
+    format!(
+        r##"<aside class="agents-install" id="add-to-your-agent" aria-labelledby="add-to-your-agent-title">
+<h2 id="add-to-your-agent-title">Add it to your agent <a class="permalink" href="#add-to-your-agent" aria-label="Link to the install buttons">#</a></h2>
+<p>Each button adds one MCP server, <code>{name}</code>, that runs <code>{line}</code>: read-only tools over stdio, with no port, no trust flag and no auto-approval. Your client shows the entry and asks before it adds it. Install <code>relish</code> {version} or later first (<code>relish agent version</code> says which you have); the server runs the <code>relish</code> on your <code>PATH</code>.</p>
+<p class="agents-install-buttons"><a class="install-button" href="{cursor}">Add to Cursor</a><a class="install-button" href="{vscode}">Add to VS Code</a><a class="install-button" href="{goose}">Add to Goose</a></p>
+<p>Claude Code, from a shell:</p>
+<pre><code data-install-command>{claude}</code></pre>
+<p>Or let <code>relish agent setup</code> find every agent on this machine and show the change before it writes anything (see <a href="#wiring-up-your-agent">Wiring up your agent</a>). Give the server a read-only token: see <a href="#a-read-only-token">A read-only token</a>.</p>
+</aside>
+"##,
+        name = escape_html(super::setup::MCP_SERVER_NAME),
+        line = escape_html(&super::setup::MCP_COMMAND_LINE.join(" ")),
+        version = escape_html(version),
+        cursor = escape_html(&links.cursor),
+        vscode = escape_html(&links.vscode),
+        goose = escape_html(&links.goose),
+        claude = escape_html(&links.claude_code),
+    )
+}
+
+/// The page's body: the intro, the install box, a list of the sections, and
+/// each `## ` section as a `<section>` whose `id` is its heading's slug, so
+/// `/agents#how-reliaburger-is-tested` links to one and CSS can style it.
+fn agents_body(page: &str, version: &str) -> String {
+    let (title, sections) = sections(page);
+    let mut sections = sections.into_iter();
+    let mut body = format!("<h1>{}</h1>\n", escape_html(&title));
+    if let Some(intro) = sections.next() {
+        body.push_str(&markdown_to_html(&intro.markdown));
+    }
+    body.push_str(&install_box(version));
+    let sections: Vec<GuideSection> = sections.collect();
+    body.push_str("<nav class=\"agents-contents\" aria-label=\"On this page\">\n<h2>On this page</h2>\n<ol>\n");
+    for section in &sections {
+        let _ = writeln!(
+            body,
+            "<li><a href=\"#{}\">{}</a></li>",
+            slug(&section.heading.replace('`', "")),
+            inline_html(&section.heading)
+        );
+    }
+    body.push_str("</ol>\n</nav>\n");
+    for section in &sections {
+        let id = slug(&section.heading.replace('`', ""));
+        let _ = write!(
+            body,
+            "<section class=\"agents-section\" id=\"{id}\">\n<h2>{heading} <a class=\"permalink\" href=\"#{id}\" aria-label=\"Link to this section\">#</a></h2>\n{content}</section>\n",
+            heading = inline_html(&section.heading),
+            content = markdown_to_html(&section.markdown),
+        );
+    }
+    body
+}
+
+/// A heading's Markdown as inline HTML, without the paragraph around it.
+fn inline_html(markdown: &str) -> String {
+    let html = markdown_to_html(markdown);
+    html.trim()
+        .trim_start_matches("<p>")
+        .trim_end_matches("</p>")
+        .to_string()
+}
+
+fn agents_html(title: &str, summary: &str, page: &str, version: &str) -> String {
+    let body = agents_body(page, version);
     format!(
         r##"<!doctype html>
 <!-- Generated from {chapter} by `{REGENERATE_COMMAND}`: edit the chapter, not this file. -->
@@ -559,7 +719,7 @@ fn agents_html(title: &str, summary: &str, page: &str) -> String {
     </header>
     <main id="main" class="agents-page">
 {body}    </main>
-    <footer><span>Reliaburger · by {AUTHOR}</span><a href="./agents.md">This page as Markdown</a><span class="footer-note">Generated from the manual chapter {title_escaped}. Static HTML and CSS. The existing copy script adds command buttons. No tracking or third-party requests.</span></footer>
+    <footer><span>Reliaburger · by {AUTHOR}</span><a href="./agents.md">This page as Markdown</a><span class="footer-note">Generated from the manual chapter {title_escaped}. Static HTML and CSS; the site’s copy script adds the copy buttons. No tracking or third-party requests.</span></footer>
   </div>
   <script src="assets/copy.js" defer></script>
 </body>
@@ -990,6 +1150,122 @@ Intro paragraph.\n\n## In brief\n\n\
     #[test]
     fn snapshot_of_the_agents_page_html() {
         insta::assert_snapshot!(artefact(paths::AGENTS_PAGE_HTML));
+    }
+
+    /// Undo [`percent_encode`], for checking what a link carries.
+    fn percent_decode(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                out.push(u8::from_str_radix(&text[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    fn query_values<'a>(link: &'a str, key: &str) -> Vec<&'a str> {
+        let query = &link[link.find('?').unwrap() + 1..];
+        query
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix(&format!("{key}=")))
+            .collect()
+    }
+
+    #[test]
+    fn every_install_link_starts_the_server_setup_registers() {
+        use base64::Engine as _;
+        let links = install_links();
+        let expected = super::super::setup::MCP_COMMAND_LINE;
+        let name = super::super::setup::MCP_SERVER_NAME;
+
+        for cursor in [&links.cursor, &links.cursor_web] {
+            assert_eq!(query_values(cursor, "name"), [name]);
+            let config = percent_decode(query_values(cursor, "config")[0]);
+            let config = base64::engine::general_purpose::STANDARD
+                .decode(config)
+                .unwrap();
+            let config: serde_json::Value = serde_json::from_slice(&config).unwrap();
+            assert_eq!(config["command"], expected[0]);
+            assert_eq!(config["args"], json!(expected[1..]));
+        }
+        assert!(
+            links
+                .cursor
+                .starts_with("cursor://anysphere.cursor-deeplink/mcp/install?")
+        );
+
+        let vscode: serde_json::Value = serde_json::from_str(&percent_decode(
+            links.vscode.strip_prefix("vscode:mcp/install?").unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(vscode["name"], name);
+        assert_eq!(vscode["command"], expected[0]);
+        assert_eq!(vscode["args"], json!(expected[1..]));
+        let redirected = query_values(&links.vscode_web, "url")[0];
+        assert_eq!(percent_decode(redirected), links.vscode);
+
+        assert!(links.goose.starts_with("goose://extension?"));
+        let mut goose = vec![percent_decode(query_values(&links.goose, "cmd")[0])];
+        goose.extend(
+            query_values(&links.goose, "arg")
+                .into_iter()
+                .map(percent_decode),
+        );
+        assert_eq!(goose, expected);
+        assert_eq!(query_values(&links.goose, "id"), [name]);
+
+        assert_eq!(
+            links.claude_code,
+            format!("claude mcp add {name} -- {}", expected.join(" "))
+        );
+    }
+
+    #[test]
+    fn slugs_follow_github_s_anchors() {
+        assert_eq!(
+            slug("How Reliaburger is tested"),
+            "how-reliaburger-is-tested"
+        );
+        assert_eq!(
+            slug("Text the cluster didn't write"),
+            "text-the-cluster-didnt-write"
+        );
+        assert_eq!(slug("Reading an app's logs"), "reading-an-apps-logs");
+    }
+
+    #[test]
+    fn the_agents_page_has_a_linkable_section_per_heading_and_the_install_box() {
+        let html = artefact(paths::AGENTS_PAGE_HTML);
+        for id in ["in-brief", "commands", "sending-us-a-fix"] {
+            assert!(
+                html.contains(&format!("<section class=\"agents-section\" id=\"{id}\">")),
+                "no section {id}"
+            );
+            assert!(
+                html.contains(&format!("<li><a href=\"#{id}\">")),
+                "{id} not listed"
+            );
+            assert!(html.contains(&format!("<a class=\"permalink\" href=\"#{id}\"")));
+        }
+        let links = install_links();
+        for link in [&links.cursor, &links.vscode, &links.goose] {
+            assert!(html.contains(&format!("href=\"{}\"", escape_html(link))));
+        }
+        assert!(html.contains(&format!(
+            "<code data-install-command>{}</code>",
+            links.claude_code
+        )));
+        assert!(html.contains("<code>relish</code> 0.2.7 or later"));
+        // The install box comes after the intro and before the first section.
+        let install = html.find("id=\"add-to-your-agent\"").unwrap();
+        assert!(html.find("Intro paragraph.").unwrap() < install);
+        assert!(install < html.find("id=\"in-brief\"").unwrap());
     }
 
     #[test]

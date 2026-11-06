@@ -2791,9 +2791,9 @@ there as code.
   Markdown copy of every chapter.
 - **`bun` serving `/llms.txt`.** Also in the original issue. `relish agent
   guide` does that job for an installed cluster, and matches the binary.
-- **The `/agents` page's design.** #1578 builds the website side: the
-  headline, install buttons, the recording. This change gives it the text and
-  a plain page in the site's shell, both generated.
+- **The `/agents` page's design.** #1578 built the website side later (see
+  "The front page" below). This change gave it the text and a plain page in
+  the site's shell, both generated.
 - **Moving `CLAUDE.md`'s rules into `AGENTS.md`.** The plan has `CLAUDE.md`
   import `AGENTS.md`, so every tool reads the same rules. `CLAUDE.md` is the
   file every Claude session here loads, so that edit is the maintainer's.
@@ -3479,6 +3479,153 @@ reads every word and takes it literally. "Check the free tier" isn't enough;
 "say when it's too small, and here's one that is" is. And the most useful
 thing in the whole playbook is a sentence any person would also want: create
 nothing that costs money until I say yes.
+
+## The front page
+
+The homepage was written for a person with a browser. From 0.2.7 a good share
+of its readers are models: an agent asked to "look at Reliaburger" fetches the
+page and reads the HTML top to bottom. So #1578 gives it four things, without
+a new script or a new stylesheet.
+
+- **A line for agents above the masthead.** "Are you an AI agent? Start here"
+  links `/agents`, its Markdown and `llms.txt`. It comes before the navigation
+  because an agent reads in source order, and a person skims past one line.
+- **The headline**, "Built for humans and their agents", under the title.
+  The title stays: it says what Reliaburger is, the headline says who it's
+  for.
+- **A sixth "Built differently" slide**, "Your agent can read the recipe".
+  The carousel script counts its slides, so a sixth needed markup and CSS
+  only. Its drawing is a recipe card with a magnifying glass running down it
+  and a reply bubble of braces, animated by CSS, so reduced motion stills it
+  like the other five.
+- **A section, "Debug the platform, not just your app"**, with the session an
+  agent runs: a read-only token, `context`, `diagnose`, `explain`, `source
+  grep`, then `patch` on a throwaway cluster, and a report for a human to
+  post.
+
+Every one of those `relish agent` commands is new in 0.2.7, and the installer
+still fetches 0.2.6 until the release, so each place that names one says
+"0.2.7, not in 0.2.6", the label the release check already demands.
+
+### A recording slot with nothing in it
+
+The section is meant to carry a recording of a real agent session. Recordings
+on this site are real runs with real timings, and the session needs a quiet
+build machine, so it isn't made yet (#1579). The slot is a `<figure>` with no
+`data-cast`: the player script only picks up `.recording[data-cast]`, so it
+leaves the slot alone, and the slot says in words that there's no recording
+and why. The steps below it are the session in writing. A test holds the slot
+to one of two states: no cast and a note that says so, or a cast and a screen
+for the player. There's no third state where an empty black box sits on the
+page looking broken.
+
+### `/agents`, a section at a time
+
+`/agents` is generated from the manual chapter, so its design goes into the
+generator, `src/relish/agent/guide.rs`, not into the HTML. The first version
+rendered the whole chapter with one `pulldown_cmark::html::push_html` call.
+That gives headings with no `id`, so nothing could link to "How Reliaburger is
+tested" and CSS couldn't single it out. The chapter was already split into
+`## ` sections for `relish agent guide`, so the page now reuses that split:
+each section becomes a `<section>` whose `id` is the heading's slug, the
+anchor GitHub would make, so a link works the same on the site and on
+GitHub:
+
+```rust
+fn slug(heading: &str) -> String {
+    heading
+        .trim()
+        .chars()
+        .filter_map(|c| match c {
+            ' ' => Some('-'),
+            c if c.is_alphanumeric() || c == '-' || c == '_' => Some(c.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+```
+
+`filter_map` is `map` and `filter` in one: the closure returns `Some(value)`
+to keep a character, changed or not, and `None` to drop it. `collect()` then
+builds whatever the return type asks for, here a `String` from an iterator of
+`char`s. The guard `c if …` in a `match` arm binds the character and tests
+it in one arm. Python would write the same as a generator expression inside
+`"".join(…)`; Go would loop and append to a `strings.Builder`.
+
+The page also gets a contents list and, after the introduction, a box with
+the install buttons. The "How Reliaburger is tested" section, which says what
+CI and the gate run and, now, what they don't, gets the accent rule the
+homepage's release-testing section has. All of it is plain CSS in the site's
+`style.css`; tables scroll inside themselves on a phone rather than widening
+the page.
+
+### Install links from the same constants
+
+Cursor, VS Code and Goose each take a link that opens the client and offers
+to add an MCP server. Each wants the server described differently: Cursor
+takes a base64 JSON blob, VS Code a percent-encoded JSON object, Goose one
+query parameter per argument. Written by hand they'd be three strings to keep
+in step with `relish agent setup`; instead `install_links()` builds all of
+them from `MCP_SERVER_NAME` and `MCP_COMMAND_LINE`, the constants setup
+writes into every config file.
+
+```rust
+pub fn install_links() -> InstallLinks {
+    use base64::Engine as _;
+    let name = super::setup::MCP_SERVER_NAME;
+    let mut words = super::setup::MCP_COMMAND_LINE.iter().copied();
+    let command = words.next().unwrap_or("relish");
+    let args: Vec<&str> = words.collect();
+    let cursor_config = base64::engine::general_purpose::STANDARD
+        .encode(json!({"command": command, "args": args}).to_string());
+    // …
+}
+```
+
+`use base64::Engine as _;` imports a trait without giving it a name. A
+trait's methods can only be called where the trait is in scope, and
+`encode` is a method of the `Engine` trait, not of the `STANDARD` value's
+type. `as _` brings the trait into scope for method calls while leaving the
+name `Engine` free; it says "I want the methods, not the word". Python and Go
+have no equivalent, because their methods belong to the type, not to an
+interface you import.
+
+The README gets the Cursor and VS Code links too, through cursor.com and
+vscode.dev, because GitHub strips links whose scheme isn't one it knows;
+Goose has no web form, so the README points at `/agents` for it.
+
+### The tests
+
+- `src/relish/agent/guide.rs` decodes every install link back to its JSON or
+  its query and checks it starts `relish mcp` under the name `reliaburger`,
+  checks the slugs against GitHub's for three of the chapter's headings, and
+  that the generated page has a linkable section per heading and the install
+  box between the introduction and the first section. The page's snapshot
+  shows the rest.
+- `tests/suite/website.rs` checks that the agent line comes before the
+  masthead and links three files the site publishes, that the hero carries
+  the headline, that there are six slides, that every command in the agent
+  section parses with the real CLI, that the recording slot is in one of its
+  two honest states, that `/agents` and the README carry exactly the links
+  `install_links()` makes and the command they start parses, that every
+  `#fragment` on `/agents`, and every link from the homepage into it, lands on
+  an `id`, and that `/agents` loads only the site's own stylesheet and copy
+  script.
+
+### What we didn't do
+
+- **The recording.** Waits for #1579's real session.
+- **Replacing the title.** "The container platform, served ready" says what
+  it is. The headline sits under it rather than in place of it.
+- **Badges.** The install buttons are text links styled by the site's CSS,
+  not images from a badge service: the site makes no third-party requests.
+
+### Lessons
+
+The homepage had always been tested as a document a person reads. Treating an
+agent as a reader too found the gap the generator had: a page with no anchors
+is fine to scroll and useless to link, and an agent links. One `id` per
+section fixed both readers at once.
 
 ## Keeping score
 

@@ -41,6 +41,15 @@ for me. Start at https://reliaburger.com/agents." The playbook there
 has it ask where the cluster should run and create nothing that costs money
 without your yes.
 
+Already have `relish` 0.2.7 and an agent you use (0.2.7, not in 0.2.6)? Add
+`relish mcp`, its read-only MCP server, with
+[Add to Cursor](https://cursor.com/en/install-mcp?name=reliaburger&config=eyJhcmdzIjpbIm1jcCJdLCJjb21tYW5kIjoicmVsaXNoIn0%3D) or
+[Add to VS Code](https://insiders.vscode.dev/redirect?url=vscode%3Amcp%2Finstall%3F%257B%2522args%2522%253A%255B%2522mcp%2522%255D%252C%2522command%2522%253A%2522relish%2522%252C%2522name%2522%253A%2522reliaburger%2522%257D);
+Goose's button is on [the agents page](https://reliaburger.com/agents#add-to-your-agent).
+In Claude Code it's `claude mcp add reliaburger -- relish mcp`, and
+`relish agent setup` wires up every agent on this machine, showing the diff
+before it writes anything.
+
 ```sh
 # Install relish and build a three-node cluster in Linux VMs on this laptop
 curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
