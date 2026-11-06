@@ -88,11 +88,11 @@ cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once 
 PR targets `main`, and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
 Pull requests into a release's merge-train branch (`release-*`) run the light set:
 lint, minimum Rust, portable Linux with coverage, the demo app and the optimised
-contract boundaries. Labelled `full-ci`, they run every heavy owner but not the
-macOS shards (the `train-full` selection), which is also what a code PR into
+contract boundaries. Labelled `full-ci`, they run every heavy owner but not
+portable macOS (the `train-full` selection), which is also what a code PR into
 `main` runs. The merge queue on the train, the push to it, pushes to `main`,
 the nightly and the gate PR into `main` labelled `release-gate` run
-everything, including the three macOS shards; any other PR runs them only
+everything, portable macOS included; any other PR runs it only
 when it touches macOS-specific code or carries a `macos` label
 ([which jobs run](../testing.md#which-jobs-a-pull-request-runs)).
 Documentation-only pull requests skip the Rust jobs entirely, except for the manual
@@ -325,8 +325,8 @@ inventory, with the original policy visible in the generated matrix.
 
 `workflow_assembly.py` defines eleven literal owners and derives light, portable,
 train-full or full selection from trusted current workflow inputs; only a pull request may
-qualify with less than full, and not a pull request labelled `release-gate`. The macOS owner runs as three hash-partition
-shards, and aggregation proves their lists cover every test exactly once. `workflow_adapter.py` preserves
+qualify with less than full, and not a pull request labelled `release-gate`. The macOS owner runs as one job under
+the hash partition `hash:1/1`, and aggregation proves it ran every listed test exactly once. `workflow_adapter.py` preserves
 those commands and their complete selections. Ordinary nextest producers retain
 discovery and JUnit under one selector/environment plan. `completion.py` retains
 libtest discovery, selected-case completion and the actual child exit for owned

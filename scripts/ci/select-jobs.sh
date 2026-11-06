@@ -8,7 +8,7 @@
 #   task_arrays  - the task-array leader, node pool, executor or their
 #                  benchmarks changed, the script that gates on them, or
 #                  criterion's version
-#   macos        - run the portable suite on macOS (three shards)
+#   macos        - run the portable suite on macOS (one job)
 #   s3           - log export, council backups or the S3 client changed, or
 #                  the script that gives `make test-s3` its server
 #

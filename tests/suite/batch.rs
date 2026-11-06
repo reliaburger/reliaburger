@@ -833,7 +833,7 @@ async fn batch_failing_job_reports_failed() {
 /// A process job whose command starts and exits non-zero is a failed
 /// attempt, not a refused launch: it's retried up to `max_attempts`, and
 /// the retries show as the run's `restart_count` (#934). The command is one
-/// every Unix host has at the same path, so macOS shards check this too.
+/// every Unix host has at the same path, so portable macOS checks this too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn process_job_that_exits_non_zero_is_retried_before_it_fails() {
     let harness = Harness::start().await;

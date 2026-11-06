@@ -380,7 +380,7 @@ jobs. What else runs depends on where the change is going:
 | Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, the source bundle build, portable Linux (with coverage, doctests and the nightly-signing key test) and the optimised contract boundaries | about 25 minutes, set by portable Linux; up to 41 on a slow runner (#1421) |
 | The same, labelled `full-ci` | The light set plus privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks the change touches | about 45 minutes |
 | The gate PR (a train into `main`) | The light set on each push; with `full-ci`, the heavy suites too | as above |
-| The gate PR labelled `release-gate` | Everything, the three macOS shards included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
+| The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
 | Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 25 minutes |
 | Push to a train or to `main`, merge-queue group, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
@@ -388,9 +388,10 @@ jobs. What else runs depends on where the change is going:
 **macOS only where it adds something**
 ([#1443](https://github.com/reliaburger/reliaburger/issues/1443), maintainer
 decision of 28 October 2026). The organisation's plan runs at most five macOS
-jobs at once and a full run takes three, so between 25 and 28 October macOS
-shards queued a median of 0 minutes but 24 at p90 and 47 at worst. A pull
-request gets the three macOS shards only when
+jobs at once, so between 25 and 28 October, when a full run took three of them,
+macOS jobs queued a median of 0 minutes but 24 at p90 and 47 at worst. A full
+run now takes one ([below](#portable-macos-in-one-job)). A pull request gets
+portable macOS only when
 
 - it touches macOS-specific code: `src/grill/apple*`, any Rust file with a
   `target_os = "macos"` cfg before or after the change, the installers
@@ -401,8 +402,8 @@ request gets the three macOS shards only when
 - it's the gate PR labelled `release-gate`.
 
 Dependabot's PRs never get macOS otherwise; the nightly covers them. Every
-push to a train or to `main`, the nightly and the candidate build still run
-all three shards, so no commit reaches a train or `main` without them.
+push to a train or to `main`, the merge queue, the nightly and the candidate
+build still run it, so no commit reaches a train or `main` without it.
 
 The light set exists because macOS was the critical path of almost every run:
 twelve runs before the change took 45–55 minutes of wall time, of which
@@ -418,10 +419,12 @@ request `full-ci` when you want the heavy suites on the PR itself, for
 example for a change to privileged Linux, cluster or acceptance code. The
 evidence gate calls a heavy selection without macOS `train-full` and accepts
 it, like the light set, only on a `pull_request` event, and never on a
-`release-gate` PR. For macOS-only code the PR runs the shards itself; for
+`release-gate` PR. For macOS-only code the PR runs portable macOS itself; for
 anything else, check it on a Mac with `make test`, or add the `macos` label.
 
-The merge queue requires one check, `ignored-test evidence`. It waits for
+Every train merges through the merge queue, with `gh pr merge --merge --auto`
+([merging through the queue](releasing.md#merging-through-the-queue)).
+The queue requires one check, `ignored-test evidence`. It waits for
 every other job, fails if any of them failed or was cancelled, and then runs
 the evidence aggregation below, so a skipped job can only count when select
 jobs left it out. On a merge-queue group, a push or a manual run the
@@ -463,36 +466,42 @@ an HTTP `Range` request, abandons an attempt after 60 s without a byte, logs
 its progress, checks the zip's digest and stops at 13 minutes, inside the
 step's 14.
 
-### Portable macOS in three shards
+### Portable macOS in one job
 
-The portable suite on macOS runs as three parallel jobs, `portable macOS
-(1/3)` to `(3/3)`, each running `make test` with `--partition hash:K/3`
-(`SHARDS` in [`workflow_assembly.py`](../scripts/ci/workflow_assembly.py)).
-A hash partition keeps each test in the same shard whatever else is added, so
-a failure in shard 2 reproduces locally with
-`cargo nextest run --partition hash:2/3`. Each shard compiles the suite
-itself, and compiling is most of a macOS job: on the first sharded run each
-shard spent about 38 minutes compiling and under 3 testing (7 unsharded), so
-a shard took 42–44 minutes. That included a second build of the library and
-binaries, 8–10 minutes of it, until `warm-executables` switched to
-`cargo test --no-run`
-([#846](https://github.com/reliaburger/reliaburger/issues/846)). Across nine
-runs before that change, shard jobs took 23.6–46.1 minutes, with the slowest
-shard in a run at a median of about 41.6. On the first full run after it,
-shards took 31.0–35.8 minutes, the "Portable tests" step 29.1–34.7 of that,
-still a few minutes longer than acceptance (26.5–32.6). Building once and sharing
-a nextest archive would take the compile off two of the three runners, but not
-off the critical path. One shard runs `make lint-macos` and another the
-doctests. A shard re-run on its own keeps its own attempt; the evidence gate
-treats each shard as its own job when it checks attempts.
+The portable suite on macOS runs as one job, `portable macOS`: it compiles
+the suite once, runs `make lint-macos`, runs every portable test with
+`make test` under `--partition hash:1/1` (`SHARDS` in
+[`workflow_assembly.py`](../scripts/ci/workflow_assembly.py)), which nextest
+treats as the whole suite, and runs the doctests. It takes about 30 to 50
+minutes in one runner, depending on the compile.
 
-Each shard seals its own envelope (`contract-darwin-portable-darwin-K`) and
-sets only its own output. A nextest list under a partition still names every
-test, marking the other shards' tests as `mismatch` with reason `partition`,
-so the evidence gate merges the three: they must list the same tests, run
-disjoint parts of them, run all of them between them, and together complete
-every required case. A missing, failed or swapped shard fails the gate.
-[`test_shard_partition.py`](../scripts/ci/test_shard_partition.py) checks that
+From 12 October to 6 November 2026 it ran as three shards, `portable macOS
+(1/3)` to `(3/3)`, each under `--partition hash:K/3`. They didn't pay. Each
+shard compiled the whole suite itself, 17 to 40 minutes on the 3-core
+`macos-15` runner, to test for about 3: shard 3 of
+[run 42126022681](https://github.com/reliaburger/reliaburger/actions/runs/42126022681)
+compiled for 30 minutes and tested for 3.1. A full run took three of the five
+macOS runners the organisation's plan allows, for about 120 job-minutes, so
+with `build.yml`'s macOS build a second full run had to queue: across 147
+macOS jobs in the three days to 6 November the queue's median was 6.9 minutes and its p90
+90.2. One job is about 6 minutes slower than the slowest shard on an idle
+queue, takes one runner instead of three and uses about 60% fewer macOS
+minutes per full run (the
+[faster-feedback plan](https://github.com/reliaburger/reliaburger/pull/1614),
+F1, maintainer decision of 6 November 2026). Building once and sharing a
+nextest archive would have taken the compile off two of the three runners,
+but not off the critical path, and the compile is still most of the job.
+
+The job seals one envelope (`contract-darwin-portable-darwin-1`) and sets one
+output. The evidence gate still merges partitioned lists the way it did for
+three shards: a nextest list under a partition names every test, marking any
+left to other shards as `mismatch` with reason `partition`, and the gate checks
+that the shards listed the same tests, ran disjoint parts of them, ran all of
+them between them and together completed every required case. With one shard
+that means the job ran every listed test. Splitting again is a change to
+`SHARDS` and a matrix on the job, and the gate's own tests still split three
+ways to keep the merge honest.
+[`test_shard_partition.py`](../scripts/ci/test_shard_partition.py) checks the
 merge against what the pinned nextest really prints, on a throwaway crate.
 Coverage is unaffected: only the Linux portable job measures it.
 

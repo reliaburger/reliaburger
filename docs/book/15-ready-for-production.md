@@ -1021,6 +1021,25 @@ with `git show` into a variable and matches it with `case`, not `git show | grep
 `set -o pipefail`, `grep -q` exits at its first match, `git show` can die of `SIGPIPE`
 writing the rest, and the pipeline then reports failure for a file that matched.
 
+Three weeks later we undid the split. By November the macOS queue was worse, not better:
+over three days, 147 macOS jobs queued a median of 6.9 minutes, but 90 at p90. The job logs
+said why. Shard 3 of one run spent 30 minutes compiling and 3.1 testing; on `main`, with a
+full cache match, the same shard compiled for 17 minutes and tested for 2.9. Three shards
+compile the identical suite three times, so a full run took three of the five runners for
+about 120 job-minutes to do about 9 minutes of testing. One full run plus `build.yml`'s macOS
+build took four of the five, and the next full run waited.
+
+So portable macOS is one job again
+([faster-feedback plan, F1](https://github.com/reliaburger/reliaburger/pull/1614), maintainer
+decision of 6 November 2026): one compile, the lint, the whole suite and the doctests, about
+30 to 50 minutes in one runner. On an idle queue that's about six minutes slower than the
+slowest shard was. On the queue we actually have, four full runs fit beside the macOS build instead of one,
+and a full run uses about 60% fewer macOS minutes. The evidence machinery stayed put.
+`SHARDS` now says 1, the job runs `--partition hash:1/1`, which nextest treats as the whole
+suite, and the gate's merge checks one list the way it checked three: every listed test ran,
+and the required cases are all there. The lesson? Parallel jobs only help when they split the
+expensive part. Ours was the compile, and every shard paid for it in full.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took
