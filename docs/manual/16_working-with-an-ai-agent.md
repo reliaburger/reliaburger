@@ -8,8 +8,9 @@ another sends it chasing the wrong problem. `relish agent` is the family of
 commands built for it.
 
 This chapter grows through 0.2.7 as the commands arrive (#1090). Today it has
-the contract every one of them follows, `version`, `schema`, and the commands
-that read the source this binary was built from.
+the contract every one of them follows, `version`, `schema`, `setup`, which
+wires Reliaburger into the agents on your machine, and the commands that read
+the source this binary was built from.
 
 ## The contract
 
@@ -153,6 +154,94 @@ relish agent schema version
 ```
 
 The commands that read the cluster (`context`, `diagnose`, `logs`) come next.
+
+## Wiring up your agent
+
+`relish agent setup` adds Reliaburger to the AI agents on your machine:
+Claude Code, Codex, Cursor, VS Code, Goose and Gemini CLI. For each one it
+finds, it adds one MCP server called `reliaburger`, which runs `relish mcp`
+(the read-only MCP server, #1094) over stdio. Run on its own, it only shows
+you what it would do:
+
+```sh
+relish agent setup
+```
+
+`data.agents` lists all six agents, with `detected` saying whether each one's
+config directory exists. Each change names the file, the entry inside it, a
+`status` and a unified diff of exactly the lines setup adds or takes away. To
+read the diffs as diffs:
+
+```sh
+relish agent setup | jq -r '.data.agents[].changes[].diff // empty'
+```
+
+When you've read them, run it again with `--yes`:
+
+```sh
+relish agent setup --yes
+```
+
+That's the one yes. Name agents to set up only those, found or not:
+
+```sh
+relish agent setup cursor vscode --yes
+```
+
+`--dry-run` (or `--print`) is the preview spelt out, for scripts that want to
+say so; it can't be combined with `--yes`.
+
+| Agent | Name | File | Entry |
+|-------|------|------|-------|
+| Claude Code | `claude-code` | `~/.claude.json` | `mcpServers.reliaburger` |
+| Codex | `codex` | `~/.codex/config.toml` | `[mcp_servers.reliaburger]` |
+| Cursor | `cursor` | `~/.cursor/mcp.json` | `mcpServers.reliaburger` |
+| VS Code | `vscode` | `~/Library/Application Support/Code/User/mcp.json` on macOS, `~/.config/Code/User/mcp.json` on Linux | `servers.reliaburger` |
+| Goose | `goose` | `~/.config/goose/config.yaml` | `extensions.reliaburger` |
+| Gemini CLI | `gemini` | `~/.gemini/settings.json` | `mcpServers.reliaburger` |
+
+These are the user-level files, so one setup covers every project.
+
+Setup keeps to a few rules, and each one has a test:
+
+- **It writes only the files its answer names**, and in each one only its
+  own entry. Every other key keeps its order and its text. TOML keeps its
+  comments too. A YAML file with comments, or a JSON file with them (VS Code
+  allows comments in `mcp.json`), can't be rewritten without losing them, so
+  setup leaves it alone: the status is `unreadable` and the `note` holds the
+  entry to paste in by hand.
+- **Your entry stays yours.** A `reliaburger` entry that isn't exactly the
+  one setup writes is reported as a `conflict` and left alone. `--force`
+  replaces it, or with `--remove`, takes it out.
+- **Running it twice changes nothing.** The second time every status is
+  `unchanged`.
+- **No entry approves anything.** There's no `trust` flag, no auto-approve
+  list and no wildcard, and setup never touches Claude Code's `permissions`.
+  Your agent still asks before it calls a tool, as it always does. We don't
+  suggest switching that off, for Reliaburger or anything else: `relish mcp`
+  only reads, but the agent calling it can do much more.
+- **A file that changed while setup was working is not overwritten.** The
+  change says `not written`; run setup again.
+
+`--remove` takes Reliaburger back out by the same rules, and on its own it
+also only previews:
+
+```sh
+relish agent setup --remove --yes
+```
+
+A server map left empty goes too, so a file setup changed reads as it did
+before, and a file setup created is left as `{}`. Restart the agent after
+either.
+
+The server entry runs plain `relish`, found on your `PATH`, so an upgrade that
+moves the binary doesn't break it. An editor started from the Dock on macOS
+may not see your shell's `PATH`. If Cursor or VS Code says it can't start
+`relish`, put the output of `command -v relish` in the entry's `command`.
+Setup then reports that entry as a `conflict`, which is right: it's yours now.
+
+Once the agent guide lands (#1090), setup also installs the Reliaburger skill
+for Claude Code, at `~/.claude/skills/reliaburger/SKILL.md`, by the same rules.
 
 ## Reading the source
 

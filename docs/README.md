@@ -798,9 +798,12 @@ flag.
 
 `relish agent` is the family for LLM agents: every command prints one
 `relish.agent/v1` JSON envelope within a byte budget, never prompts, and exits
-`0` whenever it answered. So far it has `version`, `schema`, and `source`
+`0` whenever it answered. So far it has `version`, `schema`, `source`
 (`version`, `tree`, `grep`, `show` and `extract` over the code this binary was
-built from, with a warning when a node runs another commit); the commands that
+built from, with a warning when a node runs another commit), and `setup`,
+which adds the `relish mcp` server to Claude Code, Codex, Cursor, VS Code,
+Goose and Gemini CLI: it shows the diff, writes only with `--yes`, never
+touches an entry it didn't write, and approves no tools. The commands that
 read the cluster arrive through 0.2.7. See
 [Working with an AI agent](manual/16_working-with-an-ai-agent.md).
 

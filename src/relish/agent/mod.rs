@@ -14,6 +14,7 @@
 
 pub mod budget;
 pub mod envelope;
+pub mod setup;
 pub mod source;
 pub mod untrusted;
 
@@ -54,6 +55,9 @@ pub enum AgentCommand {
     },
     /// The source this binary was built from: search it, read it, extract it.
     Source(source::SourceOptions),
+    /// Wire Reliaburger into the AI agents on this machine. Shows the diff;
+    /// writes only with --yes.
+    Setup(setup::SetupOptions),
 }
 
 impl AgentCommand {
@@ -63,6 +67,7 @@ impl AgentCommand {
             AgentCommand::Version => CommandName::Version,
             AgentCommand::Schema { .. } => CommandName::Schema,
             AgentCommand::Source(options) => options.command.name(),
+            AgentCommand::Setup(_) => CommandName::Setup,
         }
     }
 }
@@ -103,6 +108,7 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
             rerun,
         ),
         AgentCommand::Source(source) => source::run(source, options.max_bytes, rerun).await,
+        AgentCommand::Setup(setup) => setup::run(setup, options.max_bytes, rerun).await,
     }
 }
 
@@ -190,6 +196,7 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::SourceGrep => Some(schema_of::<source::GrepData>()),
         CommandName::SourceShow => Some(schema_of::<source::ShowData>()),
         CommandName::SourceExtract => Some(schema_of::<source::ExtractData>()),
+        CommandName::Setup => Some(schema_of::<setup::SetupData>()),
     }
 }
 
@@ -419,7 +426,8 @@ mod tests {
                 "source tree",
                 "source grep",
                 "source show",
-                "source extract"
+                "source extract",
+                "setup"
             ]
         );
         let envelope = &value["data"]["envelope"];

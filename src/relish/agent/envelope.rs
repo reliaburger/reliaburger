@@ -52,6 +52,8 @@ pub enum CommandName {
     #[serde(rename = "source extract")]
     #[value(name = "source-extract")]
     SourceExtract,
+    /// `relish agent setup`.
+    Setup,
 }
 
 impl CommandName {
@@ -66,6 +68,7 @@ impl CommandName {
             CommandName::SourceGrep => "source grep",
             CommandName::SourceShow => "source show",
             CommandName::SourceExtract => "source extract",
+            CommandName::Setup => "setup",
         }
     }
 
@@ -79,6 +82,7 @@ impl CommandName {
         CommandName::SourceGrep,
         CommandName::SourceShow,
         CommandName::SourceExtract,
+        CommandName::Setup,
     ];
 }
 

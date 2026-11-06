@@ -1277,3 +1277,217 @@ documentation that can skip the Rust jobs.
 - **PR caps in the repository.** GitHub can cap open pull requests from
   accounts without write access and exempt people with merged work, but those
   are repository settings for the maintainer, not files in a PR.
+
+## Wiring up the agents
+
+An agent can't use `relish mcp` until someone tells it the server exists. For
+Claude Code that's `claude mcp add reliaburger -- relish mcp`. Codex wants a
+`[mcp_servers.reliaburger]` table in `~/.codex/config.toml`, Cursor and Gemini
+CLI a `mcpServers` key in a JSON file each, VS Code a `servers` key in a
+different JSON file, and Goose an `extensions:` entry in YAML. Six agents,
+six files, three formats, and every one a place to make a typo. Stripe
+(`stripe agent setup`), Neon (`npx neon init`) and Vercel (`npx add-mcp`) all
+ship one command that does it for you
+([onboarding scan](../plans/2026-11-04-research-agent-onboarding-scan.md),
+suggestion 4). [#1581](https://github.com/reliaburger/reliaburger/issues/1581)
+is ours: `relish agent setup`.
+
+It's also the first `relish agent` command that writes to files other people
+own. `~/.claude.json` holds Claude Code's whole state; a careless rewrite
+loses someone's project history. So the design starts from the ways it could
+go wrong, and each one became a rule with a test:
+
+- **No surprises.** Without `--yes`, setup writes nothing. The answer is the
+  diff of every file it would change, and `next` offers the same command with
+  `--yes`, marked `read_only: false` so the agent asks a human first. The
+  issue asked for "one yes, showing the diff". An interactive prompt would
+  break the contract (`relish agent` never reads stdin), so the yes is a flag
+  on a second run, which the agent's own permission prompt puts in front of
+  the human anyway.
+- **No collateral.** It writes only the files its answer names, and in each
+  only its own entry.
+- **No stomping.** An entry called `reliaburger` that isn't exactly what
+  setup writes belongs to someone: maybe they pointed it at `/opt/rb/relish`
+  or added `--no-logs`. That's a `conflict`, left alone, unless `--force`.
+- **No drift.** A second run finds every entry `unchanged`.
+- **No blanket approval.** No entry carries Gemini's `trust`, an
+  `autoApprove` list or a wildcard, and setup never opens Claude Code's
+  `settings.json`, where `permissions` live. The [0.2.7
+  plan](../plans/2026-11-04-plan-0.2.7.md)'s safety line is that our docs
+  never advise "always allow"; it would be odd for our code to do it quietly.
+
+### Six agents, one table
+
+`clients.rs` is that table in code: an enum, `Client`, with a method for each
+column. `config` returns the file, its format and the key the servers live
+under; `entry` returns the JSON setup puts there; `detected` checks for the
+agent's config directory. Every entry starts the same command line:
+
+```rust
+pub const MCP_COMMAND_LINE: &[&str] = &["relish", "mcp"];
+```
+
+`&[&str]` is a borrowed slice of borrowed strings: a fixed list, built into
+the binary, that nothing can grow. `relish mcp` (#1094) was being written at
+the same time as setup, so the command line it registers lives in this one
+constant, where a change to the server's flags is one edit. The entry runs
+plain `relish`, found on `PATH`, rather than this binary's absolute path, so
+an upgrade that moves the binary doesn't break six configs. The cost is that
+a macOS editor launched from the Dock may not see your shell's `PATH`; the
+manual says what to do then.
+
+Goose's entry has an `enabled: true`. That reads like approval but isn't: it
+turns the extension on, which is the point of adding it. Goose's
+tool-approval mode is a separate setting, and setup leaves it alone. The test
+that checks every entry for approval keys (`trust`, `alwaysAllow`,
+`autoApprove`, `permissions`, `allow`, `yolo` and friends, plus any `*`) runs
+over all six.
+
+### Editing JSON without reformatting it
+
+The obvious way to add a key to a JSON file in Rust is to parse it into a
+`serde_json::Value`, insert, and print it back out. Try it on `~/.claude.json`
+and the diff is the whole file. `serde_json`'s `Map` is a `BTreeMap` (a
+sorted map), so every key comes back in alphabetical order. There's a
+`preserve_order` feature that swaps in an insertion-ordered map, but Cargo
+features are unified across the whole build: if any crate in the graph turns
+a feature on, every user of `serde_json` gets it. Every JSON document
+`relish` and `bun` print, and every snapshot of one, would change key order
+to fix one command. In Python it's a keyword argument; in Rust it's a
+property of the whole build.
+
+So `edit.rs` reads the file differently. `RawValue` (behind serde_json's
+`raw_value` feature, which only adds a type and changes nothing else) is a
+value serde doesn't parse: it keeps the exact text. Read an object as a list
+of `(key, RawValue)` pairs and you have every member in file order, each
+value untouched, numbers like `1.50` included. That needs a hand-written
+`Deserialize`:
+
+```rust
+impl<'de> Deserialize<'de> for Members {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MembersVisitor;
+
+        impl<'de> Visitor<'de> for MembersVisitor {
+            type Value = Members;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Members, A::Error> {
+                let mut members = Vec::new();
+                while let Some(member) = map.next_entry::<String, Box<RawValue>>()? {
+                    members.push(member);
+                }
+                Ok(Members(members))
+            }
+        }
+
+        deserializer.deserialize_map(MembersVisitor)
+    }
+}
+```
+
+This is serde's visitor pattern, and it's worth reading slowly once. `'de` is
+a lifetime, the lifetime of the input being parsed: it lets a deserialiser
+hand out `&str`s that point into the input instead of copying them. `D:
+Deserializer<'de>` means "any format": the same impl works for JSON, TOML or
+anything else serde speaks. Our code doesn't drive the parsing. It tells the
+deserialiser "I want a map" (`deserialize_map`) and hands over a visitor,
+and the deserialiser calls the visitor's method for what it found:
+`visit_map` for an object. If the file holds an array it calls `visit_seq`,
+which we didn't write, so the default fails with "expected a JSON object",
+the text `expecting` supplies. `type Value = Members` is an associated type:
+each `Visitor` impl names what it produces, so `visit_map` can return it. In
+Go you'd reach for `json.Decoder.Token()` and walk the stream yourself; serde
+turns that round and walks the stream to you.
+
+Then setup writes the object back with two-space indentation, which is what
+`JSON.stringify(value, null, 2)` writes and so what every Node-based agent's
+own file looks like. Only two levels are re-printed, the top and the server
+map; everything inside any other member is its original text. New keys go
+*first*. Appending would add a comma to the line before, and that line could
+be another server's `env`, with its API key, now in a diff an agent reads.
+Inserting at the front means the diff, with zero context lines, is only the
+lines setup adds, and removing our entry gives back the original file byte
+for byte. A test checks exactly that on a file with keys out of order, odd
+spacing and a `1.50`.
+
+TOML was easier: `toml_edit`, which `relish fmt` already uses, edits a
+document in place and keeps comments and layout. YAML wasn't. The YAML crate
+round-trips data, not comments, and Goose's `config.yaml` is the user's too.
+Setup refuses a YAML file with any comment, and a JSON file with comments (VS
+Code allows them in `mcp.json`), as `unreadable`, with the entry to paste in
+by hand in the `note`. A refusal you can act on beats a rewrite that quietly
+eats your comments.
+
+### Writing the file
+
+Three details in `write`, each from a way it could go wrong:
+
+- **Rename, don't overwrite.** The new text goes to `<file>.relish-setup.tmp`
+  beside the original, then `fs::rename` moves it over. On one filesystem a
+  rename is atomic, so a crash leaves the old file or the new one, never half
+  of each. The original's permissions are copied first: `~/.claude.json` is
+  often `0600`, and it should stay that way.
+- **Check before writing.** Claude Code rewrites `~/.claude.json` while it
+  runs. Setup keeps the text it planned against and reads the file again just
+  before the rename; if it changed, setup writes nothing and says `not
+  written`.
+- **Follow symlinks.** Plenty of people keep dotfiles in a git repository and
+  link them into place. A rename over the link would replace it with a plain
+  file, so setup resolves a link first, writes the file it points at, and
+  reports that path.
+
+The work is all blocking file I/O, so `run` does it inside
+`tokio::task::spawn_blocking`, which moves it to tokio's pool of threads
+meant for blocking, away from the threads that drive async tasks.
+
+### The tests
+
+Every test runs against a temporary home directory, never yours. `Home` is a
+struct holding the root path (and whether it's macOS, for VS Code's path), so
+`setup` takes it as an argument rather than reading `$HOME`. The fixture
+installs all six agents with config of their own: a GitHub server with a
+token in `~/.claude.json`, a commented `config.toml`, a Goose `developer`
+extension, a Claude Code `settings.json` with a `permissions` block.
+
+The tests follow the rules. A preview leaves every file and directory as it
+was, for plain, `--dry-run`, `--print`, `--remove` and `--force` alike.
+`--yes` changes only files the answer names, leaves no temporary file, never
+touches `settings.json`, and what it writes is an insta snapshot. A second
+run is all `unchanged`, and `--remove` gives back the originals byte for
+byte. Someone else's entry and someone else's skill survive both `--yes` and
+`--remove --yes`, and fall to `--force`. A commented YAML or JSONC file is
+left alone. The diff never shows the GitHub token, or any line that isn't
+ours. A file changed between plan and write isn't overwritten. A `0600` file
+stays `0600`, and a symlink stays a symlink. The whole preview, six agents
+and their diffs, is one snapshot, so a change to any agent's entry shows up
+in review.
+
+### What we didn't do
+
+- **Shell out to `claude mcp add`.** It's the official way for Claude Code,
+  but it's one agent of six, it can't preview, and a test would need Claude
+  Code installed. Vercel's `add-mcp` writes the files too.
+- **Project-level files.** Claude Code's `.mcp.json` and Cursor's
+  `.cursor/mcp.json` in a repository share the server with a team. That's a
+  commit, which is a human's call, not a setup step.
+- **Install links.** Cursor, VS Code and Goose accept links that open the
+  editor and ask the user to confirm. They belong on the website and in the
+  README, not in a CLI.
+- **The skill, yet.** The Reliaburger skill is generated from the manual's
+  agent chapter by #1090. Setup already knows where Claude Code's skill goes,
+  with the same conflict rules, tested over a stand-in skill, but `SKILL_MD`
+  is `None` until #1090 provides the real one. One source, no second copy to
+  drift.
+
+### Lessons
+
+Writing down how setup could hurt someone, before writing any of it, shaped
+every part. The risk that wasn't obvious was the diff itself. Context lines
+are what make a diff readable for a person, and in someone else's config
+file they're also what leaks: the server above ours has an `env`, and the
+`env` has a key. Zero context, keys inserted where they disturb nothing, and
+the redaction module over the top mean the diff is only what we add.
