@@ -1313,12 +1313,25 @@ thousand runner-hours. Three limits keep it affordable:
 
 - **Only the change.** `--in-diff` mutates only the lines a pull request
   touches, and the weekly run takes only the week's changes on `main`.
-- **A budget.** At most 20 mutants a pull request, as one round-robin shard
+- **A budget.** At most 12 mutants a pull request, as one round-robin shard
   of the list, so the sample spreads over every file instead of using up the
   budget on the first one.
 - **Only the nearby tests.** A mutant in `src/council/network.rs` runs
   `council::`'s unit tests, not the whole suite. A mutant that only an
   integration test catches then shows as missed, and the summary says so.
+- **A clock.** The test step stops itself after 60 minutes and reports what
+  it finished, so a slow run still produces a summary.
+
+The clock came from the first CI run, which had only the count. Each mutant
+took seven and a half minutes to build, the job hit its 90-minute limit
+with four mutants to go, and a job killed by its limit writes no summary.
+The seven and a half minutes were a full rebuild of the crate every time.
+`Swatinem/rust-cache`, which every job here uses, sets `CARGO_INCREMENTAL=0`,
+because incremental artefacts make a poor cache. For mutation testing that's
+exactly wrong: every mutant changes one line of an otherwise identical
+crate, which is the case incremental compilation exists for. The test step
+now turns it back on, and `toolchain_pins.rs` checks it stays on. That run
+still found two missed mutants, both in `FileLock::remove`.
 
 The job runs on Linux, in its own workflow, and doesn't fail on a missed
 mutant. Pull request CI is already about 28 minutes, nearly all of it one

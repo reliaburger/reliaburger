@@ -12,7 +12,8 @@ the test part short. A unit test lives beside its code, so a mutant in
 that only an integration test would catch then shows as missed, and the
 summary says so.
 
-`summary` turns `mutants.out/missed.txt` into the job summary: one row per
+`summary` turns a `mutants.out` directory into the job summary: how many
+mutants finished, whether the time budget stopped the run, and one row per
 missed mutant, each with a link that opens a pre-filled `missed-mutant`
 issue. A person files it; the job never does.
 """
@@ -108,15 +109,37 @@ def issue_link(repository, commit, path, line, what):
     return f"https://github.com/{repository}/issues/new?{query}"
 
 
-def summary(missed_text, planned, repository, commit):
-    """The job summary for a finished run, as Markdown."""
-    missed = mutants(missed_text)
+# The files cargo-mutants appends one line to as each mutant finishes.
+OUTCOMES = ("caught", "missed", "timeout", "unviable")
+
+
+def results(directory):
+    """Each outcome's mutants from a `mutants.out` directory; a missing file is none."""
+    found = {}
+    for outcome in OUTCOMES:
+        path = Path(directory) / f"{outcome}.txt"
+        found[outcome] = mutants(path.read_text()) if path.is_file() else []
+    return found
+
+
+def summary(outcomes, planned, repository, commit, stopped=False):
+    """The job summary for a run, as Markdown.
+
+    `outcomes` maps each of OUTCOMES to its mutants, as `results` reads
+    them. `stopped` says the run hit its time budget before the last one.
+    """
+    missed = outcomes["missed"]
     lines = ["## Mutation testing", ""]
     if planned["count"] == 0:
         lines.append("No mutants in this change.")
         return "\n".join(lines) + "\n"
-    lines.append(f"Tested {planned['tested']} of {planned['count']} mutants "
-                 f"(shard 1 of {planned['shards']}, round-robin); {len(missed)} missed.")
+    finished = sum(len(outcomes[outcome]) for outcome in OUTCOMES)
+    counts = ", ".join(f"{len(outcomes[outcome])} {outcome}" for outcome in OUTCOMES)
+    lines.append(f"Tested {finished} of {planned['count']} mutants ({counts}); the plan was "
+                 f"{planned['tested']}, shard 1 of {planned['shards']}, round-robin.")
+    if stopped:
+        lines += ["", f"The run stopped at its time budget with {planned['tested'] - finished} "
+                  "of the planned mutants untested."]
     if planned["filter"]:
         lines += ["", f"Tests run per mutant: the library's unit tests matching `{planned['filter']}`. "
                   "A mutant only an integration test catches shows as missed here."]
@@ -141,7 +164,8 @@ def main(argv=None):
     reporting = commands.add_parser("summary", help="Markdown for the job summary")
     reporting.add_argument("--list", required=True, type=Path)
     reporting.add_argument("--max", required=True, type=int)
-    reporting.add_argument("--missed", required=True, type=Path, help="mutants.out/missed.txt")
+    reporting.add_argument("--results", required=True, type=Path, help="the mutants.out directory")
+    reporting.add_argument("--stopped", action="store_true", help="the run hit its time budget")
     reporting.add_argument("--repository", required=True, help="owner/name")
     reporting.add_argument("--commit", required=True)
     arguments = parser.parse_args(argv)
@@ -155,8 +179,8 @@ def main(argv=None):
                 output.write(lines)
         sys.stdout.write(lines)
         return
-    missed = arguments.missed.read_text() if arguments.missed.is_file() else ""
-    sys.stdout.write(summary(missed, planned, arguments.repository, arguments.commit))
+    sys.stdout.write(summary(results(arguments.results), planned, arguments.repository, arguments.commit,
+                             arguments.stopped))
 
 
 if __name__ == "__main__":

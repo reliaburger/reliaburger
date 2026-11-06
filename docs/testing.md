@@ -706,23 +706,36 @@ in its own workflow, so it's never on a pull request's critical path: the
 evidence gate doesn't wait for it, and a missed mutant doesn't turn the check
 red. Only a broken run (the unmutated tree failing its tests, say) does.
 
-| Run | What it mutates | At most | Wall time |
+| Run | What it mutates | At most | Test budget |
 |---|---|---|---|
-| A pull request that touches `src/` | The lines it changes ([`--in-diff`](https://mutants.rs/in-diff.html)) | 20 mutants | an estimated 10 minutes plus about 3 a mutant, so at most about 70 |
-| A pull request that changes only the mutants set-up | `src/file_lock.rs`, as a check that the job still works | 20 | the same |
-| Sundays at 04:23 UTC | What landed on `main` in the last seven days | 90 | up to six hours |
-| By hand (`workflow_dispatch`) | A glob of files, or the last seven days | as asked | |
+| A pull request that touches `src/` | The lines it changes ([`--in-diff`](https://mutants.rs/in-diff.html)) | 12 mutants | 60 minutes, in a 75-minute job |
+| A pull request that changes only the mutants set-up | `src/file_lock.rs`, as a check that the job still works | 12 | the same |
+| Sundays at 04:23 UTC | What landed on `main` in the last seven days | 60 | 300 minutes, in a 330-minute job |
+| By hand (`workflow_dispatch`) | A glob of files, or the last seven days | as asked (12 by default) | 300 minutes |
 
-Each mutant rebuilds the crate, so the budget is a count. In the first local
-trial (6 November 2026, the Mac Studio at a load average of about 40),
-`src/file_lock.rs`'s first shard built its baseline cold in 37 minutes, then
-took 194 s to rebuild for its one buildable mutant and 5 s to test it; the
-other two failed to compile (*unviable*) within 75 s. The estimate above is
-from CI's own crate rebuilds (the nightly-signing step, 2.5 minutes), until
-the job has a record of its own. Over it, the job
-tests one round-robin shard (`--shard 0/K --sharding round-robin`), which
-spreads the sample over every file the change touches, and the summary says
-"Tested 20 of 47". The sizing is in
+Each mutant rebuilds the crate, so the budget is a count and a clock. Over
+the count, the job tests one round-robin shard (`--shard 0/K --sharding
+round-robin`), which spreads the sample over every file the change touches.
+The clock is `timeout`: when the test step's budget runs out it stops
+cargo-mutants, keeps every result so far (cargo-mutants appends each one to
+`mutants.out` as it finishes) and says in the summary how many went
+untested, so a slow run still reports and stays green.
+
+The first CI run ([run
+42213963003](https://github.com/reliaburger/reliaburger/actions/runs/42213963003),
+6 November 2026, this set-up's own pull request, a cold cache) shows where
+the time goes: 40 s of set-up, a 13.5-minute baseline build (807 s), then 442
+to 456 s of build and 3 s of tests for each mutant. Seven and a half minutes a
+mutant was a full rebuild every time: `Swatinem/rust-cache` sets
+`CARGO_INCREMENTAL=0`, so the test step turns incremental compilation back on.
+That run had the old budget (20 mutants, no clock) and hit the job's
+90-minute limit with no summary; it found two missed mutants in
+`FileLock::remove` before it did. The first local trial (the Mac Studio at a
+load average of about 40) took 194 s for its one buildable mutant and 5 s to
+test it; two others failed to compile (*unviable*) within 75 s. A pull
+request that touches `src/` therefore costs up to 75 Linux runner-minutes,
+and usually far less with a warm cache and a short diff; one that doesn't
+touch it costs nothing. The sizing is in
 [`mutants_plan.py`](../scripts/ci/mutants_plan.py) and its tests in
 [`test_mutants_plan.py`](../scripts/ci/test_mutants_plan.py).
 

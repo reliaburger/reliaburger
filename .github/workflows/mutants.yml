@@ -34,7 +34,7 @@ on:
         default: ""
       max:
         description: Most mutants to test
-        default: "20"
+        default: "12"
 
 permissions:
   contents: read
@@ -48,7 +48,10 @@ env:
   # A mutant only has to build and fail; no debugger reads these binaries,
   # and no debug info makes each rebuild's link faster.
   CARGO_PROFILE_DEV_DEBUG: "0"
-  MUTANTS_MAX: ${{ github.event_name == 'pull_request' && '20' || github.event_name == 'schedule' && '90' || inputs.max }}
+  MUTANTS_MAX: ${{ github.event_name == 'pull_request' && '12' || github.event_name == 'schedule' && '60' || inputs.max }}
+  # The test step's own budget, inside the job's limit, so the summary and
+  # the artefact still come out when the mutants take longer than planned.
+  MUTANTS_MINUTES: ${{ github.event_name == 'pull_request' && '60' || '300' }}
   # When a pull request changes only this set-up, it mutates one small file,
   # so the change shows the job still works.
   SETUP_SAMPLE: src/file_lock.rs
@@ -57,10 +60,11 @@ jobs:
   mutants:
     name: mutants in the change
     runs-on: ubuntu-24.04
-    # A pull request: about 10 minutes of set-up and baseline, then up to 20
-    # mutants at about 3 minutes each. The weekly run's 90 fit in the six
-    # hours GitHub allows a job.
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 90 || 350 }}
+    # Run 42213963003, a pull request with a cold cache: 40 s of set-up, a
+    # 13.5-minute baseline build, then 7.5 minutes a mutant without
+    # incremental builds. The test step stops itself at MUTANTS_MINUTES; this
+    # limit leaves room for the summary and the artefact after it.
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 75 || 330 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -113,22 +117,32 @@ jobs:
           cargo mutants --list "$SELECT_FLAG" "$SELECT_VALUE" | tee "$RUNNER_TEMP/mutants.list"
           python3 scripts/ci/mutants_plan.py plan --list "$RUNNER_TEMP/mutants.list" --max "$MUTANTS_MAX" --github-output "$GITHUB_OUTPUT"
       # Exit 2 is a missed mutant and 3 a timeout: findings, not failures.
-      # Anything else (the unmutated tree failing its tests, say) fails. A
-      # module with no unit tests is a warning: every mutant in it is missed.
+      # 124 is `timeout` ending the run at MUTANTS_MINUTES; cargo-mutants
+      # appends each result to mutants.out as it finishes, so the summary
+      # reports what got done. Anything else (the unmutated tree failing its
+      # tests, say) fails. A module with no unit tests is a warning: every
+      # mutant in it is missed.
       - name: Test the mutants
         if: steps.plan.outputs.count != '0'
         env:
           SHARDS: ${{ steps.plan.outputs.shards }}
           FILTER: ${{ steps.plan.outputs.filter }}
+          # rust-cache turns incremental compilation off, so each mutant
+          # rebuilt the whole crate: 442 to 456 s a mutant on run
+          # 42213963003. Each mutant changes one line, which is what
+          # incremental compilation is for.
+          CARGO_INCREMENTAL: "1"
         run: |
           filter=()
           if [ -n "$FILTER" ]; then filter=(-E "$FILTER"); fi
           status=0
-          cargo mutants "$SELECT_FLAG" "$SELECT_VALUE" --in-place \
+          timeout --signal=INT --kill-after=2m "${MUTANTS_MINUTES}m" \
+            cargo mutants "$SELECT_FLAG" "$SELECT_VALUE" --in-place \
             --shard "0/$SHARDS" --sharding round-robin --output "$RUNNER_TEMP" \
             -- --lib --no-tests=warn "${filter[@]}" || status=$?
           case "$status" in
             0|2|3) ;;
+            124) echo "MUTANTS_STOPPED=--stopped" >> "$GITHUB_ENV" ;;
             *) exit "$status" ;;
           esac
       - name: Summarise
@@ -138,8 +152,8 @@ jobs:
           COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           python3 scripts/ci/mutants_plan.py summary --list "$RUNNER_TEMP/mutants.list" --max "$MUTANTS_MAX" \
-            --missed "$RUNNER_TEMP/mutants.out/missed.txt" --repository "$REPOSITORY" --commit "$COMMIT" \
-            >> "$GITHUB_STEP_SUMMARY"
+            --results "$RUNNER_TEMP/mutants.out" --repository "$REPOSITORY" --commit "$COMMIT" \
+            ${MUTANTS_STOPPED:-} >> "$GITHUB_STEP_SUMMARY"
       - name: Keep the results
         if: always()
         uses: actions/upload-artifact@v4

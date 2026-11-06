@@ -247,13 +247,22 @@ fn the_mutants_job_stays_off_the_pull_request_s_critical_path() {
         "${{ github.event_name == 'pull_request' }}"
     );
     // A missed mutant (2) or a timeout (3) is a finding, never a red check.
-    let test = steps(job)
+    let step = steps(job)
         .iter()
         .find(|step| step["name"] == "Test the mutants")
-        .and_then(|step| step["run"].as_str())
         .unwrap();
+    let test = step["run"].as_str().unwrap();
     assert!(test.contains("0|2|3) ;;"), "{test}");
     assert!(test.contains("--in-place") && test.contains("--sharding round-robin"));
+    // Run 42213963003 hit the job's limit, so no summary and no artefact:
+    // the step stops itself first, and reports what it finished.
+    assert!(
+        test.contains("timeout --signal=INT") && test.contains("124) echo \"MUTANTS_STOPPED"),
+        "{test}"
+    );
+    // rust-cache sets CARGO_INCREMENTAL=0, which made every mutant a full
+    // rebuild of the crate (7.5 minutes each on that run).
+    assert_eq!(step["env"]["CARGO_INCREMENTAL"], "1");
 }
 
 #[test]

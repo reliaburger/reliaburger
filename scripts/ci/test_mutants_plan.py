@@ -65,17 +65,36 @@ class PlanTests(unittest.TestCase):
 
 
 class SummaryTests(unittest.TestCase):
-    def summary(self, missed, listing=LISTING, maximum=20):
-        return mutants_plan.summary(missed, mutants_plan.plan(listing, maximum), "owner/repo", "abc123")
+    def summary(self, missed, listing=LISTING, maximum=20, caught="", stopped=False):
+        outcomes = {"caught": mutants_plan.mutants(caught), "missed": mutants_plan.mutants(missed),
+                    "timeout": [], "unviable": []}
+        return mutants_plan.summary(outcomes, mutants_plan.plan(listing, maximum), "owner/repo", "abc123",
+                                    stopped)
 
     def test_no_mutants_says_so(self):
         self.assertIn("No mutants in this change.", self.summary("", listing=""))
 
-    def test_it_says_how_many_were_tested_of_how_many_and_which_tests_ran(self):
-        text = self.summary("")
-        self.assertIn("Tested 4 of 4 mutants (shard 1 of 1, round-robin); 0 missed.", text)
+    def test_it_counts_what_finished_against_the_plan_and_names_the_tests_run(self):
+        caught, missed = LISTING.splitlines(keepends=True)[:3], LISTING.splitlines(keepends=True)[3]
+        text = self.summary(missed, caught="".join(caught))
+        self.assertIn("Tested 4 of 4 mutants (3 caught, 1 missed, 0 timeout, 0 unviable); "
+                      "the plan was 4, shard 1 of 1, round-robin.", text)
+        self.assertNotIn("time budget", text)
         self.assertIn("`test(/^(council|onion|redact)::/)`", text)
         self.assertIn("only an integration test catches shows as missed", text)
+
+    def test_a_run_stopped_by_its_time_budget_says_how_many_went_untested(self):
+        text = self.summary("", caught=LISTING.splitlines(keepends=True)[0], stopped=True)
+        self.assertIn("Tested 1 of 4 mutants", text)
+        self.assertIn("stopped at its time budget with 3 of the planned mutants untested", text)
+
+    def test_results_reads_each_outcome_file_and_treats_a_missing_one_as_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "missed.txt").write_text(LISTING.splitlines(keepends=True)[2])
+            (Path(directory) / "caught.txt").write_text("".join(LISTING.splitlines(keepends=True)[:2]))
+            found = mutants_plan.results(directory)
+        self.assertEqual([len(found[outcome]) for outcome in mutants_plan.OUTCOMES], [2, 1, 0, 0])
+        self.assertEqual(found["missed"], [("src/onion/dns.rs", 40, "replace > with >= in decode_query")])
 
     def test_each_missed_mutant_links_a_prefilled_missed_mutant_issue(self):
         text = self.summary("src/onion/dns.rs:40:17: replace > with >= in decode_query\n")
