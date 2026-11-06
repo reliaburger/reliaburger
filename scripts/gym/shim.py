@@ -10,11 +10,19 @@ did, so a Claude Code run and the scripted baseline are judged the same way.
 Output is passed through when the command exits, not as it streams, so
 `relish logs --follow` shows nothing until it ends. Nothing in the gym's
 scenarios needs to follow.
+
+`relish mcp` is the exception. It's a server that talks JSON-RPC over stdin
+and stdout for as long as its client runs, so the shim streams it line by line
+and records each `tools/call` as the `relish agent` command the tool is, with
+the envelope it answered as the output. A Claude Code solver that uses the
+plugin's MCP server is then scored from the same log as one that types the
+commands into a shell. The server process itself isn't a call.
 """
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 # Enough for any `relish agent` answer (its default budget is far smaller)
@@ -28,7 +36,7 @@ def _kept(text):
     return text[:MAX_KEPT_BYTES] + "\n[gym: output cut]"
 
 
-def record(log_path, argv, exit_code, stdout, stderr, started, seconds):
+def record(log_path, argv, exit_code, stdout, stderr, started, seconds, via=None):
     """Append one call to the log as a JSON line."""
     entry = {
         "argv": ["relish", *argv],
@@ -38,13 +46,99 @@ def record(log_path, argv, exit_code, stdout, stderr, started, seconds):
         "started": started,
         "seconds": round(seconds, 3),
     }
+    if via:
+        entry["via"] = via
     with open(log_path, "a", encoding="utf-8") as log:
         log.write(json.dumps(entry) + "\n")
+
+
+def tool_argv(name, arguments):
+    """The `relish` argv a `relish mcp` tool call stands for.
+
+    A tool is named after its `relish agent` command with spaces as
+    underscores (`source_grep`), and its arguments become `--name=value`, so
+    the scorer reads the command and subcommand the same way it reads a typed
+    one.
+    """
+    argv = ["agent", *name.split("_")]
+    for key, value in sorted((arguments or {}).items()):
+        if value is None or value is False:
+            continue
+        if value is True:
+            argv.append(f"--{key}")
+        else:
+            argv.append(f"--{key}={value if isinstance(value, str) else json.dumps(value)}")
+    return argv
+
+
+def _tool_output(message):
+    """The text a tool answered with, and the exit code it stands for."""
+    if "error" in message:
+        return json.dumps(message["error"]), 1
+    result = message.get("result") or {}
+    text = "".join(
+        block.get("text", "") for block in result.get("content", []) if isinstance(block, dict)
+    )
+    return text, 1 if result.get("isError") else 0
+
+
+def _parse(line):
+    try:
+        message = json.loads(line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return message if isinstance(message, dict) else None
+
+
+def serve_mcp(real, argv, log_path, stdin=None, stdout=None):
+    """Run `relish mcp` with its stdio passed through, recording tool calls."""
+    stdin = stdin or sys.stdin.buffer
+    stdout = stdout or sys.stdout.buffer
+    server = subprocess.Popen([real, *argv], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    pending = {}
+    lock = threading.Lock()
+
+    def forward_requests():
+        for line in stdin:
+            message = _parse(line)
+            if message and message.get("method") == "tools/call" and "id" in message:
+                params = message.get("params") or {}
+                with lock:
+                    pending[json.dumps(message["id"])] = (
+                        params.get("name", ""), params.get("arguments") or {},
+                        time.time(), time.monotonic(),
+                    )
+            try:
+                server.stdin.write(line)
+                server.stdin.flush()
+            except BrokenPipeError:
+                return
+        server.stdin.close()
+
+    threading.Thread(target=forward_requests, daemon=True).start()
+    for line in server.stdout:
+        stdout.write(line)
+        stdout.flush()
+        message = _parse(line)
+        if not message or "id" not in message or "method" in message:
+            continue
+        with lock:
+            request = pending.pop(json.dumps(message["id"]), None)
+        if request is None:
+            continue
+        name, arguments, started, clock = request
+        text, exit_code = _tool_output(message)
+        record(log_path, tool_argv(name, arguments), exit_code, text, "", started,
+               time.monotonic() - clock, via="mcp")
+    server.stdout.close()
+    return server.wait()
 
 
 def main(argv):
     real = os.environ["GYM_REAL_RELISH"]
     log_path = os.environ["GYM_CALL_LOG"]
+    if argv[:1] == ["mcp"] and not {"--help", "-h", "--list"} & set(argv):
+        return serve_mcp(real, argv, log_path)
     started = time.time()
     clock = time.monotonic()
     completed = subprocess.run(

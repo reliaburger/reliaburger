@@ -42,7 +42,7 @@ variable GYM_ANSWER, with these fields (null for any you can't name):
       "node": "the node at fault",
       "fault_kind": "one of: {kinds}",
       "location": {{"file": "repository-relative path", "function": "function name"}},
-      "patch": "a unified diff against the source, for a bug in Reliaburger",
+      "patch": "a unified diff against the source that `git apply` takes at its root, for a bug in Reliaburger",
       "summary": "what you found, in a few sentences"
     }}
 """
@@ -139,6 +139,8 @@ class ScriptedSolver:
         self.work_dir = work_dir
         if "relish agent source" in prompt:
             answer = self.find_bug(prompt)
+        elif "relish agent report" in prompt:
+            answer = self.draft_report(prompt)
         else:
             answer = self.diagnose()
         Path(env["GYM_ANSWER"]).write_text(json.dumps(answer, indent=2) + "\n")
@@ -190,6 +192,27 @@ class ScriptedSolver:
             break
         return answer
 
+    def draft_report(self, prompt):
+        """Paste the app's raw log into a report, as a careless agent would.
+
+        `relish logs` prints the lines unredacted, so this is the hardest
+        case for the report's own redaction: every planted secret goes in.
+        """
+        named = re.search(r"The `([a-z0-9-]+)` app", prompt)
+        app = named.group(1) if named else None
+        shown = self.relish("logs", app, "--tail", "50") if app else None
+        self.relish(
+            "agent", "report",
+            "--title", f"{app}: calls to its upstream fail",
+            "--what-happened", (shown.stdout if shown else "") or "no log lines",
+            "--expected", "the upstream calls succeed",
+            "--not-tested", "nothing beyond reading the app's log",
+            "--caught-by", "unknown",
+            "--out", "report",
+        )
+        return {"app": app, "namespace": "default", "node": None, "fault_kind": "other",
+                "location": None, "patch": None, "summary": "drafted a report in report/"}
+
     def find_bug(self, prompt):
         """Reproduce the symptom, then find the code with `relish agent source`."""
         answer = {"app": None, "namespace": None, "node": None, "fault_kind": "relish_bug",
@@ -230,12 +253,27 @@ def solver_from_spec(spec):
     raise ValueError(f"unknown solver {spec!r}: use scripted or command:PROGRAM")
 
 
-def environment(base_env, shim_bin, call_log, answer_path, prompt_path, extra):
-    """The solver's environment: the shim first on PATH, and the gym's files."""
+def environment(base_env, shim_bin, call_log, answer_path, prompt_path, extra, meta_path=None):
+    """The solver's environment: the shim first on PATH, and the gym's files.
+
+    `GYM_SOLVER_META` names a file the solver may write a JSON object to
+    (its model, client version, cost); the runner keeps it in the result.
+    """
     env = dict(base_env)
     env.update(extra)
     env["PATH"] = f"{shim_bin}{os.pathsep}{base_env.get('PATH', '')}"
     env["GYM_CALL_LOG"] = str(call_log)
     env["GYM_ANSWER"] = str(answer_path)
     env["GYM_PROMPT"] = str(prompt_path)
+    if meta_path is not None:
+        env["GYM_SOLVER_META"] = str(meta_path)
     return env
+
+
+def read_meta(path):
+    """What the solver said about itself, or None when it said nothing usable."""
+    try:
+        meta = json.loads(Path(path).read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return meta if isinstance(meta, dict) else None
