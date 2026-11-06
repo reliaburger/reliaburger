@@ -4,9 +4,11 @@ RUST · APACHE 2.0 · 0.2.6
 
 # The container platform, served ready.
 
-Kubernetes hands you the ingredients. Reliaburger hands you the burger: app scheduling, batch jobs, metrics, logs, service discovery, ingress, mTLS, a Docker registry, GitOps and chaos testing, in one Rust agent and one CLI.
+Built for humans and their agents.
 
-[Get a working cluster in under 5 minutes](https://reliaburger.com/#install)
+Kubernetes hands you the ingredients. Reliaburger hands you the burger: app scheduling, batch jobs, metrics, logs, service discovery, ingress, mTLS, a Docker registry, GitOps and chaos testing, in one Rust agent and one CLI. And that CLI speaks to your AI agent too (0.2.7, not in 0.2.6).
+
+[Get a working cluster in under 5 minutes](https://reliaburger.com/#install) [Debug it with your agent](https://reliaburger.com/#debug)
 
 [Read the source](https://github.com/reliaburger/reliaburger) [Read the whitepaper](https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md) [PDF](https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf) [Read the book](https://github.com/reliaburger/reliaburger/tree/main/docs/book) [PDF](https://github.com/reliaburger/reliaburger/releases/latest/download/building-reliaburger.pdf)
 
@@ -31,6 +33,10 @@ Kubernetes hands you the ingredients. Reliaburger hands you the burger: app sche
 5.  ### Chaos is a command, not an install.
 
     `relish fault` adds latency, partitions, DNS failures, kills and CPU, memory or disk pressure from inside the agent, so there’s no chaos operator to deploy. Every fault ends on its own, and the cluster refuses one that would take out every replica or put the council’s quorum at risk.
+
+6.  ### Your agent can read the recipe.
+
+    New in 0.2.7 (0.2.7, not in 0.2.6), `relish agent` answers an AI agent in one line of JSON within a byte budget, and carries the manual and the exact source its binary was built from. Your agent reads how a finding is decided instead of guessing, and with a read-only token it can read the cluster and change nothing.
 
 ## Install it
 
@@ -58,7 +64,7 @@ Paste that into Claude Code, Codex or any agent with a shell. The page it reads 
 
 You still make the decisions; it does the typing. Give it a read-only token afterwards, and it can help you run the cluster too.
 
-[Read the playbook](https://reliaburger.com/agents.html) · [As Markdown](https://reliaburger.com/agents.md)
+[Read the playbook](https://reliaburger.com/agents.html) · [As Markdown](https://reliaburger.com/agents.md) · [Add Reliaburger to your agent](https://reliaburger.com/agents.html#add-to-your-agent)
 
 **Where it stands**
 
@@ -387,6 +393,55 @@ Open file descriptors per node.
 Bun CPU per node, as a percentage of one core.
 
 What the soaks don't prove: they run three small VMs on one laptop, so they say nothing about large clusters, real networks between machines or hardware failing. A VM forced off isn't a real power loss, the fault rates are a schedule, not production traffic, and zero failures in 25 runs only rules out failure rates above about 12%. [How each gate works](https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release), and [how it compares with Kubernetes' release testing](https://reliaburger.com/compare/kubernetes.html#testing).
+
+## Debug the platform, not just your app
+
+When something breaks, the bug may be in your app or in the platform under it. Your AI agent can tell which (0.2.7, not in 0.2.6): it reads the cluster, the manual and the exact source its `relish` was built from. When the bug is ours, it proves a fix on a throwaway cluster and drafts the report for you to send. It never fixes your cluster for you.
+
+No recording yet. A real session, an agent with a read-only token on a real cluster with real build times, is being recorded for [#1579](https://github.com/reliaburger/reliaburger/issues/1579), and we won’t show a mock-up in its place. Until then, here are the steps it takes.
+
+1.  ```
+    relish token create --name agent --role read-only --ttl-days 1
+    ```
+
+    You make a read-only token and give it to the agent in `RELIABURGER_TOKEN`. The token’s role is what stops it changing anything, not its good manners.
+
+2.  ```
+    relish agent context
+    ```
+    ```
+    relish agent diagnose
+    ```
+
+    The first calls: findings, faults, alerts, one line per app and the newest events in one bounded answer, then every finding with its evidence and the read-only commands to run next. Text a workload wrote arrives marked as untrusted.
+
+3.  ```
+    relish agent explain
+    ```
+    ```
+    relish agent source grep classify_error
+    ```
+
+    What each finding means, its thresholds and where it’s decided, then the code itself, from the source this `relish` was built from rather than whatever is on GitHub today.
+
+4.  ```
+    relish agent patch init ./fix
+    ```
+    ```
+    relish agent patch build ./fix
+    ```
+    ```
+    relish agent patch test ./fix
+    ```
+    ```
+    relish agent patch try ./fix
+    ```
+
+    If the bug is in Reliaburger: a workspace from that source, a build, the portable test suite, then a throwaway cluster of the patched binaries with its own `RELIABURGER_HOME`, never yours. The build takes minutes, and the binaries it makes stay unsigned.
+
+Last, it drafts a redacted bug report with the reproducer, the patch and what it didn’t test, for you to read and post. Nothing goes to GitHub on its own.
+
+[The agent’s own page](https://reliaburger.com/agents.html) · [The manual chapter](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/16_working-with-an-ai-agent.md) · [How we test, for agents](https://reliaburger.com/agents.html#how-reliaburger-is-tested)
 
 ## What’s next
 

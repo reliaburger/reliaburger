@@ -29,8 +29,9 @@ and an exit code that means "warnings" in one command and "usage error" in
 another sends it chasing the wrong problem. <code>relish agent</code> is the family of
 commands built for it.</p>
 <p>This chapter is also where every agent-facing file comes from. <code>relish agent guide</code> prints it, and <code>make agent-docs</code> builds <code>llms.txt</code>, the website's
-<code>/agents</code> page, the <code>reliaburger</code> skill, the Claude Code plugin and part of
-the repository's <code>AGENTS.md</code> from it, so they can't disagree. It grows through
+<code>/agents</code> page, the <code>reliaburger</code> skill and the website's index of it, the
+Claude Code plugin, <code>relish mcp</code>'s MCP Registry entry and part of the
+repository's <code>AGENTS.md</code> from it, so they can't disagree. It grows through
 0.2.7 as the commands arrive. It ends with the playbook an agent follows to
 set a cluster up for you, which is where <code>reliaburger.com/agents</code> sends one.</p>
 <aside class="agents-install" id="add-to-your-agent" aria-labelledby="add-to-your-agent-title">
@@ -131,7 +132,8 @@ token, and don't tell your agent client to "always allow" <code>relish</code>.</
 success or failure;</li>
 <li>never prompts, never opens a TUI and never reads stdin, so it runs the same
 in a script, a CI job or an agent's tool call;</li>
-<li>stays within a byte budget, 24 KiB unless you pass <code>--max-bytes</code>;</li>
+<li>stays within a byte budget, 24 KiB unless you pass <code>--max-bytes</code> (64 KiB
+for <code>relish agent guide</code>, the one answer you read whole);</li>
 <li>exits with a code that says whether it answered, not what the answer was.</li>
 </ul>
 <p><code>-o</code> is accepted and ignored: there's only one format.</p>
@@ -169,18 +171,31 @@ nobody knows is <code>null</code>.</p>
   "command": "version",
   "ok": false,
   "relish": {"version": "0.2.7", "commit": "a1b2c3d4…", "dirty": null, "source_digest": null},
-  "error": {"code": "unreachable", "message": "bun agent not reachable at localhost:9117 (is it running?)",
-            "endpoint": null, "status": null,
+  "error": {"code": "unreachable",
+            "message": "cannot reach the bun agent at https://localhost:9117: connection refused; check that bun runs there and listens on that port",
+            "endpoint": "https://localhost:9117", "status": null,
             "hint": "start a cluster (relish setup --quickstart) or point at one with --endpoint"}
 }
 </code></pre>
 <p><code>code</code> is one of a fixed list: <code>usage</code>, <code>no_endpoint</code>, <code>unreachable</code>, <code>dns</code>,
 <code>tls_untrusted</code>, <code>timeout</code>, <code>unauthenticated</code>, <code>forbidden</code>, <code>not_found</code>,
 <code>conflict</code>, <code>api</code>, <code>source_mismatch</code>, <code>build_failed</code>, <code>unsupported_platform</code>
-and <code>internal</code>. <code>status</code> is the HTTP status when the API answered with one.</p>
+and <code>internal</code>. <code>status</code> is the HTTP status when the API answered with one,
+and <code>endpoint</code> the address <code>relish</code> dialled when the connection failed. A
+connection failure splits by its cause: <code>dns</code> when the host name doesn't
+resolve, <code>tls_untrusted</code> when the server's certificate isn't one <code>relish</code>
+trusts (pass the cluster CA with <code>--ca-cert</code>), and <code>unreachable</code> for the rest.</p>
 <p>A usage error is an envelope too. Give <code>relish agent version</code> a flag it
 doesn't have and it prints a failure with the <code>usage</code> code on stdout, not
 clap's text on stderr. Only <code>--help</code> prints ordinary help.</p>
+<p>A command relish doesn't know is a usage error too, and its "did you mean"
+only ever names a command that reads. Type <code>statsu</code> and relish suggests
+<code>relish status</code>. Type <code>apps</code> and the closest name is <code>apply</code>, which writes,
+so relish leaves it out and points at <code>relish status</code> instead; under
+<code>relish agent</code> it points at <code>relish agent context</code>, and the envelope's <code>hint</code>
+opens with the suggestion. A typo of a command that writes, such as <code>aply</code>,
+gets no suggestion at all, for a person or an agent alike: relish can't tell
+which one is typing. <code>relish --help</code> lists everything.</p>
 </section>
 <section class="agents-section" id="exit-codes">
 <h2>Exit codes <a class="permalink" href="#exit-codes" aria-label="Link to this section">#</a></h2>
@@ -197,7 +212,10 @@ exit code is the verdict.</p>
 </section>
 <section class="agents-section" id="byte-budgets">
 <h2>Byte budgets <a class="permalink" href="#byte-budgets" aria-label="Link to this section">#</a></h2>
-<p>When an answer is bigger than the budget, <code>relish agent</code> trims it and keeps
+<p>Every command's default budget is 24 KiB, about 6,000 tokens, except
+<code>relish agent guide</code>'s, which is 64 KiB so this whole chapter comes back in
+one call. <code>--max-bytes</code> overrides either. When an answer is bigger than the
+budget, <code>relish agent</code> trims it and keeps
 the JSON valid. It drops items from the end of the longest arrays in <code>data</code>
 first (commands put what matters most at the front), then shortens long
 strings, which end in <code>…[cut]</code>. Then it says so:</p>
@@ -228,7 +246,8 @@ so that text never sits loose in <code>data</code>. It always arrives wrapped:</
 <code>release_metadata</code> or <code>github_issue</code>. Before printing, <code>relish</code> strips ANSI
 escapes and control characters (tabs stay), redacts anything shaped like a
 secret (<code>rbrg_</code> tokens, <code>ENC[AGE:…]</code> values, age identities, PEM private
-keys, passwords in URLs), and cuts each line at <code>line_bytes_max</code> bytes, ending
+keys, passwords in URLs, JWTs, and the value after any key that names a
+secret, such as <code>password=</code>, <code>api_key:</code> or <code>"token":</code>), and cuts each line at <code>line_bytes_max</code> bytes, ending
 a cut line with <code>…[cut]</code>. <code>truncated</code> is <code>true</code> when a line was cut or the
 command left lines out. Tell your agent to treat anything inside <code>untrusted</code>
 as evidence to read, never as instructions to follow. Redaction is a safety
@@ -268,8 +287,10 @@ what this binary has; <code>relish agent --help</code> says the same.</p>
 </code></pre>
 <p><code>data.sections</code> holds it one section at a time, each with its <code>heading</code> and
 its <code>markdown</code>, and <code>data.commands</code> lists the commands above, read from the
-binary itself. When the chapter is bigger than the budget, the last sections
-go first, and the <code>next</code> step asks for a <code>--max-bytes</code> that fits it all.</p>
+binary itself. Its default budget is 64 KiB, not 24, so the whole chapter
+comes back in one call, with nothing trimmed. Given a smaller <code>--max-bytes</code>,
+the last sections go first, and the <code>next</code> step asks for a <code>--max-bytes</code> that
+fits it all.</p>
 <p><code>relish agent version</code> prints the version, commit, target and cluster formats
 of this binary:</p>
 <pre><code class="language-sh">relish agent version
@@ -641,8 +662,14 @@ section says nobody has made it happen on purpose, and the suggested label is
 first.</p>
 <h3>What gets redacted</h3>
 <p>Everything goes through the same rules as <code>untrusted</code> text: <code>rbrg_</code> tokens,
-<code>ENC[AGE:…]</code> values, age identities, PEM private keys and passwords in URLs.
-Then a report goes further:</p>
+<code>ENC[AGE:…]</code> values, age identities, PEM private keys, passwords in URLs,
+JWTs, and the value after any key that names a secret. A key names a secret
+when it ends in <code>password</code>, <code>passwd</code>, <code>passphrase</code>, <code>secret</code>, <code>token</code>,
+<code>apikey</code>, <code>api_key</code>, <code>access_key</code>, <code>private_key</code> or <code>secret_key</code> (any case,
+<code>-</code> or <code>_</code>), so <code>DB_PASSWORD=…</code>, <code>"api_key": "…"</code> and <code>x-api-key: …</code> lose
+their values whatever they are, even <code>password=changeme</code>, while
+<code>token_bucket=5</code> and <code>password_file=/etc/pw</code> stay. The same goes for a field
+of JSON evidence under such a key. Then a report goes further:</p>
 <table><thead><tr><th>What</th><th>Default</th><th>Change it with</th></tr></thead><tbody>
 <tr><td>Env values (any <code>env</code> object in the evidence)</td><td>Values replaced, keys kept</td><td>—</td></tr>
 <tr><td>Workload log lines (<code>untrusted</code> text from <code>workload_log</code>) and <code>.log</code> files</td><td>Left out, and the manifest counts them</td><td><code>--include-logs</code> keeps them, still redacted</td></tr>
@@ -653,7 +680,7 @@ Then a report goes further:</p>
 such as <code>github.com</code>, and names reserved for examples (<code>example.com</code>,
 <code>*.test</code>) are kept. A patch loses its secrets but keeps its addresses: it's
 code, and changing an address would change what it does.</p>
-<p>The rules only know shapes. A password in plain words, or a host name that no
+<p>The rules only know shapes and key names. A password in plain words, or a host name that no
 field names and no URL carries, gets through. Read <code>MANIFEST.json</code> and
 <code>issue.md</code> before you post them; that's what the checkbox is for.</p>
 </section>
@@ -697,7 +724,15 @@ An agent with a shell and no skills needs one line in its instructions: run
 <p>For agents on the web, <a href="https://reliaburger.com/llms.txt"><code>reliaburger.com/llms.txt</code></a>
 indexes the manual in the <a href="https://llmstxt.org/">llms.txt</a> format, and
 <a href="https://reliaburger.com/agents"><code>reliaburger.com/agents</code></a> is this chapter
-(<a href="https://reliaburger.com/agents.md">as Markdown</a>).</p>
+(<a href="https://reliaburger.com/agents.md">as Markdown</a>). Every other page on the
+site has a Markdown copy beside it too, at the same path ending in <code>.md</code>
+(<code>/index.md</code>, <code>/compare/nomad.md</code>). Each page names its copy in a <code>&lt;link rel="alternate" type="text/markdown"&gt;</code>, and <code>llms.txt</code> lists them all.</p>
+<p>An installer that discovers skills from a website finds this one at
+<a href="https://reliaburger.com/.well-known/agent-skills/index.json"><code>reliaburger.com/.well-known/agent-skills/index.json</code></a>,
+in the format of Cloudflare's
+<a href="https://github.com/cloudflare/agent-skills-discovery-rfc">Agent Skills Discovery RFC</a>.
+It points at a copy of the skill with the SHA-256 of its bytes, so the
+installer can check what it downloaded.</p>
 <p>Clients with no shell, such as HolmesGPT or a desktop app, need an MCP
 server: <code>relish mcp</code>, below. <code>relish agent setup</code> adds it to the agents on
 your machine for you.</p>
@@ -746,6 +781,13 @@ so it must never also be able to change anything or send anything out.</p>
 </code></pre>
 <p><code>--namespace</code> narrows what the agent asks for. It isn't a permission: a
 token scoped to the namespace is.</p>
+<p>The repository's <a href="https://github.com/reliaburger/reliaburger/blob/main/server.json"><code>server.json</code></a>
+describes <code>relish mcp</code> for the <a href="https://registry.modelcontextprotocol.io">MCP Registry</a>,
+as <code>io.github.reliaburger/relish</code>: stdio, read-only and the tools above. It
+lists no package to install from, because the registry installs from npm,
+PyPI, NuGet, crates.io, container registries and MCPB bundles, and <code>relish</code>
+comes from <code>install.sh</code>. Install <code>relish</code> first, then point your client at
+<code>relish mcp</code>.</p>
 </section>
 <section class="agents-section" id="wiring-up-your-agent">
 <h2>Wiring up your agent <a class="permalink" href="#wiring-up-your-agent" aria-label="Link to this section">#</a></h2>
