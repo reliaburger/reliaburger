@@ -52,6 +52,15 @@ pub struct AgentOptions {
     pub command: AgentCommand,
 }
 
+/// `relish agent` as clap defines it, without the rest of `relish`: the
+/// tree `relish agent guide` lists and `relish mcp` turns into tools.
+pub fn agent_command() -> clap::Command {
+    // `Args` is the trait `#[derive(clap::Args)]` implemented for
+    // `AgentOptions`; `augment_args` adds its flags and subcommands to a
+    // command we name ourselves.
+    <AgentOptions as clap::Args>::augment_args(clap::Command::new("agent"))
+}
+
 /// The `relish agent` commands.
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum AgentCommand {

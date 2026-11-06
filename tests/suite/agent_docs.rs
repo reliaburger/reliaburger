@@ -52,7 +52,8 @@ fn generated() -> Vec<guide::Artefact> {
         version: env!("CARGO_PKG_VERSION"),
         site: &super::website_markdown::site_pages(),
     };
-    guide::generate(&inputs, &guide::agent_command()).unwrap_or_else(|e| panic!("{e}"))
+    guide::generate(&inputs, &reliaburger::relish::agent::agent_command())
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 #[test]

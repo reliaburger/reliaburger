@@ -428,7 +428,12 @@ fn unreachable_cause(error: &reqwest::Error) -> super::UnreachableCause {
 fn io_cause(error: &(dyn std::error::Error + 'static)) -> Option<super::UnreachableCause> {
     use super::UnreachableCause;
     if let Some(tls) = error.downcast_ref::<rustls::Error>() {
-        return Some(UnreachableCause::Tls(tls.to_string()));
+        return Some(match tls {
+            rustls::Error::InvalidCertificate(_) => {
+                UnreachableCause::UntrustedCertificate(tls.to_string())
+            }
+            _ => UnreachableCause::Tls(tls.to_string()),
+        });
     }
     let io = error.downcast_ref::<std::io::Error>()?;
     match io.kind() {
@@ -4381,10 +4386,65 @@ mod tests {
         };
         assert_eq!(endpoint, &format!("https://{address}"));
         assert!(
-            matches!(cause, crate::relish::UnreachableCause::Tls(_)),
+            matches!(
+                cause,
+                crate::relish::UnreachableCause::UntrustedCertificate(_)
+            ),
             "{cause:?}"
         );
         assert!(error.to_string().contains("--ca-cert"), "{error}");
+    }
+
+    /// An agent reading the `relish.agent/v1` envelope sees `dns`, not
+    /// `unreachable`, when the endpoint's name doesn't resolve, and the
+    /// endpoint relish dialled.
+    #[tokio::test]
+    async fn an_unresolvable_name_gives_the_agent_the_dns_code() {
+        use crate::relish::agent::envelope::{AgentError, ErrorCode};
+        // `.invalid` is reserved (RFC 6761): it never resolves.
+        let client = BunClient::build("https://no-such-node.invalid:9117", None, None);
+
+        let error = client.health().await.unwrap_err();
+        let agent_error = AgentError::from(&error);
+
+        assert_eq!(agent_error.code, ErrorCode::Dns, "{error}");
+        assert_eq!(agent_error.code.exit_status().code(), 3);
+        assert_eq!(
+            agent_error.endpoint.as_deref(),
+            Some("https://no-such-node.invalid:9117")
+        );
+    }
+
+    /// A server whose certificate chains to a CA relish wasn't given reads as
+    /// `tls_untrusted`: the agent is up, and the fix is `--ca-cert`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_untrusted_certificate_gives_the_agent_the_tls_untrusted_code() {
+        use crate::relish::agent::envelope::{AgentError, ErrorCode};
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("untrusted-agent", b"ikm").unwrap();
+        let server = test_identity(&hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let address = spawn_tls_health(&server, shutdown.clone()).await;
+        let client = BunClient::build(&format!("https://{address}"), None, None);
+
+        let error = client.health().await.unwrap_err();
+        shutdown.cancel();
+        let agent_error = AgentError::from(&error);
+
+        assert_eq!(agent_error.code, ErrorCode::TlsUntrusted, "{error}");
+        assert_eq!(agent_error.code.exit_status().code(), 3);
+        assert_eq!(
+            agent_error.endpoint.as_deref(),
+            Some(format!("https://{address}").as_str())
+        );
+        assert!(
+            agent_error
+                .hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("--ca-cert"),
+            "{agent_error:?}"
+        );
     }
 
     /// Every cause says what to do; none falls back to "is it running?".
@@ -4407,10 +4467,16 @@ mod tests {
             "cannot reach the bun agent at https://10.0.0.5:9117: connection refused; check that bun runs there and listens on that port"
         );
         assert_eq!(
-            message(UnreachableCause::Tls(
+            message(UnreachableCause::UntrustedCertificate(
                 "invalid peer certificate: UnknownIssuer".to_string()
             )),
-            "cannot reach the bun agent at https://10.0.0.5:9117: TLS handshake failed (invalid peer certificate: UnknownIssuer); pass the cluster CA with --ca-cert or RELIABURGER_CA_CERT, and check the endpoint is https"
+            "cannot reach the bun agent at https://10.0.0.5:9117: the server's certificate isn't trusted (invalid peer certificate: UnknownIssuer); pass the cluster CA with --ca-cert or RELIABURGER_CA_CERT"
+        );
+        assert_eq!(
+            message(UnreachableCause::Tls(
+                "received corrupt message".to_string()
+            )),
+            "cannot reach the bun agent at https://10.0.0.5:9117: TLS handshake failed (received corrupt message); check the endpoint is https and serves TLS"
         );
         assert_eq!(
             message(UnreachableCause::TimedOut),

@@ -398,7 +398,7 @@ fn arguments_of_the_wrong_shape_or_name_are_refused() {
 // The real tool list.
 
 fn real_tools() -> Vec<ToolSpec> {
-    tools::derive(tools::agent_command(), &tools::data_schema)
+    tools::derive(crate::relish::agent::agent_command(), &tools::data_schema)
 }
 
 #[test]

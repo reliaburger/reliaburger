@@ -9,7 +9,7 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::relish::RelishError;
+use crate::relish::{RelishError, UnreachableCause};
 
 /// The envelope's version tag. One variant, so the schema says exactly which
 /// string to expect; a `v2` would be a new variant and a deliberate change.
@@ -342,15 +342,33 @@ impl AgentError {
 impl From<&RelishError> for AgentError {
     /// Classify an error from the rest of `relish`.
     ///
-    /// The client still folds DNS and TLS failures into "unreachable"; #1567
-    /// splits them, and then `dns` and `tls_untrusted` get their sources here.
+    /// A connection that never carried a request splits by its cause (#1567):
+    /// a name that doesn't resolve is `dns`, a server certificate relish
+    /// doesn't trust is `tls_untrusted`, and the rest are `unreachable`.
     fn from(error: &RelishError) -> Self {
         let message = error.to_string();
         match error {
-            RelishError::AgentUnreachable { .. } => {
-                AgentError::new(ErrorCode::Unreachable, message).with_hint(
-                    "start a cluster (relish setup --quickstart) or point at one with --endpoint",
-                )
+            RelishError::AgentUnreachable { endpoint, cause } => {
+                let (code, hint) = match cause {
+                    UnreachableCause::NameResolution => (
+                        ErrorCode::Dns,
+                        "check the host name in --endpoint, RELIABURGER_ENDPOINT or the current context",
+                    ),
+                    UnreachableCause::UntrustedCertificate(_) => (
+                        ErrorCode::TlsUntrusted,
+                        "pass the cluster CA with --ca-cert or RELIABURGER_CA_CERT",
+                    ),
+                    UnreachableCause::Refused
+                    | UnreachableCause::Tls(_)
+                    | UnreachableCause::TimedOut
+                    | UnreachableCause::Other(_) => (
+                        ErrorCode::Unreachable,
+                        "start a cluster (relish setup --quickstart) or point at one with --endpoint",
+                    ),
+                };
+                let mut agent_error = AgentError::new(code, message).with_hint(hint);
+                agent_error.endpoint = Some(endpoint.clone());
+                agent_error
             }
             RelishError::AgentRequired { .. } => AgentError::new(ErrorCode::NoEndpoint, message),
             RelishError::RequestTimeout => AgentError::new(ErrorCode::Timeout, message),
@@ -617,6 +635,31 @@ mod tests {
                 RelishError::AgentUnreachable {
                     endpoint: "https://10.0.0.5:9117".to_string(),
                     cause: crate::relish::UnreachableCause::Refused,
+                },
+                ErrorCode::Unreachable,
+            ),
+            (
+                RelishError::AgentUnreachable {
+                    endpoint: "https://no-such-node.invalid:9117".to_string(),
+                    cause: crate::relish::UnreachableCause::NameResolution,
+                },
+                ErrorCode::Dns,
+            ),
+            (
+                RelishError::AgentUnreachable {
+                    endpoint: "https://10.0.0.5:9117".to_string(),
+                    cause: crate::relish::UnreachableCause::UntrustedCertificate(
+                        "invalid peer certificate: UnknownIssuer".to_string(),
+                    ),
+                },
+                ErrorCode::TlsUntrusted,
+            ),
+            (
+                RelishError::AgentUnreachable {
+                    endpoint: "https://10.0.0.5:9117".to_string(),
+                    cause: crate::relish::UnreachableCause::Tls(
+                        "received corrupt message".to_string(),
+                    ),
                 },
                 ErrorCode::Unreachable,
             ),
