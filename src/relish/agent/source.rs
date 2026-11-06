@@ -29,7 +29,7 @@ use crate::relish::source_bundle::{self, Origin, SourceBundleError, SourceFile};
 pub use extract::{ExtractData, GitRecord, STAMP_FILE};
 pub use grep::{GrepArgs, GrepData, GrepMatch};
 pub use nodes::{ClusterSource, NodeSource};
-pub use show::{EnclosingItem, ItemKind, ShowData, ShownLine};
+pub use show::{EnclosingItem, ItemKind, MAX_SHOW_LINES, ShowData, ShownLine, enclosing_items};
 pub use tree::{EntryKind, TreeData, TreeEntry};
 
 /// Where permalinks and node commits point.
@@ -163,7 +163,7 @@ impl Bundle {
     /// A GitHub link to `path` at the build's commit, with `anchor` (such
     /// as `L12` or `L12-L40`), when the build is known to be clean: a dirty
     /// or unknown tree may not match what GitHub has at that commit.
-    fn permalink(&self, path: &str, anchor: &str) -> Option<String> {
+    pub(super) fn permalink(&self, path: &str, anchor: &str) -> Option<String> {
         let commit = self.build.commit.as_deref()?;
         (self.build.dirty == Some(false))
             .then(|| format!("{REPOSITORY_URL}/blob/{commit}/{path}#{anchor}"))
@@ -171,6 +171,19 @@ impl Bundle {
 
     fn file(&self, path: &str) -> Option<&SourceFile> {
         self.files.iter().find(|file| file.path == path)
+    }
+
+    /// The text of the file at `path`, or `None` when it isn't in the
+    /// bundle or isn't text.
+    pub(super) fn text(&self, path: &str) -> Option<&str> {
+        self.file(path).and_then(text_of)
+    }
+
+    /// Every text file in the bundle, as `(path, text)`, in path order.
+    pub(super) fn texts(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.files
+            .iter()
+            .filter_map(|file| text_of(file).map(|text| (file.path.as_str(), text)))
     }
 }
 

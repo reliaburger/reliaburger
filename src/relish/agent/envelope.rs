@@ -62,6 +62,12 @@ pub enum CommandName {
     #[serde(rename = "manual show")]
     #[value(name = "manual-show")]
     ManualShow,
+    /// `relish agent context`.
+    Context,
+    /// `relish agent diagnose`.
+    Diagnose,
+    /// `relish agent explain`.
+    Explain,
 }
 
 impl CommandName {
@@ -79,6 +85,9 @@ impl CommandName {
             CommandName::Logs => "logs",
             CommandName::ManualSearch => "manual search",
             CommandName::ManualShow => "manual show",
+            CommandName::Context => "context",
+            CommandName::Diagnose => "diagnose",
+            CommandName::Explain => "explain",
         }
     }
 
@@ -95,6 +104,9 @@ impl CommandName {
         CommandName::Logs,
         CommandName::ManualSearch,
         CommandName::ManualShow,
+        CommandName::Context,
+        CommandName::Diagnose,
+        CommandName::Explain,
     ];
 }
 

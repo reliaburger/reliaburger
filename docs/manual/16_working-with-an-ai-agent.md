@@ -8,8 +8,10 @@ another sends it chasing the wrong problem. `relish agent` is the family of
 commands built for it.
 
 This chapter grows through 0.2.7 as the commands arrive (#1090). Today it has
-the contract every one of them follows, `version`, `schema`, an app's logs,
-the manual, and the commands that read the source this binary was built from.
+the contract every one of them follows, `version`, `schema`, the commands
+that read the cluster (`context`, `diagnose`, `explain`), an app's logs,
+the manual, and the commands that read the source this binary was built
+from.
 
 ## The contract
 
@@ -152,7 +154,74 @@ command's `data`; name a command to get only its schema:
 relish agent schema version
 ```
 
-The commands that read the cluster's state (`context`, `diagnose`) come next.
+All of them together are bigger than the default budget, so a bare `relish
+agent schema` comes back trimmed; name the command you need, as above. Each
+one fits on its own.
+
+## Reading the cluster
+
+Three commands answer "what's going on?" without changing anything. Start
+with `context`, the way you'd start with `relish status`:
+
+```sh
+relish agent context
+```
+
+`data` has `wtf`'s summary and its findings in one line each (`critical`,
+`warnings`), the checks it couldn't make (`unknown`), the active Smoker
+`faults`, the firing `alerts`, one line per app (`apps`, the worst first:
+`down`, `degraded`, `troubled`, `unknown`, `running`, `stopped`) and the
+newest cluster events (`timeline`, newest first, each message in an
+`untrusted` object). `--events` sets how many events, 20 by default and at
+most 200.
+
+`faults`, `alerts`, `apps` and `timeline` each say how much they saw:
+`state` is `known`, `partial` (some nodes didn't answer; the list is a
+lower bound) or `unknown` (nothing could be read, with `reason` saying why).
+An empty list with `unknown` means "couldn't look", never "none". The same
+goes for `unknown` at the top: a check `wtf` couldn't make stays unknown
+here, and is never counted as OK. On a big cluster the byte budget trims the
+longest lists from the end and says what it cut, so the worst apps and the
+newest events survive.
+
+`diagnose` is `relish wtf` for an agent: the same checks, with the evidence
+behind each finding.
+
+```sh
+relish agent diagnose
+relish agent diagnose --app web
+```
+
+Each item in `findings` (critical first) has the `id`, `severity`, `title`,
+the `resource` it's about, `details`, a `suggestion` for a human, related
+`events`, and three pointers: `manual` (the section that covers it, with a
+`read` command that prints it), `source` (the file, line and function that
+decide it, with a permalink when the build is clean) and `next` (read-only
+commands such as `relish agent explain crashloop`). An app's log line, or an
+event message quoting one, travels only inside `untrusted`; where `wtf`'s own
+sentence quoted it, `diagnose` says `<the app's log line, in events as
+untrusted text>` instead. The `suggestion` can name commands that change the
+cluster, such as `relish rollback`: those are for you to run, not your agent.
+
+`diagnose` exits `0` whatever it finds; `relish wtf`'s exit codes don't apply.
+
+`explain` says what a finding id means, and reads only the binary, never the
+cluster:
+
+```sh
+relish agent explain crashloop
+relish agent explain
+```
+
+You get the `meaning`, the `severities` it comes at, its `thresholds` (each
+with the constant's name, its `value` and `unit`, and where it's defined),
+`decided_in` (the line in `src/relish/wtf/diagnose.rs` that reports it, and
+the function around it) and the `manual` section. The thresholds are the very
+constants the check compares against, and the line is found by searching the
+embedded source for the id, so neither can drift from the code. With no id,
+`explain` lists every finding. An id `wtf` doesn't have is `not_found`, with
+the closest ids in the hint. The table under "Every finding" in
+`diagnostics` lists them all.
 
 ## Reading an app's logs
 

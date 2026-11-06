@@ -220,8 +220,11 @@ instead, and keeps the document whole:
 1. Serialise the envelope to a `serde_json::Value`, a tree we can edit.
 2. If it fits, print it.
 3. Otherwise, find the biggest non-empty array in `data` and drop items from
-   its end until we've saved roughly the excess. Commands put what matters at
-   the front (worst findings, newest events), so the end is what goes.
+   its end until we've saved roughly the excess, or until it's no bigger than
+   the next biggest array, whichever comes first (but at least half the
+   excess, so the loop always ends). Commands put what matters at the front
+   (worst findings, newest events), so the end is what goes, and two big
+   lists end up cut to about the same size.
 4. When no array is left to trim, shorten the longest string and end it with
    `…[cut]`.
 5. Then drop the command's own `next` steps and warnings from the end.
@@ -1206,6 +1209,238 @@ showing it. It was making every answer say whether that source is the one that
 matters: the commit, the `dirty` flag, the digest, the mismatch warning, a
 permalink only when it's true. An agent will reason confidently about whatever
 it's given. The tool's job is to make sure what it's given is labelled.
+
+## What's going on here?
+
+A person who lands on a broken cluster runs `relish status`, then `relish
+wtf`, then reads the logs of whatever looks worst. An agent does the same,
+only it pays for every byte and can't skim. So the first call should be one
+answer that's small, complete about what it couldn't see, and points at the
+next call. [#1088](https://github.com/reliaburger/reliaburger/issues/1088)
+and [#1572](https://github.com/reliaburger/reliaburger/issues/1572) add three
+commands for that:
+
+| Command | Answers |
+|---|---|
+| `context` | `wtf`'s findings in one line each, what it couldn't see, faults, alerts, one line per app, the newest events |
+| `diagnose [--app APP]` | Every finding with its evidence, read-only next steps, and pointers into the manual and the source |
+| `explain [ID]` | What a finding means, the numbers that decide it, and the line of code that does |
+
+None of them is new diagnosis. `context` and `diagnose` call the same
+`wtf::collect` and the same pure `wtf::diagnose` that `relish wtf` does, and
+reshape the report. That was the point: two diagnosers would disagree sooner
+or later, and the one an agent used would be the one nobody tested by hand.
+There's no LLM inside either. The model is on the other end of the pipe.
+
+### Unknown stays unknown
+
+`wtf`'s best property is that a check whose evidence it couldn't read is
+UNKNOWN, never a green OK. `context` has to keep that. Its lists of faults,
+alerts, apps and events are each a `Section`:
+
+```rust
+pub struct Section<T> {
+    pub state: SectionState, // known, partial or unknown
+    pub reason: Option<String>,
+    pub items: Vec<T>,
+}
+```
+
+`Section<T>` is a *generic* struct, like a Go generic type or a C++ template:
+one definition, and the compiler stamps out a `Section<FaultLine>`, a
+`Section<AppLine>` and so on, each with its own concrete `items`. Methods go
+in an `impl<T> Section<T>` block, where `<T>` after `impl` declares the type
+parameter the rest of the line uses. The conversion from `wtf`'s evidence is
+one exhaustive `match`:
+
+```rust
+Evidence::Degraded { value, reason, .. } => Section {
+    state: SectionState::Partial,
+    reason: Some(reason.clone()),
+    items: items(value),
+},
+Evidence::Unavailable { reason } | Evidence::Unsupported { reason } => {
+    Section::unknown(reason.clone())
+}
+```
+
+An empty `items` with `state: unknown` reads "couldn't look"; with `known` it
+reads "none". The JSON can't confuse the two, and because the `match` must
+cover every `Evidence` variant, a sixth kind of evidence added to `wtf` later
+won't compile until someone decides how `context` shows it.
+
+### Worst first, so the budget cuts the right end
+
+A cluster with two thousand apps doesn't fit in 24 KiB, and the byte budget
+from earlier in this chapter trims arrays from the end. So the order of each
+list is a decision about what to lose. Events come newest first. Apps come
+worst first, and the ordering is the enum itself:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
+pub enum AppState { Down, Degraded, Troubled, Unknown, Running, Stopped }
+```
+
+Deriving `PartialOrd` and `Ord` on a fieldless enum orders its variants as
+they're written, so `Down < Degraded < … < Stopped` and sorting by a tuple
+`(state, namespace, app)` puts the broken apps at the front. The test for the
+budget builds that two-thousand-app cluster with two hundred events and checks
+three things: the answer fits, the warning says `/data/apps/items: kept N of
+2000 items`, and the app that's down is still the first one.
+
+That test found a bug in the budget. It used to cut the biggest array by the
+whole excess in one go, so 300 KB of apps beside 70 KB of events lost every
+app and kept every event. Now it stops cutting an array once it's no bigger
+than the next one, so both lists keep their fronts.
+
+`context` also fetches the events at the same time as `wtf` collects:
+
+```rust
+let (collected, events) = tokio::join!(
+    wtf::collect(&client, None),
+    tokio::time::timeout(EVENTS_TIMEOUT, client.events(args.events)),
+);
+```
+
+`tokio::join!` is a macro that polls a fixed set of futures concurrently and
+waits for all of them, returning their results as a tuple. It's the
+fixed-size cousin of `join_all` from the source section. The events request
+gets its own ten-second timeout: a slow event ring shouldn't hold up the
+findings, so a timeout makes the timeline `unknown` and the rest still comes
+back.
+
+### Reshaping a finding for an agent
+
+`diagnose` takes each `wtf` finding and adds three things. `next` is a list
+of read-only commands (`relish agent explain crashloop`, `relish agent
+diagnose --app web`, a `source show` of the deciding code). `manual` points at
+the first section of the manual that mentions the id in backticks, with a
+`read` command that prints the section. `source` is the file, line and
+function that report the finding.
+
+It also takes something out. A crashloop finding quotes the app's first error
+line twice in `wtf`'s report: once as a correlated event and once inside its
+own sentence, `4 timestamped restarts in the last 15 minutes; first error:
+...`. In the sentence, an agent can't tell where our words stop and the app's
+start, and an app can log "IGNORE PREVIOUS INSTRUCTIONS". `diagnose` swaps
+the quoted line for `<the app's log line, in events as untrusted text>` and
+carries the line in the event as an `Untrusted` object, cleaned and redacted
+like every other. A restart's message is an event message, which can quote
+the app too, so it's untrusted as well. Only a deploy's message, which `wtf`
+writes from an operation id and phase, stays a plain string. The event's
+`message` is an untagged enum, so it serialises as either a bare string or an
+`{"untrusted": ...}` object:
+
+```rust
+#[serde(untagged)]
+pub enum EventText {
+    Ours(String),
+    Theirs(Untrusted),
+}
+```
+
+The test walks the whole JSON answer, collects every string that isn't under
+an `untrusted` key, and checks none of them contains the injected text.
+
+`wtf` keeps its schema. The swap happens in `relish agent` only, so the human
+report and its JSON are unchanged.
+
+### A threshold that can't drift
+
+`explain crashloop` answers with what a crashloop is and the numbers that
+decide it:
+
+```json
+{"constant": "CRASHLOOP_RESTARTS", "value": 3, "unit": "count",
+ "meaning": "restarts inside the window that make a crash loop",
+ "defined_at": {"path": "src/relish/wtf/findings.rs", "line": 16, ...}}
+```
+
+The tempting way to write that is a table of strings: "3 restarts in 15
+minutes". It would be right on the day it was written. The catalogue in
+`src/relish/wtf/findings.rs` instead holds the constants the checks compare
+against, and the check imports them from there:
+
+```rust
+pub const CRASHLOOP_RESTARTS: usize = 3;
+
+pub const FINDINGS: &[FindingKind] = &[
+    // ...
+    FindingKind {
+        id: "crashloop",
+        severities: CRITICAL,
+        meaning: "an app restarted repeatedly in a short window; ...",
+        thresholds: &[Threshold {
+            constant: "CRASHLOOP_RESTARTS",
+            value: CRASHLOOP_RESTARTS as u64,
+            unit: Unit::Count,
+            meaning: "restarts inside the window that make a crash loop",
+        }],
+    },
+];
+```
+
+A Rust `const` is evaluated at compile time and inlined wherever it's used,
+much like a C `#define` but typed. A `const` can hold a whole slice of structs
+(`&'static [FindingKind]`; `'static` means it lives for the whole program,
+since the compiler bakes it into the binary), and its initialiser may call
+only `const fn` functions. That's how the token thresholds get in: they're
+`Duration`s in `src/sesame/token.rs`, and `TOKEN_EXPIRY_WARNING.as_secs()` is
+allowed in a `const` because `Duration::as_secs` is a `const fn`. Change the
+number in one place and `wtf`, `explain` and the manual's numbers come from
+it. (The manual's table of findings is prose. A test checks it lists exactly
+the catalogue's ids, in order, but the numbers in it are the one copy a human
+keeps in step.)
+
+Two more tests hold the check to the constant. One feeds `wtf::diagnose` two
+restarts and then three, and expects the crashloop only on the third; the
+other walks a disk from just below 85% through 95%. If someone changes the
+check's comparison without the constant, those fail.
+
+### Where it's decided, found rather than written down
+
+`explain` also says which line reports the finding. A line number written in
+a table is stale the next time anyone edits `diagnose.rs`, so `explain`
+doesn't keep one. It searches the embedded source, the same bundle
+`relish agent source` reads, for the id as a string literal (`"crashloop"`,
+quotes included, so `"crashloops"` doesn't match), stops at the file's
+`#[cfg(test)]`, and reuses `enclosing_items` from the source section to name
+the function around the line. The answer is right for the binary that gave
+it, by construction.
+
+That only works if every id has exactly one home. A test over the real
+bundle checks it both ways. Every id in the catalogue must appear in
+`diagnose.rs`, and every line where it does must sit in the same function.
+(`namespace-isolation` appears three times, twice as an OK row's id, but all
+three are in `check_isolation`.) And every `id: "..."` that follows a
+`WtfFinding {` in the source must be in the catalogue, so a new check can't
+ship without an explanation. Another test checks that each threshold's
+constant is defined exactly once under `src/`, and the last two that the
+manual mentions every id and that its new table of findings lists exactly the
+catalogue.
+
+### What we didn't do
+
+- **A `context` endpoint on `bun`.** The issue asked for no server work, and
+  `wtf`'s collector already fans out through the entry node. One more API is
+  one more thing to version.
+- **Explain the OK rows and unknown sources.** Their ids name checks, not
+  problems, and `diagnose` already says what each saw.
+- **Rank findings by likely cause.** `wtf` correlates a crashloop with a
+  recent deploy and says so; anything cleverer is the agent's job, with the
+  source in front of it.
+- **Generate the manual's table.** It would need a build step for one table.
+  The test that the table lists exactly the catalogue catches the drift that
+  matters, a finding nobody documented.
+
+### Lessons
+
+The small decision that mattered most was making the thresholds constants in
+one place before writing `explain`. It meant `explain` couldn't lie about a
+number, and it caught a bare `3` in `has_crashloop` that the crashloop check
+had duplicated. And searching the source for the deciding line, instead of
+recording it, turned "keep the docs in step" from a chore into a test that
+fails.
 
 ## The front door
 
