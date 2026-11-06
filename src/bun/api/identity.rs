@@ -240,7 +240,7 @@ pub(super) async fn token_revoke_handler(
             .into_response();
     };
 
-    if let Some(council) = crate::bun::task_array_api::council_to_forward_to(&state).await {
+    if let Some(council) = crate::bun::leadership::council_to_forward_to(&state).await {
         let answer = forward_token_write(
             &state,
             council,
@@ -406,7 +406,7 @@ pub(super) async fn token_create_handler(
         if let Err(response) = test_operation_authorisation(&state, user) {
             return response;
         }
-        if !council.is_leader().await {
+        if !crate::bun::leadership::leads(council).await {
             let answer = forward_test_lease_request(
                 &state,
                 council,
@@ -424,7 +424,7 @@ pub(super) async fn token_create_handler(
         // config: a follower's replica could miss a `[permission]` spec or
         // an existing name. It repeats the checks above with the caller's
         // credential, so forwarding grants nothing.
-        if let Some(council) = crate::bun::task_array_api::council_to_forward_to(&state).await {
+        if let Some(council) = crate::bun::leadership::council_to_forward_to(&state).await {
             let answer = forward_token_write(
                 &state,
                 council,
@@ -857,7 +857,7 @@ pub(super) async fn token_rotate_handler(
         )
             .into_response();
     };
-    if let Some(council) = crate::bun::task_array_api::council_to_forward_to(&state).await {
+    if let Some(council) = crate::bun::leadership::council_to_forward_to(&state).await {
         // Rotating again after a lost answer isn't a clean retry: the first
         // rotation made its secret the previous one, so the second ends the
         // secret clients still hold at once, grace or no grace.
@@ -1028,7 +1028,7 @@ pub(super) async fn join_token_create_handler(
             .into_response();
     };
 
-    if let Some(council) = crate::bun::task_array_api::council_to_forward_to(&state).await {
+    if let Some(council) = crate::bun::leadership::council_to_forward_to(&state).await {
         let mut answer = forward_token_write(
             &state,
             council,
