@@ -1,7 +1,7 @@
-# What relish v0.2.5 accepts, read from its -h pages by
+# What relish v0.2.6 accepts, read from its -h pages by
 # scripts/release/released_cli.py. Regenerate it when docs/website/install.sh's
 # default version changes; tests/suite/website.rs checks the two match.
-version	v0.2.5
+version	v0.2.6
 argument	relish apply	[PATH_OR_URL]
 argument	relish batch	[PATH]
 argument	relish batch cancel	<ID>
@@ -531,6 +531,7 @@ option	relish secret encrypt	--pubkey	<PUBKEY>
 option	relish secret pubkey	--namespace	<NAMESPACE>	
 option	relish secret rotate	--finalize		
 option	relish secret rotate	--namespace	<NAMESPACE>	
+option	relish setup	--advertise	<ADDRESSES>	
 option	relish setup	--api-port	<API_PORT>	
 option	relish setup	--binary-dir	<BINARY_DIR>	
 option	relish setup	--development-binaries	<DEVELOPMENT_BINARIES>	
@@ -542,6 +543,7 @@ option	relish setup	--quickstart
 option	relish setup	--registry-port	<REGISTRY_PORT>	
 option	relish setup	--release-mirror	<RELEASE_MIRROR>	
 option	relish setup	--release-url	<RELEASE_URL>	
+option	relish setup	--ssh	<MACHINES>	
 option	relish setup	--timings		
 option	relish setup	--yes		
 option	relish setup	-o,--output	<OUTPUT>	
@@ -549,6 +551,7 @@ option	relish setup	API token for authenticating to the agent. Overrides	`RELIAB
 option	relish setup	Accept the default answer to every question	(non-interactive)	
 option	relish setup	Also print every setup step's timing (always saved as	timings.json)	
 option	relish setup	Boot a secure managed Linux cluster and verify a sample	container	
+option	relish setup	Build a cluster on Linux machines you already have:	user@host,user@host,...	
 option	relish setup	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish setup	Directory to install the bun binary into (default:	~/.reliaburger/bin)	
 option	relish setup	Directory to write reliaburger.toml into [default:	.]	
@@ -558,6 +561,8 @@ option	relish setup	Output format: human,json,or yaml. A command that has no mac
 option	relish setup	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish setup	Print	help	
 option	relish setup	Release metadata URL [default:	https://github.com/reliaburger/reliaburger/releases/latest/download/metadata.json]	
+option	relish setup	The address peers should use for each machine,comma separated,in the same	order	
+option	relish setup	The cluster's name: `laptop` for a laptop cluster,`servers` for one built over	SSH	
 option	relish setup	Use explicitly supplied Linux binaries for development before a release	exists	
 option	relish sign	--key	<KEY>	
 option	relish sign keygen	--out	<OUT>	

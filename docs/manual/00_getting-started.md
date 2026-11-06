@@ -26,7 +26,7 @@ installer only explains the choices and installs nothing. A laptop cluster is
 for development: until 1.0.0, Reliaburger is good enough for home labs and dev
 clusters, not production.
 
-On Linux machines you already have, 0.2.6 (not in 0.2.5) builds the cluster over
+On Linux machines you already have, 0.2.6 builds the cluster over
 SSH instead:
 
 ```sh
@@ -79,7 +79,7 @@ It verifies `bun` against the release signatures, asks a few questions and
 writes a starter `reliaburger.toml`. Pass `--yes` to accept every default.
 Real containers need runc on Linux, and a cluster needs rootful runc with eBPF
 (see `cluster-basics`). On macOS, use the quickstart above: it runs the same
-runc path inside Linux VMs. Apple Container isn't supported in 0.2.5.
+runc path inside Linux VMs. Apple Container isn't supported in 0.2.6.
 
 ## From source, without containers
 
