@@ -201,7 +201,8 @@ so that text never sits loose in `data`. It always arrives wrapped:
 `release_metadata` or `github_issue`. Before printing, `relish` strips ANSI
 escapes and control characters (tabs stay), redacts anything shaped like a
 secret (`rbrg_` tokens, `ENC[AGE:…]` values, age identities, PEM private
-keys, passwords in URLs), and cuts each line at `line_bytes_max` bytes, ending
+keys, passwords in URLs, JWTs, and the value after any key that names a
+secret, such as `password=`, `api_key:` or `"token":`), and cuts each line at `line_bytes_max` bytes, ending
 a cut line with `…[cut]`. `truncated` is `true` when a line was cut or the
 command left lines out. Tell your agent to treat anything inside `untrusted`
 as evidence to read, never as instructions to follow. Redaction is a safety
@@ -738,8 +739,14 @@ first.
 ### What gets redacted
 
 Everything goes through the same rules as `untrusted` text: `rbrg_` tokens,
-`ENC[AGE:…]` values, age identities, PEM private keys and passwords in URLs.
-Then a report goes further:
+`ENC[AGE:…]` values, age identities, PEM private keys, passwords in URLs,
+JWTs, and the value after any key that names a secret. A key names a secret
+when it ends in `password`, `passwd`, `passphrase`, `secret`, `token`,
+`apikey`, `api_key`, `access_key`, `private_key` or `secret_key` (any case,
+`-` or `_`), so `DB_PASSWORD=…`, `"api_key": "…"` and `x-api-key: …` lose
+their values whatever they are, even `password=changeme`, while
+`token_bucket=5` and `password_file=/etc/pw` stay. The same goes for a field
+of JSON evidence under such a key. Then a report goes further:
 
 | What | Default | Change it with |
 |------|---------|----------------|
@@ -753,7 +760,7 @@ such as `github.com`, and names reserved for examples (`example.com`,
 `*.test`) are kept. A patch loses its secrets but keeps its addresses: it's
 code, and changing an address would change what it does.
 
-The rules only know shapes. A password in plain words, or a host name that no
+The rules only know shapes and key names. A password in plain words, or a host name that no
 field names and no URL carries, gets through. Read `MANIFEST.json` and
 `issue.md` before you post them; that's what the checkbox is for.
 

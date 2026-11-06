@@ -9,7 +9,8 @@
 //! The rules are deterministic and deliberately narrow: each one recognises
 //! a shape Reliaburger itself produces or handles (an API token, an
 //! encrypted env value, an age identity, a PEM private key, a URL carrying
-//! credentials). They're a second line of defence, not a guarantee: a
+//! credentials, a JWT), or a value whose key names a secret (`password=…`,
+//! `"api_key": "…"`). They're a second line of defence, not a guarantee: a
 //! password typed into a log line in plain words still gets through.
 //!
 //! Every rule leaves a marker saying what was there, and running the rules
@@ -38,6 +39,33 @@ pub enum Rule {
     UrlCredentials,
     /// The value of an environment variable.
     EnvValue,
+    /// A JSON Web Token, `eyJ…` and two more base64url segments.
+    Jwt,
+    /// The value after a key that names a secret: `password=…`,
+    /// `"api_key": "…"`, `token: …`.
+    SecretKeyValue,
+}
+
+/// Whether `key` names a secret: it ends in `password`, `passwd`,
+/// `passphrase`, `secret`, `token`, `apikey`, or `api`, `access`, `private`
+/// or `secret` then `key` (with or without a `_` or `-`), in any case.
+///
+/// So `DB_PASSWORD`, `x-api-key` and `accessToken` do, and `token_bucket`,
+/// `max_tokens` and `password_file` don't.
+pub fn is_secret_key(key: &str) -> bool {
+    SECRET_KEY.is_match(key)
+}
+
+/// `value` with secrets redacted, as [`redact`] does, except that when `key`
+/// names a secret ([`is_secret_key`]) the whole value goes, counted as
+/// [`Rule::SecretKeyValue`]. For a field of structured evidence, where the
+/// key and the value arrive apart and the text rules can't see both.
+pub fn redact_value(key: &str, value: &str, counts: &mut RedactionCounts) -> String {
+    if is_secret_key(key) && !value.contains(REDACTED) {
+        counts.record(Rule::SecretKeyValue);
+        return REDACTED.to_string();
+    }
+    redact(value, counts)
 }
 
 /// How many times each rule fired.
@@ -76,15 +104,17 @@ impl RedactionCounts {
 /// counting each replacement in `counts`.
 ///
 /// The rules run in a fixed order, widest first: a PEM block can hold
-/// anything, so it goes before the rules that look inside lines, and the
-/// token scanner goes last because every other rule may already have
-/// swallowed a token.
+/// anything, so it goes before the rules that look inside lines. The rules
+/// that recognise a secret by its own shape come next, and the key-based
+/// rule goes last, so `token=rbrg_…` is counted once, as the token it is.
 pub fn redact(text: &str, counts: &mut RedactionCounts) -> String {
     let text = redact_pem_private_keys(text, counts);
     let text = redact_encrypted_values(&text, counts);
     let text = redact_age_identities(&text, counts);
     let text = redact_url_credentials(&text, counts);
-    redact_reliaburger_tokens(&text, counts)
+    let text = redact_jwts(&text, counts);
+    let text = redact_reliaburger_tokens(&text, counts);
+    redact_secret_key_values(&text, counts)
 }
 
 /// `text` with every secret the rules recognise replaced by a marker.
@@ -207,6 +237,73 @@ fn redact_url_credentials(text: &str, counts: &mut RedactionCounts) -> String {
             }
             counts.record(Rule::UrlCredentials);
             format!("{}{REDACTED}@", &captures[1])
+        })
+        .into_owned()
+}
+
+/// A JWT: a base64url header that starts `eyJ` (the encoding of `{"`), a
+/// payload and a signature, joined by dots. The signature may be empty (an
+/// `alg: none` token). The `\b` keeps `heyJude.abcd.efgh` out.
+static JWT: LazyLock<Regex> =
+    LazyLock::new(|| pattern(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*"));
+
+fn redact_jwts(text: &str, counts: &mut RedactionCounts) -> String {
+    JWT.replace_all(text, |_: &Captures| {
+        counts.record(Rule::Jwt);
+        format!("eyJ{REDACTED}")
+    })
+    .into_owned()
+}
+
+/// The end of a key that names a secret. A word that merely contains one
+/// (`token_bucket`, `max_tokens`, `password_file`) doesn't.
+const SECRET_WORD: &str =
+    "(?:password|passwd|passphrase|secret|token|apikey|(?:api|access|private|secret)[_-]?key)";
+
+/// A whole key that names a secret, for [`is_secret_key`].
+static SECRET_KEY: LazyLock<Regex> =
+    LazyLock::new(|| pattern(&format!("(?i)^[A-Za-z0-9_.-]*{SECRET_WORD}$")));
+
+/// A key that names a secret, `=` or `:`, then its value.
+///
+/// The key may be quoted, or quoted with escaped quotes (JSON logged inside
+/// a JSON string). The value is one of four shapes, each its own group:
+/// `\"…\"`, `"…"` (backslash escapes allowed), `'…'`, or a bare run up to a
+/// space, quote, comma, semicolon, `&` or bracket. A quoted value whose
+/// closing quote never came runs to the end of the line. A bare value can't
+/// start with `:` or `=`, so `Token::new` and `token == other` are code,
+/// not secrets.
+static SECRET_KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
+    pattern(&format!(
+        r#"(?i)([A-Za-z0-9_.-]*{SECRET_WORD}\\?["']?[ \t]*[=:][ \t]*)(?:\\"([^"\\\n]*)((?:\\")?)|"((?:[^"\\\n]|\\.)*)("?)|'([^'\n]*)('?)|([^\s"'`,;&<>(){{}}:=\\][^\s"'`,;&<>(){{}}]*))"#
+    ))
+});
+
+/// Replace the value after every key that names a secret.
+///
+/// The key decides, not the value: `password=changeme` goes too, because no
+/// pattern can tell a placeholder from a real password. A value that
+/// already holds a marker was redacted by a rule that knows its shape
+/// (`token=rbrg_[redacted]`), so it's left alone and counted once.
+fn redact_secret_key_values(text: &str, counts: &mut RedactionCounts) -> String {
+    SECRET_KEY_VALUE
+        .replace_all(text, |captures: &Captures| {
+            let group = |index: usize| captures.get(index).map_or("", |found| found.as_str());
+            // (value group, closing-quote group, opening quote) per shape.
+            let shapes = [(2, 3, r#"\""#), (4, 5, "\""), (6, 7, "'"), (8, 0, "")];
+            let Some((value, close, open)) = shapes.into_iter().find_map(|(value, close, open)| {
+                captures.get(value).map(|found| {
+                    let close = if close == 0 { "" } else { group(close) };
+                    (found.as_str(), close, open)
+                })
+            }) else {
+                return captures[0].to_string();
+            };
+            if value.is_empty() || value.contains(REDACTED) {
+                return captures[0].to_string();
+            }
+            counts.record(Rule::SecretKeyValue);
+            format!("{}{open}{REDACTED}{close}", &captures[1])
         })
         .into_owned()
 }
@@ -454,16 +551,19 @@ mod tests {
 
     #[test]
     fn counts_add_up_across_rules() {
-        let (_, counts) = run(
+        let (_, counts) = run(&format!(
             "rbrg_a rbrg_b ENC[AGE:x] https://u:p@h AGE-SECRET-KEY-1ABC \
-             -----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
-        );
+             -----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY----- \
+             Bearer {JWT} password=pw"
+        ));
         assert_eq!(counts.count(Rule::ReliaburgerToken), 2);
         assert_eq!(counts.count(Rule::EncryptedValue), 1);
         assert_eq!(counts.count(Rule::UrlCredentials), 1);
         assert_eq!(counts.count(Rule::AgeIdentity), 1);
         assert_eq!(counts.count(Rule::PemPrivateKey), 1);
-        assert_eq!(counts.total(), 6);
+        assert_eq!(counts.count(Rule::Jwt), 1);
+        assert_eq!(counts.count(Rule::SecretKeyValue), 1);
+        assert_eq!(counts.total(), 8);
         let rules: Vec<Rule> = counts.iter().map(|(rule, _)| rule).collect();
         assert_eq!(
             rules,
@@ -473,8 +573,224 @@ mod tests {
                 Rule::AgeIdentity,
                 Rule::PemPrivateKey,
                 Rule::UrlCredentials,
+                Rule::Jwt,
+                Rule::SecretKeyValue,
             ]
         );
+    }
+
+    // JWTs.
+
+    /// A real-shaped JWT: `{"alg":"HS256","typ":"JWT"}`, a payload and a
+    /// signature, each base64url.
+    const JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
+                       eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ.\
+                       SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+
+    #[test]
+    fn a_jwt_as_a_bearer_token_is_redacted() {
+        let (text, counts) = run(&format!("Authorization: Bearer {JWT}\r\nHost: api"));
+        assert_eq!(text, "Authorization: Bearer eyJ[redacted]\r\nHost: api");
+        assert_eq!(counts.count(Rule::Jwt), 1);
+    }
+
+    #[test]
+    fn a_bare_jwt_in_a_sentence_is_redacted() {
+        let (text, counts) = run(&format!("the session {JWT}, then it expired"));
+        assert_eq!(text, "the session eyJ[redacted], then it expired");
+        assert_eq!(counts.count(Rule::Jwt), 1);
+    }
+
+    #[test]
+    fn a_jwt_without_a_signature_is_still_redacted() {
+        // An `alg: none` token ends in its second dot.
+        let (text, _) = run("t=eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0. ok");
+        assert_eq!(text, "t=eyJ[redacted] ok");
+    }
+
+    #[test]
+    fn words_that_merely_start_like_a_jwt_are_left_alone() {
+        let line = "eyJustin said hi; eyJhbGciOiJIUzI1NiJ9 alone; heyJude.abcd.efgh";
+        let (text, counts) = run(line);
+        assert_eq!(text, line);
+        assert!(counts.is_empty());
+    }
+
+    // Values whose key names a secret.
+
+    #[test]
+    fn a_password_with_equals_or_colon_is_redacted() {
+        let (text, counts) =
+            run(r#"password=hunter2 and password: "hunter3" and Password : 'x y'"#);
+        assert_eq!(
+            text,
+            r#"password=[redacted] and password: "[redacted]" and Password : '[redacted]'"#
+        );
+        assert_eq!(counts.count(Rule::SecretKeyValue), 3);
+    }
+
+    #[test]
+    fn api_keys_secrets_and_tokens_are_redacted_in_any_case() {
+        let (text, counts) = run(
+            "API_KEY=abc123 apikey=abc api-key: abc ApiKey:abc secret=s3 \
+             TOKEN=t0k token: t1 Secret='s4'",
+        );
+        assert_eq!(
+            text,
+            "API_KEY=[redacted] apikey=[redacted] api-key: [redacted] ApiKey:[redacted] \
+             secret=[redacted] TOKEN=[redacted] token: [redacted] Secret='[redacted]'"
+        );
+        assert_eq!(counts.count(Rule::SecretKeyValue), 8);
+    }
+
+    #[test]
+    fn a_key_ending_in_a_secret_word_has_its_value_redacted() {
+        let (text, _) = run(
+            "DB_PASSWORD=pw GITHUB_TOKEN=ghp_x AWS_SECRET_ACCESS_KEY=k client_secret: c \
+             x-api-key: h --token=cli private_key=p secret-key=q passphrase=r accessToken=a",
+        );
+        assert_eq!(
+            text,
+            "DB_PASSWORD=[redacted] GITHUB_TOKEN=[redacted] AWS_SECRET_ACCESS_KEY=[redacted] \
+             client_secret: [redacted] x-api-key: [redacted] --token=[redacted] \
+             private_key=[redacted] secret-key=[redacted] passphrase=[redacted] \
+             accessToken=[redacted]"
+        );
+    }
+
+    #[test]
+    fn secrets_in_log_lines_env_text_and_json_strings_are_redacted() {
+        for (line, want) in [
+            (
+                "2026-11-06T10:00:00Z ERROR login failed user=bob password=hunter2 retry=3",
+                "2026-11-06T10:00:00Z ERROR login failed user=bob password=[redacted] retry=3",
+            ),
+            (
+                "export API_KEY=abc123\nexport LOG_LEVEL=debug\n",
+                "export API_KEY=[redacted]\nexport LOG_LEVEL=debug\n",
+            ),
+            (
+                r#"{"user":"bob","password":"hunter2","api_key": "k-123"}"#,
+                r#"{"user":"bob","password":"[redacted]","api_key": "[redacted]"}"#,
+            ),
+            (
+                r#"{"msg":"{\"token\":\"t0k\",\"n\":1}"}"#,
+                r#"{"msg":"{\"token\":\"[redacted]\",\"n\":1}"}"#,
+            ),
+            (
+                "GET /callback?code=1&token=abc&state=x",
+                "GET /callback?code=1&token=[redacted]&state=x",
+            ),
+            (
+                r#"{"secret": "with \"quotes\" inside"}"#,
+                r#"{"secret": "[redacted]"}"#,
+            ),
+        ] {
+            let (text, counts) = run(line);
+            assert_eq!(text, want);
+            assert!(counts.count(Rule::SecretKeyValue) >= 1, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_secret_cut_off_before_its_quote_is_redacted_to_the_end_of_the_line() {
+        let (text, _) = run("password=\"hunter2 and more\nnext line");
+        assert_eq!(text, "password=\"[redacted]\nnext line");
+    }
+
+    #[test]
+    fn the_value_goes_whatever_it_is_because_the_key_decides() {
+        // `changeme` and `example` look harmless, but no pattern can tell a
+        // placeholder from a real password, so the key decides.
+        let (text, _) = run("password=changeme token: example");
+        assert_eq!(text, "password=[redacted] token: [redacted]");
+    }
+
+    #[test]
+    fn plain_words_and_ordinary_config_are_left_alone() {
+        for line in [
+            "enter your password to continue",
+            "the token bucket refills at 10/s; tokens left: 3",
+            "key=value log_level=debug replicas: 3 max_tokens=100 token_bucket=5",
+            "password_file=/etc/pw secret_name: db-creds token_ttl=60s",
+            "relish 0.2.7 version=0.2.7 sha256=deadbeefcafe commit: a1b2c3d4",
+            "Token::new(x) and if token == other { secret::open() }",
+            "password:\n  from_file: /etc/pw",
+        ] {
+            let (text, counts) = run(line);
+            assert_eq!(text, line);
+            assert!(counts.is_empty(), "{line}: {counts:?}");
+        }
+    }
+
+    #[test]
+    fn a_secret_another_rule_already_redacted_is_counted_once() {
+        let (text, counts) = run("token=rbrg_abc password=postgres://u:p@db/app");
+        assert_eq!(
+            text,
+            "token=rbrg_[redacted] password=postgres://[redacted]@db/app"
+        );
+        assert_eq!(counts.count(Rule::SecretKeyValue), 0);
+        assert_eq!(counts.total(), 2);
+    }
+
+    #[test]
+    fn a_key_names_a_secret_when_it_ends_in_a_secret_word() {
+        for key in [
+            "password",
+            "DB_PASSWORD",
+            "passwd",
+            "passphrase",
+            "secret",
+            "client_secret",
+            "clientSecret",
+            "token",
+            "GITHUB_TOKEN",
+            "accessToken",
+            "api_key",
+            "API-KEY",
+            "apikey",
+            "apiKey",
+            "x-api-key",
+            "AWS_SECRET_ACCESS_KEY",
+            "private_key",
+            "secret_key",
+        ] {
+            assert!(is_secret_key(key), "{key}");
+        }
+        for key in [
+            "key",
+            "keys",
+            "monkey",
+            "passwords_allowed",
+            "password_file",
+            "token_bucket",
+            "max_tokens",
+            "tokenizer",
+            "secret_name",
+            "",
+        ] {
+            assert!(!is_secret_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_value_under_a_secret_key_is_redacted_whole_and_counted() {
+        let mut counts = RedactionCounts::default();
+        assert_eq!(
+            redact_value("api_key", "plain words", &mut counts),
+            "[redacted]"
+        );
+        assert_eq!(
+            redact_value("api_key", "[redacted]", &mut counts),
+            "[redacted]"
+        );
+        assert_eq!(
+            redact_value("note", "see rbrg_abc", &mut counts),
+            "see rbrg_[redacted]"
+        );
+        assert_eq!(counts.count(Rule::SecretKeyValue), 1);
+        assert_eq!(counts.count(Rule::ReliaburgerToken), 1);
     }
 
     #[test]
@@ -521,6 +837,14 @@ mod tests {
             Just("]".to_string()),
             Just("\n".to_string()),
             Just("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n".to_string()),
+            Just("eyJhbGciOi".to_string()),
+            Just(".".to_string()),
+            Just("password=".to_string()),
+            Just(r#""token": ""#.to_string()),
+            Just("api-key: ".to_string()),
+            Just(r#"\""#.to_string()),
+            Just("'".to_string()),
+            Just("\"".to_string()),
             "[a-zA-Z0-9_:/=+ .-]{0,12}",
             ".{0,8}",
         ];

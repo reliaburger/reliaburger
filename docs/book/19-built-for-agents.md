@@ -471,7 +471,9 @@ The rules, in the order they run:
 | Encrypted value | `ENC[AGE:YWdlLWVuY3J5…]` | `ENC[AGE:[redacted]]` |
 | age identity | `AGE-SECRET-KEY-1QYQSZ…` | `AGE-SECRET-KEY-1[redacted]` |
 | URL credentials | `https://deploy:hunter2@git.example.com/r.git` | `https://[redacted]@git.example.com/r.git` |
+| JWT | `Bearer eyJhbGciOi….eyJzdWIi….SflKxw…` | `Bearer eyJ[redacted]` |
 | Reliaburger token | `rbrg_0123abcd` | `rbrg_[redacted]` |
+| Value of a secret key | `password=hunter2`, `"api_key": "k-123"`, `TOKEN: t0k` | `password=[redacted]`, `"api_key": "[redacted]"`, `TOKEN: [redacted]` |
 
 Each one keeps enough to say what was there. An agent that sees
 `ENC[AGE:[redacted]]` knows the app has an encrypted env value, which might
@@ -482,7 +484,48 @@ redacted to the end of the text, and the body lines before an `END` whose
 `BEGIN` fell outside the window are redacted too. Public keys and
 certificates are left alone; they're public.
 
-A sixth helper, `redact_env`, doesn't look at text at all. It takes an app's
+The JWT and secret-key rules came late, after the exit-test gym planted a
+bearer token and a `password=` in a log line and both walked straight into a
+draft bug report (#1676). A JWT has a shape: three base64url segments joined
+by dots, and the first one always starts `eyJ`, because that's `{"` in
+base64. So the rule doesn't care whether `Bearer` comes before it; a bare
+token in a sentence goes too.
+
+A password has no shape. `hunter2` looks like any other word. What it does
+have is a label: `password=`, `"api_key":`, `GITHUB_TOKEN=`, `x-api-key:`.
+So the last rule works on the key, not the value. If the key ends in
+`password`, `passwd`, `passphrase`, `secret`, `token`, `apikey`, or `api`,
+`access`, `private` or `secret` followed by `key` (with or without a `_` or
+`-`, in any case), the value after `=` or `:` goes, whatever it is. Why not
+look at the value too, and spare `password=changeme`? Because a pattern
+can't tell a placeholder from a real password, and the one time it guesses
+wrong is the time it matters. A `[redacted]` where `changeme` was costs a
+reader nothing.
+
+The key has to *end* in the secret word, and that's what keeps ordinary text
+out. `token_bucket=5`, `max_tokens=100` and `password_file=/etc/pw` stay, and
+so do `key=value`, `version=0.2.7` and `sha256=deadbeef`, because none of
+those keys name a secret. A plain word stays too: "enter your password" and
+"the token bucket" have no `=` or `:` after them. A value can't start with
+`:` or `=`, so Rust's `Token::new` and `token == other` aren't mistaken for
+assignments. The value itself can be bare (up to a space, quote, comma,
+semicolon, `&` or bracket, so `?token=abc&state=x` keeps its `state`), in
+double or single quotes, or in escaped quotes, `\"token\":\"t0k\"`, which is
+what JSON looks like after it's been logged inside another JSON string. A
+quoted value whose closing quote never came (a log line cut off mid-value)
+is redacted to the end of the line.
+
+This rule runs last. By then `token=rbrg_abc` is already
+`token=rbrg_[redacted]`, so the rule sees a marker in the value, leaves it
+alone and doesn't count it a second time. A report's evidence is often
+structured JSON, though, where `"password"` and `"hunter2"` arrive as a
+separate key and value and no text rule sees both. For that, the module
+exports `is_secret_key` and `redact_value`, and the report's scrubber calls
+them on every object field, so `{"api_key": "k-123"}` comes out as
+`{"api_key": "[redacted]"}` and still counts in the manifest under
+`secret_key_value`.
+
+A helper of a different kind, `redact_env`, doesn't look at text at all. It takes an app's
 environment and returns the keys with every value replaced. No pattern can
 tell `DB_PASSWORD=hunter2` from `LOG_LEVEL=debug` reliably, so the bug report
 gets the names (often useful) and none of the values.
@@ -508,7 +551,7 @@ text.
 
 ### Regex or hand-written?
 
-Four of the rules are regular expressions from the
+All the rules but one are regular expressions from the
 [regex](https://docs.rs/regex) crate, which the project already used for
 `relish logs --grep`. Rust's `regex` makes a promise PCRE and Python's `re`
 don't: matching takes time linear in the input, whatever the pattern, because
@@ -584,9 +627,10 @@ URL_CREDENTIALS.replace_all(text, |captures: &Captures| {
 original when nothing matched, an owned `String` when something did. Text
 with no secrets in it, which is nearly all of it, costs no copy.
 
-What doesn't this catch? Anything without a shape. A password typed into a
-log line in plain words, a cloud provider's key without a recognisable
-prefix, a customer's address. The rules are a second line of defence, and
+What doesn't this catch? Anything without a shape or a label. A password
+typed into a log line in plain words ("the password is hunter2"), a cloud
+provider's key without a recognisable prefix or a key that names it, a
+customer's address. The rules are a second line of defence, and
 the docs say so. Ketchup, our log store, deliberately does no redaction at
 all ([logs design](../design/logs-ketchup.md)): it stores what the app wrote,
 because false positives would corrupt the evidence. We redact on the way out
