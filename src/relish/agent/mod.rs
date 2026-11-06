@@ -8,12 +8,15 @@
 //!
 //! This module holds the contract ([`envelope`], [`budget`], and
 //! [`untrusted`] for text a workload wrote), the first two commands,
-//! `version` and `schema`, which exercise it end to end, and [`source`],
-//! which reads the source this binary was built from. The commands that
-//! read the cluster come later and reuse it.
+//! `version` and `schema`, which exercise it end to end, [`source`], which
+//! reads the source this binary was built from, [`logs`], which reads an
+//! app's recent lines, and [`manual`], which searches and prints the manual.
 
 pub mod budget;
 pub mod envelope;
+pub mod fit;
+pub mod logs;
+pub mod manual;
 pub mod source;
 pub mod untrusted;
 
@@ -54,6 +57,13 @@ pub enum AgentCommand {
     },
     /// The source this binary was built from: search it, read it, extract it.
     Source(source::SourceOptions),
+    /// An app's recent log lines, newest kept, each wrapped as untrusted.
+    Logs(logs::LogsArgs),
+    /// The manual compiled into this binary: search it, show a section.
+    Manual {
+        #[command(subcommand)]
+        command: manual::ManualCommand,
+    },
 }
 
 impl AgentCommand {
@@ -63,6 +73,8 @@ impl AgentCommand {
             AgentCommand::Version => CommandName::Version,
             AgentCommand::Schema { .. } => CommandName::Schema,
             AgentCommand::Source(options) => options.command.name(),
+            AgentCommand::Logs(_) => CommandName::Logs,
+            AgentCommand::Manual { command } => command.name(),
         }
     }
 }
@@ -103,6 +115,8 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
             rerun,
         ),
         AgentCommand::Source(source) => source::run(source, options.max_bytes, rerun).await,
+        AgentCommand::Logs(args) => logs::run(args, options.max_bytes, rerun).await,
+        AgentCommand::Manual { command } => manual::run(command, options.max_bytes, rerun),
     }
 }
 
@@ -190,6 +204,9 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::SourceGrep => Some(schema_of::<source::GrepData>()),
         CommandName::SourceShow => Some(schema_of::<source::ShowData>()),
         CommandName::SourceExtract => Some(schema_of::<source::ExtractData>()),
+        CommandName::Logs => Some(schema_of::<logs::LogsData>()),
+        CommandName::ManualSearch => Some(schema_of::<manual::SearchData>()),
+        CommandName::ManualShow => Some(schema_of::<manual::ShowData>()),
     }
 }
 
@@ -231,8 +248,8 @@ pub fn invoked(args: &[String]) -> bool {
 }
 
 /// The command `args` named after `agent`, or [`CommandName::Agent`] when
-/// they named none it knows. `source` takes the word after it too, as in
-/// `source grep`.
+/// they named none it knows. `source` and `manual` take the word after
+/// them too, as in `source grep`.
 pub fn command_named(args: &[String]) -> CommandName {
     let mut words = args
         .iter()
@@ -240,8 +257,8 @@ pub fn command_named(args: &[String]) -> CommandName {
         .skip(1)
         .filter(|arg| !arg.starts_with('-'));
     let name = match words.next().map(String::as_str) {
-        Some("source") => match words.next() {
-            Some(word) => format!("source-{word}"),
+        Some(family @ ("source" | "manual")) => match words.next() {
+            Some(word) => format!("{family}-{word}"),
             None => return CommandName::Agent,
         },
         Some(word) => word.to_string(),
@@ -397,13 +414,26 @@ mod tests {
 
     #[tokio::test]
     async fn schema_lists_the_envelope_and_every_answering_command() {
-        let rendered = run(&parse("agent schema").unwrap(), "relish agent schema").await;
+        // Every command's schema together outgrew the default budget once
+        // `logs` and `manual` arrived; one command's schema still fits it.
+        let rendered = run(
+            &parse("agent schema --max-bytes 65536").unwrap(),
+            "relish agent schema",
+        )
+        .await;
         assert_eq!(rendered.exit, ExitStatus::Answered);
         let value = json_of(&rendered);
-        assert_eq!(
-            value["truncated"], false,
-            "the schema fits the default budget"
-        );
+        assert_eq!(value["truncated"], false, "the schema fits in 64 KiB");
+        for command in CommandName::ANSWERING {
+            let line = format!(
+                "agent schema {}",
+                clap::ValueEnum::to_possible_value(command)
+                    .unwrap()
+                    .get_name()
+            );
+            let one = run(&parse(&line).unwrap(), "relish agent schema").await;
+            assert_eq!(json_of(&one)["truncated"], false, "{line}");
+        }
         let names: Vec<&str> = value["data"]["commands"]
             .as_array()
             .unwrap()
@@ -419,7 +449,10 @@ mod tests {
                 "source tree",
                 "source grep",
                 "source show",
-                "source extract"
+                "source extract",
+                "logs",
+                "manual search",
+                "manual show"
             ]
         );
         let envelope = &value["data"]["envelope"];
@@ -491,6 +524,37 @@ mod tests {
     }
 
     #[test]
+    fn logs_and_manual_commands_parse_with_their_flags() {
+        let options = parse("agent logs payments --since 1h --tail 50 --stream stderr").unwrap();
+        let AgentCommand::Logs(logs) = &options.command else {
+            panic!("{options:?}");
+        };
+        assert_eq!(logs.app, "payments");
+        assert_eq!(logs.since, "1h");
+        assert_eq!(logs.tail, 50);
+        assert_eq!(logs.stream, Some(logs::StreamArg::Stderr));
+        assert_eq!(options.command.name(), CommandName::Logs);
+        let options = parse("agent manual search rolling deploy --max-bytes 4096").unwrap();
+        assert_eq!(options.max_bytes, 4096);
+        let AgentCommand::Manual {
+            command: manual::ManualCommand::Search { words },
+        } = &options.command
+        else {
+            panic!("{options:?}");
+        };
+        assert_eq!(words, &["rolling", "deploy"]);
+        assert_eq!(
+            parse("agent manual show diagnostics#reading-wtf")
+                .unwrap()
+                .command
+                .name(),
+            CommandName::ManualShow
+        );
+        assert!(parse("agent manual search").is_err(), "search needs a word");
+        assert!(parse("agent manual").is_err());
+    }
+
+    #[test]
     fn schema_does_not_offer_agent_itself() {
         assert!(parse("agent schema agent").is_err());
     }
@@ -526,6 +590,14 @@ mod tests {
         assert_eq!(
             command_named(&args("agent source nope")),
             CommandName::Agent
+        );
+        assert_eq!(
+            command_named(&args("agent manual show diagnostics --bogus")),
+            CommandName::ManualShow
+        );
+        assert_eq!(
+            command_named(&args("agent logs payments --bogus")),
+            CommandName::Logs
         );
         assert_eq!(command_named(&args("agent")), CommandName::Agent);
     }

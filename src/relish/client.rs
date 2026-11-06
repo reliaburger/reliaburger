@@ -1423,6 +1423,46 @@ impl BunClient {
         .await
     }
 
+    /// Ask the log store, and only the store, for an app's lines across the
+    /// cluster, with `options`' window, tail and filters sent to the server.
+    ///
+    /// Unlike [`BunClient::log_lines`], this never falls back to a node's
+    /// own capture, which can't honour a window (#1515), and it never
+    /// swallows an error: an unreachable cluster is an error, not an empty
+    /// answer. `relish agent logs` is built on it.
+    pub async fn log_query(
+        &self,
+        app: &str,
+        namespace: &str,
+        options: &LogOptions,
+    ) -> Result<crate::ketchup::types::LogQueryResult, RelishError> {
+        let app_segment: String = url::form_urlencoded::byte_serialize(app.as_bytes()).collect();
+        let namespace_segment: String =
+            url::form_urlencoded::byte_serialize(namespace.as_bytes()).collect();
+        let response = self
+            .http()?
+            .get(format!(
+                "{}/v1/logs/query/{app_segment}/{namespace_segment}",
+                self.base_url
+            ))
+            .query(&options.query_params())
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        response
+            .json()
+            .await
+            .map_err(|error| RelishError::ApiError {
+                status: 0,
+                body: format!("failed to parse response: {error}"),
+            })
+    }
+
     /// Fetch an app's deploy history from every node, each entry tagged
     /// with its node, plus a warning per node that didn't answer.
     pub async fn deploy_history(

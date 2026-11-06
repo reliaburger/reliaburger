@@ -439,9 +439,9 @@ the command left out (`mark_truncated`). A test renders a 200-line object
 under a 2 KiB budget and checks that the front survived and that `origin` and
 `notice` didn't.
 
-Nothing uses `Untrusted` yet. The commands that read workload text,
-`relish agent diagnose` (#1572) and `relish agent logs` (#1573), come later
-in 0.2.7, and `wtf`'s crashloop finding carries a `TODO` pointing at them.
+The first command to use `Untrusted` is `relish agent logs` (#1573,
+[below](#logs-and-the-manual)). `relish agent diagnose` (#1572) comes later
+in 0.2.7, and `wtf`'s crashloop finding carries a `TODO` pointing at it.
 `wtf` itself doesn't change: its JSON has users, and its schema isn't part of
 this contract.
 
@@ -1389,3 +1389,253 @@ say so.
 - **Advertise `brew install` yet.** The tap repository doesn't exist until the
   maintainer creates it, and no release has fed it. The docs say how; they
   don't say it works.
+
+## Logs and the manual
+
+An agent chasing a crash loop wants two more things after the source: what
+the app said, and what the manual says about it. [#1573](https://github.com/reliaburger/reliaburger/issues/1573)
+adds both:
+
+| Command | Answers |
+|---|---|
+| `logs APP [--since 15m] [--tail 200]` | The newest lines in a window, each group wrapped as `untrusted`, and a summary of what was left out |
+| `manual search WORDS…` | Up to ten sections that mention every word, with an excerpt and the command that shows each |
+| `manual show CHAPTER[#ANCHOR]` | One chapter, or one section of it, as Markdown |
+
+### Always a window, never the capture
+
+`relish logs` has two places to look. The log store (Ketchup) records each
+line with its time, node, instance and stream. Each node also keeps its own
+capture of an app's output, which records only the text. When the store has
+nothing, `relish logs` falls back to the capture, and for an unwindowed read
+that's a fine fallback. For a windowed one it was a bug:
+[#1515](https://github.com/reliaburger/reliaburger/issues/1515) found that
+`--since 5m` on a quiet app printed lines from an hour ago, because the
+capture can't tell old from new. [#1542](https://github.com/reliaburger/reliaburger/pull/1542)
+settled the rule: a windowed read never asks the capture.
+
+`relish agent logs` always has a window (`--since 15m` unless told otherwise),
+so it never asks the capture at all. It doesn't go through `log_lines`, the
+function behind `relish logs`, either. That function treats a store it
+couldn't reach as "no lines" and moves on to the capture, which is right for
+a person, who'll see the error from the second attempt, and wrong for an
+agent, which would read an unreachable cluster as a quiet app. So the client
+grew a second method, `log_query`, that asks the store and only the store,
+and returns its errors. An unreachable cluster comes back as `unreachable`
+with exit 3; an empty window comes back as `ok: true` with no lines and a
+`next` step suggesting a wider one.
+
+A test holds the rule. It starts an axum server that answers the store's query
+with nothing and counts every request to the capture endpoint, runs the
+command against it, and checks the count is zero, that the capture's line is
+nowhere in the output, and that the query carried `start=` and `tail=201`.
+
+### One more than you asked for
+
+Why 201? The store applies `tail` itself, so if you ask for 200 and get 200,
+you can't tell "exactly 200 lines" from "200 of thousands". Asking for one
+more answers that for the price of one line: 201 back means there were
+more, so the command drops the oldest and sets `summary.more_than_tail`.
+
+### The newest lines win
+
+The byte budget from the start of this chapter could trim the answer on its
+own: it drops items from the end of the biggest array. For logs, that's the
+wrong end. Lines are oldest first, because that's how people read them, and
+the budget would drop the newest, which are the ones that explain why the app
+is crashing *now*. Reversing the order would fix the budget and annoy every
+reader.
+
+So `logs` fits itself to the budget before the budget has to. It asks how many
+of the newest lines fit, and the answer comes from a new helper in
+`src/relish/agent/fit.rs`:
+
+```rust
+pub fn largest_that_fits(total: usize, fits: impl Fn(usize) -> bool) -> Option<usize> {
+    if !fits(0) {
+        return None;
+    }
+    let (mut low, mut high) = (0, total);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if fits(middle) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Some(low)
+}
+```
+
+It's a binary search, and the interesting part for a C or Go reader is the
+parameter type. `impl Fn(usize) -> bool` means "any closure that takes a
+`usize` and returns a `bool`". Each closure in Rust has its own anonymous
+type, and `impl Fn` makes the compiler generate a copy of
+`largest_that_fits` for each one, so the call costs no more than a direct
+function call (Go would box it into a `func` value; C would want a function
+pointer and a `void *` for its state). `Fn`, rather than `FnMut` or `FnOnce`,
+promises the closure only reads what it captured, so calling it several
+times is safe. `div_ceil` divides rounding up, which keeps `middle` above
+`low`, so the loop can't stall.
+
+The closure `logs` passes builds the whole envelope with that many lines,
+serialises it and compares its length with `--max-bytes`. That's eight or so
+full renders of a 200-line answer, a few milliseconds, and it's exact: no
+estimating how many bytes JSON escaping adds to a line full of quotes.
+`manual show` uses the same helper to cut a long section at a line rather
+than mid-word.
+
+Having done the cutting, the command has to say so, because an agent that
+doesn't know lines are missing will reason confidently from the ones it has.
+`data.summary` closes every answer:
+
+```json
+"summary": {"lines": 34, "truncated": true, "more_than_tail": true,
+            "dropped_for_budget": 16, "lines_cut": 1,
+            "dropped_before": "2026-11-06T09:52:10Z", "nodes_queried": 3}
+```
+
+The envelope's own `truncated` is `true` when the budget forced a cut, through
+a new `Envelope::mark_truncated`, and `next` carries two commands: the same
+query with `--until` at the oldest line shown, which pages backwards, and the
+`--max-bytes` that would fit everything.
+
+### Grouping lines, and `chunk_by`
+
+Every line is workload text, so every line has to sit inside an `untrusted`
+object. One object per line would cost about 250 bytes of wrapper each (the
+`origin`, the `notice`, the app and the instance), which at the default budget
+leaves room for barely 60 short lines. One object for all of them would lose
+each line's time and instance. The compromise is one object per run of lines
+that share a second, a node, an instance and a stream. A chatty app writing
+fifty lines a second gets one wrapper for all fifty, and every line still
+says when and where it came from, to the second.
+
+The slice method `chunk_by` does the grouping:
+
+```rust
+shown
+    .chunk_by(|left, right| key(left) == key(right))
+    .map(|run| { /* one LogLines per run */ })
+```
+
+It walks the slice and starts a new chunk wherever the closure says two
+neighbours differ. Each `run` it hands over is a `&[LogEntry]`, a borrowed
+window into the original slice rather than a copy: Rust's slices are a
+pointer and a length, like Go's, and taking a sub-slice allocates nothing.
+`Untrusted::with_line_bytes_max` then cleans, redacts and caps the run's
+lines as one text, so a private key logged over several lines is still one
+PEM block to the redaction rules.
+
+### Why not JSON Lines
+
+The research note and the issue described `logs` as JSON Lines: one object
+per line, then a summary line. We print one envelope instead, with the lines
+in `data.entries` and the summary in `data.summary`. The command doesn't
+follow (there's no `--follow`), so it isn't a stream, and every other
+`relish agent` command prints exactly one document. Keeping `logs` the same
+means the budget, the error codes, `relish agent schema` and the coming
+`relish mcp` all treat it like any other command. `relish logs -o json` is
+still JSON Lines for scripts that want one line per record.
+
+### Sections and anchors
+
+The manual is compiled into `relish` already, for `relish manual`'s TUI. The
+agent commands read the same chapters but cut them into sections: a heading
+and everything up to the next heading at its level or above. Each section
+gets the anchor GitHub would give its heading (lower case, spaces to `-`,
+punctuation dropped, a repeat numbered `-1`), so
+`` `relish wtf`: what's broken and why `` becomes
+`relish-wtf-whats-broken-and-why`. An agent that quotes
+`relish agent manual show diagnostics#relish-wtf-whats-broken-and-why` to a
+human has also named the place on GitHub.
+
+The scan that finds headings is a line loop with one piece of state, whether
+it's inside a fenced code block, because a `# start the node` comment in a
+shell example starts with `#` too. Its `match` is worth a look:
+
+```rust
+match (fence, marker) {
+    (None, Some(marker)) => fence = Some(marker),
+    (Some(open), Some(marker)) if open == marker => fence = None,
+    (None, None) => { /* maybe a heading */ }
+    _ => {}
+}
+```
+
+Matching on a tuple checks two things at once, and the `if` after a pattern
+is a *match guard*: the arm applies only when the condition holds too, so a
+`~~~` line inside a backtick fence falls through to `_` and changes nothing.
+The compiler checks that the arms cover every case, and the `_` makes the
+"anything else" case explicit.
+
+Dispatch picked up a pattern of its own. `source` was the only two-word
+family of commands, and now `manual` is another:
+
+```rust
+Some(family @ ("source" | "manual")) => match words.next() {
+    Some(word) => format!("{family}-{word}"),
+    None => return CommandName::Agent,
+},
+```
+
+`family @ pattern` binds whatever matched the pattern to a name, so one arm
+handles both families and still knows which one it saw.
+
+### Searching without an index
+
+`search` lower-cases the words and keeps the sections that mention every one
+of them. A word in the heading scores ten, one in the text scores one, and the
+whole phrase earns a bonus, so `search rolling deploy` puts "Rolling deploys"
+above a section that mentions both words once in passing. The top ten come
+back, each with a two-line excerpt (the line that mentions most of the words,
+and the next one) and its `show` command, and `total_hits` says how many
+there were in all.
+
+That's crude next to BM25 or embeddings, and on purpose. The manual is 380 KB;
+scanning all of it takes about a millisecond, needs no index to keep in step
+with the text, and gives the same answer every time, which a snapshot test
+can pin. The agent on the other end is a language model. Given ten decent
+candidates and their headings, it's better at picking the right one than any
+ranking we'd write.
+
+### The tests
+
+Both commands are plain functions over their inputs, so the snapshots never
+touch a cluster or the real manual. `logs` has a snapshot of a small answer
+(two instances, both streams, two lines sharing an entry) and of one cut
+three ways, by `--tail`, the budget and `--line-bytes`, with a node that timed
+out. Unit tests check the defaults (15 minutes, 200 lines, 512 bytes, 201
+asked for), that bad flags are `usage` failures, that an injection and a
+token in a coloured line come out inside `untrusted`, cleaned and redacted,
+and nowhere else, that every answer fits budgets from 1 KiB to 200 KiB
+without losing count of a line, and that the paging command names the oldest
+line shown. Two tests against a fake node check the capture rule and that an
+unreachable cluster is a failure.
+
+`manual` has snapshots of a search and of a section with a subsection. Unit
+tests pin the anchors against GitHub's, the fence rule, the ten-hit cap, the
+chapter names `show` accepts, the `not_found` hints, a long section cut at a
+line with `next` pointing past the cut, and that every hit's `show` command
+prints that hit. One test reads the real manual: every chapter parses, no two
+sections in a chapter share an anchor, and a search and a `show` of a real
+section answer.
+
+### What we didn't do
+
+- **`--follow`.** A stream doesn't fit a budget, and an agent polling with
+  `--since` gets the same lines without holding a connection open.
+- **Stemming or fuzzy search.** `deploy` finds `deploys` because it's a
+  substring; `deployment` doesn't find a section that only says `deploy`. The
+  excerpt and `total_hits` make a miss obvious, and the agent tries another
+  word.
+- **`manual list`.** A wrong chapter name answers with every chapter's name,
+  and `relish agent guide` (#1090) will be the place to start.
+
+### Lessons
+
+The budget is a safety net, not a design. It keeps any answer valid and
+bounded, but it doesn't know which half of a log matters. A command that
+knows its data should fit itself, and then say, in fields an agent can't
+miss, exactly what it left out.
