@@ -250,21 +250,16 @@ mod tests {
         app
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn approving_host_paths_resolves_them_off_the_runtime() {
+    #[test]
+    fn approving_host_paths_resolves_them_off_the_runtime() {
         let root = tempfile::tempdir().unwrap();
         let import = root.path().join("import");
         std::fs::create_dir_all(&import).unwrap();
         let policy = policy(&[&import], &root.path().join("volumes"));
         let app = app_with_volume_source(import.join("daily"));
-        let mut approve = std::pin::pin!(policy.approve_app_off_runtime(&app));
-
-        let first = futures_util::poll!(approve.as_mut());
-        assert!(
-            first.is_pending(),
-            "the host paths were resolved inside one poll, on the runtime"
-        );
-        let approved = approve.await.unwrap();
+        let approved =
+            crate::off_runtime::assert_runs_on_blocking_pool(policy.approve_app_off_runtime(&app))
+                .unwrap();
         assert_eq!(
             approved.volumes[0].source,
             Some(std::fs::canonicalize(&import).unwrap().join("daily"))

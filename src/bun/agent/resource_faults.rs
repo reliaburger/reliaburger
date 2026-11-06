@@ -302,18 +302,15 @@ mod tests {
         std::fs::write(cgroup.join("memory.high"), saved).unwrap();
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn cgroup_writes_run_off_the_runtime() {
+    #[test]
+    fn cgroup_writes_run_off_the_runtime() {
         let dir = tempfile::tempdir().unwrap();
         let targets = targets(dir.path(), 3);
-        let mut write = std::pin::pin!(write_cgroups(targets, squeeze, put_back));
 
-        let first = futures_util::poll!(write.as_mut());
-        assert!(
-            first.is_pending(),
-            "the cgroups were written inside one poll, on the runtime"
-        );
-        let written = write.await.unwrap();
+        let written = crate::off_runtime::assert_runs_on_blocking_pool(write_cgroups(
+            targets, squeeze, put_back,
+        ))
+        .unwrap();
         assert_eq!(written.len(), 3);
         for done in &written {
             assert_eq!(done.saved, "max");
