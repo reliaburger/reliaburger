@@ -30,6 +30,8 @@ pub mod mayo;
 pub mod meat;
 pub mod mustard;
 pub(crate) mod object_storage;
+#[cfg(test)]
+pub(crate) mod off_runtime;
 pub mod onion;
 pub mod pickle;
 pub mod policy;

@@ -7019,13 +7019,54 @@ can fail, a panic on the blocking thread, by measuring nothing and so
 pruning nothing.
 
 How do you test "doesn't block the runtime" without timing it? On a
-single-threaded runtime (`#[tokio::test(flavor = "current_thread")]`), work
-done inline can't be interrupted: it all happens inside the first poll of
-the future. `relief_does_its_filesystem_work_off_the_runtime` polls
-`check_and_relieve` once with `futures_util::poll!` over a directory of
-500 files and asserts the poll comes back `Pending`, which can only happen
-if the work is waiting on another thread. Before the fix it came back
-`Ready`, every file already deleted. No clock, so no flake.
+single-threaded runtime, work done inline can't be interrupted: it all
+happens inside the first poll of the future. So poll it once with
+`futures_util::poll!` and check what comes back. Our first version of
+the test stopped there, on a plain
+`#[tokio::test(flavor = "current_thread")]`, and asserted `Pending`. Before
+the fix the poll came back `Ready`, every file already deleted, and we
+wrote "no clock, so no flake".
+
+That was wrong, and CI said so a few weeks later (#1674). `spawn_blocking`
+hands the closure to another thread at once. The future then polls the
+`JoinHandle` in the same first poll, and if the blocking thread has
+already finished, which is easy when the work is one `create_dir_all`
+on a fast Linux runner, the handle is `Ready` and so is the whole future.
+There was no clock in the test, but there were two threads, and the
+assertion depended on which of them got there first.
+
+The fix is to take the race away. `off_runtime::assert_runs_on_blocking_pool`
+builds its own single-threaded runtime with `max_blocking_threads(1)`,
+which `#[tokio::test]` can't do, and fills that one thread with a closure
+waiting on a channel the test holds. Then it polls the future under test:
+
+```rust
+let occupant = tokio::task::spawn_blocking(move || {
+    holding_tx.send(()).unwrap();
+    let _ = release_rx.recv();
+});
+holding_rx.await.unwrap();
+
+let mut work = std::pin::pin!(work);
+let first = futures_util::poll!(work.as_mut());
+assert!(first.is_pending(), "the work finished inside one poll, on the runtime thread");
+
+release_tx.send(()).unwrap();
+occupant.await.unwrap();
+work.await
+```
+
+Work sent to the pool queues behind the occupant and can't start, so
+the first poll is `Pending` every time. Work done inline doesn't need the
+pool and finishes inside that poll, so it's `Ready` every time, and the
+helper's own `work_done_inline_fails` test checks that it panics. Only
+then does the test release the occupant and let the work finish. The
+`holding_rx.await` makes sure the occupant really has the thread before
+the poll. `std::pin::pin!` pins the future on the stack, which
+`poll!` needs: a future may hold references into itself, so it mustn't
+move once polled. The relief test now reads
+`assert_runs_on_blocking_pool(check_and_relieve(...))`. A future does
+nothing until it's polled, so building it outside the runtime is fine.
 
 A test can't show the late timer itself: making a worker block on purpose
 on a test runtime proves only that tokio behaves like tokio. What we have
@@ -7070,7 +7111,8 @@ shared borrow alive, no flush can start. The borrow checker enforces that
 for us, across the `.await`. Each of the three has a test in the style of
 the relief one (`expiry_reads_the_files_off_the_runtime`,
 `prune_reads_the_files_off_the_runtime`, `usage_is_measured_off_the_runtime`):
-one poll on a single-threaded runtime, which must come back `Pending`.
+one poll with the blocking pool held busy, which must come back
+`Pending`.
 
 Having found three, we went looking for the rest: every `std::fs`,
 `std::process::Command`, sysinfo refresh and big copy reachable from an
@@ -7170,8 +7212,8 @@ kernel reclaim anything, which is also why a clear's own restores stay
 where they were, in the clearing turn.
 
 The test is the one-poll test again. `cgroup_writes_run_off_the_runtime`
-points `write_cgroups` at three fake cgroup directories on a
-single-threaded runtime and asserts the first poll is `Pending`. A
+points `write_cgroups` at three fake cgroup directories and hands it to
+`assert_runs_on_blocking_pool`. A
 `tmpfs` file doesn't reclaim anything, so the test can't show a slow
 write, only where it runs. That's the property we want.
 
@@ -7219,8 +7261,8 @@ against it. The double `??` is the two-layer `Result` from earlier: the
 first `?` returns a panicked thread as `CheckFailed`, the second returns
 the policy's own refusal.
 
-`approving_host_paths_resolves_them_off_the_runtime` polls once and
-expects `Pending`, and `an_app_without_host_paths_is_approved_in_one_poll`
+`approving_host_paths_resolves_them_off_the_runtime` goes through
+`assert_runs_on_blocking_pool` too, and `an_app_without_host_paths_is_approved_in_one_poll`
 expects the opposite: `Ready`, still borrowed. The deploy still waits for
 the answer, because a container can't be built before its mounts are
 approved, so the two awaits in `launch.rs` carry `// LOOP-INLINE:` tags.
