@@ -14,6 +14,7 @@
 
 pub mod budget;
 pub mod envelope;
+pub mod patch;
 pub mod source;
 pub mod untrusted;
 
@@ -54,6 +55,8 @@ pub enum AgentCommand {
     },
     /// The source this binary was built from: search it, read it, extract it.
     Source(source::SourceOptions),
+    /// Build, test and try a fix on a throwaway cluster.
+    Patch(patch::PatchOptions),
 }
 
 impl AgentCommand {
@@ -63,6 +66,7 @@ impl AgentCommand {
             AgentCommand::Version => CommandName::Version,
             AgentCommand::Schema { .. } => CommandName::Schema,
             AgentCommand::Source(options) => options.command.name(),
+            AgentCommand::Patch(options) => options.command.name(),
         }
     }
 }
@@ -103,6 +107,7 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
             rerun,
         ),
         AgentCommand::Source(source) => source::run(source, options.max_bytes, rerun).await,
+        AgentCommand::Patch(patch) => patch::run(patch, options.max_bytes, rerun).await,
     }
 }
 
@@ -190,6 +195,12 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::SourceGrep => Some(schema_of::<source::GrepData>()),
         CommandName::SourceShow => Some(schema_of::<source::ShowData>()),
         CommandName::SourceExtract => Some(schema_of::<source::ExtractData>()),
+        CommandName::PatchInit => Some(schema_of::<patch::InitData>()),
+        CommandName::PatchBuild => Some(schema_of::<patch::BuildData>()),
+        CommandName::PatchTest => Some(schema_of::<patch::TestData>()),
+        CommandName::PatchTry => Some(schema_of::<patch::TryData>()),
+        CommandName::PatchDiff => Some(schema_of::<patch::DiffData>()),
+        CommandName::PatchDestroy => Some(schema_of::<patch::DestroyData>()),
     }
 }
 
@@ -231,8 +242,8 @@ pub fn invoked(args: &[String]) -> bool {
 }
 
 /// The command `args` named after `agent`, or [`CommandName::Agent`] when
-/// they named none it knows. `source` takes the word after it too, as in
-/// `source grep`.
+/// they named none it knows. `source` and `patch` take the word after them
+/// too, as in `source grep`.
 pub fn command_named(args: &[String]) -> CommandName {
     let mut words = args
         .iter()
@@ -240,8 +251,8 @@ pub fn command_named(args: &[String]) -> CommandName {
         .skip(1)
         .filter(|arg| !arg.starts_with('-'));
     let name = match words.next().map(String::as_str) {
-        Some("source") => match words.next() {
-            Some(word) => format!("source-{word}"),
+        Some(group @ ("source" | "patch")) => match words.next() {
+            Some(word) => format!("{group}-{word}"),
             None => return CommandName::Agent,
         },
         Some(word) => word.to_string(),
@@ -397,13 +408,16 @@ mod tests {
 
     #[tokio::test]
     async fn schema_lists_the_envelope_and_every_answering_command() {
-        let rendered = run(&parse("agent schema").unwrap(), "relish agent schema").await;
+        // The whole family's schema outgrew the default budget with `patch`;
+        // each command's own schema still fits it (the test below).
+        let rendered = run(
+            &parse("agent schema --max-bytes 131072").unwrap(),
+            "relish agent schema",
+        )
+        .await;
         assert_eq!(rendered.exit, ExitStatus::Answered);
         let value = json_of(&rendered);
-        assert_eq!(
-            value["truncated"], false,
-            "the schema fits the default budget"
-        );
+        assert_eq!(value["truncated"], false, "the schema fits 128 KiB");
         let names: Vec<&str> = value["data"]["commands"]
             .as_array()
             .unwrap()
@@ -419,7 +433,13 @@ mod tests {
                 "source tree",
                 "source grep",
                 "source show",
-                "source extract"
+                "source extract",
+                "patch init",
+                "patch build",
+                "patch test",
+                "patch try",
+                "patch diff",
+                "patch destroy"
             ]
         );
         let envelope = &value["data"]["envelope"];
@@ -428,6 +448,20 @@ mod tests {
             error_codes.to_string().contains("tls_untrusted"),
             "{error_codes}"
         );
+    }
+
+    #[tokio::test]
+    async fn each_commands_schema_fits_the_default_budget() {
+        for command in CommandName::ANSWERING {
+            let options = AgentOptions {
+                max_bytes: DEFAULT_MAX_BYTES,
+                command: AgentCommand::Schema {
+                    command: Some(*command),
+                },
+            };
+            let value = json_of(&run(&options, "relish agent schema").await);
+            assert_eq!(value["truncated"], false, "{}", command.as_str());
+        }
     }
 
     #[tokio::test]
@@ -487,6 +521,36 @@ mod tests {
         assert!(
             parse("agent --offline source version").is_err(),
             "--offline belongs to source"
+        );
+    }
+
+    #[test]
+    fn patch_commands_parse_with_their_flags() {
+        let options = parse("agent patch build ./w --bun --allow-build-changes").unwrap();
+        let AgentCommand::Patch(patch) = &options.command else {
+            panic!("{options:?}");
+        };
+        assert!(matches!(
+            &patch.command,
+            patch::PatchCommand::Build {
+                relish: false,
+                bun: true,
+                allow_build_changes: true,
+                ..
+            }
+        ));
+        assert_eq!(options.command.name(), CommandName::PatchBuild);
+        assert!(parse("agent patch try ./w --nodes 3").is_ok());
+        assert!(parse("agent patch try ./w --nodes 2").is_err());
+        assert!(parse("agent patch destroy --all").is_ok());
+        assert!(
+            parse("agent patch destroy").is_err(),
+            "a workspace or --all"
+        );
+        assert!(parse("agent patch destroy ./w --all").is_err());
+        assert_eq!(
+            command_named(&args("agent patch test --bogus")),
+            CommandName::PatchTest
         );
     }
 

@@ -1,0 +1,32 @@
+---
+source: src/relish/agent/patch/cluster.rs
+expression: "without_id(value, &id)"
+---
+{
+  "command": "patch destroy",
+  "data": {
+    "clusters": [
+      {
+        "cluster": "patch-[id]",
+        "home": "[root]/clusters/[id]",
+        "reason": null,
+        "removed": true,
+        "workspace": "[root]/work"
+      }
+    ],
+    "kept": [
+      "[root]/work"
+    ]
+  },
+  "next": [],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": false,
+    "source_digest": "sha256:1639b607afe38bc2d97354cd49b82921653880e34c8d918491816b50df78c953",
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": []
+}

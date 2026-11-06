@@ -128,6 +128,36 @@ expression: "schema_of::<Envelope<Value>>()"
           "const": "source extract",
           "description": "`relish agent source extract`.",
           "type": "string"
+        },
+        {
+          "const": "patch init",
+          "description": "`relish agent patch init`.",
+          "type": "string"
+        },
+        {
+          "const": "patch build",
+          "description": "`relish agent patch build`.",
+          "type": "string"
+        },
+        {
+          "const": "patch test",
+          "description": "`relish agent patch test`.",
+          "type": "string"
+        },
+        {
+          "const": "patch try",
+          "description": "`relish agent patch try`.",
+          "type": "string"
+        },
+        {
+          "const": "patch diff",
+          "description": "`relish agent patch diff`.",
+          "type": "string"
+        },
+        {
+          "const": "patch destroy",
+          "description": "`relish agent patch destroy`.",
+          "type": "string"
         }
       ]
     },

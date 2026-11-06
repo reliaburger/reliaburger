@@ -26,6 +26,7 @@ use super::envelope::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, N
 use crate::relish::client::BunClient;
 use crate::relish::source_bundle::{self, Origin, SourceBundleError, SourceFile};
 
+pub(crate) use extract::extract;
 pub use extract::{ExtractData, GitRecord, STAMP_FILE};
 pub use grep::{GrepArgs, GrepData, GrepMatch};
 pub use nodes::{ClusterSource, NodeSource};

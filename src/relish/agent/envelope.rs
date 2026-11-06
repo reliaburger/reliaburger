@@ -52,6 +52,30 @@ pub enum CommandName {
     #[serde(rename = "source extract")]
     #[value(name = "source-extract")]
     SourceExtract,
+    /// `relish agent patch init`.
+    #[serde(rename = "patch init")]
+    #[value(name = "patch-init")]
+    PatchInit,
+    /// `relish agent patch build`.
+    #[serde(rename = "patch build")]
+    #[value(name = "patch-build")]
+    PatchBuild,
+    /// `relish agent patch test`.
+    #[serde(rename = "patch test")]
+    #[value(name = "patch-test")]
+    PatchTest,
+    /// `relish agent patch try`.
+    #[serde(rename = "patch try")]
+    #[value(name = "patch-try")]
+    PatchTry,
+    /// `relish agent patch diff`.
+    #[serde(rename = "patch diff")]
+    #[value(name = "patch-diff")]
+    PatchDiff,
+    /// `relish agent patch destroy`.
+    #[serde(rename = "patch destroy")]
+    #[value(name = "patch-destroy")]
+    PatchDestroy,
 }
 
 impl CommandName {
@@ -66,6 +90,12 @@ impl CommandName {
             CommandName::SourceGrep => "source grep",
             CommandName::SourceShow => "source show",
             CommandName::SourceExtract => "source extract",
+            CommandName::PatchInit => "patch init",
+            CommandName::PatchBuild => "patch build",
+            CommandName::PatchTest => "patch test",
+            CommandName::PatchTry => "patch try",
+            CommandName::PatchDiff => "patch diff",
+            CommandName::PatchDestroy => "patch destroy",
         }
     }
 
@@ -79,6 +109,12 @@ impl CommandName {
         CommandName::SourceGrep,
         CommandName::SourceShow,
         CommandName::SourceExtract,
+        CommandName::PatchInit,
+        CommandName::PatchBuild,
+        CommandName::PatchTest,
+        CommandName::PatchTry,
+        CommandName::PatchDiff,
+        CommandName::PatchDestroy,
     ];
 }
 

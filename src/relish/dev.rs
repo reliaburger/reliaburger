@@ -305,61 +305,116 @@ fn vm_target_dir(repo_path: &str) -> String {
     format!("/tmp/reliaburger-target{}", repo_path.replace('/', "-"))
 }
 
-/// Build `bun` and `relish` (release, Linux) inside the build VM and copy the
-/// artefacts out to host temp files. Returns `(bun_path, relish_path)`.
-async fn build_binaries_in_vm() -> Result<(PathBuf, PathBuf), RelishError> {
-    let repo_dir = checkout_path()?;
-    path_text(&std::env::temp_dir())?;
-    let repo_path = path_text(&repo_dir)?;
-    let vm_target = vm_target_dir(repo_path);
-    let quoted_repo = shell_word(repo_path);
-    let quoted_target = shell_word(&vm_target);
+/// How [`build_binaries_in_vm`] treats cargo's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VmBuildOutput {
+    /// Stream cargo's progress to the terminal, for `relish dev create`.
+    Stream,
+    /// Capture cargo's JSON messages, for `relish agent patch build`, which
+    /// reads the compiler errors out of them. The build is `--locked`, with
+    /// eBPF, as a quickstart node needs.
+    Capture,
+}
+
+/// What a build in the VM produced.
+#[derive(Debug)]
+pub(crate) struct VmBuild {
+    /// Cargo's stdout: its JSON messages when captured, empty when streamed.
+    pub cargo_stdout: String,
+    /// `(bun, relish)` on the host, when the build succeeded.
+    pub binaries: Option<(PathBuf, PathBuf)>,
+}
+
+/// The shell command the build VM runs to build `bun` and `relish` (debug,
+/// Linux) from the checkout at `source`.
+///
+/// Debug, because it's much faster than release and fine for a cluster you'll
+/// throw away. `sudo -E` matches `dev test`, so the shared cargo cache in the
+/// VM has one (root) owner rather than half root and half user.
+fn vm_build_command(source: &str, output: VmBuildOutput) -> String {
+    let quoted_source = shell_word(source);
+    let quoted_target = shell_word(&vm_target_dir(source));
+    let flags = match output {
+        VmBuildOutput::Stream => "",
+        // A quickstart node's bun won't start without eBPF.
+        VmBuildOutput::Capture => " --locked --message-format=json --features ebpf",
+    };
+    format!(
+        "cd {quoted_source} && source \"$HOME/.cargo/env\" && mkdir -p {quoted_target} && \
+         sudo -E env PATH=\"$PATH\" CARGO_TARGET_DIR={quoted_target} \
+         cargo build{flags} --bin bun --bin relish -j 2"
+    )
+}
+
+/// Build `bun` and `relish` (debug, Linux) from the checkout in `source_dir`
+/// inside the build VM, and copy them to `bun_out` and `relish_out` on the
+/// host.
+///
+/// The VM mounts the home directory, so `source_dir` has to be under it. A
+/// failed build is an error when streaming; when capturing, it's a
+/// [`VmBuild`] with no binaries, so the caller can read the errors.
+pub(crate) async fn build_binaries_in_vm(
+    source_dir: &std::path::Path,
+    bun_out: &std::path::Path,
+    relish_out: &std::path::Path,
+    output: VmBuildOutput,
+) -> Result<VmBuild, RelishError> {
+    let source = path_text(source_dir)?;
+    let vm_target = vm_target_dir(source);
+    let command = vm_build_command(source, output);
     ensure_build_vm().await?;
 
-    // On stderr, so `relish -o json dev create` keeps stdout for its report.
-    eprintln!("  building bun + relish for Linux in the build VM (first run is slow)...");
-    // Debug build — much faster than release, and fine for a dev cluster.
-    // Run with `sudo -E` to match `dev test`, so the shared cargo cache in the
-    // VM has consistent (root) ownership and isn't half root / half user.
-    let build_cmd = format!(
-        "cd {quoted_repo} && source \"$HOME/.cargo/env\" && mkdir -p {quoted_target} && \
-         sudo -E env PATH=\"$PATH\" CARGO_TARGET_DIR={quoted_target} \
-         cargo build --bin bun --bin relish -j 2"
-    );
-    // Stream build output so the user sees progress.
-    let status = std::process::Command::new("limactl")
-        .args(["shell", TEST_VM_NAME, "bash", "-c", &build_cmd])
-        .status()
-        .map_err(|e| RelishError::LimaError {
-            command: "build in VM".to_string(),
-            stderr: e.to_string(),
-        })?;
-    if !status.success() {
-        return Err(RelishError::LimaError {
-            command: "cargo build (VM)".to_string(),
-            stderr: format!(
-                "build failed with exit code {}",
-                status.code().unwrap_or(-1)
-            ),
-        });
-    }
+    let lima_error = |stderr: String| RelishError::LimaError {
+        command: "build in VM".to_string(),
+        stderr,
+    };
+    let mut build = std::process::Command::new("limactl");
+    build.args(["shell", TEST_VM_NAME, "bash", "-c", &command]);
+    let cargo_stdout = match output {
+        VmBuildOutput::Stream => {
+            // On stderr, so `relish -o json dev create` keeps stdout for its report.
+            eprintln!("  building bun + relish for Linux in the build VM (first run is slow)...");
+            let status = build.status().map_err(|e| lima_error(e.to_string()))?;
+            if !status.success() {
+                return Err(RelishError::LimaError {
+                    command: "cargo build (VM)".to_string(),
+                    stderr: format!(
+                        "build failed with exit code {}",
+                        status.code().unwrap_or(-1)
+                    ),
+                });
+            }
+            String::new()
+        }
+        VmBuildOutput::Capture => {
+            let captured = tokio::process::Command::from(build)
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|e| lima_error(e.to_string()))?;
+            let stdout = String::from_utf8_lossy(&captured.stdout).into_owned();
+            if !captured.status.success() {
+                return Ok(VmBuild {
+                    cargo_stdout: stdout,
+                    binaries: None,
+                });
+            }
+            stdout
+        }
+    };
 
-    let tmp = std::env::temp_dir();
-    let bun_path = tmp.join("reliaburger-dev-bun");
-    let relish_path = tmp.join("reliaburger-dev-relish");
-    limactl(&[
-        "copy",
-        &format!("{TEST_VM_NAME}:{vm_target}/debug/bun"),
-        path_text(&bun_path)?,
-    ])
-    .await?;
-    limactl(&[
-        "copy",
-        &format!("{TEST_VM_NAME}:{vm_target}/debug/relish"),
-        path_text(&relish_path)?,
-    ])
-    .await?;
-    Ok((bun_path, relish_path))
+    for (name, out) in [("bun", bun_out), ("relish", relish_out)] {
+        limactl(&[
+            "copy",
+            &format!("{TEST_VM_NAME}:{vm_target}/debug/{name}"),
+            path_text(out)?,
+        ])
+        .await?;
+    }
+    Ok(VmBuild {
+        cargo_stdout,
+        binaries: Some((bun_out.to_path_buf(), relish_out.to_path_buf())),
+    })
 }
 
 /// Copy a host binary into a cluster VM at `/usr/local/bin/<name>` (via a
@@ -882,7 +937,19 @@ pub async fn create(
     let (bun_path, relish_path) = match (bun, relish) {
         (Some(bun), Some(relish)) => (bun, relish),
         (bun, relish) => {
-            let (built_bun, built_relish) = build_binaries_in_vm().await?;
+            let tmp = std::env::temp_dir();
+            let build = build_binaries_in_vm(
+                &checkout_path()?,
+                &tmp.join("reliaburger-dev-bun"),
+                &tmp.join("reliaburger-dev-relish"),
+                VmBuildOutput::Stream,
+            )
+            .await?;
+            let (built_bun, built_relish) =
+                build.binaries.ok_or_else(|| RelishError::LimaError {
+                    command: "cargo build (VM)".to_string(),
+                    stderr: "the build left no binaries".to_string(),
+                })?;
             (bun.unwrap_or(built_bun), relish.unwrap_or(built_relish))
         }
     };
@@ -1713,6 +1780,27 @@ mod tests {
         let err =
             countersign_binary(&operator, &binary, None, None, OutputFormat::Human).unwrap_err();
         assert!(err.to_string().contains("hash mismatch"), "{err}");
+    }
+
+    #[test]
+    fn the_vm_build_runs_in_the_source_directory_it_is_given() {
+        let streamed = vm_build_command("/Users/me/fix it", VmBuildOutput::Stream);
+        assert!(
+            streamed.starts_with("cd '/Users/me/fix it' && "),
+            "{streamed}"
+        );
+        assert!(
+            streamed.contains("CARGO_TARGET_DIR='/tmp/reliaburger-target-Users-me-fix it'"),
+            "{streamed}"
+        );
+        assert!(streamed.ends_with("cargo build --bin bun --bin relish -j 2"));
+        let captured = vm_build_command("/Users/me/fix", VmBuildOutput::Capture);
+        assert!(
+            captured.ends_with(
+                "cargo build --locked --message-format=json --features ebpf --bin bun --bin relish -j 2"
+            ),
+            "{captured}"
+        );
     }
 
     #[test]
