@@ -916,15 +916,16 @@ Intro paragraph.\n\n## In brief\n\n\
         (headings, value)
     }
 
-    /// The setup playbook (#1579) is the chapter's last section because an
-    /// agent driving a cluster needs it least. With every 0.2.7 command in,
-    /// the chapter outgrew the default budget, which keeps the front (the
-    /// brief, the contract, the command table), drops sections only from the
-    /// end, the playbook first, and says how to get the rest.
+    /// `relish agent guide` is the one document an agent reads whole, so
+    /// its default budget (64 KiB, not 24) returns every section in one
+    /// call, the setup playbook (#1579) last, with no `next` asking for
+    /// more.
     #[test]
-    fn guide_answers_from_the_embedded_chapter_within_the_default_budget() {
+    fn guide_answers_the_whole_chapter_within_its_default_budget() {
         const PLAYBOOK: &str = "Setting up a cluster for your human";
-        let (headings, value) = guide_headings(super::super::DEFAULT_MAX_BYTES);
+        let (headings, value) = guide_headings(super::super::GUIDE_MAX_BYTES);
+        assert_eq!(value["truncated"], false, "{headings:?}");
+        assert_eq!(headings.last().map(String::as_str), Some(PLAYBOOK));
         assert!(
             value["data"]["commands"]
                 .as_array()
@@ -932,9 +933,37 @@ Intro paragraph.\n\n## In brief\n\n\
                 .iter()
                 .any(|command| command["command"] == "relish agent guide")
         );
-        let (whole, untrimmed) = guide_headings(128 * 1024);
-        assert_eq!(untrimmed["truncated"], false, "128 KiB fits the chapter");
-        assert_eq!(whole.last().map(String::as_str), Some(PLAYBOOK));
+        let (whole, _) = guide_headings(128 * 1024);
+        assert_eq!(headings, whole);
+        for next in value["next"].as_array().unwrap() {
+            let run = next["run"].as_str().unwrap();
+            assert!(!run.contains("--max-bytes"), "asks for more: {run}");
+        }
+    }
+
+    /// The guide's default budget exists so the whole chapter comes back in
+    /// one call. If chapter 16 outgrows it, someone has to choose: split
+    /// the chapter, or raise `GUIDE_MAX_BYTES` knowing what it costs.
+    #[test]
+    fn the_agent_chapter_fits_the_guides_default_budget() {
+        let rendered = run(1024 * 1024, "relish agent guide");
+        let whole = rendered.json.len();
+        assert!(
+            whole <= super::super::GUIDE_MAX_BYTES,
+            "relish agent guide is {whole} bytes, over its {} byte default: split \
+             {CHAPTER_FILE} or raise GUIDE_MAX_BYTES deliberately",
+            super::super::GUIDE_MAX_BYTES
+        );
+    }
+
+    /// An explicit `--max-bytes` still wins. At the 24 KiB every other
+    /// command defaults to, the chapter doesn't fit, so the budget keeps the
+    /// front (the brief, the contract, the command table), drops sections
+    /// only from the end, and says how to get the rest.
+    #[test]
+    fn an_explicit_smaller_budget_drops_trailing_sections() {
+        let (headings, value) = guide_headings(super::super::DEFAULT_MAX_BYTES);
+        let (whole, _) = guide_headings(super::super::GUIDE_MAX_BYTES);
         assert_eq!(value["truncated"], true);
         assert!(
             headings.len() < whole.len() && headings[..] == whole[..headings.len()],
