@@ -999,7 +999,7 @@ When the entire Raft council is lost simultaneously (all 3-7 members fail at onc
 
 **If no recovery candidates survive:**
 
-All nodes remain in read-only mode. Apps continue running. No new deploys are accepted. Manual intervention via `relish recover` bootstraps a new council from any surviving node. This is the true catastrophic case and manual intervention is appropriate.
+All nodes remain in read-only mode. Apps continue running. No new deploys are accepted. Manual intervention via `relish council recover` bootstraps a new council from any surviving node. This is the true catastrophic case and manual intervention is appropriate.
 
 ### 5.6 Split-Brain Prevention
 
@@ -1025,29 +1025,33 @@ Split-brain can occur during a network partition where two groups each believe t
 
 ### 5.7 Membership Changes (Raft)
 
-Council membership changes use the single-server-at-a-time approach (Raft's joint consensus is complex and error-prone). The leader issues one AddNode or RemoveNode Raft log entry at a time and waits for it to commit before issuing another.
+The council reconciler on the leader makes one membership change at a time. Each tick it plans a single action (`plan_council_action`, `src/council/selection.rs`), and its change-in-flight gate holds the next until the current one has committed.
 
 ```
 Add member flow:
-1. Leader selects candidate C via council selection algorithm.
-2. Leader appends AddNode(C) to the Raft log.
-3. Once committed, leader begins sending AppendEntries to C.
-4. C enters LEARNER state, receiving log entries but not voting.
-5. Once C's log is within a configurable threshold of the leader's log:
-   C transitions to FOLLOWER and becomes a voting member.
-6. Leader broadcasts updated council membership via Mustard.
+1. The planner takes the best-ranked candidate C (select_council_candidates).
+2. AddLearner(C): a learner membership entry commits, and the leader
+   replicates the log to C. C receives entries but doesn't vote.
+3. Once C's replicated index is within max_promotion_lag (64) entries of
+   the leader's, the planner may promote it. Growth promotes two caught-up
+   learners together (PromotePair), so the voter count stays odd.
+4. Gossip carries the new council membership to every node.
 
 Remove member flow:
-1. Leader detects member M is unhealthy (Raft heartbeat timeout).
-2. Leader appends RemoveNode(M) to the Raft log.
-3. Once committed, M is no longer counted for quorum.
-4. Leader selects a replacement (loops back to Add member flow).
-5. Leader broadcasts updated council membership via Mustard.
+1. The leader's HealthTracker, fed by gossip, reports voter M dead, or M is
+   under sustained disk pressure. (A voter an operator retired is different:
+   the reconciler takes it out of the voter set straight away.)
+2. Add before remove: if a caught-up learner L exists, the planner swaps L
+   in for M in one change (Replace). M stops counting for quorum when the
+   change commits.
+3. With no replacement, two dead voters leave together (RemoveVoterPair),
+   never below min_council_size.
+4. Gossip carries the new council membership to every node.
 ```
 
 In the implementation, promotion and eviction go through openraft's joint consensus (`change_membership`): a joint configuration commits first, then the uniform one. The caller's future proposes the second step, so a caller that times out or a leader that fails over between the steps leaves a committed joint configuration behind. The council reconciler finishes it before planning anything else (`CouncilNode::finish_membership_change`), proposing the joint configuration's target voter set; otherwise its change-in-flight gate would hold every later membership change (#673).
 
-Each reconciler operation runs under a five-second bound and costs a fixed number of commits: a guard no-op that makes earlier node-fault grants visible, then one membership entry (add or remove a learner) or two (the joint and uniform steps of a voter change). Step 5's catch-up is not part of any operation. Adding a learner returns once its membership entry commits, without openraft's blocking wait, which holds until the learner trails by at most 5,000 entries and so grows with the log gap (on a large council log, it includes installing a snapshot). Replication carries on between ticks, and the planner promotes the learner only once its replicated index is within `max_promotion_lag` (64) entries of the leader's. With a log store that takes 20 ms per entry, the guard no-op took 46 ms, adding a learner 90 ms and a promotion 147 ms (#779).
+Each reconciler operation runs under a five-second bound and costs a fixed number of commits: a guard no-op that makes earlier node-fault grants visible, then one membership entry (add or remove a learner) or two (the joint and uniform steps of a voter change). The catch-up in step 3 of the add flow is not part of any operation. Adding a learner returns once its membership entry commits, without openraft's blocking wait, which holds until the learner trails by at most 5,000 entries and so grows with the log gap (on a large council log, it includes installing a snapshot). Replication carries on between ticks, and the planner promotes the learner only once its replicated index is within `max_promotion_lag` (64) entries of the leader's. With a log store that takes 20 ms per entry, the guard no-op took 46 ms, adding a learner 90 ms and a promotion 147 ms (#779).
 
 ---
 
@@ -1083,7 +1087,9 @@ reporting_port = 9445
 The council sizing constants below are compile-time defaults in `CouncilSelectionConfig` (`src/council/selection.rs`), shown here for reference — they are **not** a `[council]` TOML section:
 
 ```text
-# Minimum council size (below this, the cluster enters degraded mode).
+# Minimum council size: the planner's target never drops below it, and
+# it never removes voters past it. A smaller cluster-wide council_size
+# lowers it to match.
 min_council_size = 3
 
 # Maximum council size. The council holds the largest odd number of
