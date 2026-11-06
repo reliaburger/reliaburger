@@ -133,6 +133,10 @@ class SelectJobsTests(unittest.TestCase):
                 self.repo.git("checkout", "-q", "main")
                 self.repo.git("branch", "-q", "-D", "feature")
 
+    def test_the_skill_counts_as_code_because_the_agent_docs_test_reads_it(self):
+        self.pull_request("plugins/reliaburger/skills/reliaburger/SKILL.md")
+        self.assertTrue(self.repo.select(base_sha=self.main)["code"])
+
     def test_the_manual_counts_as_code_because_relish_compiles_it_in(self):
         self.pull_request("docs/manual/intro.md")
         self.assertTrue(self.repo.select(base_sha=self.main)["code"])

@@ -28,6 +28,8 @@ pub enum CommandName {
     /// `relish agent` itself, when the arguments named no command it knows.
     #[value(skip)]
     Agent,
+    /// `relish agent guide`.
+    Guide,
     /// `relish agent version`.
     Version,
     /// `relish agent schema`.
@@ -59,6 +61,7 @@ impl CommandName {
     pub fn as_str(self) -> &'static str {
         match self {
             CommandName::Agent => "agent",
+            CommandName::Guide => "guide",
             CommandName::Version => "version",
             CommandName::Schema => "schema",
             CommandName::SourceVersion => "source version",
@@ -72,6 +75,7 @@ impl CommandName {
     /// The commands that answer with `data`, in the order `relish agent
     /// schema` lists them.
     pub const ANSWERING: &'static [CommandName] = &[
+        CommandName::Guide,
         CommandName::Version,
         CommandName::Schema,
         CommandName::SourceVersion,

@@ -8,12 +8,14 @@
 //!
 //! This module holds the contract ([`envelope`], [`budget`], and
 //! [`untrusted`] for text a workload wrote), the first two commands,
-//! `version` and `schema`, which exercise it end to end, and [`source`],
-//! which reads the source this binary was built from. The commands that
+//! `version` and `schema`, which exercise it end to end, [`guide`], which
+//! prints the manual's agent chapter, and [`source`], which reads the source
+//! this binary was built from. The commands that
 //! read the cluster come later and reuse it.
 
 pub mod budget;
 pub mod envelope;
+pub mod guide;
 pub mod source;
 pub mod untrusted;
 
@@ -44,6 +46,8 @@ pub struct AgentOptions {
 /// The `relish agent` commands.
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum AgentCommand {
+    /// How to use relish as an agent: the manual chapter, as Markdown sections.
+    Guide,
     /// This binary's version, commit, target and cluster formats.
     Version,
     /// The JSON Schema of the envelope and of each command's data.
@@ -60,6 +64,7 @@ impl AgentCommand {
     /// The name the envelope's `command` field carries.
     pub fn name(&self) -> CommandName {
         match self {
+            AgentCommand::Guide => CommandName::Guide,
             AgentCommand::Version => CommandName::Version,
             AgentCommand::Schema { .. } => CommandName::Schema,
             AgentCommand::Source(options) => options.command.name(),
@@ -88,6 +93,7 @@ pub fn render<T: Serialize>(envelope: &Envelope<T>, max_bytes: usize, rerun: &st
 /// hint a trimmed answer carries.
 pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
     match &options.command {
+        AgentCommand::Guide => guide::run(options.max_bytes, rerun),
         AgentCommand::Version => render(
             &Envelope::answered(CommandName::Version, BuildInfo::current(), version_data()),
             options.max_bytes,
@@ -183,6 +189,7 @@ fn schema_of<T: JsonSchema>() -> Value {
 pub fn data_schema(command: CommandName) -> Option<Value> {
     match command {
         CommandName::Agent => None,
+        CommandName::Guide => Some(schema_of::<guide::GuideData>()),
         CommandName::Version => Some(schema_of::<VersionData>()),
         CommandName::Schema => Some(schema_of::<SchemaData>()),
         CommandName::SourceVersion => Some(schema_of::<source::VersionData>()),
@@ -413,6 +420,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "guide",
                 "version",
                 "schema",
                 "source version",

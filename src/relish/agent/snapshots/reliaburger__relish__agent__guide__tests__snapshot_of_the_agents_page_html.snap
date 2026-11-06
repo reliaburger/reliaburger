@@ -1,0 +1,50 @@
+---
+source: src/relish/agent/guide.rs
+expression: "artefact(paths::AGENTS_PAGE_HTML)"
+---
+<!doctype html>
+<!-- Generated from docs/manual/16_working-with-an-ai-agent.md by `make agent-docs`: edit the chapter, not this file. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Reliaburger is an orchestrator. Its CLI is `relish`.">
+  <meta name="theme-color" content="#181b19">
+  <title>Working with an AI agent · Reliaburger</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="alternate" type="text/markdown" href="agents.md">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <div class="page">
+    <header class="masthead">
+      <a class="wordmark" href="./" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
+      <nav aria-label="Main navigation"><a href="./#install">Install</a><a href="./agents.md">Markdown</a><a href="./llms.txt">llms.txt</a><a href="https://github.com/reliaburger/reliaburger">GitHub ↗</a></nav>
+    </header>
+    <main id="main" class="agents-page">
+<h1>Working with an AI agent</h1>
+<p>Reliaburger is an orchestrator.
+Its CLI is <code>relish</code>.</p>
+<p>Intro paragraph.</p>
+<h2>In brief</h2>
+<ul>
+<li><strong>Run <code>relish agent guide</code> first.</strong></li>
+</ul>
+<h2>Commands</h2>
+<table><thead><tr><th>Command</th><th>What it does</th></tr></thead><tbody>
+<tr><td><code>relish agent guide</code></td><td>This chapter, as Markdown sections.</td></tr>
+<tr><td><code>relish agent source grep</code></td><td>Search it | quickly.</td></tr>
+</tbody></table>
+<pre><code class="language-sh">## not a heading inside a fence
+relish agent guide
+</code></pre>
+<h2>Sending us a fix</h2>
+<ul>
+<li><strong>Disclose.</strong></li>
+</ul>
+    </main>
+    <footer><span>Reliaburger · by Miko Pawlikowski</span><a href="./agents.md">This page as Markdown</a><span class="footer-note">Generated from the manual chapter “Working with an AI agent”. Static HTML and CSS. The existing copy script adds command buttons. No tracking or third-party requests.</span></footer>
+  </div>
+  <script src="assets/copy.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+---
+source: src/relish/agent/guide.rs
+expression: "artefact(paths::LLMS_TXT)"
+---
+# Reliaburger
+
+> Reliaburger is an orchestrator. Its CLI is `relish`.
+
+- **Run `relish agent guide` first.**
+
+## Start here
+
+- [Working with an AI agent](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.7/docs/manual/16_working-with-an-ai-agent.md): the agent chapter; `relish agent guide` prints the copy that matches your installed `relish`
+
+## Manual
+
+- [Getting started](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.7/docs/manual/00_getting-started.md)
+
+## Optional
+
+- [Building Reliaburger](https://github.com/reliaburger/reliaburger/tree/v0.2.7/docs/book): the book, how and why each part was built
+- [Design documents](https://github.com/reliaburger/reliaburger/tree/v0.2.7/docs/design): one per subsystem
+- [Whitepaper](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.7/docs/whitepaper.md): the architecture in one document
