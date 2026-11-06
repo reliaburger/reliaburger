@@ -8,6 +8,58 @@ release contains is in the [roadmap](roadmap.md#releases-after-010). A new
 paragraph goes at the top when a release is promoted
 ([release gate, step 9](releasing.md#staging-a-candidate)).
 
+## 0.2.6: the rest of the evaluation's bugs, and setup over SSH
+
+Promoted on 6 November 2026 as tag `v0.2.6` at `50596cfe`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/42178473916)).
+`relish setup --ssh` builds a cluster on Linux machines you already have,
+past the seven-seat council cap too
+([#1529](https://github.com/reliaburger/reliaburger/issues/1529)); a node
+with no Raft seat reads the leader's view of the security state, so a secure
+cluster's eighth node no longer restarts for ever
+([#1477](https://github.com/reliaburger/reliaburger/issues/1477)); node
+certificates carry an IP SAN
+([#1508](https://github.com/reliaburger/reliaburger/issues/1508)); Bun with
+eBPF starts on Linux 7.0
+([#1557](https://github.com/reliaburger/reliaburger/issues/1557)); and CI
+runs `make test-s3` and a privileged job on Ubuntu 26.04
+([#1534](https://github.com/reliaburger/reliaburger/issues/1534),
+[#1559](https://github.com/reliaburger/reliaburger/issues/1559))
+([plan](plans/archive/2026-11-03-plan-0.2.6.md)).
+[#1500](https://github.com/reliaburger/reliaburger/issues/1500) closed as not
+reproduced in 60 cycles. Qualification ran on 5 and 6 November 2026 (UTC),
+the first on the Mac Studio, and took two candidates
+([closure record](qualification/2026-11-06-v0.2.6-release-closure.md)), on
+the full gate, because 0.2.6 moves the protocol (56 to 57) and changes the
+agent loop. Candidate 1 failed the dependency audit on
+[RUSTSEC-2026-0442](https://rustsec.org/advisories/RUSTSEC-2026-0442.html),
+published against arrow that morning, and ran no gate; arrow 59.3.2 fixed it
+([#1599](https://github.com/reliaburger/reliaburger/pull/1599)). Candidate 2
+passed both staged installs, in 72 s and 57 s
+([first](qualification/2026-11-05-v0.2.6-staged-install-apple-silicon.md),
+[second](qualification/2026-11-05-v0.2.6-staged-install-apple-silicon-2.md)),
+the power-cut and reboot lanes, 25 of 25 in every lane
+([record](qualification/2026-11-05-power-cut-reboot.md)), the V02 fast tier
+([record](qualification/2026-11-05-v0.2.6-sustained-v02-fast.md)) and the
+jobs fast tier at 8,647.9 accepted jobs a second
+([record](qualification/2026-11-05-v0.2.6-job-qualification-fast.md)), all
+clean with no turn over budget. The 8-hour jobs final completed its schedule,
+10 h 15 min with every leak checker armed in the quiet tail, at 9,580.2
+accepted jobs a second, six times 0.2.5's final on the hot laptop, but it
+wasn't clean
+([record](qualification/2026-11-06-v0.2.6-job-qualification.md)): a
+partition fault was refused because its source's cgroup lookup missed the
+inject turn's deadline
+([#1601](https://github.com/reliaburger/reliaburger/issues/1601)), and one
+compaction turn on node 1 took 1,232 ms against the 1 s budget
+([#1606](https://github.com/reliaburger/reliaburger/issues/1606)). The
+maintainer accepted both as known issues rather than build a third
+candidate; both are fixed or tracked in 0.2.7. It ships with the `zstd` 0.13
+advisories under the exception that expires on 18 November 2026
+([#1366](https://github.com/reliaburger/reliaburger/issues/1366)). 0.2.6
+moves the protocol, so a 0.2.5 cluster can't roll to it: start a fresh
+cluster ([upgrading from 0.2.5](releasing.md#upgrading-from-025)).
+
 ## 0.2.5: bugs an outside evaluation found
 
 Promoted on 3 November 2026 as tag `v0.2.5` at `954bb7b1`

@@ -515,6 +515,19 @@ same steps and the same losses. The next release that keeps 0.2.5's pair can
 roll from it, and it won't move a restarting node's replicas
 ([#1449](https://github.com/reliaburger/reliaburger/issues/1449)).
 
+### Upgrading from 0.2.5
+
+0.2.6 can't roll onto a 0.2.5 cluster. A node with no Raft seat now asks the
+leader for its view of the security state over a new route between nodes,
+`GET /v1/cluster/security-view`
+([#1548](https://github.com/reliaburger/reliaburger/pull/1548)), which a
+0.2.5 leader doesn't serve. So the protocol moved from 56 to 57; the state
+format stays at 73. A 0.2.5 leader refuses `relish upgrade start v0.2.6`
+before it records a run.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses.
+
 ## Signing identity
 
 Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub
@@ -690,7 +703,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.2.5` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.6` today), so
 bump that default in the same change that announces a newer release. Both
 scripts need a mode, `--laptop` or `--install-only`; with none they explain the
 choices and exit 2. For a release from before 0.2.2 the bootstrap drops
