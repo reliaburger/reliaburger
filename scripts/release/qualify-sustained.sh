@@ -81,6 +81,7 @@ set -euo pipefail
 
 usage() { sed -n '3,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
 fail() { printf 'sustained: %s\n' "$*" >&2; exit 1; }
+python3 "$(dirname "$0")/require_python.py" || exit 1
 say() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
 # A long run must not sleep with the lid open or on idle.

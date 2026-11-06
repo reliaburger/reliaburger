@@ -355,7 +355,12 @@ async fn json_or_api_error<T: serde::de::DeserializeOwned>(
 }
 
 fn classify_error(e: reqwest::Error) -> RelishError {
-    if e.is_timeout() {
+    // A connection that never opened reached no agent, even when it gave up
+    // by timing out, which is how a firewall that drops packets looks. Only
+    // a request that got through may still be running.
+    if e.is_connect() {
+        RelishError::AgentUnreachable
+    } else if e.is_timeout() {
         RelishError::RequestTimeout
     } else {
         RelishError::AgentUnreachable
@@ -386,6 +391,9 @@ static CLI_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new
 /// `main`. When present, the CLI reaches the agent API over HTTPS trusting
 /// this CA.
 static CLI_CA_CERT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// How long a command waits for the agent to accept a connection.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The `--endpoint` CLI override, set once from `main` before dispatch.
 static CLI_ENDPOINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -453,6 +461,12 @@ fn resolve_token() -> Option<String> {
 /// `RELIABURGER_ENDPOINT`, then the ordinary local default.
 fn resolve_endpoint() -> Option<String> {
     CLI_ENDPOINT.get().cloned().flatten()
+}
+
+/// Whether `--endpoint` or `RELIABURGER_ENDPOINT` chose the node, rather than
+/// the saved context or the local default.
+pub fn endpoint_overridden() -> bool {
+    resolve_endpoint().is_some()
 }
 
 /// Precedence rule for [`resolve_token`], split out to be testable without the
@@ -566,6 +580,9 @@ impl BunClient {
         let client = (|| -> Result<reqwest::Client, String> {
             let mut builder = crate::http_client::builder()
                 .timeout(std::time::Duration::from_secs(300))
+                // A firewall that drops packets would otherwise hold every
+                // command for the operating system's own connect timeout.
+                .connect_timeout(CONNECT_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none());
             if let Some(token) = token {
                 let mut headers = reqwest::header::HeaderMap::new();
@@ -1267,11 +1284,46 @@ impl BunClient {
             .collect())
     }
 
+    /// List the agent's flushed log files (`GET /v1/logs/archive`).
+    pub async fn logs_archive(
+        &self,
+    ) -> Result<crate::ketchup::export::ArchiveListing, RelishError> {
+        self.get_typed_json("/v1/logs/archive").await
+    }
+
+    /// Start fetching one flushed log file (`GET /v1/logs/archive/{name}`).
+    /// The caller reads the body as it arrives. `None` means the file is gone.
+    pub async fn logs_archive_file(
+        &self,
+        name: &str,
+    ) -> Result<Option<reqwest::Response>, RelishError> {
+        let segment: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();
+        let response = self
+            .http()?
+            .get(format!("{}/v1/logs/archive/{segment}", self.base_url))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(Some(response))
+    }
+
     /// Trigger an immediate log export on the agent (`POST /v1/logs/export`).
     ///
-    /// The destination is resolved agent-side — a path on the agent host,
-    /// `file://`, `s3://` or `gs://` — and the agent names the subdirectory
-    /// after its own node name.
+    /// The destination is resolved on the agent, with its credentials: a path
+    /// on the agent host, `file://`, `s3://` or `gs://`. `relish logs-export`
+    /// only sends object-store URLs here; a directory it copies to itself. The
+    /// agent names the subdirectory after its own node name.
     pub async fn logs_export(&self, destination: &str) -> Result<LogsExportOutcome, RelishError> {
         let response = self
             .http()?
@@ -1788,6 +1840,7 @@ impl BunClient {
         // In single-node mode it queries the local LogStore.
         let url = format!("{}/v1/logs/query/{}/{}", self.base_url, app, namespace);
 
+        let mut store_answered = false;
         if let Ok(response) = self
             .http()?
             .get(&url)
@@ -1799,6 +1852,7 @@ impl BunClient {
                 .json::<crate::ketchup::types::LogQueryResult>()
                 .await
         {
+            store_answered = true;
             // Filters also apply client-side: json_field has no server-side
             // equivalent, and grep re-checking is harmless when the server
             // already filtered.
@@ -1815,23 +1869,30 @@ impl BunClient {
             }
         }
 
-        // The agent's own endpoint answers plain text with no instance or
-        // time on each line, so it can't honour these filters: an empty
-        // answer is the answer.
+        // The agent's own endpoint answers plain text with no instance, time
+        // or stream on each line, so it can't honour these filters: an empty
+        // answer is the answer. The store holds its unflushed buffer too, so
+        // nothing inside a window is missed by not asking the capture (#1515).
         let selected_run = options.instance.as_deref().is_some_and(|id| {
             id.strip_prefix("run-")
                 .is_some_and(|id| id.parse::<u64>().is_ok())
         });
-        if options.end.is_some()
+        if options.start.is_some()
+            || options.end.is_some()
             || options.stream.is_some()
-            || (options.instance.is_some() && (!selected_run || options.start.is_some()))
+            || (options.instance.is_some() && !selected_run)
         {
             return Ok(String::new());
         }
 
         // Fall back to the local agent endpoint (process logs that
         // haven't been ingested into the LogStore yet)
-        self.logs_local(app, namespace, options).await
+        match self.logs_local(app, namespace, options).await {
+            // The store already answered for every node; this one just
+            // holds no capture of the app (#1515).
+            Err(RelishError::ApiError { status: 404, .. }) if store_answered => Ok(String::new()),
+            other => other,
+        }
     }
 
     /// Query local agent logs (process stdout/stderr).
@@ -3170,6 +3231,9 @@ fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String 
     if let Some(principal) = &filter.principal {
         params.append_pair("principal", principal);
     }
+    if let Some(app) = &filter.app {
+        params.append_pair("app", app);
+    }
     if let Some(namespace) = &filter.namespace {
         params.append_pair("namespace", namespace);
     }
@@ -3186,6 +3250,15 @@ fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String 
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn the_audit_query_carries_the_app_filter() {
+        let filter = crate::bun::audit::AuditFilter {
+            app: Some("web&co".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(audit_path(&filter, false), "/v1/audit?app=web%26co");
+    }
 
     #[test]
     fn the_public_key_path_names_an_encoded_namespace() {
@@ -3379,6 +3452,137 @@ mod tests {
             .unwrap();
         server.abort();
         output
+    }
+
+    /// Serve a `/v1/logs/query` answer (`None` answers 500, as a store that
+    /// couldn't be asked) beside an agent capture endpoint answering
+    /// `capture` with `capture_status`, and return what `relish logs` gets.
+    async fn logs_with_capture(
+        stored: Option<Vec<crate::ketchup::types::LogEntry>>,
+        capture_status: axum::http::StatusCode,
+        capture: &'static str,
+        options: LogOptions,
+    ) -> Result<String, RelishError> {
+        use axum::{Json, Router, response::IntoResponse, routing::get};
+        let app = Router::new()
+            .route(
+                "/v1/logs/query/{app}/{namespace}",
+                get(move || {
+                    let stored = stored.clone();
+                    async move {
+                        match stored {
+                            Some(entries) => Json(crate::ketchup::types::LogQueryResult {
+                                entries,
+                                node_count: 1,
+                                warnings: vec![],
+                            })
+                            .into_response(),
+                            None => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/logs/{app}/{namespace}",
+                get(move || async move {
+                    if capture_status.is_success() {
+                        Json(serde_json::json!({ "logs": capture })).into_response()
+                    } else {
+                        (
+                            capture_status,
+                            Json(
+                                serde_json::json!({"error": "no local capture for this workload"}),
+                            ),
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+        let output = client.logs("quiet", "default", &options).await;
+        server.abort();
+        output
+    }
+
+    /// #1515: an app quiet for the last five minutes has nothing in the
+    /// store's window. The capture can't tell old lines from new, so falling
+    /// back to it printed everything it still held.
+    #[tokio::test]
+    async fn since_on_a_quiet_app_prints_nothing_from_the_old_capture() {
+        let options = LogOptions {
+            start: Some(1_750_000_000),
+            ..LogOptions::default()
+        };
+        let output = logs_with_capture(
+            Some(vec![]),
+            axum::http::StatusCode::OK,
+            "an hour old\nolder still",
+            options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "");
+    }
+
+    #[tokio::test]
+    async fn since_prints_the_stored_lines_inside_the_window() {
+        let options = LogOptions {
+            start: Some(1),
+            ..LogOptions::default()
+        };
+        let output = logs_with_capture(
+            Some(vec![queried(2_000_000_000, "quiet-0", "fresh")]),
+            axum::http::StatusCode::OK,
+            "an hour old\nfresh",
+            options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "fresh");
+    }
+
+    /// #1515: the store answered for the whole cluster; this node simply
+    /// holds no capture of the app, which isn't an error.
+    #[tokio::test]
+    async fn a_node_without_the_capture_is_not_an_error_once_the_store_answered() {
+        let output = logs_with_capture(
+            Some(vec![]),
+            axum::http::StatusCode::NOT_FOUND,
+            "",
+            LogOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "");
+    }
+
+    #[tokio::test]
+    async fn a_missing_capture_is_an_error_when_the_store_did_not_answer() {
+        let error = logs_with_capture(
+            None,
+            axum::http::StatusCode::NOT_FOUND,
+            "",
+            LogOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, RelishError::ApiError { status: 404, .. }));
+    }
+
+    #[tokio::test]
+    async fn an_unwindowed_query_still_reads_the_capture_when_the_store_is_empty() {
+        let output = logs_with_capture(
+            Some(vec![]),
+            axum::http::StatusCode::OK,
+            "not stored yet",
+            LogOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "not stored yet");
     }
 
     fn queried(sequence: u64, instance: &str, line: &str) -> crate::ketchup::types::LogEntry {
@@ -4097,6 +4301,27 @@ mod tests {
             Some("https://env.example:9117".to_string())
         );
         assert_eq!(pick_endpoint(None, None), None);
+    }
+
+    /// A firewall that drops packets makes the connection time out. Nothing
+    /// was sent, so "the operation may still be running" would be wrong.
+    #[tokio::test]
+    async fn a_connection_that_never_opens_is_unreachable_even_when_it_times_out() {
+        let client = crate::http_client::builder()
+            .connect_timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap();
+        // TEST-NET-1 (RFC 5737) is never routed: the connect times out or fails.
+        let error = client
+            .get("http://192.0.2.1:9117/v1/health")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_connect(), "{error:?}");
+        assert!(matches!(
+            classify_error(error),
+            RelishError::AgentUnreachable
+        ));
     }
 
     #[tokio::test]

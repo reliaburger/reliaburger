@@ -22,6 +22,9 @@ use super::types::{
 };
 use crate::sesame::types::{CaRole, SerialNumber, SpiffeUri};
 
+/// How often [`CouncilNode::applied_api_token`] looks at the replica again.
+const API_TOKEN_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Result of signing a workload CSR.
 #[derive(Debug, Clone)]
 pub struct CsrSignResult {
@@ -81,6 +84,10 @@ pub struct CouncilNode {
     /// The leadership proof callers share, so a burst of requests doesn't
     /// send a burst of heartbeat rounds (#1441).
     leadership_proof: super::proof::SharedProof,
+    /// The leader's [`node_view`](crate::sesame::types::SecurityState::node_view)
+    /// of the security state, for a node whose own replica holds none
+    /// because it has no Raft seat (#1477). `None` until it has fetched one.
+    leader_security_view: tokio::sync::RwLock<Option<crate::sesame::types::SecurityState>>,
     /// Test hook: writes and linearizable reads never return, as they don't
     /// on a leader that has lost its quorum and not yet stepped down.
     #[cfg(test)]
@@ -165,6 +172,7 @@ impl CouncilNode {
             raft_id,
             election_hold,
             leadership_proof: super::proof::SharedProof::new(),
+            leader_security_view: tokio::sync::RwLock::new(None),
             state_machine,
             node_fault_membership: tokio::sync::Mutex::new(()),
             consumer_contacts: tokio::sync::Mutex::new(crate::onion::lease::ConsumerContacts::new(
@@ -665,8 +673,110 @@ impl CouncilNode {
     /// ticker, fast-fail pre-checks whose authoritative decision goes through
     /// Raft anyway). For a read that *is* the security decision, use
     /// [`Self::security_state_linearizable`].
+    ///
+    /// A node with no Raft seat has nothing applied; it gets the leader's view
+    /// instead, once it has fetched one (#1477).
     pub async fn security_state(&self) -> crate::sesame::types::SecurityState {
-        self.state_machine.desired_state().await.security_state
+        let local = self.state_machine.desired_state().await.security_state;
+        if local.is_initialised() {
+            return local;
+        }
+        self.leader_security_view
+            .read()
+            .await
+            .clone()
+            .unwrap_or(local)
+    }
+
+    /// Whether this node's own replica holds the security state. A node with
+    /// no Raft seat doesn't, and fetches the leader's view (#1477).
+    pub async fn holds_security_state(&self) -> bool {
+        self.state_machine
+            .read_desired(|state| state.security_state.is_initialised())
+            .await
+    }
+
+    /// Keep the leader's view of the security state, for a node whose replica
+    /// holds none (#1477). Ignored once the replica holds its own.
+    pub async fn adopt_leader_security_view(&self, view: crate::sesame::types::SecurityState) {
+        *self.leader_security_view.write().await = Some(view);
+    }
+
+    /// The API token stored under `token_hash` in this node's replica,
+    /// waiting up to `within` for the replica to apply it. `None` when it
+    /// hasn't by then, which on a follower only means it's still lagging.
+    pub async fn applied_api_token(
+        &self,
+        token_hash: &[u8],
+        within: std::time::Duration,
+    ) -> Option<crate::sesame::types::ApiToken> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let token = self
+                .state_machine
+                .read_desired(|state| {
+                    state
+                        .security_state
+                        .api_tokens
+                        .iter()
+                        .find(|token| token.token_hash == token_hash)
+                        .cloned()
+                })
+                .await;
+            if token.is_some() || tokio::time::Instant::now() >= deadline {
+                return token;
+            }
+            tokio::time::sleep(API_TOKEN_POLL).await;
+        }
+    }
+
+    /// Every API token this node's replica has applied. Copies only the
+    /// tokens, where [`Self::security_state`] copies the whole desired state.
+    ///
+    /// A node with no Raft seat gets the tokens in the leader's view (#1477).
+    pub async fn api_tokens(&self) -> Vec<crate::sesame::types::ApiToken> {
+        let local = self
+            .state_machine
+            .read_desired(|state| {
+                state
+                    .security_state
+                    .is_initialised()
+                    .then(|| state.security_state.api_tokens.clone())
+            })
+            .await;
+        match local {
+            Some(tokens) => tokens,
+            None => self
+                .leader_security_view
+                .read()
+                .await
+                .as_ref()
+                .map(|view| view.api_tokens.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Whether this node's replica holds no token called `name`, waiting up
+    /// to `within` for it to apply the removal. `false` means it still held
+    /// one at the deadline, which on a follower only means it's lagging.
+    pub async fn api_token_removal_applied(&self, name: &str, within: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let removed = self
+                .state_machine
+                .read_desired(|state| {
+                    !state
+                        .security_state
+                        .api_tokens
+                        .iter()
+                        .any(|token| token.name == name)
+                })
+                .await;
+            if removed || tokio::time::Instant::now() >= deadline {
+                return removed;
+            }
+            tokio::time::sleep(API_TOKEN_POLL).await;
+        }
     }
 
     /// How many voters the council grows to, if the cluster was created
@@ -1135,6 +1245,93 @@ mod tests {
         // Can write immediately.
         let resp = nodes[0].write(RaftRequest::Noop).await.unwrap();
         assert!(matches!(resp, CouncilResponse::Applied { .. }));
+    }
+
+    #[tokio::test]
+    async fn applied_api_token_finds_a_committed_token_and_gives_up_on_a_missing_one() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5)).await;
+        let created = crate::sesame::token::create_token(
+            "ci",
+            crate::sesame::types::ApiRole::Deployer,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let missing = nodes[0]
+            .applied_api_token(&created.token.token_hash, Duration::from_millis(60))
+            .await;
+        assert!(missing.is_none());
+        assert!(started.elapsed() >= Duration::from_millis(60));
+
+        nodes[0]
+            .write(RaftRequest::CreateApiToken(created.token.clone()))
+            .await
+            .unwrap();
+        let found = nodes[0]
+            .applied_api_token(&created.token.token_hash, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(found.name, "ci");
+    }
+
+    #[tokio::test]
+    async fn api_tokens_reads_the_applied_tokens() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5)).await;
+        assert!(nodes[0].api_tokens().await.is_empty());
+        let created = crate::sesame::token::create_token(
+            "ci",
+            crate::sesame::types::ApiRole::Deployer,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        nodes[0]
+            .write(RaftRequest::CreateApiToken(created.token.clone()))
+            .await
+            .unwrap();
+        assert_eq!(nodes[0].api_tokens().await, vec![created.token]);
+    }
+
+    #[tokio::test]
+    async fn api_token_removal_gives_up_on_a_token_still_there_and_sees_one_gone() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5)).await;
+        let created = crate::sesame::token::create_token(
+            "ci",
+            crate::sesame::types::ApiRole::Deployer,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        nodes[0]
+            .write(RaftRequest::CreateApiToken(created.token))
+            .await
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        assert!(
+            !nodes[0]
+                .api_token_removal_applied("ci", Duration::from_millis(60))
+                .await
+        );
+        assert!(started.elapsed() >= Duration::from_millis(60));
+
+        nodes[0]
+            .write(RaftRequest::RevokeApiToken { name: "ci".into() })
+            .await
+            .unwrap();
+        assert!(
+            nodes[0]
+                .api_token_removal_applied("ci", Duration::ZERO)
+                .await
+        );
     }
 
     #[tokio::test]

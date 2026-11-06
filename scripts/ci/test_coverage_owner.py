@@ -149,7 +149,7 @@ class Owner(unittest.TestCase):
                 except c.Invalid as error:
                     self.refusal = str(error)
                     return SimpleNamespace(returncode=77)
-                return SimpleNamespace(returncode=17 if self.mode == 'test-exit' else result)
+                return SimpleNamespace(returncode=17 if self.mode in ('test-exit', 'test-failure') else result)
             if '--lcov' in cmd and self.mode == 'lcov':
                 return SimpleNamespace(returncode=18)
             if '--fail-under-lines' in cmd and self.mode == 'floor':
@@ -167,7 +167,8 @@ class Owner(unittest.TestCase):
                 self.child_count += 1
                 p = self.root / 'target/nextest/ci/junit.xml'
                 p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text('<testsuites><testsuite name="reliaburger"><testcase classname="reliaburger" name="cron::boundary"/></testsuite></testsuites>')
+                failure = '<failure message="boom"/>' if self.mode == 'test-failure' else ''
+                p.write_text(f'<testsuites><testsuite name="reliaburger"><testcase classname="reliaburger" name="cron::boundary">{failure}</testcase></testsuite></testsuites>')
             return SimpleNamespace(returncode=0)
         raise AssertionError(cmd)
 
@@ -290,6 +291,13 @@ class Owner(unittest.TestCase):
         self.assertEqual(owner['stages'][-1]['exit_code'], 17)
         self.assertEqual(len(owner['stages']), 2)
         self.assertEqual(self.child_count, 1)
+
+    def test_a_failed_test_is_named_in_the_owner_failure(self):
+        # #1531: the step's log kept nothing, and the refusal said only
+        # "coverage owner failed:", so the failing test went unnamed.
+        self.mode = 'test-failure'
+        with self.assertRaisesRegex(c.Invalid, r'failing tests: reliaburger cron::boundary'):
+            self.execute()
 
     def test_failed_lcov_stops_remaining_stages_without_repeating_tests(self):
         self.mode = 'lcov'

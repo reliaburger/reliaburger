@@ -8,6 +8,10 @@ workload.
 Often the VMs already exist, and you want to use the configuration and
 runtimes you've already got on them.
 
+From 0.2.6, `relish setup --ssh user@host,user@host,...` does
+everything in this guide from your laptop, so read this one when you want to
+choose each step yourself, or need to know what that command does.
+
 If you want an automated, disposable local cluster on macOS or Linux using
 managed Lima VMs instead, see the [quickstart guide](quickstart.md).
 
@@ -108,8 +112,8 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
-# Release version to install (e.g. v0.2.3 or vX.Y.Z)
-VERSION="v0.2.3"
+# Release version to install (e.g. v0.2.6 or vX.Y.Z)
+VERSION="v0.2.6"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download binaries and SHA256SUMS into /tmp
@@ -136,7 +140,7 @@ relish --version
 ```
 
 Each prints its version and the commit it was built from, such as
-`bun 0.2.3 (d387d56)`. Every node should print the same commit.
+`bun 0.2.6 (50596cf)`. Every node should print the same commit.
 
 *(Optional: If building from source instead of using pre-built releases, install
 `build-essential clang llvm libbpf-dev` (the static job executor helpers need a
@@ -551,8 +555,8 @@ curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
 # The macOS build is Apple silicon only (arm64)
 ARCH="aarch64"
 
-# Release version to install (e.g. v0.2.3 or vX.Y.Z)
-VERSION="v0.2.3"
+# Release version to install (e.g. v0.2.6 or vX.Y.Z)
+VERSION="v0.2.6"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download relish binary and SHA256SUMS into /tmp

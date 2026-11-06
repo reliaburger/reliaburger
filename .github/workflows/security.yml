@@ -11,7 +11,7 @@ permissions:
 jobs:
   audit:
     name: weekly RustSec advisory audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@cargo-audit
@@ -21,7 +21,7 @@ jobs:
   # refresh itself is a release step (docs/releasing.md) and Dependabot's job.
   outdated:
     name: weekly dependency lag report
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0

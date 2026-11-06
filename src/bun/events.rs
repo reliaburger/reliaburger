@@ -249,7 +249,11 @@ impl EventStore {
             .buffer
             .iter()
             .rev()
-            .filter(|event| app.is_none_or(|name| event.app.as_deref() == Some(name)))
+            .filter(|event| {
+                app.is_none_or(|name| {
+                    crate::bun::audit::touched_app(event.app.as_deref(), &event.details, name)
+                })
+            })
             .filter(|event| min_severity.is_none_or(|level| event.severity >= level))
             .take(limit.min(EVENT_BUFFER_CAP))
             .cloned()
@@ -301,6 +305,30 @@ mod tests {
         let events = store.recent(10, Some("web"), Some(EventSeverity::Warning));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].app.as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn recent_finds_a_multi_app_apply_by_any_app_it_listed() {
+        let mut store = EventStore::new();
+        store.record_audit(AuditEvent {
+            timestamp: 1,
+            kind: EventKind::Operation,
+            severity: EventSeverity::Info,
+            action: "app.applied".to_string(),
+            principal: "token:alice".to_string(),
+            app: None,
+            namespace: Some("default".to_string()),
+            node: None,
+            source_address: None,
+            details: BTreeMap::from([(
+                "workloads".to_string(),
+                "backend@default,frontend@default".to_string(),
+            )]),
+            message: "app.applied in default by alice".to_string(),
+        });
+        assert_eq!(store.recent(10, Some("backend"), None).len(), 1);
+        assert_eq!(store.recent(10, Some("frontend"), None).len(), 1);
+        assert!(store.recent(10, Some("worker"), None).is_empty());
     }
 
     #[tokio::test]

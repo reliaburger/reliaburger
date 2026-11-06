@@ -74,23 +74,39 @@ download() {
 # so `curl | sh` with no flag explains the choices before downloading anything.
 explain_choices() {
   cat <<'CHOICES'
-Reliaburger installs in one of two ways. Pick one and run the installer again:
+Reliaburger installs in one of three ways. Pick one and run the installer again:
 
   --laptop        a development cluster on this computer: relish, then three
                   Linux VMs in Lima, running real containers with runc.
                     curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
 
+  --ssh MACHINES  a cluster on Linux machines you already have, from 0.2.6:
+                  relish here, then a node on each machine over SSH. They need
+                  Ubuntu or Debian, and passwordless sudo.
+                    curl -fsSL https://reliaburger.com/install.sh | sh -s -- --ssh ubuntu@10.0.0.1,ubuntu@10.0.0.2,ubuntu@10.0.0.3
+
   --install-only  just the relish CLI, for a cluster on Linux machines you
-                  already have: install bun on each, run `relish init` on the
-                  first and `relish join` on the rest. The walkthrough is
+                  set up by hand: install bun on each, run `relish init` on
+                  the first and `relish join` on the rest. The walkthrough is
                   https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md
                     curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
 
 Netbooting a set of machines into a cluster is planned, but not built yet.
 
-Until 1.0.0, Reliaburger is for developers and enthusiasts trying it out:
-every mode builds a cluster to learn on, not for production.
+Until 1.0.0, Reliaburger is good enough for home labs and dev clusters,
+not for production.
 CHOICES
+}
+
+# --ssh arrived in 0.2.6, and an older release would only call it unknown.
+knows_ssh_flag() {
+  numbers=${1#v}
+  numbers=${numbers%%-*}
+  major=${numbers%%.*}
+  rest=${numbers#*.}
+  minor=${rest%%.*}
+  patch=${rest#*.}
+  [ "$major" -gt 0 ] || [ "$minor" -gt 2 ] || { [ "$minor" -eq 2 ] && [ "$patch" -ge 6 ]; }
 }
 
 # Releases before 0.2.2 build the laptop cluster without a flag and hand any
@@ -114,13 +130,18 @@ main() {
     exit 2
   fi
   command -v curl >/dev/null 2>&1 || fail 'curl is required'
-  version=${RELIABURGER_VERSION:-v0.2.3}
+  version=${RELIABURGER_VERSION:-v0.2.6}
   # The character gate rejects newlines, so the grep below sees exactly one line.
   case $version in
     ''|*[!A-Za-z0-9.-]*) fail 'invalid RELIABURGER_VERSION' ;;
   esac
   printf '%s\n' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$' \
     || fail 'invalid RELIABURGER_VERSION'
+  for argument do
+    if [ "$argument" = --ssh ] && ! knows_ssh_flag "$version"; then
+      fail "--ssh arrived in 0.2.6, and this installs $version"
+    fi
+  done
   # A mirror serves a candidate of this release, which knows the flag.
   if [ -z "${RELIABURGER_RELEASE_BASE_URL:-}" ] && ! knows_laptop_flag "$version"; then
     for argument do

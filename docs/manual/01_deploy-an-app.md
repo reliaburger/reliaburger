@@ -107,6 +107,25 @@ migration can read `DATABASE_URL` and a config generator can write a volume.
 The volume stays the app's: an init container doesn't take it over, so run it
 as root (most images do) or as the app's user.
 
+Give an init container variables of its own with `env`. They go on top of the
+app's, and only that init container sees them:
+
+```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+env = { LOG_LEVEL = "info" }
+
+[[app.api.init]]
+image = "ghcr.io/example/migrate:2.1"
+command = ["migrate", "up"]
+env = { LOG_LEVEL = "debug", LOCK_TIMEOUT = "30s" }
+```
+
+A value is plain text or a provider reference (`PROVIDER[name:path]`, see
+`security`), resolved when the init container launches. If the provider fails,
+the instance fails. An encrypted value (`ENC[AGE:...]`) is refused here: put it
+in the app's `env`, which every init container inherits.
+
 An `exec` or `script` app's init container that names no image runs its
 command on the host, like the app. The node's `[process_workloads]
 allowed_binaries` must name the command's first word by its full path, or the
@@ -410,6 +429,26 @@ In a cluster, `relish stop` and `relish delete` return as soon as the council
 has recorded the change. Each node then retires its instances on its own, and
 a node that's unreachable does so when it comes back. Run `relish status` (or
 `relish inspect web`) to watch the instances go.
+
+A delete followed straight away by an apply of the same file may not restart
+anything. A node that hasn't acted on the delete yet sees the app come back
+with the spec it's already running, and keeps the instances it has, with
+the same process IDs. That's deliberate: the app ends up as the file says,
+without a pointless restart. Images bind to a digest at apply ([Tags bind to
+digests at apply](11_images-and-volumes.md#tags-bind-to-digests-at-apply)),
+so a tag that has moved gives a new spec and new instances. What a kept
+instance won't pick up is anything outside the spec:
+
+- **A mutable image the apply didn't re-resolve.** If the registry doesn't
+  answer, the apply binds the pull-through cache's copy of the tag, which may
+  be the one already running. Push under a new tag, or pin `name@sha256:…`,
+  when you need new bytes.
+- **A host binary or script** that an `exec` or `script` app runs, replaced on
+  disk. The kept process still runs the old one.
+- **State the process holds in memory**, such as a cache or a connection pool.
+
+When you need fresh processes, wait until `relish status` shows none of the
+app's instances before you apply again.
 
 Commands that take an app name also take `--namespace` (default `default`).
 

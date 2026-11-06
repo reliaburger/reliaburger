@@ -130,11 +130,7 @@ pub fn generate_intermediate_ca(
     let private_key_der = key_pair.serialize_der();
     let params = intermediate_ca_params(role, cluster_name, serial)?;
 
-    let certificate = params
-        .signed_by(
-            &key_pair,
-            &Issuer::from_params(parent_params, parent_keypair),
-        )
+    let certificate = sign_as_issuer(params.clone(), &key_pair, parent_params, parent_keypair)
         .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
     let certificate_der = certificate.der().to_vec();
 
@@ -267,11 +263,7 @@ pub fn sign_intermediate_csr(
 
     let mut params = intermediate_ca_params(role, cluster_name, serial)?;
     bound_leaf_validity(&mut params, &root_params)?;
-    let certificate = params
-        .signed_by(
-            &csr.public_key,
-            &Issuer::from_params(&root_params, &root_keypair),
-        )
+    let certificate = sign_as_issuer(params, &csr.public_key, &root_params, &root_keypair)
         .map_err(|e| CaError::SignFailed(e.to_string()))?;
     Ok(certificate.der().to_vec())
 }
@@ -289,6 +281,27 @@ pub fn node_spiffe_uri(node_id: &str) -> String {
 /// one. Returns `None` for any other URI shape.
 pub fn node_id_from_spiffe_uri(uri: &str) -> Option<&str> {
     uri.strip_prefix("spiffe://reliaburger/node/")
+}
+
+/// Sign `params` around `subject_key` with the given CA: the one way the
+/// cluster issues a non-root certificate.
+///
+/// The certificate carries an authority key identifier equal to the issuer's
+/// subject key identifier. rcgen leaves that extension off by default, and
+/// RFC 5280 requires it: strict verifiers, such as Python 3.13's default
+/// `ssl` context, refuse a chain without it (#1497). The flag belongs here and
+/// not in the shared params because rcgen refuses to put it in a CSR.
+pub(crate) fn sign_as_issuer(
+    mut params: CertificateParams,
+    subject_key: &impl rcgen::PublicKeyData,
+    issuer_params: &CertificateParams,
+    issuer_keypair: &KeyPair,
+) -> Result<rcgen::Certificate, rcgen::Error> {
+    params.use_authority_key_identifier_extension = true;
+    params.signed_by(
+        subject_key,
+        &Issuer::from_params(issuer_params, issuer_keypair),
+    )
 }
 
 /// Reconstruct a CA's signing keypair and issuer params from stored state.
@@ -324,9 +337,9 @@ pub fn ca_signing_material(
 /// validity is clamped to the CA's. So the params carry what an issuer needs,
 /// read off the signed certificate: the subject name with its original
 /// string types (a verifier compares names byte for byte), the validity
-/// window, and the subject key identifier (rcgen would copy it into an
-/// authority key identifier, which our leaves don't currently carry). They
-/// describe an issuer, not a certificate to re-create.
+/// window, and the subject key identifier, which [`sign_as_issuer`] copies
+/// byte for byte into the authority key identifier of everything these params
+/// sign. They describe an issuer, not a certificate to re-create.
 ///
 /// rcgen 0.13 had `CertificateParams::from_ca_cert_der` for this; 0.14 folds
 /// it into `Issuer::from_ca_cert_der`, which hides the name and validity we
@@ -495,8 +508,7 @@ fn sign_end_entity_cert(
     set_validity(&mut params, lifetime)?;
     bound_leaf_validity(&mut params, ca_params)?;
 
-    let certificate = params
-        .signed_by(&key_pair, &Issuer::from_params(ca_params, ca_keypair))
+    let certificate = sign_as_issuer(params, &key_pair, ca_params, ca_keypair)
         .map_err(|e| CaError::SignFailed(e.to_string()))?;
     let certificate_der = certificate.der().to_vec();
 
@@ -522,8 +534,7 @@ pub fn issue_node_cert(
     let mut params = node_cert_params(node_id, serial, NODE_LEAF_LIFETIME)?;
     bound_leaf_validity(&mut params, ca_params)?;
 
-    let certificate = params
-        .signed_by(&key_pair, &Issuer::from_params(ca_params, ca_keypair))
+    let certificate = sign_as_issuer(params, &key_pair, ca_params, ca_keypair)
         .map_err(|e| CaError::SignFailed(e.to_string()))?;
 
     Ok((certificate.der().to_vec(), private_key_der, serial))
@@ -542,6 +553,11 @@ pub fn issue_node_cert(
 /// `[security] leaf_lifetime_override_secs`. The issuer's CA validity still
 /// clamps it.
 ///
+/// `address` is where the issuer saw the node: the source of its join or
+/// renewal request. A routable one becomes an IP SAN, so a strict client can
+/// connect by address (#1508); it never comes from the CSR, which could claim
+/// another node's.
+///
 /// Returns `(certificate_der, serial)`.
 pub fn sign_node_csr(
     csr_der: &[u8],
@@ -550,6 +566,7 @@ pub fn sign_node_csr(
     lifetime: Duration,
     ca_keypair: &KeyPair,
     ca_params: &CertificateParams,
+    address: Option<std::net::IpAddr>,
 ) -> Result<(Vec<u8>, SerialNumber), CaError> {
     let csr_der_owned: Vec<u8> = csr_der.to_vec();
     let csr_der_ref = rustls::pki_types::CertificateSigningRequestDer::from(csr_der_owned);
@@ -557,15 +574,48 @@ pub fn sign_node_csr(
         .map_err(|e| CaError::SignFailed(format!("failed to parse node CSR: {e}")))?;
 
     let mut params = node_cert_params(node_id, serial, lifetime)?;
+    if let Some(address) = address.filter(|address| names_a_machine(*address)) {
+        params.subject_alt_names.push(SanType::IpAddress(address));
+    }
     bound_leaf_validity(&mut params, ca_params)?;
-    let certificate = params
-        .signed_by(
-            &csr_params.public_key,
-            &Issuer::from_params(ca_params, ca_keypair),
-        )
+    let certificate = sign_as_issuer(params, &csr_params.public_key, ca_params, ca_keypair)
         .map_err(|e| CaError::SignFailed(e.to_string()))?;
 
     Ok((certificate.der().to_vec(), serial))
+}
+
+/// Whether `address` can name a node to a client elsewhere: not loopback,
+/// which would name the client's own machine, and not unspecified.
+pub fn names_a_machine(address: std::net::IpAddr) -> bool {
+    !address.is_loopback() && !address.is_unspecified()
+}
+
+/// The IP SANs a DER certificate names, in order. An unparsable
+/// certificate names none.
+pub fn ip_sans(cert_der: &[u8]) -> Vec<std::net::IpAddr> {
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert_der) else {
+        return Vec::new();
+    };
+    let Ok(Some(extension)) = cert.subject_alternative_name() else {
+        return Vec::new();
+    };
+    extension
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            x509_parser::extensions::GeneralName::IPAddress(bytes) => {
+                if let Ok(octets) = <[u8; 4]>::try_from(*bytes) {
+                    Some(std::net::IpAddr::from(octets))
+                } else {
+                    <[u8; 16]>::try_from(*bytes)
+                        .ok()
+                        .map(std::net::IpAddr::from)
+                }
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn bound_leaf_validity(
@@ -812,9 +862,46 @@ fn set_validity(params: &mut CertificateParams, lifetime: Duration) -> Result<()
 }
 
 #[cfg(test)]
+pub(crate) mod key_identifier_checks {
+    use x509_parser::extensions::ParsedExtension;
+
+    /// A certificate's subject key identifier and the key identifier in
+    /// its authority key identifier, when it carries them.
+    pub(crate) fn key_identifiers(der: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let (_, certificate) = x509_parser::parse_x509_certificate(der).unwrap();
+        let mut subject = None;
+        let mut authority = None;
+        for extension in certificate.extensions() {
+            match extension.parsed_extension() {
+                ParsedExtension::SubjectKeyIdentifier(key_id) => subject = Some(key_id.0.to_vec()),
+                ParsedExtension::AuthorityKeyIdentifier(aki) => {
+                    authority = aki.key_identifier.as_ref().map(|key_id| key_id.0.to_vec());
+                }
+                _ => {}
+            }
+        }
+        (subject, authority)
+    }
+
+    /// Assert `child` names `issuer` by key: its authority key identifier is
+    /// the issuer's subject key identifier, byte for byte.
+    pub(crate) fn assert_names_issuer_by_key(child: &[u8], issuer: &[u8]) {
+        let (issuer_ski, _) = key_identifiers(issuer);
+        let issuer_ski = issuer_ski.expect("the issuing CA carries a subject key identifier");
+        let (_, child_aki) = key_identifiers(child);
+        assert_eq!(
+            child_aki.as_deref(),
+            Some(issuer_ski.as_slice()),
+            "the authority key identifier must equal the issuer's subject key identifier"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::sesame::cert;
+    use key_identifier_checks::{assert_names_issuer_by_key, key_identifiers};
     use std::time::SystemTime;
 
     #[test]
@@ -1081,6 +1168,7 @@ mod tests {
             NODE_LEAF_LIFETIME,
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
+            None,
         )
         .unwrap();
         let (leaf_der, _, _) = issue_end_entity_cert(
@@ -1219,6 +1307,7 @@ mod tests {
             NODE_LEAF_LIFETIME,
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
+            None,
         )
         .unwrap();
 
@@ -1233,6 +1322,43 @@ mod tests {
         // Chains to the Node CA that signed it.
         crate::sesame::cert::verify_signature(&cert_der, &hierarchy.node.ca.certificate_der)
             .unwrap();
+    }
+
+    /// #1508: a strict client that connects by address checks an IP SAN.
+    /// The issuer names the address it saw the node at, and leaves out one
+    /// that names no machine on the network.
+    #[test]
+    fn a_node_certificate_names_the_address_the_issuer_saw() {
+        let hierarchy = generate_ca_hierarchy("test", b"ikm").unwrap();
+        let (csr_der, _) = create_node_csr("node-2").unwrap();
+        let sign = |address: Option<&str>| {
+            sign_node_csr(
+                &csr_der,
+                "node-2",
+                SerialNumber(12),
+                NODE_LEAF_LIFETIME,
+                &hierarchy.node.signing_keypair,
+                &hierarchy.node.certificate_params,
+                address.map(|address| address.parse().unwrap()),
+            )
+            .unwrap()
+            .0
+        };
+        assert_eq!(
+            ip_sans(&sign(Some("10.0.0.5"))),
+            ["10.0.0.5".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            ip_sans(&sign(Some("fd00::5"))),
+            ["fd00::5".parse::<std::net::IpAddr>().unwrap()]
+        );
+        for nowhere in [None, Some("127.0.0.1"), Some("::1"), Some("0.0.0.0")] {
+            assert!(ip_sans(&sign(nowhere)).is_empty(), "{nowhere:?}");
+        }
+        // The node id stays bound whatever the address.
+        let signed = sign(Some("10.0.0.5"));
+        let (_, cert) = x509_parser::parse_x509_certificate(&signed).unwrap();
+        assert!(cert.subject().to_string().contains("node-2"));
     }
 
     #[test]
@@ -1271,6 +1397,7 @@ mod tests {
             NODE_LEAF_LIFETIME,
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
+            None,
         )
         .unwrap();
         // The backdated start may be clamped to the Node CA's own start; the
@@ -1296,6 +1423,7 @@ mod tests {
             Duration::from_secs(3600),
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
+            None,
         )
         .unwrap();
         let (_, cert) = x509_parser::parse_x509_certificate(&signed).unwrap();
@@ -1428,6 +1556,7 @@ mod tests {
                 NODE_LEAF_LIFETIME,
                 &hierarchy.node.signing_keypair,
                 params,
+                None,
             )
             .unwrap();
             webpki_accepts(&signed, node_ca, root, "node-b");
@@ -1442,5 +1571,128 @@ mod tests {
         )
         .unwrap();
         webpki_accepts(&ingress, ingress_ca, root, "app.example.com");
+    }
+
+    #[test]
+    fn every_intermediate_names_the_root_by_key_identifier() {
+        // Strict verifiers (OpenSSL's X509_STRICT, Python 3.13's default
+        // `ssl` context) refuse a non-root certificate without an authority
+        // key identifier (#1497).
+        let hierarchy = generate_ca_hierarchy("aki", b"ikm").unwrap();
+        let root = &hierarchy.root.ca.certificate_der;
+        for intermediate in [&hierarchy.node, &hierarchy.workload, &hierarchy.ingress] {
+            assert_names_issuer_by_key(&intermediate.ca.certificate_der, root);
+        }
+
+        // `relish ca rotate` signs with a root rebuilt from its stored DER.
+        let (csr, _) = create_intermediate_csr(CaRole::Node, b"ikm").unwrap();
+        let rotated = sign_intermediate_csr(
+            &csr,
+            CaRole::Node,
+            "aki",
+            SerialNumber(42),
+            &hierarchy.root.private_key_der,
+            root,
+        )
+        .unwrap();
+        assert_names_issuer_by_key(&rotated, root);
+    }
+
+    #[test]
+    fn every_leaf_names_its_issuing_ca_by_key_identifier() {
+        let ikm = b"ikm";
+        let hierarchy = generate_ca_hierarchy("aki", ikm).unwrap();
+        let node_ca = &hierarchy.node.ca.certificate_der;
+        let ingress_ca = &hierarchy.ingress.ca.certificate_der;
+
+        // Fresh params from `relish init`, params rebuilt from the stored
+        // DER, and the key and params a restarted node unwraps from state.
+        let stored_node = issuer_params_from_der(node_ca).unwrap();
+        let (restarted_key, restarted_node) = ca_signing_material(&hierarchy.node.ca, ikm).unwrap();
+        let issuers = [
+            (
+                &hierarchy.node.signing_keypair,
+                &hierarchy.node.certificate_params,
+            ),
+            (&hierarchy.node.signing_keypair, &stored_node),
+            (&restarted_key, &restarted_node),
+        ];
+        for (keypair, params) in issuers {
+            let (issued, _, _) =
+                issue_node_cert("node-a", SerialNumber(60), keypair, params).unwrap();
+            assert_names_issuer_by_key(&issued, node_ca);
+
+            let (csr, _) = create_node_csr("node-b").unwrap();
+            let (signed, _) = sign_node_csr(
+                &csr,
+                "node-b",
+                SerialNumber(61),
+                NODE_LEAF_LIFETIME,
+                keypair,
+                params,
+                None,
+            )
+            .unwrap();
+            assert_names_issuer_by_key(&signed, node_ca);
+
+            let (api, _, _) = issue_end_entity_cert(
+                "api.example",
+                SerialNumber(62),
+                Duration::from_secs(3600),
+                &[],
+                &[ExtendedKeyUsagePurpose::ServerAuth],
+                keypair,
+                params,
+            )
+            .unwrap();
+            assert_names_issuer_by_key(&api, node_ca);
+        }
+
+        let (ingress_key, ingress_params) =
+            ca_signing_material(&hierarchy.ingress.ca, ikm).unwrap();
+        let (ingress, _) = issue_ingress_leaf_cert(
+            "app.example.com",
+            Duration::from_secs(3600),
+            &[],
+            &ingress_key,
+            &ingress_params,
+        )
+        .unwrap();
+        assert_names_issuer_by_key(&ingress, ingress_ca);
+    }
+
+    #[test]
+    fn leaves_from_a_rotated_intermediate_name_the_new_key_not_the_old_one() {
+        let ikm = b"ikm";
+        let hierarchy = generate_ca_hierarchy("aki", ikm).unwrap();
+        let (csr, wrapped) = create_intermediate_csr(CaRole::Node, ikm).unwrap();
+        let rotated_der = sign_intermediate_csr(
+            &csr,
+            CaRole::Node,
+            "aki",
+            SerialNumber(42),
+            &hierarchy.root.private_key_der,
+            &hierarchy.root.ca.certificate_der,
+        )
+        .unwrap();
+        let rotated = CertificateAuthority {
+            role: CaRole::Node,
+            certificate_der: rotated_der.clone(),
+            private_key_wrapped: Some(wrapped),
+            serial: SerialNumber(42),
+            not_before: SystemTime::now(),
+            not_after: SystemTime::now(),
+            issuer_serial: Some(SerialNumber(1)),
+            generation: 1,
+            state: CaState::Active,
+        };
+        let (keypair, params) = ca_signing_material(&rotated, ikm).unwrap();
+        let (leaf, _, _) = issue_node_cert("node-a", SerialNumber(43), &keypair, &params).unwrap();
+
+        assert_names_issuer_by_key(&leaf, &rotated_der);
+        let (old_ski, _) = key_identifiers(&hierarchy.node.ca.certificate_der);
+        let (_, leaf_aki) = key_identifiers(&leaf);
+        assert_ne!(leaf_aki, old_ski);
+        cert::validate_chain(&leaf, &rotated_der, &hierarchy.root.ca.certificate_der).unwrap();
     }
 }

@@ -101,11 +101,11 @@ use internal::{
 };
 use join::{
     cluster_ca_handler, join_handler, master_key_handler, node_renewal_handler,
-    node_trust_ack_handler,
+    node_security_view_handler, node_trust_ack_handler,
 };
 use logs::{
-    logs_cross_node_handler, logs_entries_handler, logs_export_handler, logs_handler,
-    logs_sql_handler, ws_logs_handler,
+    logs_archive_file_handler, logs_archive_handler, logs_cross_node_handler, logs_entries_handler,
+    logs_export_handler, logs_handler, logs_sql_handler, ws_logs_handler,
 };
 use metrics::{
     alerts_handler, app_metric_rows, metrics_app_chart_handler, metrics_app_handler,
@@ -705,6 +705,7 @@ pub fn router_with_upgrade(
             "/v1/cluster/renew",
             post(node_renewal_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
+        .route("/v1/cluster/security-view", get(node_security_view_handler))
         .route(
             "/v1/cluster/trust-ack",
             post(node_trust_ack_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
@@ -801,6 +802,8 @@ pub fn router_with_upgrade(
         .route("/v1/alerts", get(alerts_handler))
         .route("/v1/logs/sql", get(logs_sql_handler))
         .route("/v1/logs/export", post(logs_export_handler))
+        .route("/v1/logs/archive", get(logs_archive_handler))
+        .route("/v1/logs/archive/{name}", get(logs_archive_file_handler))
         .route("/v1/deploys/active", get(deploys_active_handler))
         .route("/v1/deploys/operations", get(deploys_operations_handler))
         .route(

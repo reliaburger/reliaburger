@@ -969,7 +969,9 @@ pub fn job_process(spec: &JobSpec) -> OciProcess {
 /// `app`.
 ///
 /// The init runs `init.command` in its own image, or the app's when it names
-/// none (on the host, for an `exec` or `script` app), with the app's environment (secrets already decrypted), the app's
+/// none (on the host, for an `exec` or `script` app), with the app's
+/// environment (secrets already decrypted) and its own `env` on top
+/// (#1498), the app's
 /// mounts (volumes, config files and identity, host paths already approved)
 /// and the app's cgroup. It takes nothing from the app's process settings and
 /// publishes no port. Building on the app's finished spec rather than its
@@ -995,7 +997,7 @@ pub fn generate_init_oci_spec(
         process: OciProcess {
             rlimits: Vec::new(),
             args: init.command.clone(),
-            env: app.process.env.clone(),
+            env: layered_env(&app.process.env, &init.env),
             cwd: "/".to_string(),
             user: OciUser {
                 uid: 65534,
@@ -1091,7 +1093,7 @@ pub fn generate_sidecar_oci_spec(
                 .chain(&sidecar.args)
                 .cloned()
                 .collect(),
-            env: sidecar_env(&app.process.env, &sidecar.env),
+            env: layered_env(&app.process.env, &sidecar.env),
             cwd: "/".to_string(),
             user: OciUser {
                 uid: 65534,
@@ -1128,11 +1130,12 @@ pub fn generate_sidecar_oci_spec(
     }
 }
 
-/// The app's environment entries with a sidecar's own on top: an entry the
-/// sidecar names replaces the app's. Encrypted values never reach here
-/// (validation refuses them in a sidecar's `env`), so one is left out
-/// rather than passed on as ciphertext.
-fn sidecar_env(app: &[String], own: &BTreeMap<String, EnvValue>) -> Vec<String> {
+/// The app's environment entries with a sidecar's or an init container's
+/// own on top: an entry it names replaces the app's. A `PROVIDER[...]`
+/// reference passes through for the launch to resolve. Encrypted values
+/// never reach here (validation refuses them in a sidecar's or an init's
+/// `env`), so one is left out rather than passed on as ciphertext.
+fn layered_env(app: &[String], own: &BTreeMap<String, EnvValue>) -> Vec<String> {
     let inherited = app.iter().filter(|entry| {
         let name = entry
             .split_once('=')
@@ -1184,7 +1187,42 @@ mod tests {
         crate::config::app::InitContainerSpec {
             image: image.map(String::from),
             command: command.iter().map(|part| part.to_string()).collect(),
+            env: BTreeMap::new(),
         }
+    }
+
+    /// #1498: an init container gets the app's environment with its own
+    /// `env` on top: a name it sets replaces the app's, the rest pass
+    /// through, and a provider reference stays a reference for the launch
+    /// to resolve. It used to get the app's alone, so Online Boutique's
+    /// loadgenerator init never saw `FRONTEND_ADDR`.
+    #[test]
+    fn init_spec_layers_its_own_env_over_the_apps() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "loadgen:v1"
+            env = { MODE = "app", SHARED = "from-app" }
+            "#,
+        )
+        .unwrap();
+        let app = app_oci(&app);
+        let init: crate::config::app::InitContainerSpec = toml::from_str(
+            r#"
+            command = ["wait"]
+            env = { FRONTEND_ADDR = "frontend:80", SHARED = "from-init", TOKEN = "PROVIDER[vault:lg/token]" }
+            "#,
+        )
+        .unwrap();
+        let env = generate_init_oci_spec(&init, &app).process.env;
+        for expected in [
+            "MODE=app",
+            "SHARED=from-init",
+            "FRONTEND_ADDR=frontend:80",
+            "TOKEN=PROVIDER[vault:lg/token]",
+        ] {
+            assert!(env.contains(&expected.to_string()), "{expected}: {env:?}");
+        }
+        assert!(!env.contains(&"SHARED=from-app".to_string()), "{env:?}");
     }
 
     /// The spec Bun would generate for instance `default__web-0` of `app`.

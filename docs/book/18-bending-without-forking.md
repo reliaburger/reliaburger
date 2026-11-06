@@ -19,7 +19,7 @@ This chapter is unusual for the book: we wrote it before the code. The design
 needs more context than any of the issues can carry, and the context is mostly
 other people's mistakes. The research behind it is in the
 [extension points note](../plans/2026-10-19-research-extension-points.md), and
-the order of the work is in the [0.2.4 plan](../plans/2026-10-23-plan-0.2.4.md).
+the order of the work is in the [0.2.4 plan](../plans/archive/2026-10-23-plan-0.2.4.md).
 The sections near the end that show the Rust and the tests were
 placeholders when we started. Each issue on the 0.2.4 train filled in its
 part as it landed, and the exit test, which uses all of them, came last.
@@ -2891,6 +2891,19 @@ always did, and the owner check runs on the leader, against the state the
 write will land on. `rollback` checks where it's asked and re-applies
 through the apply path, whose forward now carries the caller too, so the
 leader's owner rules judge it again.
+
+That last sentence went untested until #1310 asked for proof. The rollback
+handler builds a config and hands it to `cluster_apply`, so whether the
+caller survives the trip depends on one argument at one call site, and
+nothing failed when we swapped it for an empty `HeaderMap`.
+`a_follower_forwards_a_rollback_to_the_leader_with_the_callers_token` now
+posts a rollback to a follower whose fake leader records what it receives.
+It seeds the follower with two completed deploy records, so the rollback has
+a target without any Raft writes, and checks that exactly one `/v1/apply`
+reaches the leader carrying the caller's bearer, the forwarded mark and the
+older image. With the bearer there, the leader audits the rollback under the
+caller's token name and a policy's `caller.role` is the caller's, because the
+leader authenticates a forwarded apply like any other.
 
 **The JSON is pinned.** `src/bun/api/contract_tests.rs` builds one example of
 every shape a controller reads or writes, and checks its JSON against a

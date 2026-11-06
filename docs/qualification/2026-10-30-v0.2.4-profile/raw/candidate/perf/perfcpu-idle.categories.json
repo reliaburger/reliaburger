@@ -1,0 +1,50 @@
+{
+  "bun_categories": {
+    "Bun: API server": 29.0,
+    "Bun: Raft core and log": 13.0,
+    "Bun: agent loop and supervisor": 29.0,
+    "Bun: async runtime (scheduler, timers, parking)": 62.0,
+    "Bun: containers (Grill)": 81.0,
+    "Bun: gossip (Mustard)": 1.0,
+    "Bun: other Reliaburger code": 12.0,
+    "Bun: pool path, rest of ReusablePool::run (slots lock, timers, logs)": 1.0,
+    "Bun: task-array leader tick and node sync": 5.0,
+    "Bun: uncategorised (extend the map)": 21.0
+  },
+  "bun_total": 254.0,
+  "categories": {
+    "Bun: API server": 29.0,
+    "Bun: Raft core and log": 13.0,
+    "Bun: agent loop and supervisor": 29.0,
+    "Bun: async runtime (scheduler, timers, parking)": 62.0,
+    "Bun: containers (Grill)": 81.0,
+    "Bun: gossip (Mustard)": 1.0,
+    "Bun: other Reliaburger code": 12.0,
+    "Bun: pool path, rest of ReusablePool::run (slots lock, timers, logs)": 1.0,
+    "Bun: task-array leader tick and node sync": 5.0,
+    "Bun: uncategorised (extend the map)": 21.0,
+    "idle (no runnable work)": 37397.0,
+    "other processes and kernel threads": 153.0
+  },
+  "other_by_command": {
+    "buildkitd": 1.0,
+    "containerd": 20.0,
+    "containerd-star": 1.0,
+    "exe": 65.0,
+    "gmain": 1.0,
+    "jbd2/vda1": 1.0,
+    "khungtaskd": 1.0,
+    "kworker/0:3-eve": 1.0,
+    "kworker/2:2-eve": 1.0,
+    "kworker/u8:1-ev": 1.0,
+    "lima-guestagent": 33.0,
+    "multipathd": 1.0,
+    "perf": 9.0,
+    "rcu_preempt": 13.0,
+    "slirp4netns": 1.0,
+    "vmstat": 3.0
+  },
+  "rate": 0.0,
+  "total": 37804.0,
+  "uncategorised_share": 0.08267716535433071
+}

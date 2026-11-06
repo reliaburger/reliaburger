@@ -1,0 +1,6 @@
+samples 38751, Bun 271
+ 98.91%                   idle (no runnable work)
+  0.70%  100.00% of Bun    Bun: uncategorised (extend the map)
+  0.39%                   other processes and kernel threads
+other by command: exe 0.14%, lima-guestagent 0.10%, rcu_preempt 0.05%, containerd 0.04%, perf 0.02%, vmstat 0.02%, buildkitd 0.01%, containerd-star 0.01%, kworker/u8:0-fl 0.01%, kcompactd 0.00%, ksoftirqd/ 0.00%, kworker/0:0-mm_ 0.00%
+100.0% of Bun's samples are uncategorised, over the 5% limit: extend BUN_RULES in scripts/release/profiling/profile_categories.py

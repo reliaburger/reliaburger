@@ -234,6 +234,13 @@ class NightlySigningTests(unittest.TestCase):
         self.assertIn("--channel nightly", sign)
         self.assertNotIn("RELIABURGER_RELEASE_KEY", sign)
 
+    def test_each_key_is_reachable_only_through_its_environment(self):
+        # The `if:` lines live in the dispatched branch's own copy of this
+        # file, so they can't protect a secret. The environments' branch
+        # rules, held in repository settings, can (#1439).
+        candidate = job(self.text, "candidate")
+        self.assertIn("    environment: ${{ github.ref == 'refs/heads/main' && 'release' || 'nightly' }}\n", candidate)
+
     def test_only_main_and_trains_are_ever_signed(self):
         for ref, allowed in [("refs/heads/main", True), ("refs/heads/release-0-2-4", True),
                              ("refs/heads/feature", False), ("refs/pull/1/merge", False),

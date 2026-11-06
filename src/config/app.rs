@@ -344,6 +344,11 @@ pub struct InitContainerSpec {
     /// Command and arguments.
     #[serde(default)]
     pub command: Vec<String>,
+    /// Variables set on top of the app's environment, which the init
+    /// container inherits: plain values and `PROVIDER[...]` references
+    /// (#1498). An encrypted value belongs in the app's `env`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvValue>,
 }
 
 /// A sidecar: a container that runs beside each instance of its app (#1120).
@@ -796,6 +801,37 @@ mod tests {
         assert_eq!(app.init.len(), 2);
         assert_eq!(app.init[0].image.as_deref(), Some("migration:v1"));
         assert!(app.init[1].image.is_none());
+    }
+
+    /// #1498: an init container takes an `env` of its own, as a sidecar
+    /// does: plain values and `PROVIDER[...]` references, on top of the
+    /// app's. Without one it has none, and serialises without the key.
+    #[test]
+    fn parse_init_container_env() {
+        let app = parse_app(
+            r#"
+            image = "loadgen:v1"
+
+            [[init]]
+            command = ["/bin/sh", "-c", "wait-for $FRONTEND_ADDR"]
+            env = { FRONTEND_ADDR = "frontend:80", TOKEN = "PROVIDER[vault:loadgen/token]" }
+
+            [[init]]
+            command = ["true"]
+        "#,
+        );
+        assert_eq!(
+            app.init[0].env.get("FRONTEND_ADDR"),
+            Some(&EnvValue::Plain("frontend:80".to_string()))
+        );
+        assert!(app.init[0].env.get("TOKEN").unwrap().is_provider());
+        assert!(app.init[1].env.is_empty());
+
+        let written = toml::to_string(&app.init[1]).unwrap();
+        assert!(!written.contains("env"), "{written}");
+        let round_trip: InitContainerSpec =
+            toml::from_str(&toml::to_string(&app.init[0]).unwrap()).unwrap();
+        assert_eq!(round_trip, app.init[0]);
     }
 
     #[test]

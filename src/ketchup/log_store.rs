@@ -1425,6 +1425,108 @@ mod tests {
         assert_eq!(lines, expected);
     }
 
+    /// #1493's shape: a quiet app beside a chatty one, an hour of flushes. A
+    /// quiet app's rows are a sliver of each file, and the row groups of the
+    /// busy one split every flush, yet its tail must follow every flush.
+    #[tokio::test]
+    async fn tail_follows_a_quiet_app_through_many_flushes() {
+        let (mut store, _dir) = test_store();
+        let mut acks = 0;
+        for flush in 0..40u64 {
+            let time = 1_793_000_000 + flush * 60;
+            // Past LOG_ROW_GROUP_SIZE, so a flush holds several row groups.
+            for line in 0..9_000 {
+                store.append_at(
+                    time,
+                    "spam",
+                    "default",
+                    LogStream::Stdout,
+                    &format!("{line}"),
+                );
+            }
+            for _ in 0..7 {
+                acks += 1;
+                let line = format!("ACK {acks}");
+                store.append_at(time, "writer", "default", LogStream::Stdout, &line);
+            }
+            store.flush().await.unwrap();
+
+            let tail = store
+                .query("writer", "default", None, None, None, Some(20))
+                .await
+                .unwrap();
+            let oldest = (acks - 19_i32).max(1);
+            let newest: Vec<String> = (oldest..=acks).map(|n| format!("ACK {n}")).collect();
+            assert_eq!(lines(&tail), newest, "after flush {flush}");
+        }
+    }
+
+    /// The newest lines sit in the buffer, or in a batch still being written.
+    /// A tail straddles both and the Parquet files behind them, with no line
+    /// twice and none missing.
+    #[tokio::test]
+    async fn tail_crosses_parquet_a_flush_in_flight_and_the_buffer() {
+        let (mut store, _dir) = test_store();
+        let add = |store: &mut LogStore, from: u32, to: u32| {
+            for n in from..=to {
+                store.append_at(
+                    7,
+                    "writer",
+                    "default",
+                    LogStream::Stdout,
+                    &format!("ACK {n}"),
+                );
+            }
+        };
+        add(&mut store, 1, 10);
+        store.flush().await.unwrap();
+        add(&mut store, 11, 20);
+        store.flush().await.unwrap();
+        add(&mut store, 21, 25);
+        let in_flight = store.take_flush_batch().unwrap().unwrap();
+        add(&mut store, 26, 30);
+
+        let expected: Vec<String> = (16..=30).map(|n| format!("ACK {n}")).collect();
+        let tail = store
+            .query("writer", "default", None, None, None, Some(15))
+            .await
+            .unwrap();
+        assert_eq!(lines(&tail), expected, "with the batch unwritten");
+
+        write_log_pending(in_flight).await.unwrap();
+        let tail = store
+            .query("writer", "default", None, None, None, Some(15))
+            .await
+            .unwrap();
+        assert_eq!(lines(&tail), expected, "with the batch on disk");
+    }
+
+    /// Disk pressure prunes the oldest files under a live store. What's left
+    /// still ends at the newest line.
+    #[tokio::test]
+    async fn tail_survives_the_oldest_files_being_pruned() {
+        let (mut store, dir) = test_store();
+        for n in 1..=30 {
+            store.append_at(
+                n,
+                "writer",
+                "default",
+                LogStream::Stdout,
+                &format!("ACK {n}"),
+            );
+            if n % 10 == 0 {
+                store.flush().await.unwrap();
+            }
+        }
+        std::fs::remove_file(dir.path().join("logs_000000.parquet")).unwrap();
+
+        let tail = store
+            .query("writer", "default", None, None, None, Some(3))
+            .await
+            .unwrap();
+        assert_eq!(lines(&tail), ["ACK 28", "ACK 29", "ACK 30"]);
+    }
+
     /// A writer logging ten lines a second puts ten rows under every
     /// one-second timestamp. Sorting on the timestamp alone left their order
     /// to DataFusion, which interleaved Parquet files (`ACK 968, 974, 969`).

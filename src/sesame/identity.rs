@@ -198,10 +198,13 @@ pub fn validate_and_sign_csr(
         }
     };
 
-    let issuer = rcgen::Issuer::from_params(workload_ca_params, workload_ca_keypair);
-    let signed = params
-        .signed_by(&csr_params.public_key, &issuer)
-        .map_err(|e| IdentityError::SignFailed(e.to_string()))?;
+    let signed = super::ca::sign_as_issuer(
+        params,
+        &csr_params.public_key,
+        workload_ca_params,
+        workload_ca_keypair,
+    )
+    .map_err(|e| IdentityError::SignFailed(e.to_string()))?;
 
     Ok(signed.der().to_vec())
 }
@@ -978,6 +981,33 @@ mod tests {
 
         // Verify the workload cert is signed by the Workload CA
         cert::verify_signature(&cert_der, &workload_ca_cert_der).unwrap();
+    }
+
+    #[test]
+    fn workload_certificates_name_the_workload_ca_by_key_identifier() {
+        // The council signs workload CSRs with params rebuilt from the
+        // stored Workload CA certificate; `relish init` hands out fresh ones.
+        // Both must yield the authority key identifier strict verifiers
+        // require (#1497).
+        let uri = test_spiffe_uri();
+        let (ca_kp, fresh_params, workload_ca_der, _) = test_workload_ca();
+        let stored_params = ca::issuer_params_from_der(&workload_ca_der).unwrap();
+        for params in [&fresh_params, &stored_params] {
+            for usage in [CertUsage::Mtls, CertUsage::CodeSigning] {
+                let (csr_der, _) = create_workload_csr(&uri).unwrap();
+                let cert_der = validate_and_sign_csr(
+                    &csr_der,
+                    &uri,
+                    SerialNumber(100),
+                    usage,
+                    &ca_kp,
+                    params,
+                    SystemTime::now(),
+                )
+                .unwrap();
+                ca::key_identifier_checks::assert_names_issuer_by_key(&cert_der, &workload_ca_der);
+            }
+        }
     }
 
     #[test]

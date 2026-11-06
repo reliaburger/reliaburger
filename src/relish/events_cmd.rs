@@ -101,14 +101,13 @@ fn kind_name(event: &ClusterEvent) -> String {
     }
 }
 
-/// `app@namespace`, whichever of them the event has.
+/// The event's target column, the same as `relish audit`'s.
 fn target(event: &ClusterEvent) -> String {
-    match (&event.app, &event.namespace) {
-        (Some(app), Some(namespace)) => format!("{app}@{namespace}"),
-        (Some(app), None) => app.clone(),
-        (None, Some(namespace)) => format!("@{namespace}"),
-        (None, None) => "-".to_string(),
-    }
+    super::audit_cmd::target(
+        event.app.as_deref(),
+        event.namespace.as_deref(),
+        &event.details,
+    )
 }
 
 #[cfg(test)]
@@ -131,6 +130,17 @@ mod tests {
             details: Default::default(),
             message: message.into(),
         }
+    }
+
+    #[test]
+    fn a_multi_app_apply_names_its_apps_in_the_target_column() {
+        let mut apply = event(EventKind::Operation, EventSeverity::Info, "app.applied");
+        apply.app = None;
+        apply.details.insert(
+            "workloads".to_string(),
+            "backend@default,frontend@default".to_string(),
+        );
+        assert_eq!(target(&apply), "backend, frontend @default");
     }
 
     #[test]

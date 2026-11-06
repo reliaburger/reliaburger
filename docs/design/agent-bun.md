@@ -507,6 +507,7 @@ pub struct MountPath {
 pub struct InitContainerSpec {
     pub image: Option<String>,   // inherits parent app image if None
     pub command: Vec<String>,
+    pub env: BTreeMap<String, EnvValue>,  // on top of the app's; no encrypted values
 }
 
 /// Deployment strategy.

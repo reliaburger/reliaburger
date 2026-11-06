@@ -788,14 +788,15 @@ mod tests {
         assert!(file_store(&dest).latest().await.unwrap().is_none());
     }
 
-    /// `make test-s3`: a council backup goes up to a real bucket, lists,
-    /// prunes and restores by key, with credentials and region taken from
-    /// the standard `AWS_*` variables.
+    /// `make test-s3`: a council backup goes up to an S3 bucket, lists,
+    /// prunes and restores by key, with endpoint, credentials and region
+    /// taken from the standard `AWS_*` variables. The bucket is a throwaway
+    /// local SeaweedFS one unless `RELIABURGER_TEST_S3_URL` names a real one.
     #[tokio::test]
-    #[ignore = "requires AWS credentials and RELIABURGER_TEST_S3_URL; run with make test-s3"]
+    #[ignore = "needs an S3 server, which make test-s3 starts (or a real bucket in RELIABURGER_TEST_S3_URL); run with make test-s3"]
     async fn council_backup_round_trips_through_real_s3() {
         let Ok(base) = std::env::var("RELIABURGER_TEST_S3_URL") else {
-            panic!("set RELIABURGER_TEST_S3_URL=s3://bucket/prefix to run this suite");
+            panic!("run this suite with make test-s3, which sets RELIABURGER_TEST_S3_URL");
         };
         let run = format!(
             "{}/council-backup-{}",

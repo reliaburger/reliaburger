@@ -477,18 +477,27 @@ async fn simultaneous_api_admission_deduplicates_the_same_durable_batch_request(
     let b: serde_json::Value =
         serde_json::from_slice(&b.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(a["batch_id"], b["batch_id"]);
-    let before = council.desired_state().await.task_arrays;
-    assert_eq!(before.jobs().runs().count(), 1);
-    assert_eq!(before.manifests().count(), 1);
-    let id = before.jobs().runs().next().unwrap().0;
-    assert_eq!(before.get(id).unwrap().state.summary().queued, 1);
+    let before = council.desired_state().await;
+    let arrays = &before.task_arrays;
+    assert_eq!(arrays.jobs().runs().count(), 1);
+    assert_eq!(arrays.manifests().count(), 1);
+    let id = arrays.jobs().runs().next().unwrap().0;
+    assert_eq!(arrays.get(id).unwrap().state.summary().queued, 1);
+    // The routers' task-array loops record the cron minute on their own
+    // timer; only a write the refused request made counts. Record one here
+    // so that race is met on every run (#1331).
+    crate::raft_writes::observe_a_later_minute(&council).await;
     let changed = Request::post("/v1/batch")
         .header("content-type", "application/json")
         .header("idempotency-key", "same-durable-request")
         .body(Body::from(body.replace("true", "false")))
         .unwrap();
     assert_eq!(second.oneshot(changed).await.unwrap().status(), 409);
-    assert_eq!(council.desired_state().await.task_arrays, before);
+    assert_eq!(
+        crate::raft_writes::changed_desired_fields(&before, &council.desired_state().await),
+        Vec::<String>::new(),
+        "a refused repeat changed desired state"
+    );
     drop(first);
     council.shutdown().await.unwrap();
 }

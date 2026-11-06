@@ -20,17 +20,16 @@ use reliaburger::council::log_store::MemLogStore;
 use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
 use reliaburger::council::node::CouncilNode;
 use reliaburger::council::state_machine::CouncilStateMachine;
-use reliaburger::council::types::{
-    CouncilConfig, CouncilNodeInfo, CouncilResponse, RaftRequest, TypeConfig,
-};
+use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo, CouncilResponse, RaftRequest};
 use reliaburger::lettuce::runner::spawn_gitops_sync;
 use reliaburger::lettuce::types::GitOpsConfig;
-use reliaburger::meat::task_array_store::TaskArrayWrite;
 use reliaburger::meat::types::AppId;
 use reliaburger::policy::{AdmitError, Caller, Source, admit};
 use reliaburger::sesame::types::ApiRole;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
+
+use crate::raft_writes;
 
 const NO_LATEST: &str = r#"
 [policy.no-latest]
@@ -99,25 +98,6 @@ pub(crate) async fn post_apply(
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Every entry in the council's Raft log, oldest first.
-async fn log_entries(log_store: &MemLogStore) -> Vec<openraft::Entry<TypeConfig>> {
-    use openraft::storage::RaftLogReader;
-    log_store.clone().try_get_log_entries(..).await.unwrap()
-}
-
-/// Whether a log entry is the task-array leader loop's cron clock.
-///
-/// Building the API router spawns that loop, and it records the minute it
-/// has observed on its first tick and again each new minute, on its own
-/// timer. It's the one write in this council that no request makes.
-fn is_cron_observation(entry: &openraft::Entry<TypeConfig>) -> bool {
-    matches!(
-        &entry.payload,
-        openraft::EntryPayload::Normal(RaftRequest::TaskArray(write))
-            if matches!(**write, TaskArrayWrite::CronObserve { .. })
-    )
-}
-
 #[tokio::test]
 async fn a_denied_apply_leaves_no_raft_write_but_an_audit_entry() {
     let (council, log_store) = single_node_leader_with_log(1).await;
@@ -152,7 +132,11 @@ async fn a_denied_apply_leaves_no_raft_write_but_an_audit_entry() {
     assert!(body.contains("policy no-latest: committed"), "{body}");
 
     // The policy's write has applied, so it's in the log already.
-    let before = log_entries(&log_store).await.len();
+    let before = raft_writes::last_index(&log_store).await;
+    // The router's task-array loop records the cron minute on its own
+    // timer, so an entry nobody asked for can land in this window. Commit
+    // one here, so the verdict below meets it on every run (#1331).
+    raft_writes::observe_a_later_minute(&council).await;
     let (status, body) = post_apply(&router, "[app.web]\nimage = 'web:latest'\n").await;
     assert_eq!(
         status,
@@ -164,19 +148,8 @@ async fn a_denied_apply_leaves_no_raft_write_but_an_audit_entry() {
         "{body}"
     );
 
-    // Judged by what was written, not by how many entries: the router's
-    // task-array loop records the cron minute on its own timer, and that
-    // can land between any two reads of the log (#1329).
-    let written: Vec<_> = log_entries(&log_store)
-        .await
-        .into_iter()
-        .skip(before)
-        .filter(|entry| !is_cron_observation(entry))
-        .map(|entry| match entry.payload {
-            openraft::EntryPayload::Normal(request) => format!("{}: {request:?}", entry.log_id),
-            other => format!("{}: {other:?}", entry.log_id),
-        })
-        .collect();
+    // Judged by what was written, not by how many entries (#1329).
+    let written = raft_writes::writes_after(&log_store, before).await;
     assert!(written.is_empty(), "a denial writes nothing: {written:?}");
     assert!(council.desired_state().await.apps.is_empty());
     let denied = log

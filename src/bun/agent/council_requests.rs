@@ -40,6 +40,7 @@ async fn issue_join_bundle(
     token: String,
     node_id: String,
     csr_der: Vec<u8>,
+    address: Option<std::net::IpAddr>,
 ) -> Result<crate::sesame::join::JoinBundle, BunError> {
     let council = &authority.council;
     // Fast-fail check against the replicated state (unknown, expired or
@@ -81,6 +82,7 @@ async fn issue_join_bundle(
         authority.node_leaf_lifetime,
         &security_state,
         &authority.wrapping_ikm,
+        address,
     )
     .map_err(|e| security_error(format!("join signing failed: {e}")))?;
 
@@ -160,6 +162,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         token: String,
         node_id: String,
         csr_der: Vec<u8>,
+        address: Option<std::net::IpAddr>,
         response: oneshot::Sender<Result<crate::sesame::join::JoinBundle, BunError>>,
     ) {
         let authority = match self.join_authority() {
@@ -170,7 +173,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         };
         answer_from_task(
-            issue_join_bundle(authority, token, node_id, csr_der),
+            issue_join_bundle(authority, token, node_id, csr_der, address),
             // The write may still commit after this, consuming the token.
             "the council did not answer the join in time; if a retry is refused, create a new join token",
             response,

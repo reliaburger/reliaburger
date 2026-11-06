@@ -421,7 +421,7 @@ no_fault:
 
     /* --- Backend selection: round-robin among healthy (and, once the
      * lease has lapsed, local) backends --- */
-    __u32 selected_idx = 0;
+    __u64 selected_idx = 0;
     int found = 0;
 
     /* Try up to count times to find a healthy backend.
@@ -437,10 +437,22 @@ no_fault:
             break;
 
         __u32 idx = (rr + i) % val->count;
+        if (idx >= MAX_BACKENDS)
+            continue;
+        /* Already below MAX_BACKENDS, but the verifier must see the bound
+         * on the 64-bit register that indexes the map value. Linux 7.0's
+         * verifier treats the result of the 32-bit modulo above as unknown
+         * in its upper half, so the 32-bit comparison no longer bounds it
+         * and the program was refused (#1557). A 64-bit mask bounds it on
+         * every kernel. The empty asm hides idx's value from clang, which
+         * would otherwise drop the mask as redundant. */
+        __u64 slot = idx;
+        asm volatile("" : "+r"(slot));
+        slot &= MAX_BACKENDS - 1;
 
-        if (idx < MAX_BACKENDS && val->backends[idx].healthy == 1 &&
-            (!local_only || val->backends[idx].local == 1)) {
-            selected_idx = idx;
+        if (val->backends[slot].healthy == 1 &&
+            (!local_only || val->backends[slot].local == 1)) {
+            selected_idx = slot;
             found = 1;
             val->rr_index = rr + i + 1;
             break;
@@ -451,7 +463,8 @@ no_fault:
         return 0;  /* deny -> EPERM: no healthy (or, lapsed, local) backends */
 
     /* Rewrite destination to the selected backend */
-    struct backend_endpoint *be = &val->backends[selected_idx];
+    asm volatile("" : "+r"(selected_idx));
+    struct backend_endpoint *be = &val->backends[selected_idx & (MAX_BACKENDS - 1)];
     ctx->user_ip4  = be->host_ip;
     ctx->user_port = be->host_port;
 
