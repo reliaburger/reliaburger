@@ -125,7 +125,9 @@ pub fn task_data_pressured(task_bytes: u64, filesystem: FilesystemUsage, max_per
 /// export leaves every local file in place and reports `export_error`.
 ///
 /// Async because export ships to an object store (`s3://`/`gs://`/local)
-/// via `object_store`.
+/// via `object_store`. Listing, measuring and deleting files run on a
+/// blocking thread: on a slow disk they take long enough to stall the
+/// runtime worker, and with it the agent loop's turn deadlines (#1606).
 pub async fn check_and_relieve(
     source_dir: &Path,
     export_dest: Option<&str>,
@@ -134,7 +136,10 @@ pub async fn check_and_relieve(
     max_bytes: u64,
     retention_days: u32,
 ) -> PressureResult {
-    let current_size = dir_parquet_size(source_dir);
+    let directory = source_dir.to_path_buf();
+    let current_size = tokio::task::spawn_blocking(move || dir_parquet_size(&directory))
+        .await
+        .unwrap_or(0);
     let mut result = PressureResult {
         exported: false,
         export_error: None,
@@ -160,21 +165,56 @@ pub async fn check_and_relieve(
     // Prune if over threshold or past retention
     let should_prune_for_pressure = max_bytes > 0 && current_size > max_bytes;
     let should_prune_for_retention = retention_days > 0;
+    if !should_prune_for_pressure && !should_prune_for_retention {
+        return result;
+    }
+    let prune = Prune {
+        directory: source_dir.to_path_buf(),
+        export_dest: export_dest.map(str::to_string),
+        node_id: node_id.to_string(),
+        // The blocking thread needs its own copy: it outlives no borrow.
+        checkpoint: checkpoint.clone(),
+        current_size,
+        max_bytes,
+        retention_days,
+    };
+    if let Ok((files_pruned, bytes_reclaimed)) =
+        tokio::task::spawn_blocking(move || prune.run()).await
+    {
+        result.files_pruned = files_pruned;
+        result.bytes_reclaimed = bytes_reclaimed;
+    }
+    result
+}
 
-    if should_prune_for_pressure || should_prune_for_retention {
-        let retention_cutoff = if retention_days > 0 {
+/// What one prune pass needs, owned, for a blocking thread.
+struct Prune {
+    directory: std::path::PathBuf,
+    export_dest: Option<String>,
+    node_id: String,
+    checkpoint: ExportCheckpoint,
+    current_size: u64,
+    max_bytes: u64,
+    retention_days: u32,
+}
+
+impl Prune {
+    /// Delete the oldest exported Parquet files past retention or over the
+    /// cap: how many, and the bytes they held.
+    fn run(self) -> (usize, u64) {
+        let retention_cutoff = if self.retention_days > 0 {
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs()
-                .saturating_sub(retention_days as u64 * 86400)
+                .saturating_sub(self.retention_days as u64 * 86400)
         } else {
             0
         };
 
         // Collect Parquet files with their metadata
         let mut files: Vec<(std::path::PathBuf, u64, u64)> = Vec::new(); // (path, size, mtime)
-        if let Ok(entries) = std::fs::read_dir(source_dir) {
+        if let Ok(entries) = std::fs::read_dir(&self.directory) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().is_some_and(|ext| ext == "parquet")
@@ -193,30 +233,33 @@ pub async fn check_and_relieve(
         // Sort oldest first
         files.sort_by_key(|f| f.2);
 
-        let mut remaining_size = current_size;
+        let mut pruned = 0;
+        let mut reclaimed = 0;
+        let mut remaining_size = self.current_size;
         for (path, size, mtime) in &files {
             // Prune if file is past retention OR we're over the size limit
             let past_retention = retention_cutoff > 0 && *mtime < retention_cutoff;
-            let over_pressure = max_bytes > 0 && remaining_size > max_bytes;
+            let over_pressure = self.max_bytes > 0 && remaining_size > self.max_bytes;
 
             // Only prune if this exact content has been exported (or no export
             // dest configured). Keyed by durable id, so pruning never deletes a
             // reused-filename file whose new bytes haven't shipped yet.
-            let is_exported = export_dest
-                .is_none_or(|destination| checkpoint.contains_file(path, destination, node_id));
+            let is_exported = self.export_dest.as_deref().is_none_or(|destination| {
+                self.checkpoint
+                    .contains_file(path, destination, &self.node_id)
+            });
 
             if (past_retention || over_pressure)
                 && is_exported
                 && std::fs::remove_file(path).is_ok()
             {
-                result.files_pruned += 1;
-                result.bytes_reclaimed += size;
+                pruned += 1;
+                reclaimed += size;
                 remaining_size = remaining_size.saturating_sub(*size);
             }
         }
+        (pruned, reclaimed)
     }
-
-    result
 }
 
 /// Export, waiting up to [`EXPORT_BUSY_WAIT`] for a competing exporter.
@@ -577,6 +620,43 @@ mod tests {
 
         assert!(!result.exported);
         assert_eq!(result.files_pruned, 1);
+    }
+
+    /// The 0.2.6 jobs final (#1606): relief listed, measured and deleted
+    /// files with `std::fs` on a runtime worker, on a disk where a journal
+    /// write took over a second. While it ran, the agent loop's turn
+    /// deadline timer didn't fire, and a turn that should have handed its
+    /// journal write off at 500 ms took 1,232 ms. On a single-threaded
+    /// runtime, work done inline finishes inside the first poll, so a first
+    /// poll that comes back pending means the filesystem work runs on a
+    /// blocking thread and the runtime goes on meanwhile.
+    #[tokio::test(flavor = "current_thread")]
+    async fn relief_does_its_filesystem_work_off_the_runtime() {
+        let source = tempfile::tempdir().unwrap();
+        for file in 0..500 {
+            std::fs::write(
+                source.path().join(format!("logs_{file:06}.parquet")),
+                [0u8; 10],
+            )
+            .unwrap();
+        }
+        let mut checkpoint = ExportCheckpoint::default();
+        let mut relief = std::pin::pin!(check_and_relieve(
+            source.path(),
+            None,
+            "node-1",
+            &mut checkpoint,
+            1000,
+            0,
+        ));
+
+        let first = futures_util::poll!(relief.as_mut());
+        assert!(
+            first.is_pending(),
+            "relief did all its filesystem work inside one poll, on the runtime"
+        );
+        let result = relief.await;
+        assert_eq!(result.files_pruned, 400, "relief pruned down to the cap");
     }
 
     #[tokio::test]

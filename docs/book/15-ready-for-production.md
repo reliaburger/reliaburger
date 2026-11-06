@@ -6952,6 +6952,74 @@ What still waits for a discovery journal write? Adoption itself, which
 runs before the loop starts and has nobody to hold up. That's the whole
 list.
 
+#### And the runtime under it
+
+The list was right, and 0.2.6's jobs final still caught a turn that
+waited (#1606). Ten hours in, on node 1:
+
+```
+01:20:45 bun: agent loop turn took 1232 ms in follow_up (consumer_sync/compact): journal write 1232 ms
+01:20:45 bun: a discovery journal write took 1243 ms; the agent loop went on meanwhile
+01:20:45 bun: disk pressure — pruned 5 log file(s), reclaimed 430451 bytes
+```
+
+The first line says the compaction step waited for its write. The second
+says it didn't: "went on meanwhile" is printed only for a write that was
+handed off, and it landed 11 ms after the turn ended. Both are true. We
+read the compaction path from end to end looking for a write without a
+deadline, and there isn't one: `compact_step` passes the turn's deadline
+down to `write_discovery_inventory`, and a test that stalls every write of
+a changed view at 1.6 s,
+`a_consumer_compaction_hands_a_slow_journal_write_off_at_the_turn_deadline`,
+shows each turn, compaction's included, handing off in time. The
+`timeout_at` did fire. It just fired 732 ms late.
+
+The third line is the clue. Every five minutes Bun's disk-pressure task
+checks the log and metrics stores, and `check_and_relieve` listed the
+directory, read each file's metadata and deleted the oldest files with
+`std::fs`, right there on a runtime worker thread. On a disk where a
+journal write took over a second, that took most of a second too. Tokio's
+timers don't run themselves: a worker thread checks them when it has
+nothing else to do, or between tasks. A worker stuck in a synchronous
+`unlink` checks nothing, and if the other workers are asleep, waiting to
+be told there is work, nothing may wake the agent loop when its deadline
+passes. In C or Go a blocking call stalls one thread. In async Rust it
+stalls every task that thread would have run next, and sometimes the
+clock.
+
+So `check_and_relieve` now does its filesystem work on a blocking thread,
+the way the export next to it already did:
+
+```rust
+let directory = source_dir.to_path_buf();
+let current_size = tokio::task::spawn_blocking(move || dir_parquet_size(&directory))
+    .await
+    .unwrap_or(0);
+```
+
+The closure is `move`, so it owns `directory`. It has to: the blocking
+thread may run after the caller's `&Path` borrow is gone, and
+`spawn_blocking` requires a `'static` closure, one that borrows nothing it
+doesn't own. That's why the prune pass is a small `Prune` struct with
+owned fields and a copy of the export checkpoint, rather than a closure
+over the caller's references. `.unwrap_or(0)` covers the one way the join
+can fail, a panic on the blocking thread, by measuring nothing and so
+pruning nothing.
+
+How do you test "doesn't block the runtime" without timing it? On a
+single-threaded runtime (`#[tokio::test(flavor = "current_thread")]`), work
+done inline can't be interrupted: it all happens inside the first poll of
+the future. `relief_does_its_filesystem_work_off_the_runtime` polls
+`check_and_relieve` once with `futures_util::poll!` over a directory of
+500 files and asserts the poll comes back `Pending`, which can only happen
+if the work is waiting on another thread. Before the fix it came back
+`Ready`, every file already deleted. No clock, so no flake.
+
+A test can't show the late timer itself: making a worker block on purpose
+on a test runtime proves only that tokio behaves like tokio. What we have
+is the evidence above, a turn that ended in the second the prune ran, on a
+node whose other compaction turns all handed off at 500 ms.
+
 #### A 503 is an answer, not a verdict
 
 Candidate 7's jobs soak failed a pulse on one line: `deploy_from_cluster_registry`

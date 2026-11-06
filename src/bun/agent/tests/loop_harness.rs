@@ -1608,6 +1608,55 @@ async fn a_consumer_view_is_installed_only_after_its_journal_write_lands() {
     );
 }
 
+/// The 0.2.6 jobs final (#1606): one `consumer_sync/compact` turn took
+/// 1,232 ms, all of it journal write, while every other consumer step
+/// handed its slow write off at the turn's deadline. Here every write of a
+/// changed view is that slow, compaction's included, and each turn of the
+/// synchronisation, compaction's included, hands off within the budget.
+#[tokio::test]
+async fn a_consumer_compaction_hands_a_slow_journal_write_off_at_the_turn_deadline() {
+    let (mut agent, _root, ingress) = published_consumer().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let (response, reply) = oneshot::channel();
+    agent
+        .request_consumer_sync(crate::bun::agent::consumer::ConsumerRequest {
+            generation: 2,
+            catalog: moved_remote_backend(),
+            ingress,
+            withdrawals: vec![],
+            answer: Some(crate::bun::agent::consumer::ConsumerAnswer {
+                requested_at_ns: crate::onion::lease::boot_clock_ns(),
+                response,
+            }),
+        })
+        .await;
+    let mut compactions = 0;
+    while !agent.consumer_syncs.is_idle() || agent.discovery_write_in_flight() {
+        let turn = one_consumer_sync_turn(&mut agent).await;
+        if turn.detail == Some("consumer_sync/compact") {
+            compactions += 1;
+            assert!(
+                agent.discovery_write_in_flight(),
+                "the compaction wrote nothing to hand off: {turn}"
+            );
+        }
+        assert!(
+            turn.took < TURN_BUDGET,
+            "{turn} waited for a {STALLED_JOURNAL_WRITE:?} journal write: {:?}",
+            turn.part(TurnPart::JournalWrite)
+        );
+    }
+    assert_eq!(compactions, 1, "the synchronisation never compacted");
+    assert!(reply.await.unwrap().unwrap().published);
+    assert_eq!(
+        agent.consumer_owner().unwrap().publications.len(),
+        1,
+        "the earlier view was not compacted away"
+    );
+}
+
 /// A journal write that fails after the turn moved on fences discovery as
 /// a failed inline write does: ownership becomes uncertain, readiness says
 /// so, the view it would have recorded never reaches the kernel, and the
