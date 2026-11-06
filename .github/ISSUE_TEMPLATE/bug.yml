@@ -1,0 +1,60 @@
+name: Bug report
+description: Something in Reliaburger doesn't do what it should, and you can show it.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please search the [open issues](https://github.com/reliaburger/reliaburger/issues) first.
+        If your agent drafted this with `relish agent report`, use the **Agent-drafted bug** form instead.
+        A report with no reproducer may be closed. If you can't reproduce it, say so, and we'll label it `unverified`.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `relish --version`, and of `bun --version` if the nodes run a different build.
+      placeholder: relish 0.2.7 (abcdef12)
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Reproducer
+      description: The smallest commands and config that show the bug on a fresh cluster, such as one from `relish dev`. Write "none" if you have none.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Output, `relish wtf` findings or log lines. Remove tokens, keys and addresses first.
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: not_tested
+    attributes:
+      label: What was not tested
+      description: Platforms, runtimes, versions or steps you didn't try. "Nothing else" is a fine answer if it's true.
+    validations:
+      required: true
+  - type: dropdown
+    id: ai_disclosure
+    attributes:
+      label: AI assistance
+      description: Did an AI tool help write this report? See the AI-assistance policy in CONTRIBUTING.md.
+      options:
+        - No AI assistance
+        - An AI tool helped, and a human checked every line
+        - An AI agent drafted it, and a human checked every line
+    validations:
+      required: true
