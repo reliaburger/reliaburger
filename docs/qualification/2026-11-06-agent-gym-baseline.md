@@ -74,8 +74,12 @@ The baseline's first crash-loop run scored `wrong`, and it was right to. After
 straight away through `supervisor.maybe_restart` and records no event. Only a
 restart that waited out its backoff, through `retry_restart`
 (`src/bun/agent/restarts.rs`), records one, and `wtf` needs three in fifteen
-minutes. That bug is for its own issue and fix; the baseline now reads restarts
-from `status` when `wtf` doesn't name the loop, and the runs above use it.
+minutes. The runs above used a baseline that read restarts from `status` when
+`wtf` didn't name the loop. The bug was
+[#1652](https://github.com/reliaburger/reliaburger/issues/1652), fixed by
+[#1656](https://github.com/reliaburger/reliaburger/pull/1656): every exit now
+restarts through `retry_restart` and records its event, so the baseline reads
+`wtf`'s `crashloop` finding again.
 
 Two smaller observations: Bun rolled back the first version of the bad deploy
 (an unknown testapp mode that exited at once) by itself, so the scenario's v2

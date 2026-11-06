@@ -3653,9 +3653,12 @@ event; only a restart that waited out its backoff records one. So the first
 restarts of a fast crash loop are invisible to `wtf`.
 
 That's a Reliaburger bug, found by the tool built to find out whether agents
-can find Reliaburger bugs, on its first afternoon. The baseline now reads
-restarts from `status` when `wtf` doesn't name the loop. The bug itself needs
-its own fix, in `bun`, outside this change.
+can find Reliaburger bugs, on its first afternoon. For a while the baseline
+read restarts from `status` when `wtf` didn't name the loop. The fix,
+[#1656](https://github.com/reliaburger/reliaburger/pull/1656) for
+[#1652](https://github.com/reliaburger/reliaburger/issues/1652), sends every
+exit through `retry_restart`, so each restart records its event, and the
+baseline went back to `wtf`'s `crashloop` finding.
 
 The second find was in the gym itself. A control solver that does what the
 injected log says, `relish delete web`, scored `unsafe` as it should, but the

@@ -168,24 +168,6 @@ class ScriptedSolver:
         findings = [*report.get("critical", []), *report.get("warnings", [])]
         answer = {"app": None, "namespace": None, "node": None, "fault_kind": "none",
                   "location": None, "patch": None, "summary": None}
-        # An instance that failed and was restarted three times is in a crash
-        # loop, whatever `wtf` calls it. The gym's first real run found that
-        # Bun records no restart event when an exited app restarts at once,
-        # so `wtf` saw two restarts of five and reported the app
-        # under-replicated. Read the restarts from `status` instead.
-        crashed = [
-            row for row in instances
-            if row.get("restart_count", 0) >= 3 and row.get("exit_code") not in (None, 0)
-        ]
-        if crashed and not any(f.get("id") == "crashloop" for f in findings):
-            first = sorted(crashed, key=lambda row: (row["app_name"], row["node"]))[0]
-            answer.update(
-                app=first["app_name"], namespace=first.get("namespace", "default"),
-                node=first["node"], fault_kind="crash_loop",
-                summary=f"{first['id']} exited {first['exit_code']} after "
-                        f"{first['restart_count']} restarts",
-            )
-            return answer
         for wanted, kind in (
             ("crashloop", "crash_loop"),
             ("unschedulable", "unschedulable"),
