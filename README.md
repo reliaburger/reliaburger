@@ -450,8 +450,10 @@ cover the logic. On top of them sit crash-recovery suites that kill the agent at
 awkward moment, multi-node failover and council-loss tests, power-cut fixtures
 that pull the plug on a VM mid-write, a live-cluster test runner you can point
 at your own cluster (`relish test`), and a soak that installs the signed
-release the way you would and then breaks it for hours. CI never retries a
-failure. See [how Reliaburger is tested](docs/testing.md).
+release the way you would and then breaks it for hours. An agent gym breaks
+throwaway clusters in ways it knows and scores whatever diagnoses them, an AI
+agent included, against the ground truth (`make test-gym`, from 0.2.7). CI
+never retries a failure. See [how Reliaburger is tested](docs/testing.md).
 
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
 TUI; `relish dashboard` opens the web UI through your authenticated CLI session.

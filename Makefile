@@ -1,4 +1,4 @@
-.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands agent-docs bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed
+.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gym test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands agent-docs bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -79,6 +79,19 @@ test-standard-clients: ## Push and pull through Pickle's TLS listener with docke
 	scripts/standard-clients-host.sh
 	$(NEXTEST) --run-ignored=only -E 'binary(suite) & test(/^registry_standard_clients::/)'
 
+# The agent gym (#1086): every scenario on fresh local clusters, scored against
+# ground truth. The default solver is the scripted baseline, which costs
+# nothing; GYM_SOLVER=command:PROGRAM plugs in an agent, which costs API spend,
+# so no CI job runs this. Results and the Markdown record land in GYM_OUT.
+GYM_SOLVER ?= scripted
+GYM_RUNS ?= 1
+GYM_PORT_BASE ?= 29400
+GYM_OUT ?= target/gym/$(shell date -u +%Y%m%dT%H%M%SZ)
+test-gym: ## Run the agent gym's scenarios on throwaway local clusters (#1086); GYM_SOLVER=command:PROGRAM runs an agent instead of the baseline
+	python3 scripts/release/require_python.py
+	$(CARGO) build --locked --bin relish --bin bun --bin testapp
+	python3 scripts/gym/gym.py run --solver '$(GYM_SOLVER)' --runs $(GYM_RUNS) --port-base $(GYM_PORT_BASE) --out '$(GYM_OUT)'
+
 test-gpu: ## Detect a real NVIDIA GPU (needs the GPU and nvidia-smi)
 	RELIABURGER_GPU_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(=bun::gpu::tests::nvidia_detector_finds_hardware)'
 
@@ -154,10 +167,11 @@ kubernetes-demo: build ## Demo Kubernetes YAML import/export round-trip
 toml-demo: build ## Demo config tooling (lint, fmt, compile, diff)
 	./scripts/relish-toml-demo.sh
 
-test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping
+test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping, and the agent gym's scorer and runner
 	python3 scripts/release/require_python.py
 	python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 	python3 -m unittest discover -s scripts/release -p 'test_*.py'
+	python3 -m unittest discover -s scripts/gym -p 'test_*.py'
 
 check-ignored: ## Fail when an #[ignore] reason names no gate, script, fixture parent or issue
 	python3 scripts/ci/ignored_owners.py reasons

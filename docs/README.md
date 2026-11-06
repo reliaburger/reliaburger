@@ -462,6 +462,7 @@ sudo make test-linux       # runc, netns, eBPF, Btrfs, Buildah and root-only tes
 make test-rootless-runc    # rootless runc port and replacement test (never sudo)
 make test-cluster          # failover, healing, recovery, placement and chaos
 make test-hollow           # a three-member council and twenty hollow nodes (#1401)
+make test-gym              # the agent gym's scenarios on throwaway clusters, scored (#1086)
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement
 make coverage              # portable suite under line coverage (HTML and LCOV)
