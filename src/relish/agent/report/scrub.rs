@@ -1,7 +1,9 @@
 //! Redaction for a report: the shared secret rules, then addresses.
 //!
 //! Secrets go first, through [`crate::redact`], the same rules the
-//! `untrusted` envelopes and the audit log use. Then, unless the caller
+//! `untrusted` envelopes and the audit log use; a JSON field whose key
+//! names a secret (`api_key`, `password`) loses its whole value, since the
+//! text rules see the key and the value apart. Then, unless the caller
 //! asked to keep them, addresses are replaced with aliases that stay the
 //! same across the whole report, so "`node-1` couldn't reach `ipv4-2`"
 //! still says which node and which address, just not what they're called:
@@ -105,6 +107,8 @@ fn rule_name(rule: Rule) -> &'static str {
         Rule::PemPrivateKey => "pem_private_key",
         Rule::UrlCredentials => "url_credentials",
         Rule::EnvValue => "env_value",
+        Rule::Jwt => "jwt",
+        Rule::SecretKeyValue => "secret_key_value",
     }
 }
 
@@ -215,6 +219,12 @@ impl Scrubber {
                 for (key, value) in map {
                     let value = match (key.as_str(), value) {
                         ("env", Value::Object(env)) => env_keys(&env, counts),
+                        (name, Value::String(text)) if redact::is_secret_key(name) => {
+                            let mut secrets = RedactionCounts::default();
+                            let text = redact::redact_value(name, &text, &mut secrets);
+                            counts.add_secrets(&secrets);
+                            Value::String(self.text(&text, counts))
+                        }
                         ("untrusted", Value::Object(text)) if !self.include_logs => {
                             self.json(drop_log_lines(text, counts), counts)
                         }

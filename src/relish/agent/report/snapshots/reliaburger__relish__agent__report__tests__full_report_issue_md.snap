@@ -44,10 +44,21 @@ relish fault partition node-1 --one-way, then relish agent diagnose
             },
             "name": "payments"
           },
+          "config": {
+            "api_key": "[redacted]",
+            "client_secret": "[redacted]",
+            "token_bucket": "10/s"
+          },
           "endpoint": "https://ipv4-1:9117",
           "events": [
             {
               "message": "deploy by ENC[AGE:[redacted]] from https://[redacted]@host-1/r.git"
+            },
+            {
+              "message": "probe sent Authorization: Bearer eyJ[redacted]"
+            },
+            {
+              "message": "webhook body {\"user\":\"bob\",\"password\":\"[redacted]\"}"
             }
           ],
           "findings": [
@@ -91,7 +102,7 @@ relish fault partition node-1 --one-way, then relish agent diagnose
       "name": "diagnose.json"
     },
     {
-      "content": "found this on node-1 at ipv4-1:\n-----BEGIN PRIVATE KEY-----[redacted]-----END PRIVATE KEY-----\nand the identity\nAGE-SECRET-KEY-1[redacted]\n",
+      "content": "found this on node-1 at ipv4-1:\n-----BEGIN PRIVATE KEY-----[redacted]-----END PRIVATE KEY-----\nand the identity\nAGE-SECRET-KEY-1[redacted]\npassword: \"[redacted]\"\napi-key: [redacted]\nexport secret=[redacted] TOKEN=[redacted]\nand the session eyJ[redacted] was refused\n",
       "format": "text",
       "name": "notes.txt"
     }
@@ -153,8 +164,8 @@ Addresses aliased; log lines left out. From `MANIFEST.json`, what went in and wh
 | field `reproducer` | 67 | yes | node_name 1 |
 | field `not_tested` | 34 | yes | none |
 | field `caught_how` | 74 | yes | none |
-| evidence `diagnose.json` | 818 | yes (2 log lines left out; pass --include-logs to keep them) | encrypted_value 1, env_value 2, hostname 3, ipv4_address 3, node_name 4, url_credentials 1 |
-| evidence `notes.txt` | 145 | yes | age_identity 1, ipv4_address 1, node_name 1, pem_private_key 1 |
+| evidence `diagnose.json` | 1038 | yes (3 log lines left out; pass --include-logs to keep them) | encrypted_value 1, env_value 2, hostname 3, ipv4_address 3, jwt 1, node_name 4, secret_key_value 3, url_credentials 1 |
+| evidence `notes.txt` | 278 | yes | age_identity 1, ipv4_address 1, jwt 1, node_name 1, pem_private_key 1, secret_key_value 4 |
 | evidence `payments.log` | 39 | no (a log file; pass --include-logs to add it) | none |
 | patch `fix.diff` | 169 | yes | reliaburger_token 1 |
 

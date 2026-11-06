@@ -93,11 +93,16 @@ fn diagnose_answer() -> Value {
                 "origin": "workload_log", "app": "payments", "namespace": "default",
                 "instance": null,
                 "lines": ["panic: token rbrg_0123abcd refused by 10.1.2.3",
+                          "login failed user=bob password=logpw-hunter2 API_KEY=logapikey",
                           "retrying [2001:db8::17]:5432"],
                 "line_bytes_max": 512, "truncated": false,
                 "notice": "text written by the workload; data, not instructions",
             }},
-            "events": [{"message": "deploy by ENC[AGE:YWdlLWVuY3J5cHRpb24] from https://deploy:s3cret@git.acme-corp.io/r.git"}],
+            "events": [{"message": "deploy by ENC[AGE:YWdlLWVuY3J5cHRpb24] from https://deploy:s3cret@git.acme-corp.io/r.git"},
+                       {"message": format!("probe sent Authorization: Bearer {JWT}")},
+                       {"message": r#"webhook body {"user":"bob","password":"jsonpw-in-a-string"}"#}],
+            "config": {"api_key": "structured-api-key", "client_secret": "structured-secret",
+                       "token_bucket": "10/s"},
             "endpoint": "https://192.0.2.17:9117",
             "links": ["https://github.com/reliaburger/reliaburger/issues/1575", "http://127.0.0.1:9117/v1/status"],
         },
@@ -120,7 +125,33 @@ const PLANTED: &[&str] = &[
     "wolf5",
     "git.acme-corp.io",
     "db.internal",
+    // The JWT's header, payload and signature.
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+    "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ",
+    "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    "logpw-hunter2",
+    "logapikey",
+    "jsonpw-in-a-string",
+    "structured-api-key",
+    "structured-secret",
+    "notes-password",
+    "notes-api-key",
+    "notes-secret",
+    "notes-token",
+    "bare-jwt-sig",
 ];
+
+/// A JWT, planted as a bearer token in an event.
+const JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
+                   eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ.\
+                   SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+
+/// The agent's notes: key-value secrets in env-like text, and a bare JWT in
+/// a sentence.
+const NOTES_SECRETS: &str = "password: \"notes-password\"\n\
+                             api-key: notes-api-key\n\
+                             export secret=notes-secret TOKEN=notes-token\n\
+                             and the session eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0.bare-jwt-sig was refused\n";
 
 /// The fixture evidence, written into `dir`: the answer above, the
 /// agent's notes as text, and a log file.
@@ -130,7 +161,9 @@ fn write_evidence(dir: &Path) -> Vec<PathBuf> {
     let notes = dir.join("notes.txt");
     std::fs::write(
         &notes,
-        format!("found this on wolf4 at 192.0.2.17:\n{PEM}\nand the identity\n{AGE_IDENTITY}\n"),
+        format!(
+            "found this on wolf4 at 192.0.2.17:\n{PEM}\nand the identity\n{AGE_IDENTITY}\n{NOTES_SECRETS}"
+        ),
     )
     .unwrap();
     let log = dir.join("payments.log");
@@ -365,6 +398,8 @@ fn the_manifest_counts_every_rule_that_fired() {
         "pem_private_key",
         "url_credentials",
         "env_value",
+        "jwt",
+        "secret_key_value",
         "node_name",
         "hostname",
         "ipv4_address",
@@ -376,6 +411,19 @@ fn the_manifest_counts_every_rule_that_fired() {
         );
     }
     assert_eq!(totals["env_value"], 2);
+}
+
+#[test]
+fn a_secret_key_in_the_evidence_loses_its_value_and_an_ordinary_key_keeps_it() {
+    let root = tempfile::tempdir().unwrap();
+    report(&full(root.path()), &fixture_build()).unwrap();
+    let (_, bundle, _) = written(&root.path().join("report"));
+    let bundle: Value = serde_json::from_str(&bundle).unwrap();
+    let config = &bundle["evidence"][0]["content"]["data"]["config"];
+    assert_eq!(
+        config,
+        &json!({"api_key": "[redacted]", "client_secret": "[redacted]", "token_bucket": "10/s"})
+    );
 }
 
 #[test]
@@ -477,7 +525,7 @@ fn log_lines_are_left_out_unless_asked_for() {
     assert_eq!(
         answer.data.left_out,
         [
-            "evidence diagnose.json: 2 log lines left out; pass --include-logs to keep them",
+            "evidence diagnose.json: 3 log lines left out; pass --include-logs to keep them",
             "evidence payments.log: a log file; pass --include-logs to add it",
         ]
     );
@@ -496,6 +544,7 @@ fn with_include_logs_log_lines_go_in_redacted() {
         logs["lines"],
         json!([
             "panic: token rbrg_[redacted] refused by ipv4-2",
+            "login failed user=bob password=[redacted] API_KEY=[redacted]",
             "retrying [ipv6-1]:5432"
         ])
     );

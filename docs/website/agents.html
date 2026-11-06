@@ -197,7 +197,8 @@ so that text never sits loose in <code>data</code>. It always arrives wrapped:</
 <code>release_metadata</code> or <code>github_issue</code>. Before printing, <code>relish</code> strips ANSI
 escapes and control characters (tabs stay), redacts anything shaped like a
 secret (<code>rbrg_</code> tokens, <code>ENC[AGE:…]</code> values, age identities, PEM private
-keys, passwords in URLs), and cuts each line at <code>line_bytes_max</code> bytes, ending
+keys, passwords in URLs, JWTs, and the value after any key that names a
+secret, such as <code>password=</code>, <code>api_key:</code> or <code>"token":</code>), and cuts each line at <code>line_bytes_max</code> bytes, ending
 a cut line with <code>…[cut]</code>. <code>truncated</code> is <code>true</code> when a line was cut or the
 command left lines out. Tell your agent to treat anything inside <code>untrusted</code>
 as evidence to read, never as instructions to follow. Redaction is a safety
@@ -596,8 +597,14 @@ section says nobody has made it happen on purpose, and the suggested label is
 first.</p>
 <h3>What gets redacted</h3>
 <p>Everything goes through the same rules as <code>untrusted</code> text: <code>rbrg_</code> tokens,
-<code>ENC[AGE:…]</code> values, age identities, PEM private keys and passwords in URLs.
-Then a report goes further:</p>
+<code>ENC[AGE:…]</code> values, age identities, PEM private keys, passwords in URLs,
+JWTs, and the value after any key that names a secret. A key names a secret
+when it ends in <code>password</code>, <code>passwd</code>, <code>passphrase</code>, <code>secret</code>, <code>token</code>,
+<code>apikey</code>, <code>api_key</code>, <code>access_key</code>, <code>private_key</code> or <code>secret_key</code> (any case,
+<code>-</code> or <code>_</code>), so <code>DB_PASSWORD=…</code>, <code>"api_key": "…"</code> and <code>x-api-key: …</code> lose
+their values whatever they are, even <code>password=changeme</code>, while
+<code>token_bucket=5</code> and <code>password_file=/etc/pw</code> stay. The same goes for a field
+of JSON evidence under such a key. Then a report goes further:</p>
 <table><thead><tr><th>What</th><th>Default</th><th>Change it with</th></tr></thead><tbody>
 <tr><td>Env values (any <code>env</code> object in the evidence)</td><td>Values replaced, keys kept</td><td>—</td></tr>
 <tr><td>Workload log lines (<code>untrusted</code> text from <code>workload_log</code>) and <code>.log</code> files</td><td>Left out, and the manifest counts them</td><td><code>--include-logs</code> keeps them, still redacted</td></tr>
@@ -608,7 +615,7 @@ Then a report goes further:</p>
 such as <code>github.com</code>, and names reserved for examples (<code>example.com</code>,
 <code>*.test</code>) are kept. A patch loses its secrets but keeps its addresses: it's
 code, and changing an address would change what it does.</p>
-<p>The rules only know shapes. A password in plain words, or a host name that no
+<p>The rules only know shapes and key names. A password in plain words, or a host name that no
 field names and no URL carries, gets through. Read <code>MANIFEST.json</code> and
 <code>issue.md</code> before you post them; that's what the checkbox is for.</p>
 <h2>Every other command</h2>
