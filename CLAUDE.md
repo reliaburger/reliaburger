@@ -90,6 +90,10 @@ Fixes and hardening update the existing chapter for that subsystem; they don't g
 | 0.2.7 | `19-built-for-agents.md` | "Built for Humans and Their Agents" |
 | — | `16-appendix-rust.md` | "Appendix: Rust for C, Python, and Go Programmers" |
 
+### 5. Keep the Line Busy
+
+The work runs as a factory line (maintainer, 6 November 2026). The Mac Studio is there only for this project: keep it at full load with builds, tests, soaks and parallel agents. The laptop session stays busy too, with what its smaller hardware can do. Whenever a piece of work finishes, start the next one that's ready; never sit idle. Independent issues run as parallel agents, each in its own worktree with its own `CARGO_TARGET_DIR`. The one exception is a release gate's soaks, which need a quiet Studio ([docs/releasing.md](docs/releasing.md)); fill that time with reviews, docs, planning and the laptop's work.
+
 ## Quality Standards
 
 - **Working**: Every feature must actually work, not just compile. If it's in the code, it's tested.
