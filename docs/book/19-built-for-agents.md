@@ -1277,3 +1277,115 @@ documentation that can skip the Rust jobs.
 - **PR caps in the repository.** GitHub can cap open pull requests from
   accounts without write access and exempt people with merged work, but those
   are repository settings for the maintainer, not files in a PR.
+
+## Checks a stranger can run
+
+Ask an agent to install Reliaburger on your laptop and it'll run the
+one-liner. Ask a careful agent and it'll first ask how it can tell the binary
+is ours. Until 0.2.7 the honest answer was "you can't, yet". Every binary
+carried a signature, but the key that checks it lives inside `relish` and
+`bun`: it proves an upgrade to a cluster that already trusts us, and proves
+nothing to someone who hasn't installed anything. The `SHA256SUMS` file sat
+right next to the binaries it described, on the same release page, so anyone
+who could swap one could swap the other.
+
+0.2.7 adds checks that need nothing from us (#1583). The first is a build
+provenance attestation for every file of a release. When the candidate job has
+recorded `candidate.json`, it runs GitHub's `attest-build-provenance` action
+over `dist/*`. For each file, GitHub's OIDC token gets Sigstore to issue a
+short-lived certificate saying "this is `build.yml` in
+`reliaburger/reliaburger`, at this commit, on `main`, run this", and the
+action signs a statement naming the file's SHA-256 with it. The statement goes
+to GitHub's attestation store and to Sigstore's public transparency log.
+Checking a download is then one command:
+
+```sh
+gh attestation verify ~/.reliaburger/bin/relish --repo reliaburger/reliaburger \
+  --signer-workflow reliaburger/reliaburger/.github/workflows/build.yml \
+  --source-ref refs/heads/main
+```
+
+The two flags at the end do most of the work. `--repo` alone would accept an
+attestation from any workflow in the repository, on any branch, and a release
+train is a branch anyone with push access can edit. Pinning the workflow file
+and `main` narrows it to the one job that builds releases.
+
+### Not changing the bytes
+
+The hard constraint was promotion's contract: it publishes exactly the files
+the gate qualified, and the gate records one SHA-256, that of `candidate.json`,
+which lists the digest and size of every other file. An attestation that
+lived next to the binaries, as a `.intoto.jsonl` file on the release page,
+would have had to be in `candidate.json` too, or `candidate.py`'s inventory
+check would refuse the candidate for having a file it didn't expect. Storing
+it outside the release solves that. The attestation names files by digest, so
+it describes `dist/` without being part of it.
+
+"It writes nothing to `dist/`" is a claim about someone else's action, though,
+and we don't take claims like that on trust. The step after the attestation
+runs `candidate.py verify` against the digest the record step has just
+printed. If the action ever left a file behind, or changed one, the candidate
+fails there, an hour before anyone stages it.
+
+Notarisation has the opposite problem. `codesign` rewrites the Mach-O file,
+appending a signature, so it changes the bytes, and so it has to come before
+anything hashes them. It gets a job of its own, `notarise-macos`, between the
+build and the candidate: it downloads `relish-macos-aarch64`, signs it with a
+Developer ID certificate, sends it to Apple's notary service and waits for an
+answer, then uploads the signed file under the same artefact name with
+`overwrite: true`. The candidate job, which collects `binaries-*`, never knows
+the difference, and the `.sig`, `SHA256SUMS`, the installer's pinned digest and
+`candidate.json` all describe the notarised file.
+
+That job can't run for real until the maintainer has an Apple Developer ID
+and adds five secrets, so the script has three outcomes. With none of the
+secrets it logs a notice that the binary is not notarised and succeeds, which
+is what every build does today. With all five it signs and notarises. With
+some but not all it fails, because half a configuration is a typo, not a
+decision. The tests run all three against stub `security`, `codesign`,
+`ditto` and `xcrun` commands that log their arguments: no secrets means no
+Apple tool is called and the binary's bytes don't change; a full set means
+`codesign` runs with `--options runtime --timestamp` before
+`notarytool submit --wait`, and the signed binary still runs afterwards; a
+rejection fetches Apple's log and fails. They prove our decisions and their
+order. Whether Apple says `Accepted` is something only a real build will tell
+us.
+
+### A tap, not a fork
+
+Homebrew users expect `brew install`. A third-party formula lives in a "tap",
+a Git repository named `homebrew-<something>`, so ours will be
+`reliaburger/homebrew-tap`, and its one formula is generated here from
+`relish.rb.in`. `homebrew.py formula` fills the template from a release's
+`candidate.json`, the same record promotion verified, so the formula pins the
+qualified digests without downloading or hashing anything itself. It refuses a
+record whose SHA-256 isn't the qualified digest, a nightly record, a
+pre-release tag, and a release missing one of the platforms in `PLATFORMS`, the
+dictionary `package.py` already uses to decide what to sign.
+
+`promote.yml` runs it in a separate job after the release is public. If the tap
+push fails, the release is still out and green; the tap job is the only thing
+that's red. `homebrew.py publish` clones the tap, writes `Formula/relish.rb`,
+commits and pushes, passing the token as an HTTP header rather than in the
+URL, so it never lands in `.git/config`. The tests push to a local bare
+repository standing in for the tap, and check that publishing the same
+formula twice leaves the history alone.
+
+The formula installs the CLI and nothing else. Homebrew upgrades `relish`; a
+cluster's nodes are still `relish upgrade`'s job, and the formula's caveats
+say so.
+
+### What we didn't do
+
+- **Attest nightly builds.** They're never a release, and the `main` ref
+  pin would refuse them anyway.
+- **Our own Sigstore keys, or cosign.** The attestation's identity is the
+  workflow, issued per run; there's no long-lived key to lose.
+- **Stapling.** Apple can staple a ticket to an app bundle, a disk image or
+  an installer package, not to a bare executable, so Gatekeeper checks a
+  notarised `relish` online the first time it runs.
+- **A formula for `bun`.** Nodes get `bun` from `relish setup` and upgrade it
+  with `relish upgrade`; a second way would only drift.
+- **Advertise `brew install` yet.** The tap repository doesn't exist until the
+  maintainer creates it, and no release has fed it. The docs say how; they
+  don't say it works.

@@ -299,7 +299,11 @@
           <div class="install-copy">
             <p>One line installs <code>relish</code>, then builds a three-node cluster of Linux
               VMs on your laptop, running real containers. Every download is checked against a
-              pinned digest or the release’s signing key. Got Linux machines already? Swap
+              pinned digest or the release’s signing key. From 0.2.7 (0.2.7, not in 0.2.6), you can
+              check any release file yourself, too:
+              <code>gh attestation verify FILE --repo reliaburger/reliaburger</code>, with the flags in
+              <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#build-provenance-attestations">the release guide</a>.
+              Got Linux machines already? Swap
               <code>--laptop</code> for <code>--install-only</code> to install just
               <code>relish</code>, then follow the
               <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md">Linux servers guide</a>.</p>

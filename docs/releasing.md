@@ -54,8 +54,10 @@ Native runners avoid depending on tools installed outside a cross-build
 container. Runner labels follow GitHub's
 [hosted runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 The initial Linux build baseline is Ubuntu 22.04. Compatibility with older
-systems is not promised. macOS builds are not yet Developer ID signed or
-notarised; don't equate an Actions build with clean-host acceptance.
+systems is not promised. From 0.2.7 a candidate's macOS `relish` is
+Developer ID signed and notarised once the maintainer has added the Apple
+secrets ([macOS notarisation](#macos-notarisation)); until then it isn't, and
+either way an Actions build is no substitute for clean-host acceptance.
 
 ## Merge trains and their CI
 
@@ -619,6 +621,130 @@ half. Keep an offline backup of the private key
 with the release key's. Losing it costs nothing that matters: generate a
 new pair, replace the secret and the line, and the next night uses it.
 
+## Checks a stranger can run
+
+The release key proves a binary to `relish` and `bun`, which carry its public
+half. Someone deciding whether to install Reliaburger at all, an agent among
+them, has neither, so from 0.2.7 a release carries two checks that need
+nothing from us, and a third way in
+([#1583](https://github.com/reliaburger/reliaburger/issues/1583)).
+
+### Build provenance attestations
+
+The candidate job of a manual build of `main` runs
+[`actions/attest-build-provenance`](https://github.com/actions/attest-build-provenance)
+over every file in `dist/` once `candidate.json` is recorded: each binary,
+`.sig`, PDF, guest image, `SHA256SUMS`, `install.sh`, both metadata files and
+`candidate.json` itself. Each gets a Sigstore-signed
+[SLSA provenance](https://slsa.dev/spec/v1.0/provenance) statement naming
+the file's SHA-256, the repository, `build.yml`, the commit and the run. Anyone
+can check one with the GitHub CLI, no account needed beyond `gh`'s own
+sign-in:
+
+```sh
+gh attestation verify relish-macos-aarch64 --repo reliaburger/reliaburger \
+  --signer-workflow reliaburger/reliaburger/.github/workflows/build.yml \
+  --source-ref refs/heads/main
+```
+
+`--signer-workflow` and `--source-ref` matter: without them, any workflow in
+the repository, on any branch, could have made the attestation. The
+installer's `--help` prints the same command for an installed
+`~/.reliaburger/bin/relish`.
+
+The attestation doesn't change what promotion publishes. It's stored in
+GitHub's attestation store (and, the repository being public, in Sigstore's
+public transparency log), keyed by each file's digest, never written into
+`dist/`. So `candidate.json` and the digest the gate records are what they'd
+have been without it, and the step after it, `candidate.py verify`, proves it
+on every build: an extra file or a changed byte fails the candidate there,
+before anything is uploaded. Promotion publishes the same bytes, so the
+attestations made at build time describe the published files exactly.
+
+A train's nightly build isn't attested: it's never a release, and
+`--source-ref refs/heads/main` would refuse it anyway.
+
+`promote.yml` runs the stranger's check itself before it creates the draft:
+every file of the downloaded candidate must verify with those flags. A
+candidate built before 0.2.7, or by anything but `main`'s `build.yml`, stops
+there, with no draft to clean up. The job reads attestations
+(`attestations: read`) and publishes nothing new.
+
+### macOS notarisation
+
+The `notarise-macos` job takes `relish-macos-aarch64` from the build, signs it
+with a Developer ID Application certificate (hardened runtime, secure
+timestamp, identifier `com.reliaburger.relish`), submits it to Apple's notary
+service, waits for `Accepted`, checks it still runs, and replaces the
+`binaries-macos-aarch64` artefact with the signed file. The candidate job
+waits for it, so everything that hashes or signs the binary sees the notarised
+bytes. [`notarise_macos.sh`](../scripts/release/notarise_macos.sh) does the
+work, in a throwaway keychain it deletes afterwards. A bare Mach-O file can't
+carry a stapled ticket, so Gatekeeper checks the notarisation online the first
+time it runs.
+
+It needs five secrets of the `release` environment, the same one that guards
+the release key:
+
+| Secret | What it holds |
+| --- | --- |
+| `APPLE_DEVELOPER_ID_P12` | base64 of a `.p12` holding the Developer ID Application certificate and its private key |
+| `APPLE_DEVELOPER_ID_P12_PASSWORD` | the password that `.p12` was exported with |
+| `APPLE_NOTARY_KEY` | base64 of an App Store Connect API key (`AuthKey_….p8`) with the Developer role |
+| `APPLE_NOTARY_KEY_ID` | that key's ID |
+| `APPLE_NOTARY_ISSUER_ID` | the issuer ID shown above the team's API keys |
+
+The maintainer sets them up once, from an Apple Developer Program membership:
+
+```sh
+base64 < developer-id.p12 | gh secret set APPLE_DEVELOPER_ID_P12 --env release
+gh secret set APPLE_DEVELOPER_ID_P12_PASSWORD --env release
+base64 < AuthKey_KEYID.p8 | gh secret set APPLE_NOTARY_KEY --env release
+gh secret set APPLE_NOTARY_KEY_ID --env release
+gh secret set APPLE_NOTARY_ISSUER_ID --env release
+```
+
+With none of them, the job logs a notice ("relish-macos-aarch64 is NOT
+notarised"), says so in the run summary and succeeds, leaving the binary as
+built; that's also every train's nightly build, since the `nightly`
+environment has no Apple secrets. With only some, it fails and names the
+missing ones. A rejected submission fails the build and prints Apple's log.
+
+### The Homebrew tap
+
+`brew install reliaburger/tap/relish` needs a repository named
+`reliaburger/homebrew-tap` holding `Formula/relish.rb`. This repository holds
+the formula's template, [`relish.rb.in`](../scripts/release/relish.rb.in),
+and its generator, [`homebrew.py`](../scripts/release/homebrew.py). The
+formula installs only the CLI, from the release's own `relish-*` assets at
+the digests `candidate.json` records, and says that `relish upgrade` still
+upgrades the cluster.
+
+`promote.yml`'s `homebrew-tap` job runs after publication, in a job of its own
+so a tap that fails to update never touches the release. It downloads the
+published `candidate.json`, refuses it unless its SHA-256 is the qualified
+digest, writes the formula, and pushes it as one commit, `relish 0.2.7`. A
+dry run needs no secrets:
+
+```sh
+gh release download v0.2.6 --repo reliaburger/reliaburger --pattern candidate.json
+python3 scripts/release/homebrew.py formula --record candidate.json
+```
+
+The maintainer does this once before the first release that should reach
+Homebrew:
+
+1. Create the public repository `reliaburger/homebrew-tap`, with a README so
+   it has a `main` branch.
+2. Create a fine-grained personal access token whose only repository is
+   `reliaburger/homebrew-tap`, with Contents read and write, and store it as
+   `HOMEBREW_TAP_TOKEN` in the `release` environment:
+   `gh secret set HOMEBREW_TAP_TOKEN --env release`.
+3. After the next promotion, check the commit in the tap, then
+   `brew install reliaburger/tap/relish` on a Mac and `relish --version`.
+
+Without the token, the job logs that the tap wasn't updated and succeeds.
+
 ## Metadata and publication
 
 Candidate building and release publication are separate manual operations.
@@ -684,7 +810,9 @@ candidate and requires an exact file inventory and matching lengths/hashes.
 It then uploads those unchanged files to a new draft, checks GitHub's stored
 asset digests and publishes. It neither compiles nor signs. An existing release
 refuses replacement; a failed upload/check leaves a draft for investigation,
-not an automatically repaired or overwritten release.
+not an automatically repaired or overwritten release. Before the draft, it
+checks every file's [build provenance attestation](#build-provenance-attestations);
+after publication, a separate job updates the [Homebrew tap](#the-homebrew-tap).
 
 The digest input must come from the qualification record. Copying a fresh digest
 from unqualified downloads defeats the gate. Workflow verification establishes

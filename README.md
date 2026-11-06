@@ -25,7 +25,9 @@ batch of jobs on it, breaks it and watches it heal. Five minutes is the target.
 
 0.2.6 was released on 6 November 2026, and the one-line installer fetches
 its signed binaries. You'll need a Mac with Apple silicon, or Linux with QEMU
-and KVM, plus about 8 GiB of free memory and 15 GiB of disk.
+and KVM, plus about 8 GiB of free memory and 15 GiB of disk. From 0.2.7
+(0.2.7, not in 0.2.6) you can check any release file yourself with
+`gh attestation verify` ([how](docs/releasing.md#build-provenance-attestations)).
 
 `--laptop` asks for a development cluster on this computer. Without a flag the
 installer only explains the choices, including clusters on Linux machines you
