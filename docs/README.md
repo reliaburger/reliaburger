@@ -802,7 +802,7 @@ flag.
 
 `relish agent` is the family for LLM agents: every command prints one
 `relish.agent/v1` JSON envelope within a byte budget, never prompts, and exits
-`0` whenever it answered. So far it has `guide` (the manual's agent chapter),
+`0` whenever it answered. It has `guide` (the manual's agent chapter),
 `version`, `schema`, `context` (the first call: findings, unknowns, faults,
 alerts, one line per app and the newest events), `diagnose` (`wtf`'s findings
 with their evidence and pointers into the manual and the source), `explain`
@@ -833,7 +833,12 @@ The chapter ends with the playbook an agent follows to set a cluster up for
 you, on this computer, on machines over SSH or in a cloud, with a cloud-init
 file that readies machines for `relish setup --ssh` and the rule that nothing
 paid is created without your yes. The homepage's install section has a "With
-your agent" tab with the one prompt that sends an agent there.
+your agent" tab with the one prompt that sends an agent there. Why it's built
+this way, the loop it serves (an agent finds a bug in the exact source,
+proves a fix, a human posts the report, we release, you upgrade) and what we
+chose not to do are in the whitepaper's [Built for Humans and Their
+Agents](whitepaper.md#17-built-for-humans-and-their-agents) and the book
+chapter of the same name ([chapter 19](book/19-built-for-agents.md)).
 
 Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select
 an exact supported chaos scenario. Omitting the filter runs all five, including

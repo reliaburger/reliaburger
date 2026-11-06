@@ -920,7 +920,7 @@ for years. Each of these is just a spec field, with its own tests.
 
 **Sidecars** ([#1120](https://github.com/reliaburger/reliaburger/issues/1120)).
 The whitepaper planned a `sidecar` field for v2
-([what's deliberately not included](../whitepaper.md#22-whats-deliberately-not-included)).
+([what's deliberately not included](../whitepaper.md#23-whats-deliberately-not-included)).
 The evidence says sidecars are one of the commonest reasons teams leave a
 simple orchestrator, so we're bringing them forward. A sidecar shares the
 parent's network namespace and lifecycle, starts before it and stops after it.
