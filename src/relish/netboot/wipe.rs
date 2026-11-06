@@ -384,10 +384,9 @@ impl DiskSession {
 
     /// True if a machine with this MAC or UUID was declined this session.
     pub fn is_declined(&self, client: &BootClient) -> bool {
-        self.declined.iter().any(|machine| {
-            (client.mac.is_some() && machine.mac == client.mac)
-                || (client.uuid.is_some() && machine.uuid == client.uuid)
-        })
+        self.declined
+            .iter()
+            .any(|machine| client.same_machine(machine))
     }
 }
 

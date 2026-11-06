@@ -465,7 +465,21 @@ pub fn decide(
 | used | no | no answer in 10 minutes | leave it alone |
 | used | no | no terminal (stdin isn't a TTY) | leave it alone |
 
-A disk that already holds Reliaburger OS never reaches the table: as before, the installer boots it.
+A disk that already holds Reliaburger OS never reaches the table: as before, the installer boots it. Unless the operator asked for a reinstall. Then the installer would boot the old system, because nothing told it otherwise, and `--reinstall` used to stop there. Now the install script adds `reliaburger.reinstall=1` to the command line, and the installer's "already installed" check steps aside, so the disk reaches the table as a used one: a yes or `--wipe`, never a silent wipe.
+
+That opened a loop. A machine whose firmware tries the network first, as CI's reinstall test sets up on purpose, would ask relish on every boot, and `--reinstall` would install it every time. So `HttpState` keeps the machines that fetched the installer during this run, and `--reinstall` applies to each machine once:
+
+```rust
+let reinstall = state.reinstall
+    && !state
+        .reinstalled
+        .lock()
+        .await
+        .iter()
+        .any(|machine| machine.same_machine(&client));
+```
+
+`same_machine` is the rule the declined list already used: the same MAC or the same UUID, and two machines that say nothing about themselves are never the same. It now lives on `BootClient`, and the declined list and the reinstall list both call it.
 
 #### Why a machine can't approve its own wipe
 

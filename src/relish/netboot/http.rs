@@ -49,8 +49,10 @@ pub struct HttpState {
     pub installed: Mutex<InstalledRecord>,
     /// When not empty, only these machines may install.
     pub allowed: Vec<MacAddress>,
-    /// Install again even on machines in the record.
+    /// Install again even on machines in the record, once each per run.
     pub reinstall: bool,
+    /// Machines that fetched the installer this run under `--reinstall`.
+    pub reinstalled: Mutex<Vec<BootClient>>,
     /// Machines whose used disk may be wiped without asking (`--wipe`).
     pub wipe: Vec<MacAddress>,
     /// Where questions for the operator go; `None` when stdin isn't a
@@ -101,13 +103,22 @@ async fn boot_script(
 ) -> Response {
     let client = query.client();
     let declined = state.disks.lock().await.is_declined(&client);
+    // `--reinstall` installs each machine once per run, not on every boot
+    // of a machine whose firmware tries the network first.
+    let reinstall = state.reinstall
+        && !state
+            .reinstalled
+            .lock()
+            .await
+            .iter()
+            .any(|machine| machine.same_machine(&client));
     let decision = {
         let record = state.installed.lock().await;
-        decide(&client, &record, &state.allowed, state.reinstall, declined)
+        decide(&client, &record, &state.allowed, reinstall, declined)
     };
     let (script, what) = match decision {
         BootDecision::Install => (
-            install_script(state.server, state.port, &client),
+            install_script(state.server, state.port, &client, reinstall),
             "install".to_string(),
         ),
         BootDecision::AlreadyInstalled => (
@@ -336,10 +347,22 @@ async fn remember(state: Arc<HttpState>, client: BootClient) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    if state.reinstall {
+        let mut reinstalled = state.reinstalled.lock().await;
+        if !reinstalled
+            .iter()
+            .any(|machine| machine.same_machine(&client))
+        {
+            reinstalled.push(client.clone());
+        }
+    }
     let result = state.installed.lock().await.remember(&client, now);
     match result {
         Ok(true) => (state.log)(format!(
             "http: {client} has the installer; it gets exit from now on (--reinstall to install again)"
+        )),
+        Ok(false) if state.reinstall => (state.log)(format!(
+            "http: {client} has the installer and is being installed again; it gets exit for the rest of this run"
         )),
         Ok(false) => {}
         Err(e) => (state.log)(format!("http: couldn't remember {client}: {e}")),
@@ -398,6 +421,7 @@ mod tests {
             installed: Mutex::new(InstalledRecord::load(&dir.path().join(RECORD_FILE)).unwrap()),
             allowed,
             reinstall,
+            reinstalled: Mutex::new(Vec::new()),
             wipe,
             operator,
             question_timeout,
@@ -577,9 +601,45 @@ mod tests {
     #[tokio::test]
     async fn reinstall_serves_the_install_script_to_installed_machines() {
         let f = fixture_with(vec![], true);
+        let earlier_run = BootClient::from_query(Some(MAC), None, None);
+        f.state
+            .installed
+            .lock()
+            .await
+            .remember(&earlier_run, 1)
+            .unwrap();
+        let (_, _, _, script) = get_path(&f.state, &boot_uri(MAC)).await;
+        let script = String::from_utf8(script).unwrap();
+        assert!(script.contains("installer.efi"), "{script}");
+        assert!(script.contains(" reliaburger.reinstall=1 "), "{script}");
+    }
+
+    /// A machine whose firmware tries the network first would otherwise
+    /// reinstall on every boot: `--reinstall` installs each machine once.
+    #[tokio::test]
+    async fn reinstall_installs_each_machine_once_per_run() {
+        let f = fixture_with(vec![], true);
+        let earlier_run = BootClient::from_query(Some(MAC), None, None);
+        f.state
+            .installed
+            .lock()
+            .await
+            .remember(&earlier_run, 1)
+            .unwrap();
         get_path(&f.state, &format!("/x86_64/installer.efi?mac={MAC}")).await;
         let (_, _, _, script) = get_path(&f.state, &boot_uri(MAC)).await;
-        assert!(String::from_utf8(script).unwrap().contains("installer.efi"));
+        assert_eq!(script, EXIT_SCRIPT.as_bytes());
+        let lines = f.lines.lock().unwrap().join("\n");
+        assert!(lines.contains("installed again"), "{lines}");
+    }
+
+    #[tokio::test]
+    async fn without_reinstall_the_install_script_keeps_reliaburger_on_disk() {
+        let f = fixture_with(vec![], false);
+        let (_, _, _, script) = get_path(&f.state, &boot_uri(MAC)).await;
+        let script = String::from_utf8(script).unwrap();
+        assert!(script.contains("installer.efi"), "{script}");
+        assert!(!script.contains("reliaburger.reinstall"), "{script}");
     }
 
     #[tokio::test]

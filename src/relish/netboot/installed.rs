@@ -55,6 +55,13 @@ impl BootClient {
         parts.join("&")
     }
 
+    /// True if `other` is this machine: the same MAC or the same UUID. Two
+    /// clients that say nothing about themselves aren't the same machine.
+    pub fn same_machine(&self, other: &BootClient) -> bool {
+        (self.mac.is_some() && self.mac == other.mac)
+            || (self.uuid.is_some() && self.uuid == other.uuid)
+    }
+
     fn describe(&self) -> String {
         let mac = self
             .mac
@@ -259,13 +266,23 @@ pub fn chain_script(server: Ipv4Addr, http_port: u16) -> String {
 /// installer refuses a used disk as it always did. The script never passes
 /// `reliaburger.wipe=1`: only the operator's yes or `--wipe` wipes a disk.
 ///
+/// With `reinstall` (`relish netboot --reinstall`) it adds
+/// `reliaburger.reinstall=1`. The installer then treats a disk that holds
+/// Reliaburger already like any other used disk, so it asks, rather than
+/// booting it.
+///
 /// Arguments to a UKI replace its built-in command line (Secure Boot
 /// off), so this passes the console too. `--autofree`: a failed attempt
 /// mustn't leave the installer registered, or iPXE hands it to the next
 /// try as an initrd.
-pub fn install_script(server: Ipv4Addr, http_port: u16, client: &BootClient) -> String {
+pub fn install_script(
+    server: Ipv4Addr,
+    http_port: u16,
+    client: &BootClient,
+    reinstall: bool,
+) -> String {
     let query = client.query();
-    let (query, ask) = if query.is_empty() {
+    let (query, mut ask) = if query.is_empty() {
         (String::new(), String::new())
     } else {
         (
@@ -273,6 +290,9 @@ pub fn install_script(server: Ipv4Addr, http_port: u16, client: &BootClient) -> 
             format!(" reliaburger.ask=http://{server}:{http_port}/disk?{query}"),
         )
     };
+    if reinstall {
+        ask.push_str(" reliaburger.reinstall=1");
+    }
     format!(
         "#!ipxe\n\
          # relish netboot: install Reliaburger on this machine.\n\
@@ -444,6 +464,7 @@ mod tests {
             Ipv4Addr::new(192, 168, 1, 20),
             8081,
             &client(Some(MAC), None),
+            false,
         );
         assert!(script.starts_with("#!ipxe\n"));
         assert!(script.contains("set base http://192.168.1.20:8081/${buildarch}\n"));
@@ -451,7 +472,7 @@ mod tests {
             "chain --autofree ${base}/installer.efi?mac=52:54:00:12:34:56 reliaburger.url=${base} reliaburger.ask=http://192.168.1.20:8081/disk?mac=52:54:00:12:34:56 console=tty0 console=${console},115200\n"
         ));
         assert!(script.contains("set console ttyAMA0 || set console ttyS0"));
-        let anonymous = install_script(Ipv4Addr::LOCALHOST, 8080, &BootClient::default());
+        let anonymous = install_script(Ipv4Addr::LOCALHOST, 8080, &BootClient::default(), false);
         assert!(anonymous.contains("${base}/installer.efi reliaburger.url="));
     }
 
@@ -463,6 +484,7 @@ mod tests {
             Ipv4Addr::new(192, 168, 1, 20),
             8081,
             &client(Some(MAC), Some(UUID)),
+            false,
         );
         assert!(
             script.contains(
@@ -473,8 +495,30 @@ mod tests {
         assert!(!script.contains("reliaburger.wipe"), "{script}");
         // With nothing to key the question on, there's no question: the
         // installer refuses a used disk, as it always did.
-        let anonymous = install_script(Ipv4Addr::LOCALHOST, 8080, &BootClient::default());
+        let anonymous = install_script(Ipv4Addr::LOCALHOST, 8080, &BootClient::default(), false);
         assert!(!anonymous.contains("reliaburger.ask"), "{anonymous}");
+    }
+
+    /// `--reinstall` tells the installer not to boot a disk that holds
+    /// Reliaburger already, so it asks about that disk like any used one.
+    /// It never skips the question: the script still has no wipe.
+    #[test]
+    fn a_reinstall_tells_the_installer_to_replace_reliaburger_too() {
+        let machine = client(Some(MAC), Some(UUID));
+        let again = install_script(Ipv4Addr::new(192, 168, 1, 20), 8081, &machine, true);
+        assert!(again.contains(" reliaburger.reinstall=1 "), "{again}");
+        assert!(!again.contains("reliaburger.wipe"), "{again}");
+        let first = install_script(Ipv4Addr::new(192, 168, 1, 20), 8081, &machine, false);
+        assert!(!first.contains("reliaburger.reinstall"), "{first}");
+    }
+
+    #[test]
+    fn a_machine_is_the_same_by_its_mac_or_its_uuid() {
+        let both = client(Some(MAC), Some(UUID));
+        assert!(both.same_machine(&client(Some(MAC), None)));
+        assert!(both.same_machine(&client(None, Some(UUID))));
+        assert!(!both.same_machine(&client(Some("52:54:00:00:00:02"), None)));
+        assert!(!BootClient::default().same_machine(&BootClient::default()));
     }
 
     #[test]
