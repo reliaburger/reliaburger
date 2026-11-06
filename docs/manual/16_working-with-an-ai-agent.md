@@ -8,8 +8,8 @@ another sends it chasing the wrong problem. `relish agent` is the family of
 commands built for it.
 
 This chapter grows through 0.2.7 as the commands arrive (#1090). Today it has
-the contract every one of them follows, `version`, `schema`, and the commands
-that read the source this binary was built from.
+the contract every one of them follows, `version`, `schema`, the commands
+that read the source this binary was built from, and `upgrade-check`.
 
 ## The contract
 
@@ -239,3 +239,57 @@ builds on its own with `cargo build --locked --bins`, and its tests run with
 
 On a development build, the source is the checkout the binary was built in, as
 it is now, and `data.origin` in `version` says so. Release builds embed it.
+
+## Before an upgrade
+
+`relish agent upgrade-check` answers one question: can this cluster take the
+latest release now? It reads the cluster and the release metadata, asks
+`relish wtf` what's wrong, and changes nothing.
+
+```sh
+relish agent upgrade-check
+```
+
+`data.verdict` is one of five words:
+
+| Verdict | Meaning |
+|---------|---------|
+| `ready` | A newer release exists and nothing stands in its way. `next` has the plan and the start command. |
+| `up_to_date` | Every node already runs the latest release or newer. |
+| `needs_fresh_cluster` | The release changes a cluster format, so it can't roll onto this cluster ([cluster compatibility](12_operations.md)). |
+| `blocked` | Something has to be fixed first. |
+| `unknown` | A question went unanswered, so no verdict is safe. |
+
+`data.reasons` says why, blockers first. Each reason has a `code`, a `kind`
+(`blocker`, `format_change` or `missing_evidence`), the `node` it's about when
+there is one, and a one-line `message`. The blockers are a `wtf` critical
+(`wtf_critical`), a council that would lose quorum restarting one member at a
+time (`quorum_risk`) or has no leader (`no_leader`), a node whose platform the
+release has no build for (`missing_artefact`), nodes already on different
+versions (`version_skew`), an upgrade already under way
+(`upgrade_in_progress`) and a dead node that would miss the roll
+(`node_down`). Missing evidence is the cluster or the metadata not answering,
+a node that didn't say its build, platform or formats, a version `relish`
+can't read, or `wtf` failing. It's never read as good news: `ready` needs
+every live node to have answered every question.
+
+`data.nodes` lists every node with its role, state, version, commit, platform
+and formats, and `artefact`, whether the release has a build for it.
+`data.latest` is the release: its version, formats and platforms.
+
+The release metadata is the only thing the command fetches from the network.
+`--url` points at another metadata host, and `--metadata` reads a file
+instead, for an air-gapped cluster or a test:
+
+```sh
+relish agent upgrade-check --metadata ./metadata.json
+```
+
+Notes the metadata publishes with the release arrive in `data.release_notes`,
+inside an `untrusted` envelope with origin `release_metadata`: the metadata
+host wrote them, not your cluster.
+
+The command answers with exit `0` whatever the verdict, and a cluster it
+couldn't reach is `unknown` with a `cluster_unreachable` reason, not an
+error. `relish upgrade check` is the same question for a person; this one
+adds the `wtf`, quorum and skew checks.

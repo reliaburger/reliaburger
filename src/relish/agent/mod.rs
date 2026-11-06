@@ -16,6 +16,7 @@ pub mod budget;
 pub mod envelope;
 pub mod source;
 pub mod untrusted;
+pub mod upgrade_check;
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -54,6 +55,9 @@ pub enum AgentCommand {
     },
     /// The source this binary was built from: search it, read it, extract it.
     Source(source::SourceOptions),
+    /// Whether the cluster can take the latest release: `ready`,
+    /// `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`.
+    UpgradeCheck(upgrade_check::UpgradeCheckArgs),
 }
 
 impl AgentCommand {
@@ -63,6 +67,7 @@ impl AgentCommand {
             AgentCommand::Version => CommandName::Version,
             AgentCommand::Schema { .. } => CommandName::Schema,
             AgentCommand::Source(options) => options.command.name(),
+            AgentCommand::UpgradeCheck(_) => CommandName::UpgradeCheck,
         }
     }
 }
@@ -103,6 +108,9 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
             rerun,
         ),
         AgentCommand::Source(source) => source::run(source, options.max_bytes, rerun).await,
+        AgentCommand::UpgradeCheck(args) => {
+            upgrade_check::run(args, options.max_bytes, rerun).await
+        }
     }
 }
 
@@ -190,6 +198,7 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::SourceGrep => Some(schema_of::<source::GrepData>()),
         CommandName::SourceShow => Some(schema_of::<source::ShowData>()),
         CommandName::SourceExtract => Some(schema_of::<source::ExtractData>()),
+        CommandName::UpgradeCheck => Some(schema_of::<upgrade_check::UpgradeCheckData>()),
     }
 }
 
@@ -397,13 +406,17 @@ mod tests {
 
     #[tokio::test]
     async fn schema_lists_the_envelope_and_every_answering_command() {
-        let rendered = run(&parse("agent schema").unwrap(), "relish agent schema").await;
+        // Every command's schema together outgrew the default budget when
+        // upgrade-check arrived; a trimmed answer says how to get the rest,
+        // and each command's own schema still fits (the test below).
+        let rendered = run(
+            &parse("agent schema --max-bytes 262144").unwrap(),
+            "relish agent schema",
+        )
+        .await;
         assert_eq!(rendered.exit, ExitStatus::Answered);
         let value = json_of(&rendered);
-        assert_eq!(
-            value["truncated"], false,
-            "the schema fits the default budget"
-        );
+        assert_eq!(value["truncated"], false);
         let names: Vec<&str> = value["data"]["commands"]
             .as_array()
             .unwrap()
@@ -419,7 +432,8 @@ mod tests {
                 "source tree",
                 "source grep",
                 "source show",
-                "source extract"
+                "source extract",
+                "upgrade-check"
             ]
         );
         let envelope = &value["data"]["envelope"];
@@ -428,6 +442,16 @@ mod tests {
             error_codes.to_string().contains("tls_untrusted"),
             "{error_codes}"
         );
+    }
+
+    #[tokio::test]
+    async fn each_command_schema_fits_the_default_budget() {
+        for command in CommandName::ANSWERING {
+            let line = format!("agent schema {}", command.as_str().replace(' ', "-"));
+            let rendered = run(&parse(&line).unwrap(), &format!("relish {line}")).await;
+            let value = json_of(&rendered);
+            assert_eq!(value["truncated"], false, "{line}");
+        }
     }
 
     #[tokio::test]
