@@ -38,6 +38,7 @@ pub mod k8s_import;
 pub mod local_context;
 pub mod manifest;
 pub mod manual;
+pub mod mcp;
 pub mod metrics_cmd;
 pub mod output;
 pub mod path_cmd;

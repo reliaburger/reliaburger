@@ -801,7 +801,11 @@ flag.
 `0` whenever it answered. So far it has `version`, `schema`, and `source`
 (`version`, `tree`, `grep`, `show` and `extract` over the code this binary was
 built from, with a warning when a node runs another commit); the commands that
-read the cluster arrive through 0.2.7. See
+read the cluster arrive through 0.2.7. `relish mcp` serves the read-only
+ones as MCP tools over stdio (`claude mcp add reliaburger -- relish mcp`),
+derived from the same definitions, with `--toolsets`, `--no-logs` and
+`--namespace` to narrow them; commands that write, build or reach past the
+cluster API aren't tools. See
 [Working with an AI agent](manual/16_working-with-an-ai-agent.md).
 
 Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select

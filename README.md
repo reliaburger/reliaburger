@@ -174,6 +174,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
     - `relish agent source grep <PATTERN>`: Search the source with a regular expression, line by line *(0.2.7, not in 0.2.6)*
     - `relish agent source show <TARGET>`: Print up to 400 numbered lines of one file: `path` or `path:from-to` *(0.2.7, not in 0.2.6)*
     - `relish agent source extract <DIR>`: Write the source into a new or empty directory, as a git repository when git is installed *(0.2.7, not in 0.2.6)*
+- `relish mcp`: Serve the `relish agent` commands as read-only MCP tools over stdio *(0.2.7, not in 0.2.6)*
 
 **Break things on purpose** ([chaos](docs/manual/05_chaos.md))
 

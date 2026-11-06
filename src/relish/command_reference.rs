@@ -153,7 +153,7 @@ pub const GROUPS: &[CommandGroup] = &[
             label: "working with an AI agent",
             path: "docs/manual/16_working-with-an-ai-agent.md",
         }],
-        commands: &["agent"],
+        commands: &["agent", "mcp"],
     },
     CommandGroup {
         title: "Break things on purpose",

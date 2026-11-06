@@ -35,6 +35,9 @@ serde_json = "1"
 # JSON Schema for `relish agent schema` (#1565), derived from the same serde
 # types the commands print, so the schema can't drift from the output.
 schemars = "1"
+# `relish mcp` (#1094): the official Model Context Protocol SDK, server side
+# over stdio only. No HTTP transport feature, so there's no listener to open.
+rmcp = { version = "3.9", default-features = false, features = ["server", "transport-io"] }
 yaml_serde = "0.10"
 semver = "1"
 thiserror = "2"

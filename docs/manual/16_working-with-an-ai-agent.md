@@ -8,8 +8,9 @@ another sends it chasing the wrong problem. `relish agent` is the family of
 commands built for it.
 
 This chapter grows through 0.2.7 as the commands arrive (#1090). Today it has
-the contract every one of them follows, `version`, `schema`, and the commands
-that read the source this binary was built from.
+the contract every one of them follows, `version`, `schema`, the commands
+that read the source this binary was built from, and `relish mcp`, which
+offers the read-only ones to an MCP client as tools.
 
 ## The contract
 
@@ -239,3 +240,62 @@ builds on its own with `cargo build --locked --bins`, and its tests run with
 
 On a development build, the source is the checkout the binary was built in, as
 it is now, and `data.origin` in `version` says so. Release builds embed it.
+
+## Through MCP
+
+An agent whose client speaks [MCP](https://modelcontextprotocol.io) (the
+Model Context Protocol) can call the same commands as tools instead of
+running them in a shell. `relish mcp` is that server. The client starts it
+and talks to it over stdin and stdout; it opens no port. In Claude Code:
+
+```sh
+claude mcp add reliaburger -- relish mcp
+```
+
+It uses the same connection as every other `relish` command: `--endpoint`,
+`--token`, `--ca-cert`, their environment variables, or the saved local
+context. Put the flags before `mcp`, as in `relish --token "$TOKEN" mcp`.
+Give it a read-only token; `bun` decides what the token may read, and the
+server can't get round that.
+
+Every `relish agent` command that only reads becomes a tool, named after it
+with `_` between the words: `version`, `schema`, `source_version`,
+`source_grep`, `manual_search`, `logs` and so on. A tool's arguments are the
+command's flags and positionals, by their long names with `_` (`max_bytes`,
+`ignore_case`), and its answer is the command's envelope, as text and as
+`structuredContent`. A failure comes back marked `isError`, with the envelope
+saying why. Each tool's output schema is the command's `relish agent schema`.
+To see the list without a client:
+
+```sh
+relish mcp --list
+```
+
+Some commands aren't tools, on purpose:
+
+| Command | Why not |
+|---------|---------|
+| `source extract` | Writes the source tree into a local directory |
+| `report` | Writes a report bundle into local files, for a human to post |
+| `patch` | Builds binaries and starts a throwaway cluster |
+| `upgrade-check` | Fetches release metadata from the internet, beyond the cluster API |
+| `setup` | Writes your agents' configuration |
+
+Run those yourself, or let the agent run them in a shell where you approve
+each one. `relish mcp` reads private cluster state and text workloads wrote,
+so it must never also be able to change anything or send anything out.
+
+Three flags narrow what it offers:
+
+| Flag | Meaning |
+|------|---------|
+| `--toolsets source,manual` | Only the tools whose command starts with one of these words |
+| `--no-logs` | No tool whose answer can carry text a workload wrote (log lines, event messages) |
+| `--namespace payments` | Fix the `namespace` argument of every tool that takes one |
+
+```sh
+relish mcp --toolsets source,manual --no-logs
+```
+
+`--namespace` narrows what the agent asks for. It isn't a permission: a
+token scoped to the namespace is.
