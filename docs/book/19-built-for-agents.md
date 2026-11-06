@@ -2667,6 +2667,8 @@ rest:
 | `plugins/reliaburger/skills/reliaburger/SKILL.md` | The summary (as the description), the brief and the command table |
 | `plugins/reliaburger/.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` | The summary and the version |
 | `plugins/reliaburger/.mcp.json` | `relish mcp`, from the same constant `relish agent setup` registers |
+| `docs/website/.well-known/agent-skills/` | A copy of the skill and an index with its digest (#1582, below) |
+| `server.json` | `relish mcp`'s MCP Registry entry, with its tool list (#1582, below) |
 | `AGENTS.md`, one marked block | The chapter's rules for agents, then the brief |
 | The chapter's own command table | The clap definition of `relish agent` |
 
@@ -2806,6 +2808,66 @@ skill is loaded into a model and never read by a person, so nobody would
 notice when it went stale. The manual chapter is read by people, compiled
 into the binary, and its snippets are tested. Make the file people read the
 source, and the files only machines read follow it.
+
+### Markdown beside every page, a skills index and a registry entry
+
+[#1582](https://github.com/reliaburger/reliaburger/issues/1582) adds three
+more doors. Stripe and [Temporal](https://docs.temporal.io/with-ai.md) serve a
+`.md` copy of every page, and the [llms.txt proposal](https://llmstxt.org/)
+suggests the same, so an agent reads words instead of scraping layout. Our
+pages are hand-written HTML, so the copies have to come from the HTML, and
+they have to be generated, or the first homepage edit leaves them behind.
+
+`tests/suite/website_markdown.rs` parses each page with
+[htmd](https://github.com/letmutex/htmd), a Rust port of turndown.js, keeps
+`<main>`, and prunes the DOM before converting it: no scripts, SVG, buttons
+or navigation, nothing `aria-hidden`, none of the `#` permalinks after the
+headings. It also resolves every link against the page's published URL, so
+`../#install` in `compare/nomad.md` becomes `https://reliaburger.com/#install`
+and still works when the copy is pasted somewhere else. The test fails while
+a copy on disk differs from what its page makes, and `make agent-docs` writes
+them, as it does the chapter's files. htmd is a dev-dependency: nothing that
+ships parses HTML.
+
+Pruning means changing the parsed tree in place, which is where Rust's
+`RefCell` shows up. A node's children sit in a `RefCell<Vec<Rc<Node>>>`:
+`Rc` because a node is shared between its parent and anyone walking the
+tree, and `RefCell` because `Rc` only hands out shared references, which
+normally can't mutate anything. `borrow_mut()` checks at run time, not at
+compile time, that nobody else holds a borrow, and panics if someone does.
+That's why `prune` clones the child list (cheap: it copies `Rc` pointers)
+before recursing, instead of holding the `borrow()` open while it edits
+grandchildren.
+
+The skills index follows Cloudflare's
+[Agent Skills Discovery RFC](https://github.com/cloudflare/agent-skills-discovery-rfc),
+version 0.2.0: `/.well-known/agent-skills/index.json` lists each skill's
+name, type, description, URL and the SHA-256 of its bytes, which an
+installer checks before it trusts the download. `generate` writes a byte
+copy of the plugin's `SKILL.md` under `.well-known` and computes the digest
+from the same string, so they can't disagree. One trap: the Pages workflow's
+`upload-pages-artifact@v3` packs dot-directories, but v4 skips them unless
+`include-hidden-files` is set, and the index would quietly vanish. A test
+pins that.
+
+The MCP Registry entry was the one where honesty cost something. The
+[registry](https://modelcontextprotocol.io/registry/package-types) only
+installs from npm, PyPI, NuGet, crates.io, an OCI registry or an MCPB bundle
+on a GitHub release, and `relish` is none of those: it's a signed binary
+fetched by `install.sh`. We could have called the release binary an MCPB
+bundle, since the registry only checks that the URL says `mcp`, but a client
+that unpacked it would find no manifest. So `server.json` has no `packages`.
+It names the server, and its publisher-provided `_meta` says it's stdio,
+read-only, started as `relish mcp`, with the tool list taken from the same
+`tools::derive` the server runs. A test validates it against the registry's
+schema, vendored in `tests/fixtures/mcp-registry/`, and another checks the
+tool list against what `relish mcp` really serves.
+
+What we didn't do: "Copy as Markdown" and "Open in Claude" buttons, which
+would add a script while #1578 reworks the pages; content negotiation on
+`Accept: text/markdown`, which GitHub Pages can't do; and real MCPB bundles,
+which belong in release packaging, not in a docs change. Publishing to the
+registry needs the maintainer's GitHub login, so it waits for them.
 
 ## Tools for any agent: `relish mcp`
 

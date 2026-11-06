@@ -183,8 +183,10 @@ ci-bench: ci bench ## Run the portable CI checks, then the 5-250 node gossip ben
 readme-commands: ## Regenerate the relish command list in README.md from the CLI definition
 	RELIABURGER_UPDATE_README=1 $(CARGO) test --bin relish readme_command_list_matches_the_cli
 
-agent-docs: ## Regenerate llms.txt, the /agents page, the skill, the plugin and AGENTS.md's block from the manual's agent chapter
-	RELIABURGER_UPDATE_AGENT_DOCS=1 $(CARGO) test --test suite agent_docs::every_agent_facing_file_matches_the_chapter
+agent-docs: ## Regenerate the agent-facing files from the manual's agent chapter, and every website page's Markdown copy
+	RELIABURGER_UPDATE_AGENT_DOCS=1 $(CARGO) test --test suite -- --exact \
+		agent_docs::every_agent_facing_file_matches_the_chapter \
+		website_markdown::every_page_has_a_current_markdown_copy
 
 # --- Fuzzing (#1398) ---
 #
