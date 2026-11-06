@@ -75,6 +75,7 @@ class AskToWipe(unittest.TestCase):
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         port = self.server.server_address[1]
         self.ask = f"http://127.0.0.1:{port}/disk?mac=52:54:00:42:00:21&uuid=4c4c4544-0042"
+        self.screen = Path(self.tmp.name) / "tty1"
 
     def tearDown(self):
         self.server.shutdown()
@@ -89,6 +90,7 @@ class AskToWipe(unittest.TestCase):
             LSBLK_ARGS=str(Path(self.tmp.name) / "lsblk-args"),
             RELIABURGER_ASK_POLL="0.05",
             RELIABURGER_ASK_TIMEOUT=timeout,
+            RELIABURGER_SCREEN=str(self.screen),
         )
         return subprocess.run(
             ["bash", str(SCRIPT), self.ask, "/dev/vda"],
@@ -146,6 +148,34 @@ class AskToWipe(unittest.TestCase):
         self.ask = "http://127.0.0.1:9/disk?mac=52:54:00:42:00:21"
         done = self.run_ask(timeout="1")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+
+    def test_every_line_also_goes_to_the_screen(self):
+        # The console is the serial port, which a Wyse 3040 doesn't have, so
+        # the operator at its monitor reads the screen copy.
+        self.server.answers = ["wait", "wipe"]
+        done = self.run_ask()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("wipe? [y/N]", self.screen.read_text())
+        self.assertEqual(self.screen.read_text(), done.stdout)
+
+    def test_a_screen_it_cannot_write_changes_nothing(self):
+        self.screen = Path(self.tmp.name) / "no-such-dir" / "tty1"
+        self.server.answers = ["wipe"]
+        done = self.run_ask()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(done.stderr, "")
+
+    def test_the_installer_says_things_the_same_way(self):
+        def say_lines(script):
+            return [
+                line
+                for line in script.read_text().splitlines()
+                if line.startswith(("say()", "screen="))
+            ]
+
+        installer = SCRIPT.with_name("install")
+        self.assertEqual(len(say_lines(SCRIPT)), 2)
+        self.assertEqual(say_lines(installer), say_lines(SCRIPT))
 
 
 if __name__ == "__main__":

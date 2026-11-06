@@ -23,7 +23,10 @@
 # instead of being reinstalled.
 set -euo pipefail
 
-say() { echo "reliaburger-install: $*"; }
+# The console is the last console= on the command line, the serial port, and
+# a Wyse 3040 has none, so each line goes to the screen as well.
+screen=${RELIABURGER_SCREEN:-/dev/tty1}
+say() { echo "reliaburger-install: $*"; echo "reliaburger-install: $*" 2>/dev/null >>"$screen" || true; }
 fail() {
     say "FAILED: $*"
     exit 1

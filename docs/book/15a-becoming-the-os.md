@@ -233,6 +233,15 @@ chain --autofree ${base}/installer.efi reliaburger.url=${base} console=tty0 cons
 
 Arguments given to a UKI replace its built-in command line (with Secure Boot off, which it is on the Wyse fleet), which is why this line repeats the console settings. `reliaburger.url=` tells the installer where the image lives.
 
+Two `console=` arguments don't make two equal consoles. The kernel prints its own messages to both, but `/dev/console`, where a service's `StandardOutput=console` goes, is the last one named: the serial port. Every CI test reads that port, so it stays last. A Wyse 3040 has no serial port, though, and its monitor would show the kernel booting and then nothing while the installer worked. So the installer's `say` writes each line twice, once to its output and once to `/dev/tty1`, the screen:
+
+```bash
+screen=${RELIABURGER_SCREEN:-/dev/tty1}
+say() { echo "reliaburger-install: $*"; echo "reliaburger-install: $*" 2>/dev/null >>"$screen" || true; }
+```
+
+Bash applies redirections left to right, so `2>/dev/null` is already in place when `>>"$screen"` fails on a machine with no screen, and the error message goes nowhere; `|| true` keeps `set -e` from ending the install over it. `ask-to-wipe` carries the same two lines, and a test checks that the two scripts still match.
+
 ### `relish netboot`: three servers and one rule
 
 `relish netboot os` replaces dnsmasq, Python's `http.server` and the script gluing them together. It's three small servers in `src/relish/netboot/`: a ProxyDHCP on UDP 67 and 4011, a read-only TFTP server on UDP 69, and HTTP through axum on 8080. They share one rule: **nothing is served until it's checked.** At start-up, `artefacts::load` verifies each architecture's `SHA256SUMS` signature against the release keys, then hashes every file it lists, and refuses to start if anything is off. A netboot server that hands out an unverified file installs it on every machine that asks, so a refusal is the friendly outcome.
