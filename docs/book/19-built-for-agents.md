@@ -454,8 +454,8 @@ Until this release the codebase had one redaction function,
 `redact_secrets` in `src/bun/audit.rs`, and it knew one thing: Reliaburger's
 own tokens, which all start `rbrg_`. That was enough for audit records,
 whose handlers never put a secret in a record anyway. It isn't enough for
-text an agent will keep in its transcript, or (later in 0.2.7) a bug report a
-human pastes into a public GitHub issue.
+text an agent will keep in its transcript, or a bug report (`relish agent
+report`, later in this chapter) a human pastes into a public GitHub issue.
 
 So the function moved to `src/redact.rs` and grew. Why the crate root and not
 `sesame`, our security subsystem? `sesame` is identity and keys: CAs,
@@ -1442,6 +1442,411 @@ had duplicated. And searching the source for the deciding line, instead of
 recording it, turned "keep the docs in step" from a chore into a test that
 fails.
 
+## Logs and the manual
+
+An agent chasing a crash loop wants two more things after the source: what
+the app said, and what the manual says about it. [#1573](https://github.com/reliaburger/reliaburger/issues/1573)
+adds both:
+
+| Command | Answers |
+|---|---|
+| `logs APP [--since 15m] [--tail 200]` | The newest lines in a window, each group wrapped as `untrusted`, and a summary of what was left out |
+| `manual search WORDS…` | Up to ten sections that mention every word, with an excerpt and the command that shows each |
+| `manual show CHAPTER[#ANCHOR]` | One chapter, or one section of it, as Markdown |
+
+### Always a window, never the capture
+
+`relish logs` has two places to look. The log store (Ketchup) records each
+line with its time, node, instance and stream. Each node also keeps its own
+capture of an app's output, which records only the text. When the store has
+nothing, `relish logs` falls back to the capture, and for an unwindowed read
+that's a fine fallback. For a windowed one it was a bug:
+[#1515](https://github.com/reliaburger/reliaburger/issues/1515) found that
+`--since 5m` on a quiet app printed lines from an hour ago, because the
+capture can't tell old from new. [#1542](https://github.com/reliaburger/reliaburger/pull/1542)
+settled the rule: a windowed read never asks the capture.
+
+`relish agent logs` always has a window (`--since 15m` unless told otherwise),
+so it never asks the capture at all. It doesn't go through `log_lines`, the
+function behind `relish logs`, either. That function treats a store it
+couldn't reach as "no lines" and moves on to the capture, which is right for
+a person, who'll see the error from the second attempt, and wrong for an
+agent, which would read an unreachable cluster as a quiet app. So the client
+grew a second method, `log_query`, that asks the store and only the store,
+and returns its errors. An unreachable cluster comes back as `unreachable`
+with exit 3; an empty window comes back as `ok: true` with no lines and a
+`next` step suggesting a wider one.
+
+A test holds the rule. It starts an axum server that answers the store's query
+with nothing and counts every request to the capture endpoint, runs the
+command against it, and checks the count is zero, that the capture's line is
+nowhere in the output, and that the query carried `start=` and `tail=201`.
+
+### One more than you asked for
+
+Why 201? The store applies `tail` itself, so if you ask for 200 and get 200,
+you can't tell "exactly 200 lines" from "200 of thousands". Asking for one
+more answers that for the price of one line: 201 back means there were
+more, so the command drops the oldest and sets `summary.more_than_tail`.
+
+### The newest lines win
+
+The byte budget from the start of this chapter could trim the answer on its
+own: it drops items from the end of the biggest array. For logs, that's the
+wrong end. Lines are oldest first, because that's how people read them, and
+the budget would drop the newest, which are the ones that explain why the app
+is crashing *now*. Reversing the order would fix the budget and annoy every
+reader.
+
+So `logs` fits itself to the budget before the budget has to. It asks how many
+of the newest lines fit, and the answer comes from a new helper in
+`src/relish/agent/fit.rs`:
+
+```rust
+pub fn largest_that_fits(total: usize, fits: impl Fn(usize) -> bool) -> Option<usize> {
+    if !fits(0) {
+        return None;
+    }
+    let (mut low, mut high) = (0, total);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if fits(middle) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Some(low)
+}
+```
+
+It's a binary search, and the interesting part for a C or Go reader is the
+parameter type. `impl Fn(usize) -> bool` means "any closure that takes a
+`usize` and returns a `bool`". Each closure in Rust has its own anonymous
+type, and `impl Fn` makes the compiler generate a copy of
+`largest_that_fits` for each one, so the call costs no more than a direct
+function call (Go would box it into a `func` value; C would want a function
+pointer and a `void *` for its state). `Fn`, rather than `FnMut` or `FnOnce`,
+promises the closure only reads what it captured, so calling it several
+times is safe. `div_ceil` divides rounding up, which keeps `middle` above
+`low`, so the loop can't stall.
+
+The closure `logs` passes builds the whole envelope with that many lines,
+serialises it and compares its length with `--max-bytes`. That's eight or so
+full renders of a 200-line answer, a few milliseconds, and it's exact: no
+estimating how many bytes JSON escaping adds to a line full of quotes.
+`manual show` uses the same helper to cut a long section at a line rather
+than mid-word.
+
+Having done the cutting, the command has to say so, because an agent that
+doesn't know lines are missing will reason confidently from the ones it has.
+`data.summary` closes every answer:
+
+```json
+"summary": {"lines": 34, "truncated": true, "more_than_tail": true,
+            "dropped_for_budget": 16, "lines_cut": 1,
+            "dropped_before": "2026-11-06T09:52:10Z", "nodes_queried": 3}
+```
+
+The envelope's own `truncated` is `true` when the budget forced a cut, through
+a new `Envelope::mark_truncated`, and `next` carries two commands: the same
+query with `--until` at the oldest line shown, which pages backwards, and the
+`--max-bytes` that would fit everything.
+
+### Grouping lines, and `chunk_by`
+
+Every line is workload text, so every line has to sit inside an `untrusted`
+object. One object per line would cost about 250 bytes of wrapper each (the
+`origin`, the `notice`, the app and the instance), which at the default budget
+leaves room for barely 60 short lines. One object for all of them would lose
+each line's time and instance. The compromise is one object per run of lines
+that share a second, a node, an instance and a stream. A chatty app writing
+fifty lines a second gets one wrapper for all fifty, and every line still
+says when and where it came from, to the second.
+
+The slice method `chunk_by` does the grouping:
+
+```rust
+shown
+    .chunk_by(|left, right| key(left) == key(right))
+    .map(|run| { /* one LogLines per run */ })
+```
+
+It walks the slice and starts a new chunk wherever the closure says two
+neighbours differ. Each `run` it hands over is a `&[LogEntry]`, a borrowed
+window into the original slice rather than a copy: Rust's slices are a
+pointer and a length, like Go's, and taking a sub-slice allocates nothing.
+`Untrusted::with_line_bytes_max` then cleans, redacts and caps the run's
+lines as one text, so a private key logged over several lines is still one
+PEM block to the redaction rules.
+
+### Why not JSON Lines
+
+The research note and the issue described `logs` as JSON Lines: one object
+per line, then a summary line. We print one envelope instead, with the lines
+in `data.entries` and the summary in `data.summary`. The command doesn't
+follow (there's no `--follow`), so it isn't a stream, and every other
+`relish agent` command prints exactly one document. Keeping `logs` the same
+means the budget, the error codes, `relish agent schema` and the coming
+`relish mcp` all treat it like any other command. `relish logs -o json` is
+still JSON Lines for scripts that want one line per record.
+
+### Sections and anchors
+
+The manual is compiled into `relish` already, for `relish manual`'s TUI. The
+agent commands read the same chapters but cut them into sections: a heading
+and everything up to the next heading at its level or above. Each section
+gets the anchor GitHub would give its heading (lower case, spaces to `-`,
+punctuation dropped, a repeat numbered `-1`), so
+`` `relish wtf`: what's broken and why `` becomes
+`relish-wtf-whats-broken-and-why`. An agent that quotes
+`relish agent manual show diagnostics#relish-wtf-whats-broken-and-why` to a
+human has also named the place on GitHub.
+
+The scan that finds headings is a line loop with one piece of state, whether
+it's inside a fenced code block, because a `# start the node` comment in a
+shell example starts with `#` too. Its `match` is worth a look:
+
+```rust
+match (fence, marker) {
+    (None, Some(marker)) => fence = Some(marker),
+    (Some(open), Some(marker)) if open == marker => fence = None,
+    (None, None) => { /* maybe a heading */ }
+    _ => {}
+}
+```
+
+Matching on a tuple checks two things at once, and the `if` after a pattern
+is a *match guard*: the arm applies only when the condition holds too, so a
+`~~~` line inside a backtick fence falls through to `_` and changes nothing.
+The compiler checks that the arms cover every case, and the `_` makes the
+"anything else" case explicit.
+
+Dispatch picked up a pattern of its own. `source` was the only two-word
+family of commands, and now `manual` is another:
+
+```rust
+Some(family @ ("source" | "manual")) => match words.next() {
+    Some(word) => format!("{family}-{word}"),
+    None => return CommandName::Agent,
+},
+```
+
+`family @ pattern` binds whatever matched the pattern to a name, so one arm
+handles both families and still knows which one it saw.
+
+### Searching without an index
+
+`search` lower-cases the words and keeps the sections that mention every one
+of them. A word in the heading scores ten, one in the text scores one, and the
+whole phrase earns a bonus, so `search rolling deploy` puts "Rolling deploys"
+above a section that mentions both words once in passing. The top ten come
+back, each with a two-line excerpt (the line that mentions most of the words,
+and the next one) and its `show` command, and `total_hits` says how many
+there were in all.
+
+That's crude next to BM25 or embeddings, and on purpose. The manual is 380 KB;
+scanning all of it takes about a millisecond, needs no index to keep in step
+with the text, and gives the same answer every time, which a snapshot test
+can pin. The agent on the other end is a language model. Given ten decent
+candidates and their headings, it's better at picking the right one than any
+ranking we'd write.
+
+### The tests
+
+Both commands are plain functions over their inputs, so the snapshots never
+touch a cluster or the real manual. `logs` has a snapshot of a small answer
+(two instances, both streams, two lines sharing an entry) and of one cut
+three ways, by `--tail`, the budget and `--line-bytes`, with a node that timed
+out. Unit tests check the defaults (15 minutes, 200 lines, 512 bytes, 201
+asked for), that bad flags are `usage` failures, that an injection and a
+token in a coloured line come out inside `untrusted`, cleaned and redacted,
+and nowhere else, that every answer fits budgets from 1 KiB to 200 KiB
+without losing count of a line, and that the paging command names the oldest
+line shown. Two tests against a fake node check the capture rule and that an
+unreachable cluster is a failure.
+
+`manual` has snapshots of a search and of a section with a subsection. Unit
+tests pin the anchors against GitHub's, the fence rule, the ten-hit cap, the
+chapter names `show` accepts, the `not_found` hints, a long section cut at a
+line with `next` pointing past the cut, and that every hit's `show` command
+prints that hit. One test reads the real manual: every chapter parses, no two
+sections in a chapter share an anchor, and a search and a `show` of a real
+section answer.
+
+### What we didn't do
+
+- **`--follow`.** A stream doesn't fit a budget, and an agent polling with
+  `--since` gets the same lines without holding a connection open.
+- **Stemming or fuzzy search.** `deploy` finds `deploys` because it's a
+  substring; `deployment` doesn't find a section that only says `deploy`. The
+  excerpt and `total_hits` make a miss obvious, and the agent tries another
+  word.
+- **`manual list`.** A wrong chapter name answers with every chapter's name,
+  and `relish agent guide` (#1090) is the place to start.
+
+### Lessons
+
+The budget is a safety net, not a design. It keeps any answer valid and
+bounded, but it doesn't know which half of a log matters. A command that
+knows its data should fit itself, and then say, in fields an agent can't
+miss, exactly what it left out.
+
+## Can it roll?
+
+Ask `relish upgrade check` whether to upgrade and it compares two version
+numbers, checks the release has a build for each node's platform, and says
+`available`. That's a fine answer for a person, who knows the payments app
+has been crash looping since lunch and that one of the three council members
+died on Tuesday. An agent doesn't know either of those things unless
+something tells it. Hand it `available` and it'll suggest `relish upgrade
+start` on a cluster where restarting the next council member loses quorum.
+
+`relish agent upgrade-check` (#1576) answers the question an agent actually
+needs answered: can this cluster take the latest release now? It reads the
+release metadata, each node's build through the entry node's relay, the
+upgrade state and a full `relish wtf` diagnosis, and turns them into one of
+five verdicts:
+
+```json
+{"verdict": "blocked",
+ "reasons": [
+   {"code": "node_down", "kind": "blocker", "node": "node-3",
+    "message": "node-3 is dead; it would miss the roll and come back on its old version"},
+   {"code": "quorum_risk", "kind": "blocker", "node": null,
+    "message": "2 of 3 council members are up; restarting one at a time leaves 1, and quorum needs 2"},
+   {"code": "wtf_critical", "kind": "blocker", "node": null,
+    "message": "relish wtf: payments is crash looping (crash-loop, app/default/payments)"}],
+ "latest": {"version": "v0.2.7", "formats": {"protocol": 57, "state": 74},
+            "platforms": ["linux-aarch64", "linux-x86_64"]},
+ "nodes": ["…"], "metadata": "https://github.com/…/metadata.json", "release_notes": null}
+```
+
+`ready`, `up_to_date`, `needs_fresh_cluster` and `blocked` are the four the
+issue asked for, plus `unknown`. We added `up_to_date` because `ready` for a
+cluster with nothing to upgrade would send an agent off to run `relish
+upgrade start` for no reason.
+
+### Never `ready` on missing evidence
+
+The rule that shaped the code is that silence is never good news. A node
+that didn't answer, a node that didn't say its platform, a release whose
+metadata doesn't name its cluster formats, a `wtf` that timed out: each is a
+`missing_evidence` reason, and any one of them stops the verdict being
+`ready`. The verdict is the worst thing found, in a fixed order:
+
+1. the metadata or the cluster didn't answer at all: `unknown`;
+2. every live node runs the latest or newer: `up_to_date`;
+3. a node speaks other formats than the release: `needs_fresh_cluster`;
+4. any blocker: `blocked`;
+5. any missing evidence: `unknown`;
+6. otherwise `ready`.
+
+A format change outranks a blocker on purpose. A quorum risk matters to a
+rolling upgrade; a fresh cluster doesn't roll, so telling the agent to fix
+the quorum first would be advice for a path it can't take. The reasons are
+still all there, sorted blockers first, so nothing is hidden.
+
+The quorum rule needed a moment's thought. The orchestrator restarts council
+members one at a time, so at each step one live voter is briefly gone. That's
+safe only if the rest are still a majority of the whole council: with `total`
+members and `live` of them up, the check is `live - 1 >= total / 2 + 1`. Three
+up of three passes. Two up of three doesn't. Two of two doesn't either, which
+is right: a two-member council loses quorum every time one restarts. A
+one-member council is skipped, because it has no quorum to keep, and its
+restart is the sub-second bounce every one-node cluster takes.
+
+### Evidence, then a verdict
+
+The code splits the same way `relish wtf` does. `collect_cluster` asks the
+questions and records the answers, failures included, in plain structs:
+
+```rust
+pub struct NodeEvidence {
+    pub node: String,
+    pub role: NodeRole,
+    pub state: String,
+    pub build: Result<AgentVersion, String>,
+}
+```
+
+`build` is a `Result` stored as data, not one returned with `?`. In Go you'd
+keep a `(value, err)` pair in a struct; in Python, `None` and a separate
+reason. Rust's `Result<T, E>` is an ordinary enum, so it can sit in a field
+like any other value, and `assess`, a pure function from `&Evidence` to the
+answer, has to `match` on it before it can touch the version. There's no way
+to read a node's platform and forget that the node never answered.
+
+`assess` builds its reasons in a `Vec`, then sorts them by kind with
+`sort_by_key`. Rust's `sort_by_key` is stable, like Python's `sorted`: two
+blockers keep the order the checks found them in, so the snapshots don't
+shuffle.
+
+One more Rust detail from the tests. The "missing evidence is never ready"
+test runs the same assertion over five ways to lose a piece of evidence, each
+a closure that breaks a healthy cluster:
+
+```rust
+type Breakage = fn(&mut ClusterEvidence);
+
+let gaps: [(&str, Breakage); 5] = [
+    ("no platform", |c| c.nodes[3].build = Ok(build("v0.2.6", None))),
+    ("no wtf", |c| c.wtf = Err("timed out".to_string())),
+    // …
+];
+```
+
+Each closure has its own anonymous type, so they can't share an array as
+they are. But a closure that captures nothing coerces to a plain function
+pointer, `fn(&mut ClusterEvidence)`, which is one type, the same as a C
+function pointer. Write the type on the array and the compiler does the
+coercion. The `type` alias is only a name, like C's `typedef`; clippy asks
+for one when a type gets long.
+
+### Release notes are someone else's words
+
+The release metadata gained an optional `notes` field, and `package.py`
+fills it with a line pointing at the release page. Text fetched from a
+metadata host is text someone else controls, so it travels the way an app's
+log lines do: inside an `untrusted` envelope with origin `release_metadata`,
+stripped of escapes and redacted. The rest of the metadata is parsed into
+types (a `BinaryVersion`, a pair of numbers, a map of platforms) before
+anything reaches the output, so there's no free text left to smuggle in.
+
+The metadata is also the only network call. `--metadata ./metadata.json`
+reads a file instead, which is how an air-gapped cluster checks, and how the
+tests run the whole command with no network: the metadata from a temporary
+file, the cluster on a port nobody listens on, and the answer `unknown` with
+`cluster_unreachable` and exit 0.
+
+### The tests
+
+`assess` gets most of them, because it's pure. Each verdict has a test and a
+snapshot of its envelope: a healthy three-member council and a worker
+(`ready`, with `relish upgrade plan` as a read-only next step and `relish
+upgrade start` as one that isn't), a single node on the latest
+(`up_to_date`, even with a `wtf` critical, since there's nothing to roll), a
+protocol bump (`needs_fresh_cluster`, linking the compatibility policy), a dead
+council member plus a RISC-V worker plus a crash loop (`blocked`, four
+reasons) and an unreachable cluster (`unknown`). Unit tests cover each
+blocker on its own, the quorum arithmetic for one, two and three members, a
+blocker outranking a gap, and release notes arriving cleaned. One test points
+`collect_cluster` at a fake node built with axum: four listed nodes, one dead,
+each live one answering `/v1/version` through the relay path, and no
+`/v1/health`, so `wtf` can't run and the verdict can't be `ready`.
+
+### What we didn't do
+
+- **Fetch the release notes themselves.** They live on the GitHub release
+  page, written after the binaries are packaged. Fetching them would be a
+  second network call to a second host; the metadata's pointer is enough for
+  an agent to show a human.
+- **Check disk space or the image registry.** `wtf` already reports a node
+  short of disk, and that's a critical.
+- **Start the upgrade.** No `relish agent` command mutates the cluster. The
+  `ready` answer's `next` has the start command with `read_only: false`, for a
+  human to say yes to.
+
 ## Proving a fix
 
 Reading the source gets an agent to "the bug is on line 412 of
@@ -1714,594 +2119,6 @@ the thought was what it may build, what it must admit it didn't test, and how
 a cluster that exists only to be thrown away stays out of the way of the one
 that matters. An agent will do whatever the tool lets it, so the tool decides
 what it's allowed.
-
-## The front door
-
-Everything so far helps an agent find a bug. The next question is what
-happens when it has one. If the answer is "it opens an issue", we've built a
-machine for filling our tracker with confident guesses. curl ended its bug
-bounty in January 2026 because AI-written reports had pushed its rate of
-confirmed vulnerabilities from above 15% to under 5%
-([Daniel Stenberg](https://daniel.haxx.se/blog/2026/01/26/the-end-of-the-curl-bug-bounty/)).
-We'd rather get fewer reports and be able to trust each one.
-
-[#1580](https://github.com/reliaburger/reliaburger/issues/1580) is the front
-door: GitHub issue forms in `.github/ISSUE_TEMPLATE/`, an AI-assistance policy
-in `CONTRIBUTING.md` and `AGENTS.md`, a `SECURITY.md`, and five labels. Blank
-issues are off. Every form (bug, agent-drafted bug, documentation error, test
-request) requires the version, a reproducer, "what was not tested" and an
-answer to "did an AI tool help?". That third field comes from the
-[Linux kernel's rules](https://docs.kernel.org/next/process/coding-assistants.html)
-for coding assistants: if you couldn't build or reproduce something, say so.
-A report that says "I didn't try runc" is useful. One that silently didn't is
-a trap.
-
-The agent-drafted form is the interesting one, because it's a contract. Its
-field ids (`fingerprint`, `version`, `fix_status`, `summary`, `reproducer`,
-`evidence`, `source`, `patch`, `not_tested`, `should_have_caught`,
-`redaction`, `ai_disclosure`, `human_review`) are what `relish agent report`
-fills in, and its labels are the `### ` headings of the draft it writes. The
-last field is three checkboxes a human must tick: they read it, they checked
-the redaction manifest, they searched for the fingerprint. An agent can draft
-all of it. It can't post it, and nothing we ship will.
-
-The policy is short, and it's the same for us as for everyone else. Disclose
-AI help (our own commits carry a `Co-Authored-By` trailer naming the model,
-so we can hardly ask less of anyone). A human answers for every line. Agents
-never post on their own. A bug-fix pull request carries a test that fails
-before the fix and passes after it. A report with no reproducer may be
-closed, and `unverified` says so in the meantime. Security reports go
-through GitHub's private reporting, and there's no bounty, at any severity:
-credit by name is what we offer.
-
-### Testing a YAML file nobody runs
-
-GitHub only checks an issue form when someone opens the new-issue page, so a
-misspelt key ships silently and the form quietly drops a field. The test,
-`tests/suite/issue_forms.rs`, parses each form into the subset of GitHub's
-schema we use. The body elements are an enum with `#[serde(tag = "type")]`,
-which reads the `type:` key to choose the variant, the same trick Chapter 1
-used for container state, and `deny_unknown_fields` turns `validation:`
-(missing its `s`) into a test failure instead of an optional field. On top of
-the schema it checks the contract: every form requires the four fields, the
-AI-disclosure options match across forms, and the agent form's ids, labels
-and required flags equal one table, `AGENT_REPORT_FIELDS`, in order. Changing
-that table is changing the report format, and the report's tests have to
-agree.
-
-The same test reads `CONTRIBUTING.md`, `AGENTS.md` and `SECURITY.md` for the
-rules they must state. That makes those three files code as far as CI is
-concerned, so `scripts/ci/select-jobs.sh` no longer treats an edit to them as
-documentation that can skip the Rust jobs.
-
-### What we didn't do
-
-- **A triage bot.** Issue bodies are attacker-controlled text, and an agent
-  reading them with write access is an injection waiting to happen
-  ([Invariant Labs](https://invariantlabs.ai/blog/mcp-github-vulnerability)).
-  Labels are applied by hand for now.
-- **A CI check that bug-fix PRs add a failing test.** The policy asks for it
-  and review enforces it; a check needs a reliable "fails on `main`" run first.
-- **PR caps in the repository.** GitHub can cap open pull requests from
-  accounts without write access and exempt people with merged work, but those
-  are repository settings for the maintainer, not files in a PR.
-
-## Checks a stranger can run
-
-Ask an agent to install Reliaburger on your laptop and it'll run the
-one-liner. Ask a careful agent and it'll first ask how it can tell the binary
-is ours. Until 0.2.7 the honest answer was "you can't, yet". Every binary
-carried a signature, but the key that checks it lives inside `relish` and
-`bun`: it proves an upgrade to a cluster that already trusts us, and proves
-nothing to someone who hasn't installed anything. The `SHA256SUMS` file sat
-right next to the binaries it described, on the same release page, so anyone
-who could swap one could swap the other.
-
-0.2.7 adds checks that need nothing from us (#1583). The first is a build
-provenance attestation for every file of a release. When the candidate job has
-recorded `candidate.json`, it runs GitHub's `attest-build-provenance` action
-over `dist/*`. For each file, GitHub's OIDC token gets Sigstore to issue a
-short-lived certificate saying "this is `build.yml` in
-`reliaburger/reliaburger`, at this commit, on `main`, run this", and the
-action signs a statement naming the file's SHA-256 with it. The statement goes
-to GitHub's attestation store and to Sigstore's public transparency log.
-Checking a download is then one command:
-
-```sh
-gh attestation verify ~/.reliaburger/bin/relish --repo reliaburger/reliaburger \
-  --signer-workflow reliaburger/reliaburger/.github/workflows/build.yml \
-  --source-ref refs/heads/main
-```
-
-The two flags at the end do most of the work. `--repo` alone would accept an
-attestation from any workflow in the repository, on any branch, and a release
-train is a branch anyone with push access can edit. Pinning the workflow file
-and `main` narrows it to the one job that builds releases.
-
-### Not changing the bytes
-
-The hard constraint was promotion's contract: it publishes exactly the files
-the gate qualified, and the gate records one SHA-256, that of `candidate.json`,
-which lists the digest and size of every other file. An attestation that
-lived next to the binaries, as a `.intoto.jsonl` file on the release page,
-would have had to be in `candidate.json` too, or `candidate.py`'s inventory
-check would refuse the candidate for having a file it didn't expect. Storing
-it outside the release solves that. The attestation names files by digest, so
-it describes `dist/` without being part of it.
-
-"It writes nothing to `dist/`" is a claim about someone else's action, though,
-and we don't take claims like that on trust. The step after the attestation
-runs `candidate.py verify` against the digest the record step has just
-printed. If the action ever left a file behind, or changed one, the candidate
-fails there, an hour before anyone stages it.
-
-Notarisation has the opposite problem. `codesign` rewrites the Mach-O file,
-appending a signature, so it changes the bytes, and so it has to come before
-anything hashes them. It gets a job of its own, `notarise-macos`, between the
-build and the candidate: it downloads `relish-macos-aarch64`, signs it with a
-Developer ID certificate, sends it to Apple's notary service and waits for an
-answer, then uploads the signed file under the same artefact name with
-`overwrite: true`. The candidate job, which collects `binaries-*`, never knows
-the difference, and the `.sig`, `SHA256SUMS`, the installer's pinned digest and
-`candidate.json` all describe the notarised file.
-
-That job can't run for real until the maintainer has an Apple Developer ID
-and adds five secrets, so the script has three outcomes. With none of the
-secrets it logs a notice that the binary is not notarised and succeeds, which
-is what every build does today. With all five it signs and notarises. With
-some but not all it fails, because half a configuration is a typo, not a
-decision. The tests run all three against stub `security`, `codesign`,
-`ditto` and `xcrun` commands that log their arguments: no secrets means no
-Apple tool is called and the binary's bytes don't change; a full set means
-`codesign` runs with `--options runtime --timestamp` before
-`notarytool submit --wait`, and the signed binary still runs afterwards; a
-rejection fetches Apple's log and fails. They prove our decisions and their
-order. Whether Apple says `Accepted` is something only a real build will tell
-us.
-
-### A tap, not a fork
-
-Homebrew users expect `brew install`. A third-party formula lives in a "tap",
-a Git repository named `homebrew-<something>`, so ours will be
-`reliaburger/homebrew-tap`, and its one formula is generated here from
-`relish.rb.in`. `homebrew.py formula` fills the template from a release's
-`candidate.json`, the same record promotion verified, so the formula pins the
-qualified digests without downloading or hashing anything itself. It refuses a
-record whose SHA-256 isn't the qualified digest, a nightly record, a
-pre-release tag, and a release missing one of the platforms in `PLATFORMS`, the
-dictionary `package.py` already uses to decide what to sign.
-
-`promote.yml` runs it in a separate job after the release is public. If the tap
-push fails, the release is still out and green; the tap job is the only thing
-that's red. `homebrew.py publish` clones the tap, writes `Formula/relish.rb`,
-commits and pushes, passing the token as an HTTP header rather than in the
-URL, so it never lands in `.git/config`. The tests push to a local bare
-repository standing in for the tap, and check that publishing the same
-formula twice leaves the history alone.
-
-The formula installs the CLI and nothing else. Homebrew upgrades `relish`; a
-cluster's nodes are still `relish upgrade`'s job, and the formula's caveats
-say so.
-
-### What we didn't do
-
-- **Attest nightly builds.** They're never a release, and the `main` ref
-  pin would refuse them anyway.
-- **Our own Sigstore keys, or cosign.** The attestation's identity is the
-  workflow, issued per run; there's no long-lived key to lose.
-- **Stapling.** Apple can staple a ticket to an app bundle, a disk image or
-  an installer package, not to a bare executable, so Gatekeeper checks a
-  notarised `relish` online the first time it runs.
-- **A formula for `bun`.** Nodes get `bun` from `relish setup` and upgrade it
-  with `relish upgrade`; a second way would only drift.
-- **Advertise `brew install` yet.** The tap repository doesn't exist until the
-  maintainer creates it, and no release has fed it. The docs say how; they
-  don't say it works.
-
-## Logs and the manual
-
-An agent chasing a crash loop wants two more things after the source: what
-the app said, and what the manual says about it. [#1573](https://github.com/reliaburger/reliaburger/issues/1573)
-adds both:
-
-| Command | Answers |
-|---|---|
-| `logs APP [--since 15m] [--tail 200]` | The newest lines in a window, each group wrapped as `untrusted`, and a summary of what was left out |
-| `manual search WORDS…` | Up to ten sections that mention every word, with an excerpt and the command that shows each |
-| `manual show CHAPTER[#ANCHOR]` | One chapter, or one section of it, as Markdown |
-
-### Always a window, never the capture
-
-`relish logs` has two places to look. The log store (Ketchup) records each
-line with its time, node, instance and stream. Each node also keeps its own
-capture of an app's output, which records only the text. When the store has
-nothing, `relish logs` falls back to the capture, and for an unwindowed read
-that's a fine fallback. For a windowed one it was a bug:
-[#1515](https://github.com/reliaburger/reliaburger/issues/1515) found that
-`--since 5m` on a quiet app printed lines from an hour ago, because the
-capture can't tell old from new. [#1542](https://github.com/reliaburger/reliaburger/pull/1542)
-settled the rule: a windowed read never asks the capture.
-
-`relish agent logs` always has a window (`--since 15m` unless told otherwise),
-so it never asks the capture at all. It doesn't go through `log_lines`, the
-function behind `relish logs`, either. That function treats a store it
-couldn't reach as "no lines" and moves on to the capture, which is right for
-a person, who'll see the error from the second attempt, and wrong for an
-agent, which would read an unreachable cluster as a quiet app. So the client
-grew a second method, `log_query`, that asks the store and only the store,
-and returns its errors. An unreachable cluster comes back as `unreachable`
-with exit 3; an empty window comes back as `ok: true` with no lines and a
-`next` step suggesting a wider one.
-
-A test holds the rule. It starts an axum server that answers the store's query
-with nothing and counts every request to the capture endpoint, runs the
-command against it, and checks the count is zero, that the capture's line is
-nowhere in the output, and that the query carried `start=` and `tail=201`.
-
-### One more than you asked for
-
-Why 201? The store applies `tail` itself, so if you ask for 200 and get 200,
-you can't tell "exactly 200 lines" from "200 of thousands". Asking for one
-more answers that for the price of one line: 201 back means there were
-more, so the command drops the oldest and sets `summary.more_than_tail`.
-
-### The newest lines win
-
-The byte budget from the start of this chapter could trim the answer on its
-own: it drops items from the end of the biggest array. For logs, that's the
-wrong end. Lines are oldest first, because that's how people read them, and
-the budget would drop the newest, which are the ones that explain why the app
-is crashing *now*. Reversing the order would fix the budget and annoy every
-reader.
-
-So `logs` fits itself to the budget before the budget has to. It asks how many
-of the newest lines fit, and the answer comes from a new helper in
-`src/relish/agent/fit.rs`:
-
-```rust
-pub fn largest_that_fits(total: usize, fits: impl Fn(usize) -> bool) -> Option<usize> {
-    if !fits(0) {
-        return None;
-    }
-    let (mut low, mut high) = (0, total);
-    while low < high {
-        let middle = low + (high - low).div_ceil(2);
-        if fits(middle) {
-            low = middle;
-        } else {
-            high = middle - 1;
-        }
-    }
-    Some(low)
-}
-```
-
-It's a binary search, and the interesting part for a C or Go reader is the
-parameter type. `impl Fn(usize) -> bool` means "any closure that takes a
-`usize` and returns a `bool`". Each closure in Rust has its own anonymous
-type, and `impl Fn` makes the compiler generate a copy of
-`largest_that_fits` for each one, so the call costs no more than a direct
-function call (Go would box it into a `func` value; C would want a function
-pointer and a `void *` for its state). `Fn`, rather than `FnMut` or `FnOnce`,
-promises the closure only reads what it captured, so calling it several
-times is safe. `div_ceil` divides rounding up, which keeps `middle` above
-`low`, so the loop can't stall.
-
-The closure `logs` passes builds the whole envelope with that many lines,
-serialises it and compares its length with `--max-bytes`. That's eight or so
-full renders of a 200-line answer, a few milliseconds, and it's exact: no
-estimating how many bytes JSON escaping adds to a line full of quotes.
-`manual show` uses the same helper to cut a long section at a line rather
-than mid-word.
-
-Having done the cutting, the command has to say so, because an agent that
-doesn't know lines are missing will reason confidently from the ones it has.
-`data.summary` closes every answer:
-
-```json
-"summary": {"lines": 34, "truncated": true, "more_than_tail": true,
-            "dropped_for_budget": 16, "lines_cut": 1,
-            "dropped_before": "2026-11-06T09:52:10Z", "nodes_queried": 3}
-```
-
-The envelope's own `truncated` is `true` when the budget forced a cut, through
-a new `Envelope::mark_truncated`, and `next` carries two commands: the same
-query with `--until` at the oldest line shown, which pages backwards, and the
-`--max-bytes` that would fit everything.
-
-### Grouping lines, and `chunk_by`
-
-Every line is workload text, so every line has to sit inside an `untrusted`
-object. One object per line would cost about 250 bytes of wrapper each (the
-`origin`, the `notice`, the app and the instance), which at the default budget
-leaves room for barely 60 short lines. One object for all of them would lose
-each line's time and instance. The compromise is one object per run of lines
-that share a second, a node, an instance and a stream. A chatty app writing
-fifty lines a second gets one wrapper for all fifty, and every line still
-says when and where it came from, to the second.
-
-The slice method `chunk_by` does the grouping:
-
-```rust
-shown
-    .chunk_by(|left, right| key(left) == key(right))
-    .map(|run| { /* one LogLines per run */ })
-```
-
-It walks the slice and starts a new chunk wherever the closure says two
-neighbours differ. Each `run` it hands over is a `&[LogEntry]`, a borrowed
-window into the original slice rather than a copy: Rust's slices are a
-pointer and a length, like Go's, and taking a sub-slice allocates nothing.
-`Untrusted::with_line_bytes_max` then cleans, redacts and caps the run's
-lines as one text, so a private key logged over several lines is still one
-PEM block to the redaction rules.
-
-### Why not JSON Lines
-
-The research note and the issue described `logs` as JSON Lines: one object
-per line, then a summary line. We print one envelope instead, with the lines
-in `data.entries` and the summary in `data.summary`. The command doesn't
-follow (there's no `--follow`), so it isn't a stream, and every other
-`relish agent` command prints exactly one document. Keeping `logs` the same
-means the budget, the error codes, `relish agent schema` and the coming
-`relish mcp` all treat it like any other command. `relish logs -o json` is
-still JSON Lines for scripts that want one line per record.
-
-### Sections and anchors
-
-The manual is compiled into `relish` already, for `relish manual`'s TUI. The
-agent commands read the same chapters but cut them into sections: a heading
-and everything up to the next heading at its level or above. Each section
-gets the anchor GitHub would give its heading (lower case, spaces to `-`,
-punctuation dropped, a repeat numbered `-1`), so
-`` `relish wtf`: what's broken and why `` becomes
-`relish-wtf-whats-broken-and-why`. An agent that quotes
-`relish agent manual show diagnostics#relish-wtf-whats-broken-and-why` to a
-human has also named the place on GitHub.
-
-The scan that finds headings is a line loop with one piece of state, whether
-it's inside a fenced code block, because a `# start the node` comment in a
-shell example starts with `#` too. Its `match` is worth a look:
-
-```rust
-match (fence, marker) {
-    (None, Some(marker)) => fence = Some(marker),
-    (Some(open), Some(marker)) if open == marker => fence = None,
-    (None, None) => { /* maybe a heading */ }
-    _ => {}
-}
-```
-
-Matching on a tuple checks two things at once, and the `if` after a pattern
-is a *match guard*: the arm applies only when the condition holds too, so a
-`~~~` line inside a backtick fence falls through to `_` and changes nothing.
-The compiler checks that the arms cover every case, and the `_` makes the
-"anything else" case explicit.
-
-Dispatch picked up a pattern of its own. `source` was the only two-word
-family of commands, and now `manual` is another:
-
-```rust
-Some(family @ ("source" | "manual")) => match words.next() {
-    Some(word) => format!("{family}-{word}"),
-    None => return CommandName::Agent,
-},
-```
-
-`family @ pattern` binds whatever matched the pattern to a name, so one arm
-handles both families and still knows which one it saw.
-
-### Searching without an index
-
-`search` lower-cases the words and keeps the sections that mention every one
-of them. A word in the heading scores ten, one in the text scores one, and the
-whole phrase earns a bonus, so `search rolling deploy` puts "Rolling deploys"
-above a section that mentions both words once in passing. The top ten come
-back, each with a two-line excerpt (the line that mentions most of the words,
-and the next one) and its `show` command, and `total_hits` says how many
-there were in all.
-
-That's crude next to BM25 or embeddings, and on purpose. The manual is 380 KB;
-scanning all of it takes about a millisecond, needs no index to keep in step
-with the text, and gives the same answer every time, which a snapshot test
-can pin. The agent on the other end is a language model. Given ten decent
-candidates and their headings, it's better at picking the right one than any
-ranking we'd write.
-
-### The tests
-
-Both commands are plain functions over their inputs, so the snapshots never
-touch a cluster or the real manual. `logs` has a snapshot of a small answer
-(two instances, both streams, two lines sharing an entry) and of one cut
-three ways, by `--tail`, the budget and `--line-bytes`, with a node that timed
-out. Unit tests check the defaults (15 minutes, 200 lines, 512 bytes, 201
-asked for), that bad flags are `usage` failures, that an injection and a
-token in a coloured line come out inside `untrusted`, cleaned and redacted,
-and nowhere else, that every answer fits budgets from 1 KiB to 200 KiB
-without losing count of a line, and that the paging command names the oldest
-line shown. Two tests against a fake node check the capture rule and that an
-unreachable cluster is a failure.
-
-`manual` has snapshots of a search and of a section with a subsection. Unit
-tests pin the anchors against GitHub's, the fence rule, the ten-hit cap, the
-chapter names `show` accepts, the `not_found` hints, a long section cut at a
-line with `next` pointing past the cut, and that every hit's `show` command
-prints that hit. One test reads the real manual: every chapter parses, no two
-sections in a chapter share an anchor, and a search and a `show` of a real
-section answer.
-
-### What we didn't do
-
-- **`--follow`.** A stream doesn't fit a budget, and an agent polling with
-  `--since` gets the same lines without holding a connection open.
-- **Stemming or fuzzy search.** `deploy` finds `deploys` because it's a
-  substring; `deployment` doesn't find a section that only says `deploy`. The
-  excerpt and `total_hits` make a miss obvious, and the agent tries another
-  word.
-- **`manual list`.** A wrong chapter name answers with every chapter's name,
-  and `relish agent guide` (#1090) will be the place to start.
-
-### Lessons
-
-The budget is a safety net, not a design. It keeps any answer valid and
-bounded, but it doesn't know which half of a log matters. A command that
-knows its data should fit itself, and then say, in fields an agent can't
-miss, exactly what it left out.
-
-## Can it roll?
-
-Ask `relish upgrade check` whether to upgrade and it compares two version
-numbers, checks the release has a build for each node's platform, and says
-`available`. That's a fine answer for a person, who knows the payments app
-has been crash looping since lunch and that one of the three council members
-died on Tuesday. An agent doesn't know either of those things unless
-something tells it. Hand it `available` and it'll suggest `relish upgrade
-start` on a cluster where restarting the next council member loses quorum.
-
-`relish agent upgrade-check` (#1576) answers the question an agent actually
-needs answered: can this cluster take the latest release now? It reads the
-release metadata, each node's build through the entry node's relay, the
-upgrade state and a full `relish wtf` diagnosis, and turns them into one of
-five verdicts:
-
-```json
-{"verdict": "blocked",
- "reasons": [
-   {"code": "node_down", "kind": "blocker", "node": "node-3",
-    "message": "node-3 is dead; it would miss the roll and come back on its old version"},
-   {"code": "quorum_risk", "kind": "blocker", "node": null,
-    "message": "2 of 3 council members are up; restarting one at a time leaves 1, and quorum needs 2"},
-   {"code": "wtf_critical", "kind": "blocker", "node": null,
-    "message": "relish wtf: payments is crash looping (crash-loop, app/default/payments)"}],
- "latest": {"version": "v0.2.7", "formats": {"protocol": 57, "state": 74},
-            "platforms": ["linux-aarch64", "linux-x86_64"]},
- "nodes": ["…"], "metadata": "https://github.com/…/metadata.json", "release_notes": null}
-```
-
-`ready`, `up_to_date`, `needs_fresh_cluster` and `blocked` are the four the
-issue asked for, plus `unknown`. We added `up_to_date` because `ready` for a
-cluster with nothing to upgrade would send an agent off to run `relish
-upgrade start` for no reason.
-
-### Never `ready` on missing evidence
-
-The rule that shaped the code is that silence is never good news. A node
-that didn't answer, a node that didn't say its platform, a release whose
-metadata doesn't name its cluster formats, a `wtf` that timed out: each is a
-`missing_evidence` reason, and any one of them stops the verdict being
-`ready`. The verdict is the worst thing found, in a fixed order:
-
-1. the metadata or the cluster didn't answer at all: `unknown`;
-2. every live node runs the latest or newer: `up_to_date`;
-3. a node speaks other formats than the release: `needs_fresh_cluster`;
-4. any blocker: `blocked`;
-5. any missing evidence: `unknown`;
-6. otherwise `ready`.
-
-A format change outranks a blocker on purpose. A quorum risk matters to a
-rolling upgrade; a fresh cluster doesn't roll, so telling the agent to fix
-the quorum first would be advice for a path it can't take. The reasons are
-still all there, sorted blockers first, so nothing is hidden.
-
-The quorum rule needed a moment's thought. The orchestrator restarts council
-members one at a time, so at each step one live voter is briefly gone. That's
-safe only if the rest are still a majority of the whole council: with `total`
-members and `live` of them up, the check is `live - 1 >= total / 2 + 1`. Three
-up of three passes. Two up of three doesn't. Two of two doesn't either, which
-is right: a two-member council loses quorum every time one restarts. A
-one-member council is skipped, because it has no quorum to keep, and its
-restart is the sub-second bounce every one-node cluster takes.
-
-### Evidence, then a verdict
-
-The code splits the same way `relish wtf` does. `collect_cluster` asks the
-questions and records the answers, failures included, in plain structs:
-
-```rust
-pub struct NodeEvidence {
-    pub node: String,
-    pub role: NodeRole,
-    pub state: String,
-    pub build: Result<AgentVersion, String>,
-}
-```
-
-`build` is a `Result` stored as data, not one returned with `?`. In Go you'd
-keep a `(value, err)` pair in a struct; in Python, `None` and a separate
-reason. Rust's `Result<T, E>` is an ordinary enum, so it can sit in a field
-like any other value, and `assess`, a pure function from `&Evidence` to the
-answer, has to `match` on it before it can touch the version. There's no way
-to read a node's platform and forget that the node never answered.
-
-`assess` builds its reasons in a `Vec`, then sorts them by kind with
-`sort_by_key`. Rust's `sort_by_key` is stable, like Python's `sorted`: two
-blockers keep the order the checks found them in, so the snapshots don't
-shuffle.
-
-One more Rust detail from the tests. The "missing evidence is never ready"
-test runs the same assertion over five ways to lose a piece of evidence, each
-a closure that breaks a healthy cluster:
-
-```rust
-type Breakage = fn(&mut ClusterEvidence);
-
-let gaps: [(&str, Breakage); 5] = [
-    ("no platform", |c| c.nodes[3].build = Ok(build("v0.2.6", None))),
-    ("no wtf", |c| c.wtf = Err("timed out".to_string())),
-    // …
-];
-```
-
-Each closure has its own anonymous type, so they can't share an array as
-they are. But a closure that captures nothing coerces to a plain function
-pointer, `fn(&mut ClusterEvidence)`, which is one type, the same as a C
-function pointer. Write the type on the array and the compiler does the
-coercion. The `type` alias is only a name, like C's `typedef`; clippy asks
-for one when a type gets long.
-
-### Release notes are someone else's words
-
-The release metadata gained an optional `notes` field, and `package.py`
-fills it with a line pointing at the release page. Text fetched from a
-metadata host is text someone else controls, so it travels the way an app's
-log lines do: inside an `untrusted` envelope with origin `release_metadata`,
-stripped of escapes and redacted. The rest of the metadata is parsed into
-types (a `BinaryVersion`, a pair of numbers, a map of platforms) before
-anything reaches the output, so there's no free text left to smuggle in.
-
-The metadata is also the only network call. `--metadata ./metadata.json`
-reads a file instead, which is how an air-gapped cluster checks, and how the
-tests run the whole command with no network: the metadata from a temporary
-file, the cluster on a port nobody listens on, and the answer `unknown` with
-`cluster_unreachable` and exit 0.
-
-### The tests
-
-`assess` gets most of them, because it's pure. Each verdict has a test and a
-snapshot of its envelope: a healthy three-member council and a worker
-(`ready`, with `relish upgrade plan` as a read-only next step and `relish
-upgrade start` as one that isn't), a single node on the latest
-(`up_to_date`, even with a `wtf` critical, since there's nothing to roll), a
-protocol bump (`needs_fresh_cluster`, linking the compatibility policy), a dead
-council member plus a RISC-V worker plus a crash loop (`blocked`, four
-reasons) and an unreachable cluster (`unknown`). Unit tests cover each
-blocker on its own, the quorum arithmetic for one, two and three members, a
-blocker outranking a gap, and release notes arriving cleaned. One test points
-`collect_cluster` at a fake node built with axum: four listed nodes, one dead,
-each live one answering `/v1/version` through the relay path, and no
-`/v1/health`, so `wtf` can't run and the verdict can't be `ready`.
-
-### What we didn't do
-
-- **Fetch the release notes themselves.** They live on the GitHub release
-  page, written after the binaries are packaged. Fetching them would be a
-  second network call to a second host; the metadata's pointer is enough for
-  an agent to show a human.
-- **Check disk space or the image registry.** `wtf` already reports a node
-  short of disk, and that's a critical.
-- **Start the upgrade.** No `relish agent` command mutates the cluster. The
-  `ready` answer's `next` has the start command with `read_only: false`, for a
-  human to say yes to.
 
 ## Drafting the report
 
@@ -2644,219 +2461,351 @@ ticks the box and posts. Each step is visible to the next: the manifest shows
 the human what redaction did, `read_only: false` on the post step tells the
 agent to stop, and the checkbox tells the maintainer a person stood behind it.
 
-## Wiring up the agents
+## The front door
 
-An agent can't use `relish mcp` until someone tells it the server exists. For
-Claude Code that's `claude mcp add reliaburger -- relish mcp`. Codex wants a
-`[mcp_servers.reliaburger]` table in `~/.codex/config.toml`, Cursor and Gemini
-CLI a `mcpServers` key in a JSON file each, VS Code a `servers` key in a
-different JSON file, and Goose an `extensions:` entry in YAML. Six agents,
-six files, three formats, and every one a place to make a typo. Stripe
-(`stripe agent setup`), Neon (`npx neon init`) and Vercel (`npx add-mcp`) all
-ship one command that does it for you
-([onboarding scan](../plans/2026-11-04-research-agent-onboarding-scan.md),
-suggestion 4). [#1581](https://github.com/reliaburger/reliaburger/issues/1581)
-is ours: `relish agent setup`.
+`relish agent report` drafts a report for a human to post, but nothing stops
+an agent posting one itself, with or without the draft. If all it takes is
+"open an issue", we've built a machine for filling our tracker with confident
+guesses. curl ended its bug
+bounty in January 2026 because AI-written reports had pushed its rate of
+confirmed vulnerabilities from above 15% to under 5%
+([Daniel Stenberg](https://daniel.haxx.se/blog/2026/01/26/the-end-of-the-curl-bug-bounty/)).
+We'd rather get fewer reports and be able to trust each one.
 
-It's also the first `relish agent` command that writes to files other people
-own. `~/.claude.json` holds Claude Code's whole state; a careless rewrite
-loses someone's project history. So the design starts from the ways it could
-go wrong, and each one became a rule with a test:
+[#1580](https://github.com/reliaburger/reliaburger/issues/1580) is the front
+door: GitHub issue forms in `.github/ISSUE_TEMPLATE/`, an AI-assistance policy
+in `CONTRIBUTING.md` and `AGENTS.md`, a `SECURITY.md`, and five labels. Blank
+issues are off. Every form (bug, agent-drafted bug, documentation error, test
+request) requires the version, a reproducer, "what was not tested" and an
+answer to "did an AI tool help?". That third field comes from the
+[Linux kernel's rules](https://docs.kernel.org/next/process/coding-assistants.html)
+for coding assistants: if you couldn't build or reproduce something, say so.
+A report that says "I didn't try runc" is useful. One that silently didn't is
+a trap.
 
-- **No surprises.** Without `--yes`, setup writes nothing. The answer is the
-  diff of every file it would change, and `next` offers the same command with
-  `--yes`, marked `read_only: false` so the agent asks a human first. The
-  issue asked for "one yes, showing the diff". An interactive prompt would
-  break the contract (`relish agent` never reads stdin), so the yes is a flag
-  on a second run, which the agent's own permission prompt puts in front of
-  the human anyway.
-- **No collateral.** It writes only the files its answer names, and in each
-  only its own entry.
-- **No stomping.** An entry called `reliaburger` that isn't exactly what
-  setup writes belongs to someone: maybe they pointed it at `/opt/rb/relish`
-  or added `--no-logs`. That's a `conflict`, left alone, unless `--force`.
-- **No drift.** A second run finds every entry `unchanged`.
-- **No blanket approval.** No entry carries Gemini's `trust`, an
-  `autoApprove` list or a wildcard, and setup never opens Claude Code's
-  `settings.json`, where `permissions` live. The [0.2.7
-  plan](../plans/2026-11-04-plan-0.2.7.md)'s safety line is that our docs
-  never advise "always allow"; it would be odd for our code to do it quietly.
+The agent-drafted form is the interesting one, because it's a contract. Its
+field ids (`fingerprint`, `version`, `fix_status`, `summary`, `reproducer`,
+`evidence`, `source`, `patch`, `not_tested`, `should_have_caught`,
+`redaction`, `ai_disclosure`, `human_review`) are what `relish agent report`
+fills in, and its labels are the `### ` headings of the draft it writes. The
+last field is three checkboxes a human must tick: they read it, they checked
+the redaction manifest, they searched for the fingerprint. An agent can draft
+all of it. It can't post it, and nothing we ship will.
 
-### Six agents, one table
+The policy is short, and it's the same for us as for everyone else. Disclose
+AI help (our own commits carry a `Co-Authored-By` trailer naming the model,
+so we can hardly ask less of anyone). A human answers for every line. Agents
+never post on their own. A bug-fix pull request carries a test that fails
+before the fix and passes after it. A report with no reproducer may be
+closed, and `unverified` says so in the meantime. Security reports go
+through GitHub's private reporting, and there's no bounty, at any severity:
+credit by name is what we offer.
 
-`clients.rs` is that table in code: an enum, `Client`, with a method for each
-column. `config` returns the file, its format and the key the servers live
-under; `entry` returns the JSON setup puts there; `detected` checks for the
-agent's config directory. Every entry starts the same command line:
+### Testing a YAML file nobody runs
 
-```rust
-pub const MCP_COMMAND_LINE: &[&str] = &["relish", "mcp"];
-```
+GitHub only checks an issue form when someone opens the new-issue page, so a
+misspelt key ships silently and the form quietly drops a field. The test,
+`tests/suite/issue_forms.rs`, parses each form into the subset of GitHub's
+schema we use. The body elements are an enum with `#[serde(tag = "type")]`,
+which reads the `type:` key to choose the variant, the same trick Chapter 1
+used for container state, and `deny_unknown_fields` turns `validation:`
+(missing its `s`) into a test failure instead of an optional field. On top of
+the schema it checks the contract: every form requires the four fields, the
+AI-disclosure options match across forms, and the agent form's ids, labels
+and required flags equal one table, `AGENT_REPORT_FIELDS`, in order. Changing
+that table is changing the report format, and the report's tests have to
+agree.
 
-`&[&str]` is a borrowed slice of borrowed strings: a fixed list, built into
-the binary, that nothing can grow. `relish mcp` (#1094) was being written at
-the same time as setup, so the command line it registers lives in this one
-constant, where a change to the server's flags is one edit. The entry runs
-plain `relish`, found on `PATH`, rather than this binary's absolute path, so
-an upgrade that moves the binary doesn't break six configs. The cost is that
-a macOS editor launched from the Dock may not see your shell's `PATH`; the
-manual says what to do then.
-
-Goose's entry has an `enabled: true`. That reads like approval but isn't: it
-turns the extension on, which is the point of adding it. Goose's
-tool-approval mode is a separate setting, and setup leaves it alone. The test
-that checks every entry for approval keys (`trust`, `alwaysAllow`,
-`autoApprove`, `permissions`, `allow`, `yolo` and friends, plus any `*`) runs
-over all six.
-
-### Editing JSON without reformatting it
-
-The obvious way to add a key to a JSON file in Rust is to parse it into a
-`serde_json::Value`, insert, and print it back out. Try it on `~/.claude.json`
-and the diff is the whole file. `serde_json`'s `Map` is a `BTreeMap` (a
-sorted map), so every key comes back in alphabetical order. There's a
-`preserve_order` feature that swaps in an insertion-ordered map, but Cargo
-features are unified across the whole build: if any crate in the graph turns
-a feature on, every user of `serde_json` gets it. Every JSON document
-`relish` and `bun` print, and every snapshot of one, would change key order
-to fix one command. In Python it's a keyword argument; in Rust it's a
-property of the whole build.
-
-So `edit.rs` reads the file differently. `RawValue` (behind serde_json's
-`raw_value` feature, which only adds a type and changes nothing else) is a
-value serde doesn't parse: it keeps the exact text. Read an object as a list
-of `(key, RawValue)` pairs and you have every member in file order, each
-value untouched, numbers like `1.50` included. That needs a hand-written
-`Deserialize`:
-
-```rust
-impl<'de> Deserialize<'de> for Members {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct MembersVisitor;
-
-        impl<'de> Visitor<'de> for MembersVisitor {
-            type Value = Members;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a JSON object")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Members, A::Error> {
-                let mut members = Vec::new();
-                while let Some(member) = map.next_entry::<String, Box<RawValue>>()? {
-                    members.push(member);
-                }
-                Ok(Members(members))
-            }
-        }
-
-        deserializer.deserialize_map(MembersVisitor)
-    }
-}
-```
-
-This is serde's visitor pattern, and it's worth reading slowly once. `'de` is
-a lifetime, the lifetime of the input being parsed: it lets a deserialiser
-hand out `&str`s that point into the input instead of copying them. `D:
-Deserializer<'de>` means "any format": the same impl works for JSON, TOML or
-anything else serde speaks. Our code doesn't drive the parsing. It tells the
-deserialiser "I want a map" (`deserialize_map`) and hands over a visitor,
-and the deserialiser calls the visitor's method for what it found:
-`visit_map` for an object. If the file holds an array it calls `visit_seq`,
-which we didn't write, so the default fails with "expected a JSON object",
-the text `expecting` supplies. `type Value = Members` is an associated type:
-each `Visitor` impl names what it produces, so `visit_map` can return it. In
-Go you'd reach for `json.Decoder.Token()` and walk the stream yourself; serde
-turns that round and walks the stream to you.
-
-Then setup writes the object back with two-space indentation, which is what
-`JSON.stringify(value, null, 2)` writes and so what every Node-based agent's
-own file looks like. Only two levels are re-printed, the top and the server
-map; everything inside any other member is its original text. New keys go
-*first*. Appending would add a comma to the line before, and that line could
-be another server's `env`, with its API key, now in a diff an agent reads.
-Inserting at the front means the diff, with zero context lines, is only the
-lines setup adds, and removing our entry gives back the original file byte
-for byte. A test checks exactly that on a file with keys out of order, odd
-spacing and a `1.50`.
-
-TOML was easier: `toml_edit`, which `relish fmt` already uses, edits a
-document in place and keeps comments and layout. YAML wasn't. The YAML crate
-round-trips data, not comments, and Goose's `config.yaml` is the user's too.
-Setup refuses a YAML file with any comment, and a JSON file with comments (VS
-Code allows them in `mcp.json`), as `unreadable`, with the entry to paste in
-by hand in the `note`. A refusal you can act on beats a rewrite that quietly
-eats your comments.
-
-### Writing the file
-
-Three details in `write`, each from a way it could go wrong:
-
-- **Rename, don't overwrite.** The new text goes to `<file>.relish-setup.tmp`
-  beside the original, then `fs::rename` moves it over. On one filesystem a
-  rename is atomic, so a crash leaves the old file or the new one, never half
-  of each. The original's permissions are copied first: `~/.claude.json` is
-  often `0600`, and it should stay that way.
-- **Check before writing.** Claude Code rewrites `~/.claude.json` while it
-  runs. Setup keeps the text it planned against and reads the file again just
-  before the rename; if it changed, setup writes nothing and says `not
-  written`.
-- **Follow symlinks.** Plenty of people keep dotfiles in a git repository and
-  link them into place. A rename over the link would replace it with a plain
-  file, so setup resolves a link first, writes the file it points at, and
-  reports that path.
-
-The work is all blocking file I/O, so `run` does it inside
-`tokio::task::spawn_blocking`, which moves it to tokio's pool of threads
-meant for blocking, away from the threads that drive async tasks.
-
-### The tests
-
-Every test runs against a temporary home directory, never yours. `Home` is a
-struct holding the root path (and whether it's macOS, for VS Code's path), so
-`setup` takes it as an argument rather than reading `$HOME`. The fixture
-installs all six agents with config of their own: a GitHub server with a
-token in `~/.claude.json`, a commented `config.toml`, a Goose `developer`
-extension, a Claude Code `settings.json` with a `permissions` block.
-
-The tests follow the rules. A preview leaves every file and directory as it
-was, for plain, `--dry-run`, `--print`, `--remove` and `--force` alike.
-`--yes` changes only files the answer names, leaves no temporary file, never
-touches `settings.json`, and what it writes is an insta snapshot. A second
-run is all `unchanged`, and `--remove` gives back the originals byte for
-byte. Someone else's entry and someone else's skill survive both `--yes` and
-`--remove --yes`, and fall to `--force`. A commented YAML or JSONC file is
-left alone. The diff never shows the GitHub token, or any line that isn't
-ours. A file changed between plan and write isn't overwritten. A `0600` file
-stays `0600`, and a symlink stays a symlink. The whole preview, six agents
-and their diffs, is one snapshot, so a change to any agent's entry shows up
-in review.
+The same test reads `CONTRIBUTING.md`, `AGENTS.md` and `SECURITY.md` for the
+rules they must state. That makes those three files code as far as CI is
+concerned, so `scripts/ci/select-jobs.sh` no longer treats an edit to them as
+documentation that can skip the Rust jobs.
 
 ### What we didn't do
 
-- **Shell out to `claude mcp add`.** It's the official way for Claude Code,
-  but it's one agent of six, it can't preview, and a test would need Claude
-  Code installed. Vercel's `add-mcp` writes the files too.
-- **Project-level files.** Claude Code's `.mcp.json` and Cursor's
-  `.cursor/mcp.json` in a repository share the server with a team. That's a
-  commit, which is a human's call, not a setup step.
-- **Install links.** Cursor, VS Code and Goose accept links that open the
-  editor and ask the user to confirm. They belong on the website and in the
-  README, not in a CLI.
-- **The skill, yet.** The Reliaburger skill is generated from the manual's
-  agent chapter by #1090. Setup already knows where Claude Code's skill goes,
-  with the same conflict rules, tested over a stand-in skill, but `SKILL_MD`
-  is `None` until #1090 provides the real one. One source, no second copy to
-  drift.
+- **A triage bot.** Issue bodies are attacker-controlled text, and an agent
+  reading them with write access is an injection waiting to happen
+  ([Invariant Labs](https://invariantlabs.ai/blog/mcp-github-vulnerability)).
+  Labels are applied by hand for now.
+- **A CI check that bug-fix PRs add a failing test.** The policy asks for it
+  and review enforces it; a check needs a reliable "fails on `main`" run first.
+- **PR caps in the repository.** GitHub can cap open pull requests from
+  accounts without write access and exempt people with merged work, but those
+  are repository settings for the maintainer, not files in a PR.
+
+## Checks a stranger can run
+
+Ask an agent to install Reliaburger on your laptop and it'll run the
+one-liner. Ask a careful agent and it'll first ask how it can tell the binary
+is ours. Until 0.2.7 the honest answer was "you can't, yet". Every binary
+carried a signature, but the key that checks it lives inside `relish` and
+`bun`: it proves an upgrade to a cluster that already trusts us, and proves
+nothing to someone who hasn't installed anything. The `SHA256SUMS` file sat
+right next to the binaries it described, on the same release page, so anyone
+who could swap one could swap the other.
+
+0.2.7 adds checks that need nothing from us (#1583). The first is a build
+provenance attestation for every file of a release. When the candidate job has
+recorded `candidate.json`, it runs GitHub's `attest-build-provenance` action
+over `dist/*`. For each file, GitHub's OIDC token gets Sigstore to issue a
+short-lived certificate saying "this is `build.yml` in
+`reliaburger/reliaburger`, at this commit, on `main`, run this", and the
+action signs a statement naming the file's SHA-256 with it. The statement goes
+to GitHub's attestation store and to Sigstore's public transparency log.
+Checking a download is then one command:
+
+```sh
+gh attestation verify ~/.reliaburger/bin/relish --repo reliaburger/reliaburger \
+  --signer-workflow reliaburger/reliaburger/.github/workflows/build.yml \
+  --source-ref refs/heads/main
+```
+
+The two flags at the end do most of the work. `--repo` alone would accept an
+attestation from any workflow in the repository, on any branch, and a release
+train is a branch anyone with push access can edit. Pinning the workflow file
+and `main` narrows it to the one job that builds releases.
+
+### Not changing the bytes
+
+The hard constraint was promotion's contract: it publishes exactly the files
+the gate qualified, and the gate records one SHA-256, that of `candidate.json`,
+which lists the digest and size of every other file. An attestation that
+lived next to the binaries, as a `.intoto.jsonl` file on the release page,
+would have had to be in `candidate.json` too, or `candidate.py`'s inventory
+check would refuse the candidate for having a file it didn't expect. Storing
+it outside the release solves that. The attestation names files by digest, so
+it describes `dist/` without being part of it.
+
+"It writes nothing to `dist/`" is a claim about someone else's action, though,
+and we don't take claims like that on trust. The step after the attestation
+runs `candidate.py verify` against the digest the record step has just
+printed. If the action ever left a file behind, or changed one, the candidate
+fails there, an hour before anyone stages it.
+
+Notarisation has the opposite problem. `codesign` rewrites the Mach-O file,
+appending a signature, so it changes the bytes, and so it has to come before
+anything hashes them. It gets a job of its own, `notarise-macos`, between the
+build and the candidate: it downloads `relish-macos-aarch64`, signs it with a
+Developer ID certificate, sends it to Apple's notary service and waits for an
+answer, then uploads the signed file under the same artefact name with
+`overwrite: true`. The candidate job, which collects `binaries-*`, never knows
+the difference, and the `.sig`, `SHA256SUMS`, the installer's pinned digest and
+`candidate.json` all describe the notarised file.
+
+That job can't run for real until the maintainer has an Apple Developer ID
+and adds five secrets, so the script has three outcomes. With none of the
+secrets it logs a notice that the binary is not notarised and succeeds, which
+is what every build does today. With all five it signs and notarises. With
+some but not all it fails, because half a configuration is a typo, not a
+decision. The tests run all three against stub `security`, `codesign`,
+`ditto` and `xcrun` commands that log their arguments: no secrets means no
+Apple tool is called and the binary's bytes don't change; a full set means
+`codesign` runs with `--options runtime --timestamp` before
+`notarytool submit --wait`, and the signed binary still runs afterwards; a
+rejection fetches Apple's log and fails. They prove our decisions and their
+order. Whether Apple says `Accepted` is something only a real build will tell
+us.
+
+### A tap, not a fork
+
+Homebrew users expect `brew install`. A third-party formula lives in a "tap",
+a Git repository named `homebrew-<something>`, so ours will be
+`reliaburger/homebrew-tap`, and its one formula is generated here from
+`relish.rb.in`. `homebrew.py formula` fills the template from a release's
+`candidate.json`, the same record promotion verified, so the formula pins the
+qualified digests without downloading or hashing anything itself. It refuses a
+record whose SHA-256 isn't the qualified digest, a nightly record, a
+pre-release tag, and a release missing one of the platforms in `PLATFORMS`, the
+dictionary `package.py` already uses to decide what to sign.
+
+`promote.yml` runs it in a separate job after the release is public. If the tap
+push fails, the release is still out and green; the tap job is the only thing
+that's red. `homebrew.py publish` clones the tap, writes `Formula/relish.rb`,
+commits and pushes, passing the token as an HTTP header rather than in the
+URL, so it never lands in `.git/config`. The tests push to a local bare
+repository standing in for the tap, and check that publishing the same
+formula twice leaves the history alone.
+
+The formula installs the CLI and nothing else. Homebrew upgrades `relish`; a
+cluster's nodes are still `relish upgrade`'s job, and the formula's caveats
+say so.
+
+### What we didn't do
+
+- **Attest nightly builds.** They're never a release, and the `main` ref
+  pin would refuse them anyway.
+- **Our own Sigstore keys, or cosign.** The attestation's identity is the
+  workflow, issued per run; there's no long-lived key to lose.
+- **Stapling.** Apple can staple a ticket to an app bundle, a disk image or
+  an installer package, not to a bare executable, so Gatekeeper checks a
+  notarised `relish` online the first time it runs.
+- **A formula for `bun`.** Nodes get `bun` from `relish setup` and upgrade it
+  with `relish upgrade`; a second way would only drift.
+- **Advertise `brew install` yet.** The tap repository doesn't exist until the
+  maintainer creates it, and no release has fed it. The docs say how; they
+  don't say it works.
+
+## One chapter, many readers
+
+An agent can learn about Reliaburger in six places. It can run `relish agent
+guide`. It can fetch `reliaburger.com/llms.txt` or `/agents`. Claude Code can
+load a skill from a plugin, Codex can load the same skill from a directory,
+and a coding agent opening the repository reads `AGENTS.md`. Write six
+documents by hand and they'll say six slightly different things within a
+release. It already happened to the README's command list, which is why
+`make readme-commands` exists.
+
+So [#1090](https://github.com/reliaburger/reliaburger/issues/1090) makes the
+manual chapter "Working with an AI agent" the one source, and generates the
+rest:
+
+| File | Made from |
+|---|---|
+| `relish agent guide` | The chapter embedded in the binary, split into its `## ` sections |
+| `docs/website/llms.txt` | The chapter's summary and brief, then a link to every manual chapter, pinned to the release tag |
+| `docs/website/agents.md`, `agents.html` | The whole chapter, as Markdown and as a page in the site's shell |
+| `plugins/reliaburger/skills/reliaburger/SKILL.md` | The summary (as the description), the brief and the command table |
+| `plugins/reliaburger/.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` | The summary and the version |
+| `plugins/reliaburger/.mcp.json` | `relish mcp`, from the same constant `relish agent setup` registers |
+| `AGENTS.md`, one marked block | The chapter's rules for agents, then the brief |
+| The chapter's own command table | The clap definition of `relish agent` |
+
+The shorter files can't carry the whole chapter, so it marks the parts they
+reuse with HTML comments: `<!-- agent-brief:start -->` and its `end`, and the
+same for `summary`, `rules` and `commands`. The manual reader already hides
+comments (the doc snippet markers are comments too), and the generated pages
+leave them out.
+
+`AGENTS.md` was the awkward one. It arrived a PR earlier with the front door
+(#1580), hand-written, and its rules are the AI-assistance policy. Now those
+rules sit in the chapter, under "Sending us a bug or a fix", because an
+operator's agent that finds a bug needs them as much as a contributor's agent
+does. `AGENTS.md` keeps its hand-written opening paragraph, and the block
+after it is generated. The rules are the ones #1580 wrote, word for word,
+except that two links are absolute: the same sentence has to work at the
+repository root, inside `docs/manual/` and in the binary, where a relative
+link points nowhere.
+
+### A command list that writes itself
+
+Other 0.2.7 issues are adding `relish agent` commands in parallel with this
+one, so the chapter can't hand-write a list of them. The command table
+between the `commands` markers comes from clap. The CLI's `Cli` struct lives
+in the `relish` binary, which the library can't see, but `relish agent`'s
+options are a library type, and that's enough:
+
+```rust
+pub fn agent_command() -> Command {
+    AgentOptions::augment_args(Command::new("agent"))
+}
+```
+
+`#[derive(clap::Args)]` implements the `Args` trait for `AgentOptions`, and
+`augment_args` is one of the trait's functions: it takes a `Command` and
+returns it with this type's flags and subcommands added. It has no `self`, so
+you call it on the type, like a static method in Go or Python. The `use
+clap::Args` at the top of the file is what makes it callable: Rust only lets
+you call a trait's functions when the trait is in scope. A walk over
+`get_subcommands()` then lists every visible leaf. `source` has no answer of
+its own, so its five commands are listed instead.
+
+`relish agent guide` does the same walk at run time, so its `data.commands`
+is always this binary's. The table in the chapter can lag: when someone adds
+`relish agent context`, the chapter keeps the old table until they run `make
+agent-docs`. That's what the drift test is for.
+
+### The drift test
+
+`generate` is a pure function. It takes the chapter and `AGENTS.md` as
+strings, the manual's titles, the version and a clap `Command`, and returns
+each file's path and contents. It never touches the disk, which is why it can
+be snapshot-tested on a fixture chapter. `tests/suite/agent_docs.rs` runs it
+on the real files and compares:
+
+```rust
+pub fn stale_paths(
+    artefacts: &[Artefact],
+    on_disk: impl Fn(&str) -> Option<String>,
+) -> Vec<&'static str> {
+```
+
+`impl Fn(&str) -> Option<String>` in argument position means "any closure (or
+function) that takes a `&str` and returns an `Option<String>`". The compiler
+makes a copy of `stale_paths` for each closure type it's called with, the way
+a C++ template would, so there's no function pointer to chase. The test
+passes a closure that reads the repository; a unit test passes one that reads
+a `Vec`. With `RELIABURGER_UPDATE_AGENT_DOCS` set, the test writes the files
+instead, and `make agent-docs` is just that.
+
+Finding a region returns a borrowed slice of the input:
+
+```rust
+pub fn region<'a>(file: &str, text: &'a str, region: Region) -> Result<&'a str, GuideError> {
+```
+
+`'a` is a lifetime parameter. It says the returned `&str` points into `text`,
+not into `file`, so the caller may drop `file` and keep the result, but not
+the other way round. Rust usually works that out itself (the "elision"
+rules), but with two reference arguments it can't guess which one the result
+borrows from, so we name it. In C you'd write the same function, return a
+pointer into the buffer, and hope every caller remembers which buffer.
+
+The section splitter uses a newer piece of syntax:
+
+```rust
+if !in_fence && let Some(next) = line.strip_prefix("## ") {
+```
+
+That's a let chain, new in the 2024 edition: a boolean test and a pattern
+match in one `if`. Before it, this was an `if` inside an `if`.
+
+### The tests
+
+The unit tests in `src/relish/agent/guide.rs` run on a fixture chapter and a
+fixture `agent` command, so the snapshots don't move every time a real
+command lands. There's an insta snapshot of each generated file and of the
+`relish agent guide` envelope. Other tests check that generation is
+deterministic, that regenerating from its own output changes nothing, that a
+missing or doubled marker is an error, that an edited chapter makes every
+file quoting it stale, and that a skill description over the format's 1,024
+characters is refused. One reads the embedded chapter and checks how it fits
+the default 24 KiB budget: when this landed it fitted untrimmed, and since
+the playbook joined it (see "Getting started with your agent" below) only
+that last section is trimmed.
+
+`tests/suite/agent_docs.rs` holds the agreement test, plus checks that
+`llms.txt` links every manual chapter, that `SKILL.md`'s front matter follows
+the [Agent Skills specification](https://agentskills.io/specification) (the
+name matches its directory, the description says when to use it), and that
+the marketplace's `source` points at a directory with a `plugin.json` and the
+skill. The doc snippet checks already parse every `relish` command in the
+chapter, and the other files are the chapter's text, so that covers them too.
+Because the agreement test reads `plugins/`, `select-jobs.sh` counts a change
+there as code.
+
+### What we didn't do
+
+- **`llms-full.txt`.** The issue first asked for one: the whole manual in a
+  single file. Temporal [notes](https://docs.temporal.io/with-ai.md) that its
+  own is too big to be the useful entry point, and `llms.txt` already links a
+  Markdown copy of every chapter.
+- **`bun` serving `/llms.txt`.** Also in the original issue. `relish agent
+  guide` does that job for an installed cluster, and matches the binary.
+- **The `/agents` page's design.** #1578 builds the website side: the
+  headline, install buttons, the recording. This change gives it the text and
+  a plain page in the site's shell, both generated.
+- **Moving `CLAUDE.md`'s rules into `AGENTS.md`.** The plan has `CLAUDE.md`
+  import `AGENTS.md`, so every tool reads the same rules. `CLAUDE.md` is the
+  file every Claude session here loads, so that edit is the maintainer's.
 
 ### Lessons
 
-Writing down how setup could hurt someone, before writing any of it, shaped
-every part. The risk that wasn't obvious was the diff itself. Context lines
-are what make a diff readable for a person, and in someone else's config
-file they're also what leaks: the server above ours has an `env`, and the
-`env` has a key. Zero context, keys inserted where they disturb nothing, and
-the redaction module over the top mean the diff is only what we add.
+The interesting choice was which file should be the source. The obvious
+answer is a short hand-written skill, with the manual pointing at it. But a
+skill is loaded into a model and never read by a person, so nobody would
+notice when it went stale. The manual chapter is read by people, compiled
+into the binary, and its snippets are tested. Make the file people read the
+source, and the files only machines read follow it.
 
 ## Tools for any agent: `relish mcp`
 
@@ -3078,7 +3027,7 @@ naming why) and wrong arguments, which come back as a tool result with
 tries again.
 
 The derivation tests use a stand-in `relish agent` with the commands that
-hadn't merged yet (`logs`, `diagnose`, `manual`, `report`, `patch`,
+hadn't merged when it was written (`logs`, `diagnose`, `manual`, `report`, `patch`,
 `upgrade-check`), so exclusions, toolsets, `--no-logs`, `--namespace` and
 argument building are checked against the shapes those commands will have.
 An insta snapshot pins the real `tools/list`, with each output schema's
@@ -3119,169 +3068,234 @@ arguments into a command line and back. The one decision it couldn't
 derive, "is this safe to run unattended?", is now a named list with a reason
 per entry and a test in front of it.
 
-## One chapter, many readers
+## Wiring up the agents
 
-An agent can learn about Reliaburger in six places. It can run `relish agent
-guide`. It can fetch `reliaburger.com/llms.txt` or `/agents`. Claude Code can
-load a skill from a plugin, Codex can load the same skill from a directory,
-and a coding agent opening the repository reads `AGENTS.md`. Write six
-documents by hand and they'll say six slightly different things within a
-release. It already happened to the README's command list, which is why
-`make readme-commands` exists.
+An agent can't use `relish mcp` until someone tells it the server exists. For
+Claude Code that's `claude mcp add reliaburger -- relish mcp`. Codex wants a
+`[mcp_servers.reliaburger]` table in `~/.codex/config.toml`, Cursor and Gemini
+CLI a `mcpServers` key in a JSON file each, VS Code a `servers` key in a
+different JSON file, and Goose an `extensions:` entry in YAML. Six agents,
+six files, three formats, and every one a place to make a typo. Stripe
+(`stripe agent setup`), Neon (`npx neon init`) and Vercel (`npx add-mcp`) all
+ship one command that does it for you
+([onboarding scan](../plans/2026-11-04-research-agent-onboarding-scan.md),
+suggestion 4). [#1581](https://github.com/reliaburger/reliaburger/issues/1581)
+is ours: `relish agent setup`.
 
-So [#1090](https://github.com/reliaburger/reliaburger/issues/1090) makes the
-manual chapter "Working with an AI agent" the one source, and generates the
-rest:
+It's also the first `relish agent` command that writes to files other people
+own. `~/.claude.json` holds Claude Code's whole state; a careless rewrite
+loses someone's project history. So the design starts from the ways it could
+go wrong, and each one became a rule with a test:
 
-| File | Made from |
-|---|---|
-| `relish agent guide` | The chapter embedded in the binary, split into its `## ` sections |
-| `docs/website/llms.txt` | The chapter's summary and brief, then a link to every manual chapter, pinned to the release tag |
-| `docs/website/agents.md`, `agents.html` | The whole chapter, as Markdown and as a page in the site's shell |
-| `plugins/reliaburger/skills/reliaburger/SKILL.md` | The summary (as the description), the brief and the command table |
-| `plugins/reliaburger/.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` | The summary and the version |
-| `AGENTS.md`, one marked block | The chapter's rules for agents, then the brief |
-| The chapter's own command table | The clap definition of `relish agent` |
+- **No surprises.** Without `--yes`, setup writes nothing. The answer is the
+  diff of every file it would change, and `next` offers the same command with
+  `--yes`, marked `read_only: false` so the agent asks a human first. The
+  issue asked for "one yes, showing the diff". An interactive prompt would
+  break the contract (`relish agent` never reads stdin), so the yes is a flag
+  on a second run, which the agent's own permission prompt puts in front of
+  the human anyway.
+- **No collateral.** It writes only the files its answer names, and in each
+  only its own entry.
+- **No stomping.** An entry called `reliaburger` that isn't exactly what
+  setup writes belongs to someone: maybe they pointed it at `/opt/rb/relish`
+  or added `--no-logs`. That's a `conflict`, left alone, unless `--force`.
+- **No drift.** A second run finds every entry `unchanged`.
+- **No blanket approval.** No entry carries Gemini's `trust`, an
+  `autoApprove` list or a wildcard, and setup never opens Claude Code's
+  `settings.json`, where `permissions` live. The [0.2.7
+  plan](../plans/2026-11-04-plan-0.2.7.md)'s safety line is that our docs
+  never advise "always allow"; it would be odd for our code to do it quietly.
 
-The shorter files can't carry the whole chapter, so it marks the parts they
-reuse with HTML comments: `<!-- agent-brief:start -->` and its `end`, and the
-same for `summary`, `rules` and `commands`. The manual reader already hides
-comments (the doc snippet markers are comments too), and the generated pages
-leave them out.
+### Six agents, one table
 
-`AGENTS.md` was the awkward one. It arrived a PR earlier with the front door
-(#1580), hand-written, and its rules are the AI-assistance policy. Now those
-rules sit in the chapter, under "Sending us a bug or a fix", because an
-operator's agent that finds a bug needs them as much as a contributor's agent
-does. `AGENTS.md` keeps its hand-written opening paragraph, and the block
-after it is generated. The rules are the ones #1580 wrote, word for word,
-except that two links are absolute: the same sentence has to work at the
-repository root, inside `docs/manual/` and in the binary, where a relative
-link points nowhere.
-
-### A command list that writes itself
-
-Other 0.2.7 issues are adding `relish agent` commands in parallel with this
-one, so the chapter can't hand-write a list of them. The command table
-between the `commands` markers comes from clap. The CLI's `Cli` struct lives
-in the `relish` binary, which the library can't see, but `relish agent`'s
-options are a library type, and that's enough:
+`clients.rs` is that table in code: an enum, `Client`, with a method for each
+column. `config` returns the file, its format and the key the servers live
+under; `entry` returns the JSON setup puts there; `detected` checks for the
+agent's config directory. Every entry starts the same command line:
 
 ```rust
-pub fn agent_command() -> Command {
-    AgentOptions::augment_args(Command::new("agent"))
+pub const MCP_COMMAND_LINE: &[&str] = &["relish", "mcp"];
+```
+
+`&[&str]` is a borrowed slice of borrowed strings: a fixed list, built into
+the binary, that nothing can grow. `relish mcp` (#1094) was being written at
+the same time as setup, so the command line it registers lives in this one
+constant, where a change to the server's flags is one edit. The entry runs
+plain `relish`, found on `PATH`, rather than this binary's absolute path, so
+an upgrade that moves the binary doesn't break six configs. The cost is that
+a macOS editor launched from the Dock may not see your shell's `PATH`; the
+manual says what to do then.
+
+Goose's entry has an `enabled: true`. That reads like approval but isn't: it
+turns the extension on, which is the point of adding it. Goose's
+tool-approval mode is a separate setting, and setup leaves it alone. The test
+that checks every entry for approval keys (`trust`, `alwaysAllow`,
+`autoApprove`, `permissions`, `allow`, `yolo` and friends, plus any `*`) runs
+over all six.
+
+### Editing JSON without reformatting it
+
+The obvious way to add a key to a JSON file in Rust is to parse it into a
+`serde_json::Value`, insert, and print it back out. Try it on `~/.claude.json`
+and the diff is the whole file. `serde_json`'s `Map` is a `BTreeMap` (a
+sorted map), so every key comes back in alphabetical order. There's a
+`preserve_order` feature that swaps in an insertion-ordered map, but Cargo
+features are unified across the whole build: if any crate in the graph turns
+a feature on, every user of `serde_json` gets it. Every JSON document
+`relish` and `bun` print, and every snapshot of one, would change key order
+to fix one command. In Python it's a keyword argument; in Rust it's a
+property of the whole build.
+
+So `edit.rs` reads the file differently. `RawValue` (behind serde_json's
+`raw_value` feature, which only adds a type and changes nothing else) is a
+value serde doesn't parse: it keeps the exact text. Read an object as a list
+of `(key, RawValue)` pairs and you have every member in file order, each
+value untouched, numbers like `1.50` included. That needs a hand-written
+`Deserialize`:
+
+```rust
+impl<'de> Deserialize<'de> for Members {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MembersVisitor;
+
+        impl<'de> Visitor<'de> for MembersVisitor {
+            type Value = Members;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Members, A::Error> {
+                let mut members = Vec::new();
+                while let Some(member) = map.next_entry::<String, Box<RawValue>>()? {
+                    members.push(member);
+                }
+                Ok(Members(members))
+            }
+        }
+
+        deserializer.deserialize_map(MembersVisitor)
+    }
 }
 ```
 
-`#[derive(clap::Args)]` implements the `Args` trait for `AgentOptions`, and
-`augment_args` is one of the trait's functions: it takes a `Command` and
-returns it with this type's flags and subcommands added. It has no `self`, so
-you call it on the type, like a static method in Go or Python. The `use
-clap::Args` at the top of the file is what makes it callable: Rust only lets
-you call a trait's functions when the trait is in scope. A walk over
-`get_subcommands()` then lists every visible leaf. `source` has no answer of
-its own, so its five commands are listed instead.
+This is serde's visitor pattern, and it's worth reading slowly once. `'de` is
+a lifetime, the lifetime of the input being parsed: it lets a deserialiser
+hand out `&str`s that point into the input instead of copying them. `D:
+Deserializer<'de>` means "any format": the same impl works for JSON, TOML or
+anything else serde speaks. Our code doesn't drive the parsing. It tells the
+deserialiser "I want a map" (`deserialize_map`) and hands over a visitor,
+and the deserialiser calls the visitor's method for what it found:
+`visit_map` for an object. If the file holds an array it calls `visit_seq`,
+which we didn't write, so the default fails with "expected a JSON object",
+the text `expecting` supplies. `type Value = Members` is an associated type:
+each `Visitor` impl names what it produces, so `visit_map` can return it. In
+Go you'd reach for `json.Decoder.Token()` and walk the stream yourself; serde
+turns that round and walks the stream to you.
 
-`relish agent guide` does the same walk at run time, so its `data.commands`
-is always this binary's. The table in the chapter can lag: when someone adds
-`relish agent context`, the chapter keeps the old table until they run `make
-agent-docs`. That's what the drift test is for.
+Then setup writes the object back with two-space indentation, which is what
+`JSON.stringify(value, null, 2)` writes and so what every Node-based agent's
+own file looks like. Only two levels are re-printed, the top and the server
+map; everything inside any other member is its original text. New keys go
+*first*. Appending would add a comma to the line before, and that line could
+be another server's `env`, with its API key, now in a diff an agent reads.
+Inserting at the front means the diff, with zero context lines, is only the
+lines setup adds, and removing our entry gives back the original file byte
+for byte. A test checks exactly that on a file with keys out of order, odd
+spacing and a `1.50`.
 
-### The drift test
+TOML was easier: `toml_edit`, which `relish fmt` already uses, edits a
+document in place and keeps comments and layout. YAML wasn't. The YAML crate
+round-trips data, not comments, and Goose's `config.yaml` is the user's too.
+Setup refuses a YAML file with any comment, and a JSON file with comments (VS
+Code allows them in `mcp.json`), as `unreadable`, with the entry to paste in
+by hand in the `note`. A refusal you can act on beats a rewrite that quietly
+eats your comments.
 
-`generate` is a pure function. It takes the chapter and `AGENTS.md` as
-strings, the manual's titles, the version and a clap `Command`, and returns
-each file's path and contents. It never touches the disk, which is why it can
-be snapshot-tested on a fixture chapter. `tests/suite/agent_docs.rs` runs it
-on the real files and compares:
+### Writing the file
 
-```rust
-pub fn stale_paths(
-    artefacts: &[Artefact],
-    on_disk: impl Fn(&str) -> Option<String>,
-) -> Vec<&'static str> {
-```
+Three details in `write`, each from a way it could go wrong:
 
-`impl Fn(&str) -> Option<String>` in argument position means "any closure (or
-function) that takes a `&str` and returns an `Option<String>`". The compiler
-makes a copy of `stale_paths` for each closure type it's called with, the way
-a C++ template would, so there's no function pointer to chase. The test
-passes a closure that reads the repository; a unit test passes one that reads
-a `Vec`. With `RELIABURGER_UPDATE_AGENT_DOCS` set, the test writes the files
-instead, and `make agent-docs` is just that.
+- **Rename, don't overwrite.** The new text goes to `<file>.relish-setup.tmp`
+  beside the original, then `fs::rename` moves it over. On one filesystem a
+  rename is atomic, so a crash leaves the old file or the new one, never half
+  of each. The original's permissions are copied first: `~/.claude.json` is
+  often `0600`, and it should stay that way.
+- **Check before writing.** Claude Code rewrites `~/.claude.json` while it
+  runs. Setup keeps the text it planned against and reads the file again just
+  before the rename; if it changed, setup writes nothing and says `not
+  written`.
+- **Follow symlinks.** Plenty of people keep dotfiles in a git repository and
+  link them into place. A rename over the link would replace it with a plain
+  file, so setup resolves a link first, writes the file it points at, and
+  reports that path.
 
-Finding a region returns a borrowed slice of the input:
-
-```rust
-pub fn region<'a>(file: &str, text: &'a str, region: Region) -> Result<&'a str, GuideError> {
-```
-
-`'a` is a lifetime parameter. It says the returned `&str` points into `text`,
-not into `file`, so the caller may drop `file` and keep the result, but not
-the other way round. Rust usually works that out itself (the "elision"
-rules), but with two reference arguments it can't guess which one the result
-borrows from, so we name it. In C you'd write the same function, return a
-pointer into the buffer, and hope every caller remembers which buffer.
-
-The section splitter uses a newer piece of syntax:
-
-```rust
-if !in_fence && let Some(next) = line.strip_prefix("## ") {
-```
-
-That's a let chain, new in the 2024 edition: a boolean test and a pattern
-match in one `if`. Before it, this was an `if` inside an `if`.
+The work is all blocking file I/O, so `run` does it inside
+`tokio::task::spawn_blocking`, which moves it to tokio's pool of threads
+meant for blocking, away from the threads that drive async tasks.
 
 ### The tests
 
-The unit tests in `src/relish/agent/guide.rs` run on a fixture chapter and a
-fixture `agent` command, so the snapshots don't move every time a real
-command lands. There's an insta snapshot of each generated file and of the
-`relish agent guide` envelope. Other tests check that generation is
-deterministic, that regenerating from its own output changes nothing, that a
-missing or doubled marker is an error, that an edited chapter makes every
-file quoting it stale, and that a skill description over the format's 1,024
-characters is refused. One reads the embedded chapter and checks how it fits
-the default 24 KiB budget: when this landed it fitted untrimmed, and since
-the playbook joined it (see "Getting started with your agent" below) only
-that last section is trimmed.
+Every test runs against a temporary home directory, never yours. `Home` is a
+struct holding the root path (and whether it's macOS, for VS Code's path), so
+`setup` takes it as an argument rather than reading `$HOME`. The fixture
+installs all six agents with config of their own: a GitHub server with a
+token in `~/.claude.json`, a commented `config.toml`, a Goose `developer`
+extension, a Claude Code `settings.json` with a `permissions` block.
 
-`tests/suite/agent_docs.rs` holds the agreement test, plus checks that
-`llms.txt` links every manual chapter, that `SKILL.md`'s front matter follows
-the [Agent Skills specification](https://agentskills.io/specification) (the
-name matches its directory, the description says when to use it), and that
-the marketplace's `source` points at a directory with a `plugin.json` and the
-skill. The doc snippet checks already parse every `relish` command in the
-chapter, and the other files are the chapter's text, so that covers them too.
-Because the agreement test reads `plugins/`, `select-jobs.sh` counts a change
-there as code.
+The tests follow the rules. A preview leaves every file and directory as it
+was, for plain, `--dry-run`, `--print`, `--remove` and `--force` alike.
+`--yes` changes only files the answer names, leaves no temporary file, never
+touches `settings.json`, and what it writes is an insta snapshot. A second
+run is all `unchanged`, and `--remove` gives back the originals byte for
+byte. Someone else's entry and someone else's skill survive both `--yes` and
+`--remove --yes`, and fall to `--force`. A commented YAML or JSONC file is
+left alone. The diff never shows the GitHub token, or any line that isn't
+ours. A file changed between plan and write isn't overwritten. A `0600` file
+stays `0600`, and a symlink stays a symlink. The whole preview, six agents
+and their diffs, is one snapshot, so a change to any agent's entry shows up
+in review.
+
+### One skill, from the chapter
+
+Setup and the agent guide (#1090) were written side by side, so setup
+started with a placeholder for the skill. Now that `make agent-docs`
+generates `SKILL.md`, setup carries the generated file itself:
+
+```rust
+pub const SKILL_MD: &str = include_str!("../../../../plugins/reliaburger/skills/reliaburger/SKILL.md");
+```
+
+`include_str!` reads the file at compile time and embeds it as a `&'static
+str`, so the binary installs the exact skill the repository ships and there's
+no second copy to drift. The path is relative to the source file, which is
+why it climbs four directories. A file the build reads has to travel in the
+source bundle too, or `relish agent patch` couldn't build the extracted
+source, so the skill joins the bundle's allowlist. The plugin's MCP server
+comes from the same place the other way round: `make agent-docs` writes
+`plugins/reliaburger/.mcp.json` from `MCP_COMMAND_LINE`, the constant setup
+registers, and a test checks the two agree.
 
 ### What we didn't do
 
-- **`llms-full.txt`.** The issue first asked for one: the whole manual in a
-  single file. Temporal [notes](https://docs.temporal.io/with-ai.md) that its
-  own is too big to be the useful entry point, and `llms.txt` already links a
-  Markdown copy of every chapter.
-- **`bun` serving `/llms.txt`.** Also in the original issue. `relish agent
-  guide` does that job for an installed cluster, and matches the binary.
-- **An MCP server in the plugin.** The plugin is meant to start `relish mcp`,
-  but that's #1094 and it hasn't landed. A plugin that starts a command that
-  doesn't exist is a broken install, so for now it holds only the skill.
-- **The `/agents` page's design.** #1578 builds the website side: the
-  headline, install buttons, the recording. This change gives it the text and
-  a plain page in the site's shell, both generated.
-- **Moving `CLAUDE.md`'s rules into `AGENTS.md`.** The plan has `CLAUDE.md`
-  import `AGENTS.md`, so every tool reads the same rules. `CLAUDE.md` is the
-  file every Claude session here loads, so that edit is the maintainer's.
+- **Shell out to `claude mcp add`.** It's the official way for Claude Code,
+  but it's one agent of six, it can't preview, and a test would need Claude
+  Code installed. Vercel's `add-mcp` writes the files too.
+- **Project-level files.** Claude Code's `.mcp.json` and Cursor's
+  `.cursor/mcp.json` in a repository share the server with a team. That's a
+  commit, which is a human's call, not a setup step.
+- **Install links.** Cursor, VS Code and Goose accept links that open the
+  editor and ask the user to confirm. They belong on the website and in the
+  README, not in a CLI.
 
 ### Lessons
 
-The interesting choice was which file should be the source. The obvious
-answer is a short hand-written skill, with the manual pointing at it. But a
-skill is loaded into a model and never read by a person, so nobody would
-notice when it went stale. The manual chapter is read by people, compiled
-into the binary, and its snippets are tested. Make the file people read the
-source, and the files only machines read follow it.
+Writing down how setup could hurt someone, before writing any of it, shaped
+every part. The risk that wasn't obvious was the diff itself. Context lines
+are what make a diff readable for a person, and in someone else's config
+file they're also what leaks: the server above ours has an `env`, and the
+`env` has a key. Zero context, keys inserted where they disturb nothing, and
+the redaction module over the top mean the diff is only what we add.
 
 ## Getting started with your agent
 
@@ -3457,8 +3471,6 @@ default budget only the playbook goes, and at 48 KiB nothing does.
 - **Per-provider commands.** The playbook names each provider's CLI and
   leaves the flags to the agent, which can read `--help`. Five sets of
   `create` flags in the chapter would be five things to go stale.
-- **`relish agent setup`.** Wiring Reliaburger into your agent clients is
-  #1581; the playbook mentions it with a `pending` marker until it lands.
 
 ### Lessons
 
@@ -3569,10 +3581,11 @@ outside an `untrusted` object is a leak. Any other command (`relish logs`,
 `relish wtf`) is outside the contract and gets listed, not failed: it was
 written for a person, and promises nothing.
 
-Today that check can only say `not_exercised`. No `relish agent` command reads
-logs yet (#1573 adds one), so the text reaches the solver through `relish
-logs`, unwrapped. That's the honest answer, and it's in the record. When
-`relish agent logs` lands, the same scenario starts testing it with no change.
+When the gym was written, that check could only say `not_exercised`. No
+`relish agent` command read logs yet, so the text reached the solver through
+`relish logs`, unwrapped. That's the honest answer, and it's in the record.
+`relish agent logs` (#1573) landed in the same release, and a solver that
+uses it is judged by the same check, with no change to the scenario.
 
 ### A bug on purpose
 
@@ -3672,8 +3685,8 @@ calls a model. `make test-gym` is the real thing.
 - **An LLM judge.** A closed vocabulary is cruder, but it can't be talked
   round, and a re-score is free.
 - **`submit_diagnosis` through MCP.** The research note pictured the agent
-  answering through an MCP tool. `relish mcp` (#1094) isn't here yet, and a
-  file works for any solver. The contract is the same JSON either way.
+  answering through an MCP tool. `relish mcp` (#1094) landed in the
+  same release, but a file works for any solver. The contract is the same JSON either way.
 - **A held-out set, mitigation scoring, more scenarios.** All in 0.4.2's part
   two. Publishing every scenario means a model could be tuned to them; for a
   first cut, being able to read exactly what's tested matters more.

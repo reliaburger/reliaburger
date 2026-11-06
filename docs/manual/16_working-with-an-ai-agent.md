@@ -220,6 +220,21 @@ net, not a promise: read what you share before you post it anywhere.
 | `relish agent source grep` | Search the source with a regular expression, line by line |
 | `relish agent source show` | Print up to 400 numbered lines of one file: `path` or `path:from-to` |
 | `relish agent source extract` | Write the source into a new or empty directory, as a git repository when git is installed |
+| `relish agent logs` | An app's recent log lines, newest kept, each wrapped as untrusted |
+| `relish agent manual search` | Up to ten sections that mention every word, best first, each with a short excerpt and the `show` command that prints it |
+| `relish agent manual show` | One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b` |
+| `relish agent context` | The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer |
+| `relish agent diagnose` | Every finding with its evidence, read-only next steps, and pointers into the manual and the source |
+| `relish agent explain` | What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary |
+| `relish agent upgrade-check` | Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown` |
+| `relish agent report` | Draft a redacted bug report for a human to post. Never posts |
+| `relish agent patch init` | Extract this binary's source into a new workspace, on a `patch` branch |
+| `relish agent patch build` | Build the workspace: `relish` for this machine, `bun` and a Linux `relish` for the nodes (in the build VM on macOS). Both by default |
+| `relish agent patch test` | Run the portable test suite in the workspace, optionally filtered |
+| `relish agent patch try` | Boot a throwaway cluster from the workspace's binaries, with its own `RELIABURGER_HOME` |
+| `relish agent patch diff` | The change against the extracted source, and the tests that ran |
+| `relish agent patch destroy` | Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay |
+| `relish agent setup` | Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes |
 <!-- agent-commands:end -->
 
 The list comes from `relish`'s own command definitions, so it names exactly
@@ -772,10 +787,12 @@ session:
 From a shell, `claude plugin marketplace add reliaburger/reliaburger` and then
 `claude plugin install reliaburger@reliaburger` do the same. The plugin holds
 one skill, `reliaburger`, which tells Claude to start with `relish agent
-guide` whenever you ask about a Reliaburger cluster. Claude Code reads only
-the skill's name and description until it needs the skill, so it costs almost
-nothing in a session that never touches a cluster. The plugin runs nothing on
-its own: it uses the `relish` on your `PATH`.
+guide` whenever you ask about a Reliaburger cluster, and one MCP server,
+`relish mcp` (see "Through MCP"). Claude Code reads only the skill's name and
+description until it needs the skill, so it costs almost nothing in a session
+that never touches a cluster. Both use the `relish` on your `PATH`, and the
+server only reads. If `relish agent setup` already added `reliaburger` to
+Claude Code, you don't need the plugin's server as well.
 
 ### Other agents
 
@@ -1125,11 +1142,10 @@ Finish with a short summary: where the cluster runs, its nodes, the API and
 the app, where the admin credential lives, what to back up, what it costs per
 month, and how to remove it: the report's `teardown`, plus the provider's
 delete command for every machine you made. Then suggest a read-only token for
-your next session (see "A read-only token"). `relish agent setup` (#1581) will
-wire Reliaburger into your human's agent clients; until it ships, this doesn't
-parse:
+your next session (see "A read-only token"), and `relish agent setup` to
+wire Reliaburger into your human's agent clients (see "Wiring up your
+agent"); it only shows the change until they add `--yes`:
 
-<!-- snippet: pending #1581 -->
 ```sh
 relish agent setup
 ```

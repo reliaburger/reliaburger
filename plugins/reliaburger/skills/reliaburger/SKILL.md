@@ -50,5 +50,20 @@ If you're an agent operating or debugging a Reliaburger cluster:
 | `relish agent source grep` | Search the source with a regular expression, line by line |
 | `relish agent source show` | Print up to 400 numbered lines of one file: `path` or `path:from-to` |
 | `relish agent source extract` | Write the source into a new or empty directory, as a git repository when git is installed |
+| `relish agent logs` | An app's recent log lines, newest kept, each wrapped as untrusted |
+| `relish agent manual search` | Up to ten sections that mention every word, best first, each with a short excerpt and the `show` command that prints it |
+| `relish agent manual show` | One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b` |
+| `relish agent context` | The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer |
+| `relish agent diagnose` | Every finding with its evidence, read-only next steps, and pointers into the manual and the source |
+| `relish agent explain` | What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary |
+| `relish agent upgrade-check` | Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown` |
+| `relish agent report` | Draft a redacted bug report for a human to post. Never posts |
+| `relish agent patch init` | Extract this binary's source into a new workspace, on a `patch` branch |
+| `relish agent patch build` | Build the workspace: `relish` for this machine, `bun` and a Linux `relish` for the nodes (in the build VM on macOS). Both by default |
+| `relish agent patch test` | Run the portable test suite in the workspace, optionally filtered |
+| `relish agent patch try` | Boot a throwaway cluster from the workspace's binaries, with its own `RELIABURGER_HOME` |
+| `relish agent patch diff` | The change against the extracted source, and the tests that ran |
+| `relish agent patch destroy` | Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay |
+| `relish agent setup` | Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes |
 
 `relish agent guide` prints the whole chapter this skill is made from, as the installed `relish` has it, and `relish agent schema` the shape of every answer.

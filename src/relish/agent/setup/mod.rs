@@ -30,16 +30,16 @@ use serde::Serialize;
 
 use super::budget::{self, Rendered};
 use super::envelope::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, NextStep};
-use clients::{Client, Home, MCP_SERVER_NAME};
+use clients::{Client, Home};
 use edit::Existing;
 
-pub use clients::{MCP_COMMAND_LINE, mcp_command_line};
+pub use clients::{MCP_COMMAND_LINE, MCP_SERVER_NAME, mcp_command_line};
 
-/// The Reliaburger skill for agents that read Agent Skills.
-// TODO(#1090): the one manual chapter generates `SKILL.md`; include it here
-// (`Some(include_str!(…))`) and setup installs it for Claude Code. Until
-// then setup writes only the MCP entries.
-pub const SKILL_MD: Option<&str> = None;
+/// The Reliaburger skill for agents that read Agent Skills, as `make
+/// agent-docs` generates it from the manual's agent chapter. Setup installs
+/// it for Claude Code.
+pub const SKILL_MD: &str =
+    include_str!("../../../../plugins/reliaburger/skills/reliaburger/SKILL.md");
 
 /// `relish agent setup`'s arguments.
 #[derive(Debug, Clone, clap::Args)]
@@ -559,7 +559,7 @@ pub async fn run(options: &SetupOptions, max_bytes: usize, rerun: &str) -> Rende
         Some(answer(
             &options,
             &home,
-            SKILL_MD,
+            Some(SKILL_MD),
             BuildInfo::current(),
             &rerun_for_task,
         ))

@@ -66,6 +66,8 @@ pub mod paths {
     pub const SKILL: &str = "plugins/reliaburger/skills/reliaburger/SKILL.md";
     /// The Claude Code plugin's manifest.
     pub const PLUGIN: &str = "plugins/reliaburger/.claude-plugin/plugin.json";
+    /// The MCP server the Claude Code plugin starts: `relish mcp`.
+    pub const PLUGIN_MCP: &str = "plugins/reliaburger/.mcp.json";
     /// The Claude Code marketplace this repository is.
     pub const MARKETPLACE: &str = ".claude-plugin/marketplace.json";
 }
@@ -453,6 +455,10 @@ pub fn generate(inputs: &Inputs<'_>, agent: &Command) -> Result<Vec<Artefact>, G
             contents: plugin_json(&summary, inputs.version),
         },
         Artefact {
+            path: paths::PLUGIN_MCP,
+            contents: plugin_mcp_json(),
+        },
+        Artefact {
             path: paths::MARKETPLACE,
             contents: marketplace_json(&summary),
         },
@@ -606,6 +612,20 @@ fn plugin_json(summary: &str, version: &str) -> String {
         "license": LICENSE,
         "keywords": ["reliaburger", "relish", "orchestrator", "containers", "sre"],
     }))
+}
+
+/// The plugin's `.mcp.json`: the same server, under the same name, that
+/// `relish agent setup` writes into an agent's own config.
+fn plugin_mcp_json() -> String {
+    let mut words = super::setup::MCP_COMMAND_LINE.iter();
+    let command = words.next().copied().unwrap_or("relish");
+    let args: Vec<&str> = words.copied().collect();
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        super::setup::MCP_SERVER_NAME.to_string(),
+        json!({"command": command, "args": args}),
+    );
+    pretty_json(&json!({ "mcpServers": servers }))
 }
 
 fn marketplace_json(summary: &str) -> String {
@@ -968,6 +988,21 @@ Intro paragraph.\n\n## In brief\n\n\
     #[test]
     fn snapshot_of_the_plugin_manifest() {
         insta::assert_snapshot!(artefact(paths::PLUGIN));
+    }
+
+    #[test]
+    fn the_plugin_starts_the_server_setup_registers() {
+        let value: serde_json::Value = serde_json::from_str(&artefact(paths::PLUGIN_MCP)).unwrap();
+        let server = &value["mcpServers"][super::super::setup::MCP_SERVER_NAME];
+        let mut line = vec![server["command"].as_str().unwrap()];
+        line.extend(
+            server["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a.as_str().unwrap()),
+        );
+        assert_eq!(line, super::super::setup::MCP_COMMAND_LINE);
     }
 
     #[test]
