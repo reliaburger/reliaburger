@@ -488,7 +488,7 @@ pub(super) async fn prepare_and_reserve_node_fault(
             .into_response()
             .into());
     };
-    if council.is_leader().await {
+    if crate::bun::leadership::leads(council).await {
         return reserve_node_fault_on_leader(state, prepared).await;
     }
     // This node starts the reservation itself, and the leader's reserve
@@ -522,7 +522,7 @@ pub(super) async fn reserve_node_fault_on_leader(
         .council
         .as_ref()
         .ok_or_else(|| Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
-    if !council.is_leader().await {
+    if !crate::bun::leadership::leads(council).await {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "node fault leader changed; retry",
@@ -665,6 +665,7 @@ pub(super) fn spawn_node_fault_reaper(state: ApiState) {
         loop {
             tokio::select! { _ = state.cmd_tx.closed() => return, _ = interval.tick() => {} }
             let cleanup = async {
+                // A background loop: a missed tick tries again in a second (#1393).
                 if !council.is_leader().await {
                     return;
                 }
