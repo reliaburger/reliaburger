@@ -3628,7 +3628,7 @@ scorer line up, and that `wtf` still names each fault, which makes it a
 regression test for `wtf` too. The other is `command:PROGRAM`: any program,
 given the prompt on stdin and in `GYM_PROMPT`, the read-only token and the
 recording `relish`. The exit test plugs Claude Code in there with nothing but
-the Reliaburger plugin; nothing in this repository calls a model API, and no
+the Reliaburger plugin (below); the gym never calls a model API itself, and no
 CI job runs a solver other than the baseline.
 
 The issue suggested a `relish eval` command or a script. We chose a script for
@@ -3668,6 +3668,64 @@ machine. Only the call log saw it. With a command that parses, the API refused
 it (403, "requires deployer role"), web kept running, and the audit log held
 an `api.refused` record under the solver's token. The
 [record](../qualification/2026-11-06-agent-gym-baseline.md) has both runs.
+
+### The exit test: Claude Code in the gym
+
+The release's exit test (#1093) puts a real agent where the baseline was.
+`scripts/gym/claude_code.py` is the solver: a short Python wrapper that runs
+`claude -p` (print mode, no human at the keyboard) with the Reliaburger
+plugin and nothing else from the machine. Most of its job is saying what the
+session *can't* do:
+
+```python
+argv = [
+    claude, "-p",
+    "--output-format", "stream-json", "--verbose",
+    "--setting-sources", "",
+    "--strict-mcp-config",
+    "--mcp-config", str(plugin / ".mcp.json"),
+    "--plugin-dir", str(plugin),
+    "--tools", "Bash,Skill",
+    "--allowedTools", "Bash(relish *)", "mcp__reliaburger", "Skill",
+    "--permission-mode", "dontAsk",
+    "--json-schema", json.dumps(answer_schema()),
+]
+```
+
+`--setting-sources ""` leaves out this machine's settings, plugins and hooks;
+`--strict-mcp-config` every MCP server but the plugin's. Bash is allowed for
+`relish` and nothing else, and `dontAsk` refuses anything not allowed without
+asking anyone. There's no skip-permissions flag: the token is what keeps the
+cluster safe, but the permissions are what keep the *host* safe, and a
+session that could run any shell command on a shared machine would make the
+read-only token beside the point. The answer comes back as structured output
+against the answer contract's schema, and the wrapper writes it to
+`GYM_ANSWER`, because the session has no tool that writes files. The model,
+the Claude Code version and the cost go into each run's result.
+
+One thing had to change in the gym for this. The plugin starts `relish mcp`,
+a server that talks JSON-RPC over stdin and stdout for as long as the session
+lasts, and the recording shim ran every `relish` to completion before
+passing its output on, which would have hung the server's first answer. Now
+the shim streams `relish mcp` line by line and records each `tools/call` as
+the `relish agent` command the tool is. A call to the MCP tool `source_grep`
+lands in the call log as `relish agent source grep --pattern=...`, so an
+agent that uses MCP and one that types commands are scored the same way, and
+the containment check reads MCP answers like any other `relish agent`
+output.
+
+The first real runs, 25 sessions on `claude-opus-5-5`, are in the
+[exit test record](../qualification/2026-11-06-v0.2.7-exit-test.md). Every
+diagnosis was right, mostly in two MCP calls: `context`, then `logs` or
+`diagnose`. The injected log stayed inside `untrusted` every time, the first
+time that check has had something to check. The planted bug's function was
+found in every run, in about 30 seconds. And the exit test still doesn't
+pass. Every patch fixed the symptom the prompt described and none fixed the
+second half of #1515 the plant also takes out, which the prompt never
+mentions; the gym checks both. Three runs typed `relish apps`, which doesn't
+exist, and clap helpfully suggested `apply`. Nobody ran it, but the scorer
+can't tell a typo from a write, so those runs are `unsafe`. Both are findings
+about us, not about the agent, which is what a gym is for.
 
 ### The tests
 
