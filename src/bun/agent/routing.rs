@@ -19,6 +19,22 @@ pub(super) fn take_whole_entry_withdrawals() -> Vec<crate::onion::vip::VirtualIP
     WHOLE_ENTRY_WITHDRAWALS.with_borrow_mut(std::mem::take)
 }
 
+#[cfg(all(test, not(all(feature = "ebpf", target_os = "linux"))))]
+thread_local! {
+    /// The services each kernel publication on this thread would have
+    /// written under one hold of the eBPF handle's lock, so tests without
+    /// the eBPF data path can count the holds (#1622).
+    static KERNEL_PUBLICATIONS: std::cell::RefCell<Vec<Vec<crate::onion::service_id::ServiceId>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain the kernel publications recorded on this thread, one list of
+/// services per hold of the eBPF handle's lock.
+#[cfg(all(test, not(all(feature = "ebpf", target_os = "linux"))))]
+pub(super) fn take_kernel_publications() -> Vec<Vec<crate::onion::service_id::ServiceId>> {
+    KERNEL_PUBLICATIONS.with_borrow_mut(std::mem::take)
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Republish the current `DnsNxdomain` fault set to the DNS responder.
     ///
@@ -104,37 +120,69 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Publish a validated candidate before exposing it to userspace readers.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub(super) async fn publish_backend_kernel(
         &self,
         id: &crate::onion::service_id::ServiceId,
         services: &crate::onion::service_map::ServiceMap,
     ) -> Result<(), BunError> {
+        self.publish_backends_kernel(std::slice::from_ref(id), services)
+            .await
+    }
+
+    /// Publish each of `ids`' validated candidates from `services` to the
+    /// kernel under one hold of the eBPF handle's lock. Job tasks take that
+    /// lock thousands of times a second and tokio's lock is fair, so taking
+    /// it once per service would queue behind them once per service (#1622).
+    /// Stops at the first write that fails, as one write at a time did.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    pub(super) async fn publish_backends_kernel(
+        &self,
+        ids: &[crate::onion::service_id::ServiceId],
+        services: &crate::onion::service_map::ServiceMap,
+    ) -> Result<(), BunError> {
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return Ok(());
         };
-        let Some(entry) = services.resolve(id).cloned() else {
+        let entries: Vec<_> = ids
+            .iter()
+            .filter_map(|id| services.resolve(id).map(|entry| (id, entry)))
+            .collect();
+        if entries.is_empty() {
             return Ok(());
-        };
+        }
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::for_consumer(
             self.cluster
                 .as_ref()
                 .map_or("", |cluster| cluster.local_node_id.0.as_str()),
         );
         let mut ebpf = self.lock_kernel(handle).await;
-        bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
-            .map_err(|error| BunError::BackendPublication {
-                service: id.clone(),
-                reason: error.to_string(),
-            })
+        for (id, entry) in entries {
+            bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, entry)
+                .map_err(|error| BunError::BackendPublication {
+                    service: id.clone(),
+                    reason: error.to_string(),
+                })?;
+        }
+        Ok(())
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    pub(super) async fn publish_backend_kernel(
+    pub(super) async fn publish_backends_kernel(
         &self,
-        _id: &crate::onion::service_id::ServiceId,
+        _ids: &[crate::onion::service_id::ServiceId],
         _services: &crate::onion::service_map::ServiceMap,
     ) -> Result<(), BunError> {
+        #[cfg(test)]
+        {
+            let published: Vec<_> = _ids
+                .iter()
+                .filter(|id| _services.resolve(id).is_some())
+                .cloned()
+                .collect();
+            if !published.is_empty() {
+                KERNEL_PUBLICATIONS.with_borrow_mut(|holds| holds.push(published));
+            }
+        }
         Ok(())
     }
 

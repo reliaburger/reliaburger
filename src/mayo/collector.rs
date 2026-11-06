@@ -71,6 +71,18 @@ impl SystemCollector {
         self.disks.refresh(true);
     }
 
+    /// [`refresh`](Self::refresh) on a blocking thread, for async callers:
+    /// it reads `/proc` for every process on the host and `statvfs`es every
+    /// mount. The collector moves to that thread and comes back; the error
+    /// is a panic there, which loses it.
+    pub async fn refreshed(mut self) -> Result<Self, tokio::task::JoinError> {
+        tokio::task::spawn_blocking(move || {
+            self.refresh();
+            self
+        })
+        .await
+    }
+
     /// Collect node-level metrics (CPU, memory, disk, network).
     pub fn collect_node_metrics(&self) -> Vec<CollectedMetric> {
         let mut metrics = Vec::new();
@@ -243,6 +255,26 @@ impl Default for SystemCollector {
 
 #[cfg(test)]
 mod tests {
+    /// The collection loop refreshed sysinfo on a runtime worker every
+    /// tick: a read of several `/proc/<pid>` files for every process on the
+    /// host, and a `statvfs` of every mount. A node running host jobs has
+    /// thousands of processes. On a single-threaded runtime, work done
+    /// inline finishes inside the first poll, so a pending first poll means
+    /// the refresh runs on a blocking thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refreshing_runs_off_the_runtime() {
+        let collector = super::SystemCollector::new();
+        let mut refresh = std::pin::pin!(collector.refreshed());
+
+        let first = futures_util::poll!(refresh.as_mut());
+        assert!(
+            first.is_pending(),
+            "sysinfo refreshed inside one poll, on the runtime"
+        );
+        let collector = refresh.await.unwrap();
+        assert!(!collector.collect_node_metrics().is_empty());
+    }
+
     #[test]
     fn exited_processes_are_forgotten_on_refresh() {
         let mut collector = SystemCollector::new();

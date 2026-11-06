@@ -324,6 +324,16 @@ impl FilesystemUsage {
         })
     }
 
+    /// [`of`](Self::of) on a blocking thread, for async callers: `statvfs`
+    /// waits on the filesystem, and on a slow disk it can stall a runtime
+    /// worker and the turn deadlines it would fire.
+    pub async fn measure(path: &Path) -> std::io::Result<Self> {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::of(&path))
+            .await
+            .map_err(std::io::Error::other)?
+    }
+
     /// Bytes in use, counting root-reserved blocks as used.
     pub fn used_bytes(&self) -> u64 {
         self.total_bytes.saturating_sub(self.available_bytes)
@@ -714,6 +724,26 @@ mod tests {
         let missing = directory.path().join("raft").join("not-yet");
         let measured = FilesystemUsage::of(&missing).unwrap();
         assert!(measured.total_bytes > 0);
+        assert!(measured.available_bytes <= measured.total_bytes);
+    }
+
+    /// #1618 moved relief's filesystem work off the runtime, but the same
+    /// disk-pressure tick still measured the Raft filesystem with `statvfs`
+    /// on a runtime worker. A `statvfs` on a disk that takes over a second
+    /// to fsync a journal can stall as long, and a stalled worker fires no
+    /// turn deadlines. As in the relief test, a first poll that comes back
+    /// pending on a single-threaded runtime means the call runs elsewhere.
+    #[tokio::test(flavor = "current_thread")]
+    async fn usage_is_measured_off_the_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut measure = std::pin::pin!(FilesystemUsage::measure(directory.path()));
+
+        let first = futures_util::poll!(measure.as_mut());
+        assert!(
+            first.is_pending(),
+            "statvfs ran inside one poll, on the runtime"
+        );
+        let measured = measure.await.unwrap();
         assert!(measured.available_bytes <= measured.total_bytes);
     }
 

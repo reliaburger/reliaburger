@@ -7020,6 +7020,166 @@ on a test runtime proves only that tokio behaves like tokio. What we have
 is the evidence above, a turn that ended in the second the prune ran, on a
 node whose other compaction turns all handed off at 500 ms.
 
+The same five-minute tick had two more calls like it. After relief, it
+pruned expired cluster rollups with `RollupStore::prune_expired`, which
+opens every rollup Parquet file to read its newest timestamp from the
+footer, and then measured the Raft log's filesystem with `statvfs` through
+`FilesystemUsage::of`. An hourly metrics-retention task next to it did the
+same footer scan through `MayoStore::prune`. All three ran on a runtime
+worker, and the two prunes did it while holding the store's read guard,
+so every writer waiting for that guard waited for the disk too.
+
+The prunes are `async fn`s now, and their scan, moved into a plain
+`prune_directory` function, runs on a blocking thread. The disk-pressure
+tick calls `FilesystemUsage::measure`, an async twin of `of`:
+
+```rust
+pub async fn measure(path: &Path) -> std::io::Result<Self> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || Self::of(&path))
+        .await
+        .map_err(std::io::Error::other)?
+}
+```
+
+There are two `?`-shaped failures stacked here. `spawn_blocking` returns a
+`JoinHandle<io::Result<Self>>`, and awaiting it gives a
+`Result<io::Result<Self>, JoinError>`: the outer error says the thread
+panicked, the inner one says `statvfs` failed. `map_err` turns the first
+into an `io::Error` and `?` returns it; what's left is the inner result,
+which the function returns as it is.
+
+`MayoStore::prune` needed one more thought. It skips the file a flush is
+still writing, and it learnt which one from `self.pending`. The blocking
+thread can't borrow `self`, so the prune copies that path out first and
+hands the closure owned copies. That's safe because `prune` takes `&self`
+and `flush` takes `&mut self`: while the caller's read guard keeps the
+shared borrow alive, no flush can start. The borrow checker enforces that
+for us, across the `.await`. Each of the three has a test in the style of
+the relief one (`expiry_reads_the_files_off_the_runtime`,
+`prune_reads_the_files_off_the_runtime`, `usage_is_measured_off_the_runtime`):
+one poll on a single-threaded runtime, which must come back `Pending`.
+
+Having found three, we went looking for the rest: every `std::fs`,
+`std::process::Command`, sysinfo refresh and big copy reachable from an
+async task in Bun, ranked by how close it runs to the agent loop. Two
+classes stood out. The worst ran on the loop's own task. Storing a freshly
+signed workload identity prepared its directory (on rootful Linux that
+reads `/proc/self/mounts` and may fork `mount -t tmpfs` and wait for it),
+then wrote six files with an fsync for each and for its directory, all in
+an identity-signing turn. Preparing an instance's identity directory before
+its container is created did the first half in a deploy turn. Both go
+through `sesame::identity::install_identity` and
+`prepare_identity_dir_off_runtime` now, which do the same work in a
+`spawn_blocking` closure. `install_identity` takes the owner lookup as a
+plain function pointer, `fn(&Path) -> Option<(u32, u32)>`, because it has
+to run after the directory exists, on the blocking thread, and a function
+pointer is `Send` and `'static` for free; a closure capturing the agent
+wouldn't be.
+
+The loop still waits for both: a container can't start before its
+identity directory exists. What changed is who's stuck while it waits.
+Before, the loop's worker thread sat in the system calls, so the timers
+and tasks queued on that worker waited too. Now the loop's task is parked
+on a `JoinHandle` and the worker goes on with everyone else. The loop rule
+test from earlier in this chapter noticed the two new awaits at once, and
+each now carries a `// LOOP-INLINE:` comment saying why it may wait.
+
+The other ran on a shared worker every collection tick: the metrics
+collector's sysinfo refresh reads several `/proc/<pid>` files for every
+process on the host, and a node running thousands of host jobs has
+thousands of processes. `SystemCollector::refreshed` moves the collector
+onto a blocking thread and hands it back:
+
+```rust
+pub async fn refreshed(mut self) -> Result<Self, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        self.refresh();
+        self
+    })
+    .await
+}
+```
+
+`refresh` needs `&mut self`, and you can't send a borrow to another thread
+that might outlive it. So the method takes `self` by value, the closure
+owns the collector while it refreshes, and returns it. The collection
+loop writes `collector = match collector.refreshed().await { ... }`, which
+reads like a reassignment because it is one: ownership goes out and comes
+back. The `Err` arm is a panic inside sysinfo, which took the collector
+with it, so the loop builds a new one. In Go
+you'd pass a pointer and trust nobody touches it meanwhile; here the
+compiler won't let anybody.
+
+The rest of the list is longer and less likely to bite: a memory-pressure
+fault's `memory.high` write, which makes the kernel reclaim before it
+returns, still runs in the fault turn; log and metrics queries and flushes
+copy up to a million buffered rows under their store's lock; the log
+export hashes every archive file on the worker. They're in the pull
+request for this section, with a line each.
+
+#### The lock that went to the back of the queue
+
+The 24-hour memory run of the published 0.2.6 (#1417) logged a different
+slow turn on the morning of 6 November:
+
+```
+08:27:24 bun: agent loop turn took 1805 ms in follow_up (consumer_sync/journal): journal write 225 ms, kernel lock wait 1579 ms, view install 1579 ms, firewall sync 0 ms
+```
+
+This is the line #890 built the meter for, and it points at one thing:
+the view install spent its whole time waiting for the eBPF handle's lock.
+So who held it? Outside the agent loop, three kinds of task take it. Job
+tasks do, through `TaskNamespacePolicy`, to bind a task's cgroup to its
+namespace, check the binding is still there, record its run identity and
+lift it all again on retirement. Path traces do, to read the live maps.
+And every one of them holds it for a map read or write or two, a few
+system calls, with no `.await` and no file I/O inside. The only holders
+that do more, the egress allowlist writes that scan every entry of four
+maps, run only for jobs with an `egress` allowlist, and the soak has none.
+
+Nobody held the lock for 1.6 seconds. What took the time was the queue.
+Job tasks take the lock thousands of times a second on a busy node, and
+tokio's `Mutex` is fair: waiters get it in the order they asked, and on
+release the lock passes straight to the next waiter, which keeps it until
+the scheduler gets round to polling that task. On a loaded host, the same
+one whose discovery journal writes took up to 1.4 s that hour, each of
+those hand-offs takes a while. And `install_view` took the lock once per
+service:
+
+```rust
+for entry in services {
+    self.publish_backend_kernel(&ServiceId::new(&entry.namespace, &entry.app_name), &map)
+        .await?;
+}
+```
+
+Each call locked, wrote one entry and unlocked, then went to the back of
+the queue for the next service. The soak's view has about a dozen
+services, so the install queued about a dozen times. In Go you'd see the
+same with a `sync.Mutex` in starvation mode, which also hands off in
+order; a C `pthread_mutex` usually lets the releasing thread grab the lock
+straight back, which is fast and unfair.
+
+`publish_backends_kernel` (#1622) now takes the lock once for all of a view's
+services and writes every entry under that one guard, stopping at the
+first write that fails, as the loop did. `publish_backend_kernel`, for one
+service, calls it with `std::slice::from_ref(id)`, which views a single
+`&T` as a one-element `&[T]` without copying. How do we test the number
+of holds on a Mac, with no eBPF? The same way the withdrawal tests do:
+without the data path, the agent records the services each hold would
+have written in a thread-local, and
+`a_view_install_takes_the_kernel_lock_once_for_all_its_services` publishes
+a view of 20 services and expects exactly one hold of 20. Before the fix
+it saw twenty holds of one.
+
+That doesn't make the queue shorter. A job-heavy node still sends every
+task through the same lock a few times, and the reusable executors' policy
+check, every 100 ms per running command, adds to it. Splitting the kernel
+handle so job tasks stop sharing a lock with the agent loop is a bigger
+change, and we'd want a soak's numbers before making it. What the fix does
+is make a view install pay for the queue once, not once per service.
+
 #### A 503 is an answer, not a verdict
 
 Candidate 7's jobs soak failed a pulse on one line: `deploy_from_cluster_registry`

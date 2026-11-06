@@ -1334,6 +1334,32 @@ async fn each_consumer_sync_turn_names_its_step_and_times_its_slow_awaits() {
     assert!(publish.part(TurnPart::FirewallSync).is_some(), "{publish}");
 }
 
+/// The #1417 memory run of 0.2.6 (6 November 2026): a
+/// `consumer_sync/journal` turn took 1,805 ms, 1,579 of them waiting for
+/// the eBPF handle's lock inside one view install. Nothing holding that
+/// lock did I/O or awaited; job tasks take it for a map write or two each,
+/// thousands of times a second. But the install took the lock once per
+/// service, and tokio's lock is fair, so each service joined the back of
+/// the queue again. A view install now takes the lock once for every
+/// service in the view. Without the eBPF data path, the agent records each
+/// hold's services in its place, so the test sees how many holds there were.
+#[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+#[tokio::test]
+async fn a_view_install_takes_the_kernel_lock_once_for_all_its_services() {
+    let (mut agent, _root, _, ingress) = recovered_consumer().await;
+    crate::bun::agent::routing::take_kernel_publications();
+    consumer_sync_turns(&mut agent, 1, large_catalogue(20, 30000), ingress).await;
+    let holds: Vec<usize> = crate::bun::agent::routing::take_kernel_publications()
+        .iter()
+        .map(Vec::len)
+        .collect();
+    assert_eq!(
+        holds,
+        [20],
+        "one hold of the kernel lock per view install, not one per service"
+    );
+}
+
 /// A catalogue of `services` services, three remote backends each, on
 /// host ports from `port_base`.
 fn large_catalogue(services: usize, port_base: u16) -> crate::onion::catalog::EndpointCatalog {
