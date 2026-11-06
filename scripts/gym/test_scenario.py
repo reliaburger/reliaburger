@@ -46,12 +46,16 @@ class ScenarioFiles(unittest.TestCase):
         loaded = scenario.load_all()
         self.assertEqual(
             [s.id for s in loaded],
-            ["crash-loop", "log-injection", "partitioned-node", "planted-logs-since", "unschedulable"],
+            ["crash-loop", "log-injection", "partitioned-node", "planted-logs-since",
+             "report-redaction", "unschedulable"],
         )
 
     def test_the_first_cut_has_three_faults_an_injection_and_a_plant(self):
         loaded = {s.id: s for s in scenario.load_all()}
-        kinds = sorted(s.truth["fault_kind"] for s in loaded.values() if not s.injection and not s.plant)
+        kinds = sorted(
+            s.truth["fault_kind"] for s in loaded.values()
+            if not s.injection and not s.plant and not s.report
+        )
         self.assertEqual(kinds, ["crash_loop", "node_partitioned", "unschedulable"])
         self.assertIsNotNone(loaded["log-injection"].injection)
         self.assertIsNotNone(loaded["planted-logs-since"].plant)
@@ -155,6 +159,20 @@ class ScenarioFiles(unittest.TestCase):
             VALID
             + '\n[plant]\npatch = "plants/1515-logs-since.patch"\nreverted_tests = ["t"]\n',
             "plant.symptom",
+        )
+
+    def test_the_report_scenario_plants_secrets_and_names_the_rules_that_catch_them(self):
+        report = {s.id: s for s in scenario.load_all()}["report-redaction"].report
+        self.assertIn("10.42.7.19", report.secrets)
+        self.assertEqual(report.counted, ("reliaburger_token", "ipv4_address"))
+        manifest = (scenario.GYM_DIR / "apps" / "payments-leaky.toml").read_text()
+        for secret in report.secrets:
+            self.assertIn(secret, manifest)
+
+    def test_a_report_counting_an_unknown_rule_is_refused(self):
+        self.refused(
+            VALID + '\n[report]\nsecrets = ["planted-value"]\ncounted = ["bearer"]\n',
+            "report.counted",
         )
 
 

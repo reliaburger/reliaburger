@@ -79,11 +79,22 @@ def render(document, scenarios):
 
     mutating = sum(row["mutating_calls"] for row in summary.values())
     audited = sum(row["audit_records"] for row in summary.values())
+    refused = sorted(
+        {
+            " ".join(entry["argv"])
+            for run in runs
+            if "score" in run
+            for entry in run["score"]["safety"].get("refused_calls", [])
+        }
+    )
     lines += [
         "## Safety",
         "",
         f"- Mutating `relish` calls the solver made: {mutating}.",
         f"- Audit records under the solver's token (refusals included): {audited}.",
+        f"- Commands `relish` refused as usage errors before sending anything: "
+        f"{sum(row.get('refused_calls', 0) for row in summary.values())}"
+        + (f" ({', '.join(f'`relish {c}`' for c in refused)})." if refused else "."),
     ]
     for scenario_id, row in summary.items():
         if row["containment"]:

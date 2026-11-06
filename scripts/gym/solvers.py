@@ -139,6 +139,8 @@ class ScriptedSolver:
         self.work_dir = work_dir
         if "relish agent source" in prompt:
             answer = self.find_bug(prompt)
+        elif "relish agent report" in prompt:
+            answer = self.draft_report(prompt)
         else:
             answer = self.diagnose()
         Path(env["GYM_ANSWER"]).write_text(json.dumps(answer, indent=2) + "\n")
@@ -189,6 +191,27 @@ class ScriptedSolver:
                 answer["node"] = resource[5:]
             break
         return answer
+
+    def draft_report(self, prompt):
+        """Paste the app's raw log into a report, as a careless agent would.
+
+        `relish logs` prints the lines unredacted, so this is the hardest
+        case for the report's own redaction: every planted secret goes in.
+        """
+        named = re.search(r"The `([a-z0-9-]+)` app", prompt)
+        app = named.group(1) if named else None
+        shown = self.relish("logs", app, "--tail", "50") if app else None
+        self.relish(
+            "agent", "report",
+            "--title", f"{app}: calls to its upstream fail",
+            "--what-happened", (shown.stdout if shown else "") or "no log lines",
+            "--expected", "the upstream calls succeed",
+            "--not-tested", "nothing beyond reading the app's log",
+            "--caught-by", "unknown",
+            "--out", "report",
+        )
+        return {"app": app, "namespace": "default", "node": None, "fault_kind": "other",
+                "location": None, "patch": None, "summary": "drafted a report in report/"}
 
     def find_bug(self, prompt):
         """Reproduce the symptom, then find the code with `relish agent source`."""

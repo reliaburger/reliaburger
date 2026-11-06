@@ -5,7 +5,8 @@ scripted solver, the shim and the scorer run end to end with no cluster. A
 fixture is a JSON object from the argument list, joined by spaces, to the
 recorded `stdout` and `exit` of that call on a real cluster
 (`fixtures/<scenario>.json`, made from a real run's call log with `gym.py
-fixture`). A call with no recording fails, as an unknown command would.
+fixture`). A call with no recording fails with exit 1, as a request the API
+refused would; exit 2 would mean a usage error that never left the machine.
 """
 import json
 import os
@@ -18,7 +19,7 @@ def main(argv):
     key = " ".join(argv)
     if key not in recorded:
         sys.stderr.write(f"fake relish: no recording for `relish {key}`\n")
-        return 2
+        return 1
     sys.stdout.write(recorded[key]["stdout"])
     return recorded[key]["exit"]
 

@@ -83,6 +83,32 @@ def symptom_control(cluster, plant, planted_relish):
     }
 
 
+def find_reports(directory):
+    """Every report draft under `directory`: each directory with a MANIFEST.json.
+
+    Each comes back with the text of every file in it, for the scorer to
+    search for planted secrets, and its parsed manifest.
+    """
+    reports = []
+    for manifest_path in sorted(Path(directory).rglob("MANIFEST.json")):
+        draft = manifest_path.parent
+        files = {
+            str(path.relative_to(draft)): path.read_text(errors="replace")
+            for path in sorted(draft.rglob("*"))
+            if path.is_file()
+        }
+        try:
+            manifest = json.loads(files.get("MANIFEST.json", ""))
+        except json.JSONDecodeError:
+            manifest = None
+        reports.append({
+            "dir": str(draft.relative_to(directory)),
+            "files": files,
+            "manifest": manifest,
+        })
+    return reports
+
+
 def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, timeout=DEFAULT_TIMEOUT,
              sleep=time.sleep):
     """One run of one scenario; returns the run's result and writes its files.
@@ -149,7 +175,9 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
                 answer["patch"], scenario.plant.reverted_tests
             )
             result["patch_reason"] = reason
-        scored = score_module.score(scenario, truth, answer, calls, audit, patch_result)
+        scored = score_module.score(
+            scenario, truth, answer, calls, audit, patch_result, find_reports(solver_dir)
+        )
         if answer_error:
             scored["answer_problems"].insert(0, answer_error)
         result.update(
@@ -179,7 +207,7 @@ def rescore(run_dir):
     audit = json.loads((run_dir / "audit.json").read_text())
     scored = score_module.score(
         scenario, result["truth"], answer, shim.read_log(run_dir / "calls.jsonl"), audit,
-        result.get("patch_result"),
+        result.get("patch_result"), find_reports(run_dir / "solver"),
     )
     if answer_error:
         scored["answer_problems"].insert(0, answer_error)
