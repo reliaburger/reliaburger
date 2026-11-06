@@ -121,7 +121,7 @@ fn write_error(failure: TaskArrayWriteError) -> Response {
 
 /// Check a submission and settle its namespace. Everything here is also
 /// enforced by the state machine; checking first gives a precise 400.
-fn validate_submission(request: &mut TaskArraySubmitRequest) -> Result<String, String> {
+pub(crate) fn validate_submission(request: &mut TaskArraySubmitRequest) -> Result<String, String> {
     let namespace = match (&request.namespace, &request.template.namespace) {
         (Some(a), Some(b)) if a != b => {
             return Err(format!(

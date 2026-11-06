@@ -1,0 +1,22 @@
+{
+  "cohort": [
+    {
+      "count": 100,
+      "name": "thumbnails",
+      "template": {
+        "exec": "/bin/true",
+        "runtime": "process"
+      }
+    },
+    {
+      "count": 3,
+      "name": "posters",
+      "template": {
+        "exec": "/bin/true",
+        "runtime": "process"
+      }
+    }
+  ],
+  "name": "render",
+  "namespace": "media"
+}

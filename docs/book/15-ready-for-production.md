@@ -8138,6 +8138,19 @@ The next step is OSS-Fuzz, which runs the same cargo-fuzz targets on
 Google's machines around the clock. That wants targets that have run clean
 nightly for a while first, so it's a follow-up.
 
+Three decoders missed the first cut, and they have targets now
+([#1414](https://github.com/reliaburger/reliaburger/issues/1414)). They are the task-array
+manifest, the chaos scenario file, and the council state inside a backup. The last one
+shows why one target per file isn't enough. `council_backup` already fuzzes the backup
+file, but its bytes are sealed with the master key, and random input never unseals. So the
+JSON a restore parses once it has unsealed a backup was never reached. `council_backup_state`
+starts after the seal. It also checks the one property a restore leans on: the backup name
+worked out from a state must parse back to the same position, because `relish council
+recover` refuses a state that doesn't sit where its name says. None of the three types
+derives `PartialEq`, and `DesiredState` holds `HashMap`s that re-encode in a different order
+each time. So each round trip compares `serde_json::Value`s, whose maps are ordered, rather
+than the structs.
+
 ## Did it happen in some order?
 
 Here's a history from three clients and one lease. Client 1 renews it through node A, and the
