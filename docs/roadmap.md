@@ -442,9 +442,10 @@ migration and no feature gate
   0.2.5 changes the cluster's formats, so a 0.2.4 cluster can't roll to it:
   recreate the cluster
   ([upgrading from 0.2.4](releasing.md#upgrading-from-024)).
-- [ ] **0.2.6: the rest of the evaluation's bugs, and setup over SSH**
+- [x] **0.2.6: the rest of the evaluation's bugs, and setup over SSH.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.6)
+  on 6 November 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/28),
-  [plan](plans/2026-11-03-plan-0.2.6.md)). What 0.2.5 left of [#1477](https://github.com/reliaburger/reliaburger/issues/1477)
+  [plan](plans/archive/2026-11-03-plan-0.2.6.md)). What 0.2.5 left of [#1477](https://github.com/reliaburger/reliaburger/issues/1477)
   (secure clusters past the council cap) and
   [#1500](https://github.com/reliaburger/reliaburger/issues/1500) (delete then
   re-apply on real multi-node runc), `relish setup --ssh` for clusters on
@@ -453,7 +454,17 @@ migration and no feature gate
   and Apple Container tests in CI
   ([#1534](https://github.com/reliaburger/reliaburger/issues/1534),
   [#1535](https://github.com/reliaburger/reliaburger/issues/1535)), and the
-  known flakes.
+  known flakes. #1500 closed as not reproduced in 60 cycles; #1535 and the
+  flakes moved to 0.2.7. Candidate 2 passed the full gate, the first on the
+  Mac Studio, but for two failures in the 8-hour final that the maintainer
+  accepted as known issues: a refused partition fault
+  ([#1601](https://github.com/reliaburger/reliaburger/issues/1601)) and one
+  1,232 ms compaction turn
+  ([#1606](https://github.com/reliaburger/reliaburger/issues/1606))
+  ([closure](qualification/2026-11-06-v0.2.6-release-closure.md),
+  [release log](release-log.md#026-the-rest-of-the-evaluations-bugs-and-setup-over-ssh)).
+  0.2.6 moves the protocol, so a 0.2.5 cluster can't roll to it: recreate
+  the cluster ([upgrading from 0.2.5](releasing.md#upgrading-from-025)).
 - [ ] **0.2.7: "Built for humans and their agents"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/29),
   [plan](plans/2026-11-04-plan-0.2.7.md)). The read-only half of the AI SRE
@@ -477,7 +488,7 @@ migration and no feature gate
   [#369](https://github.com/reliaburger/reliaburger/issues/369)), and fault
   pre-checks that read the leader's gossip view
   ([#334](https://github.com/reliaburger/reliaburger/issues/334)). Exit test:
-  ten Dell Wyse 3040s from power-on to a cluster.
+  three Dell Wyse 3040s from power-on to a cluster.
   Next. Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
   which waited for the 0.2.x patch releases.
 - [ ] **0.4.0 and 0.4.1: "Full container migration"**

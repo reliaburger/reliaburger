@@ -219,6 +219,9 @@ cluster's leader refuses it the way a 0.2.1 cluster refused 0.2.2
 0.2.5 moves it once more, to protocol 56 and state format 73, and a 0.2.4
 cluster's leader refuses it the same way
 ([upgrading from 0.2.4](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-024)).
+0.2.6 moves the protocol to 57 and keeps state format 73, and a 0.2.5
+cluster's leader refuses it too
+([upgrading from 0.2.5](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-025)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it
