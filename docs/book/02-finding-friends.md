@@ -1403,7 +1403,7 @@ The algorithm evaluates candidates on four things, in priority order.
 
 **Stability.** Older nodes rank first. A node that joined 30 seconds ago might be flapping (restarting repeatedly, hitting a boot loop, or just barely connecting), and we'd rather a node with a track record made quorum decisions. The age is `now.duration_since(node.first_seen)`, where `first_seen` is set when the node first appears in the membership table via gossip. The selection function can also refuse nodes younger than `min_node_age`, and its default is 10 minutes, but the cluster runtime that `bun --cluster` runs sets it to zero: a fresh cluster has to form a council at all before it can be choosy about one. So age orders candidates without blocking them. We'll come back to why in "Trying it yourself" below.
 
-**Resource availability.** A council member runs the Raft engine, stores the log, applies entries to the state machine. That's not free. If a node is already at 95% CPU, adding council duties might push it over the edge. We filter out nodes where CPU usage exceeds 90% of capacity or memory exceeds 85%. These thresholds come from `ResourceSummary`, the compact resource snapshot that nodes piggyback on gossip messages.
+**Resource availability.** A council member runs the Raft engine, stores the log, applies entries to the state machine. That's not free. If a node is already at 95% CPU, adding council duties might push it over the edge. So `select_council_candidates` skips a node whose `ResourceSummary` shows CPU above 90% or memory above 85%. The catch is that gossip doesn't carry a `ResourceSummary` yet. Outside tests every member's `resources` is `None`, and selection treats a node that reported nothing as eligible, so today this check never refuses anyone. It's ready for the day nodes gossip their resources, which is a feature of its own.
 
 What about nodes that haven't reported resources yet? They're excluded. No data means no guarantee they're not overloaded. A node has to have reported at least once to be eligible.
 
@@ -2502,11 +2502,11 @@ The council isn't static. Nodes join, nodes leave, nodes crash. The council adap
 
 Three things:
 
-**1. A council member departs.** Either gracefully (it announces `Left` via gossip) or by crashing (detected by Raft heartbeat timeout, typically 1–2 seconds). The remaining members continue with reduced quorum. The leader evaluates the candidate pool and promotes a replacement.
+**1. A council member departs.** Either gracefully (it announces `Left` via gossip) or by crashing, when gossip declares it dead and the leader's `HealthTracker` stops counting it as alive. Raft's own heartbeats don't decide this. The remaining members continue with reduced quorum. The leader evaluates the candidate pool and promotes a replacement.
 
 **2. The cluster grows past the current council size.** The council starts at 1 and grows towards `max_council_size` (default 7). With 3 nodes, you have 3 council members. With 50 nodes, you probably want 5. With 500 nodes, 7. The leader periodically checks whether the council should grow.
 
-**3. A council member becomes ineligible.** If a council member's CPU usage stays above 90% or its memory above 85% for an extended period, the leader may decide to replace it with a healthier node. This is a soft constraint: the leader doesn't immediately eject overloaded members, because that would cause unnecessary churn.
+**3. A council member has to go.** The planner replaces a voter that's under sustained disk pressure, as well as a dead one. A voter an operator retired leaves the voter set straight away, without waiting for a replacement. It doesn't replace a voter for being busy. There's no CPU or memory figure to judge by, because gossip carries none (see "Resource availability" above).
 
 ### How it works mechanically
 
@@ -2514,16 +2514,16 @@ The leader drives all council changes. Nobody else can modify the Raft membershi
 
 1. **Evaluate.** The leader calls `select_council_candidates()` with the current gossip membership table. This returns a ranked list of eligible nodes.
 2. **Add learner.** `council.add_learner(new_id, CouncilNodeInfo { addr, name })`. The new node starts receiving log replication. It doesn't vote yet.
-3. **Wait for catch-up.** The leader watches the learner's `match_index` in the Raft metrics. Once it's caught up to the leader's commit index, the learner is ready.
+3. **Wait for catch-up.** The leader watches the learner's replicated index in the Raft metrics. The planner promotes a learner only once it's within `max_promotion_lag` (64) entries of the leader's log, and promotes two at a time (`PromotePair`) so the voter count stays odd.
 4. **Change membership.** `council.change_membership(new_voter_set)`. Raft handles the joint consensus protocol internally: openraft does the heavy lifting. The old set and new set overlap during the transition, so there's no moment where no quorum exists.
 
-If a council member is being *removed* rather than added, the leader first ensures the remaining members form a quorum, then issues the membership change. Raft's joint consensus guarantees safety.
+A voter that has to go isn't removed first. If a caught-up learner exists, the planner swaps it in for the voter in one change (`Replace`), adding before it removes, so the voter count never passes through an even number. With no replacement, two dead voters leave together (`RemoveVoterPair`), and never below `min_council_size`. Raft's joint consensus keeps each change safe.
 
 ### The selection algorithm
 
 `select_council_candidates()` is a pure function. No side effects, no I/O. It takes a `MembershipTable` snapshot and returns candidates sorted by desirability:
 
-1. **Filter.** Only `Alive` nodes are eligible. Must not already be on the council. Must have been in the cluster for at least `min_node_age` (zero in the cluster runtime, so in practice this never refuses anyone). Must have reported resource usage, and that usage must be below the CPU/memory thresholds.
+1. **Filter.** Only `Alive` nodes are eligible. Must not already be on the council. Must have been in the cluster for at least `min_node_age` (zero in the cluster runtime, so in practice this never refuses anyone). A node that reports CPU or memory above the thresholds is skipped. None reports any yet, so this never refuses anyone either.
 2. **Score.** Zone diversity comes first: nodes in zones not yet represented on the council score higher. Then age: older nodes are more stable. Then a deterministic tiebreak by `NodeId` (lexicographic).
 
 The leader calls this function periodically (every gossip cycle, since it's cheap) and acts only when the result differs from the current council composition. Most of the time, nothing changes. When something does change (a member departed, a new zone came online, the cluster grew), the leader reacts within one gossip period.
