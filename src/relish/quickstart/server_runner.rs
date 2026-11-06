@@ -804,17 +804,20 @@ exit 0
             for binary in ["bun", "relish"] {
                 std::fs::write(fake.path().join("bin").join(binary), binary).unwrap();
             }
-            // Nothing listens here, so a tunnel can't seem to open by
-            // accident, and the ports for every machine fit below 65536.
-            let api_port = std::iter::repeat_with(|| {
-                std::net::TcpListener::bind("127.0.0.1:0")
-                    .unwrap()
-                    .local_addr()
-                    .unwrap()
-                    .port()
-            })
-            .find(|port| *port < 65000)
-            .unwrap();
+            // Nothing may listen on any machine's port, so a tunnel can't seem
+            // to open by accident. A port from `bind(0)` is in the ephemeral
+            // range, where the next outgoing connections on the host land:
+            // one of those, or a listener another test bound there, answered
+            // a tunnel's probe, and the test waited out the 60 s readiness
+            // deadline (#1608). Below the ephemeral ranges of both macOS
+            // (49152) and Linux (32768), only a fixed port collides, and the
+            // integration fixtures keep theirs in 27000..30000.
+            let api_port = std::iter::repeat_with(|| rand::random_range(20_000..27_000))
+                .find(|base: &u16| {
+                    (*base..*base + HOSTS.len() as u16)
+                        .all(|port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
+                })
+                .unwrap();
             Self {
                 ssh: Ssh::shell_script(script, Duration::from_secs(10), ""),
                 fake,
@@ -961,9 +964,13 @@ exit 0
         let checkpoints = tokio::sync::Mutex::new(&mut operation);
         for index in 0..HOSTS.len() {
             let client = (index > 0).then_some(&client);
-            let error = configure(&setup, index, client, &checkpoints)
-                .await
-                .unwrap_err();
+            let error = tokio::time::timeout(
+                Duration::from_secs(30),
+                configure(&setup, index, client, &checkpoints),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("node {} never stopped at its tunnel", index + 1))
+            .unwrap_err();
             assert!(stopped_at_the_tunnel(&error), "{error:#}");
         }
         // Release the operation lock, which `phases` takes.
