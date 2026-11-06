@@ -2433,13 +2433,23 @@ mod tests {
             "the whole output is on disk before a flush"
         );
 
+        // APFS gives an appending file blocks past its end that it hasn't
+        // written yet, and keeps them after the writer closes: on a loaded
+        // host, up to 1 MiB, which `st_blocks` counts (#1537). The reclaim
+        // only ever frees what the store has ingested, so the test makes
+        // that allocation itself, on every filesystem, and measures what
+        // the flush freed rather than what's left.
+        allocate_past_the_end(&capture, 1024 * 1024);
+        let before = allocated();
+
         store.flush().await.unwrap();
 
         assert_eq!(std::fs::metadata(&capture).unwrap().len(), BYTES);
+        let retained = super::super::capture::RETAINED_CAPTURE_BYTES + 256 * 1024;
+        let freed = before - allocated();
         assert!(
-            allocated() <= super::super::capture::RETAINED_CAPTURE_BYTES + 256 * 1024,
-            "{} bytes of the capture are still allocated",
-            allocated()
+            freed >= BYTES - retained,
+            "the flush freed {freed} of the capture's {before} allocated bytes"
         );
         let stdout = grill.stdout(&id).await.unwrap();
         assert!(!stdout.contains(&0), "reclaimed bytes read back as zeros");
@@ -2447,6 +2457,35 @@ mod tests {
         let mut lines = text.split('\n');
         assert_eq!(lines.next(), Some(LINE), "the first line read is whole");
         grill.kill(&id).await.unwrap();
+    }
+
+    /// Allocate `length` bytes past the end of `path` without changing its
+    /// length, as a filesystem's preallocation for an appending file does.
+    fn allocate_past_the_end(path: &std::path::Path, length: i64) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            use nix::fcntl::{FallocateFlags, fallocate};
+            let end = i64::try_from(file.metadata().unwrap().len()).unwrap();
+            fallocate(&file, FallocateFlags::FALLOC_FL_KEEP_SIZE, end, length).unwrap();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut store = nix::libc::fstore_t {
+                fst_flags: nix::libc::F_ALLOCATEALL,
+                fst_posmode: nix::libc::F_PEOFPOSMODE,
+                fst_offset: 0,
+                fst_length: length,
+                fst_bytesalloc: 0,
+            };
+            // SAFETY: `file` is open for the call, and F_PREALLOCATE reads
+            // and writes one `fstore_t`, which `store` is and outlives the
+            // call. The kernel does not keep the pointer.
+            let result =
+                unsafe { nix::libc::fcntl(file.as_raw_fd(), nix::libc::F_PREALLOCATE, &mut store) };
+            assert_ne!(result, -1, "{}", std::io::Error::last_os_error());
+        }
     }
 
     fn printf_spec(output: &str) -> OciSpec {
