@@ -1441,3 +1441,74 @@ number, and it caught a bare `3` in `has_crashloop` that the crashloop check
 had duplicated. And searching the source for the deciding line, instead of
 recording it, turned "keep the docs in step" from a chore into a test that
 fails.
+
+## The front door
+
+Everything so far helps an agent find a bug. The next question is what
+happens when it has one. If the answer is "it opens an issue", we've built a
+machine for filling our tracker with confident guesses. curl ended its bug
+bounty in January 2026 because AI-written reports had pushed its rate of
+confirmed vulnerabilities from above 15% to under 5%
+([Daniel Stenberg](https://daniel.haxx.se/blog/2026/01/26/the-end-of-the-curl-bug-bounty/)).
+We'd rather get fewer reports and be able to trust each one.
+
+[#1580](https://github.com/reliaburger/reliaburger/issues/1580) is the front
+door: GitHub issue forms in `.github/ISSUE_TEMPLATE/`, an AI-assistance policy
+in `CONTRIBUTING.md` and `AGENTS.md`, a `SECURITY.md`, and five labels. Blank
+issues are off. Every form (bug, agent-drafted bug, documentation error, test
+request) requires the version, a reproducer, "what was not tested" and an
+answer to "did an AI tool help?". That third field comes from the
+[Linux kernel's rules](https://docs.kernel.org/next/process/coding-assistants.html)
+for coding assistants: if you couldn't build or reproduce something, say so.
+A report that says "I didn't try runc" is useful. One that silently didn't is
+a trap.
+
+The agent-drafted form is the interesting one, because it's a contract. Its
+field ids (`fingerprint`, `version`, `fix_status`, `summary`, `reproducer`,
+`evidence`, `source`, `patch`, `not_tested`, `should_have_caught`,
+`redaction`, `ai_disclosure`, `human_review`) are what `relish agent report`
+fills in, and its labels are the `### ` headings of the draft it writes. The
+last field is three checkboxes a human must tick: they read it, they checked
+the redaction manifest, they searched for the fingerprint. An agent can draft
+all of it. It can't post it, and nothing we ship will.
+
+The policy is short, and it's the same for us as for everyone else. Disclose
+AI help (our own commits carry a `Co-Authored-By` trailer naming the model,
+so we can hardly ask less of anyone). A human answers for every line. Agents
+never post on their own. A bug-fix pull request carries a test that fails
+before the fix and passes after it. A report with no reproducer may be
+closed, and `unverified` says so in the meantime. Security reports go
+through GitHub's private reporting, and there's no bounty, at any severity:
+credit by name is what we offer.
+
+### Testing a YAML file nobody runs
+
+GitHub only checks an issue form when someone opens the new-issue page, so a
+misspelt key ships silently and the form quietly drops a field. The test,
+`tests/suite/issue_forms.rs`, parses each form into the subset of GitHub's
+schema we use. The body elements are an enum with `#[serde(tag = "type")]`,
+which reads the `type:` key to choose the variant, the same trick Chapter 1
+used for container state, and `deny_unknown_fields` turns `validation:`
+(missing its `s`) into a test failure instead of an optional field. On top of
+the schema it checks the contract: every form requires the four fields, the
+AI-disclosure options match across forms, and the agent form's ids, labels
+and required flags equal one table, `AGENT_REPORT_FIELDS`, in order. Changing
+that table is changing the report format, and the report's tests have to
+agree.
+
+The same test reads `CONTRIBUTING.md`, `AGENTS.md` and `SECURITY.md` for the
+rules they must state. That makes those three files code as far as CI is
+concerned, so `scripts/ci/select-jobs.sh` no longer treats an edit to them as
+documentation that can skip the Rust jobs.
+
+### What we didn't do
+
+- **A triage bot.** Issue bodies are attacker-controlled text, and an agent
+  reading them with write access is an injection waiting to happen
+  ([Invariant Labs](https://invariantlabs.ai/blog/mcp-github-vulnerability)).
+  Labels are applied by hand for now.
+- **A CI check that bug-fix PRs add a failing test.** The policy asks for it
+  and review enforces it; a check needs a reliable "fails on `main`" run first.
+- **PR caps in the repository.** GitHub can cap open pull requests from
+  accounts without write access and exempt people with merged work, but those
+  are repository settings for the maintainer, not files in a PR.

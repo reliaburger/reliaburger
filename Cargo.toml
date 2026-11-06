@@ -86,9 +86,10 @@ prometheus-parse = "0.2"
 # The manual, the examples and the dashboard's assets; the compression
 # feature shrinks them in release builds.
 rust-embed = { version = "8", features = ["compression", "debug-embed"] }
-# Reads the source bundle build.rs packs (src/relish/source_bundle.rs). The
-# same version arrow-ipc already pulls in, so no new crate.
-zstd = { version = "0.13", default-features = false }
+# Reads the source bundle build.rs packs (src/relish/source_bundle.rs). 0.14,
+# not the 0.13 that Arrow 59 still needs: RUSTSEC-2026-0391 and 0395 to 0406
+# (#1366). async-compression and include-flate already pull 0.14 in.
+zstd = { version = "0.14", default-features = false }
 mime_guess = "2"
 k8s-openapi = { version = "0.28", default-features = false, features = ["std", "v1_36"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
@@ -126,7 +127,7 @@ embed-source = []
 [build-dependencies]
 sha2 = "0.11"
 tar = "0.4"
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
