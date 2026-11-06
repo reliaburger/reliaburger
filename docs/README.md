@@ -810,10 +810,13 @@ constants and code that decide it), `source` (`version`, `tree`, `grep`,
 when a node runs another commit), `logs` (an app's newest lines in a time
 window, each wrapped as untrusted text, with a summary of what was left out),
 `manual` (`search` and `show` over this manual), `upgrade-check` (whether
-the cluster can take the latest release, with the reasons) and `report`
-(a redacted bug report, with a fingerprint for finding duplicates, for a
-human to read and post; it never posts, and makes no network call); more
-arrive through 0.2.7. See
+the cluster can take the latest release, with the reasons), `patch` (build,
+test and try a fix on a throwaway cluster), `report` (a redacted bug report,
+with a fingerprint for finding duplicates, for a human to read and post; it
+never posts, and makes no network call) and `setup`, which adds the `relish
+mcp` server to Claude Code, Codex, Cursor, VS Code, Goose and Gemini CLI: it
+shows the diff, writes only with `--yes`, never touches an entry it didn't
+write, and approves no tools. See
 [Working with an AI agent](manual/16_working-with-an-ai-agent.md).
 
 Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select

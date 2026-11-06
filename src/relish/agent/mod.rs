@@ -23,6 +23,7 @@ pub mod logs;
 pub mod manual;
 pub mod report;
 pub mod patch;
+pub mod setup;
 pub mod source;
 pub mod untrusted;
 pub mod upgrade_check;
@@ -90,6 +91,9 @@ pub enum AgentCommand {
     Report(Box<report::ReportArgs>),
     /// Build, test and try a fix on a throwaway cluster.
     Patch(patch::PatchOptions),
+    /// Wire Reliaburger into the AI agents on this machine. Shows the diff;
+    /// writes only with --yes.
+    Setup(setup::SetupOptions),
 }
 
 impl AgentCommand {
@@ -107,6 +111,7 @@ impl AgentCommand {
             AgentCommand::UpgradeCheck(_) => CommandName::UpgradeCheck,
             AgentCommand::Report(_) => CommandName::Report,
             AgentCommand::Patch(options) => options.command.name(),
+            AgentCommand::Setup(_) => CommandName::Setup,
         }
     }
 }
@@ -161,6 +166,7 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
         }
         AgentCommand::Report(args) => report::run(args, options.max_bytes, rerun),
         AgentCommand::Patch(patch) => patch::run(patch, options.max_bytes, rerun).await,
+        AgentCommand::Setup(setup) => setup::run(setup, options.max_bytes, rerun).await,
     }
 }
 
@@ -262,6 +268,7 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::PatchTry => Some(schema_of::<patch::TryData>()),
         CommandName::PatchDiff => Some(schema_of::<patch::DiffData>()),
         CommandName::PatchDestroy => Some(schema_of::<patch::DestroyData>()),
+        CommandName::Setup => Some(schema_of::<setup::SetupData>()),
     }
 }
 
@@ -510,6 +517,7 @@ mod tests {
                 "patch try",
                 "patch diff",
                 "patch destroy"
+                "setup"
             ]
         );
         let envelope = &value["data"]["envelope"];

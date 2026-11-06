@@ -31,7 +31,7 @@ rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls-no-provider", "stream"] }
 webpki-root-certs = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 # JSON Schema for `relish agent schema` (#1565), derived from the same serde
 # types the commands print, so the schema can't drift from the output.
 schemars = "1"
@@ -44,6 +44,8 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }
 toml = { version = "1", features = ["preserve_order"] }
 toml_edit = "0.25"
+# Line diffs for `relish agent setup` (#1581); already in the lock file via insta.
+similar = "2"
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
 flate2 = "1"
 crc32fast = "1"

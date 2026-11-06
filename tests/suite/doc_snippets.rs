@@ -44,6 +44,7 @@ const OPEN_ISSUES: &[(u32, &str)] = &[
     (656, "drain: cordon, drain and uncordon"),
     (711, "Franchise multi-cluster"),
     (1090, "relish agent guide"),
+    (1094, "relish mcp"),
     (1209, "GPU metrics and relish gpus"),
     (1210, "relish fault gpu"),
     (1221, "model shorthand and relish model"),
