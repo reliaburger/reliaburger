@@ -3003,6 +3003,14 @@ if let Some(committed) = committed.filter(|committed| committed.index >= first) 
 
 Why stop at the commit point and not the end of the log? Entries past it were never agreed by the dead council. Replaying one could resurrect a write whose client was told it failed. A follower's commit point can trail the leader's by a heartbeat, so recovering from a follower may lose the last write or two. That's the same honest cost as a backup's interval, just much smaller.
 
+### A replaced voter that comes back
+
+What happens when a voter the planner replaced while it was down comes back? It has its data and its log, but it missed its own removal, so its Raft state still says it's a voter. It does what a voter with no leader does: it campaigns. The other voters refuse it, because the leader's lease is still running, so no harm done yet. But a Raft candidate raises its term each time it campaigns, and the refusals don't lower it again.
+
+Then gossip sees the node again. To the reconciler it's just a live spare, so the leader adds it as a learner and starts replicating to it. The node answers with its higher term, and Raft's rule is that anyone who hears a higher term steps down, the leader included. The node can't win the election that follows, because its log is behind, so the cost is a few seconds without writes. That's every time a replaced voter returns.
+
+We found this by reading the code (#1524), and the test came before any fix: `a_replaced_voter_coming_back_joins_as_a_learner_without_an_election` in `tests/council_self_healing.rs`. The first version passed, and that was misleading. The returning node was added back within 200 ms, before its election timer had fired, so its term never rose. The version that counts waits until the node has campaigned, and then the leader steps down every time. It stays `#[ignore]`d under #1524 until the fix lands. The fix has a cost to weigh: stopping a returning node from campaigning while a leader is alive mustn't slow the election after a real leader failure.
+
 ### Resigning under disk pressure
 
 There's a slower failure worth heading off before it becomes a total loss: a voter whose disk is filling up. Raft can't make progress if a voter can't persist its log, so a voter drowning in disk pressure is a liability sitting in the quorum. Better it resigns and lets a healthy spare take the seat.
