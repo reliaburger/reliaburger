@@ -628,6 +628,41 @@ asking every second, and it writes a key only for a cgroup the runtime proved.
 caller.cgroup_id)`, which drops every `None`, so an unverified caller never
 gets a key.
 
+Job attempts had the same bug, by a different road (#1602). A fault can
+name a job as its source, and each attempt that runs in a runtime instance
+of its own is a caller too, listed by `attempt_callers` rather than the
+supervisor. Its lookup under the turn's deadline turned a timeout into
+`None` and never marked the attempt pending, so the follow-up never read
+it and a busy node refused the fault. Making it pending was the easy half.
+The other half was a cache. An app instance's proven cgroup is kept per
+restart count, so the follow-up's proof survives the reconcile that comes
+next. Attempts weren't cached at all, on purpose: a runtime slot's instance
+id comes back for the next task, under a new cgroup. Without a cache, the
+follow-up would prove the attempt, and the very next reconcile would ask
+the slow runtime again, miss the deadline again, and key nothing, while
+the operator heard "applied". So attempts now get their own cache,
+`attempt_cgroups`, keyed by instance id but holding the attempt it was
+read for:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AttemptRun {
+    pub(super) batch_id: u64,
+    pub(super) index: u32,
+    pub(super) attempt: u8,
+}
+```
+
+A cached cgroup counts only while the live attempt under that id is the
+same run, the same task index and the same attempt number. A reused slot
+is a different `AttemptRun`, so its entry is dropped and read again. It's
+the restart count's job, done with the identity jobs actually have. The
+struct derives `Copy` because it's three small numbers: copying it is as
+cheap as copying a pointer, and it saves a `.clone()` everywhere a pending
+caller is compared. `source_proven` checks this cache as well, so a fault
+accepted on a pending attempt is refused if the follow-up finds no cgroup,
+exactly as for an app.
+
 ### The pool that didn't notice
 
 With the partition landing on the right node, we ran the demo again. `relish

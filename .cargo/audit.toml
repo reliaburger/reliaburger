@@ -45,6 +45,10 @@
 # docs/qualification/2026-10-26-dependency-exceptions.md): parquet, arrow-ipc
 # and DataFusion 55.2.0 still require zstd 0.13, and only Parquet that
 # Reliaburger wrote itself is decompressed. Moving to zstd 0.14.3 is #1366.
+# On 6 November 2026 the source bundle and include-flate 0.3.5 moved to zstd
+# 0.14.3, so only parquet, arrow-ipc and DataFusion 55.2.0 still need these
+# (tests/suite/dependency_audit.rs); they go when DataFusion 56 (arrow 60) is
+# on crates.io. See docs/qualification/2026-11-06-dependency-exceptions.md.
 # Next review: 18 November 2026.
 [advisories]
 ignore = [
