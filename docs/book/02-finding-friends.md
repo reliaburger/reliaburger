@@ -3028,6 +3028,8 @@ pub fn observe(&mut self, over_threshold: bool, now: Instant) -> ResignationVerd
 
 A resigning *follower* is easy: it becomes a new input to the self-healing planner, which treats it like a soft-dead voter: bring a replacement in first, promote it, then evict the pressured seat, never dropping below quorum. The planner's existing invariants (never remove the leader, never break quorum, one action per tick) are untouched; disk pressure is just one more reason a seat might open. The property test that guards those invariants got a new generated input (a random set of pressured voters) and still holds.
 
+"Bring a replacement in first" hid a gap that only showed on a full council. The planner gets its candidates from `select_council_candidates`, which hands out `max_council_size` minus the voters gossip can see. A pressured voter is alive, so gossip sees it. With seven voters seated, that's seven minus seven: no candidates, so no replacement, and the voter kept its seat until its disk filled and bun stopped. The planner's unit test passed its candidates in by hand, so it never went through the step that came back empty (#1523). Now the reconciler leaves pressured nodes out of both sides of that call. A pressured voter doesn't count as staying, which frees its seat, and no pressured node is offered as a candidate. A test drives `reconcile_council_once` on a full council: four nodes, a council size of three, then one follower's disk fills, and the spare must take its seat.
+
 A resigning *leader* is the hard case, and it's where openraft 0.9 fought us.
 
 ### The leadership-transfer trick
