@@ -1293,7 +1293,19 @@ async fn each_consumer_sync_turn_names_its_step_and_times_its_slow_awaits() {
         .supervisor
         .grill()
         .set_inventory_delay(Some(std::time::Duration::from_millis(50)));
-    let turns = consumer_sync_turns(&mut agent, 1, catalog, ingress).await;
+    let all_turns = consumer_sync_turns(&mut agent, 1, catalog, ingress).await;
+    // A write that outlasts the turn's 500 ms runtime budget carries on off
+    // the loop, and the rest of its step runs in a later turn once it has
+    // landed: `install` after the publish step's write, `landed` after any
+    // other. The stall is 50 ms, but on a loaded host the write itself can
+    // take the rest of the budget (#1619), so either may appear.
+    let landing = |turn: &&crate::bun::loop_meter::TurnRecord| {
+        matches!(
+            turn.detail,
+            Some("consumer_sync/landed" | "consumer_sync/install")
+        )
+    };
+    let turns: Vec<_> = all_turns.iter().filter(|turn| !landing(turn)).collect();
     let steps: Vec<_> = turns.iter().map(|turn| turn.detail).collect();
     assert_eq!(
         steps,
@@ -1329,9 +1341,23 @@ async fn each_consumer_sync_turn_names_its_step_and_times_its_slow_awaits() {
         "{candidate}'s inventory read: {:?}",
         candidate.part(TurnPart::RuntimeInventory)
     );
-    let publish = &turns[4];
-    assert!(publish.part(TurnPart::ViewInstall).is_some(), "{publish}");
-    assert!(publish.part(TurnPart::FirewallSync).is_some(), "{publish}");
+    // The view is installed in the publish turn, or in the `install` turn
+    // after it when the publish step's write landed late.
+    let installing: Vec<_> = all_turns
+        .iter()
+        .filter(|turn| {
+            matches!(
+                turn.detail,
+                Some("consumer_sync/publish" | "consumer_sync/install")
+            )
+        })
+        .collect();
+    for part in [TurnPart::ViewInstall, TurnPart::FirewallSync] {
+        assert!(
+            installing.iter().any(|turn| turn.part(part).is_some()),
+            "{part:?}: {installing:?}"
+        );
+    }
 }
 
 /// A catalogue of `services` services, three remote backends each, on
