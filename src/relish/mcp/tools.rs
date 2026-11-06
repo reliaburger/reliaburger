@@ -59,9 +59,15 @@ pub const EXCLUDED: &[Exclusion] = &[
     },
 ];
 
-/// The exclusion for `command`, if there is one.
+/// The exclusion for `command`, if there is one. An excluded group, such as
+/// `patch`, excludes every command under it (`patch init`, `patch try`).
 pub fn exclusion(command: &str) -> Option<&'static Exclusion> {
-    EXCLUDED.iter().find(|excluded| excluded.command == command)
+    EXCLUDED.iter().find(|excluded| {
+        command == excluded.command
+            || command
+                .strip_prefix(excluded.command)
+                .is_some_and(|rest| rest.starts_with(' '))
+    })
 }
 
 /// The shape of one argument's value, as JSON and on the command line.

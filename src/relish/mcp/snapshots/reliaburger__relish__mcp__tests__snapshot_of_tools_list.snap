@@ -9,6 +9,73 @@ expression: listed_for_snapshot(server.tools())
       "idempotentHint": true,
       "openWorldHint": false,
       "readOnlyHint": true,
+      "title": "relish agent guide"
+    },
+    "description": "How to use relish as an agent: the manual chapter, as Markdown sections",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "max_bytes": {
+          "default": 24576,
+          "description": "Largest answer to print, in bytes (at least 1024). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "guide",
+    "outputSchema": {
+      "description": "The relish.agent/v1 envelope. `ok` says whether the command answered: then `data` is the answer, otherwise `error` says why not.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "data": "<relish agent guide data schema>",
+        "error": {
+          "description": "Why the command couldn't answer: code, message, endpoint, status, hint.",
+          "type": "object"
+        },
+        "next": {
+          "description": "Commands worth running next, each with run, why and read_only.",
+          "type": "array"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "relish": {
+          "description": "The build of relish that answered.",
+          "type": "object"
+        },
+        "schema": {
+          "const": "relish.agent/v1"
+        },
+        "truncated": {
+          "description": "The answer was trimmed to fit max_bytes; a warning says what was cut.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema",
+        "command",
+        "ok",
+        "relish"
+      ],
+      "type": "object"
+    },
+    "title": "relish agent guide"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
       "title": "relish agent version"
     },
     "description": "This binary's version, commit, target and cluster formats",
@@ -85,13 +152,29 @@ expression: listed_for_snapshot(server.tools())
         "command": {
           "description": "Only this command's data schema",
           "enum": [
+            "guide",
             "version",
             "schema",
             "source-version",
             "source-tree",
             "source-grep",
             "source-show",
-            "source-extract"
+            "source-extract",
+            "logs",
+            "manual-search",
+            "manual-show",
+            "context",
+            "diagnose",
+            "explain",
+            "upgrade-check",
+            "report",
+            "patch-init",
+            "patch-build",
+            "patch-test",
+            "patch-try",
+            "patch-diff",
+            "patch-destroy",
+            "setup"
           ],
           "type": "string"
         },
@@ -473,5 +556,484 @@ expression: listed_for_snapshot(server.tools())
       "type": "object"
     },
     "title": "relish agent source show"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "relish agent logs"
+    },
+    "description": "An app's recent log lines, newest kept, each wrapped as untrusted",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "app": {
+          "description": "The app or job whose lines to read",
+          "type": "string"
+        },
+        "grep": {
+          "description": "Keep only lines matching this regular expression (`error|warn`)",
+          "type": "string"
+        },
+        "instance": {
+          "description": "Only this instance's lines (`default__web-2`)",
+          "type": "string"
+        },
+        "line_bytes": {
+          "default": 512,
+          "description": "The longest a line may be, in bytes (at least 64); longer ones are cut and end in `…[cut]`",
+          "type": "integer"
+        },
+        "max_bytes": {
+          "default": 24576,
+          "description": "Largest answer to print, in bytes (at least 1024). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "type": "integer"
+        },
+        "namespace": {
+          "default": "default",
+          "description": "The namespace it lives in",
+          "type": "string"
+        },
+        "since": {
+          "default": "15m",
+          "description": "Start of the window: a duration before now (30s, 15m, 2h, 1d) or epoch seconds",
+          "type": "string"
+        },
+        "stream": {
+          "description": "Only one stream",
+          "enum": [
+            "stdout",
+            "stderr"
+          ],
+          "type": "string"
+        },
+        "tail": {
+          "default": 200,
+          "description": "The newest lines in the window to return, at most 2000",
+          "type": "integer"
+        },
+        "until": {
+          "description": "End of the window, the same way; now when left out",
+          "type": "string"
+        }
+      },
+      "required": [
+        "app"
+      ],
+      "type": "object"
+    },
+    "name": "logs",
+    "outputSchema": {
+      "description": "The relish.agent/v1 envelope. `ok` says whether the command answered: then `data` is the answer, otherwise `error` says why not.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "data": "<relish agent logs data schema>",
+        "error": {
+          "description": "Why the command couldn't answer: code, message, endpoint, status, hint.",
+          "type": "object"
+        },
+        "next": {
+          "description": "Commands worth running next, each with run, why and read_only.",
+          "type": "array"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "relish": {
+          "description": "The build of relish that answered.",
+          "type": "object"
+        },
+        "schema": {
+          "const": "relish.agent/v1"
+        },
+        "truncated": {
+          "description": "The answer was trimmed to fit max_bytes; a warning says what was cut.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema",
+        "command",
+        "ok",
+        "relish"
+      ],
+      "type": "object"
+    },
+    "title": "relish agent logs"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "relish agent manual search"
+    },
+    "description": "Up to ten sections that mention every word, best first, each with a short excerpt and the `show` command that prints it",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "max_bytes": {
+          "default": 24576,
+          "description": "Largest answer to print, in bytes (at least 1024). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "type": "integer"
+        },
+        "words": {
+          "description": "The words to look for; case doesn't matter",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "words"
+      ],
+      "type": "object"
+    },
+    "name": "manual_search",
+    "outputSchema": {
+      "description": "The relish.agent/v1 envelope. `ok` says whether the command answered: then `data` is the answer, otherwise `error` says why not.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "data": "<relish agent manual search data schema>",
+        "error": {
+          "description": "Why the command couldn't answer: code, message, endpoint, status, hint.",
+          "type": "object"
+        },
+        "next": {
+          "description": "Commands worth running next, each with run, why and read_only.",
+          "type": "array"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "relish": {
+          "description": "The build of relish that answered.",
+          "type": "object"
+        },
+        "schema": {
+          "const": "relish.agent/v1"
+        },
+        "truncated": {
+          "description": "The answer was trimmed to fit max_bytes; a warning says what was cut.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema",
+        "command",
+        "ok",
+        "relish"
+      ],
+      "type": "object"
+    },
+    "title": "relish agent manual search"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "relish agent manual show"
+    },
+    "description": "One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b`",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "max_bytes": {
+          "default": 24576,
+          "description": "Largest answer to print, in bytes (at least 1024). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "type": "integer"
+        },
+        "target": {
+          "description": "A chapter (its short name, part of it, or part of its title), optionally followed by `#` and a section's anchor",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    },
+    "name": "manual_show",
+    "outputSchema": {
+      "description": "The relish.agent/v1 envelope. `ok` says whether the command answered: then `data` is the answer, otherwise `error` says why not.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "data": "<relish agent manual show data schema>",
+        "error": {
+          "description": "Why the command couldn't answer: code, message, endpoint, status, hint.",
+          "type": "object"
+        },
+        "next": {
+          "description": "Commands worth running next, each with run, why and read_only.",
+          "type": "array"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "relish": {
+          "description": "The build of relish that answered.",
+          "type": "object"
+        },
+        "schema": {
+          "const": "relish.agent/v1"
+        },
+        "truncated": {
+          "description": "The answer was trimmed to fit max_bytes; a warning says what was cut.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema",
+        "command",
+        "ok",
+        "relish"
+      ],
+      "type": "object"
+    },
+    "title": "relish agent manual show"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "relish agent context"
+    },
+    "description": "The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "events": {
+          "default": 20,
+          "description": "How many of the newest cluster events to include, at most 200",
+          "type": "integer"
+        },
+        "max_bytes": {
+          "default": 24576,
+          "description": "Largest answer to print, in bytes (at least 1024). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "context",
+    "outputSchema": {
+      "description": "The relish.agent/v1 envelope. `ok` says whether the command answered: then `data` is the answer, otherwise `error` says why not.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "data": "<relish agent context data schema>",
+        "error": {
+          "description": "Why the command couldn't answer: code, message, endpoint, status, hint.",
+          "type": "object"
+        },
+        "next": {
+          "description": "Commands worth running next, each with run, why and read_only.",
+          "type": "array"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "relish": {
+          "description": "The build of relish that answered.",
+          "type": "object"
+        },
+        "schema": {
+          "const": "relish.agent/v1"
+        },
+        "truncated": {
+          "description": "The answer was trimmed to fit max_bytes; a warning says what was cut.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema",
+        "command",
+        "ok",
+        "relish"
+      ],
+      "type": "object"
+    },
+    "title": "relish agent context"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "relish agent diagnose"
+    },
+    "description": "Every finding with its evidence, read-only next steps, and pointers into the manual and the source",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "app": {
+          "description": "Diagnose only this app; the cluster-wide checks are skipped",
+          "type": "string"
+        },
+        "max_bytes": {
+          "default": 24576,
+          "description": "Largest answer to print, in bytes (at least 1024). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "diagnose",
+    "outputSchema": {
+      "description": "The relish.agent/v1 envelope. `ok` says whether the command answered: then `data` is the answer, otherwise `error` says why not.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "data": "<relish agent diagnose data schema>",
+        "error": {
+          "description": "Why the command couldn't answer: code, message, endpoint, status, hint.",
+          "type": "object"
+        },
+        "next": {
+          "description": "Commands worth running next, each with run, why and read_only.",
+          "type": "array"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "relish": {
+          "description": "The build of relish that answered.",
+          "type": "object"
+        },
+        "schema": {
+          "const": "relish.agent/v1"
+        },
+        "truncated": {
+          "description": "The answer was trimmed to fit max_bytes; a warning says what was cut.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema",
+        "command",
+        "ok",
+        "relish"
+      ],
+      "type": "object"
+    },
+    "title": "relish agent diagnose"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "relish agent explain"
+    },
+    "description": "What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "A finding id, e.g. `crashloop`",
+          "type": "string"
+        },
+        "max_bytes": {
+          "default": 24576,
+          "description": "Largest answer to print, in bytes (at least 1024). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "explain",
+    "outputSchema": {
+      "description": "The relish.agent/v1 envelope. `ok` says whether the command answered: then `data` is the answer, otherwise `error` says why not.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "data": "<relish agent explain data schema>",
+        "error": {
+          "description": "Why the command couldn't answer: code, message, endpoint, status, hint.",
+          "type": "object"
+        },
+        "next": {
+          "description": "Commands worth running next, each with run, why and read_only.",
+          "type": "array"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "relish": {
+          "description": "The build of relish that answered.",
+          "type": "object"
+        },
+        "schema": {
+          "const": "relish.agent/v1"
+        },
+        "truncated": {
+          "description": "The answer was trimmed to fit max_bytes; a warning says what was cut.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema",
+        "command",
+        "ok",
+        "relish"
+      ],
+      "type": "object"
+    },
+    "title": "relish agent explain"
   }
 ]

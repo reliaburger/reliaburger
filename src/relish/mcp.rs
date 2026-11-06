@@ -139,9 +139,13 @@ impl Server {
 /// The protocol error for a tool the server doesn't offer, saying why when
 /// it's one we left out on purpose.
 fn unknown_tool(name: &str) -> ErrorData {
-    let excluded = tools::EXCLUDED
-        .iter()
-        .find(|excluded| tools::tool_name(excluded.command) == name);
+    let excluded = tools::EXCLUDED.iter().find(|excluded| {
+        let excluded_name = tools::tool_name(excluded.command);
+        name == excluded_name
+            || name
+                .strip_prefix(&excluded_name)
+                .is_some_and(|rest| rest.starts_with('_'))
+    });
     let message = match excluded {
         Some(excluded) => format!(
             "relish mcp doesn't offer {name}: it {}; run `relish agent {}` yourself if you mean to",

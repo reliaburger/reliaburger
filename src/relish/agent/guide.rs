@@ -778,6 +778,10 @@ Intro paragraph.\n\n## In brief\n\n\
     fn every_artefact_carries_the_brief_or_the_whole_chapter() {
         let brief = "Run `relish agent guide` first.";
         for artefact in generated() {
+            if artefact.path == paths::PLUGIN_MCP {
+                // A server entry, with no prose; its own test checks it.
+                continue;
+            }
             if artefact.path.ends_with(".json") {
                 assert!(
                     artefact
@@ -913,8 +917,10 @@ Intro paragraph.\n\n## In brief\n\n\
     }
 
     /// The setup playbook (#1579) is the chapter's last section because an
-    /// agent driving a cluster needs it least: the default budget drops only
-    /// it, and says how to get it.
+    /// agent driving a cluster needs it least. With every 0.2.7 command in,
+    /// the chapter outgrew the default budget, which keeps the front (the
+    /// brief, the contract, the command table), drops sections only from the
+    /// end, the playbook first, and says how to get the rest.
     #[test]
     fn guide_answers_from_the_embedded_chapter_within_the_default_budget() {
         const PLAYBOOK: &str = "Setting up a cluster for your human";
@@ -926,11 +932,17 @@ Intro paragraph.\n\n## In brief\n\n\
                 .iter()
                 .any(|command| command["command"] == "relish agent guide")
         );
-        let (whole, untrimmed) = guide_headings(48 * 1024);
-        assert_eq!(untrimmed["truncated"], false, "48 KiB fits the chapter");
+        let (whole, untrimmed) = guide_headings(128 * 1024);
+        assert_eq!(untrimmed["truncated"], false, "128 KiB fits the chapter");
         assert_eq!(whole.last().map(String::as_str), Some(PLAYBOOK));
         assert_eq!(value["truncated"], true);
-        assert_eq!(headings, whole[..whole.len() - 1], "only the playbook goes");
+        assert!(
+            headings.len() < whole.len() && headings[..] == whole[..headings.len()],
+            "only sections from the end go: {headings:?}"
+        );
+        for kept in ["In brief", "The contract", "Commands"] {
+            assert!(headings.iter().any(|h| h == kept), "{kept}: {headings:?}");
+        }
         let rerun = value["next"][0]["run"].as_str().unwrap();
         assert!(
             rerun.starts_with("relish agent guide --max-bytes "),

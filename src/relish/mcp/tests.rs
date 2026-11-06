@@ -192,6 +192,24 @@ fn the_exclusions_are_the_commands_that_write_build_or_reach_past_the_cluster() 
 }
 
 #[test]
+fn an_excluded_group_excludes_every_command_under_it() {
+    for command in ["patch init", "patch build", "patch try", "patch destroy"] {
+        assert_eq!(
+            tools::exclusion(command).map(|e| e.command),
+            Some("patch"),
+            "{command}"
+        );
+    }
+    assert!(tools::exclusion("patched").is_none());
+    assert!(tools::exclusion("source grep").is_none());
+    let offered = names(&real_tools());
+    assert!(
+        !offered.iter().any(|name| name.starts_with("patch")),
+        "{offered:?}"
+    );
+}
+
+#[test]
 fn a_command_without_a_data_schema_is_not_a_tool() {
     let tools = tools::derive(<FakeAgent as clap::CommandFactory>::command(), &|command| {
         (command != "diagnose").then(|| json!({"type": "object"}))
