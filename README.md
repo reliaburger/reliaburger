@@ -193,6 +193,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
     - `relish agent patch diff <DIR>`: The change against the extracted source, and the tests that ran *(0.2.7, not in 0.2.6)*
     - `relish agent patch destroy [DIR]`: Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay *(0.2.7, not in 0.2.6)*
   - `relish agent setup [claude-code|codex|cursor|vscode|goose|gemini]...`: Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes *(0.2.7, not in 0.2.6)*
+- `relish mcp`: Serve the `relish agent` commands as read-only MCP tools over stdio *(0.2.7, not in 0.2.6)*
 
 **Break things on purpose** ([chaos](docs/manual/05_chaos.md))
 

@@ -516,7 +516,7 @@ mod tests {
                 "patch test",
                 "patch try",
                 "patch diff",
-                "patch destroy"
+                "patch destroy",
                 "setup"
             ]
         );

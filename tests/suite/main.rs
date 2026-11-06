@@ -87,6 +87,7 @@ mod registry_routable_push;
 mod registry_standard_clients;
 mod registry_upload;
 mod relish_cli;
+mod relish_mcp;
 mod reporting_tree;
 mod rollout_failed;
 #[cfg(target_os = "linux")]

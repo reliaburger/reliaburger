@@ -994,6 +994,11 @@ enum Command {
     Path(Box<PathOptions>),
     /// Commands for LLM agents: one JSON envelope, bounded, never interactive.
     Agent(Box<reliaburger::relish::agent::AgentOptions>),
+    /// Serve the `relish agent` commands as read-only MCP tools over stdio.
+    ///
+    /// For an agent's MCP client to start, as in `claude mcp add reliaburger
+    /// -- relish mcp`. No network listener, no write tools.
+    Mcp(Box<reliaburger::relish::mcp::McpOptions>),
 }
 
 #[derive(Subcommand)]
@@ -2995,6 +3000,7 @@ async fn main() -> ExitCode {
         // Handled before the endpoint check above, so an invalid endpoint
         // still answers with an envelope; this arm only keeps the match whole.
         Command::Agent(options) => return run_agent(&options, None).await,
+        Command::Mcp(options) => reliaburger::relish::mcp::run(&options).await,
     };
 
     finish(result)
@@ -3070,6 +3076,8 @@ fn output_support(command: &Command) -> OutputSupport {
         // refusing it would fail an agent over a flag that can't change
         // anything.
         Command::Agent(_) => Structured,
+        // MCP is JSON-RPC whatever `-o` says, as `agent` is JSON.
+        Command::Mcp(_) => Structured,
         Command::Apply { .. }
         | Command::Council { .. }
         | Command::Images { .. }

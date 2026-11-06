@@ -816,7 +816,11 @@ with a fingerprint for finding duplicates, for a human to read and post; it
 never posts, and makes no network call) and `setup`, which adds the `relish
 mcp` server to Claude Code, Codex, Cursor, VS Code, Goose and Gemini CLI: it
 shows the diff, writes only with `--yes`, never touches an entry it didn't
-write, and approves no tools. See
+write, and approves no tools. `relish mcp` serves the read-only commands as MCP
+tools over stdio (`claude mcp add reliaburger -- relish mcp`), derived from
+the same definitions, with `--toolsets`, `--no-logs` and `--namespace` to
+narrow them; commands that write, build or reach past the cluster API aren't
+tools. See
 [Working with an AI agent](manual/16_working-with-an-ai-agent.md).
 
 Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select
