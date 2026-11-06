@@ -59,7 +59,7 @@ BURGER_URL="https://reliaburger.com/demo/burger.tar.gz"
 BURGER_FETCH="curl -fsSL ${BURGER_URL} | tar xz"
 # The example policies, from the release's tag: the demo archive is
 # built from the tag too, so the tour never needs a file the release lacks.
-PLATFORM_FETCH="curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.5/examples/policies/platform.toml"
+PLATFORM_FETCH="curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.6/examples/policies/platform.toml"
 POLICY_TEST="relish policy test -f platform.toml -f burger/burger.toml"
 # The burger as the page shows it, on the default ingress port.
 BURGER="curl http://burger.localhost:18080"
