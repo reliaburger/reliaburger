@@ -1185,6 +1185,28 @@ its private key never leaves it. Every node needs the cluster's master key
 (`*-master.key` from `init`): it unwraps the CA keys and the secret keys, and
 seals council backups. Keep it safe and backed up.
 
+### If the master key leaks
+
+There's no way to change the master key yet, nor the cluster's own service
+token, which is derived from it, nor the key that signs workload identity
+tokens. Whoever has a copy can sign gossip every node accepts, call node APIs
+as the cluster, and unwrap the CA and secret keys, for as long as the cluster
+runs. So if a node's disk, a copy of a node, or root on any node may have
+exposed `master.key`, build a new cluster rather than rotating what you can:
+
+1. Create it: `relish init` on fresh or reinstalled machines, or
+   `relish machines claim --create` for appliances. It gets its own master
+   key and CAs.
+2. Encrypt your secrets again with `relish secret encrypt`, using the new
+   cluster's key from `relish secret pubkey`. The old ciphertexts still open
+   with the leaked key.
+3. Apply your configs to the new cluster and move traffic to it.
+4. Shut down every node of the old cluster and wipe its disks.
+
+The plan for rotating the master key in place is in the security design doc
+([`docs/design/security-sesame.md` §5.12](https://github.com/reliaburger/reliaburger/blob/main/docs/design/security-sesame.md),
+[#709](https://github.com/reliaburger/reliaburger/issues/709)).
+
 ### Cluster build signing authority
 
 Cluster build signers receive code-signing certificates valid for at most five
