@@ -10,10 +10,20 @@ import tempfile
 import time
 import unittest
 
+import soak_slo
 import sustained_check as checker
 
 NOW = 1_790_000_000
 NODES = ["rb-a-1", "rb-a-2", "rb-a-3"]
+
+
+def quiet_slo_samples(evidence):
+    """A quiet cluster's API reads and one rollout. Every soak since 0.2.4
+    takes them, and the API and rollout SLOs are gated (#1405), so a run
+    without them would fail its tier on that alone."""
+    soak_slo.fold_reads(evidence, [dict(node=node, path="/v1/cluster/nodes", ms=40, ok=True) for node in NODES],
+                        None, set())
+    soak_slo.record_rollout(evidence, apply_ms=300, ready_ms=9000, starts=[2000, 2500, 3000])
 
 
 def wtf(critical=(), warnings=(), ok=("replicas",)):
@@ -1028,6 +1038,7 @@ class Record(Evidence):
             "soak_bun": "not supplied: upgrade slots skipped", "deviations": ["provision_isolated_workloads"],
             "cycles": 4, "ingress_rotation_secs": 300,
             "teardown": "`relish local destroy --yes` and `relish uninstall --yes` succeeded"}))
+        quiet_slo_samples(self.evidence)
         for offset, seconds in ((0, 40), (100, 60)):
             checker.append_event(self.evidence, ts=NOW + offset, phase="fault:bun-kill-follower", target="rb-a-2")
             checker.append_event(self.evidence, ts=NOW + offset + seconds, phase="fault:bun-kill-follower",
@@ -1213,6 +1224,7 @@ class ExecutionInventory(unittest.TestCase):
                    node_faults=job_final, cycles=8, ingress_rotation_secs=None, quiet_tail=QUIET)
         run.update(metadata)
         (self.evidence / "metadata.json").write_text(json.dumps(run))
+        quiet_slo_samples(self.evidence)
         if candidate is not None and "candidate" not in drop:
             (self.evidence / "candidate.json").write_bytes(candidate)
         (self.evidence / "jobs").mkdir()
