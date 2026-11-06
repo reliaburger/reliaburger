@@ -476,7 +476,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         // Mount the host paths the policy approves now, resolved (#797).
-        let spec = self.supervisor.approve_host_paths(app_name, spec)?;
+        // LOOP-INLINE: the container is built from the approved paths; symlinks resolve on a blocking thread, and an app with none does no I/O
+        let spec = self.supervisor.approve_host_paths(app_name, spec).await?;
         let oci_spec = Self::oci_spec_with_secrets(
             app_name,
             namespace,
@@ -683,7 +684,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             crate::grill::cgroup::instance_cgroup_path(namespace, app_name, instance_id)?;
         // A replacement never went through `admit_app`, so this is its host
         // path check as well as the resolution of what to mount (#797).
-        let spec = self.supervisor.approve_host_paths(app_name, spec)?;
+        // LOOP-INLINE: the container is built from the approved paths; symlinks resolve on a blocking thread, and an app with none does no I/O
+        let spec = self.supervisor.approve_host_paths(app_name, spec).await?;
         let oci_spec = Self::oci_spec_with_secrets(
             app_name,
             namespace,

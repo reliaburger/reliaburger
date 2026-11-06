@@ -352,7 +352,6 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.admit_process_workload(app_name, spec.exec.as_deref(), spec.script.as_deref())?;
         self.admit_host_inits(app_name, spec)?;
         self.admit_sidecars(app_name, spec)?;
-        self.admit_host_paths(app_name, spec)?;
         self.admit_runtime_knobs(app_name, spec)?;
         self.admit_gpu(app_name, spec.gpu.unwrap_or(0))?;
         self.admit_rootless_limits(
@@ -370,26 +369,25 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(())
     }
 
-    /// Refuse a volume or config-file `source` this node's
-    /// `[storage] allowed_host_paths` doesn't cover, or one that overlaps the
-    /// node's own storage and security directories.
-    fn admit_host_paths(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
-        self.approve_host_paths(app_name, spec).map(|_| ())
-    }
-
     /// Check every host-path `source` of `spec` again, just before its
     /// container is built, and return the spec to build it from: one whose
     /// sources are the resolved paths the check approved (#797). Every path
     /// that builds an OCI spec for an app (a fresh instance, a rolling or
     /// blue-green replacement) goes through this, so what runc mounts is what
     /// the policy checked, not whatever a symlink points at by then.
-    pub(crate) fn approve_host_paths<'a>(
+    ///
+    /// It resolves symlinks, so it runs on a blocking thread
+    /// ([`HostPathPolicy::approve_app_off_runtime`]).
+    ///
+    /// [`HostPathPolicy::approve_app_off_runtime`]: super::host_paths::HostPathPolicy::approve_app_off_runtime
+    pub(crate) async fn approve_host_paths<'a>(
         &self,
         app_name: &str,
         spec: &'a AppSpec,
     ) -> Result<std::borrow::Cow<'a, AppSpec>, BunError> {
         self.host_paths
-            .approve_app(spec)
+            .approve_app_off_runtime(spec)
+            .await
             .map_err(|refusal| BunError::DeployFailed {
                 app_name: app_name.to_string(),
                 reason: format!("host path refused: {refusal}"),
@@ -716,6 +714,10 @@ impl<G: Grill> WorkloadSupervisor<G> {
         // an un-allowlisted host binary/script, a GPU we don't have, or a
         // resource limit rootless can't enforce.
         self.admit_app(app_name, spec)?;
+        // A volume or config-file `source` this node's
+        // `[storage] allowed_host_paths` doesn't cover, or one that overlaps
+        // the node's own storage and security directories, refuses the app.
+        self.approve_host_paths(app_name, spec).await?;
 
         // Preflight the whole fleet before reserving a port for any replica.
         for index in indices {
@@ -1230,13 +1232,13 @@ mod tests {
             content: None,
             source: Some(import.join("app.yaml").to_string_lossy().into_owned()),
         }];
-        let error = sup.admit_app("web", &app).unwrap_err();
+        let error = sup.approve_host_paths("web", &app).await.unwrap_err();
         assert!(error.to_string().contains("allowed_host_paths"), "{error}");
         sup.set_host_path_policy(super::super::host_paths::HostPathPolicy::new(
             vec![import],
             vec![root.path().join("volumes")],
         ));
-        sup.admit_app("web", &app).unwrap();
+        sup.approve_host_paths("web", &app).await.unwrap();
         // A managed volume needs no allowlist entry at all.
         let mut managed = basic_app_spec(None);
         managed.volumes = vec![crate::config::types::VolumeSpec {
@@ -1245,7 +1247,8 @@ mod tests {
             size: None,
         }];
         WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000))
-            .admit_app("db", &managed)
+            .approve_host_paths("db", &managed)
+            .await
             .unwrap();
     }
 

@@ -105,6 +105,7 @@ mod node_pressure_work;
 mod off_loop_work;
 mod producer_release;
 mod records;
+mod resource_faults;
 mod restarts;
 mod retirement;
 mod routing;
@@ -691,6 +692,10 @@ pub struct BunAgent<G: Grill> {
     /// written, so the reconcile deletes the departed ones. eBPF only.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     destination_bpf_keys: std::collections::HashSet<crate::onion::types::DestinationKey>,
+    /// The values the reconcile last wrote to those three maps, so it writes
+    /// only what changed (#1622). eBPF only.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    firewall_writes: crate::sesame::firewall::FirewallWrites,
     /// Task addresses and allowlists the delegated job runtimes hold, which
     /// the kernel reconciliation and sweep must keep. eBPF only.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1018,6 +1023,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             destination_bpf_keys: std::collections::HashSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            firewall_writes: Default::default(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             delegated_network: Default::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             isolation_rules: Default::default(),
@@ -1173,6 +1180,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             destination_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            firewall_writes: Default::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             delegated_network: Default::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
