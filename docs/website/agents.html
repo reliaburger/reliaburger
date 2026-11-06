@@ -90,7 +90,8 @@ token, and don't tell your agent client to "always allow" <code>relish</code>.</
 success or failure;</li>
 <li>never prompts, never opens a TUI and never reads stdin, so it runs the same
 in a script, a CI job or an agent's tool call;</li>
-<li>stays within a byte budget, 24 KiB unless you pass <code>--max-bytes</code>;</li>
+<li>stays within a byte budget, 24 KiB unless you pass <code>--max-bytes</code> (64 KiB
+for <code>relish agent guide</code>, the one answer you read whole);</li>
 <li>exits with a code that says whether it answered, not what the answer was.</li>
 </ul>
 <p><code>-o</code> is accepted and ignored: there's only one format.</p>
@@ -150,7 +151,10 @@ clap's text on stderr. Only <code>--help</code> prints ordinary help.</p>
 and the verdict is in <code>data</code>. That's the difference from <code>relish wtf</code>, whose
 exit code is the verdict.</p>
 <h2>Byte budgets</h2>
-<p>When an answer is bigger than the budget, <code>relish agent</code> trims it and keeps
+<p>Every command's default budget is 24 KiB, about 6,000 tokens, except
+<code>relish agent guide</code>'s, which is 64 KiB so this whole chapter comes back in
+one call. <code>--max-bytes</code> overrides either. When an answer is bigger than the
+budget, <code>relish agent</code> trims it and keeps
 the JSON valid. It drops items from the end of the longest arrays in <code>data</code>
 first (commands put what matters most at the front), then shortens long
 strings, which end in <code>…[cut]</code>. Then it says so:</p>
@@ -217,8 +221,10 @@ what this binary has; <code>relish agent --help</code> says the same.</p>
 </code></pre>
 <p><code>data.sections</code> holds it one section at a time, each with its <code>heading</code> and
 its <code>markdown</code>, and <code>data.commands</code> lists the commands above, read from the
-binary itself. When the chapter is bigger than the budget, the last sections
-go first, and the <code>next</code> step asks for a <code>--max-bytes</code> that fits it all.</p>
+binary itself. Its default budget is 64 KiB, not 24, so the whole chapter
+comes back in one call, with nothing trimmed. Given a smaller <code>--max-bytes</code>,
+the last sections go first, and the <code>next</code> step asks for a <code>--max-bytes</code> that
+fits it all.</p>
 <p><code>relish agent version</code> prints the version, commit, target and cluster formats
 of this binary:</p>
 <pre><code class="language-sh">relish agent version

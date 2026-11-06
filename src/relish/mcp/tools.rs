@@ -198,11 +198,9 @@ fn tool_spec(words: &[String], command: &clap::Command, data: Value) -> ToolSpec
         .get_about()
         .map(|about| about.to_string())
         .unwrap_or_else(|| format!("relish agent {name}"));
-    let mut tool = Tool::new(
-        tool_name(&name),
-        description,
-        Arc::new(input_schema(command)),
-    );
+    let mut input = input_schema(command);
+    with_budget_default(&mut input, &name);
+    let mut tool = Tool::new(tool_name(&name), description, Arc::new(input));
     tool.title = Some(format!("relish agent {name}"));
     tool.output_schema = Some(Arc::new(output_schema(data)));
     tool.annotations = Some(
@@ -292,6 +290,20 @@ fn input_schema(command: &clap::Command) -> JsonObject {
     }
     schema.insert("additionalProperties".into(), json!(false));
     schema
+}
+
+/// `--max-bytes` has no clap default because the default depends on the
+/// command, so the schema gets this command's from
+/// [`agent::default_max_bytes`].
+fn with_budget_default(schema: &mut JsonObject, command: &str) {
+    let Some(name) = command_name(command) else {
+        return;
+    };
+    if let Some(Value::Object(properties)) = schema.get_mut("properties")
+        && let Some(Value::Object(property)) = properties.get_mut("max_bytes")
+    {
+        property.insert("default".into(), json!(agent::default_max_bytes(name)));
+    }
 }
 
 fn property_schema(argument: &clap::Arg) -> Value {

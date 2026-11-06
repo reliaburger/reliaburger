@@ -88,7 +88,8 @@ Every `relish agent` command:
   success or failure;
 - never prompts, never opens a TUI and never reads stdin, so it runs the same
   in a script, a CI job or an agent's tool call;
-- stays within a byte budget, 24 KiB unless you pass `--max-bytes`;
+- stays within a byte budget, 24 KiB unless you pass `--max-bytes` (64 KiB
+  for `relish agent guide`, the one answer you read whole);
 - exits with a code that says whether it answered, not what the answer was.
 
 `-o` is accepted and ignored: there's only one format.
@@ -163,7 +164,10 @@ exit code is the verdict.
 
 ## Byte budgets
 
-When an answer is bigger than the budget, `relish agent` trims it and keeps
+Every command's default budget is 24 KiB, about 6,000 tokens, except
+`relish agent guide`'s, which is 64 KiB so this whole chapter comes back in
+one call. `--max-bytes` overrides either. When an answer is bigger than the
+budget, `relish agent` trims it and keeps
 the JSON valid. It drops items from the end of the longest arrays in `data`
 first (commands put what matters most at the front), then shortens long
 strings, which end in `…[cut]`. Then it says so:
@@ -244,8 +248,10 @@ relish agent guide
 
 `data.sections` holds it one section at a time, each with its `heading` and
 its `markdown`, and `data.commands` lists the commands above, read from the
-binary itself. When the chapter is bigger than the budget, the last sections
-go first, and the `next` step asks for a `--max-bytes` that fits it all.
+binary itself. Its default budget is 64 KiB, not 24, so the whole chapter
+comes back in one call, with nothing trimmed. Given a smaller `--max-bytes`,
+the last sections go first, and the `next` step asks for a `--max-bytes` that
+fits it all.
 
 `relish agent version` prints the version, commit, target and cluster formats
 of this binary:

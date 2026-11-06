@@ -3174,7 +3174,7 @@ async fn run_agent(
             options.command.name(),
             agent::AgentError::new(agent::ErrorCode::Usage, reason.to_string())
                 .with_hint("pass an https:// endpoint, or http:// to a loopback address"),
-            options.max_bytes,
+            options.max_bytes(),
             &rerun,
         ),
         None => agent::run(options, &rerun).await,

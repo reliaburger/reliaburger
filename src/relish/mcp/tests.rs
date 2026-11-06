@@ -428,6 +428,23 @@ fn every_real_tool_is_read_only_closed_world_and_not_excluded() {
 }
 
 #[test]
+fn each_tool_advertises_its_own_default_budget() {
+    for spec in real_tools() {
+        let schema = Value::Object((*spec.tool.input_schema).clone());
+        let expected = if spec.command == "guide" {
+            65536
+        } else {
+            24576
+        };
+        assert_eq!(
+            schema["properties"]["max_bytes"]["default"], expected,
+            "{}",
+            spec.command
+        );
+    }
+}
+
+#[test]
 fn each_output_schema_holds_the_commands_data_schema() {
     for spec in real_tools() {
         let output = Value::Object((*spec.tool.output_schema.clone().unwrap()).clone());

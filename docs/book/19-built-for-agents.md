@@ -211,7 +211,12 @@ An agent pays for every byte it reads, in tokens and in context it can't use
 for anything else. Claude Code warns when an MCP tool's output passes 10,000
 tokens ([docs](https://code.claude.com/docs/en/mcp)). One `relish logs` on a chatty app can blow past that. So every
 `relish agent` command has a budget, 24 KiB by default (about 6,000 tokens),
-and `--max-bytes` to change it.
+and `--max-bytes` to change it. `relish agent guide` is the one exception, at
+64 KiB: it's the one document an agent reads whole, so trimming it would only
+cost a second call for the rest. `AgentOptions` holds `--max-bytes` as an
+`Option<usize>` with no clap default, and `AgentOptions::max_bytes()` fills in
+the command's own default when it's `None`, because a clap default can't
+depend on which subcommand follows the flag.
 
 Cutting the output at 24 KiB would be easy and useless: half a JSON document
 is a parse error. The budget in `src/relish/agent/budget.rs` trims the *data*
@@ -2768,10 +2773,14 @@ command lands. There's an insta snapshot of each generated file and of the
 deterministic, that regenerating from its own output changes nothing, that a
 missing or doubled marker is an error, that an edited chapter makes every
 file quoting it stale, and that a skill description over the format's 1,024
-characters is refused. One reads the embedded chapter and checks how it fits
-the default 24 KiB budget: when this landed it fitted untrimmed, and since
-the playbook joined it (see "Getting started with your agent" below) only
-that last section is trimmed.
+characters is refused. Three read the embedded chapter. One checks that the
+guide's 64 KiB default returns every section, untrimmed and with no `next`
+asking for more. One fails when the chapter outgrows that budget, with a
+message saying to split the chapter or raise `GUIDE_MAX_BYTES` deliberately.
+And one checks that an explicit 24 KiB budget drops sections only from the
+end, the playbook (see "Getting started with your agent" below) first. The
+default used to be 24 KiB here too, and once the playbook joined, the first
+call trimmed it every time.
 
 `tests/suite/agent_docs.rs` holds the agreement test, plus checks that
 `llms.txt` links every manual chapter, that `SKILL.md`'s front matter follows
