@@ -160,7 +160,9 @@ answer, up to about ten seconds per try, instead of failing. It's refused
 only if no instance of the source app runs on the node, or the runtime
 can't prove any of their cgroups (`no running instance of source app ... has
 a verified workload cgroup`), or the runtime still hasn't answered (`the
-runtime didn't name the cgroup of ... in 10s`).
+runtime didn't name the cgroup of ... in 10s`). A partition `--from` a job
+works the same way: each attempt that runs in a container of its own is a
+source.
 
 A drop or partition also cuts the connections the callers already hold open
 to the target's backends (Bun runs `ss -K` in each affected container's

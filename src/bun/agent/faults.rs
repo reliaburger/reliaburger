@@ -37,6 +37,11 @@ pub(super) struct InstalledNetworkFaults {
     /// Proven workload cgroup per caller instance, with the restart count it
     /// was read at, so a restarted container is looked up again.
     pub(super) caller_cgroups: std::collections::HashMap<InstanceId, (u32, u64)>,
+    /// Proven workload cgroup per job attempt in a runtime instance of its
+    /// own, with the attempt it was read for: a runtime slot's instance id
+    /// comes back for the next attempt, under a new cgroup (#1602).
+    pub(super) attempt_cgroups:
+        std::collections::HashMap<InstanceId, (super::fault_coverage::AttemptRun, u64)>,
     /// netem delay bands installed per caller instance id, with the restart
     /// count they were installed at.
     pub(super) delays:
@@ -56,6 +61,27 @@ pub(super) struct InstalledNetworkFaults {
     /// (#1601). Their injection is answered only once a source is proven,
     /// and refused if none is.
     pub(super) unproven_sources: std::collections::HashSet<crate::smoker::types::FaultId>,
+}
+
+impl InstalledNetworkFaults {
+    /// Keep the cgroup a read proved for `caller`, for the run of its
+    /// instance id the read was for.
+    pub(super) fn remember_cgroup(
+        &mut self,
+        caller: &super::fault_coverage::PendingCaller,
+        cgroup: u64,
+    ) {
+        match caller.attempt {
+            Some(run) => {
+                self.attempt_cgroups
+                    .insert(caller.id.clone(), (run, cgroup));
+            }
+            None => {
+                self.caller_cgroups
+                    .insert(caller.id.clone(), (caller.restarts, cgroup));
+            }
+        }
+    }
 }
 
 /// Why a source-scoped fault can't act on this node.
@@ -1331,6 +1357,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             app: app.clone(),
                             namespace: namespace.clone(),
                             restarts,
+                            attempt: None,
                         });
                         None
                     }
@@ -1353,44 +1380,73 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// cgroup and network with the tasks around it, so it is never one; a
     /// fault from it is refused at injection.
     ///
-    /// An attempt's cgroup is read afresh each time rather than cached: a
-    /// runtime slot's instance id comes back for the next task, under a new
-    /// cgroup. One the runtime can't name before `deadline` is left out
-    /// until the next reconcile, a second later.
+    /// An attempt's cgroup is cached for that attempt alone, not for its
+    /// instance id: a runtime slot's instance id comes back for the next
+    /// task, under a new cgroup. One the runtime can't name before
+    /// `deadline` is pending, as an app instance is (#1602): an injection
+    /// waits for it, and the next reconcile asks again.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     async fn attempt_callers(
-        &self,
+        &mut self,
         deadline: tokio::time::Instant,
     ) -> Vec<crate::smoker::network::LocalCaller> {
+        use super::fault_coverage::{AttemptRun, PendingCaller};
         use crate::smoker::network::applies_to_caller;
+        let attempts: Vec<_> = self
+            .live_attempts
+            .snapshot()
+            .into_iter()
+            .filter_map(|attempt| match &attempt.handle {
+                crate::bun::live_attempts::AttemptHandle::Instance(id)
+                    if attempt.shared_executor.is_none() =>
+                {
+                    Some((id.clone(), AttemptRun::of(&attempt), attempt))
+                }
+                _ => None,
+            })
+            .collect();
+        self.network_faults.attempt_cgroups.retain(|id, (run, _)| {
+            attempts
+                .iter()
+                .any(|(live_id, live_run, _)| live_id == id && live_run == run)
+        });
         let mut callers = Vec::new();
-        for attempt in self.live_attempts.snapshot() {
-            let crate::bun::live_attempts::AttemptHandle::Instance(id) = attempt.handle else {
-                continue;
-            };
-            if attempt.shared_executor.is_some() {
-                continue;
-            }
+        for (id, run, attempt) in attempts {
             let named_as_source = self.fault_registry.iter().any(|rule| {
                 rule.fault_type.source_app().is_some()
                     && applies_to_caller(rule, &attempt.job, &attempt.namespace)
             });
-            let cgroup_id = if named_as_source {
-                match tokio::time::timeout_at(
+            let cgroup_id = match self.network_faults.attempt_cgroups.get(&id) {
+                _ if !named_as_source => None,
+                Some((_, cgroup)) => Some(*cgroup),
+                None => match tokio::time::timeout_at(
                     deadline,
                     self.supervisor.grill().workload_cgroup(&id),
                 )
                 .await
                 {
-                    Ok(Ok(cgroup)) => cgroup,
+                    Ok(Ok(Some(cgroup))) => {
+                        self.network_faults
+                            .attempt_cgroups
+                            .insert(id.clone(), (run, cgroup));
+                        Some(cgroup)
+                    }
+                    Ok(Ok(None)) => None,
                     Ok(Err(error)) => {
                         eprintln!("smoker: attempt {id} has no provable cgroup: {error}");
                         None
                     }
-                    Err(_) => None,
-                }
-            } else {
-                None
+                    Err(_) => {
+                        self.network_faults.pending_callers.push(PendingCaller {
+                            id: id.clone(),
+                            app: attempt.job.clone(),
+                            namespace: attempt.namespace.clone(),
+                            restarts: 0,
+                            attempt: Some(run),
+                        });
+                        None
+                    }
+                },
             };
             callers.push(crate::smoker::network::LocalCaller {
                 instance_id: id.0,
@@ -1803,11 +1859,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Whether a local instance `rule` acts on as its source has a cgroup
     /// the runtime proved, at the instance's current restart count.
     pub(super) fn source_proven(&self, rule: &crate::smoker::types::FaultRule) -> bool {
-        self.supervisor.list_instances().iter().any(|instance| {
-            crate::smoker::network::applies_to_caller(rule, &instance.app_name, &instance.namespace)
+        use crate::smoker::network::applies_to_caller;
+        let instance_proven = self.supervisor.list_instances().iter().any(|instance| {
+            applies_to_caller(rule, &instance.app_name, &instance.namespace)
                 && matches!(
                     self.network_faults.caller_cgroups.get(&instance.id),
                     Some((restarts, _)) if *restarts == instance.restart_count
+                )
+        });
+        instance_proven || self.source_attempt_proven(rule)
+    }
+
+    /// Whether a running job attempt `rule` acts on as its source has a
+    /// cgroup the runtime proved for that attempt (#1602).
+    fn source_attempt_proven(&self, rule: &crate::smoker::types::FaultRule) -> bool {
+        self.live_attempts.snapshot().iter().any(|attempt| {
+            let crate::bun::live_attempts::AttemptHandle::Instance(id) = &attempt.handle else {
+                return false;
+            };
+            crate::smoker::network::applies_to_caller(rule, &attempt.job, &attempt.namespace)
+                && matches!(
+                    self.network_faults.attempt_cgroups.get(id),
+                    Some((run, _)) if *run == super::fault_coverage::AttemptRun::of(attempt)
                 )
         })
     }
