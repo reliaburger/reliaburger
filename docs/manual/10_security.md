@@ -49,6 +49,23 @@ Rootless Bun and macOS don't run the perimeter, so the setting has no effect
 there. The laptop quickstart doesn't need it either: it reaches each node's API
 through a port forward that arrives on the node's loopback.
 
+### Letting new nodes in
+
+A node that hasn't joined yet isn't a member, so the perimeter drops it unless
+it's in `bootstrap_peers`. List the nodes you know about, or the network that
+nodes you add later will join from:
+
+```toml
+[security]
+bootstrap_peers = ["192.168.0.101", "192.168.0.102", "192.168.0.0/24"]
+```
+
+- It opens the API and cluster ports (9117, 9443-9445) to them, not container
+  host ports. Joining still needs a join token, and every cluster port is mTLS.
+- Entries follow the `operator_cidrs` rules: bare addresses or CIDRs, IPv4 or
+  IPv6, no `/0` and no host bits set.
+- Releases up to 0.1.2 take bare addresses only.
+
 ## API tokens
 
 ```sh
@@ -646,9 +663,9 @@ What's recorded:
 |------|---------|
 | Workloads | `app.applied`, `app.stopped`, `app.deleted`, `app.exec`, `deploy.rolled_back`, `deploy.cancelled`, `snapshot.created`, `snapshot.restored`, `snapshot.deleted` |
 | Jobs and builds | `job.submitted`, `job.replayed`, `job.schedule_disabled`, `batch.submitted`, `array.submitted`, `batch.cancelled`, `build.submitted` |
-| The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
+| The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `os.staged`, `os.rollout_started` (and `rollout_resumed`, `rollout_aborted`), `perimeter.admitted`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
 | Policies | `policy.denied`, `policy.deleted`; an apply that writes a policy is `app.applied` with the policy names under `policies` |
-| Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
+| Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `join_token.revoked`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
 | Chaos | `fault.injected`, `fault.cleared`, `fault.cleared-by-service`, `fault.cleared-all-workload`, `fault.expired` |
 
 The cluster's own actions (a fault expiring, an expired token being swept)
@@ -1167,6 +1184,28 @@ new node joins with a single-use token and a certificate signing request, so
 its private key never leaves it. Every node needs the cluster's master key
 (`*-master.key` from `init`): it unwraps the CA keys and the secret keys, and
 seals council backups. Keep it safe and backed up.
+
+### If the master key leaks
+
+There's no way to change the master key yet, nor the cluster's own service
+token, which is derived from it, nor the key that signs workload identity
+tokens. Whoever has a copy can sign gossip every node accepts, call node APIs
+as the cluster, and unwrap the CA and secret keys, for as long as the cluster
+runs. So if a node's disk, a copy of a node, or root on any node may have
+exposed `master.key`, build a new cluster rather than rotating what you can:
+
+1. Create it: `relish init` on fresh or reinstalled machines, or
+   `relish machines claim --create` for appliances. It gets its own master
+   key and CAs.
+2. Encrypt your secrets again with `relish secret encrypt`, using the new
+   cluster's key from `relish secret pubkey`. The old ciphertexts still open
+   with the leaked key.
+3. Apply your configs to the new cluster and move traffic to it.
+4. Shut down every node of the old cluster and wipe its disks.
+
+The plan for rotating the master key in place is in the security design doc
+([`docs/design/security-sesame.md` §5.12](https://github.com/reliaburger/reliaburger/blob/main/docs/design/security-sesame.md),
+[#709](https://github.com/reliaburger/reliaburger/issues/709)).
 
 ### Cluster build signing authority
 

@@ -33,6 +33,11 @@ on:
       - src/sesame/ca.rs
       - src/config/mod.rs
       - src/config/node.rs
+      - src/bun/task_array_api.rs
+      - src/meat/task_array_store.rs
+      - src/smoker/types.rs
+      - src/smoker/scenario.rs
+      - src/council/types.rs
       - .github/workflows/fuzz.yml
   workflow_dispatch:
     inputs:
@@ -58,12 +63,12 @@ jobs:
   fuzz:
     name: fuzz every decoder
     runs-on: ubuntu-24.04
-    # Uncached: a 33-minute sanitizer build (run 40697356210), nine targets
-    # at five minutes each and about 3 minutes of set-up, 81 in all, with
+    # Uncached: a 33-minute sanitizer build (run 40697356210), twelve targets
+    # at five minutes each and about 3 minutes of set-up, 96 in all, with
     # half that again to spare. Cached, only reliaburger itself rebuilds
     # (14 minutes): a path dependency's fingerprint is its files' mtimes,
     # which every checkout resets.
-    timeout-minutes: 130
+    timeout-minutes: 145
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

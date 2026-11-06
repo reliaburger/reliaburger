@@ -120,18 +120,43 @@ class Rows(unittest.TestCase):
                 self.assertEqual(self.verdicts(rows)["job-start"], "FAIL")
                 self.assertEqual(soak_slo.failures(rows), ["job-start: no job task start samples"])
 
-    def test_record_only_slos_never_fail_the_tier(self):
-        slow = self.measured(read=5000, write=30000, start=120000, ready=600000)
+    def test_app_start_is_record_only_and_never_fails_the_tier(self):
+        # #1640: deploy history doesn't time a deploy yet, so app start isn't gated.
+        slow = self.measured(start=120000)
         rows = soak_slo.rows(slow, self.job_report(), "final")
         self.assertEqual(soak_slo.failures(rows), [])
-        verdicts = self.verdicts(rows)
-        for name in ("api-read", "api-write", "app-start", "deploy-ready"):
-            self.assertEqual(verdicts[name], "over (record only)", name)
+        self.assertEqual(self.verdicts(rows)["app-start"], "over (record only)")
 
-    def test_record_only_slos_with_no_samples_say_so(self):
-        rows = soak_slo.rows({}, self.job_report(), "fast")
+    def test_app_start_with_no_samples_says_so(self):
+        data = self.measured()
+        del data["app-start"]
+        rows = soak_slo.rows(data, self.job_report(), "fast")
         self.assertEqual(soak_slo.failures(rows), [])
-        self.assertEqual(self.verdicts(rows)["api-read"], "not measured")
+        self.assertEqual(self.verdicts(rows)["app-start"], "not measured")
+
+    def test_a_slow_api_or_rollout_fails_a_gated_tier(self):
+        # #1405: gated two buckets above the worst 0.2.4 to 0.2.6 fast or final record.
+        slow = self.measured(read=5000, write=5000, ready=150000)
+        for tier in ("fast", "final"):
+            with self.subTest(tier=tier):
+                rows = soak_slo.rows(slow, self.job_report(), tier)
+                failed = {line.split(":")[0] for line in soak_slo.failures(rows)}
+                self.assertEqual(failed, {"api-read", "api-write", "deploy-ready"})
+
+    def test_the_worst_recorded_values_pass_the_new_gates(self):
+        rows = soak_slo.rows(self.measured(read=1500, write=1500, ready=50000), self.job_report(), "final")
+        self.assertEqual(soak_slo.failures(rows), [])
+
+    def test_a_day_tier_records_api_and_rollout_slos_without_gating_them(self):
+        slow = self.measured(read=5000, write=5000, ready=150000)
+        rows = soak_slo.rows(slow, self.job_report(), "day")
+        self.assertEqual(soak_slo.failures(rows), [])
+        for name in ("api-read", "api-write", "deploy-ready"):
+            self.assertEqual(self.verdicts(rows)[name], "over (record only)", name)
+
+    def test_a_gated_api_slo_with_no_samples_fails(self):
+        rows = soak_slo.rows({}, self.job_report(), "fast")
+        self.assertIn("api-read: no API read samples", soak_slo.failures(rows))
 
     def test_a_run_without_a_job_campaign_has_no_job_starts_to_gate(self):
         rows = soak_slo.rows(self.measured(), None, "final", job_campaign=False)
@@ -318,7 +343,8 @@ class Record(unittest.TestCase):
         self.run_with()
         _, text = self.render()
         section = text.split("## Latency SLOs")[1].split("\n## ")[0]
-        self.assertIn("| API read p99 | 50 ms | ≤ 1,000 ms | 60 | record only | PASS |", section)
+        self.assertIn("| API read p99 | 50 ms | ≤ 3,000 ms | 60 | gated | PASS |", section)
+        self.assertIn("| App start p99 | 3,000 ms | ≤ 5,000 ms | 60 | record only | PASS |", section)
         self.assertIn("| Job task start p99 | 32 ms | ≤ 256 ms |", section)
         self.assertIn("gated", section)
 

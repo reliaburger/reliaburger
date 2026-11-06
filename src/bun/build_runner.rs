@@ -420,7 +420,7 @@ async fn sign_on_leader(
     let Some(council) = &state.council else {
         return Err(BuildSignError::Failed("no council available".to_string()));
     };
-    if !council.is_leader().await {
+    if !crate::bun::leadership::leads(council).await {
         return Err(BuildSignError::NotLeader);
     }
     let running = council

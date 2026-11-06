@@ -209,6 +209,8 @@ pub(crate) fn record_deploy_history(
 
 For a long time there was no cap. The agent's history was a plain `Vec` that every deploy, retry and abort pushed a whole `AppSpec` onto, and nothing ever trimmed it. A bad version that the reconciler retried every five minutes added an entry every five minutes, forever, and a restart threw the lot away, so `relish rollback` answered 404 after an upgrade. Now the history is capped on each node, and the rollback source moved to the council (see the end of the chapter).
 
+Each entry carries a `created_at` and a `completed_at`, and for a long time they were the same moment. All four places that write an entry filled both with `SystemTime::now()` as they wrote it, at the end of the deploy, so every deploy looked as if it took a microsecond. Nobody reads the gap in `relish history`. The soak does, though: its "app start" is `completed_at − created_at`, and it reported 1 ms in every record (#1640). A deploy times itself with `Instant`, a monotonic clock that can't jump when NTP adjusts the wall clock, but `Instant` has no meaning outside the process, and the entry crosses the wire. So `run_deploy` now takes `Instant::now()` once per app, as that app's deploy starts. The fresh path and the rollout's final bookkeeping turn it into wall-clock time with `wall_clock_at`, `SystemTime::now()` less the time elapsed since. A test delays the mock runtime's container start by 200 ms and checks that a fresh deploy and a rolling redeploy each record at least that.
+
 ## Under the hood: key patterns
 
 ### The transition function

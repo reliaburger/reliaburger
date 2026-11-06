@@ -10,6 +10,7 @@
 #[path = "../tests/support/first_launch.rs"]
 pub(crate) mod first_launch;
 
+pub mod appliance;
 pub mod brioche;
 pub mod bun;
 pub mod cluster;
@@ -31,6 +32,7 @@ pub mod meat;
 pub mod mustard;
 pub(crate) mod object_storage;
 pub mod onion;
+pub mod os;
 pub mod pickle;
 pub mod policy;
 pub mod reconstruction;

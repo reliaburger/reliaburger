@@ -454,6 +454,17 @@ bucket bound for the same reason we picked 256 ms: the record's number is then e
 one the gate compared. `soak_slo.py trend` lists every record's values side by side, which
 is the closest we'll come to a dashboard for now.
 
+Three releases of records later, that listing set the gates
+([#1405](https://github.com/reliaburger/reliaburger/issues/1405)). The API read, the API write
+and the rolling update are now gated at two buckets above the worst fast or final value: 3 s,
+3 s and 100 s. The same listing showed something else, which a dashboard would have shown
+at a glance. App start was 1 ms in every record, on machines that take seconds to start a
+container. "A start and a completion on that node's own clock" turned out to be one clock
+reading taken twice: every deploy-history writer filled both fields with `SystemTime::now()`
+as it wrote the entry ([#1640](https://github.com/reliaburger/reliaburger/issues/1640)). A
+number that never moves deserves suspicion. App start stays record only until its
+timestamps mean something.
+
 
 Here's a bug that a passing test hid for a while. Bun can run a workload as a plain host
 process, not just a container. You tell it a binary path and it runs it. Obviously you don't
@@ -8126,6 +8137,19 @@ per target (about two million inputs across the nine) found nothing else.
 The next step is OSS-Fuzz, which runs the same cargo-fuzz targets on
 Google's machines around the clock. That wants targets that have run clean
 nightly for a while first, so it's a follow-up.
+
+Three decoders missed the first cut, and they have targets now
+([#1414](https://github.com/reliaburger/reliaburger/issues/1414)). They are the task-array
+manifest, the chaos scenario file, and the council state inside a backup. The last one
+shows why one target per file isn't enough. `council_backup` already fuzzes the backup
+file, but its bytes are sealed with the master key, and random input never unseals. So the
+JSON a restore parses once it has unsealed a backup was never reached. `council_backup_state`
+starts after the seal. It also checks the one property a restore leans on: the backup name
+worked out from a state must parse back to the same position, because `relish council
+recover` refuses a state that doesn't sit where its name says. None of the three types
+derives `PartialEq`, and `DesiredState` holds `HashMap`s that re-encode in a different order
+each time. So each round trip compares `serde_json::Value`s, whose maps are ordered, rather
+than the structs.
 
 ## Did it happen in some order?
 

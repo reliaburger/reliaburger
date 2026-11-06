@@ -6,11 +6,12 @@ on:
     # A push to a release's merge train runs everything on the merged result.
     branches: [main, "release-*"]
   pull_request:
-    # fix/** covers review PRs stacked on each other rather than on main.
+    # fix/** covers review PRs stacked on each other rather than on main,
+    # feat/appliance-* the appliance workstreams stacked on #259.
     # release-* is each release's merge train: PRs into it get the light set
     # (scripts/ci/select-jobs.sh), and the merge queue and the push to the
     # train run everything.
-    branches: [main, "codex/**", "fix/**", "release-*"]
+    branches: [main, "codex/**", "fix/**", "feat/appliance-*", "release-*"]
     # labeled lets a `full-ci` label start the heavy suites on any PR (on a
     # PR into a train, everything but the macOS shards). closed starts a
     # no-op run in the PR's concurrency group, which cancels the run still

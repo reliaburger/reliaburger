@@ -1,0 +1,51 @@
+# A scripted Smoker scenario: the five-minute tour's cache goes bad.
+#
+# It targets the podinfo apps from examples/kubernetes/podinfo.yaml, so
+# apply that first (the tour does), and watch `relish metrics frontend`
+# while it runs. Every injection needs --acknowledge, because a fault hurts
+# real traffic; --dry-run prints the timeline and injects nothing.
+#
+#   relish apply -f examples/kubernetes/podinfo.yaml
+#   relish fault scenario examples/phase-8/container-chaos-scenario.toml --dry-run
+#   relish fault scenario examples/phase-8/container-chaos-scenario.toml --acknowledge
+#   relish fault scenario examples/phase-8/container-chaos-scenario.toml --speed 2.0 --acknowledge
+#
+# Faults need rootful runc with eBPF on Linux (on macOS, the managed Linux
+# VM from `relish setup --quickstart`). These steps fault the tour's apps.
+# Faults can also target a job or one task of a task array (for example
+# `relish fault kill render --instance 3`, and the array retries that task):
+# see "Jobs and task arrays" in manual 05.
+
+name = "Cache cascade"
+
+[[step]]
+description = "The cache slows down for the frontend"
+fault = "delay"
+target = "redis"
+from = "frontend"
+value = "300ms"
+jitter = "100ms"
+duration = "2m"
+
+[[step]]
+description = "The cache starts dropping connections"
+fault = "drop"
+target = "redis"
+value = "25%"
+start_after = "2m"
+duration = "2m"
+
+[[step]]
+description = "Retries pile up and the backend runs short of memory"
+fault = "memory"
+target = "backend"
+value = "90%"
+start_after = "3m"
+duration = "1m"
+
+[[step]]
+description = "A frontend replica dies mid-incident"
+fault = "kill"
+target = "frontend"
+count = 1
+start_after = "4m"

@@ -1,0 +1,42 @@
+#!ipxe
+# Built into the vendored iPXE (ipxe-<arch>.efi). It gets an address from
+# the LAN's DHCP, then runs boot.ipxe from the server that answered the PXE
+# request: the ProxyDHCP server if there is one (relish netboot, or dnsmasq
+# in the lab), else plain next-server (QEMU's user network). Everything
+# site-specific lives in boot.ipxe, so one binary serves every site.
+
+# iPXE fetches autoexec.ipxe from the TFTP server it was loaded from, even
+# with this script built in. Drop it unrun: any image iPXE still holds is
+# handed to the next EFI binary as an initrd, and systemd-stub then can't
+# register its own ("Error registering initrd: Already started").
+imgfree autoexec.ipxe || echo -n
+
+set tries:int32 0
+set waits:int32 0
+:retry
+dhcp || goto wait
+isset ${proxydhcp/next-server} || goto noproxy
+set server ${proxydhcp/next-server}
+goto chain
+:noproxy
+# The ProxyDHCP answer races the LAN's DHCP offer, and iPXE only waits for
+# it when that offer says PXEClient, which a home router's doesn't. Ask
+# again twice before settling for next-server.
+inc tries
+iseq ${tries} 3 || goto retry
+set server ${next-server}
+:chain
+set tries:int32 0
+echo reliaburger: iPXE ${buildarch} at ${ip}, boot server ${server}
+chain --autofree tftp://${server}/boot.ipxe || goto wait
+:wait
+# Give up after about 30 s, so a machine whose boot order puts the network
+# first still reaches its disk when no netboot server is around.
+inc waits
+iseq ${waits} 6 && goto give_up || echo -n
+echo reliaburger: no boot script yet, retrying in 5 s
+sleep 5
+goto retry
+:give_up
+echo reliaburger: no netboot server answered; trying the next boot option
+exit 1
