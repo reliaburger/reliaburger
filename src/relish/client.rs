@@ -256,18 +256,34 @@ impl LogOptions {
     }
 }
 
+/// The lines a log query found, before rendering.
+#[derive(Debug, Clone)]
+pub enum LogLines {
+    /// Entries from the log store, which say when, where and on which stream
+    /// each line was written. Already filtered.
+    Stored(Vec<crate::ketchup::types::LogEntry>),
+    /// Lines from the agent's own capture, which says none of that. Already
+    /// filtered.
+    Captured(Vec<String>),
+}
+
+impl LogLines {
+    /// The lines as `relish logs` prints them for people.
+    pub fn render(&self) -> String {
+        match self {
+            LogLines::Stored(entries) => render_log_entries(entries),
+            LogLines::Captured(lines) => lines.join("\n"),
+        }
+    }
+}
+
 /// Render queried log entries as lines, oldest first.
 ///
 /// When the lines come from more than one instance, each line starts with
 /// `[instance] `. During a rolling deploy or after a restart an old and a new
 /// instance both appear in a tail, and unlabelled their output reads as one
 /// app skipping values.
-fn render_log_entries(entries: &[crate::ketchup::types::LogEntry], options: &LogOptions) -> String {
-    let filter = options.line_filter();
-    let shown: Vec<&crate::ketchup::types::LogEntry> = entries
-        .iter()
-        .filter(|entry| filter.matches(&entry.line))
-        .collect();
+fn render_log_entries(shown: &[crate::ketchup::types::LogEntry]) -> String {
     // A run is one instance on one node. An instance that moves keeps its
     // name, and the view interleaves its two runs by two nodes' clocks, so
     // the label names the node wherever the name alone would hide the move.
@@ -1892,8 +1908,19 @@ impl BunClient {
             // cluster but does not filter server-side, so filters apply here.
             return self.logs_follow(app, namespace, options).await;
         }
+        Ok(self.log_lines(app, namespace, options).await?.render())
+    }
 
-        // Non-follow: try the cross-node query endpoint first.
+    /// The lines a log query finds, before rendering, so `relish logs -o
+    /// json` can print each with its time, node, instance and stream. It
+    /// never follows: `options.follow` is ignored.
+    pub async fn log_lines(
+        &self,
+        app: &str,
+        namespace: &str,
+        options: &LogOptions,
+    ) -> Result<LogLines, RelishError> {
+        // Try the cross-node query endpoint first.
         // In cluster mode this fans out to all nodes running the app.
         // In single-node mode it queries the local LogStore.
         let url = format!("{}/v1/logs/query/{}/{}", self.base_url, app, namespace);
@@ -1914,7 +1941,12 @@ impl BunClient {
             // Filters also apply client-side: json_field has no server-side
             // equivalent, and grep re-checking is harmless when the server
             // already filtered.
-            let output = render_log_entries(&result.entries, options);
+            let filter = options.line_filter();
+            let shown: Vec<_> = result
+                .entries
+                .into_iter()
+                .filter(|entry| filter.matches(&entry.line))
+                .collect();
 
             // Name every node that contributed nothing, and why.
             for warning in &result.warnings {
@@ -1922,8 +1954,8 @@ impl BunClient {
             }
 
             // If we got entries, return them
-            if !output.is_empty() {
-                return Ok(output);
+            if !shown.is_empty() {
+                return Ok(LogLines::Stored(shown));
             }
         }
 
@@ -1940,7 +1972,7 @@ impl BunClient {
             || options.stream.is_some()
             || (options.instance.is_some() && !selected_run)
         {
-            return Ok(String::new());
+            return Ok(LogLines::Captured(Vec::new()));
         }
 
         // Fall back to the local agent endpoint (process logs that
@@ -1948,8 +1980,10 @@ impl BunClient {
         match self.logs_local(app, namespace, options).await {
             // The store already answered for every node; this one just
             // holds no capture of the app (#1515).
-            Err(RelishError::ApiError { status: 404, .. }) if store_answered => Ok(String::new()),
-            other => other,
+            Err(RelishError::ApiError { status: 404, .. }) if store_answered => {
+                Ok(LogLines::Captured(Vec::new()))
+            }
+            other => other.map(LogLines::Captured),
         }
     }
 
@@ -1959,7 +1993,7 @@ impl BunClient {
         app: &str,
         namespace: &str,
         options: &LogOptions,
-    ) -> Result<String, RelishError> {
+    ) -> Result<Vec<String>, RelishError> {
         let url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
 
         let response = self
@@ -1983,8 +2017,11 @@ impl BunClient {
 
         let logs = json["logs"].as_str().unwrap_or("");
         let filter = options.line_filter();
-        let filtered: Vec<&str> = logs.lines().filter(|l| filter.matches(l)).collect();
-        Ok(filtered.join("\n"))
+        Ok(logs
+            .lines()
+            .filter(|line| filter.matches(line))
+            .map(str::to_string)
+            .collect())
     }
 
     /// Follow logs via the SSE stream. On a cluster the node follows every

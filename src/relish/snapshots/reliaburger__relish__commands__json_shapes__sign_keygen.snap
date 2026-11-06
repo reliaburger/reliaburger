@@ -1,0 +1,8 @@
+---
+source: src/relish/commands.rs
+expression: "json(&SigningKeyReport\n{ path: Path::new(\"image.key\"), public_key: \"MCowBQYDK2VwAyEA\".to_string(), })"
+---
+{
+  "path": "image.key",
+  "public_key": "MCowBQYDK2VwAyEA"
+}

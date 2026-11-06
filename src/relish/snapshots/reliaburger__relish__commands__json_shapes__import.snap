@@ -1,0 +1,21 @@
+---
+source: src/relish/commands.rs
+expression: "json(&ImportReport { config: &imported.config, report: &imported.report, })"
+---
+{
+  "config": {
+    "app": {
+      "web": {
+        "image": "nginx:1",
+        "replicas": 1
+      }
+    }
+  },
+  "report": {
+    "converted": [
+      "Deployment/web → [app.web]"
+    ],
+    "warnings": [],
+    "dropped": []
+  }
+}

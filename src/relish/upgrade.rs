@@ -179,11 +179,7 @@ pub async fn check(
         &metadata,
         &platforms,
     );
-    match output {
-        super::OutputFormat::Human => print!("{report}"),
-        _ => println!("{}", super::output::format_output(&report, output)?),
-    }
-    Ok(())
+    super::output::print_output(&report, output)
 }
 
 /// What `relish upgrade check` found: the versions, the verdict, and what
@@ -327,7 +323,15 @@ enum StartForm<'a> {
 }
 
 /// `relish upgrade start`: network (a version) or air-gapped (`--binary`).
-pub async fn start(client: &BunClient, args: StartArgs) -> Result<(), RelishError> {
+///
+/// For people it says what started; `-o json` prints `{scope, target_version,
+/// upgrade_id, already_running, detail}`. Download and push progress goes to
+/// stderr either way.
+pub async fn start(
+    client: &BunClient,
+    args: StartArgs,
+    output: super::OutputFormat,
+) -> Result<(), RelishError> {
     // Matching on a tuple of both options checks every combination at once.
     let form = match (&args.version, &args.binary) {
         (Some(version), None) => StartForm::Release(version.as_str()),
@@ -346,9 +350,75 @@ pub async fn start(client: &BunClient, args: StartArgs) -> Result<(), RelishErro
         ));
     }
     let topology = topology(client.upgrade_cluster().await)?;
-    match form {
-        StartForm::Release(version) => start_from_release(client, &args, &topology, version).await,
-        StartForm::File(path) => start_from_file(client, &args, &topology, path).await,
+    let started = match form {
+        StartForm::Release(version) => {
+            start_from_release(client, &args, &topology, version).await?
+        }
+        StartForm::File(path) => start_from_file(client, &args, &topology, path).await?,
+    };
+    super::output::print_output(&started, output)
+}
+
+/// What `relish upgrade start` set going.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UpgradeStarted {
+    /// `cluster` (the leader walks every node) or `node` (just this one).
+    pub scope: UpgradeScope,
+    pub target_version: String,
+    /// The cluster run's id, when the leader gave one.
+    pub upgrade_id: Option<String>,
+    /// An upgrade was already under way, so nothing new started.
+    pub already_running: bool,
+    /// What the node said about the one already running.
+    pub detail: Option<String>,
+}
+
+/// Whom an upgrade, or a rollback, covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeScope {
+    Cluster,
+    Node,
+}
+
+impl UpgradeStarted {
+    /// Read the node's answer to a start request.
+    fn from_answer(
+        scope: UpgradeScope,
+        target_version: &BinaryVersion,
+        response: &serde_json::Value,
+    ) -> Self {
+        let already_running = response["status"] == "already_running";
+        Self {
+            scope,
+            target_version: target_version.to_string(),
+            upgrade_id: response["upgrade_id"].as_str().map(str::to_string),
+            already_running,
+            detail: already_running.then(|| {
+                response["detail"]
+                    .as_str()
+                    .unwrap_or("already running")
+                    .to_string()
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for UpgradeStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.already_running {
+            return writeln!(f, "{}", self.detail.as_deref().unwrap_or("already running"));
+        }
+        match self.scope {
+            UpgradeScope::Cluster => writeln!(
+                f,
+                "cluster upgrade to {} started ({})",
+                self.target_version,
+                self.upgrade_id.as_deref().unwrap_or("?")
+            )?,
+            UpgradeScope::Node => writeln!(f, "node upgrade to {} started", self.target_version)?,
+        }
+        writeln!(f, "watch it with: relish upgrade status")
     }
 }
 
@@ -359,7 +429,7 @@ async fn start_from_release(
     args: &StartArgs,
     topology: &Topology,
     version: &str,
-) -> Result<(), RelishError> {
+) -> Result<UpgradeStarted, RelishError> {
     let version: BinaryVersion = version
         .parse()
         .map_err(|e: crate::upgrade::UpgradeError| RelishError::FormatFailed(e.to_string()))?;
@@ -504,7 +574,7 @@ async fn start_from_file(
     args: &StartArgs,
     topology: &Topology,
     path: &Path,
-) -> Result<(), RelishError> {
+) -> Result<UpgradeStarted, RelishError> {
     let sig_path = args.sig.clone().unwrap_or_else(|| sidecar_sig_path(path));
     let envelope = SignatureEnvelope::load(&sig_path)?;
     let version = version_from_file_name(path).ok_or_else(|| {
@@ -570,7 +640,7 @@ async fn start_cluster(
     args: &StartArgs,
     target_version: &BinaryVersion,
     builds: &[Build],
-) -> Result<(), RelishError> {
+) -> Result<UpgradeStarted, RelishError> {
     let nodes = client.nodes().await?;
     let overrides = parse_overrides(&args.node_addresses)?;
     let node_list = build_node_list(&nodes, &overrides)?;
@@ -612,37 +682,24 @@ async fn start_cluster(
         "allow_downgrade": args.allow_downgrade,
     });
     let response = client.upgrade_start(&request).await?;
-    if response["status"] == "already_running" {
-        println!(
-            "{}",
-            response["detail"].as_str().unwrap_or("already running")
-        );
-        return Ok(());
-    }
-    println!(
-        "cluster upgrade to {target_version} started ({})",
-        response["upgrade_id"].as_str().unwrap_or("?")
-    );
-    println!("watch it with: relish upgrade status");
-    Ok(())
+    Ok(UpgradeStarted::from_answer(
+        UpgradeScope::Cluster,
+        target_version,
+        &response,
+    ))
 }
 
 /// Hand a node-level directive straight to the connected (single) node.
 async fn apply_on_this_node(
     client: &BunClient,
     directive: &UpgradeDirective,
-) -> Result<(), RelishError> {
+) -> Result<UpgradeStarted, RelishError> {
     let response = client.upgrade_apply(directive).await?;
-    if response["status"] == "already_running" {
-        println!(
-            "{}",
-            response["detail"].as_str().unwrap_or("already running")
-        );
-        return Ok(());
-    }
-    println!("node upgrade to {} started", directive.target_version);
-    println!("watch it with: relish upgrade status");
-    Ok(())
+    Ok(UpgradeStarted::from_answer(
+        UpgradeScope::Node,
+        &directive.target_version,
+        &response,
+    ))
 }
 
 /// A downloaded binary staged for the local bun to read, in a private
@@ -694,15 +751,83 @@ impl StagedBinary {
 }
 
 /// `relish upgrade status`: cluster state on a cluster, else node state.
-pub async fn status(client: &BunClient) -> Result<(), RelishError> {
-    match topology(client.upgrade_cluster().await)? {
-        Topology::Cluster(cluster) => print!("{}", render_cluster_status(&cluster)),
-        Topology::SingleNode => {
-            let node = client.upgrade_status().await?;
-            print!("{}", render_node_status(&node));
+/// `-o json` prints `{scope, state}`, `state` as the node answered it.
+pub async fn status(client: &BunClient, output: super::OutputFormat) -> Result<(), RelishError> {
+    let report = match topology(client.upgrade_cluster().await)? {
+        Topology::Cluster(cluster) => UpgradeStatus {
+            scope: UpgradeScope::Cluster,
+            state: cluster,
+        },
+        Topology::SingleNode => UpgradeStatus {
+            scope: UpgradeScope::Node,
+            state: client.upgrade_status().await?,
+        },
+    };
+    super::output::print_output(&report, output)
+}
+
+/// `relish upgrade status`: the leader's run record on a cluster, the
+/// node's own record on a single node.
+#[derive(Debug, serde::Serialize)]
+pub struct UpgradeStatus {
+    pub scope: UpgradeScope,
+    pub state: serde_json::Value,
+}
+
+impl std::fmt::Display for UpgradeStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.scope {
+            UpgradeScope::Cluster => f.write_str(&render_cluster_status(&self.state)),
+            UpgradeScope::Node => f.write_str(&render_node_status(&self.state)),
         }
     }
-    Ok(())
+}
+
+/// What `relish upgrade rollback`, `resume` or `abort` set going.
+#[derive(Debug, serde::Serialize)]
+pub struct UpgradeChange {
+    pub change: UpgradeChangeKind,
+    /// Whom a rollback covers; `null` for resume and abort.
+    pub scope: Option<UpgradeScope>,
+    /// A rollback's target; `null` means the node's previous version.
+    pub version: Option<String>,
+    /// The aborted upgrade's id.
+    pub upgrade_id: Option<String>,
+}
+
+/// The change in an [`UpgradeChange`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeChangeKind {
+    RollbackStarted,
+    Resumed,
+    Aborted,
+}
+
+impl std::fmt::Display for UpgradeChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.change, self.scope, &self.version) {
+            (UpgradeChangeKind::RollbackStarted, Some(UpgradeScope::Cluster), version) => {
+                writeln!(
+                    f,
+                    "cluster rollback to {} started",
+                    version.as_deref().unwrap_or("?")
+                )
+            }
+            (UpgradeChangeKind::RollbackStarted, _, Some(version)) => {
+                writeln!(f, "node rollback to {version} started")
+            }
+            (UpgradeChangeKind::RollbackStarted, _, None) => {
+                writeln!(f, "node rollback to the previous version started")
+            }
+            (UpgradeChangeKind::Resumed, _, _) => writeln!(f, "upgrade resumed"),
+            (UpgradeChangeKind::Aborted, _, _) => writeln!(
+                f,
+                "upgrade {} aborted; every node stays on its current version",
+                self.upgrade_id.as_deref().unwrap_or("?")
+            ),
+        }
+    }
 }
 
 /// `relish upgrade plan` — offline preview of the rolling order.
@@ -711,13 +836,13 @@ pub async fn plan(
     version: &str,
     cluster_size: Option<usize>,
     parallel: u32,
+    output: super::OutputFormat,
 ) -> Result<(), RelishError> {
     let (workers, council, leader) = plan_roles(client, cluster_size).await?;
-    print!(
-        "{}",
-        render_plan(version, workers, council, leader, parallel)
-    );
-    Ok(())
+    super::output::print_output(
+        &UpgradePlan::new(version, workers, council, leader, parallel),
+        output,
+    )
 }
 
 /// How many workers, followers and leaders the plan covers: the hypothetical
@@ -754,8 +879,9 @@ pub async fn rollback(
     client: &BunClient,
     version: Option<String>,
     node_addresses: Vec<String>,
+    output: super::OutputFormat,
 ) -> Result<(), RelishError> {
-    match topology(client.upgrade_cluster().await)? {
+    let change = match topology(client.upgrade_cluster().await)? {
         Topology::Cluster(_) => {
             let Some(version) = version else {
                 return Err(RelishError::FormatFailed(
@@ -770,37 +896,173 @@ pub async fn rollback(
                 "nodes": build_node_list(&nodes, &overrides)?,
             });
             client.upgrade_cluster_rollback(&request).await?;
-            println!("cluster rollback to {version} started");
+            UpgradeChange {
+                change: UpgradeChangeKind::RollbackStarted,
+                scope: Some(UpgradeScope::Cluster),
+                version: Some(version),
+                upgrade_id: None,
+            }
         }
         Topology::SingleNode => {
             client.upgrade_node_rollback(version.as_deref()).await?;
-            match version {
-                Some(version) => println!("node rollback to {version} started"),
-                None => println!("node rollback to the previous version started"),
+            UpgradeChange {
+                change: UpgradeChangeKind::RollbackStarted,
+                scope: Some(UpgradeScope::Node),
+                version,
+                upgrade_id: None,
             }
         }
-    }
-    Ok(())
+    };
+    super::output::print_output(&change, output)
 }
 
 /// `relish upgrade resume`.
-pub async fn resume(client: &BunClient) -> Result<(), RelishError> {
+pub async fn resume(client: &BunClient, output: super::OutputFormat) -> Result<(), RelishError> {
     client.upgrade_resume().await?;
-    println!("upgrade resumed");
-    Ok(())
+    super::output::print_output(
+        &UpgradeChange {
+            change: UpgradeChangeKind::Resumed,
+            scope: None,
+            version: None,
+            upgrade_id: None,
+        },
+        output,
+    )
 }
 
 /// `relish upgrade abort` — end a paused upgrade that moved no node.
-pub async fn abort(client: &BunClient) -> Result<(), RelishError> {
+pub async fn abort(client: &BunClient, output: super::OutputFormat) -> Result<(), RelishError> {
     let upgrade_id = client.upgrade_abort().await?;
-    println!("upgrade {upgrade_id} aborted; every node stays on its current version");
-    Ok(())
+    super::output::print_output(
+        &UpgradeChange {
+            change: UpgradeChangeKind::Aborted,
+            scope: None,
+            version: None,
+            upgrade_id: Some(upgrade_id.to_string()),
+        },
+        output,
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Rendering (pure, snapshot-tested)
 // ---------------------------------------------------------------------------
 
+/// `relish upgrade plan`: the rolling order and an estimate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UpgradePlan {
+    /// The target version, as typed.
+    pub version: String,
+    /// Nodes the plan covers.
+    pub nodes: usize,
+    /// Workers upgraded at once.
+    pub parallel: usize,
+    /// The stages, in order: workers, then council members, then the leader.
+    pub stages: Vec<PlanStage>,
+    /// Estimated seconds for the whole roll, at `seconds_per_node`.
+    pub estimated_secs: u64,
+    /// The assumed time for one node to swap and verify.
+    pub seconds_per_node: u64,
+}
+
+/// One stage of an [`UpgradePlan`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlanStage {
+    /// Which nodes move in this stage.
+    pub role: PlanRole,
+    /// How many of them.
+    pub nodes: usize,
+    /// In how many batches: workers go up to `parallel` at a time, council
+    /// members and the leader one at a time.
+    pub batches: usize,
+}
+
+/// The nodes a [`PlanStage`] moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanRole {
+    Workers,
+    Council,
+    Leader,
+}
+
+impl UpgradePlan {
+    fn new(version: &str, workers: usize, council: usize, leader: usize, parallel: u32) -> Self {
+        let parallel = parallel.max(1) as usize;
+        let mut stages = Vec::new();
+        if workers > 0 {
+            stages.push(PlanStage {
+                role: PlanRole::Workers,
+                nodes: workers,
+                batches: workers.div_ceil(parallel),
+            });
+        }
+        if council > 0 {
+            stages.push(PlanStage {
+                role: PlanRole::Council,
+                nodes: council,
+                batches: council,
+            });
+        }
+        if leader > 0 {
+            // The leader always upgrades last, in place (openraft 0.9 can't
+            // gracefully hand off; a >=3-node council keeps quorum through
+            // the sub-second exec bounce).
+            stages.push(PlanStage {
+                role: PlanRole::Leader,
+                nodes: 1,
+                batches: 1,
+            });
+        }
+        let batches: usize = stages.iter().map(|stage| stage.batches).sum();
+        Self {
+            version: version.to_string(),
+            nodes: workers + council + leader,
+            parallel,
+            stages,
+            estimated_secs: batches as u64 * SECONDS_PER_NODE,
+            seconds_per_node: SECONDS_PER_NODE,
+        }
+    }
+}
+
+impl std::fmt::Display for UpgradePlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "upgrade plan to {} ({} node(s))",
+            self.version, self.nodes
+        )?;
+        for (index, stage) in self.stages.iter().enumerate() {
+            let step = index + 1;
+            match stage.role {
+                PlanRole::Workers => writeln!(
+                    f,
+                    "  {step}. workers: {} node(s) in {} batch(es) of up to {}",
+                    stage.nodes, stage.batches, self.parallel
+                )?,
+                PlanRole::Council => writeln!(
+                    f,
+                    "  {step}. council members: {} node(s), strictly one at a time",
+                    stage.nodes
+                )?,
+                PlanRole::Leader => writeln!(f, "  {step}. the leader, in place (last)")?,
+            }
+        }
+        writeln!(
+            f,
+            "estimated duration: ~{} min (assuming {}s per node)",
+            self.estimated_secs.div_ceil(60),
+            self.seconds_per_node
+        )?;
+        writeln!(
+            f,
+            "workloads keep running throughout (adoption across exec)"
+        )
+    }
+}
+
+#[cfg(test)]
 fn render_plan(
     version: &str,
     workers: usize,
@@ -808,47 +1070,7 @@ fn render_plan(
     leader: usize,
     parallel: u32,
 ) -> String {
-    // Writing to a String never fails.
-    use std::fmt::Write as _;
-
-    let parallel = parallel.max(1) as usize;
-    let mut out = String::new();
-    let total = workers + council + leader;
-    let _ = writeln!(out, "upgrade plan to {version} ({total} node(s))");
-
-    let mut step = 1;
-    let mut estimate = 0u64;
-    if workers > 0 {
-        let batches = workers.div_ceil(parallel);
-        let _ = writeln!(
-            out,
-            "  {step}. workers: {workers} node(s) in {batches} batch(es) of up to {parallel}"
-        );
-        estimate += batches as u64 * SECONDS_PER_NODE;
-        step += 1;
-    }
-    if council > 0 {
-        let _ = writeln!(
-            out,
-            "  {step}. council members: {council} node(s), strictly one at a time"
-        );
-        estimate += council as u64 * SECONDS_PER_NODE;
-        step += 1;
-    }
-    if leader > 0 {
-        // The leader always upgrades last, in place (openraft 0.9 can't
-        // gracefully hand off; a >=3-node council keeps quorum through the
-        // sub-second exec bounce).
-        let _ = writeln!(out, "  {step}. the leader, in place (last)");
-        estimate += SECONDS_PER_NODE;
-    }
-    let _ = writeln!(
-        out,
-        "estimated duration: ~{} min (assuming {SECONDS_PER_NODE}s per node)",
-        estimate.div_ceil(60)
-    );
-    out.push_str("workloads keep running throughout (adoption across exec)\n");
-    out
+    UpgradePlan::new(version, workers, council, leader, parallel).to_string()
 }
 
 fn render_cluster_status(cluster: &serde_json::Value) -> String {
@@ -1596,6 +1818,51 @@ mod tests {
         );
     }
 
+    /// #1566: `relish upgrade check -o json` gives a verdict a script can
+    /// branch on, not a sentence to parse. The one snapshot of its shape.
+    #[test]
+    fn check_as_json_gives_a_verdict_and_the_command() {
+        let running: BinaryVersion = "v0.1.6".parse().unwrap();
+        let formats = Compatibility {
+            protocol: 51,
+            state: 68,
+        };
+        let available = check_report(
+            &running,
+            Some(formats),
+            &release_fixture(Some(formats)),
+            &[on("a", "linux-x86_64")],
+        );
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(&available, crate::relish::OutputFormat::Json)
+                .unwrap()
+        );
+
+        let current: BinaryVersion = "v0.2.0".parse().unwrap();
+        let up_to_date = check_report(
+            &current,
+            Some(formats),
+            &release_fixture(Some(formats)),
+            &[on("a", "linux-x86_64")],
+        );
+        assert_eq!(up_to_date.verdict, CheckVerdict::UpToDate);
+        assert_eq!(
+            up_to_date.to_string(),
+            "running: v0.2.0\nlatest:  v0.2.0\nup to date\n"
+        );
+    }
+
+    #[test]
+    fn plan_as_json_lists_the_stages_in_order() {
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(
+                &UpgradePlan::new("v0.2.0", 5, 2, 1, 2),
+                crate::relish::OutputFormat::Json
+            )
+            .unwrap()
+        );
+    }
+
     #[test]
     fn version_form_carries_the_countersigned_external_signature() {
         let (release_pkcs8, release_public) = signing::generate_keypair().unwrap();
@@ -1765,22 +2032,18 @@ mod tests {
         };
         let nodes = [on("a", "linux-x86_64")];
 
-        let available = check_report(
+        let fresh = check_report(
             &running,
-            Some(formats),
+            Some(Compatibility {
+                protocol: 46,
+                state: 63,
+            }),
             &release_fixture(Some(formats)),
             &nodes,
         );
-        let json = serde_json::to_value(&available).unwrap();
         assert_eq!(
-            json,
-            serde_json::json!({
-                "running": "v0.1.6",
-                "latest": "v0.2.0",
-                "verdict": "available",
-                "command": "relish upgrade start v0.2.0 --external-key <your key>",
-                "nodes": [{ "node": "node a", "platform": "linux-x86_64" }],
-            })
+            serde_json::to_value(&fresh).unwrap()["verdict"],
+            "needs_fresh_cluster"
         );
 
         let current: BinaryVersion = "v0.2.0".parse().unwrap();
@@ -1809,5 +2072,56 @@ mod tests {
         assert_eq!(hypothetical_roles(1), (0, 0, 1));
         assert_eq!(hypothetical_roles(3), (0, 2, 1));
         assert_eq!(hypothetical_roles(10), (7, 2, 1));
+    }
+
+    /// #1566: `upgrade start`, `status`, `rollback`, `resume` and `abort`
+    /// as `-o json` prints them.
+    #[test]
+    fn upgrade_changes_as_json() {
+        let target: BinaryVersion = "v0.2.7".parse().unwrap();
+        insta::assert_snapshot!(
+            "start",
+            json(&UpgradeStarted::from_answer(
+                UpgradeScope::Cluster,
+                &target,
+                &serde_json::json!({"status": "started", "upgrade_id": "u-1"}),
+            ))
+        );
+        insta::assert_snapshot!(
+            "status",
+            json(&UpgradeStatus {
+                scope: UpgradeScope::Node,
+                state: serde_json::json!({"running_version": "v0.2.6", "in_flight": null}),
+            })
+        );
+        insta::assert_snapshot!(
+            "rollback",
+            json(&UpgradeChange {
+                change: UpgradeChangeKind::RollbackStarted,
+                scope: Some(UpgradeScope::Cluster),
+                version: Some("v0.2.6".to_string()),
+                upgrade_id: None,
+            })
+        );
+        insta::assert_snapshot!(
+            "abort",
+            json(&UpgradeChange {
+                change: UpgradeChangeKind::Aborted,
+                scope: None,
+                version: None,
+                upgrade_id: Some("u-1".to_string()),
+            })
+        );
+        let running = UpgradeStarted::from_answer(
+            UpgradeScope::Node,
+            &target,
+            &serde_json::json!({"status": "already_running", "detail": "upgrade u-0 is running"}),
+        );
+        assert!(running.already_running);
+        assert_eq!(running.to_string(), "upgrade u-0 is running\n");
+    }
+
+    fn json<T: serde::Serialize + std::fmt::Display>(value: &T) -> String {
+        crate::relish::output::format_output(value, crate::relish::OutputFormat::Json).unwrap()
     }
 }

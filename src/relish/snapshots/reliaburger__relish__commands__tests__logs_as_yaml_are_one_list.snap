@@ -1,0 +1,9 @@
+---
+source: src/relish/commands.rs
+expression: "render_logs(&lines, OutputFormat::Yaml).unwrap()"
+---
+- at: 2026-09-21T14:13:20Z
+  node: node-1
+  instance: default__web-0
+  stream: stdout
+  text: ready

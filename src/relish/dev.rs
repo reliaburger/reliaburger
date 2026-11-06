@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::RelishError;
 use super::local_context::LocalContext;
+use super::output::{OutputFormat, print_output, progress};
 use super::quickstart::lima::{GuestFile, Lima, POWER_OFF_DEADLINE};
 use super::quickstart::runner::JOIN_SCRIPT;
 
@@ -315,7 +316,8 @@ async fn build_binaries_in_vm() -> Result<(PathBuf, PathBuf), RelishError> {
     let quoted_target = shell_word(&vm_target);
     ensure_build_vm().await?;
 
-    println!("  building bun + relish for Linux in the build VM (first run is slow)...");
+    // On stderr, so `relish -o json dev create` keeps stdout for its report.
+    eprintln!("  building bun + relish for Linux in the build VM (first run is slow)...");
     // Debug build — much faster than release, and fine for a dev cluster.
     // Run with `sudo -E` to match `dev test`, so the shared cargo cache in the
     // VM has consistent (root) ownership and isn't half root / half user.
@@ -680,7 +682,9 @@ fn delete_cluster_state(name: &str) {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// Create a new dev cluster.
+/// Create a new dev cluster. Progress goes to stdout for people and to
+/// stderr with `-o json`, which ends with the cluster's report.
+#[allow(clippy::too_many_arguments)]
 pub async fn create(
     name: &str,
     nodes: usize,
@@ -689,6 +693,7 @@ pub async fn create(
     runtime: &str,
     bun: Option<PathBuf>,
     relish: Option<PathBuf>,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     validate_name(name)?;
     if nodes == 0 {
@@ -724,7 +729,10 @@ pub async fn create(
         });
     }
 
-    println!("Creating dev cluster \"{name}\" with {nodes} nodes...");
+    progress(
+        output,
+        format_args!("Creating dev cluster \"{name}\" with {nodes} nodes..."),
+    );
 
     let yaml = generate_lima_yaml(cpus, memory);
     let mut cluster = DevCluster {
@@ -743,10 +751,16 @@ pub async fn create(
         let node_name = format!("reliaburger-{name}-{i}");
 
         if existing.lines().any(|l| l.trim() == node_name) {
-            println!("  {node_name} already exists — reusing");
+            progress(
+                output,
+                format_args!("  {node_name} already exists — reusing"),
+            );
             limactl(&["start", &node_name]).await?;
         } else {
-            println!("  creating {node_name} ({cpus} CPUs, {memory} RAM)...");
+            progress(
+                output,
+                format_args!("  creating {node_name} ({cpus} CPUs, {memory} RAM)..."),
+            );
             let yaml_path = std::env::temp_dir().join(format!("{node_name}.yaml"));
             std::fs::write(&yaml_path, &yaml)?;
             limactl(&[
@@ -770,7 +784,7 @@ pub async fn create(
     }
 
     // Discover IPs
-    println!("  discovering node IPs...");
+    progress(output, "  discovering node IPs...");
     for node in &mut cluster.nodes {
         node.ip = Some(get_vm_ip(&node.name).await?);
     }
@@ -786,7 +800,7 @@ pub async fn create(
     // bootstrap code as `relish setup --quickstart`: the CA, master key, an
     // administrator token and the first node's identity. They persist with
     // the cluster state, so a resumed `create` reuses them.
-    println!("  generating cluster credentials...");
+    progress(output, "  generating cluster credentials...");
     let first_name = cluster
         .nodes
         .first()
@@ -805,7 +819,7 @@ pub async fn create(
         .collect();
 
     // Generate and copy node configs + credentials
-    println!("  configuring cluster...");
+    progress(output, "  configuring cluster...");
     for (i, node) in cluster.nodes.iter().enumerate() {
         let join_ip = if i == 0 { None } else { Some(first_ip) };
         let node_ip = node.ip.as_deref().unwrap_or("127.0.0.1");
@@ -873,7 +887,7 @@ pub async fn create(
         }
     };
 
-    println!("  installing binaries on nodes...");
+    progress(output, "  installing binaries on nodes...");
     for node in &cluster.nodes {
         install_binary(&node.name, &bun_path, "bun").await?;
         install_binary(&node.name, &relish_path, "relish").await?;
@@ -881,11 +895,11 @@ pub async fn create(
 
     // Start the bootstrap node, then enrol and start every other node through
     // it: a join token bound to the node's name, then `relish join`.
-    println!("  starting bun agents...");
+    progress(output, "  starting bun agents...");
     let launch = agent_launch_cmd(&cluster.runtime);
     limactl(&["shell", &first_name, "sudo", "bash", "-c", &launch]).await?;
     for node in cluster.nodes.iter().skip(1) {
-        println!("  enrolling {}...", node.name);
+        progress(output, format_args!("  enrolling {}...", node.name));
         enrol(
             &first_name,
             &node.name,
@@ -901,7 +915,7 @@ pub async fn create(
     // Give the cluster time to gossip, elect a leader, and form the council,
     // then report the actual state (best-effort — don't fail create if the
     // API isn't ready yet).
-    println!("  waiting for the cluster to converge...");
+    progress(output, "  waiting for the cluster to converge...");
     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 
     // The nodes sit on Lima's user-v2 network, which the host can't route to,
@@ -912,8 +926,13 @@ pub async fn create(
         .first()
         .ok_or_else(|| invalid_input("cluster has no nodes"))?
         .name;
+    let council = limactl(&["shell", first, "relish", "council"]).await;
+    let ready = matches!(&council, Ok(out) if !out.trim().is_empty());
+    if output != OutputFormat::Human {
+        return print_output(&DevClusterReport::new(&cluster, ready, None), output);
+    }
     println!();
-    match limactl(&["shell", first, "relish", "council"]).await {
+    match council {
         Ok(out) if !out.trim().is_empty() => {
             println!("Dev cluster \"{name}\" ready:");
             print!("{out}");
@@ -936,26 +955,104 @@ pub async fn create(
     Ok(())
 }
 
+/// A dev cluster as `relish dev create`, `status`, `stop`, `start` and
+/// `destroy` report it with `-o json`.
+#[derive(Debug, Serialize)]
+pub struct DevClusterReport<'a> {
+    pub cluster: &'a str,
+    pub runtime: &'a str,
+    pub nodes: Vec<DevNodeReport<'a>>,
+    /// After `create`: the council answered from node 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready: Option<bool>,
+    /// After `stop`, `start` or `destroy`: what happened to every VM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<DevAction>,
+}
+
+/// One VM in a [`DevClusterReport`].
+#[derive(Debug, Serialize)]
+pub struct DevNodeReport<'a> {
+    pub name: &'a str,
+    pub ip: Option<&'a str>,
+    pub cpus: usize,
+    pub memory: &'a str,
+    /// What Lima says, for `status`: `Running`, `Stopped`, or `unknown`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_status: Option<String>,
+}
+
+/// What `relish dev stop`, `start` or `destroy` did to every VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevAction {
+    Stopped,
+    Started,
+    Destroyed,
+}
+
+impl<'a> DevClusterReport<'a> {
+    fn new(cluster: &'a DevCluster, ready: bool, action: Option<DevAction>) -> Self {
+        Self {
+            cluster: &cluster.name,
+            runtime: &cluster.runtime,
+            nodes: cluster
+                .nodes
+                .iter()
+                .map(|node| DevNodeReport {
+                    name: &node.name,
+                    ip: node.ip.as_deref(),
+                    cpus: node.cpus,
+                    memory: &node.memory,
+                    vm_status: None,
+                })
+                .collect(),
+            ready: action.is_none().then_some(ready),
+            action,
+        }
+    }
+}
+
+impl std::fmt::Display for DevClusterReport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = self.cluster;
+        match self.action {
+            Some(DevAction::Stopped) => return writeln!(f, "Dev cluster \"{name}\" stopped."),
+            Some(DevAction::Started) => return writeln!(f, "Dev cluster \"{name}\" started."),
+            Some(DevAction::Destroyed) => {
+                return writeln!(f, "Dev cluster \"{name}\" destroyed.");
+            }
+            None => {}
+        }
+        writeln!(f, "{:<12} {:<6} {:<10}", "CLUSTER", "NODES", "STATUS")?;
+        writeln!(f, "{:<12} {:<6} {:<10}", name, self.nodes.len(), "created")?;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "{:<20} {:<18} {:<6} {:<8} {:<10}",
+            "NODE", "IP", "CPUS", "MEM", "STATUS"
+        )?;
+        for node in &self.nodes {
+            writeln!(
+                f,
+                "{:<20} {:<18} {:<6} {:<8} {:<10}",
+                node.name,
+                node.ip.unwrap_or("unknown"),
+                node.cpus,
+                node.memory,
+                node.vm_status.as_deref().unwrap_or("unknown")
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Show dev cluster status.
-pub async fn status(name: &str) -> Result<(), RelishError> {
+pub async fn status(name: &str, output: OutputFormat) -> Result<(), RelishError> {
     let cluster = load_cluster(name)?;
-
-    println!("{:<12} {:<6} {:<10}", "CLUSTER", "NODES", "STATUS");
-    println!(
-        "{:<12} {:<6} {:<10}",
-        cluster.name,
-        cluster.nodes.len(),
-        "created"
-    );
-    println!();
-
-    println!(
-        "{:<20} {:<18} {:<6} {:<8} {:<10}",
-        "NODE", "IP", "CPUS", "MEM", "STATUS"
-    );
-    for node in &cluster.nodes {
-        let ip = node.ip.as_deref().unwrap_or("unknown");
-
+    let mut report = DevClusterReport::new(&cluster, false, None);
+    report.ready = None;
+    for node in &mut report.nodes {
         // Check if VM is running via limactl
         let vm_status = limactl(&["list", "--json"])
             .await
@@ -964,18 +1061,13 @@ pub async fn status(name: &str) -> Result<(), RelishError> {
                 // Lima outputs one JSON object per line
                 json.lines()
                     .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                    .find(|v| v["name"].as_str() == Some(&node.name))
+                    .find(|v| v["name"].as_str() == Some(node.name))
                     .and_then(|v| v["status"].as_str().map(String::from))
             })
             .unwrap_or_else(|| "unknown".to_string());
-
-        println!(
-            "{:<20} {:<18} {:<6} {:<8} {:<10}",
-            node.name, ip, node.cpus, node.memory, vm_status
-        );
+        node.vm_status = Some(vm_status);
     }
-
-    Ok(())
+    print_output(&report, output)
 }
 
 /// Open a shell on a dev cluster node.
@@ -1000,10 +1092,13 @@ pub async fn shell(node_name: &str) -> Result<(), RelishError> {
 }
 
 /// Stop all VMs in a dev cluster.
-pub async fn stop(name: &str) -> Result<(), RelishError> {
+pub async fn stop(name: &str, output: OutputFormat) -> Result<(), RelishError> {
     let cluster = load_cluster(name)?;
     require_cluster_vms(&cluster).await?;
-    println!("Stopping {} nodes...", cluster.nodes.len());
+    progress(
+        output,
+        format_args!("Stopping {} nodes...", cluster.nodes.len()),
+    );
     // Each guest powers itself off, because `limactl stop` power-cuts it
     // (#1023). Each Lima command gets the same 120 s as `relish local`.
     let lima = Lima::new(
@@ -1018,15 +1113,20 @@ pub async fn stop(name: &str) -> Result<(), RelishError> {
                 stderr: format!("{error:#}"),
             })?;
     }
-    println!("Dev cluster \"{name}\" stopped.");
-    Ok(())
+    print_output(
+        &DevClusterReport::new(&cluster, false, Some(DevAction::Stopped)),
+        output,
+    )
 }
 
 /// Start all VMs in a stopped dev cluster.
-pub async fn start(name: &str) -> Result<(), RelishError> {
+pub async fn start(name: &str, output: OutputFormat) -> Result<(), RelishError> {
     let cluster = load_cluster(name)?;
     require_cluster_vms(&cluster).await?;
-    println!("Starting {} nodes...", cluster.nodes.len());
+    progress(
+        output,
+        format_args!("Starting {} nodes...", cluster.nodes.len()),
+    );
     for node in &cluster.nodes {
         limactl(&["start", &node.name]).await?;
     }
@@ -1037,22 +1137,30 @@ pub async fn start(name: &str) -> Result<(), RelishError> {
         limactl(&["shell", &node.name, "sudo", "bash", "-c", &launch]).await?;
     }
 
-    println!("Dev cluster \"{name}\" started.");
-    Ok(())
+    print_output(
+        &DevClusterReport::new(&cluster, false, Some(DevAction::Started)),
+        output,
+    )
 }
 
 /// Destroy a dev cluster (stop and delete all VMs).
-pub async fn destroy(name: &str) -> Result<(), RelishError> {
+pub async fn destroy(name: &str, output: OutputFormat) -> Result<(), RelishError> {
     let cluster = load_cluster(name)?;
     require_cluster_vms(&cluster).await?;
-    println!("Stopping and deleting {} nodes...", cluster.nodes.len());
+    progress(
+        output,
+        format_args!("Stopping and deleting {} nodes...", cluster.nodes.len()),
+    );
     for node in &cluster.nodes {
         limactl(&["stop", &node.name]).await?;
         limactl(&["delete", &node.name, "-f"]).await?;
     }
     delete_cluster_state(name);
     remove_security(&security_directory(&state_dir(), name));
-    println!("Dev cluster \"{name}\" destroyed.");
+    print_output(
+        &DevClusterReport::new(&cluster, false, Some(DevAction::Destroyed)),
+        output,
+    )?;
 
     // The build VM (`reliaburger-test`) is shared across all dev clusters, so
     // destroying one cluster must NOT delete it (O14) — that would break every
@@ -1109,7 +1217,14 @@ provision:
 /// Creates the test VM on first run, reuses it afterwards. The
 /// repo is mounted from the host, so no code copying needed. The
 /// Rust toolchain and cargo cache persist inside the VM.
-pub async fn test(filter: Option<&str>, recreate: bool) -> Result<(), RelishError> {
+///
+/// The test run's own output streams to the terminal for people; with `-o
+/// json` it streams to stderr and stdout gets `{filter, passed}` at the end.
+pub async fn test(
+    filter: Option<&str>,
+    recreate: bool,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let repo_dir = checkout_path()?;
     path_text(&std::env::temp_dir())?;
     let repo_path = path_text(&repo_dir)?;
@@ -1171,6 +1286,7 @@ pub async fn test(filter: Option<&str>, recreate: bool) -> Result<(), RelishErro
     // Run interactively so output streams to the terminal
     let status = std::process::Command::new("limactl")
         .args(["shell", TEST_VM_NAME, "bash", "-c", &test_cmd])
+        .stdout(child_stdout(output))
         .status()
         .map_err(|e| RelishError::LimaError {
             command: "run tests".to_string(),
@@ -1187,43 +1303,129 @@ pub async fn test(filter: Option<&str>, recreate: bool) -> Result<(), RelishErro
         });
     }
 
-    Ok(())
+    print_output(
+        &TestRun {
+            filter,
+            passed: true,
+        },
+        output,
+    )
+}
+
+/// Where a Lima command's stdout goes: the terminal for people, stderr
+/// when relish's own stdout carries JSON or YAML.
+fn child_stdout(output: OutputFormat) -> std::process::Stdio {
+    match output {
+        OutputFormat::Human => std::process::Stdio::inherit(),
+        OutputFormat::Json | OutputFormat::Yaml => std::io::stderr().into(),
+    }
+}
+
+/// A `relish dev test` run that passed. A failing run is an error.
+#[derive(Debug, Serialize)]
+pub struct TestRun<'a> {
+    pub filter: Option<&'a str>,
+    pub passed: bool,
+}
+
+impl std::fmt::Display for TestRun<'_> {
+    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // People watched cargo say so.
+        Ok(())
+    }
+}
+
+/// What `relish dev disk` or `dev clean` found in the build VM. The VM's
+/// own report is `output`, as `df` and `du` print it.
+#[derive(Debug, Serialize)]
+pub struct BuildVmReport {
+    pub vm: &'static str,
+    /// The build VM exists.
+    pub exists: bool,
+    pub output: String,
+}
+
+impl std::fmt::Display for BuildVmReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.output)
+    }
+}
+
+/// Run `cmd` in the build VM: streamed to the terminal for people,
+/// captured into a [`BuildVmReport`] for `-o json`.
+async fn run_in_build_vm(
+    cmd: &str,
+    what: &str,
+    failure: &str,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    let error = |stderr: String| RelishError::LimaError {
+        command: what.to_string(),
+        stderr,
+    };
+    if output == OutputFormat::Human {
+        let status = std::process::Command::new("limactl")
+            .args(["shell", TEST_VM_NAME, "bash", "-c", cmd])
+            .status()
+            .map_err(|e| error(e.to_string()))?;
+        if !status.success() {
+            return Err(error(failure.to_string()));
+        }
+        return Ok(());
+    }
+    let captured = std::process::Command::new("limactl")
+        .args(["shell", TEST_VM_NAME, "bash", "-c", cmd])
+        .output()
+        .map_err(|e| error(e.to_string()))?;
+    if !captured.status.success() {
+        return Err(error(failure.to_string()));
+    }
+    print_output(
+        &BuildVmReport {
+            vm: TEST_VM_NAME,
+            exists: true,
+            output: String::from_utf8_lossy(&captured.stdout).into_owned(),
+        },
+        output,
+    )
+}
+
+/// The build VM isn't there: say so on stderr, and as data for `-o json`.
+fn no_build_vm(message: &str, output: OutputFormat) -> Result<(), RelishError> {
+    eprintln!("{message}");
+    if output == OutputFormat::Human {
+        return Ok(());
+    }
+    print_output(
+        &BuildVmReport {
+            vm: TEST_VM_NAME,
+            exists: false,
+            output: String::new(),
+        },
+        output,
+    )
 }
 
 /// Show disk usage inside the test VM.
 ///
 /// Prints filesystem usage and the size of the cargo target directory.
-pub async fn disk() -> Result<(), RelishError> {
+pub async fn disk(output: OutputFormat) -> Result<(), RelishError> {
     if !lima_available() {
         return Err(RelishError::LimaNotFound);
     }
 
     let list = limactl(&["list", "--format", "{{.Name}}"]).await?;
     if !list.lines().any(|l| l.trim() == TEST_VM_NAME) {
-        eprintln!("test VM ({TEST_VM_NAME}) does not exist — nothing to show");
-        return Ok(());
+        return no_build_vm(
+            &format!("test VM ({TEST_VM_NAME}) does not exist — nothing to show"),
+            output,
+        );
     }
 
     let cmd = "echo '=== Filesystem ===' && df -h / && \
                echo && echo '=== Cargo target dirs ===' && \
                du -sh /tmp/reliaburger-target-* 2>/dev/null || echo '(none)'";
-
-    let status = std::process::Command::new("limactl")
-        .args(["shell", TEST_VM_NAME, "bash", "-c", cmd])
-        .status()
-        .map_err(|e| RelishError::LimaError {
-            command: "disk usage".to_string(),
-            stderr: e.to_string(),
-        })?;
-
-    if !status.success() {
-        return Err(RelishError::LimaError {
-            command: "disk usage".to_string(),
-            stderr: "failed to query disk usage".to_string(),
-        });
-    }
-
-    Ok(())
+    run_in_build_vm(cmd, "disk usage", "failed to query disk usage", output).await
 }
 
 /// Clean cargo build artefacts inside the test VM.
@@ -1231,15 +1433,17 @@ pub async fn disk() -> Result<(), RelishError> {
 /// Removes the VM-local target directories to free disk space without
 /// destroying the VM (which would require re-downloading the Rust
 /// toolchain and system packages).
-pub async fn clean() -> Result<(), RelishError> {
+pub async fn clean(output: OutputFormat) -> Result<(), RelishError> {
     if !lima_available() {
         return Err(RelishError::LimaNotFound);
     }
 
     let list = limactl(&["list", "--format", "{{.Name}}"]).await?;
     if !list.lines().any(|l| l.trim() == TEST_VM_NAME) {
-        eprintln!("test VM ({TEST_VM_NAME}) does not exist — nothing to clean");
-        return Ok(());
+        return no_build_vm(
+            &format!("test VM ({TEST_VM_NAME}) does not exist — nothing to clean"),
+            output,
+        );
     }
 
     eprintln!("cleaning cargo build artefacts in test VM...");
@@ -1247,23 +1451,7 @@ pub async fn clean() -> Result<(), RelishError> {
     let cmd = "sudo du -sh /tmp/reliaburger-target-* 2>/dev/null && \
                sudo rm -rf /tmp/reliaburger-target-* && \
                echo 'cleaned.' || echo 'nothing to clean'";
-
-    let status = std::process::Command::new("limactl")
-        .args(["shell", TEST_VM_NAME, "bash", "-c", cmd])
-        .status()
-        .map_err(|e| RelishError::LimaError {
-            command: "clean".to_string(),
-            stderr: e.to_string(),
-        })?;
-
-    if !status.success() {
-        return Err(RelishError::LimaError {
-            command: "clean".to_string(),
-            stderr: "failed to clean artefacts".to_string(),
-        });
-    }
-
-    Ok(())
+    run_in_build_vm(cmd, "clean", "failed to clean artefacts", output).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,7 +1462,7 @@ pub async fn clean() -> Result<(), RelishError> {
 ///
 /// Writes `release.key` (PKCS#8 private key, mode 0600 — keep it outside
 /// any repository) and `release.pub` (`ed25519:` + base64 public key).
-pub fn keygen(out: &std::path::Path) -> Result<(), RelishError> {
+pub fn keygen(out: &std::path::Path, output: OutputFormat) -> Result<(), RelishError> {
     use crate::upgrade::signing;
 
     std::fs::create_dir_all(out)?;
@@ -1301,13 +1489,59 @@ pub fn keygen(out: &std::path::Path) -> Result<(), RelishError> {
     let encoded = signing::encode_public_key(&public);
     std::fs::write(&pub_path, &encoded)?;
 
-    println!(
-        "keygen: private key {} (keep it safe, never commit it)",
-        key_path.display()
-    );
-    println!("keygen: public key  {}", pub_path.display());
-    println!("public key: {encoded}");
-    Ok(())
+    print_output(
+        &ReleaseKeyReport {
+            private_key: &key_path,
+            public_key_file: &pub_path,
+            public_key: &encoded,
+        },
+        output,
+    )
+}
+
+/// What `relish dev keygen` wrote: where the private key is (never the key
+/// itself) and the public key.
+#[derive(Debug, Serialize)]
+pub struct ReleaseKeyReport<'a> {
+    pub private_key: &'a std::path::Path,
+    pub public_key_file: &'a std::path::Path,
+    pub public_key: &'a str,
+}
+
+impl std::fmt::Display for ReleaseKeyReport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "keygen: private key {} (keep it safe, never commit it)",
+            self.private_key.display()
+        )?;
+        writeln!(f, "keygen: public key  {}", self.public_key_file.display())?;
+        writeln!(f, "public key: {}", self.public_key)
+    }
+}
+
+/// The signature envelope `relish dev sign-binary` or `countersign-binary`
+/// wrote.
+#[derive(Debug, Serialize)]
+pub struct SignatureReport<'a> {
+    pub signature: &'a std::path::Path,
+    /// The signed binary's SHA-256.
+    pub sha256: &'a str,
+    /// The operator's public key, after a countersignature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_public_key: Option<&'a str>,
+}
+
+impl std::fmt::Display for SignatureReport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.external_public_key {
+            None => writeln!(f, "sign-binary: wrote {}", self.signature.display()),
+            Some(public) => {
+                writeln!(f, "countersign-binary: wrote {}", self.signature.display())?;
+                writeln!(f, "external public key: {public}")
+            }
+        }
+    }
 }
 
 /// Sign a binary with a release key (and optionally an external key),
@@ -1317,6 +1551,7 @@ pub fn sign_binary(
     binary: &std::path::Path,
     external_key: Option<&std::path::Path>,
     out: Option<&std::path::Path>,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     use crate::upgrade::signing::{self, SignatureEnvelope};
 
@@ -1338,8 +1573,14 @@ pub fn sign_binary(
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| sidecar_sig_path(binary));
     envelope.store(&sig_path)?;
-    println!("sign-binary: wrote {}", sig_path.display());
-    Ok(())
+    print_output(
+        &SignatureReport {
+            signature: &sig_path,
+            sha256: &envelope.sha256,
+            external_public_key: None,
+        },
+        output,
+    )
 }
 
 /// Add the operator's external signature to a binary's existing envelope.
@@ -1354,6 +1595,7 @@ pub fn countersign_binary(
     binary: &std::path::Path,
     sig: Option<&std::path::Path>,
     out: Option<&std::path::Path>,
+    output: OutputFormat,
 ) -> Result<String, RelishError> {
     use crate::upgrade::signing::{self, SignatureEnvelope};
 
@@ -1368,8 +1610,14 @@ pub fn countersign_binary(
 
     let out_path = out.map(std::path::Path::to_path_buf).unwrap_or(sig_path);
     countersigned.store(&out_path)?;
-    println!("countersign-binary: wrote {}", out_path.display());
-    println!("external public key: {public}");
+    print_output(
+        &SignatureReport {
+            signature: &out_path,
+            sha256: &countersigned.sha256,
+            external_public_key: Some(&public),
+        },
+        output,
+    )?;
     Ok(public)
 }
 
@@ -1402,7 +1650,14 @@ mod tests {
         std::fs::write(&binary, b"the binary").unwrap();
         let (release, _) = generate_keypair().unwrap();
         std::fs::write(dir.join("release.key"), release).unwrap();
-        sign_binary(&dir.join("release.key"), &binary, None, None).unwrap();
+        sign_binary(
+            &dir.join("release.key"),
+            &binary,
+            None,
+            None,
+            OutputFormat::Human,
+        )
+        .unwrap();
         let (operator, _) = generate_keypair().unwrap();
         std::fs::write(dir.join("operator.key"), operator).unwrap();
         (binary, dir.join("operator.key"))
@@ -1417,7 +1672,8 @@ mod tests {
         let released = SignatureEnvelope::load(&sig).unwrap();
         assert!(released.external.is_none());
 
-        let public = countersign_binary(&operator, &binary, None, None).unwrap();
+        let public =
+            countersign_binary(&operator, &binary, None, None, OutputFormat::Human).unwrap();
 
         let countersigned = SignatureEnvelope::load(&sig).unwrap();
         assert_eq!(countersigned.embedded, released.embedded);
@@ -1436,7 +1692,14 @@ mod tests {
         let sig = dir.path().join("bun-v0.2.0.sig");
         let out = dir.path().join("countersigned.sig");
 
-        countersign_binary(&operator, &binary, Some(&sig), Some(&out)).unwrap();
+        countersign_binary(
+            &operator,
+            &binary,
+            Some(&sig),
+            Some(&out),
+            OutputFormat::Human,
+        )
+        .unwrap();
 
         assert!(SignatureEnvelope::load(&sig).unwrap().external.is_none());
         assert!(SignatureEnvelope::load(&out).unwrap().external.is_some());
@@ -1447,7 +1710,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (binary, operator) = released_binary(dir.path());
         std::fs::write(&binary, b"different bytes").unwrap();
-        let err = countersign_binary(&operator, &binary, None, None).unwrap_err();
+        let err =
+            countersign_binary(&operator, &binary, None, None, OutputFormat::Human).unwrap_err();
         assert!(err.to_string().contains("hash mismatch"), "{err}");
     }
 
@@ -1745,5 +2009,68 @@ mod tests {
             assert!(yaml.contains(&format!("cpus: {cpus}")));
             assert!(yaml.contains(mem));
         }
+    }
+
+    /// #1566: every `relish dev` report, as `-o json` prints it.
+    #[test]
+    fn dev_reports_as_json() {
+        let cluster = DevCluster {
+            name: "default".to_string(),
+            nodes: vec![DevNode {
+                name: "reliaburger-default-1".to_string(),
+                ip: Some("192.168.105.2".to_string()),
+                cpus: 2,
+                memory: "2GiB".to_string(),
+            }],
+            runtime: "runc".to_string(),
+        };
+        insta::assert_snapshot!("create", json(&DevClusterReport::new(&cluster, true, None)));
+        let mut status = DevClusterReport::new(&cluster, false, None);
+        status.ready = None;
+        status.nodes[0].vm_status = Some("Running".to_string());
+        insta::assert_snapshot!("status", json(&status));
+        insta::assert_snapshot!(
+            "stop",
+            json(&DevClusterReport::new(
+                &cluster,
+                false,
+                Some(DevAction::Stopped)
+            ))
+        );
+        insta::assert_snapshot!(
+            "test",
+            json(&TestRun {
+                filter: Some("gossip"),
+                passed: true,
+            })
+        );
+        insta::assert_snapshot!(
+            "disk",
+            json(&BuildVmReport {
+                vm: TEST_VM_NAME,
+                exists: true,
+                output: "=== Filesystem ===\n".to_string(),
+            })
+        );
+        insta::assert_snapshot!(
+            "keygen",
+            json(&ReleaseKeyReport {
+                private_key: std::path::Path::new("keys/release.key"),
+                public_key_file: std::path::Path::new("keys/release.pub"),
+                public_key: "ed25519:abc",
+            })
+        );
+        insta::assert_snapshot!(
+            "countersign",
+            json(&SignatureReport {
+                signature: std::path::Path::new("bun.sig"),
+                sha256: "ab12",
+                external_public_key: Some("ed25519:def"),
+            })
+        );
+    }
+
+    fn json<T: serde::Serialize + std::fmt::Display>(value: &T) -> String {
+        crate::relish::output::format_output(value, crate::relish::OutputFormat::Json).unwrap()
     }
 }

@@ -1,0 +1,20 @@
+---
+source: src/relish/commands.rs
+expression: json(&diff)
+---
+{
+  "added": [],
+  "modified": [
+    {
+      "resource": "app.web",
+      "field_changes": [
+        {
+          "path": "image",
+          "old": "web:v1",
+          "new": "web:v2"
+        }
+      ]
+    }
+  ],
+  "removed": []
+}

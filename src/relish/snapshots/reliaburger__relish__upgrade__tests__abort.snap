@@ -1,0 +1,10 @@
+---
+source: src/relish/upgrade.rs
+expression: "json(&UpgradeChange\n{\n    change: UpgradeChangeKind::Aborted, scope: None, version: None,\n    upgrade_id: Some(\"u-1\".to_string()),\n})"
+---
+{
+  "change": "aborted",
+  "scope": null,
+  "version": null,
+  "upgrade_id": "u-1"
+}

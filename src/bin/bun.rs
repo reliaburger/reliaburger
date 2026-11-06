@@ -4899,6 +4899,7 @@ mod tests {
             "dev",
             "node-01",
             reliaburger::relish::commands::InitSecurityMode::DevelopmentPlaintext,
+            reliaburger::relish::OutputFormat::Human,
         )
         .unwrap();
         let config = NodeConfig::from_file(&dir.path().join("reliaburger.toml")).unwrap();

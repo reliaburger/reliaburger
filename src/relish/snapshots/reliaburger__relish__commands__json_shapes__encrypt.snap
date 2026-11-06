@@ -1,0 +1,7 @@
+---
+source: src/relish/commands.rs
+expression: "json(&Encrypted { encrypted: \"ENC[AGE:abc]\".to_string(), })"
+---
+{
+  "encrypted": "ENC[AGE:abc]"
+}

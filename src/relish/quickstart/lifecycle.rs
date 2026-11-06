@@ -6,11 +6,13 @@ use super::{
     state::{ClusterState, Operation},
 };
 use crate::relish::local_context::{self, LocalContext};
+use crate::relish::output::{OutputFormat, print_output};
 use anyhow::{Context, Result, bail};
 use std::time::Duration;
 
 /// Supported actions for an existing managed cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Action {
     /// Print VM status and live API readiness.
     Status,
@@ -174,13 +176,14 @@ pub fn stop_consequences(state: &ClusterState, index: usize, running: &[bool]) -
     reasons
 }
 
-/// Stop the selected VMs. Stopping one node asks for `confirmed` when
-/// [`stop_consequences`] finds a reason to.
+/// Stop the selected VMs, recording each in `changes`. Stopping one node
+/// asks for `confirmed` when [`stop_consequences`] finds a reason to.
 pub async fn stop(
     lima: &Lima,
     operation: &Operation,
     selection: NodeSelection,
     confirmed: bool,
+    changes: &mut LocalChanges,
 ) -> Result<()> {
     let nodes = &operation.state.nodes;
     let mut running = Vec::with_capacity(nodes.len());
@@ -193,7 +196,7 @@ pub async fn stop(
             bail!("{}\npass --yes to stop it anyway", reasons.join("\n"));
         }
         if !running[index] {
-            println!("{} is not running", nodes[index].name);
+            changes.record(&nodes[index].name, NodeResult::NotRunning);
             return Ok(());
         }
     }
@@ -201,7 +204,7 @@ pub async fn stop(
         if running[index] {
             lima.power_off(&nodes[index].name, POWER_OFF_DEADLINE)
                 .await?;
-            println!("stopped {}", nodes[index].name);
+            changes.record(&nodes[index].name, NodeResult::Stopped);
         }
     }
     Ok(())
@@ -248,7 +251,141 @@ fn refuse_ssh_cluster(spec: &super::state::ClusterSpec) -> Result<()> {
     )
 }
 
-pub async fn run(action: Action, name: &str, node: Option<&str>, confirmed: bool) -> Result<()> {
+/// What `relish local status` saw, as `-o json` prints it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LocalStatus {
+    /// The managed cluster's name.
+    pub cluster: String,
+    /// Every owned node, in the saved order.
+    pub nodes: Vec<NodeStatus>,
+    /// The fault policy the first node serves, when it could be read.
+    pub fault_policy: Option<String>,
+    /// Every node is ready.
+    pub ready: bool,
+}
+
+impl std::fmt::Display for LocalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for node in &self.nodes {
+            let detail = match &node.condition {
+                NodeCondition::Ready => "Running; API ready".to_owned(),
+                NodeCondition::Missing => "Missing".to_owned(),
+                NodeCondition::NotRunning { vm_state } => vm_state.clone(),
+                NodeCondition::ApiNotReady { reason } => {
+                    format!("Running; API not ready: {reason}")
+                }
+                NodeCondition::Unknown { reason } => format!("Unknown: {reason}"),
+            };
+            writeln!(f, "{}: {detail}", node.name)?;
+        }
+        if let Some(policy) = &self.fault_policy {
+            writeln!(f, "{policy}")?;
+        }
+        Ok(())
+    }
+}
+
+/// What a lifecycle command did to one node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeResult {
+    /// `stop` shut it down.
+    Stopped,
+    /// `stop` found it already down and left it.
+    NotRunning,
+    /// `start` booted it and its API answered.
+    Started,
+    /// `destroy` deleted its VM.
+    Removed,
+}
+
+/// One node in a [`LocalChanges`] report.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NodeChange {
+    pub name: String,
+    pub result: NodeResult,
+}
+
+impl std::fmt::Display for NodeChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = &self.name;
+        match self.result {
+            NodeResult::Stopped => write!(f, "stopped {name}"),
+            NodeResult::NotRunning => write!(f, "{name} is not running"),
+            NodeResult::Started => write!(f, "started {name}"),
+            NodeResult::Removed => write!(f, "removed {name}"),
+        }
+    }
+}
+
+/// What `relish local start`, `stop` or `destroy` did. People see each
+/// change as it happens; `-o json` gets the whole report at the end.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LocalChanges {
+    /// The managed cluster's name.
+    pub cluster: String,
+    pub action: Action,
+    /// The nodes the command changed, or found already as asked.
+    pub nodes: Vec<NodeChange>,
+    /// After starting the whole cluster: the council formed again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quorum_ready: Option<bool>,
+    #[serde(skip)]
+    narrate: bool,
+}
+
+impl LocalChanges {
+    /// An empty report; with `narrate`, each change prints as it's recorded.
+    pub fn new(cluster: &str, action: Action, narrate: bool) -> Self {
+        Self {
+            cluster: cluster.to_string(),
+            action,
+            nodes: Vec::new(),
+            quorum_ready: None,
+            narrate,
+        }
+    }
+
+    fn record(&mut self, name: &str, result: NodeResult) {
+        let change = NodeChange {
+            name: name.to_string(),
+            result,
+        };
+        if self.narrate {
+            println!("{change}");
+        }
+        self.nodes.push(change);
+    }
+
+    fn quorum_ready(&mut self) {
+        if self.narrate {
+            println!("cluster quorum ready");
+        }
+        self.quorum_ready = Some(true);
+    }
+}
+
+impl std::fmt::Display for LocalChanges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for change in &self.nodes {
+            writeln!(f, "{change}")?;
+        }
+        if self.quorum_ready == Some(true) {
+            writeln!(f, "cluster quorum ready")?;
+        }
+        Ok(())
+    }
+}
+
+/// Run a lifecycle action on the managed cluster `name`, printing in
+/// `output`.
+pub async fn run(
+    action: Action,
+    name: &str,
+    node: Option<&str>,
+    confirmed: bool,
+    output: OutputFormat,
+) -> Result<()> {
     if action == Action::Destroy && !confirmed {
         bail!("destroy removes this cluster's VMs and data permanently; pass --yes to confirm");
     }
@@ -257,6 +394,7 @@ pub async fn run(action: Action, name: &str, node: Option<&str>, confirmed: bool
     }
     let root = local_context::root_directory()?;
     let operation_root = root.clone();
+    let cluster = name.to_owned();
     let name = name.to_owned();
     let (operation, bootstrap) = tokio::task::spawn_blocking(move || -> Result<_> {
         let operation = Operation::load(&operation_root, &name)?;
@@ -281,24 +419,13 @@ pub async fn run(action: Action, name: &str, node: Option<&str>, confirmed: bool
     if action == Action::Status {
         let bootstrap = bootstrap.as_ref().context("cluster bootstrap is missing")?;
         let nodes = collect_status(&lima, &operation, bootstrap).await;
-        let mut unhealthy = 0;
-        for node in &nodes {
-            let detail = match &node.condition {
-                NodeCondition::Ready => "Running; API ready".to_owned(),
-                NodeCondition::Missing => "Missing".to_owned(),
-                NodeCondition::NotRunning { vm_state } => vm_state.clone(),
-                NodeCondition::ApiNotReady { reason } => {
-                    format!("Running; API not ready: {reason}")
-                }
-                NodeCondition::Unknown { reason } => format!("Unknown: {reason}"),
-            };
-            println!("{}: {detail}", node.name);
-            if node.condition != NodeCondition::Ready {
-                unhealthy += 1;
-            }
-        }
+        let unhealthy = nodes
+            .iter()
+            .filter(|node| node.condition != NodeCondition::Ready)
+            .count();
         // Report the policy the first node actually serves, not the one setup
         // meant to write, so an edited node.toml shows up here.
+        let mut fault_policy = None;
         if nodes
             .first()
             .is_some_and(|node| node.condition == NodeCondition::Ready)
@@ -307,31 +434,38 @@ pub async fn run(action: Action, name: &str, node: Option<&str>, confirmed: bool
                 "https://127.0.0.1:{}",
                 operation.state.spec.api_port
             ))?;
-            match tokio::time::timeout(Duration::from_secs(3), client.capabilities()).await {
-                Ok(Ok(report)) => println!(
-                    "{}",
-                    super::provision::describe_test_policy(&report.test_policy)
-                ),
-                Ok(Err(error)) => println!("fault policy: unknown ({error})"),
-                Err(_) => println!("fault policy: unknown (capabilities timed out)"),
-            }
+            fault_policy = Some(
+                match tokio::time::timeout(Duration::from_secs(3), client.capabilities()).await {
+                    Ok(Ok(report)) => super::provision::describe_test_policy(&report.test_policy),
+                    Ok(Err(error)) => format!("fault policy: unknown ({error})"),
+                    Err(_) => "fault policy: unknown (capabilities timed out)".to_string(),
+                },
+            );
         }
-        if nodes.is_empty() || unhealthy > 0 {
+        let total = nodes.len();
+        let status = LocalStatus {
+            cluster,
+            ready: total > 0 && unhealthy == 0,
+            nodes,
+            fault_policy,
+        };
+        print_output(&status, output)?;
+        if !status.ready {
             bail!(
-                "managed cluster is not ready: {unhealthy} of {} nodes unhealthy or unknown",
-                nodes.len()
+                "managed cluster is not ready: {unhealthy} of {total} nodes unhealthy or unknown"
             );
         }
         return Ok(());
     }
+    let mut changes = LocalChanges::new(&cluster, action, output == OutputFormat::Human);
     match action {
         Action::Status => {} // Handled by the structured observation path above.
-        Action::Stop => stop(&lima, &operation, selection, confirmed).await?,
+        Action::Stop => stop(&lima, &operation, selection, confirmed, &mut changes).await?,
         Action::Destroy => {
             for node in &operation.state.nodes {
                 if lima.status(&node.name).await?.is_some() {
                     lima.command(&["delete", "--force", &node.name]).await?;
-                    println!("removed {}", node.name);
+                    changes.record(&node.name, NodeResult::Removed);
                 }
             }
         }
@@ -344,9 +478,7 @@ pub async fn run(action: Action, name: &str, node: Option<&str>, confirmed: bool
                     operation.state.spec.api_port + index as u16
                 ))?;
                 crate::relish::readiness::wait_for_node(&client, Duration::from_secs(45)).await?;
-                if selection != NodeSelection::All {
-                    println!("started {}", operation.state.nodes[index].name);
-                }
+                changes.record(&operation.state.nodes[index].name, NodeResult::Started);
             }
             // One node rejoins a running council by itself; a whole-cluster
             // start has to prove the council formed again.
@@ -362,10 +494,11 @@ pub async fn run(action: Action, name: &str, node: Option<&str>, confirmed: bool
                     .map(|node| node.name.clone())
                     .collect::<Vec<_>>();
                 super::runner::wait_for_quorum(&client, &names).await?;
-                println!("cluster quorum ready");
+                changes.quorum_ready();
             }
         }
     }
+
     if action == Action::Destroy {
         tokio::task::spawn_blocking(move || -> Result<()> {
             LocalContext::remove_owned(&root.join("context.json"), &operation.state.id)?;
@@ -384,6 +517,9 @@ pub async fn run(action: Action, name: &str, node: Option<&str>, confirmed: bool
             Ok(())
         })
         .await??;
+    }
+    if !changes.narrate {
+        print_output(&changes, output)?;
     }
     Ok(())
 }
@@ -473,6 +609,103 @@ fi
         format!("shell {name} sudo systemctl poweroff --no-block")
     }
 
+    /// A report that records without printing, as `-o json` uses.
+    fn quiet() -> LocalChanges {
+        LocalChanges::new("laptop", Action::Stop, false)
+    }
+
+    #[tokio::test]
+    async fn a_stop_records_which_nodes_it_stopped_and_which_were_down() {
+        let root = tempfile::tempdir().unwrap();
+        let operation = operation(root.path());
+        let fake = FakeLima::new();
+        fake.set_states(&operation, &["Running", "Stopped", "Running"]);
+
+        let mut changes = quiet();
+        stop(
+            &fake.lima,
+            &operation,
+            NodeSelection::All,
+            false,
+            &mut changes,
+        )
+        .await
+        .unwrap();
+        let names: Vec<_> = changes
+            .nodes
+            .iter()
+            .map(|change| (change.name.as_str(), change.result))
+            .collect();
+        let nodes = &operation.state.nodes;
+        assert_eq!(
+            names,
+            [
+                (nodes[0].name.as_str(), NodeResult::Stopped),
+                (nodes[2].name.as_str(), NodeResult::Stopped),
+            ]
+        );
+
+        let mut changes = quiet();
+        stop(
+            &fake.lima,
+            &operation,
+            NodeSelection::One(1),
+            false,
+            &mut changes,
+        )
+        .await
+        .unwrap();
+        assert_eq!(changes.nodes[0].result, NodeResult::NotRunning);
+    }
+
+    #[test]
+    fn local_changes_as_json_name_the_action_and_each_node() {
+        let mut changes = LocalChanges::new("laptop", Action::Start, false);
+        changes.record("rb-laptop-1", NodeResult::Started);
+        changes.record("rb-laptop-2", NodeResult::Started);
+        changes.quorum_ready();
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(&changes, OutputFormat::Json).unwrap()
+        );
+    }
+
+    #[test]
+    fn local_status_as_json_gives_each_nodes_condition() {
+        let status = LocalStatus {
+            cluster: "laptop".to_string(),
+            nodes: vec![
+                NodeStatus {
+                    name: "rb-laptop-1".to_string(),
+                    condition: NodeCondition::Ready,
+                },
+                NodeStatus {
+                    name: "rb-laptop-2".to_string(),
+                    condition: NodeCondition::ApiNotReady {
+                        reason: "council not formed".to_string(),
+                    },
+                },
+                NodeStatus {
+                    name: "rb-laptop-3".to_string(),
+                    condition: NodeCondition::NotRunning {
+                        vm_state: "Stopped".to_string(),
+                    },
+                },
+            ],
+            fault_policy: Some("fault policy: workload faults allowed".to_string()),
+            ready: false,
+        };
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(&status, OutputFormat::Json).unwrap()
+        );
+        assert_eq!(
+            status.to_string(),
+            "rb-laptop-1: Running; API ready\n\
+             rb-laptop-2: Running; API not ready: council not formed\n\
+             rb-laptop-3: Stopped\n\
+             fault policy: workload faults allowed\n"
+        );
+    }
+
     fn operation(root: &std::path::Path) -> Operation {
         Operation::open(
             root,
@@ -512,9 +745,15 @@ fi
         let fake = FakeLima::new();
         fake.set_states(&operation, &["Running", "Running", "Running"]);
 
-        stop(&fake.lima, &operation, NodeSelection::One(2), false)
-            .await
-            .unwrap();
+        stop(
+            &fake.lima,
+            &operation,
+            NodeSelection::One(2),
+            false,
+            &mut quiet(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             fake.actions(),
             vec![power_off(&operation.state.nodes[2].name)]
@@ -528,17 +767,29 @@ fi
         let fake = FakeLima::new();
         fake.set_states(&operation, &["Running", "Running", "Running"]);
 
-        let error = stop(&fake.lima, &operation, NodeSelection::One(0), false)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = stop(
+            &fake.lima,
+            &operation,
+            NodeSelection::One(0),
+            false,
+            &mut quiet(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("CLI endpoint (127.0.0.1:19117)"), "{error}");
         assert!(error.contains("--yes"), "{error}");
         assert!(fake.actions().is_empty(), "{:?}", fake.actions());
 
-        stop(&fake.lima, &operation, NodeSelection::One(0), true)
-            .await
-            .unwrap();
+        stop(
+            &fake.lima,
+            &operation,
+            NodeSelection::One(0),
+            true,
+            &mut quiet(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             fake.actions(),
             vec![power_off(&operation.state.nodes[0].name)]
@@ -552,10 +803,16 @@ fi
         let fake = FakeLima::new();
         fake.set_states(&operation, &["Running", "Running", "Stopped"]);
 
-        let error = stop(&fake.lima, &operation, NodeSelection::One(1), false)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = stop(
+            &fake.lima,
+            &operation,
+            NodeSelection::One(1),
+            false,
+            &mut quiet(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("leaves 1 of 3 nodes running"), "{error}");
         assert!(fake.actions().is_empty());
     }
@@ -567,9 +824,15 @@ fi
         let fake = FakeLima::new();
         fake.set_states(&operation, &["Running", "Running", "Stopped"]);
 
-        stop(&fake.lima, &operation, NodeSelection::One(2), false)
-            .await
-            .unwrap();
+        stop(
+            &fake.lima,
+            &operation,
+            NodeSelection::One(2),
+            false,
+            &mut quiet(),
+        )
+        .await
+        .unwrap();
         assert!(fake.actions().is_empty(), "{:?}", fake.actions());
     }
 
@@ -580,9 +843,15 @@ fi
         let fake = FakeLima::new();
         fake.set_states(&operation, &["Running", "Stopped", "Running"]);
 
-        stop(&fake.lima, &operation, NodeSelection::All, false)
-            .await
-            .unwrap();
+        stop(
+            &fake.lima,
+            &operation,
+            NodeSelection::All,
+            false,
+            &mut quiet(),
+        )
+        .await
+        .unwrap();
         let names = &operation.state.nodes;
         assert_eq!(
             fake.actions(),
@@ -613,7 +882,7 @@ fi
     #[tokio::test]
     async fn only_start_and_stop_take_a_node() {
         for action in [Action::Status, Action::Destroy] {
-            let error = run(action, "laptop", Some("3"), true)
+            let error = run(action, "laptop", Some("3"), true, OutputFormat::Human)
                 .await
                 .unwrap_err()
                 .to_string();

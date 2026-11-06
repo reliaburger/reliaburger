@@ -54,6 +54,23 @@ the reason, and you still get every other node's lines:
 
 `relish wtf` reports the same reasons in its log evidence.
 
+For a script or an agent, `-o json` prints one JSON object per line (JSON
+Lines), so you never have to parse the `[instance]` labels:
+
+```sh
+relish -o json logs web --since 10m --stream stderr
+```
+
+```json
+{"at":"2026-11-05T09:14:02Z","node":"rb-4f2a9c1e07b3-2","instance":"default__web-0","stream":"stderr","text":"db timeout"}
+```
+
+`at` is when the node stored the line, in UTC to the second. A line that came
+from the agent's own capture (an app the log store hasn't seen yet) has only
+its `text`; the other fields are `null` rather than guessed. `-o yaml` prints
+the same records as one list. `-f` doesn't take `-o json` yet: a followed
+line doesn't say when, or on which stream, it was written.
+
 Retention and export are node config:
 
 ```toml

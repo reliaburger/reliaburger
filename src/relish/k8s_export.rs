@@ -49,7 +49,7 @@ pub struct ExportResult {
 }
 
 /// Export report.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct ExportReport {
     /// Resources created.
     pub resources_created: Vec<String>,
