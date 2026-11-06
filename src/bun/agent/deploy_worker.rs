@@ -200,7 +200,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 .await;
             return;
         }
-        let now = Instant::now();
         let mut all_ids: Vec<String> = Vec::new();
         let deployed_apps: Vec<(String, String)> = config
             .app
@@ -231,6 +230,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             if self.report_cancellation(&events).await {
                 return;
             }
+            // When this node's deploy of this app started: its health clocks
+            // count from here, and its history entry's `created_at` (#1640).
+            let now = Instant::now();
             let namespace = spec.namespace.as_deref().unwrap_or("default");
 
             if self.report_cancellation(&events).await {
@@ -471,7 +473,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     app_id: crate::meat::types::AppId::new(app_name, namespace),
                     image: spec.image.clone().unwrap_or_default(),
                     result: crate::meat::deploy_types::DeployResult::Completed,
-                    created_at: SystemTime::now(),
+                    created_at: crate::meat::deploy_types::wall_clock_at(now),
                     completed_at: SystemTime::now(),
                     steps_completed: ids.len(),
                     steps_total: ids.len(),
@@ -850,6 +852,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         change: super::scale_in_place::InPlaceChange,
         events: &mpsc::Sender<ApplyEvent>,
     ) -> std::ops::ControlFlow<()> {
+        let started_at = SystemTime::now();
         let super::scale_in_place::InPlaceChange { add: count, retire } = change;
         let message = match (count, retire.len()) {
             (0, 0) => format!(
@@ -966,7 +969,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 app_id: crate::meat::types::AppId::new(app_name, namespace),
                 image: spec.image.clone().unwrap_or_default(),
                 result: crate::meat::deploy_types::DeployResult::Completed,
-                created_at: SystemTime::now(),
+                created_at: started_at,
                 completed_at: SystemTime::now(),
                 steps_completed: ids.len(),
                 steps_total: ids.len(),
@@ -1452,6 +1455,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         rollout: AbortedRollout<'_>,
         events: &mpsc::Sender<ApplyEvent>,
     ) {
+        let started_at = SystemTime::now();
         let AbortedRollout {
             app_name,
             namespace,
@@ -1564,7 +1568,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 app_id: crate::meat::types::AppId::new(app_name, namespace),
                 image: spec.image.clone().unwrap_or_default(),
                 result,
-                created_at: SystemTime::now(),
+                created_at: started_at,
                 completed_at: SystemTime::now(),
                 steps_completed: started.healthy.len(),
                 steps_total: replica_count as usize,

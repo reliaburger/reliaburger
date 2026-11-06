@@ -7617,6 +7617,44 @@ async fn halted_rollout_keeps_healthy_replacements_in_ordinary_supervision() {
     }
 }
 
+/// #1640: a history entry's `created_at` is when this node's deploy of the
+/// app started, so `completed_at − created_at` is how long it took. Both
+/// used to be stamped together as the entry was written, so the soak's app
+/// start read about 1 ms however slow the start was.
+#[tokio::test]
+async fn deploy_history_times_a_fresh_deploy_and_a_rolling_redeploy() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    let slow = std::time::Duration::from_millis(200);
+    grill.set_call_delay(crate::grill::mock::MockCall::Start, Some(slow));
+    let history = agent.deploy_history_handle();
+    let took = |history: &[crate::meat::deploy_types::DeployHistoryEntry]| {
+        let entry = history.last().expect("a history entry");
+        entry
+            .completed_at
+            .duration_since(entry.created_at)
+            .unwrap_or_default()
+    };
+
+    let first = Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\n").unwrap();
+    expect_complete(&drain_deploy(&mut agent, first).await);
+    let fresh = took(&history.read().await);
+    assert!(
+        fresh >= slow,
+        "a fresh deploy that took over {slow:?} recorded {fresh:?}"
+    );
+
+    let second = Config::parse("[app.web]\nimage = 'web:v2'\nport = 8080\n").unwrap();
+    expect_complete(&drain_deploy(&mut agent, second).await);
+    let entries = history.read().await;
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    let rolled = took(&entries);
+    assert!(
+        rolled >= slow,
+        "a rolling redeploy that took over {slow:?} recorded {rolled:?}"
+    );
+}
+
 #[tokio::test]
 async fn rolling_redeploy_halts_without_reverting_when_auto_rollback_is_false() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
