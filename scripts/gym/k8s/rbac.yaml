@@ -1,0 +1,43 @@
+# The solver's read-only access on the k3s lab, the counterpart of a
+# Reliaburger `--role read-only` token.
+#
+# Each run's service account lives in gym-solver and is bound to two roles:
+# the built-in `view` ClusterRole (every namespaced object but Secrets, plus
+# pod logs; https://kubernetes.io/docs/reference/access-authn-authz/rbac/#user-facing-roles)
+# and gym-cluster-read below, for the cluster-scoped objects `view` leaves
+# out, nodes above all, which the partition scenario needs. Neither grants a
+# write, exec, attach, port-forward or proxy.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gym-solver
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gym-cluster-read
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "namespaces", "persistentvolumes", "componentstatuses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes", "csidrivers", "volumeattachments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingressclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "watch"]

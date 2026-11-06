@@ -1,0 +1,14 @@
+{
+  "get pods -A -o json": {
+    "stdout": "{\"apiVersion\": \"v1\", \"kind\": \"List\", \"items\": [{\"metadata\": {\"name\": \"web-7d9f8-abcde\", \"namespace\": \"default\", \"labels\": {\"app\": \"web\"}}, \"spec\": {\"containers\": [{\"name\": \"web\"}], \"nodeName\": \"gym-2\"}, \"status\": {\"phase\": \"Running\", \"conditions\": [], \"containerStatuses\": [{\"name\": \"web\", \"restartCount\": 0, \"state\": {\"running\": {}}}]}}]}",
+    "exit": 0
+  },
+  "get nodes -o json": {
+    "stdout": "{\"apiVersion\": \"v1\", \"kind\": \"List\", \"items\": [{\"metadata\": {\"name\": \"gym-1\"}, \"status\": {\"conditions\": [{\"type\": \"Ready\", \"status\": \"True\", \"reason\": \"KubeletReady\", \"message\": \"kubelet is posting ready status\"}]}}, {\"metadata\": {\"name\": \"gym-2\"}, \"status\": {\"conditions\": [{\"type\": \"Ready\", \"status\": \"True\", \"reason\": \"KubeletReady\", \"message\": \"kubelet is posting ready status\"}]}}, {\"metadata\": {\"name\": \"gym-3\"}, \"status\": {\"conditions\": [{\"type\": \"Ready\", \"status\": \"Unknown\", \"reason\": \"NodeStatusUnknown\", \"message\": \"Kubelet stopped posting node status.\"}]}}]}",
+    "exit": 0
+  },
+  "logs deployment/web --tail 20": {
+    "stdout": "web: listening\n",
+    "exit": 0
+  }
+}
