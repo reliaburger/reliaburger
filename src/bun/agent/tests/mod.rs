@@ -6023,6 +6023,101 @@ async fn real_process_restart_stays_eligible_and_fails_at_once_without_its_execu
     agent.stop_app("retry", "default").await.unwrap();
 }
 
+/// Every restart records one `restart` event, whether the exit was seen
+/// with no backoff owed (restarted at once by `observe_app_exit`) or the
+/// restart waited out its backoff (`retry_restart`). Without it, `relish
+/// wtf` counted too few restarts to name a crash loop (#1652).
+#[tokio::test]
+async fn every_restart_after_an_exit_records_one_restart_event() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let events = Arc::new(tokio::sync::RwLock::new(
+        crate::bun::events::EventStore::new(),
+    ));
+    agent.set_event_store(Arc::clone(&events));
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+    let restart_events = |events: &crate::bun::events::EventStore| {
+        events
+            .recent(100, None, None)
+            .iter()
+            .filter(|event| event.kind == crate::bun::events::EventKind::Restart)
+            .count()
+    };
+
+    // Three exits, each seen once its backoff is over: restarted at once.
+    for attempt in 1..=3 {
+        if let Some(instance) = agent.supervisor.get_instance_mut(&id)
+            && instance.last_restart.is_some()
+        {
+            instance.last_restart = Some(Instant::now() - std::time::Duration::from_secs(600));
+        }
+        grill.set_state(&id, ContainerState::Stopped);
+        agent.check_apps().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().restart_count,
+            attempt
+        );
+        agent.drive_pending_restarts_to_completion().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        assert_eq!(restart_events(&*events.read().await), attempt as usize);
+    }
+
+    // A fourth exit inside its backoff waits, records nothing yet, then
+    // records exactly one event when the backoff ends.
+    grill.set_state(&id, ContainerState::Stopped);
+    agent.check_apps().await;
+    assert_eq!(
+        agent.supervisor.get_instance(&id).unwrap().state,
+        ContainerState::Stopped
+    );
+    agent.drive_pending_restarts_to_completion().await;
+    assert_eq!(restart_events(&*events.read().await), 3);
+    agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+        Some(Instant::now() - std::time::Duration::from_secs(600));
+    agent.drive_pending_restarts_to_completion().await;
+    agent.drive_pending_restarts_to_completion().await;
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Running);
+    assert_eq!(instance.restart_count, 4);
+    assert_eq!(restart_events(&*events.read().await), 4);
+    agent.stop_app("web", "default").await.unwrap();
+}
+
+/// An exit that finds the restart budget spent fails the instance and says
+/// so, as a restart that waited out its backoff does.
+#[tokio::test]
+async fn an_exit_past_the_restart_budget_records_the_exhausted_budget() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let events = Arc::new(tokio::sync::RwLock::new(
+        crate::bun::events::EventStore::new(),
+    ));
+    agent.set_event_store(Arc::clone(&events));
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+    agent
+        .supervisor
+        .get_instance_mut(&id)
+        .unwrap()
+        .restart_policy
+        .max_restarts = Some(0);
+    grill.set_state(&id, ContainerState::Stopped);
+    agent.check_apps().await;
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Failed);
+    assert!(!instance.retry_pending);
+    let recorded = events.read().await.recent(100, None, None);
+    assert!(
+        recorded.iter().any(|event| {
+            event.kind == crate::bun::events::EventKind::JobFailed
+                && event.message.contains("exhausted its restart budget")
+        }),
+        "no exhausted-budget event: {recorded:?}"
+    );
+}
+
 #[tokio::test]
 async fn redeployed_instance_restarts_after_a_crash() {
     let (_tx, rx) = mpsc::channel(32);

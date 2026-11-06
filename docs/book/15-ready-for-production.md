@@ -3390,6 +3390,18 @@ same application and namespace in the preceding 30 minutes, then attaches the
 first recent error log. One finding now answers three questions: what failed,
 what changed, and what did the process say?
 
+That rule is only as good as the events behind it, and in 0.2.7 the agent gym
+(#1086) caught us short. An app that exited five seconds after each start
+reached `restart_count` 5 with only two `restart` events, so `wtf` called it
+`under-replicated`. An exited app has two ways into a restart. An exit the state
+sweep sees goes through `observe_app_exit`, which restarted the instance at
+once if its backoff was over and recorded nothing. An exit inside the backoff
+waits for `retry_restart`, which recorded the event. Only the slow path wrote
+history. The fix is to have one door: `observe_app_exit` now calls
+`retry_restart` too, so whichever tick moves the instance back to Pending
+records the event, exactly once, and an exhausted budget fails the instance
+with the same `exhausted its restart budget` event either way (#1652).
+
 The same rule keeps the other checks honest. Disk pressure needs used capacity
 with a node and storage-domain attribution. CPU throttling needs an increase in
 cgroup throttled time, not high CPU usage. Certificate expiry needs public

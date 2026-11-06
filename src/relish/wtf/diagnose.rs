@@ -1587,7 +1587,7 @@ fn with_caveat(description: &str, caveat: Option<&str>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::relish::wtf::{
         AlertObservation, CertificateObservation, CouncilObservation, CpuThrottleObservation,
@@ -1597,9 +1597,10 @@ mod tests {
         RestartObservation, ServiceObservation, TokenObservation,
     };
 
-    const NOW: u64 = 2_000_000;
+    pub(in crate::relish::wtf) const NOW: u64 = 2_000_000;
 
-    fn healthy_inputs() -> WtfInputs {
+    /// A one-node cluster with one healthy app, `api`, and nothing wrong.
+    pub(in crate::relish::wtf) fn healthy_inputs() -> WtfInputs {
         WtfInputs {
             cluster_name: "test".to_string(),
             collected_at: NOW,
