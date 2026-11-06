@@ -56,6 +56,7 @@ pub mod test_cmd;
 mod tls;
 pub mod tui;
 pub mod uninstall;
+pub mod unknown_command;
 pub mod upgrade;
 pub mod wtf;
 pub mod wtf_cmd;

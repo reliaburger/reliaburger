@@ -123,6 +123,26 @@ Even clap's usage errors come out as an envelope. `relish agent version
 --bogus` prints a failure with the `usage` code on stdout and exits 2. For
 every other command, clap's message still goes to stderr as before.
 
+clap's message had one trap in it, which the 0.2.7 exit test (#1093) caught.
+Ask for a command that doesn't exist and clap picks the closest name it has,
+whatever that command does. A read-only agent that typed `relish apps` was
+told "a similar subcommand exists: 'apply'". It was pointed straight at a
+write. `src/relish/unknown_command.rs` now reads the suggestions out of the
+`clap::Error` before it's printed (`error.get(ContextKind::SuggestedSubcommand)`),
+keeps only the names on a short read-only list, and puts them back with
+`error.insert`. When nothing survives, it adds a `tip:` line naming
+`relish status`, or `relish agent context` under `relish agent`, and the
+envelope's `hint` opens with the same advice.
+
+The list is of commands that read, not of commands that write, so a new
+command is never suggested until someone decides it's safe. A test fails
+until every top-level command is classified. We kept the rule the same for
+people: `relish aply` gets no suggestion either. A human loses a small
+convenience, but relish can't tell a human from an agent running the plain
+CLI, and the exit test showed agents do exactly that. We also didn't add a
+`relish apps` alias. `relish status` already lists the apps, and an alias
+would only cover the one word we happened to see.
+
 ### Four ways to write an enum
 
 The envelope is a handful of serde types in

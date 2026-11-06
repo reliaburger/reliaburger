@@ -304,7 +304,7 @@ fn schema_data(only: Option<CommandName>) -> SchemaData {
 }
 
 /// Global `relish` flags that take a value as the next argument.
-const VALUE_FLAGS: &[&str] = &["-o", "--output", "--token", "--ca-cert", "--endpoint"];
+pub(crate) const VALUE_FLAGS: &[&str] = &["-o", "--output", "--token", "--ca-cert", "--endpoint"];
 
 /// Whether `args` (without the program name) run a `relish agent` command:
 /// the first argument that isn't a flag or a flag's value is `agent`.
@@ -363,11 +363,17 @@ fn max_bytes_in(args: &[String]) -> Option<usize> {
 
 /// The usage failure for a `relish agent` command line clap rejected.
 ///
-/// `message` is clap's own explanation. It honours a valid `--max-bytes`
+/// `message` is clap's own explanation and `lead`, when there is one, opens
+/// the hint: a read-only command close to what was typed, or where to
+/// start. It honours a valid `--max-bytes`
 /// even though the rest of the line didn't parse.
-pub fn usage_failure(args: &[String], message: &str) -> Rendered {
-    let error = AgentError::new(ErrorCode::Usage, message.trim_end())
-        .with_hint("relish agent --help lists the commands; relish agent schema their output");
+pub fn usage_failure(args: &[String], message: &str, lead: Option<&str>) -> Rendered {
+    let help = "relish agent --help lists the commands; relish agent schema their output";
+    let hint = match lead {
+        Some(lead) => format!("{lead} {help}"),
+        None => help.to_string(),
+    };
+    let error = AgentError::new(ErrorCode::Usage, message.trim_end()).with_hint(hint);
     let command = command_named(args);
     failure(
         command,
@@ -821,7 +827,7 @@ mod tests {
     #[test]
     fn a_usage_failure_is_an_envelope_with_exit_2() {
         let line = args("agent version --bogus");
-        let rendered = usage_failure(&line, "error: unexpected argument '--bogus' found\n");
+        let rendered = usage_failure(&line, "error: unexpected argument '--bogus' found\n", None);
         assert_eq!(rendered.exit, ExitStatus::Usage);
         assert_eq!(rendered.exit.code(), 2);
         let value = json_of(&rendered);
