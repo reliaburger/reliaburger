@@ -9,10 +9,13 @@
 //! This module holds the contract ([`envelope`], [`budget`], and
 //! [`untrusted`] for text a workload wrote), the first two commands,
 //! `version` and `schema`, which exercise it end to end, and [`source`],
-//! which reads the source this binary was built from. The commands that
-//! read the cluster come later and reuse it.
+//! which reads the source this binary was built from. [`context`] and
+//! [`diagnose`] read the cluster through `relish wtf`'s collector, and
+//! `explain` says what each of `wtf`'s findings means.
 
 pub mod budget;
+pub mod context;
+pub mod diagnose;
 pub mod envelope;
 pub mod source;
 pub mod untrusted;
@@ -54,6 +57,18 @@ pub enum AgentCommand {
     },
     /// The source this binary was built from: search it, read it, extract it.
     Source(source::SourceOptions),
+    /// The first call: findings, unknowns, faults, alerts, one line per app
+    /// and the newest events, in one bounded answer.
+    Context(context::ContextArgs),
+    /// Every finding with its evidence, read-only next steps, and pointers
+    /// into the manual and the source.
+    Diagnose(diagnose::DiagnoseArgs),
+    /// What a finding means, its thresholds and where it's decided; every
+    /// finding when no id is given. Reads only this binary.
+    Explain {
+        /// A finding id, e.g. `crashloop`.
+        id: Option<String>,
+    },
 }
 
 impl AgentCommand {
@@ -63,6 +78,9 @@ impl AgentCommand {
             AgentCommand::Version => CommandName::Version,
             AgentCommand::Schema { .. } => CommandName::Schema,
             AgentCommand::Source(options) => options.command.name(),
+            AgentCommand::Context(_) => CommandName::Context,
+            AgentCommand::Diagnose(_) => CommandName::Diagnose,
+            AgentCommand::Explain { .. } => CommandName::Explain,
         }
     }
 }
@@ -103,6 +121,13 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
             rerun,
         ),
         AgentCommand::Source(source) => source::run(source, options.max_bytes, rerun).await,
+        AgentCommand::Context(args) => context::run(args, options.max_bytes, rerun).await,
+        AgentCommand::Diagnose(args) => {
+            diagnose::run_diagnose(args, options.max_bytes, rerun).await
+        }
+        AgentCommand::Explain { id } => {
+            diagnose::run_explain(id.as_deref(), options.max_bytes, rerun)
+        }
     }
 }
 
@@ -190,6 +215,9 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::SourceGrep => Some(schema_of::<source::GrepData>()),
         CommandName::SourceShow => Some(schema_of::<source::ShowData>()),
         CommandName::SourceExtract => Some(schema_of::<source::ExtractData>()),
+        CommandName::Context => Some(schema_of::<context::ContextData>()),
+        CommandName::Diagnose => Some(schema_of::<diagnose::DiagnoseData>()),
+        CommandName::Explain => Some(schema_of::<diagnose::ExplainData>()),
     }
 }
 
@@ -397,13 +425,17 @@ mod tests {
 
     #[tokio::test]
     async fn schema_lists_the_envelope_and_every_answering_command() {
-        let rendered = run(&parse("agent schema").unwrap(), "relish agent schema").await;
+        // Every command's schema together outgrew the default budget once
+        // `context` and `diagnose` arrived; `schema <command>` is the
+        // bounded call, and the test below holds each one to the default.
+        let rendered = run(
+            &parse("agent schema --max-bytes 131072").unwrap(),
+            "relish agent schema",
+        )
+        .await;
         assert_eq!(rendered.exit, ExitStatus::Answered);
         let value = json_of(&rendered);
-        assert_eq!(
-            value["truncated"], false,
-            "the schema fits the default budget"
-        );
+        assert_eq!(value["truncated"], false, "the whole schema fits 128 KiB");
         let names: Vec<&str> = value["data"]["commands"]
             .as_array()
             .unwrap()
@@ -419,7 +451,10 @@ mod tests {
                 "source tree",
                 "source grep",
                 "source show",
-                "source extract"
+                "source extract",
+                "context",
+                "diagnose",
+                "explain"
             ]
         );
         let envelope = &value["data"]["envelope"];
@@ -428,6 +463,20 @@ mod tests {
             error_codes.to_string().contains("tls_untrusted"),
             "{error_codes}"
         );
+    }
+
+    #[tokio::test]
+    async fn each_commands_schema_fits_the_default_budget() {
+        for command in CommandName::ANSWERING {
+            let line = format!(
+                "agent schema {}",
+                clap::ValueEnum::to_possible_value(command)
+                    .unwrap()
+                    .get_name()
+            );
+            let rendered = run(&parse(&line).unwrap(), &format!("relish {line}")).await;
+            assert_eq!(json_of(&rendered)["truncated"], false, "{line}");
+        }
     }
 
     #[tokio::test]
@@ -487,6 +536,35 @@ mod tests {
         assert!(
             parse("agent --offline source version").is_err(),
             "--offline belongs to source"
+        );
+    }
+
+    #[test]
+    fn cluster_commands_parse_with_their_flags() {
+        let options = parse("agent context --events 50").unwrap();
+        let AgentCommand::Context(context) = &options.command else {
+            panic!("{options:?}");
+        };
+        assert_eq!(context.events, 50);
+        assert_eq!(options.command.name(), CommandName::Context);
+        assert!(parse("agent context --events 0").is_err());
+        assert!(parse("agent context --events 201").is_err());
+        let options = parse("agent diagnose --app web").unwrap();
+        let AgentCommand::Diagnose(diagnose) = &options.command else {
+            panic!("{options:?}");
+        };
+        assert_eq!(diagnose.app.as_deref(), Some("web"));
+        let options = parse("agent explain crashloop").unwrap();
+        assert!(
+            matches!(&options.command, AgentCommand::Explain { id: Some(id) } if id == "crashloop")
+        );
+        assert!(matches!(
+            parse("agent explain").unwrap().command,
+            AgentCommand::Explain { id: None }
+        ));
+        assert_eq!(
+            command_named(&args("agent explain --bogus")),
+            CommandName::Explain
         );
     }
 

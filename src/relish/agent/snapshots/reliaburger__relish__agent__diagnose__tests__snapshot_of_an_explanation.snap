@@ -1,0 +1,94 @@
+---
+source: src/relish/agent/diagnose.rs
+expression: value
+---
+{
+  "command": "explain",
+  "data": {
+    "findings": [
+      {
+        "decided_in": {
+          "function": "check_crashloops",
+          "function_line": 3,
+          "line": 8,
+          "path": "src/relish/wtf/diagnose.rs",
+          "permalink": "https://github.com/reliaburger/reliaburger/blob/a1b2c3d4e5f60718293a4b5c6d7e8f9012345678/src/relish/wtf/diagnose.rs#L8"
+        },
+        "id": "crashloop",
+        "manual": {
+          "heading": "`relish wtf`: what's broken and why",
+          "line": 10,
+          "path": "docs/manual/07_diagnostics.md",
+          "read": "relish agent source show docs/manual/07_diagnostics.md:3-11"
+        },
+        "meaning": "an app restarted repeatedly in a short window; a recent deploy and the app's first error line are attached when there are any",
+        "severities": [
+          "critical"
+        ],
+        "thresholds": [
+          {
+            "constant": "CRASHLOOP_RESTARTS",
+            "defined_at": {
+              "function": null,
+              "function_line": null,
+              "line": 2,
+              "path": "src/relish/wtf/findings.rs",
+              "permalink": "https://github.com/reliaburger/reliaburger/blob/a1b2c3d4e5f60718293a4b5c6d7e8f9012345678/src/relish/wtf/findings.rs#L2"
+            },
+            "meaning": "restarts inside the window that make a crash loop",
+            "unit": "count",
+            "value": 3
+          },
+          {
+            "constant": "CRASHLOOP_WINDOW_SECONDS",
+            "defined_at": {
+              "function": null,
+              "function_line": null,
+              "line": 4,
+              "path": "src/relish/wtf/findings.rs",
+              "permalink": "https://github.com/reliaburger/reliaburger/blob/a1b2c3d4e5f60718293a4b5c6d7e8f9012345678/src/relish/wtf/findings.rs#L4"
+            },
+            "meaning": "the window restarts are counted in",
+            "unit": "seconds",
+            "value": 900
+          },
+          {
+            "constant": "RECENT_DEPLOY_SECONDS",
+            "defined_at": {
+              "function": null,
+              "function_line": null,
+              "line": 5,
+              "path": "src/relish/wtf/findings.rs",
+              "permalink": "https://github.com/reliaburger/reliaburger/blob/a1b2c3d4e5f60718293a4b5c6d7e8f9012345678/src/relish/wtf/findings.rs#L5"
+            },
+            "meaning": "a deploy started this recently is named as the likely cause",
+            "unit": "seconds",
+            "value": 1800
+          }
+        ]
+      }
+    ]
+  },
+  "next": [
+    {
+      "read_only": true,
+      "run": "relish agent source show src/relish/wtf/diagnose.rs:3-42",
+      "why": "the code that decides it"
+    },
+    {
+      "read_only": true,
+      "run": "relish agent source show docs/manual/07_diagnostics.md:3-11",
+      "why": "the manual's section on it"
+    }
+  ],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": false,
+    "source_digest": "sha256:d6ab18c9727fb040aef235e15a93f4fa154b7fa11ac0fdb78ffcefbedd66ead6",
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": []
+}

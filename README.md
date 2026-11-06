@@ -167,13 +167,16 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 - `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive *(0.2.7, not in 0.2.6)*
   - `relish agent version`: This binary's version, commit, target and cluster formats *(0.2.7, not in 0.2.6)*
-  - `relish agent schema [version|schema|source-version|source-tree|source-grep|source-show|source-extract]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.6)*
+  - `relish agent schema [version|schema|source-version|source-tree|source-grep|source-show|source-extract|context|diagnose|explain]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.6)*
   - `relish agent source`: The source this binary was built from: search it, read it, extract it *(0.2.7, not in 0.2.6)*
     - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs *(0.2.7, not in 0.2.6)*
     - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count *(0.2.7, not in 0.2.6)*
     - `relish agent source grep <PATTERN>`: Search the source with a regular expression, line by line *(0.2.7, not in 0.2.6)*
     - `relish agent source show <TARGET>`: Print up to 400 numbered lines of one file: `path` or `path:from-to` *(0.2.7, not in 0.2.6)*
     - `relish agent source extract <DIR>`: Write the source into a new or empty directory, as a git repository when git is installed *(0.2.7, not in 0.2.6)*
+  - `relish agent context`: The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer *(0.2.7, not in 0.2.6)*
+  - `relish agent diagnose`: Every finding with its evidence, read-only next steps, and pointers into the manual and the source *(0.2.7, not in 0.2.6)*
+  - `relish agent explain [ID]`: What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary *(0.2.7, not in 0.2.6)*
 
 **Break things on purpose** ([chaos](docs/manual/05_chaos.md))
 

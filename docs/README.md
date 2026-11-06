@@ -789,10 +789,13 @@ flag.
 
 `relish agent` is the family for LLM agents: every command prints one
 `relish.agent/v1` JSON envelope within a byte budget, never prompts, and exits
-`0` whenever it answered. So far it has `version`, `schema`, and `source`
-(`version`, `tree`, `grep`, `show` and `extract` over the code this binary was
-built from, with a warning when a node runs another commit); the commands that
-read the cluster arrive through 0.2.7. See
+`0` whenever it answered. So far it has `version`, `schema`, `context` (the
+first call: findings, unknowns, faults, alerts, one line per app and the newest
+events), `diagnose` (`wtf`'s findings with their evidence and pointers into
+the manual and the source), `explain` (what a finding id means and the
+constants and code that decide it), and `source` (`version`, `tree`, `grep`,
+`show` and `extract` over the code this binary was built from, with a warning
+when a node runs another commit); more arrive through 0.2.7. See
 [Working with an AI agent](manual/16_working-with-an-ai-agent.md).
 
 Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select
