@@ -8810,6 +8810,22 @@ The fake can't be Bun, so every tunnel to a node's API closes, and that's
 where the tests stop. Readiness, the council and the demo need a real cluster,
 which `scripts/release/qualify-ssh-setup.sh` builds on VMs.
 
+Or that's where they're meant to stop. Once, on a busy laptop, the
+step-by-step test that takes under a second sat for a full minute until
+nextest killed it (#1608). `Ssh::tunnel` decides the forward is up when a
+connection to its local port succeeds, and it checks that while `ssh` is still
+logging in. Anything else answering on that port passes the check. The test
+picked its ports with `bind(0)`, which hands out a port from the ephemeral
+range, exactly where the next outgoing connections on the host land, and
+another process's listener there, or a connection that the kernel happened to
+give that same source port (TCP's "simultaneous open" then connects a socket to
+itself), answered for node 2. Setup took the stranger for Bun and waited out
+its 60-second readiness deadline. A real operator can hit the same thing with
+an old tunnel still holding the port. So now `tunnel` refuses a port something
+already answers on before it starts `ssh`, a connection to itself doesn't
+count, and the test takes its ports from below every ephemeral range, with a
+30-second limit per node that names the node if it ever hangs again.
+
 Setup reaches each machine's API through SSH tunnels, which close when it
 finishes. After that `relish` talks to port 9117 on the first machine directly,
 and a firewall in between used to get you `bun agent not reachable at
