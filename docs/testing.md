@@ -821,10 +821,10 @@ why we copied the idea and not the tooling.
 | SLO (p99) | What's timed | Threshold | Mode |
 |---|---|---|---|
 | Job task start | A job task's start lag on a pooled executor, from the job campaign's buckets, in runs no fault window overlapped | ≤ 256 ms | Gated in the fast and final tiers |
-| API read | `GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` (what `relish status` and `relish nodes` ask) on every node, at every light check, from the host | ≤ 1,000 ms | Record only |
-| API write | `relish apply` of the soak workloads, from the call to the Raft commit | ≤ 2,000 ms | Record only |
+| API read | `GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` (what `relish status` and `relish nodes` ask) on every node, at every light check, from the host | ≤ 3,000 ms | Gated in the fast and final tiers |
+| API write | `relish apply` of the soak workloads, from the call to the Raft commit | ≤ 3,000 ms | Gated in the fast and final tiers |
 | App start | Each node's deploy of a new `soak-slo` instance, from its start until the instance passes its health check | ≤ 5,000 ms | Record only |
-| Rolling update | From `relish apply` returning until every node runs the new `soak-slo` | ≤ 30,000 ms | Record only |
+| Rolling update | From `relish apply` returning until every node runs the new `soak-slo` | ≤ 100,000 ms | Gated in the fast and final tiers |
 
 **Where the gated number comes from.** The job start lag is the one latency
 earlier records already kept. Across the ten 0.2.0 to 0.2.2 soak records its
@@ -854,15 +854,33 @@ tail gives it millions, so a final short of 1,000 fails. 0.2.4's 8-hour
 final, the first to gate on it, measured 32 ms over 137,306,923 quiet tasks
 ([record](qualification/2026-10-30-v0.2.4-job-qualification.md)).
 
-**Record only, from 28 October 2026.** No soak before 0.2.4 timed the API,
-an app start or a rolling update, so those four start in record-only mode:
-the record shows the value and whether it's over the provisional threshold,
-and never fails on it. The provisional thresholds are Kubernetes's for reads
-and app start, and a guess with room to spare for writes and rolling updates.
-The first 0.2.4 fast and final records exist now
-([release closure](qualification/2026-10-30-v0.2.4-release-closure.md)),
-and the maintainer sets each gate from them, with margin, the same way as
-the job start.
+**The API and rollout gates, from 6 November 2026.** No soak before 0.2.4
+timed the API, an app start or a rolling update, so those four started in
+record-only mode on 28 October: the record showed the value and whether it
+was over a provisional threshold, and never failed on it. The fast and final
+records from 0.2.4 to 0.2.6 then set three of the gates
+([#1405](https://github.com/reliaburger/reliaburger/issues/1405);
+`python3 scripts/release/soak_slo.py trend docs/qualification` lists them):
+
+| SLO (p99) | Fast-tier records | Final records | Worst | Gate |
+|---|---|---|---|---|
+| API read | 100 to 150 ms | 150, 1,500, 150 ms | 1,500 ms | 3,000 ms |
+| API write | 150 to 300 ms | 500, 1,500, 1,500 ms | 1,500 ms | 3,000 ms |
+| Rolling update | 30,000 ms | 30,000, 50,000, 50,000 ms | 50,000 ms | 100,000 ms |
+
+Each gate sits two histogram buckets above the worst value. A p99 is the
+upper bound of its bucket, so one bucket of margin would fail a run that was
+only a little slower than the worst so far, and the job start's four times
+would leave the rolling update at 200 s, longer than the rollout's own
+budget. A day tier and a custom run still record these without gating them:
+the 0.2.4 day run measured a rolling update p99 of 100,000 ms at six times
+the load.
+
+App start stays record only. It's 1 ms in every record, because deploy
+history stamps a deploy's start at the moment it records the deploy's end,
+so `completed_at − created_at` measures nothing
+([#1640](https://github.com/reliaburger/reliaburger/issues/1640)). Its gate
+waits until records time it for real.
 
 **How it's measured.** At every light, settle and heavy check outside a fault
 window, the harness times the two API reads on each node that is up

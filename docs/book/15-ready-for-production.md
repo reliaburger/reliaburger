@@ -454,6 +454,17 @@ bucket bound for the same reason we picked 256 ms: the record's number is then e
 one the gate compared. `soak_slo.py trend` lists every record's values side by side, which
 is the closest we'll come to a dashboard for now.
 
+Three releases of records later, that listing set the gates
+([#1405](https://github.com/reliaburger/reliaburger/issues/1405)). The API read, the API write
+and the rolling update are now gated at two buckets above the worst fast or final value: 3 s,
+3 s and 100 s. The same listing showed something else, which a dashboard would have shown
+at a glance. App start was 1 ms in every record, on machines that take seconds to start a
+container. "A start and a completion on that node's own clock" turned out to be one clock
+reading taken twice: every deploy-history writer filled both fields with `SystemTime::now()`
+as it wrote the entry ([#1640](https://github.com/reliaburger/reliaburger/issues/1640)). A
+number that never moves deserves suspicion. App start stays record only until its
+timestamps mean something.
+
 
 Here's a bug that a passing test hid for a while. Bun can run a workload as a plain host
 process, not just a container. You tell it a binary path and it runs it. Obviously you don't
