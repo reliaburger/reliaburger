@@ -138,6 +138,14 @@ and <code>internal</code>. <code>status</code> is the HTTP status when the API a
 <p>A usage error is an envelope too. Give <code>relish agent version</code> a flag it
 doesn't have and it prints a failure with the <code>usage</code> code on stdout, not
 clap's text on stderr. Only <code>--help</code> prints ordinary help.</p>
+<p>A command relish doesn't know is a usage error too, and its "did you mean"
+only ever names a command that reads. Type <code>statsu</code> and relish suggests
+<code>relish status</code>. Type <code>apps</code> and the closest name is <code>apply</code>, which writes,
+so relish leaves it out and points at <code>relish status</code> instead; under
+<code>relish agent</code> it points at <code>relish agent context</code>, and the envelope's <code>hint</code>
+opens with the suggestion. A typo of a command that writes, such as <code>aply</code>,
+gets no suggestion at all, for a person or an agent alike: relish can't tell
+which one is typing. <code>relish --help</code> lists everything.</p>
 <h2>Exit codes</h2>
 <table><thead><tr><th>Code</th><th>Meaning</th></tr></thead><tbody>
 <tr><td><code>0</code></td><td>The command answered. Read <code>data</code>.</td></tr>
