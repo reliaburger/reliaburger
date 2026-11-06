@@ -73,6 +73,30 @@ pub enum CommandName {
     UpgradeCheck,
     /// `relish agent report`.
     Report,
+    /// `relish agent patch init`.
+    #[serde(rename = "patch init")]
+    #[value(name = "patch-init")]
+    PatchInit,
+    /// `relish agent patch build`.
+    #[serde(rename = "patch build")]
+    #[value(name = "patch-build")]
+    PatchBuild,
+    /// `relish agent patch test`.
+    #[serde(rename = "patch test")]
+    #[value(name = "patch-test")]
+    PatchTest,
+    /// `relish agent patch try`.
+    #[serde(rename = "patch try")]
+    #[value(name = "patch-try")]
+    PatchTry,
+    /// `relish agent patch diff`.
+    #[serde(rename = "patch diff")]
+    #[value(name = "patch-diff")]
+    PatchDiff,
+    /// `relish agent patch destroy`.
+    #[serde(rename = "patch destroy")]
+    #[value(name = "patch-destroy")]
+    PatchDestroy,
 }
 
 impl CommandName {
@@ -95,6 +119,12 @@ impl CommandName {
             CommandName::Explain => "explain",
             CommandName::UpgradeCheck => "upgrade-check",
             CommandName::Report => "report",
+            CommandName::PatchInit => "patch init",
+            CommandName::PatchBuild => "patch build",
+            CommandName::PatchTest => "patch test",
+            CommandName::PatchTry => "patch try",
+            CommandName::PatchDiff => "patch diff",
+            CommandName::PatchDestroy => "patch destroy",
         }
     }
 
@@ -116,6 +146,12 @@ impl CommandName {
         CommandName::Explain,
         CommandName::UpgradeCheck,
         CommandName::Report,
+        CommandName::PatchInit,
+        CommandName::PatchBuild,
+        CommandName::PatchTest,
+        CommandName::PatchTry,
+        CommandName::PatchDiff,
+        CommandName::PatchDestroy,
     ];
 }
 

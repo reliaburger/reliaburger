@@ -11,7 +11,8 @@ This chapter grows through 0.2.7 as the commands arrive (#1090). Today it has
 the contract every one of them follows, `version`, `schema`, the commands
 that read the cluster (`context`, `diagnose`, `explain`), an app's logs,
 the manual, the commands that read the source this binary was built from,
-`upgrade-check`, and `report`, which drafts a bug report for you to post.
+`upgrade-check`, `patch`, which proves a fix to it, and `report`, which
+drafts a bug report for you to post.
 
 ## The contract
 
@@ -546,3 +547,102 @@ code, and changing an address would change what it does.
 The rules only know shapes. A password in plain words, or a host name that no
 field names and no URL carries, gets through. Read `MANIFEST.json` and
 `issue.md` before you post them; that's what the checkbox is for.
+
+## Proving a fix
+
+When the source shows that a bug is in Reliaburger itself, `relish agent
+patch` lets an agent fix it, run the tests and boot a throwaway cluster with
+the fix, all without touching your cluster. It takes six commands, each
+naming the same workspace directory.
+
+`init` extracts the source, as `source extract` does, and puts it on a branch
+called `patch`:
+
+```sh
+relish agent patch init ./fix
+```
+
+The agent then edits files in `./fix` with whatever it edits files with.
+`patch` keeps its own state, binaries and logs in `./fix/.reliaburger-patch/`,
+which git ignores.
+
+`test` runs the portable suite in the workspace, or only the tests whose name
+contains a filter:
+
+```sh
+relish agent patch test ./fix classify_error
+```
+
+That's `cargo test`: unit tests, `tests/suite`, the doctests and every other
+test that isn't `#[ignore]`. The gated suites (`make test-cluster`,
+`test-linux`, `test-slow` and the rest) are ignored there, so they don't run,
+and `data.not_run` says so in every answer. A failing test or a compile error
+is still an answer, with exit code 0: `data.ok` is `false`, and `failures` or
+`errors` says why, with each test's output or each error's file and line.
+
+`build` compiles the workspace:
+
+```sh
+relish agent patch build ./fix
+```
+
+By default it builds both `relish` for this machine and what the nodes run,
+`bun` and a Linux `relish`, with eBPF, which a node's `bun` needs to start.
+`--relish` builds only the first and `--bun` only the second. On Linux it's one `cargo build`. On macOS `bun` builds in the
+Lima build VM that `relish dev` uses, which needs Lima and a workspace under
+your home directory, the part of the disk the VM can see. The answer has each binary's
+path, SHA-256 and size, how long each step took, and, when it didn't compile,
+the first 20 errors with their file and line. A first build compiles every
+dependency and takes several minutes; later ones take seconds.
+
+`build` and `test` check two things before they start. They want 15 GiB free
+on the workspace's disk, and they refuse a change to `build.rs`, a
+`Cargo.toml`, `Cargo.lock`, `.cargo/` or the toolchain file with a
+`forbidden` failure. A build script and a new dependency both run code on
+your machine while it builds, so read such a change before you pass
+`--allow-build-changes`.
+
+Nothing `patch` builds is signed. `relish upgrade` and a real cluster's node
+upgrades only take binaries the release keys signed, so a patched binary can't
+reach your cluster that way, and every build says so in a warning.
+
+`try` boots a throwaway cluster from the built binaries:
+
+```sh
+relish agent patch try ./fix
+```
+
+It's `relish setup --quickstart --development-binaries` with its own
+`RELIABURGER_HOME` under `~/.reliaburger-patch/`, a name like `patch-1a2b3c4d`
+and ports from 39000 up, so its context, credentials and VMs never mix with
+yours. It has one node unless you pass `--nodes 3`. Setup is driven by the
+workspace's own `relish` when `build` made one. The answer has the cluster's
+home and endpoints, and its first `next` step is a `status` against that
+cluster alone:
+
+```sh
+RELIABURGER_HOME=~/.reliaburger-patch/1a2b3c4d ./fix/.reliaburger-patch/bin/relish status
+```
+
+A setup that fails is an answer too: `data.ready` is `false` and `log_tail`
+has the end of setup's output, because a patched `bun` that doesn't boot is
+worth knowing. Throwaway clusters share one download cache, so only the first
+fetches the guest image.
+
+`diff` shows the change against the extracted source, committed or not, with
+each file's line counts, any build changes, and every test run and build with
+whether it ran against the change as it is now:
+
+```sh
+relish agent patch diff ./fix
+```
+
+That's what a report needs: what changed, and which tests prove it.
+
+`destroy` removes the workspace's throwaway cluster, or every one with
+`--all`. The workspace and its change stay:
+
+```sh
+relish agent patch destroy ./fix
+relish agent patch destroy --all
+```

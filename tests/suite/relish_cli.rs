@@ -892,6 +892,51 @@ fn agent_help_is_ordinary_help() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("--max-bytes"));
 }
 
+/// #1574: the real binary makes a workspace from its own source, and `diff`
+/// sees an edit to it. Building and testing are covered with fake cargos in
+/// the unit tests; this proves the wiring and the real bundle.
+#[test]
+fn agent_patch_init_then_diff_shows_the_edit() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("fix");
+    let dir_text = dir.to_str().unwrap();
+    let output = run_agent(&["agent", "patch", "init", dir_text]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let init = agent_envelope(&output);
+    assert_eq!(init["command"], "patch init");
+    assert_eq!(init["data"]["branch"], "patch");
+    assert!(dir.join("src/relish/agent/patch.rs").is_file());
+
+    let path = dir.join("src/relish/agent/patch.rs");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("// a fix\n");
+    std::fs::write(&path, text).unwrap();
+    let output = run_agent(&["agent", "patch", "diff", dir_text]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let diff = agent_envelope(&output);
+    assert_eq!(diff["command"], "patch diff");
+    assert_eq!(
+        diff["data"]["files"],
+        serde_json::json!([{
+            "path": "src/relish/agent/patch.rs",
+            "status": "modified",
+            "insertions": 1,
+            "deletions": 0
+        }])
+    );
+    assert!(diff["data"]["diff"].as_str().unwrap().contains("+// a fix"));
+    assert_eq!(diff["data"]["build_changes"], serde_json::json!([]));
+}
+
+#[test]
+fn agent_patch_on_a_directory_that_is_not_a_workspace_is_not_found() {
+    let root = tempfile::tempdir().unwrap();
+    let output = run_agent(&["agent", "patch", "diff", root.path().to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(5));
+    let value = agent_envelope(&output);
+    assert_eq!(value["error"]["code"], "not_found");
+}
+
 #[test]
 fn agent_schema_stays_within_a_small_budget() {
     let output = run_agent(&["agent", "schema", "--max-bytes", "1024"]);

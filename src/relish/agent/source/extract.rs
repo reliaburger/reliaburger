@@ -61,7 +61,7 @@ struct Stamp<'a> {
     digest: String,
 }
 
-pub(super) fn extract(bundle: &Bundle, dir: &Path) -> Result<Answer<ExtractData>, AgentError> {
+pub(crate) fn extract(bundle: &Bundle, dir: &Path) -> Result<Answer<ExtractData>, AgentError> {
     let files = source_bundle::extract_from(&bundle.tar, dir).map_err(|error| match error {
         SourceBundleError::NotEmpty(_) => AgentError::new(ErrorCode::Conflict, error.to_string())
             .with_hint("name a directory that doesn't exist yet"),

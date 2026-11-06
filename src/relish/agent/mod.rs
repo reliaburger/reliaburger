@@ -22,6 +22,7 @@ pub mod fit;
 pub mod logs;
 pub mod manual;
 pub mod report;
+pub mod patch;
 pub mod source;
 pub mod untrusted;
 pub mod upgrade_check;
@@ -87,6 +88,8 @@ pub enum AgentCommand {
     UpgradeCheck(upgrade_check::UpgradeCheckArgs),
     /// Draft a redacted bug report for a human to post. Never posts.
     Report(Box<report::ReportArgs>),
+    /// Build, test and try a fix on a throwaway cluster.
+    Patch(patch::PatchOptions),
 }
 
 impl AgentCommand {
@@ -103,6 +106,7 @@ impl AgentCommand {
             AgentCommand::Explain { .. } => CommandName::Explain,
             AgentCommand::UpgradeCheck(_) => CommandName::UpgradeCheck,
             AgentCommand::Report(_) => CommandName::Report,
+            AgentCommand::Patch(options) => options.command.name(),
         }
     }
 }
@@ -156,6 +160,7 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
             upgrade_check::run(args, options.max_bytes, rerun).await
         }
         AgentCommand::Report(args) => report::run(args, options.max_bytes, rerun),
+        AgentCommand::Patch(patch) => patch::run(patch, options.max_bytes, rerun).await,
     }
 }
 
@@ -251,6 +256,12 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::Explain => Some(schema_of::<diagnose::ExplainData>()),
         CommandName::UpgradeCheck => Some(schema_of::<upgrade_check::UpgradeCheckData>()),
         CommandName::Report => Some(schema_of::<report::ReportData>()),
+        CommandName::PatchInit => Some(schema_of::<patch::InitData>()),
+        CommandName::PatchBuild => Some(schema_of::<patch::BuildData>()),
+        CommandName::PatchTest => Some(schema_of::<patch::TestData>()),
+        CommandName::PatchTry => Some(schema_of::<patch::TryData>()),
+        CommandName::PatchDiff => Some(schema_of::<patch::DiffData>()),
+        CommandName::PatchDestroy => Some(schema_of::<patch::DestroyData>()),
     }
 }
 
@@ -292,8 +303,8 @@ pub fn invoked(args: &[String]) -> bool {
 }
 
 /// The command `args` named after `agent`, or [`CommandName::Agent`] when
-/// they named none it knows. `source` and `manual` take the word after
-/// them too, as in `source grep`.
+/// they named none it knows. `source`, `manual` and `patch` take the word
+/// after them too, as in `source grep`.
 pub fn command_named(args: &[String]) -> CommandName {
     let mut words = args
         .iter()
@@ -301,7 +312,7 @@ pub fn command_named(args: &[String]) -> CommandName {
         .skip(1)
         .filter(|arg| !arg.starts_with('-'));
     let name = match words.next().map(String::as_str) {
-        Some(family @ ("source" | "manual")) => match words.next() {
+        Some(family @ ("source" | "manual" | "patch")) => match words.next() {
             Some(word) => format!("{family}-{word}"),
             None => return CommandName::Agent,
         },
@@ -492,7 +503,13 @@ mod tests {
                 "diagnose",
                 "explain",
                 "upgrade-check",
-                "report"
+                "report",
+                "patch init",
+                "patch build",
+                "patch test",
+                "patch try",
+                "patch diff",
+                "patch destroy"
             ]
         );
         let envelope = &value["data"]["envelope"];
@@ -634,6 +651,36 @@ mod tests {
         assert_eq!(
             command_named(&args("agent explain --bogus")),
             CommandName::Explain
+        );
+    }
+
+    #[test]
+    fn patch_commands_parse_with_their_flags() {
+        let options = parse("agent patch build ./w --bun --allow-build-changes").unwrap();
+        let AgentCommand::Patch(patch) = &options.command else {
+            panic!("{options:?}");
+        };
+        assert!(matches!(
+            &patch.command,
+            patch::PatchCommand::Build {
+                relish: false,
+                bun: true,
+                allow_build_changes: true,
+                ..
+            }
+        ));
+        assert_eq!(options.command.name(), CommandName::PatchBuild);
+        assert!(parse("agent patch try ./w --nodes 3").is_ok());
+        assert!(parse("agent patch try ./w --nodes 2").is_err());
+        assert!(parse("agent patch destroy --all").is_ok());
+        assert!(
+            parse("agent patch destroy").is_err(),
+            "a workspace or --all"
+        );
+        assert!(parse("agent patch destroy ./w --all").is_err());
+        assert_eq!(
+            command_named(&args("agent patch test --bogus")),
+            CommandName::PatchTest
         );
     }
 

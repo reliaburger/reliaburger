@@ -1442,6 +1442,279 @@ had duplicated. And searching the source for the deciding line, instead of
 recording it, turned "keep the docs in step" from a chore into a test that
 fails.
 
+## Proving a fix
+
+Reading the source gets an agent to "the bug is on line 412 of
+`src/relish/client.rs`". That's a claim. What turns it into something a
+maintainer can merge the same day is a patch that compiles, a test that
+failed before and passes after, and a cluster that boots with the fix in it.
+[#1574](https://github.com/reliaburger/reliaburger/issues/1574) gives the
+agent all three, under `relish agent patch`:
+
+| Command | Does |
+|---|---|
+| `init DIR` | `source extract`, then a `patch` branch |
+| `build DIR [--relish] [--bun]` | `relish` for this machine; `bun` and a Linux `relish` for the nodes |
+| `test DIR [FILTER]` | The portable suite, and says that's all it was |
+| `try DIR [--nodes 3]` | A throwaway cluster from those binaries, with its own `RELIABURGER_HOME` |
+| `diff DIR` | The change, and which tests and builds ran against it |
+| `destroy DIR` or `--all` | The throwaway clusters; never the change |
+
+Every one of them prints the same envelope as the rest of the chapter. The
+interesting decisions were about what *not* to let a patch do.
+
+### A workspace, and a snapshot that doesn't touch the index
+
+`init` is `extract` with two additions. It switches to a branch, and it writes
+`/.reliaburger-patch/` and `/target/` to `.git/info/exclude`, git's per-clone
+ignore list. The bundle carries no `.gitignore` (it's not in the build, test
+or read set), so without that second line the first build would put 10 GiB of
+`target/` into every diff.
+
+The state `build`, `test` and `try` leave behind goes in
+`.reliaburger-patch/state.json`: the base commit, the last build per
+platform, the last twenty test runs, and the throwaway cluster if there is
+one. Each build and test run also records *which version of the source* it
+ran against, because `diff` has to tell "these tests passed" apart from
+"these tests passed an hour ago, before you changed the fix".
+
+How do you name "the source as it is now" cheaply? Git already does: a tree
+object's id is a hash of every file in it. `git write-tree` writes the index
+as a tree, but the agent may not have staged anything, and we've no business
+staging things for it. So the snapshot goes through a scratch index:
+
+```rust
+let scratch = git_dir.join("relish-patch-index");
+std::fs::copy(&real, &scratch)?;          // keep git's stat cache
+git(dir, &["add", "--all", "."], Some(&scratch))?;
+let tree = git(dir, &["write-tree"], Some(&scratch))?;
+```
+
+`GIT_INDEX_FILE` points each of those commands at the scratch file, so the
+agent's own index is exactly as it left it, and a file it created but never
+added still counts. Two snapshots of the same files have the same id, so "is
+this test run current?" is a string comparison. `diff` then runs `git diff
+<base> <tree>` between two objects, which needs no index at all.
+
+### What a build may not change
+
+`build` refuses a change to `build.rs`, any `Cargo.toml`, `Cargo.lock`,
+`.cargo/` or the toolchain file unless it's given `--allow-build-changes`, and
+`test` does the same. Why both? Because `cargo test` compiles too. A build
+script is a program cargo runs on your machine, and a new dependency brings
+its own build script and procedural macros with it. An agent that edits
+`src/relish/client.rs` changes what the binary does. An agent that edits
+`build.rs` changes what *your laptop* does the next time it builds, and a
+human should look first. The failure is `forbidden`, exit 4, the same class
+as a policy refusing a request.
+
+The check is a filter over the paths in the snapshot's diff. It matches
+`build.rs` only at the root, where Cargo looks for one, so our own
+`src/relish/agent/patch/builder.rs` doesn't trip it. (The module was called
+`build.rs` for about ten minutes.)
+
+### Reading what cargo says
+
+The issue asked for "the first 20 compiler errors with file and line". Cargo
+prints them as JSON if you ask, one object per line, with
+`--message-format=json`. We describe only the shapes we read:
+
+```rust
+#[derive(Deserialize)]
+#[serde(tag = "reason", rename_all = "kebab-case")]
+enum CargoLine {
+    CompilerMessage { message: Diagnostic },
+    CompilerArtifact { target: Target, executable: Option<String> },
+    #[serde(other)]
+    Other,
+}
+```
+
+You've seen `tag` before: serde reads the `reason` field to pick the variant,
+so `{"reason":"compiler-artifact",...}` becomes `CompilerArtifact`. The new
+part is `#[serde(other)]`. Cargo sends a dozen other reasons
+(`build-script-executed`, `build-finished` and so on), and a newer cargo may
+add more. Without `other`, each would be a deserialisation error; with it,
+any tag we don't know lands on the fieldless `Other` and we skip it. Fields
+we didn't declare are ignored too, which is serde's default. That's the whole
+trick to reading someone else's JSON without breaking when it grows: declare
+what you need, and give the unknown somewhere to go.
+
+The artifacts are the other half. Each executable cargo builds comes with its
+path, so `build` never guesses where cargo put `relish`: it copies it into
+`.reliaburger-patch/bin/`, hashes it and reports the SHA-256. The same error
+also arrives twice when two targets compile one file (the library, then its
+tests), so errors are deduplicated by file, line, column and message.
+
+`test` reads the test harness's plain text instead (`test result: ok. 3
+passed; 1 failed; ...` and the `---- name stdout ----` blocks), because
+libtest's JSON output is still unstable. That's the one place we parse text
+meant for people, and the tests pin it with real output.
+
+### A failure is still an answer
+
+A compile error is exit code 0. So is a failing test, and so is a throwaway
+cluster that didn't boot. That looks wrong until you recall why the exit code
+isn't the verdict: the command *answered*. `data.ok` is `false`, and
+`errors`, `failures` or `log_tail` say why. The `build_failed` code is for
+when there's no answer to give: no `cargo` on `PATH`, too little disk, no
+Lima for the build VM. An agent that sees `ok: false` reads the errors and
+edits; an agent that sees a failure envelope fixes its environment or asks a
+human. Those are different next moves, and the split tells it which.
+
+### Only the portable suite, and saying so
+
+`test` runs `cargo test`: the unit tests, `tests/suite`, the doctests and
+every other test without `#[ignore]`, which is what `make test-cargo` runs.
+The gated suites (`test-cluster`, `test-linux`, `test-slow`) need VMs, root or
+hours, and an agent's patch loop has none of those. Running less than
+everything is fine. Letting anyone believe it ran everything isn't, so every
+answer carries `suite: "portable"` and a `not_run` sentence naming what was
+skipped.
+
+### Somebody else's cluster
+
+`try` is `relish setup --quickstart --development-binaries`, run as a child
+process with three things changed. `RELIABURGER_HOME` is a fresh directory
+under `~/.reliaburger-patch/`, so the child's context, credentials, state and
+Lima home all live there. `RELIABURGER_ENDPOINT`, `RELIABURGER_TOKEN` and
+`RELIABURGER_CA_CERT` are removed, so nothing the user exported can point it
+at their real cluster. And the name (`patch-` and eight hex digits) and the
+ports (blocks of a hundred from 39000, the first one that's free) differ from
+every default.
+
+Each home is an island, which would mean downloading the guest image again
+for every `try`. So each home's `cache` and `tools` directories are symbolic
+links to one shared pair. `destroy` removes the home with
+`std::fs::remove_dir_all`, which deletes a symbolic link rather than following
+it. There's a test that the shared cache survives a destroy, because that's
+the line that would be catastrophic to get wrong.
+
+`try` writes its record into the workspace *before* setup starts, so a setup
+that dies halfway still leaves `destroy` something to find. `destroy` asks
+`relish local destroy` (this binary, not the patched one) to remove the VMs
+in that home, then removes the home. If the VMs won't go, the home stays and
+the answer says why, so a second `destroy` can try again. The workspace
+itself is never touched. It holds the agent's change, and an agent tidying up
+shouldn't be able to lose it.
+
+On macOS `bun` can't build natively, so `build --bun` goes through the build
+VM `relish dev` already keeps. `build_binaries_in_vm` used to build whichever
+checkout you ran `relish dev create` in and stream cargo's output to the
+terminal. It now takes the source directory and whether to stream or
+capture, so the same function builds a dev cluster and a patch, and the patch
+gets cargo's JSON to read errors from.
+
+### The first real run
+
+The tests all passed with fake cargos, so the first run against the real
+source, on the Mac Studio we build releases on, was the real test. `init`
+took under three seconds. A cold `build --relish` took eight minutes and a
+cold filtered `test` eleven, most of both compiling dependencies, and `build
+--bun` took ten in the build VM. Then `try` booted a VM, installed the
+binaries, and answered `ready: false` after two minutes. The `log_tail` said
+the node never answered. The node's journal said why:
+
+```
+Error: durable discovery requires a binary with working Linux eBPF support
+```
+
+The VM build was the one `relish dev create` used, and `dev create` launches
+`bun` itself without durable discovery. A quickstart node runs it as a
+systemd unit, which needs eBPF, so a node build needs `--features ebpf`. It
+was a one-line fix in two places, with a test to pin it. The rebuild took
+five minutes, and the second `try` had a cluster up in 63 seconds, the guest
+image already in the shared cache; its first `next` step, `status` against
+that cluster's own home, showed the sample app running. The more useful
+lesson is that `try` did exactly its job: a `bun` that wouldn't boot came
+back as an answer with the log attached, and `destroy` cleaned up the VM it
+left behind.
+
+### Unsigned on purpose
+
+Nothing `patch` builds is signed, and nothing in it can sign. Every node
+upgrade checks the release signature against the key compiled into the
+running `bun` before anything else, so a patched binary can't reach a real
+cluster through `relish upgrade`, whatever the agent tries. Every successful
+build says so in a warning. The fix reaches users the ordinary way: a human
+posts the report, we merge, we release.
+
+### The Rust: a closure for work you might not need
+
+`patch::answer` takes the source bundle as a closure rather than a value:
+
+```rust
+pub async fn answer(
+    command: &PatchCommand,
+    bundle: impl FnOnce() -> Result<Bundle, AgentError>,
+    tools: &Tools,
+    max_bytes: usize,
+    rerun: &str,
+) -> Rendered
+```
+
+Only `init` needs the bundle, and loading it unpacks 27 MB. `impl FnOnce() ->
+...` means "any closure the caller likes, called at most once": `init` calls
+it, and the others never do. In Go you'd pass a `func() (Bundle, error)`; in
+Python, a lambda. The difference is that every closure in Rust has its own
+type, and `impl` makes `answer` generic over it, so the call is resolved at
+compile time with no allocation and no indirection. `FnOnce` is the least
+demanding of the three closure traits (`Fn`, `FnMut`, `FnOnce`): by promising
+to call it only once, `answer` lets the closure move things out of whatever
+it captured.
+
+The other new piece is in `command_named`, which turns `agent patch test`
+into the name `patch-test`:
+
+```rust
+Some(group @ ("source" | "patch")) => match words.next() {
+    Some(word) => format!("{group}-{word}"),
+```
+
+`"source" | "patch"` matches either string, and `group @` binds whichever
+one matched to a name, so one arm handles both families.
+
+### The tests
+
+The commands are functions over a `Tools`: which `cargo` to run, which
+`relish`, where clusters live, and how much free disk to insist on. The tests
+swap in shell scripts. One fake `cargo` prints cargo's JSON for the `--bin`s
+it's given and writes a file for each; another prints a type error; another
+fails the way a stale lockfile does. A fake `relish` records its arguments and
+environment into `$RELIABURGER_HOME/calls`. No test compiles the crate or
+starts a VM.
+
+There's a snapshot for every shape: `init`, a build, a build with compiler
+errors, a build refused for touching `build.rs`, a test run with a failure, a
+filtered run that passes, `diff`, `try` and `destroy`. The unit tests check
+the rest: the plan (one cargo run on Linux, the build VM on macOS, a clear
+refusal elsewhere); that the snapshot sees untracked files and leaves the
+index alone; that a test run against an older snapshot isn't current; that
+`try` hands setup its own home, the workspace's Linux binaries and none of
+the user's endpoint or token; that a second `try` is a `conflict` until
+`destroy`; that `destroy` runs `local destroy` in the cluster's own home,
+keeps the shared cache and the workspace, and keeps the home when the VMs
+won't go; and that no block of ports lands on a default.
+
+### What we didn't do
+
+- **Sign patched binaries with a local key.** A cluster that trusts that key
+  would then take them, which is exactly what this command mustn't make easy.
+- **Reuse one cluster across builds.** A second `try` is a `conflict`.
+  Upgrading a throwaway cluster in place would test the upgrade path as much
+  as the fix, and a fresh one takes a few minutes.
+- **Run the gated suites.** They need root, VMs or hours; `not_run` says so.
+- **Delete the workspace in `destroy`.** It's the agent's work, and `rm -rf`
+  is one command away if that's really what it wants.
+
+### Lessons
+
+Most of `patch` is fences. The build loop is a few `cargo` calls. What took
+the thought was what it may build, what it must admit it didn't test, and how
+a cluster that exists only to be thrown away stays out of the way of the one
+that matters. An agent will do whatever the tool lets it, so the tool decides
+what it's allowed.
+
 ## The front door
 
 Everything so far helps an agent find a bug. The next question is what
