@@ -3804,8 +3804,17 @@ of them applied. The other four had every line right and the hunk headers'
 line counts wrong, because the agent writes a diff the way you'd write one in
 an email, with no `diff` to make it for it. `git apply --recount` takes them,
 and the gym now falls back to it. Changing a check after seeing the results
-is exactly what a qualification record shouldn't hide, so the record gives
-both numbers, 5 of 5 and 1 of 5, and leaves the call to the maintainer.
+is exactly what a qualification record shouldn't hide, so the record gave
+both numbers, 5 of 5 and 1 of 5, and left the call to the maintainer.
+
+The call was to run it again, the honest way round: write the check into the
+record and commit it, then run. The commit order shows the rule came before
+the results. Five more sessions on the planted bug: five correct, four
+patches applying plain and one needing `--recount`, both reverted tests
+passing every time. That closed criterion 2, and the exit test passed. The
+fix for the underlying problem, a way for `relish agent patch` to hand the
+agent a correct diff instead of making it write hunk headers (#1691), went
+into 0.2.8.
 
 There was one more quiet lesson in the report runs. In one of them the agent
 paraphrased every secret away before the report ever saw it ("password
