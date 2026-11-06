@@ -43,7 +43,6 @@ const OPEN_ISSUES: &[(u32, &str)] = &[
     (362, "CA status and revocation"),
     (656, "drain: cordon, drain and uncordon"),
     (711, "Franchise multi-cluster"),
-    (1090, "relish agent guide"),
     (1094, "relish mcp"),
     (1209, "GPU metrics and relish gpus"),
     (1210, "relish fault gpu"),
@@ -68,7 +67,6 @@ const INLINE_PENDING: &[(&str, u32)] = &[
     ("relish model run qwen3-32b", 1221),
     ("relish model run <name>", 1221),
     ("relish usage", 1238),
-    ("relish agent guide", 1090),
     ("relish agent report", 1575),
 ];
 

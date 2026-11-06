@@ -801,27 +801,33 @@ flag.
 
 `relish agent` is the family for LLM agents: every command prints one
 `relish.agent/v1` JSON envelope within a byte budget, never prompts, and exits
-`0` whenever it answered. So far it has `version`, `schema`, `context` (the
-first call: findings, unknowns, faults, alerts, one line per app and the newest
-events), `diagnose` (`wtf`'s findings with their evidence and pointers into
-the manual and the source), `explain` (what a finding id means and the
-constants and code that decide it), `source` (`version`, `tree`, `grep`,
-`show` and `extract` over the code this binary was built from, with a warning
-when a node runs another commit), `logs` (an app's newest lines in a time
-window, each wrapped as untrusted text, with a summary of what was left out),
-`manual` (`search` and `show` over this manual), `upgrade-check` (whether
-the cluster can take the latest release, with the reasons), `patch` (build,
-test and try a fix on a throwaway cluster), `report` (a redacted bug report,
-with a fingerprint for finding duplicates, for a human to read and post; it
-never posts, and makes no network call) and `setup`, which adds the `relish
-mcp` server to Claude Code, Codex, Cursor, VS Code, Goose and Gemini CLI: it
-shows the diff, writes only with `--yes`, never touches an entry it didn't
-write, and approves no tools. `relish mcp` serves the read-only commands as MCP
-tools over stdio (`claude mcp add reliaburger -- relish mcp`), derived from
-the same definitions, with `--toolsets`, `--no-logs` and `--namespace` to
-narrow them; commands that write, build or reach past the cluster API aren't
-tools. See
-[Working with an AI agent](manual/16_working-with-an-ai-agent.md).
+`0` whenever it answered. So far it has `guide` (the manual's agent chapter),
+`version`, `schema`, `context` (the first call: findings, unknowns, faults,
+alerts, one line per app and the newest events), `diagnose` (`wtf`'s findings
+with their evidence and pointers into the manual and the source), `explain`
+(what a finding id means and the constants and code that decide it), `source`
+(`version`, `tree`, `grep`, `show` and `extract` over the code this binary was
+built from, with a warning when a node runs another commit), `logs` (an app's
+newest lines in a time window, each wrapped as untrusted text, with a summary
+of what was left out), `manual` (`search` and `show` over this manual),
+`upgrade-check` (whether the cluster can take the latest release, with the
+reasons), `patch` (build, test and try a fix on a throwaway cluster), `report`
+(a redacted bug report, with a fingerprint for finding duplicates, for a human
+to read and post; it never posts, and makes no network call) and `setup`, which
+adds the `relish mcp` server to Claude Code, Codex, Cursor, VS Code, Goose and
+Gemini CLI: it shows the diff, writes only with `--yes`, never touches an entry
+it didn't write, and approves no tools. `relish mcp` serves the read-only
+commands as MCP tools over stdio (`claude mcp add reliaburger -- relish mcp`),
+derived from the same definitions, with `--toolsets`, `--no-logs` and
+`--namespace` to narrow them; commands that write, build or reach past the
+cluster API aren't tools. See [Working with an AI
+agent](manual/16_working-with-an-ai-agent.md). That chapter is the one source
+of everything agent-facing: `make agent-docs` generates
+[`llms.txt`](website/llms.txt), the website's [`/agents`](website/agents.md)
+page, the `reliaburger` skill and Claude Code plugin in
+[`plugins/`](../plugins/reliaburger) (install it with `/plugin marketplace add
+reliaburger/reliaburger`) and a block of [`AGENTS.md`](../AGENTS.md), and a
+test fails when any of them is stale.
 
 Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select
 an exact supported chaos scenario. Omitting the filter runs all five, including

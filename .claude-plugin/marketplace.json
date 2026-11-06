@@ -1,0 +1,15 @@
+{
+  "description": "Reliaburger's own Claude Code plugin, from its repository.",
+  "name": "reliaburger",
+  "owner": {
+    "name": "Miko Pawlikowski",
+    "url": "https://github.com/reliaburger/reliaburger"
+  },
+  "plugins": [
+    {
+      "description": "Reliaburger is a container orchestrator in one binary. Its CLI, `relish`, has a family of commands built for LLM agents, `relish agent`: each prints one line of JSON, never prompts and stays within a byte budget, and `relish agent source` reads the exact source the binary was built from.",
+      "name": "reliaburger",
+      "source": "./plugins/reliaburger"
+    }
+  ]
+}

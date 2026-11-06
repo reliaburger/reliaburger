@@ -351,7 +351,7 @@ workload. And like every key in the envelope, `app`, `namespace` and
 `instance` are always there, `null` when they don't apply.
 
 The wrapper doesn't make the text safe. It makes it *labelled*, which is the
-part we control. The agent guide (#1090) then tells the agent what the label
+part we control. The agent guide (`relish agent guide`) then tells the agent what the label
 means, and the eval (#1086) checks that agents actually listen.
 
 ### Building one cleans it
@@ -3118,3 +3118,165 @@ are what an MCP tool needs, so the server's job shrank to turning JSON
 arguments into a command line and back. The one decision it couldn't
 derive, "is this safe to run unattended?", is now a named list with a reason
 per entry and a test in front of it.
+
+## One chapter, many readers
+
+An agent can learn about Reliaburger in six places. It can run `relish agent
+guide`. It can fetch `reliaburger.com/llms.txt` or `/agents`. Claude Code can
+load a skill from a plugin, Codex can load the same skill from a directory,
+and a coding agent opening the repository reads `AGENTS.md`. Write six
+documents by hand and they'll say six slightly different things within a
+release. It already happened to the README's command list, which is why
+`make readme-commands` exists.
+
+So [#1090](https://github.com/reliaburger/reliaburger/issues/1090) makes the
+manual chapter "Working with an AI agent" the one source, and generates the
+rest:
+
+| File | Made from |
+|---|---|
+| `relish agent guide` | The chapter embedded in the binary, split into its `## ` sections |
+| `docs/website/llms.txt` | The chapter's summary and brief, then a link to every manual chapter, pinned to the release tag |
+| `docs/website/agents.md`, `agents.html` | The whole chapter, as Markdown and as a page in the site's shell |
+| `plugins/reliaburger/skills/reliaburger/SKILL.md` | The summary (as the description), the brief and the command table |
+| `plugins/reliaburger/.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` | The summary and the version |
+| `AGENTS.md`, one marked block | The chapter's rules for agents, then the brief |
+| The chapter's own command table | The clap definition of `relish agent` |
+
+The shorter files can't carry the whole chapter, so it marks the parts they
+reuse with HTML comments: `<!-- agent-brief:start -->` and its `end`, and the
+same for `summary`, `rules` and `commands`. The manual reader already hides
+comments (the doc snippet markers are comments too), and the generated pages
+leave them out.
+
+`AGENTS.md` was the awkward one. It arrived a PR earlier with the front door
+(#1580), hand-written, and its rules are the AI-assistance policy. Now those
+rules sit in the chapter, under "Sending us a bug or a fix", because an
+operator's agent that finds a bug needs them as much as a contributor's agent
+does. `AGENTS.md` keeps its hand-written opening paragraph, and the block
+after it is generated. The rules are the ones #1580 wrote, word for word,
+except that two links are absolute: the same sentence has to work at the
+repository root, inside `docs/manual/` and in the binary, where a relative
+link points nowhere.
+
+### A command list that writes itself
+
+Other 0.2.7 issues are adding `relish agent` commands in parallel with this
+one, so the chapter can't hand-write a list of them. The command table
+between the `commands` markers comes from clap. The CLI's `Cli` struct lives
+in the `relish` binary, which the library can't see, but `relish agent`'s
+options are a library type, and that's enough:
+
+```rust
+pub fn agent_command() -> Command {
+    AgentOptions::augment_args(Command::new("agent"))
+}
+```
+
+`#[derive(clap::Args)]` implements the `Args` trait for `AgentOptions`, and
+`augment_args` is one of the trait's functions: it takes a `Command` and
+returns it with this type's flags and subcommands added. It has no `self`, so
+you call it on the type, like a static method in Go or Python. The `use
+clap::Args` at the top of the file is what makes it callable: Rust only lets
+you call a trait's functions when the trait is in scope. A walk over
+`get_subcommands()` then lists every visible leaf. `source` has no answer of
+its own, so its five commands are listed instead.
+
+`relish agent guide` does the same walk at run time, so its `data.commands`
+is always this binary's. The table in the chapter can lag: when someone adds
+`relish agent context`, the chapter keeps the old table until they run `make
+agent-docs`. That's what the drift test is for.
+
+### The drift test
+
+`generate` is a pure function. It takes the chapter and `AGENTS.md` as
+strings, the manual's titles, the version and a clap `Command`, and returns
+each file's path and contents. It never touches the disk, which is why it can
+be snapshot-tested on a fixture chapter. `tests/suite/agent_docs.rs` runs it
+on the real files and compares:
+
+```rust
+pub fn stale_paths(
+    artefacts: &[Artefact],
+    on_disk: impl Fn(&str) -> Option<String>,
+) -> Vec<&'static str> {
+```
+
+`impl Fn(&str) -> Option<String>` in argument position means "any closure (or
+function) that takes a `&str` and returns an `Option<String>`". The compiler
+makes a copy of `stale_paths` for each closure type it's called with, the way
+a C++ template would, so there's no function pointer to chase. The test
+passes a closure that reads the repository; a unit test passes one that reads
+a `Vec`. With `RELIABURGER_UPDATE_AGENT_DOCS` set, the test writes the files
+instead, and `make agent-docs` is just that.
+
+Finding a region returns a borrowed slice of the input:
+
+```rust
+pub fn region<'a>(file: &str, text: &'a str, region: Region) -> Result<&'a str, GuideError> {
+```
+
+`'a` is a lifetime parameter. It says the returned `&str` points into `text`,
+not into `file`, so the caller may drop `file` and keep the result, but not
+the other way round. Rust usually works that out itself (the "elision"
+rules), but with two reference arguments it can't guess which one the result
+borrows from, so we name it. In C you'd write the same function, return a
+pointer into the buffer, and hope every caller remembers which buffer.
+
+The section splitter uses a newer piece of syntax:
+
+```rust
+if !in_fence && let Some(next) = line.strip_prefix("## ") {
+```
+
+That's a let chain, new in the 2024 edition: a boolean test and a pattern
+match in one `if`. Before it, this was an `if` inside an `if`.
+
+### The tests
+
+The unit tests in `src/relish/agent/guide.rs` run on a fixture chapter and a
+fixture `agent` command, so the snapshots don't move every time a real
+command lands. There's an insta snapshot of each generated file and of the
+`relish agent guide` envelope. Other tests check that generation is
+deterministic, that regenerating from its own output changes nothing, that a
+missing or doubled marker is an error, that an edited chapter makes every
+file quoting it stale, and that a skill description over the format's 1,024
+characters is refused. One reads the embedded chapter and checks that it fits
+the default 24 KiB budget untrimmed. Today it does.
+
+`tests/suite/agent_docs.rs` holds the agreement test, plus checks that
+`llms.txt` links every manual chapter, that `SKILL.md`'s front matter follows
+the [Agent Skills specification](https://agentskills.io/specification) (the
+name matches its directory, the description says when to use it), and that
+the marketplace's `source` points at a directory with a `plugin.json` and the
+skill. The doc snippet checks already parse every `relish` command in the
+chapter, and the other files are the chapter's text, so that covers them too.
+Because the agreement test reads `plugins/`, `select-jobs.sh` counts a change
+there as code.
+
+### What we didn't do
+
+- **`llms-full.txt`.** The issue first asked for one: the whole manual in a
+  single file. Temporal [notes](https://docs.temporal.io/with-ai.md) that its
+  own is too big to be the useful entry point, and `llms.txt` already links a
+  Markdown copy of every chapter.
+- **`bun` serving `/llms.txt`.** Also in the original issue. `relish agent
+  guide` does that job for an installed cluster, and matches the binary.
+- **An MCP server in the plugin.** The plugin is meant to start `relish mcp`,
+  but that's #1094 and it hasn't landed. A plugin that starts a command that
+  doesn't exist is a broken install, so for now it holds only the skill.
+- **The `/agents` page's design.** #1578 builds the website side: the
+  headline, install buttons, the recording. This change gives it the text and
+  a plain page in the site's shell, both generated.
+- **Moving `CLAUDE.md`'s rules into `AGENTS.md`.** The plan has `CLAUDE.md`
+  import `AGENTS.md`, so every tool reads the same rules. `CLAUDE.md` is the
+  file every Claude session here loads, so that edit is the maintainer's.
+
+### Lessons
+
+The interesting choice was which file should be the source. The obvious
+answer is a short hand-written skill, with the manual pointing at it. But a
+skill is loaded into a model and never read by a person, so nobody would
+notice when it went stale. The manual chapter is read by people, compiled
+into the binary, and its snippets are tested. Make the file people read the
+source, and the files only machines read follow it.

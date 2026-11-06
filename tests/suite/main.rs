@@ -31,6 +31,7 @@ mod admission_fixture;
 mod raft_writes;
 
 mod agent_cluster;
+mod agent_docs;
 mod api_tls;
 mod api_tokens;
 mod app_metrics;

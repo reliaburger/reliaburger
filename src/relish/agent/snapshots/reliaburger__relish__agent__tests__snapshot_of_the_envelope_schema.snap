@@ -95,6 +95,11 @@ expression: "schema_of::<Envelope<Value>>()"
           "type": "string"
         },
         {
+          "const": "guide",
+          "description": "`relish agent guide`.",
+          "type": "string"
+        },
+        {
           "const": "version",
           "description": "`relish agent version`.",
           "type": "string"

@@ -168,8 +168,9 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 **Work with an AI agent** ([working with an AI agent](docs/manual/16_working-with-an-ai-agent.md))
 
 - `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive *(0.2.7, not in 0.2.6)*
+  - `relish agent guide`: How to use relish as an agent: the manual chapter, as Markdown sections *(0.2.7, not in 0.2.6)*
   - `relish agent version`: This binary's version, commit, target and cluster formats *(0.2.7, not in 0.2.6)*
-  - `relish agent schema [version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.6)*
+  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.6)*
   - `relish agent source`: The source this binary was built from: search it, read it, extract it *(0.2.7, not in 0.2.6)*
     - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs *(0.2.7, not in 0.2.6)*
     - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count *(0.2.7, not in 0.2.6)*
