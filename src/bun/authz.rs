@@ -395,6 +395,12 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/ca/rotation/prepare", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/ca/rotation/begin", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/ca/rotation/finalize", Admin, Cluster(ADMIN)),
+    gated(
+        Post,
+        "/v1/identity/signing-key/rotate",
+        Admin,
+        Cluster(ADMIN),
+    ),
 ];
 
 /// Look up the principal a `(method, path)` requires, if the matrix

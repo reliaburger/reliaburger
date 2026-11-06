@@ -3118,6 +3118,20 @@ impl BunClient {
             .to_string())
     }
 
+    /// Sign workload JWTs with a new key (#709). The leader answers; a
+    /// follower refuses with 421.
+    pub async fn identity_rotate_signing_key(
+        &self,
+    ) -> Result<crate::sesame::oidc::RotatedSigningKey, RelishError> {
+        let response = self
+            .post_json("/v1/identity/signing-key/rotate", "{}".to_string())
+            .await?;
+        serde_json::from_value(response).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("unexpected answer to a signing key rotation: {e}"),
+        })
+    }
+
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}{path}", self.base_url);
         let response = self

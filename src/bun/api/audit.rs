@@ -196,6 +196,7 @@ pub(crate) const HANDLER_AUDITED_ROUTES: &[(RouteMethod, &str)] = &[
     (Post, "/v1/ca/rotation/prepare"),
     (Post, "/v1/ca/rotation/begin"),
     (Post, "/v1/ca/rotation/finalize"),
+    (Post, "/v1/identity/signing-key/rotate"),
 ];
 
 /// Mutating routes that are not audited, and why. A new `POST` or `DELETE`

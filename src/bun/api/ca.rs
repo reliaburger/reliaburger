@@ -294,3 +294,102 @@ pub(super) async fn ca_rotation_finalize_handler(
         Err(error) => write_failed(error),
     }
 }
+
+/// `POST /v1/identity/signing-key/rotate`: sign workload JWTs with a new
+/// key from now on (#709). The old key keeps verifying for
+/// [`crate::sesame::oidc::RETIRING_KEY_WINDOW_SECS`], long enough for every
+/// token it signed to expire, and workloads take new tokens on their usual
+/// refresh. Leader only, like `relish ca rotate`: a follower names the
+/// leader.
+pub(super) async fn signing_key_rotate_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    let council = match authorise(
+        auth.as_deref(),
+        &state,
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        Ok(council) => council,
+        Err(response) => return response,
+    };
+    // Three seconds to prove it leads, as the job routes get (#1393), so a
+    // late heartbeat round doesn't send the operator to another node.
+    if !council
+        .confirm_leadership(std::time::Duration::from_secs(3))
+        .await
+    {
+        return error_response(
+            StatusCode::MISDIRECTED_REQUEST,
+            "this node is not the council leader; run the command against the leader",
+        );
+    }
+    let Some(ikm) = council.wrapping_ikm().copied() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "no wrapping key available");
+    };
+    let security = match council.security_state_linearizable().await {
+        Ok(security) => security,
+        Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error),
+    };
+    let Some(current) = security.oidc_signing_config else {
+        return error_response(
+            StatusCode::CONFLICT,
+            crate::sesame::oidc::OidcError::NoSigningKey,
+        );
+    };
+    let issuer = current.issuer.clone();
+    let made = tokio::task::spawn_blocking(move || {
+        crate::sesame::oidc::generate_oidc_keypair(&issuer, &ikm)
+    })
+    .await;
+    let signing_key = match made {
+        Ok(Ok(made)) => made,
+        Ok(Err(error)) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let retire_after = now + crate::sesame::oidc::RETIRING_KEY_WINDOW_SECS;
+    let key_id = signing_key.key_id.clone();
+    match council
+        .write(crate::council::RaftRequest::RotateOidcSigningKey {
+            signing_key,
+            retire_after_unix_secs: retire_after,
+            now_unix_secs: now,
+        })
+        .await
+    {
+        Ok(crate::council::CouncilResponse::Refused { reason }) => {
+            error_response(StatusCode::CONFLICT, reason)
+        }
+        Ok(_) => {
+            let details = std::collections::BTreeMap::from([
+                ("key_id".to_string(), key_id.clone()),
+                ("retiring_key_id".to_string(), current.key_id.clone()),
+                ("retire_after".to_string(), retire_after.to_string()),
+            ]);
+            record_caller_audit(
+                &state,
+                auth.as_deref(),
+                crate::bun::events::EventKind::Identity,
+                "identity.signing_key_rotated",
+                details,
+                format!(
+                    "workload JWTs are signed with key {key_id}; key {} verifies until {retire_after}",
+                    current.key_id
+                ),
+            )
+            .await;
+            Json(crate::sesame::oidc::RotatedSigningKey {
+                key_id,
+                retiring_key_id: current.key_id,
+                retire_after,
+            })
+            .into_response()
+        }
+        Err(error) => write_failed(error),
+    }
+}

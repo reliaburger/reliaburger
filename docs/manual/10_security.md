@@ -1038,6 +1038,40 @@ shows only its own service, `/v1/routes` only its own ingress routes, and
 outright: events, `/v1/logs/sql`, the raw metric store and
 `/v1/fault?cluster=true`, which also lists node faults.
 
+### Rotating the workload signing key
+
+One Ed25519 key signs every workload's JWT. Anything outside the cluster
+that checks those tokens, such as a cloud provider's workload identity
+federation, fetches the public key from `/v1/identity/jwks`. To replace the
+key, say on a schedule or after a node was compromised:
+
+```sh
+relish identity rotate-signing-key
+```
+
+```
+Workload identity tokens are now signed with key 3f9a12bc77de0a41.
+Key 8c21e0f4a9b35d07 keeps verifying until 2026-11-06 14:15:00 UTC; workloads pick up new tokens on their next refresh.
+```
+
+From then on, new tokens carry the new key's `kid`. Tokens signed with the old
+key keep verifying for 75 minutes: their one-hour lifetime, five minutes of
+clock skew and ten minutes for a workload whose refresh runs late. During
+that window `/v1/identity/jwks` lists both keys, so an outside verifier that
+caches the JWKS sees the new key before any token needs it. Nothing restarts.
+Each node picks up the rotation within five seconds, and workloads get new
+tokens on their usual refresh. Once the window ends, the leader's hourly
+sweep retires the old key, and its tokens are refused everywhere.
+
+It needs an Admin token with no scope and the cluster-wide `admin`
+permission, and it runs on the council leader. A follower answers 421 and
+changes nothing. The rotation is audited as `identity.signing_key_rotated`
+(with both key ids), and the retirement as `identity.signing_key_retired`.
+
+Rotating the signing key doesn't help if the master key leaked too: the
+master key unwraps the new key just as it unwrapped the old one. See "If the
+master key leaks" below.
+
 ## Signed images
 
 Trust policy is node config. With it on, the scheduler refuses unsigned images

@@ -219,6 +219,8 @@ pub struct Compatibility {
 /// 0.3.0, Bare metal in an hour (58/74): the appliance OS rollout (a new Raft
 /// request and a new field in council state) and the cluster-wide council
 /// size (`RaftRequest::CouncilSize` and `DesiredState::council_size`).
+/// OIDC signing-key rotation (#709): `SecurityState::retiring_oidc_keys`, and
+/// the `RotateOidcSigningKey` and `RetireOidcSigningKeys` Raft requests.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 58,
     state: 74,

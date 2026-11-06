@@ -674,6 +674,14 @@ pub struct OidcSigningConfig {
     pub issuer: String,
 }
 
+/// A replaced signing key that still verifies until `not_after` (#709).
+/// `SecurityState::retiring_oidc_keys` holds them; the private key is gone.
+pub struct RetiringOidcKey {
+    pub public_key_der: Vec<u8>,
+    pub key_id: String,
+    pub not_after: u64, // Unix seconds
+}
+
 /// Claims embedded in a workload identity JWT.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkloadJwtClaims {
@@ -1228,6 +1236,42 @@ On each council node (intended design; step 1 differs today, see the status note
 6. The revoked node is effectively expelled from the cluster. It cannot communicate with any other node. It must re-join via a new join token.
 
 **CRL propagation time:** The reporting tree distributes the CRL within seconds (measured at < 2 seconds in the target cluster size of ~200 nodes). The CRL is small -- just a list of serial numbers and metadata.
+
+### 5.7a Workload Signing-Key Rotation (#709)
+
+`SecurityState` holds one active OIDC signing key (`oidc_signing_config`) and
+zero or more retiring ones (`retiring_oidc_keys`).
+- **Rotate.** `POST /v1/identity/signing-key/rotate` (`relish identity
+  rotate-signing-key`) is leader only: an unscoped Admin with cluster-wide
+  `admin`, never the service principal, and a follower answers 421. The
+  leader generates the new Ed25519 key, because Raft apply must be
+  deterministic, wraps it like every other key, and proposes
+  `RotateOidcSigningKey { signing_key, retire_after_unix_secs, now_unix_secs }`.
+  Applying it moves the old key's public half to `retiring_oidc_keys` with
+  `not_after = retire_after`. It drops any retiring key already past its
+  window as of `now_unix_secs` (the proposer's clock, so every replica drops
+  the same ones), and it makes the new key active. It's refused when the
+  cluster has no key.
+- **The window.** `RETIRING_KEY_WINDOW_SECS` is 4,500 s: the JWT age ceiling
+  (3,600 s), clock skew (300 s) and 600 s for a late refresh. Every token the
+  old key signed has expired by then.
+- **Verify.** `oidc::verifying_keys` is the active key plus each retiring key
+  whose `not_after` hasn't passed. `verify_jwt_with_keys` picks the key by the
+  token's `kid`, and refuses an unknown `kid` before it checks any signature.
+  Each node's `WorkloadJwtVerifier` holds that set in a `watch` channel, so
+  the synchronous auth middleware reads it without a lock. Bun refreshes it
+  from the replica every 5 s.
+- **Publish.** `/v1/identity/jwks` lists the same set, active key first.
+- **Retire.** The leader's hourly token sweep proposes
+  `RetireOidcSigningKeys { now_unix_secs }` when a retiring key's window has
+  ended, and writes nothing when none has. Verifiers have already stopped
+  accepting the key by then, so the sweep only keeps state tidy.
+- **Audit.** `identity.signing_key_rotated` records both key ids and the
+  window's end; `identity.signing_key_retired` records the retired id, as the
+  system.
+
+Rotating the signing key doesn't help against a leaked master key, which
+unwraps the new key too (§5.12 is the plan for rotating the master key).
 
 ### 5.8 CA Rotation
 

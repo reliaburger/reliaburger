@@ -462,6 +462,19 @@ pub enum RaftRequest {
     /// `generation` (F04 R4). The leader proposes it for the node that
     /// authenticated the request.
     AcknowledgeNodeTrust { node_id: String, generation: u64 },
+    /// Sign workload JWTs with `signing_key` from now on (#709). The old key
+    /// keeps verifying until `retire_after_unix_secs`; `now_unix_secs` is
+    /// the proposer's clock, so every replica drops the same expired keys.
+    /// The leader made the key, because Raft apply must be deterministic.
+    /// Refused when the cluster has no key to rotate from.
+    RotateOidcSigningKey {
+        signing_key: crate::sesame::types::OidcSigningConfig,
+        retire_after_unix_secs: u64,
+        now_unix_secs: u64,
+    },
+    /// Drop every retiring OIDC signing key whose window ended by
+    /// `now_unix_secs`, the proposer's clock (#709).
+    RetireOidcSigningKeys { now_unix_secs: u64 },
     /// Register, sync, cancel or requeue a task array (0.2.0, million
     /// jobs). One variant wrapping the array's own write type, so the
     /// rules live beside the data in `meat::task_array_store`.

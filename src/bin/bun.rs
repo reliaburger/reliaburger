@@ -3082,6 +3082,28 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             }),
         None => None,
     };
+    // The verifier's keys follow the council, on the token store's 5 s
+    // cadence: after `relish identity rotate-signing-key` the new key's
+    // tokens verify here, and the old key's stop once its window ends (#709).
+    // Clones share the keys, so refreshing this one refreshes the router's.
+    if let (Some(verifier), Some(council)) = (jwt_verifier.clone(), api_council.clone()) {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let state = council.security_state().await;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |elapsed| elapsed.as_secs());
+                        verifier.refresh(&state, now);
+                    }
+                }
+            }
+        });
+    }
 
     let leader_directory = registry_directory.clone().map(api::LeaderDirectory);
     let registry_forwarder = if let Some(directory) = registry_directory {
