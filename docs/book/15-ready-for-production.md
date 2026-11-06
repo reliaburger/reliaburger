@@ -7111,12 +7111,113 @@ with it, so the loop builds a new one. In Go
 you'd pass a pointer and trust nobody touches it meanwhile; here the
 compiler won't let anybody.
 
-The rest of the list is longer and less likely to bite: a memory-pressure
-fault's `memory.high` write, which makes the kernel reclaim before it
-returns, still runs in the fault turn; log and metrics queries and flushes
-copy up to a million buffered rows under their store's lock; the log
-export hashes every archive file on the worker. They're in the pull
-request for this section, with a line each.
+The top of the rest of the list was a fault. `relish fault memory web 80`
+squeezes a workload's `memory.high` down toward its hard limit, and the
+kernel doesn't take that as a request for later: it reclaims the
+workload's memory down to the new limit before the `write` returns. A
+workload with a gigabyte of page cache to give back keeps the writer
+waiting while it does, and the writer was the agent loop, inside the turn
+that handled the fault command. CPU and disk faults wrote `cpu.max` and
+`io.max` the same way. Those writes are quick, but they were still
+`std::fs` calls on the loop.
+
+Kill, pause and resume faults had already been through this (#351): the
+loop picks the targets, a task does the slow part, and the result comes
+back as a follow-up, the same shape the upgrade download and the firewall's
+`nft` call use. The cgroup faults now take the same route.
+`resource_faults::CgroupFault` says which of the three a fault is, with
+its numbers, and knows how to write itself into one cgroup, how to undo
+that, and what the registry keeps for the undo. The loop works out the
+targets' cgroup paths, which it can do from its own maps, and
+`spawn_cgroup_fault` hands the writes to a task:
+
+```rust
+self.follow_ups.spawn(async move {
+    let result = fault.write(targets).await;
+    FollowUp::CgroupFaultWritten(CgroupFaultWritten {
+        rule_id,
+        fault,
+        result,
+        response,
+    })
+});
+```
+
+`fault.write` runs the writes in `spawn_blocking`, and if the third of
+four targets fails it rolls back the first two before it reports, as the
+inline version did. The `async move` block takes ownership of `fault`,
+`targets` and the caller's `response` channel. It has to: the task may run
+long after the turn that spawned it has finished and dropped its locals.
+When the result comes back, `finish_cgroup_fault` either records the saved
+values and tells the caller the fault is in, or tells the caller why it
+isn't. There's a third case, and it's the one that's easy to miss: the
+fault was cleared, or expired, while its writes were in flight. Then
+there's nothing in the registry for a clear to undo later, so the loop
+puts each saved value straight back. Raising a limit doesn't make the
+kernel reclaim anything, which is also why a clear's own restores stay
+where they were, in the clearing turn.
+
+The test is the one-poll test again. `cgroup_writes_run_off_the_runtime`
+points `write_cgroups` at three fake cgroup directories on a
+single-threaded runtime and asserts the first poll is `Pending`. A
+`tmpfs` file doesn't reclaim anything, so the test can't show a slow
+write, only where it runs. That's the property we want.
+
+Next came host paths. A volume `source` on the node goes through
+`HostPathPolicy::approve_app`, which resolves symlinks with
+`std::fs::canonicalize` so that a link swapped after the check can't
+redirect the mount (#797). It ran in deploy turns, once when an app was
+admitted and once more for each container just before its OCI spec was
+built. On a local disk that's a few `lstat` calls. A source on NFS or
+autofs can take seconds to answer the first one. `approve_app_off_runtime`
+does the same check on a blocking thread:
+
+```rust
+pub async fn approve_app_off_runtime<'a>(
+    &self,
+    spec: &'a AppSpec,
+) -> Result<Cow<'a, AppSpec>, HostPathRefusal> {
+    if spec.host_path_sources().next().is_none() {
+        return Ok(Cow::Borrowed(spec));
+    }
+    let policy = self.clone();
+    let spec = spec.clone();
+    let approved = tokio::task::spawn_blocking(move || {
+        policy.approve_app(&spec).map(Cow::into_owned)
+    })
+    .await
+    .map_err(|error| HostPathRefusal::CheckFailed {
+        reason: error.to_string(),
+    })??;
+    Ok(Cow::Owned(approved))
+}
+```
+
+`Cow` ("clone on write") is an enum of a borrowed value or an owned one.
+`approve_app` already returned one: an app with no host paths comes back
+`Cow::Borrowed`, the caller's own spec with no copy made, and an app with
+some comes back `Cow::Owned`, a copy with the resolved paths in it. The
+async version keeps the borrowed case on the caller's thread, because
+there's nothing to resolve, and most apps have no host paths at all. For
+the rest, the blocking thread can't borrow the caller's spec, so it gets
+its own copy, and `Cow::into_owned` turns the result into a plain
+`AppSpec` to send back. The `'a` lifetime says the borrowed case lives as
+long as the caller's `spec`, and the compiler checks every return path
+against it. The double `??` is the two-layer `Result` from earlier: the
+first `?` returns a panicked thread as `CheckFailed`, the second returns
+the policy's own refusal.
+
+`approving_host_paths_resolves_them_off_the_runtime` polls once and
+expects `Pending`, and `an_app_without_host_paths_is_approved_in_one_poll`
+expects the opposite: `Ready`, still borrowed. The deploy still waits for
+the answer, because a container can't be built before its mounts are
+approved, so the two awaits in `launch.rs` carry `// LOOP-INLINE:` tags.
+As with the identity directory, what changed is who's stuck while it waits.
+
+The rest of the list is longer and less likely to bite: log and metrics
+queries and flushes copy up to a million buffered rows under their store's
+lock, and the log export hashes every archive file on the worker. They're
+in the pull requests for this section, with a line each.
 
 #### The lock that went to the back of the queue
 
@@ -7179,6 +7280,60 @@ check, every 100 ms per running command, adds to it. Splitting the kernel
 handle so job tasks stop sharing a lock with the agent loop is a bigger
 change, and we'd want a soak's numbers before making it. What the fix does
 is make a view install pay for the queue once, not once per service.
+
+The firewall sync already took the lock once. Its problem was what it did
+with it. Every sync rebuilt the three maps that namespace isolation reads
+(which namespace each cgroup is in, which cross-namespace grants exist,
+and who owns each real destination address) and wrote every entry,
+changed or not, one `bpf` system call each, before deleting the departed
+ones. On a job-heavy node the sync runs on most ticks, because every task
+that starts or ends changes the delegated network, and almost every entry
+it writes is the one already there. All that time, every job task waiting
+for the lock waits for the sync.
+
+So the reconcile now remembers what it wrote. `WrittenValues` holds the
+value of each write that succeeded, and `write_changed` skips an entry
+whose value matches:
+
+```rust
+for (key, value) in desired {
+    keys.insert(key);
+    if written.values.get(&key) == Some(&value) {
+        continue;
+    }
+    written.forget(&key);
+    write(key, value)?;
+    if remember(&value) {
+        written.values.insert(key, value);
+    }
+}
+```
+
+The order matters. The key goes into `keys`, the set of keys this node may
+own, before the write is tried, so a failed system call never makes Bun
+forget a key it might have written. The old value is forgotten before the
+write too: if the write fails, nobody knows what the kernel holds, and the
+next pass must write it again rather than skip it. `write` is an
+`impl FnMut(K, V) -> Result<(), E>`, a closure that may change what it
+captures, which here is the `&mut aya::Ebpf` handle. That's how the same
+function runs against the kernel in production and against a counter in
+the tests: `a_reconcile_writes_only_the_entries_that_changed` reconciles
+200 grants, then the same 200 again and expects no writes at all, then a
+view with one grant changed, one gone and one new, and expects two writes
+and one delete.
+
+A cache of what's in the kernel is only as good as its idea of who else
+writes there. The agent itself does, outside the reconcile: an egress
+binding writes its source's namespace and grants, retiring one deletes
+them, and withdrawing a service deletes every grant to it. Each of those
+now forgets the keys it touched, so a service that's withdrawn and comes
+back with the same grants gets them written again. Job tasks write their
+own task addresses into the destination map, and two owners claiming one
+address produce a "contested" entry that the connect hook refuses. A task
+can write its own value over that, so `remember` is `uncontested` for the
+destination map: a contested entry is written on every pass, as before.
+And the minute-by-minute kernel sweep clears the whole cache before its
+reconcile, so anything we didn't think of comes back within a sweep.
 
 #### A 503 is an answer, not a verdict
 

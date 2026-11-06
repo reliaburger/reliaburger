@@ -191,56 +191,63 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// A no-op without the eBPF data path loaded.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub(super) async fn withdraw_service_ebpf(
-        &self,
+        &mut self,
         id: &crate::onion::service_id::ServiceId,
     ) -> Result<(), BunError> {
         // Read the VIP + port straight from the live entry: the VIP is
         // whatever the map allocated (which may have probed off the natural
         // hash on a collision), so we must not re-derive it here.
-        let Some(entry) = self.service_map.resolve(id) else {
+        let Some(entry) = self.service_map.resolve(id).cloned() else {
             return Ok(());
         };
-        self.withdraw_discovery_entry(entry).await
+        self.withdraw_discovery_entry(&entry).await
     }
 
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub(super) async fn withdraw_discovery_entry(
-        &self,
+        &mut self,
         entry: &crate::onion::types::ServiceEntry,
     ) -> Result<(), BunError> {
-        let Some(handle) = self.onion_ebpf.as_ref() else {
+        let Some(handle) = self.onion_ebpf.clone() else {
             return Ok(());
         };
         let id = crate::onion::service_id::ServiceId::new(&entry.namespace, &entry.app_name);
         let (vip, port, destination) = (entry.vip, entry.port, entry.app_id);
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
-        let mut ebpf = self.lock_kernel(handle).await;
+        let mut ebpf = self.lock_kernel(&handle).await;
         bpf.remove_backends_bpf(&mut ebpf, vip, port)
             .map_err(|error| BunError::BackendRetirement {
                 service: id.clone(),
                 reason: error.to_string(),
             })?;
-        crate::sesame::firewall::delete_destination_firewall_state(&mut ebpf.bpf, destination)
-            .map_err(|error| BunError::DestinationRetirement {
-                service: id.clone(),
-                reason: error.to_string(),
-            })
+        // Whatever this deleted, the reconcile must write again if the
+        // destination comes back, even with the same grants.
+        let deleted =
+            crate::sesame::firewall::delete_destination_firewall_state(&mut ebpf.bpf, destination);
+        drop(ebpf);
+        self.firewall_writes
+            .firewall
+            .forget_where(|key| key.dst_app_id == destination);
+        deleted.map_err(|error| BunError::DestinationRetirement {
+            service: id.clone(),
+            reason: error.to_string(),
+        })
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub(super) async fn withdraw_service_ebpf(
-        &self,
+        &mut self,
         id: &crate::onion::service_id::ServiceId,
     ) -> Result<(), BunError> {
-        let Some(entry) = self.service_map.resolve(id) else {
+        let Some(entry) = self.service_map.resolve(id).cloned() else {
             return Ok(());
         };
-        self.withdraw_discovery_entry(entry).await
+        self.withdraw_discovery_entry(&entry).await
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub(super) async fn withdraw_discovery_entry(
-        &self,
+        &mut self,
         _entry: &crate::onion::types::ServiceEntry,
     ) -> Result<(), BunError> {
         #[cfg(test)]
@@ -429,12 +436,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             &fw_entries,
             &mut self.cgroup_ns_bpf_keys,
             &mut self.firewall_bpf_keys,
+            &mut self.firewall_writes,
         )
         .and_then(|()| {
             crate::sesame::firewall::reconcile_destination_map(
                 &mut ebpf.bpf,
                 &addresses,
                 &mut self.destination_bpf_keys,
+                &mut self.firewall_writes.destinations,
             )
         });
         drop(ebpf);
