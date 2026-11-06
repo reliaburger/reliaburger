@@ -1831,16 +1831,20 @@ async fn failed_runtime_reference_checkpoint_prevents_start_and_retains_the_addr
         let events = drain_deploy(&mut agent, basic_config()).await;
         (agent, events)
     });
-    tokio::time::timeout(std::time::Duration::from_secs(2), grill.wait_for_creates(1))
+    // These bounds only stop a hang: nothing here is timed. The deploy
+    // journals a fresh discovery checkpoint before it creates, and on a
+    // loaded host that took more than the 2 s this once allowed (#1623).
+    let patience = std::time::Duration::from_secs(30);
+    tokio::time::timeout(patience, grill.wait_for_creates(1))
         .await
-        .unwrap();
+        .expect("the deploy never reached its create");
     let checkpoint = path.join("discovery.json");
     std::fs::remove_file(&checkpoint).unwrap();
     std::fs::create_dir(&checkpoint).unwrap();
     grill.release_creates(1);
-    let (_agent, events) = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+    let (_agent, events) = tokio::time::timeout(patience, task)
         .await
-        .unwrap()
+        .expect("the deploy never finished")
         .unwrap();
     assert!(
         events
