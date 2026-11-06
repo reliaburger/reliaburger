@@ -984,6 +984,14 @@ and checks the record. The gated
 `cluster_failover::a_lease_history_through_a_leader_kill_is_linearizable`
 (`make test-cluster`) runs the client against three in-process nodes while
 it kills the leader, and checks the history.
+`cluster_failover::a_lease_history_through_a_leader_partition_is_linearizable`
+runs the same client while the leader is cut off rather than killed
+([#1415](https://github.com/reliaburger/reliaburger/issues/1415)): every
+cluster transport of the old leader is quiesced, as a `node-kill` fault does,
+while its API keeps answering. The test waits for one of the other two to be
+elected, leaves the old leader cut off for ten seconds more, then heals it.
+That's the direct test for a stale read after a leader change, which a kill
+can't give, because a killed leader answers nothing.
 
 **Showing it can fail.** The bug the issue names is a follower answering a
 read from its own copy without confirming leadership: in
