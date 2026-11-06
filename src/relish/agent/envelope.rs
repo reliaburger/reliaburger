@@ -71,6 +71,8 @@ pub enum CommandName {
     /// `relish agent upgrade-check`.
     #[serde(rename = "upgrade-check")]
     UpgradeCheck,
+    /// `relish agent report`.
+    Report,
 }
 
 impl CommandName {
@@ -92,6 +94,7 @@ impl CommandName {
             CommandName::Diagnose => "diagnose",
             CommandName::Explain => "explain",
             CommandName::UpgradeCheck => "upgrade-check",
+            CommandName::Report => "report",
         }
     }
 
@@ -112,6 +115,7 @@ impl CommandName {
         CommandName::Diagnose,
         CommandName::Explain,
         CommandName::UpgradeCheck,
+        CommandName::Report,
     ];
 }
 

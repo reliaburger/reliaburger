@@ -1,0 +1,85 @@
+---
+source: src/relish/agent/report/tests.rs
+expression: issue
+---
+<!-- drafted by relish agent report; a human reads it and posts it -->
+
+### Fingerprint
+
+None: no error code, finding or site was given (seen on 0.2.7).
+
+### Version
+
+relish 0.2.7, commit a1b2c3d4e5f60718293a4b5c6d7e8f9012345678, source as committed, aarch64-apple-darwin, formats protocol 57 / state 74
+
+### Fix status
+
+Not known: the agent didn't find a release with the fix.
+
+### What happened
+
+relish logs payments --since 5m printed lines from yesterday
+
+Expected: only lines from the last five minutes
+
+### Reproducer
+
+None. This report is **unverified**: nobody has made it happen on purpose yet.
+
+### Evidence
+
+```shell
+{
+  "evidence": [],
+  "fingerprint": null,
+  "patch": null,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": false,
+    "formats": {
+      "protocol": 57,
+      "state": 74
+    },
+    "target": "aarch64-apple-darwin",
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent.report/v1"
+}
+```
+
+### Suspected source
+
+None.
+
+### Patch
+
+None.
+
+### What was not tested
+
+an app that logs nothing in the window
+
+### How this should have been caught
+
+A test.
+
+### Redaction
+
+Addresses aliased; log lines left out. From `MANIFEST.json`, what went in and what redaction took out:
+
+| Item | Bytes | In | Redacted |
+|---|---:|---|---|
+| field `title` | 60 | yes | none |
+| field `what_happened` | 60 | yes | none |
+| field `expected` | 37 | yes | none |
+| field `not_tested` | 38 | yes | none |
+
+### AI assistance
+
+An AI agent drafted it, and a human checked every line
+
+### Human review
+
+- [ ] I'm a human, I read this whole report and I answer for it.
+- [ ] I checked the redaction manifest and nothing private is left.
+- [ ] I searched the issues for the fingerprint.

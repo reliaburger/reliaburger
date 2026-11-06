@@ -1,0 +1,137 @@
+---
+source: src/relish/agent/report/tests.rs
+expression: manifest
+---
+{
+  "addresses": "aliased",
+  "files": [
+    {
+      "bytes": 4991,
+      "path": "issue.md",
+      "sha256": "<sha256>"
+    },
+    {
+      "bytes": 2484,
+      "path": "bundle.json",
+      "sha256": "<sha256>"
+    }
+  ],
+  "items": [
+    {
+      "bytes": 50,
+      "included": true,
+      "kind": "field",
+      "name": "title",
+      "note": null,
+      "redactions": {
+        "ipv4_address": 1,
+        "node_name": 1
+      }
+    },
+    {
+      "bytes": 77,
+      "included": true,
+      "kind": "field",
+      "name": "what_happened",
+      "note": null,
+      "redactions": {
+        "ipv4_address": 1,
+        "node_name": 1
+      }
+    },
+    {
+      "bytes": 43,
+      "included": true,
+      "kind": "field",
+      "name": "expected",
+      "note": null,
+      "redactions": {}
+    },
+    {
+      "bytes": 67,
+      "included": true,
+      "kind": "field",
+      "name": "reproducer",
+      "note": null,
+      "redactions": {
+        "node_name": 1
+      }
+    },
+    {
+      "bytes": 34,
+      "included": true,
+      "kind": "field",
+      "name": "not_tested",
+      "note": null,
+      "redactions": {}
+    },
+    {
+      "bytes": 74,
+      "included": true,
+      "kind": "field",
+      "name": "caught_how",
+      "note": null,
+      "redactions": {}
+    },
+    {
+      "bytes": 818,
+      "included": true,
+      "kind": "evidence",
+      "name": "diagnose.json",
+      "note": "2 log lines left out; pass --include-logs to keep them",
+      "redactions": {
+        "encrypted_value": 1,
+        "env_value": 2,
+        "hostname": 3,
+        "ipv4_address": 3,
+        "node_name": 4,
+        "url_credentials": 1
+      }
+    },
+    {
+      "bytes": 145,
+      "included": true,
+      "kind": "evidence",
+      "name": "notes.txt",
+      "note": null,
+      "redactions": {
+        "age_identity": 1,
+        "ipv4_address": 1,
+        "node_name": 1,
+        "pem_private_key": 1
+      }
+    },
+    {
+      "bytes": 39,
+      "included": false,
+      "kind": "evidence",
+      "name": "payments.log",
+      "note": "a log file; pass --include-logs to add it",
+      "redactions": {}
+    },
+    {
+      "bytes": 169,
+      "included": true,
+      "kind": "patch",
+      "name": "fix.diff",
+      "note": null,
+      "redactions": {
+        "reliaburger_token": 1
+      }
+    }
+  ],
+  "logs": "left_out",
+  "network": "none: nothing was sent anywhere",
+  "redactions": {
+    "age_identity": 1,
+    "encrypted_value": 1,
+    "env_value": 2,
+    "hostname": 3,
+    "ipv4_address": 6,
+    "node_name": 8,
+    "pem_private_key": 1,
+    "reliaburger_token": 1,
+    "url_credentials": 1
+  },
+  "schema": "relish.agent.report-manifest/v1"
+}

@@ -907,3 +907,57 @@ fn agent_schema_stays_within_a_small_budget() {
         assert_eq!(value["error"]["code"], "usage");
     }
 }
+
+#[test]
+fn agent_report_writes_a_redacted_draft_and_posts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let evidence = dir.path().join("diagnose.json");
+    std::fs::write(
+        &evidence,
+        r#"{"node_id": "wolf4", "detail": "wolf4 at 192.0.2.17 sent rbrg_0123abcd"}"#,
+    )
+    .unwrap();
+    let out = dir.path().join("report");
+    let output = run_agent(&[
+        "agent",
+        "report",
+        "--title",
+        "wolf4 is reported dead",
+        "--what-happened",
+        "diagnose said wolf4 was dead",
+        "--expected",
+        "no finding",
+        "--not-tested",
+        "more than two nodes",
+        "--caught-by",
+        "smoker-fault",
+        "--finding",
+        "node-dead",
+        "--evidence",
+        evidence.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let value = agent_envelope(&output);
+    assert_eq!(value["command"], "report");
+    assert_eq!(
+        value["data"]["title"],
+        "agent: [unverified] node-1 is reported dead"
+    );
+    let post = value["next"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(post["read_only"], false);
+    assert!(
+        post["run"]
+            .as_str()
+            .unwrap()
+            .starts_with("gh issue create ")
+    );
+    for name in ["issue.md", "bundle.json", "MANIFEST.json"] {
+        let text = std::fs::read_to_string(out.join(name)).unwrap();
+        for planted in ["wolf4", "192.0.2.17", "rbrg_0123abcd"] {
+            assert!(!text.contains(planted), "{planted} in {name}");
+        }
+    }
+}

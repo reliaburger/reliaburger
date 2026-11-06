@@ -21,6 +21,7 @@ pub mod envelope;
 pub mod fit;
 pub mod logs;
 pub mod manual;
+pub mod report;
 pub mod source;
 pub mod untrusted;
 pub mod upgrade_check;
@@ -84,6 +85,8 @@ pub enum AgentCommand {
     /// Whether the cluster can take the latest release: `ready`,
     /// `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`.
     UpgradeCheck(upgrade_check::UpgradeCheckArgs),
+    /// Draft a redacted bug report for a human to post. Never posts.
+    Report(Box<report::ReportArgs>),
 }
 
 impl AgentCommand {
@@ -99,6 +102,7 @@ impl AgentCommand {
             AgentCommand::Diagnose(_) => CommandName::Diagnose,
             AgentCommand::Explain { .. } => CommandName::Explain,
             AgentCommand::UpgradeCheck(_) => CommandName::UpgradeCheck,
+            AgentCommand::Report(_) => CommandName::Report,
         }
     }
 }
@@ -151,6 +155,7 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
         AgentCommand::UpgradeCheck(args) => {
             upgrade_check::run(args, options.max_bytes, rerun).await
         }
+        AgentCommand::Report(args) => report::run(args, options.max_bytes, rerun),
     }
 }
 
@@ -245,6 +250,7 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::Diagnose => Some(schema_of::<diagnose::DiagnoseData>()),
         CommandName::Explain => Some(schema_of::<diagnose::ExplainData>()),
         CommandName::UpgradeCheck => Some(schema_of::<upgrade_check::UpgradeCheckData>()),
+        CommandName::Report => Some(schema_of::<report::ReportData>()),
     }
 }
 
@@ -485,7 +491,8 @@ mod tests {
                 "context",
                 "diagnose",
                 "explain",
-                "upgrade-check"
+                "upgrade-check",
+                "report"
             ]
         );
         let envelope = &value["data"]["envelope"];

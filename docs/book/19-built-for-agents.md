@@ -489,7 +489,7 @@ gets the names (often useful) and none of the values.
 
 ### Counting what fired
 
-`relish agent report` will write a manifest listing which rules fired how
+`relish agent report` writes a manifest ([below](#drafting-the-report)) listing which rules fired how
 often, so the human posting the report knows "two tokens and a private key
 were taken out of this". So every rule counts:
 
@@ -2029,3 +2029,344 @@ each live one answering `/v1/version` through the relay path, and no
 - **Start the upgrade.** No `relish agent` command mutates the cluster. The
   `ready` answer's `next` has the start command with `read_only: false`, for a
   human to say yes to.
+
+## Drafting the report
+
+Everything so far helps an agent understand a problem. The point of the
+release is what happens next: the agent decides it's a Reliaburger bug, and
+the most useful thing it can do is hand a human a report worth posting.
+That's [#1575](https://github.com/reliaburger/reliaburger/issues/1575),
+`relish agent report`.
+
+It's also the most dangerous command in the family. Everything else prints
+to the agent's transcript. A report goes into a public GitHub issue, where
+anyone can read it forever. So the design starts from what the command
+*won't* do:
+
+- **It never posts.** It writes files and prints the `gh` command that would
+  post them, as a `next` step with `read_only: false`. The contract says an
+  agent asks a human before running one of those.
+- **It makes no network call.** Not to GitHub, not to the cluster. Every piece
+  of evidence is a file the agent already has, usually the JSON another
+  `relish agent` command printed. A command that can't reach anything can't
+  leak anything on the way.
+- **It never overwrites.** `--out` must be new or empty, like `source
+  extract`.
+
+What it writes is three files. `issue.md` is the body. `bundle.json` is the
+redacted evidence. `MANIFEST.json` lists every item that went in or was left
+out, how big it is, and which redaction rules fired how often, so the human
+can see "two tokens, one private key and four addresses were taken out" before
+they decide anything.
+
+### The form is the contract
+
+[#1580](https://github.com/reliaburger/reliaburger/issues/1580) adds issue
+forms to the repository, one of them for agent-drafted bugs,
+`.github/ISSUE_TEMPLATE/agent-bug.yml`. GitHub renders an issue filed through a
+form as one `### Label` heading per field with the answer under it, and a field
+marked `render: shell` or `render: diff` inside a code block. So if `issue.md`
+uses the same headings in the same order, and fences the same fields, a report
+posted with `gh issue create --body-file` looks just like one filed through the
+form, and whatever reads one can read the other. Thirteen fields, from
+Fingerprint, Version and Fix status through Evidence, Suspected source and
+Patch to Redaction, AI assistance and Human review.
+
+There's a second way in. GitHub fills in a form's fields from the query string
+of `issues/new?template=agent-bug.yml`, by each field's `id`. When that URL is
+short enough to open, under 8 KiB, the answer carries it as
+`data.new_issue_url`, and the human can post from the browser instead. With
+real evidence in it, it usually isn't, and the field is `null`: GitHub answers
+an over-long URL with "414 URI Too Long".
+
+The fields are an enum, not a list of strings:
+
+```rust
+pub(super) enum Section {
+    Fingerprint,
+    Version,
+    FixStatus,
+    // ...
+    HumanReview,
+}
+
+impl Section {
+    pub(super) const ALL: &'static [Section] = &[Section::Fingerprint, /* ... */];
+
+    pub(super) fn id(self) -> &'static str {
+        match self {
+            Section::Fingerprint => "fingerprint",
+            Section::WhatHappened => "summary",
+            // ...
+        }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Section::Fingerprint => "Fingerprint",
+            Section::WhatHappened => "What happened",
+            // ...
+        }
+    }
+}
+```
+
+The renderer loops over `Section::ALL` and calls one `match` to fill each in.
+Add a section to the enum and forget to render it, and the `match` doesn't
+compile: Rust insists every variant is handled. With strings, the same mistake
+is a section that silently comes out empty. A test pins every id and label in
+`ALL` to the form's, and #1580's own test pins the form's side, so
+changing one without the other fails.
+
+Two sections need explaining. "How this should have been caught" is the one
+we care most about: every bug that reaches a user is a test, a gate or a
+Smoker fault we didn't have. `--caught-by` takes one of `test`, `gate`,
+`smoker-fault`, `review` or `unknown`, so the answer is something we can count,
+and `--caught-how` says which one. "AI assistance" is the form's dropdown, and
+the draft always picks "An AI agent drafted it, and a human checked every
+line". "Human review" is the form's three checkboxes, written unticked: a human
+read the whole report, checked the redaction, and searched for the
+fingerprint. Only the human can tick them. That's the disclosure the
+[0.2.7 plan](../plans/2026-11-04-plan-0.2.7.md) asks of everyone.
+
+### Unverified until proven
+
+Every title starts with the form's `agent: ` prefix. A report with no
+reproducer then gets `[unverified]`, a
+Reproducer section that says nobody made it happen on purpose, and the
+`unverified` label instead of `has-reproducer`. It's the Linux kernel's rule
+for AI-assisted reports, and it fails closed: the agent has to *add* a
+reproducer to lose the label. Leaving one out costs nothing to write and a lot
+to triage.
+
+### A fingerprint for dedupe
+
+Ten agents hitting the same bug shouldn't file ten issues. So the report
+carries a fingerprint: `rbfp-` and the first 12 hex digits of a SHA-256 over
+three things the agent may know:
+
+| Part | Flag | Example |
+|---|---|---|
+| The error code or variant | `--error-code` | `unreachable` |
+| The finding id | `--finding` | `node-dead` |
+| Where the bug lives | `--site` | `src/relish/commands.rs::logs` |
+
+Go's crash telemetry was the model: function names and stable identifiers,
+never user data. Each part must be an identifier (letters, digits and
+`_.:/-`), because the parts aren't redacted. Redacting them would change the
+hash, and two copies of the same bug would stop matching.
+
+The version is left out of the hash on purpose. It's printed next to the
+fingerprint, because "seen on 0.2.6" matters, but the same bug reported from
+0.2.6 and 0.2.7 should find each other. Each part goes in on its own labelled
+line, so `("unreachable", "node-dead")` can't hash the same as
+`("unreachablenode-dead", "")`:
+
+```rust
+let mut hasher = Sha256::new();
+hasher.update(b"rbfp/v1\n");
+for (label, value) in [("error_code", error_code), ("finding", finding), ("site", site)] {
+    hasher.update(format!("{label}={}\n", value.unwrap_or("")).as_bytes());
+}
+```
+
+`b"rbfp/v1\n"` is a byte string literal, a `&[u8]` rather than a `&str`,
+which is what a hash takes. The `v1` is there so a later change to the recipe
+can't collide with an old fingerprint.
+
+The first `next` step is the search, `gh issue list --search '"rbfp-…"
+in:body'`, and it's read-only. If it finds the bug, the agent runs the report
+again with `--duplicate-of <number>`: the draft becomes a comment adding
+evidence to that issue, and the post command becomes `gh issue comment`.
+`--fixed-in` records a release the agent found with the fix; one newer than
+this binary gets a warning that upgrading may be all that's needed. Whatever
+the search returns was written by strangers, so the step's `why` says it's
+untrusted.
+
+### Redaction, round two
+
+A report uses the same `crate::redact` rules as `untrusted` text, then goes
+further, because a public issue is a worse place for a leak than a
+transcript:
+
+- every `env` object in the evidence keeps its keys and loses its values,
+  through the shared `redact_env`;
+- workload log lines are left out unless `--include-logs` says otherwise,
+  and the manifest counts the lines it dropped;
+- host names and addresses are replaced with aliases.
+
+That last one is new, and it lives in the report module,
+`src/relish/agent/report/scrub.rs`, rather than in `redact.rs`. The secret
+rules are stateless: a token is redacted the same way wherever it appears. An
+alias isn't. `wolf4` must become `node-1` in the title, in the evidence and in
+the notes, or the report stops making sense. So aliasing needs a table that
+lives for one report, and that's a struct with state, not a function:
+
+```rust
+pub(super) struct Scrubber {
+    keep_addresses: bool,
+    include_logs: bool,
+    known: Vec<(String, AddressKind)>,
+    known_pattern: Option<Regex>,
+    aliases: BTreeMap<String, String>,
+    issued: BTreeMap<AddressKind, usize>,
+}
+```
+
+Where do the names come from? An IP address has a shape, so a regex finds it.
+A host name mostly doesn't: `wolf4` looks like any other word. But the
+evidence is our own JSON, and our JSON says when a string is a node or a host,
+under keys like `node_id`, `hostname` and `address`. `Scrubber::new` walks the
+evidence first, collects every value under those keys, and compiles one
+pattern that matches any of them, longest first so `wolf4.lan` wins over
+`wolf4`. URL hosts, IPv4 and IPv6 addresses get their own rules. Loopback,
+`localhost`, `github.com` and the names reserved for documentation stay as
+they are; they say nothing about the reporter.
+
+The replacements are closures again, and this time they borrow the scrubber
+mutably, because handing out an alias changes the table:
+
+```rust
+pattern
+    .replace_all(text, |captures: &Captures| {
+        let name = &captures[0];
+        let kind = /* look the name up in self.known */;
+        self.alias(name, kind, counts)
+    })
+    .into_owned()
+```
+
+`replace_all` takes anything that implements `FnMut`, the closure trait for
+"may change what it captured". Go and Python closures can always mutate what
+they capture; Rust makes you say so, and checks that nothing else touches
+`self` while the closure holds it. That's why `known_names` clones the
+compiled pattern out of `self` first: `replace_all` borrows the pattern, the
+closure borrows `self` mutably, and if the pattern still lived in `self` the
+two borrows would overlap. Cloning a `Regex` is cheap: it's a
+reference-counted pointer to the compiled program.
+
+IPv6 shows the limits of the `regex` crate. A candidate like `add::bad` is a
+valid IPv6 address. So is the tail of `Self::dead`, which is code. The
+difference is what comes before it, and Rust's `regex` has no lookbehind. So
+the IPv6 rule finds candidates with a loose pattern, then checks by hand that
+the characters either side aren't part of a word, and lets
+`Ipv6Addr::from_str` decide whether what's left is an address. `add::bad`
+standing alone still gets aliased. That's the side to be wrong on.
+
+What isn't caught? A host name that no field names and no URL carries, in a
+sentence the agent wrote. The manifest shows what fired, `issue.md` is short
+enough to read, and the checkbox asks the human to read it. Redaction is the
+second line of defence; the human is the first.
+
+A patch is the one exception to aliasing: it loses its secrets but keeps its
+addresses. It's code, and changing `192.0.2.1` in a test to `ipv4-1` would
+change what the test does.
+
+### Text that knows its own size
+
+Every text flag takes the text or `@file`, as `curl` does, so an agent can
+write three paragraphs to a file instead of quoting them through a shell.
+Each field is capped at 8 KiB, and a longer one is a `usage` failure that
+says to move the rest into `--evidence`. GitHub refuses issue bodies over
+65,536 characters, so the report warns when `issue.md` passes that.
+`bundle.json` is quoted whole in the Evidence field when it's under 32 KiB;
+otherwise the draft says to attach it.
+
+Quoting a patch inside Markdown has a trap: a patch that adds a Markdown file
+contains its own triple backticks, which would end our code block early. So
+the fence is one backtick longer than the longest run inside, which is
+CommonMark's own rule:
+
+```rust
+fn fenced(text: &str, language: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}{language}\n{}\n{fence}", text.trim_end())
+}
+```
+
+The body is assembled with `write!` and `writeln!` into a `String`, which
+needs `use std::fmt::Write as _;`. The macros work on anything implementing
+`fmt::Write`, and they return a `Result` because some writers (a socket, a
+file) can fail. A `String` can't, so the code says `let _ =` and a comment
+says why. `as _` imports the trait for its methods without putting the name
+`Write` in scope, where it would clash with `std::io::Write`.
+
+Reading every `--evidence` file uses a small trick:
+
+```rust
+let evidence = args
+    .evidence
+    .iter()
+    .map(|path| Evidence::read(path, args.include_logs))
+    .collect::<Result<Vec<_>, _>>()?;
+```
+
+Each `read` returns a `Result`. Collecting an iterator of `Result`s into a
+`Result<Vec<_>, _>` gives `Ok` with all the values, or the first `Err`, and
+stops reading at that error. It's the loop with an early `return` you'd write
+in Go, in one expression.
+
+Finally, the report's arguments are a big struct, and clap's subcommand enum
+holds it: `AgentCommand::Report(Box<report::ReportArgs>)`. A Rust enum is as
+large as its largest variant, so without the `Box` every `AgentCommand`,
+`Version` included, would carry room for twenty fields. The `Box` puts them
+on the heap and leaves a pointer in the enum. Clippy flags the unboxed version
+as `large_enum_variant`.
+
+### The tests
+
+The fixture is one `relish agent` answer with a secret of every kind the
+shared rules know, two node names, a host with a port, an IPv4 and an IPv6
+address, a URL with a password, an `env` map and a workload log, plus notes
+with a private key and an age identity, and a `.log` file. One test plants
+all of those, runs a full report with `--include-logs`, and checks that none
+of fourteen strings appears in `issue.md`, `bundle.json`, `MANIFEST.json` or
+the envelope. Another checks the manifest counted every rule, the address
+rules included.
+
+Snapshots pin the shapes: the envelope, `issue.md`, `bundle.json` and
+`MANIFEST.json` for a full report; the envelope and `issue.md` for an
+unverified report with no fingerprint; a duplicate's envelope; and the
+`conflict` failure for a directory that isn't empty. Unit tests cover the
+rest: aliases being the same everywhere; loopback, public and example hosts
+kept; version numbers, times, hashes and `Self::dead` left alone; a second
+pass over the output changing nothing; log lines and `.log` files left out by
+default and redacted when kept; a patch keeping its addresses; the fence
+outlasting a patch's backticks; the fingerprint ignoring the version and
+changing with every part; bad fingerprint parts and empty, missing or
+oversized text refused before anything is written; and the search coming
+first and read-only, with the post last and not. A black-box test in
+`tests/suite/relish_cli.rs` runs the real binary with no network settings and
+checks the three files appear.
+
+### What we didn't do
+
+- **Post, or offer to.** Not with a flag, not with a confirmation prompt. The
+  `gh` command is right there; a human can run it.
+- **Search GitHub ourselves.** The agent runs the search with `gh`, as the
+  user, and the report stays offline. Reading issues means reading text
+  strangers wrote, and that belongs with the agent and its guard up, not
+  inside a command whose output is meant to be published.
+- **A pre-filled URL for every report.** Only a short one gets one, for the
+  reason above.
+- **Collect evidence.** `report` could have called `diagnose` itself. Then it
+  would need the network, and the human would have to trust what it fetched
+  instead of reading the files the agent passed.
+- **Redact the fingerprint.** It's validated instead, so it can't carry
+  anything worth redacting, and it hashes the same everywhere.
+- **Guess host names from prose.** A word next to `.lan` might be a host; it
+  might be a sentence. Names come only from fields that say they're names.
+
+### Lessons
+
+The hard part of a bug report command isn't writing the report. It's deciding
+who does what. The agent writes; `relish` redacts and counts; the human reads,
+ticks the box and posts. Each step is visible to the next: the manifest shows
+the human what redaction did, `read_only: false` on the post step tells the
+agent to stop, and the checkbox tells the maintainer a person stood behind it.
