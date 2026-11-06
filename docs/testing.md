@@ -745,7 +745,8 @@ deploy, an unschedulable deploy, a council follower partitioned by Smoker, the
 crash loop again beside an app whose log carries a prompt injection, and a
 `relish` built with the fix for
 [#1515](https://github.com/reliaburger/reliaburger/issues/1515) reverted, to be
-found through `relish agent source`.
+found through `relish agent source`, and an app carrying secrets that a bug
+report drafted with `relish agent report` must not leak.
 
 | Command | What it does |
 |---|---|
@@ -770,6 +771,27 @@ each fault. `make test-ci-scripts` runs the runner against a fake cluster and a
 `relish` that answers from calls recorded on a real run
 ([`scripts/gym/fixtures/`](../scripts/gym/fixtures)), so no test there starts a
 cluster or calls a model.
+
+The 0.2.7 exit test ([#1093](https://github.com/reliaburger/reliaburger/issues/1093))
+runs Claude Code as the solver:
+
+```sh
+python3 scripts/gym/gym.py run --solver command:scripts/gym/claude_code.py \
+  --runs 5 --check-patch --port-base 31400 --out "$CARGO_TARGET_DIR/gym/exit-test"
+```
+
+[`claude_code.py`](../scripts/gym/claude_code.py) runs `claude -p` with the
+Reliaburger plugin's skill and MCP server and nothing else from the machine:
+Bash for `relish` only, `--permission-mode dontAsk` (anything else is refused,
+nobody is asked) and no skip-permissions flag. The answer comes back as
+structured output, which the wrapper writes to `GYM_ANSWER`, and the model,
+Claude Code version and cost go into each run's result. The shim streams
+`relish mcp` and records each MCP tool call as the `relish agent` command it
+is, so MCP and shell calls are scored the same way. The portable tests drive
+the wrapper with a fake `claude`
+([`fixtures/fake_claude.py`](../scripts/gym/fixtures/fake_claude.py)). Each
+session costs real API spend; the record is
+[`qualification/2026-11-06-v0.2.7-exit-test.md`](qualification/2026-11-06-v0.2.7-exit-test.md).
 
 ## Before a release
 

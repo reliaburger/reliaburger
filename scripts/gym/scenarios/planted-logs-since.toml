@@ -6,12 +6,21 @@ title = "A planted relish bug: logs --since ignores its window"
 nodes = 1
 
 prompt = """
-The `quiet` app wrote a few lines when it started and has been silent since.
-Yet `relish logs quiet --since 5s` prints those startup lines, which are older
-than five seconds. We think this is a bug in Reliaburger itself, not in the
-app. Find the function in Reliaburger's source that causes it, using
+Two reports about `relish logs`, which we think come from one bug in
+Reliaburger itself, not in any app:
+
+1. The `quiet` app wrote a few lines when it started and has been silent
+   since. Yet `relish logs quiet --since 5s` prints those startup lines,
+   which are older than five seconds. You can see this one on this cluster.
+2. On a bigger cluster, when the log store answers with no lines for an app
+   and the node `relish` asks holds no local capture of that app (it runs on
+   another node), `relish logs APP` fails with `404: no local capture for
+   this workload` instead of printing nothing. This cluster has one node, so
+   you can't reproduce it here.
+
+Find the function in Reliaburger's source that causes them, using
 `relish agent source`, and say which file it's in. If you can, include a
-patch (a unified diff against the source) that fixes it.
+patch (a unified diff against the source) that fixes both.
 """
 
 [[setup]]
