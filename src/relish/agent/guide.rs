@@ -5,8 +5,9 @@
 //! agent guide` prints it from the copy embedded in the binary, and
 //! [`generate`] turns it into the files an agent finds elsewhere: `llms.txt`
 //! and the `/agents` page on the website, the `reliaburger` skill, the Claude
-//! Code plugin and its marketplace, and the generated block of the
-//! repository's `AGENTS.md`. A test in `tests/suite/agent_docs.rs` compares
+//! Code plugin and its marketplace, the website's skills discovery index and
+//! its copy of the skill, `relish mcp`'s MCP Registry entry (`server.json`),
+//! and the generated block of the repository's `AGENTS.md`. A test in `tests/suite/agent_docs.rs` compares
 //! each file on disk with what [`generate`] makes, so none can drift, and
 //! `make agent-docs` rewrites them.
 //!
@@ -19,12 +20,12 @@
 
 use std::fmt::Write as _;
 
-use clap::{Args, Command};
+use clap::Command;
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::json;
 
-use super::{AgentError, AgentOptions, BuildInfo, CommandName, Envelope, ErrorCode, NextStep};
+use super::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, NextStep, agent_command};
 use super::{Rendered, render};
 
 /// The chapter's file name inside `docs/manual/`.
@@ -70,7 +71,29 @@ pub mod paths {
     pub const PLUGIN_MCP: &str = "plugins/reliaburger/.mcp.json";
     /// The Claude Code marketplace this repository is.
     pub const MARKETPLACE: &str = ".claude-plugin/marketplace.json";
+    /// The website's skills discovery index, in the format of Cloudflare's
+    /// [Agent Skills Discovery RFC](https://github.com/cloudflare/agent-skills-discovery-rfc).
+    pub const SKILL_INDEX: &str = "docs/website/.well-known/agent-skills/index.json";
+    /// The website's copy of the skill, which the index points at.
+    pub const SITE_SKILL: &str = "docs/website/.well-known/agent-skills/reliaburger/SKILL.md";
+    /// `relish mcp`'s entry for the official
+    /// [MCP Registry](https://registry.modelcontextprotocol.io).
+    pub const MCP_SERVER: &str = "server.json";
 }
+
+/// The `$schema` of the skills discovery index: version 0.2.0 of the RFC.
+pub const SKILL_INDEX_SCHEMA: &str = "https://schemas.agentskills.io/discovery/0.2.0/schema.json";
+
+/// The `$schema` of `server.json`, the MCP Registry's format.
+pub const MCP_SERVER_SCHEMA: &str =
+    "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json";
+
+/// `relish mcp`'s name in the MCP Registry. The `io.github.reliaburger`
+/// namespace is the one a GitHub login to the organisation proves.
+pub const MCP_REGISTRY_NAME: &str = "io.github.reliaburger/relish";
+
+/// The longest `description` the MCP Registry accepts.
+pub const MCP_DESCRIPTION_MAX: usize = 100;
 
 /// A marked part of the chapter (or of `AGENTS.md`) that a generated file
 /// reuses or that [`generate`] rewrites.
@@ -170,11 +193,6 @@ pub fn replace_region(
     }
     out.push_str(&text[close..]);
     Ok(out)
-}
-
-/// `relish agent` as clap defines it, without the rest of `relish`.
-pub fn agent_command() -> Command {
-    AgentOptions::augment_args(Command::new("agent"))
 }
 
 /// One `relish agent` command and what it does.
@@ -386,6 +404,17 @@ pub struct Inputs<'a> {
     /// The Cargo package version, which pins `llms.txt`'s links to the
     /// release tag and versions the plugin.
     pub version: &'a str,
+    /// Every website page's Markdown copy, for `llms.txt`.
+    pub site: &'a [SitePage],
+}
+
+/// A website page's Markdown copy, as `llms.txt` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SitePage {
+    /// The copy's path on the site, e.g. `compare/nomad.md`.
+    pub markdown: String,
+    /// The page's `<title>`.
+    pub title: String,
 }
 
 /// One generated file.
@@ -417,6 +446,7 @@ pub fn generate(inputs: &Inputs<'_>, agent: &Command) -> Result<Vec<Artefact>, G
     let rules = region(paths::CHAPTER, &chapter, Region::Rules)?.to_string();
     let (title, _) = sections(&chapter);
     let page = without_markers(&chapter);
+    let skill = skill_md(&summary, &brief, &table)?;
 
     let agents_md = replace_region(
         paths::AGENTS_MD,
@@ -436,7 +466,7 @@ pub fn generate(inputs: &Inputs<'_>, agent: &Command) -> Result<Vec<Artefact>, G
         },
         Artefact {
             path: paths::LLMS_TXT,
-            contents: llms_txt(&summary, &brief, &title, inputs.manual, inputs.version),
+            contents: llms_txt(&summary, &brief, &title, inputs),
         },
         Artefact {
             path: paths::AGENTS_PAGE_MARKDOWN,
@@ -444,11 +474,19 @@ pub fn generate(inputs: &Inputs<'_>, agent: &Command) -> Result<Vec<Artefact>, G
         },
         Artefact {
             path: paths::AGENTS_PAGE_HTML,
-            contents: agents_html(&title, &summary, &page),
+            contents: agents_html(&title, &summary, &page, inputs.version),
+        },
+        Artefact {
+            path: paths::SKILL_INDEX,
+            contents: skill_index_json(&skill_description(&summary)?, &skill),
+        },
+        Artefact {
+            path: paths::SITE_SKILL,
+            contents: skill.clone(),
         },
         Artefact {
             path: paths::SKILL,
-            contents: skill_md(&summary, &brief, &table)?,
+            contents: skill,
         },
         Artefact {
             path: paths::PLUGIN,
@@ -461,6 +499,10 @@ pub fn generate(inputs: &Inputs<'_>, agent: &Command) -> Result<Vec<Artefact>, G
         Artefact {
             path: paths::MARKETPLACE,
             contents: marketplace_json(&summary),
+        },
+        Artefact {
+            path: paths::MCP_SERVER,
+            contents: mcp_server_json(agent, inputs.version),
         },
     ])
 }
@@ -489,13 +531,8 @@ fn agents_md_block(rules: &str, brief: &str) -> String {
     )
 }
 
-fn llms_txt(
-    summary: &str,
-    brief: &str,
-    title: &str,
-    manual: &[ManualEntry],
-    version: &str,
-) -> String {
+fn llms_txt(summary: &str, brief: &str, title: &str, inputs: &Inputs<'_>) -> String {
+    let version = inputs.version;
     let raw = format!("https://raw.githubusercontent.com/reliaburger/reliaburger/v{version}");
     let tree = format!("{REPOSITORY}/tree/v{version}");
     let mut out = format!("# Reliaburger\n\n> {summary}\n\n{brief}\n\n## Start here\n\n");
@@ -506,8 +543,18 @@ fn llms_txt(
         chapter = paths::CHAPTER,
     );
     out.push_str("\n## Manual\n\n");
-    for entry in manual.iter().filter(|entry| entry.file != CHAPTER_FILE) {
+    for entry in inputs
+        .manual
+        .iter()
+        .filter(|entry| entry.file != CHAPTER_FILE)
+    {
         let _ = writeln!(out, "- [{}]({raw}/docs/manual/{})", entry.title, entry.file);
+    }
+    if !inputs.site.is_empty() {
+        out.push_str("\n## Website\n\nEvery page on reliaburger.com, as Markdown.\n\n");
+        for page in inputs.site {
+            let _ = writeln!(out, "- [{}]({SITE}/{})", page.title, page.markdown);
+        }
     }
     out.push_str("\n## Optional\n\n");
     let _ = writeln!(
@@ -533,10 +580,170 @@ fn escape_html(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn agents_html(title: &str, summary: &str, page: &str) -> String {
+/// `text` percent-encoded for a URL query value: everything but the
+/// unreserved characters of RFC 3986 becomes `%XX`.
+fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 3);
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// One-click links that add `relish mcp` to an agent client, each made from
+/// the same name and command line `relish agent setup` writes. Each client
+/// shows the server and asks before it adds anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallLinks {
+    /// Cursor's `cursor://` deeplink.
+    pub cursor: String,
+    /// The same, through cursor.com, for pages that strip custom schemes.
+    pub cursor_web: String,
+    /// VS Code's `vscode:mcp/install` link.
+    pub vscode: String,
+    /// The same, through vscode.dev, for pages that strip custom schemes.
+    pub vscode_web: String,
+    /// Goose's `goose://extension` link.
+    pub goose: String,
+    /// The Claude Code command that adds the same server.
+    pub claude_code: String,
+}
+
+/// The install links for `relish mcp`.
+pub fn install_links() -> InstallLinks {
+    use base64::Engine as _;
+    let name = super::setup::MCP_SERVER_NAME;
+    let mut words = super::setup::MCP_COMMAND_LINE.iter().copied();
+    let command = words.next().unwrap_or("relish");
+    let args: Vec<&str> = words.collect();
+
+    let cursor_config = base64::engine::general_purpose::STANDARD
+        .encode(json!({"command": command, "args": args}).to_string());
+    let cursor_query = format!("name={name}&config={}", percent_encode(&cursor_config));
+    let vscode = format!(
+        "vscode:mcp/install?{}",
+        percent_encode(&json!({"name": name, "command": command, "args": args}).to_string())
+    );
+    let mut goose = format!("goose://extension?cmd={}", percent_encode(command));
+    for arg in &args {
+        let _ = write!(goose, "&arg={}", percent_encode(arg));
+    }
+    let _ = write!(
+        goose,
+        "&id={name}&name={}&description={}",
+        percent_encode("Reliaburger"),
+        percent_encode(super::setup::MCP_DESCRIPTION)
+    );
+    InstallLinks {
+        cursor: format!("cursor://anysphere.cursor-deeplink/mcp/install?{cursor_query}"),
+        cursor_web: format!("https://cursor.com/en/install-mcp?{cursor_query}"),
+        vscode_web: format!(
+            "https://insiders.vscode.dev/redirect?url={}",
+            percent_encode(&vscode)
+        ),
+        vscode,
+        goose,
+        claude_code: format!(
+            "claude mcp add {name} -- {}",
+            super::setup::MCP_COMMAND_LINE.join(" ")
+        ),
+    }
+}
+
+/// A heading's anchor, the way GitHub makes one: lower case, spaces to `-`,
+/// punctuation other than `-` and `_` dropped.
+fn slug(heading: &str) -> String {
+    heading
+        .trim()
+        .chars()
+        .filter_map(|c| match c {
+            ' ' => Some('-'),
+            c if c.is_alphanumeric() || c == '-' || c == '_' => Some(c.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn markdown_to_html(markdown: &str) -> String {
     use pulldown_cmark::{Options, Parser, html};
-    let mut body = String::new();
-    html::push_html(&mut body, Parser::new_ext(page, Options::ENABLE_TABLES));
+    let mut out = String::new();
+    html::push_html(&mut out, Parser::new_ext(markdown, Options::ENABLE_TABLES));
+    out
+}
+
+/// The box near the top of `/agents` with the install buttons, the Claude
+/// Code line and what they need.
+fn install_box(version: &str) -> String {
+    let links = install_links();
+    format!(
+        r##"<aside class="agents-install" id="add-to-your-agent" aria-labelledby="add-to-your-agent-title">
+<h2 id="add-to-your-agent-title">Add it to your agent <a class="permalink" href="#add-to-your-agent" aria-label="Link to the install buttons">#</a></h2>
+<p>Each button adds one MCP server, <code>{name}</code>, that runs <code>{line}</code>: read-only tools over stdio, with no port, no trust flag and no auto-approval. Your client shows the entry and asks before it adds it. Install <code>relish</code> {version} or later first (<code>relish agent version</code> says which you have); the server runs the <code>relish</code> on your <code>PATH</code>.</p>
+<p class="agents-install-buttons"><a class="install-button" href="{cursor}">Add to Cursor</a><a class="install-button" href="{vscode}">Add to VS Code</a><a class="install-button" href="{goose}">Add to Goose</a></p>
+<p>Claude Code, from a shell:</p>
+<pre><code data-install-command>{claude}</code></pre>
+<p>Or let <code>relish agent setup</code> find every agent on this machine and show the change before it writes anything (see <a href="#wiring-up-your-agent">Wiring up your agent</a>). Give the server a read-only token: see <a href="#a-read-only-token">A read-only token</a>.</p>
+</aside>
+"##,
+        name = escape_html(super::setup::MCP_SERVER_NAME),
+        line = escape_html(&super::setup::MCP_COMMAND_LINE.join(" ")),
+        version = escape_html(version),
+        cursor = escape_html(&links.cursor),
+        vscode = escape_html(&links.vscode),
+        goose = escape_html(&links.goose),
+        claude = escape_html(&links.claude_code),
+    )
+}
+
+/// The page's body: the intro, the install box, a list of the sections, and
+/// each `## ` section as a `<section>` whose `id` is its heading's slug, so
+/// `/agents#how-reliaburger-is-tested` links to one and CSS can style it.
+fn agents_body(page: &str, version: &str) -> String {
+    let (title, sections) = sections(page);
+    let mut sections = sections.into_iter();
+    let mut body = format!("<h1>{}</h1>\n", escape_html(&title));
+    if let Some(intro) = sections.next() {
+        body.push_str(&markdown_to_html(&intro.markdown));
+    }
+    body.push_str(&install_box(version));
+    let sections: Vec<GuideSection> = sections.collect();
+    body.push_str("<nav class=\"agents-contents\" aria-label=\"On this page\">\n<h2>On this page</h2>\n<ol>\n");
+    for section in &sections {
+        let _ = writeln!(
+            body,
+            "<li><a href=\"#{}\">{}</a></li>",
+            slug(&section.heading.replace('`', "")),
+            inline_html(&section.heading)
+        );
+    }
+    body.push_str("</ol>\n</nav>\n");
+    for section in &sections {
+        let id = slug(&section.heading.replace('`', ""));
+        let _ = write!(
+            body,
+            "<section class=\"agents-section\" id=\"{id}\">\n<h2>{heading} <a class=\"permalink\" href=\"#{id}\" aria-label=\"Link to this section\">#</a></h2>\n{content}</section>\n",
+            heading = inline_html(&section.heading),
+            content = markdown_to_html(&section.markdown),
+        );
+    }
+    body
+}
+
+/// A heading's Markdown as inline HTML, without the paragraph around it.
+fn inline_html(markdown: &str) -> String {
+    let html = markdown_to_html(markdown);
+    html.trim()
+        .trim_start_matches("<p>")
+        .trim_end_matches("</p>")
+        .to_string()
+}
+
+fn agents_html(title: &str, summary: &str, page: &str, version: &str) -> String {
+    let body = agents_body(page, version);
     format!(
         r##"<!doctype html>
 <!-- Generated from {chapter} by `{REGENERATE_COMMAND}`: edit the chapter, not this file. -->
@@ -559,7 +766,7 @@ fn agents_html(title: &str, summary: &str, page: &str) -> String {
     </header>
     <main id="main" class="agents-page">
 {body}    </main>
-    <footer><span>Reliaburger · by {AUTHOR}</span><a href="./agents.md">This page as Markdown</a><span class="footer-note">Generated from the manual chapter {title_escaped}. Static HTML and CSS. The existing copy script adds command buttons. No tracking or third-party requests.</span></footer>
+    <footer><span>Reliaburger · by {AUTHOR}</span><a href="./agents.md">This page as Markdown</a><span class="footer-note">Generated from the manual chapter {title_escaped}. Static HTML and CSS; the site’s copy script adds the copy buttons. No tracking or third-party requests.</span></footer>
   </div>
   <script src="assets/copy.js" defer></script>
 </body>
@@ -641,6 +848,72 @@ fn marketplace_json(summary: &str) -> String {
     }))
 }
 
+/// The SHA-256 of `bytes`, as the skills index writes a digest.
+fn sha256_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+/// `/.well-known/agent-skills/index.json`: one `skill-md` entry, the
+/// website's copy of the skill, with the digest of its exact bytes. A client
+/// checks the digest before it installs the skill, so the index changes
+/// whenever the skill does.
+fn skill_index_json(description: &str, skill: &str) -> String {
+    pretty_json(&json!({
+        "$schema": SKILL_INDEX_SCHEMA,
+        "skills": [{
+            "name": SKILL_NAME,
+            "type": "skill-md",
+            "description": description,
+            "url": format!("/.well-known/agent-skills/{SKILL_NAME}/SKILL.md"),
+            "digest": sha256_digest(skill.as_bytes()),
+        }],
+    }))
+}
+
+/// What the registry entry says `relish mcp` is, within
+/// [`MCP_DESCRIPTION_MAX`] characters.
+pub const MCP_DESCRIPTION: &str =
+    "Read-only Reliaburger cluster diagnosis: the relish agent commands as MCP tools.";
+
+/// `server.json` for the MCP Registry.
+///
+/// It has no `packages` entry. The registry installs only from npm, PyPI,
+/// NuGet, crates.io, an OCI registry or an MCPB bundle, and `relish` ships
+/// as a signed binary through `install.sh`, which is none of those. So the
+/// entry says what the server is, how to start it and which tools it has, in
+/// the publisher-provided `_meta` the schema leaves open, and gives the
+/// install line, rather than claiming an install path a client can't follow.
+fn mcp_server_json(agent: &Command, version: &str) -> String {
+    use crate::relish::mcp::tools;
+    let tools: Vec<String> = tools::derive(agent.clone(), &tools::data_schema)
+        .into_iter()
+        .map(|spec| spec.tool.name.to_string())
+        .collect();
+    pretty_json(&json!({
+        "$schema": MCP_SERVER_SCHEMA,
+        "name": MCP_REGISTRY_NAME,
+        "title": "Reliaburger relish",
+        "description": MCP_DESCRIPTION,
+        "version": version,
+        "websiteUrl": format!("{SITE}/agents"),
+        "repository": {"url": REPOSITORY, "source": "github"},
+        "_meta": {
+            "io.modelcontextprotocol.registry/publisher-provided": {
+                "install": format!("curl -fsSL {SITE}/install.sh | sh -s -- --install-only"),
+                "command": super::setup::MCP_COMMAND_LINE,
+                "transport": "stdio",
+                "readOnly": true,
+                "tools": tools,
+                "documentation": format!(
+                    "{REPOSITORY}/blob/v{version}/{chapter}",
+                    chapter = paths::CHAPTER
+                ),
+            },
+        },
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,6 +942,19 @@ Intro paragraph.\n\n## In brief\n\n\
         ]
     }
 
+    fn fixture_site() -> Vec<SitePage> {
+        vec![
+            SitePage {
+                markdown: "index.md".to_string(),
+                title: "Reliaburger".to_string(),
+            },
+            SitePage {
+                markdown: "compare/nomad.md".to_string(),
+                title: "Reliaburger compared with Nomad".to_string(),
+            },
+        ]
+    }
+
     /// A stand-in for `relish agent`, so the snapshots don't move every time
     /// a real command lands.
     fn fixture_agent() -> Command {
@@ -689,6 +975,7 @@ Intro paragraph.\n\n## In brief\n\n\
             agents_md: FIXTURE_AGENTS_MD,
             manual: &manual,
             version: "0.2.7",
+            site: &fixture_site(),
         };
         generate(&inputs, &fixture_agent()).unwrap()
     }
@@ -767,6 +1054,7 @@ Intro paragraph.\n\n## In brief\n\n\
                 agents_md: agents,
                 manual: &manual,
                 version: "0.2.7",
+                site: &fixture_site(),
             },
             &fixture_agent(),
         )
@@ -778,8 +1066,9 @@ Intro paragraph.\n\n## In brief\n\n\
     fn every_artefact_carries_the_brief_or_the_whole_chapter() {
         let brief = "Run `relish agent guide` first.";
         for artefact in generated() {
-            if artefact.path == paths::PLUGIN_MCP {
-                // A server entry, with no prose; its own test checks it.
+            if artefact.path == paths::PLUGIN_MCP || artefact.path == paths::MCP_SERVER {
+                // Server entries, with no room for prose; their own tests
+                // check them.
                 continue;
             }
             if artefact.path.ends_with(".json") {
@@ -841,6 +1130,7 @@ Intro paragraph.\n\n## In brief\n\n\
                 agents_md: FIXTURE_AGENTS_MD,
                 manual: &manual,
                 version: "0.2.7",
+                site: &fixture_site(),
             },
             &fixture_agent(),
         )
@@ -916,15 +1206,16 @@ Intro paragraph.\n\n## In brief\n\n\
         (headings, value)
     }
 
-    /// The setup playbook (#1579) is the chapter's last section because an
-    /// agent driving a cluster needs it least. With every 0.2.7 command in,
-    /// the chapter outgrew the default budget, which keeps the front (the
-    /// brief, the contract, the command table), drops sections only from the
-    /// end, the playbook first, and says how to get the rest.
+    /// `relish agent guide` is the one document an agent reads whole, so
+    /// its default budget (64 KiB, not 24) returns every section in one
+    /// call, the setup playbook (#1579) last, with no `next` asking for
+    /// more.
     #[test]
-    fn guide_answers_from_the_embedded_chapter_within_the_default_budget() {
+    fn guide_answers_the_whole_chapter_within_its_default_budget() {
         const PLAYBOOK: &str = "Setting up a cluster for your human";
-        let (headings, value) = guide_headings(super::super::DEFAULT_MAX_BYTES);
+        let (headings, value) = guide_headings(super::super::GUIDE_MAX_BYTES);
+        assert_eq!(value["truncated"], false, "{headings:?}");
+        assert_eq!(headings.last().map(String::as_str), Some(PLAYBOOK));
         assert!(
             value["data"]["commands"]
                 .as_array()
@@ -932,9 +1223,37 @@ Intro paragraph.\n\n## In brief\n\n\
                 .iter()
                 .any(|command| command["command"] == "relish agent guide")
         );
-        let (whole, untrimmed) = guide_headings(128 * 1024);
-        assert_eq!(untrimmed["truncated"], false, "128 KiB fits the chapter");
-        assert_eq!(whole.last().map(String::as_str), Some(PLAYBOOK));
+        let (whole, _) = guide_headings(128 * 1024);
+        assert_eq!(headings, whole);
+        for next in value["next"].as_array().unwrap() {
+            let run = next["run"].as_str().unwrap();
+            assert!(!run.contains("--max-bytes"), "asks for more: {run}");
+        }
+    }
+
+    /// The guide's default budget exists so the whole chapter comes back in
+    /// one call. If chapter 16 outgrows it, someone has to choose: split
+    /// the chapter, or raise `GUIDE_MAX_BYTES` knowing what it costs.
+    #[test]
+    fn the_agent_chapter_fits_the_guides_default_budget() {
+        let rendered = run(1024 * 1024, "relish agent guide");
+        let whole = rendered.json.len();
+        assert!(
+            whole <= super::super::GUIDE_MAX_BYTES,
+            "relish agent guide is {whole} bytes, over its {} byte default: split \
+             {CHAPTER_FILE} or raise GUIDE_MAX_BYTES deliberately",
+            super::super::GUIDE_MAX_BYTES
+        );
+    }
+
+    /// An explicit `--max-bytes` still wins. At the 24 KiB every other
+    /// command defaults to, the chapter doesn't fit, so the budget keeps the
+    /// front (the brief, the contract, the command table), drops sections
+    /// only from the end, and says how to get the rest.
+    #[test]
+    fn an_explicit_smaller_budget_drops_trailing_sections() {
+        let (headings, value) = guide_headings(super::super::DEFAULT_MAX_BYTES);
+        let (whole, _) = guide_headings(super::super::GUIDE_MAX_BYTES);
         assert_eq!(value["truncated"], true);
         assert!(
             headings.len() < whole.len() && headings[..] == whole[..headings.len()],
@@ -992,6 +1311,122 @@ Intro paragraph.\n\n## In brief\n\n\
         insta::assert_snapshot!(artefact(paths::AGENTS_PAGE_HTML));
     }
 
+    /// Undo [`percent_encode`], for checking what a link carries.
+    fn percent_decode(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                out.push(u8::from_str_radix(&text[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    fn query_values<'a>(link: &'a str, key: &str) -> Vec<&'a str> {
+        let query = &link[link.find('?').unwrap() + 1..];
+        query
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix(&format!("{key}=")))
+            .collect()
+    }
+
+    #[test]
+    fn every_install_link_starts_the_server_setup_registers() {
+        use base64::Engine as _;
+        let links = install_links();
+        let expected = super::super::setup::MCP_COMMAND_LINE;
+        let name = super::super::setup::MCP_SERVER_NAME;
+
+        for cursor in [&links.cursor, &links.cursor_web] {
+            assert_eq!(query_values(cursor, "name"), [name]);
+            let config = percent_decode(query_values(cursor, "config")[0]);
+            let config = base64::engine::general_purpose::STANDARD
+                .decode(config)
+                .unwrap();
+            let config: serde_json::Value = serde_json::from_slice(&config).unwrap();
+            assert_eq!(config["command"], expected[0]);
+            assert_eq!(config["args"], json!(expected[1..]));
+        }
+        assert!(
+            links
+                .cursor
+                .starts_with("cursor://anysphere.cursor-deeplink/mcp/install?")
+        );
+
+        let vscode: serde_json::Value = serde_json::from_str(&percent_decode(
+            links.vscode.strip_prefix("vscode:mcp/install?").unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(vscode["name"], name);
+        assert_eq!(vscode["command"], expected[0]);
+        assert_eq!(vscode["args"], json!(expected[1..]));
+        let redirected = query_values(&links.vscode_web, "url")[0];
+        assert_eq!(percent_decode(redirected), links.vscode);
+
+        assert!(links.goose.starts_with("goose://extension?"));
+        let mut goose = vec![percent_decode(query_values(&links.goose, "cmd")[0])];
+        goose.extend(
+            query_values(&links.goose, "arg")
+                .into_iter()
+                .map(percent_decode),
+        );
+        assert_eq!(goose, expected);
+        assert_eq!(query_values(&links.goose, "id"), [name]);
+
+        assert_eq!(
+            links.claude_code,
+            format!("claude mcp add {name} -- {}", expected.join(" "))
+        );
+    }
+
+    #[test]
+    fn slugs_follow_github_s_anchors() {
+        assert_eq!(
+            slug("How Reliaburger is tested"),
+            "how-reliaburger-is-tested"
+        );
+        assert_eq!(
+            slug("Text the cluster didn't write"),
+            "text-the-cluster-didnt-write"
+        );
+        assert_eq!(slug("Reading an app's logs"), "reading-an-apps-logs");
+    }
+
+    #[test]
+    fn the_agents_page_has_a_linkable_section_per_heading_and_the_install_box() {
+        let html = artefact(paths::AGENTS_PAGE_HTML);
+        for id in ["in-brief", "commands", "sending-us-a-fix"] {
+            assert!(
+                html.contains(&format!("<section class=\"agents-section\" id=\"{id}\">")),
+                "no section {id}"
+            );
+            assert!(
+                html.contains(&format!("<li><a href=\"#{id}\">")),
+                "{id} not listed"
+            );
+            assert!(html.contains(&format!("<a class=\"permalink\" href=\"#{id}\"")));
+        }
+        let links = install_links();
+        for link in [&links.cursor, &links.vscode, &links.goose] {
+            assert!(html.contains(&format!("href=\"{}\"", escape_html(link))));
+        }
+        assert!(html.contains(&format!(
+            "<code data-install-command>{}</code>",
+            links.claude_code
+        )));
+        assert!(html.contains("<code>relish</code> 0.2.7 or later"));
+        // The install box comes after the intro and before the first section.
+        let install = html.find("id=\"add-to-your-agent\"").unwrap();
+        assert!(html.find("Intro paragraph.").unwrap() < install);
+        assert!(install < html.find("id=\"in-brief\"").unwrap());
+    }
+
     #[test]
     fn snapshot_of_the_skill() {
         insta::assert_snapshot!(artefact(paths::SKILL));
@@ -1020,5 +1455,142 @@ Intro paragraph.\n\n## In brief\n\n\
     #[test]
     fn snapshot_of_the_marketplace() {
         insta::assert_snapshot!(artefact(paths::MARKETPLACE));
+    }
+
+    #[test]
+    fn llms_txt_links_every_website_copy() {
+        let llms = artefact(paths::LLMS_TXT);
+        assert!(llms.contains("\n## Website\n"));
+        assert!(llms.contains("- [Reliaburger](https://reliaburger.com/index.md)"));
+        assert!(llms.contains(
+            "- [Reliaburger compared with Nomad](https://reliaburger.com/compare/nomad.md)"
+        ));
+    }
+
+    #[test]
+    fn the_website_serves_the_plugins_skill_byte_for_byte() {
+        assert_eq!(artefact(paths::SITE_SKILL), artefact(paths::SKILL));
+    }
+
+    #[test]
+    fn the_skill_index_names_the_skill_with_the_digest_of_its_bytes() {
+        let index: serde_json::Value = serde_json::from_str(&artefact(paths::SKILL_INDEX)).unwrap();
+        assert_eq!(index["$schema"], SKILL_INDEX_SCHEMA);
+        let skills = index["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 1);
+        let entry = &skills[0];
+        assert_eq!(entry["name"], SKILL_NAME);
+        assert_eq!(entry["type"], "skill-md");
+        assert_eq!(
+            entry["url"], "/.well-known/agent-skills/reliaburger/SKILL.md",
+            "served beside the index, where the site copy is"
+        );
+        assert!(
+            paths::SITE_SKILL.ends_with(entry["url"].as_str().unwrap()),
+            "the URL is the site copy's path"
+        );
+        let skill = artefact(paths::SITE_SKILL);
+        assert_eq!(entry["digest"], sha256_digest(skill.as_bytes()));
+        let digest = entry["digest"].as_str().unwrap();
+        let hex = digest.strip_prefix("sha256:").unwrap();
+        assert_eq!(hex.len(), 64);
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        // The RFC says the description should match the skill's own.
+        let front = skill.split("\n---\n").next().unwrap();
+        let description: String = front
+            .lines()
+            .find_map(|line| line.strip_prefix("description: "))
+            .map(|quoted| serde_json::from_str(quoted).unwrap())
+            .unwrap();
+        assert_eq!(entry["description"], description.as_str());
+    }
+
+    #[test]
+    fn a_changed_skill_changes_the_index_digest() {
+        let manual = fixture_manual();
+        let edited = FIXTURE_CHAPTER.replace("first.**", "first, always.**");
+        let changed = generate(
+            &Inputs {
+                chapter: &edited,
+                agents_md: FIXTURE_AGENTS_MD,
+                manual: &manual,
+                version: "0.2.7",
+                site: &fixture_site(),
+            },
+            &fixture_agent(),
+        )
+        .unwrap();
+        let stale = stale_paths(&changed, |path| Some(artefact(path)));
+        assert!(stale.contains(&paths::SKILL_INDEX), "{stale:?}");
+        assert!(stale.contains(&paths::SITE_SKILL), "{stale:?}");
+    }
+
+    /// The registry entry describes the server `relish mcp` really is: the
+    /// same command line `relish agent setup` registers, over stdio, with
+    /// exactly the tools the server offers by default.
+    #[test]
+    fn the_registry_entry_lists_exactly_the_tools_relish_mcp_serves() {
+        let entry = generate(
+            &Inputs {
+                chapter: FIXTURE_CHAPTER,
+                agents_md: FIXTURE_AGENTS_MD,
+                manual: &fixture_manual(),
+                version: "0.2.7",
+                site: &[],
+            },
+            &agent_command(),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|artefact| artefact.path == paths::MCP_SERVER)
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&entry.contents).unwrap();
+        assert_eq!(value["name"], MCP_REGISTRY_NAME);
+        assert_eq!(value["version"], "0.2.7");
+        assert!(MCP_DESCRIPTION.chars().count() <= MCP_DESCRIPTION_MAX);
+        assert!(
+            value.get("packages").is_none(),
+            "relish isn't in a package registry the MCP Registry installs from"
+        );
+        let provided = &value["_meta"]["io.modelcontextprotocol.registry/publisher-provided"];
+        assert_eq!(provided["transport"], "stdio");
+        assert_eq!(provided["readOnly"], true);
+        let command: Vec<&str> = provided["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|word| word.as_str().unwrap())
+            .collect();
+        assert_eq!(command, super::super::setup::MCP_COMMAND_LINE);
+        let listed: Vec<&str> = provided["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.as_str().unwrap())
+            .collect();
+        let server = crate::relish::mcp::Server::new(&Default::default()).unwrap();
+        let served: Vec<String> = server
+            .tools()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(listed, served);
+        for excluded in crate::relish::mcp::tools::EXCLUDED {
+            let name = crate::relish::mcp::tools::tool_name(excluded.command);
+            assert!(!listed.contains(&name.as_str()), "{name} is excluded");
+        }
+    }
+
+    #[test]
+    fn snapshot_of_the_skill_index() {
+        insta::assert_snapshot!(artefact(paths::SKILL_INDEX));
+    }
+
+    #[test]
+    fn snapshot_of_the_registry_entry() {
+        insta::assert_snapshot!(artefact(paths::MCP_SERVER));
     }
 }

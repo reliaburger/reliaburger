@@ -34,24 +34,31 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
 
-pub use budget::{DEFAULT_MAX_BYTES, MIN_MAX_BYTES, Rendered};
+pub use budget::{DEFAULT_MAX_BYTES, GUIDE_MAX_BYTES, MIN_MAX_BYTES, Rendered, default_max_bytes};
 pub use envelope::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, ExitStatus, NextStep};
 
 /// `relish agent`'s own flags and its subcommand.
 #[derive(Debug, Clone, clap::Args)]
 pub struct AgentOptions {
-    /// Largest answer to print, in bytes (at least 1024). A bigger answer is
-    /// trimmed, marked `truncated`, and says how to get the rest.
-    #[arg(
-        long,
-        global = true,
-        default_value_t = DEFAULT_MAX_BYTES,
-        value_parser = parse_max_bytes,
-    )]
-    pub max_bytes: usize,
+    /// Largest answer to print, in bytes (at least 1024; by default 24576,
+    /// and 65536 for `guide`). A bigger answer is trimmed, marked
+    /// `truncated`, and says how to get the rest.
+    // No clap default: the default depends on the command, so `None` means
+    // "not given" and [`AgentOptions::max_bytes`] picks the command's.
+    #[arg(long, global = true, value_parser = parse_max_bytes)]
+    pub max_bytes: Option<usize>,
 
     #[command(subcommand)]
     pub command: AgentCommand,
+}
+
+/// `relish agent` as clap defines it, without the rest of `relish`: the
+/// tree `relish agent guide` lists and `relish mcp` turns into tools.
+pub fn agent_command() -> clap::Command {
+    // `Args` is the trait `#[derive(clap::Args)]` implemented for
+    // `AgentOptions`; `augment_args` adds its flags and subcommands to a
+    // command we name ourselves.
+    <AgentOptions as clap::Args>::augment_args(clap::Command::new("agent"))
 }
 
 /// The `relish agent` commands.
@@ -100,6 +107,15 @@ pub enum AgentCommand {
     Setup(setup::SetupOptions),
 }
 
+impl AgentOptions {
+    /// The budget for this command line: `--max-bytes` when given, else the
+    /// command's default ([`default_max_bytes`]).
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+            .unwrap_or_else(|| default_max_bytes(self.command.name()))
+    }
+}
+
 impl AgentCommand {
     /// The name the envelope's `command` field carries.
     pub fn name(&self) -> CommandName {
@@ -141,11 +157,12 @@ pub fn render<T: Serialize>(envelope: &Envelope<T>, max_bytes: usize, rerun: &st
 /// `rerun` is the command line as [`rerun_command`] rebuilds it, for the
 /// hint a trimmed answer carries.
 pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
+    let max_bytes = options.max_bytes();
     match &options.command {
-        AgentCommand::Guide => guide::run(options.max_bytes, rerun),
+        AgentCommand::Guide => guide::run(max_bytes, rerun),
         AgentCommand::Version => render(
             &Envelope::answered(CommandName::Version, BuildInfo::current(), version_data()),
-            options.max_bytes,
+            max_bytes,
             rerun,
         ),
         AgentCommand::Schema { command } => render(
@@ -154,25 +171,19 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
                 BuildInfo::current(),
                 schema_data(*command),
             ),
-            options.max_bytes,
+            max_bytes,
             rerun,
         ),
-        AgentCommand::Source(source) => source::run(source, options.max_bytes, rerun).await,
-        AgentCommand::Logs(args) => logs::run(args, options.max_bytes, rerun).await,
-        AgentCommand::Manual { command } => manual::run(command, options.max_bytes, rerun),
-        AgentCommand::Context(args) => context::run(args, options.max_bytes, rerun).await,
-        AgentCommand::Diagnose(args) => {
-            diagnose::run_diagnose(args, options.max_bytes, rerun).await
-        }
-        AgentCommand::Explain { id } => {
-            diagnose::run_explain(id.as_deref(), options.max_bytes, rerun)
-        }
-        AgentCommand::UpgradeCheck(args) => {
-            upgrade_check::run(args, options.max_bytes, rerun).await
-        }
-        AgentCommand::Report(args) => report::run(args, options.max_bytes, rerun),
-        AgentCommand::Patch(patch) => patch::run(patch, options.max_bytes, rerun).await,
-        AgentCommand::Setup(setup) => setup::run(setup, options.max_bytes, rerun).await,
+        AgentCommand::Source(source) => source::run(source, max_bytes, rerun).await,
+        AgentCommand::Logs(args) => logs::run(args, max_bytes, rerun).await,
+        AgentCommand::Manual { command } => manual::run(command, max_bytes, rerun),
+        AgentCommand::Context(args) => context::run(args, max_bytes, rerun).await,
+        AgentCommand::Diagnose(args) => diagnose::run_diagnose(args, max_bytes, rerun).await,
+        AgentCommand::Explain { id } => diagnose::run_explain(id.as_deref(), max_bytes, rerun),
+        AgentCommand::UpgradeCheck(args) => upgrade_check::run(args, max_bytes, rerun).await,
+        AgentCommand::Report(args) => report::run(args, max_bytes, rerun),
+        AgentCommand::Patch(patch) => patch::run(patch, max_bytes, rerun).await,
+        AgentCommand::Setup(setup) => setup::run(setup, max_bytes, rerun).await,
     }
 }
 
@@ -293,7 +304,7 @@ fn schema_data(only: Option<CommandName>) -> SchemaData {
 }
 
 /// Global `relish` flags that take a value as the next argument.
-const VALUE_FLAGS: &[&str] = &["-o", "--output", "--token", "--ca-cert", "--endpoint"];
+pub(crate) const VALUE_FLAGS: &[&str] = &["-o", "--output", "--token", "--ca-cert", "--endpoint"];
 
 /// Whether `args` (without the program name) run a `relish agent` command:
 /// the first argument that isn't a flag or a flag's value is `agent`.
@@ -352,15 +363,22 @@ fn max_bytes_in(args: &[String]) -> Option<usize> {
 
 /// The usage failure for a `relish agent` command line clap rejected.
 ///
-/// `message` is clap's own explanation. It honours a valid `--max-bytes`
+/// `message` is clap's own explanation and `lead`, when there is one, opens
+/// the hint: a read-only command close to what was typed, or where to
+/// start. It honours a valid `--max-bytes`
 /// even though the rest of the line didn't parse.
-pub fn usage_failure(args: &[String], message: &str) -> Rendered {
-    let error = AgentError::new(ErrorCode::Usage, message.trim_end())
-        .with_hint("relish agent --help lists the commands; relish agent schema their output");
+pub fn usage_failure(args: &[String], message: &str, lead: Option<&str>) -> Rendered {
+    let help = "relish agent --help lists the commands; relish agent schema their output";
+    let hint = match lead {
+        Some(lead) => format!("{lead} {help}"),
+        None => help.to_string(),
+    };
+    let error = AgentError::new(ErrorCode::Usage, message.trim_end()).with_hint(hint);
+    let command = command_named(args);
     failure(
-        command_named(args),
+        command,
         error,
-        max_bytes_in(args).unwrap_or(DEFAULT_MAX_BYTES),
+        max_bytes_in(args).unwrap_or_else(|| default_max_bytes(command)),
         &rerun_command(args),
     )
 }
@@ -442,14 +460,51 @@ mod tests {
 
     #[test]
     fn max_bytes_defaults_to_24_kib_and_goes_after_the_command() {
-        assert_eq!(parse("agent version").unwrap().max_bytes, 24 * 1024);
+        assert_eq!(parse("agent version").unwrap().max_bytes(), 24 * 1024);
         assert_eq!(
-            parse("agent version --max-bytes 4096").unwrap().max_bytes,
+            parse("agent version --max-bytes 4096").unwrap().max_bytes(),
             4096
         );
         assert_eq!(
-            parse("agent --max-bytes 4096 version").unwrap().max_bytes,
+            parse("agent --max-bytes 4096 version").unwrap().max_bytes(),
             4096
+        );
+    }
+
+    #[test]
+    fn guide_defaults_to_64_kib_and_every_other_command_to_24_kib() {
+        use clap::ValueEnum;
+        for &command in CommandName::value_variants() {
+            let expected = match command {
+                CommandName::Guide => 64 * 1024,
+                _ => 24 * 1024,
+            };
+            assert_eq!(default_max_bytes(command), expected, "{command:?}");
+        }
+        assert_eq!(default_max_bytes(CommandName::Agent), 24 * 1024);
+        assert_eq!(parse("agent guide").unwrap().max_bytes(), 64 * 1024);
+        for line in [
+            "agent version",
+            "agent schema",
+            "agent explain",
+            "agent context",
+            "agent logs payments",
+            "agent manual search deploy",
+            "agent source version",
+        ] {
+            assert_eq!(parse(line).unwrap().max_bytes(), 24 * 1024, "{line}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_max_bytes_beats_the_guides_default() {
+        assert_eq!(
+            parse("agent guide --max-bytes 4096").unwrap().max_bytes(),
+            4096
+        );
+        assert_eq!(
+            parse("agent --max-bytes 131072 guide").unwrap().max_bytes(),
+            128 * 1024
         );
     }
 
@@ -622,7 +677,7 @@ mod tests {
         assert_eq!(logs.stream, Some(logs::StreamArg::Stderr));
         assert_eq!(options.command.name(), CommandName::Logs);
         let options = parse("agent manual search rolling deploy --max-bytes 4096").unwrap();
-        assert_eq!(options.max_bytes, 4096);
+        assert_eq!(options.max_bytes(), 4096);
         let AgentCommand::Manual {
             command: manual::ManualCommand::Search { words },
         } = &options.command
@@ -772,7 +827,7 @@ mod tests {
     #[test]
     fn a_usage_failure_is_an_envelope_with_exit_2() {
         let line = args("agent version --bogus");
-        let rendered = usage_failure(&line, "error: unexpected argument '--bogus' found\n");
+        let rendered = usage_failure(&line, "error: unexpected argument '--bogus' found\n", None);
         assert_eq!(rendered.exit, ExitStatus::Usage);
         assert_eq!(rendered.exit.code(), 2);
         let value = json_of(&rendered);

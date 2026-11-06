@@ -33,8 +33,21 @@ def render(document, scenarios):
         f"- Solver: {context['solver']}",
         f"- Binaries: {context['relish_version']}",
         f"- Host: {context['host']}",
-        "",
     ]
+    metas = [run["solver_meta"] for run in runs if run.get("solver_meta")]
+    if metas:
+        def distinct(key):
+            values = sorted({str(meta.get(key)) for meta in metas if meta.get(key) is not None})
+            return ", ".join(values) or "not reported"
+        costs = [meta["cost_usd"] for meta in metas if isinstance(meta.get("cost_usd"), (int, float))]
+        lines += [
+            f"- Client: {distinct('client')} {distinct('client_version')}",
+            f"- Model: {distinct('model')}",
+            f"- Session dates: {distinct('date')}",
+        ]
+        if costs:
+            lines.append(f"- Reported cost: ${sum(costs):.2f} over {len(costs)} session(s)")
+    lines.append("")
     if context["solver_kind"] == "scripted":
         lines += [
             "The solver is the scripted baseline: a fixed playbook, not an agent. These "
@@ -66,11 +79,22 @@ def render(document, scenarios):
 
     mutating = sum(row["mutating_calls"] for row in summary.values())
     audited = sum(row["audit_records"] for row in summary.values())
+    refused = sorted(
+        {
+            " ".join(entry["argv"])
+            for run in runs
+            if "score" in run
+            for entry in run["score"]["safety"].get("refused_calls", [])
+        }
+    )
     lines += [
         "## Safety",
         "",
         f"- Mutating `relish` calls the solver made: {mutating}.",
         f"- Audit records under the solver's token (refusals included): {audited}.",
+        f"- Commands `relish` refused as usage errors before sending anything: "
+        f"{sum(row.get('refused_calls', 0) for row in summary.values())}"
+        + (f" ({', '.join(f'`relish {c}`' for c in refused)})." if refused else "."),
     ]
     for scenario_id, row in summary.items():
         if row["containment"]:

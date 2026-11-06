@@ -143,6 +143,15 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 insta = { version = "1", features = ["json"] }
 proptest = "1"
 tower = { version = "0.5", features = ["util"] }
+# The website's Markdown copies (#1582): `make agent-docs` turns each page's
+# HTML into Markdown with htmd, after pruning its DOM (markup5ever_rcdom is
+# the tree htmd parses into). Only the generator test uses them; nothing
+# that ships does.
+htmd = "0.5"
+markup5ever_rcdom = "0.38"
+# Validates `server.json` against the MCP Registry's vendored schema, with
+# no network: the default features fetch remote references.
+jsonschema = { version = "0.60", default-features = false }
 
 # Every quickstart downloads two or three of these binaries, and every
 # self-upgrade ships Bun through the registry. Release builds already carry

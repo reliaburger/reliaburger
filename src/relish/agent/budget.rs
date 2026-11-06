@@ -2,7 +2,9 @@
 //!
 //! An agent pays for every byte it reads, and a tool result over about
 //! 10,000 tokens gets a warning in Claude Code, so each command's output has
-//! a ceiling: 24 KiB by default, about 6,000 tokens. When an answer is
+//! a ceiling: 24 KiB by default, about 6,000 tokens. `relish agent guide` is
+//! the exception at 64 KiB: it is the one document an agent reads whole, so
+//! its default fits the whole manual chapter. When an answer is
 //! bigger, the budget trims `data` rather than cutting the text, so what
 //! comes out is still one valid JSON document in the same shape. Then it says
 //! so: `truncated` is `true`, a warning names each array or string it cut,
@@ -14,8 +16,21 @@ use serde_json::{Value, json};
 
 use super::envelope::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, ExitStatus};
 
-/// The budget when `--max-bytes` isn't given: 24 KiB.
+/// The budget when `--max-bytes` isn't given: 24 KiB, for every command
+/// but `guide`.
 pub const DEFAULT_MAX_BYTES: usize = 24 * 1024;
+
+/// `relish agent guide`'s budget when `--max-bytes` isn't given: 64 KiB,
+/// enough for the whole agent chapter in one call.
+pub const GUIDE_MAX_BYTES: usize = 64 * 1024;
+
+/// The budget `command` gets when `--max-bytes` isn't given.
+pub fn default_max_bytes(command: CommandName) -> usize {
+    match command {
+        CommandName::Guide => GUIDE_MAX_BYTES,
+        _ => DEFAULT_MAX_BYTES,
+    }
+}
 
 /// The smallest budget `--max-bytes` accepts. Below this even a failure
 /// envelope might not fit.

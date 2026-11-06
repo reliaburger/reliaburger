@@ -33,8 +33,8 @@ pub struct Exclusion {
     pub why: &'static str,
 }
 
-/// The commands `relish mcp` never offers. Some don't exist yet; naming them
-/// now means they can't slip in as tools when they land.
+/// The commands `relish mcp` never offers. Naming them here means none
+/// becomes a tool by accident, whatever its `data` schema.
 pub const EXCLUDED: &[Exclusion] = &[
     Exclusion {
         command: "source extract",
@@ -122,14 +122,6 @@ pub fn tool_name(command: &str) -> String {
     command.replace([' ', '-'], "_")
 }
 
-/// The `relish agent` command tree, as clap builds it.
-pub fn agent_command() -> clap::Command {
-    // `Args` is the trait `#[derive(clap::Args)]` implemented for
-    // `AgentOptions`; `augment_args` adds its flags and subcommands to a
-    // command we name ourselves.
-    <agent::AgentOptions as clap::Args>::augment_args(clap::Command::new("agent"))
-}
-
 /// The `data` schema of the `relish agent` command `command`, or `None` for
 /// a command that doesn't answer with data.
 pub fn data_schema(command: &str) -> Option<Value> {
@@ -145,7 +137,7 @@ pub fn command_name(command: &str) -> Option<CommandName> {
 /// Every tool `tree` offers: each leaf command with a `data` schema that
 /// [`EXCLUDED`] doesn't name.
 ///
-/// `tree` is `relish agent`'s clap command ([`agent_command`]) and `schema`
+/// `tree` is `relish agent`'s clap command ([`agent::agent_command`]) and `schema`
 /// gives a command's `data` schema ([`data_schema`]); the tests pass
 /// stand-ins for both.
 pub fn derive(tree: clap::Command, schema: &dyn Fn(&str) -> Option<Value>) -> Vec<ToolSpec> {
@@ -198,11 +190,9 @@ fn tool_spec(words: &[String], command: &clap::Command, data: Value) -> ToolSpec
         .get_about()
         .map(|about| about.to_string())
         .unwrap_or_else(|| format!("relish agent {name}"));
-    let mut tool = Tool::new(
-        tool_name(&name),
-        description,
-        Arc::new(input_schema(command)),
-    );
+    let mut input = input_schema(command);
+    with_budget_default(&mut input, &name);
+    let mut tool = Tool::new(tool_name(&name), description, Arc::new(input));
     tool.title = Some(format!("relish agent {name}"));
     tool.output_schema = Some(Arc::new(output_schema(data)));
     tool.annotations = Some(
@@ -292,6 +282,20 @@ fn input_schema(command: &clap::Command) -> JsonObject {
     }
     schema.insert("additionalProperties".into(), json!(false));
     schema
+}
+
+/// `--max-bytes` has no clap default because the default depends on the
+/// command, so the schema gets this command's from
+/// [`agent::default_max_bytes`].
+fn with_budget_default(schema: &mut JsonObject, command: &str) {
+    let Some(name) = command_name(command) else {
+        return;
+    };
+    if let Some(Value::Object(properties)) = schema.get_mut("properties")
+        && let Some(Value::Object(property)) = properties.get_mut("max_bytes")
+    {
+        property.insert("default".into(), json!(agent::default_max_bytes(name)));
+    }
 }
 
 fn property_schema(argument: &clap::Arg) -> Value {

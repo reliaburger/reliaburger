@@ -6,12 +6,12 @@ expression: manifest
   "addresses": "aliased",
   "files": [
     {
-      "bytes": 4991,
+      "bytes": 5548,
       "path": "issue.md",
       "sha256": "<sha256>"
     },
     {
-      "bytes": 2484,
+      "bytes": 2986,
       "path": "bundle.json",
       "sha256": "<sha256>"
     }
@@ -74,22 +74,24 @@ expression: manifest
       "redactions": {}
     },
     {
-      "bytes": 818,
+      "bytes": 1038,
       "included": true,
       "kind": "evidence",
       "name": "diagnose.json",
-      "note": "2 log lines left out; pass --include-logs to keep them",
+      "note": "3 log lines left out; pass --include-logs to keep them",
       "redactions": {
         "encrypted_value": 1,
         "env_value": 2,
         "hostname": 3,
         "ipv4_address": 3,
+        "jwt": 1,
         "node_name": 4,
+        "secret_key_value": 3,
         "url_credentials": 1
       }
     },
     {
-      "bytes": 145,
+      "bytes": 278,
       "included": true,
       "kind": "evidence",
       "name": "notes.txt",
@@ -97,8 +99,10 @@ expression: manifest
       "redactions": {
         "age_identity": 1,
         "ipv4_address": 1,
+        "jwt": 1,
         "node_name": 1,
-        "pem_private_key": 1
+        "pem_private_key": 1,
+        "secret_key_value": 4
       }
     },
     {
@@ -128,9 +132,11 @@ expression: manifest
     "env_value": 2,
     "hostname": 3,
     "ipv4_address": 6,
+    "jwt": 2,
     "node_name": 8,
     "pem_private_key": 1,
     "reliaburger_token": 1,
+    "secret_key_value": 7,
     "url_credentials": 1
   },
   "schema": "relish.agent.report-manifest/v1"

@@ -112,8 +112,11 @@ fn a_hollow_runtime_claims_containers_so_image_apps_place_on_it() {
 fn free_blocks_skips_a_block_another_socket_holds() {
     let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = held.local_addr().unwrap().port();
-    // A range of three blocks whose first block contains the held port.
-    let start = port.saturating_sub(1).max(1024);
+    // A range of three blocks around the held port. The OS can hand out an
+    // ephemeral port near 65535, so keep the range's end inside u16.
+    let start = port
+        .saturating_sub(1)
+        .clamp(1024, u16::MAX - 3 * PORTS_PER_NODE);
     let blocks = free_blocks(2, start, start + 3 * PORTS_PER_NODE);
     assert!(
         blocks
