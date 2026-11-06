@@ -29,8 +29,9 @@ and an exit code that means "warnings" in one command and "usage error" in
 another sends it chasing the wrong problem. <code>relish agent</code> is the family of
 commands built for it.</p>
 <p>This chapter is also where every agent-facing file comes from. <code>relish agent guide</code> prints it, and <code>make agent-docs</code> builds <code>llms.txt</code>, the website's
-<code>/agents</code> page, the <code>reliaburger</code> skill, the Claude Code plugin and part of
-the repository's <code>AGENTS.md</code> from it, so they can't disagree. It grows through
+<code>/agents</code> page, the <code>reliaburger</code> skill and the website's index of it, the
+Claude Code plugin, <code>relish mcp</code>'s MCP Registry entry and part of the
+repository's <code>AGENTS.md</code> from it, so they can't disagree. It grows through
 0.2.7 as the commands arrive. It ends with the playbook an agent follows to
 set a cluster up for you, which is where <code>reliaburger.com/agents</code> sends one.</p>
 <h2>In brief</h2>
@@ -634,7 +635,15 @@ An agent with a shell and no skills needs one line in its instructions: run
 <p>For agents on the web, <a href="https://reliaburger.com/llms.txt"><code>reliaburger.com/llms.txt</code></a>
 indexes the manual in the <a href="https://llmstxt.org/">llms.txt</a> format, and
 <a href="https://reliaburger.com/agents"><code>reliaburger.com/agents</code></a> is this chapter
-(<a href="https://reliaburger.com/agents.md">as Markdown</a>).</p>
+(<a href="https://reliaburger.com/agents.md">as Markdown</a>). Every other page on the
+site has a Markdown copy beside it too, at the same path ending in <code>.md</code>
+(<code>/index.md</code>, <code>/compare/nomad.md</code>). Each page names its copy in a <code>&lt;link rel="alternate" type="text/markdown"&gt;</code>, and <code>llms.txt</code> lists them all.</p>
+<p>An installer that discovers skills from a website finds this one at
+<a href="https://reliaburger.com/.well-known/agent-skills/index.json"><code>reliaburger.com/.well-known/agent-skills/index.json</code></a>,
+in the format of Cloudflare's
+<a href="https://github.com/cloudflare/agent-skills-discovery-rfc">Agent Skills Discovery RFC</a>.
+It points at a copy of the skill with the SHA-256 of its bytes, so the
+installer can check what it downloaded.</p>
 <p>Clients with no shell, such as HolmesGPT or a desktop app, need an MCP
 server: <code>relish mcp</code>, below. <code>relish agent setup</code> adds it to the agents on
 your machine for you.</p>
@@ -681,6 +690,13 @@ so it must never also be able to change anything or send anything out.</p>
 </code></pre>
 <p><code>--namespace</code> narrows what the agent asks for. It isn't a permission: a
 token scoped to the namespace is.</p>
+<p>The repository's <a href="https://github.com/reliaburger/reliaburger/blob/main/server.json"><code>server.json</code></a>
+describes <code>relish mcp</code> for the <a href="https://registry.modelcontextprotocol.io">MCP Registry</a>,
+as <code>io.github.reliaburger/relish</code>: stdio, read-only and the tools above. It
+lists no package to install from, because the registry installs from npm,
+PyPI, NuGet, crates.io, container registries and MCPB bundles, and <code>relish</code>
+comes from <code>install.sh</code>. Install <code>relish</code> first, then point your client at
+<code>relish mcp</code>.</p>
 <h2>Wiring up your agent</h2>
 <p><code>relish agent setup</code> adds Reliaburger to the AI agents on your machine:
 Claude Code, Codex, Cursor, VS Code, Goose and Gemini CLI. For each one it

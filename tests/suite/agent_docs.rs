@@ -4,8 +4,9 @@
 //! `docs/manual/16_working-with-an-ai-agent.md` is the one source.
 //! `reliaburger::relish::agent::guide::generate` makes `llms.txt`, the
 //! website's `/agents` page (HTML and Markdown), the `reliaburger` skill, the
-//! Claude Code plugin and marketplace, and the generated block of
-//! `AGENTS.md` from it, and writes the chapter's own command table from the
+//! Claude Code plugin and marketplace, the website's skills index and copy of
+//! the skill, `relish mcp`'s MCP Registry entry (`server.json`), and the
+//! generated block of `AGENTS.md` from it, and writes the chapter's own command table from the
 //! clap definition of `relish agent`. This test fails when any file on disk
 //! differs from what generation makes, which is how a chapter edit or a new
 //! `relish agent` command that skipped `make agent-docs` gets caught. With
@@ -49,6 +50,7 @@ fn generated() -> Vec<guide::Artefact> {
         agents_md: &agents_md,
         manual: &manual,
         version: env!("CARGO_PKG_VERSION"),
+        site: &super::website_markdown::site_pages(),
     };
     guide::generate(&inputs, &guide::agent_command()).unwrap_or_else(|e| panic!("{e}"))
 }
@@ -136,4 +138,58 @@ fn the_marketplace_points_at_the_plugin_and_the_plugin_at_this_version() {
             .is_file()
     );
     assert_eq!(plugin["version"], env!("CARGO_PKG_VERSION"));
+}
+
+/// `server.json` passes the MCP Registry's own schema, vendored in
+/// `tests/fixtures/mcp-registry/` from the `$schema` URL it names, so the
+/// check needs no network.
+#[test]
+fn the_registry_entry_passes_the_registry_schema() {
+    let schema: serde_json::Value =
+        serde_json::from_str(&read("tests/fixtures/mcp-registry/server.schema.json")).unwrap();
+    assert_eq!(schema["$id"], guide::MCP_SERVER_SCHEMA);
+    let entry: serde_json::Value = serde_json::from_str(&read(guide::paths::MCP_SERVER)).unwrap();
+    assert_eq!(entry["$schema"], guide::MCP_SERVER_SCHEMA);
+    let validator = jsonschema::options()
+        .should_validate_formats(true)
+        .build(&schema)
+        .unwrap();
+    let errors: Vec<String> = validator
+        .iter_errors(&entry)
+        .map(|error| format!("{}: {error}", error.instance_path()))
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(entry["version"], env!("CARGO_PKG_VERSION"));
+}
+
+/// The vendored schema is byte for byte the one its README records, so
+/// replacing it is a deliberate re-vendoring that updates the README too.
+#[test]
+fn the_vendored_registry_schema_is_the_recorded_one() {
+    use sha2::{Digest, Sha256};
+    let bytes =
+        std::fs::read(repository().join("tests/fixtures/mcp-registry/server.schema.json")).unwrap();
+    let digest = hex::encode(Sha256::digest(&bytes));
+    let readme = read("tests/fixtures/mcp-registry/README.md");
+    assert!(
+        readme.contains(&digest),
+        "README.md doesn't record {digest}"
+    );
+}
+
+/// GitHub Pages publishes `docs/website` as `upload-pages-artifact` packs it.
+/// Version 3 packs dot-directories; version 4 leaves them out unless told
+/// to, which would drop `/.well-known/agent-skills/` without an error.
+#[test]
+fn the_pages_workflow_publishes_the_well_known_directory() {
+    let workflow = read(".github/workflows/static.yml");
+    let upload = workflow
+        .lines()
+        .find(|line| line.contains("actions/upload-pages-artifact@"))
+        .expect("static.yml uploads a Pages artefact");
+    assert!(
+        upload.trim().ends_with("@v3") || workflow.contains("include-hidden-files: true"),
+        "{upload}: later versions skip .well-known unless include-hidden-files is true"
+    );
+    assert!(guide::paths::SKILL_INDEX.starts_with("docs/website/.well-known/"));
 }

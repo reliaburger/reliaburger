@@ -236,6 +236,32 @@ published, it fails with a message saying so. The generated installer itself
 lives in the GitHub release, with native CLI checksums supplied by release
 packaging.
 
+### Markdown copies, the skills index and `llms.txt`
+
+Every page has a Markdown copy beside it, at its path with `.md` for `.html`
+(`index.md`, `compare/nomad.md`, `feedback/index.md`), and names it in its
+`<head>` with `<link rel="alternate" type="text/markdown" href="….md">`. Don't
+edit a copy: `make agent-docs` writes them from the pages
+(`tests/suite/website_markdown.rs`). It keeps each page's `<main>`, drops
+scripts, SVG, buttons, navigation, `aria-hidden` elements and the `#`
+permalinks, makes every link absolute against `https://reliaburger.com/`, and
+converts the rest with htmd. `make ci` fails while a copy differs from its
+page, while a page lacks its `alternate` link or copy, and while a copy
+outlives its page. So after changing a page, or adding one, run `make
+agent-docs` and commit the copy with it. `agents.html` and `agents.md` are
+the exception: both come straight from the manual's agent chapter.
+
+`llms.txt`, also generated, lists every copy under "Website".
+`.well-known/agent-skills/index.json` is the skills discovery index
+([Agent Skills Discovery RFC](https://github.com/cloudflare/agent-skills-discovery-rfc)
+0.2.0), pointing at the copy of the `reliaburger` skill beside it with the
+SHA-256 of its bytes; `make agent-docs` rewrites both when the chapter
+changes. The Pages workflow publishes `.well-known` because
+`upload-pages-artifact@v3` packs dot-directories; v4 needs
+`include-hidden-files: true`, and `tests/suite/agent_docs.rs` checks for one or
+the other. The workflow stamps the released minor version into
+`feedback/index.md` as it does into the page.
+
 ### Comparison pages
 
 `compare/index.html` links six practical comparisons; `compare/methodology.html`
@@ -243,8 +269,8 @@ explains the evidence and version boundaries. Public pages foreground Reliaburge
 strengths and honest trade-offs. Adaptation recommendations belong in the separate
 [Markdown research writeup](../research/2026-10-15-competitor-review.md).
 Each public page is hand-maintained static HTML,
-using `style.css` and the small `comparisons.css` extension. There is no generated
-copy or build dependency. The homepage links them under the stable `compare` id.
+using `style.css` and the small `comparisons.css` extension, with no build
+dependency; only its Markdown copy is generated (above). The homepage links them under the stable `compare` id.
 
 Keep evidence adjacent to factual claims. Pin source-code links to the inspected
 commit or tag; date moving documentation. Distinguish the public installer release,

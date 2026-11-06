@@ -16,8 +16,9 @@ commands built for it.
 
 This chapter is also where every agent-facing file comes from. `relish agent
 guide` prints it, and `make agent-docs` builds `llms.txt`, the website's
-`/agents` page, the `reliaburger` skill, the Claude Code plugin and part of
-the repository's `AGENTS.md` from it, so they can't disagree. It grows through
+`/agents` page, the `reliaburger` skill and the website's index of it, the
+Claude Code plugin, `relish mcp`'s MCP Registry entry and part of the
+repository's `AGENTS.md` from it, so they can't disagree. It grows through
 0.2.7 as the commands arrive. It ends with the playbook an agent follows to
 set a cluster up for you, which is where `reliaburger.com/agents` sends one.
 
@@ -812,7 +813,17 @@ An agent with a shell and no skills needs one line in its instructions: run
 For agents on the web, [`reliaburger.com/llms.txt`](https://reliaburger.com/llms.txt)
 indexes the manual in the [llms.txt](https://llmstxt.org/) format, and
 [`reliaburger.com/agents`](https://reliaburger.com/agents) is this chapter
-([as Markdown](https://reliaburger.com/agents.md)).
+([as Markdown](https://reliaburger.com/agents.md)). Every other page on the
+site has a Markdown copy beside it too, at the same path ending in `.md`
+(`/index.md`, `/compare/nomad.md`). Each page names its copy in a `<link
+rel="alternate" type="text/markdown">`, and `llms.txt` lists them all.
+
+An installer that discovers skills from a website finds this one at
+[`reliaburger.com/.well-known/agent-skills/index.json`](https://reliaburger.com/.well-known/agent-skills/index.json),
+in the format of Cloudflare's
+[Agent Skills Discovery RFC](https://github.com/cloudflare/agent-skills-discovery-rfc).
+It points at a copy of the skill with the SHA-256 of its bytes, so the
+installer can check what it downloaded.
 
 Clients with no shell, such as HolmesGPT or a desktop app, need an MCP
 server: `relish mcp`, below. `relish agent setup` adds it to the agents on
@@ -876,6 +887,14 @@ relish mcp --toolsets source,manual --no-logs
 
 `--namespace` narrows what the agent asks for. It isn't a permission: a
 token scoped to the namespace is.
+
+The repository's [`server.json`](https://github.com/reliaburger/reliaburger/blob/main/server.json)
+describes `relish mcp` for the [MCP Registry](https://registry.modelcontextprotocol.io),
+as `io.github.reliaburger/relish`: stdio, read-only and the tools above. It
+lists no package to install from, because the registry installs from npm,
+PyPI, NuGet, crates.io, container registries and MCPB bundles, and `relish`
+comes from `install.sh`. Install `relish` first, then point your client at
+`relish mcp`.
 
 ## Wiring up your agent
 
