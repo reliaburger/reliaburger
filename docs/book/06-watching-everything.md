@@ -1262,7 +1262,23 @@ fresh reader returns is whole and numbered where it should be.
 `a_durable_flush_reclaims_the_ingested_capture_prefix` checks nothing is
 freed until the flush, and `a_chatty_instance_s_capture_stays_bounded_once_its_lines_are_stored`
 runs a real process that prints 8 MiB through `yes`, follows it into a store,
-flushes, and measures what's left on disk.
+flushes, and measures what the flush freed.
+
+It used to measure what was left, and on a busy Mac it failed now and then
+with 1.4 MB still allocated against a bound of 1.25 (#1537). Under load it
+failed about once in 25 runs, so we could look. The data was exactly where it
+should be: `lseek(SEEK_DATA)` found the first byte at 7 MiB and the last at
+8 MiB, so the punch had freed everything it was meant to. The extra blocks
+were there *before* the flush, past the end of the file. APFS gives a file
+that's being appended to some space ahead of its writer, and under load it
+gave up to a megabyte. `st_blocks` counts that space, the writer exiting
+didn't return it, and no punch inside the file's length can touch it. The
+product was fine; the test was counting something the reclaim doesn't own.
+So now the test makes that allocation itself, on every filesystem
+(`F_PREALLOCATE` on macOS, `fallocate` with `FALLOC_FL_KEEP_SIZE` on Linux),
+and asserts that the flush freed all but the retained tail. The old
+assertion fails every time with the preallocation in place; the new one
+passed 544 runs in a row under the same load.
 
 What we didn't do: route every app's output through Bun, which would let us
 rotate at will but put Bun in the path of every byte every app writes, and
