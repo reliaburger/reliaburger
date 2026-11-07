@@ -1746,6 +1746,7 @@ mod tests {
             releases: vec![Release {
                 version: "v0.2.0".parse().unwrap(),
                 compatibility,
+                notes: None,
                 platforms: BTreeMap::from([
                     ("linux-aarch64".to_string(), artefact("bun-linux-aarch64")),
                     ("linux-x86_64".to_string(), artefact("bun-linux-x86_64")),

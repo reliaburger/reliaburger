@@ -25,13 +25,30 @@ batch of jobs on it, breaks it and watches it heal. Five minutes is the target.
 
 0.2.6 was released on 6 November 2026, and the one-line installer fetches
 its signed binaries. You'll need a Mac with Apple silicon, or Linux with QEMU
-and KVM, plus about 8 GiB of free memory and 15 GiB of disk.
+and KVM, plus about 8 GiB of free memory and 15 GiB of disk. From 0.2.7
+(0.2.7, not in 0.2.6) you can check any release file yourself with
+`gh attestation verify` ([how](docs/releasing.md#build-provenance-attestations)).
 
 `--laptop` asks for a development cluster on this computer. Without a flag the
 installer only explains the choices, including clusters on Linux machines you
 already have (`--install-only`, then the [Linux servers guide](docs/linux-servers.md)).
 Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not
 for production.
+
+From 0.2.7 your agent can do it for you: tell it "Set up a Reliaburger cluster
+for me. Start at https://reliaburger.com/agents." The playbook there
+([working with an AI agent](docs/manual/16_working-with-an-ai-agent.md#setting-up-a-cluster-for-your-human))
+has it ask where the cluster should run and create nothing that costs money
+without your yes.
+
+Already have `relish` 0.2.7 and an agent you use (0.2.7, not in 0.2.6)? Add
+`relish mcp`, its read-only MCP server, with
+[Add to Cursor](https://cursor.com/en/install-mcp?name=reliaburger&config=eyJhcmdzIjpbIm1jcCJdLCJjb21tYW5kIjoicmVsaXNoIn0%3D) or
+[Add to VS Code](https://insiders.vscode.dev/redirect?url=vscode%3Amcp%2Finstall%3F%257B%2522args%2522%253A%255B%2522mcp%2522%255D%252C%2522command%2522%253A%2522relish%2522%252C%2522name%2522%253A%2522reliaburger%2522%257D);
+Goose's button is on [the agents page](https://reliaburger.com/agents#add-to-your-agent).
+In Claude Code it's `claude mcp add reliaburger -- relish mcp`, and
+`relish agent setup` wires up every agent on this machine, showing the diff
+before it writes anything.
 
 ```sh
 # Install relish and build a three-node cluster in Linux VMs on this laptop
@@ -166,14 +183,33 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 **Work with an AI agent** ([working with an AI agent](docs/manual/16_working-with-an-ai-agent.md))
 
 - `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive *(0.2.7, not in 0.2.6)*
+  - `relish agent guide`: How to use relish as an agent: the manual chapter, as Markdown sections *(0.2.7, not in 0.2.6)*
   - `relish agent version`: This binary's version, commit, target and cluster formats *(0.2.7, not in 0.2.6)*
-  - `relish agent schema [version|schema|source-version|source-tree|source-grep|source-show|source-extract]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.6)*
+  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.6)*
   - `relish agent source`: The source this binary was built from: search it, read it, extract it *(0.2.7, not in 0.2.6)*
     - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs *(0.2.7, not in 0.2.6)*
     - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count *(0.2.7, not in 0.2.6)*
     - `relish agent source grep <PATTERN>`: Search the source with a regular expression, line by line *(0.2.7, not in 0.2.6)*
     - `relish agent source show <TARGET>`: Print up to 400 numbered lines of one file: `path` or `path:from-to` *(0.2.7, not in 0.2.6)*
     - `relish agent source extract <DIR>`: Write the source into a new or empty directory, as a git repository when git is installed *(0.2.7, not in 0.2.6)*
+  - `relish agent logs <APP>`: An app's recent log lines, newest kept, each wrapped as untrusted *(0.2.7, not in 0.2.6)*
+  - `relish agent manual`: The manual compiled into this binary: search it, show a section *(0.2.7, not in 0.2.6)*
+    - `relish agent manual search <WORDS>...`: Up to ten sections that mention every word, best first, each with a short excerpt and the `show` command that prints it *(0.2.7, not in 0.2.6)*
+    - `relish agent manual show <TARGET>`: One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b` *(0.2.7, not in 0.2.6)*
+  - `relish agent context`: The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer *(0.2.7, not in 0.2.6)*
+  - `relish agent diagnose`: Every finding with its evidence, read-only next steps, and pointers into the manual and the source *(0.2.7, not in 0.2.6)*
+  - `relish agent explain [ID]`: What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary *(0.2.7, not in 0.2.6)*
+  - `relish agent upgrade-check`: Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown` *(0.2.7, not in 0.2.6)*
+  - `relish agent report --title <TITLE> --what-happened <WHAT_HAPPENED> --expected <EXPECTED> --not-tested <NOT_TESTED> --caught-by <CAUGHT_BY> --out <OUT>`: Draft a redacted bug report for a human to post. Never posts *(0.2.7, not in 0.2.6)*
+  - `relish agent patch`: Build, test and try a fix on a throwaway cluster *(0.2.7, not in 0.2.6)*
+    - `relish agent patch init <DIR>`: Extract this binary's source into a new workspace, on a `patch` branch *(0.2.7, not in 0.2.6)*
+    - `relish agent patch build <DIR>`: Build the workspace: `relish` for this machine, `bun` and a Linux `relish` for the nodes (in the build VM on macOS). Both by default *(0.2.7, not in 0.2.6)*
+    - `relish agent patch test <DIR> [FILTER]`: Run the portable test suite in the workspace, optionally filtered *(0.2.7, not in 0.2.6)*
+    - `relish agent patch try <DIR>`: Boot a throwaway cluster from the workspace's binaries, with its own `RELIABURGER_HOME` *(0.2.7, not in 0.2.6)*
+    - `relish agent patch diff <DIR>`: The change against the extracted source, and the tests that ran *(0.2.7, not in 0.2.6)*
+    - `relish agent patch destroy [DIR]`: Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay *(0.2.7, not in 0.2.6)*
+  - `relish agent setup [claude-code|codex|cursor|vscode|goose|gemini]...`: Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes *(0.2.7, not in 0.2.6)*
+- `relish mcp`: Serve the `relish agent` commands as read-only MCP tools over stdio *(0.2.7, not in 0.2.6)*
 
 **Break things on purpose** ([chaos](docs/manual/05_chaos.md))
 
@@ -423,8 +459,10 @@ cover the logic. On top of them sit crash-recovery suites that kill the agent at
 awkward moment, multi-node failover and council-loss tests, power-cut fixtures
 that pull the plug on a VM mid-write, a live-cluster test runner you can point
 at your own cluster (`relish test`), and a soak that installs the signed
-release the way you would and then breaks it for hours. CI never retries a
-failure. See [how Reliaburger is tested](docs/testing.md).
+release the way you would and then breaks it for hours. An agent gym breaks
+throwaway clusters in ways it knows and scores whatever diagnoses them, an AI
+agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`). CI
+never retries a failure. See [how Reliaburger is tested](docs/testing.md).
 
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
 TUI; `relish dashboard` opens the web UI through your authenticated CLI session.

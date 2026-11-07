@@ -1021,6 +1021,25 @@ with `git show` into a variable and matches it with `case`, not `git show | grep
 `set -o pipefail`, `grep -q` exits at its first match, `git show` can die of `SIGPIPE`
 writing the rest, and the pipeline then reports failure for a file that matched.
 
+Three weeks later we undid the split. By November the macOS queue was worse, not better:
+over three days, 147 macOS jobs queued a median of 6.9 minutes, but 90 at p90. The job logs
+said why. Shard 3 of one run spent 30 minutes compiling and 3.1 testing; on `main`, with a
+full cache match, the same shard compiled for 17 minutes and tested for 2.9. Three shards
+compile the identical suite three times, so a full run took three of the five runners for
+about 120 job-minutes to do about 9 minutes of testing. One full run plus `build.yml`'s macOS
+build took four of the five, and the next full run waited.
+
+So portable macOS is one job again
+([faster-feedback plan, F1](https://github.com/reliaburger/reliaburger/pull/1614), maintainer
+decision of 6 November 2026): one compile, the lint, the whole suite and the doctests, about
+30 to 50 minutes in one runner. On an idle queue that's about six minutes slower than the
+slowest shard was. On the queue we actually have, four full runs fit beside the macOS build instead of one,
+and a full run uses about 60% fewer macOS minutes. The evidence machinery stayed put.
+`SHARDS` now says 1, the job runs `--partition hash:1/1`, which nextest treats as the whole
+suite, and the gate's merge checks one list the way it checked three: every listed test ran,
+and the required cases are all there. The lesson? Parallel jobs only help when they split the
+expensive part. Ours was the compile, and every shard paid for it in full.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took
@@ -3389,6 +3408,18 @@ last 15 minutes. When that pattern fires, the engine looks for a deploy of the
 same application and namespace in the preceding 30 minutes, then attaches the
 first recent error log. One finding now answers three questions: what failed,
 what changed, and what did the process say?
+
+That rule is only as good as the events behind it, and in 0.2.7 the agent gym
+(#1086) caught us short. An app that exited five seconds after each start
+reached `restart_count` 5 with only two `restart` events, so `wtf` called it
+`under-replicated`. An exited app has two ways into a restart. An exit the state
+sweep sees goes through `observe_app_exit`, which restarted the instance at
+once if its backoff was over and recorded nothing. An exit inside the backoff
+waits for `retry_restart`, which recorded the event. Only the slow path wrote
+history. The fix is to have one door: `observe_app_exit` now calls
+`retry_restart` too, so whichever tick moves the instance back to Pending
+records the event, exactly once, and an exhausted budget fails the instance
+with the same `exhausted its restart budget` event either way (#1652).
 
 The same rule keeps the other checks honest. Disk pressure needs used capacity
 with a node and storage-domain attribution. CPU throttling needs an increase in
@@ -7007,18 +7038,375 @@ can fail, a panic on the blocking thread, by measuring nothing and so
 pruning nothing.
 
 How do you test "doesn't block the runtime" without timing it? On a
-single-threaded runtime (`#[tokio::test(flavor = "current_thread")]`), work
-done inline can't be interrupted: it all happens inside the first poll of
-the future. `relief_does_its_filesystem_work_off_the_runtime` polls
-`check_and_relieve` once with `futures_util::poll!` over a directory of
-500 files and asserts the poll comes back `Pending`, which can only happen
-if the work is waiting on another thread. Before the fix it came back
-`Ready`, every file already deleted. No clock, so no flake.
+single-threaded runtime, work done inline can't be interrupted: it all
+happens inside the first poll of the future. So poll it once with
+`futures_util::poll!` and check what comes back. Our first version of
+the test stopped there, on a plain
+`#[tokio::test(flavor = "current_thread")]`, and asserted `Pending`. Before
+the fix the poll came back `Ready`, every file already deleted, and we
+wrote "no clock, so no flake".
+
+That was wrong, and CI said so a few weeks later (#1674). `spawn_blocking`
+hands the closure to another thread at once. The future then polls the
+`JoinHandle` in the same first poll, and if the blocking thread has
+already finished, which is easy when the work is one `create_dir_all`
+on a fast Linux runner, the handle is `Ready` and so is the whole future.
+There was no clock in the test, but there were two threads, and the
+assertion depended on which of them got there first.
+
+The fix is to take the race away. `off_runtime::assert_runs_on_blocking_pool`
+builds its own single-threaded runtime with `max_blocking_threads(1)`,
+which `#[tokio::test]` can't do, and fills that one thread with a closure
+waiting on a channel the test holds. Then it polls the future under test:
+
+```rust
+let occupant = tokio::task::spawn_blocking(move || {
+    holding_tx.send(()).unwrap();
+    let _ = release_rx.recv();
+});
+holding_rx.await.unwrap();
+
+let mut work = std::pin::pin!(work);
+let first = futures_util::poll!(work.as_mut());
+assert!(first.is_pending(), "the work finished inside one poll, on the runtime thread");
+
+release_tx.send(()).unwrap();
+occupant.await.unwrap();
+work.await
+```
+
+Work sent to the pool queues behind the occupant and can't start, so
+the first poll is `Pending` every time. Work done inline doesn't need the
+pool and finishes inside that poll, so it's `Ready` every time, and the
+helper's own `work_done_inline_fails` test checks that it panics. Only
+then does the test release the occupant and let the work finish. The
+`holding_rx.await` makes sure the occupant really has the thread before
+the poll. `std::pin::pin!` pins the future on the stack, which
+`poll!` needs: a future may hold references into itself, so it mustn't
+move once polled. The relief test now reads
+`assert_runs_on_blocking_pool(check_and_relieve(...))`. A future does
+nothing until it's polled, so building it outside the runtime is fine.
 
 A test can't show the late timer itself: making a worker block on purpose
 on a test runtime proves only that tokio behaves like tokio. What we have
 is the evidence above, a turn that ended in the second the prune ran, on a
 node whose other compaction turns all handed off at 500 ms.
+
+The same five-minute tick had two more calls like it. After relief, it
+pruned expired cluster rollups with `RollupStore::prune_expired`, which
+opens every rollup Parquet file to read its newest timestamp from the
+footer, and then measured the Raft log's filesystem with `statvfs` through
+`FilesystemUsage::of`. An hourly metrics-retention task next to it did the
+same footer scan through `MayoStore::prune`. All three ran on a runtime
+worker, and the two prunes did it while holding the store's read guard,
+so every writer waiting for that guard waited for the disk too.
+
+The prunes are `async fn`s now, and their scan, moved into a plain
+`prune_directory` function, runs on a blocking thread. The disk-pressure
+tick calls `FilesystemUsage::measure`, an async twin of `of`:
+
+```rust
+pub async fn measure(path: &Path) -> std::io::Result<Self> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || Self::of(&path))
+        .await
+        .map_err(std::io::Error::other)?
+}
+```
+
+There are two `?`-shaped failures stacked here. `spawn_blocking` returns a
+`JoinHandle<io::Result<Self>>`, and awaiting it gives a
+`Result<io::Result<Self>, JoinError>`: the outer error says the thread
+panicked, the inner one says `statvfs` failed. `map_err` turns the first
+into an `io::Error` and `?` returns it; what's left is the inner result,
+which the function returns as it is.
+
+`MayoStore::prune` needed one more thought. It skips the file a flush is
+still writing, and it learnt which one from `self.pending`. The blocking
+thread can't borrow `self`, so the prune copies that path out first and
+hands the closure owned copies. That's safe because `prune` takes `&self`
+and `flush` takes `&mut self`: while the caller's read guard keeps the
+shared borrow alive, no flush can start. The borrow checker enforces that
+for us, across the `.await`. Each of the three has a test in the style of
+the relief one (`expiry_reads_the_files_off_the_runtime`,
+`prune_reads_the_files_off_the_runtime`, `usage_is_measured_off_the_runtime`):
+one poll with the blocking pool held busy, which must come back
+`Pending`.
+
+Having found three, we went looking for the rest: every `std::fs`,
+`std::process::Command`, sysinfo refresh and big copy reachable from an
+async task in Bun, ranked by how close it runs to the agent loop. Two
+classes stood out. The worst ran on the loop's own task. Storing a freshly
+signed workload identity prepared its directory (on rootful Linux that
+reads `/proc/self/mounts` and may fork `mount -t tmpfs` and wait for it),
+then wrote six files with an fsync for each and for its directory, all in
+an identity-signing turn. Preparing an instance's identity directory before
+its container is created did the first half in a deploy turn. Both go
+through `sesame::identity::install_identity` and
+`prepare_identity_dir_off_runtime` now, which do the same work in a
+`spawn_blocking` closure. `install_identity` takes the owner lookup as a
+plain function pointer, `fn(&Path) -> Option<(u32, u32)>`, because it has
+to run after the directory exists, on the blocking thread, and a function
+pointer is `Send` and `'static` for free; a closure capturing the agent
+wouldn't be.
+
+The loop still waits for both: a container can't start before its
+identity directory exists. What changed is who's stuck while it waits.
+Before, the loop's worker thread sat in the system calls, so the timers
+and tasks queued on that worker waited too. Now the loop's task is parked
+on a `JoinHandle` and the worker goes on with everyone else. The loop rule
+test from earlier in this chapter noticed the two new awaits at once, and
+each now carries a `// LOOP-INLINE:` comment saying why it may wait.
+
+The other ran on a shared worker every collection tick: the metrics
+collector's sysinfo refresh reads several `/proc/<pid>` files for every
+process on the host, and a node running thousands of host jobs has
+thousands of processes. `SystemCollector::refreshed` moves the collector
+onto a blocking thread and hands it back:
+
+```rust
+pub async fn refreshed(mut self) -> Result<Self, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        self.refresh();
+        self
+    })
+    .await
+}
+```
+
+`refresh` needs `&mut self`, and you can't send a borrow to another thread
+that might outlive it. So the method takes `self` by value, the closure
+owns the collector while it refreshes, and returns it. The collection
+loop writes `collector = match collector.refreshed().await { ... }`, which
+reads like a reassignment because it is one: ownership goes out and comes
+back. The `Err` arm is a panic inside sysinfo, which took the collector
+with it, so the loop builds a new one. In Go
+you'd pass a pointer and trust nobody touches it meanwhile; here the
+compiler won't let anybody.
+
+The top of the rest of the list was a fault. `relish fault memory web 80`
+squeezes a workload's `memory.high` down toward its hard limit, and the
+kernel doesn't take that as a request for later: it reclaims the
+workload's memory down to the new limit before the `write` returns. A
+workload with a gigabyte of page cache to give back keeps the writer
+waiting while it does, and the writer was the agent loop, inside the turn
+that handled the fault command. CPU and disk faults wrote `cpu.max` and
+`io.max` the same way. Those writes are quick, but they were still
+`std::fs` calls on the loop.
+
+Kill, pause and resume faults had already been through this (#351): the
+loop picks the targets, a task does the slow part, and the result comes
+back as a follow-up, the same shape the upgrade download and the firewall's
+`nft` call use. The cgroup faults now take the same route.
+`resource_faults::CgroupFault` says which of the three a fault is, with
+its numbers, and knows how to write itself into one cgroup, how to undo
+that, and what the registry keeps for the undo. The loop works out the
+targets' cgroup paths, which it can do from its own maps, and
+`spawn_cgroup_fault` hands the writes to a task:
+
+```rust
+self.follow_ups.spawn(async move {
+    let result = fault.write(targets).await;
+    FollowUp::CgroupFaultWritten(CgroupFaultWritten {
+        rule_id,
+        fault,
+        result,
+        response,
+    })
+});
+```
+
+`fault.write` runs the writes in `spawn_blocking`, and if the third of
+four targets fails it rolls back the first two before it reports, as the
+inline version did. The `async move` block takes ownership of `fault`,
+`targets` and the caller's `response` channel. It has to: the task may run
+long after the turn that spawned it has finished and dropped its locals.
+When the result comes back, `finish_cgroup_fault` either records the saved
+values and tells the caller the fault is in, or tells the caller why it
+isn't. There's a third case, and it's the one that's easy to miss: the
+fault was cleared, or expired, while its writes were in flight. Then
+there's nothing in the registry for a clear to undo later, so the loop
+puts each saved value straight back. Raising a limit doesn't make the
+kernel reclaim anything, which is also why a clear's own restores stay
+where they were, in the clearing turn.
+
+The test is the one-poll test again. `cgroup_writes_run_off_the_runtime`
+points `write_cgroups` at three fake cgroup directories and hands it to
+`assert_runs_on_blocking_pool`. A
+`tmpfs` file doesn't reclaim anything, so the test can't show a slow
+write, only where it runs. That's the property we want.
+
+Next came host paths. A volume `source` on the node goes through
+`HostPathPolicy::approve_app`, which resolves symlinks with
+`std::fs::canonicalize` so that a link swapped after the check can't
+redirect the mount (#797). It ran in deploy turns, once when an app was
+admitted and once more for each container just before its OCI spec was
+built. On a local disk that's a few `lstat` calls. A source on NFS or
+autofs can take seconds to answer the first one. `approve_app_off_runtime`
+does the same check on a blocking thread:
+
+```rust
+pub async fn approve_app_off_runtime<'a>(
+    &self,
+    spec: &'a AppSpec,
+) -> Result<Cow<'a, AppSpec>, HostPathRefusal> {
+    if spec.host_path_sources().next().is_none() {
+        return Ok(Cow::Borrowed(spec));
+    }
+    let policy = self.clone();
+    let spec = spec.clone();
+    let approved = tokio::task::spawn_blocking(move || {
+        policy.approve_app(&spec).map(Cow::into_owned)
+    })
+    .await
+    .map_err(|error| HostPathRefusal::CheckFailed {
+        reason: error.to_string(),
+    })??;
+    Ok(Cow::Owned(approved))
+}
+```
+
+`Cow` ("clone on write") is an enum of a borrowed value or an owned one.
+`approve_app` already returned one: an app with no host paths comes back
+`Cow::Borrowed`, the caller's own spec with no copy made, and an app with
+some comes back `Cow::Owned`, a copy with the resolved paths in it. The
+async version keeps the borrowed case on the caller's thread, because
+there's nothing to resolve, and most apps have no host paths at all. For
+the rest, the blocking thread can't borrow the caller's spec, so it gets
+its own copy, and `Cow::into_owned` turns the result into a plain
+`AppSpec` to send back. The `'a` lifetime says the borrowed case lives as
+long as the caller's `spec`, and the compiler checks every return path
+against it. The double `??` is the two-layer `Result` from earlier: the
+first `?` returns a panicked thread as `CheckFailed`, the second returns
+the policy's own refusal.
+
+`approving_host_paths_resolves_them_off_the_runtime` goes through
+`assert_runs_on_blocking_pool` too, and `an_app_without_host_paths_is_approved_in_one_poll`
+expects the opposite: `Ready`, still borrowed. The deploy still waits for
+the answer, because a container can't be built before its mounts are
+approved, so the two awaits in `launch.rs` carry `// LOOP-INLINE:` tags.
+As with the identity directory, what changed is who's stuck while it waits.
+
+The rest of the list is longer and less likely to bite: log and metrics
+queries and flushes copy up to a million buffered rows under their store's
+lock, and the log export hashes every archive file on the worker. They're
+in the pull requests for this section, with a line each.
+
+#### The lock that went to the back of the queue
+
+The 24-hour memory run of the published 0.2.6 (#1417) logged a different
+slow turn on the morning of 6 November:
+
+```
+08:27:24 bun: agent loop turn took 1805 ms in follow_up (consumer_sync/journal): journal write 225 ms, kernel lock wait 1579 ms, view install 1579 ms, firewall sync 0 ms
+```
+
+This is the line #890 built the meter for, and it points at one thing:
+the view install spent its whole time waiting for the eBPF handle's lock.
+So who held it? Outside the agent loop, three kinds of task take it. Job
+tasks do, through `TaskNamespacePolicy`, to bind a task's cgroup to its
+namespace, check the binding is still there, record its run identity and
+lift it all again on retirement. Path traces do, to read the live maps.
+And every one of them holds it for a map read or write or two, a few
+system calls, with no `.await` and no file I/O inside. The only holders
+that do more, the egress allowlist writes that scan every entry of four
+maps, run only for jobs with an `egress` allowlist, and the soak has none.
+
+Nobody held the lock for 1.6 seconds. What took the time was the queue.
+Job tasks take the lock thousands of times a second on a busy node, and
+tokio's `Mutex` is fair: waiters get it in the order they asked, and on
+release the lock passes straight to the next waiter, which keeps it until
+the scheduler gets round to polling that task. On a loaded host, the same
+one whose discovery journal writes took up to 1.4 s that hour, each of
+those hand-offs takes a while. And `install_view` took the lock once per
+service:
+
+```rust
+for entry in services {
+    self.publish_backend_kernel(&ServiceId::new(&entry.namespace, &entry.app_name), &map)
+        .await?;
+}
+```
+
+Each call locked, wrote one entry and unlocked, then went to the back of
+the queue for the next service. The soak's view has about a dozen
+services, so the install queued about a dozen times. In Go you'd see the
+same with a `sync.Mutex` in starvation mode, which also hands off in
+order; a C `pthread_mutex` usually lets the releasing thread grab the lock
+straight back, which is fast and unfair.
+
+`publish_backends_kernel` (#1622) now takes the lock once for all of a view's
+services and writes every entry under that one guard, stopping at the
+first write that fails, as the loop did. `publish_backend_kernel`, for one
+service, calls it with `std::slice::from_ref(id)`, which views a single
+`&T` as a one-element `&[T]` without copying. How do we test the number
+of holds on a Mac, with no eBPF? The same way the withdrawal tests do:
+without the data path, the agent records the services each hold would
+have written in a thread-local, and
+`a_view_install_takes_the_kernel_lock_once_for_all_its_services` publishes
+a view of 20 services and expects exactly one hold of 20. Before the fix
+it saw twenty holds of one.
+
+That doesn't make the queue shorter. A job-heavy node still sends every
+task through the same lock a few times, and the reusable executors' policy
+check, every 100 ms per running command, adds to it. Splitting the kernel
+handle so job tasks stop sharing a lock with the agent loop is a bigger
+change, and we'd want a soak's numbers before making it. What the fix does
+is make a view install pay for the queue once, not once per service.
+
+The firewall sync already took the lock once. Its problem was what it did
+with it. Every sync rebuilt the three maps that namespace isolation reads
+(which namespace each cgroup is in, which cross-namespace grants exist,
+and who owns each real destination address) and wrote every entry,
+changed or not, one `bpf` system call each, before deleting the departed
+ones. On a job-heavy node the sync runs on most ticks, because every task
+that starts or ends changes the delegated network, and almost every entry
+it writes is the one already there. All that time, every job task waiting
+for the lock waits for the sync.
+
+So the reconcile now remembers what it wrote. `WrittenValues` holds the
+value of each write that succeeded, and `write_changed` skips an entry
+whose value matches:
+
+```rust
+for (key, value) in desired {
+    keys.insert(key);
+    if written.values.get(&key) == Some(&value) {
+        continue;
+    }
+    written.forget(&key);
+    write(key, value)?;
+    if remember(&value) {
+        written.values.insert(key, value);
+    }
+}
+```
+
+The order matters. The key goes into `keys`, the set of keys this node may
+own, before the write is tried, so a failed system call never makes Bun
+forget a key it might have written. The old value is forgotten before the
+write too: if the write fails, nobody knows what the kernel holds, and the
+next pass must write it again rather than skip it. `write` is an
+`impl FnMut(K, V) -> Result<(), E>`, a closure that may change what it
+captures, which here is the `&mut aya::Ebpf` handle. That's how the same
+function runs against the kernel in production and against a counter in
+the tests: `a_reconcile_writes_only_the_entries_that_changed` reconciles
+200 grants, then the same 200 again and expects no writes at all, then a
+view with one grant changed, one gone and one new, and expects two writes
+and one delete.
+
+A cache of what's in the kernel is only as good as its idea of who else
+writes there. The agent itself does, outside the reconcile: an egress
+binding writes its source's namespace and grants, retiring one deletes
+them, and withdrawing a service deletes every grant to it. Each of those
+now forgets the keys it touched, so a service that's withdrawn and comes
+back with the same grants gets them written again. Job tasks write their
+own task addresses into the destination map, and two owners claiming one
+address produce a "contested" entry that the connect hook refuses. A task
+can write its own value over that, so `remember` is `uncontested` for the
+destination map: a contested entry is written on every pass, as before.
+And the minute-by-minute kernel sweep clears the whole cache before its
+reconcile, so anything we didn't think of comes back within a sweep.
 
 #### A 503 is an answer, not a verdict
 
@@ -8495,6 +8883,22 @@ The fake can't be Bun, so every tunnel to a node's API closes, and that's
 where the tests stop. Readiness, the council and the demo need a real cluster,
 which `scripts/release/qualify-ssh-setup.sh` builds on VMs.
 
+Or that's where they're meant to stop. Once, on a busy laptop, the
+step-by-step test that takes under a second sat for a full minute until
+nextest killed it (#1608). `Ssh::tunnel` decides the forward is up when a
+connection to its local port succeeds, and it checks that while `ssh` is still
+logging in. Anything else answering on that port passes the check. The test
+picked its ports with `bind(0)`, which hands out a port from the ephemeral
+range, exactly where the next outgoing connections on the host land, and
+another process's listener there, or a connection that the kernel happened to
+give that same source port (TCP's "simultaneous open" then connects a socket to
+itself), answered for node 2. Setup took the stranger for Bun and waited out
+its 60-second readiness deadline. A real operator can hit the same thing with
+an old tunnel still holding the port. So now `tunnel` refuses a port something
+already answers on before it starts `ssh`, a connection to itself doesn't
+count, and the test takes its ports from below every ephemeral range, with a
+30-second limit per node that names the node if it ever hangs again.
+
 Setup reaches each machine's API through SSH tunnels, which close when it
 finishes. After that `relish` talks to port 9117 on the first machine directly,
 and a firewall in between used to get you `bun agent not reachable at
@@ -8517,7 +8921,9 @@ got the setup hint. An agent reading that from a shell does what it says: it
 checks whether Bun runs, finds it does, and is stuck. So `AgentUnreachable`
 grew two fields (#1567), the endpoint relish actually dialled and an
 `UnreachableCause`: `NameResolution`, `Refused`, `Tls`, `TimedOut`, or `Other`
-with the network stack's own words. Each cause's message ends with its fix, and
+with the network stack's own words. (0.2.7 splits a certificate relish doesn't
+trust out of `Tls` as `UntrustedCertificate`, so `relish agent` can report it
+as `tls_untrusted`; see chapter 19.) Each cause's message ends with its fix, and
 the setup hint now shows only for a refusal or a timeout, where a firewall is
 the likely story.
 

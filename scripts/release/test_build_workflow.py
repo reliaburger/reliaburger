@@ -174,7 +174,7 @@ class SourceCiReuseTests(unittest.TestCase):
     def test_the_candidate_is_signed_only_after_a_full_pass(self):
         candidate = job(self.text, "candidate")
         condition = " ".join(re.search(r"if: >-\n(.*?)\n    needs:", candidate, re.S).group(1).split())
-        for build in ("build-pdf", "build-binaries", "build-guest-images", "test-packaging"):
+        for build in ("build-pdf", "build-binaries", "build-guest-images", "test-packaging", "notarise-macos"):
             self.assertIn(f"needs.{build}.result == 'success'", condition)
         self.assertIn("needs.validate-release.result == 'success' || "
                       "(needs.validate-release.result == 'skipped' && needs.ci-evidence.result == 'success' "
@@ -182,7 +182,7 @@ class SourceCiReuseTests(unittest.TestCase):
         self.assertIn("github.ref == 'refs/heads/main'", condition)
         needs = re.search(r"^    needs: \[(.*)\]$", candidate, re.M).group(1).split(", ")
         self.assertEqual(set(needs), {"ci-evidence", "validate-release", "build-pdf", "build-binaries",
-                                      "build-guest-images", "test-packaging"})
+                                      "build-guest-images", "test-packaging", "notarise-macos"})
 
     def test_the_summary_says_which_ci_run_the_candidate_rests_on(self):
         record = step_named(self.text, "Record exact candidate identity and all asset digests")
@@ -286,6 +286,132 @@ class SourceBundleTests(unittest.TestCase):
         text = WORKFLOW.read_text()
         job = text.split("\n  build-binaries:\n", 1)[1].split("\n  build-profiling:\n", 1)[0]
         self.assertIn('RELIABURGER_REQUIRE_CLEAN_SOURCE: "1"', job)
+
+    def test_no_source_bundle_work_is_left_to_do(self):
+        self.assertNotIn("TODO(#1570)", WORKFLOW.read_text())
+
+    def test_each_build_reads_the_digest_from_the_relish_it_built(self):
+        # The relish itself says what it embeds; nothing recomputes it (#1694).
+        text = WORKFLOW.read_text()
+        binaries = job(text, "build-binaries")
+        record = step_named(binaries, "Record the embedded source bundle's digest")
+        self.assertIn("target/${{ matrix.target }}/release/relish agent source version --offline", record)
+        self.assertIn("python3 scripts/release/candidate.py bundle-digest", record)
+        self.assertIn("source-digest/relish-${{ matrix.suffix }}", record)
+        upload = step_named(binaries, "Upload the source bundle's digest")
+        self.assertIn("name: source-digest-${{ matrix.suffix }}", upload)
+        self.assertIn("path: source-digest/*", upload)
+        self.assertIn("if-no-files-found: error", upload)
+        # Never among the binaries: the candidate job records every file it
+        # downloads as `binaries-*` as a release asset, and notarisation
+        # replaces the macOS one wholesale.
+        self.assertFalse(fnmatch.fnmatch("source-digest-linux-x86_64", "binaries-*"))
+        order = [block.splitlines()[0].strip() for block in steps(binaries)]
+        self.assertLess(order.index("- name: Smoke test and package native binaries"),
+                        order.index("- name: Record the embedded source bundle's digest"))
+
+    def test_the_candidate_records_the_digest_every_platform_agrees_on(self):
+        text = WORKFLOW.read_text()
+        candidate = job(text, "candidate")
+        download = step_named(candidate, "Download every build's source bundle digest")
+        self.assertIn("pattern: source-digest-*", download)
+        self.assertIn("merge-multiple: true", download)
+        self.assertIn("path: source-digests", download)
+        agree = step_named(candidate, "Agree on the source bundle's digest")
+        self.assertIn("python3 scripts/release/candidate.py agreed-source-digest --directory source-digests",
+                      agree)
+        self.assertIn('echo "SOURCE_DIGEST=$digest" >> "$GITHUB_ENV"', agree)
+        record = step_named(candidate, "Record exact candidate identity and all asset digests")
+        self.assertIn('--source-digest "$SOURCE_DIGEST"', record)
+        self.assertIn("Source bundle: ", record)
+        check = step_named(candidate, "Check the candidate is still exactly what was recorded")
+        self.assertIn('--source-digest "$SOURCE_DIGEST"', check)
+        order = [block.splitlines()[0].strip() for block in steps(candidate)]
+        self.assertLess(order.index("- name: Agree on the source bundle's digest"),
+                        order.index("- name: Record exact candidate identity and all asset digests"))
+
+    def test_the_digest_files_are_named_for_every_relish_platform(self):
+        from package import PLATFORMS
+
+        suffixes = {entry["suffix"] for entry in build_matrix(WORKFLOW.read_text())}
+        self.assertTrue(set(PLATFORMS["relish"]) <= suffixes)
+
+
+class StrangerChecksTests(unittest.TestCase):
+    """Attestations and notarisation (#1583) never change what promotion publishes."""
+
+    def setUp(self):
+        self.text = WORKFLOW.read_text()
+        self.candidate = job(self.text, "candidate")
+        self.notarise = job(self.text, "notarise-macos")
+
+    def candidate_steps(self):
+        return [block.splitlines()[0].strip() for block in steps(self.candidate)]
+
+    def test_main_candidates_attest_every_asset(self):
+        attest = step_named(self.candidate, "Attest the build provenance of every asset")
+        self.assertIn("uses: actions/attest-build-provenance@", attest)
+        self.assertIn("subject-path: dist/*", attest)
+        self.assertIn("if: github.ref == 'refs/heads/main'", attest)
+        for permission in ("contents: read", "id-token: write", "attestations: write"):
+            self.assertIn(f"      {permission}\n", self.candidate)
+
+    def test_attestation_comes_after_the_record_and_before_anything_is_uploaded(self):
+        order = self.candidate_steps()
+        position = {name: index for index, name in enumerate(order)}
+        record = position["- name: Record exact candidate identity and all asset digests"]
+        attest = position["- name: Attest the build provenance of every asset"]
+        check = position["- name: Check the candidate is still exactly what was recorded"]
+        manifest = position["- name: Preserve the qualification manifest on its own"]
+        self.assertLess(record, attest)
+        self.assertLess(attest, check)
+        self.assertLess(check, manifest)
+
+    def test_the_candidate_is_checked_against_its_own_digest_after_attesting(self):
+        # The attestation lives in GitHub's store; if it ever wrote into
+        # dist, the inventory check in `candidate.py verify` would fail here
+        # instead of at staging.
+        record = step_named(self.text, "Record exact candidate identity and all asset digests")
+        self.assertIn('echo "QUALIFIED_DIGEST=$digest" >> "$GITHUB_ENV"', record)
+        check = step_named(self.candidate, "Check the candidate is still exactly what was recorded")
+        self.assertIn("python3 scripts/release/candidate.py verify --directory dist", check)
+        self.assertIn('--qualified-digest "$QUALIFIED_DIGEST"', check)
+        self.assertIn('--channel "$CHANNEL"', check)
+
+    def test_notarisation_finishes_before_the_candidate_starts(self):
+        # codesign rewrites the binary, so it has to happen before anything
+        # hashes or signs it.
+        needs = re.search(r"^    needs: \[(.*)\]$", self.candidate, re.M).group(1).split(", ")
+        self.assertIn("notarise-macos", needs)
+        self.assertIn("needs: build-binaries", self.notarise)
+        self.assertIn("runs-on: macos-15", self.notarise)
+
+    def test_notarisation_replaces_the_artefact_the_candidate_downloads(self):
+        upload = step_named(self.notarise, "Replace the macOS relish with the notarised one")
+        self.assertIn("name: binaries-macos-aarch64", upload)
+        self.assertIn("overwrite: true", upload)
+        self.assertIn("if: steps.notarise.outputs.notarised == 'true'", upload)
+        self.assertTrue(fnmatch.fnmatch("binaries-macos-aarch64", "binaries-*"))
+        self.assertIn("macos-aarch64", [entry["suffix"] for entry in build_matrix(self.text)])
+
+    def test_the_apple_secrets_reach_only_the_notarisation_step(self):
+        notarise = step_named(self.notarise, "Sign and notarise the macOS relish")
+        self.assertIn("run: scripts/release/notarise_macos.sh dist/relish-macos-aarch64", notarise)
+        for secret in ("APPLE_DEVELOPER_ID_P12", "APPLE_DEVELOPER_ID_P12_PASSWORD", "APPLE_NOTARY_KEY",
+                       "APPLE_NOTARY_KEY_ID", "APPLE_NOTARY_ISSUER_ID"):
+            self.assertEqual(self.text.count(f"secrets.{secret} }}}}"), 1, secret)
+            self.assertIn(f"{secret}: ${{{{ secrets.{secret} }}}}", notarise)
+        # Like the signing keys, they are environment secrets: only main
+        # reaches `release`.
+        self.assertIn("    environment: ${{ github.ref == 'refs/heads/main' && 'release' || 'nightly' }}\n",
+                      self.notarise)
+
+    def test_notarisation_runs_on_manual_builds_of_main_and_trains_only(self):
+        condition = " ".join(re.search(r"if: >-\n(.*?)\n    runs-on:", self.notarise, re.S).group(1).split())
+        self.assertIn("github.event_name == 'workflow_dispatch'", condition)
+        self.assertIn("(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release-'))",
+                      condition)
+        self.assertIn("needs.build-binaries.result == 'success'", condition)
 
 
 if __name__ == "__main__":

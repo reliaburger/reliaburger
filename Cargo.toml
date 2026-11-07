@@ -31,10 +31,13 @@ rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls-no-provider", "stream"] }
 webpki-root-certs = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 # JSON Schema for `relish agent schema` (#1565), derived from the same serde
 # types the commands print, so the schema can't drift from the output.
 schemars = "1"
+# `relish mcp` (#1094): the official Model Context Protocol SDK, server side
+# over stdio only. No HTTP transport feature, so there's no listener to open.
+rmcp = { version = "3.9", default-features = false, features = ["server", "transport-io"] }
 yaml_serde = "0.10"
 semver = "1"
 thiserror = "2"
@@ -44,6 +47,8 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }
 toml = { version = "1", features = ["preserve_order"] }
 toml_edit = "0.25"
+# Line diffs for `relish agent setup` (#1581); already in the lock file via insta.
+similar = "2"
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
 flate2 = "1"
 crc32fast = "1"
@@ -138,6 +143,15 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 insta = { version = "1", features = ["json"] }
 proptest = "1"
 tower = { version = "0.5", features = ["util"] }
+# The website's Markdown copies (#1582): `make agent-docs` turns each page's
+# HTML into Markdown with htmd, after pruning its DOM (markup5ever_rcdom is
+# the tree htmd parses into). Only the generator test uses them; nothing
+# that ships does.
+htmd = "0.5"
+markup5ever_rcdom = "0.38"
+# Validates `server.json` against the MCP Registry's vendored schema, with
+# no network: the default features fetch remote references.
+jsonschema = { version = "0.60", default-features = false }
 
 # Every quickstart downloads two or three of these binaries, and every
 # self-upgrade ships Bun through the registry. Release builds already carry

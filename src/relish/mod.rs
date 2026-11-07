@@ -38,6 +38,7 @@ pub mod k8s_import;
 pub mod local_context;
 pub mod manifest;
 pub mod manual;
+pub mod mcp;
 pub mod metrics_cmd;
 pub mod output;
 pub mod path_cmd;
@@ -55,6 +56,7 @@ pub mod test_cmd;
 mod tls;
 pub mod tui;
 pub mod uninstall;
+pub mod unknown_command;
 pub mod upgrade;
 pub mod wtf;
 pub mod wtf_cmd;
@@ -143,7 +145,7 @@ impl FullScreen {
             FullScreen::Tui => {
                 "`relish agent guide` lists the commands that print plain output, such as `relish status`"
             }
-            FullScreen::Manual => "`relish agent manual` prints a chapter as text",
+            FullScreen::Manual => "`relish agent manual search` and `show` print it as Markdown",
             FullScreen::Source => "`relish agent source` searches and prints the source",
         }
     }
@@ -162,10 +164,15 @@ pub enum UnreachableCause {
     /// The host answered, and nothing listened on the port.
     #[error("connection refused; check that bun runs there and listens on that port")]
     Refused,
-    /// The TCP connection opened, and the TLS handshake failed.
+    /// The TLS handshake reached the server's certificate, and relish didn't
+    /// trust it: an unknown CA, the wrong name, an expired certificate.
     #[error(
-        "TLS handshake failed ({0}); pass the cluster CA with --ca-cert or RELIABURGER_CA_CERT, and check the endpoint is https"
+        "the server's certificate isn't trusted ({0}); pass the cluster CA with --ca-cert or RELIABURGER_CA_CERT"
     )]
+    UntrustedCertificate(String),
+    /// The TCP connection opened, and the TLS handshake failed for a reason
+    /// other than the certificate.
+    #[error("TLS handshake failed ({0}); check the endpoint is https and serves TLS")]
     Tls(String),
     /// Nothing answered before relish gave up.
     #[error(
@@ -366,7 +373,7 @@ mod tests {
         );
         assert_eq!(
             refusal(FullScreen::Manual),
-            "relish manual needs a terminal, and stdin or stdout isn't one; `relish agent manual` prints a chapter as text"
+            "relish manual needs a terminal, and stdin or stdout isn't one; `relish agent manual search` and `show` print it as Markdown"
         );
         assert_eq!(
             refusal(FullScreen::Source),

@@ -551,42 +551,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 Ok(())
             }
-            FaultType::CpuStress { percentage, cores } => {
-                // Cap the TARGET instance's `cpu.max` quota instead of
-                // burning cycles in Bun's own cgroup (CHAOS1). The old code
-                // spun blocking tasks that competed for whatever CPU the Bun
-                // process could get, which starved Bun — not the workload —
-                // and could not be lifted before the deadline. Now the
-                // workload keeps only `100 - percentage` of a core, and clear
-                // /expiry restores its original quota.
-                self.apply_cgroup_fault(
-                    rule,
-                    |cgroup| {
-                        let saved = crate::smoker::resource::read_cpu_max(cgroup)
-                            .map_err(|e| e.to_string())?;
-                        // O17: `cores` used to be parsed and thrown away while
-                        // the quota maths assumed one core, so on a 4-core node
-                        // "80% stress" actually took 95%.
-                        crate::smoker::resource::apply_cpu_stress(cgroup, *percentage, *cores)
-                            .map_err(|e| e.to_string())?;
-                        Ok(saved)
-                    },
-                    |cgroup, saved| {
-                        if let Err(e) = crate::smoker::resource::restore_cpu_max(cgroup, saved) {
-                            eprintln!(
-                                "smoker: rollback cpu.max on {} failed: {e}",
-                                cgroup.display()
-                            );
-                        }
-                    },
-                )
-                .await
-                .map(|saved| {
-                    self.record_reversal(
-                        rule.id,
-                        crate::smoker::types::FaultReversal::CpuMax(saved),
-                    );
-                })
+            FaultType::CpuStress { .. }
+            | FaultType::MemoryPressure { .. }
+            | FaultType::DiskIoThrottle { .. } => {
+                // CPU stress caps the TARGET instance's `cpu.max` quota
+                // instead of burning cycles in Bun's own cgroup (CHAOS1),
+                // memory pressure squeezes its `memory.high` toward its hard
+                // limit so the kernel forces reclaim and allocation stalls,
+                // and a disk throttle sets `io.max` on the device its volumes
+                // live on. Clear and expiry restore each.
+                let device = || self.io_device_major_minor();
+                let Some(fault) = resource_faults::CgroupFault::of(&rule.fault_type, device) else {
+                    return Err(format!("{} is not a cgroup fault", rule.fault_type));
+                };
+                let written = self.apply_cgroup_fault(rule, &fault).await?;
+                self.record_reversal(rule.id, fault.reversal(written));
+                Ok(())
             }
             FaultType::DnsNxdomain => {
                 if rule.namespace.as_deref().is_none_or(str::is_empty) {
@@ -639,85 +619,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "bandwidth faults are not implemented yet; delay traffic with `relish fault delay` instead"
                     .to_string(),
             ),
-            FaultType::MemoryPressure { percentage } => {
-                // Squeeze the TARGET instance's `memory.high` toward its hard
-                // limit so the kernel forces reclaim/allocation stalls on the
-                // workload (CHAOS1 — this used to be a genuine no-op that
-                // reported success).
-                self.apply_cgroup_fault(
-                    rule,
-                    |cgroup| {
-                        let saved = crate::smoker::resource::read_memory_high(cgroup)
-                            .map_err(|e| e.to_string())?;
-                        crate::smoker::resource::apply_memory_pressure(cgroup, *percentage)
-                            .map_err(|e| e.to_string())?;
-                        Ok(saved)
-                    },
-                    |cgroup, saved| {
-                        if let Err(e) = crate::smoker::resource::restore_memory_high(cgroup, saved)
-                        {
-                            eprintln!(
-                                "smoker: rollback memory.high on {} failed: {e}",
-                                cgroup.display()
-                            );
-                        }
-                    },
-                )
-                .await
-                .map(|saved| {
-                    self.record_reversal(
-                        rule.id,
-                        crate::smoker::types::FaultReversal::MemoryHigh(saved),
-                    );
-                })
-            }
-            FaultType::DiskIoThrottle {
-                bytes_per_sec,
-                write_only,
-            } => {
-                // Throttle the TARGET instance's block-I/O via `io.max`
-                // (CHAOS1). The device major:minor is read from the workload's
-                // volumes dir so the throttle lands on the disk the workload
-                // actually writes to; clear/expiry lifts it.
-                let device = self.io_device_major_minor();
-                let dev_for_reverse = device.clone();
-                let dev_for_rollback = device.clone();
-                self.apply_cgroup_fault(
-                    rule,
-                    |cgroup| {
-                        crate::smoker::resource::apply_disk_io_throttle(
-                            cgroup,
-                            *bytes_per_sec,
-                            *write_only,
-                            &device,
-                        )
-                        .map_err(|e| e.to_string())?;
-                        Ok(cgroup.to_string_lossy().into_owned())
-                    },
-                    |cgroup, _saved| {
-                        if let Err(e) = crate::smoker::resource::remove_disk_io_throttle(
-                            cgroup,
-                            &dev_for_rollback,
-                        ) {
-                            eprintln!(
-                                "smoker: rollback io.max on {} failed: {e}",
-                                cgroup.display()
-                            );
-                        }
-                    },
-                )
-                .await
-                .map(|paths| {
-                    let instances = paths
-                        .into_iter()
-                        .map(|(_, path)| (path, dev_for_reverse.clone()))
-                        .collect();
-                    self.record_reversal(
-                        rule.id,
-                        crate::smoker::types::FaultReversal::DiskIo { instances },
-                    );
-                })
-            }
             FaultType::NodeDrain => {
                 if rule.duration_ns == 0 {
                     return Err("node faults require a non-zero duration".to_string());
@@ -837,65 +738,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect()
     }
 
-    /// Apply a cgroup-writing fault to every target instance and collect the
-    /// per-instance saved state the `apply` closure returns (for later
-    /// reversal).
+    /// Apply a cgroup-writing fault to every target instance and collect
+    /// what each one needs to undo it.
     ///
     /// Returns an honest error when there are no running instances to target,
-    /// or on any platform without cgroup v2. The `apply` closure runs once per
-    /// target cgroup. If one fails partway through, the instances already
-    /// modified are rolled back with `restore` before the error is surfaced
-    /// (M1) — without that, an earlier replica stayed throttled while the
-    /// caller, seeing the error, dropped the registry entry that would have
-    /// let a later clear undo it.
-    #[cfg(target_os = "linux")]
-    pub(super) async fn apply_cgroup_fault<F, R>(
+    /// or on any platform without cgroup v2. If one write fails partway
+    /// through, the instances already modified are rolled back before the
+    /// error is surfaced (M1). The writes run on a blocking thread
+    /// ([`resource_faults::CgroupFault::write`]).
+    pub(super) async fn apply_cgroup_fault(
         &self,
         rule: &crate::smoker::types::FaultRule,
-        mut apply: F,
-        restore: R,
-    ) -> Result<Vec<(String, String)>, String>
-    where
-        F: FnMut(&std::path::Path) -> Result<String, String>,
-        R: Fn(&std::path::Path, &str),
-    {
-        let targets = self.target_instance_cgroups(rule);
-        if targets.is_empty() {
-            return Err(format!("no running instances of {}", rule.target_service));
-        }
-        let mut saved = Vec::with_capacity(targets.len());
-        let mut applied: Vec<(std::path::PathBuf, String)> = Vec::new();
-        for (id, cgroup) in targets {
-            match apply(&cgroup) {
-                Ok(value) => {
-                    applied.push((cgroup.clone(), value.clone()));
-                    saved.push((id.0, value));
-                }
-                Err(e) => {
-                    // Roll back the instances already modified, newest first,
-                    // so a partial application never leaks a limit.
-                    for (cgroup, value) in applied.iter().rev() {
-                        restore(cgroup, value);
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        Ok(saved)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(super) async fn apply_cgroup_fault<F, R>(
-        &self,
-        rule: &crate::smoker::types::FaultRule,
-        _apply: F,
-        _restore: R,
-    ) -> Result<Vec<(String, String)>, String>
-    where
-        F: FnMut(&std::path::Path) -> Result<String, String>,
-        R: Fn(&std::path::Path, &str),
-    {
-        Err(format!("{} requires Linux cgroups", rule.fault_type))
+        fault: &resource_faults::CgroupFault,
+    ) -> Result<Vec<resource_faults::Written>, String> {
+        let targets = self.cgroup_fault_targets(rule)?;
+        // LOOP-INLINE: the command path hands cgroup faults to a task (spawn_cgroup_fault); only a direct caller waits here, on a blocking thread
+        fault.write(targets).await
     }
 
     /// Record a fault's reversal state in the registry after it was applied,

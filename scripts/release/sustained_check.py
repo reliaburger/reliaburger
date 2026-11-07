@@ -51,6 +51,7 @@ import statistics
 import sys
 import time
 import tomllib
+import bun_memory
 import job_soak
 import job_soak_inventory
 import soak_charts
@@ -916,6 +917,9 @@ def evaluate(evidence, snapshot):
             inventory = parse_inventory(text)
             findings += restart_findings(state, node, inventory, restart_expectations(evidence, node), now)
             findings += resource_trend_findings(state, node, inventory, now)
+            memory = bun_memory.sample(inventory, node, now)
+            if memory is not None:
+                bun_memory.append(evidence, memory)
             findings += clock_findings(state, node, inventory, fault_window)
             if jobs_enabled:
                 job_metric_samples(state, node, inventory, now)
@@ -2110,6 +2114,7 @@ def render(evidence, record):
         for measure, entry in sorted(trend.items()):
             lines.append(f"| {node} | {measure} | {entry['first']} | {entry.get('last', entry['first'])} | {entry['max']} |")
     lines.append("")
+    lines += bun_memory.section(evidence)
     charts_directory = record.parent / f"{record.stem}-charts"
     lines += soak_charts.section(soak_charts.write_charts(evidence, charts_directory), charts_directory.name)
     lines += ["## Failures", ""]

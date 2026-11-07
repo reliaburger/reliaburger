@@ -60,7 +60,13 @@ jobs:
           test -n "$minor"
           sed -i "s|<span data-release-minor>[^<]*</span>|<span data-release-minor>$minor</span>|" docs/website/feedback/index.html
           grep -q "<span data-release-minor>$minor</span>" docs/website/feedback/index.html
+          # The page's Markdown copy (#1582) says the same, without the span.
+          sed -i "s|early in development at [0-9][0-9.]*[0-9],|early in development at $minor,|" docs/website/feedback/index.md
+          grep -q "early in development at $minor," docs/website/feedback/index.md
       - name: Upload artifact
+        # v3 packs dot-directories, so /.well-known/agent-skills/ is
+        # published. v4 leaves them out unless include-hidden-files is true
+        # (tests/suite/agent_docs.rs checks this).
         uses: actions/upload-pages-artifact@v3
         with:
           # Publish only the static website assets

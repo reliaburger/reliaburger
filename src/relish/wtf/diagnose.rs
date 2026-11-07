@@ -7,10 +7,12 @@ use super::model::{
     WtfFinding, WtfInputs, WtfOk, WtfReport, WtfSummary, WtfUnknown,
 };
 
-const CRASHLOOP_WINDOW_SECONDS: u64 = 15 * 60;
-const RECENT_DEPLOY_SECONDS: u64 = 30 * 60;
-const STUCK_DEPLOY_SECONDS: u64 = 15 * 60;
-const CERTIFICATE_WARNING_SECONDS: u64 = 14 * 24 * 60 * 60;
+// The thresholds live beside the finding ids they decide, so `relish agent
+// explain` reports the numbers these checks use.
+use super::findings::{
+    CERTIFICATE_WARNING_SECONDS, CRASHLOOP_RESTARTS, CRASHLOOP_WINDOW_SECONDS,
+    DISK_CRITICAL_PERCENT, DISK_WARNING_PERCENT, RECENT_DEPLOY_SECONDS, STUCK_DEPLOY_SECONDS,
+};
 
 /// Diagnose a cluster from an immutable evidence snapshot.
 ///
@@ -518,7 +520,7 @@ fn check_crashloops(inputs: &WtfInputs, report: &mut WtfReport) {
 
     let mut found = false;
     for ((app, namespace), mut app_restarts) in grouped {
-        if app_restarts.len() < 3 {
+        if app_restarts.len() < CRASHLOOP_RESTARTS {
             continue;
         }
         found = true;
@@ -541,10 +543,9 @@ fn check_crashloops(inputs: &WtfInputs, report: &mut WtfReport) {
         }
         // The app's own log line lands in `correlated_events[].message` and
         // inside the finding's `details` sentence, where an agent can't tell
-        // it from our words.
-        // TODO(#1572): `relish agent diagnose` carries this line as a
-        // `relish::agent::untrusted::Untrusted` (origin `workload_log`)
-        // instead; `wtf`'s own schema stays as it is.
+        // it from our words. `relish agent diagnose` moves it into an
+        // `untrusted` object (origin `workload_log`); `wtf`'s own schema
+        // stays as it is.
         // TODO(#1573): `relish agent logs` wraps every line it returns the same way.
         let log = first_error_log(inputs, app, namespace);
         if let Some(log) = log {
@@ -904,7 +905,7 @@ fn has_crashloop(inputs: &WtfInputs, app: &str, namespace: &str) -> bool {
                         && restart.timestamp >= cutoff
                 })
                 .count()
-                >= 3
+                >= CRASHLOOP_RESTARTS
         })
         .unwrap_or(false)
 }
@@ -1055,7 +1056,10 @@ fn check_disks(inputs: &WtfInputs, report: &mut WtfReport) {
         return;
     };
     let mut found = false;
-    for disk in disks.iter().filter(|disk| disk.used_percent >= 85.0) {
+    for disk in disks
+        .iter()
+        .filter(|disk| disk.used_percent >= DISK_WARNING_PERCENT as f64)
+    {
         found = true;
         let finding = WtfFinding {
             id: "disk-high".to_string(),
@@ -1078,7 +1082,7 @@ fn check_disks(inputs: &WtfInputs, report: &mut WtfReport) {
             correlated_events: Vec::new(),
             affected_resource: format!("node.{}", disk.node_id),
         };
-        if disk.used_percent >= 95.0 {
+        if disk.used_percent >= DISK_CRITICAL_PERCENT as f64 {
             report.critical.push(finding);
         } else {
             report.warnings.push(finding);
@@ -1583,7 +1587,7 @@ fn with_caveat(description: &str, caveat: Option<&str>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::relish::wtf::{
         AlertObservation, CertificateObservation, CouncilObservation, CpuThrottleObservation,
@@ -1593,9 +1597,10 @@ mod tests {
         RestartObservation, ServiceObservation, TokenObservation,
     };
 
-    const NOW: u64 = 2_000_000;
+    pub(in crate::relish::wtf) const NOW: u64 = 2_000_000;
 
-    fn healthy_inputs() -> WtfInputs {
+    /// A one-node cluster with one healthy app, `api`, and nothing wrong.
+    pub(in crate::relish::wtf) fn healthy_inputs() -> WtfInputs {
         WtfInputs {
             cluster_name: "test".to_string(),
             collected_at: NOW,
@@ -3200,5 +3205,64 @@ mod tests {
 
         assert!(report.unknown.iter().any(|u| u.source == "builds"));
         assert!(report.ok.iter().all(|ok| ok.id != "builds"));
+    }
+
+    // `relish agent explain` reports the constants in `findings` as each
+    // check's thresholds. These pin that the checks use exactly them.
+
+    #[test]
+    fn a_crashloop_takes_crashloop_restarts_inside_the_window() {
+        let inside = NOW - CRASHLOOP_WINDOW_SECONDS;
+        let restarts = |count: usize| -> Vec<RestartObservation> {
+            (0..count as u64).map(|at| restart(inside + at)).collect()
+        };
+        let mut inputs = healthy_inputs();
+        inputs.applications.restarts = available(restarts(CRASHLOOP_RESTARTS - 1));
+        assert!(
+            diagnose(&inputs)
+                .critical
+                .iter()
+                .all(|f| f.id != "crashloop")
+        );
+        inputs.applications.restarts = available(restarts(CRASHLOOP_RESTARTS));
+        assert!(
+            diagnose(&inputs)
+                .critical
+                .iter()
+                .any(|f| f.id == "crashloop")
+        );
+        let mut early = restarts(CRASHLOOP_RESTARTS);
+        early[0].timestamp = inside - 1;
+        inputs.applications.restarts = available(early);
+        assert!(
+            diagnose(&inputs)
+                .critical
+                .iter()
+                .all(|f| f.id != "crashloop")
+        );
+    }
+
+    #[test]
+    fn disk_high_warns_and_turns_critical_at_its_two_percentages() {
+        let at = |percent: f64| {
+            let mut inputs = healthy_inputs();
+            inputs.cluster.disks = available(vec![DiskObservation {
+                filesystem_id: None,
+                node_id: "node-1".to_string(),
+                storage_domains: vec!["images".to_string()],
+                used_bytes: 1,
+                total_bytes: 100,
+                used_percent: percent,
+            }]);
+            let report = diagnose(&inputs);
+            (
+                report.warnings.iter().any(|f| f.id == "disk-high"),
+                report.critical.iter().any(|f| f.id == "disk-high"),
+            )
+        };
+        assert_eq!(at(DISK_WARNING_PERCENT as f64 - 0.1), (false, false));
+        assert_eq!(at(DISK_WARNING_PERCENT as f64), (true, false));
+        assert_eq!(at(DISK_CRITICAL_PERCENT as f64 - 0.1), (true, false));
+        assert_eq!(at(DISK_CRITICAL_PERCENT as f64), (false, true));
     }
 }

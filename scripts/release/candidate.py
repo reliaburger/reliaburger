@@ -6,6 +6,12 @@ built by a manual Build & Release run on a `release-*` branch, signed with the
 nightly key, recorded with `"channel": "nightly"`, uploaded as the
 `nightly-<commit>-<attempt>` artefact and staged under a `nightly-` tag.
 Promotion never takes one.
+
+The record also names the source bundle every `relish` embeds (#1570) by its
+`source_digest`, so anyone can match a binary's `relish.source_digest` against
+the release it came from (#1694). Each build job reads the digest from the
+`relish` it built (`bundle-digest`); the candidate job requires every platform
+to agree (`agreed-source-digest`) before recording it.
 """
 import argparse
 import hashlib
@@ -31,6 +37,8 @@ ARTEFACTS = {"release": "candidate", "nightly": "nightly"}
 TAG_PREFIXES = {"release": STAGING_PREFIX, "nightly": NIGHTLY_PREFIX}
 # The branches a channel's build may come from: main, or a release's merge train.
 BRANCHES = {"release": r"main", "nightly": r"release-\d+-\d+-\d+"}
+# How `relish` names its source bundle: the SHA-256 of the uncompressed tarball.
+SOURCE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 PDFS = {"building-reliaburger.pdf", "reliaburger-design-docs.pdf",
         "reliaburger-roadmap.pdf", "reliaburger-whitepaper.pdf"}
 
@@ -68,6 +76,53 @@ def check_guest_images(directory, pins, assets):
             raise ValueError("candidate guest image does not match its metadata or its pinned source")
 
 
+def check_source_digest(value):
+    """Return `value` when it names a source bundle the way `relish` does."""
+    if not isinstance(value, str) or not SOURCE_DIGEST.fullmatch(value):
+        raise ValueError(f"source digest must be sha256:<64 lower-case hex digits>, not {value!r}")
+    return value
+
+
+def bundle_digest(answer):
+    """The source digest a clean release `relish` reports, from the envelope
+    `relish agent source version --offline` printed.
+
+    The build job already makes build.rs refuse a dirty tree; refusing one
+    here too means a build that stopped asking can't reach a candidate.
+    """
+    try:
+        envelope = json.loads(answer)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"relish agent source version did not print JSON: {error}") from None
+    if not isinstance(envelope, dict) or envelope.get("ok") is not True \
+            or envelope.get("command") != "source version":
+        raise ValueError("relish agent source version did not answer")
+    build = envelope.get("relish") or {}
+    if build.get("dirty") is not False:
+        raise ValueError(f"the embedded source must come from a clean tree, but dirty is {build.get('dirty')!r}")
+    digest = check_source_digest(build.get("source_digest"))
+    if (envelope.get("data") or {}).get("digest") != digest:
+        raise ValueError("the envelope and the bundle disagree on the source digest")
+    return digest
+
+
+def agreed_source_digest(directory):
+    """The one source digest every platform's `relish` reported.
+
+    `directory` holds one `relish-<platform>` file per platform, each the
+    digest its build job read. All three are built from one commit, and the
+    bundle is deterministic, so they must agree.
+    """
+    expected = {f"relish-{platform}" for platform in PLATFORMS["relish"]}
+    paths = {path.name: path for path in directory.iterdir()}
+    if set(paths) != expected:
+        raise ValueError(f"expected a source digest from exactly {sorted(expected)}, got {sorted(paths)}")
+    digests = {check_source_digest(paths[name].read_text().strip()) for name in sorted(expected)}
+    if len(digests) != 1:
+        raise ValueError(f"the platforms embed different source: {sorted(digests)}")
+    return digests.pop()
+
+
 def inventory(directory, pins, recorded=False):
     expected = candidate_names(pins) | ({RECORD} if recorded else set())
     paths = list(directory.iterdir())
@@ -88,12 +143,14 @@ def channel_fields(channel):
     return {} if channel == "release" else {"channel": channel}
 
 
-def record_candidate(directory, pins, channel="release", **expected):
+def record_candidate(directory, pins, channel="release", *, source_digest, **expected):
     expected = identity(**expected)
+    source_digest = check_source_digest(source_digest)
     path = directory / RECORD
     if path.exists() or path.is_symlink():
         raise FileExistsError("candidate record already exists")
-    document = dict(schema=1, **expected, **channel_fields(channel), assets=inventory(directory, pins))
+    document = dict(schema=1, **expected, **channel_fields(channel), source_digest=source_digest,
+                    assets=inventory(directory, pins))
     encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
     with path.open("xb") as output:
         output.write(encoded)
@@ -102,7 +159,12 @@ def record_candidate(directory, pins, channel="release", **expected):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def verify_candidate(directory, pins, qualified_digest, channel="release", **expected):
+def verify_candidate(directory, pins, qualified_digest, channel="release", source_digest=None, **expected):
+    """Verify the record and every asset; `source_digest`, when given, must be the recorded one.
+
+    Staging and promotion pass none: the record hashes to the qualified
+    digest, so the source digest it names is the one the build recorded.
+    """
     expected = identity(**expected)
     if not re.fullmatch(r"[0-9a-f]{64}", qualified_digest):
         raise ValueError("qualification must supply the candidate record's SHA-256")
@@ -110,7 +172,10 @@ def verify_candidate(directory, pins, qualified_digest, channel="release", **exp
     if path.is_symlink() or not path.is_file() or sha256(path) != qualified_digest:
         raise ValueError("candidate record differs from the qualified digest")
     document = json.loads(path.read_text())
-    if document != dict(schema=1, **expected, **channel_fields(channel),
+    recorded = check_source_digest(document.get("source_digest"))
+    if source_digest is not None and recorded != source_digest:
+        raise ValueError("candidate source digest differs from the build's")
+    if document != dict(schema=1, **expected, **channel_fields(channel), source_digest=recorded,
                         assets=inventory(directory, pins, recorded=True)):
         raise ValueError("candidate identity or bytes differ from qualification")
     return document
@@ -323,10 +388,11 @@ def prune_nightly(repository, keep):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("operation", choices=["record", "verify", "fetch", "verify-upload",
-                                              "stage-fetch", "stage", "prune-nightly"])
+                                              "stage-fetch", "stage", "prune-nightly",
+                                              "bundle-digest", "agreed-source-digest"])
     parser.add_argument("--directory", type=Path, default=Path("dist"))
     parser.add_argument("--version", help="release tag; staging reads it from the record")
-    parser.add_argument("--repository", required=True)
+    parser.add_argument("--repository", help="required by every operation but the digest ones")
     parser.add_argument("--commit", help="candidate commit; staging reads it from the run")
     parser.add_argument("--run-id", type=int)
     parser.add_argument("--run-attempt", type=int, default=1)
@@ -334,7 +400,18 @@ def main():
     parser.add_argument("--channel", choices=CHANNELS, default="release",
                         help="release (a build of main) or nightly (a build of a release-* train)")
     parser.add_argument("--keep", type=int, default=7, help="prune-nightly: how many nightlies to keep")
+    parser.add_argument("--source-digest", help="record and verify: the source bundle's sha256: digest")
     args = parser.parse_args()
+
+    # The digest operations read only their input: no record, run or repository.
+    if args.operation == "bundle-digest":
+        print(bundle_digest(sys.stdin.read()))
+        return
+    if args.operation == "agreed-source-digest":
+        print(agreed_source_digest(args.directory))
+        return
+    if not args.repository:
+        parser.error(f"{args.operation} requires --repository")
     pins = json.loads(Path(__file__).with_name("guest-images.json").read_text())
     digest = args.qualified_digest or ""
 
@@ -368,11 +445,14 @@ def main():
         parser.error(f"{args.operation} requires --version and --commit")
     expected = identity(args.version, args.repository, args.commit, args.run_id, args.run_attempt)
     if args.operation == "record":
-        print(record_candidate(args.directory, pins, args.channel, **expected))
+        if not args.source_digest:
+            parser.error("record requires --source-digest")
+        print(record_candidate(args.directory, pins, args.channel, source_digest=args.source_digest,
+                               **expected))
         return
 
     if args.operation == "verify":
-        verify_candidate(args.directory, pins, digest, args.channel, **expected)
+        verify_candidate(args.directory, pins, digest, args.channel, args.source_digest, **expected)
         print(f"verified local candidate {args.commit}")
         return
 

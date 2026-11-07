@@ -994,6 +994,11 @@ enum Command {
     Path(Box<PathOptions>),
     /// Commands for LLM agents: one JSON envelope, bounded, never interactive.
     Agent(Box<reliaburger::relish::agent::AgentOptions>),
+    /// Serve the `relish agent` commands as read-only MCP tools over stdio.
+    ///
+    /// For an agent's MCP client to start, as in `claude mcp add reliaburger
+    /// -- relish mcp`. No network listener, no write tools.
+    Mcp(Box<reliaburger::relish::mcp::McpOptions>),
 }
 
 #[derive(Subcommand)]
@@ -2847,6 +2852,7 @@ async fn main() -> ExitCode {
                             ingress_port: ingress_port.unwrap_or(18080),
                             development_binaries,
                             release_mirror,
+                            output: cli.output,
                         },
                     )
                     .await
@@ -2865,6 +2871,7 @@ async fn main() -> ExitCode {
                         development_binaries,
                         release_mirror,
                         timings,
+                        output: cli.output,
                     },
                 )
                 .await
@@ -2995,6 +3002,7 @@ async fn main() -> ExitCode {
         // Handled before the endpoint check above, so an invalid endpoint
         // still answers with an envelope; this arm only keeps the match whole.
         Command::Agent(options) => return run_agent(&options, None).await,
+        Command::Mcp(options) => reliaburger::relish::mcp::run(&options).await,
     };
 
     finish(result)
@@ -3061,6 +3069,9 @@ fn output_support(command: &Command) -> OutputSupport {
         Command::Dev {
             action: DevAction::Shell { .. },
         } => Interactive,
+        // `--quickstart` and `--ssh` never ask anything, so an agent can run
+        // them and quote what they built; the guided setup asks as it goes.
+        Command::Setup(options) if options.quickstart || options.ssh.is_some() => Structured,
         Command::Tui
         | Command::Dashboard { .. }
         | Command::Manual { .. }
@@ -3070,6 +3081,8 @@ fn output_support(command: &Command) -> OutputSupport {
         // refusing it would fail an agent over a flag that can't change
         // anything.
         Command::Agent(_) => Structured,
+        // MCP is JSON-RPC whatever `-o` says, as `agent` is JSON.
+        Command::Mcp(_) => Structured,
         Command::Apply { .. }
         | Command::Council { .. }
         | Command::Images { .. }
@@ -3132,18 +3145,24 @@ fn output_support(command: &Command) -> OutputSupport {
 /// For `relish agent` the answer is still an envelope on stdout, with the
 /// `usage` code and exit 2, because an agent parses stdout and nothing else.
 /// Help (`--help`) and `--version` print as usual. Everything else gets
-/// clap's own message on stderr and clap's exit code.
-fn parse_failure(error: clap::Error) -> ExitCode {
+/// clap's own message on stderr and clap's exit code. An unknown command
+/// is never answered with a mutating one (#1093).
+fn parse_failure(mut error: clap::Error) -> ExitCode {
     use clap::error::ErrorKind;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let is_help = matches!(
         error.kind(),
         ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
     );
+    let lead = reliaburger::relish::unknown_command::keep_read_only_suggestions(&mut error, &args);
     if is_help || !reliaburger::relish::agent::invoked(&args) {
         error.exit();
     }
-    let rendered = reliaburger::relish::agent::usage_failure(&args, &error.render().to_string());
+    let rendered = reliaburger::relish::agent::usage_failure(
+        &args,
+        &error.render().to_string(),
+        lead.as_deref(),
+    );
     print_agent(rendered)
 }
 
@@ -3161,7 +3180,7 @@ async fn run_agent(
             options.command.name(),
             agent::AgentError::new(agent::ErrorCode::Usage, reason.to_string())
                 .with_hint("pass an https:// endpoint, or http:// to a loopback address"),
-            options.max_bytes,
+            options.max_bytes(),
             &rerun,
         ),
         None => agent::run(options, &rerun).await,
@@ -3218,6 +3237,154 @@ mod tests {
         command: Command,
         output: OutputFormat,
         token: Option<String>,
+    }
+
+    /// What relish answers to the command line `line` (without `relish`):
+    /// clap's rendered error after the read-only filter, and the hint lead.
+    fn answer_unknown(line: &str) -> (String, Option<String>) {
+        use reliaburger::relish::unknown_command::keep_read_only_suggestions;
+        let args: Vec<String> = line.split_whitespace().map(String::from).collect();
+        let mut error =
+            match Cli::try_parse_from(std::iter::once("relish".to_string()).chain(args.clone())) {
+                Ok(_) => panic!("{line} parsed"),
+                Err(error) => error,
+            };
+        let lead = keep_read_only_suggestions(&mut error, &args);
+        (error.render().to_string(), lead)
+    }
+
+    /// Every top-level command that changes the cluster or local files.
+    const MUTATING: &[&str] = &[
+        "apply",
+        "exec",
+        "stop",
+        "delete",
+        "release",
+        "init",
+        "decommission-node",
+        "council",
+        "join",
+        "fault",
+        "snapshot",
+        "deploy",
+        "cancel-deploy",
+        "rollback",
+        "fmt",
+        "import",
+        "images",
+        "build",
+        "batch",
+        "run",
+        "secret",
+        "gitops",
+        "policy",
+        "ca",
+        "token",
+        "join-token",
+        "sign",
+        "dev",
+        "upgrade",
+        "uninstall",
+        "local",
+        "setup",
+        "test",
+        "bench",
+    ];
+
+    #[test]
+    fn relish_apps_never_suggests_a_mutating_command() {
+        for line in ["apps", "apps show", "-o json apps"] {
+            let (text, lead) = answer_unknown(line);
+            for mutating in MUTATING {
+                assert!(!text.contains(&format!("'{mutating}'")), "{line}: {text}");
+            }
+            assert!(
+                text.contains("`relish status` is the place to start"),
+                "{line}: {text}"
+            );
+            assert_eq!(lead.as_deref(), Some("start with relish status;"));
+        }
+    }
+
+    #[test]
+    fn a_typo_of_a_read_only_command_still_suggests_it() {
+        let (text, lead) = answer_unknown("statsu");
+        assert!(
+            text.contains("a similar subcommand exists: 'status'"),
+            "{text}"
+        );
+        assert_eq!(lead.as_deref(), Some("did you mean relish status?"));
+    }
+
+    #[test]
+    fn a_typo_of_a_mutating_command_suggests_nothing_mutating() {
+        for line in ["aply", "deplyo", "rollbak", "delte"] {
+            let (text, _) = answer_unknown(line);
+            for mutating in MUTATING {
+                assert!(!text.contains(&format!("'{mutating}'")), "{line}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_agent_command_gets_a_usage_envelope_with_a_read_only_hint() {
+        use reliaburger::relish::agent::usage_failure;
+        for (line, lead) in [
+            ("agent apps", "start with relish agent context;"),
+            ("agent contxt", "did you mean relish agent context?"),
+            ("-o json agent contxt", "did you mean relish agent context?"),
+            ("agent reprt", "start with relish agent context;"),
+        ] {
+            let (text, got) = answer_unknown(line);
+            assert_eq!(got.as_deref(), Some(lead), "{line}: {text}");
+            let args: Vec<String> = line.split_whitespace().map(String::from).collect();
+            let rendered = usage_failure(&args, &text, got.as_deref());
+            assert_eq!(rendered.exit.code(), 2);
+            let value: serde_json::Value = serde_json::from_str(&rendered.json).unwrap();
+            assert_eq!(value["error"]["code"], "usage");
+            let hint = value["error"]["hint"].as_str().unwrap();
+            assert!(hint.starts_with(lead), "{hint}");
+            assert!(
+                !text.contains("'report'") && !text.contains("'patch'"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_read_only_lists_name_real_commands_and_no_mutating_one() {
+        use reliaburger::relish::unknown_command::{READ_ONLY_AGENT_COMMANDS, READ_ONLY_COMMANDS};
+        let cli = <Cli as clap::CommandFactory>::command();
+        let top: Vec<&str> = cli.get_subcommands().map(|c| c.get_name()).collect();
+        for name in READ_ONLY_COMMANDS {
+            assert!(
+                *name == "help" || top.contains(name),
+                "{name} isn't a command"
+            );
+            assert!(!MUTATING.contains(name), "{name} is mutating");
+        }
+        // Every command is classified, so a new one makes this fail until
+        // someone decides which list it belongs in.
+        for name in &top {
+            assert!(
+                READ_ONLY_COMMANDS.contains(name)
+                    || MUTATING.contains(name)
+                    || ["tui", "dashboard", "logs-export", "export", "source", "mcp"]
+                        .contains(name),
+                "classify {name} as read-only or mutating"
+            );
+        }
+        let agent = cli.find_subcommand("agent").unwrap();
+        let agent: Vec<&str> = agent.get_subcommands().map(|c| c.get_name()).collect();
+        for name in READ_ONLY_AGENT_COMMANDS {
+            assert!(
+                *name == "help" || agent.contains(name),
+                "agent {name} isn't a command"
+            );
+        }
+        for name in ["report", "patch", "setup"] {
+            assert!(!READ_ONLY_AGENT_COMMANDS.contains(&name));
+        }
     }
 
     fn parse(args: &[&str]) -> Result<ParsedCli, clap::Error> {
@@ -4514,6 +4681,8 @@ mod tests {
             &["relish", "-o", "json", "manual", "chaos"],
             &["relish", "-o", "json", "source"],
             &["relish", "-o", "json", "dev", "shell", "reliaburger-1"],
+            &["relish", "-o", "json", "setup"],
+            &["relish", "-o", "json", "setup", "--yes"],
         ] {
             let cli = parse(args).unwrap();
             let refusal = output_refusal(&cli.command, cli.output)
@@ -4543,6 +4712,17 @@ mod tests {
             &["relish", "-o", "json", "upgrade", "check"],
             &["relish", "-o", "json", "upgrade", "plan", "v0.2.7"],
             &["relish", "-o", "json", "local", "status"],
+            &["relish", "-o", "json", "setup", "--quickstart"],
+            &[
+                "relish",
+                "-o",
+                "yaml",
+                "setup",
+                "--quickstart",
+                "--nodes",
+                "1",
+            ],
+            &["relish", "-o", "json", "setup", "--ssh", "ubuntu@10.0.0.1"],
             &["relish", "inspect", "web"],
         ] {
             let cli = parse(args).unwrap();

@@ -8,7 +8,7 @@
 #   task_arrays  - the task-array leader, node pool, executor or their
 #                  benchmarks changed, the script that gates on them, or
 #                  criterion's version
-#   macos        - run the portable suite on macOS (three shards)
+#   macos        - run the portable suite on macOS (one job)
 #   s3           - log export, council backups or the S3 client changed, or
 #                  the script that gives `make test-s3` its server
 #
@@ -72,12 +72,14 @@ changed=$(git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA:-HEAD}")
 # tests/suite/website.rs parses the homepage tour's commands with relish and
 # checks the site's installer, recordings and release cards against the
 # roadmap, the quickstart and the release runbook. tests/suite/issue_forms.rs
-# checks the contributing guide, SECURITY.md and AGENTS.md.
+# checks the contributing guide, SECURITY.md and AGENTS.md, and
+# tests/suite/agent_docs.rs checks the skill under plugins/ against the
+# manual's agent chapter.
 is_docs_only() {
     case "$1" in
         docs/manual/* | README.md | docs/README.md | docs/whitepaper.md | \
             docs/design/cli-relish.md | docs/linux-servers.md | \
-            CONTRIBUTING.md | SECURITY.md | AGENTS.md | \
+            CONTRIBUTING.md | SECURITY.md | AGENTS.md | plugins/* | \
             docs/book/02-* | docs/book/04-* | \
             docs/website/* | docs/roadmap.md | docs/quickstart.md | docs/releasing.md)
             return 1 ;;

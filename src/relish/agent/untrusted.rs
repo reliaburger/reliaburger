@@ -380,6 +380,25 @@ mod tests {
     }
 
     #[test]
+    fn jwts_and_values_under_secret_keys_are_redacted_and_counted() {
+        let wrapped = logs(&[
+            "auth Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+            r#"login user=bob password=hunter2 {"api_key":"k-123"}"#,
+            "the token bucket is empty",
+        ]);
+        assert_eq!(
+            wrapped.lines(),
+            [
+                "auth Bearer eyJ[redacted]",
+                r#"login user=bob password=[redacted] {"api_key":"[redacted]"}"#,
+                "the token bucket is empty",
+            ]
+        );
+        assert_eq!(wrapped.redactions().count(Rule::Jwt), 1);
+        assert_eq!(wrapped.redactions().count(Rule::SecretKeyValue), 2);
+    }
+
+    #[test]
     fn a_token_split_by_an_escape_sequence_is_still_redacted() {
         let wrapped = logs(&["rbrg_\x1b[0mabcdef"]);
         assert_eq!(wrapped.lines(), ["rbrg_[redacted]"]);

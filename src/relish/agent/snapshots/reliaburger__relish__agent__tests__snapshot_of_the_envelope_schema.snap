@@ -95,6 +95,11 @@ expression: "schema_of::<Envelope<Value>>()"
           "type": "string"
         },
         {
+          "const": "guide",
+          "description": "`relish agent guide`.",
+          "type": "string"
+        },
+        {
           "const": "version",
           "description": "`relish agent version`.",
           "type": "string"
@@ -127,6 +132,81 @@ expression: "schema_of::<Envelope<Value>>()"
         {
           "const": "source extract",
           "description": "`relish agent source extract`.",
+          "type": "string"
+        },
+        {
+          "const": "logs",
+          "description": "`relish agent logs`.",
+          "type": "string"
+        },
+        {
+          "const": "manual search",
+          "description": "`relish agent manual search`.",
+          "type": "string"
+        },
+        {
+          "const": "manual show",
+          "description": "`relish agent manual show`.",
+          "type": "string"
+        },
+        {
+          "const": "context",
+          "description": "`relish agent context`.",
+          "type": "string"
+        },
+        {
+          "const": "diagnose",
+          "description": "`relish agent diagnose`.",
+          "type": "string"
+        },
+        {
+          "const": "explain",
+          "description": "`relish agent explain`.",
+          "type": "string"
+        },
+        {
+          "const": "upgrade-check",
+          "description": "`relish agent upgrade-check`.",
+          "type": "string"
+        },
+        {
+          "const": "report",
+          "description": "`relish agent report`.",
+          "type": "string"
+        },
+        {
+          "const": "patch init",
+          "description": "`relish agent patch init`.",
+          "type": "string"
+        },
+        {
+          "const": "patch build",
+          "description": "`relish agent patch build`.",
+          "type": "string"
+        },
+        {
+          "const": "patch test",
+          "description": "`relish agent patch test`.",
+          "type": "string"
+        },
+        {
+          "const": "patch try",
+          "description": "`relish agent patch try`.",
+          "type": "string"
+        },
+        {
+          "const": "patch diff",
+          "description": "`relish agent patch diff`.",
+          "type": "string"
+        },
+        {
+          "const": "patch destroy",
+          "description": "`relish agent patch destroy`.",
+          "type": "string"
+        },
+        {
+          "const": "setup",
+          "description": "`relish agent setup`.",
           "type": "string"
         }
       ]

@@ -8,42 +8,64 @@
 //!
 //! This module holds the contract ([`envelope`], [`budget`], and
 //! [`untrusted`] for text a workload wrote), the first two commands,
-//! `version` and `schema`, which exercise it end to end, and [`source`],
-//! which reads the source this binary was built from. The commands that
-//! read the cluster come later and reuse it.
+//! `version` and `schema`, which exercise it end to end, [`source`], which
+//! reads the source this binary was built from, [`logs`], which reads an
+//! app's recent lines, and [`manual`], which searches and prints the manual.
+//! [`context`] and [`diagnose`] read the cluster through `relish wtf`'s
+//! collector, and `explain` says what each of `wtf`'s findings means.
+//! [`guide`] prints the manual's agent chapter.
 
 pub mod budget;
+pub mod context;
+pub mod diagnose;
 pub mod envelope;
+pub mod fit;
+pub mod guide;
+pub mod logs;
+pub mod manual;
+pub mod patch;
+pub mod report;
+pub mod setup;
 pub mod source;
 pub mod untrusted;
+pub mod upgrade_check;
 
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
 
-pub use budget::{DEFAULT_MAX_BYTES, MIN_MAX_BYTES, Rendered};
+pub use budget::{DEFAULT_MAX_BYTES, GUIDE_MAX_BYTES, MIN_MAX_BYTES, Rendered, default_max_bytes};
 pub use envelope::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, ExitStatus, NextStep};
 
 /// `relish agent`'s own flags and its subcommand.
 #[derive(Debug, Clone, clap::Args)]
 pub struct AgentOptions {
-    /// Largest answer to print, in bytes (at least 1024). A bigger answer is
-    /// trimmed, marked `truncated`, and says how to get the rest.
-    #[arg(
-        long,
-        global = true,
-        default_value_t = DEFAULT_MAX_BYTES,
-        value_parser = parse_max_bytes,
-    )]
-    pub max_bytes: usize,
+    /// Largest answer to print, in bytes (at least 1024; by default 24576,
+    /// and 65536 for `guide`). A bigger answer is trimmed, marked
+    /// `truncated`, and says how to get the rest.
+    // No clap default: the default depends on the command, so `None` means
+    // "not given" and [`AgentOptions::max_bytes`] picks the command's.
+    #[arg(long, global = true, value_parser = parse_max_bytes)]
+    pub max_bytes: Option<usize>,
 
     #[command(subcommand)]
     pub command: AgentCommand,
 }
 
+/// `relish agent` as clap defines it, without the rest of `relish`: the
+/// tree `relish agent guide` lists and `relish mcp` turns into tools.
+pub fn agent_command() -> clap::Command {
+    // `Args` is the trait `#[derive(clap::Args)]` implemented for
+    // `AgentOptions`; `augment_args` adds its flags and subcommands to a
+    // command we name ourselves.
+    <AgentOptions as clap::Args>::augment_args(clap::Command::new("agent"))
+}
+
 /// The `relish agent` commands.
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum AgentCommand {
+    /// How to use relish as an agent: the manual chapter, as Markdown sections.
+    Guide,
     /// This binary's version, commit, target and cluster formats.
     Version,
     /// The JSON Schema of the envelope and of each command's data.
@@ -54,15 +76,63 @@ pub enum AgentCommand {
     },
     /// The source this binary was built from: search it, read it, extract it.
     Source(source::SourceOptions),
+    /// An app's recent log lines, newest kept, each wrapped as untrusted.
+    Logs(logs::LogsArgs),
+    /// The manual compiled into this binary: search it, show a section.
+    Manual {
+        #[command(subcommand)]
+        command: manual::ManualCommand,
+    },
+    /// The first call: findings, unknowns, faults, alerts, one line per app
+    /// and the newest events, in one bounded answer.
+    Context(context::ContextArgs),
+    /// Every finding with its evidence, read-only next steps, and pointers
+    /// into the manual and the source.
+    Diagnose(diagnose::DiagnoseArgs),
+    /// What a finding means, its thresholds and where it's decided; every
+    /// finding when no id is given. Reads only this binary.
+    Explain {
+        /// A finding id, e.g. `crashloop`.
+        id: Option<String>,
+    },
+    /// Whether the cluster can take the latest release: `ready`,
+    /// `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`.
+    UpgradeCheck(upgrade_check::UpgradeCheckArgs),
+    /// Draft a redacted bug report for a human to post. Never posts.
+    Report(Box<report::ReportArgs>),
+    /// Build, test and try a fix on a throwaway cluster.
+    Patch(patch::PatchOptions),
+    /// Wire Reliaburger into the AI agents on this machine. Shows the diff;
+    /// writes only with --yes.
+    Setup(setup::SetupOptions),
+}
+
+impl AgentOptions {
+    /// The budget for this command line: `--max-bytes` when given, else the
+    /// command's default ([`default_max_bytes`]).
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+            .unwrap_or_else(|| default_max_bytes(self.command.name()))
+    }
 }
 
 impl AgentCommand {
     /// The name the envelope's `command` field carries.
     pub fn name(&self) -> CommandName {
         match self {
+            AgentCommand::Guide => CommandName::Guide,
             AgentCommand::Version => CommandName::Version,
             AgentCommand::Schema { .. } => CommandName::Schema,
             AgentCommand::Source(options) => options.command.name(),
+            AgentCommand::Logs(_) => CommandName::Logs,
+            AgentCommand::Manual { command } => command.name(),
+            AgentCommand::Context(_) => CommandName::Context,
+            AgentCommand::Diagnose(_) => CommandName::Diagnose,
+            AgentCommand::Explain { .. } => CommandName::Explain,
+            AgentCommand::UpgradeCheck(_) => CommandName::UpgradeCheck,
+            AgentCommand::Report(_) => CommandName::Report,
+            AgentCommand::Patch(options) => options.command.name(),
+            AgentCommand::Setup(_) => CommandName::Setup,
         }
     }
 }
@@ -87,10 +157,12 @@ pub fn render<T: Serialize>(envelope: &Envelope<T>, max_bytes: usize, rerun: &st
 /// `rerun` is the command line as [`rerun_command`] rebuilds it, for the
 /// hint a trimmed answer carries.
 pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
+    let max_bytes = options.max_bytes();
     match &options.command {
+        AgentCommand::Guide => guide::run(max_bytes, rerun),
         AgentCommand::Version => render(
             &Envelope::answered(CommandName::Version, BuildInfo::current(), version_data()),
-            options.max_bytes,
+            max_bytes,
             rerun,
         ),
         AgentCommand::Schema { command } => render(
@@ -99,10 +171,19 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
                 BuildInfo::current(),
                 schema_data(*command),
             ),
-            options.max_bytes,
+            max_bytes,
             rerun,
         ),
-        AgentCommand::Source(source) => source::run(source, options.max_bytes, rerun).await,
+        AgentCommand::Source(source) => source::run(source, max_bytes, rerun).await,
+        AgentCommand::Logs(args) => logs::run(args, max_bytes, rerun).await,
+        AgentCommand::Manual { command } => manual::run(command, max_bytes, rerun),
+        AgentCommand::Context(args) => context::run(args, max_bytes, rerun).await,
+        AgentCommand::Diagnose(args) => diagnose::run_diagnose(args, max_bytes, rerun).await,
+        AgentCommand::Explain { id } => diagnose::run_explain(id.as_deref(), max_bytes, rerun),
+        AgentCommand::UpgradeCheck(args) => upgrade_check::run(args, max_bytes, rerun).await,
+        AgentCommand::Report(args) => report::run(args, max_bytes, rerun),
+        AgentCommand::Patch(patch) => patch::run(patch, max_bytes, rerun).await,
+        AgentCommand::Setup(setup) => setup::run(setup, max_bytes, rerun).await,
     }
 }
 
@@ -183,6 +264,7 @@ fn schema_of<T: JsonSchema>() -> Value {
 pub fn data_schema(command: CommandName) -> Option<Value> {
     match command {
         CommandName::Agent => None,
+        CommandName::Guide => Some(schema_of::<guide::GuideData>()),
         CommandName::Version => Some(schema_of::<VersionData>()),
         CommandName::Schema => Some(schema_of::<SchemaData>()),
         CommandName::SourceVersion => Some(schema_of::<source::VersionData>()),
@@ -190,6 +272,21 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::SourceGrep => Some(schema_of::<source::GrepData>()),
         CommandName::SourceShow => Some(schema_of::<source::ShowData>()),
         CommandName::SourceExtract => Some(schema_of::<source::ExtractData>()),
+        CommandName::Logs => Some(schema_of::<logs::LogsData>()),
+        CommandName::ManualSearch => Some(schema_of::<manual::SearchData>()),
+        CommandName::ManualShow => Some(schema_of::<manual::ShowData>()),
+        CommandName::Context => Some(schema_of::<context::ContextData>()),
+        CommandName::Diagnose => Some(schema_of::<diagnose::DiagnoseData>()),
+        CommandName::Explain => Some(schema_of::<diagnose::ExplainData>()),
+        CommandName::UpgradeCheck => Some(schema_of::<upgrade_check::UpgradeCheckData>()),
+        CommandName::Report => Some(schema_of::<report::ReportData>()),
+        CommandName::PatchInit => Some(schema_of::<patch::InitData>()),
+        CommandName::PatchBuild => Some(schema_of::<patch::BuildData>()),
+        CommandName::PatchTest => Some(schema_of::<patch::TestData>()),
+        CommandName::PatchTry => Some(schema_of::<patch::TryData>()),
+        CommandName::PatchDiff => Some(schema_of::<patch::DiffData>()),
+        CommandName::PatchDestroy => Some(schema_of::<patch::DestroyData>()),
+        CommandName::Setup => Some(schema_of::<setup::SetupData>()),
     }
 }
 
@@ -207,7 +304,7 @@ fn schema_data(only: Option<CommandName>) -> SchemaData {
 }
 
 /// Global `relish` flags that take a value as the next argument.
-const VALUE_FLAGS: &[&str] = &["-o", "--output", "--token", "--ca-cert", "--endpoint"];
+pub(crate) const VALUE_FLAGS: &[&str] = &["-o", "--output", "--token", "--ca-cert", "--endpoint"];
 
 /// Whether `args` (without the program name) run a `relish agent` command:
 /// the first argument that isn't a flag or a flag's value is `agent`.
@@ -231,8 +328,8 @@ pub fn invoked(args: &[String]) -> bool {
 }
 
 /// The command `args` named after `agent`, or [`CommandName::Agent`] when
-/// they named none it knows. `source` takes the word after it too, as in
-/// `source grep`.
+/// they named none it knows. `source`, `manual` and `patch` take the word
+/// after them too, as in `source grep`.
 pub fn command_named(args: &[String]) -> CommandName {
     let mut words = args
         .iter()
@@ -240,8 +337,8 @@ pub fn command_named(args: &[String]) -> CommandName {
         .skip(1)
         .filter(|arg| !arg.starts_with('-'));
     let name = match words.next().map(String::as_str) {
-        Some("source") => match words.next() {
-            Some(word) => format!("source-{word}"),
+        Some(family @ ("source" | "manual" | "patch")) => match words.next() {
+            Some(word) => format!("{family}-{word}"),
             None => return CommandName::Agent,
         },
         Some(word) => word.to_string(),
@@ -266,15 +363,22 @@ fn max_bytes_in(args: &[String]) -> Option<usize> {
 
 /// The usage failure for a `relish agent` command line clap rejected.
 ///
-/// `message` is clap's own explanation. It honours a valid `--max-bytes`
+/// `message` is clap's own explanation and `lead`, when there is one, opens
+/// the hint: a read-only command close to what was typed, or where to
+/// start. It honours a valid `--max-bytes`
 /// even though the rest of the line didn't parse.
-pub fn usage_failure(args: &[String], message: &str) -> Rendered {
-    let error = AgentError::new(ErrorCode::Usage, message.trim_end())
-        .with_hint("relish agent --help lists the commands; relish agent schema their output");
+pub fn usage_failure(args: &[String], message: &str, lead: Option<&str>) -> Rendered {
+    let help = "relish agent --help lists the commands; relish agent schema their output";
+    let hint = match lead {
+        Some(lead) => format!("{lead} {help}"),
+        None => help.to_string(),
+    };
+    let error = AgentError::new(ErrorCode::Usage, message.trim_end()).with_hint(hint);
+    let command = command_named(args);
     failure(
-        command_named(args),
+        command,
         error,
-        max_bytes_in(args).unwrap_or(DEFAULT_MAX_BYTES),
+        max_bytes_in(args).unwrap_or_else(|| default_max_bytes(command)),
         &rerun_command(args),
     )
 }
@@ -356,14 +460,51 @@ mod tests {
 
     #[test]
     fn max_bytes_defaults_to_24_kib_and_goes_after_the_command() {
-        assert_eq!(parse("agent version").unwrap().max_bytes, 24 * 1024);
+        assert_eq!(parse("agent version").unwrap().max_bytes(), 24 * 1024);
         assert_eq!(
-            parse("agent version --max-bytes 4096").unwrap().max_bytes,
+            parse("agent version --max-bytes 4096").unwrap().max_bytes(),
             4096
         );
         assert_eq!(
-            parse("agent --max-bytes 4096 version").unwrap().max_bytes,
+            parse("agent --max-bytes 4096 version").unwrap().max_bytes(),
             4096
+        );
+    }
+
+    #[test]
+    fn guide_defaults_to_64_kib_and_every_other_command_to_24_kib() {
+        use clap::ValueEnum;
+        for &command in CommandName::value_variants() {
+            let expected = match command {
+                CommandName::Guide => 64 * 1024,
+                _ => 24 * 1024,
+            };
+            assert_eq!(default_max_bytes(command), expected, "{command:?}");
+        }
+        assert_eq!(default_max_bytes(CommandName::Agent), 24 * 1024);
+        assert_eq!(parse("agent guide").unwrap().max_bytes(), 64 * 1024);
+        for line in [
+            "agent version",
+            "agent schema",
+            "agent explain",
+            "agent context",
+            "agent logs payments",
+            "agent manual search deploy",
+            "agent source version",
+        ] {
+            assert_eq!(parse(line).unwrap().max_bytes(), 24 * 1024, "{line}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_max_bytes_beats_the_guides_default() {
+        assert_eq!(
+            parse("agent guide --max-bytes 4096").unwrap().max_bytes(),
+            4096
+        );
+        assert_eq!(
+            parse("agent --max-bytes 131072 guide").unwrap().max_bytes(),
+            128 * 1024
         );
     }
 
@@ -397,13 +538,17 @@ mod tests {
 
     #[tokio::test]
     async fn schema_lists_the_envelope_and_every_answering_command() {
-        let rendered = run(&parse("agent schema").unwrap(), "relish agent schema").await;
+        // Every command's schema together outgrew the default budget once
+        // `context` and `diagnose` arrived; `schema <command>` is the
+        // bounded call, and the test below holds each one to the default.
+        let rendered = run(
+            &parse("agent schema --max-bytes 131072").unwrap(),
+            "relish agent schema",
+        )
+        .await;
         assert_eq!(rendered.exit, ExitStatus::Answered);
         let value = json_of(&rendered);
-        assert_eq!(
-            value["truncated"], false,
-            "the schema fits the default budget"
-        );
+        assert_eq!(value["truncated"], false, "the whole schema fits 128 KiB");
         let names: Vec<&str> = value["data"]["commands"]
             .as_array()
             .unwrap()
@@ -413,13 +558,29 @@ mod tests {
         assert_eq!(
             names,
             [
+                "guide",
                 "version",
                 "schema",
                 "source version",
                 "source tree",
                 "source grep",
                 "source show",
-                "source extract"
+                "source extract",
+                "logs",
+                "manual search",
+                "manual show",
+                "context",
+                "diagnose",
+                "explain",
+                "upgrade-check",
+                "report",
+                "patch init",
+                "patch build",
+                "patch test",
+                "patch try",
+                "patch diff",
+                "patch destroy",
+                "setup"
             ]
         );
         let envelope = &value["data"]["envelope"];
@@ -428,6 +589,20 @@ mod tests {
             error_codes.to_string().contains("tls_untrusted"),
             "{error_codes}"
         );
+    }
+
+    #[tokio::test]
+    async fn each_commands_schema_fits_the_default_budget() {
+        for command in CommandName::ANSWERING {
+            let line = format!(
+                "agent schema {}",
+                clap::ValueEnum::to_possible_value(command)
+                    .unwrap()
+                    .get_name()
+            );
+            let rendered = run(&parse(&line).unwrap(), &format!("relish {line}")).await;
+            assert_eq!(json_of(&rendered)["truncated"], false, "{line}");
+        }
     }
 
     #[tokio::test]
@@ -491,6 +666,96 @@ mod tests {
     }
 
     #[test]
+    fn logs_and_manual_commands_parse_with_their_flags() {
+        let options = parse("agent logs payments --since 1h --tail 50 --stream stderr").unwrap();
+        let AgentCommand::Logs(logs) = &options.command else {
+            panic!("{options:?}");
+        };
+        assert_eq!(logs.app, "payments");
+        assert_eq!(logs.since, "1h");
+        assert_eq!(logs.tail, 50);
+        assert_eq!(logs.stream, Some(logs::StreamArg::Stderr));
+        assert_eq!(options.command.name(), CommandName::Logs);
+        let options = parse("agent manual search rolling deploy --max-bytes 4096").unwrap();
+        assert_eq!(options.max_bytes(), 4096);
+        let AgentCommand::Manual {
+            command: manual::ManualCommand::Search { words },
+        } = &options.command
+        else {
+            panic!("{options:?}");
+        };
+        assert_eq!(words, &["rolling", "deploy"]);
+        assert_eq!(
+            parse("agent manual show diagnostics#reading-wtf")
+                .unwrap()
+                .command
+                .name(),
+            CommandName::ManualShow
+        );
+        assert!(parse("agent manual search").is_err(), "search needs a word");
+        assert!(parse("agent manual").is_err());
+    }
+
+    #[test]
+    fn cluster_commands_parse_with_their_flags() {
+        let options = parse("agent context --events 50").unwrap();
+        let AgentCommand::Context(context) = &options.command else {
+            panic!("{options:?}");
+        };
+        assert_eq!(context.events, 50);
+        assert_eq!(options.command.name(), CommandName::Context);
+        assert!(parse("agent context --events 0").is_err());
+        assert!(parse("agent context --events 201").is_err());
+        let options = parse("agent diagnose --app web").unwrap();
+        let AgentCommand::Diagnose(diagnose) = &options.command else {
+            panic!("{options:?}");
+        };
+        assert_eq!(diagnose.app.as_deref(), Some("web"));
+        let options = parse("agent explain crashloop").unwrap();
+        assert!(
+            matches!(&options.command, AgentCommand::Explain { id: Some(id) } if id == "crashloop")
+        );
+        assert!(matches!(
+            parse("agent explain").unwrap().command,
+            AgentCommand::Explain { id: None }
+        ));
+        assert_eq!(
+            command_named(&args("agent explain --bogus")),
+            CommandName::Explain
+        );
+    }
+
+    #[test]
+    fn patch_commands_parse_with_their_flags() {
+        let options = parse("agent patch build ./w --bun --allow-build-changes").unwrap();
+        let AgentCommand::Patch(patch) = &options.command else {
+            panic!("{options:?}");
+        };
+        assert!(matches!(
+            &patch.command,
+            patch::PatchCommand::Build {
+                relish: false,
+                bun: true,
+                allow_build_changes: true,
+                ..
+            }
+        ));
+        assert_eq!(options.command.name(), CommandName::PatchBuild);
+        assert!(parse("agent patch try ./w --nodes 3").is_ok());
+        assert!(parse("agent patch try ./w --nodes 2").is_err());
+        assert!(parse("agent patch destroy --all").is_ok());
+        assert!(
+            parse("agent patch destroy").is_err(),
+            "a workspace or --all"
+        );
+        assert!(parse("agent patch destroy ./w --all").is_err());
+        assert_eq!(
+            command_named(&args("agent patch test --bogus")),
+            CommandName::PatchTest
+        );
+    }
+
+    #[test]
     fn schema_does_not_offer_agent_itself() {
         assert!(parse("agent schema agent").is_err());
     }
@@ -527,6 +792,14 @@ mod tests {
             command_named(&args("agent source nope")),
             CommandName::Agent
         );
+        assert_eq!(
+            command_named(&args("agent manual show diagnostics --bogus")),
+            CommandName::ManualShow
+        );
+        assert_eq!(
+            command_named(&args("agent logs payments --bogus")),
+            CommandName::Logs
+        );
         assert_eq!(command_named(&args("agent")), CommandName::Agent);
     }
 
@@ -554,7 +827,7 @@ mod tests {
     #[test]
     fn a_usage_failure_is_an_envelope_with_exit_2() {
         let line = args("agent version --bogus");
-        let rendered = usage_failure(&line, "error: unexpected argument '--bogus' found\n");
+        let rendered = usage_failure(&line, "error: unexpected argument '--bogus' found\n", None);
         assert_eq!(rendered.exit, ExitStatus::Usage);
         assert_eq!(rendered.exit.code(), 2);
         let value = json_of(&rendered);

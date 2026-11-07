@@ -2,7 +2,9 @@
 //!
 //! An agent pays for every byte it reads, and a tool result over about
 //! 10,000 tokens gets a warning in Claude Code, so each command's output has
-//! a ceiling: 24 KiB by default, about 6,000 tokens. When an answer is
+//! a ceiling: 24 KiB by default, about 6,000 tokens. `relish agent guide` is
+//! the exception at 64 KiB: it is the one document an agent reads whole, so
+//! its default fits the whole manual chapter. When an answer is
 //! bigger, the budget trims `data` rather than cutting the text, so what
 //! comes out is still one valid JSON document in the same shape. Then it says
 //! so: `truncated` is `true`, a warning names each array or string it cut,
@@ -14,8 +16,21 @@ use serde_json::{Value, json};
 
 use super::envelope::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, ExitStatus};
 
-/// The budget when `--max-bytes` isn't given: 24 KiB.
+/// The budget when `--max-bytes` isn't given: 24 KiB, for every command
+/// but `guide`.
 pub const DEFAULT_MAX_BYTES: usize = 24 * 1024;
+
+/// `relish agent guide`'s budget when `--max-bytes` isn't given: 64 KiB,
+/// enough for the whole agent chapter in one call.
+pub const GUIDE_MAX_BYTES: usize = 64 * 1024;
+
+/// The budget `command` gets when `--max-bytes` isn't given.
+pub fn default_max_bytes(command: CommandName) -> usize {
+    match command {
+        CommandName::Guide => GUIDE_MAX_BYTES,
+        _ => DEFAULT_MAX_BYTES,
+    }
+}
 
 /// The smallest budget `--max-bytes` accepts. Below this even a failure
 /// envelope might not fit.
@@ -243,21 +258,36 @@ fn record_cut(cuts: &mut Vec<Cut>, pointer: String, original: usize, kind: CutKi
     }
 }
 
-/// Drop items from the end of the biggest non-empty array in `data` until
-/// at least `excess` bytes are gone or it's empty. `false` when there's no
-/// such array.
+/// Drop items from the end of the biggest non-empty array in `data`, and
+/// say whether there was one.
+///
+/// It cuts until `excess` bytes are gone, or the array is no bigger than the
+/// next biggest one outside it, whichever comes first, but always at least
+/// half of `excess`. So one huge list doesn't lose everything while a
+/// smaller one beside it stays whole: two big lists end up cut to about the
+/// same size, in a handful of passes.
 fn cut_largest_array(data: &mut Value, excess: usize, cuts: &mut Vec<Cut>) -> bool {
-    let mut largest = None;
-    find_largest_array(data, &mut String::new(), &mut largest);
-    let Some((_, pointer)) = largest else {
+    let mut arrays = Vec::new();
+    find_arrays(data, &mut String::new(), &mut arrays);
+    let Some((size, pointer)) = arrays.iter().rev().max_by_key(|(size, _)| *size).cloned() else {
         return false;
+    };
+    let inside = format!("{pointer}/");
+    let next = arrays
+        .iter()
+        .filter(|(_, other)| *other != pointer && !other.starts_with(&inside))
+        .map(|(size, _)| *size)
+        .max();
+    let target = match next {
+        Some(next) => excess.min(size - next).max(excess.div_ceil(2)),
+        None => excess,
     };
     let Some(Value::Array(items)) = data.pointer_mut(&pointer) else {
         return false;
     };
     let original = items.len();
     let mut removed = 0;
-    while removed < excess {
+    while removed < target {
         let Some(last) = items.pop() else {
             break;
         };
@@ -268,19 +298,17 @@ fn cut_largest_array(data: &mut Value, excess: usize, cuts: &mut Vec<Cut>) -> bo
     true
 }
 
-fn find_largest_array(value: &Value, pointer: &mut String, largest: &mut Option<(usize, String)>) {
+/// Every non-empty array in `value`, as (size in bytes, JSON Pointer).
+fn find_arrays(value: &Value, pointer: &mut String, arrays: &mut Vec<(usize, String)>) {
     match value {
         Value::Array(items) => {
             if !items.is_empty() {
-                let size = json_length(value);
-                if largest.as_ref().is_none_or(|(best, _)| size > *best) {
-                    *largest = Some((size, pointer.clone()));
-                }
+                arrays.push((json_length(value), pointer.clone()));
             }
             for (index, item) in items.iter().enumerate() {
                 let length = pointer.len();
                 pointer.push_str(&format!("/{index}"));
-                find_largest_array(item, pointer, largest);
+                find_arrays(item, pointer, arrays);
                 pointer.truncate(length);
             }
         }
@@ -289,7 +317,7 @@ fn find_largest_array(value: &Value, pointer: &mut String, largest: &mut Option<
                 let length = pointer.len();
                 pointer.push('/');
                 pointer.push_str(&escape_pointer_token(key));
-                find_largest_array(field, pointer, largest);
+                find_arrays(field, pointer, arrays);
                 pointer.truncate(length);
             }
         }
@@ -460,6 +488,30 @@ mod tests {
             "{hint}"
         );
         assert_eq!(hint["read_only"], json!(true));
+    }
+
+    #[test]
+    fn a_huge_list_beside_a_big_one_doesnt_lose_everything() {
+        let apps: Vec<Value> = (0..2000)
+            .map(|index| json!({"app": format!("app-{index:04}")}))
+            .collect();
+        let events: Vec<Value> = (0..200)
+            .map(|index| json!({"event": format!("event-{index:03}")}))
+            .collect();
+        let text = render_json(
+            &answered(json!({"apps": apps, "events": events})),
+            4096,
+            "relish agent version",
+        );
+        assert!(text.len() <= 4096, "{} bytes", text.len());
+        let value = parse(&text);
+        let kept_apps = value["data"]["apps"].as_array().unwrap().len();
+        let kept_events = value["data"]["events"].as_array().unwrap().len();
+        assert!(
+            kept_apps > 0 && kept_events > 0,
+            "{kept_apps} apps, {kept_events} events"
+        );
+        assert_eq!(value["data"]["apps"][0]["app"], json!("app-0000"));
     }
 
     #[test]

@@ -1,0 +1,40 @@
+---
+source: src/relish/agent/patch/suite.rs
+expression: "normalised(&rendered, fixture.root.path())"
+---
+{
+  "command": "patch test",
+  "data": {
+    "cargo_output": null,
+    "dir": "[root]/work",
+    "errors": [],
+    "failed": 1,
+    "failures": [
+      {
+        "name": "client::tests::a_refusal_is_unreachable",
+        "output": "thread 'client::tests::a_refusal_is_unreachable' panicked at src/client.rs:40:9:\nassertion `left == right` failed\n  left: Timeout\n right: Unreachable"
+      }
+    ],
+    "filter": null,
+    "filtered_out": 0,
+    "ignored": 3,
+    "not_run": "only the portable suite ran: unit tests, tests/suite, every other test that isn't #[ignore], and the doctests, as make test-cargo runs them. The gated suites (make test-cluster, test-linux, test-slow, test-upgrade and the rest) are marked ignore, so they didn't run",
+    "ok": false,
+    "passed": 1,
+    "seconds": 0,
+    "suite": "portable",
+    "total_errors": 0,
+    "tree": "[id]"
+  },
+  "next": [],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": false,
+    "source_digest": "sha256:1639b607afe38bc2d97354cd49b82921653880e34c8d918491816b50df78c953",
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": []
+}

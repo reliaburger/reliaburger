@@ -33,6 +33,8 @@ pub const ALLOWLIST: &[&str] = &[
     "scripts/release/qualify-sustained.sh",
     "scripts/release/sustained/soak-jobs.toml",
     "scripts/release/sustained/soak-workloads.toml",
+    // `relish agent setup` installs the generated skill.
+    "plugins/reliaburger/skills/reliaburger/SKILL.md",
     // The test set.
     "tests",
     "proptest-regressions",

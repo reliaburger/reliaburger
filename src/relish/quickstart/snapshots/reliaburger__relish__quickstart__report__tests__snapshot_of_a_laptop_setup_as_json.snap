@@ -1,0 +1,83 @@
+---
+source: src/relish/quickstart/report.rs
+expression: "format_output(&laptop_report(), OutputFormat::Json).unwrap()"
+---
+{
+  "cluster": "laptop",
+  "kind": "laptop",
+  "version": "0.2.7",
+  "seconds": 187.25,
+  "stages": [
+    {
+      "stage": "host",
+      "seconds": 0.5,
+      "bytes": 0
+    },
+    {
+      "stage": "download",
+      "seconds": 60.0,
+      "bytes": 629145600
+    },
+    {
+      "stage": "boot",
+      "seconds": 50.0,
+      "bytes": 0
+    },
+    {
+      "stage": "configure",
+      "seconds": 40.0,
+      "bytes": 0
+    },
+    {
+      "stage": "verify",
+      "seconds": 36.25,
+      "bytes": 0
+    }
+  ],
+  "nodes": [
+    {
+      "name": "rb-laptop-1",
+      "address": "10.0.0.1",
+      "ssh": null
+    },
+    {
+      "name": "rb-laptop-2",
+      "address": "10.0.0.2",
+      "ssh": null
+    },
+    {
+      "name": "rb-laptop-3",
+      "address": "10.0.0.3",
+      "ssh": null
+    }
+  ],
+  "api": "https://127.0.0.1:19117",
+  "context": "/home/me/.reliaburger/context.json",
+  "app": "http://localhost:18080",
+  "state_directory": "/home/me/.reliaburger/clusters/laptop",
+  "timings_file": "/home/me/.reliaburger/clusters/laptop/timings.json",
+  "back_up": null,
+  "next": [
+    {
+      "run": "relish manual tour",
+      "why": "the five-minute tour of this cluster"
+    },
+    {
+      "run": "relish status",
+      "why": "every app and node"
+    },
+    {
+      "run": "relish logs hello",
+      "why": "the demo app's logs"
+    },
+    {
+      "run": "relish local status --name laptop",
+      "why": "each VM and its API"
+    }
+  ],
+  "teardown": {
+    "kind": "command",
+    "run": "relish local destroy --name laptop --yes"
+  },
+  "warnings": []
+}

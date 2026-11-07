@@ -1,0 +1,136 @@
+---
+source: src/relish/agent/setup/tests.rs
+expression: answer
+---
+{
+  "command": "setup",
+  "data": {
+    "action": "install",
+    "agents": [
+      {
+        "agent": "claude-code",
+        "changes": [
+          {
+            "diff": "--- $HOME/.claude.json\n+++ $HOME/.claude.json\n@@ -3,0 +4,8 @@\n+    \"reliaburger\": {\n+      \"args\": [\n+        \"mcp\"\n+      ],\n+      \"command\": \"relish\",\n+      \"env\": {},\n+      \"type\": \"stdio\"\n+    },\n",
+            "entry": "mcpServers.reliaburger",
+            "kind": "mcp_server",
+            "note": null,
+            "path": "$HOME/.claude.json",
+            "status": "add",
+            "written": false
+          },
+          {
+            "diff": "--- $HOME/.claude/skills/reliaburger/SKILL.md\n+++ $HOME/.claude/skills/reliaburger/SKILL.md\n@@ -0,0 +1,6 @@\n+---\n+name: reliaburger\n+description: test skill\n+---\n+\n+Run relish agent context first.\n",
+            "entry": "file",
+            "kind": "skill",
+            "note": null,
+            "path": "$HOME/.claude/skills/reliaburger/SKILL.md",
+            "status": "add",
+            "written": false
+          }
+        ],
+        "detected": true
+      },
+      {
+        "agent": "codex",
+        "changes": [
+          {
+            "diff": "--- $HOME/.codex/config.toml\n+++ $HOME/.codex/config.toml\n@@ -5,0 +6,4 @@\n+\n+[mcp_servers.reliaburger]\n+args = [\"mcp\"]\n+command = \"relish\"\n",
+            "entry": "mcp_servers.reliaburger",
+            "kind": "mcp_server",
+            "note": null,
+            "path": "$HOME/.codex/config.toml",
+            "status": "add",
+            "written": false
+          }
+        ],
+        "detected": true
+      },
+      {
+        "agent": "cursor",
+        "changes": [
+          {
+            "diff": "--- $HOME/.cursor/mcp.json\n+++ $HOME/.cursor/mcp.json\n@@ -0,0 +1,10 @@\n+{\n+  \"mcpServers\": {\n+    \"reliaburger\": {\n+      \"args\": [\n+        \"mcp\"\n+      ],\n+      \"command\": \"relish\"\n+    }\n+  }\n+}\n",
+            "entry": "mcpServers.reliaburger",
+            "kind": "mcp_server",
+            "note": null,
+            "path": "$HOME/.cursor/mcp.json",
+            "status": "add",
+            "written": false
+          }
+        ],
+        "detected": true
+      },
+      {
+        "agent": "vscode",
+        "changes": [
+          {
+            "diff": "--- $HOME/Library/Application Support/Code/User/mcp.json\n+++ $HOME/Library/Application Support/Code/User/mcp.json\n@@ -0,0 +1,11 @@\n+{\n+  \"servers\": {\n+    \"reliaburger\": {\n+      \"args\": [\n+        \"mcp\"\n+      ],\n+      \"command\": \"relish\",\n+      \"type\": \"stdio\"\n+    }\n+  }\n+}\n",
+            "entry": "servers.reliaburger",
+            "kind": "mcp_server",
+            "note": null,
+            "path": "$HOME/Library/Application Support/Code/User/mcp.json",
+            "status": "add",
+            "written": false
+          }
+        ],
+        "detected": true
+      },
+      {
+        "agent": "goose",
+        "changes": [
+          {
+            "diff": "--- $HOME/.config/goose/config.yaml\n+++ $HOME/.config/goose/config.yaml\n@@ -6,0 +7,10 @@\n+  reliaburger:\n+    args:\n+    - mcp\n+    cmd: relish\n+    description: 'Reliaburger: read-only cluster status, diagnosis and logs'\n+    enabled: true\n+    envs: {}\n+    name: reliaburger\n+    timeout: 300\n+    type: stdio\n",
+            "entry": "extensions.reliaburger",
+            "kind": "mcp_server",
+            "note": null,
+            "path": "$HOME/.config/goose/config.yaml",
+            "status": "add",
+            "written": false
+          }
+        ],
+        "detected": true
+      },
+      {
+        "agent": "gemini",
+        "changes": [
+          {
+            "diff": "--- $HOME/.gemini/settings.json\n+++ $HOME/.gemini/settings.json\n@@ -1,0 +2,8 @@\n+  \"mcpServers\": {\n+    \"reliaburger\": {\n+      \"args\": [\n+        \"mcp\"\n+      ],\n+      \"command\": \"relish\"\n+    }\n+  },\n",
+            "entry": "mcpServers.reliaburger",
+            "kind": "mcp_server",
+            "note": null,
+            "path": "$HOME/.gemini/settings.json",
+            "status": "add",
+            "written": false
+          }
+        ],
+        "detected": true
+      }
+    ],
+    "applied": false,
+    "server": {
+      "command": [
+        "relish",
+        "mcp"
+      ],
+      "name": "reliaburger"
+    }
+  },
+  "next": [
+    {
+      "read_only": false,
+      "run": "relish agent setup --yes",
+      "why": "make exactly these changes, once a human has read the diffs"
+    }
+  ],
+  "ok": true,
+  "relish": {
+    "commit": null,
+    "dirty": null,
+    "source_digest": null,
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": []
+}

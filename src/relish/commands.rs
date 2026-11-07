@@ -345,7 +345,7 @@ pub fn log_records(lines: &super::client::LogLines) -> Vec<LogRecord<'_>> {
 }
 
 /// `seconds` since the Unix epoch as RFC 3339 in UTC, if it's a real time.
-fn rfc3339(seconds: u64) -> Option<String> {
+pub(crate) fn rfc3339(seconds: u64) -> Option<String> {
     let seconds = i64::try_from(seconds).ok()?;
     time::OffsetDateTime::from_unix_timestamp(seconds)
         .ok()?
@@ -511,7 +511,7 @@ fn parse_json_field(value: &str) -> Result<(String, String), RelishError> {
 }
 
 /// Current unix time in seconds.
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

@@ -1,0 +1,44 @@
+---
+source: src/relish/agent/patch/workspace.rs
+expression: value
+---
+{
+  "command": "patch init",
+  "data": {
+    "base": "[id]",
+    "branch": "patch",
+    "digest": "sha256:1639b607afe38bc2d97354cd49b82921653880e34c8d918491816b50df78c953",
+    "dir": "[root]/work",
+    "files": 6,
+    "source_commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "state_dir": ".reliaburger-patch",
+    "version": "0.2.7"
+  },
+  "next": [
+    {
+      "read_only": false,
+      "run": "relish agent patch test [root]/work",
+      "why": "after editing: the portable suite, or one test by name"
+    },
+    {
+      "read_only": false,
+      "run": "relish agent patch build [root]/work",
+      "why": "after editing: relish for this machine, bun for a throwaway cluster"
+    },
+    {
+      "read_only": true,
+      "run": "relish agent patch diff [root]/work",
+      "why": "the change so far and which tests ran against it"
+    }
+  ],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": false,
+    "source_digest": "sha256:1639b607afe38bc2d97354cd49b82921653880e34c8d918491816b50df78c953",
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": []
+}

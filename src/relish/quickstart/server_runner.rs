@@ -19,16 +19,21 @@ use super::{
     lima::GuestFile,
     progress::{Progress, Stage, Step},
     provision,
+    report::{ServerFacts, SetupReport},
     runner::{
         JOIN_SCRIPT, NodeSources, check_release_source, checkpoint, demo_config, node_files,
-        open_operation, probe_demo, wait_for_quorum,
+        open_operation, probe_demo, saved_endpoint, wait_for_quorum,
     },
     security::Bootstrap,
     server::{Facts, PACKAGES, PREFLIGHT},
     ssh::{Ssh, SshTarget, Tunnel},
     state::{ClusterSpec, NodePhase, Operation},
 };
-use crate::relish::{client::BunClient, local_context::LocalContext};
+use crate::relish::{
+    client::BunClient,
+    local_context::LocalContext,
+    output::{self, OutputFormat},
+};
 use crate::upgrade::BinaryVersion;
 
 /// One command on a machine, which for `apt-get` can take minutes.
@@ -55,6 +60,9 @@ pub struct Options {
     pub development_binaries: Option<PathBuf>,
     /// HTTPS directory of unchanged signed release candidate assets.
     pub release_mirror: Option<String>,
+    /// Lines for people, or the [`SetupReport`] as JSON or YAML with the
+    /// progress on standard error.
+    pub output: OutputFormat,
 }
 
 /// The shell that installs what a node needs from the distribution.
@@ -613,7 +621,7 @@ pub async fn run(options: Options) -> Result<()> {
     };
     let (mut operation, bootstrap, _setup_lock) = open_operation(&root, spec).await?;
     let ssh = Ssh::new(COMMAND_DEADLINE);
-    let progress = Progress::stdout();
+    let progress = Progress::for_output(options.output);
     let result = provision_cluster(
         &root,
         &ssh,
@@ -625,26 +633,21 @@ pub async fn run(options: Options) -> Result<()> {
     )
     .await;
     let timings = progress.finish().await;
-    println!("{}", timings.summary());
+    output::progress(options.output, timings.summary());
     match result {
         Ok(unreachable) => {
-            let spec = &operation.state.spec;
-            println!(
-                "cluster {} ready in {:.1}s",
-                spec.name, timings.total_seconds
-            );
-            println!("  app: http://{}", spec.ssh[0].host);
+            let context = root.join("context.json");
             let relish = crate::relish::install::invocation();
-            println!("  next: {relish} status; {relish} logs hello; {relish} dashboard");
-            println!(
-                "  back up {}: it holds the cluster's master key and the only copy of the root CA",
-                bootstrap.directory.display()
-            );
-            // Last, so it isn't lost above the timings: until it's dealt
-            // with, the `next:` commands above all fail.
-            if let Some(advice) = unreachable {
-                println!("\nwarning: {advice}");
-            }
+            let report = SetupReport::servers(ServerFacts {
+                operation: &operation,
+                timings: &timings,
+                api: saved_endpoint(&context).await,
+                context,
+                back_up: bootstrap.directory.clone(),
+                unreachable,
+                relish: &relish,
+            });
+            output::print_output(&report, options.output)?;
             Ok(())
         }
         Err(error) => Err(error.context(format!(
@@ -804,17 +807,20 @@ exit 0
             for binary in ["bun", "relish"] {
                 std::fs::write(fake.path().join("bin").join(binary), binary).unwrap();
             }
-            // Nothing listens here, so a tunnel can't seem to open by
-            // accident, and the ports for every machine fit below 65536.
-            let api_port = std::iter::repeat_with(|| {
-                std::net::TcpListener::bind("127.0.0.1:0")
-                    .unwrap()
-                    .local_addr()
-                    .unwrap()
-                    .port()
-            })
-            .find(|port| *port < 65000)
-            .unwrap();
+            // Nothing may listen on any machine's port, so a tunnel can't seem
+            // to open by accident. A port from `bind(0)` is in the ephemeral
+            // range, where the next outgoing connections on the host land:
+            // one of those, or a listener another test bound there, answered
+            // a tunnel's probe, and the test waited out the 60 s readiness
+            // deadline (#1608). Below the ephemeral ranges of both macOS
+            // (49152) and Linux (32768), only a fixed port collides, and the
+            // integration fixtures keep theirs in 27000..30000.
+            let api_port = std::iter::repeat_with(|| rand::random_range(20_000..27_000))
+                .find(|base: &u16| {
+                    (*base..*base + HOSTS.len() as u16)
+                        .all(|port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
+                })
+                .unwrap();
             Self {
                 ssh: Ssh::shell_script(script, Duration::from_secs(10), ""),
                 fake,
@@ -835,6 +841,7 @@ exit 0
                 ingress_port: 18080,
                 development_binaries: Some(self.fake.path().join("bin")),
                 release_mirror: None,
+                output: OutputFormat::Human,
             }
         }
 
@@ -961,9 +968,13 @@ exit 0
         let checkpoints = tokio::sync::Mutex::new(&mut operation);
         for index in 0..HOSTS.len() {
             let client = (index > 0).then_some(&client);
-            let error = configure(&setup, index, client, &checkpoints)
-                .await
-                .unwrap_err();
+            let error = tokio::time::timeout(
+                Duration::from_secs(30),
+                configure(&setup, index, client, &checkpoints),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("node {} never stopped at its tunnel", index + 1))
+            .unwrap_err();
             assert!(stopped_at_the_tunnel(&error), "{error:#}");
         }
         // Release the operation lock, which `phases` takes.

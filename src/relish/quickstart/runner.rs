@@ -6,12 +6,17 @@ use super::{
     lima::{GuestFile, Lima},
     progress::{Progress, Stage, Step, Timings},
     provision,
+    report::{LaptopFacts, SetupReport},
     security::{self, Bootstrap},
     state::{ClusterSpec, NodePhase, NodeState, Operation},
 };
 use crate::{
     bun::agent::CouncilStatus,
-    relish::{client::BunClient, local_context::LocalContext},
+    relish::{
+        client::BunClient,
+        local_context::LocalContext,
+        output::{self, OutputFormat},
+    },
     upgrade::BinaryVersion,
 };
 use anyhow::{Context, Result, bail};
@@ -39,6 +44,23 @@ pub struct Options {
     pub release_mirror: Option<String>,
     /// Print every step's timing, not just the per-stage summary.
     pub timings: bool,
+    /// Lines for people, or the [`SetupReport`] as JSON or YAML with the
+    /// progress on standard error.
+    pub output: OutputFormat,
+}
+
+/// The API endpoint in the saved context, when it can be read.
+pub(super) async fn saved_endpoint(path: &Path) -> Option<String> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        LocalContext::load(&path)
+            .ok()
+            .flatten()
+            .map(|context| context.endpoint)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// How long a download attempt may go without receiving a byte before it is
@@ -107,7 +129,7 @@ pub async fn run(options: Options) -> Result<()> {
     };
     let (mut operation, bootstrap, _setup_lock) = open_operation(&root, spec).await?;
     super::preflight::socket_paths(&root, operation.state.nodes.iter().map(|node| &node.name))?;
-    let progress = Progress::stdout();
+    let progress = Progress::for_output(options.output);
     let result = setup(
         &root,
         &mut operation,
@@ -118,9 +140,12 @@ pub async fn run(options: Options) -> Result<()> {
     )
     .await;
     let timings = progress.finish().await;
-    println!("{}", timings.summary());
+    output::progress(options.output, timings.summary());
     if options.timings {
-        println!("every step (duration, start offset):\n{}", timings.table());
+        output::progress(
+            options.output,
+            format!("every step (duration, start offset):\n{}", timings.table()),
+        );
     }
     let report = TimingsReport {
         schema: 1,
@@ -135,27 +160,26 @@ pub async fn run(options: Options) -> Result<()> {
     let timings_path = operation.directory.join("timings.json");
     // Timings are a diagnostic; failing to save them mustn't fail setup.
     match save_timings(&timings_path, &report).await {
-        Ok(()) => println!("timings saved to {}", timings_path.display()),
+        Ok(()) => output::progress(
+            options.output,
+            format!("timings saved to {}", timings_path.display()),
+        ),
         Err(error) => eprintln!("could not save timings: {error:#}"),
     }
     match result {
         Ok(()) => {
-            println!(
-                "cluster {} ready in {:.1}s",
-                operation.state.spec.name, timings.total_seconds
-            );
-            println!(
-                "  app: http://localhost:{}",
-                operation.state.spec.ingress_port
-            );
+            let context = root.join("context.json");
             // Straight after install.sh, `relish` may not be on PATH yet.
             let relish = crate::relish::install::invocation();
-            println!("  next: {relish} manual tour   (the five-minute tour of this cluster)");
-            println!("  or: {relish} status; {relish} logs hello; {relish} dashboard");
-            println!(
-                "  lifecycle: {relish} local status|stop|start|destroy --name {}",
-                operation.state.spec.name
-            );
+            let report = SetupReport::laptop(LaptopFacts {
+                operation: &operation,
+                timings: &timings,
+                api: saved_endpoint(&context).await,
+                context,
+                timings_file: timings_path,
+                relish: &relish,
+            });
+            output::print_output(&report, options.output)?;
             Ok(())
         }
         Err(error) => Err(error.context(format!(

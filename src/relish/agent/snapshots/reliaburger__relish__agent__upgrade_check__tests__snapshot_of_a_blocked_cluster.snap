@@ -1,0 +1,117 @@
+---
+source: src/relish/agent/upgrade_check.rs
+expression: rendered(&evidence(cluster))
+---
+{
+  "command": "upgrade-check",
+  "data": {
+    "latest": {
+      "formats": {
+        "protocol": 57,
+        "state": 74
+      },
+      "platforms": [
+        "linux-aarch64",
+        "linux-x86_64"
+      ],
+      "version": "v0.2.7"
+    },
+    "metadata": "https://github.com/reliaburger/reliaburger/releases/latest/download/metadata.json",
+    "nodes": [
+      {
+        "artefact": true,
+        "commit": "50596cfe0000000000000000000000000000beef",
+        "formats": {
+          "protocol": 57,
+          "state": 74
+        },
+        "node": "node-1",
+        "platform": "linux-x86_64",
+        "role": "leader",
+        "state": "alive",
+        "version": "v0.2.6"
+      },
+      {
+        "artefact": true,
+        "commit": "50596cfe0000000000000000000000000000beef",
+        "formats": {
+          "protocol": 57,
+          "state": 74
+        },
+        "node": "node-2",
+        "platform": "linux-x86_64",
+        "role": "council",
+        "state": "alive",
+        "version": "v0.2.6"
+      },
+      {
+        "artefact": null,
+        "commit": null,
+        "formats": null,
+        "node": "node-3",
+        "platform": null,
+        "role": "council",
+        "state": "dead",
+        "version": null
+      },
+      {
+        "artefact": false,
+        "commit": "50596cfe0000000000000000000000000000beef",
+        "formats": {
+          "protocol": 57,
+          "state": 74
+        },
+        "node": "node-4",
+        "platform": "linux-riscv64",
+        "role": "worker",
+        "state": "alive",
+        "version": "v0.2.6"
+      }
+    ],
+    "reasons": [
+      {
+        "code": "node_down",
+        "kind": "blocker",
+        "message": "node-3 is dead; it would miss the roll and come back on its old version",
+        "node": "node-3"
+      },
+      {
+        "code": "missing_artefact",
+        "kind": "blocker",
+        "message": "node-4 runs on linux-riscv64, and the release metadata has no v0.2.7 build for it",
+        "node": "node-4"
+      },
+      {
+        "code": "quorum_risk",
+        "kind": "blocker",
+        "message": "2 of 3 council members are up; restarting one at a time leaves 1, and quorum needs 2",
+        "node": null
+      },
+      {
+        "code": "wtf_critical",
+        "kind": "blocker",
+        "message": "relish wtf: payments is crash looping (crash-loop, app/default/payments)",
+        "node": null
+      }
+    ],
+    "release_notes": null,
+    "verdict": "blocked"
+  },
+  "next": [
+    {
+      "read_only": true,
+      "run": "relish wtf -o json",
+      "why": "the critical findings in full"
+    }
+  ],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": null,
+    "source_digest": null,
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": []
+}

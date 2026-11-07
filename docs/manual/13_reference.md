@@ -79,6 +79,7 @@ On your machine:
 | `init`, `join` | the files written and the root CA `fingerprint` |
 | `ca backup`, `ca verify` | the backup's `cluster`, `fingerprint` and `expires_at` |
 | `sign keygen`, `dev keygen` | where the private key is, and the `public_key` |
+| `setup --quickstart`, `setup --ssh` | what it built: the `nodes`, `api`, `app`, the `context` file, `stages` with their `seconds`, `next`, `teardown` and `warnings`; progress goes to stderr |
 | `local`, `dev create`, `dev status`, `dev stop`, `dev start`, `dev destroy` | each node and its state, or what the command did to it |
 | `dev test`, `dev disk`, `dev clean` | whether the run `passed`; the build VM's report as `output` |
 | `dev sign-binary`, `dev countersign-binary` | the `signature` file and the binary's `sha256` |
@@ -97,10 +98,12 @@ would the token. Everything else names where a secret is (`init`'s
 encrypt` never echoes the plaintext.
 
 Six commands refuse `-o json`, exit `2` and say they're interactive: `tui`,
-`dashboard`, `manual` (the reader and `--web`), `source`, `setup` and `dev
-shell`. They take over the terminal or a browser, or ask their questions as
+`dashboard`, `manual` (the reader and `--web`), `source`, the guided `setup`
+and `dev shell`. They take over the terminal or a browser, or ask their questions as
 they go, so there's nothing to print as data. Bare `relish -o json` is
-`relish -o json tui`, so it refuses too. `exec` isn't one of them: it runs a
+`relish -o json tui`, so it refuses too. `setup --quickstart` and `setup
+--ssh` aren't among them: they never ask, so they print what they built, and
+an agent that ran them can quote it. `exec` isn't one of them either: it runs a
 command once, with no stdin and no terminal, and prints what it said. `-f` on
 `logs` refuses `-o json` until a followed line carries its time and stream.
 

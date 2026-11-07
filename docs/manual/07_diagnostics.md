@@ -9,7 +9,10 @@ its exit code, so you can wire them straight into CI or an alert.
 `wtf` fans authenticated requests across the expected nodes, correlates the
 evidence, and prints a categorised report: CRITICAL, WARNING, UNKNOWN and OK.
 It doesn't just list problems. It links a crashloop to the recent deploy and
-the error log line behind it.
+the error log line behind it. A crashloop is three `restart` events for one
+app inside 15 minutes; Bun records one for every restart, so `relish events`
+shows the same history `wtf` read. A high lifetime `restart_count` in
+`relish status` on its own isn't one.
 
 You only need to reach one node. `wtf`, `inspect` and `path` send every
 per-node request through the node you're connected to (`/v1/nodes/<node>/relay/...`), carrying
@@ -112,6 +115,55 @@ with the reason, such as `binary not found: /usr/local/bin/ghost-server`.
 `relish status` prints it under the table, and `wtf` reports a critical
 `launch-failed` finding naming each instance, its node and the reason, in place
 of a generic under-replication (see `deploy-an-app`).
+
+### Every finding
+
+Each finding has a stable id. `relish agent explain <id>` prints what it
+means, the numbers that decide it and the line of code that does (see
+`working-with-an-ai-agent`).
+
+| Id | Severity | Means |
+|----|----------|-------|
+| `unreachable-nodes` | critical | A node's Bun API didn't answer |
+| `node-dead` | critical | Gossip marks a node dead or suspect |
+| `version-skew` | warning | Nodes run different `bun` builds |
+| `council-recovery-split` | critical | Two recoveries claimed one epoch; both councils fenced themselves |
+| `council-fence-unpersisted` | warning | A recovery fence couldn't be written to disk |
+| `council-fenced` | critical | Nodes belong to a council `relish council recover` replaced |
+| `council-epoch-split` | critical | Nodes serve different recovery epochs |
+| `council-voter-lagging` | warning | A voter answers but has applied more than 100 fewer log entries |
+| `council-multiple-leaders` | critical | More than one node is named leader |
+| `no-leader` | critical | The council has no leader |
+| `quorum-loss` | critical | Fewer than a majority of council members answer |
+| `council-member-down` | warning | A council member is missing, quorum holds |
+| `active-faults` | warning | Smoker faults are active |
+| `disk-high` | warning, critical | A filesystem is 85% full (critical at 95%) |
+| `cert-expired` | critical | A certificate has expired |
+| `cert-expiring` | warning | A certificate expires within 14 days without healthy rotation |
+| `registry-lost-images` | critical | No live node holds every layer of an image |
+| `registry-needs-mtls` | warning | A plaintext cluster's registry can't replicate |
+| `registry-redundancy` | warning | A node's registry is down, unreachable or under-replicated |
+| `token-expired` | warning | An API token has expired |
+| `token-expiring` | warning | An API token expires within 14 days |
+| `admin-token-old` | warning | An admin token's secret is over 90 days old |
+| `namespace-isolation` | warning | A node can't keep namespaces apart |
+| `gitops-plaintext-secret` | warning | A secret is plaintext in the GitOps repository |
+| `gitops-local-config` | warning | A node's own `[gitops]` is ignored |
+| `gitops-config-unreadable` | warning | A node can't unseal the GitOps credentials |
+| `policy-broken` | warning | A policy in force can't be evaluated |
+| `policy-would-deny` | warning | A committed app or job breaks a deny policy |
+| `policy-audit` | warning | A committed app or job breaks an audit policy |
+| `crashloop` | critical | An app restarted 3 times in 15 minutes |
+| `no-backends` | critical | A service has no healthy backend |
+| `launch-failed` | critical | The runtime refused to launch an app |
+| `quota-blocked` | warning | A namespace quota keeps an app unplaced |
+| `volume-home-away` | critical | An app waits for the node holding its volume |
+| `unschedulable` | warning | Some of an app's replicas have no node |
+| `under-replicated` | warning | An app runs fewer replicas than it wants |
+| `rollout-failed` | warning | An app's spec failed to roll out on a node |
+| `deploy-stuck` | warning | A deploy has been active for over 15 minutes |
+| `alerts-firing` | warning | An alert is firing |
+| `cpu-throttling` | warning | An app was CPU throttled |
 
 ## `relish path`: can A reach B?
 

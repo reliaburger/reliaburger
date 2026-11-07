@@ -1,0 +1,70 @@
+---
+source: src/relish/agent/report/tests.rs
+expression: envelope
+---
+{
+  "command": "report",
+  "data": {
+    "dir": "<tmp>/report",
+    "duplicate_of": 1515,
+    "files": [
+      {
+        "bytes": 1968,
+        "path": "issue.md"
+      },
+      {
+        "bytes": 455,
+        "path": "bundle.json"
+      },
+      {
+        "bytes": 1084,
+        "path": "MANIFEST.json"
+      }
+    ],
+    "fingerprint": {
+      "error_code": null,
+      "finding": "logs-since-ignored",
+      "id": "rbfp-96e090f8948c",
+      "site": null,
+      "version": "0.2.7"
+    },
+    "fix": {
+      "state": "unknown"
+    },
+    "labels": [
+      "bug",
+      "agent-drafted",
+      "unverified"
+    ],
+    "left_out": [],
+    "new_issue_url": null,
+    "post": "gh issue comment 1515 --repo reliaburger/reliaburger --body-file <tmp>/report/issue.md",
+    "redactions": {},
+    "title": "agent: [unverified] relish logs --since prints the whole capture for a quiet app",
+    "verified": false
+  },
+  "next": [
+    {
+      "read_only": true,
+      "run": "cat <tmp>/report/issue.md <tmp>/report/MANIFEST.json",
+      "why": "show the human exactly what would be posted, and what was redacted"
+    },
+    {
+      "read_only": false,
+      "run": "gh issue comment 1515 --repo reliaburger/reliaburger --body-file <tmp>/report/issue.md",
+      "why": "post it, once the human has read it and agrees; never on your own"
+    }
+  ],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": false,
+    "source_digest": null,
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": [
+    "unverified: no --reproducer, so the title says so; a maintainer reads reproduced reports first"
+  ]
+}

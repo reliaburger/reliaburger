@@ -9,7 +9,7 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::relish::RelishError;
+use crate::relish::{RelishError, UnreachableCause};
 
 /// The envelope's version tag. One variant, so the schema says exactly which
 /// string to expect; a `v2` would be a new variant and a deliberate change.
@@ -28,6 +28,8 @@ pub enum CommandName {
     /// `relish agent` itself, when the arguments named no command it knows.
     #[value(skip)]
     Agent,
+    /// `relish agent guide`.
+    Guide,
     /// `relish agent version`.
     Version,
     /// `relish agent schema`.
@@ -52,6 +54,53 @@ pub enum CommandName {
     #[serde(rename = "source extract")]
     #[value(name = "source-extract")]
     SourceExtract,
+    /// `relish agent logs`.
+    Logs,
+    /// `relish agent manual search`.
+    #[serde(rename = "manual search")]
+    #[value(name = "manual-search")]
+    ManualSearch,
+    /// `relish agent manual show`.
+    #[serde(rename = "manual show")]
+    #[value(name = "manual-show")]
+    ManualShow,
+    /// `relish agent context`.
+    Context,
+    /// `relish agent diagnose`.
+    Diagnose,
+    /// `relish agent explain`.
+    Explain,
+    /// `relish agent upgrade-check`.
+    #[serde(rename = "upgrade-check")]
+    UpgradeCheck,
+    /// `relish agent report`.
+    Report,
+    /// `relish agent patch init`.
+    #[serde(rename = "patch init")]
+    #[value(name = "patch-init")]
+    PatchInit,
+    /// `relish agent patch build`.
+    #[serde(rename = "patch build")]
+    #[value(name = "patch-build")]
+    PatchBuild,
+    /// `relish agent patch test`.
+    #[serde(rename = "patch test")]
+    #[value(name = "patch-test")]
+    PatchTest,
+    /// `relish agent patch try`.
+    #[serde(rename = "patch try")]
+    #[value(name = "patch-try")]
+    PatchTry,
+    /// `relish agent patch diff`.
+    #[serde(rename = "patch diff")]
+    #[value(name = "patch-diff")]
+    PatchDiff,
+    /// `relish agent patch destroy`.
+    #[serde(rename = "patch destroy")]
+    #[value(name = "patch-destroy")]
+    PatchDestroy,
+    /// `relish agent setup`.
+    Setup,
 }
 
 impl CommandName {
@@ -59,6 +108,7 @@ impl CommandName {
     pub fn as_str(self) -> &'static str {
         match self {
             CommandName::Agent => "agent",
+            CommandName::Guide => "guide",
             CommandName::Version => "version",
             CommandName::Schema => "schema",
             CommandName::SourceVersion => "source version",
@@ -66,12 +116,28 @@ impl CommandName {
             CommandName::SourceGrep => "source grep",
             CommandName::SourceShow => "source show",
             CommandName::SourceExtract => "source extract",
+            CommandName::Logs => "logs",
+            CommandName::ManualSearch => "manual search",
+            CommandName::ManualShow => "manual show",
+            CommandName::Context => "context",
+            CommandName::Diagnose => "diagnose",
+            CommandName::Explain => "explain",
+            CommandName::UpgradeCheck => "upgrade-check",
+            CommandName::Report => "report",
+            CommandName::PatchInit => "patch init",
+            CommandName::PatchBuild => "patch build",
+            CommandName::PatchTest => "patch test",
+            CommandName::PatchTry => "patch try",
+            CommandName::PatchDiff => "patch diff",
+            CommandName::PatchDestroy => "patch destroy",
+            CommandName::Setup => "setup",
         }
     }
 
     /// The commands that answer with `data`, in the order `relish agent
     /// schema` lists them.
     pub const ANSWERING: &'static [CommandName] = &[
+        CommandName::Guide,
         CommandName::Version,
         CommandName::Schema,
         CommandName::SourceVersion,
@@ -79,6 +145,21 @@ impl CommandName {
         CommandName::SourceGrep,
         CommandName::SourceShow,
         CommandName::SourceExtract,
+        CommandName::Logs,
+        CommandName::ManualSearch,
+        CommandName::ManualShow,
+        CommandName::Context,
+        CommandName::Diagnose,
+        CommandName::Explain,
+        CommandName::UpgradeCheck,
+        CommandName::Report,
+        CommandName::PatchInit,
+        CommandName::PatchBuild,
+        CommandName::PatchTest,
+        CommandName::PatchTry,
+        CommandName::PatchDiff,
+        CommandName::PatchDestroy,
+        CommandName::Setup,
     ];
 }
 
@@ -261,15 +342,33 @@ impl AgentError {
 impl From<&RelishError> for AgentError {
     /// Classify an error from the rest of `relish`.
     ///
-    /// The client still folds DNS and TLS failures into "unreachable"; #1567
-    /// splits them, and then `dns` and `tls_untrusted` get their sources here.
+    /// A connection that never carried a request splits by its cause (#1567):
+    /// a name that doesn't resolve is `dns`, a server certificate relish
+    /// doesn't trust is `tls_untrusted`, and the rest are `unreachable`.
     fn from(error: &RelishError) -> Self {
         let message = error.to_string();
         match error {
-            RelishError::AgentUnreachable { .. } => {
-                AgentError::new(ErrorCode::Unreachable, message).with_hint(
-                    "start a cluster (relish setup --quickstart) or point at one with --endpoint",
-                )
+            RelishError::AgentUnreachable { endpoint, cause } => {
+                let (code, hint) = match cause {
+                    UnreachableCause::NameResolution => (
+                        ErrorCode::Dns,
+                        "check the host name in --endpoint, RELIABURGER_ENDPOINT or the current context",
+                    ),
+                    UnreachableCause::UntrustedCertificate(_) => (
+                        ErrorCode::TlsUntrusted,
+                        "pass the cluster CA with --ca-cert or RELIABURGER_CA_CERT",
+                    ),
+                    UnreachableCause::Refused
+                    | UnreachableCause::Tls(_)
+                    | UnreachableCause::TimedOut
+                    | UnreachableCause::Other(_) => (
+                        ErrorCode::Unreachable,
+                        "start a cluster (relish setup --quickstart) or point at one with --endpoint",
+                    ),
+                };
+                let mut agent_error = AgentError::new(code, message).with_hint(hint);
+                agent_error.endpoint = Some(endpoint.clone());
+                agent_error
             }
             RelishError::AgentRequired { .. } => AgentError::new(ErrorCode::NoEndpoint, message),
             RelishError::RequestTimeout => AgentError::new(ErrorCode::Timeout, message),
@@ -401,6 +500,16 @@ impl<T> Envelope<T> {
         self
     }
 
+    /// The same answer, marked `truncated`: the command left part of `data`
+    /// out to fit the byte budget, and says what in `data`. A failure
+    /// ignores it.
+    pub fn mark_truncated(mut self) -> Self {
+        if let Outcome::Answered { truncated, .. } = &mut self.outcome {
+            *truncated = true;
+        }
+        self
+    }
+
     /// The command that answered.
     pub fn command(&self) -> CommandName {
         self.command
@@ -526,6 +635,31 @@ mod tests {
                 RelishError::AgentUnreachable {
                     endpoint: "https://10.0.0.5:9117".to_string(),
                     cause: crate::relish::UnreachableCause::Refused,
+                },
+                ErrorCode::Unreachable,
+            ),
+            (
+                RelishError::AgentUnreachable {
+                    endpoint: "https://no-such-node.invalid:9117".to_string(),
+                    cause: crate::relish::UnreachableCause::NameResolution,
+                },
+                ErrorCode::Dns,
+            ),
+            (
+                RelishError::AgentUnreachable {
+                    endpoint: "https://10.0.0.5:9117".to_string(),
+                    cause: crate::relish::UnreachableCause::UntrustedCertificate(
+                        "invalid peer certificate: UnknownIssuer".to_string(),
+                    ),
+                },
+                ErrorCode::TlsUntrusted,
+            ),
+            (
+                RelishError::AgentUnreachable {
+                    endpoint: "https://10.0.0.5:9117".to_string(),
+                    cause: crate::relish::UnreachableCause::Tls(
+                        "received corrupt message".to_string(),
+                    ),
                 },
                 ErrorCode::Unreachable,
             ),
