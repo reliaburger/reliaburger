@@ -4,7 +4,7 @@ Created 6 November 2026, for the maintainer to review. It surveys every loop
 we wait on, from `make ci` on a laptop to the 8-hour final, says where the
 time goes with measured numbers, and ranks what would shorten each loop.
 Nothing in CI, the Makefile or the code has changed; parts of it may go into
-[0.2.7](2026-11-04-plan-0.2.7.md).
+[0.2.7](archive/2026-11-04-plan-0.2.7.md).
 
 It builds on the October plan, [CI and test
 efficiency](2026-10-11-ci-and-test-efficiency.md), whose [18 October
