@@ -63,6 +63,7 @@ If you're an agent operating or debugging a Reliaburger cluster:
 | `relish agent patch test` | Run the portable test suite in the workspace, optionally filtered |
 | `relish agent patch try` | Boot a throwaway cluster from the workspace's binaries, with its own `RELIABURGER_HOME` |
 | `relish agent patch diff` | The change against the extracted source, and the tests that ran |
+| `relish agent patch apply` | Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing |
 | `relish agent patch destroy` | Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay |
 | `relish agent setup` | Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes |
 

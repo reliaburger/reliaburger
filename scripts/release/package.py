@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Sign release binaries and guest images, and emit the schema-1 metadata.
+"""Sign release binaries and guest images, emit the schema-1 metadata, and bundle `relish mcp`.
+
+Each relish platform also gets `relish-<platform>.mcpb`, an MCP Bundle
+(https://github.com/modelcontextprotocol/mcpb) of `mcpb-manifest.json` and
+that platform's relish, which the MCP Registry entry points at (#1695).
 
 OpenSSL 3 performs Ed25519 operations. The private key is PKCS#8 DER, matching
 `relish dev keygen`. This script never creates or rotates the release identity.
@@ -12,13 +16,16 @@ at all where the release key is in the environment.
 """
 import argparse
 import base64
+import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import tempfile
+import zipfile
 
 # macOS is Apple silicon only: 0.2.1 was the last release with an Intel macOS
 # build (#1018).
@@ -27,6 +34,14 @@ PLATFORMS = {
     "relish": ("linux-aarch64", "linux-x86_64", "macos-aarch64"),
 }
 GUEST_METADATA = "guest-image-metadata.json"
+# The MCP Bundle manifest for `relish mcp`, written by `make agent-docs` from
+# the same tool list `relish mcp` serves (src/relish/agent/guide.rs).
+MCPB_MANIFEST = Path(__file__).with_name("mcpb-manifest.json")
+# Where a bundle keeps its relish; the manifest's entry_point says the same.
+MCPB_ENTRY_POINT = "server/relish"
+# A zip entry's timestamp is part of its bytes. A fixed one makes a bundle of
+# the same binary the same file, so its digest means the binary's.
+MCPB_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 # SubjectPublicKeyInfo header for a 32-byte Ed25519 public key (RFC 8410).
 ED25519_SPKI = bytes.fromhex("302a300506032b6570032100")
 # What each channel signs with: the Actions secret holding the private key,
@@ -157,6 +172,41 @@ def guest_image_metadata(directory, version, key, pins):
     return {"schema": 1, "version": version, "images": images}
 
 
+def mcpb_name(platform):
+    """The release asset holding `relish mcp` for `platform` as an MCP Bundle."""
+    return f"relish-{platform}.mcpb"
+
+
+def mcpb_bundle(binary, manifest, version, platform):
+    """The `.mcpb` for one platform: its `manifest.json` and that platform's relish, as zip bytes.
+
+    `manifest` is the committed template, left unchanged. The bundle's copy
+    takes the release's version and names only the operating system this
+    binary runs on, as the MCP Bundle format's `compatibility.platforms`
+    spells it (`darwin`, `linux`).
+    """
+    manifest = copy.deepcopy(manifest)
+    manifest["version"] = version.removeprefix("v")
+    system = "darwin" if platform.startswith("macos-") else "linux"
+    manifest.setdefault("compatibility", {})["platforms"] = [system]
+    if manifest["server"]["entry_point"] != MCPB_ENTRY_POINT:
+        raise ValueError(f"{MCPB_MANIFEST.name} must start {MCPB_ENTRY_POINT}")
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for name, data, mode in (
+            ("manifest.json", (json.dumps(manifest, indent=2) + "\n").encode(), 0o644),
+            (MCPB_ENTRY_POINT, binary.read_bytes(), 0o755),
+        ):
+            entry = zipfile.ZipInfo(name, MCPB_TIMESTAMP)
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            # Unix permissions live in the top 16 bits; unzip and MCP
+            # clients restore the executable bit from them.
+            entry.external_attr = (0o100000 | mode) << 16
+            entry.create_system = 3
+            bundle.writestr(entry, data)
+    return buffer.getvalue()
+
+
 def compatibility_pair(source):
     """The cluster formats (protocol, state) in `CURRENT` of src/compatibility.rs."""
     match = re.search(r"pub const CURRENT: Compatibility = Compatibility \{\s*protocol: (\d+),\s*state: (\d+),", source)
@@ -165,13 +215,16 @@ def compatibility_pair(source):
     return {"protocol": int(match.group(1)), "state": int(match.group(2))}
 
 
-def package_release(directory, version, repository, key, trusted, pins, forbidden_keys=()):
+def package_release(directory, version, repository, key, trusted, pins, forbidden_keys=(), manifest=None):
     """Sign every artefact with `key`, which must be in `trusted` and not in `forbidden_keys`.
 
     `trusted` is the signing channel's list in keys.rs and `forbidden_keys`
     the other channel's, so a key that somehow landed in both lists still
     can't sign: the release key never signs a nightly, nor the nightly key a
     release.
+
+    `manifest` is the MCP Bundle manifest template; by default the committed
+    `mcpb-manifest.json`.
     """
     if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version):
         raise ValueError("release tag must be a version prefixed with v")
@@ -233,11 +286,24 @@ def package_release(directory, version, repository, key, trusted, pins, forbidde
     outputs[GUEST_METADATA] = guest_image_metadata(directory, version, key, pins)
     for image in outputs[GUEST_METADATA]["images"].values():
         checksums.append(f"{image['sha256']}  {image['asset']}\n")
+    # One MCP Bundle per relish platform, for the MCP Registry (#1695). The
+    # binary inside is the signed one above, byte for byte; the bundle itself
+    # is covered by SHA256SUMS, candidate.json and the build attestation.
+    if manifest is None:
+        manifest = json.loads(MCPB_MANIFEST.read_text())
+    bundles = {mcpb_name(platform): mcpb_bundle(directory / f"relish-{platform}", manifest, version, platform)
+               for platform in PLATFORMS["relish"]}
+    for name, data in bundles.items():
+        checksums.append(f"{hashlib.sha256(data).hexdigest()}  {name}\n")
 
     # No metadata is written until every expected artefact has been signed.
     for name, document in outputs.items():
         temporary = directory / (name + ".tmp")
         temporary.write_text(json.dumps(document, indent=2) + "\n")
+        temporary.replace(directory / name)
+    for name, data in bundles.items():
+        temporary = directory / (name + ".tmp")
+        temporary.write_bytes(data)
         temporary.replace(directory / name)
     (directory / "SHA256SUMS").write_text("".join(checksums))
 

@@ -285,6 +285,7 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::PatchTest => Some(schema_of::<patch::TestData>()),
         CommandName::PatchTry => Some(schema_of::<patch::TryData>()),
         CommandName::PatchDiff => Some(schema_of::<patch::DiffData>()),
+        CommandName::PatchApply => Some(schema_of::<patch::ApplyData>()),
         CommandName::PatchDestroy => Some(schema_of::<patch::DestroyData>()),
         CommandName::Setup => Some(schema_of::<setup::SetupData>()),
     }
@@ -579,6 +580,7 @@ mod tests {
                 "patch test",
                 "patch try",
                 "patch diff",
+                "patch apply",
                 "patch destroy",
                 "setup"
             ]
@@ -744,6 +746,18 @@ mod tests {
         assert!(parse("agent patch try ./w --nodes 3").is_ok());
         assert!(parse("agent patch try ./w --nodes 2").is_err());
         assert!(parse("agent patch destroy --all").is_ok());
+        // An inline diff starts with `---`, which isn't a flag.
+        let options = parse("agent patch apply ./w --- --check").unwrap();
+        let AgentCommand::Patch(patch) = &options.command else {
+            panic!("not patch: {options:?}");
+        };
+        assert!(
+            matches!(
+                &patch.command,
+                patch::PatchCommand::Apply { diff, check: true, .. } if diff == "---"
+            ),
+            "{patch:?}"
+        );
         assert!(
             parse("agent patch destroy").is_err(),
             "a workspace or --all"

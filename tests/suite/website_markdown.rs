@@ -210,8 +210,16 @@ fn renamed(node: &Rc<Node>, tag: &str) -> Rc<Node> {
         template_contents: RefCell::new(template_contents.borrow().clone()),
         mathml_annotation_xml_integration_point: *mathml_annotation_xml_integration_point,
     });
-    copy.children
-        .replace(node.children.borrow().iter().cloned().collect());
+    // Move the children out rather than share them: dropping an rcdom
+    // `Node` empties every descendant it still holds, so the original, once
+    // replaced, would take the grandchildren with it (a link's text in a row
+    // header, say). They point at their new parent too, as htmd reads it.
+    let children = node.children.take();
+    for child in &children {
+        child.parent.set(Some(Rc::downgrade(&copy)));
+    }
+    copy.children.replace(children);
+    copy.parent.set(node.parent.take());
     copy
 }
 
@@ -326,6 +334,110 @@ fn every_page_names_its_markdown_copy() {
     }
 }
 
+/// The site's one shared script, which adds the "Copy as Markdown" and
+/// "Open in Claude" buttons (#1695) beside the copy buttons on snippets.
+const BUTTON_SCRIPT: &str = "docs/website/assets/copy.js";
+
+/// The `src` of every `<script>` that loads a file, in `html`.
+fn script_sources(html: &str) -> Vec<String> {
+    html.split("<script")
+        .skip(1)
+        .filter_map(|tag| tag.split('>').next())
+        .filter_map(|tag| tag.split("src=\"").nth(1))
+        .filter_map(|rest| rest.split('"').next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every page loads the script that offers its Markdown copy, so every
+/// page with a copy gets the two buttons.
+#[test]
+fn every_page_loads_the_script_that_adds_the_markdown_buttons() {
+    let script = url::Url::parse(SITE)
+        .unwrap()
+        .join("assets/copy.js")
+        .unwrap();
+    for page in pages() {
+        let html = read(&format!("{WEBSITE}/{page}"));
+        let loads = script_sources(&html)
+            .iter()
+            .any(|source| page_url(&page).join(source).ok().as_ref() == Some(&script));
+        assert!(loads, "{page} doesn't load assets/copy.js");
+    }
+}
+
+/// Without JavaScript there's no dead button: the buttons exist only once
+/// the script has run, and the page's `alternate` link still names the copy.
+#[test]
+fn the_markdown_buttons_come_from_the_script_not_the_markup() {
+    for page in pages() {
+        let html = read(&format!("{WEBSITE}/{page}"));
+        for marker in [
+            "page-actions",
+            "Copy as Markdown",
+            "Open in Claude",
+            "claude.ai/new",
+        ] {
+            assert!(
+                !html.contains(marker),
+                "{page} has {marker:?} in its markup; the script adds it"
+            );
+        }
+    }
+    let script = read(BUTTON_SCRIPT);
+    for needle in [
+        r#"link[rel="alternate"][type="text/markdown"]"#,
+        "\"Copy as Markdown\"",
+        "\"Open in Claude\"",
+        "\"page-actions\"",
+    ] {
+        assert!(script.contains(needle), "copy.js lacks {needle}");
+    }
+}
+
+/// "Open in Claude" sends a short prompt naming the page's Markdown copy by
+/// its full address, encoded into `claude.ai/new?q=`, and the script asks
+/// nothing of any other site: no script, style or data from elsewhere.
+#[test]
+fn open_in_claude_points_at_the_copy_and_nothing_else_is_fetched_from_elsewhere() {
+    let script = read(BUTTON_SCRIPT);
+    assert!(script.contains("\"https://claude.ai/new?q=\" + encodeURIComponent("));
+    assert!(
+        script.contains("new URL(alternate.getAttribute(\"href\"), document.baseURI)"),
+        "the prompt names the copy's absolute address"
+    );
+    let addresses: Vec<&str> = script
+        .match_indices("https://")
+        .map(|(at, _)| {
+            script[at..]
+                .split(|c: char| c == '"' || c.is_whitespace())
+                .next()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(addresses, ["https://claude.ai/new?q="], "{addresses:?}");
+    assert!(!script.contains("createElement(\"script\")"));
+    assert!(!script.contains("createElement(\"link\")"));
+    // The copy comes from this site, the same file the alternate link names.
+    assert!(script.contains("fetch(markdown"));
+}
+
+/// The buttons have their own look, wrap on a phone and stay off paper.
+#[test]
+fn the_markdown_buttons_are_styled_and_left_out_of_print() {
+    let css = read("docs/website/style.css");
+    assert!(
+        css.contains(".page-actions {"),
+        "style.css has no .page-actions rule"
+    );
+    let print = css
+        .split("@media print")
+        .nth(1)
+        .expect("style.css has a print block");
+    let hidden = print.split("\n}").next().unwrap();
+    assert!(hidden.contains(".page-actions"), "{hidden}");
+}
+
 #[test]
 fn no_markdown_copy_outlives_its_page() {
     let root = repository().join(WEBSITE);
@@ -428,6 +540,17 @@ fn a_row_header_keeps_its_cell() {
         .find(|line| line.contains("A job"))
         .unwrap_or_else(|| panic!("{copy}"));
     assert!(row.contains("An app"), "the row header went missing: {row}");
+}
+
+#[test]
+fn a_link_in_a_row_header_keeps_its_text() {
+    let html = r#"<main><table><thead><tr><th>Solver</th><th>Tools</th></tr></thead>
+<tbody><tr><th scope="row"><a href="https://example.com/kubectl-ai">kubectl-ai</a></th><td>kubectl</td></tr></tbody></table></main>"#;
+    let copy = markdown_copy("compare/ai-agents.html", html);
+    assert!(
+        copy.contains("[kubectl-ai](https://example.com/kubectl-ai)"),
+        "{copy}"
+    );
 }
 
 #[test]

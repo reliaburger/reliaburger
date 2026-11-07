@@ -206,8 +206,27 @@ built from, as one zstd tarball of about 4.7 MB
 packs it at level 19, which adds about 10 seconds to the release build. The
 build job sets `RELIABURGER_REQUIRE_CLEAN_SOURCE=1`, so `build.rs` fails the
 build when git lists any change in the embedded paths: a release bundle is
-exactly its commit. Recording the bundle's digest in `candidate.json` is still
-to do (#1570).
+exactly its commit.
+
+From 0.2.8 `candidate.json` names the bundle too, as `source_digest`
+([#1694](https://github.com/reliaburger/reliaburger/issues/1694)). Each build
+job runs `relish agent source version --offline` on the `relish` it built and
+pipes it to `candidate.py bundle-digest`, which refuses an answer whose
+`relish.dirty` isn't `false`, and uploads the digest as the
+`source-digest-<platform>` artefact. The candidate job's `candidate.py
+agreed-source-digest` requires one digest from every `relish` platform, all
+equal, and the record and check steps pass it with `--source-digest`. Staging
+and promotion take it from the record, which the qualified SHA-256 pins, and
+refuse a record without one. To check that a binary carries the released
+source, compare its envelope's `relish.source_digest` with the release's:
+
+```sh
+relish agent version | jq -r .relish.source_digest
+gh release download v0.2.8 --repo reliaburger/reliaburger --pattern candidate.json -O - | jq -r .source_digest
+```
+
+`relish.dirty` comes from `build.rs`, which asks git at build time; a
+running binary has no checkout to compare with.
 
 ## Cluster compatibility
 
@@ -663,8 +682,8 @@ nothing from us, and a third way in
 The candidate job of a manual build of `main` runs
 [`actions/attest-build-provenance`](https://github.com/actions/attest-build-provenance)
 over every file in `dist/` once `candidate.json` is recorded: each binary,
-`.sig`, PDF, guest image, `SHA256SUMS`, `install.sh`, both metadata files and
-`candidate.json` itself. Each gets a Sigstore-signed
+`.sig`, PDF, guest image, `.mcpb` bundle, `SHA256SUMS`, `install.sh`, both
+metadata files and `candidate.json` itself. Each gets a Sigstore-signed
 [SLSA provenance](https://slsa.dev/spec/v1.0/provenance) statement naming
 the file's SHA-256, the repository, `build.yml`, the commit and the run. Anyone
 can check one with the GitHub CLI, no account needed beyond `gh`'s own
@@ -773,6 +792,46 @@ Homebrew:
    `brew install reliaburger/tap/relish` on a Mac and `relish --version`.
 
 Without the token, the job logs that the tap wasn't updated and succeeds.
+
+### The MCP Registry entry
+
+`package.py` also writes one [MCP Bundle](https://github.com/modelcontextprotocol/mcpb)
+per relish platform, `relish-<platform>.mcpb`
+([#1695](https://github.com/reliaburger/reliaburger/issues/1695)): a zip of
+[`mcpb-manifest.json`](../scripts/release/mcpb-manifest.json) (written by
+`make agent-docs`, with the release's version and that platform's operating
+system filled in) and that platform's signed `relish` at `server/relish`. The
+zip entries have a fixed timestamp, so the same binary always makes the same
+bundle. The bundles are candidate assets like any other: `SHA256SUMS`,
+`candidate.json` and the build attestation cover them. They aren't signed
+with `mcpb sign`; that would need an X.509 signing certificate, which is the
+maintainer's decision.
+
+The [MCP Registry](https://registry.modelcontextprotocol.io) needs each
+bundle's SHA-256 as the package's `fileSha256`, which the committed
+`server.json` can't know. `promote.yml`'s `mcp-registry-entry` job runs after
+publication. It reads the tag's `server.json` and the published
+`candidate.json` (refused unless its SHA-256 is the qualified digest), adds one
+`mcpb` package per platform with
+[`mcp_registry.py`](../scripts/release/mcp_registry.py), prints the entry in
+the run summary and keeps it as the `mcp-registry-server-json` artefact. It
+publishes nothing. A dry run needs no secrets:
+
+```sh
+gh release download v0.2.8 --repo reliaburger/reliaburger --pattern candidate.json
+git show v0.2.8:server.json > tagged-server.json
+python3 scripts/release/mcp_registry.py --record candidate.json --server tagged-server.json
+```
+
+The maintainer publishes it after each promotion, signed in to GitHub as an
+account that can publish for the `reliaburger` organisation:
+
+1. `brew install mcp-publisher`, once.
+2. `gh run download <promote run> --name mcp-registry-server-json --dir registry`.
+3. `cd registry && mcp-publisher login github && mcp-publisher publish`.
+4. Check it: `curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.reliaburger/relish"`.
+
+The registry is in preview and may reset its data; publishing again is safe.
 
 ## Metadata and publication
 
@@ -1226,7 +1285,22 @@ the real `curl … | sh` install against it on every host we advertise.
    heavy check also reports Bun's anonymous and file-backed RSS
    (`rss_anon_kb`, `rss_file_kb` in the record's resource trends), so heap
    growth isn't mistaken for mapped files
-   ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)). The
+   ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)). It
+   also breaks Bun's memory down by kind with one `awk` pass over
+   `/proc/PID/smaps` (`sustained/bun-memory.awk`): smaps_rollup's RSS,
+   anonymous, private dirty and swap figures, the thread count, the main
+   heap, glibc thread arenas (RSS and how many 64 MiB arena heaps), thread
+   stacks, other anonymous memory, file-backed memory and the five
+   anonymous mappings with the most RSS. An arena heap is a read-write
+   anonymous mapping that starts on a 64 MiB boundary and is either 64 MiB
+   long or followed directly by a `---p` reserve ending on the next
+   boundary, since 64-bit glibc reserves each arena heap as 64 MiB aligned
+   to 64 MiB. A thread stack is `[stack]`, or a read-write anonymous mapping
+   directly after a `---p` guard of 64 KiB or less that doesn't end on a
+   64 MiB boundary. Each sample is a line per node in `memory.jsonl` in the
+   evidence directory, and the record's "Bun memory by kind" section tables
+   each node hourly and says which kind grew most after the first hour.
+   It's evidence only: `leak-rss` still judges VmRSS. The
    nodes export logs and metrics to `soak-export` on their own disks; once a
    metrics export's source has been gone for 30 minutes, and the checker has
    seen it at the destination, the harness deletes it

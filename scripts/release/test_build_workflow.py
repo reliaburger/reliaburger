@@ -287,6 +287,55 @@ class SourceBundleTests(unittest.TestCase):
         job = text.split("\n  build-binaries:\n", 1)[1].split("\n  build-profiling:\n", 1)[0]
         self.assertIn('RELIABURGER_REQUIRE_CLEAN_SOURCE: "1"', job)
 
+    def test_no_source_bundle_work_is_left_to_do(self):
+        self.assertNotIn("TODO(#1570)", WORKFLOW.read_text())
+
+    def test_each_build_reads_the_digest_from_the_relish_it_built(self):
+        # The relish itself says what it embeds; nothing recomputes it (#1694).
+        text = WORKFLOW.read_text()
+        binaries = job(text, "build-binaries")
+        record = step_named(binaries, "Record the embedded source bundle's digest")
+        self.assertIn("target/${{ matrix.target }}/release/relish agent source version --offline", record)
+        self.assertIn("python3 scripts/release/candidate.py bundle-digest", record)
+        self.assertIn("source-digest/relish-${{ matrix.suffix }}", record)
+        upload = step_named(binaries, "Upload the source bundle's digest")
+        self.assertIn("name: source-digest-${{ matrix.suffix }}", upload)
+        self.assertIn("path: source-digest/*", upload)
+        self.assertIn("if-no-files-found: error", upload)
+        # Never among the binaries: the candidate job records every file it
+        # downloads as `binaries-*` as a release asset, and notarisation
+        # replaces the macOS one wholesale.
+        self.assertFalse(fnmatch.fnmatch("source-digest-linux-x86_64", "binaries-*"))
+        order = [block.splitlines()[0].strip() for block in steps(binaries)]
+        self.assertLess(order.index("- name: Smoke test and package native binaries"),
+                        order.index("- name: Record the embedded source bundle's digest"))
+
+    def test_the_candidate_records_the_digest_every_platform_agrees_on(self):
+        text = WORKFLOW.read_text()
+        candidate = job(text, "candidate")
+        download = step_named(candidate, "Download every build's source bundle digest")
+        self.assertIn("pattern: source-digest-*", download)
+        self.assertIn("merge-multiple: true", download)
+        self.assertIn("path: source-digests", download)
+        agree = step_named(candidate, "Agree on the source bundle's digest")
+        self.assertIn("python3 scripts/release/candidate.py agreed-source-digest --directory source-digests",
+                      agree)
+        self.assertIn('echo "SOURCE_DIGEST=$digest" >> "$GITHUB_ENV"', agree)
+        record = step_named(candidate, "Record exact candidate identity and all asset digests")
+        self.assertIn('--source-digest "$SOURCE_DIGEST"', record)
+        self.assertIn("Source bundle: ", record)
+        check = step_named(candidate, "Check the candidate is still exactly what was recorded")
+        self.assertIn('--source-digest "$SOURCE_DIGEST"', check)
+        order = [block.splitlines()[0].strip() for block in steps(candidate)]
+        self.assertLess(order.index("- name: Agree on the source bundle's digest"),
+                        order.index("- name: Record exact candidate identity and all asset digests"))
+
+    def test_the_digest_files_are_named_for_every_relish_platform(self):
+        from package import PLATFORMS
+
+        suffixes = {entry["suffix"] for entry in build_matrix(WORKFLOW.read_text())}
+        self.assertTrue(set(PLATFORMS["relish"]) <= suffixes)
+
 
 class StrangerChecksTests(unittest.TestCase):
     """Attestations and notarisation (#1583) never change what promotion publishes."""

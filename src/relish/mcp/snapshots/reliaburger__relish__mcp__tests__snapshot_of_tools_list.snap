@@ -173,6 +173,7 @@ expression: listed_for_snapshot(server.tools())
             "patch-test",
             "patch-try",
             "patch-diff",
+            "patch-apply",
             "patch-destroy",
             "setup"
           ],
