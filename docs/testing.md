@@ -715,11 +715,14 @@ missed.
 [`mutants.yml`](../.github/workflows/mutants.yml) runs it, on Linux only and
 in its own workflow, so it's never on a pull request's critical path: the
 evidence gate doesn't wait for it, and a missed mutant doesn't turn the check
-red. Only a broken run (the unmutated tree failing its tests, say) does.
+red. Only a broken run (the unmutated tree failing its tests, say) does. It
+runs on pull requests into the branches `ci.yml` does, so a pull request into
+a release's merge train gets it as one into `main` does; the merge queue and
+the push to the train don't run it, since it was never a required check.
 
 | Run | What it mutates | At most | Test budget |
 |---|---|---|---|
-| A pull request that touches `src/` | The lines it changes ([`--in-diff`](https://mutants.rs/in-diff.html)) | 12 mutants | 60 minutes, in a 75-minute job |
+| A pull request into `main` or a release's merge train (`release-*`) that touches `src/` | The lines it changes ([`--in-diff`](https://mutants.rs/in-diff.html)) | 12 mutants | 60 minutes, in a 75-minute job |
 | A pull request that changes only the mutants set-up | `src/file_lock.rs`, as a check that the job still works | 12 | the same |
 | Sundays at 04:23 UTC | What landed on `main` in the last seven days | 60 | 300 minutes, in a 330-minute job |
 | By hand (`workflow_dispatch`) | A glob of files, or the last seven days | as asked (12 by default) | 300 minutes |

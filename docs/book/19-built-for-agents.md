@@ -4029,7 +4029,8 @@ the lock file and returns every other error. Change that match guard to
 `true`, so every error is ignored, and `file_lock::`'s tests still pass.
 Nothing checks that a real failure to remove the file gets reported.
 
-So a pull request that touches `src/` now gets a mutants job, and the job
+So a pull request that touches `src/`, into `main` or into a release's merge
+train, now gets a mutants job, and the job
 summary lists each mutant its tests missed, with a link that opens a
 pre-filled `missed-mutant` issue. A person files it. The job never does, for
 the same reason `relish agent report` only drafts: nothing posts to GitHub on
@@ -4037,7 +4038,7 @@ its own.
 
 The cost shaped most of the design. The crate has about 27,000 mutants, and
 each one rebuilds the crate before its tests run, so a whole-crate run is a
-thousand runner-hours. Three limits keep it affordable:
+thousand runner-hours. Four limits keep it affordable:
 
 - **Only the change.** `--in-diff` mutates only the lines a pull request
   touches, and the weekly run takes only the week's changes on `main`.
@@ -4298,7 +4299,7 @@ ones, command by command, each with the reason it lost.
   integration test's job.
 - **A whole-crate run.** See the arithmetic above. The weekly run covers new
   code, where a missing test is cheapest to add.
-- **Make the job required.** A sample of 20 can miss what another sample
+- **Make the job required.** A sample of 12 can miss what another sample
   would catch, so it informs a review rather than gating it.
 
 ## Lessons learned

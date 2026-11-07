@@ -242,6 +242,19 @@ fn the_mutants_job_stays_off_the_pull_request_s_critical_path() {
         paths.contains(&"src/**"),
         "pull requests run it only for code: {paths:?}"
     );
+    // Work lands on a release's merge train (`release-*`) before main, so a
+    // pull request into a train gets the job as one into main does: the
+    // branches are ci.yml's.
+    let branches = &mutants["on"]["pull_request"]["branches"];
+    assert_eq!(branches, &workflow(CI)["on"]["pull_request"]["branches"]);
+    assert!(
+        branches
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|branch| branch == "release-*"),
+        "{branches}"
+    );
     assert_eq!(
         mutants["concurrency"]["cancel-in-progress"],
         "${{ github.event_name == 'pull_request' }}"
