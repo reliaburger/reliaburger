@@ -1591,6 +1591,26 @@ fn the_install_section_offers_the_one_line_install_and_an_agent_prompt() {
     assert!(!section.contains("<script"), "the tabs need no script");
 }
 
+/// A third tab installs the CLI with Homebrew (#1583): the tap, then the
+/// quickstart. The one-line install stays the first tab and the chosen one,
+/// and the Homebrew panel shows each tab its own style rule.
+#[test]
+fn the_install_section_offers_homebrew_after_the_one_line_install() {
+    let page = read("docs/website/index.html");
+    let section = &page[page.find("<section id=\"install\"").unwrap()..];
+    let section = &section[..section.find("</section>").unwrap()];
+    let tyres = section.find(">Kick the tyres</label>").unwrap();
+    let homebrew = section.find(">Homebrew</label>").expect("no Homebrew tab");
+    assert!(tyres < homebrew, "the one-line install comes first");
+    let panel = &section[section.find("install-panel-homebrew").unwrap()..];
+    let panel = &panel[..panel.find("</pre>").unwrap()];
+    let brew = panel.find("brew install reliaburger/tap/relish").unwrap();
+    let quickstart = panel.find("relish setup --quickstart").unwrap();
+    assert!(brew < quickstart, "install the CLI, then build the cluster");
+    let style = read("docs/website/style.css");
+    assert!(style.contains("#install-homebrew:checked ~ .install-panel-homebrew"));
+}
+
 // --- Built for humans and their agents (#1578) -----------------------------
 
 /// The text of every `<code ATTRIBUTE>` element on `page`, tags stripped
