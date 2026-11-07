@@ -94,7 +94,10 @@ portable macOS (the `train-full` selection), which is also what a code PR into
 the nightly and the gate PR into `main` labelled `release-gate` run
 everything, portable macOS included; any other PR runs it only
 when it touches macOS-specific code or carries a `macos` label
-([which jobs run](../testing.md#which-jobs-a-pull-request-runs)).
+([which jobs run](../testing.md#which-jobs-a-pull-request-runs)). Portable
+macOS runs `make test-macos`, relish's tests and the tests only macOS
+compiles, and compile-checks `bun`; every other portable test runs on Linux
+([what runs on macOS](../testing.md#what-runs-on-macos-and-what-runs-on-linux)).
 Documentation-only pull requests skip the Rust jobs entirely, except for the manual
 and the snippets `documentation_first_run` checks. `scripts/ci/test_select_jobs.py`
 holds a fixture for each of these rules.
