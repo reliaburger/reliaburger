@@ -465,9 +465,10 @@ migration and no feature gate
   [release log](release-log.md#026-the-rest-of-the-evaluations-bugs-and-setup-over-ssh)).
   0.2.6 moves the protocol, so a 0.2.5 cluster can't roll to it: recreate
   the cluster ([upgrading from 0.2.5](releasing.md#upgrading-from-025)).
-- [ ] **0.2.7: "Built for humans and their agents"**
+- [x] **0.2.7: "Built for humans and their agents".** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.7)
+  on 7 November 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/29),
-  [plan](plans/2026-11-04-plan-0.2.7.md)). The read-only half of the AI SRE
+  [plan](plans/archive/2026-11-04-plan-0.2.7.md)). The read-only half of the AI SRE
   work, brought forward from 0.4.2: a JSON-only `relish agent` command family
   over the exact source the binary was built from, a patch-and-try loop on a
   throwaway cluster, redacted reports a human posts, `relish mcp`, an agent
@@ -475,7 +476,31 @@ migration and no feature gate
   that turns agent sessions into fixes released in days. No LLM inside `bun`.
   Exit test: Claude Code with a read-only token diagnoses three Smoker
   scenarios and finds a planted Reliaburger bug in the source
-  ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)).
+  ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)). It
+  passed on 6 November
+  ([record](qualification/2026-11-06-v0.2.7-exit-test.md)). Candidate 1
+  passed the full gate but for one 1,215 ms journal turn in the 8-hour final,
+  which the maintainer accepted as a known issue
+  ([#1707](https://github.com/reliaburger/reliaburger/issues/1707), fixed in
+  0.2.8; [closure](qualification/2026-11-07-v0.2.7-release-closure.md),
+  [release log](release-log.md#027-built-for-humans-and-their-agents)). The
+  agent debugging recording
+  ([#1678](https://github.com/reliaburger/reliaburger/issues/1678)) follows
+  the tag. 0.2.7 keeps 0.2.6's cluster formats, so a 0.2.6 cluster can roll
+  onto it in place
+  ([upgrading from 0.2.6](releasing.md#upgrading-from-026)).
+- [ ] **0.2.8: "Agents you can trust, built faster"**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/30)).
+  Two halves: what sets Reliaburger apart when people work through AI agents
+  (agent changes as reviewable proposals with undo, trying a change on a copy
+  of production, decision provenance, locks between agents and more,
+  [#1681](https://github.com/reliaburger/reliaburger/issues/1681)–[#1690](https://github.com/reliaburger/reliaburger/issues/1690)),
+  and a faster loop for building, testing and releasing Reliaburger itself,
+  starting with macOS CI that builds only `relish`. The brainstorm after
+  0.2.7 settles the scope
+  ([#1673](https://github.com/reliaburger/reliaburger/issues/1673),
+  [faster-feedback plan](plans/2026-11-06-plan-faster-feedback.md)).
+  In progress.
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)

@@ -8,6 +8,58 @@ release contains is in the [roadmap](roadmap.md#releases-after-010). A new
 paragraph goes at the top when a release is promoted
 ([release gate, step 9](releasing.md#staging-a-candidate)).
 
+## 0.2.7: built for humans and their agents
+
+Promoted on 7 November 2026 as tag `v0.2.7` at `ace072c7`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/42392039001)).
+`relish agent` answers an AI agent in one JSON envelope within a byte budget
+([#1565](https://github.com/reliaburger/reliaburger/issues/1565)): `context`
+and `diagnose` read the cluster, `manual` and `source` read the manual and
+the exact source the binary was built from
+([#1570](https://github.com/reliaburger/reliaburger/issues/1570),
+[#1571](https://github.com/reliaburger/reliaburger/issues/1571)), `patch`
+builds and tries a fix on a throwaway cluster
+([#1574](https://github.com/reliaburger/reliaburger/issues/1574)), and
+`report` drafts a redacted bug report for a human to post
+([#1575](https://github.com/reliaburger/reliaburger/issues/1575)).
+`relish mcp` serves the same commands as read-only MCP tools
+([#1094](https://github.com/reliaburger/reliaburger/issues/1094)), `relish
+agent setup` wires them into the agents on a machine
+([#1581](https://github.com/reliaburger/reliaburger/issues/1581)), every
+command takes `-o json`
+([#1566](https://github.com/reliaburger/reliaburger/issues/1566)), and every
+release file carries a build provenance attestation
+([#1583](https://github.com/reliaburger/reliaburger/issues/1583))
+([plan](plans/archive/2026-11-04-plan-0.2.7.md)). Its exit test, Claude Code
+with a read-only token in the agent gym, ran three times on 6 November and
+passed: the right diagnosis in 5 of 5 runs of each fault, no planted secret in
+any report, no mutating call in 30 runs, and the planted Reliaburger bug found
+and patched in 5 of 5
+([record](qualification/2026-11-06-v0.2.7-exit-test.md)). Qualification ran
+on 7 November 2026 on the Mac Studio, on one candidate
+([closure record](qualification/2026-11-07-v0.2.7-release-closure.md)), on
+the full gate, because 0.2.7 changes the agent loop. Candidate 1 passed both
+staged installs, in 73 s and 58 s
+([first](qualification/2026-11-07-v0.2.7-staged-install-apple-silicon.md),
+[second](qualification/2026-11-07-v0.2.7-staged-install-apple-silicon-2.md)),
+the power-cut and reboot lanes, 25 of 25 in every lane
+([record](qualification/2026-11-07-power-cut-reboot.md)), the V02 fast tier
+([record](qualification/2026-11-07-v0.2.7-sustained-v02-fast.md)) and the
+jobs fast tier at 8,584.4 accepted jobs a second
+([record](qualification/2026-11-07-v0.2.7-job-qualification-fast.md)), all
+clean with no turn over budget. The 8-hour jobs final completed its schedule
+at 9,439.4 accepted jobs a second, about 0.2.6's rate, but it wasn't clean
+([record](qualification/2026-11-07-v0.2.7-job-qualification.md)): one
+journal turn on node 1 took 1,215 ms against the 1 s budget, the same family
+as 0.2.6's #1606
+([#1707](https://github.com/reliaburger/reliaburger/issues/1707)). The
+maintainer accepted it as a known issue rather than build a second
+candidate; the fix is in 0.2.8. It ships with the `zstd` 0.13 advisories
+under the exception that expires on 18 November 2026
+([#1366](https://github.com/reliaburger/reliaburger/issues/1366)). 0.2.7
+keeps 0.2.6's cluster formats, so a 0.2.6 cluster can roll onto it in place
+([upgrading from 0.2.6](releasing.md#upgrading-from-026)).
+
 ## 0.2.6: the rest of the evaluation's bugs, and setup over SSH
 
 Promoted on 6 November 2026 as tag `v0.2.6` at `50596cfe`
