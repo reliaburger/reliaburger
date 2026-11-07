@@ -37,6 +37,7 @@ pub const READ_ONLY_COMMANDS: &[&str] = &[
     "routes",
     "status",
     "top",
+    "verify",
     "wtf",
     "agent",
 ];
@@ -54,6 +55,7 @@ pub const READ_ONLY_AGENT_COMMANDS: &[&str] = &[
     "schema",
     "source",
     "upgrade-check",
+    "verify",
     "version",
 ];
 

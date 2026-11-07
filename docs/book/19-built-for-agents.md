@@ -2658,6 +2658,180 @@ from the record is refused. The bottles live on a release of the tap's own,
 so the promotion job still has no write access to the reliaburger release it
 has just published.
 
+## Is this the release?
+
+A stranger's checks prove a download. They say nothing about a cluster that
+has been running for a month. Did somebody hot-patch `bun` on node 2 to chase
+a bug, and forget? Did a half-finished upgrade leave one node a version
+behind? Is the `relish` on the bastion host the one we shipped? 0.2.8's theme
+is agents you can trust, and an agent you hand a cluster to should be able to
+ask that question and get an answer it can act on (#1689). So can you.
+
+`relish agent verify` checks three things, and changes nothing:
+
+- every node's `bun` hashes to the SHA-256 the release publishes for its
+  version and platform, and those published bytes carry a valid Ed25519
+  signature from a release key compiled into `relish`;
+- every node runs the same version;
+- the `relish` running the check is a published build too.
+
+The answer is `verified`, `mismatch` or `unknown`, with a reason for each
+thing found, in the envelope every agent command uses:
+
+```json
+{"verdict": "mismatch",
+ "reasons": [
+   {"code": "hash_mismatch", "kind": "mismatch", "node": "node-2",
+    "message": "node-2's bun hashes to 9f3c…, but the published bun-linux-x86_64 v0.2.7 is 41aa…"}],
+ "nodes": [{"node": "node-1", "version": "v0.2.7", "platform": "linux-x86_64",
+            "sha256": "41aa…", "published_sha256": "41aa…",
+            "hash": "pass", "signature": "pass"}, "…"],
+ "relish": {"node": "relish", "hash": "pass", "signature": "pass", "…": "…"},
+ "metadata": ["https://github.com/reliaburger/reliaburger/releases/download/v0.2.7/metadata.json", "…"],
+ "trusted_keys": ["ed25519:…"]}
+```
+
+We gave it a human twin, `relish verify`, which is rare in this chapter. Most
+`relish agent` commands repackage something a person already has (`wtf`,
+`logs`, `manual`), and `upgrade-check` adds questions an agent forgets to ask.
+Here the person had nothing: nobody could answer "is this the release?"
+without a shell loop over `/v1/version` and a calculator. And the person who
+asks is usually an operator or an auditor, before a change freeze or in a CI
+job, who wants a table and an exit code: `0` verified, `1` mismatch, `3`
+unknown, the same codes `relish wtf` uses. Both commands call the same
+`collect` and the same `assess`, so they can't disagree.
+
+### A signature over bytes, not a hash
+
+The obvious design compares each node's hash with the one in
+`metadata.json` and stops. It's also wrong, because the metadata isn't
+signed. It travels over TLS from whoever hosts it, and a host that can lie
+about which binaries exist can lie about their hashes too. The signatures
+are what we trust, and each `bun` build's `embedded_signature` in the metadata
+is a signature over the binary's bytes.
+
+Why not over the hash? Ed25519, the scheme our release key uses, signs a
+message, not a digest. Internally it hashes the message with SHA-512, twice,
+mixed with the key, and there's no way to feed it a SHA-256 someone else
+computed. So checking a signature needs the bytes. A node reports only its
+hash (sending 40 MB over the API to prove a point would be silly), so
+`verify` fetches each published build the nodes run, once per version and
+platform, and checks it with `signing::verify_binary`, the same function
+`bun` runs before it swaps itself onto an upgrade:
+
+```rust
+pub fn check_artefact(bytes: &[u8], artefact: &PlatformArtifact, keys: &[PublicKey]) -> ArtefactCheck {
+    let envelope = SignatureEnvelope {
+        schema: 1,
+        sha256: artefact.sha256.clone(),
+        embedded: artefact.embedded_signature.clone(),
+        external: None,
+    };
+    match signing::verify_binary(bytes, &envelope, keys, None, false) {
+        Ok(()) => ArtefactCheck::Signed,
+        Err(UpgradeError::HashMismatch { actual, .. }) => ArtefactCheck::HashMismatch { actual },
+        Err(_) => ArtefactCheck::BadSignature,
+    }
+}
+```
+
+The chain is then: the node's hash equals the published hash; the published
+bytes hash to it; a release key signed those bytes. A lying metadata host can
+break the first or second link and make the check fail. It can't make it
+pass. The match also shows a pattern we use a lot: `Err(UpgradeError::HashMismatch
+{ actual, .. })` matches one variant of an error enum and pulls one field out
+of it, `..` ignoring the rest, and the `Err(_)` arm catches every other way
+the check can fail. A Go `errors.As` followed by a type switch does the same
+in more lines.
+
+Hashing and verifying tens of megabytes is CPU work, so it runs on Tokio's
+blocking pool with `spawn_blocking`, as `bun` hashes its own binary at boot.
+For `relish` itself, `verify` streams its executable through SHA-256 first and
+only reads the whole file into memory to check the signature when the hash
+already matches. A development build doesn't, so a 500 MB debug binary costs
+one pass of the hash and no more.
+
+### Air-gapped, and saying what's missing
+
+A cluster without internet is exactly where you most want this check, so
+`--metadata FILE` reads the metadata from a file and turns the network off
+altogether. `--artefacts DIR` holds the `bun-<platform>` binaries and
+`--cli-metadata FILE` the metadata for `relish`. You download them on a
+machine with internet, with `gh release download`, and carry them across.
+
+Leave one out and the check it feeds stays `unchecked`, so the verdict is
+`unknown`, never `verified`. That's the rule `upgrade-check` taught us:
+missing evidence is never good news. When the metadata can't be fetched,
+`next` carries the two commands that fix it, the download marked
+`read_only: false` because it writes files, and the offline `verify` marked
+`true`.
+
+The verdict is a smaller ladder than `upgrade-check`'s. Any mismatch makes it
+`mismatch`, since proof that something's wrong outranks a gap; any missing
+evidence makes it `unknown`; otherwise `verified`. Reasons sort mismatches
+first. One detail took a second look: a node on a version the metadata
+doesn't list is `unpublished_version` only when every metadata document was
+read. If the fetch for that version failed, the version may be perfectly
+real, so the node gets no reason of its own beside `metadata_unavailable`:
+
+```rust
+if !evidence.publishes(&version) {
+    return evidence.all_metadata_read().then(|| {
+        Reason::new(ReasonCode::UnpublishedVersion, name, /* … */)
+    });
+}
+```
+
+`bool::then` turns a condition into an `Option`: `true.then(|| x)` is
+`Some(x)`, `false.then(|| x)` is `None`, and the closure only runs when it's
+needed. The function returns `Option<Reason>`, zero or one reason per node,
+and the caller's `reasons.extend(node_reasons(...))` takes it as is, because
+an `Option` is an iterator of zero or one item.
+
+### What it can't prove
+
+A node reports its own hash. A node someone has taken over can report
+whatever it likes, and so can a `relish` someone has replaced. Proving what a
+machine actually runs needs measured boot or remote attestation, and that's a
+different project. `verify` catches drift, accidents and half-done upgrades,
+which is most of what happens, and the manual says plainly what it doesn't
+catch. If you don't trust the `relish` in your hand, check it with `gh
+attestation verify` from the previous section first.
+
+`relish mcp` doesn't offer it as a tool. It downloads from the internet, past
+the cluster API, and its flags read local files, the same reasons
+`upgrade-check` isn't a tool.
+
+### The tests
+
+`assess` is pure, so most tests hand it evidence built in the test: three
+nodes on a published build, with a published `relish`, signed by a throwaway
+key from `generate_keypair`, which is `verified`. Each test then breaks one
+thing: a node whose hash differs (`hash_mismatch`, naming the node), a version
+the metadata doesn't list, a version `relish` can't parse, a platform with no
+build, nodes on two versions, an artefact signed by a key `relish` doesn't
+trust (`bad_signature`), bytes that don't hash to their metadata
+(`artefact_mismatch`), a garbled signature, a node that timed out, a dead
+node, an unreachable cluster, a development `relish`, and six ways to lose a
+piece of evidence, none of which may be `verified`. The signature tests run
+real Ed25519 over real bytes; only the key is temporary.
+
+Three tests run `collect` too. A fake two-node council built with axum
+answers `/v1/version` through the relay path, the metadata and a `bun` binary
+sit in a temporary directory, and the command runs offline against them: one
+node passes, the other has drifted. Without `--artefacts` the hashes pass and
+the signatures stay `unchecked`. A third checks `relish` against its own
+`cli-metadata.json`. Snapshots pin the envelope for `verified`, a drifted node
+and an offline run without the bytes, and the human table. A `tests/suite`
+test runs the real binary against a stub API, so the clap wiring, the exit
+code and the JSON all go through `main`.
+
+The gym has a scenario for it, `release-drift`: the runner writes a
+`metadata.json` for the version and platform the node reports, naming other
+bytes, and asks the solver whether the cluster is the published release. The
+right answer names the node and `binary_drift`, and it only counts if the
+solver called `relish agent verify`.
+
 ## Can it roll?
 
 The fix is out. The last step of the loop is yours: upgrade. Ask `relish
@@ -3214,11 +3388,12 @@ reason, in `tools::EXCLUDED`:
 | `report` | Writes a report bundle into local files, for a human to post |
 | `patch` | Builds binaries and starts a throwaway cluster |
 | `upgrade-check` | Fetches release metadata from the internet, and `--metadata` reads any local file |
+| `verify` | Downloads release metadata and binaries from the internet, and its flags read local files |
 | `setup` | Writes the configuration of the user's agents |
 
 An entry that names a group, such as `patch`, excludes every command under
-it, so `patch init` and `patch build` aren't tools either. Four of the five
-hadn't merged when `relish mcp` did; naming them early meant they couldn't
+it, so `patch init` and `patch build` aren't tools either. Four of the first
+five hadn't merged when `relish mcp` did; naming them early meant they couldn't
 arrive as tools by accident. Calling one anyway is a protocol error
 that names the reason, so an agent that guesses `source_extract` learns why
 not instead of seeing "unknown tool".

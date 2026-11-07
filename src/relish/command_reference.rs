@@ -185,7 +185,7 @@ pub const GROUPS: &[CommandGroup] = &[
             label: "operations",
             path: "docs/manual/12_operations.md",
         }],
-        commands: &["upgrade", "gitops"],
+        commands: &["upgrade", "verify", "gitops"],
     },
     CommandGroup {
         title: "Learn",

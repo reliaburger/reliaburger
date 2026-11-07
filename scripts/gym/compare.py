@@ -42,6 +42,12 @@ RELIABURGER_ONLY = {
         "of the cluster it's debugging), so the Kubernetes side doesn't run it and isn't "
         "scored on it."
     ),
+    "release-drift": (
+        "The release check reads a release's published hashes and signatures with `relish "
+        "agent verify`. Kubernetes signs its release binaries, but nothing in the cluster checks "
+        "a running kubelet against them, so there's no equivalent question to put to a "
+        "Kubernetes solver, and the Kubernetes side doesn't run it."
+    ),
 }
 
 

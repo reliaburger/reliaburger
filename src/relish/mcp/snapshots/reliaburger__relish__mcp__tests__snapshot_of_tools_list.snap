@@ -167,6 +167,7 @@ expression: listed_for_snapshot(server.tools())
             "diagnose",
             "explain",
             "upgrade-check",
+            "verify",
             "report",
             "patch-init",
             "patch-build",

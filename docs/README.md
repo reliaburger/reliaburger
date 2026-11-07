@@ -824,7 +824,9 @@ built from, with a warning when a node runs another commit), `logs` (an app's
 newest lines in a time window, each wrapped as untrusted text, with a summary
 of what was left out), `manual` (`search` and `show` over this manual),
 `upgrade-check` (whether the cluster can take the latest release, with the
-reasons), `patch` (build, test and try a fix on a throwaway cluster), `report`
+reasons), `verify` (whether every node's `bun` and this `relish` are the
+published release, by SHA-256 and release signature, also as `relish verify`
+for people, with `--metadata` for air-gapped clusters), `patch` (build, test and try a fix on a throwaway cluster), `report`
 (a redacted bug report, with a fingerprint for finding duplicates, for a human
 to read and post; it never posts, and makes no network call) and `setup`, which
 adds the `relish mcp` server to Claude Code, Codex, Cursor, VS Code, Goose and

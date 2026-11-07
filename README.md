@@ -187,7 +187,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive *(0.2.7, not in 0.2.6)*
   - `relish agent guide`: How to use relish as an agent: the manual chapter, as Markdown sections *(0.2.7, not in 0.2.6)*
   - `relish agent version`: This binary's version, commit, target and cluster formats *(0.2.7, not in 0.2.6)*
-  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.6)*
+  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|verify|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.6)*
   - `relish agent source`: The source this binary was built from: search it, read it, extract it *(0.2.7, not in 0.2.6)*
     - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs *(0.2.7, not in 0.2.6)*
     - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count *(0.2.7, not in 0.2.6)*
@@ -202,6 +202,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish agent diagnose`: Every finding with its evidence, read-only next steps, and pointers into the manual and the source *(0.2.7, not in 0.2.6)*
   - `relish agent explain [ID]`: What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary *(0.2.7, not in 0.2.6)*
   - `relish agent upgrade-check`: Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown` *(0.2.7, not in 0.2.6)*
+  - `relish agent verify`: Whether the cluster runs the published release, byte for byte: `verified`, `mismatch` or `unknown` *(0.2.7, not in 0.2.6)*
   - `relish agent report --title <TITLE> --what-happened <WHAT_HAPPENED> --expected <EXPECTED> --not-tested <NOT_TESTED> --caught-by <CAUGHT_BY> --out <OUT>`: Draft a redacted bug report for a human to post. Never posts *(0.2.7, not in 0.2.6)*
   - `relish agent patch`: Build, test and try a fix on a throwaway cluster *(0.2.7, not in 0.2.6)*
     - `relish agent patch init <DIR>`: Extract this binary's source into a new workspace, on a `patch` branch *(0.2.7, not in 0.2.6)*
@@ -280,6 +281,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish upgrade rollback [VERSION]`: Roll back to a previous version (cluster: version required)
   - `relish upgrade resume`: Resume a paused upgrade
   - `relish upgrade abort`: End a paused upgrade in which no node has moved. When some nodes already swapped, use `rollback <version>` instead
+- `relish verify`: Check the cluster runs exactly the published release: each node's bun and this relish, by SHA-256 and release signature *(0.2.7, not in 0.2.6)*
 - `relish gitops`: Show or change the cluster's GitOps configuration
   - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown
   - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft
@@ -450,6 +452,11 @@ place ([record](docs/qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md));
 0.2.4, 0.2.5 and 0.2.6 each change them again, so a 0.2.5 cluster moves to 0.2.6 as a fresh cluster. A release with other cluster formats, or a
 rollback to a version some node doesn't hold, is refused before anything is
 recorded.
+`relish verify` (0.2.7, not in 0.2.6) then checks that every node runs the
+published `bun`, byte for byte: its SHA-256 against the release, the release
+signature on those bytes, and one version across the cluster. `--metadata`
+runs it with no internet, and `relish agent verify` answers the same for an
+agent.
 
 **Diagnostics built for incidents.** `relish wtf` correlates cluster health into
 one screen of problems and next steps. `relish path` walks the network path

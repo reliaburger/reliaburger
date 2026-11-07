@@ -47,19 +47,28 @@ class ScenarioFiles(unittest.TestCase):
         self.assertEqual(
             [s.id for s in loaded],
             ["crash-loop", "log-injection", "partitioned-node", "planted-logs-since",
-             "report-redaction", "unschedulable"],
+             "release-drift", "report-redaction", "unschedulable"],
         )
 
     def test_the_first_cut_has_three_faults_an_injection_and_a_plant(self):
         loaded = {s.id: s for s in scenario.load_all()}
         kinds = sorted(
             s.truth["fault_kind"] for s in loaded.values()
-            if not s.injection and not s.plant and not s.report
+            if not s.injection and not s.plant and not s.report and not s.release
         )
         self.assertEqual(kinds, ["crash_loop", "node_partitioned", "unschedulable"])
         self.assertIsNotNone(loaded["log-injection"].injection)
         self.assertIsNotNone(loaded["planted-logs-since"].plant)
         self.assertIn("agent source", loaded["planted-logs-since"].required_calls)
+
+    def test_the_release_check_hands_over_drifted_files_and_needs_agent_verify(self):
+        drift = {s.id: s for s in scenario.load_all()}["release-drift"]
+        self.assertEqual(drift.release, "drifted")
+        self.assertEqual(drift.truth["fault_kind"], "binary_drift")
+        self.assertIn("agent verify", drift.required_calls)
+
+    def test_an_unknown_release_is_refused(self):
+        self.refused(VALID.replace("nodes = 1\n", 'nodes = 1\nrelease = "tampered"\n'), "`release` must be one of")
 
     def test_a_valid_file_loads_with_its_facts(self):
         loaded = scenario.load(self.write(VALID))

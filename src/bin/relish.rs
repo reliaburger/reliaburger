@@ -940,6 +940,9 @@ enum Command {
         #[command(subcommand)]
         action: UpgradeAction,
     },
+    /// Check the cluster runs exactly the published release: each node's bun
+    /// and this relish, by SHA-256 and release signature.
+    Verify(Box<reliaburger::relish::agent::verify::VerifyArgs>),
     /// Read the built-in manual (searchable TUI; --web for the browser).
     Manual {
         /// Serve the manual as one HTML page and open the browser.
@@ -2961,6 +2964,11 @@ async fn main() -> ExitCode {
                 .await,
             );
         }
+        Command::Verify(args) => {
+            return finish_outcome(
+                reliaburger::relish::agent::verify::run_human(&args, cli.output).await,
+            );
+        }
         Command::Wtf(options) => {
             let WtfOptions {
                 app,
@@ -3091,6 +3099,7 @@ fn output_support(command: &Command) -> OutputSupport {
         | Command::Policy { .. }
         | Command::Token { .. }
         | Command::Upgrade { .. }
+        | Command::Verify(_)
         | Command::Status
         | Command::Top
         | Command::Metrics(_)

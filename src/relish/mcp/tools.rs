@@ -54,6 +54,11 @@ pub const EXCLUDED: &[Exclusion] = &[
               and --metadata reads any local file",
     },
     Exclusion {
+        command: "verify",
+        why: "downloads release metadata and binaries from the internet, beyond the cluster API, \
+              and --metadata, --cli-metadata and --artefacts read any local file",
+    },
+    Exclusion {
         command: "setup",
         why: "writes the configuration of the user's agents",
     },

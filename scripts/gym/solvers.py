@@ -182,7 +182,9 @@ class ScriptedSolver:
         started = time.monotonic()
         self.env = env
         self.work_dir = work_dir
-        if "relish agent source" in prompt:
+        if "published" in prompt and "release/metadata.json" in prompt:
+            answer = self.verify_release()
+        elif "relish agent source" in prompt:
             answer = self.find_bug(prompt)
         elif "relish agent report" in prompt:
             answer = self.draft_report(prompt)
@@ -235,6 +237,22 @@ class ScriptedSolver:
             elif resource.startswith("node."):
                 answer["node"] = resource[5:]
             break
+        return answer
+
+    def verify_release(self):
+        """Check the cluster against the release files, offline, and name the
+        first node whose binary doesn't hash to the published one."""
+        answer = {"app": None, "namespace": None, "node": None, "fault_kind": "none",
+                  "location": None, "patch": None, "summary": None}
+        envelope = self.relish_json("agent", "verify", "--metadata", "release/metadata.json") or {}
+        data = envelope.get("data") or {}
+        answer["summary"] = f"relish agent verify: {data.get('verdict')}"
+        drift = next(
+            (r for r in data.get("reasons", []) if r.get("code") == "hash_mismatch"), None
+        )
+        if drift is not None:
+            answer.update({"node": drift.get("node"), "fault_kind": "binary_drift",
+                           "summary": drift.get("message")})
         return answer
 
     def draft_report(self, prompt):
