@@ -8246,6 +8246,16 @@ reads every write straight back through a different node. With that, the broken 
 three runs out of three, each time on a renew that returned one expiry and a read 3 ms later,
 through another node, that returned the one before. The honest build passed every run.
 
+A kill has a blind spot, though. A killed leader answers nothing, so it can't serve a stale
+read. The dangerous leader is the one that's alive and cut off, still sure it leads, while the
+others elect someone new. The fixture's nodes already carry the switch a `node-kill` fault
+throws: a `NodeTransportGate` that makes every cluster transport behave as if the node had
+gone, while its API keeps answering. So a second test quiesces the leader's gate instead of
+killing it, waits for one of the other two to win an election, leaves the old leader cut off
+ten seconds more, and heals it (#1415). It passes. The leader-confirmation check is what makes
+it pass: the old leader can't reach a quorum, so it can't prove it leads, and it refuses or
+forwards instead of answering from its copy.
+
 The checker's first finding wasn't that bug, though. It was in our model. On the honest
 build, a read during a release saw the lease *cleaning*, and the model said that couldn't
 happen: a release was one step, held one instant and free the next. But the council releases

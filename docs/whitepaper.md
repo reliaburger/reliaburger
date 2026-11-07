@@ -718,7 +718,7 @@ A compromise of any single intermediate CA doesn't affect the others. The root C
 Every app instance automatically receives a SPIFFE-compatible X.509 certificate and an OIDC JWT, with no configuration required from you:
 
 - **X.509 cert** (1-hour lifetime, rotated every 30 minutes) for mTLS to services that trust the Workload CA
-- **OIDC JWT** for cloud provider identity federation (AWS, GCP, Azure)
+- **OIDC JWT** for cloud provider identity federation (AWS, GCP, Azure), signed with a key you can rotate: `relish identity rotate-signing-key` signs new tokens with a new key, and the old one stays in the JWKS and keeps verifying until every token it signed has expired
 
 Delegated job tasks (fresh `runc`, `shared-runc` executors and host processes) don't receive an identity yet.
 

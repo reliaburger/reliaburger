@@ -10485,6 +10485,207 @@ async fn whole_webhook_budget_bounds_held_follower_metadata_and_restores_reserva
     );
 }
 
+/// #709 through the API: a rotation answers with the new and retiring key
+/// ids, JWKS then publishes both, the old key is in the retiring list until
+/// its window ends, and the step is audited.
+#[tokio::test]
+async fn rotating_the_signing_key_publishes_both_keys_and_is_audited() {
+    use crate::sesame::oidc::RotatedSigningKey;
+    let council = seeded_council_with_ikm("signing-key-rotation").await;
+    let before = council.security_state().await;
+    let old = before.oidc_signing_config.clone().unwrap();
+    let (admin, tok) = named_user_token("root-op", crate::sesame::types::ApiRole::Admin);
+    let token_store = crate::sesame::auth::new_token_store();
+    *token_store.write().await = vec![admin];
+    let events = Arc::new(RwLock::new(crate::bun::events::EventStore::new()));
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&council)),
+        Some(token_store),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        Some(Arc::clone(&events)),
+    );
+    let send = |method: &'static str, uri: &'static str| {
+        let app = app.clone();
+        let tok = tok.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {tok}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, body)
+        }
+    };
+
+    let (status, body) = send("POST", "/v1/identity/signing-key/rotate").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let rotated: RotatedSigningKey = serde_json::from_slice(&body).unwrap();
+    assert_eq!(rotated.retiring_key_id, old.key_id);
+    assert_ne!(rotated.key_id, old.key_id);
+
+    let after = council.security_state().await;
+    assert_eq!(after.oidc_signing_config.unwrap().key_id, rotated.key_id);
+    assert_eq!(after.retiring_oidc_keys.len(), 1);
+    assert_eq!(after.retiring_oidc_keys[0].not_after, rotated.retire_after);
+
+    let (status, body) = send("GET", "/v1/identity/jwks").await;
+    assert_eq!(status, StatusCode::OK);
+    let jwks: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let kids: Vec<&str> = jwks["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key["kid"].as_str().unwrap())
+        .collect();
+    assert_eq!(kids, [rotated.key_id.as_str(), old.key_id.as_str()]);
+
+    let recorded = events.read().await.recent(20, None, None);
+    let audit = recorded
+        .iter()
+        .find(|event| event.action.as_deref() == Some("identity.signing_key_rotated"))
+        .expect("the rotation is audited");
+    assert_eq!(audit.details.get("key_id"), Some(&rotated.key_id));
+    assert_eq!(audit.details.get("retiring_key_id"), Some(&old.key_id));
+}
+
+/// #709: a rotation reaches every node. A follower's replica carries the
+/// new key and the retiring one, so its verifier, refreshed from that
+/// replica as Bun refreshes it, accepts tokens from both keys.
+#[tokio::test]
+async fn a_signing_key_rotation_reaches_every_node() {
+    let (nodes, _network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let ikm = [8u8; 32];
+    let issuer = "https://every-node";
+    let old = crate::sesame::oidc::generate_oidc_keypair(issuer, &ikm).unwrap();
+    let new = crate::sesame::oidc::generate_oidc_keypair(issuer, &ikm).unwrap();
+    nodes[0]
+        .write(crate::council::RaftRequest::SecurityStateInit(Box::new(
+            crate::sesame::types::SecurityState {
+                oidc_signing_config: Some(old.clone()),
+                ..Default::default()
+            },
+        )))
+        .await
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    nodes[0]
+        .write(crate::council::RaftRequest::RotateOidcSigningKey {
+            signing_key: new.clone(),
+            retire_after_unix_secs: now + crate::sesame::oidc::RETIRING_KEY_WINDOW_SECS,
+            now_unix_secs: now,
+        })
+        .await
+        .unwrap();
+
+    let token = |config: &crate::sesame::types::OidcSigningConfig| {
+        let claims = crate::sesame::types::WorkloadJwtClaims {
+            iss: issuer.to_string(),
+            sub: "spiffe://test/ns/default/app/api".to_string(),
+            aud: vec!["spiffe://test".to_string()],
+            exp: now + 600,
+            iat: now,
+            namespace: "default".to_string(),
+            app: "api".to_string(),
+            cluster: "test".to_string(),
+            node: "node-1".to_string(),
+            instance: "api-g1-0".to_string(),
+        };
+        crate::sesame::oidc::mint_jwt(&claims, config, &ikm).unwrap()
+    };
+    let (old_token, new_token) = (token(&old), token(&new));
+    for follower in &nodes[1..] {
+        let replicated = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let state = follower.security_state().await;
+                if state.oidc_signing_config.as_ref() == Some(&new) {
+                    return state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the rotation reached the follower");
+        let verifier = crate::sesame::auth::WorkloadJwtVerifier::new(old.clone(), "test");
+        verifier.refresh(&replicated, now);
+        assert!(
+            verifier.verify(&old_token).is_some(),
+            "old token refused on a follower"
+        );
+        assert!(
+            verifier.verify(&new_token).is_some(),
+            "new token refused on a follower"
+        );
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// #709: rotation is leader only. A follower answers 421 and changes
+/// nothing, so the operator knows to ask the leader.
+#[tokio::test]
+async fn rotating_the_signing_key_is_refused_on_a_follower() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, _network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let follower = router_over(nodes[1].clone(), admin);
+    let (status, reply) = send_bounded(
+        follower,
+        "POST",
+        "/v1/identity/signing-key/rotate",
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{reply}");
+    assert!(
+        nodes[0]
+            .security_state()
+            .await
+            .retiring_oidc_keys
+            .is_empty()
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 /// F04 R4 through the API: prepare answers with a CSR the operator can
 /// sign, and each step refuses what it should.
 #[tokio::test]

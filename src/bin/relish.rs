@@ -902,6 +902,11 @@ enum Command {
         #[command(subcommand)]
         action: CaAction,
     },
+    /// Rotate the key that signs workload identity tokens.
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
     /// Manage API tokens.
     Token {
         #[command(subcommand)]
@@ -1763,6 +1768,19 @@ enum SecretAction {
         #[arg(long)]
         namespace: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum IdentityAction {
+    /// Sign workload identity tokens with a new key.
+    ///
+    /// The cluster makes a new signing key and signs every new workload
+    /// token with it. The old key stays in the JWKS and keeps verifying for
+    /// 75 minutes, long enough for every token it signed to expire, so
+    /// running workloads carry on and pick up new tokens on their usual
+    /// refresh. Then the cluster retires it. Needs an unscoped Admin token
+    /// with cluster-wide `admin` permission, run against the council leader.
+    RotateSigningKey,
 }
 
 #[derive(Subcommand)]
@@ -2788,6 +2806,11 @@ async fn main() -> ExitCode {
                 cli.output,
             ),
         },
+        Command::Identity { action } => match action {
+            IdentityAction::RotateSigningKey => {
+                reliaburger::relish::ca_cmd::identity_rotate_signing_key().await
+            }
+        },
         Command::Ca { action } => match &action {
             CaAction::Backup {
                 out,
@@ -3486,6 +3509,7 @@ fn honours_output(command: &Command) -> bool {
         | Command::Run(_)
         | Command::Secret { .. }
         | Command::Ca { .. }
+        | Command::Identity { .. }
         | Command::JoinToken { .. }
         | Command::Sign { .. }
         | Command::Dev { .. }
@@ -3632,6 +3656,18 @@ mod tests {
             updated == readme,
             "README.md's relish command list is out of date; run `{REGENERATE_COMMAND}`"
         );
+    }
+
+    #[test]
+    fn identity_rotate_signing_key_parses_and_takes_no_arguments() {
+        let cli = Cli::try_parse_from(["relish", "identity", "rotate-signing-key"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Identity {
+                action: IdentityAction::RotateSigningKey
+            })
+        ));
+        assert!(Cli::try_parse_from(["relish", "identity", "rotate-signing-key", "now"]).is_err());
     }
 
     #[test]

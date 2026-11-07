@@ -730,6 +730,7 @@ mod tests {
             join_tokens: vec![join_token],
             next_serial: 6,
             oidc_signing_config: None,
+            retiring_oidc_keys: Vec::new(),
             crl: super::super::types::Crl::default(),
             secret_seals: std::collections::BTreeMap::new(),
             node_leaves: std::collections::BTreeMap::new(),

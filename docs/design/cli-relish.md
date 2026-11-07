@@ -68,7 +68,7 @@ The `relish routes` command queries the Wrapper ingress proxy for the current ro
 
 ### Sesame (security)
 
-`relish init`, `relish join`, `relish join-token`, `relish token`, `relish secret` and `relish sign` drive the Sesame security subsystem (PKI, identities, tokens, secret encryption, image signing). `relish ca` backs up the root CA (`relish ca backup`), checks a backup offline (`relish ca verify`) and rotates an intermediate (`relish ca rotate`). CA status and revocation are planned (#362). There is no workload-identity command: `relish identity` *(planned)*.
+`relish init`, `relish join`, `relish join-token`, `relish token`, `relish secret` and `relish sign` drive the Sesame security subsystem (PKI, identities, tokens, secret encryption, image signing). `relish ca` backs up the root CA (`relish ca backup`), checks a backup offline (`relish ca verify`) and rotates an intermediate (`relish ca rotate`). CA status and revocation are planned (#362). `relish identity rotate-signing-key` replaces the key that signs workload JWTs, keeping the old one verifying until its tokens expire (#709).
 
 ---
 

@@ -945,6 +945,21 @@ The app never drops below its replica count during a deploy. If you have 3 repli
 
 "All connections are done" is trickier than it sounds once WebSockets are in play. A plain HTTP request is short: it arrives, gets a response, and it's gone. A WebSocket is a *long-lived splice* — the client and backend exchange frames for minutes or hours after the initial `101 Switching Protocols`. If the drain only counts HTTP requests, it declares "done" the instant the last request returns, then kills a container that still has a chat session or a live log tail flowing through it. So the tracker keeps two counts, and a backend isn't drained until *both* the HTTP count and the WebSocket count reach zero. The deadline asks the splice to stop; it does not substitute for those zero counts. We'll come back to exactly how the proxy keeps that WebSocket count honest.
 
+When the deadline does stop a WebSocket, the client should learn why. WebSocket has a word for it: a Close frame with status 1001, Going Away, which a client library treats as "reconnect", not "something broke". For a long time the proxy had the frame (`build_close_frame(1001)`, unit-tested) and never sent it, so clients saw a dropped connection instead (F08, [#369](https://github.com/reliaburger/reliaburger/issues/369)). Sending it raised a small Rust question. `copy_bidirectional` borrows both streams mutably for as long as it runs, so the termination branch of the `select!` can't write to the client stream while the copy future still exists. The fix is to decide first and act after:
+
+```rust
+let terminated = tokio::select! {
+    biased;
+    _ = super::draining::wait_for_termination(&terminate) => true,
+    _ = tokio::io::copy_bidirectional(&mut client_io, &mut backend_stream) => false,
+};
+if terminated {
+    // write the Close frame, bounded by a second
+}
+```
+
+When `select!` returns, it has dropped the losing future, and with it the borrow, so the writes after it compile. One limit remains, and the code says so: the splice copies bytes, not frames, so a deadline that lands in the middle of a backend frame leaves the client half a frame and then a Close. It sees a protocol error, which is what it saw before.
+
 ### Rate limiting
 
 Each client gets a token bucket. Tokens refill at a configured rate (requests per second). When the bucket is empty, the request gets a 429 Too Many Requests response with a `Retry-After` header telling the client exactly when to retry.

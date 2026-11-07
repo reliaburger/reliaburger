@@ -206,10 +206,10 @@ Drain coordination is event-driven: Bun publishes a `DrainBackend { app, instanc
 > stream watches the token and stops mid-stream (closing the connection) if the
 > deadline fires. A backend still inside its drain window keeps the clean
 > count-and-forward behaviour. WebSockets are torn down at the deadline too:
-> the splice watches the same token and closes both sockets when it fires.
-> **What's still a follow-up (F08):** the graceful Close-1001 frame
-> (`websocket_close_frame`) isn't sent first, so clients see the connection
-> drop rather than a Going Away close.
+> the splice watches the same token, and when it fires it sends the client a
+> Close frame with 1001 Going Away, bounded by one second, then closes both
+> sockets (F08, #369). The splice copies bytes, not frames, so a deadline that
+> lands mid-frame leaves the client a protocol error instead of a clean close.
 
 ---
 
@@ -480,7 +480,7 @@ Every inbound HTTPS request follows this path:
     b. If pool empty: respond 502 Bad Gateway
     c. Select backend by unweighted round-robin (the only strategy implemented; no strategy setting is exposed)
 8.  Proxy the request:
-    a. Add X-Forwarded-For and X-Forwarded-Proto headers (the only headers Wrapper injects today). X-Real-IP and X-Request-ID are planned, not yet added.
+    a. Replace the client's `X-Forwarded-For`, `X-Forwarded-Proto`, `Forwarded` and `X-Real-IP` with the proxy's own view of the connection, and set `X-Request-ID` to the client's value or a new 128-bit random id. A WebSocket upgrade gets the same headers (F08, #369).
     b. Forward the request to backend_addr
     c. Stream the response back to the client
 9.  Connection accounting:
@@ -509,6 +509,8 @@ The application route is served as plain HTTP. There is deliberately no
 implicit TLS default.
 
 ### 5.3 ACME Certificate Provisioning (deferred design)
+
+> The plan for building it is [`docs/plans/2026-11-06-plan-f08-acme.md`](../plans/2026-11-06-plan-f08-acme.md) (#369): HTTP-01 answered by every node from council state, with the leader as the one ACME client.
 
 `auto` and `acme` are reserved but rejected. A future implementation needs an
 explicit issuer model, production/staging directory selection, account-key
@@ -560,10 +562,11 @@ Bun (deploy coordinator)                  Wrapper
 > follow-up.** When the deadline expires with connections still open, Wrapper now
 > fires the drain entry's `terminate` token. Of the protocol below, HTTP items 2
 > and 3 ship (a new request to a terminating backend gets `503`; an in-flight
-> response stops mid-stream, closing the connection). Item 1 — the WebSocket
-> Close 1001 handshake — is not yet sent on the live WS splice path.
+> response stops mid-stream, closing the connection). Item 1 ships in a
+> shorter form: Wrapper sends the Close frame and closes, without waiting for
+> the client's half of the close handshake (F08, #369).
 >
-> 1. WebSocket connections: send a WebSocket Close frame (opcode 0x08) with status 1001 (Going Away), wait 5 seconds for the close handshake, then RST. *(follow-up)*
+> 1. WebSocket connections: send a WebSocket Close frame (opcode 0x08) with status 1001 (Going Away), within one second, then close.
 > 2. HTTP connections: send a 503 response if the request is mid-stream, then close.
 > 3. Idle keep-alive connections: closed once the backend goes away.
 
@@ -582,7 +585,7 @@ When Wrapper receives a request with `Connection: Upgrade` and `Upgrade: websock
 3. Wrapper forwards the upgrade request to the backend.
 4. If the backend responds with `101 Switching Protocols`, Wrapper enters bidirectional byte-level proxying (no HTTP framing).
 5. The connection is tracked as `is_websocket: true` in the connection tracker.
-6. WebSocket connections are long-lived. The Close-1001 drain treatment described above is a follow-up: `websocket_close_frame` exists and is unit-tested, but is not yet sent on the live WS splice — today a draining backend's WebSockets are torn down at the drain deadline via a cancellation token (see §5.5).
+6. WebSocket connections are long-lived. At a drain deadline the splice sends the client a Close 1001 (Going Away) frame, then closes both sockets (§5.5).
 
 Wrapper doesn't inspect or modify WebSocket frames. It operates as a transparent TCP proxy after the upgrade handshake.
 
@@ -754,7 +757,7 @@ Wrapper validates ingress configuration at deploy time:
 | **Invalid route** | Refused at apply and lint; a spec that predates the check is caught when a routing-table rebuild parses its TLS mode or rate limit | That one route is skipped and logged with its namespace and app; every other route and the catalogue generation install normally. | Reapply the app with `cluster`, `explicit`, or a plain-HTTP alias and a positive rate. |
 | **Backend pool empty** | All backends removed from the service map, or marked locally unhealthy by Wrapper's active probe | Route returns 502 Bad Gateway for all requests. | Automatic: backends re-appear when the service map marks them healthy or new instances are scheduled. Wrapper re-adds them within seconds. |
 | **Certificate expiry** | Currently detected by clients, not by Wrapper | Clients reject the connection. | Restart before a cluster-issued leaf expires, or rotate the configured operator files and restart. Automatic detection, telemetry and hot rotation are required follow-up work. |
-| **Slow draining** | In-flight connections exceed `drain_timeout` | Deploy step is delayed up to `drain_timeout`. On expiry Wrapper fires the drain's terminate token: new requests to that backend get `503`, in-flight HTTP responses stop mid-stream and close, and WebSockets are closed without a Close-1001 frame (§5.5). | Increase `drain_timeout` if the app has legitimately long-running requests. For WebSocket apps, set a higher timeout or implement reconnection logic in the client. |
+| **Slow draining** | In-flight connections exceed `drain_timeout` | Deploy step is delayed up to `drain_timeout`. On expiry Wrapper fires the drain's terminate token: new requests to that backend get `503`, in-flight HTTP responses stop mid-stream and close, and WebSockets get a Close 1001 frame, then close (§5.5). | Increase `drain_timeout` if the app has legitimately long-running requests. For WebSocket apps, set a higher timeout or implement reconnection logic in the client. |
 | **Ingress CA resolver unavailable at startup** | Bun can't reconstruct the Ingress CA material and logs a warning | The HTTPS listener uses its self-signed development certificate; `cluster` doesn't meet its production trust contract on that node. | Restore council/wrapping material before enabling ingress, or configure an explicit certificate pair. A future capability gate should reject placement on such a node. |
 | **Port 80/443 already in use** | `bind()` returns `EADDRINUSE` | Wrapper cannot start. Bun logs the error and retries every 30 seconds. | Operator must free the ports or reconfigure Wrapper to use alternative ports. |
 | **rustls handshake failure** | Client sends unsupported TLS version or cipher suite | Connection dropped during handshake | Client-side fix (upgrade TLS version). Wrapper logs the failure at debug level to avoid log flooding. |

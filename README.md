@@ -217,6 +217,8 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish ca backup --out <OUT>`: Write the root CA's key and certificate to a sealed file you keep
   - `relish ca verify --fingerprint <FINGERPRINT> <FILE>`: Check a root CA backup offline
   - `relish ca rotate --role <ROLE>`: Rotate an intermediate CA, signing the new one with your root backup
+- `relish identity`: Rotate the key that signs workload identity tokens *(0.3.0, not in 0.2.6)*
+  - `relish identity rotate-signing-key`: Sign workload identity tokens with a new key *(0.3.0, not in 0.2.6)*
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
 - `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster

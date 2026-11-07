@@ -2008,6 +2008,7 @@ mod tests {
             join_tokens: vec![],
             next_serial: 10,
             oidc_signing_config: Some(oidc_config),
+            retiring_oidc_keys: Vec::new(),
             crl: crate::sesame::types::Crl::default(),
             secret_seals: std::collections::BTreeMap::new(),
             node_leaves: std::collections::BTreeMap::new(),
