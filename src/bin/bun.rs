@@ -4918,7 +4918,12 @@ mod tests {
     #[test]
     fn changing_a_node_name_requires_fresh_enrolment() {
         let dir = tempfile::tempdir().unwrap();
-        reliaburger::relish::commands::init(dir.path(), "secure-test", "old-worker").unwrap();
+        reliaburger::relish::commands::init_with_throwaway_root(
+            dir.path(),
+            "secure-test",
+            "old-worker",
+        )
+        .unwrap();
         let mut config = NodeConfig::from_file(&dir.path().join("reliaburger.toml")).unwrap();
         config.node.name = Some("fresh-worker".into());
         let error = cluster_params_from_config(&config)
@@ -4930,7 +4935,12 @@ mod tests {
     #[test]
     fn normal_init_config_loads_the_generated_identity_for_mtls() {
         let dir = tempfile::tempdir().unwrap();
-        reliaburger::relish::commands::init(dir.path(), "secure-test", "node-secure").unwrap();
+        reliaburger::relish::commands::init_with_throwaway_root(
+            dir.path(),
+            "secure-test",
+            "node-secure",
+        )
+        .unwrap();
         let config = NodeConfig::from_file(&dir.path().join("reliaburger.toml")).unwrap();
 
         assert!(config.security.require_mtls);
@@ -4989,11 +4999,18 @@ mod tests {
     #[test]
     fn development_plaintext_init_sets_the_insecure_cluster_ack() {
         let dir = tempfile::tempdir().unwrap();
+        let operator = age::x25519::Identity::generate();
         reliaburger::relish::commands::init_with_security(
             dir.path(),
             "dev",
             "node-01",
             reliaburger::relish::commands::InitSecurityMode::DevelopmentPlaintext,
+            &reliaburger::relish::ca_cmd::InitRootBackup {
+                path: dir.path().join("root-backup.age"),
+                target: reliaburger::relish::ca_cmd::BackupTarget::Recipient(
+                    operator.to_public().to_string(),
+                ),
+            },
             reliaburger::relish::OutputFormat::Human,
         )
         .unwrap();
@@ -5288,9 +5305,18 @@ mod tests {
     fn enrolled_metrics_archive_owner_uses_the_root_and_certificate_node_id() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        reliaburger::relish::commands::init(first.path(), "first-cluster", "shared-label").unwrap();
-        reliaburger::relish::commands::init(second.path(), "second-cluster", "shared-label")
-            .unwrap();
+        reliaburger::relish::commands::init_with_throwaway_root(
+            first.path(),
+            "first-cluster",
+            "shared-label",
+        )
+        .unwrap();
+        reliaburger::relish::commands::init_with_throwaway_root(
+            second.path(),
+            "second-cluster",
+            "shared-label",
+        )
+        .unwrap();
         let config_one = NodeConfig::from_file(&first.path().join("reliaburger.toml")).unwrap();
         let config_two = NodeConfig::from_file(&second.path().join("reliaburger.toml")).unwrap();
         let one = metrics_archive_owner(&config_one, first.path()).unwrap();

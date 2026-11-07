@@ -198,6 +198,13 @@ mount_isolation = false|" \
         || demo_fail "couldn't rewrite the node config from relish init"
 }
 
+# `relish init` writes the root CA's key only into a backup (#709). The
+# demo's cluster is thrown away with ${DEMO_WORK}, so the backup and its
+# passphrase (owner-only) go there too.
+demo_root_passphrase() {
+    (umask 077 && printf 'a throwaway passphrase for the demo\n' >"${DEMO_WORK}/root-passphrase")
+}
+
 # Start the demo's one-node cluster and point relish at it.
 demo_start() {
     demo_binaries
@@ -210,7 +217,10 @@ demo_start() {
     fi
 
     demo_step "Starting a one-node cluster (${DEMO_RUNTIME} runtime) in ${DEMO_WORK}"
+    demo_root_passphrase
     "${RELISH}" init "${DEMO_WORK}/cluster" --cluster-name demo --node-id demo-node \
+        --root-backup "${DEMO_WORK}/root-backup.age" \
+        --passphrase-file "${DEMO_WORK}/root-passphrase" \
         >"${DEMO_WORK}/init.log" 2>&1 \
         || demo_fail "relish init failed: $(cat "${DEMO_WORK}/init.log")"
     demo_node_config "${DEMO_WORK}/cluster/reliaburger.toml" "${DEMO_WORK}/node.toml"
@@ -236,7 +246,10 @@ demo_start() {
 # identity, so the node has no service token and nobody holds a token.
 demo_start_plaintext() {
     demo_step "Starting a credential-free plaintext one-node cluster (${DEMO_RUNTIME} runtime) in ${DEMO_WORK}"
+    demo_root_passphrase
     "${RELISH}" init "${DEMO_WORK}/cluster" --cluster-name demo --node-id demo-node \
+        --root-backup "${DEMO_WORK}/root-backup.age" \
+        --passphrase-file "${DEMO_WORK}/root-passphrase" \
         --development-plaintext >"${DEMO_WORK}/init.log" 2>&1 \
         || demo_fail "relish init failed: $(cat "${DEMO_WORK}/init.log")"
     demo_node_config "${DEMO_WORK}/cluster/reliaburger.toml" "${DEMO_WORK}/node.plain.toml"

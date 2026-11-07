@@ -600,6 +600,12 @@ OS rollout and the cluster-wide council size, both new Raft requests and new
 fields in council state, so its builds are at protocol 58 and state format
 74, one past 0.2.7's 57/73. A 0.2.x leader offered a 0.3.0 development build
 refuses it before it records a run, and the move is a fresh cluster.
+On that fresh cluster the root CA is offline (#709): `relish init` writes the
+root's private key only into the backup you name with `--root-backup`, and
+without a terminal it needs `--passphrase-file` or `--recipient` too. The
+setups that run on your machine write it there, sealed to a fresh age
+identity, and print both paths. `relish ca backup` now only re-seals such a
+backup (`--from`).
 
 ### Upgrading from 0.2.6
 

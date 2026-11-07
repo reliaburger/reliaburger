@@ -412,13 +412,17 @@ say, `--trust-lan` skips the questions. relish refuses to claim without
 either a terminal to ask at or `--trust-lan`.
 
 The cluster's keys are made here, on your laptop, and never anywhere else
-until node 1's seed carries them. `~/home-cluster/secrets` holds the master
-key and the sealed root CA key, and `relish council recover` needs them if
-the cluster ever loses its quorum. So before relish sends any seed, it stops
-and waits:
+until node 1's seed carries them. The root CA's private key never leaves
+the laptop at all: its only copy is `~/home-cluster/root-ca-backup.age`,
+sealed to a fresh age identity in `~/.reliaburger/root-backup-keys/`. relish
+prints both paths; move both offline, apart from each other. No seed and no
+appliance ever carries either (`relish ca rotate` needs them, see
+`security`). `~/home-cluster/secrets` holds the master key, and `relish
+council recover` needs it if the cluster ever loses its quorum. So before
+relish sends any seed, it stops and waits:
 
 ```
-Back up /Users/you/home-cluster/secrets: it holds the master key and the sealed root CA key, and `relish council recover` needs them if the cluster ever loses its quorum. Keep them somewhere safe off this machine, such as your password manager.
+Back up /Users/you/home-cluster/secrets: it holds the master key, and `relish council recover` needs it if the cluster ever loses its quorum. Keep it somewhere safe off this machine, such as your password manager, but not with the root CA backup.
 Type yes once it's backed up:
 ```
 

@@ -438,6 +438,28 @@ pub fn run_relish(args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// Run `relish init` into `cluster_dir`, writing the root CA backup beside
+/// it (never inside it, as an operator keeps it off the node) under a
+/// throwaway passphrase (#709).
+pub fn run_relish_init(cluster_dir: &std::path::Path, cluster: &str, node: &str) -> Output {
+    let parent = cluster_dir.parent().unwrap();
+    let passphrase = parent.join("root-backup-passphrase");
+    std::fs::write(&passphrase, "a throwaway test passphrase\n").unwrap();
+    let backup = parent.join(format!("{cluster}-root-backup.age"));
+    run_relish(&[
+        "init",
+        cluster_dir.to_str().unwrap(),
+        "--cluster-name",
+        cluster,
+        "--node-id",
+        node,
+        "--root-backup",
+        backup.to_str().unwrap(),
+        "--passphrase-file",
+        passphrase.to_str().unwrap(),
+    ])
+}
+
 /// Panic with Relish's stdout and stderr unless it succeeded.
 pub fn assert_success(output: &Output, context: &str) {
     assert!(

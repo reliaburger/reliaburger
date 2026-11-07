@@ -167,23 +167,28 @@ the initial security bootstrap state, and its own node identity.
 On **Node 1 (`192.168.0.101`)**, run:
 
 ```sh
-sudo relish init /etc/reliaburger --cluster-name prod --node-id node-01
+sudo relish init /etc/reliaburger --cluster-name prod --node-id node-01 \
+    --root-backup /media/usb/prod-root-backup.age
 ```
+
+It asks for a passphrase twice: the root CA's private key goes only into
+`--root-backup`, sealed to it, and no node keeps a copy. Point it at
+removable media or anywhere off this node. In a script, add
+`--passphrase-file FILE` or `--recipient age1...` (your age public key);
+without a terminal, `relish init` refuses to run without them.
 
 This writes the following files under `/etc/reliaburger`:
 - `prod-master.key`: Master secret key (used to encrypt CA and secrets).
 - `prod-security-bootstrap.json`: Initial cluster security state.
-- `prod-root-ca.age`: The sealed root CA key.
 - `reliaburger.toml`: Sample cluster node config file.
 - `app.toml`: Sample application manifest file.
 - `identity/`: Node 1's mTLS certificates (`node.crt`, `node.key`, `root-ca.crt`, etc.).
 
 > **Important**: `relish init` prints two `Root CA:` lines to stderr. Copy the
 > one that starts with `sha256:`; that's the root CA fingerprint the joining
-> nodes pin in §4. Back up `prod-master.key` and `prod-root-ca.age` together,
-> and make a copy of the root that only you can open with
-> `sudo relish ca backup --out prod-root-backup.age --dir /etc/reliaburger`
-> (see the manual's security chapter).
+> nodes pin in §4. Back up `prod-master.key`, and keep the root CA backup
+> offline and apart from it; `relish ca verify` checks the backup against
+> that fingerprint (see the manual's security chapter).
 
 ### 3.2 Write the Node 1 configuration
 

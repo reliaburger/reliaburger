@@ -599,11 +599,15 @@ fn prepare_security(
     if let Some(parent) = directory.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let keys = crate::relish::quickstart::security::root_backup_keys_in(
+        &crate::relish::local_context::root_directory()?,
+    );
     crate::relish::quickstart::security::prepare_in(
         directory,
         cluster_name,
         first_node,
         &format!("dev-{cluster_name}-admin"),
+        &keys,
     )
 }
 

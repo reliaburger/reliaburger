@@ -64,6 +64,9 @@ pub struct CreateOptions {
     pub external_signing_key: Option<String>,
     /// How many voters the council grows to.
     pub council_size: crate::council::CouncilSize,
+    /// Where the age identity that opens the root CA backup goes: relish's
+    /// own state directory, apart from `directory` (#709).
+    pub root_backup_keys: PathBuf,
 }
 
 /// Parse `aa:bb:cc:dd:ee:ff@192.168.1.51` (any case, `-` or `:`).
@@ -164,12 +167,17 @@ pub fn seed_tarball(
     Ok(builder.into_inner()?.finish()?)
 }
 
+/// The root CA backup's name in a bare-metal cluster directory.
+pub const ROOT_BACKUP_FILE: &str = "root-ca-backup.age";
+
 /// What `create` made, for the summary.
 #[derive(Debug)]
 pub struct Created {
     pub fleet: Fleet,
     pub admin_token: String,
     pub seeds: Vec<PathBuf>,
+    /// The only copy of the root CA key, and the identity that opens it.
+    pub root_backup: super::quickstart::security::RootBackupFiles,
 }
 
 /// Create the cluster's PKI and admin token, mint a join token per extra
@@ -205,9 +213,25 @@ pub fn create(options: &CreateOptions) -> Result<Created, RelishError> {
             address: *address,
         })
         .collect();
-    let mut init =
-        crate::sesame::init::initialize_cluster(&options.cluster, &nodes[0].name, &secrets)
-            .map_err(|e| failed(&format!("generating the cluster's PKI: {e}")))?;
+    let mut init = crate::sesame::init::initialize_cluster(&options.cluster, &nodes[0].name)
+        .map_err(|e| failed(&format!("generating the cluster's PKI: {e}")))?;
+    // The root key's only copy, on this machine: no seed and no appliance
+    // ever carries it or anything that opens it (#709).
+    super::quickstart::security::create_private_dir(&options.root_backup_keys)?;
+    let root_backup = super::quickstart::security::root_backup_files_named(
+        dir,
+        ROOT_BACKUP_FILE,
+        &options.root_backup_keys,
+        &init.root_backup.fingerprint,
+    );
+    crate::sesame::root_backup::write_backup(
+        &init.root_backup,
+        &crate::sesame::root_backup::BackupDestination::FreshIdentity {
+            path: &root_backup.backup,
+            identity: &root_backup.identity,
+        },
+        std::time::SystemTime::now(),
+    )?;
     let admin = crate::sesame::token::create_token(
         "bare-metal-admin",
         ApiRole::Admin,
@@ -293,6 +317,7 @@ pub fn create(options: &CreateOptions) -> Result<Created, RelishError> {
         fleet,
         admin_token: admin.plaintext,
         seeds,
+        root_backup,
     })
 }
 
@@ -473,6 +498,12 @@ pub fn run_create(options: &CreateOptions, yes: bool) -> Result<(), RelishError>
         );
     }
     println!();
+    println!(
+        "The root CA key is only in {}, which {} opens. Move both offline, apart \
+         from each other: no node holds either, and `relish ca rotate` needs them.",
+        created.root_backup.backup.display(),
+        created.root_backup.identity.display()
+    );
     back_up(check, &secrets)?;
     println!(
         "Copy {dir}/stick/seeds onto a USB stick labelled RBSEED (FAT32), then boot each machine with it."
@@ -521,9 +552,9 @@ pub fn back_up(check: BackupCheck, secrets: &Path) -> Result<(), RelishError> {
 
 fn backup_reminder(secrets: &Path) -> String {
     format!(
-        "Back up {}: it holds the master key and the sealed root CA key, and \
-         `relish council recover` needs them if the cluster ever loses its quorum. \
-         Keep them somewhere safe off this machine, such as your password manager.",
+        "Back up {}: it holds the master key, and `relish council recover` needs it \
+         if the cluster ever loses its quorum. Keep it somewhere safe off this machine, \
+         such as your password manager, but not with the root CA backup.",
         secrets.display()
     )
 }
@@ -641,6 +672,7 @@ mod tests {
             token_ttl: crate::sesame::join::MAX_SEED_JOIN_TOKEN_TTL,
             external_signing_key: None,
             council_size: crate::council::CouncilSize::APPLIANCE,
+            root_backup_keys: dir.join("operator-keys"),
         }
     }
 

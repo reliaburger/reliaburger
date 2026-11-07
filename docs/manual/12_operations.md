@@ -549,8 +549,9 @@ the shell you run `relish council recover` from. With none set, S3 falls back
 to the instance's metadata credentials. Volume-snapshot upload and log and
 metrics export read the same variables. Volumes aren't in it; snapshot those separately (see
 `images-and-volumes`). Nor is the root CA's private key, which never enters the
-council: back that up yourself with `relish ca backup`, sealed to a passphrase
-or your own age key, and check it with `relish ca verify` (see `security`).
+council: its only copy is the backup `relish init` wrote for you, sealed to a
+passphrase or your own age key. Check it with `relish ca verify` (see
+`security`).
 
 If every voter is gone, stop a surviving node and recover it:
 

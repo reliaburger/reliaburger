@@ -630,7 +630,8 @@ lease ownership must also be unscoped, for both inspection and cleanup.
 configuration; no security switch needs hand-editing:
 
 ```sh
-sudo target/debug/relish init cluster --cluster-name prod --node-id node-01
+sudo target/debug/relish init cluster --cluster-name prod --node-id node-01 \
+  --root-backup ~/prod-root-backup.age
 sudo target/debug/bun --cluster --runtime runc --config cluster/reliaburger.toml
 ```
 
@@ -651,17 +652,17 @@ target/debug/relish --ca-cert cluster/identity/root-ca.crt apply cluster/app.tom
 target/debug/relish --ca-cert cluster/identity/root-ca.crt status
 ```
 
-Then keep a copy of the root CA that only you can open, sealed to a passphrase
-(or `--recipient` for your age key), and check it offline against the
-fingerprint `init` printed:
+`init` asked for a passphrase and sealed the root CA's private key into
+`--root-backup`, its only copy (`--passphrase-file` or `--recipient` for your
+age key, in a script). Check it offline against the fingerprint `init`
+printed, and keep it off the cluster:
 
 ```sh
-target/debug/relish ca backup --out prod-root-backup.age --dir cluster
-target/debug/relish ca verify prod-root-backup.age --fingerprint sha256:...
+target/debug/relish ca verify ~/prod-root-backup.age --fingerprint sha256:...
 ```
 
 The same file is what replaces an intermediate CA later:
-`relish ca rotate --role node --root-backup prod-root-backup.age` signs the
+`relish ca rotate --role node --root-backup ~/prod-root-backup.age` signs the
 cluster's new Node CA on your machine, and `--finalize` retires the old one
 once every node has moved (see the manual's security chapter).
 

@@ -31,7 +31,7 @@ use tower::ServiceExt;
 
 use crate::bun_process;
 use bun_process::{
-    BunProcess, WAIT, assert_success, reserve_address, reserve_ports, run_relish,
+    BunProcess, WAIT, assert_success, reserve_address, reserve_ports, run_relish_init,
     spawn_bun_with_port_retry, wait_for_relish,
 };
 
@@ -1142,14 +1142,7 @@ fn secure_bun_renews_a_due_node_leaf_and_reuses_it_after_restart() {
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
     assert_success(
-        &run_relish(&[
-            "init",
-            cluster_dir.to_str().unwrap(),
-            "--cluster-name",
-            "renewal-startup",
-            "--node-id",
-            "node-01",
-        ]),
+        &run_relish_init(&cluster_dir, "renewal-startup", "node-01"),
         "initialise renewal fixture",
     );
     let node_path = cluster_dir.join("reliaburger.toml");

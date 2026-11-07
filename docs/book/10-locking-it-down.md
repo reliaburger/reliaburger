@@ -437,9 +437,9 @@ mycluster-master.key              # hex-encoded 32-byte master secret (0o600)
 mycluster-security-bootstrap.json # full SecurityState as JSON
 ```
 
-The master key file is the crown jewel. Lose it and you can't unwrap any CA private key, which means you can't sign new node certificates, workload certificates, or JWTs. Back it up alongside the sealed root CA file, and make an operator-held copy of the root itself with `relish ca backup` (Chapter 4 explains why the sealed file alone isn't enough).
+The master key file is the crown jewel. Lose it and you can't unwrap any CA private key, which means you can't sign new node certificates, workload certificates, or JWTs. Back it up, but never with the root CA backup `relish init` wrote: the master key opens everything on the cluster, and the root backup is the one thing the cluster can't open (Chapter 4 explains why).
 
-The bootstrap file is a one-time transfer mechanism. When `bun` starts for the first time, it loads the JSON and writes a `SecurityStateInit` command to Raft. After that, SecurityState lives in Raft and replicates to every council node automatically. The file itself stays on disk: `relish ca backup` reads the root certificate and the cluster's `age` keys from it.
+The bootstrap file is a one-time transfer mechanism. When `bun` starts for the first time, it loads the JSON and writes a `SecurityStateInit` command to Raft. After that, SecurityState lives in Raft and replicates to every council node automatically. The file itself stays on disk; it holds no root key.
 
 ### Turning mTLS on: the mode matrix
 
@@ -1655,7 +1655,7 @@ The ingress swap has its own test in `wrapper::tls`, which handshakes against a 
 
 ## Rotating a CA, part three: the operator signs
 
-Parts one and two gave the council room for two CAs and taught every verifier to trust both. Nothing made a new CA yet. That needs the root, and the root key isn't on the cluster: `relish init` sealed it away, and chapter 4's `relish ca backup` put it in a file the operator keeps. The maintainer's decision was to keep it there. So who signs the new intermediate?
+Parts one and two gave the council room for two CAs and taught every verifier to trust both. Nothing made a new CA yet. That needs the root, and the root key isn't on the cluster: `relish init` wrote it only into the backup the operator keeps (chapter 4). The maintainer's decision was to keep it there. So who signs the new intermediate?
 
 The answer is the oldest trick in PKI. The cluster makes the new key pair and sends a certificate signing request (a CSR: "here's my public key, please certify it"). The operator signs it on their own machine with the root key from the backup, and sends back only the certificate. The new private key never leaves the cluster. The root key never reaches it.
 

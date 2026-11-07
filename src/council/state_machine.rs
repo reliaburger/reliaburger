@@ -215,13 +215,6 @@ fn clamp_to_bounds(replicas: u32, autoscale: &crate::config::app::AutoscaleSpec)
     replicas.max(autoscale.min).min(autoscale.max)
 }
 
-/// Whether `keypair` is the age key `relish init` sealed the root CA backup
-/// to: the cluster-wide key of generation 0. Nothing else seals to it, so
-/// finalising a rotation keeps it, read-only.
-fn opens_root_ca_backup(keypair: &crate::sesame::types::AgeKeypair) -> bool {
-    keypair.scope == crate::sesame::types::AgeKeyScope::ClusterWide && keypair.generation == 0
-}
-
 impl StateMachineInner {
     fn registry_publication_is_current(
         &self,
@@ -1130,14 +1123,12 @@ impl StateMachineInner {
                         ),
                     });
                 }
-                // The cluster-wide generation-0 key stays, read-only: `relish
-                // init` sealed the root CA's private key to it
-                // (`<cluster>-root-ca.age`), and no seal record knows that, so
-                // retiring it would leave the root backup unopenable (F04 R0).
+                // Every old key goes: the root CA backup is sealed to the
+                // operator, not to a cluster key (#709).
                 self.state
                     .security_state
                     .age_keypairs
-                    .retain(|kp| kp.scope != *scope || !kp.read_only || opens_root_ca_backup(kp));
+                    .retain(|kp| kp.scope != *scope || !kp.read_only);
             }
             RaftRequest::RevokeCertificate(entry) => {
                 self.state.security_state.crl.entries.push(entry.clone());
@@ -6630,9 +6621,9 @@ mod tests {
             .iter()
             .map(|kp| (kp.generation, kp.read_only))
             .collect();
-        // Gen 1 is retired; gen 0 stays, read-only, because it opens the
-        // root CA backup `relish init` wrote (F04 R0).
-        assert_eq!(remaining, [(0, true), (2, false)]);
+        // Every old generation is retired: nothing is sealed to gen 0 any
+        // more, because the root CA backup is the operator's (#709).
+        assert_eq!(remaining, [(2, false)]);
     }
 
     /// F04 R1 through the log: a Node CA rotation begins, a second one is
@@ -7114,15 +7105,13 @@ mod tests {
         );
     }
 
-    /// F04 R0: `relish init` seals the root CA's private key to the cluster's
-    /// generation-0 age key, in `<cluster>-root-ca.age`. Finalising a secret
-    /// rotation used to drop that key, after which nothing the cluster holds
-    /// could open the root backup.
+    /// #709: the root CA backup is sealed to the operator, so nothing keeps
+    /// an old cluster-wide key alive. Finalising a rotation retires every
+    /// one, generation 0 included.
     #[test]
-    fn the_root_backup_still_opens_after_a_finalised_secret_rotation() {
+    fn secret_rotation_finalise_retires_the_generation_zero_key() {
         use crate::sesame::types::AgeKeyScope;
-        let dir = tempfile::tempdir().unwrap();
-        let init = crate::sesame::init::initialize_cluster("prod", "node-1", dir.path()).unwrap();
+        let init = crate::sesame::init::initialize_cluster("prod", "node-1").unwrap();
         let mut inner = StateMachineInner::default();
         inner.apply_request(&RaftRequest::SecurityStateInit(Box::new(
             init.security_state.clone(),
@@ -7145,22 +7134,15 @@ mod tests {
             !matches!(response, Some(CouncilResponse::Refused { .. })),
             "{response:?}"
         );
-
-        let sealed = std::fs::read(&init.sealed_root_ca_path).unwrap();
-        let opened = inner
+        let generations: Vec<u64> = inner
             .state
             .security_state
             .age_keypairs
             .iter()
             .filter(|kp| kp.scope == AgeKeyScope::ClusterWide)
-            .filter_map(|kp| {
-                crate::sesame::secret::unwrap_age_identity(kp, &init.master_secret).ok()
-            })
-            .find_map(|identity| crate::sesame::secret::unseal_with_age(&sealed, &identity).ok());
-        assert!(
-            opened.is_some(),
-            "no key left in the state opens the root CA backup"
-        );
+            .map(|kp| kp.generation)
+            .collect();
+        assert_eq!(generations, vec![1]);
     }
 
     #[test]
@@ -7289,9 +7271,8 @@ mod tests {
             .iter()
             .map(|kp| (kp.generation, kp.read_only))
             .collect();
-        // Gen 1 is the only active key; gen 0 stays read-only for the root
-        // CA backup (F04 R0).
-        assert_eq!(remaining, [(0, true), (1, false)]);
+        // Gen 1 is the only key left (#709).
+        assert_eq!(remaining, [(1, false)]);
     }
 
     /// PKI8: a second rotation while one is un-finalised is refused; the
