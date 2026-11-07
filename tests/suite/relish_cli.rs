@@ -928,6 +928,49 @@ fn agent_patch_init_then_diff_shows_the_edit() {
     assert_eq!(diff["data"]["build_changes"], serde_json::json!([]));
 }
 
+/// #1691: an agent with only `relish` hands `patch apply` a diff whose hunk
+/// counts are wrong, inline as one argument starting `---`; it applies,
+/// and `patch diff` prints it with headers git wrote. A hunk that doesn't
+/// match is a usage error that names it.
+#[test]
+fn agent_patch_apply_takes_a_miscounted_diff_and_diff_prints_a_correct_one() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("fix");
+    let dir_text = dir.to_str().unwrap();
+    let output = run_agent(&["agent", "patch", "init", dir_text]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let source = std::fs::read_to_string(dir.join("src/relish/agent/patch.rs")).unwrap();
+    let first = source.lines().next().unwrap();
+    let miscounted = format!(
+        "--- a/src/relish/agent/patch.rs\n+++ b/src/relish/agent/patch.rs\n@@ -1,5 +1,9 @@\n-{first}\n+//! Patched by an agent.\n"
+    );
+    let output = run_agent(&["agent", "patch", "apply", dir_text, &miscounted]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let applied = agent_envelope(&output);
+    assert_eq!(applied["command"], "patch apply");
+    assert_eq!(applied["data"]["files"][0]["hunks"][0]["recounted"], true);
+
+    let output = run_agent(&["agent", "patch", "diff", dir_text]);
+    let diff = agent_envelope(&output);
+    let text = diff["data"]["diff"].as_str().unwrap();
+    assert!(text.contains("@@ -1,4 +1,4 @@"), "{text}");
+    assert!(text.contains("+//! Patched by an agent."), "{text}");
+
+    let wrong = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-no such line\n+x\n";
+    let output = run_agent(&["agent", "patch", "apply", dir_text, wrong]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let refused = agent_envelope(&output);
+    assert_eq!(refused["error"]["code"], "usage");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("hunk 1 of src/lib.rs"),
+        "{refused}"
+    );
+}
+
 #[test]
 fn agent_patch_on_a_directory_that_is_not_a_workspace_is_not_found() {
     let root = tempfile::tempdir().unwrap();

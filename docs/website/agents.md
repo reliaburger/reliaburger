@@ -252,6 +252,7 @@ net, not a promise: read what you share before you post it anywhere.
 | `relish agent patch test` | Run the portable test suite in the workspace, optionally filtered |
 | `relish agent patch try` | Boot a throwaway cluster from the workspace's binaries, with its own `RELIABURGER_HOME` |
 | `relish agent patch diff` | The change against the extracted source, and the tests that ran |
+| `relish agent patch apply` | Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing |
 | `relish agent patch destroy` | Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay |
 | `relish agent setup` | Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes |
 
@@ -582,7 +583,7 @@ adds the `wtf`, quorum and skew checks.
 
 When the source shows that a bug is in Reliaburger itself, `relish agent
 patch` lets an agent fix it, run the tests and boot a throwaway cluster with
-the fix, all without touching your cluster. It takes six commands, each
+the fix, all without touching your cluster. It takes seven commands, each
 naming the same workspace directory.
 
 `init` extracts the source, as `source extract` does, and puts it on a branch
@@ -595,6 +596,26 @@ relish agent patch init ./fix
 The agent then edits files in `./fix` with whatever it edits files with.
 `patch` keeps its own state, binaries and logs in `./fix/.reliaburger-patch/`,
 which git ignores.
+
+An agent with no editor of its own, only `relish`, makes its edit with
+`apply`. It takes a unified diff, inline or as `@file`:
+
+```sh
+relish agent patch apply ./fix @fix.diff
+```
+
+`apply` reads each hunk's lines and ignores its `@@` line counts, which a
+hand-written diff often gets wrong. Each hunk applies where its context and
+`-` lines sit in the file, nearest the line its header names. The answer
+lists every hunk with the line it applied at, how far that was from the
+header's line, and `recounted: true` when the header's counts were wrong.
+It's all or nothing: when one hunk's lines aren't in the file, nothing is
+written, and the `usage` error names the hunk, such as `hunk 2 of
+src/relish/client.rs (@@ -28,6 +28,8 @@)`, and the first line the file doesn't
+have. `--check` matches every hunk and writes nothing. `apply` only writes
+files inside the workspace: never `.git/` or `.reliaburger-patch/`, never a
+path with `..`, and never through a symbolic link. Afterwards `diff` prints
+the change as git writes it, with correct headers.
 
 `test` runs the portable suite in the workspace, or only the tests whose name
 contains a filter:
@@ -667,7 +688,9 @@ whether it ran against the change as it is now:
 relish agent patch diff ./fix
 ```
 
-That's what a report needs: what changed, and which tests prove it.
+That's what a report needs: what changed, and which tests prove it. Its
+`data.diff` applies with a plain `git apply`, so a report should carry it
+rather than the diff the agent wrote by hand.
 
 `destroy` removes the workspace's throwaway cluster, or every one with
 `--all`. The workspace and its change stay:
