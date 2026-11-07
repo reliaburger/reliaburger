@@ -2808,6 +2808,7 @@ rest:
 | `plugins/reliaburger/.mcp.json` | `relish mcp`, from the same constant `relish agent setup` registers |
 | `docs/website/.well-known/agent-skills/` | A copy of the skill and an index with its digest (#1582, below) |
 | `server.json` | `relish mcp`'s MCP Registry entry, with its tool list (#1582, below) |
+| `scripts/release/mcpb-manifest.json` | The `manifest.json` in each release's MCP Bundles, with the same tool list and their descriptions (#1695, below) |
 | `AGENTS.md`, one marked block | The chapter's rules for agents, then the brief |
 | The chapter's own command table | The clap definition of `relish agent` |
 
@@ -2961,6 +2962,29 @@ That's why `prune` clones the child list (cheap: it copies `Rc` pointers)
 before recursing, instead of holding the `borrow()` open while it edits
 grandchildren.
 
+A copy only helps a person who knows it's there, so 0.2.8 adds two buttons
+at the top of every page
+([#1695](https://github.com/reliaburger/reliaburger/issues/1695)), as Stripe
+and Temporal have. "Copy as Markdown" fetches the page's copy and puts it on
+the clipboard, ready to paste into any chat. "Open in Claude" is a link to
+`https://claude.ai/new?q=` with a one-line prompt naming the copy's full
+address, so Claude reads the words instead of the layout. Both come from
+`assets/copy.js`, the script that already adds the copy buttons to command
+snippets, and it finds the copy through the same `<link rel="alternate"
+type="text/markdown">` an agent uses. Without JavaScript there are no
+buttons at all, rather than two that do nothing, and the page still names
+its copy. The feedback page didn't load the script before; now every page
+does, and a test checks it.
+
+One browser detail shaped the code. Safari lets a click write to the
+clipboard only while it's still handling the click, and fetching the copy
+takes longer than that. So the script hands the clipboard a
+`ClipboardItem` whose content is the *promise* of the download, which Safari
+accepts, and falls back to fetching first and copying after where
+`ClipboardItem` doesn't exist. The tests can't click anything: they check
+that no page has the buttons in its markup, that every page loads the
+script, and that the only address the script names is Claude's.
+
 The skills index follows Cloudflare's
 [Agent Skills Discovery RFC](https://github.com/cloudflare/agent-skills-discovery-rfc),
 version 0.2.0: `/.well-known/agent-skills/index.json` lists each skill's
@@ -2984,6 +3008,70 @@ read-only, started as `relish mcp`, with the tool list taken from the same
 `tools::derive` the server runs. A test validates it against the registry's
 schema, vendored in `tests/fixtures/mcp-registry/`, and another checks the
 tool list against what `relish mcp` really serves.
+
+In 0.2.8 ([#1695](https://github.com/reliaburger/reliaburger/issues/1695))
+we built the real thing. An [MCP Bundle](https://github.com/modelcontextprotocol/mcpb)
+(`.mcpb`, called DXT before it was renamed) is a zip with a `manifest.json`
+at the top and whatever the server needs to run. For a compiled server
+that's one file:
+
+```text
+relish-linux-x86_64.mcpb
+├── manifest.json     the template, with this release's version and "platforms": ["linux"]
+└── server/relish     relish-linux-x86_64, byte for byte, mode 0755
+```
+
+The manifest's `server` says `"type": "binary"` and starts
+`${__dirname}/server/relish` with the argument `mcp`. `${__dirname}` is the
+format's placeholder for wherever the client unpacked the bundle, so the
+client runs the `relish` inside it, not whichever one is on the `PATH`.
+`make agent-docs` writes the template from the same `tools::derive` as
+`server.json`, this time with each tool's description too, so the code
+collects both into a `Vec<(String, String)>`: a vector of
+[tuples](https://doc.rust-lang.org/book/ch03-02-data-types.html#the-tuple-type),
+pairs with no field names, which the two callers take apart with
+`.map(|(name, _)| name)` and `.map(|(name, description)| ...)`. The `_`
+pattern says "there's a value here and I don't want it". The tool's
+description is an `Option<Cow<str>>`, and `.as_deref()` turns that into an
+`Option<&str>` without copying, like `?.` on a nullable string pointer in
+other languages, but checked by the compiler. A test validates the template
+against the format's own schema, vendored in `tests/fixtures/mcpb/` the same
+way as the registry's.
+
+We ship one bundle per platform we already build `relish` for:
+`linux-aarch64`, `linux-x86_64` and `macos-aarch64`. Why not one bundle for
+all three? The format can override the command per operating system, but
+not per CPU, so the two Linux builds can't share one manifest without a
+launcher script choosing between them, and that's one more thing to break.
+
+`scripts/release/package.py` builds the bundles in the candidate job, after
+the binaries are signed (and the Mac one notarised), so the `relish` inside
+is the very file `SHA256SUMS` and the `.sig` cover. There's a catch in that
+"very file". A zip records each entry's timestamp, so zipping the same
+binary twice a second apart makes two different files, with two different
+SHA-256s. The registry entry has to carry the digest of the one we
+published. So every entry gets the same fixed time, 1 January 1980 (the
+earliest a zip can say), and the executable bit goes in the entry's Unix
+mode by hand. A test zips the same binary twice and compares the bytes.
+
+That digest is the registry's `fileSha256`, and it can't be in the
+committed `server.json`, because the bundle doesn't exist until the release
+is built. So promotion writes it. `promote.yml`'s `mcp-registry-entry` job
+runs after the release is public, like the Homebrew one: it takes the
+tag's `server.json`, the published `candidate.json` (refused unless its
+SHA-256 is the qualified digest), and adds one `mcpb` package per platform
+with the digest the record holds, using `scripts/release/mcp_registry.py`.
+It never hashes a bundle itself, so it can't disagree with what was
+qualified. The job only writes the entry: publishing needs the maintainer's
+GitHub login to the organisation, so it keeps the file as an artefact for
+them to run `mcp-publisher publish` with.
+
+The bundles aren't signed with the format's own scheme. `mcpb sign` appends
+a PKCS#7 signature from an X.509 certificate, which would be a third
+signing identity beside the release key and Apple's Developer ID, and
+choosing one is the maintainer's call. What a bundle has today is the
+`fileSha256` clients check before installing, the build attestation every
+asset gets, and a signed, notarised binary inside.
 
 ## Tools for any agent: `relish mcp`
 
@@ -4218,14 +4306,11 @@ ones, command by command, each with the reason it lost.
   says what it is. The headline sits under it rather than in place of it.
 - **Badges.** The install buttons are text links styled by the site's CSS,
   not images from a badge service: the site makes no third-party requests.
-- **"Copy as Markdown" and "Open in Claude" buttons.** They'd add a script
-  to every page, and each page's `alternate` link and `llms.txt` already
-  point at its copy.
 - **Content negotiation on `Accept: text/markdown`.** GitHub Pages can't
   vary on headers.
-- **Real MCPB bundles for the registry.** They belong in release packaging,
-  not in a docs change. Publishing to the registry needs the maintainer's
-  GitHub login, so it waits for them.
+- **Publishing to the MCP Registry.** It needs the maintainer's GitHub
+  login, so it waits for them. 0.2.8 built the bundles and the entry it
+  publishes (#1695).
 - **The manual as MCP resources.** `manual search` and `manual show` are
   tools already.
 - **An HTTP transport for MCP.** Remote MCP is #1092, with authentication of

@@ -829,10 +829,12 @@ page, the `reliaburger` skill and Claude Code plugin in
 [`plugins/`](../plugins/reliaburger) (install it with `/plugin marketplace add
 reliaburger/reliaburger`), the website's skills index
 (`/.well-known/agent-skills/index.json`), `relish mcp`'s MCP Registry entry
-([`server.json`](../server.json), not yet published) and a block of
+([`server.json`](../server.json), not yet published; each release carries an
+MCP Bundle per platform for it) and a block of
 [`AGENTS.md`](../AGENTS.md), and a test fails when any of them is stale. It
 also writes a Markdown copy beside every website page (`/index.md`,
-`/compare/nomad.md`), which `llms.txt` lists.
+`/compare/nomad.md`), which `llms.txt` lists, and each page offers "Copy as
+Markdown" and "Open in Claude" buttons for it.
 The chapter ends with the playbook an agent follows to set a cluster up for
 you, on this computer, on machines over SSH or in a cloud, with a cloud-init
 file that readies machines for `relish setup --ssh` and the rule that nothing

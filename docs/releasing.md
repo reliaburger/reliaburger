@@ -682,8 +682,8 @@ nothing from us, and a third way in
 The candidate job of a manual build of `main` runs
 [`actions/attest-build-provenance`](https://github.com/actions/attest-build-provenance)
 over every file in `dist/` once `candidate.json` is recorded: each binary,
-`.sig`, PDF, guest image, `SHA256SUMS`, `install.sh`, both metadata files and
-`candidate.json` itself. Each gets a Sigstore-signed
+`.sig`, PDF, guest image, `.mcpb` bundle, `SHA256SUMS`, `install.sh`, both
+metadata files and `candidate.json` itself. Each gets a Sigstore-signed
 [SLSA provenance](https://slsa.dev/spec/v1.0/provenance) statement naming
 the file's SHA-256, the repository, `build.yml`, the commit and the run. Anyone
 can check one with the GitHub CLI, no account needed beyond `gh`'s own
@@ -792,6 +792,46 @@ Homebrew:
    `brew install reliaburger/tap/relish` on a Mac and `relish --version`.
 
 Without the token, the job logs that the tap wasn't updated and succeeds.
+
+### The MCP Registry entry
+
+`package.py` also writes one [MCP Bundle](https://github.com/modelcontextprotocol/mcpb)
+per relish platform, `relish-<platform>.mcpb`
+([#1695](https://github.com/reliaburger/reliaburger/issues/1695)): a zip of
+[`mcpb-manifest.json`](../scripts/release/mcpb-manifest.json) (written by
+`make agent-docs`, with the release's version and that platform's operating
+system filled in) and that platform's signed `relish` at `server/relish`. The
+zip entries have a fixed timestamp, so the same binary always makes the same
+bundle. The bundles are candidate assets like any other: `SHA256SUMS`,
+`candidate.json` and the build attestation cover them. They aren't signed
+with `mcpb sign`; that would need an X.509 signing certificate, which is the
+maintainer's decision.
+
+The [MCP Registry](https://registry.modelcontextprotocol.io) needs each
+bundle's SHA-256 as the package's `fileSha256`, which the committed
+`server.json` can't know. `promote.yml`'s `mcp-registry-entry` job runs after
+publication. It reads the tag's `server.json` and the published
+`candidate.json` (refused unless its SHA-256 is the qualified digest), adds one
+`mcpb` package per platform with
+[`mcp_registry.py`](../scripts/release/mcp_registry.py), prints the entry in
+the run summary and keeps it as the `mcp-registry-server-json` artefact. It
+publishes nothing. A dry run needs no secrets:
+
+```sh
+gh release download v0.2.8 --repo reliaburger/reliaburger --pattern candidate.json
+git show v0.2.8:server.json > tagged-server.json
+python3 scripts/release/mcp_registry.py --record candidate.json --server tagged-server.json
+```
+
+The maintainer publishes it after each promotion, signed in to GitHub as an
+account that can publish for the `reliaburger` organisation:
+
+1. `brew install mcp-publisher`, once.
+2. `gh run download <promote run> --name mcp-registry-server-json --dir registry`.
+3. `cd registry && mcp-publisher login github && mcp-publisher publish`.
+4. Check it: `curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.reliaburger/relish"`.
+
+The registry is in preview and may reset its data; publishing again is safe.
 
 ## Metadata and publication
 
