@@ -313,6 +313,15 @@ are qualitative, and source inspection is not a benchmark or security certificat
 When refreshing a comparison, review commands, installation assumptions and both
 application and platform upgrade procedures. Preserve section anchors.
 
+`compare/ai-agents.html` is different: it reports measurements, an AI agent
+operating Reliaburger and Kubernetes on the agent gym's faults
+([#1679](https://github.com/reliaburger/reliaburger/issues/1679)). Its numbers
+come from one record in `docs/qualification/`, named in its `gym-record`
+meta tag, and `scripts/gym/test_compare.py` fails if the page states a number
+that record doesn't hold. Until the real runs the tag is empty, the page says
+"No results yet" and quotes only the lab's pinned versions, and it carries
+`noindex`. The index doesn't link it until then.
+
 Serve the directory with the preview command above and open `/compare/` or
 `/compare/methodology.html`. Check all local links and fragments, desktop and narrow
 layouts, and the command examples with the current CLI's `RELISH_PARSE_ONLY=1`.

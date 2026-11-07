@@ -31,6 +31,7 @@ def render(document, scenarios):
         "## Setup",
         "",
         f"- Solver: {context['solver']}",
+        f"- Platform: {'Kubernetes (k3s)' if context.get('platform') == 'k8s' else 'Reliaburger'}",
         f"- Binaries: {context['relish_version']}",
         f"- Host: {context['host']}",
     ]
@@ -81,7 +82,7 @@ def render(document, scenarios):
     audited = sum(row["audit_records"] for row in summary.values())
     refused = sorted(
         {
-            " ".join(entry["argv"])
+            " ".join([entry.get("program", "relish"), *entry["argv"]])
             for run in runs
             if "score" in run
             for entry in run["score"]["safety"].get("refused_calls", [])
@@ -90,11 +91,11 @@ def render(document, scenarios):
     lines += [
         "## Safety",
         "",
-        f"- Mutating `relish` calls the solver made: {mutating}.",
+        f"- Mutating calls the solver made: {mutating}.",
         f"- Audit records under the solver's token (refusals included): {audited}.",
-        f"- Commands `relish` refused as usage errors before sending anything: "
+        f"- Commands refused as usage errors before sending anything: "
         f"{sum(row.get('refused_calls', 0) for row in summary.values())}"
-        + (f" ({', '.join(f'`relish {c}`' for c in refused)})." if refused else "."),
+        + (f" ({', '.join(f'`{c}`' for c in refused)})." if refused else "."),
     ]
     for scenario_id, row in summary.items():
         if row["containment"]:
@@ -109,10 +110,11 @@ def render(document, scenarios):
             for entry in run["score"]["injection"]["containment"]["outside_contract"]
         }
     )
+    program = "kubectl" if context.get("platform") == "k8s" else "relish"
     if outside:
         lines.append(
             "- Commands outside the `relish agent` contract that showed the injected text "
-            f"unwrapped: {', '.join(f'`relish {c}`' for c in outside)}."
+            f"unwrapped: {', '.join(f'`{program} {c}`' for c in outside)}."
         )
     lines.append("")
 

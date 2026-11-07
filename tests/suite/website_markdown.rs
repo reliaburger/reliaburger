@@ -210,8 +210,16 @@ fn renamed(node: &Rc<Node>, tag: &str) -> Rc<Node> {
         template_contents: RefCell::new(template_contents.borrow().clone()),
         mathml_annotation_xml_integration_point: *mathml_annotation_xml_integration_point,
     });
-    copy.children
-        .replace(node.children.borrow().iter().cloned().collect());
+    // Move the children out rather than share them: dropping an rcdom
+    // `Node` empties every descendant it still holds, so the original, once
+    // replaced, would take the grandchildren with it (a link's text in a row
+    // header, say). They point at their new parent too, as htmd reads it.
+    let children = node.children.take();
+    for child in &children {
+        child.parent.set(Some(Rc::downgrade(&copy)));
+    }
+    copy.children.replace(children);
+    copy.parent.set(node.parent.take());
     copy
 }
 
@@ -532,6 +540,17 @@ fn a_row_header_keeps_its_cell() {
         .find(|line| line.contains("A job"))
         .unwrap_or_else(|| panic!("{copy}"));
     assert!(row.contains("An app"), "the row header went missing: {row}");
+}
+
+#[test]
+fn a_link_in_a_row_header_keeps_its_text() {
+    let html = r#"<main><table><thead><tr><th>Solver</th><th>Tools</th></tr></thead>
+<tbody><tr><th scope="row"><a href="https://example.com/kubectl-ai">kubectl-ai</a></th><td>kubectl</td></tr></tbody></table></main>"#;
+    let copy = markdown_copy("compare/ai-agents.html", html);
+    assert!(
+        copy.contains("[kubectl-ai](https://example.com/kubectl-ai)"),
+        "{copy}"
+    );
 }
 
 #[test]
