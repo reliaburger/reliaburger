@@ -1026,6 +1026,11 @@ building it.
 cover lost admission replies, resumption with the same request ID, monotonic
 accounting, unknown-owner fences, independent effects, stale observations,
 exact orphan detection and failure propagation into the final V02 verdict.
+They also cover the exactly-once chunk check (#1415). A drained work or audit
+run's sampled chunks must each hold every task once, all from one grant. An
+audit task whose chunk was granted once mustn't have run more often than its
+accepted attempts. A chunk on an unreachable node waits out the same 600 s
+grace as a failure fixture's result.
 For the job qualification tiers they also parse `--plan` output (an hour-long
 fast tier whose first four cycles carry every fault kind and every special,
 node faults on every node, an 8-hour final whose cycles, quiet tail and run

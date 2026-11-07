@@ -8276,8 +8276,34 @@ hand on every exit path; here it's the type's job. The nodes come from the fixtu
 from Chapter 1: every field we don't name comes from the default.
 
 What doesn't this cover? Only what the clients do. The soak's apps, jobs and upgrades write to
-the council too, and the history sees none of it. The next step is the same check for job
-outcomes, where "every task-array chunk completes exactly once" is an invariant today.
+the council too, and the history sees none of it.
+
+### Every chunk exactly once
+
+Jobs are the next most important thing the soak writes. The council promises that every
+task-array chunk completes exactly once
+([#1415](https://github.com/reliaburger/reliaburger/issues/1415)). The leader grants a chunk
+to a node, and the node reports it done. If the node dies first, the leader grants the chunk
+again with the next attempt number, and that number fences off a late report from the dead
+node. So a chunk can *run* twice, but it must be *counted* once.
+
+The soak can't see grants: they live only in Raft state. What it can see is the accepted
+results, through `GET /v1/batch/{id}/results`. Each row there names the grant attempt that
+produced it, and that's enough for a model with two rules:
+
+1. **Counted once.** A chunk's rows hold each of its tasks exactly once, and every row comes
+   from the same grant. Rows from two grants in one chunk mean the council accepted the chunk
+   twice.
+2. **Run again only after a re-grant.** The audit runs already post one effect per execution
+   to a ledger outside the cluster. A task whose chunk was granted once can't have run more
+   often than its accepted attempts. Extra runs need a grant attempt above 1.
+
+Reading every row of a 262,144-task run after each drain would cost hundreds of requests. So
+`job_soak.py` reads the first chunk, the last chunk and six picked at random, from a generator
+seeded with the run's name, so a rerun reads the same ones. It reads small runs whole. Each
+checked chunk's grant goes into `chunk-history.jsonl` next to the campaign state, and the
+qualification record counts the chunks checked and how many of them were re-granted. A
+re-grant isn't a failure; it's the evidence that the soak's faults exercised the fence.
 
 ## Lessons learned: audit the evidence too
 
