@@ -100,7 +100,7 @@ The JSON is always the same envelope:
 
 ```json
 {"command":"version","data":{...},"next":[],"ok":true,
- "relish":{"commit":"137370e9...","dirty":null,"source_digest":null,"version":"0.2.7"},
+ "relish":{"commit":"137370e9...","dirty":false,"source_digest":"sha256:9f2c...","version":"0.2.7"},
  "schema":"relish.agent/v1","truncated":false,"warnings":[]}
 ```
 
@@ -1445,6 +1445,61 @@ uncommitted change embeds the change and says so. A release build must not, so
 the release workflow sets `RELIABURGER_REQUIRE_CLEAN_SOURCE=1` and `build.rs`
 panics if git lists a change, or can't say. A panic is how a build script fails
 a build; the message lands in Cargo's error output.
+
+### From the build job to `candidate.json`
+
+Every `relish agent` answer carries the digest and the dirty flag in its
+`relish` block. That tells an agent what this binary holds. It doesn't tell it
+whether that's what we released. For that the digest has to be in the release
+record, `candidate.json`, next to the commit and every file's SHA-256, and
+0.2.7 shipped without it (#1694).
+
+The awkward part is where the digest lives. Three build jobs, one per
+platform, run on three runners and each compiles its own `relish`. The
+candidate job that writes `candidate.json` runs on a fourth and never runs a
+binary. A job can declare `outputs`, but a matrix job has only one set of
+them, and whichever leg finishes last overwrites the others. So each build job
+writes its digest into a one-line file, `relish-<platform>`, and uploads it as
+an artefact of its own, `source-digest-<platform>`. It can't ride along with
+the binaries: everything in `binaries-*` becomes a release asset, and the
+notarisation job replaces the macOS artefact wholesale.
+
+Where does the build job get the digest? We could recompute it from the
+checkout in Python, but that's a second implementation of the tarball format
+waiting to drift. Instead the job asks the binary it just built:
+
+```sh
+target/$TARGET/release/relish agent source version --offline \
+  | python3 scripts/release/candidate.py bundle-digest > source-digest/relish-$SUFFIX
+```
+
+`bundle-digest` reads the envelope and refuses anything but an answer whose
+`relish.dirty` is `false` and whose digest is well formed. `build.rs` has
+already refused a dirty tree by then, so this is belt and braces: a build that
+stopped setting `RELIABURGER_REQUIRE_CLEAN_SOURCE` can't reach a candidate.
+
+The candidate job downloads the three files and runs `candidate.py
+agreed-source-digest`, which wants exactly one file per `relish` platform and
+one digest across them. They're built from one commit and the tarball is
+deterministic, so a disagreement is a bug in the packing, and the candidate
+fails rather than recording a digest that's true for only some of its
+binaries. The record step then writes it as `source_digest`, and the check
+after the attestation passes it again, so `candidate.py verify` refuses a
+record that names any other source.
+
+Staging and promotion don't pass it. They verify the record against the
+SHA-256 the gate qualified, so the source digest inside it is the one the
+build wrote, and they only require it to be there and well formed. A record
+without one, a 0.2.7 candidate say, no longer verifies. Before 1.0 that's
+the rule (no compatibility shims), and nobody stages an old candidate anyway.
+
+Why not decide `dirty` at run time instead, by comparing the binary's digest
+with a clean tree? Because a running `relish` has no clean tree to compare
+with: an installed binary sits in `~/.reliaburger/bin`, far from any checkout.
+Only the build knows whether git listed a change, so `build.rs` decides and
+the binary repeats it. What `candidate.json` adds is the outside view: take a
+binary's `relish.source_digest`, compare it with the release's
+`source_digest`, and you know it carries exactly the source we released.
 
 ### Reading it back: zstd streams
 
@@ -4007,9 +4062,6 @@ ones, command by command, each with the reason it lost.
   and the shape extraction wants.
 - **The bundle in `bun` too.** `relish` already knows which commit each node
   runs, and the mismatch warning links GitHub's tree at that commit.
-- **The digest in `candidate.json`.** The build jobs run on separate runners
-  per platform and the candidate job doesn't run the binaries, so carrying
-  the digest across needs its own change to the release workflow.
 - **A `source diff` against a node's commit.** GitHub's compare view does it.
 - **Searching the cluster's version.** Only this binary's source is here, and
   the warning says so when they differ instead of guessing.

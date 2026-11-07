@@ -104,7 +104,7 @@ An answer looks like this (one line on stdout, spread out here):
   "schema": "relish.agent/v1",
   "command": "version",
   "ok": true,
-  "relish": {"version": "0.2.7", "commit": "a1b2c3d4…", "dirty": null, "source_digest": null},
+  "relish": {"version": "0.2.7", "commit": "a1b2c3d4…", "dirty": false, "source_digest": "sha256:9f2c…"},
   "data": {"version": "0.2.7", "commit": "a1b2c3d4…", "target": "aarch64-apple-darwin",
            "formats": {"protocol": 57, "state": 74}},
   "truncated": false,
@@ -115,7 +115,9 @@ An answer looks like this (one line on stdout, spread out here):
 
 - `relish` says which build answered: its version, commit, whether the
   source it carries had uncommitted changes (`dirty`), and that source's
-  `sha256:` digest. A value the build doesn't know is `null`.
+  `sha256:` digest. A value the build doesn't know is `null`. A release's
+  `candidate.json` records the same digest as `source_digest`, so you can
+  check a binary carries exactly the released source.
 - `data` is the answer. Its shape depends on the command; `relish agent
   schema` prints it.
 - `next` lists commands worth running next. Each has `run` (the command line),
@@ -133,7 +135,7 @@ A failure carries `error` instead of `data`:
   "schema": "relish.agent/v1",
   "command": "version",
   "ok": false,
-  "relish": {"version": "0.2.7", "commit": "a1b2c3d4…", "dirty": null, "source_digest": null},
+  "relish": {"version": "0.2.7", "commit": "a1b2c3d4…", "dirty": false, "source_digest": "sha256:9f2c…"},
   "error": {"code": "unreachable",
             "message": "cannot reach the bun agent at https://localhost:9117: connection refused; check that bun runs there and listens on that port",
             "endpoint": "https://localhost:9117", "status": null,

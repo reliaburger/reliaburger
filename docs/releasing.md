@@ -206,8 +206,27 @@ built from, as one zstd tarball of about 4.7 MB
 packs it at level 19, which adds about 10 seconds to the release build. The
 build job sets `RELIABURGER_REQUIRE_CLEAN_SOURCE=1`, so `build.rs` fails the
 build when git lists any change in the embedded paths: a release bundle is
-exactly its commit. Recording the bundle's digest in `candidate.json` is still
-to do (#1570).
+exactly its commit.
+
+From 0.2.8 `candidate.json` names the bundle too, as `source_digest`
+([#1694](https://github.com/reliaburger/reliaburger/issues/1694)). Each build
+job runs `relish agent source version --offline` on the `relish` it built and
+pipes it to `candidate.py bundle-digest`, which refuses an answer whose
+`relish.dirty` isn't `false`, and uploads the digest as the
+`source-digest-<platform>` artefact. The candidate job's `candidate.py
+agreed-source-digest` requires one digest from every `relish` platform, all
+equal, and the record and check steps pass it with `--source-digest`. Staging
+and promotion take it from the record, which the qualified SHA-256 pins, and
+refuse a record without one. To check that a binary carries the released
+source, compare its envelope's `relish.source_digest` with the release's:
+
+```sh
+relish agent version | jq -r .relish.source_digest
+gh release download v0.2.8 --repo reliaburger/reliaburger --pattern candidate.json -O - | jq -r .source_digest
+```
+
+`relish.dirty` comes from `build.rs`, which asks git at build time; a
+running binary has no checkout to compare with.
 
 ## Cluster compatibility
 
