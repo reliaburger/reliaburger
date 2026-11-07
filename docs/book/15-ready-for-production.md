@@ -7327,6 +7327,26 @@ queries and flushes copy up to a million buffered rows under their store's
 lock, and the log export hashes every archive file on the worker. They're
 in the pull requests for this section, with a line each.
 
+0.2.7's jobs final had one more turn like it (#1707): a
+`consumer_sync/journal` turn that took 1,215 ms, all of it journal write,
+while the turns around it handed their slow writes off at 500 ms. The
+first guess was a write with no deadline, and the code has one:
+`persist_discovery_publication` passes `None` and waits for the landing.
+But it carries `#[cfg(test)]`, so it isn't in the binary at all. Every
+consumer step journals through `journal_consumer`, which passes the turn's
+deadline. The only other `None` writers are consumer recovery at startup,
+before the loop runs, and the egress checkpoint outside a turn.
+`a_recovered_consumers_journal_step_hands_a_slow_write_off_at_the_turn_deadline`
+drives the journal step's last untested branch, a recovered consumer's
+first answer, with every write stalled at 1.6 s, and each turn still
+hands off in time. The node's journal agreed: the very next line was "a
+discovery journal write took 1219 ms; the agent loop went on meanwhile".
+The write was handed off, but the 500 ms deadline fired at about 1,215 ms,
+so for some 700 ms nothing polled the turn's future or checked its timer.
+That's #1606 again: a late wake-up, not a missing deadline. This time no
+disk-pressure prune ran in that second, so the hunt for what held the
+runtime goes on.
+
 #### The lock that went to the back of the queue
 
 The 24-hour memory run of the published 0.2.6 (#1417) logged a different
