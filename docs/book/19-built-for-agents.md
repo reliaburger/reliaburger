@@ -59,7 +59,7 @@ The reasoning behind all this is in the [agent research
 note](../plans/2026-11-04-research-agent-friendly.md), what other projects do
 is in the [onboarding
 scan](../plans/2026-11-04-research-agent-onboarding-scan.md), and the order
-of the work is in the [0.2.7 plan](../plans/2026-11-04-plan-0.2.7.md).
+of the work is in the [0.2.7 plan](../plans/archive/2026-11-04-plan-0.2.7.md).
 
 ### What we chose not to build
 
@@ -2258,7 +2258,7 @@ the draft always picks "An AI agent drafted it, and a human checked every
 line". "Human review" is the form's three checkboxes, written unticked: a human
 read the whole report, checked the redaction, and searched for the
 fingerprint. Only the human can tick them. That's the disclosure the
-[0.2.7 plan](../plans/2026-11-04-plan-0.2.7.md) asks of everyone.
+[0.2.7 plan](../plans/archive/2026-11-04-plan-0.2.7.md) asks of everyone.
 
 ### Unverified until proven
 
@@ -3370,7 +3370,7 @@ go wrong, and each one became a rule with a test:
 - **No blanket approval.** No entry carries Gemini's `trust`, an
   `autoApprove` list or a wildcard, and setup never opens Claude Code's
   `settings.json`, where `permissions` live. The [0.2.7
-  plan](../plans/2026-11-04-plan-0.2.7.md)'s safety line is that our docs
+  plan](../plans/archive/2026-11-04-plan-0.2.7.md)'s safety line is that our docs
   never advise "always allow"; it would be odd for our code to do it quietly.
 
 ### Six agents, one table
