@@ -3842,6 +3842,14 @@ mod tests {
         "setup",
         "test",
         "bench",
+        // The appliance commands: each changes keys, disks or nodes, or
+        // serves the network, beside any listing it does.
+        "identity",
+        "cluster",
+        "image",
+        "machines",
+        "netboot",
+        "os",
     ];
 
     #[test]
