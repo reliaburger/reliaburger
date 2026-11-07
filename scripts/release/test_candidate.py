@@ -11,6 +11,8 @@ from package import GUEST_METADATA, PLATFORMS
 
 # What `relish agent source version` puts in the envelope's `relish` block.
 SOURCE_DIGEST = "sha256:" + "c" * 64
+# The ci.yml run the candidate's source CI rests on: one main's push ran (#1722).
+SOURCE_CI = dict(run_id=456, run_attempt=1)
 
 
 class CandidateTests(unittest.TestCase):
@@ -35,7 +37,8 @@ class CandidateTests(unittest.TestCase):
                         head_repository={"full_name": "reliaburger/reliaburger"})
 
     def record(self):
-        return record_candidate(self.directory, self.pins, source_digest=SOURCE_DIGEST, **self.identity)
+        return record_candidate(self.directory, self.pins, source_digest=SOURCE_DIGEST, source_ci=SOURCE_CI,
+                                **self.identity)
 
     def verify(self, digest):
         return verify_candidate(self.directory, self.pins, digest, **self.identity)
@@ -173,7 +176,7 @@ class CandidateTests(unittest.TestCase):
         for key, value in [("version", "../main"), ("commit", "main"),
                            ("repository", "../project"), ("run_id", 0), ("run_attempt", True)]:
             with self.subTest(key=key), self.assertRaises(ValueError):
-                record_candidate(self.directory, self.pins, source_digest=SOURCE_DIGEST,
+                record_candidate(self.directory, self.pins, source_digest=SOURCE_DIGEST, source_ci=SOURCE_CI,
                                  **dict(self.identity, **{key: value}))
         self.assertFalse((self.directory / "candidate.json").exists())
 
@@ -208,7 +211,40 @@ class CandidateTests(unittest.TestCase):
     def test_a_malformed_source_digest_is_not_recorded(self):
         for value in (None, "", "c" * 64, "sha256:" + "C" * 64, "sha256:" + "c" * 63, "sha512:" + "c" * 64):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                record_candidate(self.directory, self.pins, source_digest=value, **self.identity)
+                record_candidate(self.directory, self.pins, source_digest=value, source_ci=SOURCE_CI,
+                                 **self.identity)
+        self.assertFalse((self.directory / "candidate.json").exists())
+
+    def test_the_record_names_the_ci_run_the_candidate_rests_on(self):
+        # A build that reused main's CI run names that run, so qualification
+        # can cite it; one that ran the suite names itself (#1722).
+        digest = self.record()
+        self.assertEqual(json.loads((self.directory / "candidate.json").read_text())["source_ci"], SOURCE_CI)
+        document = verify_candidate(self.directory, self.pins, digest, source_ci=SOURCE_CI, **self.identity)
+        self.assertEqual(document["source_ci"], SOURCE_CI)
+
+    def test_verification_refuses_another_source_ci_run(self):
+        digest = self.record()
+        for other in (dict(SOURCE_CI, run_id=457), dict(SOURCE_CI, run_attempt=2)):
+            with self.subTest(other=other), self.assertRaises(ValueError):
+                verify_candidate(self.directory, self.pins, digest, source_ci=other, **self.identity)
+
+    def test_a_record_without_a_source_ci_run_does_not_verify(self):
+        self.record()
+        path = self.directory / "candidate.json"
+        document = json.loads(path.read_text())
+        del document["source_ci"]
+        encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
+        path.write_bytes(encoded)
+        with self.assertRaises(ValueError):
+            self.verify(hashlib.sha256(encoded).hexdigest())
+
+    def test_a_malformed_source_ci_run_is_not_recorded(self):
+        for value in (None, {}, dict(run_id=0, run_attempt=1), dict(run_id=456, run_attempt=True),
+                      dict(run_id="456", run_attempt=1), dict(SOURCE_CI, extra=1)):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                record_candidate(self.directory, self.pins, source_digest=SOURCE_DIGEST, source_ci=value,
+                                 **self.identity)
         self.assertFalse((self.directory / "candidate.json").exists())
 
 
