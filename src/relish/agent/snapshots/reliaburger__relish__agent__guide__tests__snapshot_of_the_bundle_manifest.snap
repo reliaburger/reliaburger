@@ -1,0 +1,56 @@
+---
+source: src/relish/agent/guide.rs
+expression: "artefact(paths::MCPB_MANIFEST)"
+---
+{
+  "author": {
+    "name": "Miko Pawlikowski",
+    "url": "https://reliaburger.com"
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "linux"
+    ]
+  },
+  "description": "Read-only Reliaburger cluster diagnosis: the relish agent commands as MCP tools.",
+  "display_name": "Reliaburger relish",
+  "documentation": "https://github.com/reliaburger/reliaburger/blob/v0.2.7/docs/manual/16_working-with-an-ai-agent.md",
+  "homepage": "https://reliaburger.com/agents",
+  "keywords": [
+    "reliaburger",
+    "relish",
+    "orchestrator",
+    "containers",
+    "sre"
+  ],
+  "license": "Apache-2.0",
+  "manifest_version": "0.3",
+  "name": "relish",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/reliaburger/reliaburger"
+  },
+  "server": {
+    "entry_point": "server/relish",
+    "mcp_config": {
+      "args": [
+        "mcp"
+      ],
+      "command": "${__dirname}/server/relish"
+    },
+    "type": "binary"
+  },
+  "support": "https://github.com/reliaburger/reliaburger/issues",
+  "tools": [
+    {
+      "description": "This chapter, as Markdown sections.",
+      "name": "guide"
+    },
+    {
+      "description": "Search it | quickly.",
+      "name": "source_grep"
+    }
+  ],
+  "version": "0.2.7"
+}

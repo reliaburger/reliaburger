@@ -907,11 +907,16 @@ token scoped to the namespace is.
 
 The repository's [`server.json`](https://github.com/reliaburger/reliaburger/blob/main/server.json)
 describes `relish mcp` for the [MCP Registry](https://registry.modelcontextprotocol.io),
-as `io.github.reliaburger/relish`: stdio, read-only and the tools above. It
-lists no package to install from, because the registry installs from npm,
-PyPI, NuGet, crates.io, container registries and MCPB bundles, and `relish`
-comes from `install.sh`. Install `relish` first, then point your client at
-`relish mcp`.
+as `io.github.reliaburger/relish`: stdio, read-only and the tools above.
+From 0.2.8, every release also carries an
+[MCP Bundle](https://github.com/modelcontextprotocol/mcpb) for each platform
+`relish` runs on, `relish-linux-x86_64.mcpb`, `relish-linux-aarch64.mcpb` and
+`relish-macos-aarch64.mcpb`, and the published registry entry lists them with
+their SHA-256s. A client that installs MCP Bundles, such as Claude Desktop,
+can install one and run the `relish` inside it, with no `install.sh`. That
+`relish` has no flags, so it uses the default local address or the saved
+local context. To connect it to anything else, or to use the `relish` you
+installed yourself, point your client at `relish mcp` as above.
 
 ## Wiring up your agent
 

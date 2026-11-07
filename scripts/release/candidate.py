@@ -16,7 +16,7 @@ import re
 import subprocess
 import sys
 
-from package import GUEST_METADATA, PLATFORMS, sha256
+from package import GUEST_METADATA, PLATFORMS, mcpb_name, sha256
 
 RECORD = "candidate.json"
 # Staging tags start with this, so nothing that expects a `v1.2.3` release tag
@@ -39,7 +39,9 @@ def candidate_names(pins):
     names = {f"{binary}-{platform}" for binary, platforms in PLATFORMS.items() for platform in platforms}
     return names | {name + ".sig" for name in names} | PDFS | {
         "metadata.json", "cli-metadata.json", "SHA256SUMS", "install.sh", GUEST_METADATA,
-    } | {image["asset"] for image in pins["images"].values()}
+    } | {image["asset"] for image in pins["images"].values()} | {
+        mcpb_name(platform) for platform in PLATFORMS["relish"]
+    }
 
 
 def identity(version, repository, commit, run_id, run_attempt):

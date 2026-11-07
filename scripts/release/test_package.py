@@ -7,8 +7,10 @@ import subprocess
 import shutil
 import tempfile
 import unittest
+import zipfile
 
-from package import GUEST_METADATA, guest_image_statement, package_release
+from package import (GUEST_METADATA, MCPB_MANIFEST, PLATFORMS, guest_image_statement, mcpb_bundle,
+                     mcpb_name, package_release)
 
 # The installers promise `curl ... | sh`. CI's `sh` is dash; macOS's is bash in
 # POSIX mode. Run every installer test under each POSIX shell present.
@@ -75,6 +77,7 @@ class ReleasePackageTests(unittest.TestCase):
             self.package()
         self.assertFalse((self.assets / "metadata.json").exists())
         self.assertFalse((self.assets / GUEST_METADATA).exists())
+        self.assertEqual(list(self.assets.glob("*.mcpb")), [], "no bundle before every artefact is signed")
 
     def test_metadata_keeps_bun_and_cli_selection_separate(self):
         self.package()
@@ -760,6 +763,53 @@ esac
                               calls.read_text().splitlines())
                 self.assertEqual((home / ".reliaburger/bin/relish").read_bytes(),
                                  (self.assets / "relish-macos-aarch64").read_bytes())
+
+    # --- MCP Bundles (#1695) ---------------------------------------------------
+
+    def test_each_relish_platform_gets_a_bundle_of_its_binary_and_the_manifest(self):
+        self.package()
+        template = json.loads(MCPB_MANIFEST.read_text())
+        sums = (self.assets / "SHA256SUMS").read_text()
+        for platform in PLATFORMS["relish"]:
+            with self.subTest(platform=platform):
+                path = self.assets / f"relish-{platform}.mcpb"
+                self.assertEqual(path.name, mcpb_name(platform))
+                with zipfile.ZipFile(path) as bundle:
+                    self.assertEqual(sorted(bundle.namelist()), ["manifest.json", "server/relish"])
+                    self.assertEqual(bundle.read("server/relish"),
+                                     (self.assets / f"relish-{platform}").read_bytes())
+                    executable = bundle.getinfo("server/relish").external_attr >> 16
+                    self.assertEqual(executable & 0o777, 0o755)
+                    manifest = json.loads(bundle.read("manifest.json"))
+                self.assertEqual(manifest["version"], "0.1.0")
+                expected = "darwin" if platform.startswith("macos-") else "linux"
+                self.assertEqual(manifest["compatibility"]["platforms"], [expected])
+                self.assertEqual(manifest["server"]["entry_point"], "server/relish")
+                for field in ("manifest_version", "name", "description", "server", "tools"):
+                    self.assertEqual(manifest[field], template[field])
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                self.assertIn(f"{digest}  {path.name}\n", sums)
+
+    def test_bun_gets_no_bundle(self):
+        self.package()
+        self.assertEqual(sorted(path.name for path in self.assets.glob("*.mcpb")),
+                         sorted(mcpb_name(platform) for platform in PLATFORMS["relish"]))
+
+    def test_a_bundle_is_the_same_bytes_every_time(self):
+        # candidate.json records the bundle's digest, and the registry entry
+        # carries it, so packaging the same binary twice must agree.
+        template = json.loads(MCPB_MANIFEST.read_text())
+        binary = self.assets / "relish-linux-x86_64"
+        first = mcpb_bundle(binary, template, "v0.1.0", "linux-x86_64")
+        binary.touch()
+        self.assertEqual(first, mcpb_bundle(binary, template, "v0.1.0", "linux-x86_64"))
+        self.assertNotEqual(first, mcpb_bundle(binary, template, "v0.1.1", "linux-x86_64"))
+
+    def test_a_bundle_never_changes_the_committed_manifest(self):
+        template = json.loads(MCPB_MANIFEST.read_text())
+        before = json.dumps(template, sort_keys=True)
+        mcpb_bundle(self.assets / "relish-macos-aarch64", template, "v0.1.0", "macos-aarch64")
+        self.assertEqual(json.dumps(template, sort_keys=True), before)
 
     def test_untrusted_key_cannot_publish_metadata(self):
         self.trusted = ["ed25519:" + base64.b64encode(bytes(32)).decode()]

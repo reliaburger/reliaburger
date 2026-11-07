@@ -6,7 +6,8 @@
 //! [`generate`] turns it into the files an agent finds elsewhere: `llms.txt`
 //! and the `/agents` page on the website, the `reliaburger` skill, the Claude
 //! Code plugin and its marketplace, the website's skills discovery index and
-//! its copy of the skill, `relish mcp`'s MCP Registry entry (`server.json`),
+//! its copy of the skill, `relish mcp`'s MCP Registry entry (`server.json`)
+//! and MCP Bundle manifest,
 //! and the generated block of the repository's `AGENTS.md`. A test in `tests/suite/agent_docs.rs` compares
 //! each file on disk with what [`generate`] makes, so none can drift, and
 //! `make agent-docs` rewrites them.
@@ -79,6 +80,9 @@ pub mod paths {
     /// `relish mcp`'s entry for the official
     /// [MCP Registry](https://registry.modelcontextprotocol.io).
     pub const MCP_SERVER: &str = "server.json";
+    /// The `manifest.json` release packaging puts in each platform's MCP
+    /// Bundle (`.mcpb`) beside that platform's `relish`.
+    pub const MCPB_MANIFEST: &str = "scripts/release/mcpb-manifest.json";
 }
 
 /// The `$schema` of the skills discovery index: version 0.2.0 of the RFC.
@@ -87,6 +91,13 @@ pub const SKILL_INDEX_SCHEMA: &str = "https://schemas.agentskills.io/discovery/0
 /// The `$schema` of `server.json`, the MCP Registry's format.
 pub const MCP_SERVER_SCHEMA: &str =
     "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json";
+
+/// The [MCP Bundle](https://github.com/modelcontextprotocol/mcpb) manifest
+/// format [`paths::MCPB_MANIFEST`] follows.
+pub const MCPB_MANIFEST_VERSION: &str = "0.3";
+
+/// Where a bundle keeps its `relish`, relative to the bundle's root.
+pub const MCPB_ENTRY_POINT: &str = "server/relish";
 
 /// `relish mcp`'s name in the MCP Registry. The `io.github.reliaburger`
 /// namespace is the one a GitHub login to the organisation proves.
@@ -504,6 +515,10 @@ pub fn generate(inputs: &Inputs<'_>, agent: &Command) -> Result<Vec<Artefact>, G
             path: paths::MCP_SERVER,
             contents: mcp_server_json(agent, inputs.version),
         },
+        Artefact {
+            path: paths::MCPB_MANIFEST,
+            contents: mcpb_manifest_json(agent, inputs.version),
+        },
     ])
 }
 
@@ -876,19 +891,36 @@ fn skill_index_json(description: &str, skill: &str) -> String {
 pub const MCP_DESCRIPTION: &str =
     "Read-only Reliaburger cluster diagnosis: the relish agent commands as MCP tools.";
 
+/// The tools `relish mcp` serves by default, with their descriptions.
+fn served_tools(agent: &Command) -> Vec<(String, String)> {
+    use crate::relish::mcp::tools;
+    tools::derive(agent.clone(), &tools::data_schema)
+        .into_iter()
+        .map(|spec| {
+            let description = spec
+                .tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .to_string();
+            (spec.tool.name.to_string(), description)
+        })
+        .collect()
+}
+
 /// `server.json` for the MCP Registry.
 ///
-/// It has no `packages` entry. The registry installs only from npm, PyPI,
-/// NuGet, crates.io, an OCI registry or an MCPB bundle, and `relish` ships
-/// as a signed binary through `install.sh`, which is none of those. So the
-/// entry says what the server is, how to start it and which tools it has, in
-/// the publisher-provided `_meta` the schema leaves open, and gives the
-/// install line, rather than claiming an install path a client can't follow.
+/// The committed file has no `packages` entry: a package's `fileSha256` is
+/// the digest of a release's `.mcpb` bundle, which only exists once the
+/// release is built. Promotion writes the entry it publishes, with one
+/// `mcpb` package per platform (`scripts/release/mcp_registry.py`). Until
+/// then the entry says what the server is, how to start it and which tools
+/// it has, in the publisher-provided `_meta` the schema leaves open, and
+/// gives the install line.
 fn mcp_server_json(agent: &Command, version: &str) -> String {
-    use crate::relish::mcp::tools;
-    let tools: Vec<String> = tools::derive(agent.clone(), &tools::data_schema)
+    let tools: Vec<String> = served_tools(agent)
         .into_iter()
-        .map(|spec| spec.tool.name.to_string())
+        .map(|(name, _)| name)
         .collect();
     pretty_json(&json!({
         "$schema": MCP_SERVER_SCHEMA,
@@ -911,6 +943,54 @@ fn mcp_server_json(agent: &Command, version: &str) -> String {
                 ),
             },
         },
+    }))
+}
+
+/// The [MCP Bundle](https://github.com/modelcontextprotocol/mcpb)
+/// `manifest.json` for `relish mcp`.
+///
+/// Release packaging (`scripts/release/package.py`) zips it with one
+/// platform's `relish` at [`MCPB_ENTRY_POINT`], sets `version` to the
+/// release's and narrows `compatibility.platforms` to that platform. A
+/// client that installs the bundle runs the `relish` inside it, so the
+/// command is relative to the bundle's directory, never a `relish` on the
+/// `PATH`.
+fn mcpb_manifest_json(agent: &Command, version: &str) -> String {
+    let tools: Vec<serde_json::Value> = served_tools(agent)
+        .into_iter()
+        .map(|(name, description)| json!({"name": name, "description": description}))
+        .collect();
+    let args: Vec<&str> = super::setup::MCP_COMMAND_LINE
+        .iter()
+        .skip(1)
+        .copied()
+        .collect();
+    pretty_json(&json!({
+        "manifest_version": MCPB_MANIFEST_VERSION,
+        "name": "relish",
+        "display_name": "Reliaburger relish",
+        "version": version,
+        "description": MCP_DESCRIPTION,
+        "author": {"name": AUTHOR, "url": SITE},
+        "repository": {"type": "git", "url": REPOSITORY},
+        "homepage": format!("{SITE}/agents"),
+        "documentation": format!(
+            "{REPOSITORY}/blob/v{version}/{chapter}",
+            chapter = paths::CHAPTER
+        ),
+        "support": format!("{REPOSITORY}/issues"),
+        "license": LICENSE,
+        "keywords": ["reliaburger", "relish", "orchestrator", "containers", "sre"],
+        "server": {
+            "type": "binary",
+            "entry_point": MCPB_ENTRY_POINT,
+            "mcp_config": {
+                "command": format!("${{__dirname}}/{MCPB_ENTRY_POINT}"),
+                "args": args,
+            },
+        },
+        "tools": tools,
+        "compatibility": {"platforms": ["darwin", "linux"]},
     }))
 }
 
@@ -1066,7 +1146,8 @@ Intro paragraph.\n\n## In brief\n\n\
     fn every_artefact_carries_the_brief_or_the_whole_chapter() {
         let brief = "Run `relish agent guide` first.";
         for artefact in generated() {
-            if artefact.path == paths::PLUGIN_MCP || artefact.path == paths::MCP_SERVER {
+            if [paths::PLUGIN_MCP, paths::MCP_SERVER, paths::MCPB_MANIFEST].contains(&artefact.path)
+            {
                 // Server entries, with no room for prose; their own tests
                 // check them.
                 continue;
@@ -1553,7 +1634,7 @@ Intro paragraph.\n\n## In brief\n\n\
         assert!(MCP_DESCRIPTION.chars().count() <= MCP_DESCRIPTION_MAX);
         assert!(
             value.get("packages").is_none(),
-            "relish isn't in a package registry the MCP Registry installs from"
+            "promotion adds the packages, once the bundles exist"
         );
         let provided = &value["_meta"]["io.modelcontextprotocol.registry/publisher-provided"];
         assert_eq!(provided["transport"], "stdio");
@@ -1592,5 +1673,74 @@ Intro paragraph.\n\n## In brief\n\n\
     #[test]
     fn snapshot_of_the_registry_entry() {
         insta::assert_snapshot!(artefact(paths::MCP_SERVER));
+    }
+
+    /// The MCP Bundle's manifest starts the `relish` inside the bundle as
+    /// `relish mcp`, over stdio, and lists exactly the tools that server
+    /// offers by default, as the registry entry does.
+    #[test]
+    fn the_bundle_manifest_runs_the_bundled_relish_mcp_with_the_served_tools() {
+        let manifest = generate(
+            &Inputs {
+                chapter: FIXTURE_CHAPTER,
+                agents_md: FIXTURE_AGENTS_MD,
+                manual: &fixture_manual(),
+                version: "0.2.7",
+                site: &[],
+            },
+            &agent_command(),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|artefact| artefact.path == paths::MCPB_MANIFEST)
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&manifest.contents).unwrap();
+        assert_eq!(value["manifest_version"], MCPB_MANIFEST_VERSION);
+        assert_eq!(value["version"], "0.2.7");
+        assert_eq!(value["description"], MCP_DESCRIPTION);
+        let server = &value["server"];
+        assert_eq!(server["type"], "binary");
+        assert_eq!(server["entry_point"], MCPB_ENTRY_POINT);
+        assert_eq!(
+            server["mcp_config"]["command"],
+            format!("${{__dirname}}/{MCPB_ENTRY_POINT}")
+        );
+        let args: Vec<&str> = server["mcp_config"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|word| word.as_str().unwrap())
+            .collect();
+        assert_eq!(args, &super::super::setup::MCP_COMMAND_LINE[1..]);
+        let listed: Vec<&str> = value["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        let served = crate::relish::mcp::Server::new(&Default::default()).unwrap();
+        let served: Vec<String> = served
+            .tools()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(listed, served);
+        assert!(
+            value["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| !tool["description"].as_str().unwrap().is_empty())
+        );
+        assert_eq!(
+            value["compatibility"]["platforms"],
+            serde_json::json!(["darwin", "linux"]),
+            "release packaging narrows this to one platform per bundle"
+        );
+    }
+
+    #[test]
+    fn snapshot_of_the_bundle_manifest() {
+        insta::assert_snapshot!(artefact(paths::MCPB_MANIFEST));
     }
 }
