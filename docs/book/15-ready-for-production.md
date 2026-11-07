@@ -7347,6 +7347,41 @@ That's #1606 again: a late wake-up, not a missing deadline. This time no
 disk-pressure prune ran in that second, so the hunt for what held the
 runtime goes on.
 
+Two things narrow it. First, tokio puts a task woken on a worker thread,
+by its timer included, in that worker's LIFO slot: the next task it runs.
+Other workers can steal from its queue but not from that slot (the
+`Builder::disable_lifo_slot` docs in tokio say so). So it takes just one
+worker stuck in one long poll to hold up the agent loop, while the rest
+sit idle. Second, the loop woke at 1,215 ms, 4 ms before the discovery
+fsync finished. That looks like a worker blocked on the same disk, in a
+call that waited for the fsync to end. On ext4 an fsync forces a journal
+commit, and a call that creates or removes a file needs a journal handle,
+so it can wait for that commit. We searched Bun for such calls on async
+workers. Nearly all its disk work is already on the blocking pool. One
+call wasn't: a job executor's cold start bound its control socket with
+`tokio::net::UnixListener::bind`, which makes the syscall on the spot, and
+the socket lives in the executor's directory on the data disk. A jobs
+soak starts executors all the time. The bind now runs on the blocking
+pool, and the listener crosses back to tokio:
+
+```rust
+let listener = blocking(move || {
+    let listener = std::os::unix::net::UnixListener::bind(&path)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+})
+.await?;
+Ok(UnixListener::from_std(listener)?)
+```
+
+`std::os::unix::net::UnixListener` is the standard library's blocking
+socket. `from_std` registers it with tokio's reactor, and that expects a
+non-blocking socket. Forget `set_nonblocking` and the first `accept`
+blocks the worker it runs on, which is the very thing this change
+removes. `a_control_socket_is_bound_off_the_runtime` checks the bind with
+`assert_runs_on_blocking_pool`. We can't prove this bind was the 700 ms:
+the evidence fits it, but it fits any file-creating call on a worker.
+
 #### The lock that went to the back of the queue
 
 The 24-hour memory run of the published 0.2.6 (#1417) logged a different
