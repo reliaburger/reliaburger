@@ -85,6 +85,15 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 filter = 'binary(mayo_memory)'
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# Two portable tests whose work is fsyncs and processes, not waiting: the
+# Mayo streamed-read property (32 cases, each flushing up to eight Parquet
+# files) and sixty-four process owners started and forgotten sixteen at a
+# time. Alone at load 3 they take 4 and 6 s; at load 45 both ran out of the
+# default 60 s (#1641). The limit only has to catch a hang.
+[[profile.default.overrides]]
+filter = 'test(/^mayo::store::tests::streamed_reads_match_the_eager_reader$/) | (binary(process_recovery) & test(=concurrent_forgets_of_retired_generations_all_succeed))'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
 # The jobs catalogue runs a real cron case, which waits for the next UTC
 # minute, then releases each job lease once the leader has settled its
 # cancelled deployment. A late minute boundary plus coverage
@@ -166,6 +175,11 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 # The mayo_memory override above (#1621).
 [[profile.ci.overrides]]
 filter = 'binary(mayo_memory)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# The streamed-read and concurrent-forget override above (#1641).
+[[profile.ci.overrides]]
+filter = 'test(/^mayo::store::tests::streamed_reads_match_the_eager_reader$/) | (binary(process_recovery) & test(=concurrent_forgets_of_retired_generations_all_succeed))'
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 # The jobs catalogue's override above. CI's coverage run uses this profile,

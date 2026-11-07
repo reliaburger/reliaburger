@@ -32,6 +32,8 @@ any release file yourself with
 `--laptop` asks for a development cluster on this computer. Without a flag the
 installer only explains the choices, including clusters on Linux machines you
 already have (`--install-only`, then the [Linux servers guide](docs/linux-servers.md)).
+With Homebrew, from 0.2.7: `brew install reliaburger/tap/relish`, then
+`relish setup --quickstart` (or `relish setup --ssh user@host,...`).
 Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not
 for production.
 

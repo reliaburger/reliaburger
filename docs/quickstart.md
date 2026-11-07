@@ -100,6 +100,10 @@ start it separately:
 relish setup --quickstart --nodes 3
 ```
 
+Homebrew installs the same CLI from 0.2.7: `brew install reliaburger/tap/relish`,
+then `relish setup --quickstart`. Homebrew owns that copy, so `brew upgrade
+relish` updates it and `relish uninstall` leaves it for `brew uninstall relish`.
+
 Use `/install.sh`: GitHub Pages serves the same static page to browsers and
 curl, so the site's root is HTML. The bootstrap downloads a complete,
 version-specific installer over HTTPS before running it. That installer pins

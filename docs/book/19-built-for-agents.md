@@ -2633,6 +2633,31 @@ The formula installs the CLI and nothing else. Homebrew upgrades `relish`; a
 cluster's nodes are still `relish upgrade`'s job, and the formula's caveats
 say so.
 
+The first published formula, 0.2.7's, failed on the first Mac that tried it:
+"Your Command Line Tools are too outdated"
+([#1712](https://github.com/reliaburger/reliaburger/issues/1712)).
+Homebrew installs a formula one of two ways. It pours a *bottle*, a
+tarball of the finished install, or it runs the formula's `install` method,
+which it treats as a build from source and guards with a check that the
+compilers are current. Our `install` only
+copies a binary, but Homebrew can't know that. So 0.2.8 ships bottles, and
+builds them without building anything: `homebrew.py bottles` checks each
+published binary against `candidate.json` and packs it, byte for byte, into
+the layout Homebrew pours into its Cellar, `relish/0.2.8/bin/relish` plus an
+install receipt. `cellar: :any_skip_relocation` tells Homebrew that nothing
+inside names the Cellar's path, so there's nothing to rewrite.
+
+One detail only showed up when a real `brew` ran it: Homebrew downloads
+`relish-0.2.7.arm64_tahoe.bottle.tar.gz` from a plain `root_url`, with one
+dash; the two-dash name in its cache and in GitHub Packages is a different
+spelling. The bottle also has to be reproducible: Python's `tarfile` and
+`gzip` record a modification time and an owner, so `bottle()` fixes both, and
+the same binary always gives the same SHA-256. The tests check that, that
+each bottle holds exactly the verified binary, and that a binary differing
+from the record is refused. The bottles live on a release of the tap's own,
+so the promotion job still has no write access to the reliaburger release it
+has just published.
+
 ## Can it roll?
 
 The fix is out. The last step of the loop is yours: upgrade. Ask `relish

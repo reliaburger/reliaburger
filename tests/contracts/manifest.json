@@ -2179,9 +2179,33 @@
           ]
         },
         {
-          "id": "issue-549-gitops_refuses_migration_prerequisites_and_standalone_jobs",
+          "id": "issue-549-gitops_refuses_a_standalone_job",
           "binary": "reliaburger",
-          "test": "lettuce::sync::tests::gitops_refuses_migration_prerequisites_and_standalone_jobs",
+          "test": "lettuce::sync::tests::gitops_refuses_a_standalone_job",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/lettuce/sync.rs"
+          ]
+        },
+        {
+          "id": "issue-549-gitops_refuses_a_migration_prerequisite",
+          "binary": "reliaburger",
+          "test": "lettuce::sync::tests::gitops_refuses_a_migration_prerequisite",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/lettuce/sync.rs"
+          ]
+        },
+        {
+          "id": "issue-549-gitops_refuses_a_scheduled_job",
+          "binary": "reliaburger",
+          "test": "lettuce::sync::tests::gitops_refuses_a_scheduled_job",
           "requires": [
             "portable-linux",
             "portable-darwin"

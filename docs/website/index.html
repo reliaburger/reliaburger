@@ -342,6 +342,8 @@
         <label class="install-tab" for="install-tyres">Kick the tyres</label>
         <input class="install-tab-input" type="radio" name="install-way" id="install-agent">
         <label class="install-tab" for="install-agent">With your agent</label>
+        <input class="install-tab-input" type="radio" name="install-way" id="install-homebrew">
+        <label class="install-tab" for="install-homebrew">Homebrew</label>
         <div class="install-grid install-panel install-panel-tyres">
           <div class="terminal">
             <div class="terminal-heading">INSTALL <span>sh</span></div>
@@ -382,6 +384,24 @@
             <p class="install-links"><a href="agents.html">Read the playbook</a>
               · <a href="agents.md">As Markdown</a>
               · <a href="agents.html#add-to-your-agent">Add Reliaburger to your agent</a></p>
+          </div>
+        </div>
+        <div class="install-grid install-panel install-panel-homebrew">
+          <div class="terminal">
+            <div class="terminal-heading">INSTALL <span>Homebrew</span></div>
+            <pre><code>brew install reliaburger/tap/relish
+relish setup --quickstart</code></pre>
+          </div>
+          <div class="install-copy">
+            <p>From 0.2.7, Homebrew installs <code>relish</code> on a Mac with Apple silicon or on
+              Linux, and <code>brew upgrade relish</code> keeps it current. The second line builds
+              the same laptop cluster as the one-line install. Got Linux machines already? Run
+              <code>relish setup --ssh user@host,user@host</code> instead.</p>
+            <p>Homebrew manages only the CLI. A cluster’s nodes still upgrade with
+              <code>relish upgrade</code>, and <code>relish uninstall</code> leaves the Homebrew
+              copy for <code>brew uninstall relish</code> to remove.</p>
+            <p class="install-links"><a href="https://github.com/reliaburger/homebrew-tap">The tap</a>
+              · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a></p>
           </div>
         </div>
         </div>

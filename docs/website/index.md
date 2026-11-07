@@ -40,7 +40,7 @@ Kubernetes hands you the ingredients. Reliaburger hands you the burger: app sche
 
 ## Install it
 
-Kick the tyres With your agent
+Kick the tyres With your agent Homebrew
 
 INSTALL sh
 
@@ -65,6 +65,19 @@ Paste that into Claude Code, Codex or any agent with a shell. The page it reads 
 You still make the decisions; it does the typing. Give it a read-only token afterwards, and it can help you run the cluster too.
 
 [Read the playbook](https://reliaburger.com/agents.html) · [As Markdown](https://reliaburger.com/agents.md) · [Add Reliaburger to your agent](https://reliaburger.com/agents.html#add-to-your-agent)
+
+INSTALL Homebrew
+
+```
+brew install reliaburger/tap/relish
+relish setup --quickstart
+```
+
+From 0.2.7, Homebrew installs `relish` on a Mac with Apple silicon or on Linux, and `brew upgrade relish` keeps it current. The second line builds the same laptop cluster as the one-line install. Got Linux machines already? Run `relish setup --ssh user@host,user@host` instead.
+
+Homebrew manages only the CLI. A cluster’s nodes still upgrade with `relish upgrade`, and `relish uninstall` leaves the Homebrew copy for `brew uninstall relish` to remove.
+
+[The tap](https://github.com/reliaburger/homebrew-tap) · [One node, CLI only, cleanup](https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md)
 
 **Where it stands**
 
