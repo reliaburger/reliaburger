@@ -1119,30 +1119,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gitops_refuses_migration_prerequisites_and_standalone_jobs() {
-        for manifest in [
-            "[job.migrate]\nimage = 'migrate:v1'\n",
-            "[app.web]\nimage = 'web:v1'\n[job.migrate]\nimage = 'migrate:v1'\nrun_before = ['app.web']\n",
-            "[job.migrate]\nimage = 'migrate:v1'\nschedule = '* * * * *'\n",
-        ] {
-            let mut repository = SigningRepo::new();
-            // A job-only watched tree must also refuse, even with no app diff.
-            std::fs::remove_file(repository.work.join("base.toml")).unwrap();
-            repository.commit_apps(manifest, false);
-            let outcome = repository.sync(None);
-            let SyncResult::Failure { error } = &outcome.result else {
-                panic!(
-                    "unsupported migration/jobs reported success: {:?}",
-                    outcome.result
-                );
-            };
-            assert!(
-                error.contains("GitOps does not reconcile jobs") && error.contains("job.migrate"),
-                "{error}"
+    /// GitOps refuses a watched tree that declares a job, even a job-only
+    /// tree with no app diff. Each case is its own test: one makes a key, a
+    /// repository and a commit, and three in a row ran out of the 60 s
+    /// timeout on a loaded host (#1641), as five did in #1555.
+    fn assert_gitops_refuses_jobs(manifest: &str) {
+        let mut repository = SigningRepo::new();
+        std::fs::remove_file(repository.work.join("base.toml")).unwrap();
+        repository.commit_apps(manifest, false);
+        let outcome = repository.sync(None);
+        let SyncResult::Failure { error } = &outcome.result else {
+            panic!(
+                "unsupported migration/jobs reported success: {:?}",
+                outcome.result
             );
-            assert!(outcome.changes.is_empty());
-            assert!(outcome.diff_summary.is_none());
-        }
+        };
+        assert!(
+            error.contains("GitOps does not reconcile jobs") && error.contains("job.migrate"),
+            "{error}"
+        );
+        assert!(outcome.changes.is_empty());
+        assert!(outcome.diff_summary.is_none());
+    }
+
+    #[test]
+    fn gitops_refuses_a_standalone_job() {
+        assert_gitops_refuses_jobs("[job.migrate]\nimage = 'migrate:v1'\n");
+    }
+
+    #[test]
+    fn gitops_refuses_a_migration_prerequisite() {
+        assert_gitops_refuses_jobs(
+            "[app.web]\nimage = 'web:v1'\n[job.migrate]\nimage = 'migrate:v1'\nrun_before = ['app.web']\n",
+        );
+    }
+
+    #[test]
+    fn gitops_refuses_a_scheduled_job() {
+        assert_gitops_refuses_jobs("[job.migrate]\nimage = 'migrate:v1'\nschedule = '* * * * *'\n");
     }
 }

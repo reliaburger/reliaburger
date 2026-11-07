@@ -5897,6 +5897,35 @@ write for 300 ms, three fifths of the turn budget, so each tick's second
 write always goes off the loop. It still counts four writes, at most two a
 tick.
 
+That third test failed once more, on a Mac at a load of about 45, with
+`[2, 0, 1, 0]`: the retirement finished, but the count came to three
+(#1625). The count was the bug. `LoopStalls::hold` counted a write inside
+the task the write runs in, and a `#[tokio::test]` runtime has one thread,
+so that task runs only when the tick yields. A tick whose first write woke
+the loop late has a deadline the timer has already passed. The second
+write's `timeout_at` then fires as it's registered, without yielding, and
+the tick ends with the write's task never polled. The write was counted
+later, in the gap between ticks, where nobody was counting. A test that
+starts a write with such a deadline reproduces it every time. Now
+`LoopStalls::reach` counts the write, and reads how long to stall it,
+where the tick starts the write, and the task only sleeps:
+
+```rust
+#[cfg(test)]
+let stall = self.loop_stalls.reach(super::LoopStall::Persist);
+let mut task = tokio::spawn(async move {
+    #[cfg(test)]
+    if let Some(stall) = stall {
+        tokio::time::sleep(stall).await;
+    }
+    journal.persist(next).await
+});
+```
+
+`stall` is an `Option<Duration>`, which is `Copy`, so the `async move`
+block takes its own copy and nothing is borrowed from `self` across the
+spawn.
+
 A day later the same trap caught a third test, in a different place
 (#1396). The scenario that publishes a thousand-service view drove its
 consumer-sync turns by hand, one step a turn, and measured each turn's CPU
@@ -6728,9 +6757,15 @@ set that sleeps 100 ms and comes back, the way it already did for Create.
 
 Releases and retirements read the journal to decide what's left, so the
 next ask works it out from there. A release whose "forget the permission"
-write landed after its turn finds the journal no longer naming the hold.
-It hands the address back again (the runtime's release is idempotent and
-names its generation) and finishes. A service retirement skips its
+write landed after its turn finds the journal no longer naming the hold,
+and only the bookkeeping is left. At first it handed the address back
+again, on the grounds that the runtime's release is idempotent and names
+its generation. That was harmless, but a loop-harness test that counts
+runtime calls saw two releases under load (#1620), and holding every
+journal write past the turn made it happen every time. So the agent now
+keeps a release the runtime has confirmed in `released_network_references`
+until the retirement finishes, and the ask after a late forget doesn't go
+back to the runtime. A service retirement skips its
 `Withdrawn` write once that's on disk. The removal after it is the one
 case the journal can't answer alone: an allocation that's gone looks like
 one that was never there, which retirement refuses as "original service

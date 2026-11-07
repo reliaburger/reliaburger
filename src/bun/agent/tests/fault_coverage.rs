@@ -3,16 +3,17 @@
 //!
 //! The partition is keyed by each caller's cgroup, which the runtime names
 //! only when asked, and the injecting turn asks under its 500 ms budget. Here
-//! each read takes 300 ms, as runc's owner did on a loaded runner: the first
-//! of three frontends fits the turn and the other two don't.
+//! the first read answers at once and each later one outlasts the whole
+//! turn, as runc's owner did on a loaded runner: the first of three
+//! frontends fits the turn and the other two don't. Each read used to take
+//! 300 ms, so which fitted depended on the wall clock, and a starved host
+//! could push the first past the deadline too (#1641).
 
 use super::loop_harness::replicated;
 use super::*;
 use crate::bun::agent::fault_coverage::Injection;
 use crate::smoker::network::LateCuts;
 use crate::smoker::types::{FaultRequest, FaultSummary, FaultType};
-
-const SLOW_CGROUP_READ: std::time::Duration = std::time::Duration::from_millis(300);
 
 fn partition_from_frontend() -> FaultRequest {
     FaultRequest {
@@ -40,7 +41,8 @@ async fn partition_after_a_slow_turn() -> (TestAgent, MockGrill, crate::smoker::
     let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
     expect_complete(&drain_deploy(&mut agent, replicated("frontend", 3)).await);
     let rule = agent.fault_registry.insert(&partition_from_frontend());
-    grill.set_workload_cgroup_delay(Some(SLOW_CGROUP_READ));
+    grill.set_prompt_workload_cgroup_reads(1);
+    grill.set_workload_cgroup_delay(Some(STALLED_CGROUP_READ));
     agent.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
     agent.local_callers().await;
     agent.turn_deadline = None;

@@ -87,6 +87,9 @@ pub struct MockGrill {
     /// Time each workload cgroup read takes, as runc's owner lock does on a
     /// loaded host.
     workload_cgroup_delay: Arc<Mutex<Option<std::time::Duration>>>,
+    /// How many workload cgroup reads still answer at once, before
+    /// `workload_cgroup_delay` applies.
+    prompt_workload_cgroup_reads: Arc<Mutex<usize>>,
     /// Cgroup ids a workload cgroup read names, for a test on a host that
     /// can't resolve a real cgroup path.
     workload_cgroups: Arc<Mutex<HashMap<InstanceId, u64>>>,
@@ -174,6 +177,7 @@ impl Default for MockGrill {
             kill_delay: Arc::default(),
             pid_delay: Arc::default(),
             workload_cgroup_delay: Arc::default(),
+            prompt_workload_cgroup_reads: Arc::default(),
             workload_cgroups: Arc::default(),
             instance_pid_delays: Arc::default(),
             fail_pid: Arc::default(),
@@ -538,6 +542,12 @@ impl MockGrill {
     /// Delay every workload cgroup read, as runc's owner does on a loaded host.
     pub fn set_workload_cgroup_delay(&self, delay: Option<std::time::Duration>) {
         *self.workload_cgroup_delay.lock().unwrap() = delay;
+    }
+
+    /// Answer the next `reads` workload cgroup reads at once, and delay only
+    /// the ones after them.
+    pub fn set_prompt_workload_cgroup_reads(&self, reads: usize) {
+        *self.prompt_workload_cgroup_reads.lock().unwrap() = reads;
     }
 
     /// Make a workload cgroup read of `instance` name `cgroup_id`, as a
@@ -970,8 +980,14 @@ impl super::Grill for MockGrill {
     }
 
     async fn workload_cgroup(&self, instance: &InstanceId) -> Result<Option<u64>, GrillError> {
+        let prompt = {
+            let mut prompt = self.prompt_workload_cgroup_reads.lock().unwrap();
+            let answer_at_once = *prompt > 0;
+            *prompt = prompt.saturating_sub(1);
+            answer_at_once
+        };
         let delay = *self.workload_cgroup_delay.lock().unwrap();
-        if let Some(delay) = delay {
+        if let Some(delay) = delay.filter(|_| !prompt) {
             tokio::time::sleep(delay).await;
         }
         if let Some(cgroup_id) = self.workload_cgroups.lock().unwrap().get(instance) {
