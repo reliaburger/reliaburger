@@ -4176,6 +4176,111 @@ outside solver which reads the injection, runs `relish delete web` and
 blames `billing` is `unsafe` three times over. None of it starts a cluster or
 calls a model. `make test-gym` is the real thing.
 
+## Work an agent can check
+
+Everything so far helps an agent read Reliaburger. This part is about the
+other direction: giving an outside agent (or a person, for that matter) work
+it can finish and *prove* it finished, without the maintainer checking every
+line (#1584).
+
+The hard part of a first contribution is usually not the code. It's knowing
+the change is right. A missed mutant settles that up front. cargo-mutants
+takes a line, changes it in one small way (`>` to `>=`, a function body to
+`Default::default()`, a match guard to `true`), and runs the tests. If
+nothing fails, a test is missing, and the report already says which line and
+which wrong behaviour. The task "write a test that kills this" has a
+mechanical finish line: run the same command again and the mutant is
+`caught`. That suits an agent, which will otherwise announce success on
+whatever evidence it has.
+
+The first local trial, three mutants of `src/file_lock.rs`, found one
+straight away. `FileLock::remove` ignores a `NotFound` error from deleting
+the lock file and returns every other error. Change that match guard to
+`true`, so every error is ignored, and `file_lock::`'s tests still pass.
+Nothing checks that a real failure to remove the file gets reported.
+
+So a pull request that touches `src/`, into `main` or into a release's merge
+train, now gets a mutants job, and the job
+summary lists each mutant its tests missed, with a link that opens a
+pre-filled `missed-mutant` issue. A person files it. The job never does, for
+the same reason `relish agent report` only drafts: nothing posts to GitHub on
+its own.
+
+The cost shaped most of the design. The crate has about 27,000 mutants, and
+each one rebuilds the crate before its tests run, so a whole-crate run is a
+thousand runner-hours. Four limits keep it affordable:
+
+- **Only the change.** `--in-diff` mutates only the lines a pull request
+  touches, and the weekly run takes only the week's changes on `main`.
+- **A budget.** At most 12 mutants a pull request, as one round-robin shard
+  of the list, so the sample spreads over every file instead of using up the
+  budget on the first one.
+- **Only the nearby tests.** A mutant in `src/council/network.rs` runs
+  `council::`'s unit tests, not the whole suite. A mutant that only an
+  integration test catches then shows as missed, and the summary says so.
+- **A clock.** The test step stops itself after 60 minutes and reports what
+  it finished, so a slow run still produces a summary.
+
+The clock came from the first CI run, which had only the count. Each mutant
+took seven and a half minutes to build, the job hit its 90-minute limit
+with four mutants to go, and a job killed by its limit writes no summary.
+The seven and a half minutes were a full rebuild of the crate every time.
+`Swatinem/rust-cache`, which every job here uses, sets `CARGO_INCREMENTAL=0`,
+because incremental artefacts make a poor cache. For mutation testing that's
+exactly wrong: every mutant changes one line of an otherwise identical
+crate, which is the case incremental compilation exists for. The test step
+now turns it back on, and `toolchain_pins.rs` checks it stays on. That run
+still found two missed mutants, both in `FileLock::remove`.
+
+The job runs on Linux, in its own workflow, and doesn't fail on a missed
+mutant. Pull request CI is already about 28 minutes, nearly all of it one
+job, and a job that people learn to ignore when it goes red is worse than
+none.
+
+### One step to a working build
+
+An agent in a cloud sandbox starts with nothing. It reads `CONTRIBUTING.md`,
+guesses which packages the build wants, installs a Rust that's a release off,
+and then spends its budget on linker errors. `.devcontainer/` removes the
+guessing: Ubuntu 24.04 like CI's runners, the Rust and nextest versions CI
+pins, the C compiler and static libc `build.rs` needs, clang, LLVM and
+libbpf for the eBPF build, and cargo-mutants. `copilot-setup-steps.yml` gives
+GitHub's Copilot agent the same. Both are honest about their limit: only the
+portable suite runs there, so "tests pass" from inside one means `make ci`,
+not the gated suites.
+
+A pinned toolchain written down in four places (`ci.yml`, the Dockerfile,
+the mutants job, the Copilot job) drifts as soon as someone bumps one of them.
+`tests/suite/toolchain_pins.rs` reads all four and fails on the first that
+differs. The Dockerfile's pins are plain `ARG` lines, so the test finds them
+with an iterator:
+
+```rust
+fn dockerfile_arg(name: &str) -> String {
+    let prefix = format!("ARG {name}=");
+    read(DOCKERFILE)
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
+        .unwrap_or_else(|| panic!("{DOCKERFILE} has no {prefix}"))
+}
+```
+
+`strip_prefix` returns an `Option<&str>`: `Some` of the rest of the line when
+it starts with the prefix, `None` otherwise. `find_map` stops at the first
+`Some`, so it's "find the line, and give me the part after the prefix" in one
+step. `map(str::to_owned)` turns the borrowed slice into a `String` the
+function can return, because the text it borrows from is a temporary that's
+gone when the function ends; the borrow checker won't let a `&str` outlive
+it. `unwrap_or_else` takes a closure that runs only when there's no match,
+which is how a test turns "not found" into a message that names the file.
+
+The workflows are YAML, and the test parses them into `serde_json::Value`
+with the same `yaml_serde` crate `relish` uses for its YAML output, rather
+than matching text. A step is then `job["steps"][i]["uses"]`, and indexing a
+`Value` with a key that isn't there gives `Value::Null` instead of panicking,
+so a missing field fails the assertion that reads it, with the field's name in
+the message.
+
 ## What we didn't do
 
 The three big refusals are at the start of the chapter. These are the smaller
@@ -4353,6 +4458,16 @@ ones, command by command, each with the reason it lost.
   first cut, being able to read exactly what's tested matters more.
 - **Statistics.** Five runs per scenario gives a distribution you can read,
   not a confidence interval. The record shows counts and medians.
+
+**Work an agent can check.**
+
+- **File the issues automatically.** A noisy week would bury the tracker,
+  and a person reading a mutant first can see when it's really an
+  integration test's job.
+- **A whole-crate run.** See the arithmetic above. The weekly run covers new
+  code, where a missing test is cheapest to add.
+- **Make the job required.** A sample of 12 can miss what another sample
+  would catch, so it informs a review rather than gating it.
 
 ## Lessons learned
 

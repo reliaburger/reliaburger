@@ -1,0 +1,164 @@
+name: Mutants
+
+# Mutation testing with cargo-mutants (#1584; docs/testing.md, "Mutation
+# testing"). It changes the code a pull request touches, one small edit at a
+# time (a `>` becomes `>=`, a function returns `Default::default()`), and
+# runs the tests against each. A mutant no test notices is a missing test:
+# the job summary lists each one with a link that opens a pre-filled
+# `missed-mutant` issue, which a person files. Nothing here posts to GitHub.
+#
+# It is its own workflow, like fuzz.yml, so it is never on a pull request's
+# critical path: ci.yml's evidence gate (the one required check) doesn't wait
+# for it, it runs on Linux only, and it doesn't fail on a missed mutant. Each
+# mutant rebuilds the crate and runs its module's unit tests, a few minutes
+# apiece, so a pull request tests at most MUTANTS_MAX of its mutants, a
+# round-robin sample over every file it touches (scripts/ci/mutants_plan.py).
+# A whole-crate run is about 27,000 mutants, far beyond any runner, so the
+# weekly run mutates what landed on the branch in the last seven days.
+
+on:
+  pull_request:
+    branches: [main, "codex/**", "fix/**", "release-*"]
+    paths:
+      - src/**
+      - .cargo/mutants.toml
+      - scripts/ci/mutants_plan.py
+      - .github/workflows/mutants.yml
+  schedule:
+    # Sundays, when the runners are quiet.
+    - cron: "23 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      files:
+        description: Glob of files to mutate, e.g. src/council/** (empty means the last seven days' changes)
+        default: ""
+      max:
+        description: Most mutants to test
+        default: "12"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # A mutant only has to build and fail; no debugger reads these binaries,
+  # and no debug info makes each rebuild's link faster.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  MUTANTS_MAX: ${{ github.event_name == 'pull_request' && '12' || github.event_name == 'schedule' && '60' || inputs.max }}
+  # The test step's own budget, inside the job's limit, so the summary and
+  # the artefact still come out when the mutants take longer than planned.
+  MUTANTS_MINUTES: ${{ github.event_name == 'pull_request' && '60' || '300' }}
+  # When a pull request changes only this set-up, it mutates one small file,
+  # so the change shows the job still works.
+  SETUP_SAMPLE: src/file_lock.rs
+
+jobs:
+  mutants:
+    name: mutants in the change
+    runs-on: ubuntu-24.04
+    # Run 42213963003, a pull request with a cold cache: 40 s of set-up, a
+    # 13.5-minute baseline build, then 7.5 minutes a mutant without
+    # incremental builds. The test step stops itself at MUTANTS_MINUTES; this
+    # limit leaves room for the summary and the artefact after it.
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 75 || 330 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145,cargo-mutants@27.1.0
+      # Only the weekly run and runs by hand save the cache, so pull requests
+      # don't eat into the quota ci.yml keeps for main.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutants
+          save-if: ${{ github.event_name != 'pull_request' }}
+          cache-on-failure: true
+      - name: Prepare portable build host
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get remove -y -qq buildah
+          sudo apt-get install -y -qq clang libbpf-dev llvm
+      - name: Choose what to mutate
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          FILES: ${{ inputs.files }}
+        run: |
+          diff="$RUNNER_TEMP/change.diff"
+          case "$EVENT" in
+            pull_request)
+              git diff "$BASE_SHA"...HEAD -- src/ > "$diff"
+              if [ ! -s "$diff" ]; then
+                echo "SELECT_FLAG=--file" >> "$GITHUB_ENV"
+                echo "SELECT_VALUE=$SETUP_SAMPLE" >> "$GITHUB_ENV"
+                exit 0
+              fi ;;
+            *)
+              if [ -n "$FILES" ]; then
+                echo "SELECT_FLAG=--file" >> "$GITHUB_ENV"
+                echo "SELECT_VALUE=$FILES" >> "$GITHUB_ENV"
+                exit 0
+              fi
+              since=$(git rev-list -1 --before='7 days ago' HEAD)
+              git diff "$since" HEAD -- src/ > "$diff" ;;
+          esac
+          echo "SELECT_FLAG=--in-diff" >> "$GITHUB_ENV"
+          echo "SELECT_VALUE=$diff" >> "$GITHUB_ENV"
+      - name: List and plan
+        id: plan
+        run: |
+          cargo mutants --list "$SELECT_FLAG" "$SELECT_VALUE" | tee "$RUNNER_TEMP/mutants.list"
+          python3 scripts/ci/mutants_plan.py plan --list "$RUNNER_TEMP/mutants.list" --max "$MUTANTS_MAX" --github-output "$GITHUB_OUTPUT"
+      # Exit 2 is a missed mutant and 3 a timeout: findings, not failures.
+      # 124 is `timeout` ending the run at MUTANTS_MINUTES; cargo-mutants
+      # appends each result to mutants.out as it finishes, so the summary
+      # reports what got done. Anything else (the unmutated tree failing its
+      # tests, say) fails. A module with no unit tests is a warning: every
+      # mutant in it is missed.
+      - name: Test the mutants
+        if: steps.plan.outputs.count != '0'
+        env:
+          SHARDS: ${{ steps.plan.outputs.shards }}
+          FILTER: ${{ steps.plan.outputs.filter }}
+          # rust-cache turns incremental compilation off, so each mutant
+          # rebuilt the whole crate: 442 to 456 s a mutant on run
+          # 42213963003. Each mutant changes one line, which is what
+          # incremental compilation is for.
+          CARGO_INCREMENTAL: "1"
+        run: |
+          filter=()
+          if [ -n "$FILTER" ]; then filter=(-E "$FILTER"); fi
+          status=0
+          timeout --signal=INT --kill-after=2m "${MUTANTS_MINUTES}m" \
+            cargo mutants "$SELECT_FLAG" "$SELECT_VALUE" --in-place \
+            --shard "0/$SHARDS" --sharding round-robin --output "$RUNNER_TEMP" \
+            -- --lib --no-tests=warn "${filter[@]}" || status=$?
+          case "$status" in
+            0|2|3) ;;
+            124) echo "MUTANTS_STOPPED=--stopped" >> "$GITHUB_ENV" ;;
+            *) exit "$status" ;;
+          esac
+      - name: Summarise
+        if: always() && steps.plan.outcome == 'success'
+        env:
+          REPOSITORY: ${{ github.repository }}
+          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 scripts/ci/mutants_plan.py summary --list "$RUNNER_TEMP/mutants.list" --max "$MUTANTS_MAX" \
+            --results "$RUNNER_TEMP/mutants.out" --repository "$REPOSITORY" --commit "$COMMIT" \
+            ${MUTANTS_STOPPED:-} >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-out
+          path: ${{ runner.temp }}/mutants.out
+          if-no-files-found: ignore
+          retention-days: 14

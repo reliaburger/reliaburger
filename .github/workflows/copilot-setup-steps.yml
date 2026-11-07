@@ -1,0 +1,47 @@
+name: Copilot setup steps
+
+# GitHub's Copilot coding agent runs the job named `copilot-setup-steps` in
+# this file before it starts work, so the agent's sandbox can run `make ci`
+# (#1584). It mirrors .devcontainer/ and ci.yml's portable job: the same Rust,
+# nextest and build packages. Only the portable suite runs there; the gated
+# suites need root, runc, eBPF or a Mac. GitHub caps the job at 59 minutes.
+#
+# It runs here too when it changes, so a broken set-up shows on its own PR.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+permissions:
+  contents: read
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-24.04
+    # An uncached debug build of the suite is about 15 minutes.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: copilot
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Prepare portable build host
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang libbpf-dev llvm
+      # The suite's binaries, built as `make test` builds them, so the
+      # agent's first test run doesn't start with a cold compile.
+      - name: Build the portable suite
+        run: cargo test --locked --no-run

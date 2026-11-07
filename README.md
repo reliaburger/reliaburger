@@ -563,6 +563,9 @@ asks for the version, a reproducer and what you didn't test. You're welcome to
 use AI tools if you say so and a human answers for every line; agents start
 with [AGENTS.md](AGENTS.md). Vulnerabilities go privately, as
 [SECURITY.md](SECURITY.md) describes, and there's no bounty.
+[`.devcontainer/`](.devcontainer) gives you CI's toolchain in one step for
+`make ci` (the portable suite only), and issues labelled `missed-mutant` are
+self-checking first tasks.
 
 ## Licence
 

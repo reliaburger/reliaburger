@@ -107,6 +107,7 @@ mod task_array_recovery;
 mod task_arrays;
 mod templates;
 mod tls_connection_lifetime;
+mod toolchain_pins;
 mod uninstall;
 mod user_directories;
 mod website;

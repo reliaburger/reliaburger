@@ -496,6 +496,18 @@ make fuzz-corpus-check  # every target body over its checked-in corpus, on stabl
 make fuzz-smoke         # every target for FUZZ_SECONDS (default 10); needs nightly and cargo-fuzz
 ```
 
+### Mutation testing
+
+A pull request that touches `src/` gets a non-blocking
+[cargo-mutants](https://mutants.rs/) job on the lines it changes, and a weekly
+run takes the week's changes on `main`. The job summary links a pre-filled
+`missed-mutant` issue for each mutant no test caught. See
+[testing.md](testing.md#mutation-testing).
+
+```sh
+cargo mutants --file src/onion/dns.rs   # mutate one file and run the portable suite against each mutant
+```
+
 ### Benchmarks
 
 Gossip protocol benchmarks use [criterion](https://docs.rs/criterion) for statistical analysis with regression detection.
