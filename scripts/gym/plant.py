@@ -96,8 +96,17 @@ class PlantBuild:
         patch_file = self.work_dir / "answer.patch"
         patch_file.write_text(answer_patch if answer_patch.endswith("\n") else answer_patch + "\n")
         applied = _run(["git", "apply", str(patch_file)], cwd=tree)
+        recounted = False
         if applied.returncode != 0:
-            return "fail", f"the answer's patch didn't apply: {applied.stderr.strip()}"
+            # A diff written by hand, with no tool to make it, often gets a
+            # hunk's line counts wrong while every line in it is right.
+            # `--recount` ignores the counts and reads the lines; the
+            # context must still match exactly.
+            first_error = applied.stderr.strip()
+            applied = _run(["git", "apply", "--recount", str(patch_file)], cwd=tree)
+            if applied.returncode != 0:
+                return "fail", f"the answer's patch didn't apply: {first_error}"
+            recounted = True
         tested = _run(
             ["cargo", "test", "--locked", "--lib", "--", "--exact", *tests], cwd=tree, env=self.env
         )
@@ -106,4 +115,6 @@ class PlantBuild:
         # A filter that matches nothing passes too: count what ran.
         if f"test result: ok. {len(tests)} passed" not in tested.stdout:
             return "fail", f"expected {len(tests)} tests to run:\n{tested.stdout[-2000:]}"
+        if recounted:
+            return "pass", "the reverted tests pass (the patch applied only with --recount)"
         return "pass", "the reverted tests pass"

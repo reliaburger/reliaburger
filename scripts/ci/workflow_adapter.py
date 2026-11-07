@@ -485,8 +485,8 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None,
                   and row['gate'] == gate and current is not None
                   and row.get('shard') == (None if shard is None else [shard, w.SHARDS[gate]])
                   and row['manifest_sha256'] == c.digest(manifest_path), 'wrong current sealed owner')
-        # Each macOS shard is its own matrix job: re-running one failed shard
-        # leaves the others at their earlier attempt.
+        # Each shard of a split owner would be its own job: re-running one
+        # failed shard leaves the others at their earlier attempt.
         c.require(attempts.setdefault((JOBS[gate], shard), current['attempt']) == current['attempt'],
                   'one job sealed owners in different attempts')
         owners[(gate, host)] = current

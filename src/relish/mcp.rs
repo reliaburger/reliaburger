@@ -92,7 +92,7 @@ pub struct Server {
 impl Server {
     /// A server over `relish agent`'s commands, as `selection` narrows them.
     pub fn new(selection: &Selection) -> Result<Self, tools::SelectionError> {
-        let all = tools::derive(tools::agent_command(), &tools::data_schema);
+        let all = tools::derive(agent::agent_command(), &tools::data_schema);
         Ok(Server {
             tools: tools::select(all, selection)?,
         })
@@ -122,7 +122,7 @@ impl Server {
             Err(message) => return Ok(tool_result(&usage(command, &message, &spec.command))),
         };
         let rerun = agent::rerun_command(&line);
-        let parsed = tools::agent_command()
+        let parsed = agent::agent_command()
             .try_get_matches_from(&line)
             .and_then(|matches| AgentOptions::from_arg_matches(&matches));
         let options = match parsed {

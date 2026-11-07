@@ -1387,11 +1387,11 @@ mod tests {
     /// The disk-pressure tick prunes expired rollups, and pruning opens
     /// every Parquet file's footer. It ran on a runtime worker, under the
     /// store's read guard, on the disks where 0.2.6's soaks saw journal
-    /// writes take over a second (#1606). On a single-threaded runtime,
-    /// work done inline finishes inside the first poll, so a pending first
-    /// poll means the files are read on a blocking thread.
-    #[tokio::test(flavor = "current_thread")]
-    async fn expiry_reads_the_files_off_the_runtime() {
+    /// writes take over a second (#1606). With the blocking pool held busy,
+    /// a pending first poll means the files are read on a blocking thread;
+    /// work done inline would finish inside that poll (#1674).
+    #[test]
+    fn expiry_reads_the_files_off_the_runtime() {
         let (store, dir) = test_store();
         for file in 0..500 {
             std::fs::write(
@@ -1400,17 +1400,11 @@ mod tests {
             )
             .unwrap();
         }
-        let mut prune = std::pin::pin!(
-            store.prune_expired(std::time::SystemTime::now(), Duration::from_secs(3600))
-        );
-
-        let first = futures_util::poll!(prune.as_mut());
-        assert!(
-            first.is_pending(),
-            "the prune read every file inside one poll, on the runtime"
+        let pruned = crate::off_runtime::assert_runs_on_blocking_pool(
+            store.prune_expired(std::time::SystemTime::now(), Duration::from_secs(3600)),
         );
         // Unreadable footers fall back to the files' mtimes, which are new.
-        assert_eq!(prune.await.unwrap(), 0);
+        assert_eq!(pruned.unwrap(), 0);
     }
 
     #[test]

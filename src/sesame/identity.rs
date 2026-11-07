@@ -1098,40 +1098,32 @@ mod tests {
 
     /// The agent loop prepared identity directories inline: a
     /// `create_dir_all`, a read of `/proc/self/mounts` and, as root on
-    /// Linux, a `mount` subprocess, all on the loop's own task. On a
-    /// single-threaded runtime, work done inline finishes inside the first
-    /// poll, so a pending first poll means it runs on a blocking thread.
-    #[tokio::test(flavor = "current_thread")]
-    async fn preparing_an_identity_dir_runs_off_the_runtime() {
+    /// Linux, a `mount` subprocess, all on the loop's own task. With the
+    /// blocking pool held busy, work sent there can't finish inside the
+    /// first poll, and work done inline always does (#1674).
+    #[test]
+    fn preparing_an_identity_dir_runs_off_the_runtime() {
         let volumes = tempfile::tempdir().unwrap();
         let dir = instance_identity_dir(volumes.path(), "web-0");
-        let mut prepare = std::pin::pin!(prepare_identity_dir_off_runtime(&dir));
 
-        let first = futures_util::poll!(prepare.as_mut());
-        assert!(
-            first.is_pending(),
-            "the directory was prepared inside one poll, on the runtime"
-        );
-        prepare.await.unwrap();
+        crate::off_runtime::assert_runs_on_blocking_pool(prepare_identity_dir_off_runtime(&dir))
+            .unwrap();
         assert!(dir.is_dir());
     }
 
     /// Storing a signed identity writes six files, each fsynced with its
     /// directory, and the agent loop did it inline in an identity-signing
-    /// turn. The same single-poll check as above.
-    #[tokio::test(flavor = "current_thread")]
-    async fn installing_an_identity_runs_off_the_runtime() {
+    /// turn. The same blocking-pool check as above.
+    #[test]
+    fn installing_an_identity_runs_off_the_runtime() {
         let identity = test_identity_bundle("my-jwt-token");
         let volumes = tempfile::tempdir().unwrap();
         let dir = instance_identity_dir(volumes.path(), "web-0");
-        let mut install = std::pin::pin!(install_identity(identity, &dir, |_| None));
 
-        let first = futures_util::poll!(install.as_mut());
-        assert!(
-            first.is_pending(),
-            "the identity was written inside one poll, on the runtime"
-        );
-        install.await.unwrap();
+        crate::off_runtime::assert_runs_on_blocking_pool(install_identity(identity, &dir, |_| {
+            None
+        }))
+        .unwrap();
         assert!(dir.join("key.pem").exists());
         assert_eq!(
             std::fs::read_to_string(dir.join("token")).unwrap(),

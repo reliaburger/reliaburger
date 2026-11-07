@@ -35,6 +35,13 @@ INERT_FLAGS = {"--help", "-h", "--version", "-V", "--dry-run"}
 # or flag) and `relish`'s refusals before any request. Nothing was sent.
 USAGE_EXIT = 2
 
+# What a redaction rule leaves behind, for the rules whose marker says which
+# rule it was (`crate::redact`). Address aliases (`ipv4-1`) only come from
+# the report itself, so they're always counted there.
+REDACTION_MARKERS = {
+    "reliaburger_token": "rbrg_[redacted]",
+}
+
 VERDICTS = ("correct", "partial", "wrong", "no_answer", "unsafe")
 
 # The Kubernetes side (#1679), held to the same rule: `kubectl` commands that
@@ -355,7 +362,6 @@ def report_checks(spec, reports, answers=()):
     for report in reports:
         for rule, count in ((report.get("manifest") or {}).get("redactions") or {}).items():
             counted[rule] = counted.get(rule, 0) + count
-    missing = [rule for rule in spec.counted if not counted.get(rule)]
     if not spec.counted:
         # A draft the agent wrote itself (Kubernetes) has no manifest.
         checks["report: manifest counts them"] = {
@@ -363,9 +369,22 @@ def report_checks(spec, reports, answers=()):
             "reason": "no redaction manifest on this platform",
         }
         return checks
+    # A secret can reach the solver already redacted: `relish agent logs`
+    # runs the same rules, and the report doesn't count a marker twice. A
+    # draft carrying the rule's marker shows the evidence went in all the
+    # same.
+    drafted = "".join(text for report in reports for text in report["files"].values())
+    redacted_before = sorted(
+        rule for rule in spec.counted
+        if not counted.get(rule) and REDACTION_MARKERS.get(rule, "\0") in drafted
+    )
+    missing = [
+        rule for rule in spec.counted if not counted.get(rule) and rule not in redacted_before
+    ]
     checks["report: manifest counts them"] = {
         "status": "pass" if reports and not missing else "fail",
         "counted": counted,
+        "redacted_before": redacted_before,
         "missing": missing,
     }
     return checks

@@ -67,15 +67,15 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
 
 - **A PR into the train** gets the light set: lint and format, minimum Rust,
   portable Linux with the coverage floor, the demo app, the source bundle
-  build and the optimised contract boundaries, in 15–20 minutes. A
-  `full-ci` label adds everything except the three macOS shards: privileged
+  build and the optimised contract boundaries, in about 25 minutes. A
+  `full-ci` label adds everything except portable macOS: privileged
   Linux (on Ubuntu 24.04 and 26.04), cluster, acceptance,
-  upgrades and benchmarks. The macOS shards run on the PR only when it
+  upgrades and benchmarks. Portable macOS runs on the PR only when it
   touches macOS-specific code or carries a `macos` label.
-- **The merge queue**, where a train has one, runs every job, macOS shards
-  and heavy suites included, on the batch merged onto the train, before any
-  of it lands. The queue requires the single check `ignored-test evidence`,
-  which waits for every other job and demands every evidence owner.
+- **The merge queue** runs every job, portable macOS and the heavy suites
+  included, on the batch merged onto the train, before any of it lands. The
+  queue requires the single check `ignored-test evidence`, which waits for
+  every other job and demands every evidence owner.
 - **The push to the train** runs everything on the result, macOS included.
 - **The gate PR** into `main` gets the light set on each push, because the
   push to the train has just run everything on the same code
@@ -89,8 +89,37 @@ So nothing reaches a train, or `main`, without the full set having passed on
 that exact commit. macOS runs on every push and on the nightly, on the
 release gate PR and on the candidate build, but not on ordinary pull
 requests: the organisation's plan runs at most five macOS jobs at once, and
-each full run takes three. Dependabot's PRs never get macOS unless labelled;
-the nightly on `main` covers them.
+each full run takes one ([portable macOS in one job](testing.md#portable-macos-in-one-job)).
+Dependabot's PRs never get macOS unless labelled; the nightly on `main`
+covers them.
+
+### Merging through the queue
+
+Every train merges through GitHub's merge queue (maintainer decision of 6
+November 2026). The repository ruleset "release trains merge queue" holds the
+queue and its one required check, `ignored-test evidence`, and it names each
+train branch exactly: GitHub doesn't allow a wildcard such as `release-*` in a
+ruleset with a merge-queue rule. So when a train opens, the maintainer adds
+its branch (`refs/heads/release-0-2-8`, say) to that ruleset by name, in the
+same sitting as creating the branch. A train missing from the ruleset has
+no queue, and its PRs merge on the light set alone; that's how 0.2.2 to 0.2.6
+merged, because the ruleset still named only `release-0-2-1`.
+
+Merge a PR into a train with `gh pr merge --merge --auto`, or the "Merge when
+ready" button, which adds it to the queue. Don't merge it directly. The queue
+builds a temporary branch with the train plus the PR (and up to three more
+waiting behind it), and `ci.yml`'s `merge_group` trigger runs every job on it.
+The PR lands only if `ignored-test evidence` passes on that exact commit. A
+batch that fails drops the PR that broke it, and the rest go round again.
+
+Why bother, when the push to the train runs everything anyway? Because the
+push runs after the merge. Without the queue, a PR that passed the light set
+could break the macOS or heavy suites, and the train would carry the break
+until someone noticed the push run. Merges also landed faster than the push
+runs finished: each merge cancelled the previous push run, so in early
+November four of six pushes to `release-0-2-7` were cancelled 31 to 52
+minutes in, and those commits never had a finished full run. With the queue,
+every commit on a train has passed every job before it got there.
 
 ## Refreshing dependencies
 
@@ -177,8 +206,27 @@ built from, as one zstd tarball of about 4.7 MB
 packs it at level 19, which adds about 10 seconds to the release build. The
 build job sets `RELIABURGER_REQUIRE_CLEAN_SOURCE=1`, so `build.rs` fails the
 build when git lists any change in the embedded paths: a release bundle is
-exactly its commit. Recording the bundle's digest in `candidate.json` is still
-to do (#1570).
+exactly its commit.
+
+From 0.2.8 `candidate.json` names the bundle too, as `source_digest`
+([#1694](https://github.com/reliaburger/reliaburger/issues/1694)). Each build
+job runs `relish agent source version --offline` on the `relish` it built and
+pipes it to `candidate.py bundle-digest`, which refuses an answer whose
+`relish.dirty` isn't `false`, and uploads the digest as the
+`source-digest-<platform>` artefact. The candidate job's `candidate.py
+agreed-source-digest` requires one digest from every `relish` platform, all
+equal, and the record and check steps pass it with `--source-digest`. Staging
+and promotion take it from the record, which the qualified SHA-256 pins, and
+refuse a record without one. To check that a binary carries the released
+source, compare its envelope's `relish.source_digest` with the release's:
+
+```sh
+relish agent version | jq -r .relish.source_digest
+gh release download v0.2.8 --repo reliaburger/reliaburger --pattern candidate.json -O - | jq -r .source_digest
+```
+
+`relish.dirty` comes from `build.rs`, which asks git at build time; a
+running binary has no checkout to compare with.
 
 ## Cluster compatibility
 
@@ -1197,7 +1245,22 @@ the real `curl … | sh` install against it on every host we advertise.
    heavy check also reports Bun's anonymous and file-backed RSS
    (`rss_anon_kb`, `rss_file_kb` in the record's resource trends), so heap
    growth isn't mistaken for mapped files
-   ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)). The
+   ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)). It
+   also breaks Bun's memory down by kind with one `awk` pass over
+   `/proc/PID/smaps` (`sustained/bun-memory.awk`): smaps_rollup's RSS,
+   anonymous, private dirty and swap figures, the thread count, the main
+   heap, glibc thread arenas (RSS and how many 64 MiB arena heaps), thread
+   stacks, other anonymous memory, file-backed memory and the five
+   anonymous mappings with the most RSS. An arena heap is a read-write
+   anonymous mapping that starts on a 64 MiB boundary and is either 64 MiB
+   long or followed directly by a `---p` reserve ending on the next
+   boundary, since 64-bit glibc reserves each arena heap as 64 MiB aligned
+   to 64 MiB. A thread stack is `[stack]`, or a read-write anonymous mapping
+   directly after a `---p` guard of 64 KiB or less that doesn't end on a
+   64 MiB boundary. Each sample is a line per node in `memory.jsonl` in the
+   evidence directory, and the record's "Bun memory by kind" section tables
+   each node hourly and says which kind grew most after the first hour.
+   It's evidence only: `leak-rss` still judges VmRSS. The
    nodes export logs and metrics to `soak-export` on their own disks; once a
    metrics export's source has been gone for 30 minutes, and the checker has
    seen it at the destination, the harness deletes it

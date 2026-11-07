@@ -258,20 +258,14 @@ mod tests {
     /// The collection loop refreshed sysinfo on a runtime worker every
     /// tick: a read of several `/proc/<pid>` files for every process on the
     /// host, and a `statvfs` of every mount. A node running host jobs has
-    /// thousands of processes. On a single-threaded runtime, work done
-    /// inline finishes inside the first poll, so a pending first poll means
-    /// the refresh runs on a blocking thread.
-    #[tokio::test(flavor = "current_thread")]
-    async fn refreshing_runs_off_the_runtime() {
+    /// thousands of processes. With the blocking pool held busy, a pending
+    /// first poll means the refresh waits for a blocking thread rather than
+    /// running inline (#1674).
+    #[test]
+    fn refreshing_runs_off_the_runtime() {
         let collector = super::SystemCollector::new();
-        let mut refresh = std::pin::pin!(collector.refreshed());
-
-        let first = futures_util::poll!(refresh.as_mut());
-        assert!(
-            first.is_pending(),
-            "sysinfo refreshed inside one poll, on the runtime"
-        );
-        let collector = refresh.await.unwrap();
+        let collector =
+            crate::off_runtime::assert_runs_on_blocking_pool(collector.refreshed()).unwrap();
         assert!(!collector.collect_node_metrics().is_empty());
     }
 

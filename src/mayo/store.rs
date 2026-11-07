@@ -2093,10 +2093,10 @@ mod tests {
     /// Metrics retention opens every Parquet file's footer under the
     /// store's read guard, once an hour. It did that on a runtime worker,
     /// where a slow disk stalls the agent loop's turn deadlines with it
-    /// (#1606). On a single-threaded runtime a pending first poll means the
-    /// files are read on a blocking thread.
-    #[tokio::test(flavor = "current_thread")]
-    async fn prune_reads_the_files_off_the_runtime() {
+    /// (#1606). With the blocking pool held busy, a pending first poll
+    /// means the files are read on a blocking thread (#1674).
+    #[test]
+    fn prune_reads_the_files_off_the_runtime() {
         let (store, dir) = test_store();
         for file in 0..500 {
             std::fs::write(
@@ -2105,15 +2105,9 @@ mod tests {
             )
             .unwrap();
         }
-        let mut prune = std::pin::pin!(store.prune(100));
-
-        let first = futures_util::poll!(prune.as_mut());
-        assert!(
-            first.is_pending(),
-            "the prune read every file inside one poll, on the runtime"
-        );
+        let pruned = crate::off_runtime::assert_runs_on_blocking_pool(store.prune(100));
         // Unreadable footers fall back to the files' mtimes, which are new.
-        assert_eq!(prune.await.unwrap(), 0);
+        assert_eq!(pruned.unwrap(), 0);
     }
 
     #[tokio::test]

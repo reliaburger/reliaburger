@@ -636,12 +636,12 @@ mod tests {
     /// files with `std::fs` on a runtime worker, on a disk where a journal
     /// write took over a second. While it ran, the agent loop's turn
     /// deadline timer didn't fire, and a turn that should have handed its
-    /// journal write off at 500 ms took 1,232 ms. On a single-threaded
-    /// runtime, work done inline finishes inside the first poll, so a first
-    /// poll that comes back pending means the filesystem work runs on a
-    /// blocking thread and the runtime goes on meanwhile.
-    #[tokio::test(flavor = "current_thread")]
-    async fn relief_does_its_filesystem_work_off_the_runtime() {
+    /// journal write off at 500 ms took 1,232 ms. With the blocking pool
+    /// held busy, a first poll that comes back pending means the filesystem
+    /// work waits for a blocking thread and the runtime goes on meanwhile;
+    /// work done inline would finish inside that poll (#1674).
+    #[test]
+    fn relief_does_its_filesystem_work_off_the_runtime() {
         let source = tempfile::tempdir().unwrap();
         for file in 0..500 {
             std::fs::write(
@@ -651,7 +651,7 @@ mod tests {
             .unwrap();
         }
         let mut checkpoint = ExportCheckpoint::default();
-        let mut relief = std::pin::pin!(check_and_relieve(
+        let result = crate::off_runtime::assert_runs_on_blocking_pool(check_and_relieve(
             source.path(),
             None,
             "node-1",
@@ -659,13 +659,6 @@ mod tests {
             1000,
             0,
         ));
-
-        let first = futures_util::poll!(relief.as_mut());
-        assert!(
-            first.is_pending(),
-            "relief did all its filesystem work inside one poll, on the runtime"
-        );
-        let result = relief.await;
         assert_eq!(result.files_pruned, 400, "relief pruned down to the cap");
     }
 
@@ -732,18 +725,14 @@ mod tests {
     /// on a runtime worker. A `statvfs` on a disk that takes over a second
     /// to fsync a journal can stall as long, and a stalled worker fires no
     /// turn deadlines. As in the relief test, a first poll that comes back
-    /// pending on a single-threaded runtime means the call runs elsewhere.
-    #[tokio::test(flavor = "current_thread")]
-    async fn usage_is_measured_off_the_runtime() {
+    /// pending with the blocking pool held busy means the call runs there.
+    #[test]
+    fn usage_is_measured_off_the_runtime() {
         let directory = tempfile::tempdir().unwrap();
-        let mut measure = std::pin::pin!(FilesystemUsage::measure(directory.path()));
-
-        let first = futures_util::poll!(measure.as_mut());
-        assert!(
-            first.is_pending(),
-            "statvfs ran inside one poll, on the runtime"
-        );
-        let measured = measure.await.unwrap();
+        let measured = crate::off_runtime::assert_runs_on_blocking_pool(FilesystemUsage::measure(
+            directory.path(),
+        ))
+        .unwrap();
         assert!(measured.available_bytes <= measured.total_bytes);
     }
 

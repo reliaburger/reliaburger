@@ -110,6 +110,7 @@ mod tls_connection_lifetime;
 mod uninstall;
 mod user_directories;
 mod website;
+mod website_markdown;
 mod worker_desired_state;
 mod workload_trust_domain;
 mod wtf_watch;

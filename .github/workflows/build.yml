@@ -157,7 +157,8 @@ jobs:
       RELIABURGER_GIT_SHA: ${{ github.sha }}
       # relish embeds its source (#1570); build.rs fails the build when git
       # lists a change in what it embeds, so a release carries its commit.
-      # TODO(#1570): record the bundle digest in candidate.json.
+      # The bundle's digest goes to the candidate job and into
+      # candidate.json (#1694).
       RELIABURGER_REQUIRE_CLEAN_SOURCE: "1"
       # A train's nightly build trusts the nightly key instead of the release
       # keys (src/upgrade/keys.rs), so the bun it signs can never reach a
@@ -189,11 +190,30 @@ jobs:
             target/${{ matrix.target }}/release/bun --version
             cp target/${{ matrix.target }}/release/bun dist/bun-${{ matrix.suffix }}
           fi
+      - name: Record the embedded source bundle's digest
+        # The relish just built says what it embeds, and that it came from a
+        # clean tree; candidate.py refuses anything else. The candidate job
+        # gets one file per platform and records the digest they agree on.
+        shell: bash
+        run: |
+          mkdir -p source-digest
+          target/${{ matrix.target }}/release/relish agent source version --offline \
+            | python3 scripts/release/candidate.py bundle-digest > source-digest/relish-${{ matrix.suffix }}
+          echo "Source bundle: $(cat source-digest/relish-${{ matrix.suffix }})"
       - name: Upload binary artifacts
         uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.suffix }}
           path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload the source bundle's digest
+        # Its own artefact: everything in `binaries-*` becomes a release
+        # asset, and notarisation replaces the macOS one wholesale.
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-digest-${{ matrix.suffix }}
+          path: source-digest/*
           if-no-files-found: error
           retention-days: 7
 
@@ -371,6 +391,19 @@ jobs:
           pattern: guest-image-*
           merge-multiple: true
           path: dist
+      - name: Download every build's source bundle digest
+        uses: actions/download-artifact@v4
+        with:
+          pattern: source-digest-*
+          merge-multiple: true
+          path: source-digests
+      - name: Agree on the source bundle's digest
+        # Every relish is built from this commit, and the bundle is
+        # deterministic, so the platforms must report one digest.
+        run: |
+          digest=$(python3 scripts/release/candidate.py agreed-source-digest --directory source-digests)
+          echo "Source bundle: $digest"
+          echo "SOURCE_DIGEST=$digest" >> "$GITHUB_ENV"
       - name: Choose the release or nightly channel
         env:
           CANDIDATE_REF: ${{ github.ref }}
@@ -417,15 +450,16 @@ jobs:
           digest=$(python3 scripts/release/candidate.py record --directory dist \
             --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" \
             --commit "$CANDIDATE_COMMIT" --run-id "$CANDIDATE_RUN" \
-            --run-attempt "$CANDIDATE_ATTEMPT" --channel "$CHANNEL")
+            --run-attempt "$CANDIDATE_ATTEMPT" --channel "$CHANNEL" \
+            --source-digest "$SOURCE_DIGEST")
           # The log line is what `gh run view --log` finds; the summary is
           # for people reading the run page.
           echo "Qualification manifest SHA-256: $digest"
           echo "QUALIFIED_DIGEST=$digest" >> "$GITHUB_ENV"
           if [ -n "$CI_RUN" ]; then source_ci="reused ci.yml run $CI_RUN, attempt $CI_RUN_ATTEMPT"; else source_ci="ran in this build"; fi
           echo "Source CI: $source_ci"
-          printf 'Channel: %s\n\nCandidate commit: `%s`\n\nRun: `%s`, attempt: `%s`\n\nSource CI: %s\n\nQualification manifest SHA-256: `%s`\n' \
-            "$CHANNEL" "$CANDIDATE_COMMIT" "$CANDIDATE_RUN" "$CANDIDATE_ATTEMPT" "$source_ci" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Channel: %s\n\nCandidate commit: `%s`\n\nRun: `%s`, attempt: `%s`\n\nSource CI: %s\n\nSource bundle: `%s`\n\nQualification manifest SHA-256: `%s`\n' \
+            "$CHANNEL" "$CANDIDATE_COMMIT" "$CANDIDATE_RUN" "$CANDIDATE_ATTEMPT" "$source_ci" "$SOURCE_DIGEST" "$digest" >> "$GITHUB_STEP_SUMMARY"
       - name: Attest the build provenance of every asset
         # A Sigstore-signed SLSA provenance statement per file, naming this
         # workflow, commit and run, so anyone can check a download with
@@ -451,7 +485,7 @@ jobs:
           --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY"
           --commit "$CANDIDATE_COMMIT" --run-id "$CANDIDATE_RUN"
           --run-attempt "$CANDIDATE_ATTEMPT" --channel "$CHANNEL"
-          --qualified-digest "$QUALIFIED_DIGEST"
+          --qualified-digest "$QUALIFIED_DIGEST" --source-digest "$SOURCE_DIGEST"
       - name: Preserve the qualification manifest on its own
         # A few kilobytes that hash to the digest above, so qualification
         # can read it without the whole candidate. Staging and promotion

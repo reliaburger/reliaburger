@@ -30,7 +30,7 @@ expression: rendered
       "command": "version",
       "error": {
         "code": "unreachable",
-        "endpoint": null,
+        "endpoint": "https://10.0.0.5:9117",
         "hint": "start a cluster (relish setup --quickstart) or point at one with --endpoint",
         "message": "cannot reach the bun agent at https://10.0.0.5:9117: connection refused; check that bun runs there and listens on that port",
         "status": null

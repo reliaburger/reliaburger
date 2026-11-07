@@ -5,8 +5,12 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from candidate import candidate_names, record_candidate, staging_notes, verify_candidate, verify_run, verify_uploaded_assets
-from package import GUEST_METADATA
+from candidate import (agreed_source_digest, bundle_digest, candidate_names, record_candidate, staging_notes,
+                       verify_candidate, verify_run, verify_uploaded_assets)
+from package import GUEST_METADATA, PLATFORMS
+
+# What `relish agent source version` puts in the envelope's `relish` block.
+SOURCE_DIGEST = "sha256:" + "c" * 64
 
 
 class CandidateTests(unittest.TestCase):
@@ -31,7 +35,7 @@ class CandidateTests(unittest.TestCase):
                         head_repository={"full_name": "reliaburger/reliaburger"})
 
     def record(self):
-        return record_candidate(self.directory, self.pins, **self.identity)
+        return record_candidate(self.directory, self.pins, source_digest=SOURCE_DIGEST, **self.identity)
 
     def verify(self, digest):
         return verify_candidate(self.directory, self.pins, digest, **self.identity)
@@ -169,8 +173,113 @@ class CandidateTests(unittest.TestCase):
         for key, value in [("version", "../main"), ("commit", "main"),
                            ("repository", "../project"), ("run_id", 0), ("run_attempt", True)]:
             with self.subTest(key=key), self.assertRaises(ValueError):
-                record_candidate(self.directory, self.pins, **dict(self.identity, **{key: value}))
+                record_candidate(self.directory, self.pins, source_digest=SOURCE_DIGEST,
+                                 **dict(self.identity, **{key: value}))
         self.assertFalse((self.directory / "candidate.json").exists())
+
+    def test_the_record_names_the_embedded_source_bundle(self):
+        # relish embeds the tree it was built from (#1570); the record says
+        # which tree, so `relish.source_digest` can be checked against it (#1694).
+        digest = self.record()
+        self.assertEqual(json.loads((self.directory / "candidate.json").read_text())["source_digest"],
+                         SOURCE_DIGEST)
+        self.assertEqual(self.verify(digest)["source_digest"], SOURCE_DIGEST)
+        document = verify_candidate(self.directory, self.pins, digest, source_digest=SOURCE_DIGEST,
+                                    **self.identity)
+        self.assertEqual(document["source_digest"], SOURCE_DIGEST)
+
+    def test_verification_refuses_another_source_digest(self):
+        digest = self.record()
+        with self.assertRaises(ValueError):
+            verify_candidate(self.directory, self.pins, digest, source_digest="sha256:" + "d" * 64,
+                             **self.identity)
+
+    def test_a_record_without_a_source_digest_does_not_verify(self):
+        digest = self.record()
+        path = self.directory / "candidate.json"
+        document = json.loads(path.read_text())
+        del document["source_digest"]
+        encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
+        path.write_bytes(encoded)
+        self.assertNotEqual(digest, hashlib.sha256(encoded).hexdigest())
+        with self.assertRaises(ValueError):
+            self.verify(hashlib.sha256(encoded).hexdigest())
+
+    def test_a_malformed_source_digest_is_not_recorded(self):
+        for value in (None, "", "c" * 64, "sha256:" + "C" * 64, "sha256:" + "c" * 63, "sha512:" + "c" * 64):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                record_candidate(self.directory, self.pins, source_digest=value, **self.identity)
+        self.assertFalse((self.directory / "candidate.json").exists())
+
+
+def source_version(**relish):
+    """The envelope `relish agent source version --offline` prints."""
+    block = dict(version="0.2.8", commit="a" * 40, dirty=False, source_digest=SOURCE_DIGEST)
+    block.update(relish)
+    return json.dumps(dict(schema="relish.agent/v1", command="source version", ok=True, relish=block,
+                           data=dict(digest=block["source_digest"]), truncated=False, next=[],
+                           warnings=[]))
+
+
+class BundleDigestTests(unittest.TestCase):
+    """Each build job reads the digest from the relish it built (#1694)."""
+
+    def test_a_clean_release_build_gives_its_digest(self):
+        self.assertEqual(bundle_digest(source_version()), SOURCE_DIGEST)
+
+    def test_a_dirty_or_unknown_tree_is_refused(self):
+        # build.rs already refuses a dirty tree when the build job asks it
+        # to; this catches a build that stopped asking.
+        for dirty in (True, None):
+            with self.subTest(dirty=dirty), self.assertRaises(ValueError):
+                bundle_digest(source_version(dirty=dirty))
+
+    def test_a_missing_or_malformed_digest_is_refused(self):
+        for value in (None, "", "c" * 64, "sha256:xyz"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                bundle_digest(source_version(source_digest=value))
+
+    def test_a_failed_answer_or_one_whose_data_disagrees_is_refused(self):
+        answer = json.loads(source_version())
+        for change in (dict(ok=False), dict(command="version"), dict(data=dict(digest="sha256:" + "d" * 64))):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                bundle_digest(json.dumps(dict(answer, **change)))
+        with self.assertRaises(ValueError):
+            bundle_digest("not json")
+
+
+class AgreedSourceDigestTests(unittest.TestCase):
+    """Every platform's relish must carry the same source (#1694)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        for platform in PLATFORMS["relish"]:
+            (self.directory / f"relish-{platform}").write_text(SOURCE_DIGEST + "\n")
+
+    def test_one_digest_when_every_platform_agrees(self):
+        self.assertEqual(agreed_source_digest(self.directory), SOURCE_DIGEST)
+
+    def test_a_platform_with_other_source_is_refused(self):
+        (self.directory / "relish-macos-aarch64").write_text("sha256:" + "d" * 64 + "\n")
+        with self.assertRaises(ValueError):
+            agreed_source_digest(self.directory)
+
+    def test_a_missing_or_extra_platform_is_refused(self):
+        (self.directory / "relish-linux-aarch64").unlink()
+        with self.assertRaises(ValueError):
+            agreed_source_digest(self.directory)
+        (self.directory / "relish-linux-aarch64").write_text(SOURCE_DIGEST)
+        (self.directory / "relish-macos-x86_64").write_text(SOURCE_DIGEST)
+        with self.assertRaises(ValueError):
+            agreed_source_digest(self.directory)
+
+    def test_a_malformed_digest_is_refused(self):
+        for platform in PLATFORMS["relish"]:
+            (self.directory / f"relish-{platform}").write_text("c" * 64)
+        with self.assertRaises(ValueError):
+            agreed_source_digest(self.directory)
 
 
 if __name__ == "__main__":

@@ -398,7 +398,7 @@ fn arguments_of_the_wrong_shape_or_name_are_refused() {
 // The real tool list.
 
 fn real_tools() -> Vec<ToolSpec> {
-    tools::derive(tools::agent_command(), &tools::data_schema)
+    tools::derive(crate::relish::agent::agent_command(), &tools::data_schema)
 }
 
 #[test]
@@ -425,6 +425,23 @@ fn every_real_tool_is_read_only_closed_world_and_not_excluded() {
         tools.len() < 15,
         "MCP clients slow down past about 15 tools"
     );
+}
+
+#[test]
+fn each_tool_advertises_its_own_default_budget() {
+    for spec in real_tools() {
+        let schema = Value::Object((*spec.tool.input_schema).clone());
+        let expected = if spec.command == "guide" {
+            65536
+        } else {
+            24576
+        };
+        assert_eq!(
+            schema["properties"]["max_bytes"]["default"], expected,
+            "{}",
+            spec.command
+        );
+    }
 }
 
 #[test]

@@ -3973,6 +3973,23 @@ Neither of these was what the day run was built to find. That's the case for
 running it anyway: give the leak checkers 23 hours instead of two, and they
 see things a gate tier can't.
 
+Seeing that RSS grows isn't the same as seeing what grows, and Bun can't
+tell us itself: it allocates through glibc's malloc, which keeps no
+statistics anyone can scrape. The kernel can, though. `/proc/PID/smaps`
+lists every mapping in a process with its resident size, so each heavy
+check now runs one `awk` pass over Bun's (`sustained/bun-memory.awk`) and
+sorts the memory into kinds: the main heap (`[heap]`), glibc's thread
+arenas, thread stacks, other anonymous memory (large allocations get a
+mapping of their own) and file-backed pages. The arenas need a heuristic.
+On 64-bit glibc each one lives in a 64 MiB reservation aligned to 64 MiB,
+with the part in use read-write and the rest `---p`, so a read-write
+mapping that starts on a 64 MiB boundary and runs into such a reserve is
+an arena. A stack is the read-write mapping just above a small `---p`
+guard page. Every sample goes into `memory.jsonl`, and the record shows
+each node hour by hour, with one line naming the kind that grew most after
+the first hour. A heap that keeps climbing points at live data or
+fragmentation; arenas that fill and stop point at a cache warming up.
+
 ### Soak jobs while the apps keep running
 
 A fast command completing a million times tells us little about what happens
@@ -4568,8 +4585,8 @@ macOS keeps `false` in `/usr/bin` and has no `/bin/false`, so `create`'s
 binary check refused the launch as `binary not found`, exactly as it should.
 Linux has both paths, so CI, which runs that test only on Linux, never saw it.
 The test now runs `/bin/sh -c "exit 1"`, a command at the same path on every
-Unix host. A portable suite test pins the behaviour too, so the macOS shards
-check it on every train: a process job whose command starts and exits
+Unix host. A portable suite test pins the behaviour too, so portable macOS
+checks it on every train: a process job whose command starts and exits
 non-zero is a failed attempt, retried up to `max_attempts`, and its retries
 show as the run's `restart_count`.
 

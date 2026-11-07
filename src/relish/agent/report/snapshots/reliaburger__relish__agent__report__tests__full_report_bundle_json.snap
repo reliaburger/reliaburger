@@ -15,10 +15,21 @@ expression: bundle
             },
             "name": "payments"
           },
+          "config": {
+            "api_key": "[redacted]",
+            "client_secret": "[redacted]",
+            "token_bucket": "10/s"
+          },
           "endpoint": "https://ipv4-1:9117",
           "events": [
             {
               "message": "deploy by ENC[AGE:[redacted]] from https://[redacted]@host-1/r.git"
+            },
+            {
+              "message": "probe sent Authorization: Bearer eyJ[redacted]"
+            },
+            {
+              "message": "webhook body {\"user\":\"bob\",\"password\":\"[redacted]\"}"
             }
           ],
           "findings": [
@@ -62,7 +73,7 @@ expression: bundle
       "name": "diagnose.json"
     },
     {
-      "content": "found this on node-1 at ipv4-1:\n-----BEGIN PRIVATE KEY-----[redacted]-----END PRIVATE KEY-----\nand the identity\nAGE-SECRET-KEY-1[redacted]\n",
+      "content": "found this on node-1 at ipv4-1:\n-----BEGIN PRIVATE KEY-----[redacted]-----END PRIVATE KEY-----\nand the identity\nAGE-SECRET-KEY-1[redacted]\npassword: \"[redacted]\"\napi-key: [redacted]\nexport secret=[redacted] TOKEN=[redacted]\nand the session eyJ[redacted] was refused\n",
       "format": "text",
       "name": "notes.txt"
     }

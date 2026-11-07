@@ -55,6 +55,23 @@ If you're an agent operating or debugging a Reliaburger cluster:
 - [Batch jobs](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.7/docs/manual/14_batch-jobs.md)
 - [Writing a controller](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.7/docs/manual/15_writing-a-controller.md)
 
+## Website
+
+Every page on reliaburger.com, as Markdown.
+
+- [Reliaburger — a container orchestrator in Rust](https://reliaburger.com/index.md)
+- [Working with an AI agent · Reliaburger](https://reliaburger.com/agents.md)
+- [AI agents on Reliaburger and Kubernetes](https://reliaburger.com/compare/ai-agents.md)
+- [Reliaburger and Coolify · Reliaburger comparisons](https://reliaburger.com/compare/coolify.md)
+- [Reliaburger and Docker Compose · Reliaburger comparisons](https://reliaburger.com/compare/docker-compose.md)
+- [Compare container platforms · Reliaburger](https://reliaburger.com/compare/index.md)
+- [Reliaburger and k3s — a practical comparison](https://reliaburger.com/compare/k3s.md)
+- [Reliaburger and Kubernetes — a practical comparison](https://reliaburger.com/compare/kubernetes.md)
+- [Comparison method · Reliaburger](https://reliaburger.com/compare/methodology.md)
+- [Reliaburger compared with Nomad](https://reliaburger.com/compare/nomad.md)
+- [Reliaburger compared with Uncloud](https://reliaburger.com/compare/uncloud.md)
+- [Reliaburger feedback](https://reliaburger.com/feedback/index.md)
+
 ## Optional
 
 - [Building Reliaburger](https://github.com/reliaburger/reliaburger/tree/v0.2.7/docs/book): the book, how and why each part was built
