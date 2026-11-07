@@ -207,7 +207,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
     - `relish agent patch test <DIR> [FILTER]`: Run the portable test suite in the workspace, optionally filtered
     - `relish agent patch try <DIR>`: Boot a throwaway cluster from the workspace's binaries, with its own `RELIABURGER_HOME`
     - `relish agent patch diff <DIR>`: The change against the extracted source, and the tests that ran
-    - `relish agent patch apply <DIR> <DIFF>`: Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing *(0.2.7, not in 0.2.7)*
+    - `relish agent patch apply <DIR> <DIFF>`: Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing *(0.2.8, not in 0.2.7)*
     - `relish agent patch destroy [DIR]`: Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay
   - `relish agent setup [claude-code|codex|cursor|vscode|goose|gemini]...`: Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes
 - `relish mcp`: Serve the `relish agent` commands as read-only MCP tools over stdio
