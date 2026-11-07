@@ -3140,12 +3140,24 @@ binary: one with a blank endpoint, which must not be refused, and one with a
 blank token against a stub server, which must receive no `Authorization`
 header at all.
 
-The bundles aren't signed with the format's own scheme. `mcpb sign` appends
-a PKCS#7 signature from an X.509 certificate, which would be a third
-signing identity beside the release key and Apple's Developer ID, and
-choosing one is the maintainer's call. What a bundle has today is the
-`fileSha256` clients check before installing, the build attestation every
-asset gets, and a signed, notarised binary inside.
+Each bundle is signed with the release key like every other release file:
+`package.py` writes `relish-<platform>.mcpb.sig`, the same `{schema, sha256,
+embedded, external}` envelope a binary gets, and `candidate.py` counts it
+among the assets a candidate must have, so staging and promotion refuse a
+release without one.
+
+That signature changes nothing a client shows. An MCP client still calls the
+bundle unsigned, because the format has its own scheme: `mcpb sign` appends a
+PKCS#7 signature made with an X.509 code-signing certificate, and `mcpb
+verify` and clients such as Claude Desktop accept it only when the operating
+system's trust store vouches for that certificate. Our release key is a bare
+Ed25519 key with no certificate, and a self-signed certificate wrapped round
+it would fail the same check. So the `.sig` is for people and scripts that
+already trust the release key, and the client relies on the `fileSha256` it
+checks before installing. Signing that clients recognise, with the Apple
+Developer ID certificate that will notarise the macOS `relish`, waits until
+that notarisation is set up; a third signing identity bought only for bundles
+wasn't worth it.
 
 ## Tools for any agent: `relish mcp`
 

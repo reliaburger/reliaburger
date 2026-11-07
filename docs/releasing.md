@@ -619,8 +619,8 @@ trust list before signing. A missing key, wrong key, incomplete matrix or failed
 signing operation stops publication. Unit tests use fresh temporary keys and
 verify that a modified binary no longer passes signature verification.
 
-Each binary gets a schema-1 `.sig` envelope compatible with the existing
-upgrade verifier. `SHA256SUMS` supports download checks; it doesn't replace
+Each binary, and each `relish-<platform>.mcpb` bundle, gets a schema-1 `.sig`
+envelope compatible with the existing upgrade verifier. `SHA256SUMS` supports download checks; it doesn't replace
 signature verification. Public release signatures establish project provenance.
 Operators using the dual-signature upgrade policy still need to approve binaries
 with their configured external key.
@@ -826,10 +826,19 @@ per relish platform, `relish-<platform>.mcpb`
 `make agent-docs`, with the release's version and that platform's operating
 system filled in) and that platform's signed `relish` at `server/relish`. The
 zip entries have a fixed timestamp, so the same binary always makes the same
-bundle. The bundles are candidate assets like any other: `SHA256SUMS`,
-`candidate.json` and the build attestation cover them. They aren't signed
-with `mcpb sign`; that would need an X.509 signing certificate, which is the
-maintainer's decision.
+bundle. The bundles are candidate assets like any other: each gets a
+`relish-<platform>.mcpb.sig` from the release key, the same envelope as a
+binary's, and `SHA256SUMS`, `candidate.json` and the build attestation cover
+it.
+
+MCP clients still show the bundles as unsigned. `mcpb verify` and clients such
+as Claude Desktop only recognise a PKCS#7 signature made with an X.509
+code-signing certificate the operating system trusts, appended inside the
+`.mcpb` by `mcpb sign`. The release key is a bare Ed25519 key with no
+certificate, so the `.sig` beside the bundle is for people and scripts that
+check releases against the release key; clients don't read it. Signing that
+clients recognise (`mcpb sign` with the Apple Developer ID certificate) waits
+until Apple notarisation is set up.
 
 The [MCP Registry](https://registry.modelcontextprotocol.io) needs each
 bundle's SHA-256 as the package's `fileSha256`, which the committed

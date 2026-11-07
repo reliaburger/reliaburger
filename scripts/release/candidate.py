@@ -48,7 +48,7 @@ def candidate_names(pins):
     return names | {name + ".sig" for name in names} | PDFS | {
         "metadata.json", "cli-metadata.json", "SHA256SUMS", "install.sh", GUEST_METADATA,
     } | {image["asset"] for image in pins["images"].values()} | {
-        mcpb_name(platform) for platform in PLATFORMS["relish"]
+        mcpb_name(platform) + suffix for platform in PLATFORMS["relish"] for suffix in ("", ".sig")
     }
 
 
