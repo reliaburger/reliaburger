@@ -1,0 +1,59 @@
+# One-off measurement for #1673 (0.2.8): how long would a macOS CI job take
+# if it built and tested only `relish`, with Bun compile-checked and tested on
+# Linux only? This file lives on a draft PR into release-0-2-8 that is closed,
+# not merged, once the numbers are on #1673. Each step is timed by Actions;
+# the job also logs memory pressure (plan 2026-11-06, F10).
+name: measure macOS relish-only
+
+on:
+  pull_request:
+    branches: [release-0-2-8]
+    types: [opened]
+
+permissions:
+  contents: read
+
+jobs:
+  relish-only:
+    name: macOS relish-only (measurement)
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
+      # The same cache as the portable macOS job, restored but never saved,
+      # so this compares like with like.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
+          save-if: false
+      - name: Sample memory pressure every 30 s
+        run: |
+          (while true; do date -u +%H:%M:%S; vm_stat | grep -E 'Pages (free|active|swapped|compressed)|Swapins|Swapouts'; sleep 30; done) > "$RUNNER_TEMP/vm_stat.log" 2>&1 &
+      - name: Lint the library and relish, all features
+        run: cargo clippy --locked --lib --bin relish --all-features -- -D warnings
+      - name: Compile-check bun
+        run: cargo check --locked --bin bun
+      - name: Build relish's tests
+        run: cargo nextest run --locked --no-run --lib --bin relish --test suite
+      - name: Count tests, all against relish-only
+        run: |
+          filter='binary_id(reliaburger::bin/relish) | (binary_id(reliaburger) & test(/^relish::/)) | (binary_id(reliaburger::suite) & test(/^relish_/))'
+          count='import json,sys; d=json.load(sys.stdin); print(sum(t["filter-match"]["status"]=="matches" for s in d["rust-suites"].values() for t in s["testcases"].values()))'
+          all=$(cargo nextest list --locked --lib --bin relish --test suite --message-format json | python3 -c "$count")
+          relish=$(cargo nextest list --locked --lib --bin relish --test suite --message-format json -E "$filter" | python3 -c "$count")
+          echo "tests in lib + relish + suite: $all; relish-only filter: $relish" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Run relish's tests
+        run: |
+          cargo nextest run --locked --no-tests=fail --lib --bin relish --test suite \
+            -E 'binary_id(reliaburger::bin/relish) | (binary_id(reliaburger) & test(/^relish::/)) | (binary_id(reliaburger::suite) & test(/^relish_/))'
+      - name: Doctests under relish
+        run: cargo test --locked --doc -- relish::
+      - name: Memory pressure log
+        if: always()
+        run: cat "$RUNNER_TEMP/vm_stat.log"
