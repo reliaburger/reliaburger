@@ -704,13 +704,13 @@ Virtual IPs are allocated per namespace-qualified service (not per instance) fro
 Sesame generates a root CA and three intermediate CAs at cluster initialisation:
 
 ```
-Root CA (signs only intermediate CAs; key sealed to the cluster key at init)
+Root CA (signs only intermediate CAs; key offline, only in the operator's backup)
 ├── Node CA         — signs node certificates for inter-node mTLS
 ├── Workload CA     — signs workload identity certificates (SPIFFE)
 └── Ingress CA      — signs certificates for tls = "cluster" ingress routes
 ```
 
-A compromise of any single intermediate CA doesn't affect the others. The root CA's private key never enters the council or reaches another node, but it isn't offline yet: `relish init` writes it as `<cluster>-root-ca.age`, sealed to the cluster's own age key, next to `master.key` on the node where init ran. Root on that node can therefore recover the root key. Make your own backup with `relish ca backup` (sealed to a passphrase or your age key), check it with `relish ca verify`, and then move the sealed file off the node. A truly offline root, never written to the node, is [#709](https://github.com/reliaburger/reliaburger/issues/709). Intermediate CAs are issued with a 5-year lifetime.
+A compromise of any single intermediate CA doesn't affect the others. The root CA is offline: its private key never enters the council or reaches any node, including the one `relish init` ran on. `relish init` writes it only into a backup you name with `--root-backup`, sealed to a passphrase or your age key, and checks the backup before it reports success; without a terminal it refuses to run unless it's told where the backup goes and what seals it ([#709](https://github.com/reliaburger/reliaburger/issues/709)). The setups that run on your own machine (`relish setup --ssh`, the laptop quickstart, `relish cluster create --bare-metal`) write the backup there, sealed to a fresh age identity kept in a separate directory, and say to move both offline. Check a backup any time with `relish ca verify`, and re-seal it with `relish ca backup --from`. Intermediate CAs are issued with a 5-year lifetime.
 
 `relish ca rotate --role node|workload|ingress --root-backup FILE` replaces an intermediate: the cluster makes the new key, `relish` signs its request with your root backup on your machine, and both CAs stay trusted while nodes and workloads move over (see the [security manual](manual/10_security.md#rotating-an-intermediate-ca)). `relish ca status` and `relish ca revoke`, with a 90-day expiry warning, are still planned ([#362](https://github.com/reliaburger/reliaburger/issues/362)).
 
@@ -912,7 +912,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish test` | Run integration test suite | (none) |
 | `relish bench` | Run performance benchmarks | (none) |
 | `relish upgrade start` | Rolling cluster upgrade | `kubeadm upgrade` (multi-step) |
-| `relish ca backup` / `ca verify` | Keep and check your own sealed copy of the root CA | (none — manual process) |
+| `relish ca backup` / `ca verify` | Re-seal and check the root CA backup `relish init` wrote, the root key's only copy | (none — manual process) |
 | `relish ca rotate` | Rotate an intermediate CA, signed with your root backup | (none — manual process) |
 | `relish ca status` *(planned)* | Show CA hierarchy and expiry | (none) |
 | `relish ca revoke` *(planned)* | Revoke a compromised certificate | (none — manual process) |

@@ -317,6 +317,7 @@ impl NewCluster {
         machines: Vec<(String, IpAddr)>,
         token_ttl: Duration,
         ssh_key: Option<Vec<u8>>,
+        root_backup_keys: PathBuf,
     ) -> bare_metal::CreateOptions {
         bare_metal::CreateOptions {
             directory: directory.to_path_buf(),
@@ -329,6 +330,7 @@ impl NewCluster {
             token_ttl,
             external_signing_key: self.external_signing_key.clone(),
             council_size: self.council_size,
+            root_backup_keys,
         }
     }
 }
@@ -423,12 +425,22 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
         .collect();
     let (created, seeds) = match &options.create {
         Some(cluster) => {
+            let keys = crate::relish::quickstart::security::root_backup_keys_in(
+                &crate::relish::local_context::root_directory()?,
+            );
             let created = bare_metal::create(&cluster.create_options(
                 &options.directory,
                 pairs,
                 options.token_ttl,
                 options.ssh_key.clone(),
+                keys,
             ))?;
+            println!(
+                "The root CA key is only in {}, which {} opens. Move both offline, apart \
+                 from each other: no machine holds either.",
+                created.root_backup.backup.display(),
+                created.root_backup.identity.display()
+            );
             let seeds = created
                 .fleet
                 .nodes
@@ -652,6 +664,7 @@ mod tests {
             vec![("d8:9e:f3:00:00:01".into(), "10.42.0.11".parse().unwrap())],
             Duration::from_secs(3600),
             None,
+            dir.path().join("operator-keys"),
         );
         assert_eq!(options.council_size, crate::council::CouncilSize::APPLIANCE);
         assert_eq!(options.cluster, "lab");

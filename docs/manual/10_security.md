@@ -771,11 +771,8 @@ names the offenders, while any stored secret still needs the old key. Plain
 `secret pubkey` follows the rotation; the offline form reads the file from
 `init`, which still holds the original key.
 
-Finalising retires the old keys, except the very first one: `relish init`
-sealed the root CA's private key to it, in `<cluster>-root-ca.age`, so that key
-stays (read-only, never used for new secrets) and the root backup keeps
-opening. Keep that file with the master key; together they're how you'd
-recover the root.
+Finalising retires every old key. Nothing else is sealed to them: the root CA
+backup is sealed to you, not to a cluster key (see "The root CA backup").
 
 ### A key per namespace
 
@@ -925,35 +922,59 @@ environment, the same way a decrypted `ENC[AGE:...]` value does, and every
 restart asks the provider again, so a secret you rotate at the source reaches
 the next restart without a redeploy.
 
-## Backing up the root CA
+## The root CA backup
 
-`<cluster>-root-ca.age` only opens with the master key and the cluster's own
-state, so it's a backup for the cluster rather than for you. Make your own
-copy of the root, one that opens with something only you hold. Run this on
-the node where `relish init` ran, since that's where the master key, the
-security state and the sealed root are:
+The root CA is offline. Its private key exists in one place: a backup that
+`relish init` writes for you, sealed to a passphrase or to your own age key.
+No node keeps it, the council never sees it, and nothing on the cluster can
+open it. You need it only to rotate an intermediate CA (below).
 
-```sh
-relish ca backup --out prod-root-backup.age --dir /etc/reliaburger
-```
-
-It asks for a passphrase twice (at least 12 characters) and writes the root's
-private key and certificate, with the cluster, trust domain, fingerprint and
-expiry, into an ASCII-armoured age file. The file is created owner-only, and
-an existing file is never overwritten. If the directory holds more than one
-cluster, add `--cluster-name`. To seal it to your own age key instead of a
-passphrase:
+`relish init` won't finish without somewhere to put it:
 
 ```sh
-relish ca backup --out prod-root-backup.age --recipient age1...
+relish init /etc/reliaburger --cluster-name prod \
+    --root-backup /media/usb/prod-root-backup.age
 ```
 
-`--passphrase-file PATH` reads the passphrase from the first line of a file,
-for scripts. The backup is never sealed to a cluster key: those rotate, and
-this file has to outlive them. Store it off the cluster, away from the
-passphrase or identity that opens it. The root's key never goes into the
-council or onto another node; rotating an intermediate (below) asks for this
-file rather than keep the root on the cluster.
+At a terminal it asks for a passphrase twice (at least 12 characters), and if
+you leave out `--root-backup` it asks where the backup goes. Without a
+terminal, as in a script or cloud-init, it refuses unless you pass
+`--root-backup` and either `--passphrase-file PATH` (the first line of the
+file) or `--recipient age1...` (your age public key). It never picks a file
+for you, because the default would be on the node.
+
+The backup holds the root's private key and certificate, with the cluster,
+trust domain, fingerprint and expiry, in an ASCII-armoured age file. It's
+created owner-only and never overwrites a file. `relish init` opens it again
+with the passphrase before it reports success; a backup sealed to a recipient
+it can't open, so it checks that the file is an age file sealed to one. If the
+backup can't be written, init writes nothing else: there's no cluster without
+its root. Move the backup off the node, and keep the passphrase or identity
+that opens it somewhere else.
+
+The setups that run on your own machine never ask anything, so an agent or a
+script can run them. `relish setup --ssh`, `relish cluster create --bare-metal`
+and the laptop quickstart (`relish setup --quickstart`, which `install.sh
+--laptop` runs) write the backup on that machine, sealed to a fresh age
+identity saved in a separate directory, `~/.reliaburger/root-backup-keys/`.
+They print both paths: move both offline, apart from each other. No node and
+no RBSEED stick ever gets either. On a laptop cluster the root is offline only
+in name, because your laptop is both you and the cluster's nodes; that's fine
+for a development cluster, and it's why the output says so. `relish local
+destroy` removes a laptop cluster's identity along with the cluster.
+
+To change what a backup is sealed to, re-seal it. `relish ca backup` reads
+only the backup you give it:
+
+```sh
+relish ca backup --from prod-root-backup.age --out prod-root-backup-2.age
+relish ca backup --from root-ca-backup.age --identity root-0123.age-identity \
+    --out prod-root-backup.age --recipient age1...
+```
+
+It asks for the old passphrase (or takes `--passphrase-file` or `--identity`),
+then a new passphrase twice (or `--new-passphrase-file`, or `--recipient`),
+checks the new copy opens, and never overwrites a file.
 
 Check a backup at any time, with no cluster running:
 

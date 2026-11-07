@@ -262,7 +262,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish secret encrypt --pubkey <PUBKEY> <VALUE>`: Encrypt a plaintext value for use in app config ENC[AGE:...] fields
   - `relish secret rotate`: Rotate the secret encryption key (start or finalise)
 - `relish ca`: Back up the cluster's root CA, check the backup, and rotate intermediates
-  - `relish ca backup --out <OUT>`: Write the root CA's key and certificate to a sealed file you keep
+  - `relish ca backup --from <FROM> --out <OUT>`: Re-seal a root CA backup to a new passphrase or age recipient *(0.3.0, not in 0.2.7)*
   - `relish ca verify --fingerprint <FINGERPRINT> <FILE>`: Check a root CA backup offline
   - `relish ca rotate --role <ROLE>`: Rotate an intermediate CA, signing the new one with your root backup
 - `relish identity`: Rotate the key that signs workload identity tokens *(0.3.0, not in 0.2.7)*

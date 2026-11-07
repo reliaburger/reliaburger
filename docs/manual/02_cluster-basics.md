@@ -31,10 +31,13 @@ the rest of this chapter is for servers.
 ## Initialise the first node
 
 `relish init` generates the cluster PKI, the first node's identity, a sample
-`app.toml` and an mTLS-required `reliaburger.toml`:
+`app.toml` and an mTLS-required `reliaburger.toml`. The root CA's private key
+goes only into a backup you keep off the node, so say where (it asks for a
+passphrase, or see `security` for scripts):
 
 ```sh
-sudo relish init cluster --cluster-name prod --node-id node-01
+sudo relish init cluster --cluster-name prod --node-id node-01 \
+    --root-backup /media/usb/prod-root-backup.age
 ```
 
 Run as root on Linux with `runc` installed, `relish init` writes `[ebpf]` and

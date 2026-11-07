@@ -364,6 +364,19 @@ struct InitOptions {
     /// transports are plaintext. Never use this on a shared network.
     #[arg(long)]
     development_plaintext: bool,
+    /// Where to write the root CA backup, the only copy of the root key.
+    /// Put it off this node, such as on a USB stick. At a terminal you're
+    /// asked if it's missing; without one it's required.
+    #[arg(long)]
+    root_backup: Option<PathBuf>,
+    /// Seal the backup to this age public key (`age1...`) instead of a
+    /// passphrase.
+    #[arg(long, conflicts_with = "passphrase_file")]
+    recipient: Option<String>,
+    /// Read the backup's passphrase from the first line of this file instead
+    /// of asking.
+    #[arg(long)]
+    passphrase_file: Option<PathBuf>,
 }
 
 // `relish wtf`, boxed to keep the generated `Command` parser
@@ -1792,31 +1805,36 @@ enum IdentityAction {
 
 #[derive(Subcommand)]
 enum CaAction {
-    /// Write the root CA's key and certificate to a sealed file you keep.
+    /// Re-seal a root CA backup to a new passphrase or age recipient.
     ///
-    /// Run it on the node where `relish init` ran: it reads the master key,
-    /// the security bootstrap state and the sealed root key from `--dir`. The
-    /// backup holds the root key and certificate plus the cluster, trust
-    /// domain, fingerprint and expiry. It's sealed to a passphrase (asked at
-    /// the terminal, twice) or, with `--recipient`, to your age public key,
-    /// never to a cluster key. The file is never overwritten.
+    /// `relish init` wrote the backup, the only copy of the root key; no node
+    /// holds it, so this reads nothing but the backup in `--from`. The new
+    /// copy goes to `--out`, sealed to a passphrase (asked at the terminal,
+    /// twice) or, with `--recipient`, to your age public key, never to a
+    /// cluster key. It's checked before it's reported, and never overwrites
+    /// a file.
     Backup {
-        /// Where to write the sealed backup (created owner-only).
+        /// The backup to re-seal.
+        #[arg(long)]
+        from: PathBuf,
+        /// Where to write the re-sealed backup (created owner-only).
         #[arg(long)]
         out: PathBuf,
-        /// The directory `relish init` wrote to.
-        #[arg(long, default_value = reliaburger::relish::ca_cmd::DEFAULT_INIT_DIR)]
-        dir: PathBuf,
-        /// The cluster name, when the directory holds more than one.
-        #[arg(long)]
-        cluster_name: Option<String>,
-        /// Seal to this age public key (`age1...`) instead of a passphrase.
-        #[arg(long, conflicts_with = "passphrase_file")]
-        recipient: Option<String>,
-        /// Read the passphrase from the first line of this file instead of
-        /// asking.
-        #[arg(long)]
+        /// Read `--from`'s passphrase from the first line of this file
+        /// instead of asking.
+        #[arg(long, conflicts_with = "identity")]
         passphrase_file: Option<PathBuf>,
+        /// Your age identity file, when `--from` is sealed to a recipient.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Seal the new copy to this age public key (`age1...`) instead of a
+        /// passphrase.
+        #[arg(long, conflicts_with = "new_passphrase_file")]
+        recipient: Option<String>,
+        /// Read the new copy's passphrase from the first line of this file
+        /// instead of asking.
+        #[arg(long)]
+        new_passphrase_file: Option<PathBuf>,
     },
     /// Check a root CA backup offline.
     ///
@@ -2332,17 +2350,46 @@ async fn main() -> ExitCode {
             ref app,
             ref namespace,
         } => commands::release(app, namespace, cli.output).await,
-        Command::Init(options) => commands::init_with_security(
-            &options.dir,
-            &options.cluster_name,
-            &options.node_id,
-            if options.development_plaintext {
-                commands::InitSecurityMode::DevelopmentPlaintext
-            } else {
-                commands::InitSecurityMode::MutualTls
-            },
-            cli.output,
-        ),
+        Command::Init(options) => {
+            use std::io::IsTerminal as _;
+            let InitOptions {
+                dir,
+                cluster_name,
+                node_id,
+                development_plaintext,
+                root_backup,
+                recipient,
+                passphrase_file,
+            } = *options;
+            reliaburger::relish::ca_cmd::InitRootBackup::from_flags(
+                root_backup,
+                recipient,
+                passphrase_file,
+                std::io::stdin().is_terminal(),
+                || {
+                    eprint!(
+                        "The root CA key goes only into a backup you keep off this node.\n\
+                         Where should it go (for example /media/usb/{cluster_name}-root.age)? "
+                    );
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line).map(|_| line)
+                },
+            )
+            .and_then(|backup| {
+                commands::init_with_security(
+                    &dir,
+                    &cluster_name,
+                    &node_id,
+                    if development_plaintext {
+                        commands::InitSecurityMode::DevelopmentPlaintext
+                    } else {
+                        commands::InitSecurityMode::MutualTls
+                    },
+                    &backup,
+                    cli.output,
+                )
+            })
+        }
         Command::Nodes => commands::nodes(cli.output).await,
         Command::DecommissionNode {
             node_id,
@@ -2890,24 +2937,29 @@ async fn main() -> ExitCode {
         },
         Command::Ca { action } => match &action {
             CaAction::Backup {
+                from,
                 out,
-                dir,
-                cluster_name,
-                recipient,
                 passphrase_file,
+                identity,
+                recipient,
+                new_passphrase_file,
             } => {
-                use reliaburger::relish::ca_cmd::{BackupTarget, PassphraseSource};
-                let target = match (recipient, passphrase_file) {
-                    (Some(recipient), _) => BackupTarget::Recipient(recipient.clone()),
-                    (None, Some(path)) => {
-                        BackupTarget::Passphrase(PassphraseSource::File(path.clone()))
-                    }
-                    (None, None) => BackupTarget::Passphrase(PassphraseSource::Prompt),
+                use reliaburger::relish::ca_cmd::{BackupKey, BackupTarget, PassphraseSource};
+                let passphrase = |file: &Option<PathBuf>| match file {
+                    Some(path) => PassphraseSource::File(path.clone()),
+                    None => PassphraseSource::Prompt,
+                };
+                let target = match recipient {
+                    Some(recipient) => BackupTarget::Recipient(recipient.clone()),
+                    None => BackupTarget::Passphrase(passphrase(new_passphrase_file)),
                 };
                 reliaburger::relish::ca_cmd::ca_backup(
+                    from,
+                    &BackupKey {
+                        passphrase: passphrase(passphrase_file),
+                        identity: identity.clone(),
+                    },
                     out,
-                    dir,
-                    cluster_name.as_deref(),
                     &target,
                     cli.output,
                 )
@@ -3020,9 +3072,13 @@ async fn main() -> ExitCode {
                     yes,
                     machines,
                 },
-        } => match ssh_key.as_deref().map(std::fs::read).transpose() {
-            Err(error) => Err(error.into()),
-            Ok(ssh_key) => reliaburger::relish::bare_metal::run_create(
+        } => match (
+            ssh_key.as_deref().map(std::fs::read).transpose(),
+            reliaburger::relish::local_context::root_directory(),
+        ) {
+            (Err(error), _) => Err(error.into()),
+            (_, Err(error)) => Err(error),
+            (Ok(ssh_key), Ok(state_root)) => reliaburger::relish::bare_metal::run_create(
                 &reliaburger::relish::bare_metal::CreateOptions {
                     directory,
                     cluster: name,
@@ -3034,6 +3090,8 @@ async fn main() -> ExitCode {
                     token_ttl: std::time::Duration::from_secs(ttl),
                     external_signing_key,
                     council_size,
+                    root_backup_keys:
+                        reliaburger::relish::quickstart::security::root_backup_keys_in(&state_root),
                 },
                 yes,
             ),
@@ -4056,53 +4114,86 @@ mod tests {
     }
 
     #[test]
-    fn ca_backup_seals_to_a_passphrase_unless_given_a_recipient() {
-        let cli = Cli::try_parse_from(["relish", "ca", "backup", "--out", "root.age"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Ca {
-                action: CaAction::Backup {
-                    recipient: None,
-                    passphrase_file: None,
-                    cluster_name: None,
-                    ref dir,
-                    ..
-                }
-            }) if dir == std::path::Path::new("/etc/reliaburger")
-        ));
+    fn ca_backup_rewraps_from_an_existing_backup_and_never_reads_a_node() {
         let cli = Cli::try_parse_from([
-            "relish",
-            "ca",
-            "backup",
-            "--out",
-            "root.age",
-            "--recipient",
-            "age1example",
+            "relish", "ca", "backup", "--from", "old.age", "--out", "new.age",
         ])
         .unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Ca {
                 action: CaAction::Backup {
-                    recipient: Some(ref r),
+                    recipient: None,
+                    new_passphrase_file: None,
+                    passphrase_file: None,
+                    identity: None,
+                    ref from,
                     ..
                 }
-            }) if r == "age1example"
+            }) if from == std::path::Path::new("old.age")
         ));
+        // There's no node directory to read from any more.
+        assert!(Cli::try_parse_from(["relish", "ca", "backup", "--out", "new.age"]).is_err());
         assert!(
             Cli::try_parse_from([
                 "relish",
                 "ca",
                 "backup",
+                "--from",
+                "old.age",
                 "--out",
-                "root.age",
+                "new.age",
+                "--dir",
+                "/etc/reliaburger",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "ca",
+                "backup",
+                "--from",
+                "old.age",
+                "--out",
+                "new.age",
+                "--recipient",
+                "age1example",
+                "--new-passphrase-file",
+                "p",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn init_takes_where_the_root_backup_goes_and_its_seal() {
+        let cli = Cli::try_parse_from([
+            "relish",
+            "init",
+            "--root-backup",
+            "/media/usb/root.age",
+            "--passphrase-file",
+            "p",
+        ])
+        .unwrap();
+        let Some(Command::Init(options)) = cli.command else {
+            panic!("not init")
+        };
+        assert_eq!(
+            options.root_backup.as_deref(),
+            Some(std::path::Path::new("/media/usb/root.age"))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "init",
                 "--recipient",
                 "age1example",
                 "--passphrase-file",
                 "p",
             ])
-            .is_err(),
-            "a recipient and a passphrase are two different seals"
+            .is_err()
         );
     }
 
@@ -5050,7 +5141,11 @@ mod tests {
                     ref cluster_name,
                     ref node_id,
                     development_plaintext,
+                    ref root_backup,
+                    ref recipient,
+                    ref passphrase_file,
                 } = *options;
+                assert!(root_backup.is_none() && recipient.is_none() && passphrase_file.is_none());
                 assert_eq!(dir.to_str(), Some("."));
                 assert_eq!(cluster_name, "default");
                 assert_eq!(node_id, "node-01");

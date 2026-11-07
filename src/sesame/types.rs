@@ -760,12 +760,7 @@ mod tests {
     /// no join tokens, seals or pending intermediates.
     #[test]
     fn a_node_view_keeps_what_verifies_and_drops_what_issues() {
-        let init = crate::sesame::init::initialize_cluster(
-            "view",
-            "node-1",
-            tempfile::tempdir().unwrap().path(),
-        )
-        .unwrap();
+        let init = crate::sesame::init::initialize_cluster("view", "node-1").unwrap();
         let mut state = init.security_state;
         state.join_tokens.push(JoinToken {
             token_hash: [7; 32],

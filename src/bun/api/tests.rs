@@ -288,7 +288,7 @@ async fn seeded_council_with_log(
         .prefix(&format!("rb-api-seeded-{tag}-"))
         .tempdir()
         .unwrap();
-    let init = crate::sesame::init::initialize_cluster("apitest", "node-1", dir.path()).unwrap();
+    let init = crate::sesame::init::initialize_cluster("apitest", "node-1").unwrap();
     drop(dir);
 
     // Retry while leadership settles after initialize.
@@ -4177,7 +4177,7 @@ async fn seeded_council_with_ikm(tag: &str) -> Arc<crate::council::CouncilNode> 
         .prefix(&format!("rb-api-seeded-{tag}-"))
         .tempdir()
         .unwrap();
-    let init = crate::sesame::init::initialize_cluster("apitest", "node-1", dir.path()).unwrap();
+    let init = crate::sesame::init::initialize_cluster("apitest", "node-1").unwrap();
     drop(dir);
 
     let raft_router = InMemoryRaftRouter::new();

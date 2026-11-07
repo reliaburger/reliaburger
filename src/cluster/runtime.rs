@@ -2432,7 +2432,7 @@ mod tests {
         let council = single_bootstrap_council().await;
         let dir = std::env::temp_dir().join("rb-runtime-seed-write");
         std::fs::create_dir_all(&dir).unwrap();
-        let init = crate::sesame::init::initialize_cluster("seedwrite", "node-1", &dir).unwrap();
+        let init = crate::sesame::init::initialize_cluster("seedwrite", "node-1").unwrap();
 
         seed_bootstrap_state(&council, &init.security_state)
             .await
@@ -2450,7 +2450,7 @@ mod tests {
         let council = single_bootstrap_council().await;
         let dir = std::env::temp_dir().join("rb-runtime-seed-idem");
         std::fs::create_dir_all(&dir).unwrap();
-        let init = crate::sesame::init::initialize_cluster("seedidem", "node-1", &dir).unwrap();
+        let init = crate::sesame::init::initialize_cluster("seedidem", "node-1").unwrap();
 
         // The apply arm refuses a second seed, so re-seeding leaves the
         // first state in place.

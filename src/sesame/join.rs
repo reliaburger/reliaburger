@@ -679,13 +679,12 @@ mod tests {
     use crate::sesame::init;
 
     fn setup() -> (init::InitResult, [u8; 32]) {
-        let dir = tempfile::tempdir().unwrap();
         let master_secret: [u8; 32] = crypto::random_bytes().unwrap();
 
         // We need to use the same master_secret that init uses internally.
         // Since init generates its own, we'll just call init and then
         // test join with a fresh token.
-        let result = init::initialize_cluster("test", "node-01", dir.path()).unwrap();
+        let result = init::initialize_cluster("test", "node-01").unwrap();
 
         // For join tests, we need the master secret that was used to wrap keys.
         // Since init generates it internally, we can't access it directly.

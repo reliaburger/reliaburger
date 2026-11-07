@@ -46,7 +46,7 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 ### 3.1 CA Hierarchy
 
 ```
-Root CA (offline after init, signs only intermediate CAs)
+Root CA (offline: only in the operator's backup, signs only intermediate CAs)
 |
 +-- Node CA         -- signs node certificates for inter-node mTLS
 |                      Lifetime: 5 years. Stored encrypted in Raft.
@@ -801,9 +801,21 @@ This is the single most security-critical operation. It generates all root key m
 8. Derive the HKDF wrapping key from the first node's certificate private key.
 9. Wrap all sensitive keys (intermediate CA private keys, age private key, OIDC signing key) with the wrapping key.
 10. Write the wrapped keys to the initial Raft log entry.
-11. Encrypt the root CA private key with the cluster's age public key.
-12. Write the sealed root CA backup to the admin's filesystem.
-13. Delete the root CA private key from memory.
+11. Seal the root CA private key and certificate into the operator's backup
+    (`RootBackup`, the `relish ca backup` format) and write it to
+    `--root-backup`, before any other file: to a passphrase (prompted twice at
+    a terminal, or `--passphrase-file`) or to `--recipient age1...`. Without a
+    terminal and without those flags, `relish init` refuses (#709). Open the
+    written file again and check it against the root's fingerprint (a
+    recipient seal can only be checked as an age file sealed to a recipient);
+    if anything fails, write nothing else.
+12. The root key is in no other file, in the Raft state or on the node. The
+    setups that run on the operator's machine (`relish setup --ssh`,
+    `--quickstart`, `relish dev create`, `relish cluster create --bare-metal`)
+    seal it instead to a fresh age identity written to
+    `~/.reliaburger/root-backup-keys/`, apart from the backup, and print both
+    paths. No node, seed or appliance ever receives either.
+13. Drop the root CA private key from memory.
 14. Write the first node config with `require_mtls = true`; when Bun starts
     with that file, it refuses to enter cluster mode without the identity and
     brings up the authenticated transports.
@@ -852,10 +864,11 @@ Cluster initialised.
   Workload CA:     serial 0x03, expires 2031-02-16
   Ingress CA:      serial 0x04, expires 2031-02-16
 
-  IMPORTANT: Back up the sealed root CA key:
-    ./prod-root-ca.age
+  IMPORTANT: The root CA key is only in this backup:
+    /media/usb/prod-root-backup.age
 
-  Losing this file means a full PKI re-bootstrap.
+  Move it off this node and keep it offline. Losing it means a
+  full PKI re-bootstrap the next time a CA needs the root.
 
   To enrol another node, start this one, then mint a token bound
   to that node's id:
@@ -1302,9 +1315,13 @@ unwraps the new key too (§5.12 is the plan for rotating the master key).
 > issuer; listeners read it on every handshake, so it applies without a
 > restart. The ingress resolver rebuilds when the active Ingress CA changes.
 >
-> The `relish ca` family has `ca backup` and `ca verify` (F04 R3): an
-> operator-held root backup sealed to a passphrase or an age recipient, checked
-> offline for key match, expiry and fingerprint. `ca rotate` rotates an
+> The `relish ca` family has `ca backup` and `ca verify` (F04 R3): the
+> operator-held root backup that `relish init` writes, sealed to a passphrase
+> or an age recipient and checked offline for key match, expiry and
+> fingerprint. `ca backup --from` only re-seals an existing backup; since
+> #709 nothing on a node can open the root, so there's nothing to read it
+> from. Finalising a secret rotation retires every old age key, generation 0
+> included. `ca rotate` rotates an
 > intermediate (F04 R4, below). There is no `ca rotate --root` yet (R5).
 > (Certificate *revocation* via the CRL — §5.7, `RaftRequest::RevokeCertificate`
 > — is separate and does ship.)

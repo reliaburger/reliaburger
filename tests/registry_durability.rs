@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 #[path = "support/bun_process.rs"]
 mod bun_process;
 use bun_process::{
-    BunProcess, WAIT, assert_success, reserve_port_block_lease, run_relish,
+    BunProcess, WAIT, assert_success, reserve_port_block_lease, run_relish, run_relish_init,
     spawn_bun_with_port_retry, wait_for_relish,
 };
 
@@ -90,14 +90,7 @@ async fn image_survives_loss_of_the_pushing_node() {
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
     assert_success(
-        &run_relish(&[
-            "init",
-            cluster_dir.to_str().unwrap(),
-            "--cluster-name",
-            "durability",
-            "--node-id",
-            "node-01",
-        ]),
+        &run_relish_init(&cluster_dir, "durability", "node-01"),
         "initialise the durability cluster",
     );
     let ca = cluster_dir.join("identity/root-ca.crt");

@@ -2,9 +2,15 @@
 //! and the first node's certificate.
 //!
 //! Called by `relish init` to bootstrap a new cluster's security state.
+//!
+//! The root CA's private key leaves here only inside a [`RootBackup`], which
+//! the caller seals to the operator and writes off the node (#709). Nothing
+//! here writes a file.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
+
+use super::root_backup::{RootBackup, RootBackupError};
 
 use super::ca::{self, CaHierarchy};
 use super::crypto;
@@ -23,8 +29,8 @@ pub enum InitError {
     SecretFailed(#[from] secret::SecretError),
     #[error("crypto error: {0}")]
     CryptoFailed(#[from] crypto::CryptoError),
-    #[error("failed to write sealed root CA backup: {0}")]
-    IoFailed(#[from] std::io::Error),
+    #[error("failed to build the root CA backup: {0}")]
+    RootBackupFailed(#[from] RootBackupError),
     #[error("OIDC keypair generation failed: {0}")]
     OidcFailed(#[from] oidc::OidcError),
 }
@@ -39,8 +45,10 @@ pub struct InitResult {
     pub age_public_key: String,
     /// The cluster name.
     pub cluster_name: String,
-    /// Path to the sealed root CA backup file.
-    pub sealed_root_ca_path: String,
+    /// The root CA's certificate and private key, for the caller to seal to
+    /// the operator with [`super::root_backup::write_backup`]. It's the only
+    /// copy of the root key: no node keeps it.
+    pub root_backup: RootBackup,
     /// OIDC signing key ID (for JWKS endpoint).
     pub oidc_key_id: String,
     /// Master secret (HKDF IKM) used to wrap CA and OIDC private keys.
@@ -52,13 +60,9 @@ pub struct InitResult {
 ///
 /// Generates the full CA hierarchy, age keypair, and first node certificate.
 /// No join token is minted: a token is bound to the one node id it may enrol
-/// (M4), which init cannot know. The root CA private key is encrypted with the
-/// age public key and written to disk as a sealed backup.
-pub fn initialize_cluster(
-    cluster_name: &str,
-    node_id: &str,
-    output_dir: &Path,
-) -> Result<InitResult, InitError> {
+/// (M4), which init cannot know. The root CA private key comes back only in
+/// [`InitResult::root_backup`].
+pub fn initialize_cluster(cluster_name: &str, node_id: &str) -> Result<InitResult, InitError> {
     // Step 1: Generate a master secret for HKDF key wrapping
     let master_secret: [u8; 32] = crypto::random_bytes()?;
 
@@ -75,11 +79,13 @@ pub fn initialize_cluster(
     let oidc_config = oidc::generate_oidc_keypair(&oidc_issuer, &master_secret)?;
     let oidc_key_id = oidc_config.key_id.clone();
 
-    // Step 4: Seal the root CA private key with age
-    let sealed_root =
-        secret::seal_with_age(&hierarchy.root.private_key_der, &age_keypair.public_key)?;
-    let sealed_path = output_dir.join(format!("{cluster_name}-root-ca.age"));
-    std::fs::write(&sealed_path, &sealed_root)?;
+    // Step 4: The root key goes into the operator's backup, nowhere else.
+    let root_backup = RootBackup::new(
+        cluster_name,
+        &hierarchy.root.ca.certificate_der,
+        &hierarchy.root.private_key_der,
+        SystemTime::now(),
+    )?;
 
     // Step 5: Issue the first node's certificate
     let node_serial = SerialNumber(5); // Root=1, Node=2, Workload=3, Ingress=4, first node=5
@@ -105,8 +111,7 @@ pub fn initialize_cluster(
     // node it may enrol (M4), and init cannot know the next node's id. The
     // operator mints one after boot with `relish join-token create --node-id`.
 
-    // Step 6: Wrap the root CA private key with age and store in the CA
-    // (Root CA private key is deleted from cluster nodes — only sealed backup exists)
+    // Step 6: The root CA goes into Raft without its private key.
     let root_ca_wrapped = CertificateAuthority {
         private_key_wrapped: None, // Root key NOT stored in Raft
         ..hierarchy.root.ca
@@ -147,14 +152,15 @@ pub fn initialize_cluster(
         node_certificate,
         age_public_key,
         cluster_name: cluster_name.to_string(),
-        sealed_root_ca_path: sealed_path.display().to_string(),
+        root_backup,
         oidc_key_id,
         master_secret,
     })
 }
 
-/// Format the init output for display to the admin.
-pub fn format_init_output(result: &InitResult) -> String {
+/// Format the init output for display to the admin, naming where the root
+/// CA backup went.
+pub fn format_init_output(result: &InitResult, root_backup: &Path) -> String {
     let state = &result.security_state;
 
     let root = state.active_ca(super::types::CaRole::Root).unwrap();
@@ -171,10 +177,11 @@ pub fn format_init_output(result: &InitResult) -> String {
          \x20 Workload CA:     serial {workload_serial}\n\
          \x20 Ingress CA:      serial {ingress_serial}\n\
          \n\
-         \x20 IMPORTANT: Back up the sealed root CA key:\n\
-         \x20   {sealed_path}\n\
+         \x20 IMPORTANT: The root CA key is only in this backup:\n\
+         \x20   {root_backup}\n\
          \n\
-         \x20 Losing this file means a full PKI re-bootstrap.\n\
+         \x20 Move it off this node and keep it offline. Losing it means a\n\
+         \x20 full PKI re-bootstrap the next time a CA needs the root.\n\
          \n\
          \x20 OIDC key ID:     {oidc_kid}\n\
          \n\
@@ -186,7 +193,7 @@ pub fn format_init_output(result: &InitResult) -> String {
         node_serial = node_ca.serial,
         workload_serial = workload_ca.serial,
         ingress_serial = ingress_ca.serial,
-        sealed_path = result.sealed_root_ca_path,
+        root_backup = root_backup.display(),
         oidc_kid = result.oidc_key_id,
     )
 }
@@ -197,8 +204,7 @@ mod tests {
 
     #[test]
     fn initialize_cluster_generates_all_four_cas() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = initialize_cluster("test-cluster", "node-01", dir.path()).unwrap();
+        let result = initialize_cluster("test-cluster", "node-01").unwrap();
 
         let state = &result.security_state;
         assert_eq!(state.certificate_authorities.len(), 4);
@@ -214,8 +220,7 @@ mod tests {
     /// it, or a Node CA rotation could finalise under that node's feet.
     #[test]
     fn initialize_cluster_records_the_first_node_leaf() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = initialize_cluster("test", "node-01", dir.path()).unwrap();
+        let result = initialize_cluster("test", "node-01").unwrap();
         assert_eq!(
             result.security_state.node_leaves["node-01"],
             NodeLeafRecord {
@@ -228,8 +233,7 @@ mod tests {
 
     #[test]
     fn initialize_cluster_root_ca_has_no_private_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = initialize_cluster("test", "node-01", dir.path()).unwrap();
+        let result = initialize_cluster("test", "node-01").unwrap();
 
         let root = result
             .security_state
@@ -240,8 +244,7 @@ mod tests {
 
     #[test]
     fn initialize_cluster_mints_no_bootstrap_join_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = initialize_cluster("test", "node-01", dir.path()).unwrap();
+        let result = initialize_cluster("test", "node-01").unwrap();
 
         // A join token is bound to the id of the one node it enrols (M4), and
         // init cannot know the next node's id — so it mints none. The operator
@@ -249,21 +252,26 @@ mod tests {
         assert!(result.security_state.join_tokens.is_empty());
     }
 
+    /// The root key leaves init only in the backup, which verifies against
+    /// the root certificate the cluster pins (#709).
     #[test]
-    fn initialize_cluster_writes_sealed_root_ca() {
-        let dir = tempfile::tempdir().unwrap();
-        let _result = initialize_cluster("test", "node-01", dir.path()).unwrap();
-
-        let sealed_path = dir.path().join("test-root-ca.age");
-        assert!(sealed_path.exists());
-        let sealed_bytes = std::fs::read(&sealed_path).unwrap();
-        assert!(!sealed_bytes.is_empty());
+    fn initialize_cluster_hands_back_the_only_copy_of_the_root_key() {
+        let result = initialize_cluster("test", "node-01").unwrap();
+        let root = result
+            .security_state
+            .active_ca(super::super::types::CaRole::Root)
+            .unwrap();
+        let fingerprint = super::super::identity_store::root_ca_fingerprint(&root.certificate_der);
+        result
+            .root_backup
+            .verify(&fingerprint, SystemTime::now())
+            .unwrap();
+        assert!(root.private_key_wrapped.is_none());
     }
 
     #[test]
     fn initialize_cluster_issues_node_cert() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = initialize_cluster("test", "node-01", dir.path()).unwrap();
+        let result = initialize_cluster("test", "node-01").unwrap();
 
         let cert = &result.node_certificate;
         assert_eq!(cert.node_id, "node-01");
@@ -281,8 +289,7 @@ mod tests {
 
     #[test]
     fn initialize_cluster_generates_age_keypair() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = initialize_cluster("test", "node-01", dir.path()).unwrap();
+        let result = initialize_cluster("test", "node-01").unwrap();
 
         assert!(!result.age_public_key.is_empty());
         assert_eq!(result.security_state.age_keypairs.len(), 1);
@@ -294,9 +301,8 @@ mod tests {
 
     #[test]
     fn format_init_output_contains_key_info() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = initialize_cluster("prod", "node-01", dir.path()).unwrap();
-        let output = format_init_output(&result);
+        let result = initialize_cluster("prod", "node-01").unwrap();
+        let output = format_init_output(&result, Path::new("/media/usb/prod-root.age"));
 
         assert!(output.contains("Cluster initialised."));
         assert!(output.contains("prod"));
@@ -304,14 +310,13 @@ mod tests {
         // at the bound-token mint command instead.
         assert!(!output.contains("rbrg_join_1_"));
         assert!(output.contains("join-token create --node-id"));
-        assert!(output.contains("root-ca.age"));
+        assert!(output.contains("/media/usb/prod-root.age"));
         assert!(output.contains("OIDC key ID:"));
     }
 
     #[test]
     fn initialize_cluster_generates_oidc_keypair() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = initialize_cluster("oidc-test", "node-01", dir.path()).unwrap();
+        let result = initialize_cluster("oidc-test", "node-01").unwrap();
 
         let oidc = result.security_state.oidc_signing_config.as_ref();
         assert!(oidc.is_some(), "OIDC signing config should be present");
@@ -325,8 +330,7 @@ mod tests {
 
     #[test]
     fn initialize_cluster_returns_nonzero_master_secret() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = initialize_cluster("secret-test", "node-01", dir.path()).unwrap();
+        let result = initialize_cluster("secret-test", "node-01").unwrap();
 
         assert_ne!(result.master_secret, [0u8; 32]);
         assert_eq!(result.master_secret.len(), 32);
