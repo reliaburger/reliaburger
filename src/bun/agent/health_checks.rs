@@ -403,7 +403,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// A running app's process has exited, which a health check catches
     /// only if the app has one. Mark it Stopped and route it through the
-    /// restart path.
+    /// restart path. `retry_restart` records the `restart` event when it
+    /// restarts the instance at once; an exit inside the backoff keeps
+    /// `retry_pending`, and the later retry records it instead (#1652).
     pub(super) async fn observe_app_exit(&mut self, id: &InstanceId) {
         // Its sidecars restart with it, not on their own (#1120).
         self.sidecars.cancel_relaunches(id);
@@ -416,14 +418,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 instance.state = s;
             }
         }
-        // LOOP-INLINE: in-memory lock, no I/O
-        if let Err(BunError::RestartLimitExceeded { .. }) =
-            self.supervisor.maybe_restart(id, Instant::now()).await
-            && let Some(instance) = self.supervisor.get_instance_mut(id)
-            && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
-        {
-            instance.state = s;
-        }
+        self.retry_restart(id).await;
     }
 
     /// Read every running app's state and apply what the reads saw, inline.

@@ -27,6 +27,56 @@ fn version_reports_the_compiled_binary() {
     assert!(output.stderr.is_empty());
 }
 
+/// Run `relish` the way an agent's shell does: no terminal on stdin or
+/// stdout. Gives up after 20 s, so a reader that hangs fails the test
+/// instead of the run.
+fn run_without_a_terminal(args: &[&str]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(args)
+        .env_remove("RELIABURGER_TOKEN")
+        .env_remove("RELIABURGER_CA_CERT")
+        .env_remove("RELIABURGER_ENDPOINT")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("relish {args:?} hung without a terminal");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// #1569: the TUI and the two readers are full-screen. From an agent's shell
+/// they used to error obscurely or hang; now they stop at once and say what
+/// to run instead.
+#[test]
+fn full_screen_commands_fail_fast_without_a_terminal() {
+    for (args, hint) in [
+        (&[][..], "relish agent guide"),
+        (&["tui"], "relish agent guide"),
+        (&["manual"], "relish agent manual"),
+        (&["manual", "tour"], "relish agent manual"),
+        (&["source"], "relish agent source"),
+        (&["source", "ebpf"], "relish agent source"),
+    ] {
+        let output = run_without_a_terminal(args);
+        assert_eq!(output.status.code(), Some(1), "relish {args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("needs a terminal"),
+            "relish {args:?}: {stderr}"
+        );
+        assert!(stderr.contains(hint), "relish {args:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "relish {args:?}");
+    }
+}
+
 #[test]
 fn invalid_output_format_exits_with_clap_error() {
     let output = run(&["--output", "xml", "status"]);
@@ -752,4 +802,207 @@ async fn hung_toml_job_times_out() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
+}
+
+/// Run `relish agent ...` the way an agent's tool runner does: no terminal,
+/// nothing on stdin, no connection settings in the environment.
+fn run_agent(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .env_remove("RELIABURGER_TOKEN")
+        .env_remove("RELIABURGER_CA_CERT")
+        .env_remove("RELIABURGER_ENDPOINT")
+        .env_remove("TERM")
+        .output()
+        .unwrap()
+}
+
+/// stdout as the one JSON document an agent command prints.
+fn agent_envelope(output: &Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches('\n').count(), 1, "one line: {stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    assert_eq!(value["schema"], "relish.agent/v1");
+    value
+}
+
+#[test]
+fn agent_version_answers_without_a_terminal_or_stdin() {
+    let output = run_agent(&["agent", "version"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let value = agent_envelope(&output);
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["command"], "version");
+    assert_eq!(value["data"]["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn agent_ignores_the_output_flag() {
+    let output = run_agent(&["-o", "yaml", "agent", "version"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(agent_envelope(&output)["ok"], true);
+}
+
+#[test]
+fn agent_usage_errors_are_envelopes_on_stdout_with_exit_2() {
+    for args in [
+        &["agent", "version", "--bogus"][..],
+        &["agent", "nonsense"],
+        &["agent"],
+        &["agent", "version", "--max-bytes", "10"],
+        &["--endpoint", "http://192.0.2.10:9117", "agent", "version"],
+    ] {
+        let output = run_agent(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        let value = agent_envelope(&output);
+        assert_eq!(value["ok"], false, "{args:?}");
+        assert_eq!(value["error"]["code"], "usage", "{args:?}");
+    }
+}
+
+#[test]
+fn agent_refuses_a_plaintext_remote_endpoint_from_the_environment_with_an_envelope() {
+    let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(["agent", "version"])
+        .stdin(std::process::Stdio::null())
+        .env("RELIABURGER_ENDPOINT", "http://192.0.2.10:9117")
+        .env_remove("RELIABURGER_TOKEN")
+        .env_remove("RELIABURGER_CA_CERT")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let value = agent_envelope(&output);
+    assert_eq!(value["error"]["code"], "usage");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must use HTTPS"),
+        "{value}"
+    );
+}
+
+#[test]
+fn agent_help_is_ordinary_help() {
+    let output = run_agent(&["agent", "--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--max-bytes"));
+}
+
+/// #1574: the real binary makes a workspace from its own source, and `diff`
+/// sees an edit to it. Building and testing are covered with fake cargos in
+/// the unit tests; this proves the wiring and the real bundle.
+#[test]
+fn agent_patch_init_then_diff_shows_the_edit() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("fix");
+    let dir_text = dir.to_str().unwrap();
+    let output = run_agent(&["agent", "patch", "init", dir_text]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let init = agent_envelope(&output);
+    assert_eq!(init["command"], "patch init");
+    assert_eq!(init["data"]["branch"], "patch");
+    assert!(dir.join("src/relish/agent/patch.rs").is_file());
+
+    let path = dir.join("src/relish/agent/patch.rs");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("// a fix\n");
+    std::fs::write(&path, text).unwrap();
+    let output = run_agent(&["agent", "patch", "diff", dir_text]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let diff = agent_envelope(&output);
+    assert_eq!(diff["command"], "patch diff");
+    assert_eq!(
+        diff["data"]["files"],
+        serde_json::json!([{
+            "path": "src/relish/agent/patch.rs",
+            "status": "modified",
+            "insertions": 1,
+            "deletions": 0
+        }])
+    );
+    assert!(diff["data"]["diff"].as_str().unwrap().contains("+// a fix"));
+    assert_eq!(diff["data"]["build_changes"], serde_json::json!([]));
+}
+
+#[test]
+fn agent_patch_on_a_directory_that_is_not_a_workspace_is_not_found() {
+    let root = tempfile::tempdir().unwrap();
+    let output = run_agent(&["agent", "patch", "diff", root.path().to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(5));
+    let value = agent_envelope(&output);
+    assert_eq!(value["error"]["code"], "not_found");
+}
+
+#[test]
+fn agent_schema_stays_within_a_small_budget() {
+    let output = run_agent(&["agent", "schema", "--max-bytes", "1024"]);
+    assert!(output.stdout.len() <= 1024, "{} bytes", output.stdout.len());
+    let value = agent_envelope(&output);
+    // The whole schema is far over 1 KiB and mostly objects, which the
+    // budget never trims, so this either trims the command list or says the
+    // budget is too small. Both are answers inside the budget.
+    if value["ok"] == true {
+        assert_eq!(value["truncated"], true);
+    } else {
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(value["error"]["code"], "usage");
+    }
+}
+
+#[test]
+fn agent_report_writes_a_redacted_draft_and_posts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let evidence = dir.path().join("diagnose.json");
+    std::fs::write(
+        &evidence,
+        r#"{"node_id": "wolf4", "detail": "wolf4 at 192.0.2.17 sent rbrg_0123abcd"}"#,
+    )
+    .unwrap();
+    let out = dir.path().join("report");
+    let output = run_agent(&[
+        "agent",
+        "report",
+        "--title",
+        "wolf4 is reported dead",
+        "--what-happened",
+        "diagnose said wolf4 was dead",
+        "--expected",
+        "no finding",
+        "--not-tested",
+        "more than two nodes",
+        "--caught-by",
+        "smoker-fault",
+        "--finding",
+        "node-dead",
+        "--evidence",
+        evidence.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let value = agent_envelope(&output);
+    assert_eq!(value["command"], "report");
+    assert_eq!(
+        value["data"]["title"],
+        "agent: [unverified] node-1 is reported dead"
+    );
+    let post = value["next"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(post["read_only"], false);
+    assert!(
+        post["run"]
+            .as_str()
+            .unwrap()
+            .starts_with("gh issue create ")
+    );
+    for name in ["issue.md", "bundle.json", "MANIFEST.json"] {
+        let text = std::fs::read_to_string(out.join(name)).unwrap();
+        for planted in ["wolf4", "192.0.2.17", "rbrg_0123abcd"] {
+            assert!(!text.contains(planted), "{planted} in {name}");
+        }
+    }
 }

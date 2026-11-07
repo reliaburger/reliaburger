@@ -12,7 +12,7 @@ on:
     # train run everything.
     branches: [main, "codex/**", "fix/**", "release-*"]
     # labeled lets a `full-ci` label start the heavy suites on any PR (on a
-    # PR into a train, everything but the macOS shards). closed starts a
+    # PR into a train, everything but portable macOS). closed starts a
     # no-op run in the PR's concurrency group, which cancels the run still
     # working on the closed (or merged) PR; every other job skips it.
     types: [opened, synchronize, reopened, labeled, closed]
@@ -102,7 +102,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
           # The gate PR runs everything only once labelled release-gate, and
-          # a macos label asks for the macOS shards on any PR (#1443).
+          # a macos label asks for portable macOS on any PR (#1443).
           RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}
           MACOS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}
         run: scripts/ci/select-jobs.sh
@@ -117,7 +117,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      # test_shard_partition.py checks the macOS shard merge against what
+      # test_shard_partition.py checks the macOS partition merge against what
       # the pinned nextest really lists, on a throwaway crate.
       - uses: taiki-e/install-action@v2
         with:
@@ -209,6 +209,52 @@ jobs:
         run: cargo check --locked --all-targets --all-features
       - name: Check every target without default features
         run: cargo check --locked --all-targets --no-default-features
+
+  source-bundle:
+    # relish embeds the source it was built from (pack::ALLOWLIST in
+    # src/relish/source_bundle/pack.rs, #1570). This makes the claim honest:
+    # extract the bundle from a built relish into an empty directory and
+    # build every binary there, packing the bundle again from the extracted
+    # tree. A new include_str! of a file the allowlist leaves out fails here,
+    # not on a user's machine, and so does a pack that isn't reproducible.
+    # The extracted build shares this checkout's target directory, so only
+    # the crate itself compiles twice; it restores the build-tests cache and
+    # never saves one.
+    name: source bundle builds
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-debug
+          save-if: false
+      # Debug builds read the checkout instead of embedding the bundle, so
+      # a book or test edit doesn't rebuild the crate; the feature embeds it.
+      - name: Build relish with the source embedded
+        run: cargo build --locked --bin relish --features embed-source
+      - name: Test the source bundle as relish embeds it
+        run: cargo test --locked --lib --features embed-source relish::source
+      - name: Extract the embedded source into an empty directory
+        run: target/debug/relish agent source extract "$RUNNER_TEMP/source-bundle" --offline | tee "$RUNNER_TEMP/first-extract.json"
+      # Both builds have the same package id, so drop the crate's own
+      # artefacts: nothing of the checkout's build can stand in for it.
+      - name: Build every binary from the extracted source alone
+        working-directory: ${{ runner.temp }}/source-bundle
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo clean --package reliaburger
+          cargo build --locked --bins --features embed-source
+      - name: The rebuilt relish carries the same source, digest for digest
+        run: |
+          target/debug/relish agent source extract "$RUNNER_TEMP/source-again" --offline | tee "$RUNNER_TEMP/second-extract.json"
+          first=$(jq -r .data.digest "$RUNNER_TEMP/first-extract.json")
+          second=$(jq -r .data.digest "$RUNNER_TEMP/second-extract.json")
+          test "$first" != null && test -n "$first" && test "$first" = "$second"
 
   portable:
     outputs:
@@ -719,7 +765,7 @@ jobs:
     # always reports, so a skipped owner can never stand in for a pass. A
     # closed PR's run has nothing to report.
     name: ignored-test evidence
-    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, portable, linux, linux-next, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
+    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, source-bundle, portable, linux, linux-next, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
     if: ${{ always() && github.event.action != 'closed' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -764,19 +810,15 @@ jobs:
   macos:
     outputs:
       portable_darwin_1_sha256: ${{ steps.portable_darwin.outputs.portable_darwin_1_sha256 }}
-      portable_darwin_2_sha256: ${{ steps.portable_darwin.outputs.portable_darwin_2_sha256 }}
-      portable_darwin_3_sha256: ${{ steps.portable_darwin.outputs.portable_darwin_3_sha256 }}
-    # The portable suite on macOS, split three ways by nextest hash partition
-    # (SHARDS in scripts/ci/workflow_assembly.py). Each shard sets only its own
-    # output; ignored-test evidence proves the three ran every test once.
-    name: portable macOS (${{ matrix.shard }}/3)
+    # The portable suite on macOS, in one job: one compile, the lint, every
+    # test (partition hash:1/1, SHARDS in scripts/ci/workflow_assembly.py)
+    # and the doctests. Three shards each compiled the same suite for 17-40
+    # minutes to test for about 3, and took three of the five macOS runners
+    # the organisation's plan allows (plan 2026-11-06, F1).
+    name: portable macOS
     needs: changes
     if: needs.changes.outputs.macos == 'true'
     runs-on: macos-15
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -788,32 +830,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos
-          # Three shards would save the same cache three times.
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - name: Clear restored execution envelopes
         run: rm -rf -- target/contracts
       # One pass, all features: the macOS-only code is in it, and the lint
       # job runs the no-features pass on Linux (see lint-macos in Makefile).
-      # One shard runs it.
       - name: Lint every target, with all features
-        if: matrix.shard == 1
         run: make lint-macos
       - name: Portable tests
         id: portable_darwin
         run: |
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-darwin --shard "${{ matrix.shard }}/3" --host darwin --directory "target/contracts/darwin/portable-darwin-${{ matrix.shard }}" --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-darwin --shard "1/1" --host darwin --directory "target/contracts/darwin/portable-darwin-1" --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Retain portable-darwin current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: contract-darwin-portable-darwin-${{ matrix.shard }}
-          path: target/contracts/darwin/portable-darwin-${{ matrix.shard }}
+          name: contract-darwin-portable-darwin-1
+          path: target/contracts/darwin/portable-darwin-1
           if-no-files-found: error
           retention-days: 14
-      # Doctests run on another shard than the lint, to even them out.
       - name: Doctests
-        if: matrix.shard == 2
         run: make test-doc
   benchmarks:
     # Criterion output is uploaded, not gated, so pull requests only pay for

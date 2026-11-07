@@ -1,0 +1,11 @@
+# An app that writes a few lines when it starts and nothing after, so a
+# `relish logs --since` window a little later should be empty.
+
+[app.quiet]
+script = """
+echo "quiet: starting up"
+echo "quiet: loaded configuration"
+echo "quiet: ready"
+exec @TESTAPP@ --mode healthy --port @APP_PORT@
+"""
+port = @APP_PORT@

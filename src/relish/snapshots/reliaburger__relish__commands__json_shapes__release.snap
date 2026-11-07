@@ -1,0 +1,10 @@
+---
+source: src/relish/commands.rs
+expression: "json(&AppChange::new(AppAction::Released, \"web\", \"shop\"))"
+---
+{
+  "action": "released",
+  "app": "web",
+  "namespace": "shop",
+  "forced": false
+}

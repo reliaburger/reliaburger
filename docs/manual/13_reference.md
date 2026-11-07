@@ -10,10 +10,102 @@ The flags, variables, files and ports you'll reach for. `relish help COMMAND`
 | `--endpoint URL` | `RELIABURGER_ENDPOINT` | Bun API to talk to |
 | `--token TOKEN` | `RELIABURGER_TOKEN` | API bearer token |
 | `--ca-cert PATH` | `RELIABURGER_CA_CERT` | cluster root CA; switches the default to HTTPS |
-| `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; a command with no machine output refuses `json` and `yaml` |
+| `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; every command takes it except the six interactive ones ([machine output](#machine-output)) |
 
 A flag beats its variable. With neither, `relish` uses the laptop cluster's
 saved context, then `http://127.0.0.1:9117`.
+
+## Machine output
+
+Every command takes `-o json` or `-o yaml` and prints the same facts the
+table does, as data, so a script or an agent never parses prose. Warnings and
+progress ("Building web...", "downloading ...") go to stderr, so stdout stays
+parseable; where a command has warnings worth keeping (`lint`, `fault list`),
+they're in the data too. A command that changes something reports what it
+did, not just that it worked.
+
+Reading the cluster:
+
+| Command | What `-o json` prints |
+|---|---|
+| `logs` | one object per line (JSON Lines): `at`, `node`, `instance`, `stream`, `text` |
+| `inspect` | `desired` (or `desired_error`), then each node's `answer`: its `instances`, or the `reason` it's missing |
+| `routes` | the list of routes |
+| `logs-search` | the rows, as one list |
+| `batch watch` | one summary per line (JSON Lines), once a second until the run ends |
+| `batch logs` | `run`, `index` and the task's kept `output` |
+| `snapshot list`, `snapshot create` | the node's snapshot records |
+| `upgrade check` | `running`, `latest`, each node's `platform`, a `verdict` (`up_to_date`, `available`, `needs_fresh_cluster`, `no_artefact_for_node`, `no_artefacts`), the `reason` behind a verdict that blocks, and the `command` to run when one is available |
+| `upgrade plan` | the `stages` in order, with `estimated_secs` |
+| `upgrade status` | `scope` (`cluster` or `node`) and the run record as the node keeps it, under `state` |
+| `secret pubkey` | `public_key`, and the `namespace` it belongs to |
+| `exec` | `exit_code` and the command's `output`; relish still exits with that code |
+
+Changing it:
+
+| Command | What `-o json` prints |
+|---|---|
+| `stop`, `delete`, `release` | `action` (`stop_requested`, `delete_requested`, `released`), `app`, `namespace`, `forced` |
+| `rollback` | the `app`, its `namespace`, and whether it was `forced` |
+| `apply --rerun-jobs`, `batch`, `run` | the node's answer: `created` and `instances`, or `batch_id` and its counts |
+| `batch replay`, `batch cancel` | `run` and the `change` (`replay_acknowledged`, `cancelled`) |
+| `fault <type>` | the fault, with any it created on other nodes under `routed` |
+| `fault list`, `fault clear` | `faults` and `warnings`; the node's `message` |
+| `fault scenario` | each step's `outcome` once the run ends; with `--dry-run`, the timeline |
+| `snapshot restore`, `snapshot delete` | the `change`, `app`, `namespace` and `snapshot` |
+| `images delete` | the `repository` and `tag` |
+| `build` | each image built: its `name`, `build_id`, `context_digest` and `image` |
+| `sign` | the `image`, the `digest` it signed and the cluster's `message` |
+| `gitops set`, `gitops disable` | whether GitOps is `enabled`, and the `config` file |
+| `policy delete` | the policy `deleted` |
+| `secret rotate`, `token revoke` | the node's `message` |
+| `token create`, `token rotate`, `join-token create` | the new `token`, with its name, role, scope and expiry |
+| `ca rotate` | the `role`, the `stage` (`begun`, `finalised`) and the council's `message` |
+| `upgrade start` | `scope`, `target_version`, `upgrade_id`, and `already_running` with its `detail` |
+| `upgrade rollback`, `resume`, `abort` | the `change`, and the version or upgrade it was about |
+| `council recover`, `council re-enrol` | what was restored or removed, and the epochs |
+| `decommission-node` | the retirement record |
+
+On your machine:
+
+| Command | What `-o json` prints |
+|---|---|
+| `lint` | `apps`, `jobs` and `warnings` |
+| `compile` | the `files` merged, the `warnings`, and the merged `config` |
+| `diff` | `added`, `modified` and `removed`, each with its `field_changes` |
+| `fmt` | the `path` and the `result` (`formatted`, or `ok` with `--check`) |
+| `import`, `export` | the converted `config` or `manifests`, and the `report` of what was approximated or dropped |
+| `secret encrypt` | the `encrypted` value |
+| `init`, `join` | the files written and the root CA `fingerprint` |
+| `ca backup`, `ca verify` | the backup's `cluster`, `fingerprint` and `expires_at` |
+| `sign keygen`, `dev keygen` | where the private key is, and the `public_key` |
+| `setup --quickstart`, `setup --ssh` | what it built: the `nodes`, `api`, `app`, the `context` file, `stages` with their `seconds`, `next`, `teardown` and `warnings`; progress goes to stderr |
+| `local`, `dev create`, `dev status`, `dev stop`, `dev start`, `dev destroy` | each node and its state, or what the command did to it |
+| `dev test`, `dev disk`, `dev clean` | whether the run `passed`; the build VM's report as `output` |
+| `dev sign-binary`, `dev countersign-binary` | the `signature` file and the binary's `sha256` |
+| `manual examples` | the files `written` |
+| `uninstall` | what was `removed` and `kept`, and the `notes` |
+
+`status`, `top`, `nodes`, `history`, `events`, `audit`, `wtf`, `path`, `test`
+and the other read commands print the same records as their tables.
+
+A secret never appears in the output unless the command exists to hand it
+over. `token create`, `token rotate` and `join-token create` print the new
+token once, in `token`, exactly as their plain output does: the cluster keeps
+only its hash, so this is the only time anyone sees it. Treat the JSON as you
+would the token. Everything else names where a secret is (`init`'s
+`master_key`, `sign keygen`'s `path`), never the secret itself, and `secret
+encrypt` never echoes the plaintext.
+
+Six commands refuse `-o json`, exit `2` and say they're interactive: `tui`,
+`dashboard`, `manual` (the reader and `--web`), `source`, the guided `setup`
+and `dev shell`. They take over the terminal or a browser, or ask their questions as
+they go, so there's nothing to print as data. Bare `relish -o json` is
+`relish -o json tui`, so it refuses too. `setup --quickstart` and `setup
+--ssh` aren't among them: they never ask, so they print what they built, and
+an agent that ran them can quote it. `exec` isn't one of them either: it runs a
+command once, with no stdin and no terminal, and prints what it said. `-f` on
+`logs` refuses `-o json` until a followed line carries its time and stream.
 
 ## Environment variables
 
@@ -275,12 +367,18 @@ lacks the setting renews once per half-override instead of spinning.
 ## Exit codes
 
 Most commands exit `0` on success and `1` on error. A usage error (an
-unknown flag, a missing argument, or `--output json` on a command that has no
-JSON) exits `2`.
+unknown flag, a missing argument, or `--output json` on an interactive
+command) exits `2`.
 
 `wtf`, `path`, `test` and `bench` exit `1` when they find a failure, and `wtf`
 and `path` exit `3` for warnings, degraded paths or incomplete evidence. Before
 0.2.2 that was `2`, which a script couldn't tell from a usage error.
+
+`relish agent` commands use their own codes, which say only whether the
+command answered: `0` answered, `2` usage, `3` couldn't reach or authenticate
+to the cluster, `4` refused, `5` anything else. A usage error there is a JSON
+envelope on stdout, not text on stderr. See
+[Working with an AI agent](16_working-with-an-ai-agent.md#exit-codes).
 
 `relish exec` exits with the remote command's own exit code, so
 `relish exec web ls /ready` works in a shell `if`. It exits `1` when it

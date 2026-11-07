@@ -1,0 +1,14 @@
+---
+source: src/relish/commands.rs
+expression: "json(&ExecReport\n{\n    app: \"web\", namespace: \"default\", command: &command, exit_code: 1, output:\n    \"cat: /ready: No such file or directory\\n\",\n})"
+---
+{
+  "app": "web",
+  "namespace": "default",
+  "command": [
+    "cat",
+    "/ready"
+  ],
+  "exit_code": 1,
+  "output": "cat: /ready: No such file or directory\n"
+}

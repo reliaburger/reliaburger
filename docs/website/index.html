@@ -8,10 +8,18 @@
   <title>Reliaburger — a container orchestrator in Rust</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23181b19'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-family='monospace' font-weight='bold' font-size='23' fill='%23f49463'%3Er%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="./style.css">
+  <link rel="alternate" type="text/markdown" href="index.md">
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
   <div class="page">
+    <!-- The first thing an agent reading this page meets: where its own page is.
+         tests/suite/website.rs checks it links /agents, its Markdown and llms.txt. -->
+    <aside class="agent-banner" aria-label="For AI agents">
+      <strong>Are you an AI agent?</strong>
+      <a href="agents.html">Start here</a>
+      <span>with the page written for you, also <a href="agents.md">as Markdown</a>, and the manual’s <a href="llms.txt">llms.txt</a>.</span>
+    </aside>
     <header class="masthead">
       <a class="wordmark" href="./" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
       <nav aria-label="Main navigation">
@@ -31,11 +39,14 @@
         <div class="intro-copy">
           <div class="eyebrow">RUST · APACHE 2.0 · 0.2.6</div>
           <h1 id="title">The container platform,<br>served ready.</h1>
+          <p class="headline-agents">Built for humans and their agents.</p>
           <p class="lede">Kubernetes hands you the ingredients. Reliaburger hands you the burger:
             app scheduling, batch jobs, metrics, logs, service discovery, ingress, mTLS,
-            a Docker registry, GitOps and chaos testing, in one Rust agent and one CLI.</p>
+            a Docker registry, GitOps and chaos testing, in one Rust agent and one CLI.
+            And that CLI speaks to your AI agent too (0.2.7, not in 0.2.6).</p>
           <div class="intro-links">
             <a class="primary-link" href="#install">Get a working cluster in under 5 minutes <span aria-hidden="true">↓</span></a>
+            <a href="#debug">Debug it with your agent <span aria-hidden="true">↓</span></a>
           </div>
           <div class="intro-reading">
             <a href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
@@ -57,7 +68,7 @@
         </figure>
       </section>
 
-      <!-- Five architectural differences. Without script it's a plain list, all five
+      <!-- Six architectural differences. Without script it's a plain list, all six
            stacked; assets/why-carousel.js shows one at a time and adds the controls.
            The drawings are decorative (the text says it all) and animate with CSS
            only, so prefers-reduced-motion turns them into still frames.
@@ -282,6 +293,38 @@
                   out every replica or put the council’s quorum at risk.</p>
               </div>
             </li>
+            <li class="why-slide" id="why-recipe">
+              <svg class="why-art why-recipe" viewBox="0 0 240 160" width="240" height="160" aria-hidden="true" focusable="false">
+                <rect x="34" y="12" width="124" height="136" rx="8" fill="#fbe7c4" stroke="#dc7f33" stroke-width="2"/>
+                <rect x="48" y="24" width="58" height="11" rx="5.5" fill="#7b2b2d"/>
+                <g stroke-width="4" stroke-linecap="round">
+                  <path class="why-line" style="animation-delay: 0s" d="M48 52 H144"/>
+                  <path class="why-line" style="animation-delay: .6s" d="M48 66 H128"/>
+                  <path class="why-line" style="animation-delay: 1.2s" d="M48 80 H140"/>
+                  <path class="why-line" style="animation-delay: 1.8s" d="M48 94 H116"/>
+                  <path class="why-line" style="animation-delay: 2.4s" d="M48 108 H136"/>
+                  <path class="why-line" style="animation-delay: 3s" d="M48 122 H104"/>
+                </g>
+                <g class="why-lens">
+                  <circle cx="132" cy="56" r="17" fill="#fafbf9" fill-opacity=".55" stroke="#7b2b2d" stroke-width="4"/>
+                  <path d="M144 68 L160 84" stroke="#7b2b2d" stroke-width="7" stroke-linecap="round"/>
+                </g>
+                <g class="why-reply">
+                  <rect x="170" y="96" width="62" height="40" rx="8" fill="#181b19"/>
+                  <path d="M180 136 L176 146 L190 136 Z" fill="#181b19"/>
+                  <path d="M182 108 c-4 0 -4 2 -4 4 v2 c0 2 -2 2 -3 2 c1 0 3 0 3 2 v2 c0 2 0 4 4 4 M220 108 c4 0 4 2 4 4 v2 c0 2 2 2 3 2 c-1 0 -3 0 -3 2 v2 c0 2 0 4 -4 4" fill="none" stroke="#f49463" stroke-width="2" stroke-linecap="round"/>
+                  <path d="M190 112 H210 M190 120 H204" stroke="#7fbf4a" stroke-width="3" stroke-linecap="round"/>
+                </g>
+              </svg>
+              <div class="why-copy">
+                <h3 class="why-punchline">Your agent can read the recipe.</h3>
+                <p>New in 0.2.7 (0.2.7, not in 0.2.6), <code>relish agent</code> answers an AI agent
+                  in one line of JSON within a byte budget, and carries the manual and the exact
+                  source its binary was built from. Your agent reads how a finding is decided
+                  instead of guessing, and with a read-only token it can read the cluster and
+                  change nothing.</p>
+              </div>
+            </li>
           </ol>
         </div>
       </section>
@@ -291,7 +334,15 @@
           <span class="section-number" aria-hidden="true">02 /</span>
           <h2 id="install-title">Install it <a class="permalink" href="#install" aria-label="Link to the install section">#</a></h2>
         </div>
-        <div class="install-grid">
+        <!-- Two ways in, as radio buttons styled as tabs so they work without
+             a script (#1579). The first panel stays first in the markup:
+             tests/suite/website.rs checks the page leads with its install line. -->
+        <div class="install-tabs" role="radiogroup" aria-label="How to install">
+        <input class="install-tab-input" type="radio" name="install-way" id="install-tyres" checked>
+        <label class="install-tab" for="install-tyres">Kick the tyres</label>
+        <input class="install-tab-input" type="radio" name="install-way" id="install-agent">
+        <label class="install-tab" for="install-agent">With your agent</label>
+        <div class="install-grid install-panel install-panel-tyres">
           <div class="terminal">
             <div class="terminal-heading">INSTALL <span>sh</span></div>
             <pre><code>curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop</code></pre>
@@ -299,7 +350,11 @@
           <div class="install-copy">
             <p>One line installs <code>relish</code>, then builds a three-node cluster of Linux
               VMs on your laptop, running real containers. Every download is checked against a
-              pinned digest or the release’s signing key. Got Linux machines already? Swap
+              pinned digest or the release’s signing key. From 0.2.7 (0.2.7, not in 0.2.6), you can
+              check any release file yourself, too:
+              <code>gh attestation verify FILE --repo reliaburger/reliaburger</code>, with the flags in
+              <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#build-provenance-attestations">the release guide</a>.
+              Got Linux machines already? Swap
               <code>--laptop</code> for <code>--install-only</code> to install just
               <code>relish</code>, then follow the
               <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md">Linux servers guide</a>.</p>
@@ -309,6 +364,26 @@
               · <a href="install.sh">Read the bootstrap script</a>
               · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.6">Release notes <span aria-hidden="true">↗</span></a></p>
           </div>
+        </div>
+        <div class="install-grid install-panel install-panel-agent">
+          <div class="terminal">
+            <div class="terminal-heading">PROMPT <span>your agent</span></div>
+            <pre><code data-agent-prompt>Set up a Reliaburger cluster for me. Start at https://reliaburger.com/agents.</code></pre>
+          </div>
+          <div class="install-copy">
+            <p>Paste that into Claude Code, Codex or any agent with a shell. The page it reads is
+              a playbook: ask you where the cluster should run (this computer, machines you
+              already have, or a cloud), check the provider’s current prices and free allowances,
+              and create nothing that costs money until you say yes. Then it installs
+              <code>relish</code>, builds the cluster, shows you around, and leaves a summary
+              with the way to remove it.</p>
+            <p>You still make the decisions; it does the typing. Give it a read-only token
+              afterwards, and it can help you run the cluster too.</p>
+            <p class="install-links"><a href="agents.html">Read the playbook</a>
+              · <a href="agents.md">As Markdown</a>
+              · <a href="agents.html#add-to-your-agent">Add Reliaburger to your agent</a></p>
+          </div>
+        </div>
         </div>
       </section>
 
@@ -803,9 +878,72 @@
         </div>
       </section>
 
-      <section id="next" class="section" aria-labelledby="next-title">
+      <!-- What an agent does on a cluster, from 0.2.7. The recording slot stays empty
+           until a real session is recorded (#1579): no mock-up. Every command here
+           carries data-agent-command, and tests/suite/website.rs parses each with the
+           real CLI. -->
+      <section id="debug" class="section" aria-labelledby="debug-title">
         <div class="section-heading">
           <span class="section-number" aria-hidden="true">06 /</span>
+          <h2 id="debug-title">Debug the platform, not just your app
+            <a class="permalink" href="#debug" aria-label="Link to debugging with your agent">#</a></h2>
+        </div>
+        <div class="tour">
+          <p class="tour-note">When something breaks, the bug may be in your app or in the
+            platform under it. Your AI agent can tell which (0.2.7, not in 0.2.6):
+            it reads the cluster, the manual and the exact source its <code>relish</code> was
+            built from. When the bug is ours, it proves a fix on a throwaway cluster and
+            drafts the report for you to send. It never fixes your cluster for you.</p>
+          <figure id="agent-recording" class="recording">
+            <p class="recording-pending">No recording yet. A real session, an agent with a
+              read-only token on a real cluster with real build times, is being recorded for
+              <a href="https://github.com/reliaburger/reliaburger/issues/1579">#1579</a>, and
+              we won’t show a mock-up in its place. Until then, here are the steps it takes.</p>
+          </figure>
+          <ol class="tour-steps agent-steps">
+            <li>
+              <pre><code data-agent-command>relish token create --name agent --role read-only --ttl-days 1</code></pre>
+              <p>You make a read-only token and give it to the agent in
+                <code>RELIABURGER_TOKEN</code>. The token’s role is what stops it changing
+                anything, not its good manners.</p>
+            </li>
+            <li>
+              <pre><code data-agent-command>relish agent context</code>
+<code data-agent-command>relish agent diagnose</code></pre>
+              <p>The first calls: findings, faults, alerts, one line per app and the newest
+                events in one bounded answer, then every finding with its evidence and the
+                read-only commands to run next. Text a workload wrote arrives marked as
+                untrusted.</p>
+            </li>
+            <li>
+              <pre><code data-agent-command>relish agent explain</code>
+<code data-agent-command>relish agent source grep classify_error</code></pre>
+              <p>What each finding means, its thresholds and where it’s decided, then the code
+                itself, from the source this <code>relish</code> was built from rather than
+                whatever is on GitHub today.</p>
+            </li>
+            <li>
+              <pre><code data-agent-command>relish agent patch init ./fix</code>
+<code data-agent-command>relish agent patch build ./fix</code>
+<code data-agent-command>relish agent patch test ./fix</code>
+<code data-agent-command>relish agent patch try ./fix</code></pre>
+              <p>If the bug is in Reliaburger: a workspace from that source, a build, the
+                portable test suite, then a throwaway cluster of the patched binaries with
+                its own <code>RELIABURGER_HOME</code>, never yours. The build takes minutes,
+                and the binaries it makes stay unsigned.</p>
+            </li>
+          </ol>
+          <p>Last, it drafts a redacted bug report with the reproducer, the patch and what it
+            didn’t test, for you to read and post. Nothing goes to GitHub on its own.</p>
+          <p class="tour-links"><a href="agents.html">The agent’s own page</a>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/16_working-with-an-ai-agent.md">The manual chapter</a>
+            · <a href="agents.html#how-reliaburger-is-tested">How we test, for agents</a></p>
+        </div>
+      </section>
+
+      <section id="next" class="section" aria-labelledby="next-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">07 /</span>
           <h2 id="next-title">What’s next <a class="permalink" href="#next" aria-label="Link to what's next">#</a></h2>
         </div>
       <aside class="status" aria-label="Release status: next">
@@ -826,7 +964,7 @@
 
       <section id="docs" class="section" aria-labelledby="docs-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">07 /</span>
+          <span class="section-number" aria-hidden="true">08 /</span>
           <h2 id="docs-title">Read the docs <a class="permalink" href="#docs" aria-label="Link to the documentation section">#</a></h2>
           <span class="section-note">Documentation lives with the code.</span>
         </div>
@@ -871,7 +1009,7 @@
       </section>
 
       <section id="compare" class="section" aria-labelledby="compare-title">
-        <div class="section-heading"><span class="section-number" aria-hidden="true">08 /</span><h2 id="compare-title">Compare the alternatives <a class="permalink" href="#compare" aria-label="Link to the comparisons">#</a></h2></div>
+        <div class="section-heading"><span class="section-number" aria-hidden="true">09 /</span><h2 id="compare-title">Compare the alternatives <a class="permalink" href="#compare" aria-label="Link to the comparisons">#</a></h2></div>
         <p class="section-intro">How Reliaburger compares, with commands and sources beside the claims.
           These pages were last re-checked on 21 October 2026, against 0.2.2; the policies, templates and sidecars 0.2.4 added aren’t in them yet.</p>
         <div class="reading-list">
@@ -911,7 +1049,7 @@
 
       <section id="internals" class="section" aria-labelledby="internals-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">09 /</span>
+          <span class="section-number" aria-hidden="true">10 /</span>
           <h2 id="internals-title">Follow a subsystem <a class="permalink" href="#internals" aria-label="Link to the subsystems section">#</a></h2>
         </div>
         <p class="section-intro"><code>bun</code> runs on each node. <code>relish</code> talks to its API.
@@ -934,7 +1072,7 @@
 
       <section id="start" class="section start" aria-labelledby="start-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">10 /</span>
+          <span class="section-number" aria-hidden="true">11 /</span>
           <h2 id="start-title">Build it from source <a class="permalink" href="#start" aria-label="Link to the build-from-source section">#</a></h2>
         </div>
         <div class="start-grid">
@@ -982,7 +1120,7 @@ target/debug/relish</code></pre>
       <a href="https://github.com/reliaburger/reliaburger/blob/main/LICENSE">Apache 2.0</a>
       <span class="footer-note">HTML and CSS. Three small scripts: one adds the copy buttons, one
         plays the recordings with a copy of the asciinema player served from this site, and one
-        turns the five differences into a slideshow. No tracking, no third-party requests.</span>
+        turns the six differences into a slideshow. No tracking, no third-party requests.</span>
     </footer>
   </div>
   <script src="./assets/copy.js" defer></script>

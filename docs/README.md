@@ -11,8 +11,20 @@ and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs
 and builds a laptop cluster; without a flag the installer explains the choices.
 Until 1.0.0 Reliaburger is good enough for home labs and dev clusters, not production. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
+From 0.2.7 (0.2.7, not in 0.2.6) every release file also carries a build provenance
+attestation that anyone can check with `gh attestation verify`, and the macOS `relish` can be
+notarised ([checks a stranger can run](releasing.md#checks-a-stranger-can-run)).
 The limits below are the ones 0.2.6 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.
+
+Found a bug? Open an issue with one of the
+[issue forms](https://github.com/reliaburger/reliaburger/issues/new/choose): each asks
+for the version, a reproducer and what you didn't test, and an agent's draft
+from `relish agent report` has a form of its own. The
+[contributing guide](../CONTRIBUTING.md) explains the forms, the triage labels and
+the AI-assistance policy. Report a vulnerability privately as
+[SECURITY.md](../SECURITY.md) describes, and point a coding agent at
+[AGENTS.md](../AGENTS.md).
 
 The [platform comparisons](website/compare/index.html) and
 [competitive research writeup](research/2026-10-15-competitor-review.md) compare installation, operations
@@ -450,6 +462,7 @@ sudo make test-linux       # runc, netns, eBPF, Btrfs, Buildah and root-only tes
 make test-rootless-runc    # rootless runc port and replacement test (never sudo)
 make test-cluster          # failover, healing, recovery, placement and chaos
 make test-hollow           # a three-member council and twenty hollow nodes (#1401)
+make test-gym              # the agent gym's scenarios on throwaway clusters, scored (#1086)
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement
 make coverage              # portable suite under line coverage (HTML and LCOV)
@@ -786,6 +799,55 @@ it, is under *Everything relish can do* in the [top-level README](../README.md).
 That list is generated from relish's own command definitions, so it matches
 the binary. `relish help COMMAND` (or `--help` on any command) shows every
 flag.
+
+`relish agent` is the family for LLM agents: every command prints one
+`relish.agent/v1` JSON envelope within a byte budget, never prompts, and exits
+`0` whenever it answered. It has `guide` (the manual's agent chapter),
+`version`, `schema`, `context` (the first call: findings, unknowns, faults,
+alerts, one line per app and the newest events), `diagnose` (`wtf`'s findings
+with their evidence and pointers into the manual and the source), `explain`
+(what a finding id means and the constants and code that decide it), `source`
+(`version`, `tree`, `grep`, `show` and `extract` over the code this binary was
+built from, with a warning when a node runs another commit), `logs` (an app's
+newest lines in a time window, each wrapped as untrusted text, with a summary
+of what was left out), `manual` (`search` and `show` over this manual),
+`upgrade-check` (whether the cluster can take the latest release, with the
+reasons), `patch` (build, test and try a fix on a throwaway cluster), `report`
+(a redacted bug report, with a fingerprint for finding duplicates, for a human
+to read and post; it never posts, and makes no network call) and `setup`, which
+adds the `relish mcp` server to Claude Code, Codex, Cursor, VS Code, Goose and
+Gemini CLI: it shows the diff, writes only with `--yes`, never touches an entry
+it didn't write, and approves no tools. `relish mcp` serves the read-only
+commands as MCP tools over stdio (`claude mcp add reliaburger -- relish mcp`),
+derived from the same definitions, with `--toolsets`, `--no-logs` and
+`--namespace` to narrow them; commands that write, build or reach past the
+cluster API aren't tools. See [Working with an AI
+agent](manual/16_working-with-an-ai-agent.md). That chapter is the one source
+of everything agent-facing: `make agent-docs` generates
+[`llms.txt`](website/llms.txt), the website's [`/agents`](website/agents.md)
+page, the `reliaburger` skill and Claude Code plugin in
+[`plugins/`](../plugins/reliaburger) (install it with `/plugin marketplace add
+reliaburger/reliaburger`), the website's skills index
+(`/.well-known/agent-skills/index.json`), `relish mcp`'s MCP Registry entry
+([`server.json`](../server.json), not yet published) and a block of
+[`AGENTS.md`](../AGENTS.md), and a test fails when any of them is stale. It
+also writes a Markdown copy beside every website page (`/index.md`,
+`/compare/nomad.md`), which `llms.txt` lists.
+The chapter ends with the playbook an agent follows to set a cluster up for
+you, on this computer, on machines over SSH or in a cloud, with a cloud-init
+file that readies machines for `relish setup --ssh` and the rule that nothing
+paid is created without your yes. The homepage's install section has a "With
+your agent" tab with the one prompt that sends an agent there. The homepage
+opens with "Are you an AI agent? Start here", linking `/agents`, its Markdown
+and `llms.txt`; its "Debug the platform, not just your app" section shows the
+session an agent runs. `/agents` has a linkable section per heading and "Add
+to Cursor / VS Code / Goose" buttons that add `relish mcp`, built from the
+same server entry `relish agent setup` writes. Why it's built
+this way, the loop it serves (an agent finds a bug in the exact source,
+proves a fix, a human posts the report, we release, you upgrade) and what we
+chose not to do are in the whitepaper's [Built for Humans and Their
+Agents](whitepaper.md#17-built-for-humans-and-their-agents) and the book
+chapter of the same name ([chapter 19](book/19-built-for-agents.md)).
 
 Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select
 an exact supported chaos scenario. Omitting the filter runs all five, including
@@ -1488,8 +1550,12 @@ that gossip reports dead is named rather than silently left out.
 (`--app`, `--severity`, `--limit`). `relish exec <app> <cmd>` runs a command
 once, without stdin or a terminal, and exits with its exit code. `relish
 resolve <name> --namespace <ns>` picks a service whose name exists in several
-namespaces. `-o json` works wherever a command has machine output, and a
-command without it refuses `-o json` (exit 2). `relish fmt` keeps comments.
+namespaces. `-o json` works on every command except the six interactive
+ones (`tui`, `dashboard`, `manual`, `source`, the guided `setup`, `dev
+shell`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
+print what they built, for an agent to quote; `logs` and `batch watch` print one object per line,
+and a command that changes something reports what it did (manual chapter
+13). `relish fmt` keeps comments.
 
 External probes are denied by default. They require an Admin credential,
 `probe_external_destination` in `[testing].allowed_operations`, the protected

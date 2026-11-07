@@ -1400,68 +1400,92 @@ impl MayoStore {
     /// touch/copy or clock skew can push forward and so drop in-range data. A
     /// file whose max timestamp can't be read falls back to mtime so a
     /// malformed file is still eligible for pruning.
-    pub fn prune(&self, before: u64) -> Result<usize, MayoError> {
+    ///
+    /// Opening every file's footer is slow on a slow disk, so the scan runs
+    /// on a blocking thread; the caller's borrow of the store keeps a flush
+    /// from starting meanwhile (#1417).
+    pub async fn prune(&self, before: u64) -> Result<usize, MayoError> {
         // Remote backends leave retention to the bucket's own lifecycle policy
         // (the idiomatic way to expire object-store data), so node-side pruning
         // is a no-op there (H8).
         if let Backend::Remote { .. } = &self.backend {
             return Ok(0);
         }
-        let mut deleted = 0;
-        let entries = match std::fs::read_dir(&self.data_dir) {
-            Ok(entries) => entries,
-            // A new store has no directory until its first flush.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => {
-                return Err(MayoError::Io(std::io::Error::new(
-                    error.kind(),
-                    format!("list metrics {}: {error}", self.data_dir.display()),
-                )));
-            }
-        };
-        for entry in entries {
-            let path = entry
-                .map_err(|error| {
-                    MayoError::Io(std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "read metrics directory {}: {error}",
-                            self.data_dir.display()
-                        ),
-                    ))
-                })?
-                .path();
-            if !path.extension().is_some_and(|e| e == "parquet") {
-                continue;
-            }
-            if self.pending.as_ref().is_some_and(|pending| {
-                matches!(&pending.target, FlushTarget::Local { path: owned, .. } if owned == &path)
-            }) { continue; }
-            let newest = file_max_timestamp(&path).unwrap_or_else(|| {
-                std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .map(|t| {
-                        t.duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                    })
-                    .unwrap_or(u64::MAX)
+        let data_dir = self.data_dir.clone();
+        // A file a flush is still writing is not prunable, however old.
+        let in_flight = self
+            .pending
+            .as_ref()
+            .and_then(|pending| match &pending.target {
+                FlushTarget::Local { path, .. } => Some(path.clone()),
+                _ => None,
             });
-            if newest < before {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => deleted += 1,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(MayoError::Io(std::io::Error::new(
-                            error.kind(),
-                            format!("prune {}: {error}", path.display()),
-                        )));
-                    }
+        tokio::task::spawn_blocking(move || {
+            prune_directory(&data_dir, before, in_flight.as_deref())
+        })
+        .await
+        .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?
+    }
+}
+
+/// Delete the Parquet files under `data_dir` whose newest datapoint is older
+/// than `before`, leaving `in_flight` alone: how many went.
+fn prune_directory(
+    data_dir: &Path,
+    before: u64,
+    in_flight: Option<&Path>,
+) -> Result<usize, MayoError> {
+    let mut deleted = 0;
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        // A new store has no directory until its first flush.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(MayoError::Io(std::io::Error::new(
+                error.kind(),
+                format!("list metrics {}: {error}", data_dir.display()),
+            )));
+        }
+    };
+    for entry in entries {
+        let path = entry
+            .map_err(|error| {
+                MayoError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("read metrics directory {}: {error}", data_dir.display()),
+                ))
+            })?
+            .path();
+        if !path.extension().is_some_and(|e| e == "parquet") {
+            continue;
+        }
+        if in_flight == Some(path.as_path()) {
+            continue;
+        }
+        let newest = file_max_timestamp(&path).unwrap_or_else(|| {
+            std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map(|t| {
+                    t.duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                })
+                .unwrap_or(u64::MAX)
+        });
+        if newest < before {
+            match std::fs::remove_file(&path) {
+                Ok(()) => deleted += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(MayoError::Io(std::io::Error::new(
+                        error.kind(),
+                        format!("prune {}: {error}", path.display()),
+                    )));
                 }
             }
         }
-        Ok(deleted)
     }
+    Ok(deleted)
 }
 
 /// The maximum `timestamp` (column 0) across a Parquet file's row groups, read
@@ -1496,14 +1520,15 @@ mod tests {
     use super::*;
     use crate::mayo::types::MetricKey;
 
-    #[test]
-    fn prune_reports_failed_deletions_and_preserves_survivors() {
+    #[tokio::test]
+    async fn prune_reports_failed_deletions_and_preserves_survivors() {
         let (store, dir) = test_store();
         let blocked = dir.path().join("blocked.parquet");
         std::fs::create_dir(&blocked).unwrap();
         std::fs::write(blocked.join("survivor"), b"preserve").unwrap();
         let error = store
             .prune(u64::MAX)
+            .await
             .expect_err("failed removal must not count as deletion");
         assert!(error.to_string().contains("blocked.parquet"), "{error}");
         assert_eq!(
@@ -1625,7 +1650,7 @@ mod tests {
         assert_eq!(rows.len(), 3, "restart must not clobber earlier objects");
 
         // Prune is a no-op for a remote backend (bucket lifecycle owns retention).
-        assert_eq!(restarted.prune(u64::MAX).unwrap(), 0);
+        assert_eq!(restarted.prune(u64::MAX).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1672,13 +1697,13 @@ mod tests {
 
         // mtime-based pruning would keep this (mtime is now); timestamp-based
         // prunes it (data max 5 < 100).
-        assert_eq!(store.prune(100).unwrap(), 1);
+        assert_eq!(store.prune(100).await.unwrap(), 1);
         assert!(!dir_has_parquet(dir.path()));
 
         // A file with recent data survives the same cutoff.
         store.insert(&MetricKey::simple("cpu"), Sample::at(1_000, 2.0));
         store.flush().await.unwrap();
-        assert_eq!(store.prune(100).unwrap(), 0);
+        assert_eq!(store.prune(100).await.unwrap(), 0);
         assert!(dir_has_parquet(dir.path()));
     }
 
@@ -2060,9 +2085,29 @@ mod tests {
             .unwrap()
             .as_secs()
             + 10_000;
-        let deleted = store.prune(future).unwrap();
+        let deleted = store.prune(future).await.unwrap();
         assert_eq!(deleted, 1);
         assert!(!dir_has_parquet(dir.path()));
+    }
+
+    /// Metrics retention opens every Parquet file's footer under the
+    /// store's read guard, once an hour. It did that on a runtime worker,
+    /// where a slow disk stalls the agent loop's turn deadlines with it
+    /// (#1606). With the blocking pool held busy, a pending first poll
+    /// means the files are read on a blocking thread (#1674).
+    #[test]
+    fn prune_reads_the_files_off_the_runtime() {
+        let (store, dir) = test_store();
+        for file in 0..500 {
+            std::fs::write(
+                dir.path().join(format!("metrics_{file:06}.parquet")),
+                [0u8; 10],
+            )
+            .unwrap();
+        }
+        let pruned = crate::off_runtime::assert_runs_on_blocking_pool(store.prune(100));
+        // Unreadable footers fall back to the files' mtimes, which are new.
+        assert_eq!(pruned.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -2072,7 +2117,7 @@ mod tests {
         store.flush().await.unwrap();
 
         // A `before` of 0 keeps everything (nothing is older than the epoch).
-        let deleted = store.prune(0).unwrap();
+        let deleted = store.prune(0).await.unwrap();
         assert_eq!(deleted, 0);
         assert!(dir_has_parquet(dir.path()));
     }
@@ -2840,7 +2885,7 @@ mod tests {
         );
         assert_mayo_values(&*store.read().await, &[11.0]).await;
         assert_eq!(
-            store.read().await.prune(u64::MAX).unwrap(),
+            store.read().await.prune(u64::MAX).await.unwrap(),
             0,
             "retention removed a still-owned publication before completion"
         );

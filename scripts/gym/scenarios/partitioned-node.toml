@@ -1,0 +1,29 @@
+# A partitioned node: Smoker cuts one council follower off from both of its
+# peers on the gossip and Raft transports. The cluster keeps quorum.
+id = "partitioned-node"
+title = "A partitioned node"
+nodes = 3
+
+prompt = """
+The cluster has three nodes. One of them seems to have dropped out in the last
+minute, though nobody touched it. Find out what is wrong: which node, and what
+kind of fault.
+"""
+
+[[setup]]
+apply = "apps/web-v1.toml"
+wait_running = "web"
+
+[[setup]]
+fault = { kind = "council_partition", target = "@follower", duration = "10m" }
+
+# Gossip marks a silent member suspect, then dead, within this.
+[[setup]]
+settle = "30s"
+
+[truth]
+node = "@follower"
+fault_kind = "node_partitioned"
+
+[score]
+checks = ["node", "fault_kind"]

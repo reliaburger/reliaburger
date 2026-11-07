@@ -158,3 +158,42 @@ fn lock_file_has_no_crypto_bigint_with_timing_leaks_and_audit_needs_no_exception
         ".cargo/audit.toml ignores RUSTSEC-2026-0387"
     );
 }
+
+/// RUSTSEC-2026-0391 and 0395 to 0406: zstd 0.13.3 and zstd-safe 7.3.0. The
+/// source bundle (#1570) and rust-embed's include-flate moved to zstd 0.14.3,
+/// so the only crates still allowed to depend on the old line are Arrow,
+/// Parquet and DataFusion 55, which `.cargo/audit.toml` excuses until
+/// DataFusion 56 moves them to arrow 60 (#1366).
+#[test]
+fn only_arrow_parquet_and_datafusion_still_lock_zstd_0_13() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    // zstd 0.13 itself is the one package that depends on zstd-safe 7.
+    let excused = [
+        "arrow-ipc",
+        "parquet",
+        "datafusion",
+        "datafusion-datasource",
+        "zstd",
+    ];
+    for package in lock.split("[[package]]") {
+        let Some(name) = package
+            .split("\nname = \"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+        else {
+            continue;
+        };
+        let old_zstd = package.contains("\"zstd 0.13") || package.contains("\"zstd-safe 7");
+        assert!(
+            !old_zstd || excused.contains(&name),
+            "{name} depends on zstd 0.13 or zstd-safe 7"
+        );
+        if name == "reliaburger" {
+            assert!(
+                package.contains("\"zstd 0.14"),
+                "reliaburger no longer depends on zstd 0.14"
+            );
+        }
+    }
+}

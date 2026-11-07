@@ -30,6 +30,8 @@ impl Drop for TerminalGuard {
 
 Panics need one extra precaution. A panic hook restores the terminal before chaining to the previous hook, so the panic message appears on a normal screen. We don't call `process::exit` from the TUI because that would skip destructors entirely. The unexciting clean-up code is doing important work.
 
+What if there's no terminal to own? Run `relish` from a pipe, a cron job or an AI agent's shell and `enable_raw_mode` fails with `Device not configured (os error 6)`, which tells you nothing about what to do next; where it gets further, the reader waits for keys that will never come. So `tui::run`, `manual::run` and `source::run` each start with `FullScreen::require_terminal()` (#1569), which asks `std::io::IsTerminal` about stdin and stdout and refuses with an error naming the plain-output command to run instead. `IsTerminal` is a trait the standard library implements for `Stdin`, `Stdout` and files, so `std::io::stdin().is_terminal()` only compiles once the trait is in scope with `use std::io::IsTerminal;`. That's a Rust rule worth knowing: a trait's methods are invisible until you import the trait, even on a type you already have. The decision itself is a pure `check_terminal(interactive: bool)`, so the unit tests don't need a terminal, and a test in `tests/suite/relish_cli.rs` runs the real binary with stdin from `/dev/null` and a 20-second deadline, so a reader that hangs fails the test instead of stalling the run.
+
 ## Immediate-mode rendering
 
 Ratatui uses immediate-mode rendering. On every frame we describe the whole screen from the current state. There is no persistent tree of mutable widgets and no DOM to reconcile.
@@ -205,7 +207,9 @@ Once documents-in-the-binary machinery exists, a stranger idea becomes a small d
 
 The whole feature is one new module because the reader from the previous section doesn't care what it's showing. Each file becomes a document whose first line is its styled path, so one fuzzy query matches paths and contents alike. No new key bindings, no new search code, no markdown involved.
 
-The cost is binary size, and rust-embed softens it twice. Its `compression` feature compresses each embedded file in release builds (source code deflates well), and in debug builds it doesn't embed at all — assets load from disk at runtime, so `cargo test` iterations don't pay for a 5 MB copy of `src/` on every link. That split, incidentally, is why an embed-backed test can pass in debug and still deserve a release-build check in CI.
+The cost is binary size, and rust-embed's `compression` feature softened it by compressing each embedded file in release builds (source code deflates well): 3.9 MB for `src/`.
+
+That version had a hole, though: `src/` alone can't be built. No `Cargo.toml`, no `Cargo.lock`, no `build.rs`, none of the eBPF programs or the files the code pulls in with `include_str!`. In 0.2.7 `relish source` moved onto a single zstd tarball of the build, test and read set, only 0.8 MB bigger than the per-file embed despite carrying 60% more, and which CI proves can rebuild every binary. [Chapter 19](19-built-for-agents.md#carrying-the-source) tells that story.
 
 ## The command list writes itself
 

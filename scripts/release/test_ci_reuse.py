@@ -33,7 +33,11 @@ def with_job(name, conclusion):
 
 
 def ci_job_names():
-    """Every check name ci.yml's jobs report, with matrices expanded."""
+    """Every check name ci.yml's jobs report.
+
+    No job has a matrix: one would report a check per entry, and a name
+    with `${{ matrix.* }}` in it would never match REQUIRED_JOBS.
+    """
     names = []
     text = CI.read_text()
     jobs = re.split(r"^  (?=[a-z][a-z0-9-]*:\s*$)", text.split("\njobs:\n", 1)[1], flags=re.M)
@@ -41,14 +45,7 @@ def ci_job_names():
         match = re.search(r"^    name: (.+)$", job, re.M)
         if match is None:
             raise AssertionError(f"ci.yml job has no name: {job.splitlines()[0]}")
-        name = match.group(1).strip()
-        shards = re.search(r"^        shard: \[([0-9, ]+)\]$", job, re.M)
-        if "${{ matrix.shard }}" in name:
-            if shards is None:
-                raise AssertionError(f"{name} names a shard but has no shard matrix")
-            names += [name.replace("${{ matrix.shard }}", shard.strip()) for shard in shards.group(1).split(",")]
-        else:
-            names.append(name)
+        names.append(match.group(1).strip())
     return names
 
 
@@ -90,9 +87,9 @@ class DecideTests(unittest.TestCase):
     def test_a_failed_cancelled_or_skipped_required_job_runs_the_suite(self):
         for conclusion in ("failure", "cancelled", "skipped", "timed_out", None):
             with self.subTest(conclusion=conclusion):
-                run_id, reasons = self.decide([run()], with_job("portable macOS (2/3)", conclusion))
+                run_id, reasons = self.decide([run()], with_job("portable macOS", conclusion))
                 self.assertIsNone(run_id)
-                self.assertIn("portable macOS (2/3)", reasons[0])
+                self.assertIn("portable macOS", reasons[0])
 
     def test_a_missing_ignored_test_evidence_runs_the_suite(self):
         jobs = [job for job in green_jobs() if job["name"] != "ignored-test evidence"]

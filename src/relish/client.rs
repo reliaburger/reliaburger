@@ -256,18 +256,34 @@ impl LogOptions {
     }
 }
 
+/// The lines a log query found, before rendering.
+#[derive(Debug, Clone)]
+pub enum LogLines {
+    /// Entries from the log store, which say when, where and on which stream
+    /// each line was written. Already filtered.
+    Stored(Vec<crate::ketchup::types::LogEntry>),
+    /// Lines from the agent's own capture, which says none of that. Already
+    /// filtered.
+    Captured(Vec<String>),
+}
+
+impl LogLines {
+    /// The lines as `relish logs` prints them for people.
+    pub fn render(&self) -> String {
+        match self {
+            LogLines::Stored(entries) => render_log_entries(entries),
+            LogLines::Captured(lines) => lines.join("\n"),
+        }
+    }
+}
+
 /// Render queried log entries as lines, oldest first.
 ///
 /// When the lines come from more than one instance, each line starts with
 /// `[instance] `. During a rolling deploy or after a restart an old and a new
 /// instance both appear in a tail, and unlabelled their output reads as one
 /// app skipping values.
-fn render_log_entries(entries: &[crate::ketchup::types::LogEntry], options: &LogOptions) -> String {
-    let filter = options.line_filter();
-    let shown: Vec<&crate::ketchup::types::LogEntry> = entries
-        .iter()
-        .filter(|entry| filter.matches(&entry.line))
-        .collect();
+fn render_log_entries(shown: &[crate::ketchup::types::LogEntry]) -> String {
     // A run is one instance on one node. An instance that moves keeps its
     // name, and the view interleaves its two runs by two nodes' clocks, so
     // the label names the node wherever the name alone would hide the move.
@@ -321,8 +337,6 @@ pub const FAULT_CLEAR_RETRY_BUDGET: std::time::Duration = std::time::Duration::f
 /// Pause between those attempts.
 const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Classify a reqwest send error as either a timeout or a connection failure.
-/// A successful response's JSON body, or the API error it carried.
 /// Attach an `Idempotency-Key` header when the caller has one.
 fn with_idempotency_key(
     request: reqwest::RequestBuilder,
@@ -348,16 +362,87 @@ async fn json_or_api_error<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Classify a reqwest error: a connection that never carried the request, a
+/// request that timed out after it was sent, or a body that didn't parse.
 fn classify_error(e: reqwest::Error) -> RelishError {
     // A connection that never opened reached no agent, even when it gave up
     // by timing out, which is how a firewall that drops packets looks. Only
     // a request that got through may still be running.
     if e.is_connect() {
-        RelishError::AgentUnreachable
+        unreachable(&e)
     } else if e.is_timeout() {
         RelishError::RequestTimeout
+    } else if e.is_decode() {
+        RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        }
     } else {
-        RelishError::AgentUnreachable
+        unreachable(&e)
+    }
+}
+
+/// The agent couldn't be reached: the endpoint the request dialled, and why.
+fn unreachable(error: &reqwest::Error) -> RelishError {
+    let endpoint = error
+        .url()
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| "the configured endpoint".to_string());
+    RelishError::AgentUnreachable {
+        endpoint,
+        cause: unreachable_cause(error),
+    }
+}
+
+/// Walk the error's sources for the reason the connection failed. reqwest
+/// wraps hyper, which wraps the resolver, the socket and rustls, so the
+/// useful part is several layers down.
+fn unreachable_cause(error: &reqwest::Error) -> super::UnreachableCause {
+    use super::UnreachableCause;
+    let mut deepest = error.to_string();
+    let mut said_dns = false;
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if let Some(cause) = io_cause(current) {
+            return cause;
+        }
+        let text = current.to_string();
+        // hyper-util's resolver error has no type of its own to match on.
+        said_dns |= text.contains("dns error") || text.contains("failed to lookup address");
+        deepest = text;
+        source = current.source();
+    }
+    if error.is_timeout() {
+        UnreachableCause::TimedOut
+    } else if said_dns {
+        UnreachableCause::NameResolution
+    } else {
+        UnreachableCause::Other(deepest)
+    }
+}
+
+/// The cause one link of the chain names, if it's a rustls error or an
+/// `io::Error` that says what happened. hyper wraps rustls's error in one
+/// `io::Error` inside another, and `io::Error::source` skips the error it
+/// wraps, so this looks inside each wrapper itself.
+fn io_cause(error: &(dyn std::error::Error + 'static)) -> Option<super::UnreachableCause> {
+    use super::UnreachableCause;
+    if let Some(tls) = error.downcast_ref::<rustls::Error>() {
+        return Some(match tls {
+            rustls::Error::InvalidCertificate(_) => {
+                UnreachableCause::UntrustedCertificate(tls.to_string())
+            }
+            _ => UnreachableCause::Tls(tls.to_string()),
+        });
+    }
+    let io = error.downcast_ref::<std::io::Error>()?;
+    match io.kind() {
+        std::io::ErrorKind::ConnectionRefused => Some(UnreachableCause::Refused),
+        std::io::ErrorKind::TimedOut => Some(UnreachableCause::TimedOut),
+        _ => {
+            let inner: &(dyn std::error::Error + 'static) = io.get_ref()?;
+            io_cause(inner)
+        }
     }
 }
 
@@ -825,7 +910,7 @@ impl BunClient {
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-            .map_err(|_| RelishError::AgentUnreachable)?;
+            .map_err(|error| unreachable(&error))?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
             return Err(RelishError::ApiError {
@@ -1343,6 +1428,46 @@ impl BunClient {
         .await
     }
 
+    /// Ask the log store, and only the store, for an app's lines across the
+    /// cluster, with `options`' window, tail and filters sent to the server.
+    ///
+    /// Unlike [`BunClient::log_lines`], this never falls back to a node's
+    /// own capture, which can't honour a window (#1515), and it never
+    /// swallows an error: an unreachable cluster is an error, not an empty
+    /// answer. `relish agent logs` is built on it.
+    pub async fn log_query(
+        &self,
+        app: &str,
+        namespace: &str,
+        options: &LogOptions,
+    ) -> Result<crate::ketchup::types::LogQueryResult, RelishError> {
+        let app_segment: String = url::form_urlencoded::byte_serialize(app.as_bytes()).collect();
+        let namespace_segment: String =
+            url::form_urlencoded::byte_serialize(namespace.as_bytes()).collect();
+        let response = self
+            .http()?
+            .get(format!(
+                "{}/v1/logs/query/{app_segment}/{namespace_segment}",
+                self.base_url
+            ))
+            .query(&options.query_params())
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        response
+            .json()
+            .await
+            .map_err(|error| RelishError::ApiError {
+                status: 0,
+                body: format!("failed to parse response: {error}"),
+            })
+    }
+
     /// Fetch an app's deploy history from every node, each entry tagged
     /// with its node, plus a warning per node that didn't answer.
     pub async fn deploy_history(
@@ -1828,8 +1953,19 @@ impl BunClient {
             // cluster but does not filter server-side, so filters apply here.
             return self.logs_follow(app, namespace, options).await;
         }
+        Ok(self.log_lines(app, namespace, options).await?.render())
+    }
 
-        // Non-follow: try the cross-node query endpoint first.
+    /// The lines a log query finds, before rendering, so `relish logs -o
+    /// json` can print each with its time, node, instance and stream. It
+    /// never follows: `options.follow` is ignored.
+    pub async fn log_lines(
+        &self,
+        app: &str,
+        namespace: &str,
+        options: &LogOptions,
+    ) -> Result<LogLines, RelishError> {
+        // Try the cross-node query endpoint first.
         // In cluster mode this fans out to all nodes running the app.
         // In single-node mode it queries the local LogStore.
         let url = format!("{}/v1/logs/query/{}/{}", self.base_url, app, namespace);
@@ -1850,7 +1986,12 @@ impl BunClient {
             // Filters also apply client-side: json_field has no server-side
             // equivalent, and grep re-checking is harmless when the server
             // already filtered.
-            let output = render_log_entries(&result.entries, options);
+            let filter = options.line_filter();
+            let shown: Vec<_> = result
+                .entries
+                .into_iter()
+                .filter(|entry| filter.matches(&entry.line))
+                .collect();
 
             // Name every node that contributed nothing, and why.
             for warning in &result.warnings {
@@ -1858,8 +1999,8 @@ impl BunClient {
             }
 
             // If we got entries, return them
-            if !output.is_empty() {
-                return Ok(output);
+            if !shown.is_empty() {
+                return Ok(LogLines::Stored(shown));
             }
         }
 
@@ -1876,7 +2017,7 @@ impl BunClient {
             || options.stream.is_some()
             || (options.instance.is_some() && !selected_run)
         {
-            return Ok(String::new());
+            return Ok(LogLines::Captured(Vec::new()));
         }
 
         // Fall back to the local agent endpoint (process logs that
@@ -1884,8 +2025,10 @@ impl BunClient {
         match self.logs_local(app, namespace, options).await {
             // The store already answered for every node; this one just
             // holds no capture of the app (#1515).
-            Err(RelishError::ApiError { status: 404, .. }) if store_answered => Ok(String::new()),
-            other => other,
+            Err(RelishError::ApiError { status: 404, .. }) if store_answered => {
+                Ok(LogLines::Captured(Vec::new()))
+            }
+            other => other.map(LogLines::Captured),
         }
     }
 
@@ -1895,7 +2038,7 @@ impl BunClient {
         app: &str,
         namespace: &str,
         options: &LogOptions,
-    ) -> Result<String, RelishError> {
+    ) -> Result<Vec<String>, RelishError> {
         let url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
 
         let response = self
@@ -1919,8 +2062,11 @@ impl BunClient {
 
         let logs = json["logs"].as_str().unwrap_or("");
         let filter = options.line_filter();
-        let filtered: Vec<&str> = logs.lines().filter(|l| filter.matches(l)).collect();
-        Ok(filtered.join("\n"))
+        Ok(logs
+            .lines()
+            .filter(|line| filter.matches(line))
+            .map(str::to_string)
+            .collect())
     }
 
     /// Follow logs via the SSE stream. On a cluster the node follows every
@@ -4177,10 +4323,165 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.is_connect(), "{error:?}");
-        assert!(matches!(
-            classify_error(error),
-            RelishError::AgentUnreachable
-        ));
+        let RelishError::AgentUnreachable { endpoint, .. } = classify_error(error) else {
+            panic!("a connection that never opened must read as unreachable");
+        };
+        assert_eq!(endpoint, "http://192.0.2.1:9117");
+    }
+
+    /// The error names the endpoint relish actually dialled, not the
+    /// localhost:9117 default, and says the port refused the connection.
+    #[tokio::test]
+    async fn a_refused_connection_names_the_endpoint_and_says_refused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = BunClient::build(&format!("http://{address}"), None, None);
+
+        let error = client.health().await.unwrap_err();
+
+        let RelishError::AgentUnreachable { endpoint, cause } = &error else {
+            panic!("expected unreachable, got {error:?}");
+        };
+        assert_eq!(endpoint, &format!("http://{address}"));
+        assert_eq!(cause, &crate::relish::UnreachableCause::Refused);
+        let message = error.to_string();
+        assert!(!message.contains("localhost:9117"), "{message}");
+        assert!(message.contains("connection refused"), "{message}");
+    }
+
+    /// A host name that doesn't resolve is a typo in the address, not a
+    /// stopped agent.
+    #[tokio::test]
+    async fn a_name_that_does_not_resolve_says_so() {
+        // `.invalid` is reserved (RFC 6761): it never resolves.
+        let client = BunClient::build("https://no-such-node.invalid:9117", None, None);
+
+        let error = client.health().await.unwrap_err();
+
+        let RelishError::AgentUnreachable { endpoint, cause } = &error else {
+            panic!("expected unreachable, got {error:?}");
+        };
+        assert_eq!(endpoint, "https://no-such-node.invalid:9117");
+        assert_eq!(cause, &crate::relish::UnreachableCause::NameResolution);
+        assert!(error.to_string().contains("doesn't resolve"), "{error}");
+    }
+
+    /// The commonest remote mistake: an https endpoint and no `--ca-cert`.
+    /// The agent is up and listening; the fix is the CA, not restarting it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_certificate_relish_does_not_trust_names_tls_and_the_ca_flag() {
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("unreachable-tls", b"ikm").unwrap();
+        let server = test_identity(&hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let address = spawn_tls_health(&server, shutdown.clone()).await;
+        let client = BunClient::build(&format!("https://{address}"), None, None);
+
+        let error = client.health().await.unwrap_err();
+        shutdown.cancel();
+
+        let RelishError::AgentUnreachable { endpoint, cause } = &error else {
+            panic!("expected unreachable, got {error:?}");
+        };
+        assert_eq!(endpoint, &format!("https://{address}"));
+        assert!(
+            matches!(
+                cause,
+                crate::relish::UnreachableCause::UntrustedCertificate(_)
+            ),
+            "{cause:?}"
+        );
+        assert!(error.to_string().contains("--ca-cert"), "{error}");
+    }
+
+    /// An agent reading the `relish.agent/v1` envelope sees `dns`, not
+    /// `unreachable`, when the endpoint's name doesn't resolve, and the
+    /// endpoint relish dialled.
+    #[tokio::test]
+    async fn an_unresolvable_name_gives_the_agent_the_dns_code() {
+        use crate::relish::agent::envelope::{AgentError, ErrorCode};
+        // `.invalid` is reserved (RFC 6761): it never resolves.
+        let client = BunClient::build("https://no-such-node.invalid:9117", None, None);
+
+        let error = client.health().await.unwrap_err();
+        let agent_error = AgentError::from(&error);
+
+        assert_eq!(agent_error.code, ErrorCode::Dns, "{error}");
+        assert_eq!(agent_error.code.exit_status().code(), 3);
+        assert_eq!(
+            agent_error.endpoint.as_deref(),
+            Some("https://no-such-node.invalid:9117")
+        );
+    }
+
+    /// A server whose certificate chains to a CA relish wasn't given reads as
+    /// `tls_untrusted`: the agent is up, and the fix is `--ca-cert`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_untrusted_certificate_gives_the_agent_the_tls_untrusted_code() {
+        use crate::relish::agent::envelope::{AgentError, ErrorCode};
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("untrusted-agent", b"ikm").unwrap();
+        let server = test_identity(&hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let address = spawn_tls_health(&server, shutdown.clone()).await;
+        let client = BunClient::build(&format!("https://{address}"), None, None);
+
+        let error = client.health().await.unwrap_err();
+        shutdown.cancel();
+        let agent_error = AgentError::from(&error);
+
+        assert_eq!(agent_error.code, ErrorCode::TlsUntrusted, "{error}");
+        assert_eq!(agent_error.code.exit_status().code(), 3);
+        assert_eq!(
+            agent_error.endpoint.as_deref(),
+            Some(format!("https://{address}").as_str())
+        );
+        assert!(
+            agent_error
+                .hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("--ca-cert"),
+            "{agent_error:?}"
+        );
+    }
+
+    /// Every cause says what to do; none falls back to "is it running?".
+    #[test]
+    fn each_unreachable_cause_names_its_fix() {
+        use crate::relish::UnreachableCause;
+        let message = |cause| {
+            RelishError::AgentUnreachable {
+                endpoint: "https://10.0.0.5:9117".to_string(),
+                cause,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            message(UnreachableCause::NameResolution),
+            "cannot reach the bun agent at https://10.0.0.5:9117: the host name doesn't resolve; check the address in --endpoint, RELIABURGER_ENDPOINT or the current context"
+        );
+        assert_eq!(
+            message(UnreachableCause::Refused),
+            "cannot reach the bun agent at https://10.0.0.5:9117: connection refused; check that bun runs there and listens on that port"
+        );
+        assert_eq!(
+            message(UnreachableCause::UntrustedCertificate(
+                "invalid peer certificate: UnknownIssuer".to_string()
+            )),
+            "cannot reach the bun agent at https://10.0.0.5:9117: the server's certificate isn't trusted (invalid peer certificate: UnknownIssuer); pass the cluster CA with --ca-cert or RELIABURGER_CA_CERT"
+        );
+        assert_eq!(
+            message(UnreachableCause::Tls(
+                "received corrupt message".to_string()
+            )),
+            "cannot reach the bun agent at https://10.0.0.5:9117: TLS handshake failed (received corrupt message); check the endpoint is https and serves TLS"
+        );
+        assert_eq!(
+            message(UnreachableCause::TimedOut),
+            "cannot reach the bun agent at https://10.0.0.5:9117: no answer before the connect timeout; the host may be down, or a firewall may drop packets to that port"
+        );
     }
 
     #[tokio::test]

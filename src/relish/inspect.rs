@@ -66,7 +66,7 @@ pub struct Inspection {
 pub async fn collect(client: &BunClient, name: &str) -> Result<Inspection, RelishError> {
     let members = match bounded(client.nodes()).await {
         Ok(members) => members,
-        Err(RelishError::AgentUnreachable) => return Err(RelishError::AgentUnreachable),
+        Err(error @ RelishError::AgentUnreachable { .. }) => return Err(error),
         // An agent without cluster membership (or one too old to list it)
         // can still describe its own instances.
         Err(_) => Vec::new(),
@@ -78,7 +78,7 @@ pub async fn collect(client: &BunClient, name: &str) -> Result<Inspection, Relis
         });
         let answer = match local {
             Ok(instances) => NodeAnswer::Answered(instances),
-            Err(RelishError::AgentUnreachable) => return Err(RelishError::AgentUnreachable),
+            Err(error @ RelishError::AgentUnreachable { .. }) => return Err(error),
             Err(error) => NodeAnswer::Silent {
                 reason: describe_failure(&error),
             },
@@ -167,6 +167,73 @@ fn describe_failure(error: &RelishError) -> String {
     match error {
         RelishError::RequestTimeout => format!("timed out after {}s", REQUEST_TIMEOUT.as_secs()),
         other => other.to_string(),
+    }
+}
+
+impl std::fmt::Display for Inspection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&render(self))
+    }
+}
+
+/// An inspection as `relish inspect -o json` prints it: what the council
+/// wants, then each node with its instances of the app or why it has none
+/// listed. Instances of other apps on the same node are left out.
+#[derive(serde::Serialize)]
+struct InspectionJson<'a> {
+    name: &'a str,
+    /// One entry per namespace holding an app of that name; `null` when the
+    /// council couldn't be asked, with `desired_error` saying why.
+    desired: Option<&'a [DesiredAppEvidence]>,
+    desired_error: Option<&'a str>,
+    nodes: Vec<NodeJson<'a>>,
+}
+
+/// One node in [`InspectionJson`], tagged by whether it answered.
+#[derive(serde::Serialize)]
+#[serde(tag = "answer", rename_all = "snake_case")]
+enum NodeJson<'a> {
+    Answered {
+        node: &'a str,
+        instances: Vec<&'a InstanceStatus>,
+    },
+    Silent {
+        node: &'a str,
+        reason: &'a str,
+    },
+    Down {
+        node: &'a str,
+        state: &'a str,
+    },
+}
+
+impl serde::Serialize for Inspection {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|report| {
+                let node = report.node.as_str();
+                match &report.answer {
+                    NodeAnswer::Answered(instances) => NodeJson::Answered {
+                        node,
+                        instances: instances
+                            .iter()
+                            .filter(|instance| instance.app_name == self.name)
+                            .collect(),
+                    },
+                    NodeAnswer::Silent { reason } => NodeJson::Silent { node, reason },
+                    NodeAnswer::Down { state } => NodeJson::Down { node, state },
+                }
+            })
+            .collect();
+        InspectionJson {
+            name: &self.name,
+            desired: self.desired.as_deref().ok(),
+            desired_error: self.desired.as_ref().err().map(String::as_str),
+            nodes,
+        }
+        .serialize(serializer)
     }
 }
 
@@ -646,5 +713,58 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("  Node:      local\n"), "{output}");
+    }
+
+    /// `-o json` gives each node's answer: its instances of the app (not the
+    /// other apps it runs), or why it has none listed.
+    #[test]
+    fn an_inspection_as_json_lists_each_nodes_answer() {
+        let mut other = instance("default__other-0", "default");
+        other.app_name = "other".to_string();
+        let inspection = Inspection {
+            name: "hello".to_string(),
+            desired: Ok(vec![desired(3, &[("node-1", 2), ("node-2", 1)])]),
+            nodes: vec![
+                NodeReport {
+                    node: "node-1".to_string(),
+                    answer: NodeAnswer::Answered(vec![
+                        instance("default__hello-0", "default"),
+                        other,
+                    ]),
+                },
+                NodeReport {
+                    node: "node-2".to_string(),
+                    answer: NodeAnswer::Silent {
+                        reason: "timed out after 10s".to_string(),
+                    },
+                },
+                NodeReport {
+                    node: "node-3".to_string(),
+                    answer: NodeAnswer::Down {
+                        state: "dead".to_string(),
+                    },
+                },
+            ],
+        };
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(&inspection, crate::relish::OutputFormat::Json)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn an_inspection_without_desired_state_says_why_in_json() {
+        let inspection = Inspection {
+            name: "hello".to_string(),
+            desired: Err("council unreachable".to_string()),
+            nodes: Vec::new(),
+        };
+        let json: serde_json::Value = serde_json::from_str(
+            &crate::relish::output::format_output(&inspection, crate::relish::OutputFormat::Json)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["desired"], serde_json::Value::Null);
+        assert_eq!(json["desired_error"], "council unreachable");
     }
 }

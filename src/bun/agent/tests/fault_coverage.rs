@@ -137,6 +137,215 @@ async fn an_injection_with_every_caller_named_answers_in_its_turn() {
     assert!(agent.follow_ups.is_empty());
 }
 
+/// A runtime read that outlasts the whole turn, as runc's owner lock did
+/// under the 0.2.6 jobs final (#1601).
+const STALLED_CGROUP_READ: std::time::Duration = std::time::Duration::from_millis(700);
+
+/// One frontend, a partition from it in the registry as `InjectFault` puts
+/// it there, and a turn deadline running.
+async fn one_frontend_and_a_partition() -> (
+    TestAgent,
+    MockGrill,
+    crate::smoker::types::FaultRule,
+    InstanceId,
+) {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("frontend", 1)).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+    let rule = agent.fault_registry.insert(&partition_from_frontend());
+    agent.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
+    (agent, grill, rule, id)
+}
+
+/// Inject `rule` the way `InjectFault` does once its check passes, and
+/// return the answer after every follow-up read has come back.
+async fn answer_after_follow_ups(
+    agent: &mut TestAgent,
+    rule: &crate::smoker::types::FaultRule,
+) -> Result<FaultSummary, BunError> {
+    agent.turn_deadline = None;
+    let (response, mut answer) = oneshot::channel();
+    agent
+        .answer_fault_injection(Injection::new(
+            rule.id,
+            FaultSummary::from(rule),
+            LateCuts::default(),
+            response,
+        ))
+        .await;
+    while let Some(read) = agent.follow_ups.join_next_with_id().await {
+        agent.apply_follow_up(read).await;
+    }
+    answer.try_recv().expect("the injection was answered")
+}
+
+/// The source is running, but the runtime can't name its cgroup before the
+/// turn's deadline. That is "not yet", not "no": the partition is accepted,
+/// a follow-up read proves the caller off the loop, and only then does the
+/// operator hear it is in (#1601).
+#[tokio::test]
+async fn a_partition_whose_only_source_misses_the_turn_deadline_is_not_refused() {
+    let (mut agent, grill, rule, id) = one_frontend_and_a_partition().await;
+    grill.set_workload_cgroup(&id, 4242);
+    grill.set_workload_cgroup_delay(Some(STALLED_CGROUP_READ));
+
+    agent
+        .check_fault_sources(&rule)
+        .await
+        .expect("a pending source is not a missing one");
+    let summary = answer_after_follow_ups(&mut agent, &rule)
+        .await
+        .expect("the follow-up read proved the frontend");
+    assert_eq!(summary.id, rule.id.0);
+    assert_eq!(
+        agent.network_faults.caller_cgroups.get(&id),
+        Some(&(0, 4242)),
+        "the fault is keyed by the caller's proven cgroup"
+    );
+    assert!(agent.fault_registry.get(rule.id).is_some());
+}
+
+/// A pending source the follow-up read then finds no cgroup for is refused,
+/// for the same reason as one refused in the turn: the rule would key
+/// nothing and never take effect.
+#[tokio::test]
+async fn a_pending_source_later_found_to_have_no_cgroup_is_refused() {
+    let (mut agent, grill, rule, _id) = one_frontend_and_a_partition().await;
+    grill.set_workload_cgroup_delay(Some(STALLED_CGROUP_READ));
+
+    agent.check_fault_sources(&rule).await.unwrap();
+    let error = answer_after_follow_ups(&mut agent, &rule)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("verified workload cgroup"), "{error}");
+    assert!(agent.fault_registry.get(rule.id).is_none());
+}
+
+#[tokio::test]
+async fn a_partition_from_an_app_with_no_running_instance_is_refused() {
+    let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+    let rule = agent.fault_registry.insert(&partition_from_frontend());
+    agent.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
+    let error = agent.check_fault_sources(&rule).await.unwrap_err();
+    assert_eq!(
+        error,
+        "no running instance of source app frontend on this node has a verified workload cgroup"
+    );
+}
+
+/// The runtime answered in time and said the source has no cgroup it can
+/// prove: a real refusal, not a timeout.
+#[tokio::test]
+async fn a_partition_whose_source_has_no_verified_cgroup_is_refused() {
+    let (mut agent, _grill, rule, _id) = one_frontend_and_a_partition().await;
+    let error = agent.check_fault_sources(&rule).await.unwrap_err();
+    assert_eq!(
+        error,
+        "no running instance of source app frontend on this node has a verified workload cgroup"
+    );
+    assert!(agent.network_faults.pending_callers.is_empty());
+}
+
+/// A partition from the job `render`.
+fn partition_from_render() -> FaultRequest {
+    FaultRequest {
+        fault_type: FaultType::Partition {
+            source_app: Some("render".into()),
+        },
+        ..partition_from_frontend()
+    }
+}
+
+/// One running attempt of the job `render`, in a runtime instance of its
+/// own, a partition from it in the registry, and a turn deadline running.
+fn one_render_attempt_and_a_partition() -> (
+    TestAgent,
+    MockGrill,
+    crate::smoker::types::FaultRule,
+    InstanceId,
+    crate::bun::live_attempts::AttemptListing,
+) {
+    use crate::bun::live_attempts::{AttemptHandle, LiveAttempt};
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let id = InstanceId("default/render-42-0".into());
+    let listing = agent.live_attempts().register(LiveAttempt {
+        namespace: "default".into(),
+        job: "render".into(),
+        batch_id: 42,
+        task_count: 1,
+        index: 0,
+        attempt: 1,
+        handle: AttemptHandle::Instance(id.clone()),
+        cgroup: None,
+        shared_executor: None,
+    });
+    let rule = agent.fault_registry.insert(&partition_from_render());
+    agent.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
+    (agent, grill, rule, id, listing)
+}
+
+/// A job attempt is a source like an app instance: a runtime that can't
+/// name its cgroup before the turn's deadline is "not yet", not "no". The
+/// follow-up read proves it, and the proof outlives the next reconcile, so
+/// the partition keys the attempt even while the runtime stays slow (#1602).
+#[tokio::test]
+async fn a_partition_whose_only_source_attempt_misses_the_turn_deadline_is_not_refused() {
+    let (mut agent, grill, rule, id, _listing) = one_render_attempt_and_a_partition();
+    grill.set_workload_cgroup(&id, 4343);
+    grill.set_workload_cgroup_delay(Some(STALLED_CGROUP_READ));
+
+    agent
+        .check_fault_sources(&rule)
+        .await
+        .expect("a pending attempt is not a missing one");
+    answer_after_follow_ups(&mut agent, &rule)
+        .await
+        .expect("the follow-up read proved the attempt");
+    assert!(agent.fault_registry.get(rule.id).is_some());
+
+    agent.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
+    let callers = agent.local_callers().await;
+    let caller = callers
+        .iter()
+        .find(|caller| caller.instance_id == id.0)
+        .expect("the attempt is a caller");
+    assert_eq!(
+        caller.cgroup_id,
+        Some(4343),
+        "the attempt keeps its proven cgroup while the runtime is slow"
+    );
+}
+
+/// A pending attempt the follow-up read finds no cgroup for is refused, as
+/// a pending app instance is.
+#[tokio::test]
+async fn a_pending_source_attempt_later_found_to_have_no_cgroup_is_refused() {
+    let (mut agent, grill, rule, _id, _listing) = one_render_attempt_and_a_partition();
+    grill.set_workload_cgroup_delay(Some(STALLED_CGROUP_READ));
+
+    agent.check_fault_sources(&rule).await.unwrap();
+    let error = answer_after_follow_ups(&mut agent, &rule)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("verified workload cgroup"), "{error}");
+    assert!(agent.fault_registry.get(rule.id).is_none());
+}
+
+/// An attempt the runtime answered for in time, with no cgroup, is still
+/// refused in the turn.
+#[tokio::test]
+async fn a_partition_whose_source_attempt_has_no_verified_cgroup_is_refused() {
+    let (mut agent, _grill, rule, _id, _listing) = one_render_attempt_and_a_partition();
+    let error = agent.check_fault_sources(&rule).await.unwrap_err();
+    assert_eq!(
+        error,
+        "no running instance of source app render on this node has a verified workload cgroup"
+    );
+    assert!(agent.network_faults.pending_callers.is_empty());
+}
+
 #[test]
 fn delays_shape_container_callers_and_skip_host_processes() {
     use crate::smoker::network::LocalCaller;

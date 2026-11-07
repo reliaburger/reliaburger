@@ -1134,9 +1134,13 @@ async fn relish_pushes_through_a_forward_while_nodes_fetch_from_the_cluster_addr
     let bytes = std::fs::read(leader_node.bin_dir.join("bun-v0.2.0")).unwrap();
     let candidate = harness.signed_candidate(staging.path(), "v0.2.0", &bytes);
 
-    reliaburger::relish::upgrade::start(&client, ClusterHarness::start_args(candidate, false))
-        .await
-        .expect("relish upgrade start");
+    reliaburger::relish::upgrade::start(
+        &client,
+        ClusterHarness::start_args(candidate, false),
+        reliaburger::relish::OutputFormat::Human,
+    )
+    .await
+    .expect("relish upgrade start");
 
     let recorded = harness
         .cluster_state()
@@ -1258,9 +1262,13 @@ async fn version_form_rolls_the_nodes_platform_build_countersigned_by_relish() {
         allow_downgrade: false,
     };
 
-    let refused = reliaburger::relish::upgrade::start(&client, args("other-formats.json"))
-        .await
-        .expect_err("a release with other formats needs a fresh cluster");
+    let refused = reliaburger::relish::upgrade::start(
+        &client,
+        args("other-formats.json"),
+        reliaburger::relish::OutputFormat::Human,
+    )
+    .await
+    .expect_err("a release with other formats needs a fresh cluster");
     assert!(refused.to_string().contains("fresh cluster"), "{refused}");
     let state = harness
         .cluster_state()
@@ -1268,9 +1276,13 @@ async fn version_form_rolls_the_nodes_platform_build_countersigned_by_relish() {
         .expect("cluster upgrade state");
     assert!(state["active"].is_null(), "nothing recorded: {state}");
 
-    reliaburger::relish::upgrade::start(&client, args("metadata.json"))
-        .await
-        .expect("relish upgrade start v0.2.0");
+    reliaburger::relish::upgrade::start(
+        &client,
+        args("metadata.json"),
+        reliaburger::relish::OutputFormat::Human,
+    )
+    .await
+    .expect("relish upgrade start v0.2.0");
 
     let recorded = harness
         .cluster_state()
@@ -1314,10 +1326,13 @@ async fn start_refuses_same_version_other_bytes_and_unrequested_downgrades() {
     let mut rebuilt = running.clone();
     rebuilt.extend_from_slice(b"\n# a different build of v0.1.0\n");
     let candidate = harness.signed_candidate(staging.path(), "v0.1.0", &rebuilt);
-    let err =
-        reliaburger::relish::upgrade::start(&client, ClusterHarness::start_args(candidate, false))
-            .await
-            .expect_err("a same-version candidate with other bytes must be refused");
+    let err = reliaburger::relish::upgrade::start(
+        &client,
+        ClusterHarness::start_args(candidate, false),
+        reliaburger::relish::OutputFormat::Human,
+    )
+    .await
+    .expect_err("a same-version candidate with other bytes must be refused");
     assert!(
         err.to_string().contains("different binary"),
         "unexpected refusal: {err}"
@@ -1327,17 +1342,24 @@ async fn start_refuses_same_version_other_bytes_and_unrequested_downgrades() {
     // Same version, same bytes: "already running", nothing recorded.
     let same = tempfile::tempdir().unwrap();
     let candidate = harness.signed_candidate(same.path(), "v0.1.0", &running);
-    reliaburger::relish::upgrade::start(&client, ClusterHarness::start_args(candidate, false))
-        .await
-        .expect("identical bytes report already running");
+    reliaburger::relish::upgrade::start(
+        &client,
+        ClusterHarness::start_args(candidate, false),
+        reliaburger::relish::OutputFormat::Human,
+    )
+    .await
+    .expect("identical bytes report already running");
     assert!(harness.cluster_state().await.unwrap()["active"].is_null());
 
     // An older version needs --allow-downgrade.
     let candidate = harness.signed_candidate(staging.path(), "v0.0.9", &running);
-    let err =
-        reliaburger::relish::upgrade::start(&client, ClusterHarness::start_args(candidate, false))
-            .await
-            .expect_err("a downgrade without the flag must be refused");
+    let err = reliaburger::relish::upgrade::start(
+        &client,
+        ClusterHarness::start_args(candidate, false),
+        reliaburger::relish::OutputFormat::Human,
+    )
+    .await
+    .expect_err("a downgrade without the flag must be refused");
     assert!(
         err.to_string().contains("--allow-downgrade"),
         "unexpected refusal: {err}"
@@ -1491,10 +1513,13 @@ async fn start_refuses_when_a_node_cannot_verify_network_upgrades() {
     let bytes = std::fs::read(leader_node.bin_dir.join("bun-v0.2.0")).unwrap();
     let candidate = harness.signed_candidate(staging.path(), "v0.2.0", &bytes);
 
-    let err =
-        reliaburger::relish::upgrade::start(&client, ClusterHarness::start_args(candidate, false))
-            .await
-            .expect_err("a node without an external key must stop the start");
+    let err = reliaburger::relish::upgrade::start(
+        &client,
+        ClusterHarness::start_args(candidate, false),
+        reliaburger::relish::OutputFormat::Human,
+    )
+    .await
+    .expect_err("a node without an external key must stop the start");
     let message = err.to_string();
     assert!(
         message.contains("node n1") && message.contains("upgrades.external_signing_key"),
@@ -1531,10 +1556,13 @@ async fn start_refuses_a_candidate_with_other_formats_before_recording_a_run() {
         b"#!/bin/sh\nprintf '%s' '{\"protocol\":1,\"state\":1}'\n",
     );
 
-    let err =
-        reliaburger::relish::upgrade::start(&client, ClusterHarness::start_args(candidate, false))
-            .await
-            .expect_err("a candidate with other formats must stop the start");
+    let err = reliaburger::relish::upgrade::start(
+        &client,
+        ClusterHarness::start_args(candidate, false),
+        reliaburger::relish::OutputFormat::Human,
+    )
+    .await
+    .expect_err("a candidate with other formats must stop the start");
     let message = err.to_string();
     assert!(
         message.contains("found protocol 1, state 1") && message.contains("needs protocol"),
@@ -1624,7 +1652,7 @@ async fn paused_upgrade_can_be_aborted_or_replaced_by_a_rollback() {
     // Abort: the paused run moves to history, marked Aborted.
     let leader = harness.wait_for_leader().await;
     let client = harness.relish_client(harness.node(&leader));
-    reliaburger::relish::upgrade::abort(&client)
+    reliaburger::relish::upgrade::abort(&client, reliaburger::relish::OutputFormat::Human)
         .await
         .expect("abort a paused run that moved no node");
     let state = harness.cluster_state().await.unwrap();
@@ -1654,9 +1682,14 @@ async fn paused_upgrade_can_be_aborted_or_replaced_by_a_rollback() {
     })
     .await;
     let client = harness.relish_client(harness.node(&leader));
-    reliaburger::relish::upgrade::rollback(&client, Some("v0.1.0".to_string()), Vec::new())
-        .await
-        .expect("rollback replaces a paused run");
+    reliaburger::relish::upgrade::rollback(
+        &client,
+        Some("v0.1.0".to_string()),
+        Vec::new(),
+        reliaburger::relish::OutputFormat::Human,
+    )
+    .await
+    .expect("rollback replaces a paused run");
     wait_for("the rollback to finish", WAIT, || async {
         harness.cluster_state().await.is_some_and(|state| {
             state["active"].is_null()

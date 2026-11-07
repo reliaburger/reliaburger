@@ -965,6 +965,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.spawn_signal_fault(&rule, signal, response);
                     return;
                 }
+                // A CPU, memory or disk I/O fault writes its targets' cgroups
+                // from a task: lowering `memory.high` makes the kernel reclaim
+                // before the write returns, which can take seconds.
+                let device = || self.io_device_major_minor();
+                if let Some(fault) = resource_faults::CgroupFault::of(&rule.fault_type, device) {
+                    self.spawn_cgroup_fault(&rule, fault, response);
+                    return;
+                }
                 // A pressure helper takes seconds to start; it starts in a
                 // task, and the caller hears once it runs (#351, stage 3).
                 if let crate::smoker::types::FaultType::NodePressure {
@@ -1003,6 +1011,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                     Err(reason) => {
                         self.fault_registry.remove(rule.id);
+                        self.network_faults.unproven_sources.remove(&rule.id);
                         // Take back anything a partial network install wrote.
                         self.reconcile_network_faults().await;
                         let _ = response.send(Err(BunError::FaultRejected { reason }));

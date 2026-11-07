@@ -1,0 +1,56 @@
+---
+source: src/relish/agent/guide.rs
+expression: value
+---
+{
+  "command": "guide",
+  "data": {
+    "chapter": "16_working-with-an-ai-agent.md",
+    "commands": [
+      {
+        "about": "This chapter, as Markdown sections.",
+        "command": "relish agent guide"
+      },
+      {
+        "about": "Search it | quickly.",
+        "command": "relish agent source grep"
+      }
+    ],
+    "sections": [
+      {
+        "heading": "Working with an AI agent",
+        "markdown": "Reliaburger is an orchestrator.\nIts CLI is `relish`.\n\nIntro paragraph."
+      },
+      {
+        "heading": "In brief",
+        "markdown": "- **Run `relish agent guide` first.**"
+      },
+      {
+        "heading": "Commands",
+        "markdown": "stale table\n\n```sh\n## not a heading inside a fence\nrelish agent guide\n```"
+      },
+      {
+        "heading": "Sending us a fix",
+        "markdown": "- **Disclose.**"
+      }
+    ],
+    "title": "Working with an AI agent"
+  },
+  "next": [
+    {
+      "read_only": true,
+      "run": "relish agent source version",
+      "why": "which source this relish carries, and whether the nodes run it"
+    }
+  ],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": null,
+    "source_digest": null,
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": []
+}

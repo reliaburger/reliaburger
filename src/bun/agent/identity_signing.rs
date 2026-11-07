@@ -119,7 +119,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Store a finished signing's identity and answer everyone waiting on it.
-    pub(super) fn finish_identity_provision(&mut self, outcome: IdentitySigningOutcome) {
+    pub(super) async fn finish_identity_provision(&mut self, outcome: IdentitySigningOutcome) {
         let (task, signed) = match outcome {
             Ok((task, signed)) => (task, Some(signed)),
             Err(error) => {
@@ -131,7 +131,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
         if let Some(signed) = signed {
-            self.store_signed_identity(&signing.instance_id, signed);
+            self.store_signed_identity(&signing.instance_id, signed)
+                .await;
         }
         for waiter in signing.waiters {
             let _ = waiter.send(());
@@ -146,7 +147,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Write a signed identity to the instance's mount and record it.
-    fn store_signed_identity(&mut self, instance_id: &InstanceId, signed: SignedIdentity) {
+    async fn store_signed_identity(&mut self, instance_id: &InstanceId, signed: SignedIdentity) {
         let signed_workload = match signed.result {
             Ok(signed_workload) => signed_workload,
             Err(error) => {
@@ -169,17 +170,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Write to the instance's own identity mount (PKI7). The directory was
         // prepared before the container was created; a rotation for an adopted
         // instance may find it missing, so prepare it (idempotently) here too.
+        // Both run on a blocking thread: a `mount`, and an fsync per file.
         let identity_dir = self.instance_identity_dir(instance_id);
-        if let Err(error) = crate::sesame::identity::prepare_identity_dir(&identity_dir) {
-            eprintln!("bun: identity for {instance_id}: failed to prepare directory: {error}");
-            return;
-        }
-        if let Err(error) = crate::sesame::identity::write_identity_files(
-            &identity,
+        // LOOP-INLINE: an fsync'd persist on a blocking thread, once per signing, like the records'
+        if let Err(error) = crate::sesame::identity::install_identity(
+            identity.clone(),
             &identity_dir,
-            Self::workload_identity_owner(&identity_dir),
-        ) {
-            eprintln!("bun: identity for {instance_id}: failed to write files: {error}");
+            Self::workload_identity_owner,
+        )
+        .await
+        {
+            eprintln!("bun: identity for {instance_id}: failed to store: {error}");
             return;
         }
         if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {

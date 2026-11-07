@@ -1,0 +1,60 @@
+---
+source: src/relish/agent/source/tree.rs
+expression: value
+---
+{
+  "command": "source tree",
+  "data": {
+    "bytes": 857,
+    "depth": 1,
+    "entries": [
+      {
+        "bytes": 26,
+        "files": null,
+        "kind": "file",
+        "lines": 2,
+        "path": "Cargo.toml"
+      },
+      {
+        "bytes": 11,
+        "files": 1,
+        "kind": "dir",
+        "lines": 0,
+        "path": "brioche/"
+      },
+      {
+        "bytes": 31,
+        "files": 1,
+        "kind": "dir",
+        "lines": 3,
+        "path": "docs/"
+      },
+      {
+        "bytes": 789,
+        "files": 3,
+        "kind": "dir",
+        "lines": 46,
+        "path": "src/"
+      }
+    ],
+    "files": 6,
+    "prefix": null
+  },
+  "next": [
+    {
+      "read_only": true,
+      "run": "relish agent source tree src",
+      "why": "the files in the largest directory"
+    }
+  ],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": false,
+    "source_digest": "sha256:1639b607afe38bc2d97354cd49b82921653880e34c8d918491816b50df78c953",
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": []
+}

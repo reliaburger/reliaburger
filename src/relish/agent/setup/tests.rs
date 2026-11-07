@@ -1,0 +1,533 @@
+//! `relish agent setup` against a temporary home directory.
+
+use std::collections::BTreeMap;
+
+use clap::Parser;
+use serde_json::{Value, json};
+
+use super::*;
+
+/// A home directory in a temporary directory, deleted when dropped.
+struct TestHome {
+    _dir: tempfile::TempDir,
+    home: Home,
+}
+
+impl TestHome {
+    fn new() -> TestHome {
+        let dir = tempfile::tempdir().unwrap();
+        // macOS's temporary directory is behind a symlink; resolve it so the
+        // paths setup reports start with the root the tests strip.
+        let root = fs::canonicalize(dir.path()).unwrap();
+        TestHome {
+            _dir: dir,
+            home: Home { root, macos: true },
+        }
+    }
+
+    fn path(&self, relative: &str) -> PathBuf {
+        self.home.root.join(relative)
+    }
+
+    fn write(&self, relative: &str, text: &str) {
+        let path = self.path(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    fn mkdir(&self, relative: &str) {
+        fs::create_dir_all(self.path(relative)).unwrap();
+    }
+
+    fn read(&self, relative: &str) -> String {
+        fs::read_to_string(self.path(relative)).unwrap()
+    }
+
+    /// Every file under the home, relative path to contents.
+    fn files(&self) -> BTreeMap<String, String> {
+        let mut files = BTreeMap::new();
+        let mut pending = vec![self.home.root.clone()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let relative = path.strip_prefix(&self.home.root).unwrap();
+                    files.insert(
+                        relative.display().to_string(),
+                        fs::read_to_string(&path).unwrap(),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    /// Every directory under the home, relative.
+    fn directories(&self) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut pending = vec![self.home.root.clone()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    let relative = path.strip_prefix(&self.home.root).unwrap();
+                    found.push(relative.display().to_string());
+                    pending.push(path);
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// A home with every agent installed and some config of their own.
+    fn with_every_agent() -> TestHome {
+        let home = TestHome::new();
+        home.write(
+            ".claude.json",
+            "{\n  \"numStartups\": 12,\n  \"mcpServers\": {\n    \"github\": {\n      \"command\": \"gh-mcp\",\n      \"env\": {\n        \"GITHUB_TOKEN\": \"ghp_not_for_the_diff\"\n      }\n    }\n  },\n  \"projects\": {}\n}\n",
+        );
+        home.write(
+            ".claude/settings.json",
+            "{\"permissions\": {\"allow\": [\"Bash(ls:*)\"]}}\n",
+        );
+        home.write(
+            ".codex/config.toml",
+            "# Codex\nmodel = \"gpt-5\"\n\n[mcp_servers.docs]\ncommand = \"docs-mcp\"\n",
+        );
+        home.mkdir(".cursor");
+        home.mkdir("Library/Application Support/Code/User");
+        home.write(
+            ".config/goose/config.yaml",
+            "GOOSE_PROVIDER: anthropic\nextensions:\n  developer:\n    enabled: true\n    type: builtin\n    name: developer\n",
+        );
+        home.write(".gemini/settings.json", "{\n  \"theme\": \"Dracula\"\n}\n");
+        home
+    }
+}
+
+#[derive(Debug, Parser)]
+struct TestCli {
+    #[command(flatten)]
+    options: SetupOptions,
+}
+
+fn options(line: &str) -> SetupOptions {
+    let mut argv = vec!["setup"];
+    argv.extend(line.split_whitespace());
+    TestCli::try_parse_from(argv).unwrap().options
+}
+
+const SKILL: &str =
+    "---\nname: reliaburger\ndescription: test skill\n---\n\nRun relish agent context first.\n";
+
+fn build() -> BuildInfo {
+    BuildInfo {
+        version: "0.2.7".to_string(),
+        commit: None,
+        dirty: None,
+        source_digest: None,
+    }
+}
+
+fn run_in(home: &TestHome, line: &str, skill: Option<&str>) -> Value {
+    let envelope = answer(
+        &options(line),
+        &home.home,
+        skill,
+        build(),
+        format!("relish agent setup {line}").trim_end(),
+    );
+    let text = serde_json::to_string(&envelope).unwrap();
+    let root = home.home.root.display().to_string();
+    serde_json::from_str(&text.replace(&root, "$HOME")).unwrap()
+}
+
+fn statuses(answer: &Value) -> Vec<(String, String, String)> {
+    let mut found = Vec::new();
+    for agent in answer["data"]["agents"].as_array().unwrap() {
+        for change in agent["changes"].as_array().unwrap() {
+            found.push((
+                agent["agent"].as_str().unwrap().to_string(),
+                change["kind"].as_str().unwrap().to_string(),
+                change["status"].as_str().unwrap().to_string(),
+            ));
+        }
+    }
+    found
+}
+
+fn named_paths(answer: &Value, home: &TestHome) -> Vec<String> {
+    let mut paths = Vec::new();
+    for agent in answer["data"]["agents"].as_array().unwrap() {
+        for change in agent["changes"].as_array().unwrap() {
+            let path = change["path"].as_str().unwrap();
+            let relative = path.strip_prefix("$HOME/").unwrap();
+            assert!(home.path(relative).starts_with(&home.home.root));
+            paths.push(relative.to_string());
+        }
+    }
+    paths
+}
+
+#[test]
+fn without_yes_nothing_is_written_and_the_answer_is_the_diff() {
+    let home = TestHome::with_every_agent();
+    let before = home.files();
+    let directories = home.directories();
+    let answer = run_in(&home, "", Some(SKILL));
+    assert_eq!(home.files(), before, "a preview writes nothing");
+    assert_eq!(home.directories(), directories, "nor makes a directory");
+    assert_eq!(answer["data"]["applied"], false);
+    insta::assert_json_snapshot!(answer);
+}
+
+#[test]
+fn dry_run_and_print_write_nothing_either() {
+    let home = TestHome::with_every_agent();
+    let before = home.files();
+    for line in [
+        "--dry-run",
+        "--print",
+        "--dry-run --remove",
+        "--dry-run --force",
+    ] {
+        let answer = run_in(&home, line, Some(SKILL));
+        assert_eq!(answer["data"]["applied"], false, "{line}");
+        assert_eq!(home.files(), before, "{line}");
+    }
+}
+
+#[test]
+fn dry_run_and_yes_together_are_a_usage_error() {
+    assert!(TestCli::try_parse_from(["setup", "--dry-run", "--yes"]).is_err());
+    assert!(TestCli::try_parse_from(["setup", "--print", "--yes"]).is_err());
+    assert!(TestCli::try_parse_from(["setup", "nonsense"]).is_err());
+    let parsed = options("cursor vscode --yes");
+    assert_eq!(parsed.agents, [Client::Cursor, Client::VsCode]);
+    assert!(parsed.yes);
+}
+
+#[test]
+fn yes_writes_only_the_paths_the_answer_names() {
+    let home = TestHome::with_every_agent();
+    let before = home.files();
+    let answer = run_in(&home, "--yes", Some(SKILL));
+    assert_eq!(answer["data"]["applied"], true);
+    let named = named_paths(&answer, &home);
+    let after = home.files();
+    for (path, text) in &after {
+        if before.get(path) != Some(text) {
+            assert!(
+                named.contains(path),
+                "wrote {path}, which the answer doesn't name"
+            );
+        }
+    }
+    for path in before.keys() {
+        assert!(after.contains_key(path), "{path} disappeared");
+    }
+    assert!(
+        !after.keys().any(|path| path.ends_with(".relish-setup.tmp")),
+        "{after:?}"
+    );
+    assert_eq!(
+        after[".claude/settings.json"], before[".claude/settings.json"],
+        "Claude Code's permissions are never touched"
+    );
+    let every_change_written = answer["data"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|agent| agent["changes"].as_array().unwrap())
+        .all(|change| change["written"] == true);
+    assert!(every_change_written, "{answer}");
+    insta::assert_json_snapshot!(
+        "files_after_setup",
+        after
+            .iter()
+            .filter(|(path, text)| before.get(*path) != Some(*text))
+            .collect::<BTreeMap<_, _>>()
+    );
+}
+
+#[test]
+fn a_second_run_changes_nothing() {
+    let home = TestHome::with_every_agent();
+    run_in(&home, "--yes", Some(SKILL));
+    let once = home.files();
+    let answer = run_in(&home, "--yes", Some(SKILL));
+    assert_eq!(home.files(), once);
+    for (agent, kind, status) in statuses(&answer) {
+        assert_eq!(status, "unchanged", "{agent} {kind}");
+    }
+    assert_eq!(
+        answer["warnings"],
+        json!([]),
+        "nothing was written, so nothing to restart"
+    );
+    assert_eq!(answer["next"], json!([]));
+}
+
+#[test]
+fn remove_undoes_setup_byte_for_byte_where_the_format_allows() {
+    let home = TestHome::with_every_agent();
+    let before = home.files();
+    run_in(&home, "--yes", Some(SKILL));
+    let answer = run_in(&home, "--remove --yes", Some(SKILL));
+    assert_eq!(answer["data"]["action"], "remove");
+    let after = home.files();
+    for path in [
+        ".claude.json",
+        ".codex/config.toml",
+        ".config/goose/config.yaml",
+        ".gemini/settings.json",
+    ] {
+        assert_eq!(after[path], before[path], "{path}");
+    }
+    assert!(!after.contains_key(".claude/skills/reliaburger/SKILL.md"));
+    assert!(
+        !home.path(".claude/skills/reliaburger").exists(),
+        "the skill's empty directory goes too"
+    );
+    // A file setup created is left as an empty object.
+    assert_eq!(after[".cursor/mcp.json"], "{}\n");
+    let again = run_in(&home, "--remove --yes", Some(SKILL));
+    for (agent, kind, status) in statuses(&again) {
+        assert_eq!(status, "unchanged", "{agent} {kind}");
+    }
+}
+
+#[test]
+fn someone_elses_entry_is_left_alone_unless_forced() {
+    let home = TestHome::new();
+    let theirs = "{\n  \"mcpServers\": {\n    \"reliaburger\": {\n      \"command\": \"/opt/rb/relish\",\n      \"args\": [\"mcp\", \"--no-logs\"]\n    }\n  }\n}\n";
+    home.write(".cursor/mcp.json", theirs);
+    let answer = run_in(&home, "cursor --yes", None);
+    assert_eq!(
+        statuses(&answer),
+        [("cursor".into(), "mcp_server".into(), "conflict".into())]
+    );
+    assert_eq!(home.read(".cursor/mcp.json"), theirs);
+    assert!(
+        answer["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("~/.cursor/mcp.json already has a mcpServers.reliaburger entry"),
+        "{answer}"
+    );
+    let removed = run_in(&home, "cursor --remove --yes", None);
+    assert_eq!(statuses(&removed)[0].2, "conflict");
+    assert_eq!(home.read(".cursor/mcp.json"), theirs);
+
+    let forced = run_in(&home, "cursor --yes --force", None);
+    assert_eq!(statuses(&forced)[0].2, "replace");
+    let written: Value = serde_json::from_str(&home.read(".cursor/mcp.json")).unwrap();
+    assert_eq!(
+        written["mcpServers"]["reliaburger"],
+        json!({"command": "relish", "args": ["mcp"]})
+    );
+}
+
+#[test]
+fn a_users_own_skill_is_left_alone_unless_forced() {
+    let home = TestHome::new();
+    home.write(".claude/skills/reliaburger/SKILL.md", "my own notes\n");
+    let answer = run_in(&home, "claude-code --yes", Some(SKILL));
+    let skill = &statuses(&answer)[1];
+    assert_eq!((skill.1.as_str(), skill.2.as_str()), ("skill", "conflict"));
+    assert_eq!(
+        home.read(".claude/skills/reliaburger/SKILL.md"),
+        "my own notes\n"
+    );
+    let removed = run_in(&home, "claude-code --remove --yes", Some(SKILL));
+    assert_eq!(statuses(&removed)[1].2, "conflict");
+    assert!(home.path(".claude/skills/reliaburger/SKILL.md").exists());
+}
+
+#[test]
+fn a_file_that_cant_be_rewritten_safely_is_left_alone() {
+    let home = TestHome::new();
+    let jsonc = "{\n  // mine\n  \"servers\": {}\n}\n";
+    home.write("Library/Application Support/Code/User/mcp.json", jsonc);
+    let yaml = "# my goose\nextensions: {}\n";
+    home.write(".config/goose/config.yaml", yaml);
+    let answer = run_in(&home, "--yes", None);
+    let found = statuses(&answer);
+    assert_eq!(
+        found,
+        [
+            ("vscode".into(), "mcp_server".into(), "unreadable".into()),
+            ("goose".into(), "mcp_server".into(), "unreadable".into()),
+        ]
+    );
+    assert_eq!(
+        home.read("Library/Application Support/Code/User/mcp.json"),
+        jsonc
+    );
+    assert_eq!(home.read(".config/goose/config.yaml"), yaml);
+    let note = answer["data"]["agents"][3]["changes"][0]["note"]
+        .as_str()
+        .unwrap();
+    assert!(note.contains("put this under \"reliaburger\""), "{note}");
+}
+
+#[test]
+fn agents_that_arent_installed_are_listed_but_untouched() {
+    let home = TestHome::new();
+    home.mkdir(".gemini");
+    let answer = run_in(&home, "--yes", None);
+    assert_eq!(
+        statuses(&answer),
+        [("gemini".into(), "mcp_server".into(), "add".into())]
+    );
+    assert_eq!(
+        home.files().keys().collect::<Vec<_>>(),
+        [".gemini/settings.json"]
+    );
+    let agents = answer["data"]["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), Client::ALL.len());
+    assert_eq!(agents[0]["detected"], false);
+}
+
+#[test]
+fn a_named_agent_is_set_up_even_when_it_wasnt_found() {
+    let home = TestHome::new();
+    let answer = run_in(&home, "codex --yes", None);
+    assert_eq!(
+        statuses(&answer),
+        [("codex".into(), "mcp_server".into(), "add".into())]
+    );
+    assert_eq!(
+        home.read(".codex/config.toml"),
+        "[mcp_servers.reliaburger]\nargs = [\"mcp\"]\ncommand = \"relish\"\n"
+    );
+}
+
+#[test]
+fn finding_no_agent_says_how_to_name_one() {
+    let home = TestHome::new();
+    let answer = run_in(&home, "", None);
+    assert_eq!(statuses(&answer), []);
+    assert!(
+        answer["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("relish agent setup cursor"),
+        "{answer}"
+    );
+    assert_eq!(answer["next"], json!([]));
+}
+
+#[test]
+fn the_diff_shows_no_neighbouring_lines() {
+    let home = TestHome::with_every_agent();
+    let answer = run_in(&home, "claude-code", None);
+    let diff = answer["data"]["agents"][0]["changes"][0]["diff"]
+        .as_str()
+        .unwrap();
+    assert!(!diff.contains("ghp_not_for_the_diff"), "{diff}");
+    assert!(!diff.contains("github"), "{diff}");
+    assert!(
+        diff.lines()
+            .filter(|line| !line.starts_with("---") && !line.starts_with("+++"))
+            .all(|line| line.starts_with('+') || line.starts_with("@@")),
+        "only added lines: {diff}"
+    );
+}
+
+#[test]
+fn the_preview_offers_the_same_command_with_yes() {
+    let home = TestHome::with_every_agent();
+    let answer = run_in(&home, "cursor --dry-run", None);
+    assert_eq!(
+        answer["next"],
+        json!([{
+            "run": "relish agent setup cursor --yes",
+            "why": "make exactly these changes, once a human has read the diffs",
+            "read_only": false,
+        }])
+    );
+}
+
+#[test]
+fn a_file_changed_after_setup_read_it_is_not_overwritten() {
+    let home = TestHome::new();
+    home.write(".gemini/settings.json", "{}\n");
+    let mut planned = plan_server(Client::Gemini, &home.home, Action::Install, false);
+    home.write(".gemini/settings.json", "{\"theme\": \"new\"}\n");
+    apply(&mut planned);
+    assert!(!planned.change.written);
+    assert!(
+        planned
+            .change
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("changed while setup was working")
+    );
+    assert_eq!(home.read(".gemini/settings.json"), "{\"theme\": \"new\"}\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_private_file_stays_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = TestHome::new();
+    home.write(".claude.json", "{}\n");
+    fs::set_permissions(home.path(".claude.json"), fs::Permissions::from_mode(0o600)).unwrap();
+    run_in(&home, "claude-code --yes", None);
+    let mode = fs::metadata(home.path(".claude.json"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_config_stays_a_symlink() {
+    let home = TestHome::new();
+    home.write("dotfiles/gemini.json", "{}\n");
+    home.mkdir(".gemini");
+    std::os::unix::fs::symlink(
+        home.path("dotfiles/gemini.json"),
+        home.path(".gemini/settings.json"),
+    )
+    .unwrap();
+    let answer = run_in(&home, "gemini --yes", None);
+    assert_eq!(
+        answer["data"]["agents"][5]["changes"][0]["path"],
+        "$HOME/dotfiles/gemini.json"
+    );
+    assert!(
+        fs::symlink_metadata(home.path(".gemini/settings.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(home.read("dotfiles/gemini.json").contains("reliaburger"));
+}
+
+#[test]
+fn the_written_configs_approve_nothing() {
+    let home = TestHome::with_every_agent();
+    run_in(&home, "--yes", Some(SKILL));
+    for (path, text) in home.files() {
+        if path.starts_with(".claude/settings") {
+            continue;
+        }
+        for word in [
+            "trust",
+            "alwaysAllow",
+            "autoApprove",
+            "allow",
+            "yolo",
+            "\"*\"",
+        ] {
+            assert!(!text.contains(word), "{path} contains {word}: {text}");
+        }
+    }
+}

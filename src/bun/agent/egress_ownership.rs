@@ -158,6 +158,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 self.cgroup_ns_bpf_keys = sources;
                 self.firewall_bpf_keys = rules;
+                self.firewall_writes.clear();
             }
             self.egress_bindings = owners;
             self.egress_store_uncertain = false;
