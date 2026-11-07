@@ -2202,6 +2202,8 @@ def job_qualification_lines(report):
     missed = ", ".join(f"{node} missed {count}" for node, count in sorted((fallbacks.get("missed") or {}).items()))
     answered = ", ".join(f"{node} answered {count}" for node, count in sorted((fallbacks.get("answered") or {}).items()))
     lines += [f"- Audited executions: {report.get('audited_attempts', 0)}; operator replay decisions: {report.get('operator_replay_decisions', 0)}",
+              f"- Chunks checked for exactly-once completion: {report.get('chunks_checked', 0)}, "
+              f"{report.get('chunks_regranted', 0)} of them re-granted (#1415)",
               "- Job controller API fallbacks: " + (f"{missed}; {answered}" if missed else "none") +
               " (requests a node didn't answer, and the node that took them instead)", ""]
     return lines

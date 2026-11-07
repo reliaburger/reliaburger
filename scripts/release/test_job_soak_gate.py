@@ -669,6 +669,12 @@ class RunBudget(unittest.TestCase):
             identity=int(path.split("/")[3])
             if identity in self.gone: raise jobs.Gone("candidate API refused "+method+" "+path+" (HTTP 404)")
             if path.endswith("/cancel"): return {}
+            if "/results?" in path:
+                # A drained run's sampled chunks (#1415): every task once, from one grant.
+                query=dict(pair.split("=") for pair in path.split("?")[1].split("&"))
+                start=int(query.get("after",-1))+1
+                return {"rows":[dict(index=i,grant_attempt=1,attempts=1,succeeded=True)
+                                for i in range(start,start+int(query["limit"]))]}
             self.gets.append(identity)
             body=next(b for i,b in self.posts.values() if i==identity)
             template=body["definition"]["template"]; count=body["definition"]["tasks"]["count"]
