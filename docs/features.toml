@@ -1,0 +1,1270 @@
+# What's ready in Reliaburger, feature by feature.
+#
+# This file is the source of truth for https://reliaburger.com/features.html.
+# `make features-page` (scripts/ci/features_page.py) writes the page from it,
+# and `make agent-docs` then refreshes the page's Markdown copy.
+# scripts/ci/test_features_page.py checks this file and the page against each
+# other on every `make test-ci-scripts`.
+#
+# Statuses:
+#   ready   built, documented, tested and exercised by the release gate, with
+#           no known serious problems
+#   beta    works and is tested, but has known gaps, limited soak evidence, or
+#           may change shape
+#   alpha   usable to try, but incomplete or likely to change
+#   planned not built: give its milestone and an issue
+#
+# Every feature has a name, a status, a one-sentence summary, its docs (paths
+# from the repository root, with an optional #anchor), and the evidence its
+# status rests on. A built feature has `since`, the release it first shipped
+# in; a planned one has `milestone`. `issues` lists open issues: known
+# problems for a built feature, the work itself for a planned one.
+# `restrictions` says what it doesn't do or needs. `needs_maintainer`, where
+# present, says which judgement call the maintainer still has to make.
+#
+# "The release gate" is the gate in docs/releasing.md: two staged installs
+# (which run a short tour), the V02 soak, the jobs soak and its 8-hour final,
+# and the power-cut lanes. Its soak workloads are in
+# scripts/release/sustained/soak-workloads.toml. A feature the gate doesn't
+# touch can't be Ready, however well its unit tests cover it.
+#
+# After each release, update the statuses, `since` versions and `release`
+# below (docs/releasing.md, step 10).
+
+release = "0.2.7"
+released = "7 November 2026"
+reviewed = "7 November 2026"
+
+# GitHub milestone numbers, for the links on planned rows.
+[milestones]
+"0.2.8" = 30
+"0.3.0" = 6
+"0.4.0" = 7
+"0.4.1" = 13
+"0.4.2" = 18
+"0.4.3" = 20
+"0.4.4" = 21
+"0.4.5" = 22
+"0.5.0" = 14
+"0.6.0" = 23
+"0.7.0" = 24
+"0.7.1" = 25
+"0.8.0" = 26
+"Later" = 9
+
+# --- Getting a cluster -------------------------------------------------------
+
+[[group]]
+id = "cluster"
+title = "Getting a cluster"
+
+[[group.feature]]
+name = "Laptop cluster"
+status = "ready"
+since = "0.1.0"
+summary = "One command installs `relish` and builds a three-node cluster of Linux VMs on your laptop, running real containers."
+restrictions = "Needs a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB of free memory and 15 GiB of disk. For development and home labs, not production."
+issues = [1495]
+docs = ["docs/manual/00_getting-started.md#a-cluster-on-your-laptop", "docs/quickstart.md"]
+evidence = "Every gate run installs this way: two staged installs passed on 0.2.7 (qualification/2026-11-07-v0.2.7-staged-install-apple-silicon.md), and every soak runs on a quickstart cluster. #1495 (Lima QEMU abort with user-v2 networking) is open with no milestone."
+
+[[group.feature]]
+name = "Cluster on Linux machines over SSH"
+status = "beta"
+since = "0.2.6"
+summary = "`relish setup --ssh` checks every machine first, then builds an mTLS cluster on Linux machines you already have."
+restrictions = "Ubuntu or Debian, with passwordless sudo. There's no command to remove the cluster yet, and `relish local` doesn't manage it."
+issues = []
+docs = ["docs/manual/00_getting-started.md#a-cluster-on-your-laptop"]
+evidence = "Shipped in 0.2.6 (#1529). scripts/release/qualify-ssh-setup.sh exercises it on Lima VMs (docs/testing.md), but it isn't part of the release gate and there's no qualification record yet. Manual says there's no removal command."
+
+[[group.feature]]
+name = "Cluster built by hand on Linux"
+status = "beta"
+since = "0.1.0"
+summary = "`relish init`, join tokens and `relish join` build a cluster on Linux servers or VMs, step by step, with systemd units."
+restrictions = "Rootful runc with eBPF. Cold installs on Linux x86_64 and arm64 hosts haven't been qualified yet."
+issues = [288]
+docs = ["docs/linux-servers.md", "docs/manual/02_cluster-basics.md#add-nodes"]
+evidence = "Documented in docs/linux-servers.md. The gate's clusters are built by `relish setup --quickstart`, not by hand. V04 (cold installs on Linux x86_64 and arm64) is still open (#288, roadmap Known gaps)."
+
+[[group.feature]]
+name = "Agent-guided setup"
+status = "alpha"
+since = "0.2.7"
+summary = "Paste one line into a coding agent and it follows a playbook: asks where the cluster should run, then installs and builds it."
+restrictions = "The agent does the typing and you make the decisions. On a cloud, it checks prices and asks before creating anything that costs money."
+issues = []
+docs = ["docs/manual/16_working-with-an-ai-agent.md#setting-up-a-cluster-for-your-human"]
+evidence = "New in 0.2.7 (homepage install section, agents page). No qualification record runs the playbook end to end; the 0.2.7 exit test (qualification/2026-11-06-v0.2.7-exit-test.md) covers diagnosis, not setup."
+needs_maintainer = "Alpha because no recorded run of the playbook exists, on a laptop or a cloud. Beta if you've run it yourself and want to say so."
+
+[[group.feature]]
+name = "Council: Raft and gossip in the agent"
+status = "ready"
+since = "0.1.0"
+summary = "Nodes find each other with SWIM gossip, and a Raft council of at most seven voters inside `bun` holds the cluster's state; spare nodes join as learners."
+restrictions = "High availability starts at three nodes. A disk-pressured voter isn't replaced on a full seven-voter council, and one slow disk write can stall a node's agent loop for just over a second."
+issues = [1523, 1524, 1707]
+docs = ["docs/manual/02_cluster-basics.md", "docs/design/gossip-mustard.md"]
+evidence = "Every gate run kills the leader and followers, cuts power, loses quorum and checks the council history is linearizable (V02 fast tier and jobs final, 0.2.7). 0.2.7 shipped with #1707 (one 1,215 ms turn, release closure). #1523 and #1524 are in 0.3.0. Learners since 0.2.5 (#1494)."
+
+[[group.feature]]
+name = "Clusters of hundreds of nodes"
+status = "alpha"
+since = "0.1.0"
+summary = "Nothing stops you adding more nodes, but every release is soaked on three, and measurements at 500 and 1,000 simulated nodes found limits."
+restrictions = "The leader refuses report connections from 500 nodes up, its API slows sharply between 500 and 1,000, and gossip at 1,000 doesn't settle within six minutes."
+issues = [1411, 1412, 1413]
+docs = ["docs/qualification/2026-10-28-hollow-nodes.md"]
+evidence = "Hollow-node record of 28 October 2026 (measurements, not a gate) and #1411-#1413 in Later. Every soak is three nodes (docs/website/index.html, 'What the soaks don't prove')."
+
+[[group.feature]]
+name = "Contributor clusters from a checkout"
+status = "beta"
+since = "0.1.0"
+summary = "`relish dev create` builds `bun` and `relish` from your source tree in a Lima VM and starts a cluster from them."
+restrictions = "For working on Reliaburger itself; everyone else wants the laptop cluster."
+issues = []
+docs = ["docs/manual/02_cluster-basics.md#contributors-clusters-from-a-checkout"]
+evidence = "Documented in the manual; used by contributors and agents, not by the release gate."
+
+[[group.feature]]
+name = "Homebrew install"
+status = "planned"
+milestone = "0.2.8"
+summary = "`brew install reliaburger/tap/relish` installs the CLI."
+restrictions = "The 0.2.7 release published a tap, but no user documentation offers it yet. The site offers it from 0.2.8, with bottles so older Command Line Tools work."
+issues = [1712]
+docs = ["docs/releasing.md#the-homebrew-tap"]
+evidence = "docs/releasing.md 'The Homebrew tap'; #1583 closed in 0.2.7; the homepage install box gains Homebrew on the 0.2.8 train (#1714, #1713); #1712 open in 0.2.8."
+needs_maintainer = "Planned or Beta? The tap exists from 0.2.7, but only releasing.md mentions it and #1712 says it fails on older Command Line Tools."
+
+[[group.feature]]
+name = "Bare metal in an hour"
+status = "planned"
+milestone = "0.3.0"
+summary = "An appliance OS, `relish netboot` and claiming machines over the LAN, with weekly signed OS builds and A/B updates."
+restrictions = "Built on the 0.3.0 merge train, not in any release yet. Exit test: three Dell Wyse 3040s from power-on to a cluster."
+issues = [401, 402, 403, 404, 405, 406, 407]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "Roadmap 0.3.0 entry; the release-1-3-0 branch (the 0.3.0 train) carries netboot, claiming, OS updates and the Ubuntu 26.04 guest."
+
+[[group.feature]]
+name = "Several clusters as one (Franchise)"
+status = "planned"
+milestone = "Later"
+summary = "Peered clusters with WAN gossip and cross-cluster ingress."
+restrictions = "A design in the whitepaper; nothing of it runs today."
+issues = [711]
+docs = ["docs/whitepaper.md"]
+evidence = "Whitepaper section 22 says it isn't implemented; #711 in Later."
+
+# --- Running apps ------------------------------------------------------------
+
+[[group]]
+id = "apps"
+title = "Running apps"
+
+[[group.feature]]
+name = "Apps, replicas and health checks"
+status = "ready"
+since = "0.1.0"
+summary = "An `[app.*]` block gives an image, replicas, resources, environment, config files and HTTP, TCP or exec health checks."
+restrictions = "GPU requests above zero are refused until GPU support lands."
+issues = []
+docs = ["docs/manual/01_deploy-an-app.md", "docs/manual/01_deploy-an-app.md#health-checks"]
+evidence = "The gate's soak runs six apps with health checks (scripts/release/sustained/soak-workloads.toml); the staged install applies the burger demo. GPU refusal: manual 01 'What a field can't do'."
+
+[[group.feature]]
+name = "Rolling deploys with automatic rollback"
+status = "ready"
+since = "0.1.0"
+summary = "A new version starts beside the old, must pass its health check, and rolls back on its own if it doesn't; a cluster rolls out one node at a time."
+restrictions = "Rolling update latency is recorded by the soak, not yet gated."
+issues = []
+docs = ["docs/manual/01_deploy-an-app.md#rolling-deploys"]
+evidence = "Gate: deploy-kill faults and the rolling update SLO in every V02 run (record only, #1405). Node-by-node rollouts since 0.2.1 (#692)."
+
+[[group.feature]]
+name = "Blue-green deploys"
+status = "beta"
+since = "0.1.0"
+summary = "`strategy = \"blue-green\"` starts a full new set beside the old and switches traffic once it's healthy."
+restrictions = "Not exercised by the release gate."
+issues = []
+docs = ["docs/manual/01_deploy-an-app.md#rolling-deploys"]
+evidence = "Documented and unit tested; none of the soak workloads uses it (soak-workloads.toml)."
+
+[[group.feature]]
+name = "Autoscaling"
+status = "beta"
+since = "0.1.0"
+summary = "Replicas scale between a minimum and a maximum on CPU or memory."
+restrictions = "Not exercised by the release gate."
+issues = []
+docs = ["docs/manual/01_deploy-an-app.md#autoscaling"]
+evidence = "Documented and tested; no soak workload autoscales."
+
+[[group.feature]]
+name = "Namespace quotas"
+status = "beta"
+since = "0.1.0"
+summary = "A namespace gets a budget of CPU, memory, apps and replicas, and an app over it waits with a \"blocked by quota\" status."
+restrictions = "Not exercised by the release gate's app soak."
+issues = []
+docs = ["docs/manual/01_deploy-an-app.md#namespace-quotas"]
+evidence = "Documented; blocked-by-quota status since 0.1.3 (#326). Not in the soak workloads."
+
+[[group.feature]]
+name = "Init containers"
+status = "beta"
+since = "0.1.0"
+summary = "Commands, or their own images, that run to completion before an app starts."
+restrictions = "Not exercised by the release gate."
+issues = []
+docs = ["docs/manual/01_deploy-an-app.md#init-containers"]
+evidence = "Init images, env and volumes honoured since 0.2.1 (#701). Not in the soak workloads."
+
+[[group.feature]]
+name = "Sidecars"
+status = "beta"
+since = "0.2.4"
+summary = "Extra containers that share an app's network, start before it and stop after it."
+restrictions = "Follow-ups are open: adoption, egress allowlists, network during stop, stop settings and visibility. Kubernetes sidecars are dropped on import."
+issues = [1315]
+docs = ["docs/manual/01_deploy-an-app.md#sidecars"]
+evidence = "Shipped in 0.2.4 (roadmap); #1315 has no milestone. Not in the soak workloads."
+
+[[group.feature]]
+name = "Stop signals, grace and pre-stop commands"
+status = "beta"
+since = "0.2.4"
+summary = "Each app picks its stop signal, its grace after the signal and a command to run inside it first."
+restrictions = "Bun's own shutdown, an image's STOPSIGNAL and the retirement deadline don't use them yet."
+issues = [1309]
+docs = ["docs/manual/01_deploy-an-app.md#stopping-gracefully"]
+evidence = "Shipped in 0.2.4 (#1121); #1309 open, no milestone."
+
+[[group.feature]]
+name = "Runtime knobs: capabilities, sysctls and devices"
+status = "alpha"
+since = "0.2.4"
+summary = "An app can ask for an added capability, a namespaced sysctl or a host device, where the node allows it and the token carries `host-exec`."
+restrictions = "No test runs it against a real container yet, and a restart doesn't re-check the node's allowlist."
+issues = [1316]
+docs = ["docs/manual/10_security.md#runtime-knobs"]
+evidence = "#1316 (no milestone): 'a real-container test, restart re-check and fuller refusals'. Shipped in 0.2.4 (#1122)."
+needs_maintainer = "Alpha because #1316 says there's no real-container test. Beta if the privileged Linux suite covers it after all."
+
+[[group.feature]]
+name = "Kubernetes YAML import"
+status = "ready"
+since = "0.1.0"
+summary = "`relish apply -f` and `relish import` convert Deployments, StatefulSets, DaemonSets, Services, Ingresses, Jobs, CronJobs, HPAs and Namespaces, and report what they approximated or dropped."
+restrictions = "Other kinds are reported, not applied. Secrets, and ConfigMaps a workload doesn't read with `envFrom`, only get a warning."
+issues = []
+docs = ["docs/manual/09_kubernetes.md#what-converts", "docs/manual/09_kubernetes.md#what-doesnt"]
+evidence = "The staged install applies examples/kubernetes/podinfo.yaml (2026-11-07 staged install record, Tour). Selector correlation and --strict since 0.2.2 (#703). Further translations are F11 (#368, Later), not a defect."
+
+[[group.feature]]
+name = "Run a command in an instance"
+status = "beta"
+since = "0.1.0"
+summary = "`relish exec` runs one command inside a running instance and exits with its exit code."
+restrictions = "Not interactive: no stdin and no terminal. Interactive exec is planned for 0.4.0."
+issues = [710]
+docs = ["docs/manual/01_deploy-an-app.md#the-everyday-loop"]
+evidence = "README command list; #710 in 0.4.0. Not used by the release gate."
+
+[[group.feature]]
+name = "Cordon, drain and moving workloads"
+status = "planned"
+milestone = "0.4.0"
+summary = "Cordon, drain and uncordon, cold moves that carry volumes, and checkpoint moves that keep memory."
+restrictions = "Today a managed-volume app stays with its node."
+issues = [656, 657, 658, 659]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "Roadmap 0.4.0 and 0.4.1; issues in milestone 0.4.0."
+
+[[group.feature]]
+name = "Apps as virtual machines"
+status = "planned"
+milestone = "0.4.3"
+summary = "`runtime = \"vm\"` runs an app as a Linux VM on Cloud Hypervisor, from the same OCI image."
+restrictions = "Needs KVM on the host."
+issues = [1156, 1158]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "Roadmap 0.4.3 to 0.4.5; milestone 0.4.3."
+
+# --- Batch jobs --------------------------------------------------------------
+
+[[group]]
+id = "jobs"
+title = "Batch jobs"
+
+[[group.feature]]
+name = "Jobs on one durable lifecycle"
+status = "ready"
+since = "0.1.0"
+summary = "One-off jobs, cron occurrences, deploy hooks and task arrays share one lifecycle, with resource admission beside apps and outcomes that survive a leader change."
+restrictions = "An outcome the cluster can't confirm stays unknown and is never replayed on its own unless the job sets `replay_unknown`; you acknowledge it with `relish batch replay`."
+issues = []
+docs = ["docs/manual/14_batch-jobs.md#one-lifecycle-several-triggers"]
+evidence = "Jobs since 0.1.0; the common lifecycle since 0.2.0. Gate: the jobs fast and 8-hour final tiers (9,439 accepted a second on 0.2.7, a job that runs twice or goes missing fails the release)."
+
+[[group.feature]]
+name = "Task arrays"
+status = "ready"
+since = "0.2.0"
+summary = "The same command run thousands or millions of times, stored as a template and a count rather than a record per task."
+restrictions = "Over a 24-hour run at 20,000 jobs a second, Bun's memory kept growing and one node's job storage filled its disk."
+issues = [1417, 1418]
+docs = ["docs/manual/14_batch-jobs.md#submit-compact-work", "docs/manual/01_deploy-an-app.md#task-arrays"]
+evidence = "0.2.7 jobs final: median 1,048,576-task array in 140 s. #1417 (0.2.8) and #1418 (0.3.0) are from the 0.2.3 day run and still open."
+needs_maintainer = "Ready, though #1417 and #1418 only show up in a day-long run at 20,000 a second. Downgrade to Beta if you count them as serious."
+
+[[group.feature]]
+name = "Cron"
+status = "beta"
+since = "0.1.0"
+summary = "Schedules in the Kubernetes CronJob dialect, in UTC, with the leader claiming each minute durably."
+restrictions = "Missed minutes are skipped: no catch-up, and no exactly-once promise. A catalogue test that waits for a cron firing is flaky."
+issues = [1527]
+docs = ["docs/README.md#jobs-and-cron"]
+evidence = "README 'Limits in 0.2.7' and docs/README 'Jobs and cron'. #1527 (flake waiting for a cron firing) in 0.2.8. The soak's job campaign isn't cron-driven."
+
+[[group.feature]]
+name = "Fresh-container and shared-container jobs"
+status = "ready"
+since = "0.2.0"
+summary = "A job runs each attempt in a fresh container, or each command as its own process with its own limits in a reused container."
+restrictions = "Needs rootful runc on Linux."
+issues = []
+docs = ["docs/manual/14_batch-jobs.md#reusable-containers"]
+evidence = "Every gate run's job campaign uses runc and shared-runc executors (V02 fast tier, 0.2.7: 16,133 and 491,487 accepted successes)."
+
+[[group.feature]]
+name = "Host jobs"
+status = "beta"
+since = "0.2.0"
+summary = "Allowlisted host commands, for speed when you don't need a container boundary."
+restrictions = "No isolation. Each binary must be allowlisted, explicit runc mode refuses them, and task arrays need `mount_isolation = false` until they can run under process mount isolation."
+issues = [714]
+docs = ["docs/manual/14_batch-jobs.md#execution-and-capacity-limits"]
+evidence = "The gate runs process jobs (504,800 in the 0.2.7 V02 fast tier), with mount_isolation=false. TODO(#714) in src/bun/task_array_node.rs; `relish test` refuses host workloads until #714."
+
+[[group.feature]]
+name = "Resident model workers"
+status = "planned"
+milestone = "Later"
+summary = "Workers that keep an interpreter or a model loaded between tasks."
+restrictions = "Today each task starts a process."
+issues = [641]
+docs = ["docs/manual/14_batch-jobs.md#reusable-containers"]
+evidence = "#641 in Later; manual 14 says resident inference workers are a separate feature."
+
+[[group.feature]]
+name = "GPUs"
+status = "planned"
+milestone = "0.6.0"
+summary = "Per-device GPU placement for apps and jobs, CDI injection, GPU health and `relish gpus`."
+restrictions = "Today a GPU request above zero is refused."
+issues = [359, 1204, 1205]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "Roadmap 0.6.0; milestone 0.6.0."
+
+[[group.feature]]
+name = "Serving LLMs"
+status = "planned"
+milestone = "0.7.0"
+summary = "From a model name to an OpenAI-compatible endpoint, with weights in Pickle and inference-aware routing."
+restrictions = ""
+issues = [1221, 1216]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "Roadmap 0.7.0; milestone 0.7.0."
+
+[[group.feature]]
+name = "Multi-node groups"
+status = "planned"
+milestone = "0.8.0"
+summary = "Multi-node work placed all-or-nothing, with ranks, roles, hot spares and checkpoint-aware restarts."
+restrictions = ""
+issues = [1223]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "Roadmap 0.8.0; milestone 0.8.0."
+
+[[group.feature]]
+name = "Job dependencies, queues and fair share"
+status = "planned"
+milestone = "Later"
+summary = "Jobs that wait for jobs (0.9.0 on the roadmap), and weighted fair-share queues with preemption (0.10.0)."
+restrictions = "Neither has a milestone yet: the maintainer revisits both after 0.8.0 ships. Arbitrary task dependency graphs aren't supported today."
+issues = [1238]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "Roadmap 0.9.0 and 0.10.0 ('no milestone yet'); #1238 in Later."
+
+# --- Networking and service discovery ----------------------------------------
+
+[[group]]
+id = "networking"
+title = "Networking and service discovery"
+
+[[group.feature]]
+name = "Virtual IPs and eBPF service routing"
+status = "ready"
+since = "0.1.0"
+summary = "Every app gets a stable virtual IP, and an eBPF hook on `connect()` sends each connection straight to a healthy backend."
+restrictions = "Needs rootful runc on Linux with eBPF. The full live catalogue hasn't been run on three independent runc nodes, only on the quickstart's VMs."
+issues = [286]
+docs = ["docs/manual/03_networking.md#service-discovery", "docs/design/discovery-onion.md"]
+evidence = "Gate: the V02 catalogue pulse and partition faults on runc nodes; the staged install runs `relish path`. V01 (#286, Later) is the open acceptance gate."
+
+[[group.feature]]
+name = "Internal DNS"
+status = "ready"
+since = "0.1.0"
+summary = "With DNS enabled, every app answers at a `.internal` name."
+restrictions = "Rootful runc only."
+issues = []
+docs = ["docs/README.md#internal-dns-on-rootful-runc", "docs/manual/03_networking.md#service-discovery"]
+evidence = "Gate: chaos-dns faults settle in every V02 run (0.2.7 fast tier)."
+
+[[group.feature]]
+name = "Namespace isolation and `allow_from`"
+status = "beta"
+since = "0.2.0"
+summary = "Namespaces can't reach each other, at a virtual IP or a real address, unless an app's or job's `allow_from` lets a named caller in."
+restrictions = "Not exercised by the release gate's soak."
+issues = []
+docs = ["docs/manual/03_networking.md#who-may-connect"]
+evidence = "0.2.0 audit fixes (roadmap). Tested in the privileged Linux eBPF suite (make test-linux); the soak workloads don't use allow_from."
+
+[[group.feature]]
+name = "Egress allowlists"
+status = "beta"
+since = "0.2.0"
+summary = "Apps and jobs can be held to the hosts and networks they list."
+restrictions = "Not exercised by the release gate's soak. Sidecars don't get them yet."
+issues = [1315]
+docs = ["docs/manual/03_networking.md#who-may-connect"]
+evidence = "0.2.0 (roadmap); tests/ebpf.rs covers the CIDR trie; sidecar egress is in #1315."
+
+# --- Ingress and TLS ---------------------------------------------------------
+
+[[group]]
+id = "ingress"
+title = "Ingress and TLS"
+
+[[group.feature]]
+name = "Host-based HTTP and HTTPS routing"
+status = "ready"
+since = "0.1.0"
+summary = "The built-in ingress routes by host name to an app's instances, and drains connections before an instance stops."
+restrictions = ""
+issues = []
+docs = ["docs/manual/03_networking.md#ingress", "docs/design/ingress-wrapper.md"]
+evidence = "Every staged install checks the demo app through the ingress (2026-11-07 records); the soak's apps serve through it."
+
+[[group.feature]]
+name = "TLS from the cluster CA or your own files"
+status = "ready"
+since = "0.1.0"
+summary = "Ingress certificates come from the cluster's own ingress CA or from files you provide, and reload when the files change."
+restrictions = "No ACME (Let's Encrypt) certificates."
+issues = []
+docs = ["docs/manual/03_networking.md#ingress"]
+evidence = "Gate: 33 operator ingress reloads, torn and expired certificates refused (0.2.7 V02 fast tier, Renewals and rotations)."
+
+[[group.feature]]
+name = "WebSockets and streaming"
+status = "beta"
+since = "0.1.0"
+summary = "WebSocket and streaming responses pass through the ingress."
+restrictions = "A drained WebSocket isn't closed with code 1001 yet, and its proxy headers don't match plain HTTP's."
+issues = [369]
+docs = ["docs/manual/03_networking.md#ingress"]
+evidence = "F08 #369 in 0.3.0; the fix (b0de7b66) is on the 0.3.0 train."
+
+[[group.feature]]
+name = "ACME certificates"
+status = "planned"
+milestone = "0.4.0"
+summary = "Certificates obtained and renewed automatically for ingress hosts."
+restrictions = ""
+issues = [1667]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "#1667 is in milestone 0.4.0; README 'Limits in 0.2.7'."
+needs_maintainer = "The roadmap's 0.3.0 entry and the whitepaper still promise ACME under F08 (#369), but #1667 sits in 0.4.0. Which is it?"
+
+# --- Security and identity ---------------------------------------------------
+
+[[group]]
+id = "security"
+title = "Security and identity"
+
+[[group.feature]]
+name = "mTLS between nodes"
+status = "ready"
+since = "0.1.0"
+summary = "A generated cluster requires mutual TLS between nodes, and node certificates renew themselves."
+restrictions = ""
+issues = []
+docs = ["docs/manual/10_security.md#between-nodes"]
+evidence = "Gate: node leaf renewals on every node, with a one-hour leaf lifetime (0.2.7 V02 fast tier, Renewals and rotations)."
+
+[[group.feature]]
+name = "Join tokens and node enrolment"
+status = "ready"
+since = "0.1.0"
+summary = "Nodes join with single-use, short-lived tokens and certificate signing requests."
+restrictions = ""
+issues = []
+docs = ["docs/manual/02_cluster-basics.md#add-nodes"]
+evidence = "Every staged install enrols two nodes this way (2026-11-07 record, 'enrol node 2/3')."
+
+[[group.feature]]
+name = "API tokens with roles and scopes"
+status = "ready"
+since = "0.1.0"
+summary = "Tokens carry a role and namespace scopes, expire after 90 days by default, and rotate with a grace period."
+restrictions = "A plaintext cluster with no master key stops taking its nodes' calls once the first API token exists."
+issues = [1248]
+docs = ["docs/manual/10_security.md#api-tokens"]
+evidence = "Rotation and lifetimes since 0.1.6. The gate's harness runs with its own tokens (verifier run token). #1248 (Later) affects plaintext clusters only."
+
+[[group.feature]]
+name = "Workload identity"
+status = "ready"
+since = "0.1.0"
+summary = "Every workload gets a SPIFFE certificate that rotates on its own."
+restrictions = ""
+issues = []
+docs = ["docs/manual/10_security.md#workload-identity"]
+evidence = "Gate: 9 workload identity rotations per node in the 0.2.7 V02 fast tier (soak-identity app)."
+
+[[group.feature]]
+name = "Audit log"
+status = "ready"
+since = "0.2.0"
+summary = "Each node keeps a durable, bounded log of who applied, deleted, exec'd, upgraded or broke what, and `relish audit` reads it."
+restrictions = "The log is per node: a lost node takes its history with it, and records aren't hash-chained."
+issues = []
+docs = ["docs/manual/10_security.md#audit-log"]
+evidence = "Gate: 24 audited executions in the 0.2.7 V02 fast tier. Whitepaper (security section, Status) says central retention and tamper evidence are planned, not implemented."
+needs_maintainer = "Central retention and tamper evidence have no issue. File one, or keep them as restrictions only?"
+
+[[group.feature]]
+name = "Root CA backup and intermediate rotation"
+status = "beta"
+since = "0.1.6"
+summary = "`relish ca backup` writes the root CA to a sealed file you keep, and `relish ca rotate` rotates an intermediate CA signed with it."
+restrictions = "Rotating the root itself isn't supported, and there's no offline root CA yet."
+issues = [362, 709]
+docs = ["docs/manual/10_security.md#backing-up-the-root-ca", "docs/manual/10_security.md#rotating-an-intermediate-ca"]
+evidence = "F04 R1-R4 in 0.1.6; root rotation is F04 (#362, Later), offline root CA #709 (0.3.0). Not exercised by the release gate."
+
+[[group.feature]]
+name = "Tags bound to digests"
+status = "ready"
+since = "0.1.6"
+summary = "Every apply binds image tags to digests, so a moved tag can't change what runs."
+restrictions = ""
+issues = []
+docs = ["docs/manual/11_images-and-volumes.md#tags-bind-to-digests-at-apply"]
+evidence = "Every staged install applies the burger demo by tag (`burger:v1`), which apply binds to a digest. The soak's own images are already pinned by digest (policy soak-pinned-images), so they don't exercise the binding."
+
+[[group.feature]]
+name = "Signed images and upstream trust"
+status = "beta"
+since = "0.1.0"
+summary = "The registry can refuse unsigned images, node config can limit which upstream registries images come from, and cosign signatures on upstream images are checked before deploy."
+restrictions = "Key-based cosign only: no keyless (Fulcio and Rekor) signatures or Sigstore bundles."
+issues = [361, 619]
+docs = ["docs/manual/10_security.md#signed-images", "docs/manual/10_security.md#cosign-signatures"]
+evidence = "Upstream trust and cosign since 0.1.6 (F03a). The gate builds and signs the burger image in the staged install. TODO(#361) in src/meat/scheduler.rs; #619 in Later."
+
+[[group.feature]]
+name = "Agent tokens labelled in audit"
+status = "planned"
+milestone = "0.4.2"
+summary = "Tokens for AI agents that are read-only by default, short-lived and labelled as agents in the audit log."
+restrictions = "Today you make a read-only token yourself with `relish token create --role read-only`."
+issues = [1082]
+docs = ["docs/manual/16_working-with-an-ai-agent.md#a-read-only-token"]
+evidence = "#1082 in 0.4.2."
+
+# --- Secrets -----------------------------------------------------------------
+
+[[group]]
+id = "secrets"
+title = "Secrets"
+
+[[group.feature]]
+name = "Secrets encrypted to the cluster key"
+status = "beta"
+since = "0.1.0"
+summary = "Secret values live in your config as `ENC[AGE:...]`, encrypted to the cluster's public key."
+restrictions = "Only `env` values take secrets, in apps and jobs. Not exercised by the release gate."
+issues = []
+docs = ["docs/manual/10_security.md#secrets"]
+evidence = "Documented and tested; none of the soak workloads carries a secret (soak-workloads.toml)."
+needs_maintainer = "A core feature, rated Beta only because no gate workload uses a secret. Add one to the soak and it's Ready."
+
+[[group.feature]]
+name = "Secret key rotation and a key per namespace"
+status = "beta"
+since = "0.1.6"
+summary = "`relish secret rotate` rotates the secret key, and each namespace can have a key of its own."
+restrictions = "The cluster master key and service token can't be rotated in place yet."
+issues = [1654]
+docs = ["docs/manual/10_security.md#a-key-per-namespace"]
+evidence = "F05 I4 in 0.1.6; #1654 in Later. Not exercised by the release gate."
+
+[[group.feature]]
+name = "Secrets from an exec provider"
+status = "beta"
+since = "0.2.4"
+summary = "A node runs a command you configure to fetch a secret at deploy time, so values can come from your own secret store."
+restrictions = "Jobs can't use providers yet, and a brief provider outage on restart isn't retried."
+issues = [1307, 1308]
+docs = ["docs/manual/10_security.md#secrets-from-a-provider"]
+evidence = "0.2.4 (roadmap); #1307 and #1308 open, no milestone."
+
+# --- Storage and volumes -----------------------------------------------------
+
+[[group]]
+id = "storage"
+title = "Storage and volumes"
+
+[[group.feature]]
+name = "Managed volumes"
+status = "ready"
+since = "0.1.0"
+summary = "A volume Bun creates and owns on the node, which survives restarts and redeploys, with an optional hard size limit."
+restrictions = "Node-local, not network storage: the app stays with its node. The size can't change once the volume exists, and rootless or macOS nodes refuse a sized volume."
+issues = []
+docs = ["docs/manual/11_images-and-volumes.md#volumes"]
+evidence = "Gate: the soak's writer and Redis keep data on managed volumes, and a lost write fails the release (0.2.7 V02 fast tier, Data); the storage power-cut lane runs 25 times."
+
+[[group.feature]]
+name = "Host-path volumes"
+status = "beta"
+since = "0.1.0"
+summary = "A volume can mount a host directory that the node's `allowed_host_paths` covers."
+restrictions = "Refused by default. Anyone who can write under a listed prefix can still swap a directory for a symlink between the check and the mount."
+issues = []
+docs = ["docs/manual/11_images-and-volumes.md#host-paths"]
+evidence = "Allowlist since 0.2.0 (#675 to #691). Manual describes the remaining race. Not in the soak workloads."
+
+[[group.feature]]
+name = "Snapshots and scheduled backups"
+status = "beta"
+since = "0.1.0"
+summary = "Instant copy-on-write snapshots of managed volumes, on a schedule, uploaded off the node."
+restrictions = "Btrfs only; other filesystems refuse snapshot commands. Test volumes have no snapshots. The uploader hasn't been qualified under power cuts."
+issues = [287]
+docs = ["docs/manual/11_images-and-volumes.md#snapshots"]
+evidence = "The soak schedules snapshots and uploads them to a directory (V02 fast tier, Configuration deviations). V02 leftovers (#287, Later): the snapshot uploader under power cuts."
+
+[[group.feature]]
+name = "Moving volumes between nodes"
+status = "planned"
+milestone = "0.4.0"
+summary = "Cold moves that carry an app's volumes to another node."
+restrictions = "Today an app with a managed volume moves only when its node is decommissioned, and then starts on an empty volume."
+issues = [657]
+docs = ["docs/manual/11_images-and-volumes.md#volumes"]
+evidence = "#657 in 0.4.0; managed-volume retirement is F10 (#367, 0.4.3)."
+
+# --- Registry and images -----------------------------------------------------
+
+[[group]]
+id = "images"
+title = "Registry and images"
+
+[[group.feature]]
+name = "Pickle, a registry on every node"
+status = "ready"
+since = "0.1.0"
+summary = "An OCI registry built into the cluster: push once and nodes pull layers from each other."
+restrictions = "Deleting by digest isn't supported: an image leaves by losing its tags. One Bun per writable image store."
+issues = []
+docs = ["docs/manual/11_images-and-volumes.md#where-images-come-from", "docs/design/registry-pickle.md"]
+evidence = "Gate: 7 images pushed and re-verified in the 0.2.7 V02 fast tier (Data). Manual 'Deleting a tag'; docs/README 'Scope and limits'."
+
+[[group.feature]]
+name = "Building images in the cluster"
+status = "ready"
+since = "0.1.0"
+summary = "`relish build` builds an image with Buildah on a node, straight into Pickle, signed, for one or several platforms."
+restrictions = "Builds run on a Linux node with Buildah."
+issues = []
+docs = ["docs/manual/11_images-and-volumes.md#building-images", "docs/manual/11_images-and-volumes.md#multi-platform-images"]
+evidence = "Every staged install runs `relish build` on the burger demo (22 s on 0.2.7). Multi-platform builds since 0.1.2."
+
+[[group.feature]]
+name = "Pull-through cache"
+status = "beta"
+since = "0.1.0"
+summary = "Pickle caches upstream registries, every platform of a multi-platform image."
+restrictions = "Tag references never use a mirror; only digest-pinned images try a mirror first."
+issues = []
+docs = ["docs/README.md#images-the-pull-through-cache-and-cluster-registries-phase-12"]
+evidence = "Multi-platform caching since 0.1.2 (#353). Not checked by name in the gate."
+
+[[group.feature]]
+name = "Docker, Podman, skopeo and crane"
+status = "beta"
+since = "0.1.0"
+summary = "Standard registry clients push to and pull from Pickle."
+restrictions = "Clients need to trust the cluster CA, and the cluster registry needs mTLS."
+issues = []
+docs = ["docs/manual/11_images-and-volumes.md#pushing-with-docker-podman-skopeo-or-crane"]
+evidence = "Covered by the gated `make test-standard-clients` suite, not by the release gate."
+
+# --- Observability -----------------------------------------------------------
+
+[[group]]
+id = "observability"
+title = "Observability: metrics, logs and alerts"
+
+[[group.feature]]
+name = "Metrics"
+status = "ready"
+since = "0.1.0"
+summary = "Each node scrapes its own workloads, including anything with `prometheus.io` annotations, and `relish metrics`, `relish top`, the TUI and the dashboard read them."
+restrictions = "No PromQL: read metrics through `relish metrics`, the dashboards and the API."
+issues = []
+docs = ["docs/manual/04_observability.md#metrics"]
+evidence = "The staged install runs `relish metrics frontend`; the soak exports metrics every 60 s. No PromQL: README 'Limits in 0.2.7'."
+
+[[group.feature]]
+name = "Logs"
+status = "ready"
+since = "0.1.0"
+summary = "Logs are captured on each node, and `relish logs -f` follows an app across the whole cluster."
+restrictions = ""
+issues = []
+docs = ["docs/manual/04_observability.md#logs"]
+evidence = "The soak reads its writer's and Redis's progress through the log view, and a spammer app writes logs throughout (0.2.7 V02 fast tier, Data). Cross-node streams since 0.1.3 and 0.1.4."
+
+[[group.feature]]
+name = "Parquet export and SQL search"
+status = "beta"
+since = "0.1.0"
+summary = "Logs and metrics export as Parquet to disk or object storage, and `relish logs-search` queries them with SQL."
+restrictions = "The gate exports to a local directory only; object storage is tested in CI against a local S3 server."
+issues = []
+docs = ["docs/manual/04_observability.md#remote-metrics-archives", "docs/manual/04_observability.md#logs"]
+evidence = "Gate: offline export runs 3 times in the 0.2.7 V02 fast tier, to file://. `make test-s3` in CI since 0.2.6 (#1534)."
+
+[[group.feature]]
+name = "Alerts and webhooks"
+status = "beta"
+since = "0.1.0"
+summary = "Five built-in rules on CPU, memory and disk, plus a critical alert for every failed job run, delivered to webhooks, optionally HMAC-signed."
+restrictions = "You can't define your own alert rules yet."
+issues = []
+docs = ["docs/manual/04_observability.md#alerts"]
+evidence = "Manual 04 'Alerts': 'You can't define your own rules yet.' Job failure alerts since 0.2.0. The README's 'Alert rules evaluate in the agent' and the 'Prometheus, Alertmanager' row of 'What you don't install' read as if you could."
+needs_maintainer = "No issue tracks user-defined alert rules. File one so this row can link it, and soften the README's Alertmanager comparison?"
+
+[[group.feature]]
+name = "Events"
+status = "beta"
+since = "0.1.0"
+summary = "`relish events` merges every node's recent events by time: deploys, restarts, health, jobs, faults and changes of trust."
+restrictions = "Kept in memory per node, the newest 1,024; the durable record is the audit log."
+issues = []
+docs = ["docs/manual/04_observability.md#events-and-dashboards"]
+evidence = "Cluster-wide events since 0.1.4, `relish events` since 0.2.2. Not checked by the release gate."
+
+[[group.feature]]
+name = "PromQL and remote read"
+status = "planned"
+milestone = "Later"
+summary = "A PromQL query layer, remote read and further rollup tiers."
+restrictions = ""
+issues = [364]
+docs = ["docs/roadmap.md#known-gaps"]
+evidence = "F06 #364 in Later."
+
+[[group.feature]]
+name = "OpenTelemetry export"
+status = "planned"
+milestone = "0.4.2"
+summary = "Metrics, logs and agent actions exported over OpenTelemetry."
+restrictions = ""
+issues = [1091]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "#1091 in 0.4.2."
+
+# --- GitOps ------------------------------------------------------------------
+
+[[group]]
+id = "gitops"
+title = "GitOps"
+
+[[group.feature]]
+name = "Sync from a Git repository"
+status = "beta"
+since = "0.1.0"
+summary = "The leader keeps the cluster in step with a repository, deletions included, and can verify commit signatures."
+restrictions = "Not exercised by the release gate. Policy writes that come through GitOps aren't audited yet."
+issues = [1312]
+docs = ["docs/manual/12_operations.md#gitops", "docs/design/gitops-lettuce.md"]
+evidence = "GitOps config in Raft and per-resource apply since 0.2.1 (#693); `relish gitops` since then. scripts/demo/gitops.sh demonstrates it; no soak uses it. #1312 has no milestone."
+
+# --- Upgrades ----------------------------------------------------------------
+
+[[group]]
+id = "upgrades"
+title = "Upgrades"
+
+[[group.feature]]
+name = "Rolling self-upgrade"
+status = "ready"
+since = "0.1.0"
+summary = "`relish upgrade start` rolls a new signed `bun` across the cluster, adopting running workloads, and a crash-looping upgrade reverts itself."
+restrictions = "Network upgrades need the release's signature and your own. Works only between builds with the same cluster formats."
+issues = []
+docs = ["docs/manual/12_operations.md#upgrading-bun"]
+evidence = "Gate: every V02 and jobs run walks every node to a signed soak build and back (three walks in the 0.2.7 V02 fast tier, four in the final), with an external signing key."
+
+[[group.feature]]
+name = "Upgrading a cluster to the next release in place"
+status = "beta"
+since = "0.2.3"
+summary = "A release that keeps the previous one's cluster formats can roll onto a running cluster; 0.2.6 to 0.2.7 is one such step."
+restrictions = "Before 1.0.0, most releases change the formats, and then you start a fresh cluster: there are no migrations."
+issues = []
+docs = ["docs/releasing.md#upgrading-from-026", "docs/releasing.md#compatibility-before-100"]
+evidence = "One recorded cross-release walk: 0.2.2 to 0.2.3 (qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md). The gate walks to a soak build of the same release, not from the previous release."
+
+[[group.feature]]
+name = "OS updates"
+status = "planned"
+milestone = "0.3.0"
+summary = "Signed A/B updates of the appliance OS, rolled across the cluster by `bun`."
+restrictions = ""
+issues = [406]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "#406 in 0.3.0; built on the 0.3.0 train."
+
+# --- Self-healing ------------------------------------------------------------
+
+[[group]]
+id = "healing"
+title = "Self-healing"
+
+[[group.feature]]
+name = "Restarting failed instances"
+status = "ready"
+since = "0.1.0"
+summary = "A killed or unhealthy instance is restarted by its node, under a new instance number."
+restrictions = ""
+issues = []
+docs = ["docs/manual/01_deploy-an-app.md#health-checks"]
+evidence = "Gate: chaos-kill faults settle in every run (0.2.7 V02 fast tier)."
+
+[[group.feature]]
+name = "Rescheduling after a node is lost"
+status = "ready"
+since = "0.1.0"
+summary = "When a node dies, its replicas start on the survivors, and healthy ones stay where they are."
+restrictions = "An app with a managed volume waits for its node instead."
+issues = []
+docs = ["docs/manual/01_deploy-an-app.md#when-a-node-stops-reporting"]
+evidence = "Gate: power-off faults (a VM forced off for 60 to 180 s) settle in every run. Spread over survivors since 0.1.2 (#346)."
+
+[[group.feature]]
+name = "Leader failover and agent restarts"
+status = "ready"
+since = "0.1.0"
+summary = "A new leader takes over within seconds, and a restarted `bun` adopts its running workloads instead of replacing them."
+restrictions = "A replaced voter coming back can force an unneeded election."
+issues = [1524]
+docs = ["docs/manual/02_cluster-basics.md#watch-it"]
+evidence = "Gate: SIGKILL of the leader and of followers, six times each in the 0.2.7 V02 fast tier; no leader for over 30 s fails the release. Replicas kept on restart since 0.2.4 (#1449)."
+
+[[group.feature]]
+name = "Recovering a lost council"
+status = "beta"
+since = "0.1.0"
+summary = "`relish council recover` rebuilds the council from a stopped voter's data or a sealed backup, and fences the old voters if they return."
+restrictions = "Writes after the last backup are lost. The gate loses quorum and turns every node off, but never runs `council recover`."
+issues = []
+docs = ["docs/manual/12_operations.md#backing-up-the-council"]
+evidence = "Hardened in 0.1.3 and 0.1.5 (roadmap). Gate specials are quorum-loss, all-off and graceful-stop (V02 fast tier), not recovery."
+
+[[group.feature]]
+name = "Retiring a dead node"
+status = "beta"
+since = "0.1.0"
+summary = "`relish decommission-node` writes off a node that's gone for good, so the catalogue stops waiting for it."
+restrictions = "Don't decommission a node that might still be running, such as one behind a partition."
+issues = []
+docs = ["docs/manual/02_cluster-basics.md#when-a-node-is-gone-for-good"]
+evidence = "Documented; not exercised by the release gate."
+
+# --- Chaos engineering (Smoker) ----------------------------------------------
+
+[[group]]
+id = "chaos"
+title = "Chaos engineering"
+
+[[group.feature]]
+name = "Network faults: delay, drop, partition and DNS"
+status = "ready"
+since = "0.1.0"
+summary = "`relish fault` adds latency, fails connections, cuts one app off from another or returns NXDOMAIN, and every fault ends on its own."
+restrictions = "Delay needs runc containers. Every fault needs `--acknowledge`, a Deployer credential and an operator opt-in on each node, and is refused when it would take out every replica or risk the council's quorum."
+issues = []
+docs = ["docs/manual/05_chaos.md#one-shot-faults"]
+evidence = "Gate: chaos-delay, chaos-drop, chaos-partition and chaos-dns all settle (0.2.7 V02 fast tier). #1601 (refused partition fault, 0.2.6) closed in 0.2.7."
+
+[[group.feature]]
+name = "Kill, pause, CPU and memory faults"
+status = "ready"
+since = "0.1.0"
+summary = "Kill or freeze an app's instances, or push its CPU or memory toward the limit."
+restrictions = ""
+issues = []
+docs = ["docs/manual/05_chaos.md#one-shot-faults"]
+evidence = "Gate: chaos-kill, chaos-pause, chaos-cpu and chaos-memory settle (0.2.7 V02 fast tier)."
+
+[[group.feature]]
+name = "Disk I/O, node pressure and node faults"
+status = "beta"
+since = "0.1.0"
+summary = "Throttle an app's disk I/O, consume a node's capacity, or simulate a node leaving gracefully or failing."
+restrictions = "Not exercised by the release gate's fault schedule, which brings its own power cuts and disk faults."
+issues = []
+docs = ["docs/manual/05_chaos.md#one-shot-faults"]
+evidence = "README fault list; the gate's fault classes don't include disk-io, node-pressure, node-drain or node-kill."
+
+[[group.feature]]
+name = "Faults on jobs and task arrays"
+status = "beta"
+since = "0.2.2"
+summary = "Kill or pause a job's running attempts to see how the lifecycle copes."
+restrictions = ""
+issues = []
+docs = ["docs/manual/05_chaos.md#jobs-and-task-arrays"]
+evidence = "0.2.2 (roadmap: 'chaos for jobs and task arrays'). The jobs soak brings its own node faults instead."
+
+[[group.feature]]
+name = "Scripted scenarios"
+status = "ready"
+since = "0.1.0"
+summary = "`relish fault scenario` runs a TOML script of faults, and `relish test --chaos` runs the recovery catalogue."
+restrictions = ""
+issues = []
+docs = ["docs/manual/05_chaos.md#scripted-scenarios", "docs/manual/05_chaos.md#recovery-catalogue"]
+evidence = "Gate: chaos-scenario settles in every V02 run (0.2.7 fast tier)."
+
+[[group.feature]]
+name = "Bandwidth faults"
+status = "planned"
+milestone = "Later"
+summary = "Throttle an app's bandwidth."
+restrictions = "`relish fault bandwidth` exists, and Bun refuses it."
+issues = [366]
+docs = ["docs/manual/05_chaos.md#one-shot-faults"]
+evidence = "README 'Limits in 0.2.7'; F09 #366 in Later."
+
+# --- Agents and AI -----------------------------------------------------------
+
+[[group]]
+id = "agents"
+title = "Agents and AI"
+
+[[group.feature]]
+name = "`relish agent`"
+status = "beta"
+since = "0.2.7"
+summary = "Commands that answer an AI agent in one line of JSON within a byte budget: the cluster's findings, its logs, the manual and the exact source the binary was built from."
+restrictions = "Read-only, with a read-only token. No LLM runs inside `bun`."
+issues = []
+docs = ["docs/manual/16_working-with-an-ai-agent.md#commands", "docs/manual/16_working-with-an-ai-agent.md#the-contract"]
+evidence = "Exit test passed on 6 November 2026: Claude Code with a read-only token diagnosed three Smoker scenarios and found a planted bug (qualification/2026-11-06-v0.2.7-exit-test.md). New in 0.2.7, so its shapes may still change."
+
+[[group.feature]]
+name = "`relish mcp`"
+status = "beta"
+since = "0.2.7"
+summary = "Serves the `relish agent` commands as read-only MCP tools over stdio."
+restrictions = "The tools are read-only, but they run with the context's token, which is usually the admin one."
+issues = [1730]
+docs = ["docs/manual/16_working-with-an-ai-agent.md#through-mcp"]
+evidence = "New in 0.2.7; #1730 (0.2.8) gives MCP clients a read-only token of their own."
+
+[[group.feature]]
+name = "Bug reports an agent drafts"
+status = "beta"
+since = "0.2.7"
+summary = "`relish agent report` drafts a redacted bug report with the reproducer, the patch and what wasn't tested, for you to read and post."
+restrictions = "Read the draft before you post it: redaction isn't idempotent, and a second pass can expose credentials in a URL."
+issues = [1717]
+docs = ["docs/manual/16_working-with-an-ai-agent.md#drafting-a-bug-report"]
+evidence = "#1717 (0.2.8). Nothing is posted on its own (manual 16)."
+
+[[group.feature]]
+name = "Proving a fix on a throwaway cluster"
+status = "alpha"
+since = "0.2.7"
+summary = "`relish agent patch` extracts the source, builds and tests a change, and boots a throwaway cluster from the patched binaries."
+restrictions = "The binaries it builds are unsigned and stay on the throwaway cluster. Producing a correct diff of the workspace is still being worked on."
+issues = [1691, 1726]
+docs = ["docs/manual/16_working-with-an-ai-agent.md#proving-a-fix"]
+evidence = "#1691 (diff) and #1726 (flake in the patch try test) in 0.2.8; `patch apply` lands on the 0.2.8 train (#1703)."
+
+[[group.feature]]
+name = "Wiring up your agent"
+status = "beta"
+since = "0.2.7"
+summary = "`relish agent setup` adds Reliaburger to Claude Code, Codex, Cursor, VS Code, Goose or Gemini on this machine, showing the diff first."
+restrictions = ""
+issues = []
+docs = ["docs/manual/16_working-with-an-ai-agent.md#wiring-up-your-agent"]
+evidence = "New in 0.2.7; not part of the release gate."
+
+[[group.feature]]
+name = "Agent gym"
+status = "alpha"
+since = "0.2.7"
+summary = "Breaks throwaway clusters in known ways and scores whatever diagnoses them, an AI agent included."
+restrictions = "Runs from a checkout with `make test-gym`; a version for your own cluster is planned for 0.2.8."
+issues = [1683]
+docs = ["docs/manual/16_working-with-an-ai-agent.md#measuring-an-agent-on-your-cluster"]
+evidence = "Baseline record qualification/2026-11-06-agent-gym-baseline.md; #1683 in 0.2.8."
+
+[[group.feature]]
+name = "Agent changes as proposals you can undo"
+status = "planned"
+milestone = "0.2.8"
+summary = "An agent's change becomes a reviewable proposal with guardrails and undo, and agents take locks so they don't collide."
+restrictions = "Today agents only read; changes are yours to make."
+issues = [1682, 1686]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "Roadmap 0.2.8; #1682 and #1686 in 0.2.8. Human approval for mutations is also #1085 in 0.4.2."
+
+[[group.feature]]
+name = "Incident timeline and decision provenance"
+status = "planned"
+milestone = "0.2.8"
+summary = "Ask the cluster why it did something, with one merged timeline of an incident."
+restrictions = ""
+issues = [1685]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "#1685 in 0.2.8; #1084 (machine-readable timeline) in 0.4.2."
+
+[[group.feature]]
+name = "Remote MCP endpoint in bun"
+status = "planned"
+milestone = "0.4.2"
+summary = "MCP over streamable HTTP, served by the cluster itself."
+restrictions = ""
+issues = [1092]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "#1092 in 0.4.2."
+
+# --- Extension points --------------------------------------------------------
+
+[[group]]
+id = "extensions"
+title = "Extension points"
+
+[[group.feature]]
+name = "Policies"
+status = "beta"
+since = "0.2.4"
+summary = "CEL rules kept in the council deny, warn about or audit an apply, or fill in fields an app leaves out, for `relish apply` and GitOps alike."
+restrictions = "Apps that arrive in a job manifest aren't fenced by policies yet, and policy audit of jobs is incomplete."
+issues = [1312, 1322]
+docs = ["docs/manual/10_security.md#policies"]
+evidence = "Gate: three soak policies checked in force 118 times (0.2.7 V02 fast tier, Data); 0.2.4 exit test #1126. Beta for the open follow-ups #1312 and #1322 (no milestone)."
+needs_maintainer = "The gate exercises policies, so this is Ready but for #1312 and #1322. Are those serious enough to hold it at Beta?"
+
+[[group.feature]]
+name = "Templates"
+status = "beta"
+since = "0.2.4"
+summary = "A `[template.*]` with typed parameters expands, when the config is read, into ordinary apps and jobs."
+restrictions = "Status doesn't show which template made an app, there's no `relish template` command, and errors don't carry template line numbers."
+issues = [1326]
+docs = ["docs/manual/01_deploy-an-app.md#templates"]
+evidence = "0.2.4 exit test #1126; #1326 open, no milestone. Not in the soak workloads."
+
+[[group.feature]]
+name = "Your own controllers"
+status = "beta"
+since = "0.2.4"
+summary = "A controller is an ordinary app with a namespace-scoped token that reads the API and event stream and claims the apps it manages with an `owner`."
+restrictions = "Before 1.0, any release may change the JSON shapes it reads and writes."
+issues = [1322]
+docs = ["docs/manual/15_writing-a-controller.md", "docs/manual/15_writing-a-controller.md#how-stable-is-this"]
+evidence = "Shapes pinned by snapshot tests (manual 15 'How stable is this?'); 0.2.4 exit test #1126; #1322 follow-ups."
+
+[[group.feature]]
+name = "Wasm extension modules"
+status = "planned"
+milestone = "Later"
+summary = "A spike, only if the 0.2.4 extension points leave a named gap."
+restrictions = ""
+issues = [1127]
+docs = ["docs/book/18-bending-without-forking.md"]
+evidence = "#1127 in Later."
+
+# --- Dashboard, TUI and diagnostics ------------------------------------------
+
+[[group]]
+id = "ui"
+title = "Dashboard, TUI and diagnostics"
+
+[[group.feature]]
+name = "Terminal UI"
+status = "beta"
+since = "0.1.0"
+summary = "`relish` with no arguments opens a terminal dashboard of apps, nodes, jobs, routes, live logs and events, for the whole cluster."
+restrictions = "Needs a terminal of at least 80 by 24."
+issues = []
+docs = ["docs/manual/04_observability.md#events-and-dashboards"]
+evidence = "Snapshot-tested (insta); not exercised by the release gate."
+
+[[group.feature]]
+name = "Web dashboard"
+status = "beta"
+since = "0.1.0"
+summary = "`relish dashboard` opens a read-only web dashboard through your authenticated CLI session."
+restrictions = "Read-only."
+issues = []
+docs = ["docs/manual/04_observability.md#events-and-dashboards", "docs/design/ui-brioche.md"]
+evidence = "Documented and tested; not exercised by the release gate."
+
+[[group.feature]]
+name = "`relish wtf`"
+status = "ready"
+since = "0.1.0"
+summary = "One screen of what's wrong with the cluster, the likely causes and what to do next."
+restrictions = ""
+issues = []
+docs = ["docs/manual/07_diagnostics.md#relish-wtf-whats-broken-and-why"]
+evidence = "Every staged install runs it (2026-11-07 record, Tour)."
+
+[[group.feature]]
+name = "`relish path`"
+status = "ready"
+since = "0.1.0"
+summary = "Walks the network path between two apps, labelling each step observed, inferred or unavailable."
+restrictions = ""
+issues = []
+docs = ["docs/manual/07_diagnostics.md#relish-path-can-a-reach-b"]
+evidence = "Every staged install runs it (2026-11-07 record, Tour)."
+
+[[group.feature]]
+name = "`relish test`"
+status = "ready"
+since = "0.1.0"
+summary = "A live-cluster test catalogue you can point at your own cluster."
+restrictions = "Refuses host workloads until they can run under process mount isolation."
+issues = [714]
+docs = ["docs/manual/07_diagnostics.md#relish-test-does-the-cluster-do-what-it-says"]
+evidence = "Gate: the catalogue pulse in every V02 run (0.2.7 fast tier). Manual 07 names #714."
+
+[[group.feature]]
+name = "`relish bench`"
+status = "beta"
+since = "0.1.0"
+summary = "Measures the data plane and job throughput on your own cluster, and `--compare` fails on a drop against an earlier report."
+restrictions = ""
+issues = []
+docs = ["docs/manual/07_diagnostics.md#relish-bench-is-it-fast-enough", "docs/manual/14_batch-jobs.md#measure-job-throughput-with-relish"]
+evidence = "Job scenarios since 0.2.0. Used for the published measurements, not by the release gate."
+
+[[group.feature]]
+name = "Manual and source inside the binary"
+status = "beta"
+since = "0.1.0"
+summary = "`relish manual` is a searchable reader, and `relish source` searches the exact source the binary was built from; neither needs a network."
+restrictions = ""
+issues = []
+docs = ["docs/manual/06_under-the-hood.md"]
+evidence = "README 'The manual ships in the binary'; CI builds from the copy inside the binary. Not exercised by the release gate."
+
+[[group.feature]]
+name = "Searchable command reference on the website"
+status = "planned"
+milestone = "Later"
+summary = "Every `relish` command on one page, generated from the CLI, plus a recorded tour of all of them."
+restrictions = "Today the README lists every command."
+issues = [315]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "Roadmap 'After 0.4.0'; #315 in Later."
+
+# --- Platforms ---------------------------------------------------------------
+
+[[group]]
+id = "platforms"
+title = "Platforms"
+
+[[group.feature]]
+name = "macOS on Apple silicon"
+status = "ready"
+since = "0.1.0"
+summary = "`relish` runs natively, and containers run in managed Linux VMs through a private copy of Lima."
+restrictions = "Apple silicon only: 0.2.1 was the last release built for Intel Macs."
+issues = [1495]
+docs = ["docs/quickstart.md", "docs/README.md#macos-containers-managed-linux-vms"]
+evidence = "The whole gate runs on an Apple silicon Mac (0.2.7 release closure). Intel dropped in 0.2.2 (#1018)."
+
+[[group.feature]]
+name = "Linux hosts, x86_64 and arm64"
+status = "beta"
+since = "0.1.0"
+summary = "`bun` runs on Linux with rootful runc and eBPF; the quickstart guest is Ubuntu 24.04."
+restrictions = "Clusters need rootful runc with eBPF and bpffs at /sys/fs/bpf. Cold installs on Linux hosts haven't been qualified yet; the gate runs arm64 guests on a Mac."
+issues = [288]
+docs = ["docs/README.md#runc-linux", "docs/linux-servers.md"]
+evidence = "The gate's nodes are Ubuntu 24.04 aarch64 Lima guests (staged install record, Downloaded bytes). Privileged Linux CI suites run on x86_64. V04 (#288) is open."
+
+[[group.feature]]
+name = "Rootless runc"
+status = "alpha"
+since = "0.1.0"
+summary = "`bun` runs containers with runc as an ordinary user, on a single node."
+restrictions = "Standalone only: `--cluster` is refused. No eBPF policy, workload DNS or resource limits, and image workloads with writable roots need root mode."
+issues = [360]
+docs = ["docs/README.md#scope-and-limits"]
+evidence = "docs/README 'Scope and limits' and README 'Limits in 0.2.7'; F02 #360 in Later; gated suite `make test-rootless-runc`."
+
+[[group.feature]]
+name = "Process runtime"
+status = "alpha"
+since = "0.1.0"
+summary = "`bun --runtime process` supervises allowlisted host binaries with no container runtime, on macOS or Linux."
+restrictions = "Foreground processes only, no isolation, and no images. A cooperative supervision contract, not a security boundary: keep it for trying things out."
+issues = [360]
+docs = ["docs/README.md#processgrill-built-in-fallback", "docs/manual/00_getting-started.md#from-source-without-containers"]
+evidence = "docs/README 'ProcessGrill (built-in fallback)'; manual 00 says keep it for trying things out."
+
+[[group.feature]]
+name = "Apple Container"
+status = "planned"
+milestone = "0.4.3"
+summary = "Native containers on macOS through Apple's container runtime."
+restrictions = "Disabled in 0.2.7: macOS runs containers in Linux VMs instead."
+issues = [367]
+docs = ["docs/README.md#scope-and-limits"]
+evidence = "F10 #367 in 0.4.3; manual 00 'Apple Container isn't supported in 0.2.7'. The code and `make test-apple` exist; selection is disabled."
+
+[[group.feature]]
+name = "gVisor and Windows guests"
+status = "planned"
+milestone = "Later"
+summary = "`runtime = \"gvisor\"` for hosts without KVM, and Windows Server guests on the disk-image path."
+restrictions = ""
+issues = [1186, 1187]
+docs = ["docs/roadmap.md#releases-after-010"]
+evidence = "#1186 and #1187 in Later."

@@ -516,7 +516,9 @@ and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 - **Cron doesn't catch up.** It skips firings missed during a crash, and a job
   whose outcome is unknown waits for `relish apply <file> --rerun-jobs`.
 
-The [documentation](docs/README.md#scope-and-limits) has the full list.
+The [documentation](docs/README.md#scope-and-limits) has the full list, and the
+[feature status page](https://reliaburger.com/features.html) rates every feature
+Ready, Beta, Alpha or Planned.
 The [roadmap](docs/roadmap.md) has what's next and the known gaps, with the
 detail in GitHub milestones and issues.
 
