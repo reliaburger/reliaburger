@@ -771,12 +771,36 @@ upgrades the cluster.
 `promote.yml`'s `homebrew-tap` job runs after publication, in a job of its own
 so a tap that fails to update never touches the release. It downloads the
 published `candidate.json`, refuses it unless its SHA-256 is the qualified
-digest, writes the formula, and pushes it as one commit, `relish 0.2.7`. A
-dry run needs no secrets:
+digest, and downloads the `relish-*` binaries. `homebrew.py bottles` checks
+each binary against the record and packs it, unchanged, as a Homebrew bottle:
+a tarball in the keg layout (`relish/0.2.7/bin/relish` and an install receipt),
+one per bottle tag (`arm64_golden_gate`, `arm64_tahoe`, `arm64_sequoia` and
+`arm64_sonoma` share the one macOS binary; `arm64_linux`; `x86_64_linux`). The
+formula's `bottle do` block names each one's SHA-256. `publish --bottles`
+attaches the bottles to a release of the tap's own, named for the tag, then
+pushes the formula as one commit, `relish 0.2.7`. The reliaburger release
+never changes after promotion.
+
+Without a bottle, Homebrew treats `bin.install` as a build from source and
+refuses to start until the Command Line Tools are current, though nothing
+compiles. 0.2.7's formula had none, and `brew install` failed on a Mac with
+older tools ([#1712](https://github.com/reliaburger/reliaburger/issues/1712)).
+
+A dry run needs no secrets. It builds the bottles from the published assets
+and points `root_url` at them; Homebrew 7 installs only from a tap, so it uses
+a throwaway local one:
 
 ```sh
-gh release download v0.2.6 --repo reliaburger/reliaburger --pattern candidate.json
-python3 scripts/release/homebrew.py formula --record candidate.json
+gh release download v0.2.7 --repo reliaburger/reliaburger \
+  --pattern candidate.json --pattern 'relish-*' --dir published
+python3 scripts/release/homebrew.py bottles --record published/candidate.json \
+  --binaries published --output bottles
+brew tap-new --no-git dryrun/bottle
+python3 scripts/release/homebrew.py formula --record published/candidate.json \
+  --bottles bottles/bottles.json --root-url "file://$PWD/bottles" \
+  --output "$(brew --repository dryrun/bottle)/Formula/relish.rb"
+brew install dryrun/bottle/relish   # "Pouring relish-0.2.7.arm64_tahoe.bottle.tar.gz"
+brew uninstall relish && brew untap dryrun/bottle
 ```
 
 The maintainer does this once before the first release that should reach
