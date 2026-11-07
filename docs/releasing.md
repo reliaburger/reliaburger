@@ -90,6 +90,8 @@ that exact commit. macOS runs on every push and on the nightly, on the
 release gate PR and on the candidate build, but not on ordinary pull
 requests: the organisation's plan runs at most five macOS jobs at once, and
 each full run takes one ([portable macOS in one job](testing.md#portable-macos-in-one-job)).
+That job builds and tests `relish` and the macOS-only code; Bun's tests run
+on Linux only ([what runs on macOS](testing.md#what-runs-on-macos-and-what-runs-on-linux)).
 Dependabot's PRs never get macOS unless labelled; the nightly on `main`
 covers them.
 

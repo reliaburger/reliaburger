@@ -509,9 +509,10 @@ class TrainAndQueueTests(unittest.TestCase):
         # job doesn't hide whether the evidence was complete.
         self.assertIn("if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}", blocks[aggregate])
 
-    def test_macos_is_one_job_that_lints_and_runs_every_portable_test(self):
+    def test_macos_is_one_job_that_lints_and_runs_its_selection(self):
         # One job, not three shards that each compiled the whole suite to
-        # run a third of it (plan 2026-11-06, F1).
+        # run a third of it (plan 2026-11-06, F1). What it runs, relish and
+        # the macOS-only tests (#1720), is pinned in test_macos_selection.py.
         macos = self.jobs["macos"]
         portable = [name for name, job in self.jobs.items() if "--gate portable-darwin " in job]
         self.assertEqual(portable, ["macos"])
@@ -521,13 +522,12 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertNotIn("matrix", macos)
         self.assertEqual(SHARDS["portable-darwin"], 1)
         self.assertIn('--shard "1/1"', macos)
-        # The same profile and features as before: the ci nextest profile
-        # from the workflow env, the all-features lint, and the doctests,
-        # each unconditional.
+        # The ci nextest profile from the workflow env, the all-features
+        # lint, the tests and relish's doctests, each unconditional.
         self.assertIn("  NEXTEST_PROFILE: ci\n", self.ci)
-        for name, command in [("Lint every target, with all features", "run: make lint-macos"),
-                              ("Portable tests", "workflow_adapter.py produce"),
-                              ("Doctests", "run: make test-doc")]:
+        for name, command in [("Lint the library, relish and bun", "run: make lint-macos"),
+                              ("Relish and macOS-only tests", "workflow_adapter.py produce"),
+                              ("Relish's doctests", "cargo test --locked --doc -- relish::")]:
             block = next(step for step in steps(macos) if "name: " + name in step)
             self.assertIn(command, block)
             self.assertNotIn("if:", block)

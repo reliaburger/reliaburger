@@ -25,7 +25,7 @@ class WorkflowAdapter(unittest.TestCase):
         self.root = Path(self.tmp.name).resolve()
         self.incoming = self.root / 'incoming'
         self.context = dict(commit='a' * 40, run_id='123', attempt='2')
-        self.root.joinpath('Makefile').write_text('coverage:\n\ttrue\ntest:\n\ttrue\ntest-contract-boundaries:\n\ttrue\n')
+        self.root.joinpath('Makefile').write_text('coverage:\n\ttrue\ntest-macos:\n\ttrue\ntest-contract-boundaries:\n\ttrue\n')
         self.root.joinpath('src').mkdir()
         self.root.joinpath('src/contract.rs').write_text('synthetic actual source')
         self.manifest = dict(schema_version=1, gates={}, contracts=[])

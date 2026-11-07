@@ -1040,6 +1040,36 @@ suite, and the gate's merge checks one list the way it checked three: every list
 and the required cases are all there. The lesson? Parallel jobs only help when they split the
 expensive part. Ours was the compile, and every shard paid for it in full.
 
+One job still took a 66-minute median, and most of what it tested was Bun. But Bun ships for
+Linux only: on a Mac, the quickstart runs it inside a Lima VM. What a Mac user runs natively is
+`relish`. So since 0.2.8 the macOS job builds and tests `relish` and the code only macOS
+compiles, and nothing else
+([#1720](https://github.com/reliaburger/reliaburger/issues/1720)). The selection is one nextest
+filterset in `make test-macos`:
+
+```make
+$(NEXTEST) --lib --bin relish --test suite --test runtime_selection -E 'binary_id(reliaburger::bin/relish) | (binary_id(reliaburger) & (test(/^relish::/) | test(/^grill::apple::/) | test(/^grill::records::tests::absolute_start_time/))) | (binary_id(reliaburger::suite) & (test(/^relish_/) | test(/^user_directories::macos_/))) | binary_id(reliaburger::runtime_selection)'
+```
+
+`--lib --bin relish --test suite` tells Cargo which test binaries to build at all, which is
+where the time goes: the other 38 integration test binaries never compile. `-E` then picks
+tests inside them. `binary_id(...)` names a test binary exactly, `test(/regex/)` matches a
+test's full path, and `&` and `|` combine them. Besides relish, it keeps the tests that exist
+only on macOS, because nowhere else can run them: the Apple Container adapter, process start
+times off Linux, where `relish` keeps files under `~/Library` and how Bun picks a runtime on a
+Mac. Bun itself only gets a compile check, through the lint. A measurement run took 31 minutes
+from a cold cache, against the 66-minute median, and 23.5 of those minutes were still compiling,
+because relish's unit tests live in the library's test binary and that compiles the whole
+crate. Splitting `relish` into its own crate is the obvious next move.
+
+The evidence gate needed telling. Its manifest listed 250 finite cases as required on macOS,
+and the gate refuses a run where a required case didn't run. A relish-only job runs 19 of
+them. We didn't edit 231 entries by hand: `scripts/ci/macos_selection.py` parses the
+filterset, evaluates it against each case's binary and test name, and keeps `portable-darwin`
+exactly where the job will run the case. Every one keeps `portable-linux`. A test fails if the
+manifest or the qualification matrix ever disagrees with the filterset, so narrowing what
+macOS proves is a change somebody has to review, not something that happens by accident.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took
