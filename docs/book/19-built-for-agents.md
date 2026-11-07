@@ -3105,6 +3105,41 @@ qualified. The job only writes the entry: publishing needs the maintainer's
 GitHub login to the organisation, so it keeps the file as an artefact for
 them to run `mcp-publisher publish` with.
 
+A bundle installed from a desktop client has no shell to pass `--endpoint`
+from, so the manifest's `user_config` declares two settings the client
+asks for: an endpoint and a token, both `"required": false` with an empty
+`default`, and the token `"sensitive": true` so the client masks it and
+stores it as a secret. `mcp_config.env`
+hands them to `relish` as `"RELIABURGER_ENDPOINT": "${user_config.endpoint}"`
+and `RELIABURGER_TOKEN` the same way. The token's title says "Read-only",
+its description gives the `relish token create --role read-only` line and
+links to the manual's section on it, and a test fails if the word "admin"
+appears anywhere in either setting: an MCP server that reads workload text
+should never hold a token that can change the cluster.
+
+The catch is in "optional". A client fills in defaults before it substitutes
+the placeholders, so a setting nobody touched doesn't leave the variable
+unset: it sets it to `""`. Before 0.2.8 `relish` took any value it found,
+so an empty endpoint failed as an invalid URL, and worse, an empty token
+replaced the saved context's own token with an empty bearer. Both now go
+through one helper:
+
+```rust
+fn unless_blank(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+```
+
+[`Option::filter`](https://doc.rust-lang.org/std/option/enum.Option.html#method.filter)
+keeps a `Some` only when the closure says `true`, and turns everything else
+into `None`, so an empty or all-whitespace variable is exactly an unset one.
+The `--token` and `--endpoint` flags don't go through it: a flag is
+something a person typed. A unit test feeds `pick_token` and `pick_endpoint`
+blank values, and two tests in `tests/suite/relish_cli.rs` run the real
+binary: one with a blank endpoint, which must not be refused, and one with a
+blank token against a stub server, which must receive no `Authorization`
+header at all.
+
 The bundles aren't signed with the format's own scheme. `mcpb sign` appends
 a PKCS#7 signature from an X.509 certificate, which would be a third
 signing identity beside the release key and Apple's Developer ID, and

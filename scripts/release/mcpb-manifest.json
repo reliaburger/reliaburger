@@ -33,7 +33,11 @@
       "args": [
         "mcp"
       ],
-      "command": "${__dirname}/server/relish"
+      "command": "${__dirname}/server/relish",
+      "env": {
+        "RELIABURGER_ENDPOINT": "${user_config.endpoint}",
+        "RELIABURGER_TOKEN": "${user_config.token}"
+      }
     },
     "type": "binary"
   },
@@ -92,5 +96,22 @@
       "name": "explain"
     }
   ],
+  "user_config": {
+    "endpoint": {
+      "default": "",
+      "description": "The Bun API address, such as https://10.0.0.5:9117. Leave it empty to use relish's current context.",
+      "required": false,
+      "title": "Cluster API endpoint (optional)",
+      "type": "string"
+    },
+    "token": {
+      "default": "",
+      "description": "A read-only token, made with `relish token create --name agent --role read-only --ttl-days 1`: https://github.com/reliaburger/reliaburger/blob/main/docs/manual/16_working-with-an-ai-agent.md#a-read-only-token. Leave it empty to use relish's current context.",
+      "required": false,
+      "sensitive": true,
+      "title": "Read-only API token (optional)",
+      "type": "string"
+    }
+  },
   "version": "0.2.7"
 }

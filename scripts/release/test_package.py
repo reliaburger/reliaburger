@@ -785,7 +785,7 @@ esac
                 expected = "darwin" if platform.startswith("macos-") else "linux"
                 self.assertEqual(manifest["compatibility"]["platforms"], [expected])
                 self.assertEqual(manifest["server"]["entry_point"], "server/relish")
-                for field in ("manifest_version", "name", "description", "server", "tools"):
+                for field in ("manifest_version", "name", "description", "server", "tools", "user_config"):
                     self.assertEqual(manifest[field], template[field])
                 digest = hashlib.sha256(path.read_bytes()).hexdigest()
                 self.assertIn(f"{digest}  {path.name}\n", sums)
