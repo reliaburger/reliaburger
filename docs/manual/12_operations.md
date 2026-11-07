@@ -244,10 +244,17 @@ cluster and the release share a pair.
 
 1. Check that it can roll. `upgrade check` compares the release's pair with
    the cluster's; `bun --compatibility` on the downloaded binary says the
-   same thing locally.
+   same thing locally. With `-o json` the answer is a `verdict` field
+   (`up_to_date`, `available`, `needs_fresh_cluster`, `no_artefact_for_node`
+   or `no_artefacts`), with the `command` to run when one is available.
+   `relish agent upgrade-check` asks the same question for an agent, and
+   adds `relish wtf`'s critical findings, the council's quorum and version
+   skew ([Working with an AI agent](16_working-with-an-ai-agent.md#before-an-upgrade)).
 
    ```sh
    relish upgrade check
+   relish -o json upgrade check
+   relish agent upgrade-check
    ```
 
 2. Make your countersigning key, once. Put the `ed25519:…` public key it
@@ -258,9 +265,13 @@ cluster and the release share a pair.
    ```
 
 3. Read the plan: workers first, then council members, the leader last.
+   `plan` reads the live cluster, and if it can't reach it, it says why and
+   stops rather than guess. `--cluster-size N` plans a cluster of N nodes
+   without asking one.
 
    ```sh
    relish upgrade plan v0.2.1
+   relish upgrade plan v0.2.1 --cluster-size 8
    ```
 
 4. Start it. relish downloads each node's build, countersigns it with your

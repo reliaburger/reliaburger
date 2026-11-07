@@ -112,14 +112,29 @@ impl<T> EvidenceBuilder<T> {
     }
 }
 
+/// Check the entry agent answers, keeping the endpoint and the cause when it
+/// doesn't.
+async fn entry_health(client: &BunClient) -> Result<(), RelishError> {
+    let unreachable = |cause| RelishError::AgentUnreachable {
+        endpoint: client.base_url().to_string(),
+        cause,
+    };
+    match tokio::time::timeout(REQUEST_TIMEOUT, client.health()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error @ RelishError::AgentUnreachable { .. })) => Err(error),
+        Ok(Err(error)) => Err(unreachable(crate::relish::UnreachableCause::Other(
+            error.to_string(),
+        ))),
+        Err(_) => Err(unreachable(crate::relish::UnreachableCause::TimedOut)),
+    }
+}
+
 /// Collect an authenticated, bounded cluster evidence snapshot.
 ///
 /// Failure of one node or subsystem becomes typed evidence. The function only
 /// returns an error when the entry Bun agent itself cannot be reached.
 pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs, RelishError> {
-    bounded("entry health", client.health())
-        .await
-        .map_err(|_| RelishError::AgentUnreachable)?;
+    entry_health(client).await?;
 
     let (nodes_result, capabilities_result) = tokio::join!(
         bounded("cluster nodes", client.nodes()),
@@ -1416,6 +1431,78 @@ mod tests {
         assert!(matches!(evidence, Evidence::AvailableWithCaveat { .. }));
         assert!(evidence.unknown_reason().is_none());
         assert!(evidence.caveat().is_some());
+    }
+
+    /// The agent gym's crash loop (#1652): an app that exits a few seconds
+    /// after each start, restarted at once each time. Its node's events hold
+    /// one `restart` per restart, as the agent records them, and its status
+    /// shows the replica stopped. `wtf` names the crash loop.
+    #[test]
+    fn an_app_restarted_after_every_exit_is_diagnosed_as_a_crashloop() {
+        use super::super::diagnose::tests::{NOW, healthy_inputs};
+        let mut store = crate::bun::events::EventStore::new();
+        for attempt in 1..=5u64 {
+            store.record(
+                NOW - 300 + attempt * 10,
+                EventKind::Restart,
+                crate::bun::events::EventSeverity::Warning,
+                Some("web".to_string()),
+                Some("default".to_string()),
+                None,
+                format!("instance default__web-0 restarted (attempt {attempt})"),
+            );
+        }
+        let collected = vec![NodeCollection {
+            node_id: "gym-1".to_string(),
+            reachable: true,
+            diagnostics: Err("unused".to_string()),
+            events: Ok(store.recent(EVENT_LIMIT, None, None)),
+            deploys: Err("unused".to_string()),
+            alerts: Err("unused".to_string()),
+            faults: Err("unused".to_string()),
+            instances: Ok(vec![InstanceStatus {
+                id: "default__web-0".to_string(),
+                app_name: "web".to_string(),
+                namespace: "default".to_string(),
+                state: "stopped".to_string(),
+                restart_count: 5,
+                host_port: None,
+                exit_code: Some(1),
+                pid: None,
+                runtime_unknown: false,
+                status_age_ms: None,
+                reason: None,
+            }]),
+            version: Err("unused".into()),
+            council: Err("unused".into()),
+        }];
+        let desired = Ok(vec![crate::bun::diagnostics::DesiredAppEvidence {
+            owner: None,
+            app: "web".to_string(),
+            namespace: "default".to_string(),
+            desired_replicas: 1,
+            scheduled_replicas: 1,
+            placements: BTreeMap::from([("gym-1".to_string(), 1)]),
+            service_port: None,
+            blocked: None,
+            volume_home_away: None,
+            unschedulable: None,
+            volume_homes: Vec::new(),
+            rollout_failed: None,
+        }]);
+        let mut inputs = healthy_inputs();
+        inputs.applications.restarts = collect_restarts(&collected, NOW);
+        inputs.applications.replicas = collect_replicas(&desired, &collected, None, NOW);
+
+        let report = crate::relish::wtf::diagnose(&inputs);
+
+        let finding = report
+            .critical
+            .iter()
+            .find(|finding| finding.id == "crashloop")
+            .unwrap_or_else(|| panic!("no crashloop finding: {report:?}"));
+        assert_eq!(finding.title, "app web/default restarted repeatedly");
+        assert!(finding.details[0].contains("5 timestamped restarts"));
     }
 
     #[test]

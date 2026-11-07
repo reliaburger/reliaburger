@@ -122,10 +122,21 @@ pub async fn policy_audit(output: OutputFormat) -> Result<(), RelishError> {
 
 /// `relish policy delete NAME`: remove a policy. Policies never judge
 /// policies, so this works even when a broken one refuses every app.
-pub async fn policy_delete(name: &str) -> Result<(), RelishError> {
+pub async fn policy_delete(name: &str, output: OutputFormat) -> Result<(), RelishError> {
     BunClient::default_local().delete_policy(name).await?;
-    println!("deleted policy {name}");
-    Ok(())
+    super::output::print_output(&DeletedPolicy { deleted: name }, output)
+}
+
+/// The policy `relish policy delete` removed.
+#[derive(Debug, serde::Serialize)]
+pub struct DeletedPolicy<'a> {
+    pub deleted: &'a str,
+}
+
+impl std::fmt::Display for DeletedPolicy<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "deleted policy {}", self.deleted)
+    }
 }
 
 /// `relish policy test -f policies.toml -f apps.toml`: judge the files'
@@ -310,6 +321,22 @@ message = "apps in prod need a memory limit"
         assert_eq!(
             render_policy_list(&PolicyListing::default()),
             "No policies (generation 0).\n"
+        );
+    }
+
+    #[test]
+    fn policy_delete_as_json_names_the_policy() {
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(
+                &DeletedPolicy { deleted: "pinned" },
+                OutputFormat::Json
+            )
+            .unwrap(),
+            @r#"
+        {
+          "deleted": "pinned"
+        }
+        "#
         );
     }
 }

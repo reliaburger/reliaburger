@@ -77,10 +77,13 @@ PORTABLE_GATES = ['portable-linux', 'portable-darwin', 'optimized-cron']
 HEAVY_GATES = [name for name in OWNERS if name not in PORTABLE_GATES]
 # Merge-train pull requests wait for these alone; see selected_workflow.
 LIGHT_GATES = ['portable-linux', 'optimized-cron']
-# Owners split across parallel jobs, by nextest hash partition. Compiling the
-# test binaries takes most of a macOS job, so this mostly overlaps the test
-# runs; the merge in workflow_adapter.py proves every test ran exactly once.
-SHARDS = {'portable-darwin': 3}
+# Owners run by nextest hash partition, and how many jobs share each one.
+# Portable macOS is one job, one partition (hash:1/1) that is the whole suite:
+# three shards each spent 17-40 minutes compiling the same suite to test for
+# about 3, and took three of the five macOS runners the organisation's plan
+# allows (docs/plans/2026-11-06-plan-faster-feedback.md, F1). The merge in
+# workflow_adapter.py still proves the one job ran every listed test.
+SHARDS = {'portable-darwin': 1}
 
 
 def selected_workflow(expected, *, code, heavy, macos):
@@ -88,7 +91,7 @@ def selected_workflow(expected, *, code, heavy, macos):
 
     `full` runs every owner, `portable` both portable hosts and the optimized
     boundaries, and `light` only portable Linux and the optimized boundaries.
-    `train-full` runs every owner except the macOS shards: a code pull
+    `train-full` runs every owner except portable macOS: a code pull
     request into main, or one into a train labelled full-ci, that doesn't
     touch macOS code (#1443). Pushes and the nightly still run them.
     """

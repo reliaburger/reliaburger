@@ -4578,8 +4578,8 @@ macOS keeps `false` in `/usr/bin` and has no `/bin/false`, so `create`'s
 binary check refused the launch as `binary not found`, exactly as it should.
 Linux has both paths, so CI, which runs that test only on Linux, never saw it.
 The test now runs `/bin/sh -c "exit 1"`, a command at the same path on every
-Unix host. A portable suite test pins the behaviour too, so the macOS shards
-check it on every train: a process job whose command starts and exits
+Unix host. A portable suite test pins the behaviour too, so portable macOS
+checks it on every train: a process job whose command starts and exits
 non-zero is a failed attempt, retried up to `max_attempts`, and its retries
 show as the run's `restart_count`.
 

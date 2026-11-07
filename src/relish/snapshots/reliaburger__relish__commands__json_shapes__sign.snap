@@ -1,0 +1,9 @@
+---
+source: src/relish/commands.rs
+expression: "json(&SignReport\n{\n    image: \"web:v1\", digest: super::tests::MYAPP_V1, message:\n    \"signature attached\".to_string(),\n})"
+---
+{
+  "image": "web:v1",
+  "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "message": "signature attached"
+}

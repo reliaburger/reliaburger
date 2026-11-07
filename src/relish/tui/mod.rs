@@ -33,6 +33,7 @@ use crate::relish::client::BunClient;
 
 /// Launch the interactive terminal UI against the local Bun agent.
 pub async fn run() -> Result<(), RelishError> {
+    crate::relish::FullScreen::Tui.require_terminal()?;
     let provider = Arc::new(HttpDataProvider {
         client: BunClient::default_local(),
     });

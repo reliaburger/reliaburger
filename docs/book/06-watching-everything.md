@@ -1262,7 +1262,23 @@ fresh reader returns is whole and numbered where it should be.
 `a_durable_flush_reclaims_the_ingested_capture_prefix` checks nothing is
 freed until the flush, and `a_chatty_instance_s_capture_stays_bounded_once_its_lines_are_stored`
 runs a real process that prints 8 MiB through `yes`, follows it into a store,
-flushes, and measures what's left on disk.
+flushes, and measures what the flush freed.
+
+It used to measure what was left, and on a busy Mac it failed now and then
+with 1.4 MB still allocated against a bound of 1.25 (#1537). Under load it
+failed about once in 25 runs, so we could look. The data was exactly where it
+should be: `lseek(SEEK_DATA)` found the first byte at 7 MiB and the last at
+8 MiB, so the punch had freed everything it was meant to. The extra blocks
+were there *before* the flush, past the end of the file. APFS gives a file
+that's being appended to some space ahead of its writer, and under load it
+gave up to a megabyte. `st_blocks` counts that space, the writer exiting
+didn't return it, and no punch inside the file's length can touch it. The
+product was fine; the test was counting something the reclaim doesn't own.
+So now the test makes that allocation itself, on every filesystem
+(`F_PREALLOCATE` on macOS, `fallocate` with `FALLOC_FL_KEEP_SIZE` on Linux),
+and asserts that the flush freed all but the retained tail. The old
+assertion fails every time with the preallocation in place; the new one
+passed 544 runs in a row under the same load.
 
 What we didn't do: route every app's output through Bun, which would let us
 rotate at will but put Bun in the path of every byte every app writes, and
@@ -1616,6 +1632,8 @@ parquet = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214
 A fork is a debt: every arrow-rs fix after 59.3.0 passes you by until you redo the patch. So we also asked upstream to backport the fix to the 59 line (apache/arrow-rs#11186), and they released Parquet 59.3.1 with it. In 0.2.1 we deleted the whole `[patch.crates-io]` block, and `Cargo.lock` now takes every arrow-rs crate from crates.io at 59.3.1 (#975). The regression tests didn't change, and they still run on Linux in CI, where the abort happened. The lesson: a test only proves something on the platform where it ran.
 
 Leaving the fork paid off in 0.2.6. On 2 November, RUSTSEC-2026-0442 reported that arrow-data 59.3.1 can read past the end of a RunEndEncoded array's values. The 0.2.6 candidate's release audit refused it. Upstream had already released 59.3.2 on the same line, so the fix was `cargo update` on the fifteen arrow and parquet crates: a `Cargo.lock` change, with no code and no fork. Our own files never build RunEndEncoded arrays, but the advisory is in a crate that reads files from disk, so we took the patch rather than adding an exception to `.cargo/audit.toml`.
+
+zstd hasn't been so easy. On 26 October RustSec published thirteen advisories against zstd 0.13.3 and zstd-safe 7.3.0, and zstd 0.14.3 fixes all of them. But Parquet's zstd codec on the 59 line still asks for `zstd = "^0.13"`, and in Cargo a caret requirement below 1.0 treats the minor version as the breaking one, so `^0.13` will never accept 0.14. Only Arrow 60 moves, and DataFusion 55 needs Arrow 59. 0.2.3 shipped with a dated exception for the thirteen IDs (#1366). Then we shrank it: our own source bundle (#1570) and rust-embed's `include-flate` moved to zstd 0.14, and a test in `tests/suite/dependency_audit.rs` now fails if anything except Arrow, Parquet and DataFusion depends on the old line. The two versions share one copy of the C library, `zstd-sys` 2.1.2 with libzstd 1.5.7, so the bytes we write didn't change. The Rust wrapper got a new major version, but the frames on disk are the same, so no log, metric or bundle needs migrating. The rest of the exception waits for DataFusion 56, which moves to Arrow 60. It's on a release branch but not yet on crates.io, and we won't ship a database engine from a git branch to save one audit entry.
 
 ### Server-rendered HTML with meta refresh beats React
 

@@ -153,6 +153,14 @@ pub const GROUPS: &[CommandGroup] = &[
         commands: &["wtf", "path", "test", "bench"],
     },
     CommandGroup {
+        title: "Work with an AI agent",
+        guides: &[Guide {
+            label: "working with an AI agent",
+            path: "docs/manual/16_working-with-an-ai-agent.md",
+        }],
+        commands: &["agent", "mcp"],
+    },
+    CommandGroup {
         title: "Break things on purpose",
         guides: &[Guide {
             label: "chaos",

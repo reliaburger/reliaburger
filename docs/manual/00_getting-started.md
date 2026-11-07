@@ -112,6 +112,26 @@ You should see the `hello` workload in `Running` state. Open
 arguments for the terminal one. The process runtime supervises real processes but
 doesn't isolate them, so keep it for trying things out.
 
+## Checking a download
+
+From 0.2.7 (0.2.7, not in 0.2.6), every release file carries a build
+provenance attestation: a signed statement that the build workflow on `main`
+made a file with exactly this SHA-256. Check the `relish` you installed with
+the GitHub CLI (<https://cli.github.com>), the same command
+`install.sh --help` prints:
+
+```sh
+gh attestation verify ~/.reliaburger/bin/relish --repo reliaburger/reliaburger \
+  --signer-workflow reliaburger/reliaburger/.github/workflows/build.yml \
+  --source-ref refs/heads/main
+```
+
+The last two flags matter: without them, any workflow in the repository, on
+any branch, could have made the attestation. Any other release file works in
+place of the binary: `SHA256SUMS`, `install.sh`, `metadata.json`, a guest
+image. Releases before 0.2.7 and nightly builds carry no attestation, so the
+check fails for them.
+
 ## Where to next
 
 - The five-minute tour: `relish manual tour`

@@ -660,6 +660,7 @@ fn every_section_can_be_linked_to() {
         "install",
         "tour",
         "netboot",
+        "debug",
         "start",
         "docs",
         "internals",
@@ -1559,11 +1560,12 @@ fn why_section(page: &str) -> &str {
     &page[start..start + page[start..].find("</section>").unwrap()]
 }
 
-/// The five differences sit between the hero and the install, each a short
+/// The six differences sit between the hero and the install, each a short
 /// punchline, two sentences and a drawing. The list works without script;
-/// `assets/why-carousel.js` turns it into a slideshow.
+/// `assets/why-carousel.js` turns it into a slideshow. The sixth, from 0.2.7,
+/// is the one for agents (#1578).
 #[test]
-fn five_differences_come_just_before_the_install() {
+fn six_differences_come_just_before_the_install() {
     let page = read("docs/website/index.html");
     let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
     let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
@@ -1572,7 +1574,11 @@ fn five_differences_come_just_before_the_install() {
     let section = why_section(&page);
     assert!(section.contains("data-carousel"));
     let slides: Vec<&str> = section.split("<li class=\"why-slide\"").skip(1).collect();
-    assert_eq!(slides.len(), 5, "the section should show five differences");
+    assert_eq!(slides.len(), 6, "the section should show six differences");
+    assert!(
+        section.contains(">Your agent can read the recipe.</h3>"),
+        "the sixth difference is the agent one"
+    );
     for slide in slides {
         assert_eq!(slide.matches("<h3 class=\"why-punchline\">").count(), 1);
         assert_eq!(slide.matches("<p>").count(), 1);
@@ -1623,4 +1629,248 @@ fn the_differences_load_nothing_and_respect_reduced_motion() {
         reduced,
         "style.css should stop the drawings' animation for reduced motion"
     );
+}
+
+/// The install section has two tabs (#1579): the one-line install, and one
+/// prompt for an agent that sends it to the playbook on `/agents`. They're
+/// radio buttons, so they switch without a script, and the one-line install
+/// is the one chosen when the page loads.
+#[test]
+fn the_install_section_offers_the_one_line_install_and_an_agent_prompt() {
+    let page = read("docs/website/index.html");
+    let section = &page[page.find("<section id=\"install\"").unwrap()..];
+    let section = &section[..section.find("</section>").unwrap()];
+    for tab in ["Kick the tyres", "With your agent"] {
+        assert!(
+            section.contains(&format!(">{tab}</label>")),
+            "no {tab:?} tab"
+        );
+    }
+    assert!(section.contains("id=\"install-tyres\" checked>"));
+    let prompt = &section[section.find("<code data-agent-prompt>").unwrap()..];
+    let prompt = &prompt["<code data-agent-prompt>".len()..prompt.find("</code>").unwrap()];
+    assert_eq!(
+        prompt,
+        "Set up a Reliaburger cluster for me. Start at https://reliaburger.com/agents."
+    );
+    // The page the prompt names is the one generated from the agent chapter,
+    // and it carries the playbook.
+    let agents = read("docs/website/agents.html");
+    assert!(agents.contains("Setting up a cluster for your human"));
+    assert!(!section.contains("<script"), "the tabs need no script");
+}
+
+// --- Built for humans and their agents (#1578) -----------------------------
+
+/// The text of every `<code ATTRIBUTE>` element on `page`, tags stripped
+/// and entities decoded.
+fn marked_commands(page: &str, attribute: &str) -> Vec<String> {
+    let open = format!("<code {attribute}>");
+    page.split(open.as_str())
+        .skip(1)
+        .map(|rest| decode(&strip_tags(&rest[..rest.find("</code>").unwrap()])))
+        .collect()
+}
+
+/// An agent reading the homepage meets its own page first: one line above
+/// the masthead that links `/agents`, its Markdown and `llms.txt`, all three
+/// of them files this directory publishes.
+#[test]
+fn the_homepage_opens_with_a_line_for_agents() {
+    let page = read("docs/website/index.html");
+    let start = page
+        .find("<aside class=\"agent-banner\"")
+        .expect("no agent banner");
+    assert!(
+        start < page.find("<header class=\"masthead\"").unwrap(),
+        "the agent banner should come before the masthead"
+    );
+    let banner = &page[start..start + page[start..].find("</aside>").unwrap()];
+    let text = decode(&strip_tags(banner));
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        text.starts_with("Are you an AI agent? Start here"),
+        "{text:?}"
+    );
+    for href in ["agents.html", "agents.md", "llms.txt"] {
+        assert!(
+            banner.contains(&format!("href=\"{href}\"")),
+            "the banner doesn't link {href}"
+        );
+        assert!(
+            repository().join("docs/website").join(href).is_file(),
+            "{href} isn't published"
+        );
+    }
+    assert!(
+        banner.contains("<a href=\"agents.html\">Start here</a>"),
+        "\"Start here\" goes to /agents"
+    );
+    assert!(read("docs/website/llms.txt").starts_with("# Reliaburger\n"));
+}
+
+/// The 0.2.7 headline sits in the hero, under the title.
+#[test]
+fn the_hero_says_who_it_is_built_for() {
+    let page = read("docs/website/index.html");
+    let intro = &page[page.find("<section id=\"intro\"").unwrap()..];
+    let intro = &intro[..intro.find("</section>").unwrap()];
+    let headline = intro
+        .find("<p class=\"headline-agents\">Built for humans and their agents.</p>")
+        .expect("the hero lacks the headline");
+    assert!(intro.find("<h1 id=\"title\">").unwrap() < headline);
+}
+
+/// Every command the agent section shows parses with the real CLI. They're
+/// 0.2.7 commands, so the installed-release check wants the section to say
+/// so, which `every_advertised_command_exists_in_the_installed_release`
+/// covers.
+#[test]
+fn every_agent_section_command_parses_with_the_real_cli() {
+    let page = read("docs/website/index.html");
+    let start = page
+        .find("<section id=\"debug\"")
+        .expect("no #debug section");
+    let section = &page[start..start + page[start..].find("</section>").unwrap()];
+    let commands = marked_commands(section, "data-agent-command");
+    assert!(commands.len() >= 8, "too few commands: {commands:?}");
+    assert_eq!(
+        commands.len(),
+        marked_commands(&page, "data-agent-command").len(),
+        "data-agent-command belongs to the #debug section"
+    );
+    for command in &commands {
+        assert!(command.starts_with("relish "), "{command:?}");
+        parses(command).unwrap_or_else(|error| panic!("{command:?}: {error}"));
+    }
+    let heading = &section[section.find("<h2").unwrap()..section.find("</h2>").unwrap()];
+    assert!(
+        strip_tags(heading).contains("Debug the platform, not just your app"),
+        "{heading:?}"
+    );
+}
+
+/// The agent section's recording isn't made yet (#1579). Until it is, the slot
+/// says so and gives the player nothing to load; once it has a `data-cast`, it
+/// needs a screen for the player like every other recording.
+#[test]
+fn the_agent_recording_slot_says_plainly_whether_there_is_a_recording() {
+    let page = read("docs/website/index.html");
+    let start = page
+        .find("<figure id=\"agent-recording\"")
+        .expect("no agent recording slot");
+    let figure = &page[start..start + page[start..].find("</figure>").unwrap()];
+    let tag = &figure[..figure.find('>').unwrap()];
+    if tag.contains("data-cast=") {
+        assert!(figure.contains("<div class=\"recording-screen\"></div>"));
+        assert!(!figure.contains("recording-pending"));
+    } else {
+        assert!(
+            !figure.contains("recording-screen"),
+            "an empty screen with no cast"
+        );
+        assert!(figure.contains("class=\"recording-pending\""));
+        let text = decode(&strip_tags(figure));
+        assert!(text.contains("No recording yet"), "{text:?}");
+        assert!(figure.contains("https://github.com/reliaburger/reliaburger/issues/1579"));
+    }
+}
+
+/// The install buttons on `/agents` and in the README add the server `relish
+/// agent setup` writes, and the command they start parses with the real CLI.
+#[test]
+fn the_install_buttons_add_the_server_setup_writes() {
+    use reliaburger::relish::agent::{guide, setup};
+    let links = guide::install_links();
+    let escape = |text: &str| text.replace('&', "&amp;").replace('"', "&quot;");
+
+    let agents = read("docs/website/agents.html");
+    for (label, link) in [
+        ("Add to Cursor", &links.cursor),
+        ("Add to VS Code", &links.vscode),
+        ("Add to Goose", &links.goose),
+    ] {
+        assert!(
+            agents.contains(&format!("href=\"{}\">{label}</a>", escape(link))),
+            "/agents has no {label:?} button for {link}"
+        );
+    }
+    let shown = marked_commands(&agents, "data-install-command");
+    assert_eq!(shown, std::slice::from_ref(&links.claude_code));
+
+    let readme = read("README.md");
+    for link in [&links.cursor_web, &links.vscode_web] {
+        assert!(
+            readme.contains(&format!("]({link})")),
+            "README lacks {link}"
+        );
+    }
+    assert!(readme.contains(&format!("`{}`", links.claude_code)));
+    assert!(readme.contains("https://reliaburger.com/agents#add-to-your-agent"));
+
+    // What every button and the Claude Code line start.
+    let server = setup::MCP_COMMAND_LINE.join(" ");
+    assert!(links.claude_code.ends_with(&format!(" -- {server}")));
+    parses(&server).unwrap_or_else(|error| panic!("{server:?}: {error}"));
+}
+
+/// `/agents` links its own sections by the slugs the generator gives them, so
+/// every `#fragment` on it must land on an element with that `id`, and so must
+/// the homepage's links into it.
+#[test]
+fn every_link_into_the_agents_page_lands() {
+    let agents = read("docs/website/agents.html");
+    let lands = |fragment: &str| agents.contains(&format!("id=\"{fragment}\""));
+    let fragments: Vec<&str> = agents
+        .split("href=\"#")
+        .skip(1)
+        .map(|rest| &rest[..rest.find('"').unwrap()])
+        .collect();
+    assert!(fragments.len() > 20, "too few: {fragments:?}");
+    for fragment in fragments {
+        assert!(
+            lands(fragment),
+            "/agents links #{fragment}, which isn't there"
+        );
+    }
+    let page = read("docs/website/index.html");
+    for rest in page.split("href=\"agents.html#").skip(1) {
+        let fragment = &rest[..rest.find('"').unwrap()];
+        assert!(
+            lands(fragment),
+            "the homepage links /agents#{fragment}, which isn't there"
+        );
+    }
+    // "How we test" is a section of its own, and says what doesn't run.
+    let start = agents
+        .find("<section class=\"agents-section\" id=\"how-reliaburger-is-tested\">")
+        .expect("no how-we-test section");
+    let section = &agents[start..start + agents[start..].find("</section>").unwrap()];
+    for needle in [
+        "make ci",
+        "full-ci",
+        "make test-apple",
+        "What none of that proves",
+    ] {
+        assert!(section.contains(needle), "how-we-test lacks {needle:?}");
+    }
+}
+
+/// `/agents` loads the site's stylesheet and copy script and nothing else.
+#[test]
+fn the_agents_page_loads_only_the_site_s_own_files() {
+    let agents = read("docs/website/agents.html");
+    assert_eq!(agents.matches("<script").count(), 1);
+    assert!(agents.contains("<script src=\"assets/copy.js\" defer></script>"));
+    assert_eq!(agents.matches("rel=\"stylesheet\"").count(), 1);
+    assert!(agents.contains("<link rel=\"stylesheet\" href=\"style.css\">"));
+    let css = read("docs/website/style.css");
+    for rule in [
+        ".agents-page",
+        ".agents-install",
+        ".install-button",
+        ".agent-banner",
+    ] {
+        assert!(css.contains(rule), "style.css has no {rule} rule");
+    }
 }

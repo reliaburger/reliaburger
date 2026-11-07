@@ -47,7 +47,7 @@ SKIPPED_JOB = "closed pull request"
 FIRST_ATTEMPT = 1
 
 # Every check name a full ci.yml run reports, as the API names them: the
-# job's `name:`, with the macOS matrix expanded. test_ci_reuse.py fails when
+# job's `name:`. test_ci_reuse.py fails when
 # ci.yml gains, loses or renames a job and this list doesn't follow.
 REQUIRED_JOBS = (
     "select jobs",
@@ -56,6 +56,7 @@ REQUIRED_JOBS = (
     "lint",
     "demo app",
     "minimum Rust 1.97.0",
+    "source bundle builds",
     "portable Linux",
     "privileged Linux",
     "privileged Linux (Ubuntu 26.04)",
@@ -64,9 +65,7 @@ REQUIRED_JOBS = (
     "acceptance",
     "optimized contract boundaries",
     "ignored-test evidence",
-    "portable macOS (1/3)",
-    "portable macOS (2/3)",
-    "portable macOS (3/3)",
+    "portable macOS",
     "benchmarks",
     "task-array benchmarks",
     "S3 round trip",

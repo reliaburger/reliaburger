@@ -1,0 +1,8 @@
+---
+source: src/relish/commands.rs
+expression: "json(&FormatReport\n{ path: Path::new(\"app.toml\"), result: FormatResult::Formatted, })"
+---
+{
+  "path": "app.toml",
+  "result": "formatted"
+}

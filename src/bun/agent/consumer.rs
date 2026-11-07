@@ -1015,10 +1015,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Err(error) = table.rebuild(&map, &routes) {
             eprintln!("wrapper: consumer view skipped invalid routes: {error}");
         }
-        for entry in services {
-            self.publish_backend_kernel(&ServiceId::new(&entry.namespace, &entry.app_name), &map)
-                .await?;
-        }
+        // One hold of the kernel lock for the whole view (#1622).
+        let ids: Vec<_> = services
+            .iter()
+            .map(|entry| ServiceId::new(&entry.namespace, &entry.app_name))
+            .collect();
+        self.publish_backends_kernel(&ids, &map).await?;
         let mut current = self.routing_table.write().await;
         table.inherit_local_health(&current);
         *current = table;

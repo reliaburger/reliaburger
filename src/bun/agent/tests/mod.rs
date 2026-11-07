@@ -1831,16 +1831,20 @@ async fn failed_runtime_reference_checkpoint_prevents_start_and_retains_the_addr
         let events = drain_deploy(&mut agent, basic_config()).await;
         (agent, events)
     });
-    tokio::time::timeout(std::time::Duration::from_secs(2), grill.wait_for_creates(1))
+    // These bounds only stop a hang: nothing here is timed. The deploy
+    // journals a fresh discovery checkpoint before it creates, and on a
+    // loaded host that took more than the 2 s this once allowed (#1623).
+    let patience = std::time::Duration::from_secs(30);
+    tokio::time::timeout(patience, grill.wait_for_creates(1))
         .await
-        .unwrap();
+        .expect("the deploy never reached its create");
     let checkpoint = path.join("discovery.json");
     std::fs::remove_file(&checkpoint).unwrap();
     std::fs::create_dir(&checkpoint).unwrap();
     grill.release_creates(1);
-    let (_agent, events) = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+    let (_agent, events) = tokio::time::timeout(patience, task)
         .await
-        .unwrap()
+        .expect("the deploy never finished")
         .unwrap();
     assert!(
         events
@@ -3010,7 +3014,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 Some(outcome) = self.identity_signing_tasks.join_next_with_id(),
                     if !self.identity_signing_tasks.is_empty() => {
-                    self.finish_identity_provision(outcome);
+                    self.finish_identity_provision(outcome).await;
                 }
                 result = &mut task => {
                     let _ = result;
@@ -6017,6 +6021,101 @@ async fn real_process_restart_stays_eligible_and_fails_at_once_without_its_execu
     );
     assert_eq!(instance.restart_count, 3);
     agent.stop_app("retry", "default").await.unwrap();
+}
+
+/// Every restart records one `restart` event, whether the exit was seen
+/// with no backoff owed (restarted at once by `observe_app_exit`) or the
+/// restart waited out its backoff (`retry_restart`). Without it, `relish
+/// wtf` counted too few restarts to name a crash loop (#1652).
+#[tokio::test]
+async fn every_restart_after_an_exit_records_one_restart_event() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let events = Arc::new(tokio::sync::RwLock::new(
+        crate::bun::events::EventStore::new(),
+    ));
+    agent.set_event_store(Arc::clone(&events));
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+    let restart_events = |events: &crate::bun::events::EventStore| {
+        events
+            .recent(100, None, None)
+            .iter()
+            .filter(|event| event.kind == crate::bun::events::EventKind::Restart)
+            .count()
+    };
+
+    // Three exits, each seen once its backoff is over: restarted at once.
+    for attempt in 1..=3 {
+        if let Some(instance) = agent.supervisor.get_instance_mut(&id)
+            && instance.last_restart.is_some()
+        {
+            instance.last_restart = Some(Instant::now() - std::time::Duration::from_secs(600));
+        }
+        grill.set_state(&id, ContainerState::Stopped);
+        agent.check_apps().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().restart_count,
+            attempt
+        );
+        agent.drive_pending_restarts_to_completion().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        assert_eq!(restart_events(&*events.read().await), attempt as usize);
+    }
+
+    // A fourth exit inside its backoff waits, records nothing yet, then
+    // records exactly one event when the backoff ends.
+    grill.set_state(&id, ContainerState::Stopped);
+    agent.check_apps().await;
+    assert_eq!(
+        agent.supervisor.get_instance(&id).unwrap().state,
+        ContainerState::Stopped
+    );
+    agent.drive_pending_restarts_to_completion().await;
+    assert_eq!(restart_events(&*events.read().await), 3);
+    agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+        Some(Instant::now() - std::time::Duration::from_secs(600));
+    agent.drive_pending_restarts_to_completion().await;
+    agent.drive_pending_restarts_to_completion().await;
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Running);
+    assert_eq!(instance.restart_count, 4);
+    assert_eq!(restart_events(&*events.read().await), 4);
+    agent.stop_app("web", "default").await.unwrap();
+}
+
+/// An exit that finds the restart budget spent fails the instance and says
+/// so, as a restart that waited out its backoff does.
+#[tokio::test]
+async fn an_exit_past_the_restart_budget_records_the_exhausted_budget() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let events = Arc::new(tokio::sync::RwLock::new(
+        crate::bun::events::EventStore::new(),
+    ));
+    agent.set_event_store(Arc::clone(&events));
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+    agent
+        .supervisor
+        .get_instance_mut(&id)
+        .unwrap()
+        .restart_policy
+        .max_restarts = Some(0);
+    grill.set_state(&id, ContainerState::Stopped);
+    agent.check_apps().await;
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Failed);
+    assert!(!instance.retry_pending);
+    let recorded = events.read().await.recent(100, None, None);
+    assert!(
+        recorded.iter().any(|event| {
+            event.kind == crate::bun::events::EventKind::JobFailed
+                && event.message.contains("exhausted its restart budget")
+        }),
+        "no exhausted-budget event: {recorded:?}"
+    );
 }
 
 #[tokio::test]
@@ -13732,7 +13831,7 @@ async fn concurrent_requests_for_one_identity_share_one_signing() {
     .await
     .unwrap()
     .unwrap();
-    agent.finish_identity_provision(outcome);
+    agent.finish_identity_provision(outcome).await;
     for answered in [first_answered, second_answered] {
         answered.await.expect("a waiter was dropped unanswered");
     }
@@ -13781,7 +13880,7 @@ async fn signed_identity_is_stored_only_for_a_live_instance() {
             .join_next_with_id()
             .await
             .unwrap();
-        agent.finish_identity_provision(outcome);
+        agent.finish_identity_provision(outcome).await;
     }
 
     let instance = agent.supervisor.get_instance(&live).unwrap();

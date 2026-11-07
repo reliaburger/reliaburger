@@ -185,26 +185,63 @@ pub fn execute(plan: &Plan) -> Result<(), UninstallError> {
     Ok(())
 }
 
-/// `relish uninstall`: plan, show, confirm (`--yes` skips the question), remove.
-pub fn run(yes: bool) -> Result<(), UninstallError> {
+/// What `relish uninstall` removed and left.
+#[derive(Debug, serde::Serialize)]
+pub struct UninstallReport {
+    /// The relish home it looked in.
+    pub home: PathBuf,
+    pub removed: Vec<PathBuf>,
+    /// Files in the home the installer didn't create, left alone.
+    pub kept: Vec<PathBuf>,
+    /// Things left for you to do: a PATH line, a relish installed some
+    /// other way.
+    pub notes: Vec<String>,
+}
+
+impl std::fmt::Display for UninstallReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.removed.is_empty() {
+            return writeln!(f, "nothing to uninstall in {}", self.home.display());
+        }
+        writeln!(f, "removed")?;
+        for note in &self.notes {
+            writeln!(f, "note: {note}")?;
+        }
+        Ok(())
+    }
+}
+
+/// `relish uninstall`: plan, show, confirm (`--yes` skips the question),
+/// remove. The plan is shown as it goes (on stderr with `-o json`); the
+/// report comes back for the caller to print.
+pub fn run(
+    yes: bool,
+    output: crate::relish::OutputFormat,
+) -> Result<UninstallReport, UninstallError> {
+    use crate::relish::output::progress;
     let root = crate::relish::local_context::root_directory()
         .map_err(|error| UninstallError::Home(error.to_string()))?;
     // An isolated RELIABURGER_HOME never gets a ~/.local/bin link, and the
     // plan only removes a link that points at this home's binary anyway.
     let local_bin = dirs::home_dir().map(|home| home.join(".local").join("bin"));
     let plan = plan(&root, local_bin.as_deref())?;
+    let mut report = UninstallReport {
+        home: root.clone(),
+        removed: Vec::new(),
+        kept: plan.keep.clone(),
+        notes: Vec::new(),
+    };
     if plan.remove.is_empty() {
-        println!("nothing to uninstall in {}", root.display());
-        return Ok(());
+        return Ok(report);
     }
-    println!("relish uninstall will remove:");
+    progress(output, "relish uninstall will remove:");
     for path in &plan.remove {
-        println!("  {}", path.display());
+        progress(output, format_args!("  {}", path.display()));
     }
     if !plan.keep.is_empty() {
-        println!("and keep (not created by the installer):");
+        progress(output, "and keep (not created by the installer):");
         for path in &plan.keep {
-            println!("  {}", path.display());
+            progress(output, format_args!("  {}", path.display()));
         }
     }
     if !yes {
@@ -217,24 +254,24 @@ pub fn run(yes: bool) -> Result<(), UninstallError> {
         .as_deref()
         .is_some_and(|running| plan.removes(running));
     execute(&plan)?;
-    println!("removed");
+    report.removed = plan.remove.clone();
 
     if let Some(running) = running.filter(|_| !ours) {
-        println!(
-            "note: this relish ({}) wasn't installed by install.sh; remove it the way you installed it",
+        report.notes.push(format!(
+            "this relish ({}) wasn't installed by install.sh; remove it the way you installed it",
             running.display()
-        );
+        ));
     }
     let store = root.join("bin");
     let on_path = std::env::var_os("PATH")
         .is_some_and(|path| std::env::split_paths(&path).any(|entry| entry == store));
     if on_path {
-        println!(
-            "note: remove the line that adds {} to PATH from your shell's rc file",
+        report.notes.push(format!(
+            "remove the line that adds {} to PATH from your shell's rc file",
             store.display()
-        );
+        ));
     }
-    Ok(())
+    Ok(report)
 }
 
 fn confirm() -> Result<(), UninstallError> {
@@ -513,5 +550,23 @@ mod tests {
         let plan = plan(&temp.path().join("missing"), None).unwrap();
         assert!(plan.remove.is_empty());
         assert!(plan.keep.is_empty());
+    }
+
+    #[test]
+    fn uninstall_as_json_lists_what_went_and_what_stayed() {
+        let report = UninstallReport {
+            home: PathBuf::from("/home/me/.reliaburger"),
+            removed: vec![PathBuf::from("/home/me/.reliaburger/bin")],
+            kept: vec![PathBuf::from("/home/me/.reliaburger/notes.txt")],
+            notes: vec!["remove the line that adds /home/me/.reliaburger/bin to PATH from your shell's rc file".to_string()],
+        };
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(&report, crate::relish::OutputFormat::Json)
+                .unwrap()
+        );
+        assert_eq!(
+            report.to_string(),
+            "removed\nnote: remove the line that adds /home/me/.reliaburger/bin to PATH from your shell's rc file\n"
+        );
     }
 }

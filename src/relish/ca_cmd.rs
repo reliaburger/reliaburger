@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use age::secrecy::SecretString;
 
 use super::RelishError;
+use super::output::{OutputFormat, print_output};
 use crate::sesame::bootstrap;
 use crate::sesame::ca_rotation::{PreparedRotation, SignedIntermediate};
 use crate::sesame::root_backup::{self, BackupOpener, BackupSeal, RootBackup, SealKind};
@@ -107,6 +108,7 @@ pub fn ca_backup(
     dir: &Path,
     cluster: Option<&str>,
     target: &BackupTarget,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     // Resolve the seal first, so a mistyped passphrase or recipient fails
     // before the root key is ever unsealed.
@@ -115,17 +117,76 @@ pub fn ca_backup(
         BackupTarget::Recipient(public_key) => BackupSeal::Recipient(public_key.clone()),
     };
     let backup = write_backup(out, dir, cluster, &seal, SystemTime::now())?;
+    print_output(
+        &BackupSummary::new(BackupCheck::Written, out, &backup),
+        output,
+    )
+}
 
-    println!("wrote the root CA backup to {}", out.display());
-    print_summary(&backup);
-    println!();
-    println!("Keep it off the cluster, with the passphrase or age identity stored apart from it.");
-    println!(
-        "Check it at any time with `relish ca verify {} --fingerprint {}`.",
-        out.display(),
-        backup.fingerprint
-    );
-    Ok(())
+/// A root CA backup `relish ca backup` wrote or `ca verify` opened: what it
+/// holds, never the key itself.
+#[derive(Debug, serde::Serialize)]
+pub struct BackupSummary<'a> {
+    pub result: BackupCheck,
+    pub path: &'a Path,
+    pub cluster: &'a str,
+    pub trust_domain: &'a str,
+    /// The root certificate's fingerprint, to check the backup against.
+    pub fingerprint: &'a str,
+    /// When the root certificate expires, Unix seconds.
+    pub expires_at: i64,
+}
+
+/// What became of the backup in a [`BackupSummary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupCheck {
+    /// `ca backup` wrote it.
+    Written,
+    /// `ca verify` opened it and it matches the fingerprint.
+    Ok,
+}
+
+impl<'a> BackupSummary<'a> {
+    fn new(result: BackupCheck, path: &'a Path, backup: &'a RootBackup) -> Self {
+        Self {
+            result,
+            path,
+            cluster: &backup.cluster,
+            trust_domain: &backup.trust_domain,
+            fingerprint: &backup.fingerprint,
+            expires_at: backup.not_after,
+        }
+    }
+}
+
+impl std::fmt::Display for BackupSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.result {
+            BackupCheck::Written => {
+                writeln!(f, "wrote the root CA backup to {}", self.path.display())?
+            }
+            BackupCheck::Ok => writeln!(f, "{}: OK", self.path.display())?,
+        }
+        writeln!(f, "  cluster:      {}", self.cluster)?;
+        writeln!(f, "  trust domain: {}", self.trust_domain)?;
+        writeln!(f, "  fingerprint:  {}", self.fingerprint)?;
+        writeln!(f, "  expires:      {}", format_expiry(self.expires_at))?;
+        if self.result == BackupCheck::Written {
+            writeln!(f)?;
+            writeln!(
+                f,
+                "Keep it off the cluster, with the passphrase or age identity stored apart from it."
+            )?;
+            writeln!(
+                f,
+                "Check it at any time with `relish ca verify {} --fingerprint {}`.",
+                self.path.display(),
+                self.fingerprint
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Build, seal and write the backup. Split from [`ca_backup`] so tests can
@@ -160,11 +221,10 @@ pub fn ca_verify(
     fingerprint: &str,
     passphrase: &PassphraseSource,
     identity: Option<&Path>,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let backup = open_and_verify(file, fingerprint, passphrase, identity, SystemTime::now())?;
-    println!("{}: OK", file.display());
-    print_summary(&backup);
-    Ok(())
+    print_output(&BackupSummary::new(BackupCheck::Ok, file, &backup), output)
 }
 
 fn open_and_verify(
@@ -199,6 +259,7 @@ pub async fn ca_rotate(
     root_backup: &Path,
     passphrase: &PassphraseSource,
     identity: Option<&Path>,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let client = super::client::BunClient::default_local();
     let prepared = client.ca_rotation_prepare(role).await?;
@@ -211,35 +272,81 @@ pub async fn ca_rotate(
     )?;
     let signed = sign_prepared_rotation(&backup, &prepared)?;
     let message = client.ca_rotation_begin(&signed).await?;
-    println!("{message}");
-    println!();
-    match role {
-        CaRole::Node => println!(
-            "Every node now acknowledges the new trust set, then renews onto the new CA one at \
-             a time."
-        ),
-        CaRole::Workload => {
-            println!("Workload certificates move to the new CA as they renew, within the hour.")
-        }
-        CaRole::Ingress | CaRole::Root => println!(
-            "Ingress certificates now come from the new CA; each node re-mints its routes' \
-             certificates as it picks the new CA up."
-        ),
-    }
-    println!(
-        "Retire the old CA with `relish ca rotate --role {} --finalize`; it says what is still \
-         waiting if it's too early.",
-        role_flag(role)
-    );
-    Ok(())
+    print_output(
+        &CaRotation {
+            role: role_flag(role),
+            stage: RotationStage::Begun,
+            message,
+        },
+        output,
+    )
 }
 
 /// `relish ca rotate --role ROLE --finalize`: retire the old CA, refused
 /// while anything could still depend on it.
-pub async fn ca_rotate_finalize(role: CaRole) -> Result<(), RelishError> {
+pub async fn ca_rotate_finalize(role: CaRole, output: OutputFormat) -> Result<(), RelishError> {
     let client = super::client::BunClient::default_local();
-    println!("{}", client.ca_rotation_finalize(role).await?);
-    Ok(())
+    let message = client.ca_rotation_finalize(role).await?;
+    print_output(
+        &CaRotation {
+            role: role_flag(role),
+            stage: RotationStage::Finalised,
+            message,
+        },
+        output,
+    )
+}
+
+/// What `relish ca rotate` did to an intermediate CA.
+#[derive(Debug, serde::Serialize)]
+pub struct CaRotation {
+    /// The role as `--role` spells it.
+    pub role: &'static str,
+    pub stage: RotationStage,
+    /// What the council said.
+    pub message: String,
+}
+
+/// How far a [`CaRotation`] has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RotationStage {
+    /// The new CA is signed and rolling out.
+    Begun,
+    /// The old CA is retired.
+    Finalised,
+}
+
+impl std::fmt::Display for CaRotation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.message)?;
+        if self.stage == RotationStage::Finalised {
+            return Ok(());
+        }
+        writeln!(f)?;
+        match self.role {
+            "node" => writeln!(
+                f,
+                "Every node now acknowledges the new trust set, then renews onto the new CA one at \
+                 a time."
+            )?,
+            "workload" => writeln!(
+                f,
+                "Workload certificates move to the new CA as they renew, within the hour."
+            )?,
+            _ => writeln!(
+                f,
+                "Ingress certificates now come from the new CA; each node re-mints its routes' \
+                 certificates as it picks the new CA up."
+            )?,
+        }
+        writeln!(
+            f,
+            "Retire the old CA with `relish ca rotate --role {} --finalize`; it says what is still \
+             waiting if it's too early.",
+            self.role
+        )
+    }
 }
 
 /// `relish identity rotate-signing-key`: sign workload JWTs with a new key,
@@ -297,13 +404,6 @@ fn role_flag(role: CaRole) -> &'static str {
         CaRole::Ingress => "ingress",
         CaRole::Root => "root",
     }
-}
-
-fn print_summary(backup: &RootBackup) {
-    println!("  cluster:      {}", backup.cluster);
-    println!("  trust domain: {}", backup.trust_domain);
-    println!("  fingerprint:  {}", backup.fingerprint);
-    println!("  expires:      {}", format_expiry(backup.not_after));
 }
 
 fn format_expiry(unix_seconds: i64) -> String {
@@ -447,6 +547,7 @@ mod tests {
             cluster,
             "node-01",
             super::super::commands::InitSecurityMode::MutualTls,
+            OutputFormat::Human,
         )
         .unwrap();
         let identity = crate::sesame::identity_store::load(&dir.path().join("identity"))
@@ -701,6 +802,35 @@ mod tests {
         assert_eq!(
             read_passphrase_file(&path).unwrap().expose_secret(),
             "  spaced passphrase  "
+        );
+    }
+
+    /// #1566: a backup's JSON says what it holds, never the key.
+    #[test]
+    fn ca_reports_as_json() {
+        let summary = BackupSummary {
+            result: BackupCheck::Ok,
+            path: Path::new("root-ca.backup"),
+            cluster: "prod",
+            trust_domain: "prod.reliaburger",
+            fingerprint: "sha256:ab12",
+            expires_at: 2_000_000_000,
+        };
+        insta::assert_snapshot!(
+            "backup",
+            crate::relish::output::format_output(&summary, OutputFormat::Json).unwrap()
+        );
+        insta::assert_snapshot!(
+            "rotate",
+            crate::relish::output::format_output(
+                &CaRotation {
+                    role: "node",
+                    stage: RotationStage::Begun,
+                    message: "node CA rotation begun".to_string(),
+                },
+                OutputFormat::Json
+            )
+            .unwrap()
         );
     }
 }

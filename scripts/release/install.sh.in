@@ -134,6 +134,25 @@ not for production.
 CHOICES
 }
 
+# How to check this release's files, for --help only: releases before 0.2.7
+# carry no attestations, so the website bootstrap doesn't print it (#1583).
+explain_verification() {
+  cat <<'VERIFY'
+
+Every file of a release, from 0.2.7 on, carries a build provenance
+attestation from the workflow that built it on main (a nightly build has
+none). Check a download, or the relish you're running, with the GitHub CLI
+(https://cli.github.com):
+
+  gh attestation verify ~/.reliaburger/bin/relish --repo @REPOSITORY@ \
+    --signer-workflow @REPOSITORY@/.github/workflows/build.yml \
+    --source-ref refs/heads/main
+
+Any other release file works in place of the binary: SHA256SUMS, install.sh,
+metadata.json, a guest image.
+VERIFY
+}
+
 usage() {
   printf '%s\n' \
     'usage: install.sh --laptop [--no-modify-path] [relish setup options...]' \
@@ -239,7 +258,7 @@ main() {
         shift 2 ;;
       --install-only) choose_mode install-only; shift ;;
       --no-modify-path) modify_path=false; shift ;;
-      -h|--help) explain_choices; exit 0 ;;
+      -h|--help) explain_choices; explain_verification; exit 0 ;;
       *)
         # The rest belongs to `relish setup`.
         case $mode in laptop|ssh) break ;; esac

@@ -1673,7 +1673,8 @@ fn isolate_probe(
     )
     .unwrap();
     let mut keys = std::collections::HashSet::new();
-    firewall::reconcile_destination_map(&mut ebpf.bpf, entries, &mut keys).unwrap();
+    firewall::reconcile_destination_map(&mut ebpf.bpf, entries, &mut keys, &mut Default::default())
+        .unwrap();
     keys
 }
 
@@ -1684,7 +1685,13 @@ fn release_probe(
     mut keys: std::collections::HashSet<reliaburger::onion::types::DestinationKey>,
 ) {
     use reliaburger::sesame::firewall;
-    firewall::reconcile_destination_map(&mut ebpf.bpf, &Default::default(), &mut keys).unwrap();
+    firewall::reconcile_destination_map(
+        &mut ebpf.bpf,
+        &Default::default(),
+        &mut keys,
+        &mut Default::default(),
+    )
+    .unwrap();
     firewall::delete_cgroup_firewall_state(&mut ebpf.bpf, probe.id).unwrap();
 }
 
@@ -2370,6 +2377,7 @@ async fn allow_from_can_name_a_delegated_job_as_its_source() {
             &mut e.bpf,
             &firewall::destination_entries(&entries, &Default::default(), &[]),
             &mut destination_keys,
+            &mut Default::default(),
         )
         .unwrap();
         for (key, value) in &grants {
@@ -2424,8 +2432,13 @@ async fn allow_from_can_name_a_delegated_job_as_its_source() {
         for (key, _) in &grants {
             firewall::delete_firewall_entry(&mut e.bpf, *key).unwrap();
         }
-        firewall::reconcile_destination_map(&mut e.bpf, &Default::default(), &mut destination_keys)
-            .unwrap();
+        firewall::reconcile_destination_map(
+            &mut e.bpf,
+            &Default::default(),
+            &mut destination_keys,
+            &mut Default::default(),
+        )
+        .unwrap();
     }
     drop(probes);
     drop(policy);
@@ -4622,6 +4635,7 @@ fn firewall_reconciliation_retains_refused_cleanup_for_repeated_attempts() {
             )],
             &mut namespaces,
             &mut rules,
+            &mut Default::default(),
         )
         .unwrap();
         freeze_egress_map(&ebpf, frozen);
@@ -4632,6 +4646,7 @@ fn firewall_reconciliation_retains_refused_cleanup_for_repeated_attempts() {
                 &[],
                 &mut namespaces,
                 &mut rules,
+                &mut Default::default(),
             );
             let retained =
                 firewall::read_firewall_state(&mut ebpf.bpf, cgroup, key.dst_app_id).unwrap();
@@ -4681,6 +4696,7 @@ fn firewall_reconciliation_retains_partial_publication_and_unrelated_entries() {
         )],
         &mut namespaces,
         &mut rules,
+        &mut Default::default(),
     );
     let state = firewall::read_firewall_state(&mut ebpf.bpf, cgroup, key.dst_app_id).unwrap();
     let unrelated = firewall::read_firewall_state(&mut ebpf.bpf, other, 0).unwrap();
@@ -4722,11 +4738,19 @@ fn firewall_reconciliation_forgets_confirmed_removals_only() {
         )],
         &mut namespaces,
         &mut rules,
+        &mut Default::default(),
     )
     .unwrap();
     for _ in 0..2 {
-        firewall::reconcile_firewall_maps(&mut ebpf.bpf, &[], &[], &mut namespaces, &mut rules)
-            .unwrap();
+        firewall::reconcile_firewall_maps(
+            &mut ebpf.bpf,
+            &[],
+            &[],
+            &mut namespaces,
+            &mut rules,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert!(namespaces.is_empty() && rules.is_empty());
         let state = firewall::read_firewall_state(&mut ebpf.bpf, cgroup, key.dst_app_id).unwrap();
         assert_eq!(state.source_namespace_id, None);

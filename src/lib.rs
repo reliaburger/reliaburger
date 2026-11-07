@@ -31,11 +31,14 @@ pub mod mayo;
 pub mod meat;
 pub mod mustard;
 pub(crate) mod object_storage;
+#[cfg(test)]
+pub(crate) mod off_runtime;
 pub mod onion;
 pub mod os;
 pub mod pickle;
 pub mod policy;
 pub mod reconstruction;
+pub mod redact;
 pub mod relish;
 pub mod reporting;
 pub mod sesame;

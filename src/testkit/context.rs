@@ -780,7 +780,7 @@ impl TestContext {
                     // durable ownership evidence, but runtime absence still
                     // needs the independent check below.
                 }
-                Ok(Err(crate::relish::RelishError::AgentUnreachable)) => {
+                Ok(Err(crate::relish::RelishError::AgentUnreachable { .. })) => {
                     return CleanupOutcome::Unknown {
                         reason: "could not reach the lease owner to confirm cleanup".to_string(),
                     };

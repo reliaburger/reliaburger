@@ -1,0 +1,28 @@
+---
+source: src/relish/fault.rs
+expression: "crate::relish::output::format_output(&Injection(first),\nOutputFormat::Json).unwrap()"
+---
+{
+  "id": 1,
+  "fault_type": "kill",
+  "target_service": "web",
+  "namespace": "default",
+  "target_instance": null,
+  "target_node": "node-1",
+  "remaining_secs": 0,
+  "injected_by": "ops",
+  "node": "node-1",
+  "routed": [
+    {
+      "id": 3,
+      "fault_type": "kill",
+      "target_service": "web",
+      "namespace": "default",
+      "target_instance": null,
+      "target_node": "node-2",
+      "remaining_secs": 0,
+      "injected_by": "ops",
+      "node": "node-2"
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+---
+source: src/relish/agent/manual.rs
+expression: value
+---
+{
+  "command": "manual show",
+  "data": {
+    "anchor": "rolling-deploys",
+    "chapter": "deploy-an-app",
+    "complete": true,
+    "file": "01_deploy-an-app.md",
+    "heading": "Rolling deploys",
+    "lines": {
+      "from": 5,
+      "to": 17
+    },
+    "markdown": "## Rolling deploys\n\nA rolling deploy replaces instances in batches.\nEach batch waits for health checks.\n\n```sh\n# not a heading\nrelish apply app.toml\n```\n\n### Rollback\n\nA failed rolling deploy rolls back.",
+    "subsections": [
+      {
+        "anchor": "rollback",
+        "heading": "Rollback",
+        "level": 3,
+        "line": 15,
+        "show": "relish agent manual show deploy-an-app#rollback"
+      }
+    ],
+    "title": "Deploy an app"
+  },
+  "next": [],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": false,
+    "source_digest": null,
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": []
+}
