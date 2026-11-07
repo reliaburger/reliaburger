@@ -124,3 +124,41 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: python3 scripts/release/homebrew.py publish --formula relish.rb --version "$RELEASE_TAG"
+
+  mcp-registry-entry:
+    # The MCP Registry entry for this release (#1695): the tag's server.json
+    # plus one `mcpb` package per relish platform, each with the SHA-256 the
+    # published candidate.json records for its bundle. Publishing it needs
+    # the maintainer's GitHub login to the organisation, so this job only
+    # writes it, to the run summary and as an artefact; the maintainer runs
+    # `mcp-publisher publish` with it (docs/releasing.md).
+    needs: promote
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_REPOSITORY: ${{ github.repository }}
+      QUALIFIED_DIGEST: ${{ inputs.qualified_digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write the entry from the published release
+        run: |
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          git show "refs/tags/$RELEASE_TAG:server.json" > tagged-server.json
+          gh release download "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
+            --pattern candidate.json --dir published
+          mkdir registry
+          python3 scripts/release/mcp_registry.py --record published/candidate.json \
+            --server tagged-server.json --qualified-digest "$QUALIFIED_DIGEST" \
+            --output registry/server.json
+          { echo '### MCP Registry entry'; echo '```json'; cat registry/server.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the entry for the maintainer to publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-registry-server-json
+          path: registry/server.json
+          if-no-files-found: error
+          retention-days: 90

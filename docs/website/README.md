@@ -277,6 +277,14 @@ outlives its page. So after changing a page, or adding one, run `make
 agent-docs` and commit the copy with it. `agents.html` and `agents.md` are
 the exception: both come straight from the manual's agent chapter.
 
+`assets/copy.js` puts two buttons at the top of each page's `<main>`: "Copy
+as Markdown", which fetches the copy the `alternate` link names and puts it
+on the clipboard, and "Open in Claude", a link to `https://claude.ai/new?q=`
+with a one-line prompt naming the copy's full address. The script makes
+them, so a page without JavaScript has neither, and a page without an
+`alternate` link gets none. Every page must load `copy.js`; a test checks
+it, and that the buttons never appear in a page's markup.
+
 `llms.txt`, also generated, lists every copy under "Website".
 `.well-known/agent-skills/index.json` is the skills discovery index
 ([Agent Skills Discovery RFC](https://github.com/cloudflare/agent-skills-discovery-rfc)

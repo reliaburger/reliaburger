@@ -95,6 +95,10 @@ pub enum CommandName {
     #[serde(rename = "patch diff")]
     #[value(name = "patch-diff")]
     PatchDiff,
+    /// `relish agent patch apply`.
+    #[serde(rename = "patch apply")]
+    #[value(name = "patch-apply")]
+    PatchApply,
     /// `relish agent patch destroy`.
     #[serde(rename = "patch destroy")]
     #[value(name = "patch-destroy")]
@@ -129,6 +133,7 @@ impl CommandName {
             CommandName::PatchTest => "patch test",
             CommandName::PatchTry => "patch try",
             CommandName::PatchDiff => "patch diff",
+            CommandName::PatchApply => "patch apply",
             CommandName::PatchDestroy => "patch destroy",
             CommandName::Setup => "setup",
         }
@@ -158,6 +163,7 @@ impl CommandName {
         CommandName::PatchTest,
         CommandName::PatchTry,
         CommandName::PatchDiff,
+        CommandName::PatchApply,
         CommandName::PatchDestroy,
         CommandName::Setup,
     ];

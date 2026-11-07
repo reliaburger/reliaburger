@@ -255,6 +255,7 @@ net, not a promise: read what you share before you post it anywhere.
 | `relish agent patch test` | Run the portable test suite in the workspace, optionally filtered |
 | `relish agent patch try` | Boot a throwaway cluster from the workspace's binaries, with its own `RELIABURGER_HOME` |
 | `relish agent patch diff` | The change against the extracted source, and the tests that ran |
+| `relish agent patch apply` | Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing |
 | `relish agent patch destroy` | Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay |
 | `relish agent setup` | Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes |
 <!-- agent-commands:end -->
@@ -586,7 +587,7 @@ adds the `wtf`, quorum and skew checks.
 
 When the source shows that a bug is in Reliaburger itself, `relish agent
 patch` lets an agent fix it, run the tests and boot a throwaway cluster with
-the fix, all without touching your cluster. It takes six commands, each
+the fix, all without touching your cluster. It takes seven commands, each
 naming the same workspace directory.
 
 `init` extracts the source, as `source extract` does, and puts it on a branch
@@ -599,6 +600,26 @@ relish agent patch init ./fix
 The agent then edits files in `./fix` with whatever it edits files with.
 `patch` keeps its own state, binaries and logs in `./fix/.reliaburger-patch/`,
 which git ignores.
+
+An agent with no editor of its own, only `relish`, makes its edit with
+`apply`. It takes a unified diff, inline or as `@file`:
+
+```sh
+relish agent patch apply ./fix @fix.diff
+```
+
+`apply` reads each hunk's lines and ignores its `@@` line counts, which a
+hand-written diff often gets wrong. Each hunk applies where its context and
+`-` lines sit in the file, nearest the line its header names. The answer
+lists every hunk with the line it applied at, how far that was from the
+header's line, and `recounted: true` when the header's counts were wrong.
+It's all or nothing: when one hunk's lines aren't in the file, nothing is
+written, and the `usage` error names the hunk, such as `hunk 2 of
+src/relish/client.rs (@@ -28,6 +28,8 @@)`, and the first line the file doesn't
+have. `--check` matches every hunk and writes nothing. `apply` only writes
+files inside the workspace: never `.git/` or `.reliaburger-patch/`, never a
+path with `..`, and never through a symbolic link. Afterwards `diff` prints
+the change as git writes it, with correct headers.
 
 `test` runs the portable suite in the workspace, or only the tests whose name
 contains a filter:
@@ -671,7 +692,9 @@ whether it ran against the change as it is now:
 relish agent patch diff ./fix
 ```
 
-That's what a report needs: what changed, and which tests prove it.
+That's what a report needs: what changed, and which tests prove it. Its
+`data.diff` applies with a plain `git apply`, so a report should carry it
+rather than the diff the agent wrote by hand.
 
 `destroy` removes the workspace's throwaway cluster, or every one with
 `--all`. The workspace and its change stay:
@@ -913,11 +936,16 @@ token scoped to the namespace is.
 
 The repository's [`server.json`](https://github.com/reliaburger/reliaburger/blob/main/server.json)
 describes `relish mcp` for the [MCP Registry](https://registry.modelcontextprotocol.io),
-as `io.github.reliaburger/relish`: stdio, read-only and the tools above. It
-lists no package to install from, because the registry installs from npm,
-PyPI, NuGet, crates.io, container registries and MCPB bundles, and `relish`
-comes from `install.sh`. Install `relish` first, then point your client at
-`relish mcp`.
+as `io.github.reliaburger/relish`: stdio, read-only and the tools above.
+From 0.2.8, every release also carries an
+[MCP Bundle](https://github.com/modelcontextprotocol/mcpb) for each platform
+`relish` runs on, `relish-linux-x86_64.mcpb`, `relish-linux-aarch64.mcpb` and
+`relish-macos-aarch64.mcpb`, and the published registry entry lists them with
+their SHA-256s. A client that installs MCP Bundles, such as Claude Desktop,
+can install one and run the `relish` inside it, with no `install.sh`. That
+`relish` has no flags, so it uses the default local address or the saved
+local context. To connect it to anything else, or to use the `relish` you
+installed yourself, point your client at `relish mcp` as above.
 
 ## Wiring up your agent
 
@@ -1019,6 +1047,7 @@ agents apply:
 - **A human answers for every line.** Your human reviews and submits your work. Write nothing they couldn't explain in a review.
 - **Agents never post on their own.** Don't open, comment on or close issues or pull requests, and don't push to someone else's branch, unless your human asks for that specific action. Draft it, show it, and let them send it.
 - **Every bug fix carries its test.** Write the failing test first, then the fix, and say which suites you ran and which you couldn't.
+- **Build where CI builds.** The repository's [`.devcontainer/`](https://github.com/reliaburger/reliaburger/tree/main/.devcontainer) (and `copilot-setup-steps.yml` for Copilot) has the toolchain CI pins, so `make ci` runs there in one step. It runs only the portable suite: "tests pass" from there means `make ci`, never the gated suites ([docs/testing.md](https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#the-development-container)).
 - **Report with evidence.** Use the [issue forms](https://github.com/reliaburger/reliaburger/issues/new/choose). A Reliaburger bug goes through `relish agent report`, which writes a redacted draft whose fields match the agent-drafted form. With no reproducer, say "unverified" in the title; a report with no reproducer may be closed. Fill in "What was not tested" honestly.
 - **Search first.** Look for the report's fingerprint in the existing issues and add evidence to a match instead of opening a duplicate.
 - **Security bugs stay private.** Never put a vulnerability in a public issue; [SECURITY.md](https://github.com/reliaburger/reliaburger/blob/main/SECURITY.md) says where it goes.
