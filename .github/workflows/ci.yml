@@ -260,13 +260,16 @@ jobs:
     outputs:
       portable_linux_sha256: ${{ steps.portable_linux.outputs.portable_linux_sha256 }}
     # The Linux portable suite runs once, instrumented: the same run is the
-    # test gate, the coverage gate and the JUnit source.
+    # test gate, the coverage gate and the JUnit source. It's every train
+    # PR's critical path, so it does nothing else: the doctests and the
+    # nightly-signing test run beside it, and the HTML report waits for main.
     name: portable Linux
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
-    # About 25 minutes, but 35 to 41 on a slow runner (#1421). nextest's
-    # per-test timeouts catch a hung test, so this only catches a stuck runner.
+    # About 25 minutes, but 35 to 41 on a slow runner (#1421), before the
+    # doctests and two report passes left it (#1723). nextest's per-test
+    # timeouts catch a hung test, so this only catches a stuck runner.
     timeout-minutes: 62
     steps:
       - uses: actions/checkout@v4
@@ -302,14 +305,12 @@ jobs:
           path: target/contracts/linux/portable-linux
           if-no-files-found: error
           retention-days: 14
-      - name: Doctests
-        run: make test-doc
-      # A train's nightly build trusts the nightly key instead of every
-      # release key (#1363). The test that says so only compiles with the
-      # feature, so no other run has it (#1442). The doctests have just
-      # built the dependencies for this profile; only the crate rebuilds.
-      - name: Nightly-signing key trust
-        run: 'cargo test --locked --lib --features nightly-signing upgrade::keys::'
+      # The evidence owner's one report wrote the lcov file and checked the
+      # floor. The HTML is for reading, so only main and the nightly write
+      # it (D5 in plan 2026-11-06), from the same profiles.
+      - name: HTML coverage report
+        if: github.ref == 'refs/heads/main'
+        run: make coverage-html
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v4
@@ -318,6 +319,32 @@ jobs:
           path: target/coverage
           if-no-files-found: warn
           retention-days: 14
+
+  doctests:
+    # Doctests and the nightly-signing key test build the crate without
+    # instrumentation, so they never shared the coverage run's build. On
+    # portable Linux they added about six minutes to every train PR's
+    # critical path; here they finish well inside it (#1723).
+    name: doctests and feature tests
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-debug
+          save-if: false
+      - name: Doctests
+        run: make test-doc
+      # A train's nightly build trusts the nightly key instead of every
+      # release key (#1363). The test that says so only compiles with the
+      # feature, so no other run has it (#1442). The doctests have just
+      # built the dependencies for this profile; only the crate rebuilds.
+      - name: Nightly-signing key trust
+        run: 'cargo test --locked --lib --features nightly-signing upgrade::keys::'
 
   linux:
     outputs:
@@ -765,7 +792,7 @@ jobs:
     # always reports, so a skipped owner can never stand in for a pass. A
     # closed PR's run has nothing to report.
     name: ignored-test evidence
-    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, source-bundle, portable, linux, linux-next, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
+    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, source-bundle, portable, doctests, linux, linux-next, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
     if: ${{ always() && github.event.action != 'closed' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10

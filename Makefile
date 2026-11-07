@@ -1,4 +1,4 @@
-.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gym test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos test-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands agent-docs bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed
+.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gym test-gpu test-s3 test-ci-scripts check-ignored coverage coverage-html check fmt lint lint-macos test-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands agent-docs bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -163,13 +163,19 @@ bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 bench-task-arrays: ## Run in-process task-array benchmarks (leader cost, pool overhead, fork/exec floor)
 	$(CARGO) bench --bench task_arrays
 
-coverage: ## Run the portable suite once under line coverage and enforce the floor
+# One report call writes the lcov file and then checks the floor: each call
+# merges every profile and reads every binary's coverage map again, about two
+# minutes on CI (plan 2026-11-06, F3). scripts/ci/coverage_owner.py pins this
+# recipe, so CI's evidence owner runs exactly these stages.
+coverage: ## Run the portable suite once under line coverage, write the lcov report and enforce the floor
 	$(CARGO) llvm-cov clean --workspace
 	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
 	mkdir -p target/coverage
-	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info
+	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
+
+# CI writes the HTML on pushes to main and the nightly only (D5).
+coverage-html: ## Write the HTML coverage report from the last make coverage run
 	$(COVERAGE_REPORT) --html --output-dir target/coverage/html
-	$(COVERAGE_REPORT) --fail-under-lines $(COVERAGE_MIN_LINES)
 
 rollout-demo: ## Roll an app forward, roll it back, and watch a bad version roll back by itself
 	scripts/demo/rollout.sh

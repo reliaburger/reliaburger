@@ -19,7 +19,7 @@ run it.
 | Doctests | Examples in doc comments compile and run | `///` blocks | `make test-doc` |
 | Doc snippets | Every `relish` command and TOML block a reader copies from the manual, the READMEs and the whitepaper parses with the real code ([below](#doc-snippets)) | [`tests/suite/doc_snippets.rs`](../tests/suite/doc_snippets.rs) | `make test` |
 | Lint and format | Clippy with warnings as errors, all features and none, over every target; the macOS job runs the all-features pass only, because that one holds the macOS-only code, over the library, `relish` and `bun` ([what runs on macOS](#what-runs-on-macos-and-what-runs-on-linux)) | [`Makefile`](../Makefile) | `make lint`, `make lint-macos`, `make fmt-check` |
-| Coverage floor | Line coverage of the portable suite never drops below 78.65% | `COVERAGE_MIN_LINES` in the [`Makefile`](../Makefile) | `make coverage` |
+| Coverage floor | Line coverage of the portable suite never drops below 78.65% | `COVERAGE_MIN_LINES` in the [`Makefile`](../Makefile) | `make coverage` (then `make coverage-html` for the HTML report) |
 | Dependency audit | No new RustSec advisory; every exception is dated | [`security.yml`](../.github/workflows/security.yml), [exceptions](qualification/2026-09-18-dependency-exceptions.md) ([12 Oct](qualification/2026-10-12-dependency-exceptions.md), [21 Oct](qualification/2026-10-21-dependency-exceptions.md), [24 Oct](qualification/2026-10-24-dependency-exceptions.md), [25 Oct](qualification/2026-10-25-dependency-exceptions.md), [26 Oct](qualification/2026-10-26-dependency-exceptions.md), [28 Oct](qualification/2026-10-28-dependency-exceptions.md) and [6 Nov](qualification/2026-11-06-dependency-exceptions.md) reviews) | `make audit` |
 | Dependency lag | Nothing: a report, never a failure. It lists what `cargo update` would move and every crate a major version behind, for the refresh at the start of each minor release ([`releasing.md`](releasing.md#refreshing-dependencies)); [Dependabot](../.github/dependabot.yml) opens the weekly compatible refresh | [`security.yml`](../.github/workflows/security.yml) prints it in the weekly job summary | `make outdated` |
 | CI scripts | Job selection, ignored-test owners, JUnit keeping, the benchmark baseline and the flakes register, against fixture repositories and the real workflow | [`scripts/ci/test_*.py`](../scripts/ci) | `make test-ci-scripts` |
@@ -406,12 +406,12 @@ jobs. What else runs depends on where the change is going:
 
 | Run | Jobs | Typical wall time |
 |---|---|---|
-| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, the source bundle build, portable Linux (with coverage, doctests and the nightly-signing key test) and the optimised contract boundaries | about 25 minutes, set by portable Linux; up to 41 on a slow runner (#1421) |
+| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 22 minutes, set by portable Linux (#1723) |
 | The same, labelled `full-ci` | The light set plus privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks the change touches | about 45 minutes |
 | The gate PR (a train into `main`) | The light set on each push; with `full-ci`, the heavy suites too | as above |
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
-| Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 25 minutes |
+| Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 22 minutes |
 | Push to a train or to `main`, merge-queue group, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
 
 **macOS only where it adds something**
@@ -519,6 +519,14 @@ the [`Makefile`](../Makefile), and
 with the lint and the doctest step, so widening or narrowing what macOS proves
 is a reviewed change. Test code only macOS compiles is built by `make
 test-macos` but linted only by `make lint` on a Mac.
+
+So Bun's macOS-only branches are compiled and linted in CI, but not tested
+there, because Bun ships only for Linux. They are the EPERM and reaping
+paths of `grill::process` and `process_owner`, `grill::capture`'s hole
+punching, `grill::volume::owned`'s mount listing and `mayo::collector`.
+`make test` on a Mac still runs their tests, so run it locally when you touch
+them. Bringing them back into CI is
+[#1741](https://github.com/reliaburger/reliaburger/issues/1741).
 
 The evidence manifest follows the same line. A finite case requires the
 `portable-darwin` gate only when the macOS filterset selects it, or the
@@ -640,7 +648,9 @@ a seal from another commit or run, a later attempt or an earlier attempt that a
 re-run replaced can't qualify.
 
 Linux coverage wraps the existing `make coverage` once, including its clean,
-instrumented nextest run, LCOV/HTML reports and unchanged line floor. Discovery
+instrumented nextest run and its one report, which writes the LCOV file and
+checks the unchanged line floor. The HTML report isn't evidence: the job writes
+it with `make coverage-html` on pushes to `main` and the nightly only. Discovery
 uses that run's instrumented environment, selectors and target directory.
 A separate ordinary test run doesn't validate the coverage run. The owner also
 checks actual compiler/tool bytes and the runtime parent/child context, so a
