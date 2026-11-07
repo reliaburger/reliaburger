@@ -1245,7 +1245,22 @@ the real `curl … | sh` install against it on every host we advertise.
    heavy check also reports Bun's anonymous and file-backed RSS
    (`rss_anon_kb`, `rss_file_kb` in the record's resource trends), so heap
    growth isn't mistaken for mapped files
-   ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)). The
+   ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)). It
+   also breaks Bun's memory down by kind with one `awk` pass over
+   `/proc/PID/smaps` (`sustained/bun-memory.awk`): smaps_rollup's RSS,
+   anonymous, private dirty and swap figures, the thread count, the main
+   heap, glibc thread arenas (RSS and how many 64 MiB arena heaps), thread
+   stacks, other anonymous memory, file-backed memory and the five
+   anonymous mappings with the most RSS. An arena heap is a read-write
+   anonymous mapping that starts on a 64 MiB boundary and is either 64 MiB
+   long or followed directly by a `---p` reserve ending on the next
+   boundary, since 64-bit glibc reserves each arena heap as 64 MiB aligned
+   to 64 MiB. A thread stack is `[stack]`, or a read-write anonymous mapping
+   directly after a `---p` guard of 64 KiB or less that doesn't end on a
+   64 MiB boundary. Each sample is a line per node in `memory.jsonl` in the
+   evidence directory, and the record's "Bun memory by kind" section tables
+   each node hourly and says which kind grew most after the first hour.
+   It's evidence only: `leak-rss` still judges VmRSS. The
    nodes export logs and metrics to `soak-export` on their own disks; once a
    metrics export's source has been gone for 30 minutes, and the checker has
    seen it at the destination, the harness deletes it

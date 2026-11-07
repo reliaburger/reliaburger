@@ -3973,6 +3973,23 @@ Neither of these was what the day run was built to find. That's the case for
 running it anyway: give the leak checkers 23 hours instead of two, and they
 see things a gate tier can't.
 
+Seeing that RSS grows isn't the same as seeing what grows, and Bun can't
+tell us itself: it allocates through glibc's malloc, which keeps no
+statistics anyone can scrape. The kernel can, though. `/proc/PID/smaps`
+lists every mapping in a process with its resident size, so each heavy
+check now runs one `awk` pass over Bun's (`sustained/bun-memory.awk`) and
+sorts the memory into kinds: the main heap (`[heap]`), glibc's thread
+arenas, thread stacks, other anonymous memory (large allocations get a
+mapping of their own) and file-backed pages. The arenas need a heuristic.
+On 64-bit glibc each one lives in a 64 MiB reservation aligned to 64 MiB,
+with the part in use read-write and the rest `---p`, so a read-write
+mapping that starts on a 64 MiB boundary and runs into such a reserve is
+an arena. A stack is the read-write mapping just above a small `---p`
+guard page. Every sample goes into `memory.jsonl`, and the record shows
+each node hour by hour, with one line naming the kind that grew most after
+the first hour. A heap that keeps climbing points at live data or
+fragmentation; arenas that fill and stop point at a cache warming up.
+
 ### Soak jobs while the apps keep running
 
 A fast command completing a million times tells us little about what happens

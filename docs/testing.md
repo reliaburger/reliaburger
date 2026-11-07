@@ -1084,7 +1084,15 @@ them, and the controller's per-node API fallbacks reach the record. The
 guest memory report (#985) runs against stub `ps`, `systemctl` and
 `journalctl` and a fake `/proc`: it keeps meminfo, the top RSS, the guest
 agent's RSS and fds and only the OOM report from the kernel log, and each
-rise in unexplained Bun restarts is a failure of its own.
+rise in unexplained Bun restarts is a failure of its own. Bun's memory
+breakdown (#1417) runs `sustained/bun-memory.awk` over a fixture smaps that
+holds each kind of mapping it tells apart (heap, arena heaps with and without
+a reserve, a guarded thread stack, a 64 MiB reserve that isn't a guard, file
+mappings), checks the program reaches the guest byte for byte inside
+`guest_report`, and drives hours of samples through the checker: arenas that
+fill in the first hour and then stop aren't named as what grew, a heap that
+climbs every hour is, and a Bun restarted within the last hour is too young
+to judge.
 
 On rootful Linux with runc, BusyBox and cgroup v2, run the actual mixed-runtime
 fixtures with:
